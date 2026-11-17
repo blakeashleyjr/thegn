@@ -4,7 +4,7 @@
 //! deterministically, plus the leak-safety ledger flow (intent → ready →
 //! removed-on-destroy). Mirrors `sprites_mock.rs`.
 //!
-//! One #[test] only: the registry lives under `THEGN_DIR`, set process-wide
+//! One #[test] only: the registry lives under `XDG_STATE_HOME` (legacy `THEGN_DIR`), set process-wide
 //! here — parallel tests in this binary would race the env var.
 //!
 //! Run: `cargo test -p thegn-svc --test vps_mock`.
@@ -152,6 +152,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     let tmp = tempfile::tempdir().unwrap();
     // Isolate the registry (one test per binary — no env-var race).
     unsafe { std::env::set_var("THEGN_DIR", tmp.path()) };
+    unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path().join("state")) };
     let (base, recorded) = start_mock();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

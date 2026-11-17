@@ -189,6 +189,7 @@ fn bounded_stderr_tail(bytes: &[u8], cap: usize) -> String {
 /// This is blocking; call it off the UI loop.
 pub fn git_run(dir: &Path, args: &[&str], policy: &GitPolicy, cancel: &AtomicBool) -> GitOutcome {
     crate::util::note_core_git_spawn();
+    crate::git_spawn_stats::record(args);
     let mut cmd = crate::util::git_cmd(dir);
     cmd.args(args);
     run_command(&mut cmd, policy, cancel)
@@ -373,6 +374,27 @@ mod tests {
             other => panic!("expected success despite pipe holder, got {other:?}"),
         }
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn git_run_records_the_subcommand() {
+        let _g = crate::git_spawn_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::git_spawn_stats::reset_for_test();
+        let dir = repo();
+        let before = util::core_git_spawn_count();
+        // The outcome is irrelevant (the fixture has no commits); only the
+        // recorded spawn is under test.
+        let _outcome = git_run(
+            dir.path(),
+            &["rev-parse", "HEAD"],
+            &policy(),
+            &AtomicBool::new(false),
+        );
+        assert!(util::core_git_spawn_count() > before);
+        let window = crate::git_spawn_stats::take_window();
+        assert!(window.iter().any(|e| e.1 == "rev-parse"));
     }
 
     #[test]

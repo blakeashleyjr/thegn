@@ -1198,6 +1198,10 @@ impl LoopPerf {
                 .saturating_add(thegn_core::util::core_git_spawn_count())
                 .saturating_sub(self.git_spawns_t0) as f64
                 / secs,
+            git_spawn_top = thegn_core::git_spawn_stats::top_text(
+                &thegn_core::git_spawn_stats::take_window(),
+                3
+            ),
             // Allocator counters are cumulative since process start, like db_open.
             malloc_arena_max = snap.malloc.arena_cap.max,
             malloc_arena_cap_applied = snap.malloc.arena_cap.applied,

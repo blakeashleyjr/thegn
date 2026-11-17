@@ -1697,7 +1697,7 @@ mod tests {
             ..spec()
         });
         let id_path =
-            thegn_core::util::thegn_dir().join(crate::vps::controller::CONTROLLER_ID_FILE);
+            crate::state_promote::state_root().join(crate::vps::controller::CONTROLLER_ID_FILE);
         std::fs::create_dir_all(id_path.parent().unwrap()).unwrap();
         std::fs::write(&id_path, b"malformed").unwrap();
 

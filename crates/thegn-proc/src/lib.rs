@@ -206,7 +206,8 @@ fn aggregate_fit(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Containment {
-    /// Own process group; leader pinned as an unreaped zombie until settlement (unix).
+    /// Own process group (unix). Emptiness is proved by reaping the leader and probing
+    /// `killpg(pgid, 0)`; a /proc scan is only the fallback for a leader we cannot reap.
     ProcessGroup,
     /// Direct child only (non-unix until THE-274 Job Objects).
     DirectChildOnly,

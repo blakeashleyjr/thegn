@@ -303,7 +303,11 @@ pub(crate) fn provision_worktree(
                 );
                 set_ready_init(worktree, init);
             }
-            let out = crate::agent::provision_worktree(cfg, worktree, progress);
+            // An ssh `in_env` worktree is seeded onto its host first (a no-op
+            // otherwise); its failure fails the provision like any other step.
+            let out = crate::ssh_seed::seed_if_needed(cfg, worktree).and_then(|seeded| {
+                crate::agent::provision_worktree(cfg, worktree, progress).map(|p| p || seeded)
+            });
             match &out {
                 Ok(_) => crate::placement_flow::mark_active(worktree),
                 Err(e) => {
@@ -314,7 +318,9 @@ pub(crate) fn provision_worktree(
             out
         }
         Ok(_) => {
-            let out = crate::agent::provision_worktree(cfg, worktree, progress);
+            let out = crate::ssh_seed::seed_if_needed(cfg, worktree).and_then(|seeded| {
+                crate::agent::provision_worktree(cfg, worktree, progress).map(|p| p || seeded)
+            });
             if let Err(e) = &out {
                 // A spilled-over worktree's provider failure cools its lane.
                 crate::placement_flow::note_spillover_failure(cfg, worktree, &e.to_string());

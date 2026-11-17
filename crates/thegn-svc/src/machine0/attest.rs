@@ -16,6 +16,25 @@ pub fn dir_in(root: &Path) -> PathBuf {
     root.join("machine0").join("attest")
 }
 
+/// The root to pass to [`dir_in`] / [`load_in`] / [`store_in`] / [`remove_in`]:
+/// `$XDG_STATE_HOME/thegn` (THE-2057). A legacy `~/.thegn/machine0/attest`
+/// directory is moved there once (see [`crate::state_promote::promote`]); when
+/// that move fails the legacy root (`~/.thegn`) keeps serving.
+pub fn state_root() -> PathBuf {
+    let new_root = crate::state_promote::state_root();
+    let legacy_root = thegn_core::util::thegn_dir();
+    let chosen = crate::state_promote::promote(
+        &dir_in(&legacy_root),
+        &dir_in(&new_root),
+        "machine0 attestations",
+    );
+    if chosen == dir_in(&new_root) {
+        new_root
+    } else {
+        legacy_root
+    }
+}
+
 pub fn load_in(root: &Path, vm_name: &str) -> Option<Attestation> {
     let checked = match crate::vps::registry::checked_name(vm_name) {
         Ok(name) => name,
@@ -145,6 +164,37 @@ mod tests {
         assert_eq!(load_in(root.path(), "dev"), Some(record));
         let mode = thegn_core::fsperm::mode_bits(&dir_in(root.path()).join("dev.json")).unwrap();
         assert!(mode.is_none() || mode == Some(0o600));
+    }
+
+    #[test]
+    fn state_root_round_trips_under_the_xdg_state_home() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let root = state_root();
+        assert_eq!(root, state.state_home().join("thegn"));
+        store_in(&state_root(), &sample()).unwrap();
+        assert_eq!(load_in(&state_root(), "dev"), Some(sample()));
+        assert!(dir_in(&root).join("dev.json").exists());
+        assert!(
+            std::fs::symlink_metadata(dir_in(&state.thegn_dir())).is_err(),
+            "nothing written at the legacy location"
+        );
+    }
+
+    #[test]
+    fn state_root_promotes_legacy_attestations_together() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let legacy_root = state.thegn_dir();
+        let mut other = sample();
+        other.vm_name = "other".to_string();
+        store_in(&legacy_root, &sample()).unwrap();
+        store_in(&legacy_root, &other).unwrap();
+
+        let root = state_root();
+
+        assert_eq!(root, state.state_home().join("thegn"));
+        assert!(std::fs::symlink_metadata(dir_in(&legacy_root)).is_err());
+        assert_eq!(load_in(&root, "dev"), Some(sample()));
+        assert_eq!(load_in(&root, "other"), Some(other));
     }
 
     #[test]
