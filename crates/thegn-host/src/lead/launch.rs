@@ -8,17 +8,33 @@
 //! unreachable from the Lead's shell. The Lead reaches thegn only through its
 //! scoped loopback token (`lead::mcp`).
 //!
-//! The sandbox fails closed: no bwrap means no Lead, never a host shell. This
-//! runs off the event loop, inside `handlers::materialize`.
+//! b155: thegn's state/data/cache dirs and every harness home are masked as
+//! well (THE-2221; only the notes dir, the private harness home and the MCP
+//! files are re-exposed), and with `[lead] network = "isolated"` (the
+//! default) the bwrap argv runs inside `pasta`'s own network namespace with
+//! only the Lead listener port forwarded (THE-2220).
+//!
+//! The sandbox fails closed: no bwrap means no Lead, never a host shell; an
+//! isolated Lead without pasta refuses too, never falling back to the shared
+//! network. This runs off the event loop, inside `handlers::materialize`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use thegn_core::config::Config;
+use thegn_core::config_lead::LeadNetwork;
 use thegn_core::lead_sandbox::{self, LeadMountPlan};
 
 /// The refusal when bwrap is missing. Fixed text: the docs and tests cite it.
 const NO_BWRAP: &str = "the Lead needs bwrap (Linux); not available here";
+/// The refusal when the isolated network has no pasta. Fixed text: the docs
+/// and tests cite it.
+const NO_PASTA: &str = "the Lead's isolated network needs pasta (passt); install it or set \
+                        [lead] network = \"host\"";
+/// Where the isolated network's generated `resolv.conf` lives, relative to
+/// `$XDG_STATE_HOME`.
+const NET_DIR_REL: &str = "thegn/lead-net";
+const RESOLV_CONF_FILE: &str = "resolv.conf";
 
 /// Host sockets outside `$XDG_RUNTIME_DIR` that grant host command authority
 /// (a rootful docker/podman socket is root on the host for a member of its
@@ -34,6 +50,8 @@ const HOST_SOCKETS: &[&str] = &[
 struct LeadHost<'a> {
     /// Whether bwrap can run here.
     bwrap_available: &'a dyn Fn() -> bool,
+    /// Whether pasta (passt) is installed, for `[lead] network = "isolated"`.
+    pasta_available: &'a dyn Fn() -> bool,
     /// Every registered repo root and local worktree path.
     repo_roots: &'a dyn Fn() -> anyhow::Result<Vec<PathBuf>>,
     /// The control-socket directories to hide behind a tmpfs.
@@ -44,6 +62,11 @@ struct LeadHost<'a> {
     daemon_owned: bool,
     /// `$XDG_STATE_HOME`: the parent of the Lead's private harness home.
     state_home: PathBuf,
+    /// `$XDG_DATA_HOME` and `$XDG_CACHE_HOME`: their `thegn` dirs are masked.
+    data_home: PathBuf,
+    cache_home: PathBuf,
+    /// `$HOME` (credentials and harness homes are masked beneath it).
+    home: Option<PathBuf>,
 }
 
 /// What a Lead launch is for: a tab's interactive TUI, or one bounded
@@ -101,12 +124,31 @@ pub(crate) fn headless_spec(cfg: &Config, prompt: &str) -> anyhow::Result<LeadLa
 fn real_host(cfg: &Config) -> LeadHost<'static> {
     LeadHost {
         bwrap_available: &lead_sandbox::bwrap_available,
+        pasta_available: &thegn_core::lead_net::pasta_available,
         repo_roots: &registered_repo_roots,
         control_dirs: &control_dirs,
         mcp: &crate::lead::mcp::prepare,
         daemon_owned: crate::handlers::startup::daemon_active(cfg),
         state_home: thegn_core::util::xdg_state_home(),
+        data_home: xdg_home("XDG_DATA_HOME", ".local/share"),
+        cache_home: xdg_home("XDG_CACHE_HOME", ".cache"),
+        home: env_home(),
     }
+}
+
+fn env_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `$<var>` when absolute, else `$HOME/<fallback>` (the XDG rule).
+fn xdg_home(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| env_home().map(|h| h.join(fallback)))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent").join(fallback))
 }
 
 fn launch_spec_with(
@@ -120,6 +162,12 @@ fn launch_spec_with(
     // Fail closed before touching the disk: no bwrap, no Lead, no host shell.
     if !(host.bwrap_available)() {
         bail!(NO_BWRAP);
+    }
+    // Same for the isolated network: no pasta, no Lead. Never the shared
+    // network unless `[lead] network = "host"` says so.
+    let network = lead.network;
+    if network == LeadNetwork::Isolated && !(host.pasta_available)() {
+        bail!(NO_PASTA);
     }
     if lead
         .account
@@ -203,9 +251,9 @@ fn launch_spec_with(
     let inner = thegn_core::shellinv::exec_argv(&thegn_core::util::shell(), &cmd);
 
     // The mount plan.
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
+    let home = host
+        .home
+        .clone()
         .context("the Lead needs $HOME to locate the credentials it hides")?;
     // The harness home is private to the Lead, never the shared `~/.claude`
     // (a hook or MCP entry written there would run unsandboxed in the next
@@ -222,7 +270,9 @@ fn launch_spec_with(
             .filter(|e| !e.is_empty())
             .or_else(|| lead_sandbox::private_home_env(h.id()))
     {
-        let rel = Path::new("thegn/lead-harness").join(h.id());
+        let rel = Path::new("thegn")
+            .join(lead_sandbox::HARNESS_HOME_DIR)
+            .join(h.id());
         let dir = thegn_core::fsperm::ensure_private_dir_beneath(&host.state_home, &rel)
             .context("creating the Lead's private harness home")?;
         let dir = std::fs::canonicalize(dir.path())
@@ -273,12 +323,78 @@ fn launch_spec_with(
             Err(_) => {}
         }
     }
-    let readable = readable_under_masks(&mcp.readable, &masked)?;
+    // thegn's own state/data/cache dirs and the shared harness homes
+    // (THE-2221): existing dirs only (a tmpfs needs a mount point under the
+    // read-only root; a missing dir hides nothing), canonical, parents
+    // first. The notes dir, the private harness home and the MCP files are
+    // re-exposed after them (bwrap binds every source from the host root
+    // and creates the mount points inside the tmpfs).
+    let mut state_masked: Vec<PathBuf> = Vec::new();
+    let mut candidates =
+        lead_sandbox::state_masks(&host.state_home, &host.data_home, &host.cache_home, &home);
+    candidates.sort();
+    candidates.dedup();
+    for dir in candidates {
+        if !dir.is_absolute() || dir.starts_with("/tmp") {
+            continue;
+        }
+        if !std::fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        if state_masked.iter().any(|m| dir.starts_with(m)) {
+            continue;
+        }
+        state_masked.push(dir);
+    }
+    for file in lead_sandbox::state_masked_files(&home) {
+        if std::fs::metadata(&file).is_ok_and(|m| !m.is_dir()) {
+            masked_files.push(file);
+        }
+    }
+    let all_masks: Vec<PathBuf> = masked.iter().chain(&state_masked).cloned().collect();
+    let readable = readable_under_masks(&mcp.readable, &all_masks)?;
+
+    // The network (THE-2220).
+    let mut file_binds: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let listener_port = match network {
+        LeadNetwork::Isolated => {
+            let addr = mcp.control_addr.context(
+                "the Lead's isolated network needs the daemon's Lead listener address; \
+                 restart the daemon",
+            )?;
+            let dir = thegn_core::fsperm::ensure_private_dir_beneath(
+                &host.state_home,
+                Path::new(NET_DIR_REL),
+            )
+            .context("creating the Lead's network dir")?;
+            let file = dir
+                .write_owner_only_atomic(
+                    RESOLV_CONF_FILE,
+                    thegn_core::lead_net::resolv_conf().as_bytes(),
+                )
+                .context("writing the Lead's resolv.conf")?;
+            let file = std::fs::canonicalize(&file).unwrap_or(file);
+            file_binds.push((file, PathBuf::from("/etc/resolv.conf")));
+            Some(addr.port())
+        }
+        LeadNetwork::Host => {
+            tracing::warn!(
+                target: "thegn::lead",
+                "[lead] network = \"host\": the Lead shares the host network namespace and can \
+                 reach every host loopback service and abstract unix socket"
+            );
+            None
+        }
+    };
+
     let plan = LeadMountPlan {
         writable,
         masked,
+        state_masked,
         masked_files,
         readable,
+        file_binds,
         chdir: notes.clone(),
         // A headless turn is a plain child of the blocking thread that waits
         // on it for the whole run: it always dies with its parent.
@@ -288,6 +404,16 @@ fn launch_spec_with(
         .map_err(|why| anyhow::anyhow!("the Lead sandbox was refused: {why}"))?;
 
     let sandboxed = lead_sandbox::bwrap_argv(&plan, &inner);
+    let sandboxed = match listener_port {
+        Some(port) => thegn_core::lead_net::pasta_argv(port, &sandboxed),
+        None => sandboxed,
+    };
+    tracing::debug!(
+        target: "thegn::lead",
+        backend = "bwrap",
+        network = network.as_str(),
+        "the Lead sandbox is ready"
+    );
     let argv = match mode {
         LeadMode::Interactive { .. } => {
             thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(sandboxed)
@@ -416,12 +542,26 @@ fn prepare_mask_dir(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
 
 /// The MCP plan's readable paths that a mask would hide: re-bound read-only.
 /// Only regular files qualify; re-exposing anything else under a mask (a
-/// socket, a directory of sockets) would undo the mask, so it is refused.
+/// socket, a directory of sockets) would undo the mask. A directory (the
+/// Lead control dir, now beneath the masked state dir) is expanded to the
+/// regular files directly inside it; any other entry stays hidden. Any
+/// other non-file path is refused.
 fn readable_under_masks(readable: &[PathBuf], masked: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for path in readable {
         let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
         if !masked.iter().any(|m| path.starts_with(m)) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&path)
+                .with_context(|| format!("listing {} to re-expose it", path.display()))?
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.path())
+                .collect();
+            files.sort();
+            out.extend(files);
             continue;
         }
         if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
@@ -528,6 +668,10 @@ mod tests {
         _tmp: tempfile::TempDir,
         root: PathBuf,
         cfg: Config,
+        /// What the injected pasta probe answers.
+        pasta: bool,
+        /// The Lead listener address the injected MCP plan reports.
+        listener: Option<std::net::SocketAddr>,
     }
 
     fn fixture() -> Fixture {
@@ -538,11 +682,14 @@ mod tests {
             .unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::create_dir_all(root.join("home")).unwrap();
         let cfg = Config {
             agents: vec![toml::from_str("name = \"lead-agent\"\ncommand = \"true\"").unwrap()],
             lead: Some(thegn_core::config_lead::LeadConfig {
                 agent: "lead-agent".into(),
                 notes_dir: Some(root.join("notes")),
+                // Today's argv by default; the isolated tests opt in.
+                network: LeadNetwork::Host,
                 ..Default::default()
             }),
             ..Config::default()
@@ -551,11 +698,16 @@ mod tests {
             _tmp: tmp,
             root,
             cfg,
+            pasta: true,
+            listener: None,
         }
     }
 
-    fn no_mcp(_: &Config, _: &Path, _: &str) -> anyhow::Result<crate::lead::mcp::LeadMcpPlan> {
-        Ok(crate::lead::mcp::LeadMcpPlan::default())
+    fn isolated(fx: &mut Fixture) {
+        if let Some(lead) = fx.cfg.lead.as_mut() {
+            lead.network = LeadNetwork::Isolated;
+        }
+        fx.listener = Some("127.0.0.1:4242".parse().unwrap());
     }
 
     fn run(
@@ -585,18 +737,32 @@ mod tests {
         control: Vec<PathBuf>,
     ) -> anyhow::Result<LeadLaunch> {
         let available = move || bwrap;
+        let pasta = fx.pasta;
+        let pasta_available = move || pasta;
         let roots = move || -> anyhow::Result<Vec<PathBuf>> { Ok(repos.clone()) };
         let dirs = move |_: &Config| control.clone();
+        let listener = fx.listener;
+        let mcp =
+            move |_: &Config, _: &Path, _: &str| -> anyhow::Result<crate::lead::mcp::LeadMcpPlan> {
+                Ok(crate::lead::mcp::LeadMcpPlan {
+                    control_addr: listener,
+                    ..Default::default()
+                })
+            };
         launch_spec_with(
             &fx.cfg,
             mode,
             &LeadHost {
                 bwrap_available: &available,
+                pasta_available: &pasta_available,
                 repo_roots: &roots,
                 control_dirs: &dirs,
-                mcp: &no_mcp,
+                mcp: &mcp,
                 daemon_owned: true,
                 state_home: fx.root.join("state"),
+                data_home: fx.root.join("data"),
+                cache_home: fx.root.join("cache"),
+                home: Some(fx.root.join("home")),
             },
         )
     }
@@ -865,7 +1031,172 @@ mod tests {
         let got = readable_under_masks(&[mask.join("token"), outside], std::slice::from_ref(&mask))
             .unwrap();
         assert_eq!(got, vec![mask.join("token")]);
-        assert!(readable_under_masks(&[mask.join("sub")], &[mask]).is_err());
+        // A directory under a mask re-exposes only the regular files
+        // directly inside it, never its subdirectories.
+        std::fs::write(mask.join("sub/mcp.json"), "{}").unwrap();
+        std::fs::create_dir_all(mask.join("sub/nested")).unwrap();
+        assert_eq!(
+            readable_under_masks(&[mask.join("sub")], std::slice::from_ref(&mask)).unwrap(),
+            vec![mask.join("sub/mcp.json")]
+        );
+        if crate::platform::test_symlink_supported() {
+            crate::platform::test_symlink(&mask.join("token"), &mask.join("link")).unwrap();
+            assert!(readable_under_masks(&[mask.join("link")], &[mask]).is_ok());
+        }
+    }
+
+    #[test]
+    fn isolated_without_pasta_bails_and_never_returns_a_host_argv() {
+        let mut fx = fixture();
+        isolated(&mut fx);
+        fx.pasta = false;
+        let err = run(&fx, true, vec![], vec![]).unwrap_err();
+        assert_eq!(err.to_string(), NO_PASTA);
+        assert!(err.to_string().contains("network = \"host\""));
+        assert!(
+            !fx.root.join("notes").exists(),
+            "a refused launch creates nothing"
+        );
+        let err = headless(&fx, "hi", true).err().expect("refused");
+        assert_eq!(err.to_string(), NO_PASTA);
+    }
+
+    #[test]
+    fn isolated_without_a_listener_address_bails() {
+        let mut fx = fixture();
+        isolated(&mut fx);
+        fx.listener = None;
+        assert!(run(&fx, true, vec![], vec![]).is_err());
+    }
+
+    #[test]
+    fn isolated_runs_bwrap_inside_pasta_forwarding_only_the_listener() {
+        let mut fx = fixture();
+        isolated(&mut fx);
+        let spec = run(&fx, true, vec![], vec![]).unwrap();
+        let pasta = spec.argv.iter().position(|a| a == "pasta").expect("pasta");
+        let bwrap = spec.argv.iter().position(|a| a == "bwrap").expect("bwrap");
+        assert!(pasta < bwrap, "{:?}", spec.argv);
+        assert!(has(&spec.argv, &["-T", "4242"]));
+        assert_eq!(
+            spec.argv[bwrap - 1],
+            "--",
+            "pasta's `--` immediately precedes bwrap"
+        );
+        assert!(!spec.argv.iter().any(|a| a == "--map-host-loopback"));
+        assert_eq!(spec.backend, "bwrap");
+        // The generated resolv.conf is bound over the host's.
+        let resolv = fx.root.join("state/thegn/lead-net/resolv.conf");
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            thegn_core::lead_net::resolv_conf()
+        );
+        let resolv_s = resolv.display().to_string();
+        assert!(has(
+            &spec.argv,
+            &["--ro-bind", &resolv_s, "/etc/resolv.conf"]
+        ));
+        // The headless spec follows the same path.
+        let wake = headless(&fx, "go", true).unwrap().spec;
+        let p = wake.argv.iter().position(|a| a == "pasta").expect("pasta");
+        let b = wake.argv.iter().position(|a| a == "bwrap").expect("bwrap");
+        assert!(p < b && has(&wake.argv, &["-T", "4242"]));
+    }
+
+    #[test]
+    fn host_network_yields_the_plain_bwrap_argv() {
+        let fx = fixture();
+        let spec = run(&fx, true, vec![], vec![]).unwrap();
+        assert!(!spec.argv.iter().any(|a| a == "pasta"), "{:?}", spec.argv);
+        assert!(!spec.argv.iter().any(|a| a == "/etc/resolv.conf"));
+        assert!(spec.argv.iter().any(|a| a == "bwrap"));
+        // Host mode never consults the pasta probe.
+        let mut fx = fixture();
+        fx.pasta = false;
+        assert!(run(&fx, true, vec![], vec![]).is_ok());
+    }
+
+    #[test]
+    fn the_state_dir_is_masked_and_the_notes_dir_bound_after_it() {
+        let mut fx = fixture();
+        let state = fx.root.join("state/thegn");
+        let notes = state.join("lead");
+        if let Some(lead) = fx.cfg.lead.as_mut() {
+            lead.notes_dir = Some(notes.clone());
+        }
+        std::fs::create_dir_all(fx.root.join("data/thegn")).unwrap();
+        let spec = run(&fx, true, vec![], vec![]).unwrap();
+        let state_s = state.display().to_string();
+        let notes_s = notes.display().to_string();
+        let data_s = fx.root.join("data/thegn").display().to_string();
+        let pos = |needle: &[&str]| {
+            spec.argv
+                .windows(needle.len())
+                .position(|w| w.iter().map(String::as_str).eq(needle.iter().copied()))
+                .unwrap_or_else(|| panic!("{needle:?} not in {:?}", spec.argv))
+        };
+        let mask = pos(&["--tmpfs", &state_s]);
+        pos(&["--tmpfs", &data_s]);
+        let bind = pos(&["--bind", &notes_s, &notes_s]);
+        assert!(mask < bind, "the notes dir is re-exposed after the mask");
+        assert!(
+            !has(
+                &spec.argv,
+                &[
+                    "--tmpfs",
+                    &fx.root.join("cache/thegn").display().to_string()
+                ]
+            ),
+            "a missing dir is not masked"
+        );
+    }
+
+    #[test]
+    fn harness_homes_are_masked_while_the_private_home_is_bound() {
+        let mut fx = fixture();
+        set_agent(&mut fx, "name = \"lead-agent\"\ncommand = \"pi\"");
+        let home = fx.root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".pi")).unwrap();
+        std::fs::write(home.join(".claude.json"), "{}").unwrap();
+        let spec = run(&fx, true, vec![], vec![]).unwrap();
+        let s = |p: PathBuf| p.display().to_string();
+        let claude = s(home.join(".claude"));
+        let pi = s(home.join(".pi"));
+        let claude_json = s(home.join(".claude.json"));
+        let private = s(fx.root.join("state/thegn/lead-harness/pi"));
+        let state = s(fx.root.join("state/thegn"));
+        assert!(has(&spec.argv, &["--tmpfs", &claude]), "{:?}", spec.argv);
+        assert!(has(&spec.argv, &["--tmpfs", &pi]));
+        assert!(has(&spec.argv, &["--tmpfs", &state]));
+        assert!(has(&spec.argv, &["--ro-bind", "/dev/null", &claude_json]));
+        let mask = spec
+            .argv
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == state)
+            .unwrap();
+        let bind = spec
+            .argv
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == private && w[2] == private)
+            .expect("private harness home bound");
+        assert!(mask < bind);
+        assert!(
+            !spec
+                .argv
+                .windows(2)
+                .any(|w| w[0] == "--bind" && (w[1] == claude || w[1] == pi)),
+            "the shared harness homes are never writable"
+        );
+    }
+
+    #[test]
+    fn launch_unsets_the_display() {
+        let fx = fixture();
+        let spec = run(&fx, true, vec![], vec![]).unwrap();
+        for k in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"] {
+            assert!(has(&spec.argv, &["--unsetenv", k]), "{k}");
+        }
     }
 
     #[test]
