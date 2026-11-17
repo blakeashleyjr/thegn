@@ -70,7 +70,14 @@ and date formats, `ci.poll_interval_secs`, `pr_queue.enabled` and its poll
 interval, `git.auto_fetch` and its interval, `disk.scan_interval_secs`,
 `loc.enabled`, `loc.scan_interval_secs` and `watch.pr_interval_secs` (the
 PR refresh cadence, floored at 5 seconds; the rest of `[watch]` still needs
-a restart). The status line lists them as "refresh cadences". Some keys are read afresh each time they are used,
+a restart). The status line lists them as "refresh cadences". `[metrics]`
+applies live: saving restarts the metrics collector from the new targets, and
+removing every target clears the metrics rows. The monitor's
+`window_ladder`, `default_window`, `default_style` and `default_scale` apply
+to the next monitor open. A style, scale or window you chose in the monitor
+is kept; tabs still on the old default follow the new one, and an open
+monitor keeps its state. `monitor.processes` applies live; the other
+`[monitor]` keys need a restart. Some keys are read afresh each time they are used,
 such as `[sandbox]`, `[env.*]`, `[project.*]`, the rest of `[git]` and the
 queues, so the next worktree, launch or queue run picks them up. Daemon launches pick up `[env.*]` and
 env-selection edits without a restart; `[host.*]`, `[sandbox.profiles.*]` and
