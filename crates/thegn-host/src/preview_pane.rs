@@ -203,6 +203,7 @@ fn route_and_render(
             },
         ),
         PreviewRoute::Archive => (read_archive_listing(abs, cancel), None),
+        PreviewRoute::Docx => (read_docx_text(abs, cancel), None),
         PreviewRoute::Unknown => (read_hex_preview(abs), None),
     }
 }
@@ -371,6 +372,109 @@ fn read_archive_listing(
         header.push_str(", listing truncated");
     }
     lines.splice(0..0, [header, String::new()]);
+    Ok(lines)
+}
+
+/// Cap on a docx entry's stored (compressed) size.
+const DOCX_MAX_COMPRESSED: u64 = 16 * 1024 * 1024;
+/// Cap on the inflated `word/document.xml` bytes we scan.
+const DOCX_MAX_XML: u64 = 8 * 1024 * 1024;
+
+/// Extract the paragraph text of a `.docx` for the preview pane. Any failure
+/// falls back to the zip part listing with a one-line note on top.
+fn read_docx_text(
+    abs: &std::path::Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<String>, String> {
+    match docx_text_lines(abs, cancel) {
+        Ok(lines) => Ok(lines),
+        Err(why) => {
+            let mut lines = vec![bounded_line(&format!(
+                "(docx text unavailable: {}; showing parts)",
+                thegn_core::msg::terminal_safe(&why)
+            ))];
+            lines.extend(read_archive_listing(abs, cancel)?);
+            Ok(lines)
+        }
+    }
+}
+
+fn docx_text_lines(
+    abs: &std::path::Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<String>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::atomic::Ordering;
+    use thegn_core::archive_list as al;
+    let mut file = crate::rasterize::open_regular_nonblocking(abs)
+        .map_err(|e| format!("cannot preview file: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot preview file: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    let len = meta.len();
+    let loc = al::zip_find_entry(&mut file, len, "word/document.xml")?
+        .ok_or_else(|| "word/document.xml not found".to_string())?;
+    if loc.flags & 1 != 0 {
+        return Err("document is encrypted".into());
+    }
+    if loc.method != 0 && loc.method != 8 {
+        return Err(format!("unsupported compression method {}", loc.method));
+    }
+    if loc.compressed > DOCX_MAX_COMPRESSED {
+        return Err("document.xml too large".into());
+    }
+    let data = al::zip_entry_data_offset(&mut file, len, &loc)?;
+    file.seek(SeekFrom::Start(data))
+        .map_err(|e| format!("seek failed: {e}"))?;
+    let stored = file.take(loc.compressed);
+    let mut src: Box<dyn Read> = if loc.method == 8 {
+        Box::new(flate2::read::DeflateDecoder::new(stored))
+    } else {
+        Box::new(stored)
+    };
+    let mut xml: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut xml_truncated = false;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let n = src
+            .read(&mut buf)
+            .map_err(|e| format!("inflate failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let room = usize::try_from(DOCX_MAX_XML)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(xml.len());
+        if n > room {
+            xml.extend_from_slice(buf.get(..room).unwrap_or(&[]));
+            xml_truncated = true;
+            break;
+        }
+        xml.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+    }
+    let max_lines = PREVIEW_MAX_LINES.saturating_sub(3);
+    let text = thegn_core::docx_text::document_xml_lines(&xml, max_lines, PREVIEW_MAX_LINE_BYTES)?;
+    let mut header = String::from("docx document");
+    if text.truncated || xml_truncated {
+        header.push_str(", text truncated");
+    }
+    let mut lines = vec![header, String::new()];
+    let mut retained = 0usize;
+    for l in &text.lines {
+        let line = bounded_line(&thegn_core::msg::terminal_safe(l));
+        if retained.saturating_add(line.len()) > PREVIEW_MAX_TOTAL_BYTES {
+            lines[0].push_str(", text truncated");
+            break;
+        }
+        retained += line.len();
+        lines.push(line);
+    }
     Ok(lines)
 }
 
@@ -839,5 +943,118 @@ mod tests {
             "{lines:?}"
         );
         assert!(lines[1].starts_with("binary file: first"), "{lines:?}");
+    }
+
+    /// Single-entry zip (`word/document.xml`) with explicit method and flags.
+    fn docx_fixture(data: &[u8], method: u16, flags: u16) -> Vec<u8> {
+        let name = b"word/document.xml";
+        let mut out = b"PK\x03\x04".to_vec();
+        out.extend_from_slice(&[0u8; 22]);
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0u8; 2]);
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd.extend_from_slice(&[0u8; 4]);
+        cd.extend_from_slice(&flags.to_le_bytes());
+        cd.extend_from_slice(&method.to_le_bytes());
+        cd.extend_from_slice(&[0u8; 8]);
+        cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        cd.extend_from_slice(&[0u8; 14]);
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(name);
+        let off = out.len() as u32;
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+        out.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    const DOC_XML: &str = "<w:document><w:body><w:p><w:r><w:t>First para</w:t></w:r></w:p>\
+        <w:p><w:r><w:t>Second &amp; last</w:t></w:r></w:p></w:body></w:document>";
+
+    #[test]
+    fn read_docx_text_renders_stored_and_deflated() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.docx");
+        for z in [
+            docx_fixture(DOC_XML.as_bytes(), 0, 0),
+            docx_fixture(&deflate(DOC_XML.as_bytes()), 8, 0),
+        ] {
+            std::fs::write(&f, z).unwrap();
+            let lines = read_docx_text(&f, &no_cancel()).unwrap();
+            assert_eq!(lines[0], "docx document", "{lines:?}");
+            assert_eq!(lines[1], "");
+            assert_eq!(lines[2], "First para");
+            assert_eq!(lines[3], "Second & last");
+        }
+    }
+
+    #[test]
+    fn read_docx_text_is_escape_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.docx");
+        let xml = "<w:p><w:t>red\x1b[31m text \x07</w:t></w:p>";
+        std::fs::write(&f, docx_fixture(xml.as_bytes(), 0, 0)).unwrap();
+        let lines = read_docx_text(&f, &no_cancel()).unwrap();
+        assert!(lines[2].contains("red"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains('\x1b') && !l.contains('\x07')),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn read_docx_text_bad_inputs_fall_back_with_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.docx");
+        let cases = [
+            docx_fixture(b"xx", 0, 1),                   // encrypted
+            docx_fixture(b"xx", 12, 0),                  // bzip2
+            docx_fixture(b"\xff\xff\xff garbage", 8, 0), // corrupt deflate
+            docx_fixture(b"not xml at all", 0, 0),
+            b"PK\x03\x04 junk".to_vec(),
+        ];
+        for z in cases {
+            std::fs::write(&f, z).unwrap();
+            let lines = read_docx_text(&f, &no_cancel()).unwrap();
+            assert!(
+                lines[0].starts_with("(docx text unavailable: ")
+                    && lines[0].ends_with("; showing parts)"),
+                "{lines:?}"
+            );
+        }
+        // Cancelled mid-read falls back too (never panics).
+        std::fs::write(&f, docx_fixture(DOC_XML.as_bytes(), 0, 0)).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let lines = read_docx_text(&f, &cancel).unwrap();
+        assert!(lines[0].contains("cancelled"), "{lines:?}");
+    }
+
+    #[test]
+    fn read_docx_text_inflate_bomb_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.docx");
+        let mut xml = b"<w:p><w:t>x</w:t></w:p>".to_vec();
+        xml.resize(DOCX_MAX_XML as usize + 4096, b' ');
+        std::fs::write(&f, docx_fixture(&deflate(&xml), 8, 0)).unwrap();
+        let lines = read_docx_text(&f, &no_cancel()).unwrap();
+        assert_eq!(lines[0], "docx document, text truncated", "{lines:?}");
+        assert_eq!(lines[2], "x");
     }
 }
