@@ -569,6 +569,18 @@ untracked changes. Nothing is seeded while `[merge_queue] enabled = false`.
 Edit them freely — they are rewritten on the next launch, so keep local
 changes elsewhere.
 
+### `merge.drain` over the control API
+
+`thegn api call merge.drain '{"worktree":"<path>"}'` (also an MCP tool, gated
+like `merge.add`) starts `thegn merge drain --json` for that worktree's repo in
+the background and answers at once with `{started, repo, pid}`. The worktree
+must be registered with thegn and local to the host that owns the queue. The
+drain runs inside the same CPU cap as the gate. Only one drain per repo runs at
+a time: a second request, or one made while another drain holds a queue claim,
+is refused with "a drain is already running". When the drain finishes, one
+notification summarizes it: `queue_landed` if anything landed, otherwise
+`queue_held`.
+
 ## Watching
 
 The full sidebar token and optional `mq` widget show queue depth; the _merge_
