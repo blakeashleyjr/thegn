@@ -208,11 +208,11 @@
       # that bloat the closure (both cross `rust-std` sets + docs were in the
       # from-scratch "wall of text"). `just check-cross` can't run on a sprite as a
       # result — by design.
-      # The MSRV toolchain (`rust-version` in Cargo.toml), exposed as `cargo-1.89`
+      # The MSRV toolchain (`rust-version` in Cargo.toml), exposed as `cargo-1.96`
       # so `just check-msrv` is hermetic: no rustup, no network. `minimal` keeps
       # the closure small (it only needs to typecheck). Bump both together.
-      msrvRustToolchain = pkgs.rust-bin.stable."1.89.0".minimal;
-      msrvCargo = pkgs.writeShellScriptBin "cargo-1.89" ''
+      msrvRustToolchain = pkgs.rust-bin.stable."1.96.0".minimal;
+      msrvCargo = pkgs.writeShellScriptBin "cargo-1.96" ''
         exec ${msrvRustToolchain}/bin/cargo "$@"
       '';
       # Optional native dictation is exercised by the all-features gate. Keep
@@ -848,7 +848,7 @@
           [
             # rust toolchain (clippy/rustfmt/rust-analyzer + wasm32-wasip1 target)
             rustToolchain
-            # `cargo-1.89`: the pinned MSRV toolchain behind `just check-msrv`
+            # `cargo-1.96`: the pinned MSRV toolchain behind `just check-msrv`
             msrvCargo
             # task runner + formatter (treefmt wrapper with all formatters on PATH)
             just

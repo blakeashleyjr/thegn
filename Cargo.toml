@@ -35,11 +35,10 @@ license = "MIT OR Apache-2.0"
 # Resolves cargo-binstall's `{ repo }` template variable (thegn-host's
 # [package.metadata.binstall]) once the crates are published.
 repository = "https://github.com/blakeashleyjr/thegn"
-# MSRV floor: edition 2024 + stable let-chains + std file locks
-# (`File::{lock,try_lock,unlock}`, 1.89). The dev shell pins stable.latest via
-# rust-overlay; this field documents the oldest compiler expected to work and
-# lets cargo/cargo-deny flag deps that outrun it.
-rust-version = "1.89"
+# MSRV floor: the newest dependency `rust-version` (kstring via
+# gix-attributes: 1.96; sysinfo 0.39: 1.95). The dev shell pins stable.latest
+# via rust-overlay; cargo/cargo-deny flag deps that outrun this field.
+rust-version = "1.96"
 
 [workspace.dependencies]
 unicode-segmentation = "1"
