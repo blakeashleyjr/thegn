@@ -356,6 +356,19 @@ impl AutoscaleConfig {
     }
 }
 
+/// One `[placement.fleet_budget.<provider>]` entry: hourly USD burn limits
+/// for one provider's sandboxes (`0` = off). `warn_hourly` turns the masthead
+/// fleet badge amber; `max_hourly` refuses NEW provider sandboxes while the
+/// provider's burn is at or above it (resume/reuse is never refused).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct FleetBudget {
+    /// Hourly burn (USD/h) at which the fleet badge warns. `0` = off.
+    pub warn_hourly: f64,
+    /// Hourly burn (USD/h) at which a new sandbox is refused. `0` = off.
+    pub max_hourly: f64,
+}
+
 /// `[placement]` — the engine's global/profile-layer table. Off by default:
 /// with `enabled = false` every existing spawn path is byte-identical.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -401,6 +414,10 @@ pub struct PlacementConfig {
     /// (`0` ⇒ uncapped). Breach refuses/queues PAID lanes (autoscale,
     /// spillover) while packing onto already-paid hosts keeps serving.
     pub max_monthly_spend: f64,
+    /// `[placement.fleet_budget.<provider>]` — hourly burn budgets keyed by
+    /// the env provider name (`fly`, `digitalocean`, …), compared against the
+    /// `thegn fleet cost` per-provider estimate.
+    pub fleet_budget: std::collections::BTreeMap<String, FleetBudget>,
     pub autoscale: AutoscaleConfig,
 }
 
@@ -421,8 +438,55 @@ impl Default for PlacementConfig {
             spillover_envs: Vec::new(),
             price: std::collections::BTreeMap::new(),
             max_monthly_spend: 0.0,
+            fleet_budget: std::collections::BTreeMap::new(),
             autoscale: AutoscaleConfig::default(),
         }
+    }
+}
+
+impl PlacementConfig {
+    /// `config validate` refusals for `[placement.fleet_budget]`: a negative
+    /// or non-finite limit is never a usable budget.
+    pub fn fleet_budget_errors(&self) -> Vec<String> {
+        let mut errs = Vec::new();
+        for (provider, budget) in &self.fleet_budget {
+            for (key, value) in [
+                ("warn_hourly", budget.warn_hourly),
+                ("max_hourly", budget.max_hourly),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    errs.push(format!(
+                        "placement.fleet_budget.{provider}.{key} must be a finite non-negative USD/h amount (0 = off)"
+                    ));
+                }
+            }
+        }
+        errs
+    }
+
+    /// `config validate` warnings for `[placement.fleet_budget]`: a key that
+    /// is not a known API provider never matches a fleet row, and a warn
+    /// limit above the max limit can never show before the refusal.
+    pub fn fleet_budget_warnings(&self) -> Vec<String> {
+        use crate::config::EnvProviderKind;
+        let mut warnings = Vec::new();
+        for (provider, budget) in &self.fleet_budget {
+            if !matches!(
+                EnvProviderKind::from_str_validated(provider),
+                Ok(kind) if kind != EnvProviderKind::Custom && kind.as_str() == provider
+            ) {
+                warnings.push(format!(
+                    "placement.fleet_budget.{provider}: unknown provider {provider:?} — no fleet row will match it"
+                ));
+            }
+            if budget.max_hourly > 0.0 && budget.warn_hourly > budget.max_hourly {
+                warnings.push(format!(
+                    "placement.fleet_budget.{provider}: warn_hourly {} is above max_hourly {} — the warning can never show before the cap",
+                    budget.warn_hourly, budget.max_hourly
+                ));
+            }
+        }
+        warnings
     }
 }
 
@@ -724,6 +788,128 @@ mod tests {
         assert_eq!(
             cfg.zone["clientA"].placement_floor,
             Some(PlacementModePref::Dedicated)
+        );
+    }
+
+    #[test]
+    fn fleet_budget_parses_pretty_and_minified() {
+        let pretty = cfg_from(
+            r#"
+            [placement.fleet_budget.fly]
+            warn_hourly = 3.0
+            max_hourly = 5.5
+            [placement.fleet_budget.digitalocean]
+            max_hourly = 1
+            "#,
+        );
+        let fly = pretty.placement.fleet_budget["fly"];
+        assert!((fly.warn_hourly - 3.0).abs() < 1e-9);
+        assert!((fly.max_hourly - 5.5).abs() < 1e-9);
+        let d = pretty.placement.fleet_budget["digitalocean"];
+        assert!(d.warn_hourly.abs() < 1e-9, "absent key ⇒ 0 (off)");
+        assert!((d.max_hourly - 1.0).abs() < 1e-9);
+
+        let minified = cfg_from(
+            "[placement]\nfleet_budget = { fly = { warn_hourly = 3.0, max_hourly = 5.5 } }\n",
+        );
+        assert_eq!(minified.placement.fleet_budget["fly"], fly);
+        assert!(cfg_from("").placement.fleet_budget.is_empty());
+    }
+
+    #[test]
+    fn fleet_budget_validate_errors_and_warnings() {
+        let mut pl = PlacementConfig::default();
+        assert!(pl.fleet_budget_errors().is_empty());
+        assert!(pl.fleet_budget_warnings().is_empty());
+        pl.fleet_budget.insert(
+            "fly".into(),
+            FleetBudget {
+                warn_hourly: 2.0,
+                max_hourly: 3.0,
+            },
+        );
+        pl.fleet_budget.insert(
+            "hetzner".into(),
+            FleetBudget {
+                warn_hourly: 2.0,
+                max_hourly: 0.0,
+            },
+        );
+        assert!(pl.fleet_budget_errors().is_empty());
+        assert!(
+            pl.fleet_budget_warnings().is_empty(),
+            "warn with max off is fine"
+        );
+
+        pl.fleet_budget.insert(
+            "digitalocean".into(),
+            FleetBudget {
+                warn_hourly: 4.0,
+                max_hourly: 3.0,
+            },
+        );
+        pl.fleet_budget
+            .insert("flyy".into(), FleetBudget::default());
+        pl.fleet_budget
+            .insert("custom".into(), FleetBudget::default());
+        pl.fleet_budget.insert("FLY".into(), FleetBudget::default());
+        let warnings = pl.fleet_budget_warnings();
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("\"FLY\"")),
+            "keys match fleet rows exactly, so a non-canonical spelling warns"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("digitalocean") && w.contains("above max_hourly"))
+        );
+        assert!(warnings.iter().any(|w| w.contains("\"flyy\"")));
+        assert!(warnings.iter().any(|w| w.contains("\"custom\"")));
+
+        pl.fleet_budget.insert(
+            "sprites".into(),
+            FleetBudget {
+                warn_hourly: -1.0,
+                max_hourly: f64::NAN,
+            },
+        );
+        pl.fleet_budget.insert(
+            "machine0".into(),
+            FleetBudget {
+                warn_hourly: f64::INFINITY,
+                max_hourly: 1.0,
+            },
+        );
+        let errs = pl.fleet_budget_errors();
+        assert_eq!(errs.len(), 3, "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("sprites.warn_hourly")));
+        assert!(errs.iter().any(|e| e.contains("sprites.max_hourly")));
+        assert!(errs.iter().any(|e| e.contains("machine0.warn_hourly")));
+    }
+
+    #[test]
+    fn config_validate_reports_fleet_budget_errors_and_warnings() {
+        use crate::config_validate::{ValidationSeverity, validate_diagnostics};
+        let diags = validate_diagnostics(
+            "[placement.fleet_budget.fly]\nwarn_hourly = 4.0\nmax_hourly = 3.0\n\
+             [placement.fleet_budget.flyy]\nmax_hourly = 1.0\n\
+             [placement.fleet_budget.sprites]\nmax_hourly = -1.0\n",
+        );
+        let has = |severity: fn(&ValidationSeverity) -> bool, needle: &str| {
+            diags
+                .iter()
+                .any(|d| severity(&d.severity) && d.message.contains(needle))
+        };
+        let warning = |s: &ValidationSeverity| matches!(s, ValidationSeverity::Warning);
+        let error = |s: &ValidationSeverity| matches!(s, ValidationSeverity::Error);
+        assert!(has(warning, "fleet_budget.fly: warn_hourly"), "{diags:?}");
+        assert!(has(warning, "\"flyy\""), "{diags:?}");
+        assert!(has(error, "fleet_budget.sprites.max_hourly"), "{diags:?}");
+        let clean = validate_diagnostics("[placement.fleet_budget.fly]\nmax_hourly = 3.0\n");
+        assert!(
+            !clean.iter().any(|d| d.message.contains("fleet_budget")),
+            "{clean:?}"
         );
     }
 

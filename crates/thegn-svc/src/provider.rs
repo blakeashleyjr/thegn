@@ -903,14 +903,14 @@ impl SpritesProvider {
         ))
     }
 
-    /// The exec handle for a sprite: the `sprite` CLI exec bridge (PTY-capable).
+    /// The exec handle for a sprite: thegn's own `sprite-exec` self-bridge, which
+    /// streams a PTY over the native exec API (reattaching across network blips),
+    /// so the handle never depends on the vendor `sprite` CLI being installed.
     fn exec_for(name: &str) -> ExecKind {
         ExecKind::Command(vec![
-            "sprite".into(),
-            "exec".into(),
-            "-s".into(),
+            thegn_core::util::self_exe_str(),
+            "sprite-exec".into(),
             name.to_string(),
-            "--tty".into(),
             "--".into(),
         ])
     }
@@ -5454,18 +5454,23 @@ mod tests {
     }
 
     #[test]
-    fn sprites_exec_builds_cli_pty_bridge() {
+    fn sprites_exec_builds_self_bridge_not_vendor_cli() {
+        let exec = SpritesProvider::exec_for("dev");
         assert_eq!(
-            SpritesProvider::exec_for("dev"),
+            exec,
             ExecKind::Command(vec![
-                "sprite".into(),
-                "exec".into(),
-                "-s".into(),
+                thegn_core::util::self_exe_str(),
+                "sprite-exec".into(),
                 "dev".into(),
-                "--tty".into(),
                 "--".into(),
             ])
         );
+        if let ExecKind::Command(argv) = exec {
+            assert!(
+                argv.iter().all(|a| a != "sprite"),
+                "the create handle must not name the vendor `sprite` CLI: {argv:?}"
+            );
+        }
     }
 
     #[test]

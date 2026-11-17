@@ -270,6 +270,7 @@ pub const CATALOG: &[Slot] = &[
     // --- worktree ---------------------------------------------------------
     // `worktree` is the `--worktree` flag; `worktree_pos` is the positional
     // twin the shared `WorktreeTarget` flattens in beside it.
+    slot("agent run", "worktree", SourceKind::Worktree),
     slot("agent sessions", "worktree", SourceKind::Worktree),
     slot("ci cancel", "worktree", SourceKind::Worktree),
     slot("ci detect", "worktree", SourceKind::Worktree),
@@ -439,6 +440,18 @@ pub const CATALOG: &[Slot] = &[
         SourceKind::Reserved(Reserved::Freeform),
     ),
     slot("session open", "vars", SourceKind::Structural),
+    // `agent run` (THE-2005): the brief is a path (clap's path completer),
+    // the bindings and the tracked issue id are free-form, the timeout a
+    // number; the task text itself has no source.
+    slot("agent run", "brief_file", SourceKind::Structural),
+    slot("agent run", "var", SourceKind::Structural),
+    slot("agent run", "track", SourceKind::Structural),
+    slot("agent run", "timeout", SourceKind::Structural),
+    slot(
+        "agent run",
+        "prompt",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("session fork", "worktree", SourceKind::Worktree),
     slot("session move", "worktree", SourceKind::Worktree),
     slot("share start", "worktree", SourceKind::Worktree),
@@ -563,6 +576,7 @@ pub const CATALOG: &[Slot] = &[
     // --- agent (`[[agents]]`) ----------------------------------------------
     // Both slots also accept an `[[tools]]` name or a bare provider id; the
     // configured agents are the useful majority and the arg stays free-form.
+    slot("agent run", "agent", SourceKind::Agent),
     slot("dispatch put", "agent_name", SourceKind::Agent),
     slot("session open", "agent", SourceKind::Agent),
     slot("session fork", "agent", SourceKind::Agent),
@@ -1033,6 +1047,20 @@ mod tests {
             assert_eq!(lookup(s.command_path, s.arg_id), Some(s));
         }
         assert_eq!(lookup("no-such-verb", "nope"), None);
+    }
+
+    #[test]
+    fn agent_run_value_slots_have_their_completion_sources() {
+        let source = |arg: &str| lookup("agent run", arg).map(|slot| slot.source);
+        assert_eq!(source("agent"), Some(SourceKind::Agent));
+        assert_eq!(source("worktree"), Some(SourceKind::Worktree));
+        for arg in ["brief_file", "var", "track", "timeout"] {
+            assert_eq!(source(arg), Some(SourceKind::Structural), "{arg}");
+        }
+        assert_eq!(
+            source("prompt"),
+            Some(SourceKind::Reserved(Reserved::Freeform))
+        );
     }
 
     #[test]

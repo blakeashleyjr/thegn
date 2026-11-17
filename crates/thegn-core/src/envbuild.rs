@@ -257,19 +257,28 @@ pub(crate) fn build_env_placement(
             // providers (which have no vendor CLI) — see
             // `EnvProviderConfig::control_command_template`.
             let control_prefix = sub(&envc.provider.control_command_template());
-            let interactive_prefix = if !envc.provider.interactive_command.is_empty() {
-                sub(&envc.provider.interactive_command)
-            } else if crate::config_env_tables::wss_native_provider_kind(&envc.provider.provider) {
-                // WSS-native providers (sprites) attach panes over the provider's
-                // native exec API (see host `native_exec_for`), NOT the control
-                // self-bridge — so the interactive prefix stays EMPTY. Only the
-                // control/read path (`control_prefix`) uses the `sprite-exec`
-                // bridge; giving panes that prefix would route the interactive
-                // shell through a captured non-tty exec instead of the PTY path.
-                Vec::new()
-            } else {
-                control_prefix.clone()
-            };
+            // Interactive (pane) prefix:
+            // - WSS-native kinds (sprites) in `exec = auto|api` use the
+            //   `sprite-exec` self-bridge — the SAME argv as the control
+            //   prefix. Panes that take the native path (`native_exec_for`)
+            //   never read this; a launch argv built from it (headless
+            //   sessions, `sandbox-argv`) runs inside the sprite instead of
+            //   falling back to a bare host shell. `interactive_command` is a
+            //   vendor-CLI bridge and only applies under `exec = cli`.
+            // - everyone else: `interactive_command` if set, else the control
+            //   prefix.
+            // An empty result (daytona/custom with no exec_command) is refused
+            // by `Placement::transport_refusal` before any launch.
+            let wss_native =
+                crate::config_env_tables::wss_native_provider_kind(&envc.provider.provider);
+            let use_cli_bridge =
+                envc.provider.exec == crate::config::ProviderExecMode::Cli || !wss_native;
+            let interactive_prefix =
+                if use_cli_bridge && !envc.provider.interactive_command.is_empty() {
+                    sub(&envc.provider.interactive_command)
+                } else {
+                    control_prefix.clone()
+                };
             // Compute all substitutions before moving `id` into the struct (the
             // `sub` closure borrows it).
             let up_command = sub(&envc.provider.up_command);
@@ -326,9 +335,9 @@ mod tests {
         };
         assert_eq!(pp2.control_prefix[0], "mycli");
         // WSS-native providers (sprites) get the `sprite-exec` self-bridge as
-        // their CONTROL prefix (so chrome git/fs reads + the persisted GitLoc
-        // route into the sprite), but keep an EMPTY interactive prefix — panes
-        // attach over the native exec API, not the bridge.
+        // BOTH prefixes: chrome git/fs reads + the persisted GitLoc route into
+        // the sprite, and a launch argv built from the interactive prefix runs
+        // in the sprite (native panes take `native_exec_for` first).
         let mut sprites = envc.clone();
         sprites.provider.provider = "sprites".into();
         let Placement::Provider(pp3) =
@@ -340,11 +349,91 @@ mod tests {
         assert_eq!(pp3.control_prefix[1], "sprite-exec");
         assert_eq!(pp3.control_prefix[2], pp3.id);
         assert_eq!(pp3.control_prefix[3], "--");
-        assert!(
-            pp3.interactive_prefix.is_empty(),
-            "sprites panes stay native: {:?}",
-            pp3.interactive_prefix
+        assert_eq!(pp3.interactive_prefix, pp3.control_prefix);
+    }
+
+    fn provider_placement(envc: &crate::config::EnvConfig) -> ProviderPlacement {
+        let sb = crate::config::SandboxConfig::default();
+        let wt = Path::new("/home/u/code/repo/worktrees/repo/dev");
+        let loc = GitLoc::Local(wt.to_path_buf());
+        match build_env_placement(envc, &sb, &loc, wt, Path::new("/home/u/code/repo")) {
+            Placement::Provider(pp) => pp,
+            other => panic!("provider placement expected, got {other:?}"),
+        }
+    }
+
+    fn provider_env(kind: &str) -> crate::config::EnvConfig {
+        use crate::config::{EnvConfig, EnvProviderConfig, PlacementMode};
+        EnvConfig {
+            placement: PlacementMode::Provider,
+            provider: EnvProviderConfig {
+                provider: kind.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fly_provider_routes_both_prefixes_over_vps_ssh() {
+        let pp = provider_placement(&provider_env("fly"));
+        for prefix in [&pp.control_prefix, &pp.interactive_prefix] {
+            assert_eq!(prefix.len(), 4, "{prefix:?}");
+            assert_eq!(prefix[1], "vps-ssh");
+            assert_eq!(prefix[2], pp.id);
+            assert_eq!(prefix[3], "--");
+        }
+        assert!(Placement::Provider(pp).transport_refusal().is_none());
+    }
+
+    #[test]
+    fn sprites_auto_exec_ignores_interactive_command_for_the_bridge() {
+        let mut envc = provider_env("sprites");
+        envc.provider.interactive_command = vec!["sprite".into(), "console".into(), "{id}".into()];
+        // `exec = auto` (default): the pane prefix is the sprite-exec bridge.
+        let pp = provider_placement(&envc);
+        assert_eq!(pp.control_prefix[1], "sprite-exec");
+        assert_eq!(pp.interactive_prefix, pp.control_prefix);
+        // `exec = api` behaves the same.
+        envc.provider.exec = crate::config::ProviderExecMode::Api;
+        let pp = provider_placement(&envc);
+        assert_eq!(pp.interactive_prefix, pp.control_prefix);
+    }
+
+    #[test]
+    fn sprites_cli_exec_uses_interactive_command() {
+        let mut envc = provider_env("sprites");
+        envc.provider.exec = crate::config::ProviderExecMode::Cli;
+        envc.provider.interactive_command = vec!["sprite".into(), "console".into(), "{id}".into()];
+        let pp = provider_placement(&envc);
+        assert_eq!(
+            pp.interactive_prefix,
+            vec!["sprite".to_string(), "console".into(), pp.id.clone()]
         );
+        assert_eq!(pp.control_prefix[1], "sprite-exec");
+    }
+
+    #[test]
+    fn non_native_provider_prefers_interactive_command() {
+        let mut envc = provider_env("hetzner");
+        envc.provider.interactive_command = vec!["mosh".into(), "{id}".into()];
+        let pp = provider_placement(&envc);
+        assert_eq!(
+            pp.interactive_prefix,
+            vec!["mosh".to_string(), pp.id.clone()]
+        );
+        assert_eq!(pp.control_prefix[1], "vps-ssh");
+    }
+
+    #[test]
+    fn daytona_without_exec_command_has_no_transport() {
+        let pp = provider_placement(&provider_env("daytona"));
+        assert!(pp.control_prefix.is_empty());
+        assert!(pp.interactive_prefix.is_empty());
+        let reason = Placement::Provider(pp)
+            .transport_refusal()
+            .expect("daytona with no exec_command must be refused");
+        assert!(reason.contains("daytona:"), "{reason}");
     }
 
     #[test]

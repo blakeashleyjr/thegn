@@ -150,14 +150,15 @@ pub const SSH_PORT: u16 = 22;
 
 /// Guest init (`config.init.exec`, runs as PID 1): a Fly machine has no cloud-init
 /// and the stock image has no sshd, so this installs the same prereqs the VPS
-/// cloud-init does (openssh-server + curl/ca-certificates), preps docker for the
+/// cloud-init does (openssh-server + curl/ca-certificates, plus `xz-utils`: the official Nix
+/// installer unpacks a `.xz` tarball and the stock image lacks `xz`), preps docker for the
 /// **`vfs`** storage driver (Fly's rootfs can't nest overlayfs — the default
 /// overlay driver fails), fixes key perms, and execs sshd in the foreground so
 /// the machine stays up as an ssh box (the same model thegn gives a VPS).
 /// Verified live. `thegn env image-bake` can later fold this into an image.
 pub const SSHD_INIT: &str = "set -e; export DEBIAN_FRONTEND=noninteractive; \
 apt-get update -qq; \
-apt-get install -y -qq openssh-server curl ca-certificates >/dev/null 2>&1; \
+apt-get install -y -qq openssh-server curl ca-certificates xz-utils >/dev/null 2>&1; \
 mkdir -p /run/sshd /etc/docker; \
 printf '{\"features\":{\"containerd-snapshotter\":false},\"storage-driver\":\"vfs\"}\\n' > /etc/docker/daemon.json; \
 chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; \
@@ -824,5 +825,16 @@ mod tests {
         assert!(SSHD_INIT.contains("chmod 600 /root/.ssh/authorized_keys"));
         assert!(!SSHD_INIT.contains("chmod 700 /root/.ssh || true"));
         assert!(!SSHD_INIT.contains("chmod 600 /root/.ssh/authorized_keys || true"));
+    }
+
+    #[test]
+    fn sshd_init_installs_xz_for_the_nix_installer() {
+        // THE-2045: the official Nix installer unpacks a `.xz` tarball; the
+        // stock image has no `xz`, so env up would fail "Install Nix".
+        assert!(
+            SSHD_INIT
+                .contains("apt-get install -y -qq openssh-server curl ca-certificates xz-utils"),
+            "{SSHD_INIT}"
+        );
     }
 }

@@ -92,6 +92,7 @@ fn shell(content: DetailContent) -> DetailOverlay {
 pub fn usage_loading(cols: usize, rows: usize) -> DetailOverlay {
     let _ = (cols, rows); // centered placement self-positions
     shell(DetailContent::Sections(SectionsDetail {
+        cursor: None,
         sections: vec![Section::Heading {
             label: "gathering usage\u{2026}".into(),
             note: None,
@@ -113,6 +114,7 @@ pub fn usage_overlay(
     cfg: &UsageConfig,
 ) -> DetailOverlay {
     shell(DetailContent::Sections(SectionsDetail {
+        cursor: None,
         sections: usage_sections(
             &UsagePayload {
                 accounts: accounts.to_vec(),

@@ -230,13 +230,88 @@ fn normalize_origin(raw: &str, scheme: &str) -> Result<String> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// Why no secure origin exists *yet*. A miss is a recoverable, expected state
+/// (no `thegn serve` running, or a plaintext topology): provisioning proceeds
+/// without a credential and the next open/reattach mints lazily. Hard faults
+/// (an invalid serve config, a malformed advertised origin, ambiguous live
+/// daemons) stay `Err` and keep blocking: they need an operator fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OriginMiss {
+    /// No live, same-host serving daemon in this state scope advertises an origin.
+    NoLiveEndpoint,
+    /// `[serve]` resolves to a topology that is not eligible (plaintext direct).
+    IneligibleTopology(String),
+}
+
+impl OriginMiss {
+    fn describe(&self) -> String {
+        match self {
+            Self::NoLiveEndpoint => "no live `thegn serve` endpoint".to_string(),
+            Self::IneligibleTopology(reason) => reason.clone(),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::NoLiveEndpoint => anyhow::anyhow!(
+                "route-to-host provisioning needs a live `thegn serve` endpoint; start the secure serving topology and retry"
+            ),
+            Self::IneligibleTopology(reason) => anyhow::anyhow!(reason),
+        }
+    }
+}
+
+/// Outer `Err` = hard fault; inner `Err` = a recoverable [`OriginMiss`].
+type OriginLookup = Result<std::result::Result<String, OriginMiss>>;
+
+const UNAVAILABLE_NOTICE: &str = "route-to-host merges are unavailable until `thegn serve` is live with a tls-terminated or tunnel topology; reopen the worktree afterwards to install the credential";
+
+/// Process-global, per-worktree dedup: the first miss for a worktree reports,
+/// every later miss in this process is silent.
+fn first_miss_for(worktree: &str) -> bool {
+    static NOTIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NOTIFIED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(worktree.to_string())
+}
+
+fn post_unavailable_notice(worktree: &str, miss: &OriginMiss) {
+    if !first_miss_for(worktree) {
+        return;
+    }
+    tracing::info!(target: "thegn::route_credential", worktree, cause = %miss.describe(), "route-to-host credential deferred");
+    thegn_core::msg::info(UNAVAILABLE_NOTICE);
+    crate::launch_notice::post(worktree, UNAVAILABLE_NOTICE);
+}
+
+/// Route mode with no secure origin yet: leave the worktree exactly as push
+/// mode would (no live grant, no credential file) so `merge add` fails closed,
+/// tell the user once, and let provisioning continue. No token is minted here.
+fn retire_for_miss(
+    store: &dyn ControlStore,
+    worktree: &str,
+    miss: &OriginMiss,
+    at_ms: i64,
+    revoke_owner_grants: impl FnOnce() -> Result<usize>,
+    remove_file: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    revoke_worktree_grants(store, worktree, None, at_ms)?;
+    revoke_owner_grants()?;
+    remove_file()?;
+    post_unavailable_notice(worktree, miss);
+    Ok(())
+}
+
 fn select_control_origin(
     rows: &[DaemonRow],
     scopes: &[String],
     scheme: &str,
     at_ms: i64,
     pid_alive: impl Fn(i64) -> bool,
-) -> Result<String> {
+) -> OriginLookup {
     let local_hostname = thegn_core::util::hostname();
     let mut origins = Vec::new();
     for row in rows {
@@ -251,31 +326,30 @@ fn select_control_origin(
         }
     }
     let Some(origin) = origins.first() else {
-        anyhow::bail!(
-            "route-to-host provisioning needs a live `thegn serve` endpoint; start the secure serving topology and retry"
-        );
+        return Ok(Err(OriginMiss::NoLiveEndpoint));
     };
     anyhow::ensure!(
         origins.iter().all(|candidate| candidate == origin),
         "ambiguous: {} live serving daemons in this state scope advertise different origins",
         origins.len()
     );
-    Ok(origin.clone())
+    Ok(Ok(origin.clone()))
 }
 
-fn secure_control_origin(cfg: &Config, store: &dyn ControlStore, at_ms: i64) -> Result<String> {
+fn secure_control_origin(cfg: &Config, store: &dyn ControlStore, at_ms: i64) -> OriginLookup {
     let transport = cfg
         .serve
         .resolve_transport(None, false)
         .map_err(anyhow::Error::msg)
         .context("route-to-host control endpoint is invalid")?;
-    anyhow::ensure!(
-        matches!(
-            transport.exposure,
-            ServeExposure::TlsTerminated | ServeExposure::Tunnel
-        ),
-        "route-to-host provisioning requires [serve] topology = \"tls-terminated\" or \"tunnel\"; plaintext direct endpoints are not eligible"
-    );
+    if !matches!(
+        transport.exposure,
+        ServeExposure::TlsTerminated | ServeExposure::Tunnel
+    ) {
+        return Ok(Err(OriginMiss::IneligibleTopology(
+            "route-to-host provisioning requires [serve] topology = \"tls-terminated\" or \"tunnel\"; plaintext direct endpoints are not eligible".to_string(),
+        )));
+    }
     let rows = store.daemons()?;
     select_control_origin(
         &rows,
@@ -300,7 +374,8 @@ fn rotate_credential(
     worktree: &str,
     at_ms: i64,
 ) -> Result<RouteCredential> {
-    let origin = secure_control_origin(cfg, store, at_ms)?;
+    // Fail closed: a miss is an error here, never a token without an origin.
+    let origin = secure_control_origin(cfg, store, at_ms)?.map_err(OriginMiss::into_error)?;
     mint_bound_credential(
         store,
         origin,
@@ -498,6 +573,8 @@ fn parse_credential_response(text: &str) -> Result<Option<(String, String)>> {
 /// Reconcile the route-to-host credential after provider provisioning. A valid
 /// installed token is reused across reattach; mismatch/expiry rotates it. A
 /// spare/base image receives none, and push mode actively retires stale grants.
+/// Route mode without a secure origin yet ([`OriginMiss`]) is retired the same
+/// way and returns `Ok`, so provisioning never blocks on `thegn serve`.
 pub(crate) fn reconcile_provider_credential(
     cfg: &Config,
     provider: &Provider,
@@ -523,7 +600,22 @@ pub(crate) fn reconcile_provider_credential(
         return Ok(());
     }
     let at_ms = now_ms();
-    let origin = secure_control_origin(cfg, &db, at_ms)?;
+    let origin = match secure_control_origin(cfg, &db, at_ms)? {
+        Ok(origin) => origin,
+        // No secure origin yet: provision without a credential (fail closed in
+        // `merge add`); the next open/reattach reaches this function again and
+        // mints once `thegn serve` is live.
+        Err(miss) => {
+            return retire_for_miss(
+                &db,
+                worktree,
+                &miss,
+                at_ms,
+                || revoke_owner(&db, provider_config, sandbox_id, at_ms),
+                || remove_credential_file(provider, sandbox_id, worktree),
+            );
+        }
+    };
     let installed = read_provider_credential(provider, sandbox_id, worktree)?;
     if let Some(credential) = reusable_credential(&db, &owner, worktree, &origin, installed, at_ms)
     {
@@ -779,7 +871,19 @@ pub(crate) fn reconcile_ssh_credential(
         return Ok(());
     }
 
-    let origin = secure_control_origin(cfg, &db, at_ms)?;
+    let origin = match secure_control_origin(cfg, &db, at_ms)? {
+        Ok(origin) => origin,
+        Err(miss) => {
+            return retire_for_miss(
+                &db,
+                worktree,
+                &miss,
+                at_ms,
+                || revoke_owner_label(&db, &owner, None, None, at_ms),
+                || remove_ssh_credential(target, worktree),
+            );
+        }
+    };
     let installed = read_ssh_credential(target, worktree)?;
     if let Some(credential) = reusable_credential(&db, &owner, worktree, &origin, installed, at_ms)
     {
@@ -930,13 +1034,14 @@ mod tests {
         ];
         let selected =
             select_control_origin(&rows, &scopes(), "https", 10_000, |pid| pid == live).unwrap();
-        assert_eq!(selected, "https://live.example");
+        assert_eq!(selected, Ok("https://live.example".to_string()));
 
-        assert!(
+        assert_eq!(
             select_control_origin(&rows[..2], &scopes(), "https", 10_000, |pid| {
                 pid == live
             })
-            .is_err()
+            .unwrap(),
+            Err(OriginMiss::NoLiveEndpoint)
         );
     }
 
@@ -949,7 +1054,7 @@ mod tests {
         let result = select_control_origin(&rows, &scopes(), "https", 10_000, |_| true);
         match result {
             Err(error) => assert!(error.to_string().contains("ambiguous")),
-            Ok(origin) => panic!("accepted ambiguous origin {origin}"),
+            Ok(origin) => panic!("accepted ambiguous origin {origin:?}"),
         }
     }
 
@@ -959,7 +1064,9 @@ mod tests {
             daemon_row("/state", 41, "https://HOST.example:443/", 9_000),
             daemon_row("/state", 42, "https://host.example", 10_000),
         ];
-        let forward = select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).unwrap();
+        let forward = select_control_origin(&rows, &scopes(), "https", 10_000, |_| true)
+            .unwrap()
+            .unwrap();
         let reverse = select_control_origin(
             &rows.iter().rev().cloned().collect::<Vec<_>>(),
             &scopes(),
@@ -967,6 +1074,7 @@ mod tests {
             10_000,
             |_| true,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(forward, "https://host.example");
         assert_eq!(reverse, forward);
@@ -985,7 +1093,10 @@ mod tests {
         let mut row = daemon_row("/state", 41, "https://remote.example", 10_000);
         row.hostname = format!("{}-remote", thegn_core::util::hostname());
         let rows = [row];
-        assert!(select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).is_err());
+        assert_eq!(
+            select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).unwrap(),
+            Err(OriginMiss::NoLiveEndpoint)
+        );
     }
 
     fn ssh_target(host: &str) -> SshTarget {
@@ -1217,6 +1328,112 @@ mod tests {
         .to_string();
         assert!(error.contains("tls-terminated") && error.contains("tunnel"));
         assert!(db.pairings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_daemon_rows_is_a_no_live_endpoint_miss() {
+        assert_eq!(
+            select_control_origin(&[], &scopes(), "https", 10_000, |_| true).unwrap(),
+            Err(OriginMiss::NoLiveEndpoint)
+        );
+
+        // The same miss through the config-aware lookup: an eligible topology
+        // with an empty daemon registry is recoverable, not a hard error.
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&temp.path().join("db.sqlite")).unwrap();
+        let mut cfg = Config::default();
+        cfg.serve.topology = ServeTopology::Tunnel;
+        cfg.serve.advertise_host = "host.example".into();
+        assert_eq!(
+            secure_control_origin(&cfg, &db, 10_000).unwrap(),
+            Err(OriginMiss::NoLiveEndpoint)
+        );
+    }
+
+    #[test]
+    fn plaintext_topology_is_an_ineligible_topology_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = serving_db(&temp.path().join("db.sqlite"), 10_000);
+        match secure_control_origin(&Config::default(), &db, 10_000).unwrap() {
+            Err(OriginMiss::IneligibleTopology(reason)) => {
+                assert!(reason.contains("tls-terminated") && reason.contains("tunnel"));
+            }
+            other => panic!("expected an ineligible-topology miss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn differing_live_origins_stay_a_hard_error_not_a_miss() {
+        let rows = [
+            daemon_row("/state", 41, "https://one.example", 10_000),
+            daemon_row("/state", 42, "https://two.example", 10_000),
+        ];
+        assert!(select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).is_err());
+    }
+
+    #[test]
+    fn miss_retires_grants_removes_the_file_and_mints_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let at_ms = 10_000;
+        let db = Db::open_at(&temp.path().join("db.sqlite")).unwrap();
+        let provider = provider("sprites", "SPRITES_ACCOUNT_A");
+        let owner = provider_owner_label(&provider, "sandbox-a");
+        let stale = put_route_token(&db, owner, "/remote/miss-a", at_ms);
+        let other_owner = put_route_token(&db, "older-owner".into(), "/remote/miss-a", at_ms);
+        let neighbor = put_route_token(&db, "neighbor".into(), "/remote/neighbor", at_ms);
+        let pairings_before = db.pairings().unwrap().len();
+        let removed = std::cell::Cell::new(false);
+        let owner_revoked = std::cell::Cell::new(false);
+
+        retire_for_miss(
+            &db,
+            "/remote/miss-a",
+            &OriginMiss::NoLiveEndpoint,
+            at_ms + 1,
+            || {
+                owner_revoked.set(true);
+                revoke_owner(&db, &provider, "sandbox-a", at_ms + 1)
+            },
+            || {
+                removed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(removed.get(), "the credential file removal path must run");
+        assert!(owner_revoked.get(), "owner grants must be revoked");
+        assert_eq!(
+            db.pairings().unwrap().len(),
+            pairings_before,
+            "a miss never mints"
+        );
+        assert!(thegn_svc::control::auth::verify(&db, &stale.token, at_ms + 2).is_none());
+        assert!(thegn_svc::control::auth::verify(&db, &other_owner.token, at_ms + 2).is_none());
+        assert!(thegn_svc::control::auth::verify(&db, &neighbor.token, at_ms + 2).is_some());
+    }
+
+    #[test]
+    fn miss_propagates_a_failed_file_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&temp.path().join("db.sqlite")).unwrap();
+        let result = retire_for_miss(
+            &db,
+            "/remote/miss-b",
+            &OriginMiss::IneligibleTopology("plaintext".into()),
+            10_000,
+            || Ok(0),
+            || anyhow::bail!("simulated removal failure"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unavailable_notice_is_once_per_worktree_per_process() {
+        let worktree = "/remote/notice-dedup-unique";
+        assert!(first_miss_for(worktree));
+        assert!(!first_miss_for(worktree));
+        assert!(first_miss_for("/remote/notice-dedup-other"));
     }
 
     #[test]
