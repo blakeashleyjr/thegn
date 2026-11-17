@@ -6,8 +6,11 @@
 //! was invisible until the daemon — and every pane it owns — was restarted.
 //! `main` records the CLI's config source here once; the daemon's agent-launch
 //! path then loads a fresh layered config for each request (off the runtime
-//! threads — it is file + DB I/O) and copies only the agent/tool/pipeline
-//! registries over the boot snapshot. Everything else remains boot-fixed.
+//! threads — it is file + DB I/O) and copies only the launch registry over the
+//! boot snapshot: the agent/tool/pipeline registries, the `[env.*]` tables and
+//! env selection (`sandbox.default_env`/`sandbox.main_env`), so an `[env.*]`
+//! edit reaches the next daemon launch without a restart. Everything else
+//! (other `[sandbox]` keys, `[daemon]`, network, resources) remains boot-fixed.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -39,8 +42,11 @@ pub fn overrides() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `boot` with only its agent/tool/pipeline registries refreshed from a
-/// freshly **admitted** generation.
+/// `boot` with only its launch registry (agent/tool/pipeline registries, the
+/// `[env.*]` tables, `sandbox.default_env`/`sandbox.main_env`) refreshed from a
+/// freshly **admitted** generation; see
+/// [`thegn_core::pipeline_run::with_fresh_registry`]. The env tables refresh per
+/// launch request, with no watcher or timer.
 ///
 /// When this process performed startup admission (every configured verb,
 /// including the daemon, does), the refresh re-admits from the frozen process
@@ -112,5 +118,21 @@ mod tests {
                 Ok(None)
             ));
         }
+    }
+
+    #[test]
+    fn the_refresh_overlay_carries_env_tables_but_keeps_boot_sandbox_policy() {
+        // The overlay `fresh` applies to an authorized generation: env tables
+        // and env selection follow disk, the rest of `[sandbox]` stays fixed.
+        let mut boot = thegn_core::config::Config::default();
+        boot.sandbox.enabled = false;
+        let mut next: thegn_core::config::Config =
+            toml::from_str("[env.dev]\nplacement = \"local\"\n").expect("fresh config");
+        next.sandbox.enabled = true;
+        next.sandbox.default_env = "dev".into();
+        let merged = thegn_core::pipeline_run::with_fresh_registry(&boot, &next);
+        assert!(merged.env.contains_key("dev"));
+        assert_eq!(merged.sandbox.default_env, "dev");
+        assert!(!merged.sandbox.enabled);
     }
 }

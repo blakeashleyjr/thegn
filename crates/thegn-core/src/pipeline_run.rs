@@ -734,13 +734,19 @@ pub fn wait_candidates(
     }
 }
 
-/// `base` with only its agent/tool/pipeline registries replaced from `fresh`.
+/// `base` with its launch registry replaced from `fresh`: the
+/// agent/tool/pipeline registries, the `[env.*]` tables, and env selection
+/// (`sandbox.default_env`, `sandbox.main_env`).
 ///
 /// Deliberately narrow: a long-lived daemon's boot snapshot can carry settings
 /// that must remain fixed for its lifetime. Re-reading the whole config for an
 /// agent launch would make an unrelated on-disk edit silently change sandbox,
-/// network, resource, or control-plane policy under that daemon. Only the
-/// registries consulted while resolving an agent/tool/stage are refreshed.
+/// network, resource, or control-plane policy under that daemon. Only what is
+/// consulted while resolving an agent/tool/stage and the env it launches in is
+/// refreshed, matching the `NextUse` class of `env.*` in
+/// [`crate::config::reload_class`]. Every other `[sandbox]`/`[daemon]` key
+/// stays boot-fixed. `fresh` must be a generation the caller has already
+/// authorized for launch (see `config_source::fresh` in thegn-host).
 pub fn with_fresh_registry(
     base: &crate::config::Config,
     fresh: &crate::config::Config,
@@ -749,6 +755,9 @@ pub fn with_fresh_registry(
     out.agents = fresh.agents.clone();
     out.tools = fresh.tools.clone();
     out.pipeline = fresh.pipeline.clone();
+    out.env = fresh.env.clone();
+    out.sandbox.default_env = fresh.sandbox.default_env.clone();
+    out.sandbox.main_env = fresh.sandbox.main_env.clone();
     out
 }
 
@@ -1723,9 +1732,22 @@ mod tests {
     }
 
     #[test]
-    fn registry_refresh_changes_only_agent_tool_and_pipeline_registries() {
-        let mut base = crate::config::Config::default();
+    fn registry_refresh_changes_only_the_launch_registry_and_env_tables() {
+        let mut base: crate::config::Config = toml::from_str(
+            r#"
+[env.sprites]
+placement = "provider"
+[env.sprites.provider]
+provider = "sprites"
+exec = "cli"
+
+[env.removed]
+placement = "local"
+"#,
+        )
+        .expect("base env config");
         base.sandbox.enabled = false;
+        base.sandbox.main_env = "removed".into();
         base.daemon.idle_exit_secs = 17;
 
         let mut fresh: crate::config::Config = toml::from_str(
@@ -1742,10 +1764,17 @@ command = "fresh-tool-command"
 name = "fresh-stage"
 agent = "fresh-agent"
 prompt = "row {row}; thegn dispatch report {row}"
+
+[env.sprites]
+placement = "provider"
+[env.sprites.provider]
+provider = "sprites"
+exec = "api"
 "#,
         )
         .expect("fresh registry config");
         fresh.sandbox.enabled = true;
+        fresh.sandbox.default_env = "sprites".into();
         fresh.daemon.idle_exit_secs = 99;
 
         let merged = with_fresh_registry(&base, &fresh);
@@ -1754,6 +1783,21 @@ prompt = "row {row}; thegn dispatch report {row}"
         assert_eq!(merged.tools.len(), 1);
         assert_eq!(merged.tools[0].name, "fresh-tool");
         assert_eq!(merged.pipeline, fresh.pipeline);
+        let sprites = merged.env.get("sprites").expect("fresh env merged");
+        assert_eq!(sprites.provider.provider, "sprites");
+        assert!(
+            matches!(sprites.provider.exec, crate::config::ProviderExecMode::Api),
+            "the fresh [env.sprites] exec wins over the boot one"
+        );
+        assert!(
+            !merged.env.contains_key("removed"),
+            "an env removed on disk is gone from the launch config"
+        );
+        assert_eq!(merged.sandbox.default_env, "sprites");
+        assert_eq!(
+            merged.sandbox.main_env, "",
+            "env selection follows the fresh generation, including a cleared key"
+        );
         assert!(!merged.sandbox.enabled, "sandbox remains boot-fixed");
         assert_eq!(
             merged.daemon.idle_exit_secs, 17,
