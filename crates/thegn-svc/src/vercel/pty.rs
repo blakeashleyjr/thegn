@@ -1,7 +1,7 @@
 //! The `/interactive` WebSocket PTY for a Vercel sandbox (in-process callers:
 //! the `vercel-exec` bridge). Native panes stay off: `exec_api` is false.
 //!
-//! Flow: resolve the session (resuming under [`Wake::Allow`]), mint the
+//! Flow: resolve the session (resuming under [`super::Wake::Allow`]), mint the
 //! `/interactive` ticket, wait for the sandbox's `/health`, connect the socket
 //! with the ticket token in the query, send the start frame, then pump frames
 //! in a driver task. The ticket token never reaches a log or an error string:
@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use thegn_core::vercel::admit::valid_sandbox_name;
 use thegn_core::vercel::api::{WsControl, interactive_start_frame, parse_ws_control, resize_frame};
 
-use super::{VercelProvider, Wake};
+use super::VercelProvider;
 use crate::provider::{EXEC_EXIT_STATUS_UNKNOWN, ExecControl, ExecFrame, ExecSession, ExecSpec};
 
 // Copied from provider.rs (`exec_ws_config` and its limits) so this lane does
@@ -162,7 +162,7 @@ impl VercelProvider {
     pub async fn open_exec(&self, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
         anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
         let start = self.start_frame(spec)?;
-        let session = self.session_for(name, Wake::Allow).await?;
+        let session = self.interactive_session(name).await?;
         let ticket = self.client.interactive(&session).await?;
         wait_healthy(&health_url(&ticket.url)?).await?;
         let url = zeroize::Zeroizing::new(

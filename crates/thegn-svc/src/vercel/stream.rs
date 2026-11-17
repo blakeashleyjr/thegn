@@ -16,9 +16,9 @@ use anyhow::Result;
 use thegn_core::vercel::admit::valid_sandbox_name;
 use thegn_core::vercel::api::LogLine;
 
+use super::VercelProvider;
 use super::client::WAIT_COMMAND_DEADLINE;
 use super::pty::{CHANNEL_CAPACITY, send_chunked};
-use super::{VercelProvider, Wake};
 use crate::provider::{EXEC_EXIT_STATUS_UNKNOWN, ExecControl, ExecFrame, ExecSession, ExecSpec};
 
 /// SIGTERM → SIGKILL grace after a close.
@@ -77,7 +77,7 @@ impl VercelProvider {
     pub async fn open_stream(self: Arc<Self>, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
         anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
         let body = self.command_body(&spec.argv, spec.cwd.as_deref(), &spec.env, false)?;
-        let session = self.session_for(name, Wake::Allow).await?;
+        let session = self.interactive_session(name).await?;
         let cmd = self.client.run_detached(&session, &body).await?;
         let logs = match self.client.logs(&session, &cmd).await {
             Ok(logs) => logs,
