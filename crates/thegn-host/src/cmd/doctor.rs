@@ -3942,6 +3942,11 @@ fn provider_cache_report(cfg: &Config) {
         if let Some(note) = provider_cache_lifecycle_note(p.provider.trim()) {
             outln!("{note}");
         }
+        if sprite_cli_required(p) && thegn_core::util::which_path("sprite").is_none() {
+            outln!(
+                "               exec = \"cli\" but the `sprite` CLI is MISSING from PATH — install it, or use exec = \"auto\" (native exec, no CLI)"
+            );
+        }
         if p.host_cache {
             match &bridge {
                 Some(pth) => outln!("               host_cache: on (bridge {})", pth.display()),
@@ -3964,6 +3969,17 @@ fn provider_cache_report(cfg: &Config) {
             }
         }
     }
+}
+
+/// Whether a provider env still needs the vendor `sprite` CLI on PATH: only a
+/// sprites env pinned to `exec = "cli"`. `auto`/`api` attach over the native
+/// exec API and the control plane rides `thegn sprite-exec`, so a missing
+/// `sprite` binary is not a fault there and doctor says nothing.
+fn sprite_cli_required(pc: &thegn_core::config::EnvProviderConfig) -> bool {
+    matches!(
+        EnvProviderKind::of(pc.provider.trim()),
+        EnvProviderKind::Sprites
+    ) && matches!(pc.exec, thegn_core::config::ProviderExecMode::Cli)
 }
 
 fn provider_cache_lifecycle_note(provider: &str) -> Option<&'static str> {
@@ -6026,6 +6042,27 @@ mod pins;
 mod tests {
     use super::*;
     use thegn_core::notification::{Notification, NotificationKind};
+
+    #[test]
+    fn sprite_cli_required_only_for_sprites_pinned_to_cli_exec() {
+        use thegn_core::config::{EnvProviderConfig, ProviderExecMode};
+        let pc = |provider: &str, exec: ProviderExecMode| EnvProviderConfig {
+            provider: provider.into(),
+            exec,
+            ..Default::default()
+        };
+        assert!(sprite_cli_required(&pc("sprites", ProviderExecMode::Cli)));
+        assert!(sprite_cli_required(&pc(" sprites ", ProviderExecMode::Cli)));
+        assert!(!sprite_cli_required(&pc("sprites", ProviderExecMode::Auto)));
+        assert!(!sprite_cli_required(&pc("sprites", ProviderExecMode::Api)));
+        assert!(!sprite_cli_required(&pc("daytona", ProviderExecMode::Cli)));
+        assert!(!sprite_cli_required(&pc("fly", ProviderExecMode::Cli)));
+        // The default exec mode (`auto`) never demands the vendor CLI.
+        assert!(!sprite_cli_required(&EnvProviderConfig {
+            provider: "sprites".into(),
+            ..Default::default()
+        }));
+    }
 
     fn row(kind: NotificationKind, source: &str, msg: &str, created: i64) -> Notification {
         Notification {
