@@ -954,6 +954,136 @@ impl PrivateDir {
         }
     }
 
+    /// Open an existing child directory relative to this held handle without
+    /// following a symlink and without ever creating it. A missing child, a
+    /// symlink or a non-directory is `None`. The child must be owned by the
+    /// current user and not group/other writable (the same checks
+    /// [`ensure_private_dir_beneath`] applies to its walked components).
+    pub fn open_child_nofollow(&self, name: &str) -> std::io::Result<Option<PrivateDir>> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{OFlag, openat};
+            use nix::sys::stat::{Mode, SFlag, fstat};
+
+            let fd = match openat(
+                &self.fd,
+                name_path,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(
+                    nix::errno::Errno::ENOENT
+                    | nix::errno::Errno::ENOTDIR
+                    | nix::errno::Errno::ELOOP,
+                ) => return Ok(None),
+                Err(error) => return Err(nix_io_error(error)),
+            };
+            let stat = fstat(&fd).map_err(nix_io_error)?;
+            // O_DIRECTORY already enforces this; defence in depth.
+            if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR {
+                return Ok(None);
+            }
+            check_private_child_dir(stat.st_uid, stat.st_mode & 0o022 != 0)?;
+            Ok(Some(PrivateDir {
+                path: self.path.join(name_path),
+                fd,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name_path);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Ok(None),
+                Ok(_) => Ok(Some(PrivateDir { path })),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    /// Read one entry's metadata relative to this held handle without
+    /// following a leaf symlink. A missing entry is `None`.
+    ///
+    /// On Linux/Android the entry is opened `O_PATH | O_NOFOLLOW` (no read
+    /// access, no device side effects) and stat'ed through that fd, so the
+    /// answer is pinned to this directory. Other platforms fall back to a
+    /// path-based `symlink_metadata`, like the non-unix [`Self::remove_file`].
+    pub fn metadata_nofollow(&self, name: &str) -> std::io::Result<Option<std::fs::Metadata>> {
+        let name_path = single_component(name)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use nix::fcntl::{OFlag, openat};
+            let fd = match openat(
+                &self.fd,
+                name_path,
+                OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::ENOENT) => return Ok(None),
+                Err(error) => return Err(nix_io_error(error)),
+            };
+            std::fs::File::from(fd).metadata().map(Some)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            match std::fs::symlink_metadata(self.path.join(name_path)) {
+                Ok(metadata) => Ok(Some(metadata)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    /// Remove one empty child directory relative to the held handle. A
+    /// symlink is never followed. Returns false when the child is absent or
+    /// not empty; any other failure (including a non-directory) is an error.
+    pub fn remove_empty_child_dir(&self, name: &str) -> std::io::Result<bool> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        {
+            use nix::unistd::{UnlinkatFlags, unlinkat};
+            match unlinkat(&self.fd, name_path, UnlinkatFlags::RemoveDir) {
+                Ok(()) => Ok(true),
+                Err(
+                    nix::errno::Errno::ENOENT
+                    | nix::errno::Errno::ENOTEMPTY
+                    | nix::errno::Errno::EEXIST,
+                ) => Ok(false),
+                Err(error) => Err(nix_io_error(error)),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name_path);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "private directory entry is not a directory",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            }
+            match std::fs::remove_dir(&path) {
+                Ok(()) => Ok(true),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+
     /// Create or open a lock file beneath this held private directory without
     /// following a leaf symlink. The file is never truncated.
     pub fn open_or_create_regular_nofollow(&self, name: &str) -> std::io::Result<std::fs::File> {
@@ -1990,6 +2120,25 @@ fn validate_relative_directory(rel: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn nix_io_error(error: nix::errno::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error as i32)
+}
+
+/// Owner and mode policy for a child opened by [`PrivateDir::open_child_nofollow`]:
+/// owned by the effective user and not group/other writable.
+#[cfg(unix)]
+fn check_private_child_dir(uid: u32, group_or_other_writable: bool) -> std::io::Result<()> {
+    if uid != nix::unistd::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private child directory is owned by another user",
+        ));
+    }
+    if group_or_other_writable {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private child directory is group/other writable",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3162,6 +3311,124 @@ mod tests {
         )
         .unwrap();
         assert!(pinned.open_regular_nofollow("link").is_err());
+    }
+
+    fn pinned_private_fixture() -> (tempfile::TempDir, PathBuf, PrivateDir) {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        let pinned = open_private_dir(&private).unwrap();
+        (root, private, pinned)
+    }
+
+    #[test]
+    fn open_child_nofollow_matrix() {
+        let (root, private, pinned) = pinned_private_fixture();
+        // Absent: None, never created.
+        assert!(pinned.open_child_nofollow("absent").unwrap().is_none());
+        assert!(!private.join("absent").exists());
+        // A regular file is not a directory.
+        std::fs::write(private.join("file"), b"x").unwrap();
+        assert!(pinned.open_child_nofollow("file").unwrap().is_none());
+        // A symlink to a directory is never followed.
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        create_symlink(&victim, &private.join("link"), true).unwrap();
+        assert!(pinned.open_child_nofollow("link").unwrap().is_none());
+        // Group/other writable is refused.
+        std::fs::create_dir(private.join("loose")).unwrap();
+        std::fs::set_permissions(
+            private.join("loose"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let error = pinned.open_child_nofollow("loose").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        // A read-only-for-others legacy directory and a private one open.
+        std::fs::create_dir(private.join("legacy")).unwrap();
+        std::fs::set_permissions(
+            private.join("legacy"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let legacy = pinned.open_child_nofollow("legacy").unwrap().unwrap();
+        assert_eq!(legacy.path(), private.join("legacy").as_path());
+        // Non-component names are rejected.
+        assert!(pinned.open_child_nofollow("../private").is_err());
+        assert!(pinned.open_child_nofollow("a/b").is_err());
+        // The child handle stays pinned after its path is swapped.
+        std::fs::write(private.join("legacy/inside.log"), b"in").unwrap();
+        std::fs::rename(private.join("legacy"), root.path().join("moved")).unwrap();
+        create_symlink(&victim, &private.join("legacy"), true).unwrap();
+        std::fs::write(victim.join("inside.log"), b"victim").unwrap();
+        assert!(legacy.remove_file("inside.log").unwrap());
+        assert_eq!(std::fs::read(victim.join("inside.log")).unwrap(), b"victim");
+        assert!(!root.path().join("moved/inside.log").exists());
+    }
+
+    #[test]
+    fn check_private_child_dir_refuses_a_foreign_owner() {
+        let me = nix::unistd::geteuid().as_raw();
+        assert!(check_private_child_dir(me, false).is_ok());
+        assert_eq!(
+            check_private_child_dir(me.wrapping_add(1), false)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            check_private_child_dir(me, true).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn metadata_nofollow_matrix() {
+        let (root, private, pinned) = pinned_private_fixture();
+        assert!(pinned.metadata_nofollow("absent").unwrap().is_none());
+        std::fs::write(private.join("file.log"), b"12345").unwrap();
+        let file = pinned.metadata_nofollow("file.log").unwrap().unwrap();
+        assert!(file.is_file());
+        assert_eq!(file.len(), 5);
+        assert_eq!(file.nlink(), 1);
+        std::fs::hard_link(private.join("file.log"), root.path().join("other")).unwrap();
+        let linked = pinned.metadata_nofollow("file.log").unwrap().unwrap();
+        assert_eq!(extra_hard_links(&linked), 1);
+        let target = root.path().join("target.log");
+        std::fs::write(&target, b"a much longer target").unwrap();
+        create_symlink(&target, &private.join("link.log"), false).unwrap();
+        let link = pinned.metadata_nofollow("link.log").unwrap().unwrap();
+        assert!(link.file_type().is_symlink());
+        std::fs::create_dir(private.join("dir")).unwrap();
+        assert!(pinned.metadata_nofollow("dir").unwrap().unwrap().is_dir());
+        nix::unistd::mkfifo(&private.join("fifo"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let fifo = pinned.metadata_nofollow("fifo").unwrap().unwrap();
+        assert!(!fifo.is_file() && !fifo.is_dir());
+        assert!(pinned.metadata_nofollow("../private").is_err());
+    }
+
+    #[test]
+    fn remove_empty_child_dir_matrix() {
+        let (root, private, pinned) = pinned_private_fixture();
+        assert!(!pinned.remove_empty_child_dir("absent").unwrap());
+        std::fs::create_dir(private.join("full")).unwrap();
+        std::fs::write(private.join("full/keep.log"), b"x").unwrap();
+        assert!(!pinned.remove_empty_child_dir("full").unwrap());
+        assert!(private.join("full/keep.log").exists());
+        std::fs::write(private.join("file"), b"x").unwrap();
+        assert!(pinned.remove_empty_child_dir("file").is_err());
+        assert!(private.join("file").exists());
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        create_symlink(&victim, &private.join("link"), true).unwrap();
+        assert!(pinned.remove_empty_child_dir("link").is_err());
+        assert!(victim.is_dir());
+        assert!(std::fs::symlink_metadata(private.join("link")).is_ok());
+        std::fs::create_dir(private.join("empty")).unwrap();
+        assert!(pinned.remove_empty_child_dir("empty").unwrap());
+        assert!(!private.join("empty").exists());
+        assert!(pinned.remove_empty_child_dir("../victim").is_err());
+        assert!(victim.is_dir());
     }
 
     #[test]
