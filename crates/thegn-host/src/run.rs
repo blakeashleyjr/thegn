@@ -7933,6 +7933,11 @@ async fn event_loop<T: Terminal>(
     // frame (title bar) and focuses the pane (drag model rule 2 applied to
     // panes: press arms, motion commits). Esc cancels.
     let mut pane_lift: Option<(crate::center::PaneId, usize, usize, bool)> = None;
+    // Files-panel → pane drag (THE-135): a press on a Files FILE row arms it
+    // (the click still selects the row); motion off the press cell makes it a
+    // drag; a release over a center pane types the shell-quoted path there
+    // (never executed). Holds pointer capture while armed. See `dragdrop`.
+    let mut file_drag: Option<crate::dragdrop::FileDrag> = None;
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
@@ -17416,6 +17421,13 @@ async fn event_loop<T: Terminal>(
                 // it lands here and goes through the same dispatch the key path
                 // uses.
                 let mut detail_act: Option<crate::detail::DetailAction> = None;
+                // A fresh press while a Files drag is still armed means its
+                // release was swallowed by a modal (help, board, monitor,
+                // theme builder): drop the stale drag so this click neither
+                // stays captured nor later inserts a path.
+                if left && !mouse_left_down {
+                    file_drag = None;
+                }
                 let pre = crate::handlers::overlay::pre_dispatch(
                     current_config.ui.dismiss_overlay_on_click_outside,
                     &mut bar_detail,
@@ -17445,7 +17457,8 @@ async fn event_loop<T: Terminal>(
                     // forward to the pane app (the gesture owns the pointer).
                     sidebar_mouse_ui.drag_active()
                         || pane_border_grab.is_some()
-                        || pane_lift.is_some(),
+                        || pane_lift.is_some()
+                        || file_drag.is_some(),
                 );
                 if let Some(action) = detail_act {
                     bar_detail = CiActionCtx {
@@ -17563,6 +17576,83 @@ async fn event_loop<T: Terminal>(
                         mouse_left_down = false;
                         dirty = true;
                     }
+                    continue;
+                }
+
+                // Files-panel → pane drag (THE-135). Motion only arms the drop
+                // (and shows the prompt once); the release decides. Only a
+                // drag that MOVED and ends over a displayed center pane
+                // inserts — the drawer, strip, sidebar, panel and bars are
+                // not in `frames`, and an open modal / overlay cover / app
+                // tile cancels. The payload refuses any control character and
+                // goes through `paste_text_into_pane` (one chunk, bracketed
+                // when the app asked, markers neutralized). Wheel samples
+                // during the hold are ignored rather than read as a release.
+                if file_drag.is_some()
+                    && !m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
+                    && !m.mouse_buttons.contains(MouseButtons::HORZ_WHEEL)
+                {
+                    if left {
+                        if let Some(drag) = file_drag.as_mut()
+                            && drag.on_motion(mx, my)
+                        {
+                            model.status = format!(
+                                "drop on a pane to insert {}",
+                                crate::dragdrop::status_path(&drag.path)
+                            );
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                    mouse_left_down = false;
+                    if let Some(drag) = file_drag.take() {
+                        let blocked = bar_detail.is_some()
+                            || app_host.active_tile_mut().is_some()
+                            || !crate::caret::no_popup_covers()
+                            || crate::caret::covered_at(mx, my)
+                            || center_dormant
+                            || crate::chrome::center_shows_splash(&frames, &model, |id| {
+                                panes.table.contains_key(&id)
+                            });
+                        let hit = if blocked {
+                            None
+                        } else {
+                            crate::dragdrop::pane_at(&frames, mx, my)
+                        };
+                        match drag.release_target(hit) {
+                            Some(pane_id) => {
+                                let shown = crate::dragdrop::status_path(&drag.path);
+                                let file = crate::dragdrop::DragFile { path: drag.path };
+                                match crate::dragdrop::drop_payload(
+                                    crate::dragdrop::DropTarget::Terminal,
+                                    &file,
+                                ) {
+                                    None => {
+                                        model.status =
+                                            "path has control characters: not inserted".into();
+                                    }
+                                    Some(text) => match panes.table.get_mut(&pane_id) {
+                                        Some(p) => match paste_text_into_pane(p, &text) {
+                                            Ok(()) => model.status = format!("inserted {shown}"),
+                                            Err(e) => {
+                                                tracing::debug!(error = %e, "file drop paste failed");
+                                                model.status =
+                                                    "pane busy: path not inserted".into();
+                                            }
+                                        },
+                                        // The pane is still loading (splash) or
+                                        // just closed: nothing to type into.
+                                        None => model.status.clear(),
+                                    },
+                                }
+                            }
+                            // A moved drag released off-target: clear the prompt.
+                            None if drag.moved => model.status.clear(),
+                            // Never moved: a plain click — leave the status be.
+                            None => {}
+                        }
+                    }
+                    dirty = true;
                     continue;
                 }
 
@@ -18734,6 +18824,22 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                }
+                                // Files FILE row: the click above selected it;
+                                // also arm a drag-to-pane (THE-135). Motion
+                                // makes it a drag; a motionless release stays
+                                // a plain click.
+                                if sec == crate::panel::Section::Files
+                                    && let Some(entry) = file_entry_at(
+                                        &model,
+                                        &panel_ui.files_collapsed,
+                                        &panel_ui.files_filter,
+                                        i,
+                                    )
+                                    && !entry.is_dir
+                                {
+                                    file_drag =
+                                        Some(crate::dragdrop::FileDrag::new(entry.path, (mx, my)));
                                 }
                             }
                             None => {
