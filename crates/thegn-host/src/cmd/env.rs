@@ -184,6 +184,17 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
+    /// Find Vercel sandboxes this host's controller created but no longer records (dry-run unless --apply).
+    Reap {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -262,6 +273,12 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Rm { name } => remove(&name),
         Action::Test { name } => test(cfg, &name),
         Action::Pull { target } => pull(cfg, target.get()),
+        Action::Reap {
+            provider,
+            apply,
+            yes,
+            json,
+        } => super::env_reap::run(cfg, &provider, apply, yes, json),
     }
 }
 
@@ -1314,9 +1331,14 @@ fn pull(cfg: &Config, worktree: Option<String>) -> Result<()> {
             outln!("nothing to pull: {} runs on this machine", env.name);
             Ok(())
         }
-        thegn_core::placement::Placement::Provider(_) => {
+        thegn_core::placement::Placement::Provider(placement) => {
             let report = crate::provider_git::pull_back(cfg, &wt, &env.name)?;
             outln!("{}", report.summary());
+            if thegn_core::config::EnvProviderKind::of(placement.provider.trim())
+                == thegn_core::config::EnvProviderKind::Vercel
+            {
+                crate::vercel_pull_marker::clear_for_worktree(cfg, &wt);
+            }
             Ok(())
         }
         other => anyhow::bail!(

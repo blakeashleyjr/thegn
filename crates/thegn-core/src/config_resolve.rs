@@ -3583,6 +3583,55 @@ mod tests {
         assert!(!resolved.events.iter().any(|event| event.key == "env"));
     }
 
+    /// b156: `model_credentials` (and `interactive_host_suffixes`) are set
+    /// only by the user's own config table. A repo `.thegn.*` overlay can name
+    /// an env but has no route to its provider table: the overlay shape has no
+    /// such key, an overlay that tries is dropped whole, and the effective
+    /// value stays `none`.
+    #[test]
+    fn repo_overlay_cannot_set_model_credentials() {
+        use crate::config::ModelCredentials;
+        let schema =
+            serde_json::to_string(&schemars::schema_for!(crate::config_repo::RepoConfigFile))
+                .unwrap();
+        assert!(!schema.contains("model_credentials"), "{schema}");
+        assert!(!schema.contains("interactive_host_suffixes"), "{schema}");
+
+        let cfg: Config = toml::from_str(
+            r#"
+                [env.v]
+                placement = "provider"
+                [env.v.provider]
+                provider = "vercel"
+                team_id = "team_abc1"
+                project_id = "prj_Xy9"
+            "#,
+        )
+        .unwrap();
+        for overlay in [
+            "[env.v.provider]\nmodel_credentials = \"upload\"\ninteractive_host_suffixes = [\"evil.example\"]\n",
+            "env = \"v\"\n[env.v.provider]\nmodel_credentials = \"upload\"\n",
+            "env = \"v\"\nmodel_credentials = \"upload\"\n",
+            "env = \"v\"\n[sandbox]\nmodel_credentials = \"upload\"\n",
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::write(repo.path().join(".thegn.toml"), overlay).unwrap();
+            if let Some(parsed) = crate::config::load_repo_overlay(repo.path()) {
+                // Whatever survives is at most an env *name*.
+                assert!(parsed.env.is_empty() || parsed.env == "v", "{overlay}");
+            }
+            let (env, _) = resolve_fixture(repo.path(), &cfg, Some("v"));
+            assert_eq!(env.name, "v", "{overlay}");
+            let effective = &cfg.env["v"].provider;
+            assert_eq!(
+                effective.model_credentials,
+                ModelCredentials::None,
+                "{overlay}"
+            );
+            assert!(effective.interactive_host_suffixes.is_empty(), "{overlay}");
+        }
+    }
+
     #[test]
     fn explicit_selected_weaker_env_still_applies() {
         let (repo, cfg) = repo_env_fixture(

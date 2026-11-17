@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use crate::config::ModelCredentials;
+
 /// A refused `[env.<name>.provider]` field: label + fixed reason, no value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmitError {
@@ -19,6 +21,44 @@ impl fmt::Display for AdmitError {
 impl std::error::Error for AdmitError {}
 
 const MAX_TEMPLATE_BYTES: usize = 256;
+
+/// The refusal for `model_credentials = "proxy"` (shared with `creds`).
+pub const PROXY_REFUSAL: &str = "proxy is not implemented: it needs a public HTTPS endpoint, \
+     Vercel OIDC verification, per-sandbox scoping and revocation (THE-2233)";
+
+/// The refusal for `model_credentials = "inject"` (shared with `creds`).
+pub const INJECT_REFUSAL: &str =
+    "inject would hand the model key to Vercel; not offered (THE-2233)";
+
+/// The public-suffix-style domain any Vercel user can deploy to; never a
+/// trusted interactive host.
+const UNTRUSTED_SUFFIX: &str = "vercel.app";
+
+const MAX_DNS_NAME_BYTES: usize = 253;
+
+/// A lowercase DNS name with at least one dot: labels of `[a-z0-9-]`, 1..=63
+/// bytes, no leading/trailing hyphen, no empty label (so no leading, trailing
+/// or doubled dot), no wildcard, at most 253 bytes.
+pub fn valid_host_suffix(s: &str) -> bool {
+    s.len() <= MAX_DNS_NAME_BYTES
+        && s.contains('.')
+        && s.split('.').all(|label| {
+            let b = label.as_bytes();
+            !b.is_empty()
+                && b.len() <= 63
+                && b[0] != b'-'
+                && b[b.len() - 1] != b'-'
+                && b.iter()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        })
+}
+
+/// `s` is `vercel.app` or a name under it.
+fn under_untrusted_suffix(s: &str) -> bool {
+    s == UNTRUSTED_SUFFIX
+        || s.strip_suffix(UNTRUSTED_SUFFIX)
+            .is_some_and(|rest| rest.ends_with('.'))
+}
 
 fn err(field: &'static str, reason: &'static str) -> AdmitError {
     AdmitError { field, reason }
@@ -64,6 +104,26 @@ pub fn validate_env(pc: &crate::config::EnvProviderConfig) -> Result<(), AdmitEr
     }
     if pc.binary_cache_push {
         return Err(err("binary_cache_push", "unsupported on vercel"));
+    }
+    match pc.model_credentials {
+        ModelCredentials::None | ModelCredentials::Upload => {}
+        ModelCredentials::Proxy => return Err(err("model_credentials", PROXY_REFUSAL)),
+        ModelCredentials::Inject => return Err(err("model_credentials", INJECT_REFUSAL)),
+    }
+    for suffix in &pc.interactive_host_suffixes {
+        if !valid_host_suffix(suffix) {
+            return Err(err(
+                "interactive_host_suffixes",
+                "each entry must be a lowercase DNS name with a dot, no leading dot, \
+                 no wildcard, at most 253 bytes",
+            ));
+        }
+        if under_untrusted_suffix(suffix) {
+            return Err(err(
+                "interactive_host_suffixes",
+                "vercel.app is deployable by any Vercel user and is never trusted",
+            ));
+        }
     }
     Ok(())
 }
@@ -174,6 +234,70 @@ mod tests {
         let e = validate_env(&pc).unwrap_err();
         assert!(!e.to_string().contains("SECRETVALUE"));
         assert!(e.to_string().starts_with("region: "));
+    }
+
+    #[test]
+    fn model_credentials_modes() {
+        let mode = |m| EnvProviderConfig {
+            model_credentials: m,
+            ..ok()
+        };
+        assert!(validate_env(&mode(ModelCredentials::None)).is_ok());
+        assert!(validate_env(&mode(ModelCredentials::Upload)).is_ok());
+        let e = validate_env(&mode(ModelCredentials::Proxy)).unwrap_err();
+        assert_eq!(e.field, "model_credentials");
+        assert_eq!(e.reason, PROXY_REFUSAL);
+        assert!(e.reason.contains("THE-2233"));
+        let e = validate_env(&mode(ModelCredentials::Inject)).unwrap_err();
+        assert_eq!(e.field, "model_credentials");
+        assert_eq!(e.reason, INJECT_REFUSAL);
+    }
+
+    #[test]
+    fn interactive_host_suffixes_checked() {
+        let with = |s: &[&str]| EnvProviderConfig {
+            interactive_host_suffixes: s.iter().map(|x| (*x).to_string()).collect(),
+            ..ok()
+        };
+        assert!(validate_env(&with(&[])).is_ok());
+        assert!(validate_env(&with(&["vercel.run", "vercel.sh", "a-1.vercel.com"])).is_ok());
+        for bad in [
+            "vercel.app",
+            "x.vercel.app",
+            "*.vercel.run",
+            ".vercel.run",
+            "vercel.run.",
+            "vercel..run",
+            "localhost",
+            "Vercel.run",
+            "-a.vercel.run",
+            "",
+        ] {
+            assert_eq!(
+                field(&with(&["vercel.run", bad])),
+                "interactive_host_suffixes",
+                "{bad:?}"
+            );
+        }
+        // Not under vercel.app, just sharing the tail text.
+        assert!(validate_env(&with(&["notvercel.app"])).is_ok());
+        let long = format!("{}com", "a.".repeat(126));
+        assert!(long.len() > 253);
+        assert_eq!(field(&with(&[&long])), "interactive_host_suffixes");
+    }
+
+    #[test]
+    fn host_suffix_error_has_no_value() {
+        let pc = EnvProviderConfig {
+            interactive_host_suffixes: vec!["SECRET.example".into()],
+            ..ok()
+        };
+        assert!(
+            !validate_env(&pc)
+                .unwrap_err()
+                .to_string()
+                .contains("SECRET")
+        );
     }
 
     #[test]

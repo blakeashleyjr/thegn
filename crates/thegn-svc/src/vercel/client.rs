@@ -28,6 +28,7 @@ use thegn_core::vercel::admit::{valid_project_id, valid_sandbox_name, valid_team
 use thegn_core::vercel::api::{
     LogLine, SandboxView, Scope, parse_list_page, parse_log_line, parse_sandbox,
 };
+use thegn_core::vercel::usage::{SessionUsage, SnapshotUsage};
 
 use super::VercelToken;
 use crate::provider::{
@@ -175,6 +176,10 @@ pub struct VercelClient {
     token: VercelToken,
     scope: Scope,
     http: reqwest::Client,
+    /// `[env.<name>.provider] interactive_host_suffixes` (empty ⇒ the
+    /// built-in Vercel-owned defaults); the WebSocket ticket host pin.
+    #[allow(dead_code)] // spine stub, filled by lane 3
+    interactive_hosts: Vec<String>,
 }
 
 impl fmt::Debug for VercelClient {
@@ -204,7 +209,29 @@ impl VercelClient {
             token,
             scope,
             http: provider_http_client(),
+            interactive_hosts: Vec::new(),
         })
+    }
+
+    /// Pin the interactive WebSocket ticket host to `suffixes` (empty ⇒ the
+    /// built-in defaults).
+    pub(crate) fn with_interactive_hosts(mut self, suffixes: Vec<String>) -> Self {
+        self.interactive_hosts = suffixes;
+        self
+    }
+
+    /// The current session's usage of sandbox `name` (a GET; never resumes).
+    /// Spine stub: lane 3 implements the request.
+    pub(crate) async fn usage(&self, name: &str) -> Result<Option<SessionUsage>> {
+        checked_name(name)?;
+        Ok(None)
+    }
+
+    /// The snapshots of sandbox `name` with their sizes and status.
+    /// Spine stub: lane 3 implements the request.
+    pub(crate) async fn snapshot_usage(&self, name: &str) -> Result<Vec<SnapshotUsage>> {
+        checked_name(name)?;
+        Ok(Vec::new())
     }
 
     // --- control plane ----------------------------------------------------

@@ -16,6 +16,10 @@
 # Exception (b154): `vercel-exec cmd` / `vercel-exec id` were added with the
 # hidden `thegn vercel-exec` bridge verb, the same precedent as `sprite-exec`:
 # a hidden self-bridge verb nobody tab-completes.
+#
+# Temporary (b156 lane 1, the spine): `env reap provider` is pinned so the
+# spine branch stays green alone; b156 lane 6 classifies it in CATALOG and
+# deletes this line and this note.
 	log_level
 agent sessions	harness
 api call	params
@@ -54,6 +58,7 @@ env create	token_env
 env create	token_file
 env deprovision	id
 env forward	spec
+env reap	provider
 env restore	id
 env snapshot	label
 forward stop	container_port

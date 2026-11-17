@@ -474,6 +474,8 @@ fn vercel_provider_from(
         region: non_empty(pc.region.as_str()),
         max_instances: policy::max_instances(pc.max_instances),
         max_lifetime_secs: policy::max_lifetime_secs(pc.max_lifetime_secs),
+        interactive_host_suffixes: pc.interactive_host_suffixes.clone(),
+        model_credentials: pc.model_credentials,
     })
     .map_err(|_| "the vercel provider could not be built (check api_base)".to_string())
 }

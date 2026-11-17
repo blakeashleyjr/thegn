@@ -330,6 +330,8 @@ mod toast;
 mod toolchain_ui;
 mod usage_budget;
 mod vercel_bridge;
+mod vercel_login;
+mod vercel_pull_marker;
 mod vercel_reaper;
 mod voice;
 mod voice_worker;
