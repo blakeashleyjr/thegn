@@ -85,21 +85,48 @@ pub(super) fn header_rows(model: &FrameModel, focused: bool, cols: usize) -> Vec
         )
         .bold(),
     ];
-    if let Some((ahead, behind)) = data.ahead_behind {
+    let stale = data.upstream_read == super::UpstreamRead::Stale;
+    if data.upstream_read == super::UpstreamRead::Unavailable {
+        branch_l.push(seg(Tok::Slot(S::Faint), " ?"));
+    } else if let Some((ahead, behind)) = data.ahead_behind {
+        let tok = |h: Hue| if stale { Tok::Slot(S::Faint) } else { hue(h) };
         if ahead > 0 {
-            branch_l.push(seg(hue(Hue::Green), format!(" ⇡{ahead}")));
+            branch_l.push(seg(tok(Hue::Green), format!(" ⇡{ahead}")));
         }
         if behind > 0 {
-            branch_l.push(seg(hue(Hue::Red), format!("⇣{behind}")));
+            branch_l.push(seg(tok(Hue::Red), format!("⇣{behind}")));
         }
     }
-    let branch_r: Vec<Seg> = match &data.merge {
+    let mut branch_r: Vec<Seg> = match &data.merge {
         Some(m) => vec![Seg::chip(hue(Hue::Amber), format!(" {} ", m.label)), sp(1)],
         None => match &data.pr {
             Some(pr) => vec![seg(Tok::Slot(S::Ghost), format!("#{} ", pr.number)), sp(1)],
             None => Vec::new(),
         },
     };
+    // Zone chip goes ahead of the PR/merge chip and is the first thing dropped
+    // when the row is too narrow for branch + chips.
+    let zone_text = match &data.zone {
+        super::ZoneChip::Unzoned => None,
+        super::ZoneChip::Named(n) => {
+            let safe = thegn_core::msg::terminal_safe(n);
+            Some(format!("zone {} ", clip_end(&safe, 16)))
+        }
+        super::ZoneChip::Unknown => Some("zone ? ".to_string()),
+    };
+    if let Some(zt) = zone_text {
+        let used: usize = branch_l
+            .iter()
+            .map(|s| s.text.chars().count())
+            .sum::<usize>()
+            + branch_r
+                .iter()
+                .map(|s| s.text.chars().count())
+                .sum::<usize>();
+        if used + zt.chars().count() < cols {
+            branch_r.insert(0, seg(Tok::Slot(S::Ghost), zt));
+        }
+    }
     rows.push(PanelRow::plain(Line::split(branch_l, branch_r)));
 
     match &data.merge {
@@ -1474,6 +1501,94 @@ mod tests {
         );
         let rows = header_rows(&model, true, 80);
         assert!(text_of(&rows[0].line).contains("HEAD (jj working copy)"));
+    }
+
+    fn branch_row(panel: crate::panel::PanelData, cols: usize) -> (String, Vec<Seg>) {
+        let model = FrameModel {
+            panel,
+            ..Default::default()
+        };
+        let rows = header_rows(&model, true, cols);
+        let (Line::Split { l, .. } | Line::SplitMinLeft { l, .. }) = &rows[0].line else {
+            panic!("expected split branch row");
+        };
+        (text_of(&rows[0].line), l.clone())
+    }
+
+    fn ab_panel(read: crate::panel::UpstreamRead) -> crate::panel::PanelData {
+        crate::panel::PanelData {
+            branch: "main".into(),
+            ahead_behind: Some((2, 1)),
+            upstream_read: read,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn upstream_fresh_renders_hue_arrows() {
+        let (t, l) = branch_row(ab_panel(crate::panel::UpstreamRead::Fresh), 80);
+        assert!(t.contains("⇡2") && t.contains("⇣1"), "{t}");
+        assert!(
+            l.iter()
+                .any(|s| s.text == " ⇡2" && s.fg == Tok::Hue(Hue::Green))
+        );
+        assert!(
+            l.iter()
+                .any(|s| s.text == "⇣1" && s.fg == Tok::Hue(Hue::Red))
+        );
+    }
+
+    #[test]
+    fn upstream_stale_renders_faint_arrows() {
+        let (t, l) = branch_row(ab_panel(crate::panel::UpstreamRead::Stale), 80);
+        assert!(t.contains("⇡2") && t.contains("⇣1"), "{t}");
+        for s in l
+            .iter()
+            .filter(|s| s.text.contains('⇡') || s.text.contains('⇣'))
+        {
+            assert_eq!(s.fg, Tok::Slot(S::Faint));
+        }
+    }
+
+    #[test]
+    fn upstream_unavailable_renders_question_mark() {
+        let mut p = ab_panel(crate::panel::UpstreamRead::Unavailable);
+        p.ahead_behind = None;
+        let (t, l) = branch_row(p, 80);
+        assert!(t.contains("main ?"), "{t}");
+        assert!(
+            l.iter()
+                .any(|s| s.text == " ?" && s.fg == Tok::Slot(S::Faint))
+        );
+    }
+
+    #[test]
+    fn zone_chip_named_unknown_unzoned() {
+        let mut p = ab_panel(crate::panel::UpstreamRead::Fresh);
+        p.zone = crate::panel::ZoneChip::Named("z1".into());
+        assert!(branch_row(p.clone(), 80).0.contains("zone z1"));
+        p.zone = crate::panel::ZoneChip::Unknown;
+        assert!(branch_row(p.clone(), 80).0.contains("zone ?"));
+        p.zone = crate::panel::ZoneChip::Unzoned;
+        assert!(!branch_row(p, 80).0.contains("zone"));
+    }
+
+    #[test]
+    fn zone_chip_is_clipped_and_sanitised() {
+        let mut p = ab_panel(crate::panel::UpstreamRead::Fresh);
+        p.zone = crate::panel::ZoneChip::Named("a\u{1b}[31mbcdefghijklmnopqrstuvwxyz".into());
+        let t = branch_row(p, 80).0;
+        assert!(!t.contains('\u{1b}'), "{t:?}");
+        assert!(!t.contains("xyz"), "{t:?}");
+    }
+
+    #[test]
+    fn zone_chip_dropped_before_branch_clipped() {
+        let mut p = ab_panel(crate::panel::UpstreamRead::Fresh);
+        p.zone = crate::panel::ZoneChip::Named("z1".into());
+        let (t, _) = branch_row(p, 14);
+        assert!(!t.contains("zone"), "{t}");
+        assert!(t.contains("main"), "{t}");
     }
 
     #[test]
