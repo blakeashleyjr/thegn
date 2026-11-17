@@ -603,7 +603,18 @@ self: {
     limits.test_max_parallel = cfg.limitsTestMaxParallel;
     limits.test_timeout_secs = cfg.limitsTestTimeoutSecs;
     limits.discover_timeout_secs = cfg.limitsDiscoverTimeoutSecs;
+    limits.test_nice = cfg.limitsTestNice;
     limits.isolated_target_dir = cfg.limitsIsolatedTargetDir;
+    weather.enabled = cfg.weatherEnabled;
+    weather.provider = cfg.weatherProvider;
+    weather.location = cfg.weatherLocation;
+    weather.units = cfg.weatherUnits;
+    weather.refresh_interval_secs = cfg.weatherRefreshIntervalSecs;
+    weather.stale_after_secs = cfg.weatherStaleAfterSecs;
+    weather.hard_expiry_secs = cfg.weatherHardExpirySecs;
+    weather.show_forecast = cfg.weatherShowForecast;
+    weather.forecast_days = cfg.weatherForecastDays;
+    weather.timeout_secs = cfg.weatherTimeoutSecs;
     diagnostics.crash_reports = cfg.diagnosticsCrashReports;
     diagnostics.crash_retention = cfg.diagnosticsCrashRetention;
     diagnostics.ring_size = cfg.diagnosticsRingSize;
@@ -1788,6 +1799,72 @@ in {
       type = lib.types.nullOr (lib.types.ints.between 0 315360000);
       default = null;
       description = "Test discovery timeout in seconds. Unset (null) = the binary's default.";
+    };
+
+    limitsTestNice = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.s32);
+      default = null;
+      description = "Nice value for test runs (signed; negative raises priority). Rust does not validate a narrower range. Unset (null) = the binary's default.";
+    };
+
+    weatherEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Master switch and consent step for the weather reading ([weather]); false means no network activity. Unset (null) = the binary's default.";
+    };
+
+    weatherProvider = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["none" "wttr_in"]);
+      default = null;
+      description = "Weather backend. The reserved keyed providers are not offered. Unset (null) = the binary's default.";
+    };
+
+    weatherLocation = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Location to ask about (city, postcode or lat,lon); empty lets the provider infer one from the request IP. Unset (null) = the binary's default.";
+    };
+
+    weatherUnits = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["auto" "metric" "imperial"]);
+      default = null;
+      description = "Measurement system. Unset (null) = the binary's default.";
+    };
+
+    weatherRefreshIntervalSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 2678400);
+      default = null;
+      description = "Seconds between weather refreshes (floored by the binary). Unset (null) = the binary's default.";
+    };
+
+    weatherStaleAfterSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Age in seconds after which the reading is dimmed and dated. Unset (null) = the binary's default.";
+    };
+
+    weatherHardExpirySecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Age in seconds after which the reading is hidden (0 disables expiry). Unset (null) = the binary's default.";
+    };
+
+    weatherShowForecast = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the day strip in the calendar popup. Unset (null) = the binary's default.";
+    };
+
+    weatherForecastDays = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Days in the forecast strip (capped by the provider). Unset (null) = the binary's default.";
+    };
+
+    weatherTimeoutSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Seconds before a weather fetch is abandoned (clamped to 3..=60 at use). Unset (null) = the binary's default.";
     };
 
     limitsIsolatedTargetDir = lib.mkOption {
