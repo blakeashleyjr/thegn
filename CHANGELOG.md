@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.93] — 2026-11-17
+
 ### Added
 
 - The file preview shows the text of .docx documents (bounded, sanitized; tab-stop definitions are not rendered as tabs); other zip-based files still list their parts. (THE-135)
@@ -3785,7 +3787,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.92...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.93...HEAD
+[0.1.0-alpha.93]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.92...v0.1.0-alpha.93
 [0.1.0-alpha.92]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.91...v0.1.0-alpha.92
 [0.1.0-alpha.91]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.90...v0.1.0-alpha.91
 [0.1.0-alpha.90]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.89...v0.1.0-alpha.90
