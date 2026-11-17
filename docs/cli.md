@@ -159,6 +159,16 @@ the shared `--base`. The complete file is validated before the first checkout.
 The batch form accepts the usual `--repo`, `--env`, `--isolation`,
 `--exact-branch`, `--folder` and `--json` options.
 
+## Vercel orphan reap (`env reap`)
+
+`thegn env reap --provider vercel [--apply] [--yes] [--json]` finds Vercel
+sandboxes that carry this controller's tag but have no ledger record. It is a
+dry run by default and prints names, ages, tags and a cost estimate.
+`--apply` deletes only sandboxes that pass the tag proof, asks you to type
+`yes` on a tty unless `--yes` is given, and refuses with no tty and no `--yes`.
+A partial or unknown listing refuses `--apply`. It never runs automatically.
+See [Vercel sandboxes](help/vercel-sandbox.md).
+
 ## Embedded and configured skills (`skills`)
 
 ```text

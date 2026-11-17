@@ -657,6 +657,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
 - [ ] 134. Bandwidth-adaptive rendering
 - [x] 134a. Clipboard image paste → remote file drop (THE-24) _(explicit-action paste: clipboard PNG → size-gated drop over the worktree's existing GitLoc ssh channel; `[clipboard]`, `paste-image`; `openspec/changes/add-remote-image-paste`, `handlers/paste_image.rs`, `thegn_core::paste_drop`)_
+- [~] 765. Vercel sandbox model credentials (THE-2233) _(per-env `model_credentials` = `none`/`upload`/`proxy`/`inject`; only `none` and `upload` are accepted, upload is claude/codex login files into tmpfs after egress narrowing; `thegn env reap --provider vercel`, unpulled marker; openspec `vercel-sandbox-agent-credentials`)_
 
 ### K. Adaptive / mobile UI
 
