@@ -395,6 +395,7 @@ pub(crate) fn effective_token_env(pc: &EnvProviderConfig) -> String {
         "sprites" => "SPRITES_TOKEN".to_string(),
         "fly" => "FLY_API_TOKEN".to_string(),
         "machine0" => "MACHINE0_API_KEY".to_string(),
+        "vercel" => "VERCEL_TOKEN".to_string(),
         p => thegn_svc::vps::VpsKind::parse(p)
             .map(|k| k.token_env_default().to_string())
             .unwrap_or_default(),
