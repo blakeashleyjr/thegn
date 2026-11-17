@@ -62,6 +62,7 @@ pub(crate) fn emit_matched(
         tracing::info!(
             target: "thegn::automation",
             overflow,
+            provider = ctx.provider,
             "issue_matched candidates past the per-refresh cap are dropped"
         );
     }
