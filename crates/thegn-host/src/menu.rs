@@ -893,6 +893,73 @@ pub fn sandbox_profile_menu(
     menu
 }
 
+/// Zone rows the palette picker lists before the overflow note.
+pub const ZONE_PICK_CAP: usize = 20;
+/// The `zone-pick`/`zone-assign` arg meaning "no zone" (unassign).
+pub const ZONE_NONE_ARG: &str = "-";
+
+/// The zone picker: one row per zone (the current one noted `current` and
+/// pre-selected), an overflow note past [`ZONE_PICK_CAP`] pointing at the CLI,
+/// and `(none)` only when the workspace is zoned. No hotkeys: zone names are
+/// free text, so letters would collide. Rows resolve to
+/// `Confirm { tag: "zone-pick", arg }` (arg = zone name, or `-` for none).
+/// A zone literally named `-` is skipped: the arg would read as "none".
+pub fn zone_pick_menu(names: &[String], current: Option<&str>) -> MenuOverlay {
+    let pick = |arg: &str| MenuChoice::Confirm {
+        tag: "zone-pick",
+        arg: arg.to_string(),
+    };
+    let listable: Vec<&String> = names
+        .iter()
+        .filter(|name| name.as_str() != ZONE_NONE_ARG)
+        .collect();
+    let mut items: Vec<MenuItem> = Vec::new();
+    let mut selected = 0;
+    for name in listable.iter().take(ZONE_PICK_CAP) {
+        let mut row = item(None, name.as_str(), pick(name));
+        if current == Some(name.as_str()) {
+            selected = items.len();
+            row = row.note("current");
+        }
+        items.push(row);
+    }
+    if listable.len() > ZONE_PICK_CAP {
+        items.push(item(
+            None,
+            format!(
+                "+{} more: thegn zone assign",
+                listable.len() - ZONE_PICK_CAP
+            ),
+            MenuChoice::Dismiss,
+        ));
+    }
+    if current.is_some() {
+        items.push(item(None, "(none)", pick(ZONE_NONE_ARG)).note("unassign"));
+    }
+    MenuOverlay::new_with_default(
+        MenuKindTag::Confirm,
+        "Assign workspace to zone",
+        items,
+        selected,
+    )
+}
+
+/// The confirm after a zone pick. A change that can only narrow ceilings is a
+/// plain confirm; one that may widen them (unassign, or a move between zones)
+/// defaults to cancel. Resolves to `Confirm { tag: "zone-assign", arg }`.
+pub fn zone_assign_confirm_menu(
+    title: impl Into<String>,
+    body: impl Into<String>,
+    arg: String,
+    may_widen: bool,
+) -> MenuOverlay {
+    if may_widen {
+        confirm_menu_default_cancel(title, body, "zone-assign", arg)
+    } else {
+        confirm_menu(title, body, "zone-assign", arg, false)
+    }
+}
+
 pub fn keymap_preset_menu() -> MenuOverlay {
     MenuOverlay::new(
         MenuKindTag::KeymapPicker,
@@ -1501,6 +1568,87 @@ mod tests {
             .filter_map(|i| i.key)
             .map(|c| c.to_ascii_lowercase())
             .collect()
+    }
+
+    fn zone_names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("z{i}")).collect()
+    }
+
+    #[test]
+    fn zone_pick_menu_lists_zones_without_hotkeys_and_none_only_when_zoned() {
+        let names = vec!["alpha".to_string(), "beta-1".to_string()];
+        let unzoned = zone_pick_menu(&names, None);
+        let labels: Vec<&str> = unzoned.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["alpha", "beta-1"]);
+        assert!(hotkeys(&unzoned).is_empty(), "zone rows carry no hotkeys");
+        assert_eq!(unzoned.selected(), 0);
+        assert_eq!(
+            unzoned.items()[1].choice,
+            MenuChoice::Confirm {
+                tag: "zone-pick",
+                arg: "beta-1".into()
+            }
+        );
+
+        let zoned = zone_pick_menu(&names, Some("beta-1"));
+        let labels: Vec<&str> = zoned.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["alpha", "beta-1", "(none)"]);
+        assert_eq!(zoned.selected(), 1, "cursor starts on the current zone");
+        assert_eq!(zoned.items()[1].note.as_deref(), Some("current"));
+        assert_eq!(zoned.items()[0].note, None);
+        assert_eq!(
+            zoned.items()[2].choice,
+            MenuChoice::Confirm {
+                tag: "zone-pick",
+                arg: ZONE_NONE_ARG.into()
+            }
+        );
+    }
+
+    #[test]
+    fn zone_pick_menu_caps_rows_and_points_at_the_cli() {
+        let names = zone_names(ZONE_PICK_CAP + 3);
+        let m = zone_pick_menu(&names, None);
+        assert_eq!(m.items().len(), ZONE_PICK_CAP + 1);
+        let note = &m.items()[ZONE_PICK_CAP];
+        assert_eq!(note.label, "+3 more: thegn zone assign");
+        assert_eq!(note.choice, MenuChoice::Dismiss);
+
+        let exact = zone_pick_menu(&zone_names(ZONE_PICK_CAP), None);
+        assert_eq!(
+            exact.items().len(),
+            ZONE_PICK_CAP,
+            "no note at exactly the cap"
+        );
+    }
+
+    #[test]
+    fn zone_pick_menu_skips_a_zone_named_like_the_none_sentinel() {
+        let names = vec!["-".to_string(), "ok".to_string()];
+        let m = zone_pick_menu(&names, None);
+        let labels: Vec<&str> = m.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["ok"]);
+    }
+
+    #[test]
+    fn zone_assign_confirm_defaults_to_cancel_only_when_ceilings_may_widen() {
+        let mut widen = zone_assign_confirm_menu("t", "b", "-".into(), true);
+        assert_eq!(widen.items()[widen.selected()].choice, MenuChoice::Dismiss);
+        assert_eq!(
+            widen.handle_key(&KeyCode::Enter, NONE),
+            MenuOutcome::Pick(MenuChoice::Dismiss),
+            "Enter alone must not unassign or move"
+        );
+
+        let narrow = zone_assign_confirm_menu("t", "b", "z1".into(), false);
+        assert_eq!(
+            narrow.items()[narrow.selected()].choice,
+            MenuChoice::Confirm {
+                tag: "zone-assign",
+                arg: "z1".into()
+            }
+        );
+        assert!(!narrow.items()[0].danger);
     }
 
     #[test]

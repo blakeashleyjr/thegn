@@ -87,6 +87,9 @@ pub enum Action {
     SwitchProfile,
     /// Change the persisted isolation profile for the active worktree.
     SandboxProfile,
+    /// Assign (or unassign) the active workspace to a zone (palette picker +
+    /// confirm). CLI parity: `thegn zone assign`.
+    ZoneAssign,
     /// Open the identity switcher — pin a named per-tool identity (git/gh/gpg/ssh)
     /// at the focused scope (H/AU). See [`thegn_core::identity`].
     SwitchIdentity,
@@ -584,6 +587,7 @@ impl Action {
             Action::SwitchBundle => "switch-bundle",
             Action::SwitchProfile => "switch-profile",
             Action::SandboxProfile => "sandbox-profile",
+            Action::ZoneAssign => "zone-assign",
             Action::SwitchIdentity => "switch-identity",
             Action::NextTab => "next-tab",
             Action::PrevTab => "prev-tab",
@@ -742,6 +746,7 @@ impl Action {
             "switch-bundle" => Action::SwitchBundle,
             "switch-profile" => Action::SwitchProfile,
             "sandbox-profile" => Action::SandboxProfile,
+            "zone-assign" => Action::ZoneAssign,
             "switch-identity" => Action::SwitchIdentity,
             "next-tab" => Action::NextTab,
             "prev-tab" => Action::PrevTab,
@@ -2491,6 +2496,17 @@ mod tests {
             ),
             MatchResult::Matched(Action::ToggleNotifications)
         );
+    }
+
+    #[test]
+    fn zone_assign_action_round_trips_and_is_palette_only() {
+        assert_eq!(Action::ZoneAssign.key(), "zone-assign");
+        assert_eq!(Action::from_key("zone-assign"), Some(Action::ZoneAssign));
+        let spec = action_spec("zone-assign").expect("spec registered");
+        assert!(spec.palette, "must appear in the command palette");
+        assert!(spec.default_chords.is_empty(), "no default chord");
+        assert_eq!(spec.label, "Assign workspace to zone…");
+        assert!(spec.keywords.contains(&"unassign"));
     }
 
     #[test]
