@@ -206,6 +206,7 @@ pub(crate) fn run_with_timeout(
         .stderr(Stdio::piped());
     isolate_process(&mut cmd);
     GIT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    thegn_core::git_spawn_stats::record(args);
     let mut child = cmd
         .spawn()
         .map_err(|error| BackgroundCommitFailure::Spawn {

@@ -245,6 +245,7 @@ pub(crate) fn git_stdout_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
+    crate::git_spawn_stats::record(args);
     bounded_stdout(command, max_bytes)
 }
 
