@@ -254,13 +254,13 @@ fn error_status(err: &anyhow::Error) -> Option<u16> {
         }
     }
     let text = format!("{err:#}");
-    for marker in ["(", "HTTP ", "status "] {
+    for marker in ["HTTP ", "(", "status "] {
         let mut rest = text.as_str();
         while let Some(at) = rest.find(marker) {
             rest = &rest[at + marker.len()..];
             let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
             if digits.len() == 3 {
-                return digits.parse().ok();
+                return Result::ok(digits.parse());
             }
         }
     }
@@ -718,7 +718,31 @@ impl VercelProvider {
     /// checkpoints first.
     pub async fn delete_with_snapshots(&self, name: &str) -> Result<()> {
         checked_name(name)?;
-        self.api().delete(name).await?;
+        match self.api().get(name, false).await? {
+            Some(view) => {
+                let controller = self.controller().await?;
+                let keys = controller_tag_keys(&controller);
+                if !is_ours(&view, &controller, &keys) {
+                    bail!(
+                        "vercel: refusing to delete {name}: it does not carry this thegn controller's tag"
+                    );
+                }
+                self.api().delete(name).await?;
+            }
+            None => {
+                // Already gone: only clear snapshots of a name our ledger holds.
+                let dir = self.ledger_dir();
+                let owned = name.to_string();
+                let recorded = tokio::task::spawn_blocking(move || registry::read_at(&dir, &owned))
+                    .await
+                    .context("vercel: ledger worker failed")?
+                    .is_some_and(|r| r.provider == LEDGER_PROVIDER);
+                if !recorded {
+                    self.forget_session(name);
+                    return Ok(());
+                }
+            }
+        }
         self.forget_session(name);
         self.policies.lock().unwrap().remove(name);
         let snapshots = self.api().snapshots_for(name).await?;
@@ -763,7 +787,14 @@ impl VercelProvider {
     async fn remove_record(&self, name: &str) {
         let dir = self.ledger_dir();
         let name = name.to_string();
-        let _ = tokio::task::spawn_blocking(move || registry::remove_at(&dir, &name)).await; // best-effort: a stale record is reconciled by the reaper
+        if tokio::task::spawn_blocking(move || registry::remove_at(&dir, &name))
+            .await
+            .is_err()
+        {
+            tracing::debug!(
+                "vercel: ledger remove worker failed; the reaper reconciles the stale record"
+            );
+        }
     }
 
     fn at_cap(occupied: usize, cap: usize) -> anyhow::Error {
@@ -987,6 +1018,23 @@ impl ProviderEgress for VercelProvider {
                 bail!(
                     "vercel: egress supports allow lists only; refusing a policy with no allowed \
                      domain"
+                );
+            }
+            let covered = rules
+                .iter()
+                .filter(|r| r.action == "deny" && r.domain != "*")
+                .any(|d| {
+                    domains.iter().any(|a| {
+                        a == "*"
+                            || a.strip_prefix("*.").is_some_and(|s| {
+                                d.domain == s || d.domain.ends_with(&format!(".{s}"))
+                            })
+                    })
+                });
+            if covered {
+                bail!(
+                    "vercel: egress cannot block a domain inside an allowed wildcard; narrow the \
+                     allow list"
                 );
             }
             let body = api::network_policy_body(&domains);

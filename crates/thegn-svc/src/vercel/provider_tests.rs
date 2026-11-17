@@ -290,11 +290,16 @@ async fn create_4xx_clears_the_intent() {
 #[tokio::test]
 async fn failure_after_create_with_failed_delete_keeps_the_record() {
     let _state = thegn_core::testenv::IsolatedState::new();
+    let controller = crate::vps::controller::controller_id().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let fake = Arc::new(FakeApi {
         delete_fails: true,
         ..FakeApi::default()
     });
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(tagged(NAME, &controller)));
     *fake.create.lock().unwrap() = Some(Err("vercel: connection reset by peer".into()));
     provider(&fake, ledger.path(), 2)
         .create()
@@ -314,8 +319,13 @@ async fn failure_after_create_with_failed_delete_keeps_the_record() {
 #[tokio::test]
 async fn failure_after_create_with_landed_delete_clears_the_record() {
     let _state = thegn_core::testenv::IsolatedState::new();
+    let controller = crate::vps::controller::controller_id().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(tagged(NAME, &controller)));
     *fake.create.lock().unwrap() = Some(Err("vercel: request timed out".into()));
     provider(&fake, ledger.path(), 2)
         .create()
@@ -323,6 +333,25 @@ async fn failure_after_create_with_landed_delete_clears_the_record() {
         .unwrap_err();
     assert_eq!(fake.count("delete"), 1);
     assert!(registry::read_at(ledger.path(), NAME).is_none());
+}
+
+#[tokio::test]
+async fn cleanup_never_deletes_an_untagged_sandbox() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    *fake.create.lock().unwrap() = Some(Err("vercel: request timed out".into()));
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(tagged(NAME, "other-controller")));
+    provider(&fake, ledger.path(), 2)
+        .create()
+        .await
+        .unwrap_err();
+    assert_eq!(fake.count("delete"), 0, "{:?}", fake.calls());
+    assert_eq!(fake.count("delete_snapshot"), 0, "{:?}", fake.calls());
+    assert!(registry::read_at(ledger.path(), NAME).is_some());
 }
 
 #[tokio::test]
@@ -363,12 +392,17 @@ async fn create_records_ready_and_returns_the_bridge_handle() {
 #[tokio::test]
 async fn destroy_deletes_the_snapshots() {
     let _state = thegn_core::testenv::IsolatedState::new();
+    let controller = crate::vps::controller::controller_id().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     registry::write_at(ledger.path(), &ledger_record(NAME, "ready")).unwrap();
     let fake = Arc::new(FakeApi {
         snapshots: vec!["snap_1".into(), "snap_2".into()],
         ..FakeApi::default()
     });
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(tagged(NAME, &controller)));
     provider(&fake, ledger.path(), 2)
         .destroy(NAME)
         .await
@@ -376,6 +410,7 @@ async fn destroy_deletes_the_snapshots() {
     assert_eq!(
         fake.calls(),
         [
+            format!("get {NAME}"),
             format!("delete {NAME}"),
             format!("snapshots {NAME}"),
             "delete_snapshot snap_1".to_string(),
@@ -515,6 +550,12 @@ async fn block_only_egress_is_refused_and_allow_lists_are_cached() {
     let p = provider(&fake, ledger.path(), 2);
     assert!(
         p.set_network_policy(NAME, &[], &["evil.example".into()])
+            .await
+            .is_err()
+    );
+    assert_eq!(fake.count("policy"), 0);
+    assert!(
+        p.set_network_policy(NAME, &["*.github.com".into()], &["gist.github.com".into()])
             .await
             .is_err()
     );
