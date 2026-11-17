@@ -17,13 +17,14 @@
 
 use super::{
     Cell, DetailAction, DetailOverlay, Placement, RowActs, Section, SectionsCursor, SectionsDetail,
-    TableSection, spacer, trunc,
+    TableSection, spacer,
 };
 use crate::chrome::{FrameModel, S};
 use crate::fleet_read::FleetSnapshot;
 use crate::seg::Tok;
-use thegn_core::placement::fleet_cost;
+use thegn_core::placement::fleet_cost::{self, BudgetLevel};
 use thegn_core::theme::Hue;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The overlay title — also the marker [`refresh_open`] (and the loop's
 /// "popup open" check for the poll cadence) recognise the popup by.
@@ -179,6 +180,52 @@ fn usd(value: f64, decimals: usize) -> String {
     format!("${value:.decimals$}")
 }
 
+/// Clip `s` to at most `max` cells keeping its TAIL, behind a leading
+/// ellipsis glyph (ASCII fallback via caps). Width-aware: never splits a wide
+/// glyph. Unchanged when it already fits.
+fn clip_start(s: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    let ell = crate::caps::active_glyphs().ellipsis;
+    let budget = max.saturating_sub(UnicodeWidthStr::width(ell));
+    if budget == 0 {
+        return String::new();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0usize;
+    for c in s.chars().rev() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        tail.push(c);
+        used += w;
+    }
+    tail.reverse();
+    format!("{ell}{}", tail.into_iter().collect::<String>())
+}
+
+/// One KeyVal row per budget breach: the burn against its limit, red at Max
+/// (new sandboxes are refused), amber at Warn.
+fn budget_rows(breaches: &[fleet_cost::BudgetBreach]) -> Vec<(String, String, Tok)> {
+    breaches
+        .iter()
+        .map(|b| {
+            let base = format!("{}/h of {}/h", usd(b.hourly, 4), usd(b.limit, 4));
+            let provider = thegn_core::pipeline_report::display_cell(&b.provider);
+            match b.level {
+                BudgetLevel::Max => (
+                    provider,
+                    format!("{base} · new sandboxes refused"),
+                    Tok::Hue(Hue::Red),
+                ),
+                BudgetLevel::Warn => (provider, base, Tok::Hue(Hue::Amber)),
+            }
+        })
+        .collect()
+}
+
 fn text(s: impl Into<String>, tone: Tok) -> Cell {
     Cell::Text(s.into(), tone)
 }
@@ -200,6 +247,11 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
     let (view, cost) = (&snap.view, &snap.cost);
     let mut secs = Vec::new();
     let mut cursor = None;
+    if !cost.budget.is_empty() {
+        secs.push(heading("budget", None));
+        secs.push(Section::KeyVal(budget_rows(&cost.budget)));
+        secs.push(spacer());
+    }
     let age_note = crate::cmd::fleet::age(Some(snap.generated_ms), now_ms);
     secs.push(heading(
         "provider VMs",
@@ -232,7 +284,7 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
                 Tok::Hue(Hue::Green)
             };
             let worktree = match &row.worktree {
-                Some(wt) => text(trunc(wt.clone(), WORKTREE_COLS), dim()),
+                Some(wt) => text(clip_start(wt, WORKTREE_COLS), dim()),
                 None => text("ORPHAN", Tok::Hue(Hue::Amber)),
             };
             rows.push(vec![
@@ -287,7 +339,7 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
                     vec![
                         text(format!("{}/{}", rec.provider, rec.env), Tok::Slot(S::Text)),
                         text(rec.id.clone(), Tok::Hue(Hue::Amber)),
-                        text(trunc(rec.worktree.clone(), WORKTREE_COLS), dim()),
+                        text(clip_start(&rec.worktree, WORKTREE_COLS), dim()),
                     ]
                 })
                 .collect(),
@@ -360,8 +412,9 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cell, DetailAction, MAX_ROWS, Section, Tok, build_sections, confirm_menu, confirm_text,
-        fleet_down_argv, fleet_down_tag, refresh_open, started_status, stop_for_tag,
+        BudgetLevel, Cell, DetailAction, Hue, MAX_ROWS, Section, Tok, UnicodeWidthStr,
+        build_sections, clip_start, confirm_menu, confirm_text, fleet_down_argv, fleet_down_tag,
+        refresh_open, started_status, stop_for_tag,
     };
     use crate::fleet_read::FleetSnapshot;
     use thegn_core::placement::fleet_cost::{
@@ -454,6 +507,53 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    fn breach(level: BudgetLevel, hourly: f64, limit: f64) -> fleet_cost::BudgetBreach {
+        fleet_cost::BudgetBreach {
+            provider: "fly".into(),
+            level,
+            hourly,
+            limit,
+        }
+    }
+
+    #[test]
+    fn budget_section_leads_with_toned_rows_for_warn_and_max() {
+        let mut sn = snap(FleetView::default());
+        sn.cost.budget = vec![
+            breach(BudgetLevel::Warn, 1.0, 0.5),
+            breach(BudgetLevel::Max, 2.0, 1.5),
+        ];
+        let secs = build_sections(&sn, NOW).sections;
+        assert!(matches!(&secs[0], Section::Heading { label, .. } if label == "budget"));
+        let Section::KeyVal(pairs) = &secs[1] else {
+            panic!("keyval")
+        };
+        assert_eq!(pairs[0].0, "fly");
+        assert_eq!(pairs[0].1, "$1.0000/h of $0.5000/h");
+        assert_eq!(pairs[0].2, Tok::Hue(Hue::Amber));
+        assert_eq!(pairs[1].1, "$2.0000/h of $1.5000/h · new sandboxes refused");
+        assert_eq!(pairs[1].2, Tok::Hue(Hue::Red));
+        assert_theme_tokens_only(&secs);
+    }
+
+    #[test]
+    fn no_budget_section_when_no_breach() {
+        let secs = build_sections(&snap(FleetView::default()), NOW).sections;
+        assert!(!texts(&secs).iter().any(|l| l.starts_with("budget:")));
+    }
+
+    #[test]
+    fn clip_start_keeps_tail_and_respects_width() {
+        assert_eq!(clip_start("/wt/a", 32), "/wt/a");
+        let out = clip_start("/very/long/path/to/worktree-name", 12);
+        assert!(out.ends_with("tree-name"), "{out}");
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 12, "{out}");
+        assert!(out.starts_with(crate::caps::active_glyphs().ellipsis));
+        let wide = clip_start("\u{4f60}\u{597d}\u{4e16}\u{754c}", 6);
+        assert!(UnicodeWidthStr::width(wide.as_str()) <= 6, "{wide}");
+        assert!(wide.ends_with('\u{754c}'));
     }
 
     #[test]

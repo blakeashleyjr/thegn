@@ -11,7 +11,7 @@ use tokio::task;
 
 use termwiz::terminal::TerminalWaker;
 
-use crate::chrome::{FrameModel, LoadStep, StateDbAvailability};
+use crate::chrome::{FrameModel, LoadStep, StateDbAvailability, ZoneCatalog};
 use crate::glyph_types::GlyphRow;
 use crate::hydrate_tuning::{
     GlyphTtls, glyph_ttls, glyph_window, model_refresh_interval, observe_ref_generation,
@@ -2369,6 +2369,13 @@ pub(crate) fn build_initial_model(
                 .map(|(_, _, _, repo)| repo.as_str()),
         )
     });
+    let zone_catalog = db.map_or_else(ZoneCatalog::default, ZoneCatalog::read);
+    // Policy is unknown here (no config in this seed pass): leave
+    // `zones_unpoliced` empty so no `!` shows until the first full hydrate.
+    let sidebar_status = crate::sidebar::SidebarStatus {
+        zones: zone_catalog.clone(),
+        ..Default::default()
+    };
     // Seed the sidebar's dynamic (OSC) worktree titles from the DB so persisted
     // titles show on the very first frame — before any pane re-emits one. The
     // loop's live-title merge then refreshes them in place.
@@ -2381,6 +2388,8 @@ pub(crate) fn build_initial_model(
         active_tab,
         sidebar_workspaces,
         workspace_envs,
+        zone_catalog,
+        sidebar_status,
         sidebar_window_titles,
         active_container_name: thegn_core::sandbox::container_name_with_profile(
             &cwd.to_string_lossy(),
@@ -2891,6 +2900,7 @@ pub(crate) fn build_model(
             .iter()
             .map(|(_, _, _, repo)| repo.as_str()),
     );
+    let zone_catalog = ZoneCatalog::read(db);
     // Folders for every workspace shown in the sidebar (not just the active
     // tab's): the sidebar filters this list per-workspace by `repo_path`, so a
     // worktree filed into a folder stays visible whichever tab is active.
@@ -2921,6 +2931,14 @@ pub(crate) fn build_model(
         &app_cfg.lifecycle,
         &branch_observations,
     );
+    let mut sidebar_status = sidebar_status;
+    sidebar_status.zones = zone_catalog.clone();
+    sidebar_status.zones_unpoliced = zone_catalog
+        .by_repo
+        .values()
+        .filter(|name| !app_cfg.zone.contains_key(name.as_str()))
+        .cloned()
+        .collect();
     let sidebar_us = sidebar_t0.map(|t| t.elapsed().as_micros() as u64);
     // Self-throttled housekeeping (network/DB on own threads): VPS leak reaper
     // + placement engine + hibernator (snapshot-then-destroy for idle VMs).
@@ -3079,6 +3097,7 @@ pub(crate) fn build_model(
         active_tab,
         sidebar_workspaces,
         workspace_envs,
+        zone_catalog,
         sidebar_db_worktrees,
         sidebar_db_folders,
         sidebar_db_terminals,
@@ -3544,8 +3563,12 @@ pub(crate) fn build_panel(
     // is `/workspace` for every provider worktree of an env, so keying by it
     // shares one last-known row across siblings (worktree B's failed read
     // would fall back to A's branch + ahead/behind).
-    let (branch, ahead_behind, merge_info) =
-        crate::panel_header_cache::merge_header(&cache_key, branch, ahead_behind, merge_info);
+    let crate::panel_header_cache::HeaderMerge {
+        branch,
+        ahead_behind,
+        upstream: upstream_read,
+        merge: merge_info,
+    } = crate::panel_header_cache::merge_header(&cache_key, branch, ahead_behind, merge_info);
     let lists = crate::panel_header_cache::merge_lists(&cache_key, status, log, incoming);
     let mut panel = crate::panel::PanelData {
         branch,
@@ -3724,6 +3747,13 @@ pub(crate) fn build_panel(
 
     // Header zone: upstream divergence + merge-in-progress banner.
     panel.ahead_behind = ahead_behind;
+    panel.upstream_read = upstream_read;
+    // One indexed read; Err is surfaced as `zone ?`, never as "unzoned".
+    panel.zone = match thegn_core::store::ZoneStore::zone_of_worktree(db, &cwd.to_string_lossy()) {
+        Ok(Some(z)) => crate::panel::ZoneChip::Named(z.name),
+        Ok(None) => crate::panel::ZoneChip::Unzoned,
+        Err(_) => crate::panel::ZoneChip::Unknown,
+    };
     let unresolved = thegn_svc::git::conflict_count(&lists.status);
     // Host-path key (never `loc.path()` — see `worktree_cache_key`): two
     // provider worktrees sharing `/workspace` cross-contaminated each other's
