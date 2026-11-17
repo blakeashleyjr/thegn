@@ -5,15 +5,13 @@
 //! fails to compile here), so the check cannot rot by omission.
 
 use super::*;
-use crate::config::{FileAccess, Network};
-use crate::placement::Placement;
+use crate::config::FileAccess;
 use crate::sandbox::{Mount, SandboxLimits, SandboxSpec, enter_argv};
 use std::path::PathBuf;
 
 fn spec(backend: Backend) -> SandboxSpec {
     SandboxSpec {
         backend,
-        placement: Placement::Local,
         image: Some("img:latest".into()),
         worktree: PathBuf::from("/wt/feat"),
         mounts: vec![Mount {
@@ -22,39 +20,15 @@ fn spec(backend: Backend) -> SandboxSpec {
             ro: false,
             cache: false,
         }],
-        env: vec![],
-        env_overrides: std::collections::HashMap::new(),
-        env_block: Vec::new(),
-        network: Network::Nat,
-        network_allow: Vec::new(),
-        network_block: Vec::new(),
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: Vec::new(),
-        add_capabilities: Vec::new(),
-        ports: vec![],
-        gpu: None,
         // CPU capping off: it scope-wraps the argv on a host with cgroup
         // delegation, which would make these assertions host-dependent.
         limits: SandboxLimits {
             cpu_total: Some("off".into()),
             ..SandboxLimits::default()
         },
-        volumes: vec![],
-        compose: None,
-        build: None,
-        init_script: None,
         file_access: FileAccess::Worktree,
-        devenv: false,
-        devenv_path: None,
         name: "thegn-repo-feat".into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 

@@ -341,8 +341,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FileAccess, Network};
-    use crate::placement::Placement;
     use std::path::PathBuf;
 
     const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -350,38 +348,11 @@ mod tests {
     fn spec(owner: &str) -> SandboxSpec {
         SandboxSpec {
             backend: Backend::Podman,
-            placement: Placement::Local,
-            image: None,
             worktree: PathBuf::from("/worktree"),
-            mounts: Vec::new(),
-            env: Vec::new(),
-            env_overrides: Default::default(),
-            env_block: Vec::new(),
-            network: Network::Nat,
-            network_allow: Vec::new(),
-            network_block: Vec::new(),
-            read_only_root: false,
-            no_new_privileges: false,
-            pids_limit: None,
-            drop_capabilities: Vec::new(),
-            add_capabilities: Vec::new(),
-            file_access: FileAccess::default(),
-            ports: Vec::new(),
-            gpu: None,
-            limits: Default::default(),
             volumes: vec![("data".into(), "/data".into())],
-            compose: None,
-            build: None,
-            init_script: None,
-            devenv: false,
-            devenv_path: None,
             name: "test".into(),
-            vpn: None,
-            oci_host: None,
-            oci_runtime: None,
-            daemon_persistent: false,
-            seal_home: None,
             volume_owners: vec![("data".into(), owner.into())],
+            ..SandboxSpec::default()
         }
     }
 

@@ -2006,38 +2006,10 @@ mod tests {
     fn sandbox_spec() -> thegn_core::sandbox::SandboxSpec {
         thegn_core::sandbox::SandboxSpec {
             backend: thegn_core::sandbox::Backend::Bwrap,
-            placement: thegn_core::placement::Placement::Local,
-            image: None,
             worktree: std::path::PathBuf::from("/repo"),
-            mounts: Vec::new(),
-            env: Vec::new(),
-            env_overrides: std::collections::HashMap::new(),
-            env_block: Vec::new(),
-            network: thegn_core::config::Network::Nat,
-            network_allow: Vec::new(),
-            network_block: Vec::new(),
-            read_only_root: false,
-            no_new_privileges: false,
-            pids_limit: None,
-            drop_capabilities: Vec::new(),
-            add_capabilities: Vec::new(),
             file_access: thegn_core::config::FileAccess::Worktree,
-            ports: Vec::new(),
-            gpu: None,
-            limits: thegn_core::sandbox::SandboxLimits::default(),
-            volumes: Vec::new(),
-            compose: None,
-            build: None,
-            init_script: None,
-            devenv: false,
-            devenv_path: None,
             name: "agent-preflight-test".into(),
-            vpn: None,
-            oci_host: None,
-            oci_runtime: None,
-            daemon_persistent: false,
-            seal_home: None,
-            volume_owners: Vec::new(),
+            ..thegn_core::sandbox::SandboxSpec::default()
         }
     }
 
@@ -3953,6 +3925,27 @@ mod tests {
                 .unwrap_or(source);
             assert!(production.contains("credential_free: true"));
             assert!(!production.contains("credential_free: false"));
+        }
+    }
+
+    /// WS00-P1-02: the host's production spec builders never start from the
+    /// inert `SandboxSpec::default()`; only tests may use struct-update syntax.
+    #[test]
+    fn default_spec_not_used_in_host_production() {
+        let sources = [
+            ("agent_run.rs", include_str!("agent_run.rs")),
+            ("build_cache.rs", include_str!("build_cache.rs")),
+            ("remote_sync.rs", include_str!("remote_sync.rs")),
+        ];
+        for (name, source) in sources {
+            let production = source
+                .split_once("\nmod tests {")
+                .map(|(production, _)| production)
+                .unwrap_or(source);
+            assert!(
+                !production.contains("SandboxSpec::default()"),
+                "{name}: production code must not build a default SandboxSpec"
+            );
         }
     }
 

@@ -6,13 +6,11 @@
 //! stay writable), `profile = "open"` restores a writable `$HOME`, and the
 //! systemd backend closes the same gap via `ProtectHome=read-only`.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-use thegn_core::config::{FileAccess, Network, SandboxBackend, SandboxConfig, SandboxProfile};
-use thegn_core::placement::Placement;
+use thegn_core::config::{FileAccess, SandboxBackend, SandboxConfig, SandboxProfile};
 use thegn_core::remote::GitLoc;
-use thegn_core::sandbox::{Backend, Mount, SandboxLimits, SandboxSpec, enter_argv, resolve};
+use thegn_core::sandbox::{Backend, Mount, SandboxSpec, enter_argv, resolve};
 
 fn mk_spec(
     backend: Backend,
@@ -22,38 +20,12 @@ fn mk_spec(
 ) -> SandboxSpec {
     SandboxSpec {
         backend,
-        placement: Placement::Local,
-        image: None,
         worktree: PathBuf::from("/home/tester/wt"),
         mounts,
-        env: vec![],
-        env_overrides: HashMap::new(),
-        env_block: vec![],
-        network: Network::Nat,
-        network_allow: vec![],
-        network_block: vec![],
         read_only_root: ro_root,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: vec![],
-        add_capabilities: vec![],
         file_access,
-        ports: vec![],
-        gpu: None,
-        limits: SandboxLimits::default(),
-        volumes: vec![],
-        compose: None,
-        build: None,
-        init_script: None,
-        devenv: false,
-        devenv_path: None,
         name: "thegn-test".into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 

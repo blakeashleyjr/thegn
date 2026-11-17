@@ -637,12 +637,9 @@ mod tests {
 
     fn strict_spec(backend: Backend, file_access: FileAccess) -> crate::sandbox::SandboxSpec {
         use crate::config::Network;
-        use crate::placement::Placement;
-        use crate::sandbox::{Mount, SandboxLimits, SandboxSpec};
+        use crate::sandbox::{Mount, SandboxSpec};
         SandboxSpec {
-            volume_owners: Vec::new(),
             backend,
-            placement: Placement::Local,
             image: Some("img:latest".into()),
             worktree: std::path::PathBuf::from("/wt/feat"),
             mounts: vec![Mount {
@@ -651,33 +648,14 @@ mod tests {
                 ro: false,
                 cache: false,
             }],
-            env: Vec::new(),
-            env_overrides: std::collections::HashMap::new(),
-            env_block: Vec::new(),
             network: Network::None,
-            network_allow: Vec::new(),
-            network_block: Vec::new(),
             read_only_root: true,
             no_new_privileges: true,
             pids_limit: Some(256),
-            drop_capabilities: Vec::new(),
-            add_capabilities: Vec::new(),
             file_access,
-            ports: Vec::new(),
-            gpu: None,
-            limits: SandboxLimits::default(),
-            volumes: Vec::new(),
-            compose: None,
-            build: None,
-            init_script: None,
-            devenv: false,
-            devenv_path: None,
             name: "strict-test".into(),
-            vpn: None,
-            oci_host: None,
-            oci_runtime: None,
-            daemon_persistent: false,
             seal_home: Some("/home/u".into()),
+            ..SandboxSpec::default()
         }
     }
 
