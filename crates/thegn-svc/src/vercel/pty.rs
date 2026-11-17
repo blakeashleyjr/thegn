@@ -99,7 +99,7 @@ pub(super) fn health_backoff(attempt: u32, jitter_ms: u64) -> Duration {
 fn jitter_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos() / 1_000_000))
+        .map(|d| u64::from(d.subsec_millis()))
         .unwrap_or(0)
 }
 
