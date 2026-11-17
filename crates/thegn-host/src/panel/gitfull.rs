@@ -1358,6 +1358,34 @@ fn help_row(view: GitView) -> PanelRow {
     PanelRow::plain(Line::Segs(segs))
 }
 
+/// [`help_row`] with the panel-width word right-aligned when it fits (these
+/// frames have no tab bar). The returned [`ColHit`] sits on `row` and resolves
+/// to `Expand`, the same as the tab-row chip.
+fn help_row_with_chip(
+    ui: &PanelUi,
+    cols: usize,
+    row: usize,
+) -> (PanelRow, Option<super::frame::ColHit>) {
+    let base = help_row(ui.git.focus);
+    let Line::Segs(mut segs) = base.line else {
+        return (base, None);
+    };
+    let used = seg::seg_width(&segs);
+    let Some((chip, w)) = super::frame::width_chip(ui, cols.saturating_sub(used)) else {
+        return (PanelRow::plain(Line::Segs(segs)), None);
+    };
+    let x = cols.saturating_sub(1 + w);
+    segs.push(sp(x.saturating_sub(used)));
+    segs.extend(chip);
+    segs.push(sp(1));
+    let hit = super::frame::ColHit {
+        row,
+        cols: x..x + w,
+        hit: PanelHit::Expand,
+    };
+    (PanelRow::plain(Line::Segs(segs)), Some(hit))
+}
+
 /// Assemble the Full git frame for a `cols` × `rows` rect: frame header,
 /// STATUS strip, the side│main column zone, and the context help bar.
 pub(super) fn build_git_full(
@@ -1423,12 +1451,13 @@ pub(super) fn build_git_full(
                 cols,
                 body.saturating_sub(side_rows_count),
             ));
-            out.push(help_row(ui.git.focus));
+            let (help, chip) = help_row_with_chip(ui, cols, out.len());
+            out.push(help);
             out.truncate(rows);
             return PanelFrame {
                 rows: out,
                 rail: Vec::new(),
-                col_hits: Vec::new(),
+                col_hits: chip.into_iter().collect(),
                 col_zone: None,
                 tab_spans: Vec::new(),
             };
@@ -1438,9 +1467,11 @@ pub(super) fn build_git_full(
         let side = side_rows(model, ui, focused, body, side_w);
         let main = main_rows(model, ui, focused, main_w, body);
         let base = out.len();
-        let (fused, col_hits) = fuse(&side, &main, body, side_w, main_w, base);
+        let (fused, mut col_hits) = fuse(&side, &main, body, side_w, main_w, base);
         out.extend(fused);
-        out.push(help_row(ui.git.focus));
+        let (help, chip) = help_row_with_chip(ui, cols, out.len());
+        out.push(help);
+        col_hits.extend(chip);
         out.truncate(rows);
         let zone_rows = base..(base + body).min(out.len());
         return PanelFrame {
