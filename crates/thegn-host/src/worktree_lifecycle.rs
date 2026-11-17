@@ -1099,6 +1099,13 @@ pub(crate) fn destroy_one_checked(
     (true, "removed".into())
 }
 
+/// Whether `teardown_runtime` should checkpoint on close. The destroy/recycle is
+/// attempted exactly when `sync_succeeded && !placement_is_local`; after that a
+/// checkpoint is pointless.
+fn close_checkpoint_wanted(placement_is_local: bool, sync_succeeded: bool) -> bool {
+    placement_is_local || !sync_succeeded
+}
+
 /// Tear down every runtime resource that was attached to the worktree while
 /// its DB row and selected environment are still available. The caller has
 /// already resolved the worktree location. These operations are deliberately
@@ -1166,7 +1173,11 @@ fn teardown_runtime(
     }
     crate::agent::deregister_vpn(&path);
     crate::agent::deproject(&path);
-    crate::agent::checkpoint_on_close(&path);
+    // THE-2055: after a successful provider destroy/recycle the sandbox is gone
+    // or reset to its pool base, so a close checkpoint would only 404.
+    if close_checkpoint_wanted(env.placement.is_local(), sync_succeeded) {
+        crate::agent::checkpoint_on_close(&path);
+    }
     crate::bridge_sup::disconnect_path(&path);
     crate::close_teardown::sandbox_teardown(cfg, &env, loc, &path);
     crate::placement_flow::release(&path);
@@ -1990,6 +2001,14 @@ fn report_log_failure(context: &HookContext, result: &crate::hook_run::HookRunRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_checkpoint_wanted_skips_after_provider_destroy() {
+        assert!(close_checkpoint_wanted(true, true));
+        assert!(close_checkpoint_wanted(true, false));
+        assert!(close_checkpoint_wanted(false, false));
+        assert!(!close_checkpoint_wanted(false, true));
+    }
 
     #[test]
     fn refused_trusted_overlay_contributes_no_lifecycle_hooks() {
