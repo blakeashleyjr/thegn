@@ -2279,6 +2279,8 @@ fn every_nix_enum_matches_its_destination_enum() {
             "notificationsSoundMinPriority",
             "notifications.sound.min_priority",
         ),
+        ("weatherProvider", "weather.provider"),
+        ("weatherUnits", "weather.units"),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();
