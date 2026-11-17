@@ -1,6 +1,6 @@
 # Add the Lead tool surface
 
-Linear: THE-2171, THE-2173. Roadmap: tasks.md group BA (item 516).
+Linear: THE-2171, THE-2173. Roadmap: tasks.md group BA (item 761).
 
 ## Problem
 
@@ -26,3 +26,4 @@ that are weaker than config rules.
 ## Impact
 
 Specs: capability-catalog, mcp-servers, notifications.
+Roadmap: tasks.md group BA, item 761.

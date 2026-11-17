@@ -1653,4 +1653,4 @@ _An agent that changes the shell must be able to see the frame. The muse harness
 
 ### BA. The Lead meta-agent (b152)
 
-- [ ] 516. The Lead — a sandboxed agent tab with a scoped tool surface (overview, notifications, automations, approvals, merge drain) that watches the workspace and drives workers (THE-2171)
+- [ ] 761. The Lead — a sandboxed agent tab with a scoped tool surface (overview, notifications, automations, approvals, merge drain) that watches the workspace and drives workers (THE-2171)
