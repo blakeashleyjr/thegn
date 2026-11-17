@@ -174,6 +174,111 @@ fn revoke_all_lead_pairings(store: &dyn ControlStore, now: i64) -> Result<usize>
     revoke_pairings_where(store, now, |l| l == PAIRING_LABEL || l.starts_with("lead:"))
 }
 
+/// The caller id (and pairing label) of Lead tab `tab` of `group`:
+/// `lead:<group>/<tab>`. The one source for both `launch` and the close path,
+/// so a revoke always names the label the spawn minted.
+pub(crate) fn tab_caller(group: &str, tab: usize) -> String {
+    format!("lead:{group}/{tab}")
+}
+
+/// Parse a [`tab_caller`] label back into `(group, tab index)`. Anything else
+/// (the bare `lead` label, a foreign label) is `None`.
+fn parse_tab_caller(label: &str) -> Option<(&str, usize)> {
+    let (group, tab) = label.strip_prefix("lead:")?.rsplit_once('/')?;
+    if tab.is_empty() || !tab.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((group, tab.parse().ok()?))
+}
+
+/// Whether closing the Lead tab `closing` invalidates the pairing `label`.
+///
+/// Tab indices shift on close (`Vec::remove`): the tab that was at `i + 1` is
+/// now at `i`, but its running agent still holds the token labelled `i + 1`
+/// and its env still says `THEGN_CALLER=lead:<group>/<i + 1>`. Left live, that
+/// label would be ambiguous: the next tab spawned at index `i + 1` would
+/// revoke a token another tab is using, and the shifted tab's own respawn (at
+/// `i`) would never revoke its old one. So every label of the same group at
+/// or above the closed index is revoked; each surviving tab re-mints under its
+/// new index on its next spawn (`mint_lead_token` revokes first anyway).
+/// A non-tab caller (the bare `wire --lead` label) invalidates only itself.
+pub(crate) fn invalidated_by_close(closing: &str, label: &str) -> bool {
+    match (parse_tab_caller(closing), parse_tab_caller(label)) {
+        (Some((group, closed)), Some((other_group, index))) => {
+            group == other_group && index >= closed
+        }
+        _ => label == closing,
+    }
+}
+
+/// Revoke the token of the closed Lead tab `caller` (plus every label the
+/// close shifted, see [`invalidated_by_close`]) and remove those tabs'
+/// `mcp-<tab>.json` from the control dir. Blocking DB + disk I/O: callers on
+/// the loop must run it through `sched::spawn_bg`. Returns how many tokens
+/// were revoked.
+///
+/// The config carries nothing the revoke needs today; it stays in the
+/// signature so a later pairing TTL or profile scoping lands without touching
+/// the callers.
+pub(crate) fn revoke_tab_token(_cfg: &Config, caller: &str) -> Result<usize> {
+    let db = thegn_core::db::Db::open()?;
+    revoke_tab_token_in(&db, &thegn_core::util::xdg_state_home(), now_ms(), caller)
+}
+
+fn revoke_tab_token_in(
+    store: &dyn ControlStore,
+    state_home: &Path,
+    now: i64,
+    caller: &str,
+) -> Result<usize> {
+    // Every label the close touches, live or already revoked: a revoked
+    // token's file may still be on disk.
+    let mut labels: Vec<String> = store
+        .pairings()?
+        .into_iter()
+        .map(|row| row.label)
+        .filter(|label| invalidated_by_close(caller, label))
+        .collect();
+    labels.push(caller.to_string());
+    labels.sort();
+    labels.dedup();
+    let revoked = revoke_pairings_where(store, now, |l| invalidated_by_close(caller, l))?;
+    remove_mcp_files_in(state_home, &labels)?;
+    Ok(revoked)
+}
+
+/// Remove the `mcp-<label>.json` of each label, through the held control-dir
+/// handle only (`unlinkat` beneath it, never following a link; a sanitized
+/// file name can never leave it). An absent control dir is never created
+/// here: nothing was ever written. Returns how many files were removed.
+fn remove_mcp_files_in(state_home: &Path, labels: &[String]) -> Result<usize> {
+    if !state_home.join(CONTROL_DIR_REL).is_dir() {
+        return Ok(0);
+    }
+    let dir = control_dir_in(state_home)?;
+    let mut removed = 0;
+    for label in labels {
+        let file = mcp_file_name(label);
+        if dir
+            .remove_file(&file)
+            .with_context(|| format!("remove {}", dir.path().join(&file).display()))?
+        {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Revoke every Lead token at the Lead listener's start. The listener binds a
+/// fresh port each start, so no running Lead can hold a usable token for it:
+/// every Lead tab still open was wired to the previous address and re-mints on
+/// its next spawn. Must run before the new address is published, so a mint
+/// against the new listener is never caught by it.
+pub(crate) fn revoke_stale_lead_tokens() -> Result<usize> {
+    let db = thegn_core::db::Db::open()?;
+    revoke_all_lead_pairings(&db, now_ms())
+}
+
 /// The per-tab Lead MCP config file name inside [`CONTROL_DIR_REL`].
 pub(crate) fn mcp_file_name(caller: &str) -> String {
     format!(
@@ -490,6 +595,110 @@ mod tests {
         assert_eq!(live[0].scope, "read", "clamped by the read-only ceiling");
         assert!(live[0].approved_at.is_some());
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn tab_caller_is_the_launch_label_and_parses_back() {
+        assert_eq!(tab_caller("lead", 0), "lead:lead/0");
+        assert_eq!(tab_caller("lead", 12), "lead:lead/12");
+        assert_eq!(parse_tab_caller(&tab_caller("lead", 3)), Some(("lead", 3)));
+        assert_eq!(parse_tab_caller("lead:a/b/7"), Some(("a/b", 7)));
+        assert_eq!(parse_tab_caller(PAIRING_LABEL), None);
+        assert_eq!(parse_tab_caller("lead:lead/"), None);
+        assert_eq!(parse_tab_caller("lead:lead/-1"), None);
+        assert_eq!(parse_tab_caller("lead:lead/+1"), None);
+        assert_eq!(parse_tab_caller("other:lead/1"), None);
+    }
+
+    #[test]
+    fn closing_a_tab_invalidates_it_and_every_shifted_tab_above_it() {
+        let closing = tab_caller("lead", 1);
+        let set: Vec<&str> = [
+            "lead:lead/0",
+            "lead:lead/1",
+            "lead:lead/2",
+            "lead:lead/10",
+            "lead:other/5",
+            PAIRING_LABEL,
+            "cli",
+        ]
+        .into_iter()
+        .filter(|l| invalidated_by_close(&closing, l))
+        .collect();
+        assert_eq!(set, ["lead:lead/1", "lead:lead/2", "lead:lead/10"]);
+        // The bare label invalidates only itself.
+        assert!(invalidated_by_close(PAIRING_LABEL, PAIRING_LABEL));
+        assert!(!invalidated_by_close(PAIRING_LABEL, "lead:lead/0"));
+    }
+
+    #[test]
+    fn revoke_tab_token_revokes_at_or_above_and_removes_files_beneath_the_control_dir_only() {
+        let state = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let ro = ScopeSet::of(&[Scope::Read]);
+        for label in ["lead:lead/0", "lead:lead/1", "lead:lead/2", PAIRING_LABEL] {
+            mint_lead_token(&db, ro, 1, label).unwrap();
+        }
+        let dir = control_dir_in(state.path()).unwrap();
+        for label in ["lead:lead/0", "lead:lead/1", "lead:lead/2"] {
+            dir.write_owner_only_atomic(&mcp_file_name(label), b"{}")
+                .unwrap();
+        }
+        // A same-named file outside the control dir must never be touched.
+        let outside = state.path().join(mcp_file_name("lead:lead/1"));
+        std::fs::write(&outside, b"keep").unwrap();
+
+        let revoked = revoke_tab_token_in(&db, state.path(), 2, "lead:lead/1").unwrap();
+        assert_eq!(revoked, 2);
+        let mut live: Vec<String> = db
+            .pairings()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.revoked_at.is_none())
+            .map(|r| r.label)
+            .collect();
+        live.sort();
+        assert_eq!(live, [PAIRING_LABEL, "lead:lead/0"]);
+
+        let ctl = state.path().join(CONTROL_DIR_REL);
+        assert!(ctl.join(mcp_file_name("lead:lead/0")).exists());
+        assert!(!ctl.join(mcp_file_name("lead:lead/1")).exists());
+        assert!(!ctl.join(mcp_file_name("lead:lead/2")).exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+
+        // Idempotent: a second close of the same index revokes nothing new.
+        assert_eq!(
+            revoke_tab_token_in(&db, state.path(), 3, "lead:lead/1").unwrap(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_file_removal_unlinks_a_symlink_without_following_it() {
+        let state = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let victim = target.path().join("victim.json");
+        std::fs::write(&victim, b"keep").unwrap();
+        let dir = control_dir_in(state.path()).unwrap();
+        let link = dir.path().join(mcp_file_name("lead:lead/0"));
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert_eq!(
+            remove_mcp_files_in(state.path(), &["lead:lead/0".to_string()]).unwrap(),
+            1
+        );
+        assert!(link.symlink_metadata().is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn mcp_file_removal_never_creates_an_absent_control_dir() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(
+            remove_mcp_files_in(state.path(), &["lead:lead/0".to_string()]).unwrap(),
+            0
+        );
+        assert!(!state.path().join(CONTROL_DIR_REL).exists());
     }
 
     #[test]
