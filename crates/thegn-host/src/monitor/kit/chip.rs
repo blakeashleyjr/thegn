@@ -21,9 +21,8 @@ pub fn draw(
     let mut text = String::with_capacity(label.len() + unit.default_width() + 1);
     text.push_str(label);
     text.push(' ');
-    let value =
-        super::edge_fmt(fmt).reading(reading, unit, v.rect().cols.saturating_sub(text.len()));
-    text.push_str(&value);
+    let width = v.rect().cols.saturating_sub(text.len());
+    super::edge_fmt(fmt).reading_into(&mut text, reading, unit, width);
     v.put_str(
         0,
         0,
