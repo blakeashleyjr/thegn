@@ -122,6 +122,7 @@ const SECURITY_RELEVANT_ROOTS: &[&str] = &[
     "host_discovery",
     "identities",
     "issues",
+    "lead",
     "lifecycle",
     "limits",
     "lsp",

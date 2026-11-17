@@ -255,6 +255,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_unknown_profile_members() {
+        let servers = BTreeMap::from([("notes".to_string(), server(&["x"]))]);
+        let bad = McpProxyConfig {
+            profiles: BTreeMap::from([(
+                "lead".to_string(),
+                vec!["notes".to_string(), "ghost".to_string()],
+            )]),
+            ..Default::default()
+        };
+        let errs = bad.validate(&servers);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("ghost"));
+        let good = McpProxyConfig {
+            profiles: BTreeMap::from([("lead".to_string(), vec!["notes".to_string()])]),
+            ..Default::default()
+        };
+        assert!(good.validate(&servers).is_empty());
+    }
+
+    #[test]
     fn huge_cooldown_does_not_accidentally_reopen_a_failed_upstream() {
         use crate::mcp::proxy::breaker::{Breaker, BreakerState};
         let cfg = McpProxyConfig {

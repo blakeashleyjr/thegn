@@ -548,7 +548,7 @@ silently not applied: `[sandbox]` (and everything nested under it),
 `[clipboard]`, `[apps]`, `[skills]`, `[tasks]`, `[toolchain]`, `[limits]`,
 `[presets]`, `[profiles]`, `[worktree_templates]`, `[watch]`, `[ci]`,
 `[pr]`, `[issues]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
-`[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[pins]`,
+`[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[lead]`, `[pins]`,
 `[secrets]`, `[credentials]`, `[bundle]`, `[zone.*]`, `[observe]`,
 `[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, `[stats]`, and the
 per-project overlay
