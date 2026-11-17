@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::pipeline_report::display_cell;
+use thegn_core::store::NotificationStore;
 use thegn_core::store::WorkspaceStore;
 use thegn_core::{msg, outln};
 use thegn_svc::control::client::{AttachControl, ControlClient};
@@ -458,6 +459,186 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         }
     }
     Ok(process_exit_code(status))
+}
+
+/// Exit code of `agent result` while the session is still running.
+pub(crate) const EXIT_RESULT_RUNNING: i32 = crate::cmd::EXIT_NOT_FOUND;
+/// How long `agent result` waits for the first output frame.
+const RESULT_TAIL_WAIT: Duration = Duration::from_secs(2);
+
+/// Parsed `agent result` flags.
+pub(crate) struct ResultArgs {
+    pub row: Option<i64>,
+    pub session: Option<String>,
+    pub json: bool,
+}
+
+/// A session's state as `agent result` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultStatus {
+    Running,
+    Exited(Option<i32>),
+    Unknown,
+}
+
+impl ResultStatus {
+    fn label(self) -> &'static str {
+        match self {
+            ResultStatus::Running => "running",
+            ResultStatus::Exited(_) => "exited",
+            ResultStatus::Unknown => "unknown",
+        }
+    }
+
+    fn exit_code(self) -> Option<i32> {
+        match self {
+            ResultStatus::Exited(code) => code,
+            _ => None,
+        }
+    }
+}
+
+/// Pure: the session id a `--row` names, from the dispatch table.
+pub(crate) fn resolve_row_session(db: &Db, row: i64) -> Result<String> {
+    let dispatch = db
+        .get_dispatch(row)?
+        .ok_or_else(|| anyhow::anyhow!("no dispatch row {row}"))?;
+    dispatch
+        .session_id
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("dispatch {row} has no session"))
+}
+
+/// Pure: classify `session` against the daemon's listing (which keeps
+/// tombstones for exited sessions).
+pub(crate) fn status_from_sessions(
+    sessions: &[thegn_svc::control::SessionInfo],
+    session: &str,
+) -> ResultStatus {
+    match sessions.iter().find(|s| s.id == session) {
+        None => ResultStatus::Unknown,
+        Some(s) if s.exited_at_ms.is_some() => ResultStatus::Exited(s.exit_code),
+        Some(_) => ResultStatus::Running,
+    }
+}
+
+/// Pure: the process exit code for an `agent result` status.
+pub(crate) fn result_exit_code(status: ResultStatus) -> i32 {
+    match status {
+        ResultStatus::Exited(code) => process_exit_code(WaitStatus::Exited(code)),
+        ResultStatus::Running => EXIT_RESULT_RUNNING,
+        ResultStatus::Unknown => crate::cmd::EXIT_RETRYABLE,
+    }
+}
+
+/// Pure: the `--json` object.
+pub(crate) fn result_json(
+    row: Option<i64>,
+    session: &str,
+    status: ResultStatus,
+    tail: Option<&str>,
+    tail_note: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "row": row,
+        "session": session,
+        "status": status.label(),
+        "exit_code": status.exit_code(),
+        "output_tail": tail,
+        "tail_note": tail_note,
+    })
+}
+
+pub(crate) fn result(cfg: &Config, args: ResultArgs) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let code = rt.block_on(result_async(cfg, args))?;
+    if code != crate::cmd::EXIT_OK {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// One attach, the first output frame within [`RESULT_TAIL_WAIT`], detach.
+/// Never waits for exit. `Err` carries the `tail_note`.
+async fn first_output(client: &ControlClient, session: &str) -> Result<Vec<u8>, String> {
+    use thegn_core::control_wire::EventFrame;
+    let client_id = format!("agent-result-{}", std::process::id());
+    let mut stream = client
+        .attach(session, &client_id, 0, 0, true)
+        .await
+        .map_err(|e| format!("attach failed: {e}"))?;
+    let got = tokio::time::timeout(RESULT_TAIL_WAIT, async {
+        while let Some(frame) = stream.frames.recv().await {
+            if let EventFrame::PaneSnapshot { bytes, .. } | EventFrame::PaneDelta { bytes, .. } =
+                frame
+            {
+                return Some(bytes);
+            }
+        }
+        None
+    })
+    .await;
+    detach(&stream.control).await;
+    match got {
+        Ok(Some(bytes)) => Ok(bytes.to_vec()),
+        Ok(None) => Err("the session sent no output frame".to_string()),
+        Err(_) => Err("no output frame within 2s".to_string()),
+    }
+}
+
+async fn result_async(cfg: &Config, args: ResultArgs) -> Result<i32> {
+    let ResultArgs { row, session, json } = args;
+    let session = match (row, session) {
+        (Some(row), _) => resolve_row_session(&Db::open()?, row)?,
+        (None, Some(session)) => session,
+        (None, None) => anyhow::bail!("agent result needs --row or --session"),
+    };
+    let client = match crate::cmd::session::connect(cfg).await {
+        Ok(c) => c,
+        Err(e) => {
+            if json {
+                crate::cmd::emit_json(&serde_json::json!({ "error": "no_daemon" }))?;
+            }
+            return Err(crate::cmd::Retryable(e).into());
+        }
+    };
+    let status = status_from_sessions(&client.sessions().await?, &session);
+    let (tail, tail_note) = if status == ResultStatus::Unknown {
+        (
+            None,
+            Some(format!("session {session} is not known to the daemon")),
+        )
+    } else {
+        match first_output(&client, &session).await {
+            Ok(raw) => (Some(output_tail(&raw)), None),
+            Err(note) => (None, Some(note)),
+        }
+    };
+    if json {
+        crate::cmd::emit_json(&result_json(
+            row,
+            &session,
+            status,
+            tail.as_deref(),
+            tail_note.as_deref(),
+        ))?;
+    } else {
+        if let Some(tail) = tail.as_deref().filter(|t| !t.is_empty()) {
+            outln!("{tail}");
+        }
+        if let Some(note) = &tail_note {
+            outln!("[agent result: {}]", display_cell(note));
+        }
+        let code = status
+            .exit_code()
+            .map_or_else(String::new, |c| format!(" {c}"));
+        outln!(
+            "[agent result: session {} {}{code}]",
+            display_cell(&session),
+            status.label()
+        );
+    }
+    Ok(result_exit_code(status))
 }
 
 /// Detach the observer. Best-effort: a closed channel means the stream already
@@ -934,5 +1115,102 @@ mod tests {
             "the plain open spec lives in open_plain only"
         );
         assert!(spawn.contains("session::open_plain("));
+    }
+
+    #[test]
+    fn result_row_resolution_table() {
+        use thegn_core::issue::NewDispatch;
+        use thegn_core::store::NotificationStore;
+        let _state = IsolatedState::new();
+        let db = Db::open_memory().expect("db");
+        let err = super::resolve_row_session(&db, 99).unwrap_err().to_string();
+        assert_eq!(err, "no dispatch row 99");
+        let bare = db
+            .put_agent_dispatch(NewDispatch::new("THE-1", "/wt/a", "coder"))
+            .expect("row");
+        let err = super::resolve_row_session(&db, bare)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, format!("dispatch {bare} has no session"));
+        let mut new = NewDispatch::new("THE-2", "/wt/b", "coder");
+        new.session_id = Some("sess-1");
+        let ok = db.put_agent_dispatch(new).expect("row");
+        assert_eq!(super::resolve_row_session(&db, ok).expect("ok"), "sess-1");
+    }
+
+    #[test]
+    fn result_status_mapping() {
+        use super::{ResultStatus, status_from_sessions};
+        use thegn_svc::control::SessionInfo;
+        let live = SessionInfo {
+            id: "a".into(),
+            ..Default::default()
+        };
+        let done = SessionInfo {
+            id: "b".into(),
+            exited_at_ms: Some(5),
+            exit_code: Some(7),
+            ..Default::default()
+        };
+        let reaped = SessionInfo {
+            id: "c".into(),
+            exited_at_ms: Some(5),
+            ..Default::default()
+        };
+        let all = [live, done, reaped];
+        assert_eq!(status_from_sessions(&all, "a"), ResultStatus::Running);
+        assert_eq!(
+            status_from_sessions(&all, "b"),
+            ResultStatus::Exited(Some(7))
+        );
+        assert_eq!(status_from_sessions(&all, "c"), ResultStatus::Exited(None));
+        assert_eq!(status_from_sessions(&all, "z"), ResultStatus::Unknown);
+    }
+
+    #[test]
+    fn result_json_shape_and_exit_codes() {
+        use super::{ResultStatus, result_exit_code, result_json};
+        let v = result_json(
+            Some(4),
+            "s",
+            ResultStatus::Exited(Some(0)),
+            Some("hi"),
+            None,
+        );
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "row": 4, "session": "s", "status": "exited", "exit_code": 0,
+                "output_tail": "hi", "tail_note": null
+            })
+        );
+        let v = result_json(None, "s", ResultStatus::Unknown, None, Some("n"));
+        assert_eq!(v["status"], "unknown");
+        assert!(v["output_tail"].is_null() && v["row"].is_null());
+        assert_eq!(result_exit_code(ResultStatus::Exited(Some(0))), 0);
+        assert_eq!(result_exit_code(ResultStatus::Exited(Some(2))), 1);
+        assert_eq!(result_exit_code(ResultStatus::Exited(None)), 1);
+        assert_eq!(result_exit_code(ResultStatus::Running), 3);
+        assert_eq!(result_exit_code(ResultStatus::Unknown), 2);
+    }
+
+    #[test]
+    fn agent_result_parse_matrix() {
+        use crate::cmd::agent::Action;
+        assert!(parse(&["thegn", "agent", "result"]).is_err());
+        assert!(parse(&["thegn", "agent", "result", "--row", "1", "--session", "s"]).is_err());
+        assert!(parse(&["thegn", "agent", "result", "--json"]).is_err());
+        match parse(&["thegn", "agent", "result", "--row", "7", "--json"]).expect("row") {
+            Action::Result { row, session, json } => {
+                assert_eq!((row, session, json), (Some(7), None, true));
+            }
+            _ => panic!("expected agent result"),
+        }
+        match parse(&["thegn", "agent", "result", "--session", "abc"]).expect("session") {
+            Action::Result { row, session, json } => {
+                assert_eq!((row, session.as_deref(), json), (None, Some("abc"), false));
+            }
+            _ => panic!("expected agent result"),
+        }
     }
 }
