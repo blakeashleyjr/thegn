@@ -28,13 +28,14 @@ use thegn_core::vercel::admit::{valid_project_id, valid_sandbox_name, valid_team
 use thegn_core::vercel::api::{
     LogLine, SandboxView, Scope, parse_list_page, parse_log_line, parse_sandbox,
 };
+use thegn_core::vercel::token::{TokenKind, classify, oidc_refusal};
 use thegn_core::vercel::usage::{SessionUsage, SnapshotUsage};
 
 use super::VercelToken;
 use crate::provider::{
-    CONTROL_BODY_LIMIT, CONTROL_GATE, EXEC_EXIT_STATUS_UNKNOWN, authority_key,
-    provider_http_client, redacted_transport_error, response_json, transient_err, transient_status,
-    validate_api_base,
+    CONTROL_BODY_LIMIT, CONTROL_GATE, EXEC_EXIT_STATUS_UNKNOWN, FILE_TRANSFER_TIMEOUT,
+    authority_key, provider_http_client, redacted_transport_error, response_json, transient_err,
+    transient_status, validate_api_base,
 };
 
 const PROVIDER: &str = "vercel";
@@ -44,10 +45,24 @@ const USER_AGENT: &str = concat!("thegn/", env!("CARGO_PKG_VERSION"));
 const ATTEMPTS: u32 = 3;
 const BACKOFF: Duration = Duration::from_millis(500);
 
-/// Local copy of the provider file-transfer deadline (`provider.rs` keeps its
-/// own private). Also bounds `run_wait`, whose command may outlive the 30 s
-/// control deadline.
-const FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+/// Attempts for `stdin` (the SDK's rule: 5 retries, on 429 only).
+const STDIN_ATTEMPTS: u32 = 6;
+
+/// The longest `Retry-After` (seconds) a retried call waits out; a longer one
+/// fails the call with "retry after Ns".
+pub const MAX_RETRY_AFTER_S: u64 = 20;
+
+/// Most snapshot-listing pages [`VercelClient::snapshot_usage`] reads.
+pub const SNAPSHOT_PAGE_CAP: usize = 20;
+
+/// The interactive ticket host pin when `interactive_host_suffixes` is empty:
+/// Vercel-owned names only (never `vercel.app`, which any user deploys to).
+pub const DEFAULT_INTERACTIVE_HOST_SUFFIXES: &[&str] = &["vercel.run", "vercel.sh", "vercel.com"];
+
+/// The refusal for a ticket on a host outside the pin (names no URL, query or
+/// ticket).
+pub const INTERACTIVE_HOST_REFUSAL: &str = "vercel: interactive url host is not an allowed Vercel \
+     host (set env.<name>.provider.interactive_host_suffixes)";
 
 /// A `logs` follow lives as long as the stream-mode session it feeds; the
 /// thegn lifetime ceiling (24 h) bounds it.
@@ -142,15 +157,21 @@ struct Policy {
     op: &'static str,
     /// Priority permit (delete/stop: cleanup must not starve behind reads).
     priority: bool,
-    /// Retry transient statuses / transport errors up to [`ATTEMPTS`].
-    retry: bool,
+    /// Total attempts (1 = never retried).
+    attempts: u32,
+    /// Retry transient statuses other than 429 / transport errors.
+    transient: bool,
+    /// Retry a 429 (honouring `Retry-After` up to [`MAX_RETRY_AFTER_S`]).
+    rate_limited: bool,
 }
 
 const fn policy(op: &'static str) -> Policy {
     Policy {
         op,
         priority: false,
-        retry: false,
+        attempts: 1,
+        transient: false,
+        rate_limited: false,
     }
 }
 
@@ -158,7 +179,9 @@ const fn retried(op: &'static str) -> Policy {
     Policy {
         op,
         priority: false,
-        retry: true,
+        attempts: ATTEMPTS,
+        transient: true,
+        rate_limited: true,
     }
 }
 
@@ -166,7 +189,79 @@ const fn priority(op: &'static str) -> Policy {
     Policy {
         op,
         priority: true,
-        retry: false,
+        attempts: 1,
+        transient: false,
+        rate_limited: false,
+    }
+}
+
+/// A parsed `Retry-After` header (delta-seconds only; an HTTP-date is
+/// `Unparsable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryAfter {
+    Absent,
+    Secs(u64),
+    Unparsable,
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> RetryAfter {
+    let Some(value) = headers.get(reqwest::header::RETRY_AFTER) else {
+        return RetryAfter::Absent;
+    };
+    parse_retry_after(value.to_str().ok())
+}
+
+/// Checked parse of a `Retry-After` value: ASCII digits only, no overflow.
+fn parse_retry_after(value: Option<&str>) -> RetryAfter {
+    let Some(text) = value.map(str::trim) else {
+        return RetryAfter::Unparsable;
+    };
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return RetryAfter::Unparsable;
+    }
+    text.parse::<u64>()
+        .map_or(RetryAfter::Unparsable, RetryAfter::Secs)
+}
+
+/// The failure for a 429 that is not (or no longer) retried.
+fn rate_limited_error(op: &str, after: RetryAfter) -> anyhow::Error {
+    match after {
+        RetryAfter::Secs(n) => {
+            anyhow!("{PROVIDER}: {op}: rate limited by Vercel; retry after {n}s")
+        }
+        RetryAfter::Absent | RetryAfter::Unparsable => {
+            anyhow!("{PROVIDER}: {op}: rate limited by Vercel; retry later")
+        }
+    }
+}
+
+fn unix_now_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Whether `host` (a DNS name) equals one of `suffixes` or ends in
+/// `.<suffix>`; an empty `suffixes` means [`DEFAULT_INTERACTIVE_HOST_SUFFIXES`].
+/// Case and a trailing dot are ignored; `vercel.app` never matches.
+pub fn interactive_host_allowed(host: &str, suffixes: &[String]) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host == "vercel.app" || host.ends_with(".vercel.app") {
+        return false;
+    }
+    let hit = |suffix: &str| {
+        let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
+        !suffix.is_empty()
+            && suffix != "vercel.app"
+            && (host == suffix
+                || host
+                    .strip_suffix(suffix.as_str())
+                    .is_some_and(|rest| rest.ends_with('.')))
+    };
+    if suffixes.is_empty() {
+        DEFAULT_INTERACTIVE_HOST_SUFFIXES.iter().copied().any(hit)
+    } else {
+        suffixes.iter().map(String::as_str).any(hit)
     }
 }
 
@@ -176,9 +271,11 @@ pub struct VercelClient {
     token: VercelToken,
     scope: Scope,
     http: reqwest::Client,
+    /// The token's kind, classified once in [`VercelClient::new`]; an OIDC
+    /// token near expiry refuses every request.
+    token_kind: TokenKind,
     /// `[env.<name>.provider] interactive_host_suffixes` (empty ⇒ the
     /// built-in Vercel-owned defaults); the WebSocket ticket host pin.
-    #[allow(dead_code)] // spine stub, filled by lane 3
     interactive_hosts: Vec<String>,
 }
 
@@ -203,41 +300,78 @@ impl VercelClient {
             !base.cannot_be_a_base(),
             "provider api_base cannot carry a path"
         );
+        let token_kind = classify(token.expose());
         Ok(VercelClient {
             base,
             authority,
             token,
             scope,
             http: provider_http_client(),
+            token_kind,
             interactive_hosts: Vec::new(),
         })
     }
 
     /// Pin the interactive WebSocket ticket host to `suffixes` (empty ⇒ the
     /// built-in defaults).
-    pub(crate) fn with_interactive_hosts(mut self, suffixes: Vec<String>) -> Self {
+    pub fn with_interactive_hosts(mut self, suffixes: Vec<String>) -> Self {
         self.interactive_hosts = suffixes;
         self
     }
 
-    /// The current session's usage of sandbox `name` (a GET; never resumes).
-    /// Spine stub: lane 3 implements the request.
-    pub(crate) async fn usage(&self, name: &str) -> Result<Option<SessionUsage>> {
-        checked_name(name)?;
-        Ok(None)
+    /// The current session's usage of sandbox `name` (a GET without
+    /// `resume`; never buys compute). `None` when the sandbox does not exist.
+    pub async fn usage(&self, name: &str) -> Result<Option<SessionUsage>> {
+        let p = retried("read sandbox usage");
+        let url = self.url(&["v2", "sandboxes", checked_name(name)?], &[], true)?;
+        let resp = self.send(p, || Ok(self.http.get(url.clone()))).await?;
+        let Some(resp) = self.ok_or_404(resp, p.op).await? else {
+            return Ok(None);
+        };
+        let v = response_json(resp, PROVIDER, p.op).await?;
+        parse_session_usage(&v)
+            .map(Some)
+            .map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))
     }
 
-    /// The snapshots of sandbox `name` with their sizes and status.
-    /// Spine stub: lane 3 implements the request.
-    pub(crate) async fn snapshot_usage(&self, name: &str) -> Result<Vec<SnapshotUsage>> {
-        checked_name(name)?;
-        Ok(Vec::new())
+    /// The snapshots of sandbox `name` with their sizes and status, paged
+    /// through at most [`SNAPSHOT_PAGE_CAP`] listing pages (a repeated cursor
+    /// also stops it).
+    pub async fn snapshot_usage(&self, name: &str) -> Result<Vec<SnapshotUsage>> {
+        let p = retried("list snapshots");
+        let name = checked_name(name)?;
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _page in 0..SNAPSHOT_PAGE_CAP {
+            let mut extra: Vec<(&str, &str)> =
+                vec![("project", self.scope.project_id.as_str()), ("name", name)];
+            if let Some(c) = cursor.as_deref() {
+                extra.push(("cursor", c));
+            }
+            let url = self.url(&["v2", "sandboxes", "snapshots"], &extra, false)?;
+            let resp = self.send(p, || Ok(self.http.get(url.clone()))).await?;
+            let resp = self.ok(resp, p.op, false).await?;
+            let v = response_json(resp, PROVIDER, p.op).await?;
+            let (items, next) =
+                parse_snapshots(&v).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+            out.extend(items);
+            match next {
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     // --- control plane ----------------------------------------------------
 
     pub async fn create(&self, body: &serde_json::Value) -> Result<SandboxView> {
-        let p = retried("create sandbox");
+        // Transient failures are retried; a 429 is not (a create is never
+        // repeated after the API refused it for rate).
+        let p = Policy {
+            rate_limited: false,
+            ..retried("create sandbox")
+        };
         let url = self.url(&["v3", "sandboxes"], &[], false)?;
         let body = self.json_body(body, p.op)?;
         let resp = self
@@ -284,10 +418,15 @@ impl VercelClient {
         parse_list_page(&v).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))
     }
 
-    /// Delete the sandbox by name. 404 = Ok (already gone).
+    /// Delete the sandbox by name, asking the API to drop its orphaned
+    /// snapshots too (`deleteOrphanSnapshots=true`). 404 = Ok (already gone).
     pub async fn delete(&self, name: &str) -> Result<()> {
         let p = priority("delete sandbox");
-        let url = self.url(&["v2", "sandboxes", checked_name(name)?], &[], true)?;
+        let url = self.url(
+            &["v2", "sandboxes", checked_name(name)?],
+            &[("deleteOrphanSnapshots", "true")],
+            true,
+        )?;
         let resp = self.send(p, || Ok(self.http.delete(url.clone()))).await?;
         self.ok(resp, p.op, true).await.map(drop)
     }
@@ -499,9 +638,14 @@ impl VercelClient {
         }
     }
 
-    /// Write `data` to a command's stdin; `close` ends it after the write.
+    /// Write `data` to a command's stdin; `close` ends it after the write. A
+    /// 429 is retried up to 5 times (the SDK's rule); nothing else is.
     pub async fn stdin(&self, session: &str, cmd: &str, data: &[u8], close: bool) -> Result<()> {
-        let p = policy("write command stdin");
+        let p = Policy {
+            attempts: STDIN_ATTEMPTS,
+            rate_limited: true,
+            ..policy("write command stdin")
+        };
         let url = self.session_url(session, &["cmd", checked_id(cmd, "command")?, "stdin"])?;
         let body = serde_json::json!({
             "data": base64::engine::general_purpose::STANDARD.encode(data),
@@ -614,8 +758,9 @@ impl VercelClient {
     // --- interactive ----------------------------------------------------------
 
     /// Mint an `/interactive` WebSocket ticket. The returned URL is `wss` on a
-    /// DNS host (no IP literal, no `localhost`, no userinfo); its `token` is the
-    /// ticket's own secret, never the API token.
+    /// DNS host (no IP literal, no `localhost`, no userinfo) under one of the
+    /// pinned interactive host suffixes; its `token` is the ticket's own
+    /// secret, never the API token.
     pub async fn interactive(&self, session: &str) -> Result<InteractiveTicket> {
         let p = policy("open interactive session");
         let url = self.session_url(session, &["interactive"])?;
@@ -638,6 +783,10 @@ impl VercelClient {
             p.op
         );
         let url = admit_ticket_url(raw_url).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+        let host = url.host_str().unwrap_or("");
+        if !interactive_host_allowed(host, &self.interactive_hosts) {
+            bail!("{INTERACTIVE_HOST_REFUSAL}");
+        }
         Ok(InteractiveTicket {
             url,
             token: zeroize::Zeroizing::new(token.to_string()),
@@ -736,16 +885,23 @@ impl VercelClient {
         Ok(body.clone())
     }
 
-    /// Gate, authorize, send; retry transient failures under `p.retry`. Returns
-    /// the final response whatever its status (the caller judges it).
+    /// Refuse, gate, authorize, send; retry under `p`. Returns the final
+    /// response whatever its status (the caller judges it), except a 429,
+    /// which is either waited out (`p.rate_limited`, `Retry-After` absent, 0
+    /// or at most [`MAX_RETRY_AFTER_S`]) or fails the call with "rate limited
+    /// by Vercel; retry after Ns". An OIDC token near expiry fails before any
+    /// request.
     async fn send<F>(&self, p: Policy, mut build: F) -> Result<reqwest::Response>
     where
         F: FnMut() -> Result<reqwest::RequestBuilder>,
     {
-        let attempts = if p.retry { ATTEMPTS } else { 1 };
-        let mut attempt = 0;
+        let attempts = p.attempts.max(1);
+        let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            if let Some(msg) = oidc_refusal(self.token_kind, unix_now_s()) {
+                bail!("{PROVIDER}: {}: {msg}", p.op);
+            }
             let request = build()?
                 .bearer_auth(self.token.expose())
                 .header(reqwest::header::USER_AGENT, USER_AGENT);
@@ -756,15 +912,32 @@ impl VercelClient {
             };
             let result = request.send().await;
             drop(permit);
-            match result {
-                Ok(resp) if attempt < attempts && transient_status(resp.status()) => {
+            let more = attempt < attempts;
+            let backoff = BACKOFF * attempt;
+            let wait = match result {
+                Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    let after = retry_after(resp.headers());
                     drain_quietly(resp).await;
+                    match after {
+                        _ if !(more && p.rate_limited) => {
+                            return Err(rate_limited_error(p.op, after));
+                        }
+                        RetryAfter::Absent | RetryAfter::Secs(0) => backoff,
+                        RetryAfter::Secs(n) if n <= MAX_RETRY_AFTER_S => Duration::from_secs(n),
+                        RetryAfter::Secs(_) | RetryAfter::Unparsable => {
+                            return Err(rate_limited_error(p.op, after));
+                        }
+                    }
+                }
+                Ok(resp) if more && p.transient && transient_status(resp.status()) => {
+                    drain_quietly(resp).await;
+                    backoff
                 }
                 Ok(resp) => return Ok(resp),
-                Err(e) if attempt < attempts && transient_err(&e) => {}
+                Err(e) if more && p.transient && transient_err(&e) => backoff,
                 Err(e) => return Err(redacted_transport_error(PROVIDER, p.op, &e)),
-            }
-            tokio::time::sleep(BACKOFF * attempt).await;
+            };
+            tokio::time::sleep(wait).await;
         }
     }
 
@@ -903,6 +1076,82 @@ async fn drain_quietly(mut resp: reqwest::Response) {
 pub(super) fn checked_name(name: &str) -> Result<&str> {
     anyhow::ensure!(valid_sandbox_name(name), "{PROVIDER}: invalid sandbox name");
     Ok(name)
+}
+
+/// The current session's usage from a `GET /v2/sandboxes/{name}` response
+/// (`{"sandbox": …, "session": …}` or bare). Fields are read from the session
+/// object when present, else from the sandbox; every field is optional.
+pub fn parse_session_usage(v: &serde_json::Value) -> Result<SessionUsage, &'static str> {
+    let sandbox = v.get("sandbox").filter(|s| s.is_object()).unwrap_or(v);
+    if !sandbox.is_object() {
+        return Err("response has no sandbox object");
+    }
+    let session = sandbox
+        .get("session")
+        .or_else(|| v.get("session"))
+        .filter(|s| s.is_object());
+    let field = |key: &str| {
+        session
+            .and_then(|s| s.get(key))
+            .filter(|x| !x.is_null())
+            .or_else(|| sandbox.get(key).filter(|x| !x.is_null()))
+    };
+    let vcpus = field("vcpus")
+        .or_else(|| sandbox.get("resources").and_then(|r| r.get("vcpus")))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok());
+    let memory_mb = field("memory")
+        .or_else(|| sandbox.get("resources").and_then(|r| r.get("memory")))
+        .and_then(serde_json::Value::as_u64);
+    Ok(SessionUsage {
+        active_cpu_ms: field("activeCpuDurationMs").and_then(serde_json::Value::as_u64),
+        memory_mb,
+        vcpus,
+        started_at_ms: field("startedAt").and_then(serde_json::Value::as_i64),
+        stopped_at_ms: field("stoppedAt").and_then(serde_json::Value::as_i64),
+    })
+}
+
+/// One snapshot-listing page: the snapshots (entries with an invalid id are
+/// skipped) and the next cursor.
+pub fn parse_snapshots(
+    v: &serde_json::Value,
+) -> Result<(Vec<SnapshotUsage>, Option<String>), &'static str> {
+    let items = v
+        .get("snapshots")
+        .and_then(|s| s.as_array())
+        .ok_or("response has no snapshots array")?;
+    let snapshots = items
+        .iter()
+        .filter_map(|s| {
+            let id = s
+                .get("id")
+                .and_then(|id| id.as_str())
+                .filter(|id| valid_id(id))?;
+            Some(SnapshotUsage {
+                id: id.to_string(),
+                size_bytes: s
+                    .get("sizeBytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                expires_at_ms: s.get("expiresAt").and_then(serde_json::Value::as_i64),
+                status: s
+                    .get("status")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            })
+        })
+        .collect();
+    let next = v
+        .get("pagination")
+        .and_then(|p| p.get("next"))
+        .and_then(|n| match n {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        });
+    Ok((snapshots, next))
 }
 
 /// Session/command/snapshot ids: `[A-Za-z0-9_-]{1,128}`.
@@ -1163,6 +1412,96 @@ mod tests {
         assert!(v(serde_json::json!({"command": {"id": "cmd_9", "exitCode": 0}})).is_err());
         assert!(v(serde_json::json!({"command": {"id": "cmd_1", "exitCode": "0"}})).is_err());
         assert!(v(serde_json::json!(null)).is_err());
+    }
+
+    #[test]
+    fn retry_after_parse_is_checked() {
+        assert_eq!(parse_retry_after(Some("1")), RetryAfter::Secs(1));
+        assert_eq!(parse_retry_after(Some(" 20 ")), RetryAfter::Secs(20));
+        assert_eq!(parse_retry_after(Some("0")), RetryAfter::Secs(0));
+        for bad in [
+            "",
+            "-1",
+            "+5",
+            "1.5",
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(
+                parse_retry_after(Some(bad)),
+                RetryAfter::Unparsable,
+                "{bad}"
+            );
+        }
+        assert_eq!(parse_retry_after(None), RetryAfter::Unparsable);
+        let none = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after(&none), RetryAfter::Absent);
+    }
+
+    #[test]
+    fn interactive_host_pin_defaults_and_configured_suffixes() {
+        let none: Vec<String> = Vec::new();
+        for ok in [
+            "x.vercel.run",
+            "vercel.run",
+            "a.b.vercel.sh",
+            "X.Vercel.Com.",
+        ] {
+            assert!(interactive_host_allowed(ok, &none), "{ok}");
+        }
+        for bad in [
+            "evil.example",
+            "vercel.app",
+            "x.vercel.app",
+            "notvercel.run",
+            "vercel.run.evil.example",
+            "",
+        ] {
+            assert!(!interactive_host_allowed(bad, &none), "{bad}");
+        }
+        let custom = vec!["vx.example".to_string()];
+        assert!(interactive_host_allowed("a.vx.example", &custom));
+        assert!(interactive_host_allowed("vx.example", &custom));
+        assert!(!interactive_host_allowed("x.vercel.run", &custom));
+        assert!(!interactive_host_allowed("a.vx.example", &none));
+        assert!(!interactive_host_allowed(
+            "x.vercel.app",
+            &["vercel.app".to_string()]
+        ));
+    }
+
+    #[test]
+    fn session_usage_reads_session_then_sandbox_fields() {
+        let v = serde_json::json!({
+            "sandbox": {"name": "tg-a", "resources": {"vcpus": 2, "memory": 4096}},
+            "session": {"activeCpuDurationMs": 1500, "startedAt": 10, "stoppedAt": null}
+        });
+        let u = parse_session_usage(&v).expect("usage");
+        assert_eq!(u.active_cpu_ms, Some(1500));
+        assert_eq!(u.vcpus, Some(2));
+        assert_eq!(u.memory_mb, Some(4096));
+        assert_eq!(u.started_at_ms, Some(10));
+        assert_eq!(u.stopped_at_ms, None);
+        assert!(parse_session_usage(&serde_json::json!(null)).is_err());
+    }
+
+    #[test]
+    fn snapshots_page_skips_bad_ids_and_reads_the_cursor() {
+        let v = serde_json::json!({
+            "snapshots": [
+                {"id": "snap_1", "sizeBytes": 1024, "status": "created", "expiresAt": 5},
+                {"id": "bad/id", "sizeBytes": 1},
+                {"id": "snap_2"}
+            ],
+            "pagination": {"next": 17}
+        });
+        let (items, next) = parse_snapshots(&v).expect("page");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].size_bytes, 1024);
+        assert_eq!(items[0].expires_at_ms, Some(5));
+        assert_eq!(items[1].status, "unknown");
+        assert_eq!(next.as_deref(), Some("17"));
+        assert!(parse_snapshots(&serde_json::json!({})).is_err());
     }
 
     #[test]
