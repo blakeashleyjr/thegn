@@ -3866,10 +3866,12 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #                          #   cli  — always use the `*_command` CLI bridge below.
 # #                          # Native exec also persists its session id, so a restart
 # #                          # reattaches the live sprite session and replays scrollback.
-# # The CLI bridge (used for exec = "cli", and as the auto fallback). PTY-capable.
-# `interactive_command` is used only with exec = "cli"; headless sessions never need the CLI:
-# exec_command = ["sprite", "exec", "-s", "{id}", "--"]
-# interactive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]
+# # The vendor CLI bridge, used only for exec = "cli". PTY-capable. Under
+# # exec = "auto"/"api" these two keys are IGNORED (the native API and
+# # `thegn sprite-exec` carry panes, headless sessions and chrome reads), and
+# # `thegn doctor` warns when they are set. Uncomment only with exec = "cli":
+# # exec_command = ["sprite", "exec", "-s", "{id}", "--"]                      # (only with exec = "cli")
+# # interactive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]      # (only with exec = "cli")
 # up_command = ["sprite", "create", "{id}", "--skip-console"]
 # down_command = ["sprite", "destroy", "-s", "{id}", "--force"]
 # # Wired axes (capability-gated, generic across providers):

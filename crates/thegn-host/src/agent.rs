@@ -4785,7 +4785,7 @@ pub fn launch_spec_full(
     daemon_persistent: bool,
     extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
-    let loc = match GitLoc::for_worktree_op(Path::new(worktree), "pane launch") {
+    let mut loc = match GitLoc::for_worktree_op(Path::new(worktree), "pane launch") {
         Ok(loc) => loc,
         Err(_) if !remote_placement_configured(cfg) => GitLoc::Local(PathBuf::from(worktree)),
         Err(error) => return Err(anyhow::anyhow!(error)),
@@ -4897,6 +4897,21 @@ pub fn launch_spec_full(
         },
         None => None,
     };
+
+    // THE-2054: a provider row stored under an older transport (e.g. the
+    // vendor `sprite exec` CLI before `exec = auto` ignored it) is healed to the
+    // env's current control prefix before anything launches through it.
+    if let Some(db) = db.as_ref()
+        && let Some(fresh) = crate::provision_gate::heal_provider_prefix(
+            db,
+            cfg,
+            &repo_root,
+            worktree,
+            selected_env.clone(),
+        )
+    {
+        loc = fresh;
+    }
 
     // A recorded per-worktree backend is a deliberate override (only the wizard
     // writes it, when divergent); honour it as explicit so it sticks across

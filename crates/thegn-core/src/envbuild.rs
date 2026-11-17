@@ -253,8 +253,9 @@ pub(crate) fn build_env_placement(
                     .map(|s| s.replace("{id}", &id))
                     .collect::<Vec<_>>()
             };
-            // `exec_command`, or the thegn `vps-ssh` self-bridge for VPS
-            // providers (which have no vendor CLI) — see
+            // `exec_command` (a vendor-CLI bridge; for sprites only under
+            // `exec = cli`), else the thegn self-bridge for the kind
+            // (`vps-ssh`/`machine0-ssh`/`sprite-exec`) — see
             // `EnvProviderConfig::control_command_template`.
             let control_prefix = sub(&envc.provider.control_command_template());
             // Interactive (pane) prefix:
@@ -398,6 +399,27 @@ mod tests {
         envc.provider.exec = crate::config::ProviderExecMode::Api;
         let pp = provider_placement(&envc);
         assert_eq!(pp.interactive_prefix, pp.control_prefix);
+    }
+
+    #[test]
+    fn sprites_auto_ignores_both_vendor_cli_bridges() {
+        // THE-2054: a stale `exec_command` AND `interactive_command` under
+        // `exec = auto` must not reroute either prefix through the vendor CLI.
+        let mut envc = provider_env("sprites");
+        envc.provider.exec_command =
+            vec!["sprite".into(), "exec".into(), "{id}".into(), "--".into()];
+        envc.provider.interactive_command = vec!["sprite".into(), "console".into(), "{id}".into()];
+        let pp = provider_placement(&envc);
+        assert_eq!(
+            pp.control_prefix[1], "sprite-exec",
+            "{:?}",
+            pp.control_prefix
+        );
+        assert_eq!(
+            pp.interactive_prefix[1], "sprite-exec",
+            "{:?}",
+            pp.interactive_prefix
+        );
     }
 
     #[test]
