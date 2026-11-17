@@ -20,6 +20,7 @@ pub(crate) mod client;
 pub(crate) mod control_publish;
 pub(crate) mod fork;
 pub(crate) mod inbox;
+pub(crate) mod lead_caps;
 pub(crate) mod pipeline_reaper;
 pub(crate) mod pipeline_retry;
 pub(crate) mod plugins_status;
@@ -1547,6 +1548,9 @@ async fn run(
     // a human ran `dispatch reap`. Slow timer, blocking work off the runtime.
     pipeline_reaper::spawn(svc.clone());
     crate::automation_runtime::subscribe_daemon_events(svc.events.subscribe(), cfg);
+    // Lead tool surface (THE-2172): hand the event sender to the opt-in Notice
+    // feed so automation runs can publish without a service handle.
+    lead_caps::feed::install_global(svc.events.clone());
 
     let state = thegn_svc::control::http::ControlState {
         api: svc.clone(),
@@ -1680,6 +1684,21 @@ async fn run(
             );
         }
     }
+
+    // The Lead's dedicated loopback listener (THE-2171): bearer tokens only,
+    // never implicit admin. `lead_caps::listener::spawn` starts nothing unless
+    // `[lead]` is configured, so the idle invariant holds without it.
+    let lead_state = thegn_svc::control::http::ControlState {
+        api: svc.clone(),
+        store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        require_approval: false,
+        server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
+        cors_origins: Vec::new(),
+        event_streams: Default::default(),
+    };
+    lead_caps::listener::spawn(cfg, lead_state);
 
     tracing::info!(target: "thegn::daemon", %daemon_id, "pane daemon serving on {}", ep.display());
     let serve = axum::serve(
