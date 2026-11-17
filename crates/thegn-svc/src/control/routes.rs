@@ -180,6 +180,13 @@ pub static ROUTES: &[Route] = &[
     route("/v1/merge/drain", &["merge.drain"], || {
         post(http_lead::merge_drain)
     }),
+    // THE-2197 automation kill switch.
+    route("/v1/automations/pause", &["automations.pause"], || {
+        post(http_lead::automations_pause)
+    }),
+    route("/v1/automations/resume", &["automations.resume"], || {
+        post(http_lead::automations_resume)
+    }),
     route("/v1/mcp_proxy/status", &["mcp_proxy.status"], || {
         get(http::mcp_proxy_status)
     }),
@@ -292,6 +299,8 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("approvals.request", "POST", "/v1/approvals/request"),
     ("approvals.resolve", "POST", "/v1/approvals/resolve"),
     ("merge.drain", "POST", "/v1/merge/drain"),
+    ("automations.pause", "POST", "/v1/automations/pause"),
+    ("automations.resume", "POST", "/v1/automations/resume"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
     ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),
     ("plugins.status", "GET", "/v1/plugins/status"),
