@@ -917,3 +917,121 @@ fn client_debug_never_shows_the_token() {
     let shown = format!("{:?}", mock.client());
     assert!(!shown.contains(TOKEN), "{shown}");
 }
+
+// --- wait_command ------------------------------------------------------------
+
+fn command_json(exit: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"command": {"id": "cmd_1", "exitCode": exit}})
+}
+
+#[test]
+fn wait_command_polls_until_the_exit_code_arrives() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let mock = Mock::start(move |_| {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::json("200 OK", command_json(serde_json::Value::Null))
+        } else {
+            Reply::json("200 OK", command_json(serde_json::json!(3)))
+        }
+    });
+    let code = rt()
+        .block_on(
+            mock.client()
+                .wait_command("sess_1", "cmd_1", Duration::from_secs(10)),
+        )
+        .expect("wait");
+    assert_eq!(code, Some(3));
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 2);
+    for r in &reqs {
+        assert_eq!(r.method, "GET");
+        assert_eq!(r.path(), "/v2/sandboxes/sessions/sess_1/cmd/cmd_1");
+        assert_eq!(r.query().get("wait").map(String::as_str), Some("true"));
+        assert_eq!(
+            r.query().get("projectId").map(String::as_str),
+            Some(PROJECT)
+        );
+    }
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn wait_command_gives_up_at_the_hard_deadline() {
+    let mock = Mock::start(|_| Reply::json("200 OK", command_json(serde_json::Value::Null)));
+    let started = std::time::Instant::now();
+    let code = rt()
+        .block_on(
+            mock.client()
+                .wait_command("sess_1", "cmd_1", Duration::from_millis(1200)),
+        )
+        .expect("wait");
+    assert_eq!(code, None, "no exit within the deadline is unknown");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline bounds the whole wait: {:?}",
+        started.elapsed()
+    );
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn wait_command_maps_an_out_of_range_code_and_refuses_another_command() {
+    let mock = Mock::start(|_| Reply::json("200 OK", command_json(serde_json::json!(1_i64 << 40))));
+    let code = rt()
+        .block_on(
+            mock.client()
+                .wait_command("sess_1", "cmd_1", Duration::from_secs(5)),
+        )
+        .expect("wait");
+    assert_eq!(code, Some(EXEC_EXIT_STATUS_UNKNOWN));
+    mock.assert_custody(&[]);
+
+    let other = Mock::start(|_| {
+        Reply::json(
+            "200 OK",
+            serde_json::json!({"command": {"id": "cmd_2", "exitCode": 0}}),
+        )
+    });
+    let err = rt()
+        .block_on(
+            other
+                .client()
+                .wait_command("sess_1", "cmd_1", Duration::from_secs(5)),
+        )
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("different command"), "{err:#}");
+    other.assert_custody(&[&err]);
+}
+
+#[test]
+fn wait_command_errors_are_scrubbed_and_ids_are_checked_before_the_wire() {
+    let mock = Mock::start(|_| {
+        Reply::json(
+            "400 Bad Request",
+            serde_json::json!({"error": {"message": format!("bad token {TOKEN}")}}),
+        )
+    });
+    let err = rt()
+        .block_on(
+            mock.client()
+                .wait_command("sess_1", "cmd_1", Duration::from_secs(5)),
+        )
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("400"), "{err:#}");
+    mock.assert_custody(&[&err]);
+    assert_eq!(mock.requests().len(), 1, "a terminal 4xx is not retried");
+
+    let bad = rt()
+        .block_on(
+            mock.client()
+                .wait_command("sess_1", "../cmd", Duration::from_secs(5)),
+        )
+        .unwrap_err();
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "an invalid id never reaches the wire"
+    );
+    mock.assert_custody(&[&bad]);
+}

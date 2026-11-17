@@ -12,10 +12,11 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use thegn_core::vercel::admit::valid_sandbox_name;
-use thegn_core::vercel::api::{LogLine, command_body};
+use thegn_core::vercel::api::LogLine;
 
+use super::client::WAIT_COMMAND_DEADLINE;
 use super::pty::{CHANNEL_CAPACITY, send_chunked};
 use super::{VercelProvider, Wake};
 use crate::provider::{EXEC_EXIT_STATUS_UNKNOWN, ExecControl, ExecFrame, ExecSession, ExecSpec};
@@ -60,22 +61,22 @@ impl StreamOps for ClientOps {
     }
 
     async fn wait_exit(&self) -> Result<Option<i32>> {
-        // TODO(integration): use the client's wait_command once lane 3 exposes it
-        // The spine `VercelClient` has no `GET …/cmd/{id}?wait=true` call, so
-        // the exit code comes from a `Command` log line when the stream
-        // carries one; otherwise it is unknown.
-        Ok(None)
+        // The log stream ended without a `Command` line carrying the exit:
+        // ask the control plane, under the client's hard overall deadline.
+        self.provider
+            .client
+            .wait_command(&self.session, &self.cmd, WAIT_COMMAND_DEADLINE)
+            .await
     }
 }
 
 impl VercelProvider {
     /// Open a stream-mode session: run `spec.argv` detached and follow its
     /// logs. Resumes a stopped sandbox. `spec.tty`, `cols` and `rows` are
-    /// ignored (there is no PTY).
+    /// ignored (there is no PTY). `spec.env` passes the provider allowlist.
     pub async fn open_stream(self: Arc<Self>, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
         anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
-        let body = command_body(&spec.argv, spec.cwd.as_deref(), &spec.env, false)
-            .map_err(|e| anyhow!("vercel: command body: {e}"))?;
+        let body = self.command_body(&spec.argv, spec.cwd.as_deref(), &spec.env, false)?;
         let session = self.session_for(name, Wake::Allow).await?;
         let cmd = self.client.run_detached(&session, &body).await?;
         let logs = match self.client.logs(&session, &cmd).await {
