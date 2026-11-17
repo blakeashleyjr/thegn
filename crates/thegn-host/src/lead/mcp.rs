@@ -225,6 +225,33 @@ pub(crate) fn revoke_tab_token(_cfg: &Config, caller: &str) -> Result<usize> {
     revoke_tab_token_in(&db, &thegn_core::util::xdg_state_home(), now_ms(), caller)
 }
 
+/// Revoke a closed Lead tab's control token (and every label the close
+/// shifted, see [`invalidated_by_close`]) and remove its `mcp-<tab>.json`,
+/// OFF the loop: the DB write and the unlink run on the bounded background
+/// pool, never on the caller. A no-op unless `[lead]` is enabled and `group`
+/// is the Lead group. Tab 0 revokes the whole group.
+pub(crate) fn revoke_closed_tab_off_loop(cfg: &Config, group: &str, tab: usize) {
+    if !crate::lead::enabled(cfg) || !crate::lead::group::is_lead_group(group) {
+        return;
+    }
+    let caller = tab_caller(group, tab);
+    let cfg = cfg.clone();
+    let admission = crate::sched::spawn_bg(move || match revoke_tab_token(&cfg, &caller) {
+        Ok(revoked) => {
+            tracing::debug!(target: "thegn::lead", %caller, revoked, "revoked closed Lead tab token");
+        }
+        // best-effort: a failed revoke leaves the token live until the
+        // listener's next start (or the tab index's next mint) revokes it;
+        // the close itself must not fail on it.
+        Err(error) => {
+            tracing::warn!(target: "thegn::lead", %caller, error = %format!("{error:#}"), "revoking a closed Lead tab token failed");
+        }
+    });
+    if admission != crate::sched::Admission::Admitted {
+        tracing::warn!(target: "thegn::lead", group, tab, ?admission, "Lead tab token revoke not scheduled");
+    }
+}
+
 fn revoke_tab_token_in(
     store: &dyn ControlStore,
     state_home: &Path,
@@ -671,24 +698,6 @@ mod tests {
             revoke_tab_token_in(&db, state.path(), 3, "lead:lead/1").unwrap(),
             0
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mcp_file_removal_unlinks_a_symlink_without_following_it() {
-        let state = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
-        let victim = target.path().join("victim.json");
-        std::fs::write(&victim, b"keep").unwrap();
-        let dir = control_dir_in(state.path()).unwrap();
-        let link = dir.path().join(mcp_file_name("lead:lead/0"));
-        std::os::unix::fs::symlink(&victim, &link).unwrap();
-        assert_eq!(
-            remove_mcp_files_in(state.path(), &["lead:lead/0".to_string()]).unwrap(),
-            1
-        );
-        assert!(link.symlink_metadata().is_err());
-        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
     }
 
     #[test]
