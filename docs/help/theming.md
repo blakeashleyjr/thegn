@@ -24,6 +24,9 @@ The command palette also lists it as **Open theme builder**.
   dots, git graph, and popups. Each element row shows a live swatch, the
   element, and the token behind it; a token can appear under several elements.
 - `Tab` / `Shift-Tab` moves focus through the rows and the Apply row.
+- In the element view, the selected group's part of the workspace (sidebar,
+  masthead, status bar, center or panel) stays lit behind the builder while the
+  rest dims; if that part is hidden, the builder says so.
 - In the element view, `Enter` or `Space` on a group header collapses or
   expands it, and `←` / `→` collapse or expand the group under the cursor.
 - `Enter` on a token or element opens the **palette picker** for that token,
