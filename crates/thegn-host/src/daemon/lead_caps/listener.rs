@@ -32,6 +32,9 @@ pub(crate) fn spawn(
     );
     let mut state = state;
     state.require_approval = true; // a code redeemed via the Lead listener always parks for operator approval
+    // Every caller on this listener is Lead-confined, whatever its token's
+    // label (`thegn_core::lead_confine`).
+    state.lead_listener = true;
     let bound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .and_then(|l| l.set_nonblocking(true).map(|()| l))
         .and_then(|l| l.local_addr().map(|addr| (l, addr)));

@@ -109,6 +109,16 @@ pub fn validate_lead_rule(
     }
     if !lead_action_allowed(&rule.then.cap) {
         errors.push(LEAD_ESCALATION_REFUSAL.to_string());
+    } else if rule.then.cap.trim() == "sessions.open"
+        && let Err(refusal) = crate::lead_confine::check_rule_open_action(
+            rule.then.agent.as_deref(),
+            rule.then.prompt.as_deref(),
+        )
+    {
+        // The same agent-by-name-only shape a direct Lead `sessions.open`
+        // must have; re-run on every load through `compile_lead_row`. The
+        // daemon re-checks the worktree (registered, sandboxed) when it fires.
+        errors.push(refusal.to_string());
     }
     let Some(id) = id else {
         return Err(errors);
@@ -450,6 +460,26 @@ mod tests {
                 "{cap:?}: {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn lead_open_rules_must_name_an_agent_with_a_bounded_prompt() {
+        let mut no_agent = rule("ping", "sessions.open");
+        no_agent.then.agent = None;
+        let errors = validate_lead_rule(&no_agent, &[]).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.starts_with(crate::lead_confine::REFUSAL_PREFIX)),
+            "{errors:?}"
+        );
+        let mut big = rule("ping", "sessions.open");
+        big.then.prompt = Some("x".repeat(crate::lead_confine::MAX_LEAD_PROMPT_BYTES + 1));
+        let errors = validate_lead_rule(&big, &[]).unwrap_err();
+        assert!(errors.join("\n").contains("prompt is"), "{errors:?}");
+        let mut ok = rule("ping", "sessions.open");
+        ok.then.prompt = Some("review the diff".into());
+        assert!(validate_lead_rule(&ok, &[]).is_ok());
     }
 
     #[test]

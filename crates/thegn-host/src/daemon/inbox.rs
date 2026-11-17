@@ -104,6 +104,7 @@ pub fn spawn(
         // browser origin to allow (same as the other non-HTTP ControlStates).
         cors_origins: Vec::new(),
         event_streams: Default::default(),
+        lead_listener: false,
     };
 
     let (raw_tx, raw_rx) = mpsc::channel::<String>(RAW_BUFFER);
