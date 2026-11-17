@@ -10031,7 +10031,12 @@ async fn event_loop<T: Terminal>(
                     let (specs, attach) = crate::handlers::prewarm::resolve_automatic_with(
                         first_leaf,
                         || {
-                            if is_terminal {
+                            if is_terminal && crate::lead::group::is_lead_group(&name) {
+                                // THE-2187: the Lead never pre-warms. Its spec is the
+                                // sandboxed agent (materialize builds it); a terminal
+                                // spec here would be a host shell.
+                                Err(SpecError::PrewarmSkipped)
+                            } else if is_terminal {
                                 // This session's wizard choice wins over the DB row (a
                                 // failed best-effort persist must not change the spawn).
                                 let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
