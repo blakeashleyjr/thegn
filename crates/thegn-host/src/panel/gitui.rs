@@ -2872,17 +2872,10 @@ mod tests {
                 Some(GitMsg::Cheatsheet),
                 "{view:?}"
             );
-            // `/` filters the label-backed lists. Files has no filter labels
-            // (`list_labels` has no arm for it), so advertising the key there
-            // was an audited no-op and it was removed from that table.
-            let want = if view == GitView::Files {
-                None
-            } else {
-                Some(GitMsg::FilterStart)
-            };
+            // `/` filters every list, Files included (its live filter).
             assert_eq!(
                 git_key(&KeyCode::Char('/'), Modifiers::NONE, &ui),
-                want,
+                Some(GitMsg::FilterStart),
                 "{view:?}"
             );
         }
