@@ -341,12 +341,9 @@ fn read_archive_listing(
             return Ok(lines);
         }
     };
-    let count = listing.total_hint.unwrap_or(listing.entries.len() as u64);
-    let mut header = format!("{label}, {count} entries");
-    if listing.truncated.is_some() {
-        header.push_str(", listing truncated");
-    }
-    let mut lines = vec![header, String::new()];
+    let mut lines: Vec<String> = Vec::new();
+    let mut retained = 0usize;
+    let mut byte_capped = false;
     for e in &listing.entries {
         let size = e.size.map(|s| s.to_string()).unwrap_or_default();
         let name = thegn_core::msg::terminal_safe(&e.name);
@@ -360,8 +357,20 @@ fn read_archive_listing(
             _ if e.encrypted => format!("{size:>10}  {name} (encrypted)"),
             _ => format!("{size:>10}  {name}"),
         };
-        lines.push(bounded_line(&text.replace('\n', " ")));
+        let line = bounded_line(&text.replace('\n', " "));
+        if retained.saturating_add(line.len()) > PREVIEW_MAX_TOTAL_BYTES {
+            byte_capped = true;
+            break;
+        }
+        retained += line.len();
+        lines.push(line);
     }
+    let count = listing.total_hint.unwrap_or(listing.entries.len() as u64);
+    let mut header = format!("{label}, {count} entries");
+    if listing.truncated.is_some() || byte_capped {
+        header.push_str(", listing truncated");
+    }
+    lines.splice(0..0, [header, String::new()]);
     Ok(lines)
 }
 
