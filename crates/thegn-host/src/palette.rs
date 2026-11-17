@@ -939,6 +939,7 @@ pub(crate) const ENV_SETUP_KINDS: &[&str] = &[
     "sprites",
     "daytona",
     "machine0",
+    "vercel",
 ];
 /// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
 /// a literal shell. The key is the bare choice name (the `PendingAgent` gate in

@@ -569,6 +569,23 @@ pub const CATALOG: &[Slot] = &[
     slot("env deprovision", "env", SourceKind::Env),
     slot("env rm", "name", SourceKind::Env),
     slot("env set", "name", SourceKind::Env),
+    // Vercel identifiers are opaque ids the user pastes from the dashboard;
+    // there is nothing to complete them from.
+    slot(
+        "env create",
+        "team_id",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "env create",
+        "project_id",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "env reap",
+        "provider",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("env test", "name", SourceKind::Env),
     slot("fleet list", "env", SourceKind::Env),
     slot("wt new", "env", SourceKind::Env),
