@@ -275,6 +275,20 @@ impl AutomationsConfig {
     }
 }
 
+/// Validate and compile one rule outside a config document, through the same
+/// validator `compiled_rules` uses. Lead-authored rules (THE-2181) go through
+/// here; cross-rule checks (duplicate names, the rule count) are the caller's.
+pub fn compile_one(rule: &AutomationRuleConfig) -> Result<AutomationRule, Vec<String>> {
+    let key = format!("automations.rules.{}", rule.name.trim());
+    let mut errors = Vec::new();
+    validate_rule(rule, &key, &mut errors);
+    if errors.is_empty() {
+        Ok(compile_rule(rule))
+    } else {
+        Err(errors)
+    }
+}
+
 fn bounded<T>(errors: &mut Vec<String>, key: &str, value: T, min: T, max: T)
 where
     T: Ord + std::fmt::Display + Copy,
