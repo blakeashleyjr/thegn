@@ -36,7 +36,6 @@ pub mod staging;
 
 use termwiz::input::{KeyCode, Modifiers};
 
-/// The four top-level panel tabs that group sections by concern.
 /// Freshness of the header's ahead/behind read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpstreamRead {
@@ -55,6 +54,7 @@ pub enum ZoneChip {
     Unknown,
 }
 
+/// The four top-level panel tabs that group sections by concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelTab {
     /// Git operations: Changes, Commits, Branches, Stash, Files.
