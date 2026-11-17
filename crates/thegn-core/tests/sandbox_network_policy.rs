@@ -8,7 +8,7 @@ use thegn_core::config::{
 use thegn_core::placement::Placement;
 use thegn_core::remote::GitLoc;
 use thegn_core::sandbox::{
-    Backend, HOSTNAME_RULES, HostnameRulesPolicy, SandboxLimits, SandboxSpec, ensure, enter_argv,
+    Backend, HOSTNAME_RULES, HostnameRulesPolicy, SandboxSpec, ensure, enter_argv,
     hostname_rules_note, resolve_placed_exact,
 };
 
@@ -31,38 +31,12 @@ fn force_rm(name: &str) {
 fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
     SandboxSpec {
         backend: Backend::Podman,
-        placement: Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from("/tmp/tg-e2e-net"),
-        mounts: vec![],
-        env: vec![],
-        env_overrides: std::collections::HashMap::new(),
-        env_block: vec![],
-        network: Network::Nat,
-        network_allow: vec![],
         network_block: block,
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: vec![],
-        add_capabilities: vec![],
         file_access: FileAccess::None,
-        ports: vec![],
-        gpu: None,
-        limits: SandboxLimits::default(),
-        volumes: vec![],
-        compose: None,
-        build: None,
-        init_script: None,
-        devenv: false,
-        devenv_path: None,
         name: name.into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 

@@ -204,7 +204,7 @@ pub fn policy_fingerprint(spec: &SandboxSpec, vpn_join: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::policy_fingerprint;
-    use crate::config::{FileAccess, Network};
+    use crate::config::Network;
     use crate::config::{VpnDnsMode, VpnMode, VpnOnError, VpnProviderKind};
     use crate::placement::{Placement, SshPlacement, TransportKind};
     use crate::sandbox::{Backend, Mount, SandboxLimits, SandboxSpec, VpnParams, VpnSpec};
@@ -215,7 +215,6 @@ mod tests {
     fn spec() -> SandboxSpec {
         SandboxSpec {
             backend: Backend::Podman,
-            placement: Placement::Local,
             image: Some("img:latest".into()),
             worktree: PathBuf::from("/wt/feat"),
             mounts: vec![Mount {
@@ -224,34 +223,8 @@ mod tests {
                 ro: false,
                 cache: false,
             }],
-            env: Vec::new(),
-            env_overrides: std::collections::HashMap::new(),
-            env_block: Vec::new(),
-            network: Network::Nat,
-            network_allow: Vec::new(),
-            network_block: Vec::new(),
-            read_only_root: false,
-            no_new_privileges: false,
-            pids_limit: None,
-            drop_capabilities: Vec::new(),
-            add_capabilities: Vec::new(),
-            file_access: FileAccess::WorktreePlusCaches,
-            ports: Vec::new(),
-            gpu: None,
-            limits: SandboxLimits::default(),
-            volumes: Vec::new(),
-            compose: None,
-            build: None,
-            init_script: None,
-            devenv: false,
-            devenv_path: None,
             name: "thegn-repo-feat".into(),
-            vpn: None,
-            oci_host: None,
-            oci_runtime: None,
-            daemon_persistent: false,
-            seal_home: None,
-            volume_owners: Vec::new(),
+            ..SandboxSpec::default()
         }
     }
 
