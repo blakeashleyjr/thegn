@@ -1125,6 +1125,13 @@ impl Db {
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
+
+    /// Mutable connection accessor for tests that install per-connection hooks
+    /// (rusqlite 0.41's `busy_handler` takes `&mut self`).
+    #[cfg(test)]
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
 }
 
 /// One row of the local merge queue (`[merge_queue]`, v22). Keyed by worktree;
