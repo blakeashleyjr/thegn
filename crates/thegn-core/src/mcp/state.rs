@@ -2950,7 +2950,12 @@ mod tests {
             .expect("automations_pause listed");
         assert_eq!(pause["annotations"]["readOnlyHint"], json!(false));
         assert_eq!(pause["annotations"]["destructiveHint"], json!(false));
-        assert_eq!(pause["inputSchema"]["required"], json!([]));
+        // A tool with no arguments lists none as required (the key may be absent).
+        assert!(
+            pause["inputSchema"]["required"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
         assert!(r.call("automations_pause", &json!({})).is_some());
     }
 
