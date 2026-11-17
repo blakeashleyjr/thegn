@@ -29,7 +29,7 @@ exclude = ["apps", "vendor"]
 termwiz = { path = "vendor/termwiz" }
 
 [workspace.package]
-version = "0.1.0-alpha.91"
+version = "0.1.0-alpha.92"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Resolves cargo-binstall's `{ repo }` template variable (thegn-host's
@@ -59,10 +59,12 @@ clap = { version = "4.5", features = ["derive", "env", "unstable-ext"] }
 # instead of replaying a stale script. It also implies `clap/unstable-ext`.
 # Same containment boundary and same fallback as the note above.
 clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde-saphyr = { version = "2.0.0", default-features = false, features = [
+  "deserialize",
+] }
 toml = "0.8"
 url = "2.5"
 walkdir = "2.5"

@@ -14,6 +14,10 @@
 //! index. The loop refreshes it in place (like the status modal) only while the
 //! popup is open, which is also the only time the sampler runs.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
 use thegn_core::cpu_attrib::{
     self, AttribInputs, AttribRow, Owner, PaneOwner, PaneUsage, RowKind, ScopeUsage, SelfUsage,
     SortKey, TopProc, Usage,
@@ -34,7 +38,7 @@ pub(crate) const TITLE: &str = "CPU";
 /// Title of the `mem` popup (unchanged from before the breakdown existed).
 pub(crate) const MEM_TITLE: &str = "Memory";
 /// Requested popup width; `sections` clamps it to the screen.
-pub(crate) const COLS: usize = 60;
+pub(crate) const COLS: usize = 68;
 /// Label of the heading the attribution sections start at. `refresh_open`
 /// replaces everything from here down and leaves the graphs above alone.
 const HEADING: &str = "by workspace";
@@ -180,11 +184,99 @@ fn label_tone(kind: RowKind) -> Tok {
     }
 }
 
+/// Samples kept per row.
+const SERIES_CAP: usize = 16;
+/// Rows tracked at once.
+const MAX_SERIES: usize = 64;
+/// A series idle longer than this restarts (a reopened popup starts fresh).
+const STALE: Duration = Duration::from_secs(10);
+/// Width of the trend cell.
+const TREND_CELLS: usize = 8;
+
+/// One row's newest-sample instant and recent CPU samples.
+type Series = (Instant, VecDeque<f32>);
+
+/// Per-row CPU history of the open popup.
+#[derive(Default)]
+struct History {
+    series: HashMap<String, Series>,
+}
+
+thread_local! {
+    static HISTORY: RefCell<History> = RefCell::new(History::default());
+}
+
+/// Fold one refresh's per-row CPU readings into `h`: a `None` is skipped, a
+/// series is capped at [`SERIES_CAP`], a series whose newest sample is older
+/// than [`STALE`] restarts, ids absent this round are dropped, and at most
+/// [`MAX_SERIES`] series are kept.
+fn record(h: &mut History, ids_vals: &[(String, Option<f32>)], now: Instant) {
+    h.series
+        .retain(|id, _| ids_vals.iter().any(|(i, _)| i == id));
+    for (id, v) in ids_vals {
+        if !h.series.contains_key(id) && h.series.len() >= MAX_SERIES {
+            continue;
+        }
+        let entry = h
+            .series
+            .entry(id.clone())
+            .or_insert_with(|| (now, VecDeque::new()));
+        if now.saturating_duration_since(entry.0) > STALE {
+            entry.1.clear();
+        }
+        let Some(v) = v else { continue };
+        entry.0 = now;
+        entry.1.push_back(*v);
+        while entry.1.len() > SERIES_CAP {
+            entry.1.pop_front();
+        }
+    }
+}
+
+/// Stable per-row ids: the label path from the root, so equal labels under
+/// different parents stay distinct.
+fn row_ids(rows: &[AttribRow]) -> Vec<String> {
+    let mut path: Vec<&str> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    rows.iter()
+        .map(|r| {
+            path.truncate(usize::from(r.depth));
+            path.push(&r.label);
+            let id = path.join("\u{1f}");
+            let n = seen.entry(id.clone()).or_insert(0);
+            let out = if *n == 0 {
+                id
+            } else {
+                format!("{id}\u{1f}#{n}")
+            };
+            *n += 1;
+            out
+        })
+        .collect()
+}
+
+/// A sparkline of `vals` through the caps glyph table (ASCII fallback),
+/// scaled against 100% or the series peak. Empty under two samples.
+fn trend_text(vals: &VecDeque<f32>) -> String {
+    if vals.len() < 2 {
+        return String::new();
+    }
+    let peak = vals.iter().copied().fold(100.0_f32, f32::max);
+    let spark = crate::caps::raster_table().spark;
+    let top = spark.len() - 1;
+    vals.iter()
+        .rev()
+        .take(TREND_CELLS)
+        .rev()
+        .map(|v| spark[((v / peak).clamp(0.0, 1.0) * top as f32).round() as usize])
+        .collect()
+}
+
 fn dash() -> String {
     "—".to_string()
 }
 
-fn render_row(r: &AttribRow) -> Vec<Cell> {
+fn render_row(r: &AttribRow, trend: String) -> Vec<Cell> {
     let indent = "  ".repeat(usize::from(r.depth));
     let label = trunc(format!("{indent}{}", r.label), LABEL_CELLS);
     let num = if r.kind == RowKind::Proc {
@@ -201,6 +293,7 @@ fn render_row(r: &AttribRow) -> Vec<Cell> {
             Tok::Slot(S::Dim),
         ),
         Cell::Text(r.rss.map_or_else(dash, human_bytes), num),
+        Cell::Text(trend, Tok::Slot(S::Ghost2)),
     ]
 }
 
@@ -267,7 +360,25 @@ fn row_acts(owners: &[PaneOwner], rows: &[AttribRow]) -> Vec<RowActs> {
 /// `cpu` popup, RSS for `mem`.
 pub(crate) fn build_sections(model: &FrameModel, sort: SortKey) -> (Vec<Section>, Vec<RowActs>) {
     let tree = tree(model, sort);
-    let header = vec!["where".into(), "cpu".into(), "share".into(), "mem".into()];
+    let header = vec![
+        "where".into(),
+        "cpu".into(),
+        "share".into(),
+        "mem".into(),
+        "trend".into(),
+    ];
+    let ids = row_ids(&tree.rows);
+    let trends: Vec<String> = HISTORY.with(|h| {
+        let h = h.borrow();
+        ids.iter()
+            .map(|id| {
+                h.series
+                    .get(id)
+                    .map(|s| trend_text(&s.1))
+                    .unwrap_or_default()
+            })
+            .collect()
+    });
     let acts = row_acts(&model.pane_owners, &tree.rows);
     let secs = vec![
         Section::Heading {
@@ -276,7 +387,12 @@ pub(crate) fn build_sections(model: &FrameModel, sort: SortKey) -> (Vec<Section>
         },
         Section::Table(TableSection {
             header,
-            rows: tree.rows.iter().map(render_row).collect(),
+            rows: tree
+                .rows
+                .iter()
+                .zip(trends)
+                .map(|(r, t)| render_row(r, t))
+                .collect(),
             sel: None,
         }),
     ];
@@ -300,6 +416,14 @@ pub(crate) fn install(ov: &mut DetailOverlay, model: &FrameModel, screen: Rect) 
         .position(|s| matches!(s, Section::Heading { label, .. } if label == HEADING))
         .unwrap_or(sections.len());
     sections.truncate(start);
+    // Popup open only: the history advances here and nowhere else.
+    let t = tree(model, sort);
+    let ids: Vec<(String, Option<f32>)> = row_ids(&t.rows)
+        .into_iter()
+        .zip(&t.rows)
+        .map(|(id, r)| (id, r.cpu_pct))
+        .collect();
+    HISTORY.with(|h| record(&mut h.borrow_mut(), &ids, Instant::now()));
     let (fresh, rows) = build_sections(model, sort);
     sections.extend(fresh);
     let content: usize = sections.iter().map(Section::height).sum();
@@ -334,8 +458,16 @@ pub(crate) fn refresh_open(
 }
 
 #[cfg(test)]
+fn reset_history() {
+    HISTORY.with(|h| h.borrow_mut().series.clear());
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{HEADING, MEM_TITLE, TITLE, build_sections, is_open, refresh_open};
+    use super::{
+        HEADING, History, MAX_SERIES, MEM_TITLE, SERIES_CAP, STALE, TITLE, build_sections, is_open,
+        record, refresh_open, reset_history, row_ids,
+    };
     use crate::chrome::{BarItemId, FrameModel};
     use crate::compositor::Rect;
     use crate::detail::{
@@ -344,8 +476,23 @@ mod tests {
     };
     use crate::seg::Tok;
     use crate::telemetry::TelemetryHistory;
+    use std::time::{Duration, Instant};
     use termwiz::input::{KeyCode, Modifiers};
-    use thegn_core::cpu_attrib::{PaneOwner, SortKey};
+    use thegn_core::cpu_attrib::{AttribRow, PaneOwner, RowKind, SortKey};
+
+    #[test]
+    fn row_ids_are_unique_for_equal_sibling_labels() {
+        let r = |l: &str| AttribRow {
+            depth: 0,
+            kind: RowKind::Workspace,
+            label: l.into(),
+            cpu_pct: None,
+            share_of_total: None,
+            rss: None,
+        };
+        let ids = row_ids(&[r("x"), r("x")]);
+        assert_ne!(ids[0], ids[1]);
+    }
 
     fn model() -> FrameModel {
         let owner = |id: u32, ws: &str, wt: &str| PaneOwner {
@@ -563,7 +710,7 @@ mod tests {
             empty[0],
             "by workspace: open the breakdown to start sampling"
         );
-        assert!(empty.iter().any(|l| l == "thegn|—|—|—"), "{empty:?}");
+        assert!(empty.iter().any(|l| l == "thegn|—|—|—|"), "{empty:?}");
 
         let mut partial = model();
         partial.procs.summary = None;
@@ -635,5 +782,92 @@ mod tests {
         assert!(!refresh_open(&mut other, &fresh, &ctx));
         let mut none = None;
         assert!(!refresh_open(&mut none, &fresh, &ctx));
+    }
+
+    fn one(id: &str, v: Option<f32>) -> Vec<(String, Option<f32>)> {
+        vec![(id.to_string(), v)]
+    }
+
+    #[test]
+    fn record_caps_each_series_at_sixteen() {
+        let mut h = History::default();
+        let t = Instant::now();
+        for i in 0..40 {
+            record(&mut h, &one("a", Some(i as f32)), t);
+        }
+        let s = &h.series["a"].1;
+        assert_eq!(s.len(), SERIES_CAP);
+        assert_eq!(s.back().copied(), Some(39.0));
+    }
+
+    #[test]
+    fn record_resets_a_stale_series_and_skips_none() {
+        let mut h = History::default();
+        let t = Instant::now();
+        record(&mut h, &one("a", Some(1.0)), t);
+        record(&mut h, &one("a", Some(2.0)), t);
+        record(&mut h, &one("a", None), t);
+        assert_eq!(h.series["a"].1.len(), 2, "None is skipped");
+        record(
+            &mut h,
+            &one("a", Some(3.0)),
+            t + STALE + Duration::from_secs(1),
+        );
+        assert_eq!(h.series["a"].1.len(), 1, "stale series restarts");
+    }
+
+    #[test]
+    fn record_drops_absent_ids_and_caps_series_count() {
+        let mut h = History::default();
+        let t = Instant::now();
+        record(&mut h, &one("a", Some(1.0)), t);
+        record(&mut h, &one("b", Some(1.0)), t);
+        assert!(!h.series.contains_key("a"));
+        let many: Vec<_> = (0..MAX_SERIES + 10)
+            .map(|i| (format!("r{i}"), Some(1.0)))
+            .collect();
+        record(&mut h, &many, t);
+        assert_eq!(h.series.len(), MAX_SERIES);
+    }
+
+    #[test]
+    fn trend_cell_fills_after_two_installs_and_is_empty_for_fresh_rows() {
+        reset_history();
+        let hist = TelemetryHistory::default();
+        let ctx = StatusCtx::new_for_test(&hist);
+        let item = Rect {
+            x: 80,
+            y: 0,
+            cols: 8,
+            rows: 1,
+        };
+        let mut slot = open_detail_for(&BarItemId::Widget("cpu".into()), item, &model(), &ctx);
+        let trend_of = |slot: &Option<crate::detail::DetailOverlay>, label: &str| {
+            let Some(ov) = slot else { unreachable!() };
+            let DetailContent::Sections(d) = &ov.content else {
+                panic!("sectioned")
+            };
+            texts(&d.sections)
+                .into_iter()
+                .find(|l| l.starts_with(label))
+                .map(|l| l.rsplit('|').next().unwrap_or("").to_string())
+                .expect("row")
+        };
+        assert_eq!(trend_of(&slot, "alpha|"), "", "one sample: no trend");
+        assert!(refresh_open(&mut slot, &model(), &ctx));
+        assert!(!trend_of(&slot, "alpha|").is_empty());
+        assert!(!trend_of(&slot, "alpha|").is_ascii());
+        crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+            assert!(refresh_open(&mut slot, &model(), &ctx));
+            let t = trend_of(&slot, "alpha|");
+            assert!(!t.is_empty() && t.is_ascii(), "{t:?}");
+        });
+        // A row that appears only now has a single sample.
+        let mut fresh = model();
+        fresh.pane_owners = Vec::<PaneOwner>::new().into();
+        assert!(refresh_open(&mut slot, &fresh, &ctx));
+        assert_eq!(trend_of(&slot, "unattributed panes|"), "");
+        assert_eq!(row_ids(&[]).len(), 0);
+        reset_history();
     }
 }

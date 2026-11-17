@@ -47,7 +47,11 @@ accordion — four tabs, one open section at a time:
 - `↵` — act on the cursor row (open, jump, link — per section below);
   `Esc` steps back out of the rows
 - `e` — cycle the width: normal → half → full-screen; `E` shrinks the width,
-  except in git **commits**, where it edits/rewords.
+  except in git **commits**, where it edits/rewords. The current width shows
+  as a chip at the right of the tab row (`normal`, `half`, `full`; `norm`
+  when narrow, nothing when narrower) — click it to cycle, the same as `e`.
+  The `e more` hint after `normal` means the open section has a richer view
+  one keypress away.
 - `F1` — open the full help overlay; git-family sections also show their
   own gitui cheatsheet on `?`
 - Long lists show `↑N above` and `+N more` at every width. At Full width,
@@ -127,6 +131,11 @@ those workflows.
 - **Per-section memory** — each section remembers the width you last gave
   it (persisted); hopping sections restores it, so a full-screen Logs and a
   narrow Changes coexist.
+- **Width chip** — the right end of the tab row names the current width
+  (`normal`, `half`, `full`, or `norm` when narrow). Clicking it cycles the
+  width like `e`; clicking a tab label still switches tabs. The git
+  full-screen and half-width drill views have no tab row, so the word sits at
+  the right of their help row instead and clicks the same way.
 - **Auto-widen (DWIM)** — an action that needs a wider view (for example,
   `s` squash at resting width) widens the panel and performs the action in
   one press instead of printing a "widen first" note.
@@ -204,8 +213,9 @@ files), `?` shows that section's own key cheatsheet.
 
 The worktree's file tree; `/` filters it (directories stay while any
 descendant matches; Esc clears), `↵` previews a file inline, `o` pages
-it in bat, `O` opens your editor, `y` reveals it in yazi. An unknown binary
-previews as a hex dump of its first 4096 bytes. See
+it in bat, `O` opens your editor, `y` reveals it in yazi. A zip, jar, whl,
+tar or tar.gz previews as an entry listing; an unknown binary previews as a
+hex dump of its first 4096 bytes. See
 [[git-and-diffs]].
 
 {{keys:files}}

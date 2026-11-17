@@ -7,6 +7,36 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.92] — 2026-11-17
+
+### Added
+
+- The panel's current width shows as a clickable chip at the right of the tab row; clicking cycles the width like `e`.
+- Sidebar two-line rows continue the tree guide on the detail line.
+- The cpu/mem popup rows show a short CPU trend sparkline.
+- `thegn agent run --env <name>` pins the worktree to that env first; without it, a worktree with no env selection and no provider location is pinned to `pipeline` when `[env.pipeline]` is defined. `--json` includes `env`.
+- Theme catalog row.
+- The file preview lists the entries of zip, jar, whl, tar and tar.gz archives (names sanitized, bounded scan) instead of a hex dump. (THE-135)
+
+### Changed
+
+- The sidebar mode chip shrinks to the word `full`, then disappears (no `▌`).
+- YAML parsing moved from serde_yaml to serde-saphyr: merge keys (`<<:`) are now applied, duplicate keys still error, and overlay syntax errors are multi-line with a source excerpt.
+- `thegn secret` store now needs the secrets dir to be creatable even when the keyring would accept the value. (THE-522)
+- Plain-session tracking reads only the rows it needs instead of the whole dispatch roster. (THE-259)
+- `thegn dispatch note` is limited to 120 notes per row per minute; the error says when to retry, and `--json` reports `"kind":"rate"`. (THE-243)
+- termwiz vendoring decision recorded in docs/ARCHITECTURE.md. (THE-681)
+
+### Fixed
+
+- A one-shot plugin that detaches a setsid helper and exits successfully no longer leaves the helper running. (THE-929)
+
+### Security
+
+- rusqlite/SQLite bumped to address a SQLite CVE.
+- Concurrent `thegn secret` writes from two processes no longer interleave keyring and file-fallback steps; a keyring write that timed out holds the lock until it really finishes. (THE-522)
+- Hook-log pruning works through held directory handles and can no longer be redirected by a swapped directory. (THE-518)
+
 ## [0.1.0-alpha.91] — 2026-11-16
 
 ### Added
@@ -3730,7 +3760,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.91...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.92...HEAD
+[0.1.0-alpha.92]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.91...v0.1.0-alpha.92
 [0.1.0-alpha.91]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.90...v0.1.0-alpha.91
 [0.1.0-alpha.90]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.89...v0.1.0-alpha.90
 [0.1.0-alpha.89]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.88...v0.1.0-alpha.89

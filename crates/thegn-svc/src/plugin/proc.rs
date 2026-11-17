@@ -532,6 +532,22 @@ fn supervise_poll_interval(elapsed: Duration) -> Duration {
     }
 }
 
+/// Minimum gap between the descendant refreshes of a live one-shot run.
+///
+/// Timeout and cancel snapshot the tree while the leader is unreaped, but a
+/// successful exit cannot: by the time the leader is observed exited, its
+/// children have been re-parented away, so a snapshot taken then cannot see
+/// setsid escapees (which also left the process group `kill_group` signals).
+/// The run loop therefore walks the leader's `/proc` subtree at most once per
+/// this interval while the leader is alive and SIGKILLs the accumulated set
+/// (start-time guarded) after the group on every exit path.
+///
+/// Known gap (THE-929 stays open): a helper that is started and orphaned
+/// between two walks is never seen and can still escape; closing that needs
+/// cgroup or pid-namespace containment.
+#[cfg(unix)]
+const ESCAPEE_REFRESH_INTERVAL: Duration = Duration::from_millis(20);
+
 fn spawn_ndjson_stream_inner<S: NdjsonSink>(
     argv: &[String],
     env: &BTreeMap<String, String>,
@@ -716,13 +732,16 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
+        // Descendants seen by the periodic subtree walk while the leader was
+        // alive. See `ESCAPEE_REFRESH_INTERVAL` for why the success path needs them.
+        let mut tracked: Vec<(libc::pid_t, u64)> = Vec::new();
+        let mut last_refresh: Option<Instant> = None;
         'run: loop {
             match leader_exited_nowait(pid) {
                 Ok(true) => {
                     // A successful one-shot run also kills helpers left in its process group,
                     // matching gh_run; backgrounded helpers do not outlive the plugin run.
                     let stragglers = thegn_proc::group_has_live_members(pid);
-                    kill_requested = stragglers;
                     #[cfg(unix)]
                     reader_deadline_ms.store(
                         started
@@ -733,9 +752,25 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
                         Ordering::Release,
                     );
                     kill_group(pid);
+                    // setsid escapees left the group, and the leader's exit already
+                    // re-parented them, so only the snapshots taken while it ran can
+                    // still name them. `kill_tracked` re-checks each start time.
+                    let escapees = super::platform::kill_tracked(&tracked);
+                    kill_requested = stragglers || escapees > 0;
                     break child.wait().ok();
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    // The leader is alive and unreaped, so its pid is pinned and the
+                    // walk starts at the real leader. Throttled, subtree-only, and
+                    // only while this run is live: no idle cost, no full /proc scan.
+                    if last_refresh.is_none_or(|at| at.elapsed() >= ESCAPEE_REFRESH_INTERVAL) {
+                        last_refresh = Some(Instant::now());
+                        super::platform::merge_tracked(
+                            &mut tracked,
+                            super::platform::linux_descendants_subtree_only(pid as libc::pid_t),
+                        );
+                    }
+                }
                 Err(_) => {
                     hand_off_unreaped_child(child);
                     break None;
@@ -752,13 +787,13 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
                         .min(u64::MAX as u128) as u64,
                     Ordering::Release,
                 );
-                kill_group_and_escaped(pid);
+                kill_group_and_escaped(pid, &tracked);
                 break 'run reap_after_kill(child);
             }
             if Instant::now() >= deadline {
                 timed_out = true;
                 kill_requested = true;
-                kill_group_and_escaped(pid);
+                kill_group_and_escaped(pid, &tracked);
                 break 'run reap_after_kill(child);
             }
             let sleep_for = supervise_poll_interval(started.elapsed())
@@ -1381,11 +1416,14 @@ pub(crate) fn term_group(pid: u32) {
 /// Kill the leader's group, then every tracked descendant that escaped it
 /// (setsid). The /proc snapshot MUST be taken while the leader is still
 /// unreaped so the pid is pinned and the walk starts at the real leader.
+/// `tracked` (the run's periodic subtree snapshots) is merged in, so a helper
+/// that was seen earlier but has since been orphaned is still named.
 #[cfg(unix)]
-fn kill_group_and_escaped(pid: u32) {
-    let tracked = super::platform::linux_descendants(pid as libc::pid_t);
+fn kill_group_and_escaped(pid: u32, tracked: &[(libc::pid_t, u64)]) {
+    let mut targets = super::platform::linux_descendants(pid as libc::pid_t);
+    super::platform::merge_tracked(&mut targets, tracked.to_vec());
     kill_group(pid);
-    super::platform::kill_tracked(&tracked);
+    super::platform::kill_tracked(&targets);
 }
 
 #[cfg(unix)]
@@ -1511,6 +1549,97 @@ mod process_tree_deadline_tests {
         }
     }
 
+    /// Run `f` with the periodic descendant refresh blind (its `/proc` root
+    /// is an empty directory). This stands in for a helper started and
+    /// orphaned between two walks, the gap THE-929 leaves open, so the tests
+    /// below still exercise reader abandonment for an untracked escapee.
+    fn without_escapee_tracking<R>(f: impl FnOnce() -> R) -> R {
+        let blind = tempfile::tempdir().unwrap();
+        crate::plugin::platform::with_subtree_proc_root_for_test(blind.path(), f)
+    }
+
+    /// Detach a setsid grandchild (pid published atomically in `$1`), wait
+    /// for its pid file, give the supervision loop time to see it, then exit 0.
+    const SUCCESSFUL_SETSID_GRANDCHILD_SCRIPT: &str = "setsid sh -c 'echo $$ > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; exec sleep 300' sh \"$1\" & i=0; while [ ! -s \"$1\" ]; do i=$((i+1)); [ \"$i\" -gt 500 ] && exit 97; sleep 0.01; done; sleep 0.2; exit 0";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_exit_kills_a_tracked_setsid_grandchild() {
+        if !setsid_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pid_path = dir.path().join("grandchild.pid");
+        let run = spawn_ndjson(
+            &[
+                "sh".into(),
+                "-c".into(),
+                SUCCESSFUL_SETSID_GRANDCHILD_SCRIPT.into(),
+                "sh".into(),
+                pid_path.to_string_lossy().into_owned(),
+            ],
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(10),
+        );
+        let grandchild = read_pid(&pid_path);
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => {
+                // SAFETY: cleanup of the pid this test started.
+                unsafe {
+                    libc::kill(grandchild, libc::SIGKILL);
+                }
+                panic!("successful run failed: {error:?}");
+            }
+        };
+        assert_gone_within(grandchild, Duration::from_secs(2));
+        assert!(run.outcome.killed, "escapee kill was not reported");
+        assert!(run.outcome.reaped);
+        assert_readers_exit_within_margin();
+    }
+
+    #[test]
+    fn successful_run_spares_an_unrelated_process() {
+        let mut bystander = Command::new("sleep").arg("300").spawn().unwrap();
+        let pid = bystander.id() as i32;
+        let result = spawn_ndjson(
+            &["sh".into(), "-c".into(), "sleep 0.2; exit 0".into()],
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(10),
+        );
+        let alive = pid_is_alive(pid);
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
+        assert!(result.is_ok(), "successful run failed: {result:?}");
+        assert!(alive, "unrelated process was killed");
+        assert_readers_exit_within_margin();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escapee_refresh_never_falls_back_to_a_full_proc_scan() {
+        // The refresh's root walk fails on every poll (empty `/proc` root);
+        // it must stay subtree-only rather than scanning all of /proc.
+        let before = crate::plugin::platform::global_proc_scans_for_test();
+        let result = without_escapee_tracking(|| {
+            spawn_ndjson(
+                &["sh".into(), "-c".into(), "sleep 0.3; exit 0".into()],
+                &BTreeMap::new(),
+                None,
+                Duration::from_secs(10),
+            )
+        });
+        assert!(result.is_ok(), "successful run failed: {result:?}");
+        assert_eq!(
+            crate::plugin::platform::global_proc_scans_for_test(),
+            before,
+            "the periodic escapee refresh performed a full /proc scan"
+        );
+    }
+
     #[test]
     fn timeout_kills_a_setsid_grandchild() {
         if !setsid_available() {
@@ -1576,12 +1705,14 @@ mod process_tree_deadline_tests {
         };
         let script = escaped_holder("sleep 30 & p=$!; sleep 2; kill $p", redirection);
         let started = Instant::now();
-        let run = spawn_ndjson(
-            &["sh".into(), "-c".into(), script, "sh".into(), marker.into()],
-            &BTreeMap::new(),
-            None,
-            Duration::from_millis(300),
-        )
+        let run = without_escapee_tracking(|| {
+            spawn_ndjson(
+                &["sh".into(), "-c".into(), script, "sh".into(), marker.into()],
+                &BTreeMap::new(),
+                None,
+                Duration::from_millis(300),
+            )
+        })
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(4));
         run
@@ -1788,18 +1919,20 @@ mod process_tree_deadline_tests {
         }
         let started = Instant::now();
         let (_dir, marker) = marker_dir();
-        let run = spawn_ndjson(
-            &[
-                "sh".into(),
-                "-c".into(),
-                format!("{}exit 0", escaped_holder("exec sleep 30", "")),
-                "sh".into(),
-                marker.clone(),
-            ],
-            &BTreeMap::new(),
-            None,
-            Duration::from_secs(10),
-        )
+        let run = without_escapee_tracking(|| {
+            spawn_ndjson(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    format!("{}exit 0", escaped_holder("exec sleep 30", "")),
+                    "sh".into(),
+                    marker.clone(),
+                ],
+                &BTreeMap::new(),
+                None,
+                Duration::from_secs(10),
+            )
+        })
         .unwrap();
         assert!(
             Path::new(&marker).exists(),
@@ -1817,21 +1950,23 @@ mod process_tree_deadline_tests {
             return;
         }
         let (_dir, marker) = marker_dir();
-        let run = spawn_ndjson(
-            &[
-                "sh".into(),
-                "-c".into(),
-                format!(
-                    "printf '{{\"jsonrpc\":\"2.0\",\"method\":\"log\"}}'; {}exit 0",
-                    escaped_holder("exec sleep 30", "")
-                ),
-                "sh".into(),
-                marker.clone(),
-            ],
-            &BTreeMap::new(),
-            None,
-            Duration::from_secs(10),
-        )
+        let run = without_escapee_tracking(|| {
+            spawn_ndjson(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "printf '{{\"jsonrpc\":\"2.0\",\"method\":\"log\"}}'; {}exit 0",
+                        escaped_holder("exec sleep 30", "")
+                    ),
+                    "sh".into(),
+                    marker.clone(),
+                ],
+                &BTreeMap::new(),
+                None,
+                Duration::from_secs(10),
+            )
+        })
         .unwrap();
         assert!(
             Path::new(&marker).exists(),
@@ -1849,18 +1984,20 @@ mod process_tree_deadline_tests {
         }
         let (_dir, marker) = marker_dir();
         let script = "(sleep 0.3; exec setsid sh -c ': > \"$1\"; exec sleep 30' sh \"$1\") & i=0; while [ ! -e \"$1\" ]; do i=$((i+1)); [ \"$i\" -gt 500 ] && exit 97; sleep 0.01; done; exit 0";
-        let run = spawn_ndjson(
-            &[
-                "sh".into(),
-                "-c".into(),
-                script.into(),
-                "sh".into(),
-                marker.clone(),
-            ],
-            &BTreeMap::new(),
-            None,
-            Duration::from_secs(10),
-        )
+        let run = without_escapee_tracking(|| {
+            spawn_ndjson(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    script.into(),
+                    "sh".into(),
+                    marker.clone(),
+                ],
+                &BTreeMap::new(),
+                None,
+                Duration::from_secs(10),
+            )
+        })
         .unwrap();
         assert!(Path::new(&marker).exists(), "late holder never detached");
         assert!(run.outcome.abandoned);

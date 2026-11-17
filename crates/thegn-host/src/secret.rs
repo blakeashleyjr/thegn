@@ -37,6 +37,22 @@ const SECRETS_LOCK: &str = "secrets.lock";
 // waits its turn instead of failing as busy.
 const SECRETS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`SECRETS_LOCK_WAIT`] for the calling thread, so
+    /// busy-path tests do not sleep the full production wait.
+    static SECRETS_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn secrets_lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = SECRETS_LOCK_WAIT_OVERRIDE.with(std::cell::Cell::get) {
+        return wait;
+    }
+    SECRETS_LOCK_WAIT
+}
+
 /// The keyring "service" all thegn secrets live under.
 const KEYRING_SERVICE: &str = "thegn";
 
@@ -330,7 +346,7 @@ fn store_in(
     dir: &std::path::Path,
     name: &str,
     token: &str,
-    set: impl FnOnce(&str, &str) -> KeyringOutcome<Result<(), KeyringWriteError>>,
+    set: impl FnOnce(&str, &str, Option<KeyringHold>) -> KeyringMutation,
 ) -> Result<String> {
     store_with_dir(name, token, set, || Ok(dir.to_path_buf()))
 }
@@ -338,10 +354,22 @@ fn store_in(
 fn store_with_dir(
     name: &str,
     token: &str,
-    set: impl FnOnce(&str, &str) -> KeyringOutcome<Result<(), KeyringWriteError>>,
+    set: impl FnOnce(&str, &str, Option<KeyringHold>) -> KeyringMutation,
     dir: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<String> {
-    match set(name, token) {
+    // Lock FIRST and hand a clone of the cross-process lock to the keyring job:
+    // the keyring write and the file fallback for one account are then one
+    // serialized mutation across thegn processes, and a write that times out
+    // here keeps the lock held until the keyring call really returns, so a
+    // later request cannot be overtaken by it. The fallback below reuses this
+    // guard; calling `lock_secrets_in` again would self-deadlock on the
+    // non-reentrant process mutex.
+    let dir = dir()?;
+    let lock = lock_secrets_in(&dir)?;
+    let hold = lock
+        .op_hold()
+        .context("hold the secrets lock for the keyring write")?;
+    match set(name, token, Some(hold)) {
         KeyringOutcome::Completed(Ok(())) => return Ok(format!("keyring:{name}")),
         KeyringOutcome::TimedOut => anyhow::bail!(
             "keyring write outcome unknown for `{name}`; nothing was written to a file; retry once the keyring responds"
@@ -353,13 +381,12 @@ fn store_with_dir(
             tracing::debug!(target: "thegn::secret", %error, "keyring write failed; using owner-only file")
         }
     }
-    let dir = dir()?;
-    let _lock = lock_secrets_in(&dir)?;
     let private = open_secrets_in(&dir)?;
     let token_name = resolve_token_name(&private, name)?;
     write_account_sidecar_with(&private, &token_name, name)?;
     write_private_with(&private, &token_name, token)?;
     private.sync()?;
+    drop(lock);
     let path = private.path().join(token_name);
     Ok(format!("file:{}", path.display()))
 }
@@ -457,7 +484,10 @@ pub fn forget_with_report(name: &str) -> ForgetReport {
     let dir = match secrets_dir_path() {
         Ok(dir) => dir,
         Err(error) => {
-            let keyring = keyring_removal(keyring_del(name));
+            // No secrets dir means no lock file to serialize on; the keyring
+            // removal still runs (unlocked, as before) so an env deletion does
+            // not strand a keyring credential.
+            let keyring = keyring_removal(keyring_del(name, None));
             return ForgetReport {
                 keyring,
                 file: ForgetFileOutcome::Failed(error.to_string()),
@@ -470,32 +500,52 @@ pub fn forget_with_report(name: &str) -> ForgetReport {
 fn forget_in(
     dir: &std::path::Path,
     name: &str,
-    del: impl FnOnce(&str) -> KeyringOutcome<Result<(), KeyringWriteError>>,
+    del: impl FnOnce(&str, Option<KeyringHold>) -> KeyringMutation,
 ) -> ForgetReport {
-    let keyring = keyring_removal(del(name));
+    // Same order as `store_with_dir`: one guard covers the keyring removal and
+    // the file leg, and the keyring job keeps a clone of the cross-process lock
+    // until its call returns. Never re-lock below (non-reentrant mutex).
+    let lock = match lock_secrets_in(dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            let error = error.to_string();
+            return ForgetReport {
+                keyring: ForgetKeyringOutcome::Failed(error.clone()),
+                file: ForgetFileOutcome::Failed(error),
+            };
+        }
+    };
+    let keyring = match lock.op_hold() {
+        Ok(hold) => keyring_removal(del(name, Some(hold))),
+        Err(error) => {
+            let error = format!("hold the secrets lock for the keyring removal: {error}");
+            return ForgetReport {
+                keyring: ForgetKeyringOutcome::Failed(error.clone()),
+                file: ForgetFileOutcome::Failed(error),
+            };
+        }
+    };
     // Do not derive and delete the pre-hash fallback filename. That historical
     // sanitizer was not injective (`a/b` and `a_b` both became `a_b.token`), so
     // automatic legacy cleanup could delete a different account's credential.
     // Existing `file:` refs remain directly resolvable and can be removed by
     // their explicit path during a user-directed migration.
-    let file = match lock_secrets_in(dir) {
+    let file = match open_secrets_in(dir) {
         Err(error) => ForgetFileOutcome::Failed(error.to_string()),
-        Ok(_lock) => match open_secrets_in(dir) {
+        Ok(private) => match file_entry_exists(&private, name) {
             Err(error) => ForgetFileOutcome::Failed(error.to_string()),
-            Ok(private) => match file_entry_exists(&private, name) {
-                Err(error) => ForgetFileOutcome::Failed(error.to_string()),
-                Ok(existed) => match file_del_with(&private, name) {
-                    Ok(()) if existed => ForgetFileOutcome::Removed,
-                    Ok(()) => ForgetFileOutcome::Absent,
-                    Err(error) => ForgetFileOutcome::Failed(error.message().to_string()),
-                },
+            Ok(existed) => match file_del_with(&private, name) {
+                Ok(()) if existed => ForgetFileOutcome::Removed,
+                Ok(()) => ForgetFileOutcome::Absent,
+                Err(error) => ForgetFileOutcome::Failed(error.message().to_string()),
             },
         },
     };
+    drop(lock);
     ForgetReport { keyring, file }
 }
 
-fn keyring_removal(outcome: KeyringOutcome<Result<(), KeyringWriteError>>) -> ForgetKeyringOutcome {
+fn keyring_removal(outcome: KeyringMutation) -> ForgetKeyringOutcome {
     match outcome {
         KeyringOutcome::Completed(Ok(())) => ForgetKeyringOutcome::Removed,
         KeyringOutcome::Completed(Err(error)) => ForgetKeyringOutcome::Failed(error.to_string()),
@@ -897,24 +947,76 @@ fn keyring_get(account: &str) -> Result<Option<String>, KeyringReadError> {
     }
 }
 
-fn keyring_set(account: &str, token: &str) -> KeyringOutcome<Result<(), KeyringWriteError>> {
-    let account = account.to_string();
-    let token = token.to_string();
-    run_keyring_op_with_timeout("set", KEYRING_PROBE_TIMEOUT, move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(keyring_write_error)?;
-        entry.set_password(&token).map_err(keyring_write_error)
-    })
+/// The outcome of one keyring mutation (set or delete) run on the worker.
+type KeyringMutation = KeyringOutcome<Result<(), KeyringWriteError>>;
+
+/// Run a held keyring mutation. The hold lives in a slot the job takes when it
+/// STARTS; on `NotStarted` (never ran, and never will: the worker skips
+/// ABANDONED jobs) the caller takes it back and drops it now, instead of
+/// leaving the cross-process lock in a queued job behind a hung operation.
+fn run_held_mutation(
+    worker: &KeyringWorker,
+    operation: &'static str,
+    timeout: std::time::Duration,
+    hold: Option<KeyringHold>,
+    op: impl FnOnce() -> Result<(), KeyringWriteError> + Send + 'static,
+) -> KeyringMutation {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(hold));
+    let job_slot = slot.clone();
+    let outcome = worker.run(operation, timeout, move || {
+        let hold = job_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let result = op();
+        drop(hold);
+        result
+    });
+    if matches!(outcome, KeyringOutcome::NotStarted(_)) {
+        drop(
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+    outcome
 }
 
-fn keyring_del(account: &str) -> KeyringOutcome<Result<(), KeyringWriteError>> {
+/// `hold` (a clone of the caller's secrets lock) is taken by the worker job
+/// when it starts and dropped only after the keyring call returns, so the
+/// cross-process lock outlives a caller that gave up waiting. A job that never
+/// starts releases the hold as soon as the caller sees `NotStarted`.
+fn keyring_set(account: &str, token: &str, hold: Option<KeyringHold>) -> KeyringMutation {
     let account = account.to_string();
-    run_keyring_op_with_timeout("delete", KEYRING_PROBE_TIMEOUT, move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(keyring_write_error)?;
-        match entry.delete_credential() {
+    let token = token.to_string();
+    run_held_mutation(
+        keyring_worker(),
+        "set",
+        KEYRING_PROBE_TIMEOUT,
+        hold,
+        move || {
+            keyring::Entry::new(KEYRING_SERVICE, &account)
+                .and_then(|entry| entry.set_password(&token))
+                .map_err(keyring_write_error)
+        },
+    )
+}
+
+/// See [`keyring_set`] for the `hold` contract.
+fn keyring_del(account: &str, hold: Option<KeyringHold>) -> KeyringMutation {
+    let account = account.to_string();
+    run_held_mutation(
+        keyring_worker(),
+        "delete",
+        KEYRING_PROBE_TIMEOUT,
+        hold,
+        move || match keyring::Entry::new(KEYRING_SERVICE, &account)
+            .and_then(|entry| entry.delete_credential())
+        {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(keyring_write_error(error)),
-        }
-    })
+        },
+    )
 }
 
 /// `$XDG_CONFIG_HOME/thegn/secrets/<name>.token` — alongside the config file,
@@ -1200,11 +1302,15 @@ impl SecretStore for KeyringStore {
             Err(KeyringReadError::Unavailable(reason)) => Err(SecretError::unavailable(reason)),
         }
     }
+    // No secrets-lock hold here: the MCP callers already serialize these
+    // mutations across processes under the MCP index lock, and nothing takes
+    // the secrets lock and then the index lock, so adding it would only widen
+    // the lock graph without closing a gap for these accounts.
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
-        keyring_store_mutation_result(keyring_set(account, value), "write")
+        keyring_store_mutation_result(keyring_set(account, value, None), "write")
     }
     fn del(&self, account: &str) -> Result<(), SecretError> {
-        keyring_store_mutation_result(keyring_del(account), "removal")
+        keyring_store_mutation_result(keyring_del(account, None), "removal")
     }
 }
 
@@ -1734,13 +1840,18 @@ fn open_dir_lock_file(
 #[derive(Debug)]
 enum SecretsLockError {
     Busy,
+    /// Busy while this process still has a keyring job holding the lock.
+    KeyringRunning,
     Other(String),
 }
 
 impl std::fmt::Display for SecretsLockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy => f.write_str("secrets store busy"),
+            Self::Busy => f.write_str("secrets store busy; retry"),
+            Self::KeyringRunning => {
+                f.write_str("keyring operation for another request is still running; retry")
+            }
             Self::Other(error) => f.write_str(error),
         }
     }
@@ -1752,8 +1863,36 @@ impl std::error::Error for SecretsLockError {}
 /// mutex first, so they never starve each other while polling the bounded
 /// cross-process file lock (fields drop in order: file lock, then mutex).
 struct SecretsLock {
-    _file: std::fs::File,
+    file: std::fs::File,
     _process: std::sync::MutexGuard<'static, ()>,
+}
+
+impl SecretsLock {
+    /// A clone of the locked file for a keyring job. The clone shares the open
+    /// file description, so the cross-process lock stays held until the guard
+    /// AND every hold are dropped. The process mutex guard (`!Send`) stays with
+    /// the caller; only this `Send` hold may move to the keyring worker.
+    fn op_hold(&self) -> std::io::Result<KeyringHold> {
+        let file = self.file.try_clone()?;
+        KEYRING_HOLDS_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(KeyringHold { _file: file })
+    }
+}
+
+/// Live [`KeyringHold`]s in this process, so a busy lock can say that an
+/// earlier keyring operation is what still holds it.
+static KEYRING_HOLDS_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A clone of the secrets lock file moved into a keyring job (see
+/// [`SecretsLock::op_hold`]).
+struct KeyringHold {
+    _file: std::fs::File,
+}
+
+impl Drop for KeyringHold {
+    fn drop(&mut self) {
+        KEYRING_HOLDS_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 static SECRETS_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1770,18 +1909,20 @@ fn lock_secrets_in(dir: &std::path::Path) -> Result<SecretsLock, SecretsLockErro
         match file.try_lock() {
             Ok(()) => {
                 return Ok(SecretsLock {
-                    _file: file,
+                    file,
                     _process: process,
                 });
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 let elapsed = started.elapsed();
-                if elapsed >= SECRETS_LOCK_WAIT {
+                let wait = secrets_lock_wait();
+                if elapsed >= wait {
+                    if KEYRING_HOLDS_LIVE.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                        return Err(SecretsLockError::KeyringRunning);
+                    }
                     return Err(SecretsLockError::Busy);
                 }
-                std::thread::sleep(
-                    std::time::Duration::from_millis(5).min(SECRETS_LOCK_WAIT - elapsed),
-                );
+                std::thread::sleep(std::time::Duration::from_millis(5).min(wait - elapsed));
             }
             Err(std::fs::TryLockError::Error(error)) => {
                 return Err(SecretsLockError::Other(format!(
@@ -2550,6 +2691,48 @@ mod tests {
     }
 
     #[test]
+    fn not_started_held_mutation_releases_lock_while_worker_is_hung() {
+        let _wait = ShortLockWait::new();
+        let temp = private_temp();
+        let worker = std::sync::Arc::new(KeyringWorker::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let blocked_worker = worker.clone();
+        let blocker = std::thread::spawn(move || {
+            blocked_worker.run("blocker", std::time::Duration::from_secs(5), move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                true
+            })
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        let lock = lock_secrets_in(temp.path()).unwrap();
+        let hold = lock.op_hold().unwrap();
+        drop(lock);
+        let outcome = run_held_mutation(
+            &worker,
+            "set",
+            std::time::Duration::from_millis(20),
+            Some(hold),
+            || Ok(()),
+        );
+        assert!(matches!(outcome, KeyringOutcome::NotStarted(_)));
+        // The worker is still hung on the blocker, yet the lock is free.
+        let relocked = lock_secrets_in(temp.path());
+        assert!(relocked.is_ok());
+        drop(relocked);
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            blocker.join().unwrap(),
+            KeyringOutcome::Completed(true)
+        ));
+    }
+
+    #[test]
     fn keyring_worker_started_request_that_times_out_is_unknown() {
         let worker = std::sync::Arc::new(KeyringWorker::new());
         assert!(matches!(
@@ -2606,27 +2789,29 @@ mod tests {
     #[test]
     fn timed_out_keyring_set_writes_no_file_fallback() {
         let temp = private_temp();
-        let result = store_in(temp.path(), "acct", "tok", |_, _| KeyringOutcome::TimedOut);
+        let result = store_in(temp.path(), "acct", "tok", |_, _, _| {
+            KeyringOutcome::TimedOut
+        });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown"));
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert_eq!(non_lock_entries(temp.path()), 0);
     }
 
     #[test]
     fn keyring_worker_not_started_write_never_falls_back_to_file() {
         let temp = private_temp();
-        let result = store_in(temp.path(), "acct", "tok", |_, _| {
+        let result = store_in(temp.path(), "acct", "tok", |_, _, _| {
             KeyringOutcome::NotStarted("x")
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not started"));
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert_eq!(non_lock_entries(temp.path()), 0);
     }
 
     #[test]
     fn completed_keyring_set_failure_still_falls_back_to_file() {
         let temp = private_temp();
-        let result = store_in(temp.path(), "acct", "tok", |_, _| {
+        let result = store_in(temp.path(), "acct", "tok", |_, _, _| {
             KeyringOutcome::Completed(Err(KeyringWriteError::Denied("denied".into())))
         })
         .unwrap();
@@ -2637,19 +2822,160 @@ mod tests {
     #[test]
     fn completed_keyring_set_success_returns_keyring_ref() {
         let temp = private_temp();
-        let result = store_in(temp.path(), "acct", "tok", |_, _| {
+        let result = store_in(temp.path(), "acct", "tok", |_, _, _| {
             KeyringOutcome::Completed(Ok(()))
         })
         .unwrap();
         assert_eq!(result, "keyring:acct");
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert_eq!(non_lock_entries(temp.path()), 0);
+    }
+
+    /// Entries in a secrets dir other than the (persistent) lock file.
+    fn non_lock_entries(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != SECRETS_LOCK)
+            .count()
+    }
+
+    /// Shortens the secrets-lock wait on this thread for the guard's lifetime.
+    struct ShortLockWait;
+
+    impl ShortLockWait {
+        fn new() -> Self {
+            SECRETS_LOCK_WAIT_OVERRIDE
+                .with(|wait| wait.set(Some(std::time::Duration::from_millis(50))));
+            Self
+        }
+    }
+
+    impl Drop for ShortLockWait {
+        fn drop(&mut self) {
+            SECRETS_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(None));
+        }
+    }
+
+    #[test]
+    fn timed_out_keyring_set_hold_blocks_next_store_until_dropped() {
+        let _wait = ShortLockWait::new();
+        let temp = private_temp();
+        let mut stashed = None;
+        let result = store_in(temp.path(), "acct", "tok1", |_, _, hold| {
+            assert!(
+                hold.is_some(),
+                "store must pass a lock hold to the keyring job"
+            );
+            stashed = hold;
+            KeyringOutcome::TimedOut
+        });
+        assert!(result.is_err());
+
+        // The "still running" keyring job holds the lock: a second store is
+        // refused before it reaches the keyring or the file fallback.
+        let mut reached_keyring = false;
+        let busy = store_in(temp.path(), "acct", "tok2", |_, _, _| {
+            reached_keyring = true;
+            KeyringOutcome::Completed(Err(KeyringWriteError::Denied("denied".into())))
+        })
+        .unwrap_err();
+        assert!(!reached_keyring);
+        assert!(
+            busy.to_string()
+                .contains("keyring operation for another request is still running; retry"),
+            "{busy:#}"
+        );
+        assert!(!busy.to_string().contains("tok2"));
+        assert_eq!(non_lock_entries(temp.path()), 0);
+
+        drop(stashed);
+        let stored = store_in(temp.path(), "acct", "tok2", |_, _, _| {
+            KeyringOutcome::Completed(Err(KeyringWriteError::Denied("denied".into())))
+        })
+        .unwrap();
+        assert!(stored.starts_with("file:"));
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok2");
+    }
+
+    #[test]
+    fn completed_keyring_set_failure_falls_back_under_the_same_guard() {
+        // Must finish: the fallback reuses the guard instead of re-locking the
+        // non-reentrant process mutex. The hold is still alive (stashed) while
+        // the fallback writes, proving the file leg runs under this guard.
+        let _wait = ShortLockWait::new();
+        let temp = private_temp();
+        let mut stashed = None;
+        let result = store_in(temp.path(), "acct", "tok", |_, _, hold| {
+            stashed = hold;
+            KeyringOutcome::Completed(Err(KeyringWriteError::Unavailable("offline".into())))
+        })
+        .unwrap();
+        assert!(result.starts_with("file:"));
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok");
+        drop(stashed);
+    }
+
+    #[test]
+    fn timed_out_keyring_delete_hold_blocks_next_forget_until_dropped() {
+        let _wait = ShortLockWait::new();
+        let temp = private_temp();
+        file_set_at(temp.path(), "acct", "tok").unwrap();
+        let mut stashed = None;
+        let report = forget_in(temp.path(), "acct", |_, hold| {
+            assert!(
+                hold.is_some(),
+                "forget must pass a lock hold to the keyring job"
+            );
+            stashed = hold;
+            KeyringOutcome::TimedOut
+        });
+        assert_eq!(report.keyring, ForgetKeyringOutcome::OutcomeUnknown);
+        assert_eq!(report.file, ForgetFileOutcome::Removed);
+
+        file_set_at(temp.path(), "other", "tok")
+            .expect_err("the live hold keeps the secrets lock held");
+        let mut reached_keyring = false;
+        let busy = forget_in(temp.path(), "acct", |_, _| {
+            reached_keyring = true;
+            KeyringOutcome::Completed(Ok(()))
+        });
+        assert!(!reached_keyring);
+        let expected = "keyring operation for another request is still running; retry";
+        assert_eq!(busy.keyring, ForgetKeyringOutcome::Failed(expected.into()));
+        assert_eq!(busy.file, ForgetFileOutcome::Failed(expected.into()));
+        assert!(busy.ensure_file_removed("acct").is_err());
+
+        drop(stashed);
+        let report = forget_in(temp.path(), "acct", |_, _| {
+            KeyringOutcome::Completed(Ok(()))
+        });
+        assert_eq!(report.keyring, ForgetKeyringOutcome::Removed);
+        assert_eq!(report.file, ForgetFileOutcome::Absent);
+    }
+
+    #[test]
+    fn completed_keyring_delete_removes_file_under_one_guard() {
+        let _wait = ShortLockWait::new();
+        let temp = private_temp();
+        file_set_at(temp.path(), "acct", "tok").unwrap();
+        let mut stashed = None;
+        let report = forget_in(temp.path(), "acct", |_, hold| {
+            stashed = hold;
+            KeyringOutcome::Completed(Ok(()))
+        });
+        // The file leg ran while the hold was still alive, so it reused the
+        // guard (a re-lock would have reported busy, or deadlocked).
+        assert_eq!(report.keyring, ForgetKeyringOutcome::Removed);
+        assert_eq!(report.file, ForgetFileOutcome::Removed);
+        assert!(file_get_in(temp.path(), "acct").is_err());
+        assert_eq!(non_lock_entries(temp.path()), 0);
+        drop(stashed);
     }
 
     #[test]
     fn timed_out_keyring_delete_is_reported_unknown() {
         let temp = private_temp();
         file_set_at(temp.path(), "acct", "tok").unwrap();
-        let report = forget_in(temp.path(), "acct", |_| KeyringOutcome::TimedOut);
+        let report = forget_in(temp.path(), "acct", |_, _| KeyringOutcome::TimedOut);
         assert_eq!(report.keyring, ForgetKeyringOutcome::OutcomeUnknown);
         assert_eq!(report.file, ForgetFileOutcome::Removed);
         assert!(
@@ -2660,7 +2986,9 @@ mod tests {
     #[test]
     fn completed_keyring_delete_reports_removed() {
         let temp = private_temp();
-        let report = forget_in(temp.path(), "acct", |_| KeyringOutcome::Completed(Ok(())));
+        let report = forget_in(temp.path(), "acct", |_, _| {
+            KeyringOutcome::Completed(Ok(()))
+        });
         assert_eq!(report.keyring, ForgetKeyringOutcome::Removed);
         assert_eq!(report.file, ForgetFileOutcome::Absent);
     }
@@ -2997,7 +3325,7 @@ mod tests {
     fn secrets_lock_store_creates_missing_directory() {
         let temp = private_temp();
         let secrets = temp.path().join("secrets");
-        let result = store_in(&secrets, "acct", "tok", |_, _| {
+        let result = store_in(&secrets, "acct", "tok", |_, _, _| {
             KeyringOutcome::Completed(Err(KeyringWriteError::Denied("denied".into())))
         })
         .unwrap();
@@ -3010,7 +3338,7 @@ mod tests {
     fn secrets_lock_forget_creates_missing_directory_and_reports_absent() {
         let temp = private_temp();
         let secrets = temp.path().join("secrets");
-        let report = forget_in(&secrets, "acct", |_| KeyringOutcome::Completed(Ok(())));
+        let report = forget_in(&secrets, "acct", |_, _| KeyringOutcome::Completed(Ok(())));
 
         assert_eq!(report.file, ForgetFileOutcome::Absent);
         assert!(secrets.join(SECRETS_LOCK).exists());

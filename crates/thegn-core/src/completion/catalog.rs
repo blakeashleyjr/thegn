@@ -562,6 +562,7 @@ pub const CATALOG: &[Slot] = &[
     // --- env (`[env.<name>]`) ---------------------------------------------
     // `env create name` is deliberately absent: it names a NEW env, so
     // completing the existing ones would be actively misleading.
+    slot("agent run", "env", SourceKind::Env),
     slot("env deprovision", "env", SourceKind::Env),
     slot("env rm", "name", SourceKind::Env),
     slot("env set", "name", SourceKind::Env),
@@ -1054,6 +1055,7 @@ mod tests {
         let source = |arg: &str| lookup("agent run", arg).map(|slot| slot.source);
         assert_eq!(source("agent"), Some(SourceKind::Agent));
         assert_eq!(source("worktree"), Some(SourceKind::Worktree));
+        assert_eq!(source("env"), Some(SourceKind::Env));
         for arg in ["brief_file", "var", "track", "timeout"] {
             assert_eq!(source(arg), Some(SourceKind::Structural), "{arg}");
         }
