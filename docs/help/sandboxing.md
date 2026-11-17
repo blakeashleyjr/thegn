@@ -720,7 +720,9 @@ provider) appear in the panel's **system → environments** section — `↵`
 (re)binds the cursor env to the active worktree, `t` tests its provider
 token (the outcome pops as a toast and is logged), `n` opens the add
 wizard, and `x`
-removes it after a confirm (removal also forgets the stored token). An
+removes it after a confirm (removal also forgets the stored token). On a
+[[vercel-sandbox]] env, `p` runs `thegn env pull` for the worktree (it may resume
+the sandbox) and the row shows `results not pulled` until a pull succeeds. An
 environment can keep a **warm spare pool** so new worktrees start
 instantly; raise or lower the active project's pool target with the
 warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable). The
