@@ -46,6 +46,21 @@ pub(crate) fn rule_has_live_session(rule_id: &str) -> bool {
     })
 }
 
+/// Ids of every live session an automation run opened (the kill switch's
+/// view, `automations.halt`).
+pub(crate) fn origin_session_ids() -> std::collections::BTreeSet<String> {
+    SESSION_ORIGINS
+        .get()
+        .map_or_else(Default::default, |origins| {
+            origins
+                .lock()
+                .expect("automation session origin lock")
+                .keys()
+                .cloned()
+                .collect()
+        })
+}
+
 fn session_origin(session: &str) -> Option<thegn_core::automation::AutomationOrigin> {
     SESSION_ORIGINS
         .get_or_init(Default::default)
