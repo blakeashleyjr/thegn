@@ -201,6 +201,8 @@ pub fn submit_fact(
         pr_review_requested: facts.pr_review_requested,
         pr_merged: facts.pr_merged,
         origin: facts.origin,
+        issue: None,
+        exit_code: None,
     });
 }
 
@@ -266,6 +268,8 @@ fn notification_event(
         pr_review_requested: facts.pr_review_requested,
         pr_merged: facts.pr_merged,
         origin: facts.origin,
+        issue: None,
+        exit_code: None,
     }
 }
 

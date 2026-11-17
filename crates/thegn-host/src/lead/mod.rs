@@ -8,6 +8,7 @@ pub(crate) mod group;
 pub(crate) mod launch;
 pub(crate) mod mcp;
 pub(crate) mod skill;
+pub(crate) mod wake;
 
 /// Whether the Lead is configured (`[lead]` present after the channel clamp).
 #[allow(dead_code, reason = "consumed by later b152 lanes")]
