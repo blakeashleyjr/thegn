@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.94] — 2026-11-17
+
 ### Added
 
 - From the cpu/mem popup, Enter on a process opens the system monitor filtered to it, and `p` shows a worktree's or pane's processes; the monitor's process filter also applies `wt:` and `wt=` (`user`, `s` and `thr` are still not available). (THE-2025)
@@ -3815,7 +3817,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.93...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.94...HEAD
+[0.1.0-alpha.94]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.93...v0.1.0-alpha.94
 [0.1.0-alpha.93]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.92...v0.1.0-alpha.93
 [0.1.0-alpha.92]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.91...v0.1.0-alpha.92
 [0.1.0-alpha.91]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.90...v0.1.0-alpha.91
