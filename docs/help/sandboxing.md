@@ -1050,8 +1050,18 @@ listener, as Lead-confined, whatever its scopes. A Lead-confined call:
   a message naming the worktree and its backend. A raw `argv`, an `env`
   override, a `cwd` outside the worktree, `widen_permissions`, a fork and
   prompts over 64 KiB are refused.
-- **May not** type into a session (`sessions.input`), attach, resize, split or
-  fork one, run host git (`git.stage`, `git.commit`), create a worktree
+- **May type into a worker it opened** (`sessions.input`), to answer a worker
+  that is waiting on a question. The daemon records which sessions a
+  Lead-confined `sessions.open` launched and allows input only into a live one
+  of those; your own sessions, a finished session and an unknown id are
+  refused. Once you type into the worker yourself, the Lead can no longer type
+  into it. The input must be plain text plus Enter, at most 16 KiB: escape
+  sequences (ESC, CSI, OSC, bracketed-paste markers) and control characters
+  other than newline, carriage return and tab are refused. The record is kept
+  in the daemon's memory, so after a daemon restart the Lead cannot type into
+  anything until it opens a new worker. The MCP tool still needs
+  `thegn mcp serve --allow-session-input`.
+- **May not** attach to, resize, split or fork a session, run host git (`git.stage`, `git.commit`), create a worktree
   (`worktrees.create`, which runs git on a caller-named repo), open a worktree
   or an editor, write files from outside the sandbox (`search.replace`,
   `skills.seed`), run tools or presets, or change a worktree's sandbox profile.
@@ -1061,8 +1071,10 @@ listener, as Lead-confined, whatever its scopes. A Lead-confined call:
   automation rules, and the merge queue when `[lead] scopes` grants it.
 
 A Lead-authored automation rule that opens a session is held to the same
-rule when it fires. Every refusal is logged on `thegn::control::audit` with
-the outcome `lead_confined` and the Lead's label.
+rule when it fires (and the worker it opens counts as Lead-opened). Every
+refusal is logged on `thegn::control::audit` with the outcome `lead_confined`
+and the Lead's label; Lead input is logged allowed or refused with the label
+and the session id, never the text.
 
 ## Inspecting
 
