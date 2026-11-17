@@ -803,6 +803,12 @@ pub const CATALOG: &[Slot] = &[
     slot("session close", "session", SourceKind::Session),
     // --- mcp server (`[mcp_servers.<name>]`) -------------------------------
     slot("mcp install", "name", SourceKind::McpServer),
+    // The proxy profile is a free-form `[mcp_proxy] profiles` name.
+    slot(
+        "mcp proxy",
+        "profile",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     // --- config key --------------------------------------------------------
     // `--set` takes `KEY=VALUE`; completing the KEY half is still most of the
     // work, and prefix semantics stop as soon as the user types `=`.

@@ -206,3 +206,29 @@ and finish within 300 seconds total. Streams share the first-byte limit across
 opening headers and the first usable output, then use the idle limit between
 chunks; they end after one hour even while data continues. A timed-out attempt
 can fall through to the next upstream lane.
+
+## MCP tools
+
+### Lead tool surface
+
+`thegn mcp serve` exposes ten tools for the Lead, each gated by the scope in
+the table. Every one needs a running daemon. Granting an approval
+(`approvals.resolve`) is admin-only and is never an MCP tool: it stays on the
+HTTP API and `thegn api call`.
+
+| Tool                 | Scope   | What it does                                                       |
+| -------------------- | ------- | ------------------------------------------------------------------ |
+| `overview_get`       | `read`  | One cross-workspace overview: worktrees, agents, queues, attention |
+| `notifications_list` | `read`  | Notifications filtered by kind, unread state, age and worktree     |
+| `notifications_ack`  | `write` | Mark one notification, a worktree's, or all of them read           |
+| `automations_put`    | `write` | Create or replace a Lead-authored automation rule                  |
+| `automations_rm`     | `write` | Remove a Lead-authored rule (config rules refuse)                  |
+| `automations_enable` | `write` | Enable or disable a Lead-authored rule (config rules refuse)       |
+| `automations_runs`   | `read`  | Recent audited runs of an automation rule                          |
+| `approvals_list`     | `read`  | Approval history and pending approval requests                     |
+| `approvals_request`  | `write` | Ask a human to approve a pipeline stage (never grants)             |
+| `merge_drain`        | `git`   | Start the merge-queue drain for a worktree's repository            |
+
+`merge_drain` is gated like `merge_add`: the narrow `merge_add` grant belongs to
+worktree-bound route tokens, so an MCP caller needs `git`. Rules the Lead
+writes may only notify or open sessions.
