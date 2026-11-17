@@ -755,7 +755,7 @@ mod tests {
         cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
         cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
         cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        cd.extend_from_slice(&[0u8; 14]);
+        cd.extend_from_slice(&[0u8; 12]);
         cd.extend_from_slice(&local_off.to_le_bytes());
         cd.extend_from_slice(name.as_bytes());
         let cd_off = out.len() as u32;
@@ -814,7 +814,7 @@ mod tests {
         let z = zip_one("a", 0, 0, b"abc", 0);
         for n in 0..z.len() {
             let mut c = Cursor::new(&z[..n]);
-            let _ = zip_find_entry(&mut c, n as u64, "a");
+            assert!(zip_find_entry(&mut c, n as u64, "a").is_err(), "prefix {n}");
         }
         assert!(zip_find_entry(&mut Cursor::new(&b"x"[..]), 1, "a").is_err());
     }

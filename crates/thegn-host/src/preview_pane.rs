@@ -469,7 +469,9 @@ fn docx_text_lines(
     for l in &text.lines {
         let line = bounded_line(&thegn_core::msg::terminal_safe(l));
         if retained.saturating_add(line.len()) > PREVIEW_MAX_TOTAL_BYTES {
-            lines[0].push_str(", text truncated");
+            if !lines[0].ends_with(", text truncated") {
+                lines[0].push_str(", text truncated");
+            }
             break;
         }
         retained += line.len();
@@ -963,7 +965,7 @@ mod tests {
         cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
         cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
         cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        cd.extend_from_slice(&[0u8; 14]);
+        cd.extend_from_slice(&[0u8; 12]);
         cd.extend_from_slice(&0u32.to_le_bytes());
         cd.extend_from_slice(name);
         let off = out.len() as u32;
