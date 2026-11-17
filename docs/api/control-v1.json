@@ -2626,6 +2626,16 @@
       "path": "/v1/merge/drain"
     },
     {
+      "cap": "automations.pause",
+      "method": "POST",
+      "path": "/v1/automations/pause"
+    },
+    {
+      "cap": "automations.resume",
+      "method": "POST",
+      "path": "/v1/automations/resume"
+    },
+    {
       "cap": "mcp_proxy.status",
       "method": "GET",
       "path": "/v1/mcp_proxy/status"

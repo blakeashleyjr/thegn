@@ -91,6 +91,7 @@ const NO_HOST_UI: &str = "hands a host path to the compositor, which opens it ou
 const NO_HOST_GIT: &str =
     "runs git on the host, which executes repository hooks and filters outside any sandbox";
 const NO_HOST_WRITE: &str = "writes into a worktree from outside the sandbox";
+const NO_RESUME: &str = "only the operator resumes automations (admin scope); the Lead may pause them, never restart them";
 
 /// The confinement table: one explicit row per verb. No wildcard arm, so a new
 /// [`Verb`] fails to compile until someone decides its row.
@@ -167,7 +168,9 @@ pub fn rule(verb: Verb) -> Rule {
         | Verb::MergeClear
         | Verb::FolderAssign
         | Verb::MergeAdd
-        | Verb::MergeDrain => Rule::Allow,
+        | Verb::MergeDrain
+        // THE-2197: pausing only stops automations; it takes no arguments.
+        | Verb::AutomationsPause => Rule::Allow,
 
         // Shape-checked.
         Verb::OpenSession | Verb::DispatchesPut => Rule::AllowIf,
@@ -200,6 +203,8 @@ pub fn rule(verb: Verb) -> Rule {
         | Verb::ModelProxyStart
         | Verb::ModelProxyStop
         | Verb::ApprovalsResolve => Rule::Refuse(ADMIN_ONLY),
+        // THE-2197: a Lead that paused automations can never restart them.
+        Verb::AutomationsResume => Rule::Refuse(NO_RESUME),
     }
 }
 
@@ -551,6 +556,8 @@ mod tests {
         (Verb::ApprovalsRequest, Allow),
         (Verb::ApprovalsResolve, Refuse),
         (Verb::MergeDrain, Allow),
+        (Verb::AutomationsPause, Allow),
+        (Verb::AutomationsResume, Refuse),
     ];
 
     fn kind(r: Rule) -> Kind {
@@ -615,6 +622,22 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("worktrees.sandbox_profile_set"), "{msg}");
+    }
+
+    #[test]
+    fn lead_may_pause_automations_but_never_resume_them() {
+        // THE-2197: the kill switch is one-way for the Lead.
+        assert_eq!(rule(Verb::AutomationsPause), Rule::Allow);
+        assert!(check(Verb::AutomationsPause, &RequestShape::Opaque).is_ok());
+        assert!(matches!(rule(Verb::AutomationsResume), Rule::Refuse(_)));
+        let msg = check(Verb::AutomationsResume, &RequestShape::Opaque)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.starts_with(REFUSAL_PREFIX), "{msg}");
+        assert!(
+            msg.contains("only the operator resumes automations"),
+            "{msg}"
+        );
     }
 
     #[test]
