@@ -544,7 +544,7 @@ pub(crate) fn seed_from_bundle_with(
     let script = syncstate::bundle_seed_script(workdir, &staged, branch, &tip);
     let (code, out) = t
         .sh(&script)
-        .with_context(|| format!("seed the {} repository from the bundle", t.label()))?;
+        .with_context(|| format!("seed {} repository from the bundle", t.label()))?;
     if code != 0 {
         let marker = out
             .lines()
