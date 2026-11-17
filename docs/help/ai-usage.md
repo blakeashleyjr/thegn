@@ -232,3 +232,47 @@ HTTP API and `thegn api call`.
 `merge_drain` is gated like `merge_add`: the narrow `merge_add` grant belongs to
 worktree-bound route tokens, so an MCP caller needs `git`. Rules the Lead
 writes may only notify or open sessions.
+
+### Wiring the Lead
+
+When `[lead]` is configured, the daemon opens a second control listener on
+`127.0.0.1` with a random port. It accepts bearer tokens only: unlike the unix
+socket, it never treats a same-user caller as admin. The daemon writes the port
+to `$XDG_STATE_HOME/thegn/lead-control/control-addr.json`. Without `[lead]`, it
+opens nothing.
+
+Each time a Lead tab starts, thegn does three things:
+
+1. It revokes every older pairing labelled `lead`.
+2. It mints a new token for the Lead. The token's scopes are `[lead] scopes`,
+   clamped by `[mcp.serve] scopes`. The Lead can never hold more than
+   `[mcp.serve]` allows, and it never holds `admin` or `exec`.
+3. It writes the token into `$XDG_STATE_HOME/thegn/lead-control/mcp.json`, an
+   owner-only file. Claude reads it with `--mcp-config ... --strict-mcp-config`,
+   so your own `~/.claude` MCP settings never apply to the Lead.
+
+`mcp.json` registers two servers:
+
+- `thegn`: `thegn mcp serve`, which reaches the daemon through the Lead
+  listener. `sessions_input` is never enabled.
+- `thegn-lead-hub`: `thegn mcp proxy --profile <[lead] mcp_profile>`. It is
+  registered only when that profile names at least one server.
+
+The servers listed in `[mcp_proxy.profiles]` are private to their profile. The
+default `thegn mcp proxy`, which every worker agent uses, leaves them out. An
+unknown `--profile` is an error. A server inside a profile still needs its own
+`proxy.tools` list, the same as any other server.
+
+```toml
+[mcp_proxy.profiles]
+lead = ["todoist"]
+```
+
+The Lead needs the daemon. If the daemon is off, or `[lead]` was added after
+the daemon started, opening the Lead fails with a hint to restart the daemon.
+Only claude is supported as the Lead's agent so far.
+
+To debug the wiring, `thegn mcp wire --lead` writes `mcp.json` and prints its
+path without starting anything. Because it mints a new token, a Lead that is
+already running must be reopened. `thegn mcp wire --lead --remove` deletes the
+file and revokes the Lead's tokens.

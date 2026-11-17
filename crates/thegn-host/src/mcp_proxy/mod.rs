@@ -32,9 +32,15 @@ pub use hub::{Hub, now_ms};
 
 /// Run `thegn mcp proxy`: the stdio aggregation shim an agent registers as its
 /// single MCP server. Newline-delimited JSON-RPC (the MCP stdio contract).
-pub fn run_shim(cfg: &Config) -> Result<()> {
+///
+/// `profile` selects one `[mcp_proxy.profiles]` entry (`--profile`): only that
+/// profile's servers. `None` is the default hub, which excludes every profiled
+/// server so a profile (e.g. the Lead's) never reaches workers. An unknown
+/// profile errors before anything is spawned.
+pub fn run_shim(cfg: &Config, profile: Option<&str>) -> Result<()> {
+    let selection = hub::ServerSelection::resolve(&cfg.mcp_proxy.profiles, profile)?;
     let ctx = context::resolve_from_cwd();
-    let mut hub = Hub::build(cfg, &ctx);
+    let mut hub = Hub::build_selected(cfg, &ctx, &selection);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
