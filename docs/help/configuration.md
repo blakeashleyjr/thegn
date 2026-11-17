@@ -65,7 +65,7 @@ project spellings. Tracker-owned `workspace_id`, `workspace_slug`, and
 The file is watched, and every key has a reload class. Most display
 settings apply live: the sidebar, theme, bars, weather, calendar, panel,
 keys, voice and LSP. Notification routing and push sinks, `[[plugins]]`
-and `[media]` apply live too. Refresh cadences also apply live: the clock
+and `[media]` and `[metrics]` (targets restart on save) apply live too, and `[monitor]` `window_ladder`, `default_window`, `default_style` and `default_scale` take effect at the next monitor open. Refresh cadences also apply live: the clock
 and date formats, `ci.poll_interval_secs`, `pr_queue.enabled` and its poll
 interval, `git.auto_fetch` and its interval, `disk.scan_interval_secs`,
 `loc.enabled`, `loc.scan_interval_secs` and `watch.pr_interval_secs` (the
