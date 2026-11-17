@@ -4602,6 +4602,7 @@ mod tests {
     }
 
     fn zone_segs(ws: &crate::sidebar::SidebarRow, cols: usize) -> Vec<crate::seg::Seg> {
+        use crate::seg::Line;
         let disp = SidebarDisplay::default();
         let lines = compose_row_lines(
             ws, None, None, false, false, true, None, None, cols, &mut None, &disp,
