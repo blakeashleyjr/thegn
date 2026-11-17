@@ -63,7 +63,15 @@ pub enum Action {
         #[arg(long)]
         prompt: Option<String>,
         /// Bind `KEY=VALUE` in `--brief-file` (repeatable).
-        #[arg(long, value_name = "KEY=VALUE", requires = "brief_file")]
+        // clap skips `requires` when the required arg conflicts with a present
+        // one (`--brief-file` conflicts with `--prompt`), so refuse the
+        // `--prompt` pairing explicitly too.
+        #[arg(
+            long,
+            value_name = "KEY=VALUE",
+            requires = "brief_file",
+            conflicts_with = "prompt"
+        )]
         var: Vec<String>,
         /// Track the run in the dispatch roster under this issue id
         /// (`linear:THE-2005`). Optional: ad-hoc runs have no issue.
