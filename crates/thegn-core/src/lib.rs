@@ -409,6 +409,7 @@ pub mod viz_raster;
 pub mod voice;
 pub mod weather;
 pub mod work;
+pub mod workspace_mode;
 pub mod workspace_overlay;
 pub mod worktree;
 pub mod worktree_suppress;
