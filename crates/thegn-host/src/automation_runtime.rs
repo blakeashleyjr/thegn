@@ -53,7 +53,13 @@ pub fn install(cfg: &Config) {
     crate::automation_events::install_route_config(cfg);
     let effective = cfg.effective_automations();
     let slot = SENDER.get_or_init(|| Mutex::new(None));
-    if !effective.enabled || effective.rules.is_empty() {
+    // Config-only gate (THE-2181): a configured Lead may author rules later,
+    // so it arms the runtime even with no config rules. No DB read here.
+    if !thegn_core::automation_authoring::runtime_armed(
+        effective.enabled,
+        effective.rules.len(),
+        crate::lead::enabled(cfg),
+    ) {
         *slot.lock().expect("automation sender lock") = None;
         return;
     }
@@ -212,6 +218,7 @@ async fn process_event(
         event
             .validate_required_facts()
             .map_err(anyhow::Error::msg)?;
+        let rules = with_lead_rules(&db, rules);
         let now = thegn_core::util::now();
         let admissions = db.admit_automation_event(&rules, &event, now)?;
         Ok((event, admissions))
@@ -273,6 +280,7 @@ async fn process_event(
                     Ok(())
                 })
                 .await??;
+                crate::daemon::lead_caps::feed::automation_run(&action.rule_id, run_id, outcome);
                 tracing::info!(
                     target: "thegn::automation",
                     rule = %action.rule_id,
@@ -347,6 +355,42 @@ async fn process_event(
         }
     }
     Ok(())
+}
+
+/// The config rules plus the enabled, still-valid Lead-authored rules
+/// (THE-2181). Every stored row is re-validated and `merge_rules` filters the
+/// action allowlist again, so a stored rule can never reach `merge.add` or
+/// `tools.run`. A DB error keeps the config rules only.
+fn with_lead_rules(
+    db: &thegn_core::db::Db,
+    rules: Vec<thegn_core::automation::AutomationRule>,
+) -> Vec<thegn_core::automation::AutomationRule> {
+    use thegn_core::store::AutomationRuleStore;
+    let rows = match db.lead_rules() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::automation",
+                %error,
+                "failed to read Lead-authored automation rules; using config rules only"
+            );
+            return rules;
+        }
+    };
+    if rows.is_empty() {
+        return rules;
+    }
+    let config_names: Vec<String> = rules.iter().map(|rule| rule.id.clone()).collect();
+    let (lead, invalid) = thegn_core::automation_authoring::compile_lead_rows(&rows, &config_names);
+    for (rule, errors) in invalid {
+        tracing::warn!(
+            target: "thegn::automation",
+            rule = %rule,
+            errors = %errors.join("; "),
+            "skipping an invalid Lead-authored automation rule"
+        );
+    }
+    thegn_core::automation_authoring::merge_rules(rules, lead)
 }
 
 fn bounded(value: &str) -> String {
@@ -872,6 +916,60 @@ mod tests {
         let mut event = event_for_dispatch("/wt", Some("session-requested"));
         enrich_event(&db, &mut event);
         assert_eq!(event.agent_role, None);
+    }
+
+    #[test]
+    fn lead_rules_merge_after_config_and_never_escalate() {
+        use thegn_core::config_automations::{AutomationActionConfig, AutomationRuleConfig};
+        use thegn_core::store::AutomationRuleStore;
+        let rule = |name: &str, cap: &str, field: &str| {
+            let mut then = AutomationActionConfig {
+                cap: cap.into(),
+                ..AutomationActionConfig::default()
+            };
+            match field {
+                "body" => then.body = Some("done".into()),
+                "name" => then.name = Some("deploy".into()),
+                _ => {}
+            }
+            AutomationRuleConfig {
+                name: name.into(),
+                when: "agent_finished".into(),
+                then,
+                ..AutomationRuleConfig::default()
+            }
+        };
+        let config = vec![
+            thegn_core::config_automations::compile_one(&rule("cfg", "tools.run", "name")).unwrap(),
+        ];
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        assert_eq!(with_lead_rules(&db, config.clone()), config);
+        for (id, cap, field) in [
+            ("lead:ok", "notify.push", "body"),
+            ("lead:tool", "tools.run", "name"),
+            ("lead:merge", "merge.add", ""),
+        ] {
+            let body = serde_json::to_string(&rule(id, cap, field)).unwrap();
+            db.put_lead_rule(id, &body, "lead", 1).unwrap();
+        }
+        let merged = with_lead_rules(&db, config.clone());
+        let ids: Vec<&str> = merged.iter().map(|rule| rule.id.as_str()).collect();
+        assert_eq!(ids, ["cfg", "lead:ok"]);
+        db.set_lead_rule_enabled("lead:ok", false).unwrap();
+        assert_eq!(with_lead_rules(&db, config.clone()), config);
+    }
+
+    #[test]
+    fn runtime_gate_arms_for_a_configured_lead_without_config_rules() {
+        assert!(thegn_core::automation_authoring::runtime_armed(
+            true, 0, true
+        ));
+        assert!(!thegn_core::automation_authoring::runtime_armed(
+            true, 0, false
+        ));
+        assert!(!thegn_core::automation_authoring::runtime_armed(
+            false, 0, true
+        ));
     }
 
     #[test]
