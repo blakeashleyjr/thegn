@@ -55,7 +55,7 @@ pub(crate) const CONTROL_PER_AUTHORITY_CONCURRENCY: usize = 4;
 pub(crate) const CONTROL_GLOBAL_PRIORITY_RESERVE: usize = 2;
 pub(crate) const CONTROL_PER_AUTHORITY_PRIORITY_RESERVE: usize = 1;
 /// File contents use a separate, longer policy than metadata/control calls.
-const FILE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const FILE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const FILE_TRANSFER_BODY_LIMIT: usize = 256 * 1024 * 1024;
 const TRANSFER_GLOBAL_CONCURRENCY: usize = 16;
 const TRANSFER_PER_AUTHORITY_CONCURRENCY: usize = 4;
@@ -2876,9 +2876,9 @@ fn ws_scheme(api_base: &str) -> String {
 
 const EXEC_CWD_NON_TTY_SCRIPT: &str = "cd -- \"$1\" || exit 125; shift; exec \"$@\"";
 const EXEC_CWD_TTY_SCRIPT: &str = "cd -- \"$1\" 2>/dev/null; shift; exec \"$@\"";
-const EXEC_WS_MAX_MESSAGE_SIZE: usize = 16 << 20;
-const EXEC_WS_MAX_FRAME_SIZE: usize = 4 << 20;
-const EXEC_WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
+pub(crate) const EXEC_WS_MAX_MESSAGE_SIZE: usize = 16 << 20;
+pub(crate) const EXEC_WS_MAX_FRAME_SIZE: usize = 4 << 20;
+pub(crate) const EXEC_WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
 /// Maximum provider output retained by one session while its consumer is slow.
 const EXEC_DATA_BYTE_BUDGET: usize = 8 << 20;
 /// Item capacity of the provider output channels.
@@ -2946,7 +2946,7 @@ fn exec_argv(spec: &ExecSpec) -> Result<Vec<String>> {
     Ok(argv)
 }
 
-fn exec_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+pub(crate) fn exec_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(EXEC_WS_MAX_MESSAGE_SIZE))
         .max_frame_size(Some(EXEC_WS_MAX_FRAME_SIZE))
