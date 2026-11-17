@@ -157,18 +157,7 @@ fn resolve_file_ref(
     account_home: Option<&std::path::Path>,
     env_home: &std::path::Path,
 ) -> (Option<String>, SecretOutcome) {
-    let mut candidates: Vec<String> = Vec::new();
-    if path.starts_with('~') {
-        if let Some(acct) = account_home {
-            candidates.push(thegn_core::util::expand_tilde_in(path, acct));
-        }
-        let env_path = thegn_core::util::expand_tilde_in(path, env_home);
-        if !candidates.contains(&env_path) {
-            candidates.push(env_path);
-        }
-    } else {
-        candidates.push(path.to_string());
-    }
+    let candidates = file_ref_candidates(path, account_home, env_home);
     for p in &candidates {
         match thegn_core::fsperm::read_owner_only_secret_file(
             std::path::Path::new(p),
@@ -184,6 +173,99 @@ fn resolve_file_ref(
     }
     tracing::warn!(target: "thegn::secret", tried = ?candidates, "file secret not found");
     (None, SecretOutcome::Missing)
+}
+
+/// The paths a `file:` ref is tried at, in order: a `~` path expands under the
+/// account (passwd) home first, then `$HOME` when that differs; any other path
+/// is tried as written.
+fn file_ref_candidates(
+    path: &str,
+    account_home: Option<&std::path::Path>,
+    env_home: &std::path::Path,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if path.starts_with('~') {
+        if let Some(acct) = account_home {
+            candidates.push(thegn_core::util::expand_tilde_in(path, acct));
+        }
+        let env_path = thegn_core::util::expand_tilde_in(path, env_home);
+        if !candidates.contains(&env_path) {
+            candidates.push(env_path);
+        }
+    } else {
+        candidates.push(path.to_string());
+    }
+    candidates
+}
+
+/// Why `secret_ref` (an `api_key_env`-family string: bare = env var name) does
+/// not resolve, for a user-facing error (THE-2016). Names the reference, the
+/// paths tried and an outcome class per path; never a secret value. A value
+/// read while probing is dropped immediately.
+pub(crate) fn explain_unresolved(secret_ref: &str) -> String {
+    let r = SecretRef::parse(secret_ref, BareAs::EnvName);
+    if !r.is_configured() {
+        return "no token reference configured".to_string();
+    }
+    match &r {
+        SecretRef::File { path } => {
+            let account = crate::platform::account_home();
+            let env_home = thegn_core::util::home();
+            explain_file_ref(path, account.as_deref(), &env_home)
+        }
+        SecretRef::Env { var } => {
+            let set = std::env::var_os(var)
+                .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
+            if set {
+                format!("environment variable {var} is set in this process")
+            } else {
+                format!("environment variable {var} is not set in this process")
+            }
+        }
+        SecretRef::Keyring { account } => match resolve_ref_for_outcome(&r, "explain") {
+            Ok(Some(_)) => format!("keyring entry {account} resolves"),
+            Ok(None) => "no token reference configured".to_string(),
+            Err(failure) => format!("keyring entry {account}: {failure}"),
+        },
+        SecretRef::Literal(_) => "an inline literal is configured".to_string(),
+    }
+}
+
+/// The per-candidate outcome of a `file:` ref: paths and outcome classes only.
+fn explain_file_ref(
+    path: &str,
+    account_home: Option<&std::path::Path>,
+    env_home: &std::path::Path,
+) -> String {
+    let candidates = file_ref_candidates(path, account_home, env_home);
+    let outcomes: Vec<(&str, String)> = candidates
+        .iter()
+        .map(|p| {
+            let candidate = std::path::Path::new(p);
+            let outcome = if std::fs::symlink_metadata(candidate).is_err() {
+                "not found".to_string()
+            } else {
+                // The value (if any) is dropped here; only its class is kept.
+                match thegn_core::fsperm::read_owner_only_secret_file(candidate, MAX_SECRET_BYTES) {
+                    Ok(value) if value.is_empty() => "empty".to_string(),
+                    Ok(_) => "readable".to_string(),
+                    Err(thegn_core::fsperm::SecretFileError::NotFound) => "not found".to_string(),
+                    Err(thegn_core::fsperm::SecretFileError::Refused(reason)) => {
+                        format!("refused: {reason}")
+                    }
+                }
+            };
+            (p.as_str(), outcome)
+        })
+        .collect();
+    if outcomes.iter().all(|(_, outcome)| outcome == "not found") {
+        return format!("token file not found (tried {})", candidates.join(", "));
+    }
+    let detail: Vec<String> = outcomes
+        .iter()
+        .map(|(p, outcome)| format!("{p}: {outcome}"))
+        .collect();
+    format!("token file unusable ({})", detail.join("; "))
 }
 
 /// TTL-memoized PRESENCE check for the hydration path: `env_snapshots` asks
@@ -1808,6 +1890,116 @@ mod tests {
         let (v, o) = resolve_file_ref("~/.s/tok", Some(&acct), &env);
         assert!(v.is_none());
         assert!(matches!(o, SecretOutcome::Missing));
+    }
+
+    #[test]
+    fn file_ref_candidates_order_and_dedupe() {
+        let same = std::path::Path::new("/h/a");
+        assert_eq!(
+            file_ref_candidates("~/.secrets/x", Some(same), same),
+            vec!["/h/a/.secrets/x".to_string()]
+        );
+        assert_eq!(
+            file_ref_candidates(
+                "~/.secrets/x",
+                Some(std::path::Path::new("/h/acct")),
+                std::path::Path::new("/h/env")
+            ),
+            vec![
+                "/h/acct/.secrets/x".to_string(),
+                "/h/env/.secrets/x".to_string()
+            ]
+        );
+        assert_eq!(
+            file_ref_candidates("~/.secrets/x", None, std::path::Path::new("/h/env")),
+            vec!["/h/env/.secrets/x".to_string()]
+        );
+        assert_eq!(
+            file_ref_candidates(
+                "/abs/tok",
+                Some(std::path::Path::new("/h/acct")),
+                std::path::Path::new("/h/env")
+            ),
+            vec!["/abs/tok".to_string()]
+        );
+    }
+
+    #[test]
+    fn explain_unresolved_missing_file_names_every_path_tried() {
+        let state = crate::testenv::IsolatedState::new();
+        let name = "~/.secrets/tg-b145-explain-never-present";
+        let message = explain_unresolved(&format!("file:{name}"));
+        let env_path = thegn_core::util::expand_tilde_in(name, &thegn_core::util::home());
+        assert!(env_path.starts_with(&*state.root().to_string_lossy()));
+        assert!(
+            message.starts_with("token file not found (tried "),
+            "{message}"
+        );
+        assert!(message.contains(&env_path), "{message}");
+        if let Some(acct) = crate::platform::account_home() {
+            let acct_path = thegn_core::util::expand_tilde_in(name, &acct);
+            assert!(message.contains(&acct_path), "{message}");
+        }
+        // The pure seam with two distinct homes lists both, account first.
+        let t = tempfile::tempdir().unwrap();
+        let (acct, env) = (t.path().join("acct"), t.path().join("env"));
+        let message = explain_file_ref("~/.s/tok", Some(&acct), &env);
+        assert_eq!(
+            message,
+            format!(
+                "token file not found (tried {}, {})",
+                acct.join(".s/tok").display(),
+                env.join(".s/tok").display()
+            )
+        );
+    }
+
+    #[test]
+    fn explain_unresolved_refused_file_never_shows_contents() {
+        let _state = crate::testenv::IsolatedState::new();
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let path = temp.path().join("token");
+        let sentinel = "tg-b145-sentinel-secret-value";
+        std::fs::write(&path, sentinel).unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&path, 0o644) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
+        }
+        if thegn_core::fsperm::mode_bits(&path).unwrap().is_none() {
+            return;
+        }
+        let message = explain_unresolved(&format!("file:{}", path.display()));
+        assert!(message.contains("refused: "), "{message}");
+        assert!(
+            message.contains(&*path.to_string_lossy()),
+            "names the path: {message}"
+        );
+        assert!(!message.contains(sentinel), "leaked contents: {message}");
+
+        // Readable: still only the class, never the value.
+        thegn_core::fsperm::restrict_to_owner(&path).unwrap();
+        let message = explain_unresolved(&format!("file:{}", path.display()));
+        assert!(message.contains("readable"), "{message}");
+        assert!(!message.contains(sentinel), "leaked contents: {message}");
+    }
+
+    #[test]
+    fn explain_unresolved_names_env_var_and_empty_ref() {
+        let _state = crate::testenv::IsolatedState::with_env(&[("TG_B145_EXPLAIN_SET", "v4lue")]);
+        assert_eq!(
+            explain_unresolved("TG_B145_EXPLAIN_NEVER_SET"),
+            "environment variable TG_B145_EXPLAIN_NEVER_SET is not set in this process"
+        );
+        assert_eq!(
+            explain_unresolved("env:TG_B145_EXPLAIN_NEVER_SET"),
+            "environment variable TG_B145_EXPLAIN_NEVER_SET is not set in this process"
+        );
+        let set = explain_unresolved("TG_B145_EXPLAIN_SET");
+        assert!(set.ends_with("is set in this process"), "{set}");
+        assert!(!set.contains("v4lue"), "{set}");
+        assert_eq!(explain_unresolved("  "), "no token reference configured");
     }
 
     #[test]
