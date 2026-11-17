@@ -525,7 +525,8 @@ pub(crate) fn with_lead_rules(
             "skipping an invalid Lead-authored automation rule"
         );
     }
-    thegn_core::automation_authoring::merge_rules(rules, lead)
+    // Re-capped again here: only an armed pipeline.start keeps its level.
+    thegn_core::automation_authoring::merge_rules_armed(rules, lead, &armed)
 }
 
 fn bounded(value: &str) -> String {
