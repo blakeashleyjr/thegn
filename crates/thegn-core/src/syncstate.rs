@@ -665,10 +665,20 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn staged_capture_script_runs_and_its_trailer_parses() {
         use std::process::Command;
+
+        let probe = Command::new("sh")
+            .arg("-c")
+            .arg("command -v git >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 && command -v tar >/dev/null 2>&1")
+            .status();
+        let Ok(available) = probe else {
+            return;
+        };
+        if !available.success() {
+            return;
+        }
 
         let repo = tempfile::tempdir().unwrap();
         let run_git = |args: &[&str]| {
@@ -702,10 +712,12 @@ mod tests {
         let dir = parent.path().join("stage dir");
         let dir = dir.to_str().unwrap();
         let sh = |script: &str| {
-            Command::new("sh")
-                .arg("-c")
-                .arg(script)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script);
+            for var in crate::util::GIT_ENV_VARS {
+                cmd.env_remove(var);
+            }
+            cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap()
