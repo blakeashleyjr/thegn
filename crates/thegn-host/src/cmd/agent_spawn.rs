@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::pipeline_report::display_cell;
+use thegn_core::store::NotificationStore;
 use thegn_core::store::WorkspaceStore;
 use thegn_core::{msg, outln};
 use thegn_svc::control::client::{AttachControl, ControlClient};
@@ -626,7 +627,7 @@ async fn result_async(cfg: &Config, args: ResultArgs) -> Result<i32> {
             outln!("{tail}");
         }
         if let Some(note) = &tail_note {
-            outln!("[agent result: {note}]");
+            outln!("[agent result: {}]", display_cell(note));
         }
         let code = status
             .exit_code()
@@ -1119,6 +1120,7 @@ mod tests {
     #[test]
     fn result_row_resolution_table() {
         use thegn_core::issue::NewDispatch;
+        use thegn_core::store::NotificationStore;
         let _state = IsolatedState::new();
         let db = Db::open_memory().expect("db");
         let err = super::resolve_row_session(&db, 99).unwrap_err().to_string();
