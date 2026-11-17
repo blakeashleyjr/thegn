@@ -710,7 +710,7 @@ mod tests {
             empty[0],
             "by workspace: open the breakdown to start sampling"
         );
-        assert!(empty.iter().any(|l| l == "thegn|—|—|—"), "{empty:?}");
+        assert!(empty.iter().any(|l| l == "thegn|—|—|—|"), "{empty:?}");
 
         let mut partial = model();
         partial.procs.summary = None;
