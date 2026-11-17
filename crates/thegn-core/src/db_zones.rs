@@ -115,6 +115,19 @@ impl ZoneStore for Db {
         Ok(row)
     }
 
+    fn workspace_zones(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT w.repo_path, z.name FROM workspaces w
+               JOIN zones z ON z.zone_id = w.zone_id
+              ORDER BY w.repo_path LIMIT 4096",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     fn zone_of_worktree(&self, worktree: &str) -> Result<Option<ZoneRow>> {
         // worktree → its repo_path → the workspace's zone. If the arg isn't a
         // known worktree, treat it as a repo path directly (home-tab panes).
@@ -295,5 +308,42 @@ mod tests {
         db.assign_workspace_zone("/keep", Some(z)).unwrap();
         assert_eq!(db.zone_of_workspace("/keep").unwrap().unwrap().name, "z");
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn workspace_zones_lists_assigned_pairs_in_order() {
+        let db = db();
+        let z = db.create_zone("z1", 1).unwrap();
+        add_ws(&db, "/b");
+        add_ws(&db, "/a");
+        add_ws(&db, "/unzoned");
+        db.assign_workspace_zone("/b", Some(z)).unwrap();
+        db.assign_workspace_zone("/a", Some(z)).unwrap();
+        assert_eq!(
+            db.workspace_zones().unwrap(),
+            vec![
+                ("/a".to_string(), "z1".to_string()),
+                ("/b".to_string(), "z1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_zones_excludes_dangling_zone_id() {
+        let db = db();
+        let z = db.create_zone("z1", 1).unwrap();
+        add_ws(&db, "/r");
+        db.assign_workspace_zone("/r", Some(z)).unwrap();
+        db.conn()
+            .execute("DELETE FROM zones WHERE zone_id=?1", params![z])
+            .unwrap();
+        assert!(db.workspace_zones().unwrap().is_empty());
+    }
+
+    #[test]
+    fn workspace_zones_propagates_error() {
+        let db = db();
+        db.conn().execute_batch("DROP TABLE zones").unwrap();
+        assert!(db.workspace_zones().is_err());
     }
 }
