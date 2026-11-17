@@ -3,7 +3,7 @@ id: sandboxing
 title: Sandboxing
 parent: workflows
 order: 3
-contexts: [panel:sandbox#inspecting, panel:environments]
+contexts: [panel:sandbox#inspecting]
 ---
 
 # Sandboxing
