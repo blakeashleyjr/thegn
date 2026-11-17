@@ -142,6 +142,24 @@ Control clients use the Git-scoped `folders.assign` capability: pass exactly one
 of `folder` (a name) or `clear: true`; neither, or both, is rejected. Over MCP
 the `folders_assign` tool needs `--scopes git`.
 
+## Asking for an approval
+
+An agent (or the Lead) asks a human to approve a stage with
+`approvals.request` (`{"issue_id", "stage", "commit_sha", "worktree"?,
+"reason"?}`; a Write-scoped MCP tool). The request is an `agent_attention`
+inbox row, `Approval requested: <issue> <stage> @ <sha7> — <reason>`; asking
+again while it is unanswered returns the same row. `approvals.list` shows the
+recorded approvals and the requests still pending. A request stops being
+pending once a live approval covers that commit; an approval of an older
+commit (superseded), an expired one or a revoked one leaves it pending.
+
+Only a person answers: `thegn api call approvals.resolve '{"issue_id",
+"stage", "commit_sha", "decision": "approve"|"reject", "approver"}'` needs
+admin scope and is not an MCP tool, so an agent cannot approve its own
+request. Approving records the same commit-bound approval as
+`thegn supervise approve`; rejecting revokes the stage's approvals. Both clear
+the inbox row.
+
 ## Finishing a stage
 
 A worker reports with `thegn dispatch report <row>` and text that starts with
