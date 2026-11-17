@@ -11,7 +11,6 @@
 //! The sandbox fails closed: no bwrap means no Lead, never a host shell. This
 //! runs off the event loop, inside `handlers::materialize`.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -43,6 +42,8 @@ struct LeadHost<'a> {
     mcp: &'a dyn Fn(&Config, &Path, &str) -> anyhow::Result<crate::lead::mcp::LeadMcpPlan>,
     /// Whether this pane is daemon-owned (drops `--die-with-parent`).
     daemon_owned: bool,
+    /// `$XDG_STATE_HOME`: the parent of the Lead's private harness home.
+    state_home: PathBuf,
 }
 
 /// The launch spec for Lead tab `tab` of `group`.
@@ -61,6 +62,7 @@ pub(crate) fn launch_spec(
             control_dirs: &control_dirs,
             mcp: &crate::lead::mcp::prepare,
             daemon_owned: crate::handlers::startup::daemon_active(cfg),
+            state_home: thegn_core::util::xdg_state_home(),
         },
     )
 }
@@ -78,6 +80,16 @@ fn launch_spec_with(
     if !(host.bwrap_available)() {
         bail!(NO_BWRAP);
     }
+    if lead
+        .account
+        .as_deref()
+        .is_some_and(|a| !a.trim().is_empty())
+    {
+        bail!(
+            "[lead] account is not supported yet: the Lead keeps its own private credential \
+             home (log in once inside the Lead); remove [lead] account"
+        );
+    }
 
     // The notes dir is the only writable dir. Vet it against the repos BEFORE
     // creating it, through its canonical prospective path, so a notes_dir
@@ -86,6 +98,12 @@ fn launch_spec_with(
     let repo_roots = canonical_roots((host.repo_roots)().context(
         "the Lead could not read the registered repos to vet its sandbox; refusing to launch",
     )?);
+    // The thegn config dir is guarded like a repo: a writable config.toml
+    // (agents, gate_command) is host code execution.
+    let mut guarded = repo_roots.clone();
+    if let Some(dir) = Config::path().parent() {
+        guarded.extend(canonical_roots(vec![dir.to_path_buf()]));
+    }
     let notes = lead.notes_dir_resolved();
     let prospective = canonical_prospective(&notes);
     lead_sandbox::validate(
@@ -94,7 +112,7 @@ fn launch_spec_with(
             chdir: prospective,
             ..LeadMountPlan::default()
         },
-        &repo_roots,
+        &guarded,
     )
     .map_err(|why| anyhow::anyhow!("[lead] notes_dir: {why}"))?;
     if let Some(parent) = notes.parent() {
@@ -111,16 +129,13 @@ fn launch_spec_with(
     let mcp = (host.mcp)(cfg, &notes, &caller)?;
 
     // The agent: its command (+ harness model flag), its secret-expanded env
-    // overlay, then the [lead] account's credential home, then the MCP env.
+    // overlay, then the MCP env, then the Lead's private harness home.
     let eff = thegn_core::agent_task::effective_agent(cfg, &lead.agent, None)
         .map_err(|e| anyhow::anyhow!("[lead] agent: {e}"))?;
     let command = eff
         .interactive_command()
         .map_err(|e| anyhow::anyhow!("[lead] agent: {e}"))?;
     let mut env: Vec<(String, String)> = eff.expanded_env();
-    if let Some(account) = lead.account.as_deref().filter(|a| !a.trim().is_empty()) {
-        env.push(account_env(cfg, &lead.agent, account)?);
-    }
     env.extend(mcp.env.iter().cloned());
     env.push(("THEGN_CALLER".to_string(), caller));
 
@@ -135,12 +150,25 @@ fn launch_spec_with(
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
-        .context("the Lead needs $HOME to locate its harness state")?;
+        .context("the Lead needs $HOME to locate the credentials it hides")?;
+    // The harness home is private to the Lead, never the shared `~/.claude`
+    // (a hook or MCP entry written there would run unsandboxed in the next
+    // worker session). Pushed after the agent env so it overrides any
+    // agent-env `CLAUDE_CONFIG_DIR`.
     let mut writable = vec![notes.clone()];
-    for path in lead_sandbox::harness_state_paths(&eff.harness, &home, &effective_env(&env)) {
-        if let Some(path) = prepare_state_path(&path)? {
-            writable.push(path);
-        }
+    if let Some(h) = thegn_core::harness::harness(&eff.harness)
+        && let Some(spec) = h.home().filter(|s| !s.home_env.is_empty())
+    {
+        let rel = Path::new("thegn/lead-harness").join(h.id());
+        let dir = thegn_core::fsperm::ensure_private_dir_beneath(&host.state_home, &rel)
+            .context("creating the Lead's private harness home")?;
+        let dir = std::fs::canonicalize(dir.path())
+            .context("resolving the Lead's private harness home")?;
+        env.push((
+            spec.home_env.to_string(),
+            dir.to_string_lossy().into_owned(),
+        ));
+        writable.push(dir);
     }
     writable.dedup();
     // Parents first, so a dir already covered by a mask is neither created
@@ -157,11 +185,34 @@ fn launch_spec_with(
             masked.push(dir);
         }
     }
-    let masked_files = HOST_SOCKETS
+    let mut masked_files = HOST_SOCKETS
         .iter()
         .map(PathBuf::from)
         .filter(|p| std::fs::metadata(p).is_ok_and(|m| !m.is_dir()))
         .collect::<Vec<_>>();
+    // Key files and forge tokens: the Lead never pushes, and the read-only
+    // root would otherwise expose them.
+    const HOME_CREDENTIALS: &[&str] = &[
+        ".ssh",
+        ".gnupg",
+        ".config/gh",
+        ".config/glab-cli",
+        ".git-credentials",
+        ".netrc",
+    ];
+    for c in HOME_CREDENTIALS {
+        let path = home.join(c);
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                let dir = std::fs::canonicalize(&path).unwrap_or(path);
+                if !masked.iter().any(|m| dir.starts_with(m)) {
+                    masked.push(dir);
+                }
+            }
+            Ok(_) => masked_files.push(path),
+            Err(_) => {}
+        }
+    }
     let readable = readable_under_masks(&mcp.readable, &masked)?;
     let plan = LeadMountPlan {
         writable,
@@ -171,7 +222,7 @@ fn launch_spec_with(
         chdir: notes.clone(),
         die_with_parent: !host.daemon_owned,
     };
-    lead_sandbox::validate(&plan, &repo_roots)
+    lead_sandbox::validate(&plan, &guarded)
         .map_err(|why| anyhow::anyhow!("the Lead sandbox was refused: {why}"))?;
 
     let argv = thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(lead_sandbox::bwrap_argv(
@@ -186,57 +237,6 @@ fn launch_spec_with(
         degraded: false,
         remote: false,
     })
-}
-
-/// The `[lead] account` credential env: `(provider home env, account dir)`.
-/// An account that cannot be resolved is a refusal, never a fall-through to
-/// another account's credentials.
-fn account_env(cfg: &Config, agent: &str, account: &str) -> anyhow::Result<(String, String)> {
-    let Some(provider) = thegn_core::account::provider_for(cfg, agent) else {
-        bail!("[lead] account {account:?}: agent {agent:?} has no account provider");
-    };
-    let db = thegn_core::db::Db::open().context("[lead] account: opening the state db")?;
-    let Some(dir) = thegn_core::account::account_dir(cfg, &db, provider.id, account) else {
-        bail!(
-            "[lead] account {account:?} is not a usable {} account",
-            provider.id
-        );
-    };
-    Ok((
-        provider.home_env.to_string(),
-        dir.to_string_lossy().into_owned(),
-    ))
-}
-
-/// The env the agent will see for the harness-state keys: the host env,
-/// overlaid with the launch env (later pairs win).
-fn effective_env(launch: &[(String, String)]) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    for key in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR"] {
-        if let Ok(v) = std::env::var(key) {
-            env.insert(key.to_string(), v);
-        }
-    }
-    for (k, v) in launch {
-        env.insert(k.clone(), v.clone());
-    }
-    env
-}
-
-/// A harness-state path, created when it is a missing directory and
-/// canonicalized. A missing `*.json` file is skipped (the harness creates it
-/// on first run outside the Lead; bwrap cannot bind a missing source).
-fn prepare_state_path(path: &Path) -> anyhow::Result<Option<PathBuf>> {
-    if std::fs::symlink_metadata(path).is_err() {
-        if path.extension().is_some_and(|e| e == "json") {
-            return Ok(None);
-        }
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("creating the Lead harness state {}", path.display()))?;
-    }
-    Ok(Some(std::fs::canonicalize(path).with_context(|| {
-        format!("resolving the Lead harness state {}", path.display())
-    })?))
 }
 
 /// A control dir to mask. Under `/tmp` it is already covered by the private
@@ -382,8 +382,13 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let tmp = tempfile::tempdir().unwrap();
+        // outside /tmp: the Lead's private /tmp swallows masks there
+        let tmp = tempfile::Builder::new()
+            .prefix(".lead-launch-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("state")).unwrap();
         let cfg = Config {
             agents: vec![toml::from_str("name = \"lead-agent\"\ncommand = \"true\"").unwrap()],
             lead: Some(thegn_core::config_lead::LeadConfig {
@@ -423,6 +428,7 @@ mod tests {
                 control_dirs: &dirs,
                 mcp: &no_mcp,
                 daemon_owned: true,
+                state_home: fx.root.join("state"),
             },
         )
     }
@@ -507,14 +513,16 @@ mod tests {
         assert!(!repo.join("notes").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn launch_spec_refuses_a_notes_dir_symlinked_into_a_repo() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
         let mut fx = fixture();
         let repo = fx.root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let link = fx.root.join("link");
-        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        crate::platform::test_symlink(&repo, &link).unwrap();
         if let Some(lead) = fx.cfg.lead.as_mut() {
             lead.notes_dir = Some(link.join("notes"));
         }
@@ -551,22 +559,14 @@ mod tests {
     fn prepare_mask_dir_skips_tmp_and_refuses_a_file() {
         assert_eq!(prepare_mask_dir(Path::new("/tmp/thegn-x")).unwrap(), None);
         assert_eq!(prepare_mask_dir(Path::new("rel")).unwrap(), None);
-        let tmp = tempfile::tempdir().unwrap();
+        // outside /tmp: the Lead's private /tmp swallows masks there
+        let tmp = tempfile::Builder::new()
+            .prefix(".lead-launch-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
         let file = tmp.path().join("f");
         std::fs::write(&file, "").unwrap();
         assert!(prepare_mask_dir(&file).is_err());
-    }
-
-    #[test]
-    fn prepare_state_path_skips_a_missing_json_and_creates_a_missing_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(
-            prepare_state_path(&tmp.path().join(".claude.json")).unwrap(),
-            None
-        );
-        let dir = tmp.path().join(".codex");
-        assert!(prepare_state_path(&dir).unwrap().is_some());
-        assert!(dir.is_dir());
     }
 
     #[test]
