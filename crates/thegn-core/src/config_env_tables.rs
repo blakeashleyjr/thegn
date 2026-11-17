@@ -260,6 +260,10 @@ pub struct EnvProviderConfig {
     /// `[lifecycle] hibernate_after_secs`.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub hibernate_idle_secs: u64,
+    /// Vercel only: the team id (`team_…`). Not secrets.
+    pub team_id: String,
+    /// Vercel only: the project id (`prj_…`). Not secrets.
+    pub project_id: String,
 }
 
 impl EnvProviderConfig {
@@ -299,6 +303,8 @@ impl EnvProviderConfig {
             && self.max_lifetime_secs == 0
             && self.hibernate == HibernateMode::Auto
             && self.hibernate_idle_secs == 0
+            && self.team_id.is_empty()
+            && self.project_id.is_empty()
     }
 
     /// Whether this env's provider is scale-to-zero (an idle sandbox self-suspends
@@ -385,6 +391,14 @@ impl EnvProviderConfig {
             let exe = crate::util::self_exe_str();
             return vec![exe, "machine0-ssh".into(), "{id}".into(), "--".into()];
         }
+        if kind == EnvProviderKind::Vercel {
+            // Vercel has no vendor CLI and no ssh: panes AND chrome reads run
+            // through the `vercel-exec` self-bridge over the sandbox command
+            // API. Not WSS-native (`exec_api` is false), so a configured
+            // `exec_command` above still wins, like every non-WSS kind.
+            let exe = crate::util::self_exe_str();
+            return vec![exe, "vercel-exec".into(), "{id}".into(), "--".into()];
+        }
         if wss_native_provider_kind(&self.provider) {
             // WSS-native providers (sprites) have no vendor CLI. The
             // control-plane READ path (chrome git/gh/fs reads + the persisted
@@ -420,6 +434,7 @@ config_enum! {
         DigitalOcean = "digitalocean",
         Fly = "fly",
         Machine0 = "machine0",
+        Vercel = "vercel",
     } default = Custom;
 }
 
@@ -454,30 +469,44 @@ impl EnvProviderKind {
     /// (compute billed only while awake; the filesystem persists). `sprites`
     /// (~30s idle timeout, zero idle compute), `fly` (a stopped machine bills
     /// only for its rootfs), `machine0` (an idle VM `vm_suspend`s to a state
-    /// billed only for storage). Everything else is `false` on purpose: a
+    /// billed only for storage), `vercel` (a persistent sandbox stops at its
+    /// session timeout and keeps its filesystem as a snapshot; a stopped
+    /// session bills no compute). Everything else is `false` on purpose: a
     /// wrong `false` keeps the safe age-out, a wrong `true` parks billed
     /// instances forever.
     pub fn scale_to_zero(self) -> bool {
-        matches!(self, Self::Sprites | Self::Fly | Self::Machine0)
+        matches!(
+            self,
+            Self::Sprites | Self::Fly | Self::Machine0 | Self::Vercel
+        )
     }
 
     /// Self-suspends on idle without thegn's help (the warm-pool policy's
     /// "don't also age it out" case).
     pub fn self_suspends(self) -> bool {
-        matches!(self, Self::Sprites)
+        matches!(self, Self::Sprites | Self::Vercel)
     }
 
     /// Whether a reaper enforces `max_lifetime_secs` for this kind
-    /// (`fly_reaper` / `vps_reaper`).
+    /// (`fly_reaper` / `vps_reaper` / `vercel_reaper`).
     pub fn lifetime_reaped(self) -> bool {
-        matches!(self, Self::Fly) || self.is_vps()
+        matches!(self, Self::Fly | Self::Vercel) || self.is_vps()
     }
 
     /// Whether this provider's lifecycle (provision, teardown, orphan reaping,
     /// and warm pool) has not been verified against a live account. `thegn doctor`
     /// displays this state by owner decision THE-142.
     pub fn live_unverified(self) -> bool {
-        matches!(self, Self::Hetzner)
+        matches!(self, Self::Hetzner | Self::Vercel)
+    }
+
+    /// Credential-free kind: no host credential (agent logins, dotfiles,
+    /// atuin, git token) is ever uploaded to a sandbox of this kind. The repo
+    /// goes in as a host-built bundle and the credential-bearing provisioning
+    /// steps are stripped and refused (`provider_credentials`, enforced by
+    /// lane 5 of b154).
+    pub fn credential_free(self) -> bool {
+        matches!(self, Self::Vercel)
     }
 }
 
@@ -1047,9 +1076,13 @@ mod tests {
             EnvProviderKind::DigitalOcean,
             EnvProviderKind::Fly,
             EnvProviderKind::Machine0,
+            EnvProviderKind::Vercel,
         ] {
             match kind {
-                EnvProviderKind::Fly | EnvProviderKind::Hetzner | EnvProviderKind::DigitalOcean => {
+                EnvProviderKind::Fly
+                | EnvProviderKind::Hetzner
+                | EnvProviderKind::DigitalOcean
+                | EnvProviderKind::Vercel => {
                     assert!(kind.lifetime_reaped(), "{kind:?} is reaped");
                 }
                 EnvProviderKind::Custom
@@ -1063,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn live_unverified_marks_only_hetzner() {
+    fn live_unverified_marks_hetzner_and_vercel() {
         for kind in [
             EnvProviderKind::Custom,
             EnvProviderKind::Daytona,
@@ -1072,9 +1105,10 @@ mod tests {
             EnvProviderKind::DigitalOcean,
             EnvProviderKind::Fly,
             EnvProviderKind::Machine0,
+            EnvProviderKind::Vercel,
         ] {
             match kind {
-                EnvProviderKind::Hetzner => {
+                EnvProviderKind::Hetzner | EnvProviderKind::Vercel => {
                     assert!(kind.live_unverified(), "{kind:?} is live-unverified");
                 }
                 EnvProviderKind::Custom
@@ -1087,5 +1121,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn vercel_kind_predicates() {
+        let k = EnvProviderKind::of("vercel");
+        assert_eq!(k, EnvProviderKind::Vercel);
+        assert_eq!(EnvProviderKind::of(" vercel "), EnvProviderKind::Vercel);
+        assert_eq!(k.as_str(), "vercel");
+        assert!(!k.exec_api(), "no resident bridge / native pane path");
+        assert!(!k.ssh_reached(), "no ssh");
+        assert!(k.scale_to_zero());
+        assert!(k.self_suspends());
+        assert!(k.lifetime_reaped());
+        assert!(k.live_unverified());
+        assert!(!k.is_vps());
+        assert!(k.credential_free());
+        // Credential-free is Vercel only.
+        for other in [
+            EnvProviderKind::Custom,
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Sprites,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+        ] {
+            assert!(!other.credential_free(), "{other:?}");
+        }
+        // Scale-to-zero ⇒ hibernate stays off under auto.
+        assert!(!provider_env("vercel").hibernate_enabled());
+        assert!(!wss_native_provider_kind("vercel"));
+        assert!(!ssh_reached_provider_kind("vercel"));
+    }
+
+    #[test]
+    fn vercel_control_template_is_the_vercel_exec_bridge() {
+        let tpl = provider_env("vercel").control_command_template();
+        assert_eq!(tpl.len(), 4, "{tpl:?}");
+        assert_eq!(tpl[0], crate::util::self_exe_str());
+        assert_eq!(&tpl[1..], ["vercel-exec", "{id}", "--"], "{tpl:?}");
+    }
+
+    #[test]
+    fn vercel_configured_exec_command_wins() {
+        // Not WSS-native: a configured exec_command wins under every exec mode,
+        // matching the other non-WSS kinds.
+        for mode in [
+            ProviderExecMode::Auto,
+            ProviderExecMode::Api,
+            ProviderExecMode::Cli,
+        ] {
+            let tpl = with_exec_command("vercel", mode).control_command_template();
+            assert_eq!(tpl, vendor_argv(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn vercel_ids_participate_in_is_default() {
+        let e = EnvProviderConfig {
+            team_id: "team_abc".into(),
+            ..Default::default()
+        };
+        assert!(!e.is_default());
+        let e = EnvProviderConfig {
+            project_id: "prj_abc".into(),
+            ..Default::default()
+        };
+        assert!(!e.is_default());
     }
 }

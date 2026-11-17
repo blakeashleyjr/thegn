@@ -47,6 +47,7 @@ pub(crate) fn managed_key_account(pc: &thegn_core::config::EnvProviderConfig) ->
             K::DigitalOcean => "DIGITALOCEAN_TOKEN",
             K::Fly => "FLY_API_TOKEN",
             K::Machine0 => "MACHINE0_API_KEY",
+            K::Vercel => "VERCEL_TOKEN",
             K::Custom => "default",
         }
     };
@@ -165,6 +166,9 @@ pub(crate) fn provider_for_named_owned(
         (Provider::Fly(provider), Some(owner)) => {
             Provider::Fly(provider.with_owner(owner.to_owned()))
         }
+        (Provider::Vercel(provider), Some(owner)) => {
+            Provider::Vercel(provider.with_owner(owner.to_owned()))
+        }
         (provider, _) => provider,
     })
 }
@@ -272,6 +276,10 @@ pub(crate) fn provider_for_inventory(
                 }),
             ))
         }
+        K::Vercel => {
+            let (key, token) = vercel_token(pc)?;
+            vercel_provider_from(pc, "", &key, token).map(Provider::Vercel)
+        }
         K::Custom => Err("custom provider has no inventory API".to_string()),
     }
 }
@@ -315,6 +323,8 @@ pub(crate) fn provider_for_named_with_key(
         K::Machine0 => {
             machine0_provider_for_with_key(pc, name, managed_key).map(Provider::Machine0)
         }
+        // No ssh: a managed keypair has no meaning for vercel.
+        K::Vercel => vercel_provider_for(pc, name).map(Provider::Vercel),
         // exec_command-driven: no lifecycle API to build a provider for.
         K::Custom => None,
     }
@@ -335,6 +345,7 @@ pub(crate) fn token_ref(pc: &thegn_core::config::EnvProviderConfig) -> Option<St
         }
         K::Fly => "FLY_API_TOKEN",
         K::Machine0 => "MACHINE0_API_KEY",
+        K::Vercel => "VERCEL_TOKEN",
         K::Custom => return None,
     };
     Some(
@@ -400,6 +411,71 @@ fn fly_token(pc: &thegn_core::config::EnvProviderConfig) -> Result<(String, Stri
     crate::secret::resolve_for(key, "provider:fly")
         .map(|token| (key.to_string(), token))
         .ok_or_else(|| format!("API token {key} could not be resolved"))
+}
+
+/// Resolve the Vercel API token (or OIDC token) at call time through the one
+/// audited chokepoint: `(env ref, secret)`; the error names the ref only.
+fn vercel_token(pc: &thegn_core::config::EnvProviderConfig) -> Result<(String, String), String> {
+    let key = if pc.api_key_env.trim().is_empty() {
+        "VERCEL_TOKEN"
+    } else {
+        pc.api_key_env.trim()
+    };
+    crate::secret::resolve_for(key, "provider:vercel")
+        .map(|token| (key.to_string(), token))
+        .ok_or_else(|| format!("API token {key} could not be resolved"))
+}
+
+/// Build the [`VercelProvider`](thegn_svc::vercel::VercelProvider) for a
+/// `provider = "vercel"` env config, resolving the token at call time. `None`
+/// (with a value-free warning) when the token can't be resolved or the spec is
+/// refused. The token moves straight into the provider's client.
+pub(crate) fn vercel_provider_for(
+    pc: &thegn_core::config::EnvProviderConfig,
+    name: &str,
+) -> Option<thegn_svc::vercel::VercelProvider> {
+    let built =
+        vercel_token(pc).and_then(|(key, token)| vercel_provider_from(pc, name, &key, token));
+    match built {
+        Ok(provider) => Some(provider),
+        Err(why) => {
+            thegn_core::msg::warn(&format!("vercel: {why}; cannot drive vercel"));
+            None
+        }
+    }
+}
+
+/// The `VercelSpec` for `pc` with an already-resolved token. Errors name a
+/// config field or the ref, never the token.
+fn vercel_provider_from(
+    pc: &thegn_core::config::EnvProviderConfig,
+    name: &str,
+    key: &str,
+    token: String,
+) -> Result<thegn_svc::vercel::VercelProvider, String> {
+    use thegn_core::vercel::policy;
+    let vcpus = policy::vcpus_for(pc.size.trim(), pc.min_vcpu)
+        .map_err(|e| format!("provider.{}: {}", e.field, e.reason))?;
+    let non_empty = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    thegn_svc::vercel::VercelProvider::new(thegn_svc::vercel::VercelSpec {
+        api_base: pc.api_base.trim().to_string(),
+        token: thegn_svc::vercel::VercelToken::new(token),
+        credential_ref: key.to_string(),
+        scope: thegn_core::vercel::api::Scope {
+            team_id: pc.team_id.trim().to_string(),
+            project_id: pc.project_id.trim().to_string(),
+        },
+        name: name.to_string(),
+        vcpus,
+        image: non_empty(pc.template.as_str()),
+        region: non_empty(pc.region.as_str()),
+        max_instances: policy::max_instances(pc.max_instances),
+        max_lifetime_secs: policy::max_lifetime_secs(pc.max_lifetime_secs),
+    })
+    .map_err(|_| "the vercel provider could not be built (check api_base)".to_string())
 }
 
 /// Resolve a VPS-kind API token: `(kind, env ref, secret)`.
@@ -753,7 +829,7 @@ mod tests {
     #[test]
     fn inventory_provider_needs_only_a_token() {
         let _state = crate::testenv::IsolatedState::with_env(&[("TG_TEST_INV_TOKEN", "tok")]);
-        for kind in ["fly", "hetzner", "machine0"] {
+        for kind in ["fly", "hetzner", "machine0", "vercel"] {
             let pc = thegn_core::config::EnvProviderConfig {
                 provider: kind.into(),
                 api_key_env: "TG_TEST_INV_TOKEN".into(),
@@ -819,6 +895,34 @@ mod tests {
         );
         assert_eq!(token_ref(&pc("custom", "")), None);
         assert_eq!(token_ref(&pc("custom", "IGNORED")), None);
+    }
+
+    #[test]
+    fn vercel_token_ref_and_key_account_default_to_vercel_token() {
+        let pc = |key: &str| thegn_core::config::EnvProviderConfig {
+            provider: "vercel".into(),
+            api_key_env: key.into(),
+            ..Default::default()
+        };
+        assert_eq!(token_ref(&pc("")).as_deref(), Some("VERCEL_TOKEN"));
+        assert_eq!(
+            token_ref(&pc(" keyring:vercel ")).as_deref(),
+            Some("keyring:vercel")
+        );
+        assert_eq!(managed_key_account(&pc("")), "env:VERCEL_TOKEN");
+    }
+
+    #[test]
+    fn vercel_unresolved_token_names_the_ref_only() {
+        let _state = crate::testenv::IsolatedState::new();
+        let pc = thegn_core::config::EnvProviderConfig {
+            provider: "vercel".into(),
+            api_key_env: "TG_TEST_VERCEL_NO_SUCH_TOKEN".into(),
+            ..Default::default()
+        };
+        let err = provider_for_inventory(&pc).err().expect("no token");
+        assert!(err.contains("TG_TEST_VERCEL_NO_SUCH_TOKEN"), "{err}");
+        assert!(vercel_provider_for(&pc, "tg-a").is_none());
     }
 
     #[test]

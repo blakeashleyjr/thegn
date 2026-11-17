@@ -484,6 +484,7 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
                 | crate::config::EnvProviderKind::DigitalOcean
                 | crate::config::EnvProviderKind::Fly
                 | crate::config::EnvProviderKind::Machine0
+                | crate::config::EnvProviderKind::Vercel
         );
         if managed
             && env
@@ -514,6 +515,8 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
                 env.provider.max_instances,
                 env.provider.max_lifetime_secs,
             ),
+            "vercel" => crate::vercel::admit::validate_env(&env.provider)
+                .map_err(|e| ProviderAdmissionError::new(e.field, e.reason)),
             _ => Ok(()),
         };
         if let Err(error) = result {
