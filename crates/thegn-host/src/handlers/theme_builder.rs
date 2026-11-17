@@ -162,6 +162,11 @@ pub(crate) fn drain_catalog(
     changed
 }
 
-pub(crate) fn render(builder: &ThemeBuilder, surface: &mut Surface, screen: Rect) {
-    builder.render(surface, screen);
+pub(crate) fn render(
+    builder: &ThemeBuilder,
+    surface: &mut Surface,
+    screen: Rect,
+    chrome: &crate::layout::ChromeLayout,
+) {
+    builder.render(surface, screen, chrome);
 }
