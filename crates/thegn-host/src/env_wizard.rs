@@ -35,6 +35,7 @@ const KINDS: &[&str] = &[
     "daytona",
     "sprites",
     "machine0",
+    "vercel",
 ];
 
 /// Probe keyring availability on a detached thread, returning the shared
@@ -66,6 +67,8 @@ pub enum Field {
     Token,
     Region,
     Size,
+    TeamId,
+    ProjectId,
     Template,
     SshHost,
     Sandbox,
@@ -110,6 +113,8 @@ pub struct EnvWizard {
     token: String,
     region: String,
     size: String,
+    team_id: String,
+    project_id: String,
     template: String,
     ssh_host: String,
     /// `(backend_key, label)` cycle rows for a `local` env.
@@ -139,6 +144,8 @@ impl EnvWizard {
             token: String::new(),
             region: String::new(),
             size: String::new(),
+            team_id: String::new(),
+            project_id: String::new(),
             template: String::new(),
             ssh_host: String::new(),
             sandbox_rows,
@@ -171,6 +178,14 @@ impl EnvWizard {
         match self.kind() {
             "local" => f.push(Field::Sandbox),
             "ssh" => f.push(Field::SshHost),
+            "vercel" => f.extend([
+                Field::Token,
+                Field::TeamId,
+                Field::ProjectId,
+                Field::Region,
+                Field::Size,
+                Field::Template,
+            ]),
             _ => f.extend([Field::Token, Field::Region, Field::Size, Field::Template]),
         }
         f
@@ -182,6 +197,8 @@ impl EnvWizard {
             Field::Token => Some(&mut self.token),
             Field::Region => Some(&mut self.region),
             Field::Size => Some(&mut self.size),
+            Field::TeamId => Some(&mut self.team_id),
+            Field::ProjectId => Some(&mut self.project_id),
             Field::Template => Some(&mut self.template),
             Field::SshHost => Some(&mut self.ssh_host),
             _ => None,
@@ -288,6 +305,8 @@ impl EnvWizard {
             provider: self.kind().to_string(),
             region: Self::opt(&self.region),
             size: Self::opt(&self.size),
+            team_id: Self::opt(&self.team_id),
+            project_id: Self::opt(&self.project_id),
             template: Self::opt(&self.template),
             max_instances: None,
             max_lifetime: None,
@@ -367,6 +386,13 @@ impl EnvWizard {
             ),
             Field::Region => ("region  ", &self.region, "· provider default", false),
             Field::Size => ("size    ", &self.size, "· provider default", false),
+            Field::TeamId => ("team    ", &self.team_id, "team_… (Vercel team id)", false),
+            Field::ProjectId => (
+                "project ",
+                &self.project_id,
+                "prj_… (Vercel project id)",
+                false,
+            ),
             Field::Template => (
                 "image   ",
                 &self.template,
@@ -456,6 +482,28 @@ mod tests {
                 assert_eq!(a.token.as_deref(), Some("SECRET"));
                 assert_eq!(a.region.as_deref(), Some("iad"));
                 assert_eq!(a.size, None);
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn vercel_kind_asks_for_team_and_project() {
+        let mut w = wiz();
+        w.kind_sel = KINDS.iter().position(|k| *k == "vercel").unwrap();
+        assert!(w.fields().contains(&Field::TeamId));
+        assert!(w.fields().contains(&Field::ProjectId));
+        w.focus = Field::Name;
+        typ(&mut w, "vc");
+        w.focus = Field::TeamId;
+        typ(&mut w, "team_abc");
+        w.focus = Field::ProjectId;
+        typ(&mut w, "prj_abc");
+        match w.submit() {
+            Outcome::Submit(a) => {
+                assert_eq!(a.provider, "vercel");
+                assert_eq!(a.team_id.as_deref(), Some("team_abc"));
+                assert_eq!(a.project_id.as_deref(), Some("prj_abc"));
             }
             _ => panic!("expected submit"),
         }
