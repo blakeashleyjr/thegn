@@ -3680,7 +3680,9 @@ enum GitInputKind {
     Reword {
         sha: String,
     },
-    StashPush,
+    StashPush {
+        mode: crate::gitmut::StashMode,
+    },
     PatchSplit {
         sha: String,
         patch: String,
@@ -5110,17 +5112,27 @@ fn handle_git_msg(
             }
         }
         // ---- stash --------------------------------------------------------
-        GitMsg::StashPush => {
-            *ov.input = Some((
-                menu::InputOverlay::new(
-                    format!(
-                        "stash message (empty = {})",
-                        gitui::stash_message_or_default("", &model.panel.branch)
+        GitMsg::StashPush | GitMsg::StashStaged | GitMsg::StashUnstaged => {
+            let mode = match &msg {
+                GitMsg::StashStaged => crate::gitmut::StashMode::Staged,
+                GitMsg::StashUnstaged => crate::gitmut::StashMode::Unstaged,
+                _ => crate::gitmut::StashMode::All,
+            };
+            if let Some(why) = gitui::stash_preflight(mode, &model.panel.changes) {
+                model.status = why.into();
+            } else {
+                *ov.input = Some((
+                    menu::InputOverlay::new(
+                        format!(
+                            "{} (empty = {})",
+                            gitui::stash_prompt(mode),
+                            gitui::stash_message_or_default("", &model.panel.branch)
+                        ),
+                        "",
                     ),
-                    "",
-                ),
-                GitInputKind::StashPush,
-            ));
+                    GitInputKind::StashPush { mode },
+                ));
+            }
         }
         GitMsg::StashApply => {
             if let Some(s) = sel_stash(panel_ui, model) {
@@ -5503,9 +5515,9 @@ fn handle_git_input_submit(
                 enqueue(panel_ui, model, GitOp::Reword { sha, message: text });
             }
         }
-        GitInputKind::StashPush => {
+        GitInputKind::StashPush { mode } => {
             let message = gitui::stash_message_or_default(&text, &model.panel.branch);
-            enqueue(panel_ui, model, GitOp::StashPush { message });
+            enqueue(panel_ui, model, GitOp::StashPush { message, mode });
         }
         GitInputKind::PatchSplit { sha, patch } => {
             if !require(model) {
@@ -7011,7 +7023,7 @@ async fn event_loop<T: Terminal>(
     mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::hydrate::StatsTick>,
     container_slot: crate::snapshot_slot::SnapshotSlot<crate::hydrate::ContainerRefresh>,
     daemon_status_slot: crate::snapshot_slot::SnapshotSlot<crate::chrome::DaemonStatus>,
-    metrics_inbox: crate::metrics::MetricsInbox,
+    mut metrics_inbox: crate::metrics::MetricsInbox,
     sandbox_event_counter: std::sync::Arc<crate::sandbox_events::SandboxEventCounter>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -14460,6 +14472,32 @@ async fn event_loop<T: Terminal>(
                                 );
                             }
                         });
+                    }
+                    // Monitor hook: re-apply the ladder and per-tab defaults
+                    // (tabs the user changed keep their choice). Runs before
+                    // the swap below, so `current_config` is still the OLD
+                    // config. An open monitor keeps its state; the next open
+                    // uses these prefs. The DB-persisted prefs are not
+                    // rewritten.
+                    if reload_outcome.monitor {
+                        monitor_prefs.reapply_config(&current_config.monitor, &new_cfg.monitor);
+                    }
+                    // Metrics hook: re-arm the supervisor on a fresh slot. The
+                    // old inbox drops here, so the old supervisor sees
+                    // `consumer_gone` and exits without publishing again (it
+                    // may sleep out its old interval first; nothing joins it).
+                    if let Some(metrics_cfg) = reload_outcome.metrics {
+                        let (outbox, inbox) = crate::metrics::metrics_slot({
+                            let waker = waker.clone();
+                            move || {
+                                let _ = waker.wake(); // best-effort: a snapshot wake must not fail the producer
+                            }
+                        });
+                        metrics_inbox = inbox;
+                        if metrics_cfg.targets.is_empty() {
+                            model.metrics = Default::default();
+                        }
+                        crate::metrics::spawn_metrics_supervisor(metrics_cfg, outbox);
                     }
                     current_config = new_cfg;
                     // Schedule hook: re-arm only the effective hydration
