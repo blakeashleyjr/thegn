@@ -3036,9 +3036,11 @@ fn note_quota_error_json(id: i64, quota: &DispatchNoteQuotaExceeded) -> serde_js
         "kind": match quota.kind {
             NoteQuotaKind::Count => "count",
             NoteQuotaKind::Bytes => "bytes",
+            NoteQuotaKind::Rate => "rate",
         },
         "notes": quota.notes,
         "bytes": quota.bytes,
+        "retry_after_ms": quota.retry_after_ms,
     })
 }
 
@@ -4406,6 +4408,7 @@ mod tests {
             kind: NoteQuotaKind::Count,
             notes: pipeline_report::NOTE_MAX_PER_ROW,
             bytes: 2_000,
+            retry_after_ms: 0,
         };
         let value = note_quota_error_json(42, &quota);
         assert_eq!(value["id"], 42);
@@ -4418,6 +4421,14 @@ mod tests {
             ..quota
         };
         assert_eq!(note_quota_error_json(42, &byte_quota)["kind"], "bytes");
+        let rate_quota = DispatchNoteQuotaExceeded {
+            kind: NoteQuotaKind::Rate,
+            retry_after_ms: 1_500,
+            ..quota
+        };
+        let rate = note_quota_error_json(42, &rate_quota);
+        assert_eq!(rate["kind"], "rate");
+        assert_eq!(rate["retry_after_ms"], 1_500);
     }
 
     #[test]
