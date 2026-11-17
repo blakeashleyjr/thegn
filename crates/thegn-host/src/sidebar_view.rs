@@ -1843,9 +1843,6 @@ const STAGE_TAG_MAX: usize = 6;
 /// before offering the optional right cluster any width.
 const WORKSPACE_LABEL_FLOOR: usize = 10;
 
-/// Compose the right-aligned cluster for a workspace header. Keeping the
-/// token width and the complete cluster width together lets `build_sidebar`
-/// copy the same geometry into the hit model without a second layout pass.
 /// The workspace header's zone chip (empty when unzoned).
 fn zone_chip(row: &crate::sidebar::SidebarRow) -> Vec<crate::seg::Seg> {
     use crate::seg::{Tok, seg, sp};
@@ -1867,6 +1864,9 @@ fn zone_chip(row: &crate::sidebar::SidebarRow) -> Vec<crate::seg::Seg> {
     }
 }
 
+/// Compose the right-aligned cluster for a workspace header. Keeping the
+/// token width and the complete cluster width together lets `build_sidebar`
+/// copy the same geometry into the hit model without a second layout pass.
 fn workspace_right_cluster(
     row: &crate::sidebar::SidebarRow,
     pool: Option<(usize, usize)>,
