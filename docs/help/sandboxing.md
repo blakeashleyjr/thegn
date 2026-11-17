@@ -1004,6 +1004,38 @@ copy and close again. Files and directories excluded by `.gitignore`, `.ignore`,
 back (the upload skips them too), so build output never blocks the sync. Files
 deleted in the sandbox are not deleted locally.
 
+## The Lead's sandbox
+
+The Lead (`[lead]`, experimental) runs its agent under bubblewrap. Its
+`[sandbox]` settings do not apply. It always uses this fixed layout:
+
+- **Read-only:** the whole host filesystem, including every repo and worktree.
+  Writing inside a repo fails with `Read-only file system`.
+- **Writable:** the notes dir (`[lead] notes_dir`, default
+  `$XDG_STATE_HOME/thegn/lead`) and the agent's own state: `~/.claude` and
+  `~/.claude.json`, `~/.codex`, or `~/.pi`. A `CLAUDE_CONFIG_DIR`, `CODEX_HOME`
+  or `PI_CODING_AGENT_DIR` from the agent entry, or from `[lead] account`,
+  replaces the default. The Lead starts in the notes dir.
+- **Hidden:** `$XDG_RUNTIME_DIR`, the daemon socket dir, the state `run` dir,
+  every control-socket location and `/tmp` are replaced with empty dirs. The
+  rootful docker and podman sockets are hidden too. `THEGN_CONTROL_SOCKET`,
+  `DBUS_SESSION_BUS_ADDRESS` and `SSH_AUTH_SOCK` are unset.
+- **Network:** shared with the host, so the Lead reaches the daemon's loopback
+  listener. It authenticates with its own scoped token. The unix socket, which
+  grants admin to any process of your user, is out of reach.
+
+thegn refuses to open the Lead when:
+
+- bwrap is missing. The error is "the Lead needs bwrap (Linux); not available
+  here". It never falls back to a host shell.
+- `[lead] notes_dir` or an agent state dir is inside a registered repo or
+  worktree, contains one, or is `/` or `$HOME`. Symlinks are resolved first.
+- A writable path overlaps a hidden control dir.
+
+The agent's state dir is writable. Settings or hooks the Lead writes there
+apply to that agent outside the Lead too. Set `[lead] account` to give the Lead
+its own credential home.
+
 ## Inspecting
 
 The panel's **system → sandbox** section shows the live state for the
