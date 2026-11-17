@@ -2246,11 +2246,30 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
 /// to a bare one; the focused materialize provisions it). Off-loop (network);
 /// `false` for non-provider envs, a tokenless/unbuilt provider, or a list error.
 pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
+    provision_check(cfg, worktree) != ProvisionCheck::Ready
+}
+
+/// What [`provision_check`] found for a worktree's provider sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionCheck {
+    /// Nothing to do: not a provider env, provisioned, or unknown (a list error).
+    Ready,
+    /// Missing, or present but bare (no provision marker).
+    Pending,
+    /// A Vercel sandbox that exists but is not running: probing its marker
+    /// would resume it (buying compute), so it is left parked. Prewarm still
+    /// skips it ([`provision_pending`] is true); the eager provisioner and the
+    /// spare claim do not act on it (only an explicit open resumes).
+    Parked,
+}
+
+/// [`provision_pending`] with the parked-Vercel case split out.
+pub fn provision_check(cfg: &Config, worktree: &str) -> ProvisionCheck {
     let loc = match GitLoc::for_worktree_op(Path::new(worktree), "provision check") {
         Ok(loc) => loc,
         Err(error) => {
             tracing::warn!(target: "thegn::provider", worktree, %error, "provision check skipped");
-            return false;
+            return ProvisionCheck::Ready;
         }
     };
     let repo_root: PathBuf = Db::open()
@@ -2263,33 +2282,33 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
     let read =
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
     let Some(selected_env) = env_selection_or_refuse(worktree, "provision check", read) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     if !matches!(
         environment.placement,
         thegn_core::placement::Placement::Provider(_)
     ) {
-        return false;
+        return ProvisionCheck::Ready;
     }
     let Some(envc) = cfg.env.get(&environment.name) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     // Bound-aware name: a worktree that CLAIMED a pool spare is checked against
     // the SPARE (whose marker is present ⇒ not pending), not the derived id —
     // else eager would re-provision a sprite the worktree no longer uses.
     let Some(id) = provider_sandbox_name(cfg, worktree, &environment.name) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     let Some(provider) = provider_for_named(&envc.provider, &id) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     match block_on_provider(|| async { provider.list().await }) {
         // Missing ⇒ needs create + a full provision.
-        Ok(names) if !names.iter().any(|n| n == &id) => true,
+        Ok(names) if !names.iter().any(|n| n == &id) => ProvisionCheck::Pending,
         // Exists — but is the TOOLCHAIN actually provisioned? `launch_spec`'s
         // `auto_provision` only `ensure_exists`es a BARE sprite (no nix/direnv/
         // agents), and a destroyed+recreated sprite is bare too. If we gate only on
@@ -2301,11 +2320,26 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
         // scope only the worktree we're opening anyway — so it doesn't wake idle
         // sandboxes wholesale.
         Ok(_) => {
+            // A Vercel marker read resumes a stopped sandbox: probe its status
+            // with the never-resuming GET first and leave a parked one alone.
+            if let thegn_svc::provider::Provider::Vercel(vercel) = &provider {
+                let live = block_on_provider(|| async { vercel.reaper_view(&id).await })
+                    .ok()
+                    .flatten()
+                    .is_some_and(|view| !crate::vercel_bridge::needs_resume(view.status));
+                if !live {
+                    return ProvisionCheck::Parked;
+                }
+            }
             let workdir = crate::provider_workdir::resolve(&envc.provider, &id);
             let marker = thegn_core::envplan::EnvPlan::marker_path(&workdir);
-            block_on_provider(|| async { provider.read(&id, &marker).await }).is_err()
+            if block_on_provider(|| async { provider.read(&id, &marker).await }).is_err() {
+                ProvisionCheck::Pending
+            } else {
+                ProvisionCheck::Ready
+            }
         }
-        Err(_) => false,
+        Err(_) => ProvisionCheck::Ready,
     }
 }
 
@@ -3984,6 +4018,11 @@ pub fn ensure_remote_bridge(
     binary: &Path,
 ) -> Option<crate::bridge_sup::ResidentBridge> {
     let (provider, id, _) = provider_sync_target(cfg, env_name)?;
+    // Vercel never runs a resident bridge (exec rides `vercel-exec`), and the
+    // install's file calls would resume a stopped sandbox on every switch.
+    if matches!(provider, thegn_svc::provider::Provider::Vercel(_)) {
+        return None;
+    }
     let data = match std::fs::read(binary) {
         Ok(d) => d,
         Err(e) => {

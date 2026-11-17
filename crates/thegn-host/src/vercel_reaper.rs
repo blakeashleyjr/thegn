@@ -168,7 +168,7 @@ fn reap_unambiguous(pc: &EnvProviderConfig, kept: &mut crate::reaper_policy::Kep
     let account = provider.account();
     let controller_tag = match thegn_svc::vps::controller::controller_id() {
         Ok(id) => policy::tags_for(&id, "", "")
-            .remove("thegn-controller")
+            .remove(policy::CONTROLLER_TAG)
             .unwrap_or_default(),
         Err(error) => {
             for rec in &records {
@@ -597,14 +597,10 @@ fn reconcile_creating(
 
 /// The remote sandbox carries this controller's tag (and the ledger owner's
 /// tag when one is recorded): the proof thegn created it.
+/// The check is the shared [`policy::tags_prove_ours`], the same one the
+/// provider's delete reads, over the tags its create wrote.
 fn proven_ours(view: &SandboxView, rec: &registry::VpsRecord, controller_tag: &str) -> bool {
-    if controller_tag.is_empty()
-        || view.tags.get("thegn-controller").map(String::as_str) != Some(controller_tag)
-    {
-        return false;
-    }
-    rec.owner.is_empty()
-        || view.tags.get("thegn-owner") == policy::tags_for("", &rec.owner, "").get("thegn-owner")
+    policy::tags_prove_ours(&view.tags, controller_tag, &rec.owner)
 }
 
 const NOT_OURS: &str = "the Vercel sandbox does not carry this controller's ownership tags; not provably created by thegn; no action attempted";
@@ -722,6 +718,27 @@ mod tests {
     fn run(rec: &registry::VpsRecord, fake: &Fake, owner_alive: bool) -> Outcome {
         let mut ledger = fake;
         reconcile_record(rec, NOW, 600, owner_alive, fake, &mut ledger, "ctl-1")
+    }
+
+    #[test]
+    fn tags_written_at_create_are_proven_ours_by_the_reaper() {
+        // Exactly what the provider's create sends: `tags_for(controller id,
+        // ledger owner, host label)`; the reaper derives its tag the same way.
+        let raw_controller = "Ctl_0123ABCD";
+        let owner = "wt-owner-digest";
+        let mut rec = record("ready", "");
+        rec.owner = owner.to_string();
+        let mut view = sandbox(SessionStatus::Running, Some(1));
+        view.tags = policy::tags_for(raw_controller, owner, "some host");
+        let reaper_tag = policy::tags_for(raw_controller, "", "")
+            .remove(policy::CONTROLLER_TAG)
+            .unwrap_or_default();
+        assert!(proven_ours(&view, &rec, &reaper_tag));
+        rec.owner = "another-owner".to_string();
+        assert!(!proven_ours(&view, &rec, &reaper_tag));
+        rec.owner = String::new();
+        assert!(!proven_ours(&view, &rec, "other-controller"));
+        assert!(!proven_ours(&view, &rec, ""));
     }
 
     #[test]
