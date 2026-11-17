@@ -1142,7 +1142,8 @@
     },
     {
       "change": "resurrect-model-proxy",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-11-16-resurrect-model-proxy/",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -1150,7 +1151,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Proxy restoration shipped; end-to-end failover, accounting, and gate evidence remain."
+      "summary": "Proxy restoration, hermetic end-to-end failover/accounting suite and disabled no-op coverage delivered; archived in batch 147 with the final gate superseded by the batch gate. THE-123 stays open, blocked by THE-180 (live reload) and THE-151 (attribution/budget scopes)."
     },
     {
       "change": "retain-devcontainer-startup-custody",
