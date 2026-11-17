@@ -35,8 +35,10 @@ selectors agree:
   (at least one pipeline stage is configured).
 - `when` contains the current phase: `create`, `startup`, or `explicit`.
 
-The shipped registry contains `mq`, `pipeline`, and `supervise`; their gates
-remain `merge_queue`, `pipeline`, and `always`. Use `[skills].exclude` to
+The shipped registry contains `lead`, `mq`, `pipeline`, and `supervise`; their gates
+remain `always`, `merge_queue`, `pipeline`, and `always`. `lead` is the operating
+notes for the Lead tab (tools: `overview_get`, `dispatches_put`, `sessions_open`,
+`approvals_request`, `merge_drain`, `automations_put`). Use `[skills].exclude` to
 withhold a name from every harness.
 
 ## Writing a package
