@@ -11,9 +11,13 @@
 //! ~5 files (<50 KB total). Even with a slow provider this completes in seconds
 //! and guarantees the agent is usable regardless of what happens in Phase 2.
 //!
-//! **Phase 2 — full config tree (parallel, budget-capped):** Walk each agent's
-//! config directories (skipping bulky state dirs), then upload the remaining
-//! files with bounded concurrency (`UPLOAD_CONCURRENCY`). This is best-effort:
+//! **Phase 2 — full config tree (archived, budget-capped):** Walk each agent's
+//! config directories (skipping bulky state dirs), pack the remaining files
+//! into gzip'd ustar archives (`pack_batches`, ≤64 MiB each) and extract each
+//! in one exec. A content-hash marker (`AGENT_CONFIGS_MARKER`) skips an
+//! unchanged set. Files the packer refuses, and members of an archive that
+//! fails, fall back to per-file uploads with bounded concurrency
+//! (`UPLOAD_CONCURRENCY`). This is best-effort:
 //! if the 120s budget runs out, the agent still works (Phase 1 already handled
 //! auth) — only non-critical extras (hook scripts, MCP config) may be missing.
 //!
@@ -156,6 +160,348 @@ const AGENT_CONFIG_STEP_BUDGET: std::time::Duration = std::time::Duration::from_
 /// sequential to ~25 minutes at CONCURRENCY=8 — and most fit within the 120s
 /// budget since the typical tree is 100-500 files).
 const UPLOAD_CONCURRENCY: usize = 8;
+
+/// One Phase 2 file: `(rel, data, exec)`, `rel` relative to the sandbox `$HOME`.
+type PackEntry = (String, Vec<u8>, bool);
+
+/// Compressed-size ceiling for one Phase 2 config archive (THE-2056). A typical
+/// claude tree is a few MB, so this almost always yields a single archive; past
+/// it, [`pack_batches`] starts a new one so no single upload is unbounded.
+const AGENT_CONFIG_ARCHIVE_CAP: usize = 64 * 1024 * 1024;
+
+/// Marker (relative to the sandbox `$HOME`) holding the hex content hash of the
+/// last fully-synced Phase 2 set. A matching hash skips Phase 2 entirely.
+const AGENT_CONFIGS_MARKER: &str = ".thegn/agent-configs.sha256";
+
+/// ustar block size.
+const TAR_BLOCK: usize = 512;
+
+/// Is `rel` a plain relative path with no `..`, `.`, empty component or NUL —
+/// i.e. one that cannot name anything outside the directory it is joined to?
+fn rel_is_confined(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.starts_with('/')
+        && !rel.contains('\0')
+        && rel
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Write `value` as a NUL-terminated, zero-padded octal field filling `field`.
+fn tar_octal(field: &mut [u8], value: u64) -> Result<(), String> {
+    let digits = field.len() - 1;
+    let s = format!("{value:0digits$o}");
+    if s.len() > digits {
+        return Err(format!(
+            "value {value} does not fit a {digits}-digit tar field"
+        ));
+    }
+    field[..digits].copy_from_slice(s.as_bytes());
+    field[digits] = 0;
+    Ok(())
+}
+
+/// Build the 512-byte ustar header for a regular file (type `'0'`, uid/gid 0,
+/// mtime 0, mode 0755/0644). A path over 100 bytes is split across the
+/// `prefix` (≤155) and `name` (≤100) fields at a `/`; anything that can't be
+/// split that way (over 255 bytes, or no usable `/`) is an `Err`, as is a
+/// path that isn't [`rel_is_confined`].
+fn ustar_header(rel: &str, size: usize, exec: bool) -> Result<[u8; TAR_BLOCK], String> {
+    if !rel_is_confined(rel) {
+        return Err(format!("refusing unconfined archive path {rel:?}"));
+    }
+    let bytes = rel.as_bytes();
+    let (prefix, name): (&[u8], &[u8]) = if bytes.len() <= 100 {
+        (&[], bytes)
+    } else {
+        // Pick the leftmost `/` that still fits the name in 100 bytes (the
+        // shortest prefix), then check the prefix fits its 155.
+        let split = (0..bytes.len())
+            .find(|&i| bytes[i] == b'/' && bytes.len() - i - 1 <= 100)
+            .ok_or_else(|| format!("archive path too long for ustar: {} bytes", bytes.len()))?;
+        if split > 155 {
+            return Err(format!(
+                "archive path too long for ustar: {} bytes",
+                bytes.len()
+            ));
+        }
+        (&bytes[..split], &bytes[split + 1..])
+    };
+    let mut h = [0u8; TAR_BLOCK];
+    h[..name.len()].copy_from_slice(name);
+    tar_octal(&mut h[100..108], if exec { 0o755 } else { 0o644 })?;
+    tar_octal(&mut h[108..116], 0)?; // uid
+    tar_octal(&mut h[116..124], 0)?; // gid
+    tar_octal(&mut h[124..136], size as u64)?;
+    tar_octal(&mut h[136..148], 0)?; // mtime
+    h[156] = b'0';
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    tar_octal(&mut h[329..337], 0)?; // devmajor
+    tar_octal(&mut h[337..345], 0)?; // devminor
+    h[345..345 + prefix.len()].copy_from_slice(prefix);
+    // Checksum: the sum of all header bytes with the checksum field as spaces.
+    h[148..156].copy_from_slice(b"        ");
+    let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+    let ck = format!("{sum:06o}\0 ");
+    h[148..156].copy_from_slice(ck.as_bytes());
+    Ok(h)
+}
+
+/// The tar size of one member: header plus data padded to a whole block.
+fn tar_member_len(size: usize) -> usize {
+    TAR_BLOCK + size.div_ceil(TAR_BLOCK) * TAR_BLOCK
+}
+
+/// A minimal ustar writer: regular files only, root-owned, mtime 0. Private to
+/// the agent-login sync, which only ever packs small config files.
+struct TarPack {
+    buf: Vec<u8>,
+}
+
+impl TarPack {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    fn add(&mut self, rel: &str, data: &[u8], exec: bool) -> Result<(), String> {
+        let header = ustar_header(rel, data.len(), exec)?;
+        self.buf.extend_from_slice(&header);
+        self.buf.extend_from_slice(data);
+        let pad = tar_member_len(data.len()) - TAR_BLOCK - data.len();
+        self.buf.resize(self.buf.len() + pad, 0);
+        Ok(())
+    }
+
+    /// Close the archive with the two zero end-of-archive blocks.
+    fn finish(mut self) -> Vec<u8> {
+        self.buf.resize(self.buf.len() + 2 * TAR_BLOCK, 0);
+        self.buf
+    }
+}
+
+/// One gzip'd tar archive and the indices (into the packed entry slice) of the
+/// files it carries.
+struct PackedArchive {
+    bytes: Vec<u8>,
+    members: Vec<usize>,
+}
+
+/// Worst-case slack for the gzip header/footer plus the compressed tar trailer.
+const ARCHIVE_TRAILER_SLACK: usize = 2 * 1024;
+
+/// Upper bound on what `len` uncompressed bytes can add to a sync-flushed
+/// deflate stream (stored-block overhead is 5 bytes per ≤64 KiB block).
+fn deflate_bound(len: usize) -> usize {
+    len + len / 1000 + 64
+}
+
+/// An archive under construction: the tar stream plus its incremental gzip,
+/// sync-flushed after every member so the compressed length is exact.
+struct ArchiveBuilder {
+    tar: TarPack,
+    gz: flate2::write::GzEncoder<Vec<u8>>,
+    fed: usize,
+    members: Vec<usize>,
+}
+
+impl ArchiveBuilder {
+    fn new() -> Self {
+        Self {
+            tar: TarPack::new(),
+            gz: flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()),
+            fed: 0,
+            members: Vec::new(),
+        }
+    }
+
+    fn compressed_len(&self) -> usize {
+        self.gz.get_ref().len()
+    }
+
+    fn push(&mut self, idx: usize, rel: &str, data: &[u8], exec: bool) -> Result<(), String> {
+        use std::io::Write as _;
+        self.tar.add(rel, data, exec)?;
+        self.gz
+            .write_all(&self.tar.buf[self.fed..])
+            .and_then(|()| self.gz.flush())
+            .map_err(|e| e.to_string())?;
+        self.fed = self.tar.buf.len();
+        self.members.push(idx);
+        Ok(())
+    }
+
+    fn finish(self) -> std::io::Result<PackedArchive> {
+        use std::io::Write as _;
+        let Self {
+            tar,
+            mut gz,
+            fed,
+            members,
+        } = self;
+        let tar = tar.finish();
+        gz.write_all(&tar[fed..])?;
+        Ok(PackedArchive {
+            bytes: gz.finish()?,
+            members,
+        })
+    }
+}
+
+/// Pack `entries` into gzip'd ustar archives of at most `cap` compressed bytes
+/// each (a single member larger than `cap` still gets its own archive). Entries
+/// the tar writer refuses (over-long or unconfined paths) are returned by index
+/// as leftovers for the per-file path. Pure — unit-tested with a small `cap`.
+fn pack_batches(entries: &[PackEntry], cap: usize) -> (Vec<PackedArchive>, Vec<usize>) {
+    fn close(b: ArchiveBuilder, archives: &mut Vec<PackedArchive>, leftover: &mut Vec<usize>) {
+        if b.members.is_empty() {
+            return;
+        }
+        let members = b.members.clone();
+        match b.finish() {
+            Ok(a) => archives.push(a),
+            Err(_) => leftover.extend(members),
+        }
+    }
+    let mut archives = Vec::new();
+    let mut leftover = Vec::new();
+    let mut cur = ArchiveBuilder::new();
+    for (i, (rel, data, exec)) in entries.iter().enumerate() {
+        if ustar_header(rel, data.len(), *exec).is_err() {
+            leftover.push(i);
+            continue;
+        }
+        let bound = cur.compressed_len()
+            + deflate_bound(tar_member_len(data.len()))
+            + ARCHIVE_TRAILER_SLACK;
+        if !cur.members.is_empty() && bound > cap {
+            close(
+                std::mem::replace(&mut cur, ArchiveBuilder::new()),
+                &mut archives,
+                &mut leftover,
+            );
+        }
+        if cur.push(i, rel, data, *exec).is_err() {
+            // A failed in-memory gzip write leaves the builder inconsistent:
+            // route everything it held (and this entry) to the per-file path.
+            let b = std::mem::replace(&mut cur, ArchiveBuilder::new());
+            leftover.extend(b.members);
+            leftover.push(i);
+        }
+    }
+    close(cur, &mut archives, &mut leftover);
+    leftover.sort_unstable();
+    (archives, leftover)
+}
+
+/// Stable hex sha256 over the Phase 2 set: sorted `(rel, exec, bytes)`, each
+/// field length-prefixed, under a format tag so a scheme change re-syncs.
+fn content_hash(entries: &[PackEntry]) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut order: Vec<&PackEntry> = entries.iter().collect();
+    order.sort();
+    let mut h = Sha256::new();
+    h.update(b"thegn-agent-configs-v1\0");
+    for (rel, data, exec) in order {
+        h.update((rel.len() as u64).to_le_bytes());
+        h.update(rel.as_bytes());
+        h.update([u8::from(*exec)]);
+        h.update((data.len() as u64).to_le_bytes());
+        h.update(data);
+    }
+    h.finalize()
+        .iter()
+        .flat_map(|b| {
+            [
+                HEX[usize::from(b >> 4)] as char,
+                HEX[usize::from(b & 0x0f)] as char,
+            ]
+        })
+        .collect()
+}
+
+/// The remote script that extracts `archive` into `base` and always removes
+/// the `stage` dir, exiting with tar's status. Every path is `sh_quote`d.
+fn archive_extract_script(base: &str, stage: &str, archive: &str) -> String {
+    let q = thegn_core::util::sh_quote;
+    format!(
+        "mkdir -p -- {b} && tar -xzf {a} -C {b} --no-same-owner 2>&1; rc=$?; rm -rf -- {s}; exit $rc",
+        b = q(base),
+        a = q(archive),
+        s = q(stage),
+    )
+}
+
+/// Time left before `deadline`, or `None` once it has passed.
+fn remaining(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|d| !d.is_zero())
+}
+
+/// Ship one archive: `mktemp -d` a private stage, write the archive there,
+/// extract it into `base` (the script removes the stage). Bounded by
+/// `deadline`. `Err` ⇒ the caller falls back to per-file uploads.
+async fn ship_archive(
+    provider: &thegn_svc::provider::Provider,
+    id: &str,
+    base: &str,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    let budget =
+        || remaining(deadline).ok_or_else(|| anyhow::anyhow!("agent-config budget exhausted"));
+    let mk = [
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "umask 077; mktemp -d \"${TMPDIR:-/tmp}/tg-agent-configs.XXXXXX\"".to_string(),
+    ];
+    let (code, out) = tokio::time::timeout(budget()?, provider.run_exec(id, &mk, None, &[]))
+        .await
+        .map_err(|_| anyhow::anyhow!("mktemp timed out"))??;
+    let stage = out.trim().to_string();
+    anyhow::ensure!(
+        code == 0 && stage.starts_with('/') && !stage.contains(['\n', '\0']),
+        "mktemp failed (exit {code})"
+    );
+    let archive = format!("{stage}/agent-configs.tgz");
+    let wrote = match remaining(deadline) {
+        Some(to) => tokio::time::timeout(to, provider.write(id, &archive, bytes))
+            .await
+            .map_err(|_| anyhow::anyhow!("archive upload timed out"))
+            .and_then(|r| r),
+        None => Err(anyhow::anyhow!("agent-config budget exhausted")),
+    };
+    let script = if wrote.is_ok() {
+        archive_extract_script(base, &stage, &archive)
+    } else {
+        format!("rm -rf -- {}", thegn_core::util::sh_quote(&stage))
+    };
+    let argv = ["/bin/sh".to_string(), "-c".to_string(), script];
+    // best-effort: when the write failed this run is stage cleanup only; its
+    // result is checked below only on the extract path. The cleanup-only
+    // script still gets a short slot past an exhausted budget.
+    let to = remaining(deadline).unwrap_or(std::time::Duration::from_secs(5));
+    let ran = tokio::time::timeout(to, provider.run_exec(id, &argv, None, &[]))
+        .await
+        .map_err(|_| anyhow::anyhow!("archive extract timed out"))
+        .and_then(|r| r);
+    wrote?;
+    let (code, out) = ran?;
+    if code != 0 {
+        let tail: String = out
+            .chars()
+            .rev()
+            .take(512)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        anyhow::bail!("archive extract exited {code}: {}", tail.trim());
+    }
+    Ok(())
+}
 
 /// Collect `(absolute, relative)` files under an agent config `dir`, skipping the
 /// bulky-state subdirs in [`AGENT_STATE_SKIP_DIRS`] and any file over
@@ -506,7 +852,9 @@ pub(crate) fn upload_agent_configs(
         }
     }
 
-    let mut all_uploads: Vec<(String, Vec<u8>, bool)> = Vec::new();
+    // `rel` is relative to the sandbox `$HOME` (`base`): packing and the
+    // per-file fallback both join it to `base` themselves.
+    let mut all_uploads: Vec<PackEntry> = Vec::new();
     for agent in agents {
         let (files, dirs) = thegn_core::envplan::agent_config_paths(agent);
         for f in files {
@@ -521,7 +869,7 @@ pub(crate) fn upload_agent_configs(
             let exec = std::fs::metadata(&src)
                 .map(|md| is_executable(&md))
                 .unwrap_or(false);
-            all_uploads.push((format!("{base}/{f}"), data, exec));
+            all_uploads.push((f, data, exec));
         }
         for d in dirs {
             let src = agent_source_path(&host_home, &d);
@@ -546,43 +894,98 @@ pub(crate) fn upload_agent_configs(
                     continue;
                 };
                 let data = strip_sandbox_hooks(&host_rel, data);
-                all_uploads.push((format!("{base}/{host_rel}"), data, exec));
+                all_uploads.push((host_rel, data, exec));
             }
         }
     }
 
     let total_phase2 = all_uploads.len();
-    let deadline = std::time::Instant::now() + AGENT_CONFIG_STEP_BUDGET;
+    let started = std::time::Instant::now();
+    let deadline = started + AGENT_CONFIG_STEP_BUDGET;
+    let hash = content_hash(&all_uploads);
+    let marker = format!("{base}/{AGENT_CONFIGS_MARKER}");
 
-    // Run parallel uploads inside a single tokio runtime so the per-file
-    // overhead (runtime creation) is paid once, not once per file.
+    // One tokio runtime for the whole phase: the marker probe, the archive
+    // shipments and the per-file fallback all share it.
     let (p2_ok, p2_failed, p2_skipped) = block_on_provider(|| async {
         use futures::future::join_all;
+        if total_phase2 == 0 {
+            return Ok((0, 0, 0));
+        }
+        // Unchanged since the last complete sync ⇒ skip Phase 2 entirely.
+        let prev =
+            tokio::time::timeout(AGENT_CONFIG_UPLOAD_TIMEOUT, provider.read(id, &marker)).await;
+        if let Ok(Ok(prev)) = prev
+            && String::from_utf8_lossy(&prev).trim() == hash
+        {
+            tracing::info!(
+                target: "thegn::startup",
+                files = total_phase2,
+                "agent-config phase 2 unchanged; skipping"
+            );
+            return Ok((0, 0, 0));
+        }
+
+        // Pack everything into as few gzip'd tar archives as the cap allows
+        // and extract each in one exec (THE-2056: ~800 per-file round-trips
+        // took minutes). Entries the packer refuses, plus every member of an
+        // archive that fails to ship, go through the per-file fallback.
+        let (archives, mut per_file) = pack_batches(&all_uploads, AGENT_CONFIG_ARCHIVE_CAP);
+        let packed_bytes: usize = archives.iter().map(|a| a.bytes.len()).sum();
         let mut ok = 0usize;
         let mut failed = 0usize;
         let mut skipped = 0usize;
+        for a in &archives {
+            match ship_archive(provider, id, base, &a.bytes, deadline).await {
+                Ok(()) => ok += a.members.len(),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "thegn::startup",
+                        files = a.members.len(),
+                        bytes = a.bytes.len(),
+                        error = %e,
+                        "agent-config archive failed; falling back to per-file uploads"
+                    );
+                    per_file.extend_from_slice(&a.members);
+                }
+            }
+        }
+        per_file.sort_unstable();
 
-        for chunk in all_uploads.chunks(UPLOAD_CONCURRENCY) {
+        // Per-file fallback: bounded-concurrency chunks under the same deadline.
+        let per_file_total = per_file.len();
+        let mut attempted = 0usize;
+        for chunk in per_file.chunks(UPLOAD_CONCURRENCY) {
             if std::time::Instant::now() >= deadline {
                 // Budget exhausted: count all remaining (this chunk + the rest).
-                skipped += total_phase2 - ok - failed - skipped;
+                skipped += per_file_total - attempted;
                 break;
             }
+            attempted += chunk.len();
 
-            let futs: Vec<_> = chunk
-                .iter()
-                .map(|(dest, data, exec)| {
-                    let dest = dest.as_str();
-                    async move {
-                        let r = tokio::time::timeout(
-                            AGENT_CONFIG_UPLOAD_TIMEOUT,
-                            write_preserving_mode(provider, id, dest, data, *exec),
-                        )
-                        .await;
-                        (dest, r)
-                    }
-                })
-                .collect();
+            let mut futs = Vec::with_capacity(chunk.len());
+            for &idx in chunk {
+                let (rel, data, exec) = &all_uploads[idx];
+                if !rel_is_confined(rel) {
+                    // Never write outside `base`, on either path.
+                    failed += 1;
+                    tracing::warn!(
+                        target: "thegn::startup",
+                        rel = %rel,
+                        "agent-config upload: refusing an unconfined path"
+                    );
+                    continue;
+                }
+                let dest = format!("{base}/{rel}");
+                futs.push(async move {
+                    let r = tokio::time::timeout(
+                        AGENT_CONFIG_UPLOAD_TIMEOUT,
+                        write_preserving_mode(provider, id, &dest, data, *exec),
+                    )
+                    .await;
+                    (dest, r)
+                });
+            }
 
             for (dest, result) in join_all(futs).await {
                 match result {
@@ -608,6 +1011,27 @@ pub(crate) fn upload_agent_configs(
             }
         }
 
+        if failed == 0 && skipped == 0 {
+            // best-effort: the marker only lets the next `env up` skip an
+            // identical sync; a missing marker just re-syncs.
+            let _ = tokio::time::timeout(
+                AGENT_CONFIG_UPLOAD_TIMEOUT,
+                provider.write(id, &marker, hash.as_bytes()),
+            )
+            .await;
+        }
+        tracing::info!(
+            target: "thegn::startup",
+            archives = archives.len(),
+            files = total_phase2,
+            bytes = packed_bytes,
+            per_file = per_file_total,
+            ok,
+            failed,
+            skipped,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "agent-config phase 2 synced"
+        );
         Ok((ok, failed, skipped))
     })?;
 
@@ -1571,6 +1995,14 @@ mod tests {
             claude_crit.contains(&".claude.json".to_string()),
             "must include .claude.json: {claude_crit:?}"
         );
+        // THE-2051: the host's MCP needs-auth cache must never ride along —
+        // it pins the sandbox's MCP servers to the host's auth state.
+        assert!(
+            !claude_crit
+                .iter()
+                .any(|f| f.contains("mcp-needs-auth-cache")),
+            "auth-critical must not carry mcp-needs-auth-cache: {claude_crit:?}"
+        );
 
         // pi's auth-critical set must be small.
         let pi_crit = thegn_core::envplan::agent_auth_critical_files("pi");
@@ -1828,5 +2260,281 @@ mod tests {
                 .and_then(std::ffi::OsStr::to_str)
                 .is_some_and(|name| name.starts_with(".work-a.thegn-stage-"))
         );
+    }
+
+    // --- THE-2056: archived Phase 2 -------------------------------------
+
+    /// A parsed ustar member: `(path, mode, data)`.
+    type TarMember = (String, u32, Vec<u8>);
+
+    fn octal_field(f: &[u8]) -> u64 {
+        let s = std::str::from_utf8(f).unwrap();
+        u64::from_str_radix(s.trim_matches(|c| c == '\0' || c == ' '), 8).unwrap()
+    }
+
+    fn cstr(f: &[u8]) -> String {
+        let end = f.iter().position(|&b| b == 0).unwrap_or(f.len());
+        String::from_utf8(f[..end].to_vec()).unwrap()
+    }
+
+    /// Minimal ustar reader: checks magic, checksum, type, zero padding and
+    /// the two-zero-block trailer.
+    fn parse_tar(bytes: &[u8]) -> Vec<TarMember> {
+        assert!(
+            bytes.len().is_multiple_of(TAR_BLOCK),
+            "tar not block-aligned"
+        );
+        let mut out = Vec::new();
+        let mut off = 0;
+        loop {
+            let h = &bytes[off..off + TAR_BLOCK];
+            if h.iter().all(|&b| b == 0) {
+                assert!(
+                    bytes[off..].iter().all(|&b| b == 0) && bytes.len() - off >= 2 * TAR_BLOCK,
+                    "missing two-zero-block trailer"
+                );
+                return out;
+            }
+            assert_eq!(&h[257..263], b"ustar\0");
+            assert_eq!(h[156], b'0', "regular file only");
+            let mut ck = h.to_vec();
+            ck[148..156].copy_from_slice(b"        ");
+            let sum: u64 = ck.iter().map(|&b| u64::from(b)).sum();
+            assert_eq!(octal_field(&h[148..156]), sum, "header checksum");
+            assert_eq!(octal_field(&h[108..116]), 0, "uid");
+            assert_eq!(octal_field(&h[116..124]), 0, "gid");
+            assert_eq!(octal_field(&h[136..148]), 0, "mtime");
+            let name = cstr(&h[..100]);
+            let prefix = cstr(&h[345..500]);
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let mode = u32::try_from(octal_field(&h[100..108])).unwrap();
+            let size = usize::try_from(octal_field(&h[124..136])).unwrap();
+            off += TAR_BLOCK;
+            let data = bytes[off..off + size].to_vec();
+            let padded = size.div_ceil(TAR_BLOCK) * TAR_BLOCK;
+            assert!(
+                bytes[off + size..off + padded].iter().all(|&b| b == 0),
+                "padding must be zero"
+            );
+            off += padded;
+            out.push((path, mode, data));
+        }
+    }
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    /// Deterministic incompressible bytes (xorshift), so gzip can't shrink them.
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tar_pack_round_trips_names_modes_and_data() {
+        let mut tar = TarPack::new();
+        tar.add(".claude/settings.json", b"{}\n", false).unwrap();
+        tar.add(".claude/hooks/a.sh", &noise(700, 3), true).unwrap();
+        tar.add(".claude/empty", b"", false).unwrap();
+        let got = parse_tar(&tar.finish());
+        assert_eq!(
+            got,
+            vec![
+                (".claude/settings.json".to_string(), 0o644, b"{}\n".to_vec()),
+                (".claude/hooks/a.sh".to_string(), 0o755, noise(700, 3)),
+                (".claude/empty".to_string(), 0o644, Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tar_pack_splits_long_paths_across_prefix_and_name() {
+        let long = format!(".claude/skills/{}/{}", "d".repeat(120), "f".repeat(90));
+        assert!(long.len() > 100 && long.len() <= 255);
+        let mut tar = TarPack::new();
+        tar.add(&long, b"x", false).unwrap();
+        let bytes = tar.finish();
+        assert!(!cstr(&bytes[345..500]).is_empty(), "prefix field used");
+        assert_eq!(parse_tar(&bytes), vec![(long, 0o644, b"x".to_vec())]);
+
+        let mut tar = TarPack::new();
+        // Over 255 bytes, or a >100-byte final component: no ustar split.
+        assert!(
+            tar.add(&format!("a/{}", "b".repeat(300)), b"", false)
+                .is_err()
+        );
+        assert!(tar.add(&"c".repeat(101), b"", false).is_err());
+        assert!(
+            tar.add(
+                &format!("{}/{}", "p".repeat(200), "n".repeat(50)),
+                b"",
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(
+            tar.finish().len(),
+            2 * TAR_BLOCK,
+            "refused entries add nothing"
+        );
+    }
+
+    #[test]
+    fn tar_pack_rejects_unconfined_paths() {
+        let mut tar = TarPack::new();
+        for bad in [
+            "/etc/passwd",
+            "../escape",
+            ".claude/../../escape",
+            "a/./b",
+            "a//b",
+            "",
+            "nul\0byte",
+        ] {
+            assert!(tar.add(bad, b"x", false).is_err(), "accepted {bad:?}");
+            assert!(!rel_is_confined(bad), "{bad:?} confined");
+        }
+        assert!(rel_is_confined(".claude/..hidden/x"));
+        assert_eq!(tar.finish().len(), 2 * TAR_BLOCK);
+    }
+
+    #[test]
+    fn pack_batches_gzips_and_splits_at_the_cap() {
+        let mut entries: Vec<PackEntry> = (0..6u64)
+            .map(|i| (format!(".claude/f{i}"), noise(3000, i + 1), i % 2 == 0))
+            .collect();
+        entries.push(("../outside".to_string(), b"x".to_vec(), false));
+        let cap = 10_000;
+        let (archives, leftover) = pack_batches(&entries, cap);
+        assert_eq!(leftover, vec![6], "the unconfined entry is left over");
+        assert!(archives.len() >= 2, "split expected: {}", archives.len());
+        let mut seen = Vec::new();
+        for a in &archives {
+            assert_eq!(&a.bytes[..2], &[0x1f, 0x8b], "gzip magic");
+            if a.members.len() > 1 {
+                assert!(a.bytes.len() <= cap, "archive {} > cap", a.bytes.len());
+            }
+            let members = parse_tar(&gunzip(&a.bytes));
+            assert_eq!(members.len(), a.members.len());
+            for (m, &idx) in members.iter().zip(&a.members) {
+                let (rel, data, exec) = &entries[idx];
+                assert_eq!(&m.0, rel);
+                assert_eq!(&m.2, data);
+                assert_eq!(m.1, if *exec { 0o755 } else { 0o644 });
+            }
+            seen.extend_from_slice(&a.members);
+        }
+        assert_eq!(
+            seen,
+            (0..6).collect::<Vec<_>>(),
+            "every packable entry once, in order"
+        );
+
+        // The production cap packs the same set into one archive.
+        let (one, _) = pack_batches(&entries, AGENT_CONFIG_ARCHIVE_CAP);
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn content_hash_is_stable_under_input_order() {
+        let a: Vec<PackEntry> = vec![
+            (".claude/a".into(), b"1".to_vec(), false),
+            (".claude/b.sh".into(), b"2".to_vec(), true),
+            (".codex/c".into(), b"3".to_vec(), false),
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        let h = content_hash(&a);
+        assert_eq!(h, content_hash(&b));
+        assert_eq!(h.len(), 64);
+        assert!(
+            h.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        let mut c = a.clone();
+        c[1].2 = false;
+        assert_ne!(h, content_hash(&c), "exec bit is hashed");
+        let mut d = a.clone();
+        d[0].1 = b"changed".to_vec();
+        assert_ne!(h, content_hash(&d), "content is hashed");
+        let mut e = a;
+        e[2].0 = ".codex/renamed".into();
+        assert_ne!(h, content_hash(&e), "paths are hashed");
+    }
+
+    #[test]
+    fn archive_extract_script_extracts_and_removes_the_stage() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let have_tar = std::process::Command::new("/bin/sh")
+            .args(["-c", "command -v tar >/dev/null"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_tar {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("home dir");
+        let stage = root.path().join("stage");
+        std::fs::create_dir(&stage).unwrap();
+        let entries: Vec<PackEntry> = vec![
+            (".claude/settings.json".into(), b"{}".to_vec(), false),
+            (".claude/hooks/a.sh".into(), b"#!/bin/sh\n".to_vec(), true),
+        ];
+        let (archives, leftover) = pack_batches(&entries, AGENT_CONFIG_ARCHIVE_CAP);
+        assert!(leftover.is_empty());
+        let archive = stage.join("agent-configs.tgz");
+        std::fs::write(&archive, &archives[0].bytes).unwrap();
+        let script = archive_extract_script(
+            &base.to_string_lossy(),
+            &stage.to_string_lossy(),
+            &archive.to_string_lossy(),
+        );
+        assert!(script.contains("--no-same-owner"));
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(base.join(".claude/settings.json")).unwrap(),
+            b"{}"
+        );
+        let md = std::fs::metadata(base.join(".claude/hooks/a.sh")).unwrap();
+        assert!(is_executable(&md), "exec bit survives extraction");
+        assert!(!stage.exists(), "stage removed");
+
+        // A failing extract still removes the stage and reports non-zero.
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(&archive, b"not a gzip").unwrap();
+        let script = archive_extract_script(
+            &base.to_string_lossy(),
+            &stage.to_string_lossy(),
+            &archive.to_string_lossy(),
+        );
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert!(!stage.exists(), "stage removed on failure too");
     }
 }
