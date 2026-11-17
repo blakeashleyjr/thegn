@@ -137,6 +137,8 @@ pub(crate) async fn spawn_session(
             live,
             recipe: request.recipe,
             process: Some(process_owner),
+            // Marked by the confined open once every Lead check passed.
+            lead_opener: None,
         },
     );
     drop(sessions);

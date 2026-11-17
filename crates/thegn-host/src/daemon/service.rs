@@ -56,6 +56,14 @@ pub(crate) struct SessionEntry {
     /// Last-resort shutdown owner; signals only the PTY process group acquired
     /// with the child, never a pid recovered from session metadata.
     pub process: Option<crate::pane_pty::PtyProcessOwner>,
+    /// The pairing label of the Lead whose confined `sessions.open` launched
+    /// this session (`thegn_core::lead_confine`), set only after that open
+    /// passed every Lead check. The one provenance a Lead-confined
+    /// `sessions.input` is allowed on. It lives on the live entry, so it
+    /// ends with the session: a tombstone carries none, and an id reused by
+    /// a later launch gets a fresh entry with none. In memory only: lost on
+    /// a daemon restart, which fails closed (the Lead is refused).
+    pub lead_opener: Option<String>,
 }
 
 /// What a session id resolves to.
@@ -1304,18 +1312,31 @@ fn lead_rule_caller(spec: &OpenSpec) -> Option<LeadCaller> {
     })
 }
 
-/// Audit a daemon-side Lead refusal and turn it into the caller's error.
+/// Audit a daemon-side Lead `sessions.open` refusal and turn it into the
+/// caller's error.
 fn lead_refusal(
     caller: &LeadCaller,
     worktree: &str,
     refusal: &thegn_core::lead_confine::ConfineRefusal,
 ) -> ControlError {
-    thegn_svc::control::http::audit_lead_refusal(
-        &caller.pairing_id,
-        &caller.label,
+    lead_refusal_for(
         thegn_core::control::Verb::OpenSession,
+        caller,
         worktree,
-    );
+        refusal,
+    )
+}
+
+/// Audit a daemon-side Lead refusal of `verb` against `target` (a worktree, or
+/// a session id) and turn it into the caller's error. The audit record carries
+/// the caller's pairing id and label and the target, never request content.
+fn lead_refusal_for(
+    verb: thegn_core::control::Verb,
+    caller: &LeadCaller,
+    target: &str,
+    refusal: &thegn_core::lead_confine::ConfineRefusal,
+) -> ControlError {
+    thegn_svc::control::http::audit_lead_refusal(&caller.pairing_id, &caller.label, verb, target);
     ControlError::FailedPrecondition(refusal.to_string())
 }
 
@@ -1705,10 +1726,72 @@ impl DaemonService {
                     tracing::warn!(target: "thegn::daemon", "adopt intent for {id} failed: {e}");
                 }
             }
+            // Every Lead check passed and the worker is up: record who opened
+            // it, the only provenance a Lead-confined `sessions.input` accepts
+            // ([`DaemonService::lead_input_precheck`]).
+            if let Some(caller) = &confine {
+                self.mark_lead_opened(&info.id, &caller.label).await;
+            }
             if let Some(guard) = launch_guard {
                 guard.commit(&info);
             }
             Ok(info)
+        })
+    }
+
+    /// Record `session` as opened by the Lead labelled `label`. A session that
+    /// already exited stays unmarked (its tombstone is never inputtable).
+    async fn mark_lead_opened(&self, session: &str, label: &str) {
+        match self.sessions.lock().await.get_mut(session) {
+            Some(entry) => entry.lead_opener = Some(label.to_string()),
+            None => tracing::debug!(
+                target: "thegn::daemon",
+                session,
+                "Lead-opened session exited before it was marked"
+            ),
+        }
+    }
+
+    /// The daemon half of a Lead-confined `sessions.input`, run before any
+    /// byte reaches the PTY: the bytes again (plain text and Enter only,
+    /// [`thegn_core::lead_input::check`]), then provenance: `session` must be
+    /// a live entry marked Lead-opened by [`Self::mark_lead_opened`]. A
+    /// tombstone, an unknown id, a session the user opened, and an id reused by
+    /// a later launch are all refused alike, and audited. Any Lead may answer
+    /// any Lead-opened worker (Lead tabs share one trust level); the allowed
+    /// call is audited by the caller. Returns the live mailbox.
+    async fn lead_input_precheck(
+        &self,
+        session: &str,
+        bytes: &[u8],
+        caller: &LeadCaller,
+    ) -> ControlResult<mpsc::Sender<SessionMsg>> {
+        use thegn_core::lead_confine::{ConfineRefusal, RequestShape, check};
+        if let Err(refusal) = check(
+            thegn_core::control::Verb::SendInput,
+            &RequestShape::Input { bytes },
+        ) {
+            return Err(lead_refusal_for(
+                thegn_core::control::Verb::SendInput,
+                caller,
+                session,
+                &refusal,
+            ));
+        }
+        let lead_worker = self
+            .sessions
+            .lock()
+            .await
+            .get(session)
+            .filter(|entry| entry.lead_opener.is_some())
+            .map(|entry| entry.msg_tx.clone());
+        lead_worker.ok_or_else(|| {
+            lead_refusal_for(
+                thegn_core::control::Verb::SendInput,
+                caller,
+                session,
+                &ConfineRefusal::NotLeadWorker(session.to_string()),
+            )
         })
     }
 }
@@ -1825,6 +1908,26 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
             let tx = self.live_tx(session).await?;
+            tx.send(SessionMsg::Stdin(bytes))
+                .await
+                .map_err(|_| Self::not_found(session))
+        })
+    }
+
+    fn send_input_confined<'a>(
+        &'a self,
+        session: &'a str,
+        bytes: Vec<u8>,
+        caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async move {
+            let tx = self.lead_input_precheck(session, &bytes, &caller).await?;
+            thegn_svc::control::http::audit_lead_allowed(
+                &caller.pairing_id,
+                &caller.label,
+                thegn_core::control::Verb::SendInput,
+                session,
+            );
             tx.send(SessionMsg::Stdin(bytes))
                 .await
                 .map_err(|_| Self::not_found(session))
@@ -3913,6 +4016,7 @@ mod tests {
             })),
             recipe: None,
             process: None,
+            lead_opener: None,
         }
     }
 
@@ -4382,6 +4486,223 @@ mod tests {
         env.env = vec![("K".into(), "V".into())];
         expect_lead_refusal(svc.open_confined(env, lead_caller()).await, "env");
         assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    /// A live-looking session whose stub actor records every byte written to
+    /// it, so a test can prove input did (or did not) reach the PTY.
+    async fn insert_input_probe(svc: &DaemonService, id: &str) -> Arc<Mutex<Vec<u8>>> {
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = written.clone();
+        svc.sessions
+            .lock()
+            .await
+            .insert(id.to_string(), shutdown_test_entry(msg_tx));
+        tokio::spawn(async move {
+            while let Some(msg) = msg_rx.recv().await {
+                if let SessionMsg::Stdin(bytes) = msg {
+                    sink.lock().expect("probe lock").extend_from_slice(&bytes);
+                }
+            }
+        });
+        written
+    }
+
+    /// Let the probe actor drain its mailbox.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    mod lead_audit_capture {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span;
+        use tracing::{Event, Metadata, Subscriber};
+
+        #[derive(Default, Clone)]
+        pub(super) struct Captured(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+        impl Captured {
+            pub(super) fn records(&self) -> Vec<BTreeMap<String, String>> {
+                self.0.lock().expect("capture lock").clone()
+            }
+        }
+
+        struct FieldVisitor(BTreeMap<String, String>);
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        pub(super) struct AuditSubscriber(pub(super) Captured);
+        impl Subscriber for AuditSubscriber {
+            fn enabled(&self, meta: &Metadata<'_>) -> bool {
+                meta.target() == "thegn::control::audit"
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() != "thegn::control::audit" {
+                    return;
+                }
+                let mut v = FieldVisitor(BTreeMap::new());
+                event.record(&mut v);
+                self.0.0.lock().expect("capture lock").push(v.0);
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+    }
+
+    fn input_audits(
+        captured: &lead_audit_capture::Captured,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        captured
+            .records()
+            .into_iter()
+            .filter(|m| m.get("capability").map(String::as_str) == Some("sessions.input"))
+            .collect()
+    }
+
+    fn expect_input_refusal(result: ControlResult<()>, needle: &str) {
+        match result {
+            Err(ControlError::FailedPrecondition(m)) => {
+                assert!(
+                    m.starts_with(thegn_core::lead_confine::REFUSAL_PREFIX) && m.contains(needle),
+                    "{m}"
+                );
+            }
+            other => panic!("expected a Lead input refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_input_reaches_a_session_the_lead_opened_and_is_audited() {
+        let captured = lead_audit_capture::Captured::default();
+        let _guard =
+            tracing::subscriber::set_default(lead_audit_capture::AuditSubscriber(captured.clone()));
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "w1").await;
+        svc.mark_lead_opened("w1", "lead:g/0").await;
+        svc.send_input_confined("w1", b"use option 2\r".to_vec(), lead_caller())
+            .await
+            .expect("a Lead may answer its own worker");
+        settle().await;
+        assert_eq!(*written.lock().unwrap(), b"use option 2\r".to_vec());
+        let recs = input_audits(&captured);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].get("outcome").map(String::as_str), Some("ok"));
+        assert_eq!(recs[0].get("label").map(String::as_str), Some("lead:g/0"));
+        assert_eq!(recs[0].get("resource").map(String::as_str), Some("w1"));
+        assert!(
+            recs[0].values().all(|v| !v.contains("option 2")),
+            "the audit never carries the input: {recs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lead_input_to_a_session_the_user_opened_is_refused_and_audited() {
+        let captured = lead_audit_capture::Captured::default();
+        let _guard =
+            tracing::subscriber::set_default(lead_audit_capture::AuditSubscriber(captured.clone()));
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "mine").await;
+        expect_input_refusal(
+            svc.send_input_confined("mine", b"rm -rf ~\r".to_vec(), lead_caller())
+                .await,
+            "opened itself",
+        );
+        settle().await;
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "no byte reached the PTY"
+        );
+        let recs = input_audits(&captured);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(
+            recs[0].get("outcome").map(String::as_str),
+            Some("lead_confined")
+        );
+        assert_eq!(recs[0].get("label").map(String::as_str), Some("lead:g/0"));
+        assert_eq!(recs[0].get("resource").map(String::as_str), Some("mine"));
+        assert!(recs[0].values().all(|v| !v.contains("rm -rf")), "{recs:?}");
+    }
+
+    #[tokio::test]
+    async fn lead_input_to_an_unknown_or_tombstoned_session_is_refused() {
+        let (svc, _rx) = service(0);
+        expect_input_refusal(
+            svc.send_input_confined("ghost", b"hi".to_vec(), lead_caller())
+                .await,
+            "ghost",
+        );
+        // A Lead worker that exited: its tombstone is readable but never
+        // inputtable.
+        svc.tombs.lock().await.insert(
+            "dead".into(),
+            super::super::tombstone::tests::tomb("dead", Some(0)),
+            now_ms(),
+        );
+        expect_input_refusal(
+            svc.send_input_confined("dead", b"hi".to_vec(), lead_caller())
+                .await,
+            "dead",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_session_id_is_not_lead_opened() {
+        let (svc, _rx) = service(0);
+        insert_input_probe(&svc, "w2").await;
+        svc.mark_lead_opened("w2", "lead:g/0").await;
+        // The worker ends and a later, user-opened launch lands on the same id.
+        svc.sessions.lock().await.remove("w2");
+        let written = insert_input_probe(&svc, "w2").await;
+        expect_input_refusal(
+            svc.send_input_confined("w2", b"hi".to_vec(), lead_caller())
+                .await,
+            "opened itself",
+        );
+        settle().await;
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lead_input_rechecks_the_bytes_in_the_daemon() {
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "w3").await;
+        svc.mark_lead_opened("w3", "lead:g/0").await;
+        for bytes in [&b"\x1b[201~"[..], b"\x03", b"\x1b]52;c;eA==\x07", b"a\0"] {
+            expect_input_refusal(
+                svc.send_input_confined("w3", bytes.to_vec(), lead_caller())
+                    .await,
+                "sessions.input",
+            );
+        }
+        settle().await;
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plain_send_input_ignores_lead_provenance() {
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "u1").await;
+        svc.send_input("u1", b"\x1b[A\x03".to_vec())
+            .await
+            .expect("a non-Lead caller is unaffected");
+        settle().await;
+        assert_eq!(*written.lock().unwrap(), b"\x1b[A\x03".to_vec());
     }
 
     #[tokio::test]
@@ -6575,6 +6896,7 @@ mod tests {
                 })),
                 recipe: None,
                 process: None,
+                lead_opener: None,
             },
         );
 
@@ -8645,6 +8967,7 @@ mod tests {
                 live,
                 recipe: None,
                 process: None,
+                lead_opener: None,
             },
         );
         tokio::spawn(async move {

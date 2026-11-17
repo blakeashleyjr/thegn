@@ -337,6 +337,19 @@ impl ControlApi for FakeApi {
         self.record("send_input");
         Box::pin(async { Ok(()) })
     }
+    fn send_input_confined<'a>(
+        &'a self,
+        session: &'a str,
+        bytes: Vec<u8>,
+        caller: super::LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        self.record(&format!(
+            "send_input_confined:{}:{session}:{}",
+            caller.label,
+            String::from_utf8_lossy(&bytes).escape_debug()
+        ));
+        Box::pin(async { Ok(()) })
+    }
     fn resize<'a>(
         &'a self,
         _session: &'a str,
@@ -3443,14 +3456,14 @@ async fn the_lead_listener_confines_any_token() {
     assert!(r.api.calls().is_empty());
 }
 
-/// Input, split, fork, host git and the sandbox-profile pin are refused for a
-/// Lead caller even when its scopes would allow them; reads still work.
+/// Split, resize, fork, host git and the sandbox-profile pin are refused for
+/// a Lead caller even when its scopes would allow them; reads still work.
+/// (`sessions.input` is shape-checked instead; see the `lead_input_*` tests.)
 #[tokio::test]
 async fn lead_refused_verbs_never_reach_the_api() {
     let r = rig(false);
     let lead = token_with_label(&r, "read,write,git", LEAD_LABEL.to_string());
     for path in [
-        "/v1/sessions/s1/input",
         "/v1/sessions/s1/split",
         "/v1/sessions/s1/resize",
         "/v1/git/commit",
@@ -3475,6 +3488,116 @@ async fn lead_refused_verbs_never_reach_the_api() {
     assert_eq!(
         call(&r, "GET", "/v1/sessions", Some(&lead)).await,
         StatusCode::OK
+    );
+}
+
+/// Plain-text Lead input (with Enter) passes the transport and is routed to
+/// the daemon's confined path, which proves the session is a Lead worker;
+/// never the unconfined one.
+#[tokio::test]
+async fn lead_input_goes_through_the_confined_path() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions/w1/input",
+        &lead,
+        serde_json::json!({"text": "use option 2", "enter": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        r.api.calls(),
+        [format!(
+            "send_input_confined:{LEAD_LABEL}:w1:use option 2\\r"
+        )]
+    );
+}
+
+/// Escape sequences and other control bytes from the Lead are refused at the
+/// transport, audited with the label and session id (never the text), and
+/// never reach the API, whether sent as `text` or `b64`.
+#[tokio::test]
+async fn lead_input_with_control_bytes_is_refused_audited_and_never_dispatched() {
+    use base64::Engine as _;
+    let captured = audit_capture::Captured::default();
+    let _guard = tracing::subscriber::set_default(audit_capture::AuditSubscriber(captured.clone()));
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let bodies = [
+        serde_json::json!({"text": "\u{1b}[201~secret"}),
+        serde_json::json!({"text": "secret\u{3}"}),
+        serde_json::json!({
+            "b64": base64::engine::general_purpose::STANDARD.encode(b"secret\x1b]52;c;eA==\x07")
+        }),
+        serde_json::json!({"text": "x".repeat(thegn_core::lead_input::MAX_LEAD_INPUT_BYTES + 1)}),
+        // An unparseable body carries no shape: refused for the Lead too.
+        serde_json::json!({}),
+    ];
+    let count = bodies.len();
+    for body in bodies {
+        let (status, reply) = post_json(&r, "/v1/sessions/w1/input", &lead, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+        assert!(
+            refusal_text(&reply).starts_with(thegn_core::lead_confine::REFUSAL_PREFIX),
+            "{reply}"
+        );
+    }
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+    let refused = captured
+        .records()
+        .into_iter()
+        .filter(|m| {
+            m.get("capability").map(String::as_str) == Some("sessions.input")
+                && m.get("outcome").map(String::as_str) == Some("lead_confined")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), count, "{refused:?}");
+    for rec in &refused {
+        assert_eq!(rec.get("label").map(String::as_str), Some(LEAD_LABEL));
+        assert_eq!(rec.get("resource").map(String::as_str), Some("w1"));
+        assert!(rec.values().all(|v| !v.contains("secret")), "{rec:?}");
+    }
+}
+
+/// Regression guard: a normal Write token's input (control bytes included)
+/// takes the ordinary path, untouched by the Lead rules.
+#[tokio::test]
+async fn a_normal_write_token_input_is_unaffected() {
+    use base64::Engine as _;
+    let r = rig(false);
+    let write = token(&r, "read,write");
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions/s1/input",
+        &write,
+        serde_json::json!({"b64": base64::engine::general_purpose::STANDARD.encode(b"\x1b[A\x03")}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r.api.calls(), ["send_input"]);
+}
+
+/// An API impl that does not record who opened a session types nothing for
+/// the Lead.
+#[tokio::test]
+async fn the_default_confined_input_fails_closed() {
+    let api = PluginsStatusApi {
+        reply: super::PluginsStatusReply::default(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let caller = super::LeadCaller {
+        pairing_id: "p".into(),
+        label: LEAD_LABEL.into(),
+    };
+    let err = api
+        .send_input_confined("w1", b"hi".to_vec(), caller)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, super::ControlError::FailedPrecondition(_)));
+    assert!(
+        err.to_string()
+            .contains(thegn_core::lead_confine::REFUSAL_PREFIX)
     );
 }
 
