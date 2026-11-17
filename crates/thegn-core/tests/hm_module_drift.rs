@@ -890,7 +890,6 @@ fn hm_git_enum_options_offer_only_canonical_spellings() {
 fn hm_network_media_enum_options_offer_only_canonical_spellings() {
     let expected = [
         ("networkMode", "network.mode"),
-        ("weatherProvider", "weather.provider"),
         ("weatherUnits", "weather.units"),
         ("mediaDefaultAction", "media.default_action"),
         ("notificationsSoundMode", "notifications.sound.mode"),
@@ -949,6 +948,40 @@ fn hm_media_backend_offers_only_implemented_spellings() {
     assert_eq!(
         actual, implemented,
         "Home Manager mediaBackend must offer exactly the implemented spellings"
+    );
+}
+
+#[test]
+fn hm_weather_provider_offers_only_implemented_spellings() {
+    let enums = enum_lists(&module_src());
+    let values = enums
+        .iter()
+        .find(|(name, _)| name == "weatherProvider")
+        .map(|(_, values)| values)
+        .unwrap_or_else(|| panic!("Home Manager enum option `weatherProvider` is missing"));
+    let actual: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+    let schema = schema_field("weather.provider");
+    let mut implemented: BTreeSet<&str> = schema["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("destination `weather.provider` has no enum"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    // Reserved spellings parse but have no provider, so HM must not offer them.
+    if let Some(marker) = schema.get(thegn_core::config_validate::ENUM_MARKER) {
+        for reserved in marker["reserved"].as_array().into_iter().flatten() {
+            if let Some(spelling) = reserved.as_str() {
+                implemented.remove(spelling);
+            }
+        }
+    }
+    assert!(
+        !implemented.is_empty(),
+        "weather.provider must retain implemented spellings"
+    );
+    assert_eq!(
+        actual, implemented,
+        "Home Manager weatherProvider must offer exactly the implemented spellings"
     );
 }
 
