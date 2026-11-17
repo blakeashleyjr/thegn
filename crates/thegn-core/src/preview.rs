@@ -37,6 +37,8 @@ pub enum PreviewRoute {
     Pdf,
     /// A zip/tar archive shown as an entry listing (`archive_list`).
     Archive,
+    /// A Word `.docx` shown as its extracted text (`docx_text`).
+    Docx,
     /// Not previewable (binary with no recognized type).
     Unknown,
 }
@@ -79,6 +81,7 @@ pub fn route_for(path: &Path, head: &[u8]) -> PreviewRoute {
         Some("mmd" | "mermaid") => PreviewRoute::Mermaid,
         Some("pdf") => PreviewRoute::Pdf,
         Some("zip" | "jar" | "whl" | "tar" | "tgz") => PreviewRoute::Archive,
+        Some("docx") => PreviewRoute::Docx,
         Some("gz") if is_tar_gz(path) => PreviewRoute::Archive,
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif") => {
             PreviewRoute::Image
@@ -868,10 +871,12 @@ mod tests {
             assert_eq!(r(n, b""), super::PreviewRoute::Archive, "{n}");
         }
         assert_ne!(r("a.gz", b""), super::PreviewRoute::Archive);
-        assert_eq!(
-            r("doc.docx", b"PK\x03\x04\0\0"),
-            super::PreviewRoute::Archive
-        );
+        assert_eq!(r("doc.docx", b""), super::PreviewRoute::Docx);
+        assert_eq!(r("doc.DOCX", b"PK\x03\x04\0\0"), super::PreviewRoute::Docx);
+        for n in ["a.xlsx", "a.pptx", "a.odt"] {
+            assert_eq!(r(n, b"PK\x03\x04\0\0"), super::PreviewRoute::Archive, "{n}");
+        }
+        assert_eq!(r("docx", b"PK\x03\x04\0\0"), super::PreviewRoute::Archive);
         let mut tar = vec![0u8; 1024];
         tar[257..262].copy_from_slice(b"ustar");
         assert_eq!(r("noext", &tar), super::PreviewRoute::Archive);
