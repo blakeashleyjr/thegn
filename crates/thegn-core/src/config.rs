@@ -7715,7 +7715,7 @@ fn repo_overlay_with_automations(repo_root: &std::path::Path) -> Option<PathBuf>
             "toml" => toml::from_str::<toml::Value>(&text)
                 .ok()
                 .and_then(|value| serde_json::to_value(value).ok()),
-            "yaml" => serde_yaml::from_str::<serde_json::Value>(&text).ok(),
+            "yaml" => serde_saphyr::from_str::<serde_json::Value>(&text).ok(),
             _ => serde_json::from_str::<serde_json::Value>(&text).ok(),
         };
         return value

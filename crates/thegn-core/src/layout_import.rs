@@ -49,44 +49,36 @@ impl ImportedLayout {
 /// `- name: {root: …, panes: [cmd, …]}` (the first pane's command is taken).
 /// Malformed input is an error, never a panic.
 pub fn parse_tmuxinator(src: &str) -> Result<ImportedLayout> {
-    let doc: serde_yaml::Value =
-        serde_yaml::from_str(src).context("not valid YAML (tmuxinator project)")?;
+    let doc: serde_json::Value =
+        serde_saphyr::from_str(src).context("not valid YAML (tmuxinator project)")?;
     let map = doc
-        .as_mapping()
+        .as_object()
         .context("tmuxinator project is not a YAML mapping")?;
     let str_of = |key: &str| -> Option<String> {
-        map.get(serde_yaml::Value::from(key))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        map.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
     };
     let name = str_of("name").context("tmuxinator project has no `name`")?;
     let root = str_of("root").unwrap_or_default();
 
     let mut windows = Vec::new();
-    if let Some(list) = map
-        .get(serde_yaml::Value::from("windows"))
-        .and_then(|v| v.as_sequence())
-    {
+    if let Some(list) = map.get("windows").and_then(|v| v.as_array()) {
         for entry in list {
-            let Some(win) = entry.as_mapping().and_then(|m| m.iter().next()) else {
+            let Some(win) = entry.as_object().and_then(|m| m.iter().next()) else {
                 bail!("tmuxinator window entry is not a `name: …` mapping");
             };
             let (key, val) = win;
-            let name = key
-                .as_str()
-                .context("window name is not a string")?
-                .to_string();
+            let name = key.clone();
             let (cwd, command) = match val {
-                serde_yaml::Value::Null => (None, None),
-                serde_yaml::Value::String(cmd) => (None, Some(cmd.clone())),
-                serde_yaml::Value::Mapping(m) => {
+                serde_json::Value::Null => (None, None),
+                serde_json::Value::String(cmd) => (None, Some(cmd.clone())),
+                serde_json::Value::Object(m) => {
                     let cwd = m
-                        .get(serde_yaml::Value::from("root"))
+                        .get("root")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let command = m
-                        .get(serde_yaml::Value::from("panes"))
-                        .and_then(|v| v.as_sequence())
+                        .get("panes")
+                        .and_then(|v| v.as_array())
                         .and_then(|panes| panes.first())
                         .and_then(|p| p.as_str())
                         .map(|s| s.to_string());
@@ -239,6 +231,39 @@ windows:
         assert!(l.windows.is_empty());
         // But a missing name is an error.
         assert!(parse_tmuxinator("root: /x\n").is_err());
+    }
+
+    #[test]
+    fn tmuxinator_malformed_shapes_error_without_panicking() {
+        // Root is not a mapping.
+        assert!(parse_tmuxinator("- just\n- a list\n").is_err());
+        // A window entry that is a bare string, not `name: …`.
+        assert!(parse_tmuxinator("name: x\nwindows:\n  - editor\n").is_err());
+        // A window value that is neither null, a command nor a mapping.
+        let err = parse_tmuxinator("name: x\nwindows:\n  - editor: [nvim]\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported tmuxinator window value"),
+            "{err:#}"
+        );
+        // Not YAML at all.
+        assert!(parse_tmuxinator("name: [\n").is_err());
+        // Duplicate keys stay an error.
+        assert!(parse_tmuxinator("name: a\nname: b\n").is_err());
+    }
+
+    #[test]
+    fn tmuxinator_anchor_merge_resolves_window_settings() {
+        let src = "name: m\nx-base: &base\n  root: /srv\n  panes: [make]\nwindows:\n  - build:\n      <<: *base\n";
+        let l = parse_tmuxinator(src).unwrap();
+        assert_eq!(
+            l.windows,
+            vec![ImportedWindow {
+                name: "build".into(),
+                cwd: Some("/srv".into()),
+                command: Some("make".into()),
+            }]
+        );
     }
 
     #[test]
