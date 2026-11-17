@@ -619,6 +619,8 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::fleet::Action,
     },
+    /// Per-account AI usage (rate-limit windows) as a table or JSON.
+    Usage(cmd::usage::Args),
     /// Inspect and provision `[host.<name>]` machines (the once-per-host
     /// lifecycle behind fast remote OCI sandboxes).
     Host {
@@ -1533,6 +1535,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Fleet { action } => cmd::fleet::run(&cfg, action),
+        Command::Usage(args) => cmd::usage::run(&cfg, args),
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Sandbox { action } => cmd::sandbox::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),

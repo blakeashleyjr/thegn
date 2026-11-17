@@ -75,6 +75,7 @@ pub mod skills_doctor;
 pub mod supervise;
 pub mod target;
 pub mod theme;
+pub mod usage;
 pub mod voice;
 pub mod wt;
 pub mod wt_batch;
