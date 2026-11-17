@@ -16,6 +16,6 @@
 
 ## 4. Surface and docs
 
-- [ ] 4.1 Panel `p` key, unpulled marker in panel/list/doctor
+- [ ] 4.1 Panel `p` key, unpulled marker in panel/doctor
 - [ ] 4.2 Docs: help page, cli.md, roadmap item 765
 - [ ] 4.3 Live steps for every UNVERIFIED item

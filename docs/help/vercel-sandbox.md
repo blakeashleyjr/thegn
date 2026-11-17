@@ -91,7 +91,7 @@ refused (use `[sandbox.home] agents` there).
 | `proxy`  | refused: not implemented                                                                          |
 | `inject` | refused: would hand the model key to Vercel's firewall (the key is stored by Vercel); not offered |
 
-`thegn doctor` and the env wizard print the same line.
+`thegn doctor` prints the mode in effect and what leaves the machine; the env wizard only notes the default `none`.
 
 ### Upload
 
@@ -103,7 +103,7 @@ refused (use `[sandbox.home] agents` there).
   checked with `stat`). If `/dev/shm` is not tmpfs, thegn refuses; there is no
   disk fallback. Agents find it through `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
 - Memory only: a stop, suspend or delete destroys it, and every terminal open
-  re-uploads if it is missing.
+  re-uploads if it is missing (unverified that the persistent auto snapshot excludes it; see Unverified).
 - Only in a terminal pane or a headless session, which are explicit user
   actions. Never in capture mode, the reaper, provisioning, doctor, fleet or
   any read.
@@ -174,8 +174,7 @@ never runs on its own.
 ## Unpulled results
 
 When a terminal session ends, thegn writes a marker under
-`$XDG_STATE_HOME/thegn/vercel/unpulled/<name>`. The Environments panel row, `thegn env list`
-and `thegn doctor` show `results not pulled`. Press `p` on the row (or run
+`$XDG_STATE_HOME/thegn/vercel/unpulled/<name>`. The Environments panel row and `thegn doctor` (a count) show it. Press `p` on the row (or run
 `thegn env pull <worktree>`) to pull; a successful pull clears the marker.
 `p` is an explicit key, so it may resume the sandbox. There is no background
 resume and no timer.
