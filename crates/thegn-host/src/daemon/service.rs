@@ -1640,6 +1640,14 @@ impl ControlApi for DaemonService {
             if let Some(guard) = launch_guard {
                 guard.commit(&info);
             }
+            // The daemon-skew echo (WS00-P1-11, `thegn_svc::control::open_fields`):
+            // `info.honoured` names each security-relevant `OpenSpec` field this
+            // open applied to the spawn. None exists yet, so it stays
+            // `Vec::new()` (from `SessionMeta::info`) and is never serialised.
+            // Each field's owner pushes its name here only after applying it:
+            // `env_scrub` (WS02-P4-15), `egress_lease` (WS04-P2-09), `shell`
+            // (WS09-P5-05).
+            debug_assert!(info.honoured.is_empty());
             Ok(info)
         })
     }
