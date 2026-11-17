@@ -38,6 +38,14 @@ the owner crates listed in `crates/thegn-core/tests/crate_boundaries.rs`.
 `vt100` and `russh` are banned outright (`deny.toml`) — both are names from
 plans that never landed.
 
+termwiz is vendored at `vendor/termwiz` deliberately (THE-681): crates.io is
+still 0.23.3 while upstream git is active but unpublished, so thegn owns the
+copy and re-evaluates at the next crates.io release (exit condition in
+`vendor/termwiz/PATCH.md`). `alacritty_terminal` is a different layer (emulator
+grid, not the outer-terminal Surface/input) and not a drop-in replacement.
+`portable-pty` is unpatched and its replacement is explicitly deferred, to be
+re-evaluated together with termwiz.
+
 `thegn-core` may depend on the `thegn-proc` leaf for bounded process
 supervision; it has no core dependency. This is the one sanctioned core-to-leaf
 edge besides `thegn-media`, pinned in `crate_boundaries.rs`.
