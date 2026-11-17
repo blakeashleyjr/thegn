@@ -11,9 +11,10 @@
 //!
 //! - scopes = `[lead] scopes` clamped by the `[mcp.serve]` ceiling (and the
 //!   active profile's overlay); clamp-only, `admin`/`exec` never;
-//! - label `lead`; every older `lead` pairing is revoked first, so a token
-//!   lives until the next Lead spawn (a TTL is queued separately);
-//! - written only to an owner-only `mcp.json` beneath
+//! - labelled with the tab's caller id; that tab's older pairing is revoked
+//!   first, so a token lives until the tab's next spawn (a TTL is queued
+//!   separately);
+//! - written only to an owner-only per-tab `mcp-<tab>.json` beneath
 //!   `$XDG_STATE_HOME/thegn/lead-control/`, a directory deliberately distinct
 //!   from (and never inside) the Lead's writable notes dir.
 //!
@@ -35,9 +36,8 @@ use thegn_core::store::ControlStore;
 pub(crate) const CONTROL_DIR_REL: &str = "thegn/lead-control";
 /// The daemon's Lead listener address file inside [`CONTROL_DIR_REL`].
 pub(crate) const CONTROL_ADDR_FILE: &str = "control-addr.json";
-/// The Lead's private claude MCP config inside [`CONTROL_DIR_REL`].
-pub(crate) const MCP_FILE: &str = "mcp.json";
-/// The pairing label every Lead token carries (and revocation keys on).
+/// The pairing label of a bare Lead (`wire --lead`); tab Leads use their
+/// `lead:<group>/<tab>` caller id.
 pub(crate) const PAIRING_LABEL: &str = "lead";
 
 const NO_LISTENER: &str =
@@ -145,11 +145,16 @@ fn lead_scopes(cfg: &Config, lead: &thegn_core::config_lead::LeadConfig) -> Scop
     clamp_lead_scopes(global, profile, lead.scope_set())
 }
 
-/// Revoke every live `lead`-labelled token. Returns how many were revoked.
-fn revoke_lead_pairings(store: &dyn ControlStore, now: i64) -> Result<usize> {
+/// Revoke every live token whose label matches `pred`. Returns how many were
+/// revoked.
+fn revoke_pairings_where(
+    store: &dyn ControlStore,
+    now: i64,
+    pred: impl Fn(&str) -> bool,
+) -> Result<usize> {
     let mut n = 0;
     for row in store.pairings()? {
-        if row.label == PAIRING_LABEL && row.revoked_at.is_none() {
+        if pred(&row.label) && row.revoked_at.is_none() {
             store.revoke_pairing(&row.pairing_id, now)?;
             n += 1;
         }
@@ -157,14 +162,46 @@ fn revoke_lead_pairings(store: &dyn ControlStore, now: i64) -> Result<usize> {
     Ok(n)
 }
 
-/// Mint the Lead's control token (approved at mint: the host is trusted),
-/// revoking older Lead tokens first. Returns the bearer token.
-fn mint_lead_token(store: &dyn ControlStore, scopes: ScopeSet, now: i64) -> Result<String> {
-    revoke_lead_pairings(store, now)?;
+/// Revoke every live token of one Lead tab (`label`). Returns how many were
+/// revoked.
+fn revoke_lead_pairings(store: &dyn ControlStore, now: i64, label: &str) -> Result<usize> {
+    revoke_pairings_where(store, now, |l| l == label)
+}
+
+/// Revoke every live Lead token, whatever its tab. Returns how many were
+/// revoked.
+fn revoke_all_lead_pairings(store: &dyn ControlStore, now: i64) -> Result<usize> {
+    revoke_pairings_where(store, now, |l| l == PAIRING_LABEL || l.starts_with("lead:"))
+}
+
+/// The per-tab Lead MCP config file name inside [`CONTROL_DIR_REL`].
+pub(crate) fn mcp_file_name(caller: &str) -> String {
+    format!(
+        "mcp-{}.json",
+        caller
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    )
+}
+
+/// Mint one Lead tab's control token (approved at mint: the host is trusted),
+/// revoking that tab's older tokens first. Returns the bearer token.
+fn mint_lead_token(
+    store: &dyn ControlStore,
+    scopes: ScopeSet,
+    now: i64,
+    label: &str,
+) -> Result<String> {
+    revoke_lead_pairings(store, now, label)?;
     let minted = thegn_svc::control::auth::mint(
         thegn_core::control::TokenKind::Control,
         scopes,
-        PAIRING_LABEL,
+        label,
         None,
         None,
         now,
@@ -198,16 +235,16 @@ pub(crate) fn prepare(cfg: &Config, notes_dir: &Path, caller: &str) -> Result<Le
         notes_dir,
         caller,
         &thegn_core::util::xdg_state_home(),
-        &|scopes| {
+        &|scopes, label| {
             let db = thegn_core::db::Db::open()?;
-            mint_lead_token(&db, scopes, now_ms())
+            mint_lead_token(&db, scopes, now_ms(), label)
         },
     )
 }
 
 /// Mints the Lead token for the clamped scopes (the DB is opened only after
 /// every refusal has passed).
-type Mint<'a> = &'a dyn Fn(ScopeSet) -> Result<String>;
+type Mint<'a> = &'a dyn Fn(ScopeSet, &str) -> Result<String>;
 
 fn prepare_in(
     cfg: &Config,
@@ -242,7 +279,7 @@ fn prepare_in(
     let addr = read_control_addr(&dir)?;
 
     let scopes = lead_scopes(cfg, lead);
-    let token = mint(scopes)?;
+    let token = mint(scopes, caller)?;
     let hub_profile = cfg
         .mcp_proxy
         .profiles
@@ -262,9 +299,10 @@ fn prepare_in(
         hub_profile,
     });
     let bytes = serde_json::to_vec_pretty(&doc).context("serialize the Lead mcp.json")?;
+    let file = mcp_file_name(caller);
     let path = dir
-        .write_owner_only_atomic(MCP_FILE, &bytes)
-        .with_context(|| format!("write {}", dir.path().join(MCP_FILE).display()))?;
+        .write_owner_only_atomic(&file, &bytes)
+        .with_context(|| format!("write {}", dir.path().join(&file).display()))?;
     Ok(LeadMcpPlan {
         agent_args: vec![
             "--mcp-config".into(),
@@ -288,15 +326,16 @@ pub(crate) fn wire_cli(cfg: &Config, remove: bool) -> Result<()> {
     let state_home = thegn_core::util::xdg_state_home();
     if remove {
         let dir = control_dir_in(&state_home)?;
+        let file = mcp_file_name(PAIRING_LABEL);
         let removed = dir
-            .remove_file(MCP_FILE)
-            .with_context(|| format!("remove {}", dir.path().join(MCP_FILE).display()))?;
+            .remove_file(&file)
+            .with_context(|| format!("remove {}", dir.path().join(&file).display()))?;
         let db = thegn_core::db::Db::open()?;
-        let revoked = revoke_lead_pairings(&db, now_ms())?;
+        let revoked = revoke_all_lead_pairings(&db, now_ms())?;
         thegn_core::outln!(
             "{} {} (revoked {revoked} Lead token{})",
             if removed { "removed" } else { "nothing at" },
-            dir.path().join(MCP_FILE).display(),
+            dir.path().join(&file).display(),
             if revoked == 1 { "" } else { "s" }
         );
         return Ok(());
@@ -308,7 +347,10 @@ pub(crate) fn wire_cli(cfg: &Config, remove: bool) -> Result<()> {
     prepare(cfg, &lead.notes_dir_resolved(), PAIRING_LABEL)?;
     thegn_core::outln!(
         "{}",
-        state_home.join(CONTROL_DIR_REL).join(MCP_FILE).display()
+        state_home
+            .join(CONTROL_DIR_REL)
+            .join(mcp_file_name(PAIRING_LABEL))
+            .display()
     );
     thegn_core::outln!("(older Lead tokens were revoked: a running Lead must be reopened)");
     Ok(())
@@ -331,7 +373,7 @@ mod tests {
         cfg
     }
 
-    fn no_store(_: ScopeSet) -> Result<String> {
+    fn no_store(_: ScopeSet, _: &str) -> Result<String> {
         panic!("no token may be minted before the refusal")
     }
 
@@ -348,7 +390,13 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.to_string(), NO_LISTENER);
-        assert!(!state.path().join(CONTROL_DIR_REL).join(MCP_FILE).exists());
+        assert!(
+            !state
+                .path()
+                .join(CONTROL_DIR_REL)
+                .join(mcp_file_name("lead"))
+                .exists()
+        );
     }
 
     #[test]
@@ -394,10 +442,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn prepare_mints_a_clamped_token_and_writes_a_private_mcp_json() {
-        use std::os::unix::fs::PermissionsExt;
         let state = tempfile::tempdir().unwrap();
         let notes = tempfile::tempdir().unwrap();
         write_control_addr(state.path(), "127.0.0.1:4242".parse().unwrap()).unwrap();
@@ -409,13 +455,13 @@ mod tests {
             .insert("lead".into(), vec!["todoist".into()]);
         let db = thegn_core::db::Db::open_memory().unwrap();
         // An older Lead token, which the new mint must revoke.
-        let old = mint_lead_token(&db, ScopeSet::of(&[Scope::Read]), 1).unwrap();
+        let old = mint_lead_token(&db, ScopeSet::of(&[Scope::Read]), 1, "lead").unwrap();
         assert!(!old.is_empty());
-        let mint = |scopes: ScopeSet| mint_lead_token(&db, scopes, now_ms());
+        let mint = |scopes: ScopeSet, label: &str| mint_lead_token(&db, scopes, now_ms(), label);
         let plan = prepare_in(&cfg, notes.path(), "lead", state.path(), &mint).unwrap();
 
         let dir = state.path().join(CONTROL_DIR_REL);
-        let path = dir.join(MCP_FILE);
+        let path = dir.join(mcp_file_name("lead"));
         assert_eq!(
             plan.agent_args,
             [
@@ -425,8 +471,7 @@ mod tests {
             ]
         );
         assert_eq!(plan.readable, [dir.clone()]);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        crate::platform::test_assert_owner_only_permissions(&path, &dir);
         let doc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let serve = &doc["mcpServers"]["thegn"];
@@ -470,16 +515,11 @@ mod tests {
         assert!(parse_control_addr(b"nope").is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn control_addr_file_is_owner_only_and_outside_the_default_notes_dir() {
-        use std::os::unix::fs::PermissionsExt;
         let state = tempfile::tempdir().unwrap();
         let path = write_control_addr(state.path(), "127.0.0.1:1".parse().unwrap()).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        crate::platform::test_assert_owner_only_permissions(&path, path.parent().unwrap());
         // `[lead] notes_dir` defaults to `<state>/thegn/lead`.
         assert!(!dirs_nest(
             &state.path().join(CONTROL_DIR_REL),

@@ -243,12 +243,12 @@ opens nothing.
 
 Each time a Lead tab starts, thegn does three things:
 
-1. It revokes every older pairing labelled `lead`.
+1. It revokes the previous token of the same Lead tab.
 2. It mints a new token for the Lead. The token's scopes are `[lead] scopes`,
    clamped by `[mcp.serve] scopes`. The Lead can never hold more than
    `[mcp.serve]` allows, and it never holds `admin` or `exec`.
-3. It writes the token into `$XDG_STATE_HOME/thegn/lead-control/mcp.json`, an
-   owner-only file. Claude reads it with `--mcp-config ... --strict-mcp-config`,
+3. It writes the token into `$XDG_STATE_HOME/thegn/lead-control/mcp-<tab>.json`,
+   an owner-only file. Claude reads it with `--mcp-config ... --strict-mcp-config`,
    so your own `~/.claude` MCP settings never apply to the Lead.
 
 `mcp.json` registers two servers:
@@ -275,4 +275,4 @@ Only claude is supported as the Lead's agent so far.
 To debug the wiring, `thegn mcp wire --lead` writes `mcp.json` and prints its
 path without starting anything. Because it mints a new token, a Lead that is
 already running must be reopened. `thegn mcp wire --lead --remove` deletes the
-file and revokes the Lead's tokens.
+file and revokes every Lead token.
