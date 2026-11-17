@@ -5595,6 +5595,10 @@ pub struct Config {
     /// tuning only; default-deny filtering means it exposes nothing until a
     /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
     pub mcp_proxy: crate::mcp::config::McpProxyConfig,
+    /// `[lead]` — the Lead meta agent (a hosted agent CLI in a global tab).
+    /// Absent = no Lead; experimental, clamped to `None` on the stable channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<crate::config_lead::LeadConfig>,
     /// `[mcp]` — thegn's own MCP endpoint settings (`thegn mcp serve`), distinct
     /// from `[mcp_servers.<name>]` above (the servers thegn hands to agents).
     #[serde(default, skip_serializing_if = "McpConfig::is_default")]
@@ -5725,6 +5729,7 @@ impl Default for Config {
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
             mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
+            lead: None,
             mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
             credentials: CredentialsConfig::default(),
