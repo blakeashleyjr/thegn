@@ -357,8 +357,9 @@ pub(crate) fn header_chips(model: &FrameModel, rect: Rect) -> HeaderChips {
             (None, None),
         ]
     };
-    // The mode chip goes first: its full word, then its one-cell glyph, both
-    // only beside the widest form of the other two chips.
+    // The mode chip goes first: its full word, then the bare `full`, both
+    // only beside the widest form of the other two chips. A word, never a
+    // glyph: a half-block filled its cell and read brighter than its peers.
     let gl = crate::caps::active_glyphs();
     let mode_full = format!(
         "full{}{}",
@@ -366,12 +367,9 @@ pub(crate) fn header_chips(model: &FrameModel, rect: Rect) -> HeaderChips {
         mode_detail_word(model.sidebar_display.focus_detail)
     );
     let (l0, s0) = base[0];
-    let candidates = [
-        (Some(mode_full.as_str()), l0, s0),
-        (Some(gl.sidebar_mode_full), l0, s0),
-    ]
-    .into_iter()
-    .chain(base.into_iter().map(|(l, s)| (None, l, s)));
+    let candidates = [(Some(mode_full.as_str()), l0, s0), (Some("full"), l0, s0)]
+        .into_iter()
+        .chain(base.into_iter().map(|(l, s)| (None, l, s)));
     // One column of breathing room between the title and the chips.
     let budget = rect.cols.saturating_sub(HEADER_TITLE.width() + 1);
     for (m, l, s) in candidates {
@@ -1752,6 +1750,24 @@ fn tree_lead(depth: u8, is_last: bool) -> Vec<crate::seg::Seg> {
     vec![sp(indent), seg(Tok::Slot(S::Ghost2), format!("{conn} "))]
 }
 
+/// The lead of a worktree row's detail line: the same indent as the first
+/// line, with a ghost `│` under the row's own `├` (blank under `└`). Returns
+/// the segments and their display width (`4 + (depth-1)*2 + 4`).
+fn detail_tree_lead(depth: u8, is_last: bool) -> (Vec<crate::seg::Seg>, usize) {
+    use crate::seg::{Tok, seg, sp};
+    let gl = crate::caps::active_glyphs();
+    let pad = 4 + (depth.saturating_sub(1) as usize) * 2;
+    let guide = if is_last {
+        "  ".to_string()
+    } else {
+        format!("{} ", gl.tree_pipe)
+    };
+    (
+        vec![sp(pad), seg(Tok::Slot(S::Ghost2), guide), sp(2)],
+        pad + 4,
+    )
+}
+
 /// The activity dot glyph (item 20): filled while active/waiting, hollow once
 /// read-but-stuck, `↻` while building; `None` = nothing. ASCII-safe glyph set.
 fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
@@ -2282,13 +2298,17 @@ fn compose_row_lines(
                 }
             }];
             if show_detail
-                && let Some(detail) = crate::sidebar_detail::compose_detail_line_at(
-                    row,
-                    disp,
-                    crate::sidebar_detail::unix_now(),
-                    4 + (row.depth.saturating_sub(1) as usize) * 2 + 2 + 2,
-                    content_cols,
-                )
+                && let Some(detail) = {
+                    let (lead, lead_cols) = detail_tree_lead(row.depth, is_last);
+                    crate::sidebar_detail::compose_detail_line_guided(
+                        row,
+                        disp,
+                        crate::sidebar_detail::unix_now(),
+                        lead,
+                        lead_cols,
+                        content_cols,
+                    )
+                }
             {
                 lines.push(detail);
             }
@@ -4279,19 +4299,171 @@ mod tests {
         let full = 12 + 10 + 2 + 7 + 2 + sort;
         let c = header_chips(&m, chip_rect(full));
         assert_eq!(c.mode.unwrap().2, 10);
-        // One short: the glyph stands in for the word.
+        // One short: the bare word `full` stands in for `full·never`.
         let c = header_chips(&m, chip_rect(full - 1));
-        let (glyph, _, gcols) = c.mode.expect("the glyph form still fits");
-        assert_eq!(glyph, crate::caps::active_glyphs().sidebar_mode_full);
-        assert_eq!(gcols, 1);
+        let (word, _, wcols) = c.mode.expect("the bare word still fits");
+        assert_eq!(word, "full");
+        assert_eq!(wcols, 4);
         assert!(c.layout.is_some() && c.sort.is_some());
-        // 11 + 1 + 1 + 2 + 7 + 2 + sort: below that the chip is gone, while
+        // 11 + 1 + 4 + 2 + 7 + 2 + sort: below that the chip is gone, while
         // the layout and sort chips are still whole.
-        let glyph_tier = 12 + 1 + 2 + 7 + 2 + sort;
-        let c = header_chips(&m, chip_rect(glyph_tier - 1));
+        let word_tier = 12 + 4 + 2 + 7 + 2 + sort;
+        let c = header_chips(&m, chip_rect(word_tier - 1));
         assert!(c.mode.is_none());
         assert_eq!(c.layout.unwrap().0, "grouped");
         assert!(c.sort.is_some());
+    }
+
+    #[test]
+    fn detail_tree_lead_puts_the_guide_under_the_connector() {
+        let gl = crate::caps::active_glyphs();
+        // depth 1: 4 cols of gutter, the guide, 2 cols of pad.
+        let (lead, cols) = detail_tree_lead(1, false);
+        assert_eq!(cols, 8);
+        assert_eq!(lead.len(), 3);
+        assert_eq!(lead[0].text, " ".repeat(4));
+        assert_eq!(lead[1].text, format!("{} ", gl.tree_pipe));
+        assert_eq!(lead[1].fg, crate::seg::Tok::Slot(S::Ghost2));
+        // Last child: blank under `└`.
+        let (lead, cols) = detail_tree_lead(1, true);
+        assert_eq!(cols, 8);
+        assert_eq!(lead[1].text, "  ");
+        // Folder child: one more indent step.
+        let (lead, cols) = detail_tree_lead(2, false);
+        assert_eq!(cols, 10);
+        assert_eq!(lead[0].text, " ".repeat(6));
+    }
+
+    /// Three worktrees under one workspace with detail on: build, paint, and
+    /// return the surface plus the frame so tests read the detail lines.
+    fn guide_fixture(depths: &[u8]) -> (Surface, SidebarFrame) {
+        use crate::sidebar::SidebarRow;
+        let mut rows = vec![SidebarRow::base(RowKind::Workspace, 0, "ws", "ws")];
+        for (i, d) in depths.iter().enumerate() {
+            rows.push(SidebarRow::base(
+                RowKind::Worktree,
+                *d,
+                format!("feat-{i}"),
+                "ws",
+            ));
+        }
+        let mut model = FrameModel {
+            sidebar_rows: rows,
+            ..FrameModel::default()
+        };
+        model.sidebar_display = SidebarDisplay {
+            focus_detail: thegn_core::config::FocusDetail::All,
+            detail_when: thegn_core::config::DetailWhen::Always,
+            detail_branch: true,
+            ..SidebarDisplay::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let mut s = Surface::new(40, 30);
+        draw_sidebar(&mut s, rect, &model);
+        (s, build_sidebar(&model, rect, 0))
+    }
+
+    fn guide_cell(
+        s: &mut Surface,
+        frame: &SidebarFrame,
+        idx: usize,
+        x: usize,
+    ) -> (String, ColorAttribute) {
+        let p = frame
+            .rows
+            .iter()
+            .find(|p| p.visible_index == idx)
+            .expect("row painted");
+        assert!(p.height >= 2, "row {idx} must carry a detail line");
+        let cell = &s.screen_cells()[p.y + p.height - 1][x];
+        (cell.str().to_string(), cell.attrs().foreground())
+    }
+
+    #[test]
+    fn detail_line_continues_the_guide_under_each_connector() {
+        let (mut s, frame) = guide_fixture(&[1, 1, 1]);
+        let pipe = crate::caps::active_glyphs().tree_pipe;
+        for idx in [1, 2] {
+            let (t, fg) = guide_cell(&mut s, &frame, idx, 4);
+            assert_eq!(t, pipe, "row {idx}");
+            assert_eq!(fg, col(S::Ghost2), "row {idx}");
+        }
+        let (t, _) = guide_cell(&mut s, &frame, 3, 4);
+        assert_eq!(t.trim(), "", "last row is blank under `└`");
+    }
+
+    #[test]
+    fn detail_line_guide_is_a_pipe_under_the_ascii_glyph_set() {
+        use thegn_core::termcaps::UnicodeLevel;
+        crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+            let (mut s, frame) = guide_fixture(&[1, 1, 1]);
+            let (t, _) = guide_cell(&mut s, &frame, 1, 4);
+            assert_eq!(t, "|");
+        });
+    }
+
+    #[test]
+    fn detail_line_guide_follows_a_depth_two_row() {
+        let (mut s, frame) = guide_fixture(&[1, 2, 2, 1]);
+        let pipe = crate::caps::active_glyphs().tree_pipe;
+        let (t, _) = guide_cell(&mut s, &frame, 2, 4 + 2);
+        assert_eq!(t, pipe);
+        let (t, _) = guide_cell(&mut s, &frame, 2, 4);
+        assert_eq!(t.trim(), "");
+    }
+
+    #[test]
+    fn cursor_bar_spans_both_lines_of_a_two_line_row() {
+        use crate::sidebar::SidebarRow;
+        let model = FrameModel {
+            sidebar_rows: vec![
+                SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
+                SidebarRow::base(RowKind::Worktree, 1, "feat-0", "ws"),
+                SidebarRow::base(RowKind::Worktree, 1, "feat-1", "ws"),
+            ],
+            sidebar_selected: 1,
+            sidebar_display: SidebarDisplay {
+                focus_detail: thegn_core::config::FocusDetail::All,
+                detail_when: thegn_core::config::DetailWhen::Always,
+                detail_branch: true,
+                ..SidebarDisplay::default()
+            },
+            ..FrameModel::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let mut s = Surface::new(40, 30);
+        draw_sidebar(&mut s, rect, &model);
+        let frame = build_sidebar(&model, rect, 0);
+        let p = frame.rows.iter().find(|p| p.visible_index == 1).unwrap();
+        assert!(p.cursor_bar && p.height - p.lead_gap >= 2);
+        let bar = crate::caps::active_glyphs().half_block_r;
+        for dy in p.lead_gap..p.height {
+            assert_eq!(s.screen_cells()[p.y + dy][0].str(), bar, "dy {dy}");
+        }
+    }
+
+    /// The mode chip paints in the dim slot, at the geometry `header_chips`
+    /// reports.
+    #[test]
+    fn mode_chip_paints_in_the_dim_slot() {
+        let model = FrameModel::default();
+        let rect = chip_rect(60);
+        let (label, x, _) = header_chips(&model, rect).mode.expect("fits at 60");
+        let mut s = Surface::new(60, 40);
+        draw_sidebar(&mut s, rect, &model);
+        let cell = &s.screen_cells()[rect.y][x];
+        assert_eq!(cell.str(), &label[..1]);
+        assert_eq!(cell.attrs().foreground(), col(S::Dim));
     }
 
     #[test]
