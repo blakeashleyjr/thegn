@@ -193,9 +193,12 @@ fn parse_field(
         }
         let step = step.unwrap_or(1);
         let mut v = lo;
-        while v <= hi {
+        loop {
             bits |= 1u64 << v;
-            v += step;
+            match v.checked_add(step) {
+                Some(n) if n <= hi => v = n,
+                _ => break,
+            }
         }
     }
     Ok((bits, star))
@@ -342,6 +345,7 @@ mod tests {
             "0 0 * dec sun",
             "59 23 31 12 6",
             "  1   2 3 4 5 ",
+            "5-10/4294967295 * * * *",
         ] {
             assert!(parse_schedule(Some(ok), None).is_ok(), "{ok}");
         }
