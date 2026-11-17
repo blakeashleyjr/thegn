@@ -120,5 +120,5 @@ excision commits. Iterate with `just quick <crate>` + targeted
       resurrection boundary (ACP/bouncer/compression stay out).
 - [x] 6.3 `test/smoke.sh`: disabled-by-default assertion + a
       config-validate-rejects-raw-key case.
-- [ ] 6.4 Run `just ci` once (includes openspec-validate, coverage, ratchets)
-      and fix fallout. (Pre-PR gate — run at land time, not per-edit.)
+- [x] 6.4 Run `just ci` once (includes openspec-validate, coverage, ratchets)
+      and fix fallout. (Superseded by the batch gate.)
