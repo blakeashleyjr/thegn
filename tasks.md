@@ -9,7 +9,7 @@
 > (`openspec/changes/archive/2026-08-14-*`), not from live code. The generic
 > `[[agents]]` picker and the `[merge_queue] agent_command` fold-actor were kept.
 
-**735 features across 51 groups (A–AY).** The list is **two tracks joined by one
+**769 numbered items across 53 groups (A–BA)** (738 distinct numbers; a few numbers repeat across groups). The list is **two tracks joined by one
 keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**. The
 control plane has **two layers** (see
 `docs/superpowers/specs/2026-06-24-acp-two-layer-control-plane-design.md`): the
