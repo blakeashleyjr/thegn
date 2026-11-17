@@ -30,6 +30,8 @@ const MAX_LIMIT: usize = 500;
 struct ListRequest {
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    issue_id: Option<String>,
 }
 
 fn ttl_secs(svc: &DaemonService) -> u64 {
@@ -45,16 +47,32 @@ pub(crate) async fn list(svc: &DaemonService, req: serde_json::Value) -> JsonRes
         decode(req)?
     };
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let issue = request
+        .issue_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if issue
+        .as_ref()
+        .is_some_and(|s| s.len() > approval_request::MAX_ISSUE_ID)
+    {
+        return Err(ControlError::InvalidArgument("issue_id is too long".into()));
+    }
     let ttl = ttl_secs(svc);
     let (approvals, pending) = svc
         .with_db(move |db| {
             let now = thegn_core::util::now_ms();
+            let fetch = if issue.is_some() { MAX_LIMIT } else { limit };
             let approvals: Vec<ApprovalView> = db
-                .list_approvals(limit)?
+                .list_approvals(fetch)?
                 .into_iter()
+                .filter(|a| issue.as_deref().is_none_or(|i| a.issue_id == i))
+                .take(limit)
                 .map(|a| ApprovalView::evaluate(a, now, ttl))
                 .collect();
-            Ok((approvals, pending_with_ttl(db, now, ttl, limit)?))
+            let mut pending = pending_with_ttl(db, now, ttl, fetch)?;
+            pending.retain(|p| issue.as_deref().is_none_or(|i| p.issue_id == i));
+            pending.truncate(limit);
+            Ok((approvals, pending))
         })
         .await?;
     encode(&json!({ "approvals": approvals, "pending": pending }))

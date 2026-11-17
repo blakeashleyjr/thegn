@@ -235,20 +235,29 @@ fn own_drain(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = tx.send(Err(error.to_string()));
+            if tx.send(Err(error.to_string())).is_err() {
+                tracing::debug!(target: "thegn::daemon", "merge.drain requester gone before spawn failure was reported");
+            }
             return;
         }
     };
-    let _ = tx.send(Ok(child.id()));
+    if tx.send(Ok(child.id())).is_err() {
+        tracing::debug!(target: "thegn::daemon", "merge.drain requester gone before the pid was reported");
+    }
 
     let mut report = Vec::new();
     if let Some(mut stdout) = child.stdout.take() {
-        let _ = (&mut stdout)
+        if let Err(error) = (&mut stdout)
             .take(MAX_REPORT_BYTES)
-            .read_to_end(&mut report);
+            .read_to_end(&mut report)
+        {
+            tracing::debug!(target: "thegn::daemon", "merge.drain report read failed: {error}");
+        }
         // Keep reading past the cap so a chatty child never blocks on a full
         // pipe (and so never reaches the `wait` below).
-        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+        if let Err(error) = std::io::copy(&mut stdout, &mut std::io::sink()) {
+            tracing::debug!(target: "thegn::daemon", "merge.drain stdout drain failed: {error}");
+        }
     }
     #[expect(
         clippy::disallowed_methods,
