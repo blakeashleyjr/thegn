@@ -290,6 +290,34 @@ unknown `--profile` is an error. A server inside a profile still needs its own
 lead = ["todoist"]
 ```
 
+A profile's secrets come from the daemon, and only the Lead's token gets them.
+`thegn mcp proxy --profile <p>` does not read the profile's keyring entries or
+secret files itself. It asks the daemon (`mcp_proxy.profile_env`) with the
+`THEGN_CONTROL_ADDR` and `THEGN_CONTROL_TOKEN` from `mcp.json`, and the daemon
+answers only:
+
+- a Lead token, for `[lead] mcp_profile` only;
+- an admin caller, for any profile.
+
+Every other caller is refused, and so is a failed request: there is no local
+fallback. `--profile` is also refused outright inside a pipeline stage
+(`THEGN_STAGE_LAUNCH` is set) or for an `agent:` caller. A worker has no Lead
+token, so it cannot get the profile's secrets through thegn. The daemon logs
+the profile name only, never a value.
+
+The Lead's token expires. `[lead] token_ttl_secs` (default 43200, 12 hours;
+300 to 604800) sets its lifetime from the moment the tab starts. While the
+Lead keeps using it, the expiry slides: when less than half the TTL is left,
+the next request moves it to now + TTL, at most 7 days after the token was
+minted. A token that sits idle for a whole TTL stops working, and the Lead's
+calls then fail with 401. Reopen the Lead tab: it mints a fresh token. A
+revoked or expired token never slides back to life.
+
+While `[lead]` is configured, every pairing code redeemed on the
+`thegn serve` listener waits for your approval (`thegn pair approve`), as if
+`[serve] require_approval` were on. The Lead could otherwise see a pairing code
+in a pane and pair itself.
+
 The Lead needs the daemon. If the daemon is off, or `[lead]` was added after
 the daemon started, opening the Lead fails with a hint to restart the daemon.
 Only claude is supported as the Lead's agent so far.

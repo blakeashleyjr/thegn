@@ -23,12 +23,14 @@ pub mod context;
 pub mod hub;
 pub mod upstream;
 
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use thegn_core::config::Config;
 
-pub use hub::{Hub, now_ms};
+pub use hub::{EnvSource, Hub, now_ms};
 
 /// Run `thegn mcp proxy`: the stdio aggregation shim an agent registers as its
 /// single MCP server. Newline-delimited JSON-RPC (the MCP stdio contract).
@@ -37,10 +39,23 @@ pub use hub::{Hub, now_ms};
 /// profile's servers. `None` is the default hub, which excludes every profiled
 /// server so a profile (e.g. the Lead's) never reaches workers. An unknown
 /// profile errors before anything is spawned.
+///
+/// A `--profile` hub never resolves its servers' secrets itself (THE-2222):
+/// it is refused inside a worker ([`profile_shim_credentials`]), and the env
+/// comes from the daemon's `mcp_proxy.profile_env`, which answers only the
+/// Lead's own token (for `[lead] mcp_profile`) or an admin. A failed fetch is
+/// an error; there is no local fallback.
 pub fn run_shim(cfg: &Config, profile: Option<&str>) -> Result<()> {
     let selection = hub::ServerSelection::resolve(&cfg.mcp_proxy.profiles, profile)?;
+    let env_source = match profile {
+        None => EnvSource::Local,
+        Some(name) => {
+            let (addr, token) = profile_shim_credentials(&|k| std::env::var(k).ok())?;
+            EnvSource::Daemon(fetch_profile_env(addr, token, name)?)
+        }
+    };
     let ctx = context::resolve_from_cwd();
-    let mut hub = Hub::build_selected(cfg, &ctx, &selection);
+    let mut hub = Hub::build_selected(cfg, &ctx, &selection, &env_source);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -66,6 +81,140 @@ pub fn run_shim(cfg: &Config, profile: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `--profile` shim's preflight, as a pure fn over the environment:
+/// refused inside a worker (a stage launch, or an `agent:` caller), and
+/// otherwise needs the Lead's `THEGN_CONTROL_ADDR` + `THEGN_CONTROL_TOKEN`
+/// (both non-empty). Returns `(addr, token)`. Error text never carries the
+/// token.
+pub(crate) fn profile_shim_credentials(
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<(String, String)> {
+    if get("THEGN_STAGE_LAUNCH").is_some() {
+        anyhow::bail!(
+            "`thegn mcp proxy --profile` is refused inside a pipeline stage (THEGN_STAGE_LAUNCH is set): profile hubs belong to the Lead"
+        );
+    }
+    if get("THEGN_CALLER").is_some_and(|c| c.trim_start().starts_with("agent:")) {
+        anyhow::bail!(
+            "`thegn mcp proxy --profile` is refused for an agent caller: profile hubs belong to the Lead"
+        );
+    }
+    let nonempty = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+    let Some(addr) = nonempty("THEGN_CONTROL_ADDR") else {
+        anyhow::bail!(
+            "`thegn mcp proxy --profile` needs THEGN_CONTROL_ADDR and THEGN_CONTROL_TOKEN (the Lead's control credential): the profile's secrets come from the daemon"
+        );
+    };
+    let Some(token) = nonempty("THEGN_CONTROL_TOKEN") else {
+        anyhow::bail!(
+            "`thegn mcp proxy --profile` needs THEGN_CONTROL_TOKEN (the Lead's control token): the profile's secrets come from the daemon"
+        );
+    };
+    Ok((addr, token))
+}
+
+/// Fetch `profile`'s server env from the daemon (`mcp_proxy.profile_env`)
+/// with the bearer `token`. Blocking: a private current-thread runtime.
+fn fetch_profile_env(addr: String, token: String, profile: &str) -> Result<ProfileEnvReply> {
+    use thegn_svc::control::client::{ControlAddr, ControlClient};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("start the control client runtime")?;
+    let client = ControlClient::new(ControlAddr::Tcp { addr, token });
+    let body = serde_json::json!({ "profile": profile });
+    let reply = rt
+        .block_on(client.call_raw("POST", "/v1/mcp_proxy/profile_env", Some(body)))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "the daemon refused MCP proxy profile {profile:?} env ({e}); no local fallback"
+            )
+        })?;
+    serde_json::from_value(reply)
+        .with_context(|| format!("malformed mcp_proxy.profile_env reply for {profile:?}"))
+}
+
+/// One server's slot in a `mcp_proxy.profile_env` reply: its resolved env, or
+/// why it could not be resolved (never a value).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerEnv {
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The `mcp_proxy.profile_env` reply: `{servers: {name: {env}}}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileEnvReply {
+    #[serde(default)]
+    pub servers: BTreeMap<String, ServerEnv>,
+}
+
+impl ProfileEnvReply {
+    /// Server `name`'s env, or the reason it has none. A server the daemon
+    /// did not answer for is an error (never resolved locally).
+    pub fn env_for(&self, name: &str) -> Result<BTreeMap<String, String>, String> {
+        match self.servers.get(name) {
+            Some(ServerEnv {
+                error: Some(error), ..
+            }) => Err(error.clone()),
+            Some(ServerEnv { env, error: None }) => Ok(env.clone()),
+            None => Err("the daemon returned no env for this server".to_string()),
+        }
+    }
+}
+
+/// Resolve one server's (placeholder-expanded) env secret refs to concrete
+/// values. Shared by the default hub (at spawn) and the daemon's
+/// `mcp_proxy.profile_env`. The error names the key and the ref, never a value.
+pub fn resolve_server_env(
+    name: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in env {
+        let consumer = format!("mcp:{name}:{k}");
+        let value =
+            crate::secret::resolve_mcp_env(v, &consumer).map_err(|e| format!("env `{k}`: {e}"))?;
+        out.insert(k.clone(), value);
+    }
+    Ok(out)
+}
+
+/// Resolve every exposed server of `[mcp_proxy.profiles] <profile>` (the
+/// daemon side of `mcp_proxy.profile_env`). Placeholders expand against an
+/// empty worktree context (the Lead has no worktree), so a worktree-scoped
+/// server is answered with its withheld reason. Errors on an unknown profile.
+pub fn resolve_profile_env(cfg: &Config, profile: &str) -> Result<ProfileEnvReply> {
+    use thegn_core::mcp::proxy::partition::{WorktreeContext, expand_spec};
+    let selection = hub::ServerSelection::resolve(&cfg.mcp_proxy.profiles, Some(profile))?;
+    let ctx = WorktreeContext::default();
+    let mut servers = BTreeMap::new();
+    for (name, srv) in &cfg.mcp_servers {
+        if !selection.includes(name) || !srv.is_proxy_exposed() {
+            continue;
+        }
+        let slot = match expand_spec(name, srv, &ctx) {
+            Err(withheld) => ServerEnv {
+                env: BTreeMap::new(),
+                error: Some(withheld.reason),
+            },
+            Ok(spec) => match resolve_server_env(name, &spec.env) {
+                Ok(env) => ServerEnv { env, error: None },
+                Err(error) => ServerEnv {
+                    env: BTreeMap::new(),
+                    error: Some(error),
+                },
+            },
+        };
+        servers.insert(name.clone(), slot);
+    }
+    Ok(ProfileEnvReply { servers })
 }
 
 /// Build a hub for the current directory's worktree context (for `mcp status`
@@ -182,3 +331,126 @@ pub fn daemon_reload(baseline: &Config) -> McpProxyReloadReport {
 }
 
 pub use hub::effective_global_instances;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    const LEAD: &[(&str, &str)] = &[
+        ("THEGN_CONTROL_ADDR", "127.0.0.1:4242"),
+        ("THEGN_CONTROL_TOKEN", "tgc1_secret"),
+        ("THEGN_CALLER", "lead:lead/0"),
+    ];
+
+    #[test]
+    fn profile_shim_takes_the_lead_credential() {
+        let (addr, token) = profile_shim_credentials(&env_of(LEAD)).unwrap();
+        assert_eq!(addr, "127.0.0.1:4242");
+        assert_eq!(token, "tgc1_secret");
+    }
+
+    #[test]
+    fn profile_shim_refuses_workers_and_missing_credentials() {
+        let refusal = |pairs: &'static [(&'static str, &'static str)]| {
+            profile_shim_credentials(&env_of(pairs))
+                .unwrap_err()
+                .to_string()
+        };
+        // A stage launch is refused even holding a token (any value, even empty).
+        let stage = refusal(&[
+            ("THEGN_STAGE_LAUNCH", ""),
+            ("THEGN_CONTROL_ADDR", "127.0.0.1:1"),
+            ("THEGN_CONTROL_TOKEN", "tgc1_secret"),
+        ]);
+        assert!(stage.contains("pipeline stage"), "{stage}");
+        assert!(!stage.contains("tgc1_secret"));
+        // An agent caller is refused.
+        let agent = refusal(&[
+            ("THEGN_CALLER", "agent:claude"),
+            ("THEGN_CONTROL_ADDR", "127.0.0.1:1"),
+            ("THEGN_CONTROL_TOKEN", "tgc1_secret"),
+        ]);
+        assert!(agent.contains("agent caller"), "{agent}");
+        // Missing or empty credentials.
+        assert!(refusal(&[]).contains("THEGN_CONTROL_ADDR"));
+        assert!(refusal(&[("THEGN_CONTROL_ADDR", "127.0.0.1:1")]).contains("THEGN_CONTROL_TOKEN"));
+        assert!(
+            refusal(&[
+                ("THEGN_CONTROL_ADDR", "127.0.0.1:1"),
+                ("THEGN_CONTROL_TOKEN", "  ")
+            ])
+            .contains("THEGN_CONTROL_TOKEN")
+        );
+    }
+
+    #[test]
+    fn profile_env_reply_is_strict_and_unanswered_servers_error() {
+        let reply: ProfileEnvReply = serde_json::from_value(serde_json::json!({
+            "servers": {
+                "todoist": { "env": { "TOKEN": "v" } },
+                "mail": { "error": "keyring entry `mail` is not set" },
+            }
+        }))
+        .unwrap();
+        assert_eq!(reply.env_for("todoist").unwrap()["TOKEN"], "v");
+        assert!(reply.env_for("mail").unwrap_err().contains("keyring"));
+        assert!(reply.env_for("absent").is_err());
+        assert!(
+            serde_json::from_value::<ProfileEnvReply>(serde_json::json!({"servers": {}, "x": 1}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ServerEnv>(serde_json::json!({"env": {}, "value": "s"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_profile_env_answers_only_the_profiles_exposed_servers() {
+        let server =
+            |tools: &[&str], env: serde_json::Value| -> thegn_core::mcp::config::McpServerConfig {
+                serde_json::from_value(serde_json::json!({
+                    "command": ["true"],
+                    "env": env,
+                    "proxy": { "tools": tools },
+                }))
+                .unwrap()
+            };
+        let mut cfg = Config::default();
+        // Bare strings are literal values: no keyring is touched.
+        cfg.mcp_servers.insert(
+            "todoist".into(),
+            server(&["*"], serde_json::json!({ "K": "lit" })),
+        );
+        cfg.mcp_servers.insert(
+            "hidden".into(),
+            server(&[], serde_json::json!({ "K": "x" })),
+        );
+        cfg.mcp_servers.insert(
+            "github".into(),
+            server(&["*"], serde_json::json!({ "K": "y" })),
+        );
+        cfg.mcp_proxy.profiles = BTreeMap::from([(
+            "lead".to_string(),
+            vec!["todoist".to_string(), "hidden".to_string()],
+        )]);
+        let reply = resolve_profile_env(&cfg, "lead").unwrap();
+        let names: Vec<&str> = reply.servers.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["todoist"],
+            "default-deny and other servers excluded"
+        );
+        assert_eq!(reply.env_for("todoist").unwrap()["K"], "lit");
+        assert!(resolve_profile_env(&cfg, "nope").is_err());
+    }
+}
