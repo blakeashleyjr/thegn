@@ -26,7 +26,17 @@ use thegn_svc::git::{FileStatus, LogRow, MergeInfo};
 struct HeaderRow {
     branch: String,
     ahead_behind: Option<(usize, usize)>,
+    /// An ahead/behind read has succeeded at least once (even to "no upstream").
+    ahead_behind_known: bool,
     merge: Option<MergeInfo>,
+}
+
+/// Result of [`merge_header`]: the adopted fields plus the upstream read state.
+pub(crate) struct HeaderMerge {
+    pub branch: String,
+    pub ahead_behind: Option<(usize, usize)>,
+    pub upstream: crate::panel::UpstreamRead,
+    pub merge: Option<MergeInfo>,
 }
 
 /// Process-global last-known-good header cache, keyed by worktree path. Mirrors
@@ -117,7 +127,8 @@ pub(crate) fn merge_header(
     branch: Result<String, ()>,
     ahead_behind: Result<Option<(usize, usize)>, ()>,
     merge: Result<Option<MergeInfo>, ()>,
-) -> (String, Option<(usize, usize)>, Option<MergeInfo>) {
+) -> HeaderMerge {
+    use crate::panel::UpstreamRead;
     let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
     let prior = map.get(path).cloned().unwrap_or_default();
 
@@ -126,9 +137,10 @@ pub(crate) fn merge_header(
         Err(()) if !prior.branch.is_empty() => prior.branch.clone(),
         Err(()) => "—".to_string(),
     };
-    let ahead_behind = match ahead_behind {
-        Ok(v) => v,
-        Err(()) => prior.ahead_behind,
+    let (ahead_behind, upstream, known) = match ahead_behind {
+        Ok(v) => (v, UpstreamRead::Fresh, true),
+        Err(()) if prior.ahead_behind_known => (prior.ahead_behind, UpstreamRead::Stale, true),
+        Err(()) => (None, UpstreamRead::Unavailable, false),
     };
     let merge = match merge {
         Ok(v) => v,
@@ -140,10 +152,16 @@ pub(crate) fn merge_header(
         HeaderRow {
             branch: branch.clone(),
             ahead_behind,
+            ahead_behind_known: known,
             merge: merge.clone(),
         },
     );
-    (branch, ahead_behind, merge)
+    HeaderMerge {
+        branch,
+        ahead_behind,
+        upstream,
+        merge,
+    }
 }
 
 #[cfg(test)]
@@ -161,7 +179,12 @@ mod tests {
     #[test]
     fn successful_read_is_adopted_and_cached() {
         let p = "/wt/adopt";
-        let (b, ab, m) = merge_header(
+        let HeaderMerge {
+            branch: b,
+            ahead_behind: ab,
+            merge: m,
+            ..
+        } = merge_header(
             p,
             Ok("feature".into()),
             Ok(Some((2, 1))),
@@ -178,7 +201,12 @@ mod tests {
         // Prime the cache with a good read.
         merge_header(p, Ok("main".into()), Ok(Some((0, 3))), Ok(None));
         // A failing tick must not blank the header — it reuses the prior values.
-        let (b, ab, m) = merge_header(p, Err(()), Err(()), Err(()));
+        let HeaderMerge {
+            branch: b,
+            ahead_behind: ab,
+            merge: m,
+            ..
+        } = merge_header(p, Err(()), Err(()), Err(()));
         assert_eq!(b, "main", "branch must not collapse to em-dash");
         assert_eq!(ab, Some((0, 3)));
         assert!(m.is_none());
@@ -186,7 +214,12 @@ mod tests {
 
     #[test]
     fn first_failure_with_no_prior_falls_back_to_dash() {
-        let (b, ab, m) = merge_header("/wt/cold", Err(()), Err(()), Err(()));
+        let HeaderMerge {
+            branch: b,
+            ahead_behind: ab,
+            merge: m,
+            ..
+        } = merge_header("/wt/cold", Err(()), Err(()), Err(()));
         assert_eq!(b, "—");
         assert_eq!(ab, None);
         assert!(m.is_none());
@@ -199,7 +232,11 @@ mod tests {
         merge_header(p, Ok("x".into()), Ok(Some((1, 1))), Ok(Some(merging("y"))));
         // A later *successful* read with no upstream / no merge clears them —
         // this is real, distinct from a failed read reusing the prior.
-        let (_b, ab, m) = merge_header(p, Ok("x".into()), Ok(None), Ok(None));
+        let HeaderMerge {
+            ahead_behind: ab,
+            merge: m,
+            ..
+        } = merge_header(p, Ok("x".into()), Ok(None), Ok(None));
         assert_eq!(ab, None);
         assert!(m.is_none());
     }
@@ -210,9 +247,37 @@ mod tests {
         merge_header(p, Ok("main".into()), Ok(Some((5, 0))), Ok(None));
         // Branch reads fine, but divergence read fails: keep the prior arrows,
         // adopt the fresh branch.
-        let (b, ab, _m) = merge_header(p, Ok("main".into()), Err(()), Ok(None));
+        let HeaderMerge {
+            branch: b,
+            ahead_behind: ab,
+            ..
+        } = merge_header(p, Ok("main".into()), Err(()), Ok(None));
         assert_eq!(b, "main");
         assert_eq!(ab, Some((5, 0)));
+    }
+
+    #[test]
+    fn upstream_state_fresh_stale_unavailable() {
+        use crate::panel::UpstreamRead;
+        let p = "/wt/upstream-states";
+        let cold = merge_header(p, Ok("m".into()), Err(()), Ok(None));
+        assert_eq!(cold.upstream, UpstreamRead::Unavailable);
+        assert_eq!(cold.ahead_behind, None);
+        let fresh = merge_header(p, Ok("m".into()), Ok(Some((1, 2))), Ok(None));
+        assert_eq!(fresh.upstream, UpstreamRead::Fresh);
+        let stale = merge_header(p, Ok("m".into()), Err(()), Ok(None));
+        assert_eq!(stale.upstream, UpstreamRead::Stale);
+        assert_eq!(stale.ahead_behind, Some((1, 2)));
+    }
+
+    #[test]
+    fn err_after_ok_none_is_stale_not_unavailable() {
+        use crate::panel::UpstreamRead;
+        let p = "/wt/upstream-known-none";
+        merge_header(p, Ok("m".into()), Ok(None), Ok(None));
+        let r = merge_header(p, Ok("m".into()), Err(()), Ok(None));
+        assert_eq!(r.upstream, UpstreamRead::Stale);
+        assert_eq!(r.ahead_behind, None);
     }
 
     fn status(path: &str) -> FileStatus {
