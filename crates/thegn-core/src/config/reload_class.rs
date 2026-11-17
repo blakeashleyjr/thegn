@@ -267,6 +267,8 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("identities.*", NextUse, H::None),
     // Includes the per-project `project.<slug>.worktree_roots`.
     ("project.*", NextUse, H::None),
+    // Daemon launches re-read `[env.*]` (and `sandbox.default_env`/`main_env`)
+    // per request via `pipeline_run::with_fresh_registry`.
     ("env.*", NextUse, H::None),
     ("host.*", NextUse, H::None),
     ("bundle.*", NextUse, H::None),
