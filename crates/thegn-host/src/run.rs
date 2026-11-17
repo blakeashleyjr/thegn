@@ -20499,6 +20499,42 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
+                            // Zone palette: the pick opens the confirm (plain
+                            // when ceilings can only narrow, default-cancel when
+                            // they may widen); the confirm queues the write.
+                            if let menu::MenuChoice::Confirm {
+                                tag: tag @ ("zone-pick" | "zone-assign"),
+                                arg,
+                            } = &choice
+                            {
+                                let home = crate::zone_ui::home_dir();
+                                match crate::zone_ui::target_for(
+                                    session.repo_root(),
+                                    &model.sidebar_workspaces,
+                                    home.as_deref(),
+                                ) {
+                                    None => model.status = crate::zone_ui::NEEDS_REPO.into(),
+                                    Some(target) if *tag == "zone-pick" => {
+                                        match crate::zone_ui::after_pick(
+                                            &target,
+                                            &model.zone_catalog,
+                                            arg,
+                                        ) {
+                                            Ok(menu) => active_menu = Some(menu),
+                                            Err(status) => model.status = status,
+                                        }
+                                    }
+                                    Some(target) => {
+                                        model.status = crate::zone_ui::apply(
+                                            &target,
+                                            crate::zone_ui::decode_arg(arg),
+                                            refresh_tx.clone(),
+                                        );
+                                    }
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             // The fleet popup's confirmed stop/destroy: run
                             // `thegn env down [--stop] --worktree=<wt>` in a
                             // visible tab, so the CLI's pull-back, refusals and
@@ -25958,6 +25994,21 @@ async fn event_loop<T: Terminal>(
                                     profile,
                                     model.active_sandbox_profile_pin.is_some(),
                                 ));
+                            }
+                            Action::ZoneAssign => {
+                                let home = crate::zone_ui::home_dir();
+                                let target = crate::zone_ui::target_for(
+                                    session.repo_root(),
+                                    &model.sidebar_workspaces,
+                                    home.as_deref(),
+                                );
+                                match crate::zone_ui::open_picker(
+                                    target.as_ref(),
+                                    &model.zone_catalog,
+                                ) {
+                                    Ok(menu) => active_menu = Some(menu),
+                                    Err(status) => model.status = status,
+                                }
                             }
                             // Both `Ctrl+Alt+f` and `Alt+y` are the same
                             // worktree-scoped toggle. The handler remembers the

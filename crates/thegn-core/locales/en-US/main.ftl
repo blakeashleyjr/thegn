@@ -77,6 +77,7 @@ action-switch-account = Switch agent account
 action-switch-bundle = Switch env bundle
 action-switch-profile = Switch profile
 action-sandbox-profile = Isolation profile for this worktree
+action-zone-assign = Assign workspace to zone…
 action-switch-identity = Switch identity
 action-prev-tab = Previous tab
 action-next-tab = Next tab
