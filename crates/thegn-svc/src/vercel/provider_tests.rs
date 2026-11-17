@@ -777,3 +777,43 @@ async fn destroy_refuses_a_sandbox_tagged_for_another_controller() {
     );
     assert_eq!(fake.count("delete"), 0);
 }
+
+#[test]
+fn env_allowlist_passes_only_tmpfs_login_paths() {
+    let env: Vec<(String, String)> = [
+        (
+            "CLAUDE_CONFIG_DIR",
+            "/dev/shm/thegn-login-0123456789abcdef/claude",
+        ),
+        ("CODEX_HOME", "/dev/shm/thegn-login-0123456789abcdef/codex"),
+        (
+            "ANTHROPIC_API_KEY",
+            "/dev/shm/thegn-login-0123456789abcdef/k",
+        ),
+        ("VERCEL_TOKEN", "/dev/shm/thegn-login-0123456789abcdef/t"),
+        ("TERM", "xterm-256color"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let kept: Vec<String> = env_allowlisted(&env, "VERCEL_TOKEN")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(kept, ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "TERM"]);
+
+    for value in [
+        "/root/.claude",
+        "/dev/shm/other/claude",
+        "/dev/shm/thegn-login-0123456789abcdef/../../root/.claude",
+    ] {
+        let env = vec![("CLAUDE_CONFIG_DIR".to_string(), value.to_string())];
+        assert!(env_allowlisted(&env, "VERCEL_TOKEN").is_empty(), "{value}");
+    }
+    // The token ref name is dropped even when shaped like a login key.
+    let env = vec![(
+        "CODEX_HOME".to_string(),
+        "/dev/shm/thegn-login-0123456789abcdef/codex".to_string(),
+    )];
+    assert!(env_allowlisted(&env, "env:CODEX_HOME").is_empty());
+}
