@@ -514,6 +514,9 @@ pub struct MonitorOverlay {
     containers: tabs::containers::view::ContainersModel,
 }
 
+/// Longest filter [`MonitorOverlay::open_filtered`] accepts.
+const MAX_OPEN_FILTER_CHARS: usize = 128;
+
 impl MonitorOverlay {
     /// Open at `tab`, sizing against `ctx.screen`.
     pub fn open(
@@ -521,6 +524,34 @@ impl MonitorOverlay {
         prefs: MonitorPrefs,
         model: &FrameModel,
         ctx: &StatusCtx,
+    ) -> MonitorOverlay {
+        Self::open_with_filter(tab, prefs, model, ctx, String::new())
+    }
+
+    /// Open at `tab` with the process filter pre-set (a popup row jumping to
+    /// its processes). Control characters are dropped and the text is capped at
+    /// [`MAX_OPEN_FILTER_CHARS`] before the first body build.
+    pub fn open_filtered(
+        tab: MonitorTab,
+        prefs: MonitorPrefs,
+        model: &FrameModel,
+        ctx: &StatusCtx,
+        filter: String,
+    ) -> MonitorOverlay {
+        let filter: String = filter
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_OPEN_FILTER_CHARS)
+            .collect();
+        Self::open_with_filter(tab, prefs, model, ctx, filter)
+    }
+
+    fn open_with_filter(
+        tab: MonitorTab,
+        prefs: MonitorPrefs,
+        model: &FrameModel,
+        ctx: &StatusCtx,
+        filter: String,
     ) -> MonitorOverlay {
         let (cols, rows) = Self::dims(ctx.screen);
         let tabs = MonitorTab::visible_for(
@@ -544,7 +575,7 @@ impl MonitorOverlay {
             sel: 0,
             row_y: Vec::new(),
             follow: true,
-            filter: String::new(),
+            filter,
             filtering: false,
             proc_rows: Vec::new(),
             proc_invalid_terms: Vec::new(),

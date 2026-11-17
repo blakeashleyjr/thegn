@@ -13307,10 +13307,13 @@ async fn event_loop<T: Terminal>(
         if let Some(control) = &process_control {
             if model.take_process_publication(control, processes_live) {
                 loop_perf.tick(crate::perf::WakeSource::Stats);
-                if attrib_open {
+                // The monitor's `wt:` filter also reads the owner index.
+                if attrib_open || monitor.is_some() {
                     model.pane_owners =
                         crate::cpu_attrib_index::pane_owners(&session, &workspace_pool, &panes)
                             .into();
+                }
+                if attrib_open {
                     let sctx = crate::detail::StatusCtx::new(
                         &panel_ui.docs,
                         start.elapsed().as_secs(),
@@ -19382,23 +19385,35 @@ async fn event_loop<T: Terminal>(
                         // Expanding into the monitor needs the monitor slot and
                         // the saved prefs, which only the loop holds.
                         crate::detail::DetailOutcome::Act(
-                            crate::detail::DetailAction::OpenMonitor { tab },
+                            crate::detail::DetailAction::OpenMonitor { tab, filter },
                         ) => {
                             bar_detail = None;
                             if tab == crate::monitor::MonitorTab::Procs {
                                 sync_process_failure_visibility(&mut model, process_failure, false);
                             }
-                            monitor = Some(crate::monitor::MonitorOverlay::open(
-                                tab,
-                                monitor_prefs.clone(),
-                                &model,
-                                &crate::detail::StatusCtx::new(
-                                    &panel_ui.docs,
-                                    start.elapsed().as_secs(),
-                                    Rect::full(cols, rows),
-                                    &current_config.daemon,
+                            let open_ctx = crate::detail::StatusCtx::new(
+                                &panel_ui.docs,
+                                start.elapsed().as_secs(),
+                                Rect::full(cols, rows),
+                                &current_config.daemon,
+                            );
+                            monitor = Some(match filter {
+                                Some(f) if tab == crate::monitor::MonitorTab::Procs => {
+                                    crate::monitor::MonitorOverlay::open_filtered(
+                                        tab,
+                                        monitor_prefs.clone(),
+                                        &model,
+                                        &open_ctx,
+                                        f,
+                                    )
+                                }
+                                _ => crate::monitor::MonitorOverlay::open(
+                                    tab,
+                                    monitor_prefs.clone(),
+                                    &model,
+                                    &open_ctx,
                                 ),
-                            ));
+                            });
                         }
                         // Opening the merge-queue panel section needs the panel
                         // locals only the loop owns, so it's intercepted here.
