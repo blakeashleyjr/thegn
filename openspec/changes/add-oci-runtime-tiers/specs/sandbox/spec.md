@@ -10,8 +10,9 @@ pass `--runtime <value>` at container create, and MUST report the honest
 isolation class the runtime provides: `runsc` (gVisor) as `userspace-kernel` and
 `krun` (libkrun) as `guest-kernel`; an empty value or `runc`/`crun` stays
 `shared-kernel` (today's behavior). Non-OCI backends (bwrap/systemd/none) MUST
-ignore the value. The worktree bind MUST remain path-preserving and thegn MUST
-keep enforcing egress itself, exactly as for the default runtime.
+ignore the value. The worktree bind MUST remain path-preserving, and egress
+reporting MUST be unchanged by the runtime (`unmanaged` for allow/block lists,
+`offline` for `network = "none"`), exactly as for the default runtime.
 
 #### Scenario: gVisor is reported as a userspace kernel
 
@@ -31,11 +32,12 @@ keep enforcing egress itself, exactly as for the default runtime.
 - **THEN** no `--runtime` flag is emitted and the isolation class is unchanged
   (shared kernel)
 
-#### Scenario: The worktree bind and egress control are preserved
+#### Scenario: The worktree bind and egress reporting are preserved
 
 - **WHEN** a worktree runs under `oci_runtime = "runsc"` or `"krun"`
 - **THEN** the worktree is still bind-mounted at its real host path (host git
-  reads stay coherent) and thegn's own DNS/egress enforcement still applies
+  reads stay coherent) and egress reporting is unchanged by the runtime
+  (`unmanaged` for lists, `offline` for `network = "none"`)
 
 ### Requirement: An unavailable OCI runtime degrades to the default, never fails the pane
 
