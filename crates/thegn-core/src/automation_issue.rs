@@ -33,7 +33,8 @@ pub fn facts_from_issue(issue: &Issue, account: &str, assigned_to_me: bool) -> I
 /// The event one matched issue produces. The (untrusted, bounded) title rides
 /// only as `message`; the key is the issue's identity per account, so a
 /// `once_per_key` rule fires once per issue.
-pub fn issue_event(facts: IssueFacts, repo: &str, now: i64) -> AutomationEvent {
+pub fn issue_event(mut facts: IssueFacts, repo: &str, now: i64) -> AutomationEvent {
+    facts.title = facts.title.chars().take(MAX_ISSUE_TITLE_CHARS).collect();
     let mut event = AutomationEvent::bare(
         AutomationEventKind::IssueMatched,
         format!(
@@ -43,7 +44,7 @@ pub fn issue_event(facts: IssueFacts, repo: &str, now: i64) -> AutomationEvent {
         now,
     );
     event.repo = (!repo.is_empty()).then(|| repo.to_string());
-    event.message = Some(facts.title.chars().take(MAX_ISSUE_TITLE_CHARS).collect());
+    event.message = Some(facts.title.clone());
     event.source_ref = Some(facts.issue_id.clone());
     event.issue = Some(facts);
     event
@@ -69,6 +70,10 @@ mod tests {
         assert_eq!(event.source_ref.as_deref(), Some("linear:THE-7"));
         assert_eq!(
             event.message.as_deref().map(|m| m.chars().count()),
+            Some(MAX_ISSUE_TITLE_CHARS)
+        );
+        assert_eq!(
+            event.issue.as_ref().map(|i| i.title.chars().count()),
             Some(MAX_ISSUE_TITLE_CHARS)
         );
         assert_eq!(
