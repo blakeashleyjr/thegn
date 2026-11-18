@@ -35,6 +35,44 @@ Each instance has its own daemon, database, worktrees and config.
    there.
 4. Update the stable instance with `just live` when you choose.
 
+## Splitting one instance into two
+
+To move projects you already have into the dev instance, give the dev instance
+a copy of the stable database, then remove from each copy the projects that
+belong to the other. `thegn repo forget` does the removal. It deletes database
+rows only: files on disk, git worktrees and branches are never touched.
+
+1. Quit both instances and stop their daemons (`thegn daemon stop`, and again
+   after `eval "$(just devel-env)"`). `repo forget` refuses while the instance
+   it targets is running, because a running instance would write the rows back.
+2. Copy the stable database into the dev state dir with SQLite's backup, not
+   `cp`: `sqlite3 ~/.local/state/thegn/thegn.db ".backup '$HOME/.thegn-devel/state/thegn/thegn.db'"`.
+3. In the dev instance's environment, keep only the projects it owns. Run it
+   once without `--apply` to see what would go:
+
+   ```
+   eval "$(just devel-env)"
+   thegn repo forget --keep ~/code/thegn
+   thegn repo forget --keep ~/code/thegn --apply
+   ```
+
+4. In a plain shell (the stable instance), forget those same projects:
+
+   ```
+   thegn repo forget ~/code/thegn
+   thegn repo forget ~/code/thegn --apply
+   ```
+
+The dry run lists every project it would forget and keep, with what goes for
+each: worktree rows, tab groups, pins, queue entries and similar. `--apply`
+first writes a backup to `forget-backup-<UTC time>/thegn.db` in the state dir
+and prints its path; copy it back over `thegn.db` (instance stopped) to undo.
+Unfinished agent dispatches and autopilot runs are marked abandoned or stopped
+rather than deleted, so their history stays. Repo trust decisions are kept, so
+they follow the repo to whichever instance opens it. A `--keep` path that
+matches no registered project is refused, because it would forget everything.
+`--json` prints `{ "applied", "backup", "forgotten", "kept" }`.
+
 ## What is shared
 
 These are not separated, and you should know it:

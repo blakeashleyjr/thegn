@@ -153,6 +153,7 @@ pub use db_vacuum::{
     plan_maintenance,
 };
 mod db_workspace;
+pub mod db_workspace_forget;
 mod db_worktree_identity;
 mod db_zones;
 pub mod debug;
@@ -396,6 +397,7 @@ pub mod share;
 pub mod shellinv;
 pub mod snapshot_meta;
 pub mod spillover;
+pub mod sprite_hold;
 pub mod ssh_creds;
 pub mod stage_land;
 pub mod startup;

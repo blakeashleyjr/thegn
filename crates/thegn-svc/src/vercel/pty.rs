@@ -54,6 +54,39 @@ pub(super) fn health_url(ticket: &url::Url) -> Result<url::Url> {
         .map_err(|_| anyhow!("vercel: bad interactive health url"))
 }
 
+/// The hosts an admitted `/interactive` ticket points at, for the bridge's
+/// one-line report: `host[:port]` only, never the path, the query or the
+/// ticket token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveHosts {
+    /// The socket host from the admitted ticket URL.
+    pub ticket_host: String,
+    /// The `/health` host (built from the same ticket URL).
+    pub health_host: String,
+}
+
+/// `host[:port]` of `url`, or `None` when it has no host.
+fn authority(url: &url::Url) -> Option<String> {
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+/// The reportable hosts of an admitted ticket URL.
+pub(super) fn interactive_hosts(ticket: &url::Url) -> Result<InteractiveHosts> {
+    let health = health_url(ticket)?;
+    let ticket_host =
+        authority(ticket).ok_or_else(|| anyhow!("vercel: interactive url has no host"))?;
+    let health_host =
+        authority(&health).ok_or_else(|| anyhow!("vercel: bad interactive health url"))?;
+    Ok(InteractiveHosts {
+        ticket_host,
+        health_host,
+    })
+}
+
 /// The socket URL: the ticket URL (`http`→`ws`, `https`→`wss`) with the ticket
 /// token appended as the `token` query pair (url-encoded). The result is a
 /// secret: never log or format it.
@@ -147,36 +180,77 @@ impl VercelProvider {
         .map_err(|e| anyhow!("vercel: interactive start frame: {e}"))
     }
 
+    /// Resume `name` for a terminal-bound step (the `vercel-exec` login
+    /// upload). The lifetime-ceiling check of an interactive open runs
+    /// **before** any resume: past the ceiling this errors and never resumes.
+    pub async fn resume_interactive(&self, name: &str) -> Result<()> {
+        self.interactive_session(name).await.map(|_| ())
+    }
+
     /// Open a PTY session over `/interactive`. Resumes a stopped sandbox. The
     /// `session_id` watch carries the Vercel session id (informational:
     /// Vercel has no reattach). `spec.env` passes the provider allowlist.
     pub async fn open_exec(&self, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
-        anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
-        let start = self.start_frame(spec)?;
-        let session = self.interactive_session(name).await?;
-        let ticket = self.client.interactive(&session).await?;
-        wait_healthy(&health_url(&ticket.url)?).await?;
-        let url = zeroize::Zeroizing::new(
-            ws_url_with_token(&ticket.url, ticket.token.as_str())?.to_string(),
-        );
-        let ws = {
-            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-            let req = url
-                .as_str()
-                .into_client_request()
-                .map_err(|_| anyhow!("vercel: bad interactive request"))?;
-            match tokio::time::timeout(
-                WS_CONNECT_TIMEOUT,
-                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false),
-            )
-            .await
-            {
-                Ok(Ok((ws, _resp))) => ws,
-                Ok(Err(e)) => return Err(connect_error(&e)),
-                Err(_) => return Err(anyhow!("vercel: interactive pty connect timed out")),
-            }
+        self.open_exec_reported(name, spec).await.1
+    }
+
+    /// [`Self::open_exec`], plus the admitted ticket's hosts: `Some` once a
+    /// ticket was admitted (whether the socket then opened or was refused),
+    /// `None` when no ticket was minted.
+    pub async fn open_exec_reported(
+        &self,
+        name: &str,
+        spec: &ExecSpec,
+    ) -> (Option<InteractiveHosts>, Result<ExecSession>) {
+        if !valid_sandbox_name(name) {
+            return (None, Err(anyhow!("vercel: invalid sandbox name")));
+        }
+        let start = match self.start_frame(spec) {
+            Ok(start) => start,
+            Err(e) => return (None, Err(e)),
         };
-        Ok(spawn_session(ws, start, session, parse_ws_control))
+        let session = match self.interactive_session(name).await {
+            Ok(session) => session,
+            Err(e) => return (None, Err(e)),
+        };
+        let ticket = match self.client.interactive(&session).await {
+            Ok(ticket) => ticket,
+            Err(e) => return (None, Err(e)),
+        };
+        let hosts = match interactive_hosts(&ticket.url) {
+            Ok(hosts) => hosts,
+            Err(e) => return (None, Err(e)),
+        };
+        let opened = async {
+            wait_healthy(&health_url(&ticket.url)?).await?;
+            let url = zeroize::Zeroizing::new(
+                ws_url_with_token(&ticket.url, ticket.token.as_str())?.to_string(),
+            );
+            let ws = {
+                use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+                let req = url
+                    .as_str()
+                    .into_client_request()
+                    .map_err(|_| anyhow!("vercel: bad interactive request"))?;
+                match tokio::time::timeout(
+                    WS_CONNECT_TIMEOUT,
+                    tokio_tungstenite::connect_async_with_config(
+                        req,
+                        Some(exec_ws_config()),
+                        false,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok((ws, _resp))) => ws,
+                    Ok(Err(e)) => return Err(connect_error(&e)),
+                    Err(_) => return Err(anyhow!("vercel: interactive pty connect timed out")),
+                }
+            };
+            Ok::<_, anyhow::Error>(spawn_session(ws, start, session, parse_ws_control))
+        }
+        .await;
+        (Some(hosts), opened)
     }
 }
 
@@ -539,6 +613,31 @@ mod tests {
         assert_eq!(items, 3);
         assert_eq!(got, big);
         server.await.expect("server");
+    }
+
+    #[test]
+    fn interactive_hosts_report_the_host_only() {
+        let t =
+            url::Url::parse("wss://sb-1.vercel.run/interactive?token=tok_SECRET&x=1").expect("url");
+        let hosts = interactive_hosts(&t).expect("hosts");
+        assert_eq!(
+            hosts,
+            InteractiveHosts {
+                ticket_host: "sb-1.vercel.run".into(),
+                health_host: "sb-1.vercel.run".into(),
+            }
+        );
+        for text in [&hosts.ticket_host, &hosts.health_host] {
+            assert!(!text.contains('?'), "{text}");
+            assert!(!text.contains("tok_SECRET"), "{text}");
+            assert!(!text.contains('/'), "{text}");
+        }
+        let t = url::Url::parse("ws://127.0.0.1:8080/i?token=abc").expect("url");
+        let hosts = interactive_hosts(&t).expect("hosts");
+        assert_eq!(hosts.ticket_host, "127.0.0.1:8080");
+        assert_eq!(hosts.health_host, "127.0.0.1:8080");
+        let t = url::Url::parse("ftp://x/").expect("url");
+        assert!(interactive_hosts(&t).is_err());
     }
 
     #[test]
