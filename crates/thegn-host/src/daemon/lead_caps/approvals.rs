@@ -147,6 +147,11 @@ pub(crate) async fn after_request(svc: &DaemonService, req: &ApprovalRequest, in
     );
     let stored = svc
         .with_db(move |db| {
+            let description = crate::daemon::approval_effects::describe(db, &issue, &stage, &sha);
+            // No stored payload backs this triple: never make it phone-approvable.
+            if description.starts_with("unverified request") {
+                return Ok(None);
+            }
             let now = thegn_core::util::now_ms();
             db.put_push_nonce(
                 &hash,
@@ -156,13 +161,20 @@ pub(crate) async fn after_request(svc: &DaemonService, req: &ApprovalRequest, in
                 now,
                 now.saturating_add(PUSH_NONCE_TTL_MS),
             )?;
-            Ok(crate::daemon::approval_effects::describe(
-                db, &issue, &stage, &sha,
-            ))
+            Ok(Some(description))
         })
         .await;
     let description = match stored {
-        Ok(description) => description,
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            tracing::info!(
+                target: "thegn::approval",
+                issue = %req.issue_id,
+                stage = %req.stage,
+                "approval push skipped: unverified request"
+            );
+            return;
+        }
         Err(error) => {
             tracing::warn!(target: "thegn::approval", %error, "approval push skipped: nonce not stored");
             return;
@@ -246,6 +258,13 @@ pub(super) fn resolve_in(db: &Db, request: &ApprovalResolve, now_ms: i64) -> any
             db.revoke_approvals(&request.issue_id, &request.stage, now_ms)?;
         }
     }
+    // A decision made anywhere kills every outstanding phone nonce for it.
+    db.void_push_nonces(
+        &request.issue_id,
+        &request.stage,
+        &request.commit_sha,
+        now_ms,
+    )?;
     let source =
         approval_request::source_ref(&request.issue_id, &request.stage, &request.commit_sha);
     // By id rather than `mark_notification_read_by_source`: that one also
