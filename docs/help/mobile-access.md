@@ -115,8 +115,8 @@ in the push topic). An unknown, used or expired nonce is refused with
 resolve twice even across a daemon restart. The decision is recorded with
 approver `push` and has the same effect as `approvals.resolve`. Agents
 cannot redeem: the capability is never exposed over MCP, and every token
-caller over HTTP, the Lead included, is refused. The only remote path is
-the signed inbox envelope. Never let an agent read the inbox secret: thegn
+caller over HTTP, the Lead included, is refused. The only paths are the
+signed inbox envelope and a caller on the local machine's own control socket. Never let an agent read the inbox secret: thegn
 hides `env:` and `file:` refs for it and the push tokens from the Lead.
 
 ## A terminal on your phone (mosh)

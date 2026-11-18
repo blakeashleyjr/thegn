@@ -25,12 +25,12 @@ tools.run` action/parameter schema.
       envelope/origin/audit model.
 - [ ] 2.1b Add the typed `session_state_changed` kind and its authoritative
       edge producer using the same model.
-- [ ] 2.2 Add a scheduled-due producer with deterministic no-catch-up and
+- [x] 2.2 Add a scheduled-due producer with deterministic no-catch-up and
       skip-while-running auditing; dispatch only through the existing runtime.
 
 ## 3. Remaining operator surfaces
 
-- [ ] 3.1 Add scoped catalog, CLI, and control capabilities for audit history,
+- [x] 3.1 Add scoped catalog, CLI, and control capabilities for audit history,
       runtime enable/disable overrides, and explicit run/dry-run.
 - [ ] 3.2 Add doctor output for active/inert rules, daemon dependency, trusted
       source, and channel/action restrictions.

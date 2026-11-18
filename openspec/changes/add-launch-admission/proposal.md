@@ -1,6 +1,6 @@
 # One launch class and one admission handle for every repo-influenced spawn
 
-## Summary
+## Why
 
 THE-791 (owner decision 2026-10-13, programme rulings 2026-11-17) requires that every spawn of repo-influenced
 code has a launch class, that headless and untrusted launchers are admitted through one handle, and that an
@@ -14,7 +14,7 @@ Today `sandbox_admission::Admission` (THE-1202) is an opaque marker carried by a
 `LAUNCH_ROUTES` (THE-1225) lists the routes; it does not yet validate mounts, home view, environment channels,
 network hash, capabilities, limits or process scope. This change extends it rather than adding a parallel type.
 
-## What changes
+## What Changes
 
 - Every spawn of repo-influenced code carries one `LaunchClass`: `InteractiveOwner`, `Untrusted(kind)` or
   `HostTrust(kind)`, orthogonal to `LaunchKind` (PTY versus command).

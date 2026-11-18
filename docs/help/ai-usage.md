@@ -211,7 +211,7 @@ can fall through to the next upstream lane.
 
 ### Lead tool surface
 
-`thegn mcp serve` exposes ten tools for the Lead, each gated by the scope in
+`thegn mcp serve` exposes eleven tools for the Lead, each gated by the scope in
 the table. Every one needs a running daemon. Granting an approval
 (`approvals.resolve`) is admin-only and is never an MCP tool: it stays on the
 HTTP API and `thegn api call`.
@@ -225,6 +225,7 @@ HTTP API and `thegn api call`.
 | `automations_rm`     | `write` | Remove a Lead-authored rule (config rules refuse)                  |
 | `automations_enable` | `write` | Enable or disable a Lead-authored rule (config rules refuse)       |
 | `automations_runs`   | `read`  | Recent audited runs of an automation rule                          |
+| `automations_pause`  | `write` | Pause all automation (the kill flag); only you can resume          |
 | `approvals_list`     | `read`  | Approval history and pending approval requests                     |
 | `approvals_request`  | `write` | Ask a human to approve a pipeline stage (never grants)             |
 | `merge_drain`        | `git`   | Start the merge-queue drain for a worktree's repository            |
