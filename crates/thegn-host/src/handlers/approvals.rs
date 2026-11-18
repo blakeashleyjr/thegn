@@ -100,17 +100,20 @@ pub(crate) fn request_resolve(
                 }
             }
         };
-        if tx
-            .send(RefreshKind::Toast {
-                message,
-                priority: Priority::Notice,
-            })
-            .is_ok()
-            && let Err(error) = waker.wake()
-        {
+        // best-effort: consumer gone
+        if let Err(error) = tx.send(RefreshKind::Toast {
+            message,
+            priority: Priority::Notice,
+        }) {
+            tracing::debug!(%error, "approval refresh send failed");
+        }
+        // best-effort: consumer gone
+        if let Err(error) = tx.send(RefreshKind::Model) {
+            tracing::debug!(%error, "approval refresh send failed");
+        }
+        if let Err(error) = waker.wake() {
             tracing::debug!(%error, "could not wake after approval resolve");
         }
-        let _ = tx.send(RefreshKind::Model);
     });
     if admission != crate::sched::Admission::Admitted {
         model.status = "approvals busy; try again".into();

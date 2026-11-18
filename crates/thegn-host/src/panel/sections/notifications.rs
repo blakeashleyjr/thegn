@@ -279,13 +279,17 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         // the highlighted row on screen, so every row stays reachable.
     }
 
-    rows.push(hint_row(&[
+    let mut hints: Vec<(&str, &str)> = vec![
         ("↵", "jump"),
         ("space", "expand"),
         ("o", "open"),
         ("/ ", "search"),
-        ("y", "approve"),
-        ("n", "reject"),
+    ];
+    if items.iter().any(|n| is_approval(n)) {
+        hints.push(("y", "approve"));
+        hints.push(("n", "reject"));
+    }
+    hints.extend([
         ("x", "read"),
         ("d", "delete"),
         ("a", "clear"),
@@ -297,7 +301,8 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 "all worktrees"
             },
         ),
-    ]));
+    ]);
+    rows.push(hint_row(&hints));
     rows
 }
 
