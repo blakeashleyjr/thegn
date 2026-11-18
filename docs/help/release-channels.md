@@ -15,6 +15,7 @@ so nothing is missing, it is simply inert and hidden.
 
 `thegn doctor` prints the channel you are running in and the state of
 every gated feature. Set `THEGN_CHANNEL=dev` to switch for one run.
+To keep a dev instance beside your stable one, see [[two-instances]].
 
 ## What is dev-only
 
