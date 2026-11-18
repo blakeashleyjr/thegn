@@ -741,6 +741,11 @@ pub(crate) fn pull_back(
     worktree: &str,
     env_name: &str,
 ) -> anyhow::Result<PullReport> {
+    // Cross-process single flight (`thegn land`, `thegn env pull` and the
+    // daemon's exit pull may race on one worktree). Everything below — the
+    // branch and the local tip included — is read after the wait, so a second
+    // caller sees the first one's fast-forward and reports `up to date`.
+    let _lock = pull_lock(worktree)?;
     let wt = Path::new(worktree);
     let branch = git_read(wt, &["symbolic-ref", "--short", "-q", "HEAD"])
         .ok()
@@ -867,6 +872,195 @@ pub(crate) fn try_begin_pull(worktree: &str) -> Option<PullFlight> {
         .then(|| PullFlight {
             worktree: worktree.to_string(),
         })
+}
+
+/// How long a [`pull_back`] waits for another process's pull of the same
+/// worktree before failing.
+pub(crate) const PULL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The cross-process claim on one worktree's pull (an exclusive advisory file
+/// lock); released when dropped. [`try_begin_pull`] stays the in-process guard.
+#[derive(Debug)]
+pub(crate) struct PullLock {
+    _file: std::fs::File,
+}
+
+/// `$XDG_RUNTIME_DIR/thegn`, or the state home's lock dir without one.
+fn pull_lock_dir() -> std::path::PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir).join("thegn"),
+        None => thegn_core::util::xdg_state_home()
+            .join("thegn")
+            .join("locks"),
+    }
+}
+
+/// `pull-<sha12>.lock`: the first 12 hex digits of the worktree path's SHA-256.
+fn pull_lock_path_in(dir: &Path, worktree: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(worktree.as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("pull-{hex}.lock"))
+}
+
+/// Take `worktree`'s cross-process pull lock, waiting up to
+/// [`PULL_LOCK_WAIT`] for another process's pull to finish.
+// off-loop: CLI land/pull and the daemon's blocking-pool exit pull.
+pub(crate) fn pull_lock(worktree: &str) -> anyhow::Result<PullLock> {
+    pull_lock_in(&pull_lock_dir(), worktree, PULL_LOCK_WAIT)
+}
+
+fn pull_lock_in(dir: &Path, worktree: &str, wait: std::time::Duration) -> anyhow::Result<PullLock> {
+    if !dir.is_dir() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        crate::platform::restrict_dir_owner_only(dir);
+    }
+    let path = pull_lock_path_in(dir, worktree);
+    let file = crate::platform::open_lock_file(&path)
+        .with_context(|| format!("open the pull lock {}", path.display()))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(PullLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    anyhow::bail!(
+                        "another pull of {worktree} is running (waited {}s for {})",
+                        wait.as_secs(),
+                        path.display()
+                    );
+                }
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(std::time::Duration::from_millis(100)),
+                );
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("lock the pull lock {}", path.display()));
+            }
+        }
+    }
+}
+
+/// What `thegn land` may do with a worktree before folding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreLand {
+    /// Not a provider worktree: land exactly as before.
+    NotProvider,
+    /// The local branch holds everything the sandbox had: land it locally.
+    /// `report` is `None` when no pull was due (a `read-only` git policy, or an
+    /// env that no longer resolves to a provider placement).
+    Ready { report: Option<PullReport> },
+    /// A complete provider listing proves the sandbox is gone: land the local
+    /// branch.
+    SandboxGone,
+    /// The sandbox head was kept in a scratch ref; landing would drop it.
+    Refused(String),
+}
+
+/// The I/O [`pull_before_land`] needs, as a seam for tests.
+pub(crate) trait PreLandOps {
+    /// Is the worktree's stored location a provider location?
+    fn is_provider(&self, worktree: &str) -> anyhow::Result<bool>;
+    /// [`pull_back_if_provider`].
+    fn pull(&self, worktree: &str) -> anyhow::Result<Option<PullReport>>;
+    /// Is the worktree's sandbox in the provider's listing? `Some(false)` only
+    /// when a complete listing lacks it; `None` when that cannot be proven.
+    fn sandbox_listed(&self, worktree: &str) -> Option<bool>;
+}
+
+struct LivePreLand<'a> {
+    cfg: &'a Config,
+}
+
+impl PreLandOps for LivePreLand<'_> {
+    fn is_provider(&self, worktree: &str) -> anyhow::Result<bool> {
+        use thegn_core::store::WorkspaceStore;
+        let stored = thegn_core::db::Db::open()
+            .and_then(|db| db.location_for(worktree))
+            .with_context(|| format!("read the stored location of {worktree}"))?;
+        Ok(is_provider_location(worktree, stored.as_deref()))
+    }
+
+    fn pull(&self, worktree: &str) -> anyhow::Result<Option<PullReport>> {
+        pull_back_if_provider(self.cfg, worktree)
+    }
+
+    fn sandbox_listed(&self, worktree: &str) -> Option<bool> {
+        let env = crate::cmd::env::resolve_for(self.cfg, Some(worktree.to_string())).ok()?;
+        let pc = &self.cfg.env.get(&env.name)?.provider;
+        let id =
+            crate::provider_factory::provider_sandbox_name_checked(self.cfg, worktree, &env.name)
+                .ok()??;
+        if id.is_empty() {
+            return None;
+        }
+        let owner = crate::provider_factory::provider_sandbox_owner(self.cfg, worktree, &env.name);
+        let provider =
+            crate::provider_factory::provider_for_named_owned(pc, &id, owner.as_deref())?;
+        let report = block_on_provider(|| async { provider.inventory().await }).ok()?;
+        sandbox_in_inventory(&report, &id)
+    }
+}
+
+/// Whether `id` is in a provider inventory: a complete listing proves
+/// absence; a partial one only presence. Pure.
+fn sandbox_in_inventory(report: &thegn_svc::provider::InventoryReport, id: &str) -> Option<bool> {
+    use thegn_svc::provider::InventoryReport;
+    let matches =
+        |info: &thegn_svc::provider::SandboxInfo| info.id == id || info.name.as_deref() == Some(id);
+    match report {
+        InventoryReport::Complete(rows) => Some(rows.iter().any(matches)),
+        InventoryReport::Partial { rows, .. } => rows.iter().any(matches).then_some(true),
+    }
+}
+
+/// Bring a provider worktree's sandbox commits home before `thegn land`
+/// folds the local branch. An explicit action: the pull may wake or resume
+/// the sandbox.
+// off-loop: CLI path (`thegn land`).
+pub(crate) fn pull_before_land(cfg: &Config, worktree: &str) -> anyhow::Result<PreLand> {
+    pull_before_land_with(&LivePreLand { cfg }, worktree)
+}
+
+pub(crate) fn pull_before_land_with(
+    ops: &dyn PreLandOps,
+    worktree: &str,
+) -> anyhow::Result<PreLand> {
+    if !ops.is_provider(worktree)? {
+        return Ok(PreLand::NotProvider);
+    }
+    match ops.pull(worktree) {
+        Ok(None) => Ok(PreLand::Ready { report: None }),
+        Ok(Some(report)) => {
+            let kept = matches!(
+                report.outcome,
+                PullOutcome::Diverged { .. } | PullOutcome::LocalDirty { .. }
+            );
+            if kept {
+                Ok(PreLand::Refused(format!(
+                    "{} ; land refused: merge the kept ref first",
+                    report.summary()
+                )))
+            } else {
+                Ok(PreLand::Ready {
+                    report: Some(report),
+                })
+            }
+        }
+        // Only a complete listing that lacks the sandbox turns a failed pull
+        // into "gone"; anything else (a timeout, a partial listing) keeps the
+        // pull's own error so nothing is landed over unseen sandbox commits.
+        Err(error) => match ops.sandbox_listed(worktree) {
+            Some(false) => Ok(PreLand::SandboxGone),
+            Some(true) | None => {
+                Err(error.context(format!("pull {worktree} from its sandbox before landing")))
+            }
+        },
+    }
 }
 
 /// [`pull_back`] for a worktree whose recorded location is a provider
@@ -1404,5 +1598,201 @@ mod tests {
         );
         assert_eq!(git(&host, &["rev-parse", "refs/heads/lane"]), host_tip);
         assert_eq!(git(&host, &["rev-parse", &kept]), markers.head);
+    }
+
+    // ---- b162: pull lock + pull_before_land ---------------------------------
+
+    struct FakePreLand {
+        provider: bool,
+        pull: std::cell::RefCell<Option<anyhow::Result<Option<PullReport>>>>,
+        listed: Option<bool>,
+        pulls: std::cell::Cell<usize>,
+    }
+
+    impl FakePreLand {
+        fn new(
+            provider: bool,
+            pull: anyhow::Result<Option<PullReport>>,
+            listed: Option<bool>,
+        ) -> Self {
+            FakePreLand {
+                provider,
+                pull: std::cell::RefCell::new(Some(pull)),
+                listed,
+                pulls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl super::PreLandOps for FakePreLand {
+        fn is_provider(&self, _worktree: &str) -> anyhow::Result<bool> {
+            Ok(self.provider)
+        }
+        fn pull(&self, _worktree: &str) -> anyhow::Result<Option<PullReport>> {
+            self.pulls.set(self.pulls.get() + 1);
+            self.pull.borrow_mut().take().expect("pulled once")
+        }
+        fn sandbox_listed(&self, _worktree: &str) -> Option<bool> {
+            self.listed
+        }
+    }
+
+    fn report(outcome: PullOutcome) -> PullReport {
+        PullReport {
+            branch: "tg/lane".into(),
+            outcome,
+            push: None,
+        }
+    }
+
+    #[test]
+    fn pull_before_land_table() {
+        use super::{PreLand, pull_before_land_with};
+        let wt = "/wt/pre-land";
+
+        // Not a provider worktree: nothing is pulled.
+        let fake = FakePreLand::new(false, Ok(None), None);
+        assert_eq!(
+            pull_before_land_with(&fake, wt).unwrap(),
+            PreLand::NotProvider
+        );
+        assert_eq!(fake.pulls.get(), 0);
+
+        // Up to date / fast-forwarded / no pull due: Ready.
+        let up = report(PullOutcome::UpToDate);
+        let fake = FakePreLand::new(true, Ok(Some(up.clone())), None);
+        assert_eq!(
+            pull_before_land_with(&fake, wt).unwrap(),
+            PreLand::Ready { report: Some(up) }
+        );
+        let ff = report(PullOutcome::FastForwarded {
+            from: "a".repeat(40),
+            to: "b".repeat(40),
+            commits: 2,
+        });
+        let fake = FakePreLand::new(true, Ok(Some(ff.clone())), None);
+        assert_eq!(
+            pull_before_land_with(&fake, wt).unwrap(),
+            PreLand::Ready { report: Some(ff) }
+        );
+        let fake = FakePreLand::new(true, Ok(None), None);
+        assert_eq!(
+            pull_before_land_with(&fake, wt).unwrap(),
+            PreLand::Ready { report: None }
+        );
+
+        // Diverged / local-dirty: refused, naming the kept ref.
+        let kept = format!("{PULL_REF_PREFIX}abc");
+        for outcome in [
+            PullOutcome::Diverged {
+                kept_ref: kept.clone(),
+                vm_head: "c".repeat(40),
+            },
+            PullOutcome::LocalDirty {
+                kept_ref: kept.clone(),
+            },
+        ] {
+            let fake = FakePreLand::new(true, Ok(Some(report(outcome))), Some(true));
+            let PreLand::Refused(message) = pull_before_land_with(&fake, wt).unwrap() else {
+                panic!("a kept sandbox head must refuse the land");
+            };
+            assert!(message.contains(&kept), "{message}");
+            assert!(
+                message.ends_with(" ; land refused: merge the kept ref first"),
+                "{message}"
+            );
+        }
+
+        // A failed pull whose sandbox a complete listing lacks: gone.
+        let fake = FakePreLand::new(true, Err(anyhow::anyhow!("404 not found")), Some(false));
+        assert_eq!(
+            pull_before_land_with(&fake, wt).unwrap(),
+            PreLand::SandboxGone
+        );
+
+        // Any other failure (listed, or absence unprovable) stays an error.
+        for listed in [Some(true), None] {
+            let fake = FakePreLand::new(true, Err(anyhow::anyhow!("exec timed out")), listed);
+            let error = pull_before_land_with(&fake, wt).unwrap_err();
+            assert!(format!("{error:#}").contains("exec timed out"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn sandbox_absence_needs_a_complete_listing() {
+        use super::sandbox_in_inventory;
+        use thegn_svc::provider::{InventoryReport, SandboxInfo};
+        let complete = InventoryReport::Complete(vec![
+            SandboxInfo::id_only("tg-a"),
+            SandboxInfo {
+                id: "machine-1".into(),
+                name: Some("tg-b".into()),
+                ..SandboxInfo::default()
+            },
+        ]);
+        assert_eq!(sandbox_in_inventory(&complete, "tg-a"), Some(true));
+        assert_eq!(sandbox_in_inventory(&complete, "tg-b"), Some(true));
+        assert_eq!(sandbox_in_inventory(&complete, "tg-c"), Some(false));
+        let partial = InventoryReport::Partial {
+            rows: vec![SandboxInfo::id_only("tg-a")],
+            reason: "page 2 failed".into(),
+        };
+        assert_eq!(sandbox_in_inventory(&partial, "tg-a"), Some(true));
+        assert_eq!(sandbox_in_inventory(&partial, "tg-c"), None);
+    }
+
+    #[test]
+    fn pull_lock_waits_for_the_holder_then_succeeds() {
+        use super::pull_lock_in;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let wt = "/wt/pull-lock-wait";
+        let first = pull_lock_in(dir.path(), wt, Duration::from_secs(5)).expect("first lock");
+        let path = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            let lock = pull_lock_in(&path, wt, Duration::from_secs(30));
+            tx.send(()).unwrap();
+            (lock.map(drop), started.elapsed())
+        });
+        // The second caller is still waiting while the first holds the lock.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "the second pull must wait for the first"
+        );
+        drop(first);
+        let (result, waited) = waiter.join().unwrap();
+        result.expect("the second pull gets the lock once the first drops it");
+        assert!(waited >= Duration::from_millis(400), "{waited:?}");
+        // Another worktree never contends.
+        let _other = pull_lock_in(dir.path(), "/wt/pull-lock-other", Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn pull_lock_times_out_with_the_message() {
+        use super::{pull_lock_in, pull_lock_path_in};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let wt = "/wt/pull-lock-timeout";
+        let _held = pull_lock_in(dir.path(), wt, Duration::ZERO).expect("first lock");
+        let error = std::thread::scope(|scope| {
+            scope
+                .spawn(|| pull_lock_in(dir.path(), wt, Duration::from_millis(200)))
+                .join()
+                .unwrap()
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("another pull of /wt/pull-lock-timeout is running"),
+            "{error:#}"
+        );
+        let name = pull_lock_path_in(dir.path(), wt);
+        let name = name.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("pull-") && name.ends_with(".lock"),
+            "{name}"
+        );
+        assert_eq!(name.len(), "pull-".len() + 12 + ".lock".len(), "{name}");
     }
 }
