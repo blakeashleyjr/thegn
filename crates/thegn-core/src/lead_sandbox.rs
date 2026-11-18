@@ -4,6 +4,13 @@
 //! reach the implicit-admin unix socket. No bwrap means no Lead (fail closed):
 //! the host launcher never falls back to a host shell.
 //!
+//! b155 (THE-2221): thegn's own state, data and cache dirs and every agent
+//! harness home are masked too ([`state_masks`]); only the notes dir and the
+//! Lead's private harness home are re-exposed beneath them (writable), plus
+//! the MCP plan's files (read-only). The Lead reads thegn state through its
+//! tools, never from disk. b155 (THE-2220): `file_binds` carries the
+//! isolated network's generated `resolv.conf`.
+//!
 //! Everything here is pure and platform-neutral; the host side
 //! (`thegn-host` `lead::launch`) resolves the paths and probes bwrap.
 
@@ -16,31 +23,89 @@ pub struct LeadMountPlan {
     /// Host paths bound read-write at the same path (notes dir, harness state).
     pub writable: Vec<PathBuf>,
     /// Directories hidden behind an empty tmpfs (daemon socket dir, run dir,
-    /// `$XDG_RUNTIME_DIR`).
+    /// `$XDG_RUNTIME_DIR`). Nothing is ever re-exposed beneath these except
+    /// `readable` regular files.
     pub masked: Vec<PathBuf>,
+    /// State dirs hidden behind an empty tmpfs ([`state_masks`]: `thegn`
+    /// under each XDG root, the harness homes). Unlike `masked`, the notes
+    /// dir (`chdir`) and `lead-harness/<id>` may be re-exposed writable
+    /// beneath them; [`validate_in`] refuses any other writable path there.
+    pub state_masked: Vec<PathBuf>,
     /// Non-directory entries (sockets) hidden behind a read-only `/dev/null`
     /// bind, since a tmpfs cannot cover a non-directory.
     pub masked_files: Vec<PathBuf>,
     /// Regular files under a masked directory that the Lead must still read
     /// (the MCP plan's token file); re-bound read-only after the masks.
     pub readable: Vec<PathBuf>,
+    /// `(host file, target)` pairs bound read-only after the masks (the
+    /// isolated network's generated `resolv.conf` over `/etc/resolv.conf`).
+    pub file_binds: Vec<(PathBuf, PathBuf)>,
     /// The working directory inside the sandbox (the notes dir).
     pub chdir: PathBuf,
     /// Keep bwrap's `--die-with-parent`. The interactive terminal path drops
     /// it for daemon-owned panes (the guard is keyed to the transient forking
     /// thread and would reap the session); the Lead follows the same rule.
     pub die_with_parent: bool,
+    /// `(uid, gid)` the Lead runs as inside bwrap (`--uid`/`--gid`). Set in
+    /// the isolated network, where pasta starts bwrap as uid 0 of its own
+    /// user namespace; `None` keeps the caller's ids.
+    pub sandbox_ids: Option<(u32, u32)>,
+    /// Extra env vars unset after [`UNSET_ENV`] (the push and inbox secrets'
+    /// `env:` references).
+    pub unset_env: Vec<String>,
 }
 
 /// Environment variables the sandbox unsets after entry: the control socket
 /// the daemon injects (its dir is masked; the Lead talks through its scoped
-/// loopback token instead), the session bus (host command authority), and the
-/// ssh agent (the Lead never pushes).
+/// loopback token instead), the session bus (host command authority), the
+/// ssh agent (the Lead never pushes), and the display (X11 and Wayland: an
+/// input-injecting client is host command authority; in the isolated network
+/// the X11 abstract socket is unreachable anyway, and `/tmp` is private).
 pub const UNSET_ENV: &[&str] = &[
     "THEGN_CONTROL_SOCKET",
     "DBUS_SESSION_BUS_ADDRESS",
     "SSH_AUTH_SOCK",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
 ];
+
+/// The directory under thegn's state dir holding each harness's private
+/// home for the Lead (`<state>/thegn/lead-harness/<id>`).
+pub const HARNESS_HOME_DIR: &str = "lead-harness";
+
+/// The state the Lead must not read from disk (THE-2221): `thegn` under the
+/// XDG state, data and cache roots (the DB, logs, scrollback, gate target
+/// dirs, other workers' transcripts) and every agent harness home (`~/.claude`,
+/// `~/.codex`, `~/.pi`: shared credentials, hooks and settings). Directories
+/// only: `~/.claude.json` is a file and goes to `masked_files`. Also
+/// thegn's own home (`thegn_dir`: provider ssh keys, other workers' sandbox
+/// homes) and the legacy `superzej` locations. The host masks
+/// `$XDG_CONFIG_HOME/thegn` separately and re-exposes only `config.toml`.
+pub fn state_masks(
+    state: &Path,
+    data: &Path,
+    cache: &Path,
+    home: &Path,
+    thegn_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut out = vec![state.join("thegn"), data.join("thegn"), cache.join("thegn")];
+    out.extend([".claude", ".codex", ".pi"].map(|d| home.join(d)));
+    out.extend([
+        thegn_dir.to_path_buf(),
+        home.join(".superzej"),
+        state.join("superzej"),
+        data.join("superzej"),
+        cache.join("superzej"),
+    ]);
+    out.dedup();
+    out
+}
+
+/// The harness-state files to hide with `/dev/null` (see [`state_masks`]).
+pub fn state_masked_files(home: &Path) -> Vec<PathBuf> {
+    vec![home.join(".claude.json")]
+}
 
 /// The harness state the agent CLI must be able to write (session logs,
 /// credentials refresh, settings). `env` is the effective launch env (host env
@@ -113,10 +178,15 @@ pub fn validate(plan: &LeadMountPlan, repo_roots: &[PathBuf]) -> Result<(), Stri
 /// - is not absolute or carries `.`/`..` components;
 /// - is `/`, `$HOME`, or an ancestor of `$HOME`;
 /// - is inside, equal to, or an ancestor of any repo root;
-/// - is inside, equal to, or an ancestor of any masked path (a bind of an
-///   ancestor would shadow the mask; a bind inside would punch through it).
+/// - is inside, equal to, or an ancestor of any `masked` dir or masked file
+///   (a bind of an ancestor would shadow the mask; a bind inside would punch
+///   through it);
+/// - is equal to or an ancestor of a `state_masked` dir, or lies beneath one
+///   without being an allowed re-exposure: the notes dir (`chdir`) or
+///   `<mask>/lead-harness/<id>`.
 ///
-/// Masked paths must be absolute and never `/`; the chdir must be absolute.
+/// Masked paths must be absolute and never `/`; the chdir, `readable` paths
+/// and both sides of every `file_binds` pair must be absolute.
 pub fn validate_in(
     plan: &LeadMountPlan,
     repo_roots: &[PathBuf],
@@ -129,7 +199,7 @@ pub fn validate_in(
         ));
     }
     let masks = plan.masked.iter().chain(&plan.masked_files);
-    for m in masks.clone() {
+    for m in masks.clone().chain(&plan.state_masked) {
         if !lexically_clean(m) || m == Path::new("/") {
             return Err(format!(
                 "the Lead sandbox cannot mask {}: masks must be absolute and never `/`",
@@ -142,6 +212,15 @@ pub fn validate_in(
             return Err(format!(
                 "the Lead sandbox cannot re-expose {}: not an absolute path",
                 r.display()
+            ));
+        }
+    }
+    for (src, dst) in &plan.file_binds {
+        if !lexically_clean(src) || !lexically_clean(dst) || dst == Path::new("/") {
+            return Err(format!(
+                "the Lead sandbox cannot bind {} over {}: both must be absolute files",
+                src.display(),
+                dst.display()
             ));
         }
     }
@@ -179,8 +258,39 @@ pub fn validate_in(
                 ));
             }
         }
+        for m in &plan.state_masked {
+            if within(m, w) {
+                return Err(format!(
+                    "the Lead cannot write {shown}: it is or contains the masked state dir {}",
+                    m.display()
+                ));
+            }
+            if within(w, m) && !allowed_reexposure(w, m, &plan.chdir) {
+                return Err(format!(
+                    "the Lead cannot write {shown}: it is inside the masked state dir {} and is \
+                     neither the notes dir nor a private harness home",
+                    m.display()
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// A writable path `w` strictly beneath state mask `m` that may punch
+/// through it: the notes dir itself, or `<m>/lead-harness/<id>`.
+fn allowed_reexposure(w: &Path, m: &Path, notes: &Path) -> bool {
+    if w == notes {
+        return true;
+    }
+    let Ok(rel) = w.strip_prefix(m) else {
+        return false;
+    };
+    let parts: Vec<Component<'_>> = rel.components().collect();
+    matches!(
+        parts.as_slice(),
+        [Component::Normal(dir), Component::Normal(_)] if *dir == HARNESS_HOME_DIR
+    )
 }
 
 /// Drop masks covered by another mask (or by the private `/tmp`) and order
@@ -202,12 +312,20 @@ pub fn normalize_masks(masked: &[PathBuf]) -> Vec<PathBuf> {
 /// The full bwrap argv. Order matters and is fixed:
 /// 1. session flags (`--die-with-parent` only when the plan keeps it;
 ///    `--unshare-all --share-net`: no `--new-session`, a TUI needs its
-///    controlling tty, matching the interactive terminal path);
+///    controlling tty, matching the interactive terminal path;
+///    `--cap-drop ALL`, then `--uid`/`--gid` when `sandbox_ids` is set);
 /// 2. `--ro-bind / /`, fresh `/dev`, `/proc` and a private `/tmp`;
-/// 3. masks (`--tmpfs` per dir, then `/dev/null` over each masked file);
+/// 3. masks (`--tmpfs` per `masked` and `state_masked` dir, parents first,
+///    then `/dev/null` over each masked file);
 /// 4. read-only re-binds of `readable` files;
-/// 5. writable binds (after the masks; `validate` keeps them disjoint);
-/// 6. env unsets, `--chdir`, `--`, then `inner`.
+/// 5. read-only `file_binds` (host file over its target);
+/// 6. writable binds (after the masks; `validate` keeps them disjoint from
+///    every control mask and allows only the re-exposures beneath a state
+///    mask; bwrap creates their mount points inside the tmpfs);
+/// 7. env unsets, `--chdir`, `--`, then `inner`.
+///
+/// bwrap binds each source from the original root, so a source beneath a
+/// mask (the notes dir, the harness home, the token file) still binds.
 pub fn bwrap_argv(plan: &LeadMountPlan, inner: &[String]) -> Vec<String> {
     let s = |p: &Path| p.display().to_string();
     let mut v: Vec<String> = vec!["bwrap".into()];
@@ -218,6 +336,23 @@ pub fn bwrap_argv(plan: &LeadMountPlan, inner: &[String]) -> Vec<String> {
         [
             "--unshare-all",
             "--share-net",
+            // Under pasta bwrap starts as uid 0 of pasta's user namespace and
+            // would keep CAP_SYS_ADMIN (umount the masks, remount `/` rw).
+            "--cap-drop",
+            "ALL",
+        ]
+        .map(String::from),
+    );
+    if let Some((uid, gid)) = plan.sandbox_ids {
+        v.extend([
+            "--uid".into(),
+            uid.to_string(),
+            "--gid".into(),
+            gid.to_string(),
+        ]);
+    }
+    v.extend(
+        [
             "--ro-bind",
             "/",
             "/",
@@ -230,7 +365,13 @@ pub fn bwrap_argv(plan: &LeadMountPlan, inner: &[String]) -> Vec<String> {
         ]
         .map(String::from),
     );
-    for m in normalize_masks(&plan.masked) {
+    let all_masks: Vec<PathBuf> = plan
+        .masked
+        .iter()
+        .chain(&plan.state_masked)
+        .cloned()
+        .collect();
+    for m in normalize_masks(&all_masks) {
         v.extend(["--tmpfs".into(), s(&m)]);
     }
     for f in &plan.masked_files {
@@ -239,11 +380,17 @@ pub fn bwrap_argv(plan: &LeadMountPlan, inner: &[String]) -> Vec<String> {
     for r in &plan.readable {
         v.extend(["--ro-bind".into(), s(r), s(r)]);
     }
+    for (src, dst) in &plan.file_binds {
+        v.extend(["--ro-bind".into(), s(src), s(dst)]);
+    }
     for w in &plan.writable {
         v.extend(["--bind".into(), s(w), s(w)]);
     }
     for k in UNSET_ENV {
         v.extend(["--unsetenv".into(), (*k).to_string()]);
+    }
+    for k in &plan.unset_env {
+        v.extend(["--unsetenv".into(), k.clone()]);
     }
     v.extend(["--chdir".into(), s(&plan.chdir), "--".into()]);
     v.extend(inner.iter().cloned());
@@ -282,9 +429,42 @@ mod tests {
             writable: vec![p("/home/u/.local/state/thegn/lead"), p("/home/u/.claude")],
             masked: vec![p("/run/user/1000"), p("/home/u/.local/state/thegn/run")],
             masked_files: vec![p("/run/docker.sock")],
+            state_masked: vec![],
             readable: vec![],
+            file_binds: vec![],
             chdir: p("/home/u/.local/state/thegn/lead"),
             die_with_parent: false,
+            sandbox_ids: None,
+            unset_env: vec![],
+        }
+    }
+
+    /// The b155 shape: thegn's state masked, the notes dir and the claude
+    /// harness home re-exposed beneath it.
+    fn state_plan() -> LeadMountPlan {
+        LeadMountPlan {
+            writable: vec![
+                p("/home/u/.local/state/thegn/lead"),
+                p("/home/u/.local/state/thegn/lead-harness/claude"),
+            ],
+            masked: vec![p("/run/user/1000"), p("/home/u/.local/state/thegn/run")],
+            state_masked: state_masks(
+                &p("/home/u/.local/state"),
+                &p("/home/u/.local/share"),
+                &p("/home/u/.cache"),
+                &p(HOME),
+                &p("/home/u/.thegn"),
+            ),
+            masked_files: vec![p("/home/u/.claude.json")],
+            readable: vec![p("/home/u/.local/state/thegn/lead-control/mcp-lead.json")],
+            file_binds: vec![(
+                p("/home/u/.local/state/thegn/lead-net/resolv.conf"),
+                p("/etc/resolv.conf"),
+            )],
+            chdir: p("/home/u/.local/state/thegn/lead"),
+            die_with_parent: false,
+            sandbox_ids: None,
+            unset_env: vec![],
         }
     }
 
@@ -539,6 +719,180 @@ mod tests {
         let v = bwrap_argv(&LeadMountPlan::default(), &[]);
         for k in UNSET_ENV {
             pos(&v, &["--unsetenv", k]);
+        }
+    }
+
+    #[test]
+    fn state_masks_cover_thegn_under_each_xdg_root_and_harness_homes() {
+        let got = state_masks(
+            &p("/x/state"),
+            &p("/x/data"),
+            &p("/x/cache"),
+            &p(HOME),
+            &p("/x/thegn-home"),
+        );
+        assert_eq!(
+            got,
+            vec![
+                p("/x/state/thegn"),
+                p("/x/data/thegn"),
+                p("/x/cache/thegn"),
+                p("/home/u/.claude"),
+                p("/home/u/.codex"),
+                p("/home/u/.pi"),
+                p("/x/thegn-home"),
+                p("/home/u/.superzej"),
+                p("/x/state/superzej"),
+                p("/x/data/superzej"),
+                p("/x/cache/superzej"),
+            ]
+        );
+        assert!(
+            !got.iter().any(|m| m.ends_with(".claude.json")),
+            "a file cannot take a tmpfs"
+        );
+        assert_eq!(
+            state_masked_files(&p(HOME)),
+            vec![p("/home/u/.claude.json")]
+        );
+        assert!(
+            !got.iter().any(|m| m.starts_with("/home/u/.config")),
+            "the config dir stays readable"
+        );
+    }
+
+    #[test]
+    fn validate_allows_the_notes_dir_and_harness_home_under_a_state_mask() {
+        assert_eq!(check(&state_plan(), &["/home/u/code/thegn"]), Ok(()));
+    }
+
+    #[test]
+    fn validate_refuses_other_writables_under_a_state_mask() {
+        for bad in [
+            "/home/u/.local/state/thegn/logs",
+            "/home/u/.local/state/thegn/lead-harness",
+            "/home/u/.local/state/thegn/lead-harness/claude/sub",
+            "/home/u/.local/state/thegn/lead-control",
+            "/home/u/.local/share/thegn/lead-harness",
+            "/home/u/.claude/projects",
+            "/home/u/.codex",
+            "/home/u/.local/share/thegn",
+            "/home/u/.local/share",
+        ] {
+            let mut pl = state_plan();
+            pl.writable.push(p(bad));
+            assert!(check(&pl, &[]).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn validate_never_lets_the_notes_dir_punch_a_control_mask() {
+        // The notes dir is an allowed re-exposure under a state mask, never
+        // under a control mask nested inside it.
+        let mut pl = state_plan();
+        pl.chdir = p("/home/u/.local/state/thegn/run/notes");
+        pl.writable = vec![pl.chdir.clone()];
+        assert!(check(&pl, &[]).unwrap_err().contains("control path"));
+        // Nor may it equal a state mask (that would re-expose all of it).
+        let mut pl = state_plan();
+        pl.chdir = p("/home/u/.local/state/thegn");
+        pl.writable = vec![pl.chdir.clone()];
+        assert!(check(&pl, &[]).is_err());
+    }
+
+    #[test]
+    fn validate_refuses_relative_file_binds() {
+        let mut pl = state_plan();
+        pl.file_binds = vec![(p("resolv.conf"), p("/etc/resolv.conf"))];
+        assert!(check(&pl, &[]).is_err());
+        pl.file_binds = vec![(p("/x/resolv.conf"), p("/"))];
+        assert!(check(&pl, &[]).is_err());
+    }
+
+    #[test]
+    fn bwrap_argv_binds_files_and_reexposures_after_the_state_masks() {
+        let v = bwrap_argv(&state_plan(), &["claude".to_string()]);
+        let mask_state = pos(&v, &["--tmpfs", "/home/u/.local/state/thegn"]);
+        let mask_claude = pos(&v, &["--tmpfs", "/home/u/.claude"]);
+        assert!(
+            !v.windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == "/home/u/.local/state/thegn/run"),
+            "the run dir is covered by the state mask"
+        );
+        let mask_file = pos(&v, &["--ro-bind", "/dev/null", "/home/u/.claude.json"]);
+        let token = pos(
+            &v,
+            &[
+                "--ro-bind",
+                "/home/u/.local/state/thegn/lead-control/mcp-lead.json",
+                "/home/u/.local/state/thegn/lead-control/mcp-lead.json",
+            ],
+        );
+        let resolv = pos(
+            &v,
+            &[
+                "--ro-bind",
+                "/home/u/.local/state/thegn/lead-net/resolv.conf",
+                "/etc/resolv.conf",
+            ],
+        );
+        let notes = pos(
+            &v,
+            &[
+                "--bind",
+                "/home/u/.local/state/thegn/lead",
+                "/home/u/.local/state/thegn/lead",
+            ],
+        );
+        let harness = pos(
+            &v,
+            &[
+                "--bind",
+                "/home/u/.local/state/thegn/lead-harness/claude",
+                "/home/u/.local/state/thegn/lead-harness/claude",
+            ],
+        );
+        let sep = pos(&v, &["--"]);
+        let cap_drop = pos(&v, &["--cap-drop", "ALL"]);
+        let first_tmpfs = v.iter().position(|a| a == "--tmpfs").unwrap();
+        assert!(cap_drop < first_tmpfs, "caps are dropped before any mask");
+        assert!(mask_state < mask_file && mask_claude < mask_file);
+        assert!(
+            mask_file < token && token < resolv,
+            "file binds after masks"
+        );
+        assert!(resolv < notes && notes < harness && harness < sep);
+    }
+
+    #[test]
+    fn bwrap_argv_sets_uid_and_gid_after_the_cap_drop() {
+        let mut pl = plan();
+        pl.sandbox_ids = Some((1000, 100));
+        let v = bwrap_argv(&pl, &[]);
+        let cap_drop = pos(&v, &["--cap-drop", "ALL"]);
+        let ids = pos(&v, &["--uid", "1000", "--gid", "100"]);
+        assert_eq!(ids, cap_drop + 2, "--uid/--gid follow --cap-drop");
+        assert!(ids < pos(&v, &["--ro-bind", "/", "/"]));
+        // Without ids (host network) the argv carries no --uid.
+        let v = bwrap_argv(&plan(), &[]);
+        assert!(!v.iter().any(|a| a == "--uid" || a == "--gid"));
+    }
+
+    #[test]
+    fn bwrap_argv_unsets_the_plan_env_after_the_fixed_list() {
+        let mut pl = plan();
+        pl.unset_env = vec!["THEGN_INBOX_SECRET".into(), "NTFY_TOKEN".into()];
+        let v = bwrap_argv(&pl, &[]);
+        let last_fixed = pos(&v, &["--unsetenv", UNSET_ENV[UNSET_ENV.len() - 1]]);
+        let inbox = pos(&v, &["--unsetenv", "THEGN_INBOX_SECRET"]);
+        let ntfy = pos(&v, &["--unsetenv", "NTFY_TOKEN"]);
+        assert!(last_fixed < inbox && inbox < ntfy && ntfy < pos(&v, &["--chdir"]));
+    }
+
+    #[test]
+    fn unset_env_drops_the_display() {
+        for k in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "SSH_AUTH_SOCK"] {
+            assert!(UNSET_ENV.contains(&k), "{k}");
         }
     }
 }
