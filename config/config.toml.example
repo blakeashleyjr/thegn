@@ -1406,6 +1406,7 @@ command = "aider --model sonnet"
 # failure_threshold   = 3           # consecutive failures before the breaker opens
 # cooldown_secs       = 30          # open→half-open probe delay
 # request_timeout_secs = 30         # per-call timeout counted against the breaker
+# profiles = { lead = ["notes"] }   # named profiles: members are exposed ONLY by `thegn mcp proxy --profile <name>`
 #
 # `keyring:` secret refs: an upstream env value `API_KEY = "keyring:<name>"`
 # resolves from the OS keyring at spawn (agents never see it). Manage entries
@@ -2103,6 +2104,8 @@ max_concurrent = 2          # bounded off-loop actions (1..16)
 queue_capacity = 64         # pending action plans before overflow drops (1..1024)
 action_timeout_secs = 300   # per-action deadline (1..3600)
 audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
+max_concurrent_lanes = 2    # automation-started lanes active at once (0..64; 0 = none)
+max_spawns_per_day = 12     # automation spawns per rolling 24 h (0..1000; 0 = none)
 
 # One rule is exactly one normalized event (`when`) and one catalog action
 # (`then.cap`). Rules run in file order. Unknown events/caps/params, duplicate or
@@ -2113,10 +2116,25 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # enabled = true
 # when = "agent_needs_you" # notification | agent_needs_you | agent_finished |
 #                          # agent_failed | pr_checks | pr_review_requested |
-#                          # merge_landed | worktree_idle | disk_low
+#                          # merge_landed | worktree_idle | disk_low |
+#                          # schedule_due | issue_matched | session_exited |
+#                          # inbox_item (inbox_item has no producer yet)
 # debounce_secs = 60       # minimum seconds between plans for this rule (0..86400)
 # idle_secs = 300          # required only for worktree_idle (60..86400)
-# once_per_key = true      # fire once for the producer's stable event/entity key
+# schedule = "0 9 * * 1-5" # schedule_due only: 5-field cron in local time; exactly
+#                          #   one of schedule/every. Runs in the daemon; with
+#                          #   [daemon] enabled = false schedules are inert. No
+#                          #   catch-up: a missed slot is skipped, not replayed
+# every = "1h"             # schedule_due only: interval <n>s|m|h|d (60s..7d),
+#                          #   counted from daemon start
+# autonomy = "review"      # propose | review | merge (default review): how far an
+#                          #   unattended run may go. propose = raise an approval and
+#                          #   start nothing; review = start, a human lands; merge =
+#                          #   the pipeline may land. WARNING: a rule matching free
+#                          #   text (if.message_regex; for issue_matched that is the
+#                          #   issue title) is capped at review, with a warning
+# once_per_key = true      # fire once for the producer's stable event/entity key;
+#                          #   always on for issue_matched (one issue fires once)
 # max_per_hour = 30        # per-rule sliding-window bound (1..1000)
 # max_action_per_hour = 30 # action-wide bound shared by every rule using this cap
 #
@@ -2136,13 +2154,23 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # pr_checks_passed = true
 # pr_review_requested = false
 # pr_merged = false
+# Issue selectors match only issue_matched events (false on every other kind):
+# account = "work"         # tracker account, exact
+# project = "proj-id"      # one of the issue's project/sprint/milestone ids, exact
+# label = "automate"       # one of the issue's labels, case-insensitive
+# assignee = "me"          # "me" = assigned to the account's own user (provenance,
+#                          #   never a display name); otherwise an exact assignee
+# status = "todo"          # issue status, case-insensitive
 #
 # Action ids are typed strings validated against the v1 catalog set. Parameter
 # templates may use: {event_id}, {event_key}, {event_kind}, {event_time},
 # {workspace}, {repo}, {worktree}, {branch}, {agent_role}, {notification_kind}, {priority},
 # {source_ref}, {message}, {session_id}, {pr_checks_passed},
-# {pr_review_requested}, and {pr_merged}. Values are prose/data substitution,
-# never shell expansion. `agent` and tool `name` must be literal configured names.
+# {pr_review_requested}, {pr_merged}, {issue_id}, {issue_number}, {issue_url},
+# {issue_status}, {account}, and {exit_code}. The issue title is never a variable
+# of its own (it reaches rules only as {message}). Values are prose/data
+# substitution, never shell expansion. `agent`, `stage` and tool `name` must be
+# literal configured names.
 # [automations.rules.then]
 # cap = "notify.push"       # notify.push: body required; title/urgency optional
 # title = "Coder needs attention"
@@ -2156,6 +2184,14 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # cap = "merge.add"         # no parameters; worktree comes from the event
 # cap = "tools.run"         # name required; resolves trusted global/profile [[tools]]
 # name = "release-check"
+# cap = "merge.drain"       # no parameters; drains the event worktree's merge queue
+# cap = "pipeline.start"    # when = "issue_matched" only; stage/agent optional
+# stage = "code"            #   configured [[pipeline.stages]] name to start at
+# cap = "lead.wake"         # prompt required; wakes the Lead with the event attached.
+#                           #   The prompt may NOT use {message}: untrusted event text
+#                           #   reaches the Lead only inside the delimited event block
+# pipeline.start and lead.wake are rule-only actions: not catalog capabilities,
+# so nothing but a rule (no MCP tool, HTTP route or CLI verb) can invoke them.
 #
 # A named profile may refine the settings and replace the rule list:
 # [profiles.work.automations]
@@ -2170,6 +2206,9 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # when = "agent_needs_you"
 # debounce_secs = 60
 # idle_secs = 300
+# schedule = "0 9 * * 1-5"
+# every = "1h"
+# autonomy = "review"
 # once_per_key = true
 # max_per_hour = 30
 # max_action_per_hour = 30
@@ -2187,6 +2226,11 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # pr_checks_passed = true
 # pr_review_requested = false
 # pr_merged = false
+# account = "work"
+# project = "proj-id"
+# label = "automate"
+# assignee = "me"
+# status = "todo"
 # [profiles.work.automations.rules.then]
 # cap = "notify.push"
 # title = "Profile rule"
@@ -2195,6 +2239,7 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # agent = "claude"
 # prompt = "Handle {source_ref}: {message}"
 # name = "release-check"
+# stage = "code"
 
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
@@ -2826,7 +2871,7 @@ network = "nat"
 ports = []
 
 # Outbound hostname rules are advisory: no local backend enforces them; only
-# the Sprites provider translates them to its own policy API. Set
+# the Sprites and Vercel providers translate them to their own policy API. Set
 # network = "none" to deny egress. A block entry "*" lowers the sandbox to
 # network = "none" (offline).
 network_allow = []
@@ -4083,6 +4128,42 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # # → machine0 images; restore recreates from the image), SCALE-TO-ZERO (idle
 # # suspend). NOT available: native WSS exec / egress translation (the pane is ssh).
 #
+# ── Vercel Sandbox (HTTP API — NO vendor CLI, NO ssh) ──────────────────────
+# Vercel Sandbox microVMs driven over Vercel's REST API. Panes, exec and chrome
+# reads ride the hidden `thegn vercel-exec <id> --` self-bridge (the command API
+# plus the `/interactive` WebSocket PTY). Sandboxes are persistent: a session
+# stops at its timeout (compute bills $0 while stopped, the filesystem is kept)
+# and resumes by name on the next open. Only a live pane/session extends the
+# timeout, never an idle thegn. No host credential (agent logins, dotfiles,
+# atuin, git token) ever enters the sandbox: the repo goes in as a git bundle
+# and results come back through `thegn env pull`.
+#   1. Create a Vercel access token (or use an OIDC token) and note the team id
+#      (`team_…`) and project id (`prj_…`) from the dashboard.
+#   2. export VERCEL_TOKEN=...   (or api_key_env = "keyring:vercel" / "file:…")
+#
+# WARNING: no ssh/mosh; host_cache unsupported; sessions stop at their timeout
+# and resume on open.
+#
+# [env.vercel]
+# placement = "provider"
+# data = "in_env"
+# [env.vercel.provider]
+# provider = "vercel"
+# # api_key_env = "VERCEL_TOKEN"          # secret ref for the API token (this is the default)
+# team_id = "team_XXXXXXXXXXXXXXXXXXXXXXXX"   # required; not a secret
+# project_id = "prj_XXXXXXXXXXXXXXXXXXXXXXXX" # required; not a secret
+# # size = "2"                            # vCPUs: 1|2|4|8|16|32 (default 2; "auto"/empty
+# #                                       #   ⇒ min_vcpu rounded up to a legal value)
+# # region = ""                           # empty ⇒ Vercel's default (iad1)
+# # template = ""                         # sandbox image; empty ⇒ Vercel's universal default
+# # max_instances = 0                     # hard cap on concurrent sandboxes (0 ⇒ 2)
+# # max_lifetime_secs = 0                 # lifetime ceiling (0 ⇒ 24h for vercel, never
+# #                                       #   unbounded): the reaper STOPS the sandbox,
+# #                                       #   and deletes it 7 days later
+# # auto_provision = false                # create the sandbox on first open if missing
+# model_credentials = "none"   # none | upload (claude/codex login into tmpfs; see docs) | proxy, inject (refused)
+# interactive_host_suffixes = []   # empty = vercel.run, vercel.sh, vercel.com
+#
 # ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
 # A provider sandbox only stays *running* while a live exec session into it exists
@@ -4882,6 +4963,20 @@ poll_interval_secs = 3
 # socket = "127.0.0.1:6600"    # host:port, or an absolute path to MPD's unix socket.
                                # $MPD_HOST / $MPD_PORT override when left at default.
 # password = "file:~/.config/thegn/secrets/media-mpd.token" # keyring:, env:, file: refs; bare literals remain supported but are warned/migratable
+
+# ── Experimental Lead meta agent ([lead]) ───────────────────────────────────
+# A hosted agent CLI in a global tab that drives thegn through a scoped MCP
+# surface. Absent = no Lead. Dev channel only; stable clamps it off.
+# [lead]
+# agent = "claude"                  # required: an [[agents]] entry name
+# account = "work"                  # account id whose credentials the Lead uses (unset = the agent's own env)
+# scopes = ["read", "write"]        # MCP scopes, clamped by [mcp.serve]; admin and exec are refused
+# mcp_profile = "lead"              # [mcp_proxy.profiles] entry exposing the Lead's own MCP servers
+# skill = "lead"                    # skill seeded into the notes dir
+# notes_dir = "~/.local/state/thegn/lead"  # the Lead's only writable directory (default $XDG_STATE_HOME/thegn/lead)
+# network = "isolated"             # "isolated" (own netns via pasta; no pasta = no Lead) or "host" (warns on every launch)
+# token_ttl_secs = 43200            # Lead token lifetime (300..604800); slides on use, capped at 7 days from minting
+# outward_allow = []                # outward caps ("issues.comment", "issues.update") allowed without a per-call owner approval
 
 # ── Experimental voice mode ─────────────────────────────────────────────────
 # Alt v records/stops; Esc cancels. Final text is pasted without submission.
