@@ -1733,3 +1733,9 @@ fly-image-publish registry tag="v1":
 [positional-arguments]
 sprites-live *args:
     bash test/sprites-live.sh "$@"
+
+# Daily live remote run: headless agent, pull, land, reap (real spend; plan-only
+# without `--env <name> --i-accept-spend` and THEGN_CHANNEL=dev). Not in ci/smoke.
+[positional-arguments]
+remote-daily *args:
+    bash test/remote-daily.sh "$@"

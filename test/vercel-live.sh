@@ -11,7 +11,8 @@
 # Usage:
 #   test/vercel-live.sh                      # print plan, no network
 #   THEGN_CHANNEL=dev test/vercel-live.sh --token-ref keyring:vercel-token \
-#     --team-id team_x --project-id prj_x --i-accept-spend [--with-model-login]
+#     --team-id team_x --project-id prj_x --i-accept-spend [--with-model-login] \
+#     [--login-home-claude <dir>] [--with-headless]
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
@@ -20,7 +21,7 @@ MAX_LIFETIME=3600
 MAX_INSTANCES=1
 VCPUS=2
 
-token_ref="" team_id="" project_id="" accept=0 model_login=0
+token_ref="" team_id="" project_id="" accept=0 model_login=0 headless=0 login_home_claude=""
 while [ $# -gt 0 ]; do
   case "$1" in
   --token-ref)
@@ -43,8 +44,22 @@ while [ $# -gt 0 ]; do
     model_login=1
     shift
     ;;
+  --with-headless)
+    headless=1
+    shift
+    ;;
+  --login-home-claude)
+    login_home_claude="${2:?--login-home-claude needs a dir}"
+    [ -d "$login_home_claude" ] || {
+      echo "--login-home-claude: not a directory" >&2
+      exit 2
+    }
+    model_login=1
+    headless=1
+    shift 2
+    ;;
   -h | --help)
-    sed -n 2,16p "$0"
+    sed -n 2,18p "$0"
     exit 0
     ;;
   *)
@@ -75,6 +90,10 @@ Steps:
   3b  exactly one vercel ledger record for this run
   7   env pull (fast-forward)         8   stop (env down --stop), 8a resume
   8b  tmpfs login dir is gone after stop/resume
+  7h  (--with-headless) agent run --wait --pull with model_credentials =
+      "upload" (+ optional --login-home-claude <dir> -> login_homes), then
+      7l land --worktree and 7r release check (sandbox kept unless
+      --release-sandbox; the run then destroys it itself in step 9)
   9   env down (destroy)              10  env reap dry-run, 10a apply
 Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
 PLAN
@@ -224,6 +243,9 @@ CFG
   if [ "$model_login" = 1 ]; then
     # Explicit user-config opt-in; the wizard/`env create` never write this.
     echo 'model_credentials = "upload"' >>"$XDG_CONFIG_HOME/thegn/config.toml"
+    if [ -n "$login_home_claude" ]; then
+      printf 'login_homes = { claude = "%s" }\n' "$login_home_claude" >>"$XDG_CONFIG_HOME/thegn/config.toml"
+    fi
   fi
 }
 
@@ -260,6 +282,12 @@ else
   echo "SKIP 6b-6e (upload mode needs --with-model-login and a host claude login)"
 fi
 step 7 "env pull fast-forwards the lane branch" in_repo "$THEGN_BIN" env pull
+if [ "$headless" = 1 ]; then
+  step 7w "wt new vx-h" in_repo "$THEGN_BIN" wt new vx-h --env "$ENV_NAME"
+  step 7h "headless agent run --wait --pull (upload credentials)" in_repo "$THEGN_BIN" agent run vx-h --agent claude --prompt "create vx.txt containing ok and commit it" --wait --pull --json
+  step 7l "land the headless worktree" in_repo "$THEGN_BIN" land --worktree vx-h
+  step 7r "release check: land kept the sandbox (no --release-sandbox)" in_repo "$THEGN_BIN" env test "$ENV_NAME"
+fi
 step 8 "stop (env down --stop)" in_repo "$THEGN_BIN" env down --stop
 step 8a "resume (env up)" in_repo "$THEGN_BIN" env up
 step 8b "tmpfs login dir is gone after stop/resume" ask "/dev/shm/thegn-login-* absent after resume? "
