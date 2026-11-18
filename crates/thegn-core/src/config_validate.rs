@@ -1869,9 +1869,11 @@ mod tests {
         // sandbox's network namespace (isolated via pasta, or host).
         // 107 → 108 (THE-2233): `[env.<name>.provider] model_credentials`
         // (ModelCredentials) — the Vercel credential mode.
+        // 108 → 109 (THE-2200): `[merge_queue] gate_sandbox` (GateSandbox) —
+        // whether the merge gate runs on the host or in the sealed sandbox.
         assert_eq!(
             defs.len(),
-            108,
+            109,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

@@ -237,7 +237,8 @@ mod db_open_memo;
 /// v111: automation_rules, Lead-authored automation rules stored with origin = lead (THE-2181).
 /// v112: autonomy on agent_dispatches and automation_runs (THE-2195).
 /// v113: lane rule id, automation proposals, approval push nonces (THE-2200/2202).
-pub const SCHEMA_VERSION: i64 = 113;
+/// v114: producer leases (single headless producer per kind, THE-2208).
+pub const SCHEMA_VERSION: i64 = 114;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1891,6 +1892,7 @@ impl Db {
                     crate::db_migrate::verify_v111_schema(&conn)?;
                     crate::db_migrate::verify_v112_schema(&conn)?;
                     crate::db_migrate::verify_v113_schema(&conn)?;
+                    crate::db_migrate::verify_v114_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2588,6 +2590,7 @@ impl Db {
         crate::db_migrate::migrate_v111(&conn)?;
         crate::db_migrate::migrate_v112(&conn)?;
         crate::db_migrate::migrate_v113(&conn)?;
+        crate::db_migrate::migrate_v114(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2639,6 +2642,7 @@ impl Db {
             crate::db_migrate::verify_v111_schema(&conn)?;
             crate::db_migrate::verify_v112_schema(&conn)?;
             crate::db_migrate::verify_v113_schema(&conn)?;
+            crate::db_migrate::verify_v114_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

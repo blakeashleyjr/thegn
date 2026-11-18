@@ -98,6 +98,10 @@ const OMITTED: &[(&str, &str)] = &[
         "daemon.socket",
         "path-valued control-socket override is not exposed",
     ),
+    (
+        "daemon.headless_producers",
+        "headless producers run the owner's rules unattended; opt-in per machine, not exposed",
+    ),
     ("serve", "remote serving policy is not exposed"),
     ("merge_queue", "merge queue policy is not exposed"),
     ("pr_queue", "PR queue policy is not exposed"),
