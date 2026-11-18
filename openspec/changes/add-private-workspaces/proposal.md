@@ -1,6 +1,6 @@
 # Durable private-copy workspaces with explicit, journaled sync
 
-## Summary
+## Why
 
 THE-791 (owner decision 2026-10-13, programme rulings 2026-11-17) makes a private copy of the workspace the
 default for untrusted work: an independent Git repository and file tree that the sandbox owns, that only
@@ -21,7 +21,7 @@ sidebar (create, delete, zones, hooks). A **private workspace** is a different t
 of one worktree, with its own repository, baseline and journal. The new capability is therefore named
 `private-workspaces` so the two cannot be confused. Nothing here modifies the `workspace` capability.
 
-## What changes
+## What Changes
 
 - A `workspace.mode` choice (`private-copy`, `git-worktree`, `live-mount`) that is independent of the
   execution backend, with defaults per launch class (interactive panes keep `git-worktree`).

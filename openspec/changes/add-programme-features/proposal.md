@@ -1,6 +1,6 @@
 # Nine programme release-channel features
 
-## Summary
+## Why
 
 The sandbox and remote programme adds nine experimental `Feature` variants at once, so that no later item
 edits the shape of `Feature` or the length of `Feature::ALL`. This change records them in the
@@ -13,7 +13,7 @@ The variants and their ids are `SandboxBackends` (`sandbox_backends`), `LinuxCon
 (`escalation`). `Feature::ALL` then has 15 entries, the existing six first. The private-workspace gate is
 `PrivateCopy`; it was named `PrivateClone` in earlier drafts and the old name appears nowhere.
 
-## What changes
+## What Changes
 
 - One ADDED requirement in the `release-channels` capability listing the nine ids as experimental, so the
   stable channel disallows them and `thegn doctor` lists 15 features, the nine new ones reading

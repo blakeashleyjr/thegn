@@ -1,6 +1,6 @@
 # Make sandbox and remote reporting say no more than the code does
 
-## Summary
+## Why
 
 thegn reports more security than it delivers. This change collects every behavioural correction of
 workstream WS01 of the sandbox + remote programme, so that each fix is one task here and
@@ -42,7 +42,7 @@ files are frozen for a later wave):
   egress and that `SealedTunnel` routes through the tunnel; the open change `add-oci-runtime-tiers`
   claims egress "stays thegn-enforced (DNS filter)".
 
-## What changes
+## What Changes
 
 - Egress reporting is capped at what is enforced: no `enforce` without a credited datapath,
   `network = "none"` reports `offline`, a VPN or any list without enforcement reports `unmanaged`.

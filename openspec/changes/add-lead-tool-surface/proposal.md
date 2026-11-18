@@ -2,13 +2,13 @@
 
 Linear: THE-2171, THE-2173. Roadmap: tasks.md group BA (item 761).
 
-## Problem
+## Why
 
 A meta-agent that supervises the workspace needs a small, scoped, audited tool
 surface. Today the only way to give an agent control is the same-uid daemon
 socket, which grants implicit admin, so scope limits are meaningless.
 
-## Change
+## What Changes
 
 Add eleven catalog capabilities (HTTP, CLI and MCP; `approvals.resolve` HTTP and
 CLI only), an opt-in `Notice` event frame, and Lead-authored automation rules

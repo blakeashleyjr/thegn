@@ -5,7 +5,7 @@ its item merges. The owning programme item is named on each line.
 
 ## 1. Types and handle
 
-- [ ] 1.1 `LaunchClass`, `UntrustedKind`, `HostTrustKind`, admission vocabulary stubs (WS00-P1-13)
+- [x] 1.1 `LaunchClass`, `UntrustedKind`, `HostTrustKind`, admission vocabulary stubs (WS00-P1-13)
 - [ ] 1.2 `admission::evaluate` and `LaunchAdmission` with private fields; re-key `LAUNCH_ROUTES` by class (WS02-P5-08)
 - [ ] 1.3 Storage-support manifest column and ephemeral refusal (WS02-P5-07)
 - [ ] 1.4 `EffectivePolicyId`, the `thegn.policy` label and reuse by equality (WS02-P5-07)

@@ -2,12 +2,12 @@
 
 Linear: THE-2171, THE-2173. Roadmap: tasks.md group BA (item 761).
 
-## Problem
+## Why
 
 Operators want one long-lived agent that watches every worktree and drives
 workers, without handing it a host shell or the daemon's implicit-admin socket.
 
-## Change
+## What Changes
 
 A reserved terminal (`name = "lead"`, `kind = "lead"`) rendered in its own
 sidebar section, running a sandboxed agent configured by `[lead]`.

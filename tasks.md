@@ -1649,7 +1649,7 @@ _An agent that changes the shell must be able to see the frame. The muse harness
 
 _The multi-wave programme that makes sandbox and egress reporting truthful, adds the shared contracts and the launch admission handle, and builds the remote and provider seams on top (parent acceptance record THE-791). The plan, waves, freeze window, owner decisions and the hardware/accounts checklist are in `docs/superpowers/plans/2026-11-17-sandbox-remote-programme.md`; the lane rules are in CONTRIBUTING "Programme conventions (sandbox + remote, 2026-11)". Per-change detail lives in openspec (`fix-truth-in-reporting`, `add-sandbox-policy-engine`, `add-launch-admission`, `add-private-workspaces`, and the per-workstream changes listed in the plan); work items are tracked by id (`WS00`-`WS11`) in Linear._
 
-- [~] 763. Sandbox + remote programme (W0 contracts and openspec changes authored; W1 onwards pending) — see the programme record above; overlaps AC 365/372 and AJ 434 (egress truth, WS01), AB/AE (sandbox and provider seams)
+- [~] 763. Sandbox + remote programme (W0 contracts and W1 truth-in-reporting shipped: nine release-channel features, help-page split, honest egress and capability reporting, kubernetes clamp on stable, reserved smol/appcontainer backends and vpn dns mode, DNS filter removed, wave-0 spike scripts; later waves pending) — see the programme record above; overlaps AC 365/372 and AJ 434 (egress truth, WS01), AB/AE (sandbox and provider seams)
 
 ### AI-free mode (audience-widener)
 
@@ -1661,4 +1661,4 @@ _The multi-wave programme that makes sandbox and egress reporting truthful, adds
 
 ### BA. The Lead meta-agent (b152)
 
-- [ ] 761. The Lead — a sandboxed agent tab with a scoped tool surface (overview, notifications, automations, approvals, merge drain) that watches the workspace and drives workers (THE-2171)
+- [~] 761. The Lead — a sandboxed agent tab with a scoped tool surface (overview, notifications, automations, approvals) that watches the workspace and drives workers (THE-2171) _(shipped: `[lead]` config, global Lead tab, bwrap + pasta sandbox, eleven-tool MCP surface, daemon-side confinement, triggers and cron, stage executor, approvals in the panel and by phone, budgets and `thegn lead pause|resume|status`, schema v111–v113; known limit: `merge` autonomy behaves like `review` until the merge gate is sandboxed; the Lead never calls `merge.add`/`merge.drain`)_
