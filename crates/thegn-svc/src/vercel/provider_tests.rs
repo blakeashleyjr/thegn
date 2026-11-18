@@ -476,6 +476,34 @@ async fn wake_allow_resumes_a_stopped_sandbox() {
 }
 
 #[tokio::test]
+async fn interactive_open_never_resumes_past_the_lifetime_ceiling() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+
+    // (a) Created long ago: refused, never resumed.
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Stopped, None)));
+    let p = provider(&fake, ledger.path(), 2);
+    let error = p.interactive_session(NAME).await.unwrap_err();
+    assert!(format!("{error:#}").contains("lifetime"), "{error:#}");
+    assert_eq!(fake.count("resume"), 0, "{:?}", fake.calls());
+
+    // (b) Created a minute ago: resumed as usual.
+    let fake = Arc::new(FakeApi::default());
+    fake.gets.lock().unwrap().push_back(Some(SandboxView {
+        created_at_ms: Some(now_ms() - 60_000),
+        ..view(NAME, SessionStatus::Stopped, None)
+    }));
+    *fake.resume.lock().unwrap() = Some(view(NAME, SessionStatus::Running, Some("sess_2")));
+    let p = provider(&fake, ledger.path(), 2);
+    assert_eq!(p.interactive_session(NAME).await.unwrap(), "sess_2");
+    assert_eq!(fake.count("resume"), 1);
+}
+
+#[tokio::test]
 async fn stop_session_never_resumes() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let ledger = tempfile::tempdir().unwrap();
