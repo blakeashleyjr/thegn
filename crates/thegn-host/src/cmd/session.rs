@@ -1465,7 +1465,202 @@ fn stage_dispatch_env(
 /// harness's command-scoped grant). The dispatch only ADMITS the policy
 /// ([`policy_admission`]) before the roster row is claimed, so an
 /// unattestable grant is a pre-launch hold, never a failed task.
+///
+/// The work itself is [`open_stage_dispatch`] (shared with the automation
+/// `pipeline.start` action, THE-2193); this wrapper owns only the output: the
+/// `--json` refusal payload and the success lines.
 async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) -> Result<()> {
+    let json = d.json;
+    let request = StageOpenRequest {
+        stage: d.stage,
+        issue: d.issue,
+        worktree: d.worktree,
+        agent: d.agent,
+        automation_origin: None,
+        parent: d.parent,
+        parent_artifact: d.parent_artifact,
+        chunk: d.chunk,
+        lease: d.lease,
+        owner: d.owner,
+        lease_gen: d.lease_gen,
+        bind: d.bind,
+        adopt: d.adopt,
+    };
+    let opened = match open_stage_dispatch(cfg, client, request).await {
+        Ok(opened) => opened,
+        Err(error) => return Err(stage_refusal_output(error, json)?),
+    };
+    // 13. Print.
+    if json {
+        super::emit_json(&serde_json::json!({
+            "row": opened.row_id,
+            "session": opened.session,
+            "stage": opened.stage,
+            "artifact": opened.artifact,
+            "issue": opened.issue,
+            "worktree": opened.worktree,
+            "branch": opened.branch,
+        }))?;
+    } else {
+        outln!(
+            "dispatch {} → session {} (stage {})",
+            opened.row_id,
+            display_cell(&opened.session),
+            display_cell(&opened.stage)
+        );
+        outln!(
+            "artifact {} (branch {})",
+            display_cell(&opened.artifact),
+            display_cell(&opened.branch)
+        );
+    }
+    Ok(())
+}
+
+/// The inputs of one stage dispatch ([`open_stage_dispatch`]). `session open
+/// --stage --issue` fills every field; the automation `pipeline.start` action
+/// uses [`StageOpenRequest::fresh`] (no parent, no lease, no chunk) plus an
+/// `automation_origin`.
+pub(crate) struct StageOpenRequest<'a> {
+    pub stage: &'a str,
+    pub issue: &'a str,
+    pub worktree: &'a str,
+    /// Explicit agent, overriding the stage's configured one.
+    pub agent: Option<&'a str>,
+    /// Set on the launch's `OpenSpec` so the session carries its automation
+    /// ancestry (loop suppression, audit).
+    pub automation_origin: Option<thegn_svc::control::AutomationOrigin>,
+    pub parent: Option<i64>,
+    pub parent_artifact: Option<&'a str>,
+    pub chunk: Option<&'a str>,
+    pub lease: Option<&'a str>,
+    pub owner: Option<&'a str>,
+    pub lease_gen: Option<i64>,
+    pub bind: bool,
+    pub adopt: bool,
+}
+
+impl<'a> StageOpenRequest<'a> {
+    /// A first-stage dispatch with no parent, chunk, lease, explicit agent,
+    /// bind or adopt: the shape an automation starts a pipeline with.
+    pub(crate) fn fresh(stage: &'a str, issue: &'a str, worktree: &'a str) -> Self {
+        Self {
+            stage,
+            issue,
+            worktree,
+            agent: None,
+            automation_origin: None,
+            parent: None,
+            parent_artifact: None,
+            chunk: None,
+            lease: None,
+            owner: None,
+            lease_gen: None,
+            bind: false,
+            adopt: false,
+        }
+    }
+}
+
+/// What a successful stage dispatch opened. `row_id` + `session` are the
+/// identity; the rest is what `session open --json` prints.
+#[derive(Debug, Clone)]
+pub(crate) struct StageOpened {
+    pub row_id: i64,
+    pub session: String,
+    pub stage: String,
+    pub artifact: String,
+    pub issue: String,
+    pub worktree: String,
+    pub branch: String,
+}
+
+/// An admission refusal from [`open_stage_dispatch`]: no session was opened
+/// and the claim left no row. `payload` is exactly the object `session open
+/// --json` prints for it; `retryable` maps to [`crate::cmd::Retryable`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StageRefused {
+    pub payload: serde_json::Value,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for StageRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StageRefused {}
+
+impl StageRefused {
+    /// The roster claim refused (duplicate / budget / lease).
+    fn claim(reason: &str) -> Self {
+        Self {
+            payload: serde_json::json!({
+                "granted": false,
+                "reason": reason,
+            }),
+            message: format!(
+                "stage dispatch refused: {reason}\n(override with `thegn dispatch claim … \
+                 --allow-duplicate <reason>` if this really is separate work)"
+            ),
+            retryable: true,
+        }
+    }
+
+    /// The chunk scope gate refused.
+    fn scope(reason: String) -> Self {
+        Self {
+            payload: serde_json::json!({"granted": false, "reason": reason, "retryable": false}),
+            message: reason,
+            retryable: false,
+        }
+    }
+
+    /// The scope snapshot moved under admission.
+    fn snapshot(row: i64, path: &str) -> Self {
+        let message = format!("scope snapshot changed at row {row} ({path}); retry admission");
+        Self {
+            payload: serde_json::json!({"granted": false, "reason": message.clone(), "retryable": true}),
+            message,
+            retryable: true,
+        }
+    }
+
+    /// The CLI error this refusal surfaces as.
+    fn into_cli_error(self) -> anyhow::Error {
+        if self.retryable {
+            anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(self.message)))
+        } else {
+            anyhow::anyhow!(self.message)
+        }
+    }
+}
+
+/// `open_stage`'s error mapping: an admission refusal prints its `--json`
+/// payload (with `json`) and becomes the CLI error it always was; any other
+/// error passes through untouched.
+fn stage_refusal_output(error: anyhow::Error, json: bool) -> Result<anyhow::Error> {
+    let refused = match error.downcast::<StageRefused>() {
+        Ok(refused) => refused,
+        Err(other) => return Ok(other),
+    };
+    if json {
+        super::emit_json(&refused.payload)?;
+    }
+    Ok(refused.into_cli_error())
+}
+
+/// The stage dispatch itself — claim, artifact, render, open, publish, with
+/// every failure after the claim closing the row `failed`. Prints nothing:
+/// an admission refusal is returned as a [`StageRefused`] error so each caller
+/// owns its output.
+pub(crate) async fn open_stage_dispatch(
+    cfg: &Config,
+    client: &ControlClient,
+    d: StageOpenRequest<'_>,
+) -> Result<StageOpened> {
     use thegn_svc::control::{AgentLaunch, OpenSpec};
 
     // 1. The stage lookup (also done in `open_preflight`, before `connect`).
@@ -1540,34 +1735,13 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         Ok(id) => id,
         Err(thegn_core::db::DispatchAdmissionDecision::Claim(decision)) => {
             let reason = decision.reason();
-            if d.json {
-                super::emit_json(&serde_json::json!({
-                    "granted": false,
-                    "reason": reason.as_str(),
-                }))?;
-            }
-            return Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
-                "stage dispatch refused: {reason}\n(override with `thegn dispatch claim … \
-                 --allow-duplicate <reason>` if this really is separate work)"
-            ))));
+            return Err(anyhow::Error::new(StageRefused::claim(reason.as_str())));
         }
         Err(thegn_core::db::DispatchAdmissionDecision::ScopeRefused(reason)) => {
-            if d.json {
-                super::emit_json(
-                    &serde_json::json!({"granted": false, "reason": reason, "retryable": false}),
-                )?;
-            }
-            anyhow::bail!("{reason}");
+            return Err(anyhow::Error::new(StageRefused::scope(reason)));
         }
         Err(thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path }) => {
-            if d.json {
-                super::emit_json(
-                    &serde_json::json!({"granted": false, "reason": format!("scope snapshot changed at row {row} ({path}); retry admission"), "retryable": true}),
-                )?;
-            }
-            return Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
-                "scope snapshot changed at row {row} ({path}); retry admission"
-            ))));
+            return Err(anyhow::Error::new(StageRefused::snapshot(row, &path)));
         }
     };
     // 7. Read the artifact identity admission stamped in the same transaction
@@ -1626,7 +1800,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         );
         let prompt = crate::stage_prompt::render_stage(&stage.name, &stage.prompt, &vars)?;
         let spec = OpenSpec {
-            automation_origin: None,
+            automation_origin: d.automation_origin.clone(),
             argv: Vec::new(),
             cwd: None,
             env,
@@ -1664,30 +1838,16 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             // that fails after the daemon opened the process, compensate by
             // killing the process and closing the visible row as failed.
             publish_opened_dispatch(&db, client, row_id, &info.id, &artifact).await?;
-            // 13. Print.
-            if d.json {
-                super::emit_json(&serde_json::json!({
-                    "row": row_id,
-                    "session": info.id,
-                    "stage": stage.name,
-                    "artifact": artifact,
-                    "issue": issue,
-                    "worktree": wt,
-                    "branch": branch,
-                }))?;
-            } else {
-                outln!(
-                    "dispatch {row_id} → session {} (stage {})",
-                    display_cell(&info.id),
-                    display_cell(&stage.name)
-                );
-                outln!(
-                    "artifact {} (branch {})",
-                    display_cell(&artifact),
-                    display_cell(&branch)
-                );
-            }
-            Ok(())
+            // 13. The caller prints.
+            Ok(StageOpened {
+                row_id,
+                session: info.id,
+                stage: stage.name.clone(),
+                artifact,
+                issue,
+                worktree: wt,
+                branch,
+            })
         }
         Err(e) => {
             let (reconciled, row_error) =
@@ -3745,5 +3905,92 @@ mod env_control_addr_tests {
             .is_none()
         );
         assert!(env_control_addr(&env(&[])).is_none());
+    }
+}
+
+#[cfg(test)]
+mod stage_refusal_tests {
+    use super::*;
+
+    /// The `--json` refusal payloads `open_stage` printed before the
+    /// `open_stage_dispatch` extraction, byte for byte.
+    #[test]
+    fn refusal_payloads_match_the_pre_extraction_output() {
+        let claim = StageRefused::claim("row 4 already covers this");
+        assert_eq!(
+            serde_json::to_string(&claim.payload).unwrap(),
+            r#"{"granted":false,"reason":"row 4 already covers this"}"#
+        );
+        assert!(claim.retryable);
+        assert!(
+            claim
+                .message
+                .starts_with("stage dispatch refused: row 4 already covers this\n")
+        );
+        assert!(claim.message.contains("--allow-duplicate <reason>"));
+
+        let scope = StageRefused::scope("chunk escapes the lane".into());
+        assert_eq!(
+            serde_json::to_string(&scope.payload).unwrap(),
+            r#"{"granted":false,"reason":"chunk escapes the lane","retryable":false}"#
+        );
+        assert_eq!(scope.message, "chunk escapes the lane");
+        assert!(!scope.retryable);
+
+        let snap = StageRefused::snapshot(7, "a/b.md");
+        assert_eq!(
+            serde_json::to_string(&snap.payload).unwrap(),
+            r#"{"granted":false,"reason":"scope snapshot changed at row 7 (a/b.md); retry admission","retryable":true}"#
+        );
+        assert!(snap.retryable);
+    }
+
+    #[test]
+    fn refusals_map_to_the_same_cli_errors() {
+        let retry = stage_refusal_output(
+            anyhow::Error::new(StageRefused::claim("budget full")),
+            false,
+        )
+        .unwrap();
+        assert!(retry.downcast_ref::<crate::cmd::Retryable>().is_some());
+        assert!(
+            retry
+                .to_string()
+                .starts_with("stage dispatch refused: budget full")
+        );
+
+        let hard = stage_refusal_output(
+            anyhow::Error::new(StageRefused::scope("out of scope".into())),
+            false,
+        )
+        .unwrap();
+        assert!(hard.downcast_ref::<crate::cmd::Retryable>().is_none());
+        assert!(hard.downcast_ref::<StageRefused>().is_none());
+        assert_eq!(hard.to_string(), "out of scope");
+
+        let snap =
+            stage_refusal_output(anyhow::Error::new(StageRefused::snapshot(3, "c.md")), false)
+                .unwrap();
+        assert!(snap.downcast_ref::<crate::cmd::Retryable>().is_some());
+    }
+
+    #[test]
+    fn non_refusal_errors_pass_through_untouched() {
+        let other = stage_refusal_output(anyhow::anyhow!("open failed: boom"), true).unwrap();
+        assert_eq!(other.to_string(), "open failed: boom");
+        assert!(other.downcast_ref::<crate::cmd::Retryable>().is_none());
+    }
+
+    #[test]
+    fn fresh_request_carries_no_parent_lease_or_origin() {
+        let r = StageOpenRequest::fresh("implement", "linear:THE-1", "/wt");
+        assert_eq!(
+            (r.stage, r.issue, r.worktree),
+            ("implement", "linear:THE-1", "/wt")
+        );
+        assert!(r.agent.is_none() && r.automation_origin.is_none());
+        assert!(r.parent.is_none() && r.parent_artifact.is_none() && r.chunk.is_none());
+        assert!(r.lease.is_none() && r.owner.is_none() && r.lease_gen.is_none());
+        assert!(!r.bind && !r.adopt);
     }
 }
