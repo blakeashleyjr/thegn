@@ -2200,6 +2200,8 @@ max_spawns_per_day = 12     # automation spawns per rolling 24 h (0..1000; 0 = n
 # queue_capacity = 64
 # action_timeout_secs = 300
 # audit_retention_per_rule = 200
+# max_concurrent_lanes = 2
+# max_spawns_per_day = 12
 # [[profiles.work.automations.rules]]
 # name = "profile-rule"
 # enabled = true
