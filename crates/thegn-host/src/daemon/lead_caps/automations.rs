@@ -318,13 +318,17 @@ mod tests {
     #[tokio::test]
     async fn escalating_and_colliding_puts_are_refused() {
         let (svc, _profile) = service(true);
-        for cap in ["tools.run", "merge.add"] {
+        for (cap, then) in [
+            ("tools.run", json!({"cap": "tools.run", "name": "deploy"})),
+            ("merge.add", json!({"cap": "merge.add", "name": "deploy"})),
+            ("merge.drain", json!({"cap": "merge.drain"})),
+        ] {
             let mut req = ping(cap);
-            req["rule"]["then"] = json!({"cap": cap, "name": "deploy"});
+            req["rule"]["then"] = then;
             match put(&svc, req).await {
                 Err(ControlError::InvalidArgument(message)) => {
                     assert!(
-                        message.contains("may only notify or open a session"),
+                        message.contains(authoring::LEAD_ESCALATION_REFUSAL),
                         "{message}"
                     )
                 }
@@ -438,5 +442,94 @@ mod tests {
             runs(&svc, json!({"limit": "x"})).await,
             Err(ControlError::InvalidArgument(_))
         ));
+    }
+
+    fn start(autonomy: Option<&str>) -> serde_json::Value {
+        let mut req = json!({"rule": {
+            "name": "start",
+            "when": "issue_matched",
+            "if": {"label": "auto"},
+            "then": {"cap": "pipeline.start", "stage": "code", "agent": "codex"}
+        }});
+        if let Some(level) = autonomy {
+            req["rule"]["autonomy"] = json!(level);
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn lead_autonomy_ceiling_is_enforced_at_put() {
+        let (svc, _profile) = service(true);
+        let refused = |result: JsonResult, needle: &str| match result {
+            Err(ControlError::InvalidArgument(message)) => {
+                assert!(message.contains(needle), "{message}")
+            }
+            other => panic!("{needle}: {other:?}"),
+        };
+        let mut merge = ping("notify.push");
+        merge["rule"]["autonomy"] = json!("merge");
+        refused(
+            put(&svc, merge).await,
+            thegn_core::automation_autonomy::LEAD_MERGE_REFUSAL,
+        );
+        refused(
+            put(&svc, start(Some("merge"))).await,
+            thegn_core::automation_autonomy::LEAD_MERGE_REFUSAL,
+        );
+        for review in [Some("review"), None] {
+            refused(
+                put(&svc, start(review)).await,
+                thegn_core::automation_autonomy::LEAD_PIPELINE_REFUSAL,
+            );
+        }
+        assert!(list_lead_rules(&svc).await.unwrap().is_empty());
+
+        let reply = put(&svc, start(Some("propose"))).await.unwrap();
+        assert_eq!(reply["id"], json!("lead:start"));
+        let found = find_rule(&svc, "start").await.unwrap().unwrap();
+        assert_eq!(
+            found.autonomy,
+            thegn_core::automation_autonomy::Autonomy::Propose
+        );
+    }
+
+    #[tokio::test]
+    async fn a_smuggled_merge_row_loads_capped() {
+        let (svc, _profile) = service(true);
+        for (id, body) in [
+            (
+                "lead:loud",
+                json!({
+                    "name": "lead:loud",
+                    "when": "agent_finished",
+                    "autonomy": "merge",
+                    "then": {"cap": "notify.push", "body": "x"}
+                }),
+            ),
+            (
+                "lead:start",
+                json!({
+                    "name": "lead:start",
+                    "when": "issue_matched",
+                    "autonomy": "merge",
+                    "then": {"cap": "pipeline.start", "stage": "code", "agent": "codex"}
+                }),
+            ),
+        ] {
+            let body = body.to_string();
+            svc.with_db(move |db| db.put_lead_rule(id, &body, "lead", 1))
+                .await
+                .unwrap();
+        }
+        let loud = find_rule(&svc, "loud").await.unwrap().unwrap();
+        assert_eq!(
+            loud.autonomy,
+            thegn_core::automation_autonomy::Autonomy::Review
+        );
+        let start = find_rule(&svc, "start").await.unwrap().unwrap();
+        assert_eq!(
+            start.autonomy,
+            thegn_core::automation_autonomy::Autonomy::Propose
+        );
     }
 }
