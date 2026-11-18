@@ -55,7 +55,7 @@ pub(crate) const CONTROL_PER_AUTHORITY_CONCURRENCY: usize = 4;
 pub(crate) const CONTROL_GLOBAL_PRIORITY_RESERVE: usize = 2;
 pub(crate) const CONTROL_PER_AUTHORITY_PRIORITY_RESERVE: usize = 1;
 /// File contents use a separate, longer policy than metadata/control calls.
-const FILE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const FILE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const FILE_TRANSFER_BODY_LIMIT: usize = 256 * 1024 * 1024;
 const TRANSFER_GLOBAL_CONCURRENCY: usize = 16;
 const TRANSFER_PER_AUTHORITY_CONCURRENCY: usize = 4;
@@ -2876,9 +2876,9 @@ fn ws_scheme(api_base: &str) -> String {
 
 const EXEC_CWD_NON_TTY_SCRIPT: &str = "cd -- \"$1\" || exit 125; shift; exec \"$@\"";
 const EXEC_CWD_TTY_SCRIPT: &str = "cd -- \"$1\" 2>/dev/null; shift; exec \"$@\"";
-const EXEC_WS_MAX_MESSAGE_SIZE: usize = 16 << 20;
-const EXEC_WS_MAX_FRAME_SIZE: usize = 4 << 20;
-const EXEC_WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
+pub(crate) const EXEC_WS_MAX_MESSAGE_SIZE: usize = 16 << 20;
+pub(crate) const EXEC_WS_MAX_FRAME_SIZE: usize = 4 << 20;
+pub(crate) const EXEC_WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
 /// Maximum provider output retained by one session while its consumer is slow.
 const EXEC_DATA_BYTE_BUDGET: usize = 8 << 20;
 /// Item capacity of the provider output channels.
@@ -2946,7 +2946,7 @@ fn exec_argv(spec: &ExecSpec) -> Result<Vec<String>> {
     Ok(argv)
 }
 
-fn exec_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+pub(crate) fn exec_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(EXEC_WS_MAX_MESSAGE_SIZE))
         .max_frame_size(Some(EXEC_WS_MAX_FRAME_SIZE))
@@ -3600,6 +3600,11 @@ pub enum Provider {
     /// snapshots (checkpoints) + `vm_suspend` scale-to-zero; NixOS via a
     /// post-create `nixos-rebuild --flake` over ssh (see `crate::machine0`).
     Machine0(crate::machine0::Machine0Provider),
+    /// Vercel Sandbox (`provider = "vercel"`) — HTTP control plane, exec over
+    /// the command API and `/interactive` WebSocket through the `thegn
+    /// vercel-exec` self-bridge (no vendor CLI, no ssh). Persistent sandboxes
+    /// stop at their session timeout and resume by name (see `crate::vercel`).
+    Vercel(crate::vercel::VercelProvider),
     /// An **exec-only** transport to a sandbox reached over the iroh call-home
     /// reach (`crate::iroh_reach`): the sandbox dialed home and its interactive
     /// panes ride the iroh connection. The sandbox is created/destroyed through
@@ -3660,6 +3665,17 @@ impl Provider {
                 scale_to_zero,
                 ..ProviderCaps::default()
             },
+            // files over fs/read + a gzipped-tar fs/write; egress via the
+            // user-defined allow list; no checkpoints in b154. `exec_api` stays
+            // false: the pane rides the `vercel-exec` self-bridge, not the
+            // resident bridge / native pane path.
+            Provider::Vercel(_) => ProviderCaps {
+                files: true,
+                egress: true,
+                checkpoints: false,
+                exec_api: false,
+                scale_to_zero,
+            },
             // Exec-only: no files/checkpoints/egress of its own (those go through
             // the underlying provider that created the sandbox).
             Provider::Iroh { .. } => ProviderCaps {
@@ -3703,6 +3719,7 @@ impl Provider {
             Provider::Machine0(p) => p.sandbox_inventory().await,
             Provider::Sprites(p) => p.sandbox_inventory().await,
             Provider::Daytona(p) => p.sandbox_inventory().await,
+            Provider::Vercel(p) => p.sandbox_inventory().await,
             Provider::Iroh { .. } => Err(iroh_exec_only("inventory")),
         }
     }
@@ -3715,6 +3732,7 @@ impl Provider {
             Provider::Vps(p) => p.spec().kind.as_str(),
             Provider::Fly(_) => "fly",
             Provider::Machine0(_) => "machine0",
+            Provider::Vercel(_) => "vercel",
             Provider::Iroh { .. } => "iroh",
         }
     }
@@ -3732,6 +3750,7 @@ impl Provider {
             Provider::Vps(p) => Some(p),
             Provider::Fly(p) => Some(p),
             Provider::Machine0(p) => Some(p),
+            Provider::Vercel(p) => Some(p),
             Provider::Iroh { .. } => None,
         }
     }
@@ -3743,6 +3762,7 @@ impl Provider {
             Provider::Vps(p) => Some(p),
             Provider::Fly(p) => Some(p),
             Provider::Machine0(p) => Some(p),
+            Provider::Vercel(p) => Some(p),
             Provider::Daytona(_) | Provider::Iroh { .. } => None,
         }
     }
@@ -3751,6 +3771,7 @@ impl Provider {
     fn egress_ops(&self) -> Option<&dyn ProviderEgress> {
         match self {
             Provider::Sprites(p) => Some(p),
+            Provider::Vercel(p) => Some(p),
             _ => None,
         }
     }
@@ -3806,6 +3827,7 @@ impl Provider {
         match self {
             Self::Vps(provider) => provider.owner(),
             Self::Fly(provider) => provider.owner(),
+            Self::Vercel(provider) => provider.owner(),
             _ => None,
         }
     }
@@ -3818,6 +3840,7 @@ impl Provider {
         match self {
             Provider::Machine0(p) => p.suspend(id).await,
             Provider::Fly(p) => p.stop(id).await,
+            Provider::Vercel(p) => p.stop_session(id).await,
             _ => Ok(()),
         }
     }
@@ -3829,6 +3852,7 @@ impl Provider {
         match self {
             Provider::Machine0(p) => p.resume(id).await,
             Provider::Fly(p) => p.start(id).await,
+            Provider::Vercel(p) => p.resume(id).await,
             _ => Ok(()),
         }
     }
@@ -4179,6 +4203,9 @@ impl Provider {
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         match self {
             Provider::Sprites(p) => p.open_exec(id, spec).await,
+            // In-process callers only (the `vercel-exec` bridge): native panes
+            // never reach here because `caps().exec_api` is false.
+            Provider::Vercel(p) => p.open_exec(id, spec).await,
             // The iroh reach carries interactive panes: route to the home endpoint.
             Provider::Iroh { home, .. } => home.open_exec(id, spec.clone()).await,
             _ => Err(anyhow!("provider '{}' has no native exec API", self.name())),
@@ -4209,6 +4236,10 @@ impl Provider {
             Provider::Vps(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Fly(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Machine0(p) => p.run_exec(id, argv, cwd, env).await,
+            Provider::Vercel(p) => {
+                p.run_exec(id, argv, cwd, env, crate::vercel::Wake::Allow)
+                    .await
+            }
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
             // One-shot capture over iroh: open a non-tty exec and drain it.
             Provider::Iroh { home, .. } => {

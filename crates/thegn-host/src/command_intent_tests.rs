@@ -92,6 +92,7 @@ fn every_configured_top_level_variant_parses_without_static_authority() {
     case!(Command::VpsSsh { .. }, ["vps-ssh", "fixture"]);
     case!(Command::Machine0Ssh { .. }, ["machine0-ssh", "fixture"]);
     case!(Command::SpriteExec { .. }, ["sprite-exec", "fixture"]);
+    case!(Command::VercelExec { .. }, ["vercel-exec", "fixture"]);
     case!(Command::Project { .. }, ["project", "list"]);
     assert_eq!(
         classify(parse(&[]).command.as_ref()),

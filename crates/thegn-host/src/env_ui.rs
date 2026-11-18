@@ -43,6 +43,8 @@ pub struct EnvSnapshot {
     /// `Some(true/false)` whether a token resolves for a provider env; `None` for
     /// non-provider placements (which need no token).
     pub token: Option<bool>,
+    /// The bound vercel sandbox holds results not yet pulled back (set by hydration).
+    pub unpulled: bool,
     /// Sanitized-at-render config details. Never contains secret values or identity paths.
     pub detail: Vec<(String, String)>,
 }
@@ -157,6 +159,15 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                     ),
                 );
             }
+            if is_provider && e.provider.provider.trim() == "vercel" {
+                let disclosure =
+                    thegn_core::vercel::creds::disclosure(e.provider.model_credentials);
+                push_detail(
+                    &mut detail,
+                    "credentials",
+                    format!("{} · sends: {}", disclosure.mode, disclosure.leaves_machine),
+                );
+            }
             if bound == Some(name.as_str()) {
                 push_detail(&mut detail, "bound", "this worktree".to_string());
             }
@@ -168,12 +179,34 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                 size: e.provider.size.clone(),
                 bound: bound == Some(name.as_str()),
                 token,
+                unpulled: false,
                 detail,
             }
         })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
+}
+
+/// Flag the bound vercel env whose sandbox holds unpulled results. Runs in the
+/// hydration producer (off-loop: it reads the worktree binding and a marker file).
+pub(crate) fn mark_unpulled(envs: &mut [EnvSnapshot], cfg: &Config, worktree: &str) {
+    for env in envs.iter_mut().filter(|e| e.bound && e.kind == "vercel") {
+        if crate::vercel_pull_marker::is_marked_for_worktree(cfg, worktree, &env.name) {
+            env.unpulled = true;
+            push_detail(
+                &mut env.detail,
+                "results",
+                "not pulled (p to pull)".to_string(),
+            );
+        }
+    }
+}
+
+/// `p` applies when the selected or the bound env is a vercel env with unpulled results.
+pub(crate) fn pull_available(envs: &[EnvSnapshot], cursor: usize) -> bool {
+    let is_pending = |e: &EnvSnapshot| e.kind == "vercel" && e.unpulled;
+    envs.get(cursor).is_some_and(is_pending) || envs.iter().any(|e| e.bound && is_pending(e))
 }
 
 fn push_detail(detail: &mut Vec<(String, String)>, label: &str, value: String) {
@@ -297,6 +330,46 @@ pub(crate) fn spawn_bind(
     }));
 }
 
+/// Run `thegn env pull <worktree>` as a waited-on child (explicit user key, so
+/// it may resume the sandbox), then toast the outcome and refresh.
+fn spawn_pull(
+    worktree: String,
+    refresh_tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: termwiz::terminal::TerminalWaker,
+) {
+    thegn_core::thread_name::spawn_named("thegn-vx-pull", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: user-requested pull.
+        use thegn_core::notification::Priority;
+        let (message, priority) = match run_pull_child(&worktree) {
+            Ok(()) => ("pulled".to_string(), Priority::Info),
+            Err(error) => (error, Priority::Alert),
+        };
+        let _ = refresh_tx.send(crate::hydrate::RefreshKind::Toast { message, priority }); // best-effort: the consumer may be gone
+        let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: as above
+        let _ = waker.wake(); // best-effort: waker pulse
+    });
+}
+
+#[expect(clippy::disallowed_methods)]
+fn run_pull_child(worktree: &str) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("pull failed: {e}"))?;
+    let out = std::process::Command::new(exe)
+        .args(["env", "pull", worktree])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("pull failed: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&out.stderr);
+    let tail = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    Err(format!("pull failed: {}", tail.trim()))
+}
+
 pub(crate) fn confirm_bind(
     arg: &str,
     envs: &[EnvSnapshot],
@@ -395,6 +468,7 @@ pub(crate) fn effective_token_env(pc: &EnvProviderConfig) -> String {
         "sprites" => "SPRITES_TOKEN".to_string(),
         "fly" => "FLY_API_TOKEN".to_string(),
         "machine0" => "MACHINE0_API_KEY".to_string(),
+        "vercel" => "VERCEL_TOKEN".to_string(),
         p => thegn_svc::vps::VpsKind::parse(p)
             .map(|k| k.token_env_default().to_string())
             .unwrap_or_default(),
@@ -489,6 +563,14 @@ pub fn panel_key(
             ));
             true
         }
+        KeyCode::Char('p') => {
+            if !pull_available(&model.panel.environments, cursor) {
+                return false;
+            }
+            model.status = "pulling results…".to_string();
+            spawn_pull(worktree.to_string(), refresh_tx.clone(), waker.clone());
+            true
+        }
         KeyCode::Char('t') => {
             if let TestDecision::NotProvider(message) = test_decision(&env) {
                 model.status = message;
@@ -570,6 +652,7 @@ mod tests {
             size: String::new(),
             bound,
             token: None,
+            unpulled: false,
             detail: Vec::new(),
         }
     }
@@ -789,6 +872,7 @@ mod tests {
             size: String::new(),
             bound: true,
             token: None,
+            unpulled: false,
             detail: Vec::new(),
         };
         assert_eq!(bind_decision(&env, "/wt"), BindDecision::AlreadyBound);
@@ -805,6 +889,7 @@ mod tests {
             size: String::new(),
             bound: true,
             token: None,
+            unpulled: false,
             detail: Vec::new(),
         };
 
@@ -846,5 +931,35 @@ mod tests {
             TestDecision::NotProvider(message) if message.contains("provider tokens only")
         ));
         assert_eq!(test_decision(provider), TestDecision::Provider);
+    }
+
+    #[test]
+    fn pull_key_needs_a_marked_vercel_env() {
+        let mut v = snapshot("vx", "provider", true);
+        v.kind = "vercel".into();
+        assert!(!pull_available(std::slice::from_ref(&v), 0));
+        v.unpulled = true;
+        assert!(pull_available(std::slice::from_ref(&v), 0));
+        // A marked bound env counts even when another row is selected.
+        let other = snapshot("o", "provider", false);
+        assert!(pull_available(&[other.clone(), v.clone()], 0));
+        // Marked but not vercel: never.
+        v.kind = "fly".into();
+        assert!(!pull_available(&[v], 0));
+    }
+
+    #[test]
+    fn vercel_snapshot_detail_names_the_credentials_mode() {
+        let mut cfg = Config::default();
+        cfg.env
+            .insert("vx".into(), provider_env("vercel", "VERCEL_TOKEN", ""));
+        let snaps = env_snapshots(&cfg, None);
+        let creds = snaps[0]
+            .detail
+            .iter()
+            .find(|(l, _)| l == "credentials")
+            .expect("credentials row");
+        assert!(creds.1.starts_with("none"), "{creds:?}");
+        assert!(creds.1.contains("sends:"));
     }
 }

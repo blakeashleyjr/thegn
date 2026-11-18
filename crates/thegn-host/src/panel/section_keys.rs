@@ -206,6 +206,7 @@ const ENVIRONMENTS: &[SectionKey] = &[
     nav("j/k", "row"),
     nav("↵", "rebind"),
     k('t', "t", "test"),
+    k('p', "p", "pull results"),
     k('n', "n", "new"),
     danger('x', "x", "remove"),
 ];

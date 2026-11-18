@@ -4122,6 +4122,42 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # # → machine0 images; restore recreates from the image), SCALE-TO-ZERO (idle
 # # suspend). NOT available: native WSS exec / egress translation (the pane is ssh).
 #
+# ── Vercel Sandbox (HTTP API — NO vendor CLI, NO ssh) ──────────────────────
+# Vercel Sandbox microVMs driven over Vercel's REST API. Panes, exec and chrome
+# reads ride the hidden `thegn vercel-exec <id> --` self-bridge (the command API
+# plus the `/interactive` WebSocket PTY). Sandboxes are persistent: a session
+# stops at its timeout (compute bills $0 while stopped, the filesystem is kept)
+# and resumes by name on the next open. Only a live pane/session extends the
+# timeout, never an idle thegn. No host credential (agent logins, dotfiles,
+# atuin, git token) ever enters the sandbox: the repo goes in as a git bundle
+# and results come back through `thegn env pull`.
+#   1. Create a Vercel access token (or use an OIDC token) and note the team id
+#      (`team_…`) and project id (`prj_…`) from the dashboard.
+#   2. export VERCEL_TOKEN=...   (or api_key_env = "keyring:vercel" / "file:…")
+#
+# WARNING: no ssh/mosh; host_cache unsupported; sessions stop at their timeout
+# and resume on open.
+#
+# [env.vercel]
+# placement = "provider"
+# data = "in_env"
+# [env.vercel.provider]
+# provider = "vercel"
+# # api_key_env = "VERCEL_TOKEN"          # secret ref for the API token (this is the default)
+# team_id = "team_XXXXXXXXXXXXXXXXXXXXXXXX"   # required; not a secret
+# project_id = "prj_XXXXXXXXXXXXXXXXXXXXXXXX" # required; not a secret
+# # size = "2"                            # vCPUs: 1|2|4|8|16|32 (default 2; "auto"/empty
+# #                                       #   ⇒ min_vcpu rounded up to a legal value)
+# # region = ""                           # empty ⇒ Vercel's default (iad1)
+# # template = ""                         # sandbox image; empty ⇒ Vercel's universal default
+# # max_instances = 0                     # hard cap on concurrent sandboxes (0 ⇒ 2)
+# # max_lifetime_secs = 0                 # lifetime ceiling (0 ⇒ 24h for vercel, never
+# #                                       #   unbounded): the reaper STOPS the sandbox,
+# #                                       #   and deletes it 7 days later
+# # auto_provision = false                # create the sandbox on first open if missing
+# model_credentials = "none"   # none | upload (claude/codex login into tmpfs; see docs) | proxy, inject (refused)
+# interactive_host_suffixes = []   # empty = vercel.run, vercel.sh, vercel.com
+#
 # ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
 # A provider sandbox only stays *running* while a live exec session into it exists

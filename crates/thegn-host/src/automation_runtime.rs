@@ -681,6 +681,14 @@ fn spawn_exit_pull_back(boot: &Arc<Config>, worktree: &str, other_live_sessions:
         // The currently admitted config (hot reloads included), else boot.
         let admitted = crate::config_startup::display();
         let cfg = admitted.as_deref().map_or(boot.as_ref(), |a| a.config());
+        if crate::cmd::env::resolve_for(cfg, Some(worktree.clone()))
+            .ok()
+            .and_then(|env| cfg.env.get(&env.name).map(|e| e.provider.provider.clone()))
+            .is_some_and(|p| !thegn_core::config::EnvProviderKind::of(&p).exit_pull_back_enabled())
+        {
+            tracing::debug!(target: "thegn::git_audit", worktree = %worktree, "session-exit pull-back skipped: provider is not resumed in the background; left to `thegn env pull`");
+            return;
+        }
         let notice = match crate::provider_git::pull_back_if_provider(cfg, &worktree) {
             Ok(None) => None,
             Ok(Some(report)) => {

@@ -336,6 +336,10 @@ mod theme_store;
 mod toast;
 mod toolchain_ui;
 mod usage_budget;
+mod vercel_bridge;
+mod vercel_login;
+mod vercel_pull_marker;
+mod vercel_reaper;
 mod voice;
 mod voice_worker;
 mod vps_bridge;
@@ -881,6 +885,22 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Hidden: the Vercel Sandbox exec bridge (`vercel-exec <id> -- cmd…`) —
+    /// the exec prefix of a vercel provider env, with no vendor CLI and no
+    /// ssh. With a non-tty stdin it is the control-plane prefix (chrome
+    /// git/gh/fs reads, the persisted worktree location): runs the command
+    /// over the sandbox command API and relays its output, and never resumes
+    /// a stopped sandbox (exits 75). With a tty stdin it resumes if needed and
+    /// streams the `/interactive` PTY, falling back to stream mode. Resolves
+    /// the API token itself, in-process.
+    #[command(hide = true)]
+    VercelExec {
+        /// The Vercel sandbox name (the resolved provider id).
+        id: String,
+        /// Command to run (empty ⇒ a login shell).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
 }
 
 /// Sub-verbs of `thegn doctor`. `bundle` lives here (not under a top-level
@@ -1089,6 +1109,7 @@ fn run_main() -> anyhow::Result<()> {
                 | Command::VpsSsh { .. }
                 | Command::Machine0Ssh { .. }
                 | Command::SpriteExec { .. }
+                | Command::VercelExec { .. }
         )
     );
     if !is_stdio_bridge {
@@ -1317,6 +1338,7 @@ fn verb_manages_own_logging(command: &Command) -> bool {
             | Command::VpsSsh { .. }
             | Command::Machine0Ssh { .. }
             | Command::SpriteExec { .. }
+            | Command::VercelExec { .. }
     )
 }
 
@@ -1667,6 +1689,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
         Command::Machine0Ssh { name, cmd } => machine0_bridge::run(&cfg, &name, &cmd),
         Command::SpriteExec { id, cmd } => sprite_bridge::run(&cfg, &id, &cmd),
+        Command::VercelExec { id, cmd } => vercel_bridge::run(&cfg, &id, &cmd),
         Command::SandboxArgv { target } => {
             // Resolve like every other worktree-scoped verb (explicit →
             // $THEGN_WORKTREE → git toplevel → cwd) — previously raw cwd only.
