@@ -1718,13 +1718,9 @@ command = "git diff"
 # resolves, that `concurrency` is at least 1, that every `next` names a real
 # stage and closes no cycle, and that every `prompt` placeholder is a real
 # variable) and it DISPLAYS it (stage grouping/labels on the dispatch roster).
-# NO thegn code path advances `next`, enforces `concurrency`, or fires
-# `timeout_secs`. A supervising agent — the "Lead", running the `pipeline`
-# skill — reads the whole structure with `thegn config get pipeline --json`
-# and executes it with its own judgement, recording each dispatch on the
-# durable roster (`thegn dispatch put … --stage --parent --session`; a staged row
-# refuses `--artifact`, its handoff path is assigned).
-# Delete this section and nothing thegn *does* changes.
+# With `[pipeline.supervisor] enabled = true` the daemon's stage executor
+# validates and advances along `next` (see `thegn help automations`); otherwise
+# the structure is advisory.
 #
 #   name         stage id; roster rows record it and `next` points at it. Unique.
 #   agent        the [[agents]]/[[tools]] entry that runs the stage (a bare
@@ -4397,6 +4393,13 @@ lease_grace_secs = 0
 # End a pane after this long of repeated attach-stream sequence gaps. 0 = never
 # end the pane; reconnect backoff still applies.
 stream_gap_window_secs = 600
+# Let the daemon run the headless producers (tracker poll, PR poll, mentions,
+# PR queue) so automation rules and autopilot fire with no UI open. Even when
+# on, a producer runs only while something needs it: an enabled rule on its
+# events, an [autopilot] repo, or [pr_queue] enabled. Only one poller of each
+# kind runs at a time; an open UI reads the daemon's results instead of
+# polling. Read when the daemon starts: restart the daemon after changing it.
+headless_producers = false
 
 # `thegn serve`: pair remote thin clients (desktop/web/mobile) over a pairing
 # URL and let them attach through the scoped control API. Thegn's native TCP
@@ -4544,6 +4547,13 @@ gate_setup_timeout_secs = 1800 # maximum setup duration; defaults to 30 minutes.
 gate_timeout_secs = 3600      # maximum gate duration; defaults to one hour. 0 disables the
                               # deadline. A timeout is an infrastructure hold, never a red build.
 gate_on = true                # run gate_command before advancing main
+gate_sandbox = "off"          # where the gate runs. "off" = on the host (as before). "sealed" =
+                              # gate_setup_command, gate_command and regenerate_command run in
+                              # the repo's sealed sandbox: network none, no credentials, no
+                              # control sockets. A land that needs a download goes red; a
+                              # sandbox that cannot start is an infrastructure hold. Set it in
+                              # your own config: [workspace.<slug>.merge_queue] may only raise
+                              # it to "sealed", and repo .thegn.* files cannot set it.
 gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target dir between folds
                               # (warm incremental rebuild instead of a cold from-scratch compile).
                               # false = throwaway /tmp worktree each fold (cold; use for concurrent gates)
@@ -4976,7 +4986,7 @@ poll_interval_secs = 3
 # surface. Absent = no Lead. Dev channel only; stable clamps it off.
 # [lead]
 # agent = "claude"                  # required: an [[agents]] entry name
-# account = "work"                  # account id whose credentials the Lead uses (unset = the agent's own env)
+# account = "work"                  # NOT supported yet: refused at launch; the Lead logs in once (thegn lead login)
 # scopes = ["read", "write"]        # MCP scopes, clamped by [mcp.serve]; admin and exec are refused
 # mcp_profile = "lead"              # [mcp_proxy.profiles] entry exposing the Lead's own MCP servers
 # skill = "lead"                    # skill seeded into the notes dir
