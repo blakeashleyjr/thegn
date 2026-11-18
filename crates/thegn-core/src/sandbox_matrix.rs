@@ -529,9 +529,9 @@ mod tests {
 
     #[test]
     fn unverified_backends_under_promise() {
-        // smol/wsl are not verified: the row carries the caveat flag and its class
-        // must not claim a microVM it never proved. `Backend::Smol` stays
-        // shared-kernel (an under-promise) until the smolvm verification lands.
+        // smol/wsl are reserved and not verified: the row carries the caveat flag and its class
+        // must not claim a microVM it never proved. The reserved `Backend::Smol` stays
+        // shared-kernel (an under-promise) until WS07 rebuilds it as a shipped smolvm backend.
         for b in [Backend::Smol, Backend::Wsl] {
             let r = row(b, HostOs::Linux);
             assert!(!r.verified, "{b:?} must carry the unverified caveat");
