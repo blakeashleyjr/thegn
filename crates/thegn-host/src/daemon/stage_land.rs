@@ -184,6 +184,9 @@ async fn enqueue(
     let head = read_head(&ctx.worktree).await;
     let head_matches = head.as_deref().is_some_and(|h| same_commit(h, commit_sha));
     if !head_matches {
+        if head.is_none() {
+            return held(Some("the lane's head could not be read".into()));
+        }
         super::stage_executor::kick_row(ctx.row);
         return held(enqueue_hold(autonomy, false, false, &Ok(())));
     }
@@ -326,7 +329,8 @@ async fn gather_unattended(
     let ids = ctx.chain.clone();
     let head_sha = head.unwrap_or_default();
     let db_cfg = Arc::clone(cfg);
-    let (rule, validations_green, paused, budget_ok) = svc
+    let leaf = ctx.row;
+    let (rule, validations_green, paused, budget_ok, passed) = svc
         .with_db(move |db| {
             let rule = rule_id
                 .as_deref()
@@ -335,7 +339,14 @@ async fn gather_unattended(
             let paused = thegn_core::automation_control::paused(db);
             let budget_ok =
                 crate::automation_budget::admit(db, &db_cfg, SpawnKind::NextStage).is_ok();
-            Ok((rule, green, paused, budget_ok))
+            let passed = {
+                use thegn_core::store::NotificationStore;
+                db.get_dispatch(leaf)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| review_passed(r.report.as_deref()))
+            };
+            Ok((rule, green, paused, budget_ok, passed))
         })
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -351,7 +362,7 @@ async fn gather_unattended(
         rule,
         terminal_is_first_stage: first_stage_terminal(entry.as_deref(), &ctx.stage, chain.len()),
         terminal_done: ctx.facts.status == thegn_core::issue::AgentDispatchStatus::Done,
-        report_ok: ctx.facts.report_present,
+        report_ok: ctx.facts.report_present && passed,
         validations_green,
         head_matches,
         gate_on: mq.gate_on,
@@ -359,6 +370,17 @@ async fn gather_unattended(
         gate_timeout_secs: mq.gate_timeout_secs,
         paused,
         budget_ok,
+    })
+}
+
+/// The terminal stage's report states PASS and carries gate evidence. A
+/// FAIL/REVISE/BLOCKED report (which `report_gate_valid` lets through) never
+/// satisfies the unattended report check.
+pub(crate) fn review_passed(report: Option<&str>) -> bool {
+    report.is_some_and(|r| {
+        thegn_core::pipeline_report::verdict_of(Some(r))
+            == thegn_core::pipeline_report::Verdict::Pass
+            && thegn_core::pipeline_report::gate_evidence(r).is_some()
     })
 }
 
@@ -391,10 +413,21 @@ fn rule_standing(cfg: &Config, db: &Db, rule_id: &str) -> Option<RuleStanding> {
         && !rule_id.starts_with(thegn_core::automation_authoring::LEAD_RULE_PREFIX)
     {
         RuleOrigin::Config
-    } else if crate::automation_arming::armed_set(db, thegn_core::util::now_ms())
-        .iter()
-        .any(|(id, _)| id == rule_id)
-    {
+    } else if {
+        use thegn_core::store::AutomationRuleStore;
+        db.lead_rules()
+            .ok()
+            .and_then(|rows| rows.into_iter().find(|r| r.id == rule_id))
+            .is_some_and(|row| {
+                let (_, _, sha) = thegn_core::approval_digest::rule_arm_ids(
+                    rule_id,
+                    &row.body_json,
+                    Autonomy::Merge,
+                );
+                crate::automation_arming::armed_set(db, thegn_core::util::now_ms())
+                    .contains(&(rule_id.to_string(), sha))
+            })
+    } {
         RuleOrigin::LeadApproved
     } else {
         RuleOrigin::Lead
@@ -729,6 +762,18 @@ mod tests {
         // A stage no longer in the chart is not green.
         cfg.pipeline.stages.remove(1);
         assert!(!chain_validations_green(&cfg, &db, &[root, term], SHA));
+    }
+
+    #[test]
+    fn review_passed_requires_pass_with_gate_evidence() {
+        assert!(!review_passed(None));
+        assert!(!review_passed(Some(
+            "FAIL\ngate: cargo nextest run --workspace -- 1 passed, 0 skipped"
+        )));
+        assert!(!review_passed(Some("PASS")));
+        assert!(review_passed(Some(
+            "PASS\ngate: cargo nextest run --workspace -- 1 passed, 0 skipped"
+        )));
     }
 
     #[test]
