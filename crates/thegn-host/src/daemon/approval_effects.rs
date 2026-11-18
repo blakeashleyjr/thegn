@@ -140,10 +140,6 @@ pub(crate) async fn on_resolved(svc: Arc<DaemonService>, req: ApprovalResolve) {
 
 /// The trusted description of an approval triple, for the panel and the
 /// push. Falls back to "unverified request" when no trusted payload names it.
-#[allow(
-    dead_code,
-    reason = "the panel (b155 lane 5) and the push (lane 6) call this"
-)]
 pub(crate) fn describe(db: &Db, issue: &str, stage: &str, sha: &str) -> String {
     let sha7: String = sha.chars().take(7).collect();
     let trusted = match effect_kind(issue, stage) {
