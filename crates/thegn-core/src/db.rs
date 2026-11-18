@@ -235,7 +235,8 @@ mod db_open_memo;
 /// v109: worktrees.sandbox_profile, an optional per-worktree sandbox profile pin (THE-1886).
 /// v110: agent_dispatches.dispatch_kind, the typed trust class (plain/stage/legacy_held) of a roster row (THE-241).
 /// v111: automation_rules, Lead-authored automation rules stored with origin = lead (THE-2181).
-pub const SCHEMA_VERSION: i64 = 111;
+/// v112: autonomy on agent_dispatches and automation_runs (THE-2195).
+pub const SCHEMA_VERSION: i64 = 112;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1887,6 +1888,7 @@ impl Db {
                     crate::db_migrate::verify_v109_schema(&conn)?;
                     crate::db_migrate::verify_v110_schema(&conn)?;
                     crate::db_migrate::verify_v111_schema(&conn)?;
+                    crate::db_migrate::verify_v112_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2582,6 +2584,7 @@ impl Db {
         crate::db_migrate::migrate_v109(&conn)?;
         crate::db_migrate::migrate_v110(&conn)?;
         crate::db_migrate::migrate_v111(&conn)?;
+        crate::db_migrate::migrate_v112(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2631,6 +2634,7 @@ impl Db {
             crate::db_migrate::verify_v109_schema(&conn)?;
             crate::db_migrate::verify_v110_schema(&conn)?;
             crate::db_migrate::verify_v111_schema(&conn)?;
+            crate::db_migrate::verify_v112_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
