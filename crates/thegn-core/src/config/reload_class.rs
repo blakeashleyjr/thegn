@@ -573,6 +573,16 @@ mod tests {
         assert_eq!(class_for("base_branch"), Some((NextUse, H::None)));
         assert_eq!(class_for("weather.location"), Some((Live, H::Weather)));
         assert_eq!(class_for("daemon.enabled"), Some((Restart, H::None)));
+        // The daemon arms its producers at start; rule edits re-arm live.
+        assert_eq!(
+            class_for("daemon.headless_producers"),
+            Some((Restart, H::None))
+        );
+        // Same class as `merge_queue.gate_on`: read at the next gate.
+        assert_eq!(
+            class_for("merge_queue.gate_sandbox"),
+            class_for("merge_queue.gate_on")
+        );
         assert_eq!(class_for("nonsense_root_key"), None);
         assert_eq!(class_for(""), None);
     }
