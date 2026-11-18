@@ -176,11 +176,15 @@ mod tests {
                         break;
                     }
                 }
-                let _ = write!(
+                if write!(
                     writer,
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
-                );
+                )
+                .is_err()
+                {
+                    continue;
+                }
             }
         });
         (format!("http://127.0.0.1:{port}/v1"), seen)
