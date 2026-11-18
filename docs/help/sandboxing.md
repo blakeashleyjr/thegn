@@ -1018,20 +1018,25 @@ The Lead (`[lead]`, experimental) runs its agent under bubblewrap. Its
   The Lead starts in the notes dir.
 - **Hidden:** `$XDG_RUNTIME_DIR`, the daemon socket dir, the state `run` dir,
   every control-socket location and `/tmp` are replaced with empty dirs. The
-  rootful docker and podman sockets are hidden too. `THEGN_CONTROL_SOCKET`,
+  rootful docker and podman sockets and the system D-Bus socket are hidden
+  too. `THEGN_CONTROL_SOCKET`,
   `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `DISPLAY`, `WAYLAND_DISPLAY`
   and `XAUTHORITY` are unset.
   `~/.ssh`, `~/.gnupg`, `~/.config/gh`, `~/.config/glab-cli`,
   `~/.git-credentials` and `~/.netrc` are hidden too.
-- **thegn's state is hidden:** `$XDG_STATE_HOME/thegn`, `$XDG_DATA_HOME/thegn`
-  and `$XDG_CACHE_HOME/thegn` are replaced with empty dirs. That covers the
-  database, logs, scrollback, gate target dirs and other workers' transcripts.
+- **thegn's state is hidden:** `$XDG_STATE_HOME/thegn`, `$XDG_DATA_HOME/thegn`,
+  `$XDG_CACHE_HOME/thegn`, thegn's home (`~/.thegn` or `$THEGN_DIR`) and the
+  legacy `superzej` dirs are replaced with empty dirs. That covers the
+  database, logs, scrollback, gate target dirs, provider ssh keys and other
+  workers' transcripts. Registered repos beneath them come back read-only.
   The agent homes `~/.claude`, `~/.codex` and `~/.pi` are hidden the same way,
   and `~/.claude.json` reads as empty. Only three things come back inside
   them: the notes dir and the private agent home (writable), and the Lead's
-  own MCP config and token files (read-only). `$XDG_CONFIG_HOME/thegn` stays
-  readable, because the `thegn mcp` commands inside the sandbox load it.
-  Secrets in it are references, not values.
+  own MCP config and token files (read-only). `$XDG_CONFIG_HOME/thegn` is
+  hidden too, except `config.toml`, which the `thegn mcp` commands inside the
+  sandbox load. Only `config.toml` itself is readable; files named by `file:`
+  secret references are hidden. A literal secret pasted into config.toml is
+  readable by the Lead.
 - **Reading state:** the Lead sees thegn's state only through its tools:
   `overview.get`, `notifications.list`, `sessions.snapshot`,
   `automations.runs` and `approvals.list`.

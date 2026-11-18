@@ -64,6 +64,17 @@ pub(crate) fn account_home() -> Option<std::path::PathBuf> {
     None
 }
 
+/// The real `(uid, gid)` of this process. `None` where unavailable.
+#[cfg(unix)]
+pub(crate) fn current_ids() -> Option<(u32, u32)> {
+    unix::current_ids()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn current_ids() -> Option<(u32, u32)> {
+    None
+}
+
 /// Shared bounded grace interval after a PTY group receives its termination
 /// request. Windows uses an immediate Job Object terminate and needs no wait.
 #[cfg(unix)]

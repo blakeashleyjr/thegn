@@ -46,6 +46,13 @@ pub struct LeadMountPlan {
     /// it for daemon-owned panes (the guard is keyed to the transient forking
     /// thread and would reap the session); the Lead follows the same rule.
     pub die_with_parent: bool,
+    /// `(uid, gid)` the Lead runs as inside bwrap (`--uid`/`--gid`). Set in
+    /// the isolated network, where pasta starts bwrap as uid 0 of its own
+    /// user namespace; `None` keeps the caller's ids.
+    pub sandbox_ids: Option<(u32, u32)>,
+    /// Extra env vars unset after [`UNSET_ENV`] (the push and inbox secrets'
+    /// `env:` references).
+    pub unset_env: Vec<String>,
 }
 
 /// Environment variables the sandbox unsets after entry: the control socket
@@ -71,12 +78,26 @@ pub const HARNESS_HOME_DIR: &str = "lead-harness";
 /// XDG state, data and cache roots (the DB, logs, scrollback, gate target
 /// dirs, other workers' transcripts) and every agent harness home (`~/.claude`,
 /// `~/.codex`, `~/.pi`: shared credentials, hooks and settings). Directories
-/// only: `~/.claude.json` is a file and goes to `masked_files`.
-/// `$XDG_CONFIG_HOME/thegn` stays readable on purpose: the sandboxed
-/// `thegn mcp serve`/`mcp proxy` load it, and its secrets are references.
-pub fn state_masks(state: &Path, data: &Path, cache: &Path, home: &Path) -> Vec<PathBuf> {
+/// only: `~/.claude.json` is a file and goes to `masked_files`. Also
+/// thegn's own home (`thegn_dir`: provider ssh keys, other workers' sandbox
+/// homes) and the legacy `superzej` locations. The host masks
+/// `$XDG_CONFIG_HOME/thegn` separately and re-exposes only `config.toml`.
+pub fn state_masks(
+    state: &Path,
+    data: &Path,
+    cache: &Path,
+    home: &Path,
+    thegn_dir: &Path,
+) -> Vec<PathBuf> {
     let mut out = vec![state.join("thegn"), data.join("thegn"), cache.join("thegn")];
     out.extend([".claude", ".codex", ".pi"].map(|d| home.join(d)));
+    out.extend([
+        thegn_dir.to_path_buf(),
+        home.join(".superzej"),
+        state.join("superzej"),
+        data.join("superzej"),
+        cache.join("superzej"),
+    ]);
     out.dedup();
     out
 }
@@ -291,7 +312,8 @@ pub fn normalize_masks(masked: &[PathBuf]) -> Vec<PathBuf> {
 /// The full bwrap argv. Order matters and is fixed:
 /// 1. session flags (`--die-with-parent` only when the plan keeps it;
 ///    `--unshare-all --share-net`: no `--new-session`, a TUI needs its
-///    controlling tty, matching the interactive terminal path);
+///    controlling tty, matching the interactive terminal path;
+///    `--cap-drop ALL`, then `--uid`/`--gid` when `sandbox_ids` is set);
 /// 2. `--ro-bind / /`, fresh `/dev`, `/proc` and a private `/tmp`;
 /// 3. masks (`--tmpfs` per `masked` and `state_masked` dir, parents first,
 ///    then `/dev/null` over each masked file);
@@ -314,6 +336,23 @@ pub fn bwrap_argv(plan: &LeadMountPlan, inner: &[String]) -> Vec<String> {
         [
             "--unshare-all",
             "--share-net",
+            // Under pasta bwrap starts as uid 0 of pasta's user namespace and
+            // would keep CAP_SYS_ADMIN (umount the masks, remount `/` rw).
+            "--cap-drop",
+            "ALL",
+        ]
+        .map(String::from),
+    );
+    if let Some((uid, gid)) = plan.sandbox_ids {
+        v.extend([
+            "--uid".into(),
+            uid.to_string(),
+            "--gid".into(),
+            gid.to_string(),
+        ]);
+    }
+    v.extend(
+        [
             "--ro-bind",
             "/",
             "/",
@@ -349,6 +388,9 @@ pub fn bwrap_argv(plan: &LeadMountPlan, inner: &[String]) -> Vec<String> {
     }
     for k in UNSET_ENV {
         v.extend(["--unsetenv".into(), (*k).to_string()]);
+    }
+    for k in &plan.unset_env {
+        v.extend(["--unsetenv".into(), k.clone()]);
     }
     v.extend(["--chdir".into(), s(&plan.chdir), "--".into()]);
     v.extend(inner.iter().cloned());
@@ -392,6 +434,8 @@ mod tests {
             file_binds: vec![],
             chdir: p("/home/u/.local/state/thegn/lead"),
             die_with_parent: false,
+            sandbox_ids: None,
+            unset_env: vec![],
         }
     }
 
@@ -409,6 +453,7 @@ mod tests {
                 &p("/home/u/.local/share"),
                 &p("/home/u/.cache"),
                 &p(HOME),
+                &p("/home/u/.thegn"),
             ),
             masked_files: vec![p("/home/u/.claude.json")],
             readable: vec![p("/home/u/.local/state/thegn/lead-control/mcp-lead.json")],
@@ -418,6 +463,8 @@ mod tests {
             )],
             chdir: p("/home/u/.local/state/thegn/lead"),
             die_with_parent: false,
+            sandbox_ids: None,
+            unset_env: vec![],
         }
     }
 
@@ -677,7 +724,13 @@ mod tests {
 
     #[test]
     fn state_masks_cover_thegn_under_each_xdg_root_and_harness_homes() {
-        let got = state_masks(&p("/x/state"), &p("/x/data"), &p("/x/cache"), &p(HOME));
+        let got = state_masks(
+            &p("/x/state"),
+            &p("/x/data"),
+            &p("/x/cache"),
+            &p(HOME),
+            &p("/x/thegn-home"),
+        );
         assert_eq!(
             got,
             vec![
@@ -687,6 +740,11 @@ mod tests {
                 p("/home/u/.claude"),
                 p("/home/u/.codex"),
                 p("/home/u/.pi"),
+                p("/x/thegn-home"),
+                p("/home/u/.superzej"),
+                p("/x/state/superzej"),
+                p("/x/data/superzej"),
+                p("/x/cache/superzej"),
             ]
         );
         assert!(
@@ -795,12 +853,40 @@ mod tests {
             ],
         );
         let sep = pos(&v, &["--"]);
+        let cap_drop = pos(&v, &["--cap-drop", "ALL"]);
+        let first_tmpfs = v.iter().position(|a| a == "--tmpfs").unwrap();
+        assert!(cap_drop < first_tmpfs, "caps are dropped before any mask");
         assert!(mask_state < mask_file && mask_claude < mask_file);
         assert!(
             mask_file < token && token < resolv,
             "file binds after masks"
         );
         assert!(resolv < notes && notes < harness && harness < sep);
+    }
+
+    #[test]
+    fn bwrap_argv_sets_uid_and_gid_after_the_cap_drop() {
+        let mut pl = plan();
+        pl.sandbox_ids = Some((1000, 100));
+        let v = bwrap_argv(&pl, &[]);
+        let cap_drop = pos(&v, &["--cap-drop", "ALL"]);
+        let ids = pos(&v, &["--uid", "1000", "--gid", "100"]);
+        assert_eq!(ids, cap_drop + 2, "--uid/--gid follow --cap-drop");
+        assert!(ids < pos(&v, &["--ro-bind", "/", "/"]));
+        // Without ids (host network) the argv carries no --uid.
+        let v = bwrap_argv(&plan(), &[]);
+        assert!(!v.iter().any(|a| a == "--uid" || a == "--gid"));
+    }
+
+    #[test]
+    fn bwrap_argv_unsets_the_plan_env_after_the_fixed_list() {
+        let mut pl = plan();
+        pl.unset_env = vec!["THEGN_INBOX_SECRET".into(), "NTFY_TOKEN".into()];
+        let v = bwrap_argv(&pl, &[]);
+        let last_fixed = pos(&v, &["--unsetenv", UNSET_ENV[UNSET_ENV.len() - 1]]);
+        let inbox = pos(&v, &["--unsetenv", "THEGN_INBOX_SECRET"]);
+        let ntfy = pos(&v, &["--unsetenv", "NTFY_TOKEN"]);
+        assert!(last_fixed < inbox && inbox < ntfy && ntfy < pos(&v, &["--chdir"]));
     }
 
     #[test]
