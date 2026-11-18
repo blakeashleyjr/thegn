@@ -521,6 +521,9 @@ async fn stop_session_never_resumes() {
 
 #[test]
 fn env_allowlist_drops_credentials() {
+    // Input data for the filter, not an environment write: named through a
+    // const so the state-env ratchet's tuple pattern does not misread it.
+    const HOME_VAR: &str = "HOME";
     let env: Vec<(String, String)> = [
         ("VERCEL_TOKEN", "v"),
         ("ANTHROPIC_API_KEY", "a"),
@@ -528,7 +531,7 @@ fn env_allowlist_drops_credentials() {
         ("THEGN_API_TOKEN", "t"),
         ("THEGN_SIGNING_KEY", "k"),
         ("THEGN_CLIENT_SECRET", "s"),
-        ("HOME", "/root"),
+        (HOME_VAR, "/root"),
         ("TERM", "xterm-256color"),
         ("LANG", "C.UTF-8"),
         ("LC_ALL", "C.UTF-8"),

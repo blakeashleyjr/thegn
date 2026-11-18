@@ -5558,6 +5558,28 @@ mod tests {
                 skip_ready_wait: true,
             },
         ));
+        // Constructing a Vercel provider only admits the spec and builds the
+        // HTTP client; no request is made.
+        let vercel = Provider::Vercel(
+            crate::vercel::VercelProvider::new(crate::vercel::VercelSpec {
+                api_base: String::new(),
+                token: crate::vercel::VercelToken::new("vcp_test_token".into()),
+                credential_ref: "VERCEL_TOKEN".into(),
+                scope: thegn_core::vercel::api::Scope {
+                    team_id: "team_test".into(),
+                    project_id: "prj_test".into(),
+                },
+                name: "tg-vercel-1".into(),
+                vcpus: 2,
+                image: None,
+                region: None,
+                max_instances: 0,
+                max_lifetime_secs: 0,
+                interactive_host_suffixes: Vec::new(),
+                model_credentials: thegn_core::config::ModelCredentials::default(),
+            })
+            .expect("a well-formed vercel spec is admitted offline"),
+        );
         let cases = [
             (Provider::Daytona(provider()), K::Daytona),
             (Provider::Sprites(sprites()), K::Sprites),
@@ -5565,6 +5587,7 @@ mod tests {
             (vps(crate::vps::VpsKind::DigitalOcean), K::DigitalOcean),
             (fly, K::Fly),
             (machine0, K::Machine0),
+            (vercel, K::Vercel),
         ];
         for (p, kind) in &cases {
             assert_eq!(p.kind(), Some(*kind));
@@ -5584,6 +5607,9 @@ mod tests {
         assert_eq!(cases[3].0.caps(), caps(true, false, false, false, false));
         assert_eq!(cases[4].0.caps(), caps(true, false, false, false, true));
         assert_eq!(cases[5].0.caps(), caps(true, true, false, false, true));
+        // Vercel: files (fs/read + tar fs/write), egress (allow-list policy),
+        // scale-to-zero; no checkpoints and no native exec.
+        assert_eq!(cases[6].0.caps(), caps(true, false, true, false, true));
     }
 
     #[test]

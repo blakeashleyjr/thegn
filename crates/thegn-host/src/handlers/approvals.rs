@@ -77,9 +77,14 @@ pub(crate) fn request_resolve(
     }
     let body = resolve_body(&issue, &stage, &sha, decision);
     let (tx, waker) = (tx.clone(), waker.clone());
-    let handle = tokio::runtime::Handle::try_current().ok();
+    // Resolve the runtime up front: without one the resolve cannot run, and
+    // the user must hear so rather than see the keypress do nothing.
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("approval resolve: no tokio runtime");
+        model.status = "approval not recorded: no async runtime".into();
+        return;
+    };
     let admission = crate::sched::spawn_bg(move || {
-        let Some(handle) = handle else { return };
         let outcome = handle.block_on(async {
             let client = crate::automation_executor::client().await?;
             client

@@ -17,6 +17,8 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+use crate::migrate_brand::{LEGACY_DIR_NAME, LEGACY_HOME_DIR_NAME};
+
 /// The bind layout for one Lead tab.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LeadMountPlan {
@@ -80,7 +82,8 @@ pub const HARNESS_HOME_DIR: &str = "lead-harness";
 /// `~/.codex`, `~/.pi`: shared credentials, hooks and settings). Directories
 /// only: `~/.claude.json` is a file and goes to `masked_files`. Also
 /// thegn's own home (`thegn_dir`: provider ssh keys, other workers' sandbox
-/// homes) and the legacy `superzej` locations. The host masks
+/// homes) and the legacy pre-rename locations
+/// ([`crate::migrate_brand::LEGACY_DIR_NAME`]). The host masks
 /// `$XDG_CONFIG_HOME/thegn` separately and re-exposes only `config.toml`.
 pub fn state_masks(
     state: &Path,
@@ -93,10 +96,10 @@ pub fn state_masks(
     out.extend([".claude", ".codex", ".pi"].map(|d| home.join(d)));
     out.extend([
         thegn_dir.to_path_buf(),
-        home.join(".superzej"),
-        state.join("superzej"),
-        data.join("superzej"),
-        cache.join("superzej"),
+        home.join(LEGACY_HOME_DIR_NAME),
+        state.join(LEGACY_DIR_NAME),
+        data.join(LEGACY_DIR_NAME),
+        cache.join(LEGACY_DIR_NAME),
     ]);
     out.dedup();
     out
@@ -745,10 +748,10 @@ mod tests {
                 p("/home/u/.codex"),
                 p("/home/u/.pi"),
                 p("/x/thegn-home"),
-                p("/home/u/.superzej"),
-                p("/x/state/superzej"),
-                p("/x/data/superzej"),
-                p("/x/cache/superzej"),
+                p(HOME).join(LEGACY_HOME_DIR_NAME),
+                p("/x/state").join(LEGACY_DIR_NAME),
+                p("/x/data").join(LEGACY_DIR_NAME),
+                p("/x/cache").join(LEGACY_DIR_NAME),
             ]
         );
         assert!(

@@ -21,6 +21,11 @@ fn mark_in(anchor: &Path, sandbox: &str) -> std::io::Result<()> {
             "invalid sandbox name",
         ));
     }
+    // The anchor (the XDG state root) is trusted but need not exist yet (a
+    // fresh machine, an isolated test root): `ensure_private_dir_beneath`
+    // opens it without creating it, so a missing root would silently drop
+    // the marker.
+    std::fs::create_dir_all(anchor)?;
     let dir = fsperm::ensure_private_dir_beneath(anchor, &rel())?;
     match dir.create_owner_only_exclusive(sandbox) {
         Ok(_) => Ok(()),

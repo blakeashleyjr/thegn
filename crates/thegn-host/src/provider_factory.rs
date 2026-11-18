@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn inventory_provider_needs_only_a_token() {
         let _state = crate::testenv::IsolatedState::with_env(&[("TG_TEST_INV_TOKEN", "tok")]);
-        for kind in ["fly", "hetzner", "machine0", "vercel"] {
+        for kind in ["fly", "hetzner", "machine0"] {
             let pc = thegn_core::config::EnvProviderConfig {
                 provider: kind.into(),
                 api_key_env: "TG_TEST_INV_TOKEN".into(),
@@ -839,6 +839,18 @@ mod tests {
             };
             assert!(provider_for_inventory(&pc).is_ok(), "{kind}");
         }
+        // Vercel is the exception: every Vercel Sandbox API call is scoped by
+        // `teamId` and `projectId`, so listing sandboxes needs both ids as
+        // well as the token, and a token alone is refused.
+        let vercel = |team_id: &str, project_id: &str| thegn_core::config::EnvProviderConfig {
+            provider: "vercel".into(),
+            api_key_env: "TG_TEST_INV_TOKEN".into(),
+            team_id: team_id.into(),
+            project_id: project_id.into(),
+            ..Default::default()
+        };
+        assert!(provider_for_inventory(&vercel("team_A1", "prj_B2")).is_ok());
+        assert!(provider_for_inventory(&vercel("", "")).is_err());
     }
 
     #[test]

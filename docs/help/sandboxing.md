@@ -307,7 +307,7 @@ The Lead (`[lead]`, experimental) runs its agent under bubblewrap. Its
   `~/.git-credentials` and `~/.netrc` are hidden too.
 - **thegn's state is hidden:** `$XDG_STATE_HOME/thegn`, `$XDG_DATA_HOME/thegn`,
   `$XDG_CACHE_HOME/thegn`, thegn's home (`~/.thegn` or `$THEGN_DIR`) and the
-  legacy `superzej` dirs are replaced with empty dirs. That covers the
+  legacy pre-rename dirs are replaced with empty dirs. That covers the
   database, logs, scrollback, gate target dirs, provider ssh keys and other
   workers' transcripts. Registered repos beneath them come back read-only.
   The agent homes `~/.claude`, `~/.codex` and `~/.pi` are hidden the same way,

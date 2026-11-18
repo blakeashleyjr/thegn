@@ -583,8 +583,9 @@ async fn validation_sandbox(
 /// the Lead control dir exactly as for worker panes), the `thegn.slice` CPU
 /// cap, the drain's credential scrub and a git-env scrub, in the lane's own
 /// worktree, with the configured timeout. The child's process group is owned
-/// by `run_bounded`: waited on, killed on timeout or cancel, fully reaped.
-#[cfg(unix)]
+/// by the platform's bounded runner (`platform::bounded_validation`): waited
+/// on, killed on timeout or cancel, fully reaped. Where no bounded runner
+/// exists the run is refused, never run on the host.
 fn run_in_sandbox(
     spec: &thegn_core::sandbox::SandboxSpec,
     worktree: &Path,
@@ -592,6 +593,10 @@ fn run_in_sandbox(
     timeout_secs: u64,
     cancel: &AtomicBool,
 ) -> SandboxedRun {
+    use crate::platform::bounded_validation;
+    if !bounded_validation::SUPPORTED {
+        return SandboxedRun::Refused(format!("{NEEDS_SEALED} (unsupported on this platform)"));
+    }
     // Keep a secret env-file alive until the bounded runner has reaped the child.
     let (inner, _env_file) = match thegn_core::sandbox::enter_argv_guarded(spec, command) {
         Ok(guarded) => guarded.into_parts(),
@@ -619,60 +624,30 @@ fn run_in_sandbox(
     for var in thegn_core::util::GIT_ENV_VARS {
         cmd.env_remove(var);
     }
-    let run = crate::agent_run::bounded::run_bounded(
-        &mut cmd,
-        crate::agent_run::bounded::effective_timeout(timeout_secs),
-        cancel,
-    );
-    let mut text = String::from_utf8_lossy(&run.stdout.bytes).into_owned();
-    text.push_str(&String::from_utf8_lossy(&run.stderr.bytes));
-    sandboxed_end(&run.outcome, timeout_secs, text)
-}
-
-/// No bounded group runner off unix: refuse, never run on the host.
-#[cfg(not(unix))]
-fn run_in_sandbox(
-    _spec: &thegn_core::sandbox::SandboxSpec,
-    _worktree: &Path,
-    _command: &str,
-    _timeout_secs: u64,
-    _cancel: &AtomicBool,
-) -> SandboxedRun {
-    SandboxedRun::Refused(format!("{NEEDS_SEALED} (unsupported on this platform)"))
+    let run = bounded_validation::run(&mut cmd, timeout_secs, cancel);
+    sandboxed_end(run.end, timeout_secs, run.text)
 }
 
 /// Map a bounded run's end to a validation result.
-#[cfg(unix)]
 fn sandboxed_end(
-    outcome: &crate::agent_run::bounded::AgentRunOutcome,
+    end: crate::platform::bounded_validation::ValidationEnd,
     timeout_secs: u64,
     text: String,
 ) -> SandboxedRun {
-    use crate::agent_run::bounded::AgentRunOutcome;
-    match outcome {
-        AgentRunOutcome::Exited(status) if status.code() == Some(125) => {
+    use crate::platform::bounded_validation::ValidationEnd;
+    match end {
+        ValidationEnd::Exited(Some(125)) => {
             SandboxedRun::Refused("the validation sandbox refused to start (exit 125)".to_owned())
         }
-        AgentRunOutcome::Exited(status) => SandboxedRun::Done {
-            exit_code: status.code(),
-            text,
-        },
-        AgentRunOutcome::TimedOut => SandboxedRun::Done {
+        ValidationEnd::Exited(exit_code) => SandboxedRun::Done { exit_code, text },
+        ValidationEnd::TimedOut => SandboxedRun::Done {
             exit_code: Some(124),
             text: format!(
                 "validation exceeded {timeout_secs}s ([limits] test_timeout_secs) and was stopped\n{text}"
             ),
         },
-        AgentRunOutcome::Cancelled => SandboxedRun::Cancelled,
-        AgentRunOutcome::Spawn(error) => {
-            SandboxedRun::Refused(format!("the validation sandbox failed to spawn: {error}"))
-        }
-        AgentRunOutcome::Reap(error) => {
-            SandboxedRun::Refused(format!("the validation run could not be reaped: {error}"))
-        }
-        AgentRunOutcome::Unsettled => {
-            SandboxedRun::Refused("the validation run left an unsettled process group".to_owned())
-        }
+        ValidationEnd::Cancelled => SandboxedRun::Cancelled,
+        ValidationEnd::Failed(why) => SandboxedRun::Refused(why),
     }
 }
 
@@ -1235,25 +1210,21 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_sandboxed_validation_end_maps_timeouts_refusals_and_cancels() {
-        use crate::agent_run::bounded::AgentRunOutcome;
-        use std::os::unix::process::ExitStatusExt;
-        let exited =
-            |code: i32| AgentRunOutcome::Exited(std::process::ExitStatus::from_raw(code << 8));
+        use crate::platform::bounded_validation::ValidationEnd;
         assert_eq!(
-            sandboxed_end(&exited(0), 60, "ok".into()),
+            sandboxed_end(ValidationEnd::Exited(Some(0)), 60, "ok".into()),
             SandboxedRun::Done {
                 exit_code: Some(0),
                 text: "ok".into()
             }
         );
         assert!(matches!(
-            sandboxed_end(&exited(125), 60, String::new()),
+            sandboxed_end(ValidationEnd::Exited(Some(125)), 60, String::new()),
             SandboxedRun::Refused(_)
         ));
-        match sandboxed_end(&AgentRunOutcome::TimedOut, 60, "out".into()) {
+        match sandboxed_end(ValidationEnd::TimedOut, 60, "out".into()) {
             SandboxedRun::Done { exit_code, text } => {
                 assert_eq!(exit_code, Some(124));
                 assert!(text.contains("60s") && text.ends_with("out"));
@@ -1261,11 +1232,11 @@ mod tests {
             other => panic!("a timeout is a failed run, got {other:?}"),
         }
         assert_eq!(
-            sandboxed_end(&AgentRunOutcome::Cancelled, 60, String::new()),
+            sandboxed_end(ValidationEnd::Cancelled, 60, String::new()),
             SandboxedRun::Cancelled
         );
         assert!(matches!(
-            sandboxed_end(&AgentRunOutcome::Unsettled, 60, String::new()),
+            sandboxed_end(ValidationEnd::Failed("unsettled".into()), 60, String::new()),
             SandboxedRun::Refused(_)
         ));
     }
