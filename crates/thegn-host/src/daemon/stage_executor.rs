@@ -548,7 +548,7 @@ enum SandboxedRun {
 /// `$HOME` credentials readable does not qualify. Validations run worker code
 /// (its justfile, build.rs, tests) and must never run on the host, where they
 /// could reach the daemon socket (implicit local admin) and `$HOME` secrets.
-fn host_validation_isolated(spec: &thegn_core::sandbox::SandboxSpec) -> bool {
+pub(crate) fn host_validation_isolated(spec: &thegn_core::sandbox::SandboxSpec) -> bool {
     floor_refusal(crate::agent_run::AgentDispatch::Run(Some(spec.clone()))).is_none()
 }
 
@@ -811,7 +811,7 @@ fn child_automation(autonomy: Option<String>, rule: Option<String>) -> ChildAuto
 
 /// The sandbox floor, as `pipeline.start` applies it: only a sealed sandbox
 /// that met the floor passes.
-fn floor_refusal(gate: crate::agent_run::AgentDispatch) -> Option<String> {
+pub(crate) fn floor_refusal(gate: crate::agent_run::AgentDispatch) -> Option<String> {
     use crate::agent_run::AgentDispatch;
     match gate {
         AgentDispatch::Run(Some(spec)) => {
