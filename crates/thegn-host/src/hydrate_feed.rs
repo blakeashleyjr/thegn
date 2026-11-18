@@ -171,6 +171,10 @@ pub(crate) fn populate_notifications(
                 let (issue, stage, sha) =
                     thegn_core::approval_request::parse_source_ref(&n.source_ref)?;
                 let text = crate::daemon::approval_effects::describe(db, &issue, &stage, &sha);
+                let text = thegn_core::pipeline_report::display_clip(
+                    &thegn_core::pipeline_report::display_cell(&text),
+                    160,
+                );
                 Some((n.source_ref.clone(), text))
             })
             .collect();
