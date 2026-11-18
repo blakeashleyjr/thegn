@@ -356,6 +356,22 @@ part of the shipped `thegn` binary.
 
 ## Conventions & gotchas
 
+- **Sandbox + remote programme (2026-11).** Process rules for that programme's
+  lanes (schema numbers assigned at land time with one migration per wave,
+  openspec archiving per wave, the W2 freeze on `crates/thegn-core/src/sandbox*.rs`
+  and its `git diff --name-only` check, `Feature` variants added only by
+  WS00-P1-01, recipes only under `config/recipes/`, CI placement, the
+  config/catalog ratchet checklist, packaging) are in `CONTRIBUTING.md`
+  "Programme conventions (sandbox + remote, 2026-11)"; the plan and the
+  hardware/accounts checklist are in
+  `docs/superpowers/plans/2026-11-17-sandbox-remote-programme.md`. THE-791 (owner
+  decision 2026-10-13) is the parent record of that programme: headless and
+  untrusted launchers (queue and CI agents, autopilot, `thegn agent run`, merge
+  gates, regeneration, tests and discovery, repo lifecycle scripts, LSP, headless
+  tools, headless provider exec, untrusted plugins) are admitted through one
+  handle (`sandbox_admission`), while the user's own interactive panes keep the
+  `standard` default profile (owner decision 2026-11-05; `standard` is an
+  accident guard, not a boundary).
 - **Keep god-files from growing (guidance, no longer enforced).** The legacy
   oversized files (run.rs, config.rs, db.rs, agent.rs, chrome.rs, sandbox.rs,
   keymap.rs) are already large; don't add to them. Put new feature/Section key

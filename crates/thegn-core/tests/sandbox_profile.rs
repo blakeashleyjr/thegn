@@ -7,9 +7,7 @@
 use std::path::PathBuf;
 
 use thegn_core::config::{FileAccess, Network};
-use thegn_core::sandbox::{
-    Backend, SandboxLimits, SandboxSpec, container_name, container_name_with_profile,
-};
+use thegn_core::sandbox::{Backend, SandboxSpec, container_name, container_name_with_profile};
 
 #[path = "support/bounded_run.rs"]
 mod bounded_run;
@@ -112,38 +110,12 @@ fn h3_profile_switch_teardown() {
 
     let spec_work = SandboxSpec {
         backend: Backend::Podman,
-        placement: thegn_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from(worktree),
-        mounts: vec![],
-        env: vec![],
-        env_overrides: std::collections::HashMap::new(),
-        env_block: vec![],
         network: Network::None,
-        network_allow: vec![],
-        network_block: vec![],
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: vec![],
-        add_capabilities: vec![],
         file_access: FileAccess::None,
-        ports: vec![],
-        gpu: None,
-        limits: SandboxLimits::default(),
-        volumes: vec![],
-        compose: None,
-        build: None,
-        init_script: None,
-        devenv: false,
-        devenv_path: None,
         name: name_work.clone(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     };
     thegn_core::sandbox::ensure(&spec_work).expect("ensure work failed");
     assert!(container_running(&name_work));

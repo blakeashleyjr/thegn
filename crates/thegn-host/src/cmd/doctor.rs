@@ -1700,25 +1700,17 @@ fn probe_daemon_channel(cfg: &Config) -> Option<Option<String>> {
 fn channel_report(cfg: &Config) {
     let channel = crate::channel_state::current();
     outln!("Release channel");
-    outln!("  channel       {}", channel.as_str());
+    outln!("  channel          {}", channel.as_str());
     let daemon = probe_daemon_channel(cfg);
     outln!(
-        "  daemon        {}",
+        "  daemon           {}",
         daemon_channel_line(channel, daemon.as_ref().map(Option::as_deref))
     );
     for f in thegn_core::channel::Feature::ALL {
-        outln!(
-            "  {:<13} {}",
-            f.id(),
-            if f.allowed_in(channel) {
-                "enabled"
-            } else {
-                "disabled (dev-only)"
-            }
-        );
+        outln!("  {:<16} {}", f.id(), feature_state_line(f, channel));
     }
     outln!(
-        "  {:<13} {}",
+        "  {:<16} {}",
         "iroh reach",
         if thegn_svc::iroh_reach::BUILT {
             "built in (THEGN_IROH=1 enables it)"
@@ -1727,8 +1719,27 @@ fn channel_report(cfg: &Config) {
         }
     );
     if matches!(channel, thegn_core::channel::Channel::Stable) {
-        outln!("  note          experimental features need the dev build (`nix run .#dev`)");
-        outln!("                or THEGN_CHANNEL=dev. GitHub PR/issue viewing stays available.");
+        outln!("  note             experimental features need the dev build (`nix run .#dev`)");
+        outln!("                   or THEGN_CHANNEL=dev. GitHub PR/issue viewing stays available.");
+    }
+}
+
+/// One feature row's state text for the `doctor` release-channel table. The
+/// sandbox + remote programme features (WS00-P1-01) read "not yet implemented"
+/// until each owner item replaces the text.
+fn feature_state_line(
+    feature: thegn_core::channel::Feature,
+    channel: thegn_core::channel::Channel,
+) -> String {
+    let state = if feature.allowed_in(channel) {
+        "enabled"
+    } else {
+        "disabled (dev-only)"
+    };
+    if thegn_core::channel::Feature::PROGRAMME.contains(&feature) {
+        format!("{state}; experimental, not yet implemented")
+    } else {
+        state.to_string()
     }
 }
 
@@ -8016,6 +8027,36 @@ args = ["--verbose"]
     #[test]
     fn iroh_reach_json_key_is_present() {
         assert!(channel_json().get("iroh_reach").is_some());
+    }
+
+    #[test]
+    fn channel_json_lists_every_feature() {
+        let report = channel_json();
+        let features = report["features"].as_object().expect("features map");
+        assert_eq!(features.len(), thegn_core::channel::Feature::ALL.len());
+        for f in thegn_core::channel::Feature::ALL {
+            assert!(features.contains_key(f.id()), "missing {}", f.id());
+        }
+    }
+
+    #[test]
+    fn programme_features_read_not_yet_implemented() {
+        use thegn_core::channel::{Channel, Feature};
+        for f in Feature::PROGRAMME {
+            assert_eq!(
+                feature_state_line(f, Channel::Stable),
+                "disabled (dev-only); experimental, not yet implemented"
+            );
+            assert!(feature_state_line(f, Channel::Dev).starts_with("enabled;"));
+        }
+        assert_eq!(
+            feature_state_line(Feature::Remote, Channel::Stable),
+            "disabled (dev-only)"
+        );
+        assert_eq!(
+            feature_state_line(Feature::Observe, Channel::Stable),
+            "enabled"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use thegn_core::config::{FileAccess, Network};
-use thegn_core::sandbox::{Backend, SandboxLimits, SandboxSpec, ensure, enter_argv};
+use thegn_core::sandbox::{Backend, SandboxSpec, ensure, enter_argv};
 
 #[path = "support/bounded_run.rs"]
 mod bounded_run;
@@ -27,38 +27,12 @@ fn force_rm(name: &str) {
 fn base_spec(name: &str) -> SandboxSpec {
     SandboxSpec {
         backend: Backend::Podman,
-        placement: thegn_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from("/tmp/tg-e2e-cred"),
-        mounts: vec![],
-        env: vec![],
-        env_overrides: std::collections::HashMap::new(),
-        env_block: vec![],
         network: Network::None,
-        network_allow: vec![],
-        network_block: vec![],
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: vec![],
-        add_capabilities: vec![],
         file_access: FileAccess::None,
-        ports: vec![],
-        gpu: None,
-        limits: SandboxLimits::default(),
-        volumes: vec![],
-        compose: None,
-        build: None,
-        init_script: None,
-        devenv: false,
-        devenv_path: None,
         name: name.into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 

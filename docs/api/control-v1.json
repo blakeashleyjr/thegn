@@ -1810,6 +1810,13 @@
             "null"
           ]
         },
+        "honoured": {
+          "description": "Security-relevant `OpenSpec` fields the daemon applied to this session's spawn (the open reply only). Empty, and so never serialised, until a field's owner fills it; see [`open_fields`].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "id": {
           "type": "string"
         },

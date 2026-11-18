@@ -398,7 +398,6 @@ fn test_win_native_sandboxes_do_not_parse_as_oci() {
 fn spec(backend: Backend) -> SandboxSpec {
     SandboxSpec {
         backend,
-        placement: Placement::Local,
         image: Some("img:latest".into()),
         worktree: PathBuf::from("/wt/feat"),
         mounts: vec![
@@ -416,18 +415,7 @@ fn spec(backend: Backend) -> SandboxSpec {
             },
         ],
         env: vec![("GH_TOKEN".into(), "abc".into())],
-        env_overrides: std::collections::HashMap::new(),
-        env_block: Vec::new(),
-        network: Network::Nat,
-        network_allow: Vec::new(),
-        network_block: Vec::new(),
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: Vec::new(),
-        add_capabilities: Vec::new(),
         ports: vec!["8080:8080".into()],
-        gpu: None,
         // Disable CPU capping so argv-shape assertions are host-independent
         // (the aggregate cap is on-by-default and would scope-wrap on a host
         // with cgroup delegation); capping itself is tested in sandbox_cpucap.
@@ -435,20 +423,9 @@ fn spec(backend: Backend) -> SandboxSpec {
             cpu_total: Some("off".into()),
             ..SandboxLimits::default()
         },
-        volumes: vec![],
-        compose: None,
-        build: None,
-        init_script: None,
         file_access: FileAccess::Worktree,
-        devenv: false,
-        devenv_path: None,
         name: "thegn-repo-feat".into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 
@@ -7117,4 +7094,131 @@ fn cached_git_identity_reuses_a_fresh_entry() {
     assert_eq!(first.name.as_deref(), Some("Cache Probe"));
     assert_eq!(first, second);
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[test]
+fn default_spec_is_inert() {
+    let spec = SandboxSpec::default();
+    assert_eq!(spec.backend, Backend::None);
+    assert!(spec.placement.is_local());
+    assert!(spec.image.is_none());
+    assert!(spec.worktree.as_os_str().is_empty());
+    assert!(spec.mounts.is_empty());
+    assert!(spec.env.is_empty());
+    assert!(spec.env_overrides.is_empty());
+    assert!(spec.env_block.is_empty());
+    assert_eq!(spec.network, Network::default());
+    assert!(spec.network_allow.is_empty());
+    assert!(spec.network_block.is_empty());
+    assert!(!spec.read_only_root);
+    assert!(!spec.no_new_privileges);
+    assert!(spec.pids_limit.is_none());
+    assert!(spec.drop_capabilities.is_empty());
+    assert!(spec.add_capabilities.is_empty(), "no capability is added");
+    assert_eq!(spec.file_access, FileAccess::default());
+    assert!(spec.ports.is_empty());
+    assert!(spec.gpu.is_none());
+    assert_eq!(spec.limits, SandboxLimits::default());
+    assert!(spec.volumes.is_empty());
+    assert!(spec.compose.is_none());
+    assert!(spec.build.is_none());
+    assert!(spec.init_script.is_none());
+    assert!(!spec.devenv);
+    assert!(spec.devenv_path.is_none());
+    assert!(spec.name.is_empty());
+    assert!(spec.vpn.is_none());
+    assert!(spec.oci_host.is_none());
+    assert!(spec.oci_runtime.is_none());
+    assert!(!spec.daemon_persistent);
+    assert!(spec.seal_home.is_none());
+    assert!(spec.volume_owners.is_empty());
+    assert!(spec.egress.is_none(), "no egress plan until WS04-P2-08");
+}
+
+/// Every `SandboxSpec { … }` struct-literal body in `src` (function
+/// signatures, the struct definition and `impl` headers are skipped).
+fn spec_literal_bodies(src: &str) -> Vec<&str> {
+    let mut bodies = Vec::new();
+    let mut from = 0;
+    while let Some(found) = src[from..].find("SandboxSpec {") {
+        let head = from + found;
+        let open = head + "SandboxSpec ".len();
+        from = open + 1;
+        let before = src[..head]
+            .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+            .trim_end();
+        if ["->", "struct", "for", "impl"]
+            .iter()
+            .any(|kw| before.ends_with(kw))
+        {
+            continue;
+        }
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        bodies.push(&src[open + 1..open + i]);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    bodies
+}
+
+/// WS00-P1-02: production resolution never builds a spec from
+/// `SandboxSpec::default()` or struct-update syntax, so every new security
+/// field forces an explicit decision at each production constructor.
+#[test]
+fn default_spec_not_used_in_resolution() {
+    fn production(source: &'static str) -> &'static str {
+        source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap_or(source)
+    }
+    // `sandbox.rs` keeps its tests in `sandbox_tests.rs`, so its whole source
+    // is production code apart from small `#[cfg(test)]` helpers.
+    let sandbox = include_str!("sandbox.rs");
+    assert!(
+        !spec_literal_bodies(sandbox).is_empty(),
+        "the scan must see sandbox.rs's resolution literal"
+    );
+    let sources = [
+        ("sandbox.rs", sandbox),
+        ("host.rs", production(include_str!("host.rs"))),
+        (
+            "sandbox_floor.rs",
+            production(include_str!("sandbox_floor.rs")),
+        ),
+        (
+            "sandbox_preflight.rs",
+            production(include_str!("sandbox_preflight.rs")),
+        ),
+        (
+            "sandbox_tmp_hint.rs",
+            production(include_str!("sandbox_tmp_hint.rs")),
+        ),
+        (
+            "sandbox_volume_owner.rs",
+            production(include_str!("sandbox_volume_owner.rs")),
+        ),
+    ];
+    for (name, source) in sources {
+        assert!(
+            !source.contains("SandboxSpec::default()"),
+            "{name}: production code must not build a default SandboxSpec"
+        );
+        for body in spec_literal_bodies(source) {
+            assert!(
+                !body.lines().any(|line| line.trim_start().starts_with("..")),
+                "{name}: a production SandboxSpec literal uses struct-update syntax"
+            );
+        }
+    }
 }

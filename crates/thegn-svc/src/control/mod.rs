@@ -32,6 +32,7 @@ pub mod grpc;
 pub mod http;
 pub mod http_ci;
 pub mod http_lead;
+pub mod open_fields;
 pub mod route_docs;
 pub mod route_types;
 pub mod routes;
@@ -167,6 +168,11 @@ pub struct SessionInfo {
     /// has produced none yet, or when the daemon predates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_unix_secs: Option<i64>,
+    /// Security-relevant `OpenSpec` fields the daemon applied to this session's
+    /// spawn (the open reply only). Empty, and so never serialised, until a
+    /// field's owner fills it; see [`open_fields`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub honoured: Vec<String>,
 }
 
 /// What to run when opening a fresh session.
@@ -241,6 +247,16 @@ pub fn lead_open_shape(spec: &OpenSpec) -> thegn_core::lead_confine::OpenShape<'
         }),
         already_capped: spec.already_capped,
         automation_origin: spec.automation_origin.is_some(),
+    }
+}
+
+impl OpenSpec {
+    /// The security-relevant fields this spec sets, which the daemon must echo
+    /// in the open reply's `honoured` ([`open_fields`], WS00-P1-11). Always
+    /// empty until the first such field lands; its owner (WS02-P4-15,
+    /// WS04-P2-09, WS09-P5-05) adds the mapping here.
+    pub fn security_fields(&self) -> Vec<open_fields::OpenField> {
+        Vec::new()
     }
 }
 
