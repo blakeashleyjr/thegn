@@ -165,7 +165,8 @@ pub struct LeadEntries<'a> {
     pub scopes_csv: &'a str,
     /// `127.0.0.1:<port>` of the daemon's Lead listener.
     pub control_addr: &'a str,
-    /// The scoped bearer token (the only secret in the file).
+    /// The scoped bearer token (the only secret in the file; carried by the
+    /// serve and hub entries).
     pub control_token: &'a str,
     /// Audit-only caller label (`THEGN_CALLER`); never used for authorization.
     pub caller: &'a str,
@@ -177,8 +178,9 @@ pub struct LeadEntries<'a> {
 ///
 /// Unlike [`proxy_entry`] (written into a user's agent settings, so never any
 /// `env`), this goes to a private owner-only file only the Lead's agent reads,
-/// and its single secret is the scoped Lead token on the `thegn` entry. The hub
-/// entry is argv only: upstream secrets still resolve at spawn in the hub.
+/// and its single secret is the scoped Lead token, on the `thegn` entry and the
+/// hub entry. The hub fetches its upstreams' env from the daemon with that
+/// token (`mcp_proxy.profile_env`).
 pub fn lead_entries(e: &LeadEntries<'_>) -> Value {
     let scopes = if e.scopes_csv.is_empty() {
         "none"
@@ -201,11 +203,19 @@ pub fn lead_entries(e: &LeadEntries<'_>) -> Value {
         }),
     );
     if let Some(profile) = e.hub_profile {
+        // The profile's server secrets come from the daemon, bound to this
+        // Lead token (`mcp_proxy.profile_env`, b155 THE-2222): the hub holds
+        // the same scoped credential as the serve entry, never the secrets.
         servers.insert(
             LEAD_HUB_KEY.to_string(),
             json!({
                 "command": e.command,
                 "args": ["mcp", "proxy", "--profile", profile],
+                "env": {
+                    "THEGN_CONTROL_ADDR": e.control_addr,
+                    "THEGN_CONTROL_TOKEN": e.control_token,
+                    "THEGN_CALLER": e.caller,
+                },
                 MARKER_KEY: true,
             }),
         );
@@ -255,9 +265,10 @@ mod tests {
         assert_eq!(env["THEGN_CONTROL_TOKEN"], "tgc_secret");
         let hub = &servers[LEAD_HUB_KEY];
         assert_eq!(hub["args"], json!(["mcp", "proxy", "--profile", "lead"]));
-        assert!(hub.get("env").is_none(), "the hub entry is secret-free");
-        // The token appears exactly once in the whole document.
-        assert_eq!(doc.to_string().matches("tgc_secret").count(), 1);
+        // The hub carries the same scoped Lead token (it fetches the
+        // profile's env from the daemon), and nothing else secret.
+        assert_eq!(hub["env"], serve["env"]);
+        assert_eq!(doc.to_string().matches("tgc_secret").count(), 2);
     }
 
     #[test]
