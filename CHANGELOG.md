@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `just dev` starts a separate dev instance from the checkout (own state, runtime, `THEGN_DIR` and `~/.config/thegn-dev`), and `just dev-env` prints its environment. The new help page `two-instances` explains the setup and what the two instances still share.
+
 ## [0.1.0-alpha.95] — 2026-11-17
 
 ### Added

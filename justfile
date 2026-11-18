@@ -1137,6 +1137,46 @@ start-dev name="dev": build
       "THEGN_CHANNEL=dev" \
       {{bin}}
 
+# Start the DEV instance: an isolated thegn built from this checkout, beside the
+# stable one. Own state, runtime, THEGN_DIR and config dir (~/.config/thegn-dev,
+# which you must seed yourself; secrets are never copied). See `thegn help two-instances`.
+dev: build
+    #!/usr/bin/env sh
+    set -eu
+    home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
+    [ -n "$home" ] || home="$HOME"
+    root="$home/.thegn-dev"; state="$root/state"; run="$root/run"; cfg="$home/.config/thegn-dev"
+    if [ ! -d "$cfg" ]; then
+      echo "just dev: $cfg does not exist; seed it first: cp -r '$home/.config/thegn' '$cfg' (review it for secrets)" >&2
+      exit 1
+    fi
+    pidfile="$run/thegn.pid"; mkdir -p "$state" "$run" "$root/home"
+    . "$PWD/test/lib/instance.sh"; INST_STATE="$state" inst_restart "$pidfile" $$ || exit 1
+    exec env \
+      "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
+      "XDG_STATE_HOME=$state" \
+      "XDG_RUNTIME_DIR=$run" \
+      "THEGN_DIR=$root/home" \
+      "THEGN_CONFIG_DIR=$cfg" \
+      "THEGN_NO_MIGRATE=1" \
+      "THEGN_CHANNEL=dev" \
+      "$PWD/{{bin}}"
+
+# Print the dev instance's environment as `export` lines (no side effects):
+# `eval "$(just dev-env)"` targets the dev instance with CLI calls.
+dev-env:
+    #!/usr/bin/env sh
+    set -eu
+    home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
+    [ -n "$home" ] || home="$HOME"
+    root="$home/.thegn-dev"
+    printf "export XDG_STATE_HOME='%s'\n" "$root/state"
+    printf "export XDG_RUNTIME_DIR='%s'\n" "$root/run"
+    printf "export THEGN_DIR='%s'\n" "$root/home"
+    printf "export THEGN_CONFIG_DIR='%s'\n" "$home/.config/thegn-dev"
+    printf "export THEGN_CHANNEL='%s'\n" dev
+    printf "export THEGN_BIN='%s'\n" "$PWD/{{bin}}"
+
 # Headless terminal-capability matrix: run `thegn doctor` under a set of
 # degraded environments (each a clean `env -i`, so the outer terminal's
 # COLORTERM / TERM_PROGRAM can't leak in and mask a degradation) and assert the
