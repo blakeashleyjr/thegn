@@ -238,7 +238,9 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                       to the server's resolved worktree when `worktree` is omitted. \
                       Additive: it never removes queue entries. Git-scoped \
                       (`--scopes git`; the narrow `merge_add` grant is for worktree-bound \
-                      route tokens and does not enable this tool); requires a running daemon.",
+                      route tokens and does not enable this tool); requires a running daemon. \
+                      Refused for a Lead: it lands only through a rule's land step or an owner \
+                      approval.",
         args: &[ArgSpec {
             name: "worktree",
             kind: ArgKind::String,
@@ -1252,7 +1254,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
     },
     StateToolSpec {
         cap: "merge.drain",
-        description: "Start the merge-queue drain for a worktree's repository. Git-scoped (`--scopes git`; the narrow `merge_add` grant is for worktree-bound route tokens and does not enable this tool); requires a running daemon.",
+        description: "Start the merge-queue drain for a worktree's repository. Git-scoped (`--scopes git`; the narrow `merge_add` grant is for worktree-bound route tokens and does not enable this tool); requires a running daemon. Refused for a Lead: it lands only through a rule's land step or an owner approval.",
         args: &[ArgSpec {
             name: "worktree",
             kind: ArgKind::String,
@@ -2923,6 +2925,30 @@ mod tests {
                 .iter()
                 .all(|e| e["name"].as_str() != Some("approvals_resolve"))
         );
+    }
+
+    #[test]
+    fn b155_spine_caps_are_never_mcp_tools() {
+        // The phone's answer, the operator's halt and the profile env are
+        // HTTP + CLI only, on any scope.
+        let r = StateRouter::new(all_caps(), |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        for cap in [
+            "approvals.redeem",
+            "automations.halt",
+            "mcp_proxy.profile_env",
+        ] {
+            assert!(!MCP_STATE_CAPS.contains(&cap), "{cap}");
+            assert!(STATE_TOOLS.iter().all(|t| t.cap != cap), "{cap}");
+            let tool = cap.replace('.', "_");
+            assert!(r.call(&tool, &json!({})).is_none(), "{cap}");
+            assert!(
+                entries
+                    .iter()
+                    .all(|e| e["name"].as_str() != Some(tool.as_str())),
+                "{cap}"
+            );
+        }
     }
 
     #[test]

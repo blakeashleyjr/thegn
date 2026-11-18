@@ -2529,6 +2529,66 @@ pub(crate) fn verify_v112_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v113: lane rule id, automation proposals, approval push nonces (THE-2200/2202).
+/// Additive: `agent_dispatches.automation_rule` is NULL for manual dispatches;
+/// both tables are written only by the daemon.
+pub(crate) fn migrate_v113(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "automation_rule") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN automation_rule TEXT",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automation_proposals (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           approval_issue TEXT NOT NULL,
+           approval_stage TEXT NOT NULL,
+           approval_sha TEXT NOT NULL,
+           rule_id TEXT NOT NULL,
+           repo_root TEXT NOT NULL,
+           issue_id TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           account TEXT NOT NULL,
+           stage TEXT NOT NULL,
+           base_sha TEXT NOT NULL,
+           created_at_ms INTEGER NOT NULL,
+           expires_at_ms INTEGER NOT NULL,
+           state TEXT NOT NULL DEFAULT 'pending'
+             CHECK (state IN ('pending','started','rejected','expired','failed')),
+           UNIQUE (approval_issue, approval_stage, approval_sha)
+         );
+         CREATE TABLE IF NOT EXISTS approval_push_nonces (
+           nonce_hash TEXT PRIMARY KEY,
+           issue_id TEXT NOT NULL,
+           stage TEXT NOT NULL,
+           commit_sha TEXT NOT NULL,
+           created_at_ms INTEGER NOT NULL,
+           expires_at_ms INTEGER NOT NULL,
+           used_at_ms INTEGER
+         );",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v113_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "automation_rule") {
+        bail!("schema v113 migration did not add agent_dispatches.automation_rule");
+    }
+    conn.prepare(
+        "SELECT id, approval_issue, approval_stage, approval_sha, rule_id, repo_root, issue_id, \
+         provider, account, stage, base_sha, created_at_ms, expires_at_ms, state \
+         FROM automation_proposals LIMIT 0",
+    )
+    .map_err(|e| anyhow::anyhow!("schema v113 incomplete: automation_proposals unusable ({e})"))?;
+    conn.prepare(
+        "SELECT nonce_hash, issue_id, stage, commit_sha, created_at_ms, expires_at_ms, used_at_ms \
+         FROM approval_push_nonces LIMIT 0",
+    )
+    .map_err(|e| anyhow::anyhow!("schema v113 incomplete: approval_push_nonces unusable ({e})"))?;
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4764,7 +4824,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 112);
+        assert_eq!(version, 113);
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, issue_id TEXT);
@@ -4809,6 +4869,62 @@ mod tests {
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
         super::verify_v112_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v113_adds_rule_column_and_tables_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v113_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, issue_id TEXT);
+             INSERT INTO agent_dispatches (id, issue_id) VALUES (1, 'kept');",
+        )
+        .unwrap();
+        assert!(super::verify_v113_schema(&conn).is_err());
+        super::migrate_v113(&conn).unwrap();
+        super::migrate_v113(&conn).unwrap();
+        super::verify_v113_schema(&conn).unwrap();
+        let (kept, rule): (String, Option<String>) = conn
+            .query_row(
+                "SELECT issue_id, automation_rule FROM agent_dispatches WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, "kept", "v113 is additive");
+        assert_eq!(rule, None, "manual rows carry no rule");
+        let bad_state = conn.execute(
+            "INSERT INTO automation_proposals (approval_issue, approval_stage, approval_sha, rule_id, \
+             repo_root, issue_id, provider, account, stage, base_sha, created_at_ms, expires_at_ms, state) \
+             VALUES ('i','start.s','sha','r','/r','i','p','a','s','b',1,2,'bogus')",
+            [],
+        );
+        assert!(bad_state.is_err(), "state is CHECK-constrained");
+    }
+
+    #[test]
+    fn v113_upgrades_a_real_v112_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v112.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE agent_dispatches DROP COLUMN automation_rule;
+                     DROP TABLE automation_proposals;
+                     DROP TABLE approval_push_nonces;
+                     PRAGMA user_version=112;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v113_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

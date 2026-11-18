@@ -65,6 +65,60 @@ The inbox lives in the pane daemon (so a phone command does not need an
 attached UI); it is unavailable when `[daemon] enabled = false`. See
 [[daemon-and-sessions]].
 
+## Answering approvals from your phone
+
+When push is configured, every new approval request (a lane waiting to
+land, a proposed automation start, a rule asking to be armed, an outward
+action) is pushed with the title **thegn approval**. The body is the
+daemon's own trusted description of what you are approving (never the
+requester's free-text reason) and a reply line. Phone approval needs a
+token-protected topic: when any push topic has no `env:`/`file:` token, no
+approval is pushed and you answer in the panel or CLI instead.
+
+The reply line reads:
+
+```text
+Reply: approvals.redeem {"nonce":"<32 hex>","decision":"approve|reject"}
+```
+
+The nonce is 128 bits of OS randomness, single use, and valid for 24
+hours. The daemon stores only its sha256, bound to that one request.
+
+`approvals.resolve` is Admin, so the inbox refuses it unconditionally. The
+phone answers through `approvals.redeem` instead, a Write capability that
+only resolves the request its nonce was minted for. To enable it, add it to
+the allowlist and give the inbox a `write` ceiling:
+
+```toml
+[notifications.push.inbox]
+enabled = true
+inbox_secret = "env:THEGN_INBOX_SECRET"
+allow = ["approvals.redeem"]
+scopes = ["read", "write"]
+```
+
+The phone then publishes a signed envelope to the inbox topic:
+
+```text
+{ "v": 1, "id": "<unique>", "ts": <unix secs>, "cap": "approvals.redeem",
+  "params": { "decision": "approve", "nonce": "<32 hex>" },
+  "mac": "<hex hmac-sha256>" }
+```
+
+The MAC is the usual inbox MAC: HMAC-SHA256 under `inbox_secret` over
+`v\nid\nts\ncap\n<params>`, with `params` as compact, sorted-key JSON.
+`params` takes exactly `nonce` and `decision`; any other field is refused.
+
+An answer needs both halves: the inbox secret (to sign) and the nonce (only
+in the push topic). An unknown, used or expired nonce is refused with
+"unknown, used or expired approval code", so a replayed envelope cannot
+resolve twice even across a daemon restart. The decision is recorded with
+approver `push` and has the same effect as `approvals.resolve`. Agents
+cannot redeem: the capability is never exposed over MCP, and every token
+caller over HTTP, the Lead included, is refused. The only remote path is
+the signed inbox envelope. Never let an agent read the inbox secret: thegn
+hides `env:` and `file:` refs for it and the push tokens from the Lead.
+
 ## A terminal on your phone (mosh)
 
 For a full interactive session, use a mosh client app (Blink, Termius) to

@@ -12,6 +12,11 @@
 //! started, plus a probe of the queue's own merge claims so a drain started
 //! elsewhere (the CLI, another daemon) is refused too.
 //!
+//! The stage executor's unattended land (b155) starts the same drain through
+//! [`start_for_repo`] with [`DrainEnv::Scrubbed`]: the gate runs
+//! worker-written code, so agent sockets and every forge, tracker and model
+//! credential ([`SCRUBBED_ENV`]) are removed from the child's environment.
+//!
 //! [`wrap_background_argv`]: thegn_core::sandbox_cpucap::wrap_background_argv
 
 use super::{JsonResult, decode, encode};
@@ -23,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use thegn_core::db::Db;
 use thegn_core::store::{MergeClaimView, NotificationStore, WorkspaceStore, WorktreeAuxStore};
-use thegn_svc::control::ControlError;
+use thegn_svc::control::{ControlError, ControlResult};
 
 /// Repos with a drain this daemon started and has not yet reaped.
 static DRAINS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
@@ -148,22 +153,72 @@ pub(crate) async fn drain(svc: &DaemonService, req: serde_json::Value) -> JsonRe
 
     let db = svc.db.clone();
     let events = svc.events.clone();
-    let (repo, pid) = tokio::task::spawn_blocking(move || start(db, events, worktree))
-        .await
-        .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge.drain task join: {e}")))??;
+    let (repo, pid) = tokio::task::spawn_blocking(move || {
+        let repo = crate::merge_ops::repo_root_of(Path::new(&worktree)).ok_or_else(|| {
+            ControlError::FailedPrecondition(format!("{worktree}: not inside a git repository"))
+        })?;
+        let pid = start(db, events, &repo, worktree, DrainEnv::Inherit)?;
+        Ok::<_, ControlError>((repo, pid))
+    })
+    .await
+    .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge.drain task join: {e}")))??;
     encode(&json!({ "started": true, "repo": repo.to_string_lossy(), "pid": pid }))
 }
 
-/// Off the event loop: resolve the repo, take the single-flight slot, probe
-/// foreign claims, and hand the slot to the owner thread that spawns the child.
+/// The drain child's environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainEnv {
+    /// The daemon's environment, as `merge.drain` always ran.
+    Inherit,
+    /// The daemon's environment minus [`SCRUBBED_ENV`]: the stage executor's
+    /// unattended land (b155), whose gate runs worker-written code.
+    Scrubbed,
+}
+
+/// What a scrubbed drain child never sees: agent/keyring sockets, forge and
+/// tracker tokens, and model keys. The land is local only (it never pushes),
+/// so none of these is needed.
+pub(crate) const SCRUBBED_ENV: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "GPG_AGENT_INFO",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "GLAB_TOKEN",
+    "LINEAR_API_KEY",
+    "JIRA_API_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+];
+
+/// Start the drain for `repo_root` from inside the daemon (the stage
+/// executor's land). Blocking (it probes the queue's claims, which may run
+/// git): call it off the event loop. Same single-flight as `merge.drain`.
+pub(crate) fn start_for_repo(
+    svc: &DaemonService,
+    repo_root: &Path,
+    env: DrainEnv,
+) -> ControlResult<u32> {
+    start(
+        svc.db.clone(),
+        svc.events.clone(),
+        repo_root,
+        repo_root.to_string_lossy().into_owned(),
+        env,
+    )
+}
+
+/// Off the event loop: take the repo's single-flight slot, probe foreign
+/// claims, and hand the slot to the owner thread that spawns the child.
 fn start(
     db: crate::daemon::service::SharedDb,
     events: super::feed::EventsTx,
+    repo: &Path,
     worktree: String,
-) -> Result<(PathBuf, u32), ControlError> {
-    let repo = crate::merge_ops::repo_root_of(Path::new(&worktree)).ok_or_else(|| {
-        ControlError::FailedPrecondition(format!("{worktree}: not inside a git repository"))
-    })?;
+    env: DrainEnv,
+) -> Result<u32, ControlError> {
+    let repo = repo.to_path_buf();
     let guard = DrainGuard::claim(&DRAINS, &repo).map_err(ControlError::Conflict)?;
     // A fresh handle (like `merge_add`): `rows_for_repo` may run git, which
     // must not happen under the daemon's shared DB lock.
@@ -200,11 +255,11 @@ fn start(
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         // Held for the whole run; released on every path, panic included.
         let _guard = guard;
-        own_drain(&db, &events, &owner_repo, &worktree, argv, &tx);
+        own_drain(&db, &events, &owner_repo, &worktree, argv, env, &tx);
     })
     .map_err(|e| ControlError::Unavailable(format!("merge.drain thread: {e}")))?;
     match rx.recv() {
-        Ok(Ok(pid)) => Ok((repo, pid)),
+        Ok(Ok(pid)) => Ok(pid),
         Ok(Err(error)) => Err(ControlError::Internal(anyhow::anyhow!(
             "merge drain failed to start: {error}"
         ))),
@@ -212,6 +267,25 @@ fn start(
             "merge drain owner thread exited before starting the child"
         ))),
     }
+}
+
+/// The drain child's command: the (already capped) argv, run in the repo,
+/// stdin closed, stdout piped for the report, with [`SCRUBBED_ENV`] removed
+/// when `env` is [`DrainEnv::Scrubbed`].
+fn drain_command(argv: &[String], repo: &Path, env: DrainEnv) -> std::process::Command {
+    let mut command = std::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    if env == DrainEnv::Scrubbed {
+        for var in SCRUBBED_ENV {
+            command.env_remove(var);
+        }
+    }
+    command
 }
 
 /// The owner thread: spawn the capped child, report its pid, read its report,
@@ -222,16 +296,11 @@ fn own_drain(
     repo: &Path,
     worktree: &str,
     argv: Vec<String>,
+    env: DrainEnv,
     tx: &std::sync::mpsc::SyncSender<Result<u32, String>>,
 ) {
     let argv = thegn_core::sandbox_cpucap::wrap_background_argv(argv);
-    let mut command = std::process::Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+    let mut command = drain_command(&argv, repo, env);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -438,6 +507,35 @@ mod tests {
         assert!(!registered_local(&rows, "/elsewhere", identity));
         // A remote row never confines a local path, even on an exact match.
         assert!(!registered_local(&rows, "/remote/wt", identity));
+    }
+
+    #[test]
+    fn a_scrubbed_drain_removes_every_listed_variable() {
+        let argv = vec!["thegn".to_string(), "merge".into(), "drain".into()];
+        let scrubbed = drain_command(&argv, Path::new("/repo"), DrainEnv::Scrubbed);
+        let removed: Vec<_> = scrubbed
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for var in SCRUBBED_ENV {
+            assert!(removed.iter().any(|k| k == var), "{var} not removed");
+        }
+        for must in [
+            "SSH_AUTH_SOCK",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "LINEAR_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(SCRUBBED_ENV.contains(&must), "{must}");
+        }
+        assert_eq!(scrubbed.get_program(), "thegn");
+        assert_eq!(scrubbed.get_current_dir(), Some(Path::new("/repo")));
+
+        let inherit = drain_command(&argv, Path::new("/repo"), DrainEnv::Inherit);
+        assert_eq!(inherit.get_envs().count(), 0, "inherit touches nothing");
     }
 
     #[test]

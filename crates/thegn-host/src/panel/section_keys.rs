@@ -142,9 +142,10 @@ const ISSUES: &[SectionKey] = &[
 ];
 const NOTIFICATIONS: &[SectionKey] = &[
     nav("↵", "jump"),
-    k(' ', "space", "expand"),
     // `x`, not `r` — the old hint advertised a key that did nothing. Labels
     // match the section body's own hint row: `x` marks read, `d` DELETES.
+    k('y', "y", "approve"),
+    k('n', "n", "reject"),
     k('x', "x", "read"),
     k('d', "d", "delete"),
     // `a` and `g` are handled here but were never advertised. `a` is the only
@@ -152,10 +153,9 @@ const NOTIFICATIONS: &[SectionKey] = &[
     // which are derived from the PR/CI cache rather than an inbox row), so
     // leaving it hidden made the `✋` badge look unclearable; `g` is the toggle
     // between this repo and every worktree, so without it the default scoping is
-    // invisible. The strip fits ~6, so they displace `A` (show-read) and `/`
-    // (search) — both still work, and both are conventions carried by other
-    // sections' strips.
-    danger('a', "a", "clear all"),
+    // invisible. The strip is capped at 6, so `space` (expand), `a` (clear
+    // all), `A` (show-read) and `/` (search) are left off — all still work, and
+    // the in-body hint row lists them.
     k('g', "g", "scope"),
 ];
 const JOBS: &[SectionKey] = &[
@@ -955,5 +955,13 @@ mod tests {
             additions.is_empty() && stale.is_empty(),
             "panel key reachability debt changed. New violations: {additions:?}; stale entries (delete them): {stale:?}. Move the section key off the claimed chord, or drop the hint."
         );
+    }
+
+    #[test]
+    fn notifications_hints_advertise_approve_and_reject() {
+        let keys: Vec<(Option<char>, &str)> =
+            NOTIFICATIONS.iter().map(|k| (k.key, k.label)).collect();
+        assert!(keys.contains(&(Some('y'), "approve")));
+        assert!(keys.contains(&(Some('n'), "reject")));
     }
 }

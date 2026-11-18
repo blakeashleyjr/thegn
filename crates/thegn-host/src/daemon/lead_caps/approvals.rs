@@ -16,8 +16,10 @@ use thegn_core::approval_request::{
 use thegn_core::db::Db;
 use thegn_core::notification::{Notification, NotificationKind};
 use thegn_core::pipeline_approval::{Approval, state_for};
+use thegn_core::push_approval;
 use thegn_core::store::NotificationStore;
 use thegn_svc::control::ControlError;
+use thegn_svc::push::{PushMessage, PushProvider};
 
 /// The notification kind every request row carries.
 const KIND: &str = "agent_attention";
@@ -83,19 +85,209 @@ pub(crate) async fn list(svc: &DaemonService, req: serde_json::Value) -> JsonRes
 pub(crate) async fn request(svc: &DaemonService, req: serde_json::Value) -> JsonResult {
     let request: ApprovalRequest = decode(req)?;
     approval_request::validate_request(&request).map_err(ControlError::InvalidArgument)?;
-    let (requested, id) = svc.with_db(move |db| request_in(db, &request)).await?;
+    if matches!(
+        thegn_core::approval_digest::effect_kind(&request.issue_id, &request.stage),
+        thegn_core::approval_digest::EffectKind::Lane
+    ) {
+        require_current_lane_head(svc, &request).await?;
+    }
+    let stored = request.clone();
+    let (requested, id) = svc.with_db(move |db| request_in(db, &stored)).await?;
     if requested {
         super::feed::notification(&svc.events, id);
     }
+    after_request(svc, &request, requested).await;
     encode(&json!({ "requested": requested, "notification_id": id }))
+}
+
+/// A full (SHA-1 or SHA-256) hex commit id, never an abbreviation.
+fn full_commit_id(sha: &str) -> bool {
+    let s = sha.trim();
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A caller-raised land request must name the full current HEAD of a roster
+/// lane at that stage, so the owner never approves a sha a worker can grind a
+/// prefix collision against.
+async fn require_current_lane_head(
+    svc: &DaemonService,
+    request: &ApprovalRequest,
+) -> Result<(), ControlError> {
+    let refuse = || {
+        ControlError::FailedPrecondition(
+            "a land approval request must name the full current head of a lane at that stage"
+                .into(),
+        )
+    };
+    if !full_commit_id(&request.commit_sha) {
+        return Err(refuse());
+    }
+    let (issue, stage) = (request.issue_id.clone(), request.stage.clone());
+    let paths: Vec<String> = svc
+        .with_db(move |db| {
+            Ok(db
+                .list_dispatches()?
+                .into_iter()
+                .filter(|row| row.issue_id == issue && row.stage.as_deref() == Some(stage.as_str()))
+                .map(|row| row.worktree_path)
+                .collect())
+        })
+        .await?;
+    if paths.is_empty() {
+        return Err(refuse());
+    }
+    let heads = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(p))
+                    .git_text(&["rev-parse", "HEAD"])
+                    .map(|s| s.trim().to_owned())
+                    .map_err(|_| ())
+            })
+            .collect::<Result<Vec<String>, ()>>()
+    })
+    .await
+    .map_err(|_| refuse())?
+    .map_err(|_| refuse())?;
+    let want = request.commit_sha.trim();
+    if heads.iter().any(|h| h.eq_ignore_ascii_case(want)) {
+        Ok(())
+    } else {
+        Err(refuse())
+    }
+}
+
+/// Raise an approval from inside the daemon (the stage executor's land ask,
+/// a proposal, a rule arming, an outward call; b155). Validates, records the
+/// request once, publishes it, then runs [`after_request`]. Returns
+/// `(inserted, notification id)`.
+#[allow(dead_code, reason = "called by b155 lanes 2, 3 and 4")]
+pub(crate) async fn raise(
+    svc: &DaemonService,
+    req: ApprovalRequest,
+) -> anyhow::Result<(bool, i64)> {
+    approval_request::validate_request(&req).map_err(anyhow::Error::msg)?;
+    let stored = req.clone();
+    let (inserted, id) = svc
+        .with_db(move |db| request_in(db, &stored))
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if inserted {
+        super::feed::notification(&svc.events, id);
+    }
+    after_request(svc, &req, inserted).await;
+    Ok((inserted, id))
+}
+
+/// How long a pushed nonce can redeem its approval.
+const PUSH_NONCE_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+/// The push title every approval push carries.
+const PUSH_TITLE: &str = "thegn approval";
+
+/// What happens after a request is recorded (6a): when the row is new and
+/// `[notifications.push]` is configured, mint a 128-bit single-use nonce,
+/// store its hash bound to the request triple for 24 h, and push the TRUSTED
+/// description (never the request's `reason`) plus the reply line. Best-effort
+/// throughout: the request itself is already recorded.
+pub(crate) async fn after_request(svc: &DaemonService, req: &ApprovalRequest, inserted: bool) {
+    if !inserted {
+        return;
+    }
+    let Some(provider) = thegn_svc::push::provider_for(&svc.config.notifications.push) else {
+        return;
+    };
+    // An unauthenticated ntfy topic is readable (and publishable) by anyone who
+    // knows it, the Lead included: never put a redeemable nonce on one.
+    let is_ref = |t: &str| {
+        let t = t.trim();
+        t.starts_with("env:") || t.starts_with("file:")
+    };
+    let push = &svc.config.notifications.push;
+    if (!push.topic.trim().is_empty() && !is_ref(&push.token))
+        || push
+            .sinks
+            .iter()
+            .any(|s| !s.topic.trim().is_empty() && !is_ref(&s.token))
+    {
+        tracing::info!(target: "thegn::approval", "approval push skipped: a push topic has no secret-ref token (answer in the panel or CLI)");
+        return;
+    }
+    let mut bytes = [0u8; push_approval::NONCE_BYTES];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        tracing::warn!(target: "thegn::approval", %error, "approval push skipped: no OS randomness");
+        return;
+    }
+    let nonce = push_approval::nonce_from_bytes(&bytes);
+    let hash = push_approval::nonce_hash(&nonce);
+    let (issue, stage, sha) = (
+        req.issue_id.clone(),
+        req.stage.clone(),
+        req.commit_sha.clone(),
+    );
+    let stored = svc
+        .with_db(move |db| {
+            let description = crate::daemon::approval_effects::describe(db, &issue, &stage, &sha);
+            // No stored payload backs this triple: never make it phone-approvable.
+            if description.starts_with("unverified request") {
+                return Ok(None);
+            }
+            let now = thegn_core::util::now_ms();
+            db.put_push_nonce(
+                &hash,
+                &issue,
+                &stage,
+                &sha,
+                now,
+                now.saturating_add(PUSH_NONCE_TTL_MS),
+            )?;
+            Ok(Some(description))
+        })
+        .await;
+    let description = match stored {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            tracing::info!(
+                target: "thegn::approval",
+                issue = %req.issue_id,
+                stage = %req.stage,
+                "approval push skipped: unverified request"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(target: "thegn::approval", %error, "approval push skipped: nonce not stored");
+            return;
+        }
+    };
+    let msg = PushMessage {
+        title: PUSH_TITLE.into(),
+        body: push_approval::push_body(&description, &nonce),
+        priority: thegn_core::notification::Priority::Alert,
+        tags: vec!["approval".into()],
+    };
+    // best-effort: a failed push leaves the request answerable in the panel/CLI.
+    if let Err(error) = provider.publish(&msg).await {
+        tracing::warn!(
+            target: "thegn::approval",
+            issue = %req.issue_id,
+            stage = %req.stage,
+            %error,
+            "approval push failed"
+        );
+    }
 }
 
 /// Answer `approvals.resolve` (Admin; HTTP and CLI only, never MCP).
 pub(crate) async fn resolve(svc: &DaemonService, req: serde_json::Value) -> JsonResult {
     let request: ApprovalResolve = decode(req)?;
     approval_request::validate_resolve(&request).map_err(ControlError::InvalidArgument)?;
-    svc.with_db(move |db| resolve_in(db, &request, thegn_core::util::now_ms()))
+    let stored = request.clone();
+    svc.with_db(move |db| resolve_in(db, &stored, thegn_core::util::now_ms()))
         .await?;
+    // b155: the decision is recorded; its effect (arm, start, kick) runs off
+    // the request path.
+    crate::daemon::approval_effects::spawn_on_resolved(request);
     encode(&json!({ "resolved": true }))
 }
 
@@ -130,7 +322,7 @@ fn request_in(db: &Db, request: &ApprovalRequest) -> anyhow::Result<(bool, i64)>
 }
 
 /// Apply a human decision and retire every unread request row for it.
-fn resolve_in(db: &Db, request: &ApprovalResolve, now_ms: i64) -> anyhow::Result<()> {
+pub(super) fn resolve_in(db: &Db, request: &ApprovalResolve, now_ms: i64) -> anyhow::Result<()> {
     match request.decision {
         Decision::Approve => db.grant_approval(&Approval {
             issue_id: request.issue_id.clone(),
@@ -146,6 +338,13 @@ fn resolve_in(db: &Db, request: &ApprovalResolve, now_ms: i64) -> anyhow::Result
             db.revoke_approvals(&request.issue_id, &request.stage, now_ms)?;
         }
     }
+    // A decision made anywhere kills every outstanding phone nonce for it.
+    db.void_push_nonces(
+        &request.issue_id,
+        &request.stage,
+        &request.commit_sha,
+        now_ms,
+    )?;
     let source =
         approval_request::source_ref(&request.issue_id, &request.stage, &request.commit_sha);
     // By id rather than `mark_notification_read_by_source`: that one also
@@ -221,6 +420,14 @@ mod tests {
 
     const SHA: &str = "4babb0901f2c3d4e5f60718293a4b5c6d7e8f901";
     const OTHER: &str = "deadbeefcafe0011223344556677889900aabbcc";
+
+    #[test]
+    fn full_commit_id_accepts_only_full_hex_ids() {
+        assert!(!full_commit_id("4babb09"));
+        assert!(!full_commit_id(&"g".repeat(40)));
+        assert!(full_commit_id(SHA));
+        assert!(full_commit_id(&"a1".repeat(32)));
+    }
 
     fn ask(db: &Db, sha: &str) -> (bool, i64) {
         request_in(
