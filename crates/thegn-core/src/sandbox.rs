@@ -1701,6 +1701,11 @@ fn legacy_git_mounts(worktree: &std::path::Path, common: Option<&std::path::Path
     mounts
 }
 
+/// Empty directory kept inside each writable `refs/heads/<parent>/` and
+/// `logs/refs/heads/<parent>/` carve-out so git never removes the directory a
+/// running sandbox has bind-mounted.
+pub(crate) const GIT_CARVE_KEEP_DIR: &str = ".thegn-keep";
+
 /// The worktree + git common-dir binds for a LOCAL worktree under `git`
 /// (THE-2009/THE-2021), plus the warning to log when the plan fell back.
 ///
@@ -1786,7 +1791,13 @@ fn git_policy_mounts(
         }
     };
     for dir in &plan.mkdirs {
-        if let Err(error) = std::fs::create_dir_all(dir) {
+        // The keep directory pins the carve-out: `git pack-refs --prune` (and
+        // gc) rmdir a ref directory once its last loose ref is packed or
+        // deleted, which would leave every running sandbox bound to a dead
+        // inode ("cannot lock ref: unable to create directory"). git skips
+        // dot entries when it scans refs, and an empty directory there is
+        // clean under `git fsck` (a dot FILE is reported as a bad ref name).
+        if let Err(error) = std::fs::create_dir_all(dir.join(GIT_CARVE_KEEP_DIR)) {
             tracing::warn!(
                 target: "thegn::sandbox",
                 path = %dir.display(),
