@@ -475,9 +475,10 @@ impl EnvProviderKind {
 
     /// Whether this provider's lifecycle (provision, teardown, orphan reaping,
     /// and warm pool) has not been verified against a live account. `thegn doctor`
-    /// displays this state by owner decision THE-142.
+    /// displays this state by owner decision THE-142, and for Daytona because
+    /// its upstream is in maintenance (closed-core, archived public repo).
     pub fn live_unverified(self) -> bool {
-        matches!(self, Self::Hetzner)
+        matches!(self, Self::Hetzner | Self::Daytona)
     }
 
     /// Lowers `network_allow` / `network_block` to a provider policy API and
@@ -1113,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn live_unverified_marks_only_hetzner() {
+    fn live_unverified_marks_hetzner_and_daytona() {
         for kind in [
             EnvProviderKind::Custom,
             EnvProviderKind::Daytona,
@@ -1124,11 +1125,10 @@ mod tests {
             EnvProviderKind::Machine0,
         ] {
             match kind {
-                EnvProviderKind::Hetzner => {
+                EnvProviderKind::Hetzner | EnvProviderKind::Daytona => {
                     assert!(kind.live_unverified(), "{kind:?} is live-unverified");
                 }
                 EnvProviderKind::Custom
-                | EnvProviderKind::Daytona
                 | EnvProviderKind::Sprites
                 | EnvProviderKind::DigitalOcean
                 | EnvProviderKind::Fly

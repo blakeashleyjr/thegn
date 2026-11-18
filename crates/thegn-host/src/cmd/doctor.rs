@@ -3966,6 +3966,9 @@ fn provider_cache_report(cfg: &Config) {
         if let Some(note) = provider_cache_lifecycle_note(p.provider.trim()) {
             outln!("{note}");
         }
+        if let Some(note) = provider_maintenance_note(p.provider.trim()) {
+            outln!("{note}");
+        }
         if sprite_cli_required(p) && thegn_core::util::which_path("sprite").is_none() {
             outln!(
                 "               exec = \"cli\" but the `sprite` CLI is MISSING from PATH — install it, or use exec = \"auto\" (native exec, no CLI)"
@@ -4029,6 +4032,17 @@ fn provider_cache_lifecycle_note(provider: &str) -> Option<&'static str> {
     EnvProviderKind::of(provider)
         .live_unverified()
         .then_some("               experimental: lifecycle not verified on a live account")
+}
+
+/// The upstream-maintenance line for a provider kind, printed after the
+/// experimental line. Daytona only (vendor documentation; not executed by
+/// thegn).
+fn provider_maintenance_note(provider: &str) -> Option<&'static str> {
+    (EnvProviderKind::of(provider) == EnvProviderKind::Daytona).then_some(
+        "               maintenance: upstream is closed-core and archived; the CLI split into \
+         `daytona-v0` (legacy) and `daytona` (v2 alpha); thegn's exec handle moves to the ssh \
+         gateway (WS08)",
+    )
 }
 
 fn provider_cache_json(cfg: &Config) -> serde_json::Value {
@@ -7616,6 +7630,7 @@ args = ["--verbose"]
             Some("               experimental: lifecycle not verified on a live account")
         );
         assert_eq!(provider_cache_lifecycle_note("sprites"), None);
+        assert_eq!(provider_maintenance_note("hetzner"), None);
         // env_devshell falls back to the global default when no override is set.
         let plain = EnvConfig {
             provider: EnvProviderConfig {
@@ -7803,6 +7818,42 @@ args = ["--verbose"]
     #[test]
     fn secret_hard_link_notes_are_empty_without_state_entries() {
         assert!(secret_hard_link_notes(tempfile::tempdir().unwrap().path()).is_empty());
+    }
+
+    #[test]
+    fn provider_cache_lifecycle_note_daytona_has_maintenance_line() {
+        let _state = crate::testenv::IsolatedState::new();
+        assert_eq!(
+            provider_cache_lifecycle_note("daytona"),
+            Some("               experimental: lifecycle not verified on a live account")
+        );
+        let maintenance = provider_maintenance_note("daytona").expect("daytona maintenance line");
+        assert!(maintenance.contains("maintenance:"), "{maintenance}");
+        assert!(maintenance.contains("daytona-v0"), "{maintenance}");
+        for other in [
+            "hetzner",
+            "sprites",
+            "fly",
+            "machine0",
+            "digitalocean",
+            "custom",
+        ] {
+            assert_eq!(provider_maintenance_note(other), None, "{other}");
+        }
+
+        use thegn_core::config::{EnvConfig, EnvProviderConfig};
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "daytona".into(),
+            EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "daytona".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(provider_cache_json(&cfg)["daytona"]["live_verified"], false);
     }
 
     #[test]

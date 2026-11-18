@@ -167,6 +167,10 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 > Remote worktrees and cloud providers are **dev-channel only** — see
 > [[release-channels]].
 
+Daytona is in maintenance: thegn drives its REST API; interactive panes need
+the ssh gateway (planned). `thegn doctor` marks a Daytona env experimental and
+`live_verified: false`, like Hetzner.
+
 The bridge helper is uploaded to a staged file and checked by SHA-256 before
 it is moved into place. If the install cannot be verified, the bridge
 connection is skipped.

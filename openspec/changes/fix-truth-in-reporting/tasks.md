@@ -27,7 +27,7 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 
 ## 4. Remote truth
 
-- [ ] 4.1 WS01-P4-01: Daytona maintenance flag, doctor line and config example
+- [x] 4.1 WS01-P4-01: Daytona maintenance flag, doctor line and config example
 - [ ] 4.2 WS01-P4-02: Fly stale comments and config text
 - [ ] 4.3 WS01-P4-03: ssh `ControlMux` (Windows off, long paths off)
 
