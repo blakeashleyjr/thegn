@@ -537,11 +537,19 @@ pub(crate) fn kick_eager(
         if !eager_inflight.insert(wt.clone()) {
             continue; // already attempted this session
         }
+        let focused = active_path.as_deref() == Some(wt.as_str());
         let cfg = cfg.clone();
         let wk = waker.clone();
         let ptx = provision_tx.clone();
         let hui = host_ui.clone();
         tokio::task::spawn_blocking(move || {
+            let provider = (!focused)
+                .then(|| crate::cmd::env::resolve_for(&cfg, Some(wt.clone())).ok())
+                .flatten()
+                .and_then(|env| cfg.env.get(&env.name).map(|e| e.provider.provider.clone()));
+            if !eager_allows(focused, provider.as_deref()) {
+                return;
+            }
             // `Pending` only: a parked Vercel sandbox is never resumed from
             // the background (only an explicit open buys its compute).
             if crate::agent::provision_check(&cfg, &wt) == crate::agent::ProvisionCheck::Pending
@@ -578,6 +586,16 @@ pub(crate) fn kick_eager(
             }
         });
     }
+}
+
+/// Whether the eager provisioner may front-run `provider`'s sandbox. The
+/// focused worktree always may (an open would create it anyway); a background
+/// (`workspace`/`all`) target may not when its kind is not
+/// [`eager_create_enabled`](thegn_core::config::EnvProviderKind::eager_create_enabled).
+fn eager_allows(focused: bool, provider: Option<&str>) -> bool {
+    focused
+        || provider
+            .is_none_or(|p| thegn_core::config::EnvProviderKind::of(p).eager_create_enabled())
 }
 
 /// Drain live env-provisioning progress for the active tab → the splash. The
@@ -1142,6 +1160,14 @@ mod tests {
     use crate::pane::PaneEvent;
     use crate::session::{GroupKind, ProviderSession, Session, WorktreeGroup};
     use tokio::sync::mpsc as tokio_mpsc;
+
+    #[test]
+    fn eager_background_scope_never_creates_a_vercel_sandbox() {
+        assert!(!eager_allows(false, Some("vercel")));
+        assert!(eager_allows(true, Some("vercel")));
+        assert!(eager_allows(false, Some("daytona")));
+        assert!(eager_allows(false, None));
+    }
 
     fn ls(label: &str, state: crate::chrome::StepState) -> LoadStep {
         LoadStep {

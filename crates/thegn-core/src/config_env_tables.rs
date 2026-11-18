@@ -542,6 +542,14 @@ impl EnvProviderKind {
     pub fn exit_pull_back_enabled(self) -> bool {
         !matches!(self, Self::Vercel)
     }
+
+    /// Whether `[lifecycle] eager = "workspace"|"all"` may create this kind's
+    /// sandbox in the background for a worktree the user has not focused. Off
+    /// for Vercel: a paid sandbox is created only from an explicit open or
+    /// provision.
+    pub fn eager_create_enabled(self) -> bool {
+        !matches!(self, Self::Vercel)
+    }
 }
 
 /// Whether `name` names a commodity-VPS provider kind. See
@@ -1222,9 +1230,12 @@ mod tests {
         ] {
             assert!(!other.credential_free(), "{other:?}");
             assert!(other.exit_pull_back_enabled(), "{other:?}");
+            assert!(other.eager_create_enabled(), "{other:?}");
         }
         // Only an explicit `thegn env pull` may resume a stopped Vercel sandbox.
         assert!(!k.exit_pull_back_enabled());
+        // Background eager scopes never create a paid Vercel sandbox.
+        assert!(!k.eager_create_enabled());
         // Scale-to-zero ⇒ hibernate stays off under auto.
         assert!(!provider_env("vercel").hibernate_enabled());
         assert!(!wss_native_provider_kind("vercel"));
