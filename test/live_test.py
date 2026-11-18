@@ -31,6 +31,12 @@ class LiveTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="thegn-live-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        # The scans skip the scanner's own pid. Fake /proc trees use small
+        # pids (31, 42, ...), which a fresh pid namespace can hand to this
+        # very process: pin the "own pid" to one no fixture uses.
+        own_pid = patch.object(live.os, "getpid", return_value=10**7)
+        own_pid.start()
+        self.addCleanup(own_pid.stop)
         # User-namespace test runners can expose host-owned / and /tmp as
         # unmapped uid 65534. Model only those fixture ancestors as root-owned;
         # every file/directory created by the test retains its actual metadata.
