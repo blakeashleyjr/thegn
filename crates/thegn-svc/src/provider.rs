@@ -1181,9 +1181,9 @@ impl RemoteProvider for SpritesProvider {
             })?;
             let dir = self.ledger_dir();
             {
-                let (dir, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
+                let (ledger, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
                 let proof = tokio::task::spawn_blocking(move || {
-                    crate::sprites::ledger::prove_owned_at(&dir, &scope, &name, &legacy)
+                    crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
                 })
                 .await
                 .context("sprites: ledger worker failed")?;
