@@ -328,7 +328,7 @@ macro_rules! config_enum {
             fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 let s = String::deserialize(d)?;
                 Ok($name::from_str_validated(&s).unwrap_or_else(|e| {
-                    crate::config::config_warn(&e);
+                    config_warn(&e);
                     $name::default()
                 }))
             }

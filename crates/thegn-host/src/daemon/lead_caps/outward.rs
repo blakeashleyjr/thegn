@@ -328,9 +328,10 @@ mod tests {
         let body = json!({"patch": {"title": "x"}, "repo": null, "account": null});
         let ids = approval_ids("issues.update", "gh:o/r#1", &body);
         approve(&svc, &ids);
+        let (first, second) = (caller(), caller());
         let (a, b) = tokio::join!(
-            gate(&svc, "issues.update", "gh:o/r#1", body.clone(), &caller()),
-            gate(&svc, "issues.update", "gh:o/r#1", body.clone(), &caller()),
+            gate(&svc, "issues.update", "gh:o/r#1", body.clone(), &first),
+            gate(&svc, "issues.update", "gh:o/r#1", body.clone(), &second),
         );
         assert_eq!(
             [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),

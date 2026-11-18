@@ -162,7 +162,7 @@ fn describe_body(
 
 /// The set predicate fields as `key=value`, joined by ` and `; `always` when
 /// none is set. Free text is flagged rather than shown.
-fn predicate_summary(p: &thegn_core::automation::AutomationPredicate) -> String {
+fn predicate_summary<P: serde::Serialize>(p: &P) -> String {
     let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(p) else {
         return "?".into();
     };
@@ -313,6 +313,9 @@ mod tests {
             predicate_summary(&p),
             "branch=tg/ x and message_regex=<free text>"
         );
-        assert_eq!(predicate_summary(&Default::default()), "always");
+        assert_eq!(
+            predicate_summary(&thegn_core::automation::AutomationPredicate::default()),
+            "always"
+        );
     }
 }
