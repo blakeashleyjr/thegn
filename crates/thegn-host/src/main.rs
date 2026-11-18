@@ -881,6 +881,10 @@ pub enum Command {
     SpriteExec {
         /// The sprite sandbox id (the resolved provider id).
         id: String,
+        /// Keep the sprite awake while the command runs, for at most this long
+        /// (`90s`, `30m`, `4h`, or bare seconds; capped at 24h). Off by default.
+        #[arg(long, value_name = "DUR", value_parser = parse_hold_duration)]
+        hold: Option<std::time::Duration>,
         /// Command to run (empty ⇒ a login shell).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -982,6 +986,19 @@ async fn sprite_proxy_relay(
 /// live in the daemon's process group, so the process::exit doesn't touch
 /// them.
 #[allow(clippy::disallowed_macros)]
+/// `sprite-exec --hold`: a cy-style duration (`90s`, `30m`, `1h30m`) or bare
+/// seconds, through the same parser the replay search uses. Zero is refused;
+/// the 24h cap is applied where the ceiling is computed.
+fn parse_hold_duration(raw: &str) -> Result<std::time::Duration, String> {
+    match replay::parse_duration(raw) {
+        Some(duration) if !duration.is_zero() => Ok(duration),
+        Some(_) => Err("the hold must be longer than zero".to_string()),
+        None => Err(format!(
+            "invalid duration {raw:?}: use e.g. 90s, 30m, 4h, or bare seconds"
+        )),
+    }
+}
+
 fn report_kept_sessions(kept: usize) {
     if kept > 0 {
         eprintln!(
@@ -1688,7 +1705,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         }
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
         Command::Machine0Ssh { name, cmd } => machine0_bridge::run(&cfg, &name, &cmd),
-        Command::SpriteExec { id, cmd } => sprite_bridge::run(&cfg, &id, &cmd),
+        Command::SpriteExec { id, hold, cmd } => sprite_bridge::run(&cfg, &id, &cmd, hold),
         Command::VercelExec { id, cmd } => vercel_bridge::run(&cfg, &id, &cmd),
         Command::SandboxArgv { target } => {
             // Resolve like every other worktree-scoped verb (explicit →

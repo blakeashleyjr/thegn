@@ -67,6 +67,16 @@ impl IntentGuard {
         }
     }
 
+    /// A guard that never removes anything: for callers that recorded no
+    /// intent (or whose intent must always survive).
+    pub fn disarmed(name: &str) -> Self {
+        Self {
+            directory: PathBuf::new(),
+            name: name.to_owned(),
+            armed: false,
+        }
+    }
+
     /// Keep the intent for reconciliation once a remote create may have begun.
     pub fn preserve(&mut self) {
         self.armed = false;
