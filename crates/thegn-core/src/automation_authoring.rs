@@ -1,20 +1,25 @@
 //! Lead-authored automation rules (`automations.put` / `rm` / `enable` /
 //! `runs`, THE-2181): the put-time validation, the `origin = lead` action
-//! allowlist (`notify.push` and `sessions.open` only), and the merge that puts
-//! Lead rules beside the trusted config rules at evaluation time.
+//! allowlist ([`LEAD_ALLOWED_ACTIONS`]), the autonomy ceiling (never `merge`;
+//! `pipeline.start` at `propose` only, THE-2195), and the merge that puts Lead
+//! rules beside the trusted config rules at evaluation time.
 //!
 //! This is the escalation boundary. `automations.put` is a Write-scoped verb,
 //! so a rule it stores must never reach an Exec-scoped (`tools.run`) or
-//! MergeAdd-scoped (`merge.add`) action. The allowlist is enforced twice:
-//! [`validate_lead_rule`] refuses at put time, and every load re-validates the
-//! stored body ([`compile_lead_rows`]) before [`merge_rules`] filters again.
-//! A row written straight into SQLite therefore still cannot escalate.
+//! MergeAdd-scoped (`merge.add`, `merge.drain`) action, never run at `merge`,
+//! and never start a pipeline (`pipeline.start` only proposes). The allowlist
+//! is enforced twice: [`validate_lead_rule`] refuses at put time, and every
+//! load re-validates the stored body ([`compile_lead_rows`]) before
+//! [`merge_rules`] filters again. The autonomy ceiling is refused at put and
+//! capped (never refused) on every load and again in [`merge_rules`]. A row
+//! written straight into SQLite therefore still cannot escalate.
 
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::automation::{AutomationEventKind, AutomationRule};
+use crate::automation_autonomy::{Autonomy, RuleOrigin, effective_autonomy, validate_autonomy};
 use crate::config_automations::{AutomationRuleConfig, compile_one};
 use crate::store::{AutomationRunRow, LeadRuleRow};
 
@@ -22,11 +27,18 @@ use crate::store::{AutomationRunRow, LeadRuleRow};
 /// never share a throttle/audit key with a config rule.
 pub const LEAD_RULE_PREFIX: &str = "lead:";
 
-/// The only catalog actions a Lead-authored rule may target.
-pub const LEAD_ALLOWED_ACTIONS: &[&str] = &["notify.push", "sessions.open"];
+/// The only actions a Lead-authored rule may target. `pipeline.start` is
+/// admitted only at `autonomy = "propose"` ([`validate_autonomy`]), so a Lead
+/// rule raises an approval and never starts a pipeline itself.
+pub const LEAD_ALLOWED_ACTIONS: &[&str] = &[
+    "notify.push",
+    "sessions.open",
+    "lead.wake",
+    "pipeline.start",
+];
 
 /// The refusal for any other action.
-pub const LEAD_ESCALATION_REFUSAL: &str = "Lead-authored rules may only notify or open a session; merge.add and tools.run need an approval-gated rule (phase 6)";
+pub const LEAD_ESCALATION_REFUSAL: &str = "Lead-authored rules may only notify, open a session, wake the Lead or propose a pipeline; merge.add, merge.drain and tools.run need a trusted [[automations.rules]] config rule";
 
 /// The `author` recorded on rows written through the control API. The caller
 /// id is not available at the control layer; it stays in the MCP audit line.
@@ -84,10 +96,42 @@ fn rate_caps() -> (u16, u16) {
 ///
 /// Refuses: an invalid name, a name colliding with a config rule (either as
 /// written or as its `lead:` id), any action outside [`LEAD_ALLOWED_ACTIONS`],
-/// and anything the config validator refuses.
+/// an autonomy [`validate_autonomy`] forbids for a Lead rule (`merge`, or a
+/// `pipeline.start` above `propose`), and anything the config validator
+/// refuses. The compiled rule carries the Lead-capped effective autonomy.
 pub fn validate_lead_rule(
     rule: &AutomationRuleConfig,
     config_names: &[String],
+) -> Result<AutomationRule, Vec<String>> {
+    validate_lead(rule, config_names, true)
+}
+
+/// The rule's declared autonomy; an unparseable value is refused by the
+/// config validator, so the default here is never what runs.
+fn declared_autonomy(rule: &AutomationRuleConfig) -> Autonomy {
+    rule.autonomy
+        .as_deref()
+        .and_then(|value| Autonomy::parse(value.trim()))
+        .unwrap_or_default()
+}
+
+/// Cap a Lead rule's autonomy through the Lead policy. Never raises.
+fn cap_lead(rule: &mut AutomationRule, declared: Autonomy) {
+    let (effective, _) = effective_autonomy(
+        declared,
+        &rule.predicate,
+        &rule.action.cap,
+        RuleOrigin::Lead,
+    );
+    rule.autonomy = effective;
+}
+
+/// [`validate_lead_rule`], with the put-time autonomy refusal optional: a
+/// stored row is capped on load rather than refused.
+fn validate_lead(
+    rule: &AutomationRuleConfig,
+    config_names: &[String],
+    refuse_autonomy: bool,
 ) -> Result<AutomationRule, Vec<String>> {
     let mut errors = Vec::new();
     let id = match lead_rule_id(&rule.name) {
@@ -125,8 +169,24 @@ pub fn validate_lead_rule(
     };
     let normalized = normalize(rule, &id);
     match compile_one(&normalized) {
-        Ok(compiled) if errors.is_empty() => Ok(compiled),
-        Ok(_) => Err(errors),
+        Ok(mut compiled) => {
+            let declared = declared_autonomy(rule);
+            if refuse_autonomy
+                && let Err(refusal) = validate_autonomy(
+                    declared,
+                    &compiled.predicate,
+                    &compiled.action.cap,
+                    RuleOrigin::Lead,
+                )
+            {
+                errors.push(refusal);
+            }
+            if !errors.is_empty() {
+                return Err(errors);
+            }
+            cap_lead(&mut compiled, declared);
+            Ok(compiled)
+        }
         Err(more) => {
             errors.extend(more);
             Err(errors)
@@ -146,8 +206,9 @@ pub fn normalize(rule: &AutomationRuleConfig, id: &str) -> AutomationRuleConfig 
 
 /// Config rules first; then the enabled Lead rules that still pass the
 /// allowlist, carry the `lead:` prefix and do not shadow a config id, with
-/// their rates re-capped. Defense in depth: a Lead rule that slipped past put
-/// time (a hand-written row, an older build) still cannot escalate here.
+/// their rates and autonomy re-capped. Defense in depth: a Lead rule that
+/// slipped past put time (a hand-written row, an older build) still cannot
+/// escalate here.
 pub fn merge_rules(config: Vec<AutomationRule>, lead: Vec<AutomationRule>) -> Vec<AutomationRule> {
     let (max_rule, max_action) = rate_caps();
     let config_ids: BTreeSet<String> = config.iter().map(|rule| rule.id.clone()).collect();
@@ -164,6 +225,8 @@ pub fn merge_rules(config: Vec<AutomationRule>, lead: Vec<AutomationRule>) -> Ve
         }
         rule.max_per_hour = rule.max_per_hour.min(max_rule);
         rule.max_action_per_hour = rule.max_action_per_hour.min(max_action);
+        let declared = rule.autonomy;
+        cap_lead(&mut rule, declared);
         merged.push(rule);
     }
     merged
@@ -187,14 +250,16 @@ pub fn compile_lead_rows(
     (rules, invalid)
 }
 
-/// Decode and re-validate one stored row.
+/// Decode and re-validate one stored row. The allowlist still refuses; the
+/// autonomy is capped through the Lead policy instead (a hand-written
+/// `"autonomy":"merge"` row runs at `review`, a `pipeline.start` at `propose`).
 pub fn compile_lead_row(
     row: &LeadRuleRow,
     config_names: &[String],
 ) -> Result<AutomationRule, Vec<String>> {
     let body: AutomationRuleConfig = serde_json::from_str(&row.body_json)
         .map_err(|error| vec![format!("stored rule body is not a rule: {error}")])?;
-    let mut rule = validate_lead_rule(&body, config_names)?;
+    let mut rule = validate_lead(&body, config_names, false)?;
     if rule.id != row.id {
         return Err(vec![format!(
             "stored rule body names {:?}, not its row id {:?}",
@@ -403,14 +468,31 @@ mod tests {
             "notify.push" => then.body = Some("done: {message}".into()),
             "sessions.open" => then.agent = Some("claude".into()),
             "tools.run" => then.name = Some("deploy".into()),
+            "lead.wake" => then.prompt = Some("triage {event_kind} in {repo}".into()),
+            "pipeline.start" => {
+                then.stage = Some("code".into());
+                then.agent = Some("codex".into());
+            }
             _ => {}
         }
+        let pipeline = cap == "pipeline.start";
         AutomationRuleConfig {
             name: name.into(),
-            when: "agent_finished".into(),
+            when: if pipeline {
+                "issue_matched"
+            } else {
+                "agent_finished"
+            }
+            .into(),
+            autonomy: pipeline.then(|| "propose".into()),
             then,
             ..AutomationRuleConfig::default()
         }
+    }
+
+    fn with_autonomy(mut rule: AutomationRuleConfig, level: &str) -> AutomationRuleConfig {
+        rule.autonomy = Some(level.into());
+        rule
     }
 
     fn compiled(name: &str, cap: &str) -> AutomationRule {
@@ -453,7 +535,14 @@ mod tests {
 
     #[test]
     fn escalating_actions_are_refused_at_put() {
-        for cap in ["merge.add", "tools.run", " tools.run ", "invoke", ""] {
+        for cap in [
+            "merge.add",
+            "merge.drain",
+            "tools.run",
+            " tools.run ",
+            "invoke",
+            "",
+        ] {
             let errors = validate_lead_rule(&rule("ping", cap), &[]).unwrap_err();
             assert!(
                 errors.iter().any(|e| e == LEAD_ESCALATION_REFUSAL),
@@ -739,5 +828,150 @@ mod tests {
         })
         .unwrap();
         serde_json::to_value(AutomationRunsReply::default()).unwrap();
+    }
+
+    #[test]
+    fn lead_autonomy_is_refused_at_put() {
+        // Merge is refused on every allowed action.
+        for cap in LEAD_ALLOWED_ACTIONS {
+            let errors =
+                validate_lead_rule(&with_autonomy(rule("ping", cap), "merge"), &[]).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e == crate::automation_autonomy::LEAD_MERGE_REFUSAL),
+                "{cap}: {errors:?}"
+            );
+        }
+        // pipeline.start: review (explicit or defaulted) is refused, propose is accepted.
+        let start = rule("ping", "pipeline.start");
+        for declared in [Some("review"), None] {
+            let mut at = start.clone();
+            at.autonomy = declared.map(str::to_string);
+            let errors = validate_lead_rule(&at, &[]).unwrap_err();
+            assert_eq!(
+                errors,
+                [crate::automation_autonomy::LEAD_PIPELINE_REFUSAL],
+                "{declared:?}"
+            );
+        }
+        let compiled = validate_lead_rule(&start, &[]).unwrap();
+        assert_eq!(compiled.autonomy, Autonomy::Propose);
+        // Other actions keep a declared propose/review; the default is review.
+        let compiled = validate_lead_rule(&rule("ping", "notify.push"), &[]).unwrap();
+        assert_eq!(compiled.autonomy, Autonomy::Review);
+        let compiled =
+            validate_lead_rule(&with_autonomy(rule("ping", "lead.wake"), "propose"), &[]).unwrap();
+        assert_eq!(compiled.autonomy, Autonomy::Propose);
+        // Free text at review is fine for a Lead rule; at merge it is refused above.
+        let mut regex = rule("ping", "notify.push");
+        regex.predicate.message_regex = Some("deploy".into());
+        assert_eq!(
+            validate_lead_rule(&regex, &[]).unwrap().autonomy,
+            Autonomy::Review
+        );
+        // An unknown level is the config validator's refusal, not a default.
+        let errors = validate_lead_rule(&with_autonomy(rule("ping", "notify.push"), "yolo"), &[])
+            .unwrap_err();
+        assert!(errors.join("\n").contains("unknown autonomy"), "{errors:?}");
+    }
+
+    #[test]
+    fn lead_schedule_rules_are_allowed() {
+        let mut every = rule("tick", "notify.push");
+        every.when = "schedule_due".into();
+        every.every = Some("1h".into());
+        every.then.body = Some("tick".into());
+        let compiled = validate_lead_rule(&every, &[]).unwrap();
+        assert_eq!(compiled.event, AutomationEventKind::ScheduleDue);
+        assert_eq!(
+            lead_inert_reason(true, true, true, Some(compiled.event)),
+            None
+        );
+    }
+
+    #[test]
+    fn hand_written_rows_asking_for_merge_load_capped() {
+        let merge_notify = with_autonomy(
+            normalize(&rule("loud", "notify.push"), "lead:loud"),
+            "merge",
+        );
+        let merge_start = with_autonomy(
+            normalize(&rule("start", "pipeline.start"), "lead:start"),
+            "merge",
+        );
+        let review_start = with_autonomy(
+            normalize(&rule("review", "pipeline.start"), "lead:review"),
+            "review",
+        );
+        let rows = vec![
+            row("lead:loud", &merge_notify, true),
+            row("lead:start", &merge_start, true),
+            row("lead:review", &review_start, true),
+        ];
+        let (rules, invalid) = compile_lead_rows(&rows, &[]);
+        assert!(invalid.is_empty(), "{invalid:?}");
+        let levels: Vec<(&str, Autonomy)> = rules
+            .iter()
+            .map(|rule| (rule.id.as_str(), rule.autonomy))
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                ("lead:loud", Autonomy::Review),
+                ("lead:start", Autonomy::Propose),
+                ("lead:review", Autonomy::Propose),
+            ]
+        );
+        // The raw JSON shape a hand-edit would produce.
+        let raw = LeadRuleRow {
+            id: "lead:raw".into(),
+            body_json: serde_json::json!({
+                "name": "lead:raw",
+                "when": "agent_finished",
+                "autonomy": "merge",
+                "then": {"cap": "notify.push", "body": "x"}
+            })
+            .to_string(),
+            enabled: true,
+            ..LeadRuleRow::default()
+        };
+        assert_eq!(
+            compile_lead_row(&raw, &[]).unwrap().autonomy,
+            Autonomy::Review
+        );
+    }
+
+    #[test]
+    fn merge_rules_recaps_lead_autonomy_and_leaves_config_alone() {
+        let mut cfg = compiled("cfg", "notify.push");
+        cfg.autonomy = Autonomy::Merge;
+        let mut loud = compiled("lead:loud", "notify.push");
+        loud.autonomy = Autonomy::Merge;
+        let mut start = compiled_start("lead:start");
+        start.autonomy = Autonomy::Merge;
+        let mut quiet = compiled("lead:quiet", "lead.wake");
+        quiet.autonomy = Autonomy::Propose;
+        let merged = merge_rules(vec![cfg], vec![loud, start, quiet]);
+        let levels: Vec<Autonomy> = merged.iter().map(|rule| rule.autonomy).collect();
+        assert_eq!(
+            levels,
+            [
+                Autonomy::Merge,
+                Autonomy::Review,
+                Autonomy::Propose,
+                Autonomy::Propose
+            ]
+        );
+        assert!(
+            merged[1..]
+                .iter()
+                .all(|rule| rule.autonomy < Autonomy::Merge),
+            "no Lead rule leaves merge_rules at merge"
+        );
+    }
+
+    fn compiled_start(name: &str) -> AutomationRule {
+        compile_one(&rule(name, "pipeline.start")).unwrap()
     }
 }
