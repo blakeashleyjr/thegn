@@ -59,7 +59,8 @@ const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// control reads. `cmd` arrives already shaped by `GitLoc::provider_command`
 /// (`/bin/sh -lc <script>`) or the launch argv; empty falls back to a login
 /// shell.
-pub fn run(cfg: &Config, id: &str, cmd: &[String]) -> Result<()> {
+pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Result<()> {
+    tracing::debug!(target: "thegn::sprites", sprite = id, ?hold, "sprite-exec: keep-awake hold requested");
     let argv: Vec<String> = if cmd.is_empty() {
         vec![
             "/bin/sh".into(),

@@ -522,10 +522,12 @@ fn api_provider(cfg: &Config, worktree: Option<String>) -> Result<thegn_svc::pro
             let token = crate::secret::resolve(key_env).ok_or_else(|| {
                 anyhow::anyhow!("the Sprites API token {key_env:?} could not be resolved")
             })?;
-            Ok(Provider::Sprites(
+            Ok(Provider::Sprites(crate::provider_factory::sprites_policy(
                 SpritesProvider::new(&pc.api_base, &token, &pc.id)
                     .with_custody_accounts(crate::provider_factory::managed_custody_accounts(pc)),
-            ))
+                pc,
+                key_env,
+            )))
         }
         vps if thegn_core::config::vps_provider_kind(vps) => {
             // The per-worktree resolved sandbox id (the placement bakes it) —
