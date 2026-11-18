@@ -239,6 +239,10 @@ pub(crate) fn armed_any() -> bool {
 }
 
 /// Each producer kind and whether it is armed, for `thegn doctor`.
+#[allow(
+    dead_code,
+    reason = "read by thegn doctor once the queued producers.status verb lands"
+)]
 pub(crate) fn status() -> Vec<(ProducerKind, bool /*armed*/)> {
     let tasks = lock(&TASKS);
     ProducerKind::ALL
@@ -339,10 +343,38 @@ fn pass(
     let Some(_slot) = TickSlot::try_take(kind) else {
         return Pass::Busy;
     };
-    Pass::Ran(tick(&TickCtx {
+    let outcome = tick(&TickCtx {
         cfg: cfg.clone(),
         now_ms: now,
-    }))
+    });
+    // Renew at the end of the tick too: the gap between renewals is then the
+    // longer of the tick and the cadence, never their sum.
+    if let Ok(db) = thegn_core::db::Db::open() {
+        let _ops = lock(&LEASE_OPS);
+        if current() {
+            match db.try_acquire_producer_lease(
+                kind,
+                DAEMON_HOLDER,
+                pid,
+                now_ms(),
+                ttl_ms(cadence_secs),
+            ) {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    target: "thegn::producers",
+                    kind = kind.as_str(),
+                    "producer lease lapsed during a tick (the tick outlived its TTL)"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "thegn::producers",
+                    kind = kind.as_str(),
+                    %error,
+                    "producer lease renewal after the tick failed"
+                ),
+            }
+        }
+    }
+    Pass::Ran(outcome)
 }
 
 /// The kind's real tick.
@@ -561,6 +593,7 @@ mod tests {
         assert_eq!(result, Pass::Ran(TickOutcome::Done { work: 2 }));
         let row = db.producer_lease(ProducerKind::Tracker).unwrap().unwrap();
         assert_eq!((row.holder.as_str(), row.holder_pid), (DAEMON_HOLDER, pid));
+        assert!(row.expires_at_ms >= row.acquired_at_ms + ttl_ms(60));
     }
 
     #[test]
