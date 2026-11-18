@@ -1074,7 +1074,8 @@ fn assert_host_refusal(err: &anyhow::Error) {
             "ticket in error: {shown}"
         );
         assert!(!shown.contains("ticket=1"), "query in error: {shown}");
-        assert!(!shown.contains("evil.example"), "url in error: {shown}");
+        assert!(!shown.contains("wss://"), "url in error: {shown}");
+        assert!(!shown.contains("/pty"), "url path in error: {shown}");
     }
 }
 
@@ -1094,6 +1095,11 @@ fn interactive_ticket_host_is_pinned_to_vercel_suffixes() {
         assert_host_refusal(&err);
         errs.push(err);
     }
+    // The refusal names the refused host (only the host) for the live run.
+    let shown = format!("{:#}", errs[0]);
+    assert!(shown.contains("(host evil.example)"), "{shown}");
+    assert!(!shown.contains('?'), "query in error: {shown}");
+    assert!(!shown.contains("token"), "token in error: {shown}");
     // The non-IP refusals carry the pin text and the key to set.
     for err in [&errs[0], &errs[1], &errs[2], &errs[4]] {
         let shown = format!("{err:#}");

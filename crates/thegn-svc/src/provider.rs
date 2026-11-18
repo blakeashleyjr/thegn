@@ -658,6 +658,18 @@ pub struct SpritesProvider {
     /// service consumers may omit it; in that case teardown is allowed only
     /// when the provider+instance row is unique across accounts.
     custody_accounts: Vec<String>,
+    /// Who this host is in the sprites ownership ledger. `None` refuses both
+    /// create (an unrecorded sprite) and destroy (no proof of ownership).
+    scope: Option<crate::sprites::ledger::OwnerScope>,
+    /// Provider ids named by this host's worktree location rows: the proof for
+    /// sprites created before the ledger existed.
+    legacy_ids: Vec<String>,
+    /// The memory policy applied after create (`0` = leave the default).
+    memory_limit_mb: u32,
+    /// The ledger reserve cap (`0` = no cap).
+    max_instances: usize,
+    /// The ledger directory (`None` = `vps::registry::dir()`); tests isolate it.
+    ledger_dir: Option<std::path::PathBuf>,
     client: reqwest::Client,
 }
 
@@ -711,8 +723,88 @@ impl SpritesProvider {
             token: token.to_string(),
             name: name.trim().to_string(),
             custody_accounts: Vec::new(),
+            scope: None,
+            legacy_ids: Vec::new(),
+            memory_limit_mb: 0,
+            max_instances: 0,
+            ledger_dir: None,
             client: provider_http_client(),
         }
+    }
+
+    /// The ownership scope create records under and destroy proves against.
+    pub fn with_scope(mut self, scope: crate::sprites::ledger::OwnerScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    /// Scope this provider to the host's controller id and the account
+    /// fingerprint of `credential_ref` (the token's ref name, never the token).
+    /// Fails when the controller id cannot be loaded or the API base is bad.
+    pub fn with_host_scope(self, credential_ref: &str) -> Result<Self> {
+        let owner = crate::vps::controller::controller_id()?;
+        let account = self.account(credential_ref)?;
+        Ok(self.with_scope(crate::sprites::ledger::OwnerScope { owner, account }))
+    }
+
+    /// The credential-free account fingerprint for the ledger: the API
+    /// authority and the credential ref name (never the token).
+    pub fn account(&self, credential_ref: &str) -> Result<String> {
+        Ok(crate::vps::registry::account_fingerprint(
+            crate::sprites::ledger::LEDGER_PROVIDER,
+            &self.authority()?,
+            credential_ref,
+        ))
+    }
+
+    /// Provider ids of this host's worktree location rows (legacy proof).
+    pub fn with_legacy(mut self, ids: Vec<String>) -> Self {
+        self.legacy_ids = ids;
+        self
+    }
+
+    /// The memory policy limit applied after create (`0` = none).
+    pub fn with_memory_limit_mb(mut self, limit_mb: u32) -> Self {
+        self.memory_limit_mb = limit_mb;
+        self
+    }
+
+    /// The ledger reserve cap (`0` = no cap, today's behaviour for sprites).
+    pub fn with_max_instances(mut self, max_instances: u32) -> Self {
+        self.max_instances = usize::try_from(max_instances).unwrap_or(usize::MAX);
+        self
+    }
+
+    /// Use `dir` as the ownership ledger instead of the state directory.
+    pub fn with_ledger_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.ledger_dir = Some(dir);
+        self
+    }
+
+    /// The ownership scope, if this provider may create and destroy.
+    pub fn scope(&self) -> Option<&crate::sprites::ledger::OwnerScope> {
+        self.scope.as_ref()
+    }
+
+    /// The memory policy limit applied after create (`0` = none).
+    pub fn memory_limit_mb(&self) -> u32 {
+        self.memory_limit_mb
+    }
+
+    fn ledger_dir(&self) -> std::path::PathBuf {
+        self.ledger_dir
+            .clone()
+            .unwrap_or_else(crate::vps::registry::dir)
+    }
+
+    /// The validated HTTP context for this provider's own sprite.
+    pub(crate) fn sprites_http(&self) -> Result<crate::sprites::SpritesHttp<'_>> {
+        Ok(crate::sprites::SpritesHttp {
+            client: &self.client,
+            base: self.base()?,
+            token: &self.token,
+            name: &self.name,
+        })
     }
 
     pub fn with_custody_accounts(mut self, accounts: impl IntoIterator<Item = String>) -> Self {
@@ -903,6 +995,18 @@ impl SpritesProvider {
         ))
     }
 
+    /// Drop `name`'s ledger record off the async runtime (best-effort: a
+    /// leftover record only makes the reaper look again).
+    async fn forget_record(&self, dir: &std::path::Path, name: &str) {
+        let (dir, name) = (dir.to_path_buf(), name.to_string());
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || crate::sprites::ledger::forget_at(&dir, &name))
+                .await
+        {
+            tracing::warn!(target: "thegn::sprites", %error, "sprites: ledger cleanup worker failed");
+        }
+    }
+
     /// The exec handle for a sprite: thegn's own `sprite-exec` self-bridge, which
     /// streams a PTY over the native exec API (reattaching across network blips),
     /// so the handle never depends on the vendor `sprite` CLI being installed.
@@ -919,16 +1023,62 @@ impl SpritesProvider {
 impl RemoteProvider for SpritesProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
+            // Ownership first: a sprite is never created without a ledger
+            // record, so a missing scope refuses before any request.
+            let scope = self.scope.clone().ok_or_else(|| {
+                anyhow!("sprites: no controller id; refusing to create an unrecorded sprite")
+            })?;
             let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             if self.name.is_empty() {
                 return Err(anyhow!(
                     "sprites: set `[env.<name>.provider] id = \"<sprite-name>\"` — sprites are named"
                 ));
             }
+            let dir = self.ledger_dir();
+            // Proven before the reserve, so a 409 can tell "ours from an earlier
+            // attempt" from "someone else's name": the fresh intent written
+            // below must never be what proves a foreign sprite ours.
+            let prior = {
+                let (dir, scope, name, legacy) = (
+                    dir.clone(),
+                    scope.clone(),
+                    self.name.clone(),
+                    self.legacy_ids.clone(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    crate::sprites::ledger::prove_owned_at(&dir, &scope, &name, &legacy)
+                })
+                .await
+                .context("sprites: ledger worker failed")?
+                .is_ok()
+            };
+            let mut guard = {
+                let (dir, scope, name, cap) = (
+                    dir.clone(),
+                    scope.clone(),
+                    self.name.clone(),
+                    self.max_instances,
+                );
+                tokio::task::spawn_blocking(move || {
+                    crate::sprites::ledger::reserve_at(&dir, &scope, &name, cap)
+                })
+                .await
+                .context("sprites: ledger worker failed")?
+                .context("sprites: could not record the create intent; refusing to create")?
+            };
+            // From here the POST may take effect, and this future may be
+            // cancelled mid-request: keep the intent unless the create was
+            // definitively refused (removed explicitly below), so the reaper can
+            // resolve an ambiguous outcome.
+            guard.preserve();
+            drop(guard);
+
             // Bounded per-request timeout + a small retry budget: a cold-booting
             // control plane can stall or transiently 5xx, and an untimed create is
             // exactly what hung provisioning "forever" on startup.
             let mut last: Option<String> = None;
+            let mut refused = false;
+            let mut created: Option<String> = None;
             for attempt in 0..CONTROL_ATTEMPTS {
                 match self
                     .client
@@ -944,12 +1094,28 @@ impl RemoteProvider for SpritesProvider {
                         if status.is_success() {
                             let body = response_json(resp, "sprites", "POST /sprites").await?;
                             // The server echoes the name; fall back to the requested one.
-                            let name = Self::parse_name(&body).unwrap_or_else(|| self.name.clone());
-                            let exec = Self::exec_for(&name);
-                            return Ok(SandboxHandle { id: name, exec });
+                            created =
+                                Some(Self::parse_name(&body).unwrap_or_else(|| self.name.clone()));
+                            break;
+                        }
+                        if status == reqwest::StatusCode::CONFLICT {
+                            if prior {
+                                // Ours from an earlier (ambiguous) attempt.
+                                created = Some(self.name.clone());
+                                break;
+                            }
+                            // Someone else's name: drop the fresh intent so it
+                            // can never prove a foreign sprite ours.
+                            self.forget_record(&dir, &self.name).await;
+                            return Err(anyhow!(
+                                "sprites: a sprite named {} already exists and is not recorded by this host; refusing to adopt it",
+                                self.name
+                            ));
                         }
                         last = Some(status.to_string());
                         if !transient_status(status) {
+                            // A definite 4xx: nothing was created.
+                            refused = status.is_client_error();
                             break;
                         }
                     }
@@ -964,15 +1130,86 @@ impl RemoteProvider for SpritesProvider {
                     tokio::time::sleep(CONTROL_BACKOFF).await;
                 }
             }
-            Err(anyhow!(
-                "sprites create failed ({})",
-                last.unwrap_or_else(|| "no response".into())
-            ))
+            let Some(name) = created else {
+                if refused {
+                    self.forget_record(&dir, &self.name).await;
+                }
+                // Otherwise (transport failure, exhausted 5xx) the intent stays
+                // for the reaper: the sprite may exist.
+                return Err(anyhow!(
+                    "sprites create failed ({})",
+                    last.unwrap_or_else(|| "no response".into())
+                ));
+            };
+
+            let committed = {
+                let (dir, scope, name) = (dir.clone(), scope.clone(), self.name.clone());
+                tokio::task::spawn_blocking(move || {
+                    crate::sprites::ledger::commit_at(&dir, &scope, &name)
+                })
+                .await
+                .context("sprites: ledger worker failed")
+                .and_then(|result| result)
+            };
+            committed.with_context(|| {
+                format!(
+                    "sprites: {name} was created but could not be marked ready in the ledger (its intent is kept)"
+                )
+            })?;
+
+            if self.memory_limit_mb > 0 {
+                crate::sprites::resources::apply(&self.sprites_http()?, self.memory_limit_mb)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "sprites: {name} was created and recorded, but its memory policy ({} MiB) could not be applied",
+                            self.memory_limit_mb
+                        )
+                    })?;
+            }
+            let exec = Self::exec_for(&name);
+            Ok(SandboxHandle { id: name, exec })
         })
     }
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            // Ownership before the irreversible delete: thegn never deletes a
+            // sprite it cannot prove it created.
+            let scope = self.scope.clone().ok_or_else(|| {
+                anyhow!("sprites: no controller id; refusing to delete {id}, which this host cannot prove it created")
+            })?;
+            let dir = self.ledger_dir();
+            {
+                let (ledger, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
+                let proof = tokio::task::spawn_blocking(move || {
+                    crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
+                })
+                .await
+                .context("sprites: ledger worker failed")?;
+                if let Err(refusal) = proof {
+                    // No proof. Teardown stays idempotent: a record dropped by an
+                    // earlier destroy or by `env reap --apply` must not turn a
+                    // second teardown into an error. One non-mutating GET decides;
+                    // only a definite 404 (nothing to delete) is OK. The DELETE is
+                    // never sent on this path.
+                    let gone = match self
+                        .client
+                        .get(self.sprite_name_url(id)?)
+                        .bearer_auth(&self.token)
+                        .timeout(CONTROL_TIMEOUT)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => resp.status() == reqwest::StatusCode::NOT_FOUND,
+                        Err(_) => false,
+                    };
+                    if gone {
+                        return Ok(());
+                    }
+                    return Err(refusal.context(format!("sprites: refusing to delete {id}")));
+                }
+            }
             let _permit = CONTROL_GATE.acquire_priority(&self.authority()?).await?;
             // Validate custody before the irreversible remote delete. A corrupt
             // row may be the only evidence of an authorized key and must never
@@ -1001,6 +1238,7 @@ impl RemoteProvider for SpritesProvider {
                         thegn_core::managed_ssh::record_revoked("sprites", account, id)
                             .context("sprites: retire managed SSH custody")?;
                     }
+                    self.forget_record(&dir, id).await;
                     return Ok(());
                 }
                 last_status = Some(status);
