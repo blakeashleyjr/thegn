@@ -60,6 +60,7 @@ pub mod pr_queue;
 pub mod project;
 pub mod proxy;
 pub mod release;
+pub mod repo_forget;
 pub mod repos;
 pub mod sandbox;
 pub mod sandbox_containers;
