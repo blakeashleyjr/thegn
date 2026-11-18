@@ -3914,7 +3914,12 @@ fn master_status(placement: &thegn_core::placement::Placement) -> String {
     let thegn_core::placement::Placement::Ssh(p) = placement else {
         return String::new();
     };
-    let sock = thegn_core::remote::control_path(&p.host, p.port);
+    let sock = match thegn_core::remote::control_mux(&p.host, p.port) {
+        thegn_core::remote::ControlMux::Auto { concrete, .. } => concrete,
+        thegn_core::remote::ControlMux::Off(reason) => {
+            return format!("  (multiplexing off: {})", reason.as_str());
+        }
+    };
     if !sock.exists() {
         return "  (no ControlMaster socket)".into();
     }
