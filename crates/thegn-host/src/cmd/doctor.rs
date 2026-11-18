@@ -4176,6 +4176,12 @@ fn provider_cache_report(cfg: &Config) {
         if let Some(warning) = ignored_cli_bridge(p) {
             outln!("               {warning}");
         }
+        if is_sprites(p) {
+            let ledger = sprites_ledger_counts(&thegn_svc::vps::registry::list());
+            for line in sprites_report_lines(p, bridge.is_some(), ledger) {
+                outln!("               {line}");
+            }
+        }
         if is_vercel(p) {
             let (expired, orphans) = vercel_ledger_counts(&thegn_svc::vps::registry::list());
             for line in vercel_report_lines(p, vercel_token_resolves(p), expired, orphans) {
@@ -4215,6 +4221,62 @@ fn sprite_cli_required(pc: &thegn_core::config::EnvProviderConfig) -> bool {
         EnvProviderKind::of(pc.provider.trim()),
         EnvProviderKind::Sprites
     ) && matches!(pc.exec, thegn_core::config::ProviderExecMode::Cli)
+}
+
+fn is_sprites(pc: &thegn_core::config::EnvProviderConfig) -> bool {
+    matches!(
+        EnvProviderKind::of(pc.provider.trim()),
+        EnvProviderKind::Sprites
+    )
+}
+
+/// `(recorded, creating)` over the local ledger (no network): sprites records.
+fn sprites_ledger_counts(records: &[thegn_svc::vps::registry::VpsRecord]) -> (usize, usize) {
+    let mine = || records.iter().filter(|r| r.provider == "sprites");
+    (
+        mine().count(),
+        mine().filter(|r| r.state == "creating").count(),
+    )
+}
+
+/// The configured sprites memory limit in MiB (`min_ram_gb × 1024`), or `None`
+/// for the platform default.
+fn sprites_memory_limit_mb(pc: &thegn_core::config::EnvProviderConfig) -> Option<u64> {
+    (pc.min_ram_gb > 0).then(|| u64::from(pc.min_ram_gb) * 1024)
+}
+
+/// Hold ceiling (seconds) a headless session keeps the sprite awake for.
+fn sprites_hold_ceiling_secs(pc: &thegn_core::config::EnvProviderConfig) -> u64 {
+    thegn_core::sprite_hold::ceiling_secs(None, pc.max_lifetime_secs)
+}
+
+/// The per-sprites-env doctor lines: bridge binary, ledger, memory limit,
+/// keep-awake. Offline: no sprites API call.
+fn sprites_report_lines(
+    pc: &thegn_core::config::EnvProviderConfig,
+    bridge_present: bool,
+    ledger: (usize, usize),
+) -> Vec<String> {
+    let bridge = if bridge_present {
+        "bridge binary: present".to_string()
+    } else {
+        "bridge binary: MISSING — run `just bridge`".to_string()
+    };
+    let memory = match sprites_memory_limit_mb(pc) {
+        Some(mb) => format!("memory limit: {mb} MiB"),
+        None => "memory limit: platform default".to_string(),
+    };
+    let hold_secs = sprites_hold_ceiling_secs(pc);
+    let hours = hold_secs.div_ceil(3600);
+    vec![
+        bridge,
+        format!(
+            "ownership ledger: {} recorded, {} creating",
+            ledger.0, ledger.1
+        ),
+        memory,
+        format!("keep-awake: headless sessions hold the sprite up to {hours}h"),
+    ]
 }
 
 fn is_vercel(pc: &thegn_core::config::EnvProviderConfig) -> bool {
@@ -4366,6 +4428,15 @@ fn provider_cache_json_with(
         });
         if !vercel.is_null() {
             entry["vercel"] = vercel;
+        }
+        if is_sprites(p) {
+            let (recorded, creating) = sprites_ledger_counts(&thegn_svc::vps::registry::list());
+            entry["sprites_ledger"] = serde_json::json!({
+                "recorded": recorded,
+                "creating": creating,
+            });
+            entry["sprites_memory_limit_mb"] = serde_json::json!(sprites_memory_limit_mb(p));
+            entry["sprites_hold_ceiling_secs"] = serde_json::json!(sprites_hold_ceiling_secs(p));
         }
         map.insert(name.clone(), entry);
     }
@@ -6455,6 +6526,59 @@ mod pins;
 mod tests {
     use super::*;
     use thegn_core::notification::{Notification, NotificationKind};
+
+    #[test]
+    fn sprites_report_lines_cover_bridge_ledger_memory_and_hold() {
+        use thegn_core::config::EnvProviderConfig;
+        let mut pc = EnvProviderConfig {
+            provider: "sprites".into(),
+            ..Default::default()
+        };
+        let lines = sprites_report_lines(&pc, false, (3, 1));
+        assert!(lines[0].contains("`just bridge`"), "{lines:?}");
+        assert_eq!(lines[1], "ownership ledger: 3 recorded, 1 creating");
+        assert_eq!(lines[2], "memory limit: platform default");
+        assert!(lines[3].contains("up to 4h"), "{lines:?}");
+        pc.min_ram_gb = 4;
+        pc.max_lifetime_secs = 7200;
+        let lines = sprites_report_lines(&pc, true, (0, 0));
+        assert_eq!(lines[0], "bridge binary: present");
+        assert_eq!(lines[2], "memory limit: 4096 MiB");
+        assert!(lines[3].contains("up to 2h"), "{lines:?}");
+    }
+
+    #[test]
+    fn sprites_doctor_json_keys_only_for_sprites_envs() {
+        use thegn_core::config::{EnvConfig, EnvProviderConfig};
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "sprites".into(),
+            EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    min_ram_gb: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        cfg.env.insert(
+            "vps".into(),
+            EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "hetzner".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let v = provider_cache_json(&cfg);
+        assert_eq!(v["sprites"]["sprites_memory_limit_mb"], 2048);
+        assert_eq!(v["sprites"]["sprites_hold_ceiling_secs"], 4 * 3600);
+        assert!(v["sprites"]["sprites_ledger"]["recorded"].is_u64());
+        assert!(v["vps"].get("sprites_ledger").is_none());
+        assert!(v["vps"].get("sprites_hold_ceiling_secs").is_none());
+    }
 
     #[test]
     fn sprite_cli_required_only_for_sprites_pinned_to_cli_exec() {

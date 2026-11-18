@@ -355,6 +355,24 @@ pub fn require_or_skip(prereq: &str, available: bool) -> bool {
     require_or_skip_in(required, prereq, available, &mut std::io::stderr().lock())
 }
 
+/// Bind a listening Unix-domain socket at `path` for a test that only needs
+/// one to exist (a shell `[ -S path ]` probe). The returned guard keeps it
+/// bound until dropped. Non-Unix runners get `Unsupported` and skip, so the
+/// calling test needs no platform `#[cfg]` of its own.
+pub fn bind_unix_socket_for_test(path: &Path) -> std::io::Result<Box<dyn std::any::Any>> {
+    #[cfg(unix)]
+    {
+        Ok(Box::new(std::os::unix::net::UnixListener::bind(path)?))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("no Unix socket fixture at {}", path.display()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
