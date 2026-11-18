@@ -1197,7 +1197,6 @@ pub(crate) fn cancel_all() -> usize {
 mod tests {
     use super::*;
     use thegn_core::config_pipeline::PipelineStage;
-    use thegn_core::store::NotificationStore as _;
 
     fn stage(name: &str, next: Option<&str>) -> PipelineStage {
         PipelineStage {

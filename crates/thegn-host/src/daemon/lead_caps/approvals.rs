@@ -19,7 +19,7 @@ use thegn_core::pipeline_approval::{Approval, state_for};
 use thegn_core::push_approval;
 use thegn_core::store::NotificationStore;
 use thegn_svc::control::ControlError;
-use thegn_svc::push::{PushMessage, PushProvider};
+use thegn_svc::push::PushMessage;
 
 /// The notification kind every request row carries.
 const KIND: &str = "agent_attention";

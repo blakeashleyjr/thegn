@@ -3595,6 +3595,10 @@ impl InventoryReport {
 /// The generic managed-sandbox provider dispatcher. Lifecycle methods delegate to
 /// the variant's [`RemoteProvider`]; axis methods delegate to the variant's
 /// sub-trait impl or return a clear "unsupported" error (gate on `caps`).
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one long-lived provider per env; boxing a variant would ripple through every match"
+)]
 pub enum Provider {
     Daytona(DaytonaProvider),
     Sprites(SpritesProvider),
