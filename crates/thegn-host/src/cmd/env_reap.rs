@@ -456,12 +456,13 @@ fn render(report: &ReapReport) -> String {
 ///   (complete) listing no longer shows → `--apply` removes the record only.
 /// - `stale-creating`: a `creating` record older than an hour with no sprite →
 ///   `--apply` removes the record.
-/// - `over-lifetime`: a proven sprite (ledger record, or a worktree location
-///   row naming it) older than the env's `max_lifetime_secs` (age from the API
-///   `created_at`, else the record's) → `--apply` destroys it through
+/// - `over-lifetime`: a sprite with a ledger record under this host's scope
+///   older than the env's `max_lifetime_secs` (age from the API `created_at`,
+///   else the record's) → `--apply` destroys it through
 ///   `SpritesProvider::destroy`, which proves ownership again itself.
-/// - `unrecorded`: in the account with no record of this host and no legacy
-///   proof → reported, **never** deleted.
+/// - `unrecorded`: in the account with no record of this host (including one
+///   a worktree location row names, and every pre-ledger sprite) → reported,
+///   **never** deleted.
 ///
 /// A `Partial`/`Unknown` listing, an env with no ownership scope, or one whose
 /// provider cannot be built refuses `--apply`; an unreadable ledger refuses
@@ -558,7 +559,7 @@ mod sprites {
         pub status: String,
         pub created_ms: Option<i64>,
         pub age: String,
-        /// `ledger`, `legacy` or `none`.
+        /// `ledger` or `none`.
         pub proof: &'static str,
         pub note: Option<String>,
     }
@@ -592,7 +593,7 @@ mod sprites {
         pub accounts: Vec<AccountReport>,
         pub results: Vec<ActionResult>,
         pub refused: Option<String>,
-        /// Non-fatal caveats (e.g. the legacy proof could not be read).
+        /// Non-fatal caveats (e.g. unreadable ledger records left alone).
         pub notes: Vec<String>,
     }
 
@@ -642,25 +643,9 @@ mod sprites {
         } else {
             None
         };
-        // Adopt pre-ledger sprites once (they then prove as `ledger`); a
-        // worktree row written later proves nothing.
-        let mut adopt_error: Option<String> = None;
-        for env in &envs {
-            if let Some(scope) = env.api.as_deref().and_then(|api| api.scope())
-                && let Err(error) = ledger::adopt_legacy_once(&scope)
-                && adopt_error.is_none()
-            {
-                adopt_error = Some(format!("{error:#}"));
-            }
-        }
-        let legacy = match adopt_error {
-            Some(error) => Err(error),
-            None => Ok(Vec::new()),
-        };
         let mut ask = |prompt: &str| super::tty_prompt(prompt);
         let report = reap(
             &envs,
-            legacy,
             Opts { apply, yes },
             &mut ask,
             thegn_core::util::now_ms(),
@@ -720,7 +705,6 @@ mod sprites {
     /// is the process registry dir (tests isolate it with `IsolatedState`).
     pub(super) fn reap(
         envs: &[SpritesEnv],
-        legacy: std::result::Result<Vec<String>, String>,
         opts: Opts,
         ask: Ask<'_>,
         now_ms: i64,
@@ -774,15 +758,6 @@ mod sprites {
         })?;
         let unreadable: BTreeSet<String> = view.unreadable.iter().cloned().collect();
         let mut notes = Vec::new();
-        let legacy: BTreeSet<String> = match legacy {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(error) => {
-                notes.push(format!(
-                    "worktree locations unreadable ({error}); no sprite is legacy-proven this run"
-                ));
-                BTreeSet::new()
-            }
-        };
         if !unreadable.is_empty() {
             notes.push(format!(
                 "{} unreadable ledger record(s) left alone: {}",
@@ -885,23 +860,6 @@ mod sprites {
                 }
                 let status = row.state.clone().unwrap_or_else(|| "?".into());
                 let age = crate::cmd::fleet::age(row.created_at_ms, now_ms);
-                let legacy_proven = legacy.contains(&row.id)
-                    && !any_record.contains(row.id.as_str())
-                    && !unreadable.contains(&row.id);
-                if legacy_proven {
-                    if over(row.created_at_ms, lifetime, now_ms) {
-                        entries.push(Entry {
-                            name: row.id.clone(),
-                            class: Class::OverLifetime,
-                            status,
-                            created_ms: row.created_at_ms,
-                            age,
-                            proof: "legacy",
-                            note: Some("named by a thegn worktree; adopted on destroy".into()),
-                        });
-                    }
-                    continue;
-                }
                 let note = if unreadable.contains(&row.id) {
                     "its ledger record is unreadable"
                 } else if any_record.contains(row.id.as_str()) {
@@ -1258,8 +1216,7 @@ mod sprites {
         fn sprites_reap_classifies_and_dry_run_deletes_nothing() {
             let _state = thegn_core::testenv::IsolatedState::new();
             let fake = seed();
-            let report =
-                reap(&envs(&fake, 3600), Ok(Vec::new()), DRY, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
             assert!(fake.destroys.lock().unwrap().is_empty(), "dry run");
             assert_eq!(
                 classes(&report),
@@ -1294,8 +1251,7 @@ mod sprites {
                 row("sx-new", Some(NOW_MS - 60_000)),
                 row("sx-notime", None),
             ]));
-            let report =
-                reap(&envs(&fake, 3600), Ok(Vec::new()), DRY, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
             assert_eq!(
                 classes(&report),
                 [
@@ -1309,7 +1265,7 @@ mod sprites {
                 "sx-old",
                 Some(NOW_MS - 5 * HOUR_MS),
             )]));
-            let report = reap(&envs(&fake0, 0), Ok(Vec::new()), DRY, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(&envs(&fake0, 0), DRY, &mut no_tty, NOW_MS).unwrap();
             assert!(report.accounts[0].entries.is_empty());
         }
 
@@ -1317,14 +1273,7 @@ mod sprites {
         fn sprites_reap_apply_never_deletes_unrecorded() {
             let _state = thegn_core::testenv::IsolatedState::new();
             let fake = seed();
-            let report = reap(
-                &envs(&fake, 3600),
-                Ok(Vec::new()),
-                APPLY_YES,
-                &mut no_tty,
-                NOW_MS,
-            )
-            .unwrap();
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
             assert_eq!(*fake.destroys.lock().unwrap(), ["sx-old"]);
             assert!(report.results.iter().all(|r| r.name != "owner-personal"));
             assert_eq!(report.failed(), 0, "{:?}", report.results);
@@ -1340,14 +1289,7 @@ mod sprites {
             let _state = thegn_core::testenv::IsolatedState::new();
             write("sx-just-made", "ready", NOW_MS / 1000, "ctl-a");
             let fake = fake(Listing::Complete(Vec::new()));
-            let report = reap(
-                &envs(&fake, 3600),
-                Ok(Vec::new()),
-                APPLY_YES,
-                &mut no_tty,
-                NOW_MS,
-            )
-            .unwrap();
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
             assert!(report.accounts[0].entries.is_empty(), "{report:?}");
             assert!(report.results.is_empty());
             assert!(registry::read_checked("sx-just-made").unwrap().is_some());
@@ -1363,14 +1305,7 @@ mod sprites {
                 rows: vec![row("sx-old", Some(NOW_MS - 5 * HOUR_MS))],
                 reason: "inventory exceeds the page cap".into(),
             });
-            let report = reap(
-                &envs(&fake, 3600),
-                Ok(Vec::new()),
-                APPLY_YES,
-                &mut no_tty,
-                NOW_MS,
-            )
-            .unwrap();
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
             assert!(!report.complete);
             assert!(report.refused.as_deref().unwrap().contains("incomplete"));
             assert!(fake.destroys.lock().unwrap().is_empty());
@@ -1393,55 +1328,49 @@ mod sprites {
                 listing: Mutex::new(None),
                 destroys: Mutex::new(Vec::new()),
             });
-            let report = reap(
-                &envs(&unscoped, 3600),
-                Ok(Vec::new()),
-                APPLY_YES,
-                &mut no_tty,
-                NOW_MS,
-            )
-            .unwrap();
+            let report = reap(&envs(&unscoped, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
             assert_eq!(report.accounts[0].listing, "unknown");
             assert!(report.refused.is_some());
             assert!(unscoped.destroys.lock().unwrap().is_empty());
         }
 
         #[test]
-        fn sprites_reap_legacy_proof_and_foreign_records() {
+        fn sprites_reap_pre_ledger_and_foreign_sprites_are_never_deleted() {
             let _state = thegn_core::testenv::IsolatedState::new();
             let now_s = NOW_MS / 1000;
             // Another controller's record: never ours, never deleted.
             write("sx-theirs", "ready", now_s - 5 * 3600, "ctl-b");
+            // A worktree location row naming a sprite proves nothing.
+            {
+                use thegn_core::store::WorkspaceStore;
+                let db = thegn_core::db::Db::open().unwrap();
+                let blob = serde_json::json!({
+                    "control_prefix": ["/nix/store/x/bin/thegn", "sprite-exec", "sx-legacy", "--"],
+                    "path": "/workspace",
+                })
+                .to_string();
+                db.put_worktree("tab", "/repo", "/wt/l", "feat", Some(&blob), None)
+                    .unwrap();
+            }
             let fake = fake(Listing::Complete(vec![
                 row("sx-legacy", Some(NOW_MS - 5 * HOUR_MS)),
                 row("sx-theirs", Some(NOW_MS - 5 * HOUR_MS)),
             ]));
-            let legacy = Ok(vec!["sx-legacy".to_string(), "sx-theirs".to_string()]);
-            let report = reap(&envs(&fake, 3600), legacy, APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
             assert_eq!(
                 classes(&report),
                 [
-                    ("sx-legacy".to_string(), Class::OverLifetime),
+                    ("sx-legacy".to_string(), Class::Unrecorded),
                     ("sx-theirs".to_string(), Class::Unrecorded),
                 ]
             );
-            assert_eq!(report.accounts[0].entries[0].proof, "legacy");
-            assert_eq!(*fake.destroys.lock().unwrap(), ["sx-legacy"]);
-            // An unreadable legacy source proves nothing and says so.
-            let fake = self::fake(Listing::Complete(vec![row(
-                "sx-legacy",
-                Some(NOW_MS - 5 * HOUR_MS),
-            )]));
-            let report = reap(
-                &envs(&fake, 3600),
-                Err("db locked".into()),
-                DRY,
-                &mut no_tty,
-                NOW_MS,
-            )
-            .unwrap();
-            assert_eq!(report.accounts[0].entries[0].class, Class::Unrecorded);
-            assert!(report.notes[0].contains("db locked"));
+            assert_eq!(
+                report.accounts[0].entries[0].note.as_deref(),
+                Some("not recorded by this host")
+            );
+            assert!(fake.destroys.lock().unwrap().is_empty());
+            assert!(report.results.is_empty());
+            assert!(registry::read_checked("sx-legacy").unwrap().is_none());
         }
 
         #[test]
@@ -1459,14 +1388,7 @@ mod sprites {
             })
             .unwrap();
             let fake = fake(Listing::Complete(Vec::new()));
-            let report = reap(
-                &envs(&fake, 3600),
-                Ok(Vec::new()),
-                APPLY_YES,
-                &mut no_tty,
-                NOW_MS,
-            )
-            .unwrap();
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
             assert!(report.accounts[0].entries.is_empty());
             assert!(registry::read_checked("vx-a").unwrap().is_some());
         }
@@ -1479,14 +1401,7 @@ mod sprites {
                 apply: true,
                 yes: false,
             };
-            let report = reap(
-                &envs(&fake, 3600),
-                Ok(Vec::new()),
-                opts,
-                &mut no_tty,
-                NOW_MS,
-            )
-            .unwrap();
+            let report = reap(&envs(&fake, 3600), opts, &mut no_tty, NOW_MS).unwrap();
             assert!(report.refused.as_deref().unwrap().contains("--yes"));
             assert!(fake.destroys.lock().unwrap().is_empty());
             assert!(registry::read_checked("sx-gone").unwrap().is_some());
@@ -1496,8 +1411,7 @@ mod sprites {
         fn sprites_reap_json_shape() {
             let _state = thegn_core::testenv::IsolatedState::new();
             let fake = seed();
-            let report =
-                reap(&envs(&fake, 3600), Ok(Vec::new()), DRY, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
             let json = serde_json::to_value(&report).unwrap();
             assert_eq!(json["provider"], "sprites");
             assert_eq!(json["complete"], true);
