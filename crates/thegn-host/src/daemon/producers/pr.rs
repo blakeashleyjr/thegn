@@ -36,7 +36,10 @@ use super::{TickCtx, TickOutcome};
 use crate::hydrate::{PrRefreshOutcome, PrSite};
 
 /// Most worktrees one PR tick refreshes.
-pub(crate) const PR_POLL_CAP: usize = 64;
+///
+/// 8 x ~3 forge calls per >=30 s tick stays under GitHub's 5,000/h with room
+/// for the UI; rotation covers the rest.
+pub(crate) const PR_POLL_CAP: usize = 8;
 
 /// Most repo roots one mentions tick polls.
 pub(crate) const MENTIONS_CAP: usize = crate::hydrate::DAEMON_MENTION_ROOTS;
@@ -200,26 +203,27 @@ mod tests {
 
     #[test]
     fn selection_is_bounded_and_rotates_through_every_worktree() {
-        let cands: Vec<PrCandidate> = (0..150)
+        let cands: Vec<PrCandidate> = (0..20)
             .map(|i| cand(&format!("/wt/{i:03}"), true, Some("OPEN")))
             .collect();
         let (first, c1) = select_pr_worktrees(&cands, 0, PR_POLL_CAP);
         assert_eq!(first.len(), PR_POLL_CAP);
         assert_eq!(first[0], "/wt/000");
-        assert_eq!(c1, 64);
+        assert_eq!(c1, 8);
         let (second, c2) = select_pr_worktrees(&cands, c1, PR_POLL_CAP);
         assert_eq!(second.len(), PR_POLL_CAP);
-        assert_eq!(second[0], "/wt/064");
+        assert_eq!(second[0], "/wt/008");
+        assert_eq!(c2, 16);
         let (third, c3) = select_pr_worktrees(&cands, c2, PR_POLL_CAP);
         assert_eq!(third.len(), PR_POLL_CAP);
-        assert_eq!(third[0], "/wt/128");
-        assert_eq!(third[21], "/wt/149");
-        assert_eq!(third[22], "/wt/000", "wraps to the start");
-        assert_eq!(c3, (128 + 64) % 150);
+        assert_eq!(third[0], "/wt/016");
+        assert_eq!(third[3], "/wt/019");
+        assert_eq!(third[4], "/wt/000", "wraps to the start");
+        assert_eq!(c3, (16 + 8) % 20);
         let mut seen: std::collections::HashSet<String> = first.into_iter().collect();
         seen.extend(second);
         seen.extend(third);
-        assert_eq!(seen.len(), 150, "three ticks cover every worktree");
+        assert_eq!(seen.len(), 20, "three ticks cover every worktree");
     }
 
     #[test]
