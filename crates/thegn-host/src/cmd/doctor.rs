@@ -1773,7 +1773,7 @@ fn daemon_channel_line(cli: thegn_core::channel::Channel, daemon: Option<Option<
 
 /// Probe an already-running daemon for its channel: probes this state dir's
 /// unix socket only; never opens the state DB or spawns.
-fn probe_daemon_channel(cfg: &Config) -> Option<Option<String>> {
+pub(super) fn probe_daemon_channel(cfg: &Config) -> Option<Option<String>> {
     use crate::daemon::client::{StopProbe, daemon_channel, probe_stop_target};
     use thegn_svc::control::client::{ControlAddr, ControlClient};
     let socket = crate::daemon::socket_path(&cfg.daemon);
