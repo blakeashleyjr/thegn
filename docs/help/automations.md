@@ -199,7 +199,7 @@ max_spawns_per_day = 12   # automation spawns in a rolling 24 h window
 - `0` in either key means automation may spawn nothing.
 - Budgets are checked when a rule fires and again before every executor advance
   or land. A refused run is audited as skipped (`budget`) and the first refusal
-  each day files one `automation_budget` notification.
+  each day files one automation notification.
 - If the usage cannot be read from the database, the spawn is refused
   ("budget unreadable"): a budget failure never lets work through.
 

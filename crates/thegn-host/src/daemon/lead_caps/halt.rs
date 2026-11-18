@@ -34,6 +34,10 @@ struct HaltReply {
     /// Sessions skipped because of `keep_sessions`.
     kept_sessions: bool,
     headless_lead_turn: &'static str,
+    /// The dispatch roster could not be read, so live automation lanes with
+    /// no in-memory origin may have been missed. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    lanes_unreadable: bool,
 }
 
 /// One live session as the kill switch sees it.
@@ -44,12 +48,18 @@ pub(crate) struct LiveSession {
     pub lead_opened: bool,
 }
 
-/// Which live sessions halt kills: those with an automation origin and those
-/// a Lead opened. Pure; sorted and de-duplicated. An origin with no live
-/// session (it already exited) is not a target.
-pub(crate) fn halt_targets(live: &[LiveSession], origins: &BTreeSet<String>) -> Vec<String> {
+/// Which live sessions halt kills: those with an automation origin, those a
+/// Lead opened, and those running an active automation lane on the dispatch
+/// roster (covers lanes the in-memory origin map lost: a transport-retry
+/// relaunch or a daemon restart). Pure; sorted and de-duplicated. An origin
+/// or lane with no live session (it already exited) is not a target.
+pub(crate) fn halt_targets(
+    live: &[LiveSession],
+    origins: &BTreeSet<String>,
+    lane_sessions: &BTreeSet<String>,
+) -> Vec<String> {
     live.iter()
-        .filter(|s| s.lead_opened || origins.contains(&s.id))
+        .filter(|s| s.lead_opened || origins.contains(&s.id) || lane_sessions.contains(&s.id))
         .map(|s| s.id.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -68,7 +78,37 @@ pub(crate) async fn halt(svc: &DaemonService, req: serde_json::Value) -> JsonRes
         .await;
 
     let mut killed = Vec::new();
+    let mut lanes_unreadable = false;
     if !keep_sessions {
+        // Active automation lanes from the roster: the origin map is
+        // in-memory only. A read error never skips the kill.
+        let lane_sessions = match svc
+            .with_db(|db| {
+                use thegn_core::store::NotificationStore;
+                let mut out = BTreeSet::new();
+                for row in db.list_dispatches()? {
+                    if row.status.is_active()
+                        && let Some(sid) = row.session_id.clone()
+                        && db.dispatch_automation(row.id)?.1.is_some()
+                    {
+                        out.insert(sid);
+                    }
+                }
+                Ok(out)
+            })
+            .await
+        {
+            Ok(set) => set,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::automation",
+                    %error,
+                    "automations.halt could not read the dispatch roster; killing by origin only"
+                );
+                lanes_unreadable = true;
+                BTreeSet::new()
+            }
+        };
         let live: Vec<LiveSession> = svc
             .sessions
             .lock()
@@ -80,7 +120,7 @@ pub(crate) async fn halt(svc: &DaemonService, req: serde_json::Value) -> JsonRes
             })
             .collect();
         let origins = crate::automation_runtime::origin_session_ids();
-        for id in halt_targets(&live, &origins) {
+        for id in halt_targets(&live, &origins, &lane_sessions) {
             match ControlApi::kill(svc, &id).await {
                 Ok(()) => killed.push(id),
                 // Exited between the snapshot and the kill: nothing to stop.
@@ -110,6 +150,7 @@ pub(crate) async fn halt(svc: &DaemonService, req: serde_json::Value) -> JsonRes
         validations_cancelled,
         kept_sessions: keep_sessions,
         headless_lead_turn: HEADLESS_NOTE,
+        lanes_unreadable,
     })
 }
 
@@ -132,23 +173,45 @@ mod tests {
             live("auto-1", false),
             live("lead-worker", true),
             live("auto-and-lead", true),
+            live("relaunched-lane", false),
+            live("lane-and-origin", false),
         ];
-        let origins: BTreeSet<String> = ["auto-1", "auto-and-lead", "gone-already"]
+        let origins: BTreeSet<String> =
+            ["auto-1", "auto-and-lead", "lane-and-origin", "gone-already"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        let lanes: BTreeSet<String> = ["relaunched-lane", "lane-and-origin", "lane-exited"]
             .into_iter()
             .map(String::from)
             .collect();
         assert_eq!(
-            halt_targets(&sessions, &origins),
-            vec!["auto-1", "auto-and-lead", "lead-worker"]
+            halt_targets(&sessions, &origins, &lanes),
+            vec![
+                "auto-1",
+                "auto-and-lead",
+                "lane-and-origin",
+                "lead-worker",
+                "relaunched-lane"
+            ]
         );
     }
 
     #[test]
     fn halt_targets_empty_inputs_kill_nothing() {
-        assert!(halt_targets(&[], &BTreeSet::new()).is_empty());
-        assert!(halt_targets(&[live("user", false)], &BTreeSet::new()).is_empty());
+        let none = BTreeSet::new();
+        assert!(halt_targets(&[], &none, &none).is_empty());
+        assert!(halt_targets(&[live("user", false)], &none, &none).is_empty());
         let origins: BTreeSet<String> = ["dead".to_string()].into();
-        assert!(halt_targets(&[], &origins).is_empty());
+        assert!(halt_targets(&[], &origins, &none).is_empty());
+        let lanes: BTreeSet<String> = ["dead-lane".to_string()].into();
+        assert!(halt_targets(&[], &none, &lanes).is_empty());
+        assert!(halt_targets(&[live("user", false)], &none, &lanes).is_empty());
+        // Only in the lane set: still a target.
+        assert_eq!(
+            halt_targets(&[live("dead-lane", false)], &none, &lanes),
+            vec!["dead-lane"]
+        );
     }
 
     #[test]
@@ -159,8 +222,10 @@ mod tests {
             validations_cancelled: 2,
             kept_sessions: false,
             headless_lead_turn: HEADLESS_NOTE,
+            lanes_unreadable: false,
         })
         .unwrap();
+        assert!(reply.get("lanes_unreadable").is_none());
         assert_eq!(reply["paused"], true);
         assert_eq!(reply["killed"], serde_json::json!(["a"]));
         assert_eq!(reply["validations_cancelled"], 2);

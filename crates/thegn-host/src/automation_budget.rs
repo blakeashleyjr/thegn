@@ -16,6 +16,37 @@ pub(crate) fn admit(db: &Db, cfg: &Config, kind: SpawnKind) -> Result<(), Budget
     admit_at(db, &budgets, thegn_core::util::now_ms(), kind)
 }
 
+/// [`admit`] for a planned automation run whose own `'started'` audit row is
+/// already in the usage count: that row is subtracted (one spawn, plus one
+/// active lane for a new lane) so the run is not counted against itself.
+/// The executor callers have no started row and use [`admit`].
+pub(crate) fn admit_planned(db: &Db, cfg: &Config, kind: SpawnKind) -> Result<(), BudgetRefusal> {
+    let budgets = Budgets::from_config(&cfg.effective_automations());
+    admit_planned_at(db, &budgets, thegn_core::util::now_ms(), kind)
+}
+
+/// [`admit_planned`] with explicit limits and clock (testable).
+pub(crate) fn admit_planned_at(
+    db: &Db,
+    budgets: &Budgets,
+    now_ms: i64,
+    kind: SpawnKind,
+) -> Result<(), BudgetRefusal> {
+    let usage = db
+        .automation_budget_usage(now_ms)
+        .map(|u| discount_own_row(u, kind));
+    decide(budgets, usage, kind)
+}
+
+/// Remove the planned run's own started row from a usage read.
+fn discount_own_row(mut usage: BudgetUsage, kind: SpawnKind) -> BudgetUsage {
+    usage.spawns_24h = usage.spawns_24h.saturating_sub(1);
+    if kind == SpawnKind::NewLane {
+        usage.active_lanes = usage.active_lanes.saturating_sub(1);
+    }
+    usage
+}
+
 /// [`admit`] with explicit limits and clock (testable).
 pub(crate) fn admit_at(
     db: &Db,
@@ -80,6 +111,40 @@ mod tests {
                 "{refusal:?}"
             );
             assert!(refusal.to_string().contains("unreadable"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn discount_own_row_removes_one_spawn_and_one_lane_for_a_new_lane() {
+        let u = BudgetUsage {
+            active_lanes: 2,
+            spawns_24h: 12,
+        };
+        assert_eq!(
+            discount_own_row(u, SpawnKind::NewLane),
+            BudgetUsage {
+                active_lanes: 1,
+                spawns_24h: 11
+            }
+        );
+        assert_eq!(
+            discount_own_row(u, SpawnKind::Session),
+            BudgetUsage {
+                active_lanes: 2,
+                spawns_24h: 11
+            }
+        );
+        assert_eq!(
+            discount_own_row(BudgetUsage::default(), SpawnKind::NewLane),
+            BudgetUsage::default()
+        );
+    }
+
+    #[test]
+    fn admit_planned_on_a_fresh_fixture_db_allows_every_kind() {
+        let db = Db::open_memory().unwrap();
+        for kind in [SpawnKind::NewLane, SpawnKind::NextStage, SpawnKind::Session] {
+            assert_eq!(admit_planned_at(&db, &B, 1_763_337_600_000, kind), Ok(()));
         }
     }
 

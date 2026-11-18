@@ -57,11 +57,26 @@ fn call_daemon(path: &'static str, body: serde_json::Value) -> Result<serde_json
 }
 
 fn pause(keep_sessions: bool) -> Result<()> {
-    let reply = call_daemon(
+    let reply = match call_daemon(
         "/v1/automations/halt",
         serde_json::json!({ "keep_sessions": keep_sessions }),
-    )
-    .context("automations.halt")?;
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            // No live daemon: still set the flag so the UI-process runtime
+            // and every executor refuse from here on.
+            tracing::warn!(
+                target: "thegn::automation",
+                error = %format!("{error:#}"),
+                "automations.halt unreachable; setting the pause flag directly"
+            );
+            thegn_core::automation_control::set_paused(&thegn_core::db::Db::open()?, true)?;
+            thegn_core::outln!(
+                "automations paused (daemon unreachable: no sessions were stopped; run again once it is up)"
+            );
+            return Ok(());
+        }
+    };
     for line in format_halt(&reply) {
         thegn_core::outln!("{line}");
     }
@@ -207,7 +222,11 @@ fn format_status(v: &StatusView) -> Vec<String> {
                     a.issue_id,
                     a.stage,
                     sha,
-                    a.message.replace(['\n', '\r'], " ")
+                    a.message
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(160)
+                        .collect::<String>()
                 ));
             }
         }
@@ -286,9 +305,17 @@ fn status(cfg: &Config, json: bool) -> Result<()> {
         ),
         Err(e) => (Err(e.clone()), Err(e.clone()), Err(e.clone())),
     };
-    let pending_approvals = call_daemon("/v1/approvals/list", serde_json::json!({}))
+    let mut pending_approvals = call_daemon("/v1/approvals/list", serde_json::json!({}))
         .and_then(|reply| pending_from_reply(&reply))
         .map_err(err);
+    // Show the trusted description, never the requester's (Lead-controlled)
+    // free text.
+    if let (Ok(db), Ok(pending)) = (&db, &mut pending_approvals) {
+        for p in pending.iter_mut() {
+            p.message =
+                crate::daemon::approval_effects::describe(db, &p.issue_id, &p.stage, &p.commit_sha);
+        }
+    }
     let view = StatusView {
         paused,
         limits,
@@ -410,7 +437,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("linear:THE-1 review 0123456  land it"))
+                .any(|l| l.contains("linear:THE-1 review 0123456  landit"))
         );
         assert!(
             lines
