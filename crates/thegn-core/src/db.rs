@@ -2893,12 +2893,17 @@ impl Db {
     /// (e.g. persisting a whole session's tab list) must use this so a crash
     /// mid-sequence can't leave a torn half-write — and batched writes pay one
     /// fsync instead of one per statement. Uses `unchecked_transaction`
-    /// because `Db` methods take `&self`; do NOT nest `transaction` calls
-    /// (SQLite has no nested BEGIN). A closure that reads then writes under
+    /// because `Db` methods take `&self`. SQLite has no nested BEGIN, so a call
+    /// made while a transaction is already open joins it (like
+    /// [`Db::transaction_immediate`]): the outer transaction commits or rolls
+    /// back the whole unit. A closure that reads then writes under
     /// contention must use [`Db::transaction_immediate`]: upgrading a deferred
     /// read transaction can return SQLITE_BUSY without waiting for the busy
     /// handler.
     pub fn transaction<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
         let tx = self.conn.unchecked_transaction()?;
         let out = f(self)?;
         tx.commit()?;
