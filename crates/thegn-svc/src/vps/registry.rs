@@ -59,11 +59,22 @@ impl IntentGuard {
         Self::at(&dir(), name)
     }
 
-    fn at(directory: &Path, name: &str) -> Self {
+    /// An armed guard for `name`'s intent in an explicit ledger directory.
+    pub fn at(directory: &Path, name: &str) -> Self {
         Self {
             directory: directory.to_path_buf(),
             name: name.to_owned(),
             armed: true,
+        }
+    }
+
+    /// A guard that never removes anything: for callers that recorded no
+    /// intent (or whose intent must always survive).
+    pub fn disarmed(name: &str) -> Self {
+        Self {
+            directory: PathBuf::new(),
+            name: name.to_owned(),
+            armed: false,
         }
     }
 

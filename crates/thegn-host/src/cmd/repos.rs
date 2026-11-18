@@ -51,6 +51,29 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Forget workspaces from this instance's registry while it is stopped
+    /// (dry run unless --apply). Deletes database rows only: files on disk,
+    /// git worktrees and branches are never touched.
+    Forget {
+        /// Workspaces to forget: a repo path, a directory inside it, or a
+        /// unique basename.
+        #[arg(
+            value_name = "PATH",
+            conflicts_with = "keep",
+            required_unless_present = "keep"
+        )]
+        paths: Vec<String>,
+        /// Forget every registered workspace EXCEPT this one (repeatable).
+        #[arg(long, value_name = "PATH", conflicts_with = "paths")]
+        keep: Vec<String>,
+        /// Perform the forget (backs the database up first). Without it,
+        /// print what would be forgotten and change nothing.
+        #[arg(long)]
+        apply: bool,
+        /// Emit one JSON object instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -63,6 +86,20 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             revoke,
         } => trust(cfg, path, approve, revoke),
         Action::Provenance { path, json } => provenance(path, json),
+        Action::Forget {
+            paths,
+            keep,
+            apply,
+            json,
+        } => super::repo_forget::run(
+            cfg,
+            super::repo_forget::ForgetArgs {
+                paths,
+                keep,
+                apply,
+                json,
+            },
+        ),
     }
 }
 
