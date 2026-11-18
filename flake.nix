@@ -903,6 +903,10 @@
           # below. Linux-only in nixpkgs — gate it so the shell evaluates on
           # macOS (where the default ld64 is used instead).
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold]
+          # Sandbox helpers thegn shells out to at runtime (`just live` runs
+          # the binary with this shell's PATH): `bwrap` for sandboxed panes and
+          # `pasta` (passt) for the Lead's isolated network. Linux-only.
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.bubblewrap pkgs.passt]
           # Exact idle child-process counting for the Linux soak harness.
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.strace]
           # prek + the hook binaries (see `preCommit` above). ONLY the default

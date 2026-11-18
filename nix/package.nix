@@ -31,6 +31,12 @@
   gh,
   gdu,
   coreutils,
+  # Sandbox helpers (Linux only): `bwrap` for sandboxed panes and the Lead, and
+  # `pasta` (passt) for the Lead's isolated network namespace. Appended to PATH
+  # as a FALLBACK (`--suffix`), so a system `bwrap` (which may be a setuid
+  # wrapper on hosts without unprivileged user namespaces) still wins.
+  bubblewrap,
+  passt,
   # yazi's preview/runtime tools (passed pinned from the flake); injected onto
   # PATH so previews work inside the file-manager drawer.
   yaziDeps ? [],
@@ -54,6 +60,10 @@
   version ? (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version,
 }: let
   runtimeDeps = [git fzf gum lazygit yazi delta gh gdu coreutils] ++ yaziDeps;
+  sandboxDeps = lib.optionals stdenv.hostPlatform.isLinux [bubblewrap passt];
+  sandboxArgs =
+    lib.optionalString (sandboxDeps != [])
+    " --suffix PATH : ${lib.makeBinPath sandboxDeps}";
   isDev = channel == "dev";
   bridgeArgs =
     lib.optionalString (bridge != null)
@@ -161,7 +171,7 @@ in
       # (git/lazygit/delta/gh/gdu) regardless of the user's PATH.
       wrapProgram $out/bin/${binName} \
         --set THEGN_YAZI_BIN ${yazi}/bin/yazi \
-        --prefix PATH : ${lib.makeBinPath runtimeDeps}${bridgeArgs}
+        --prefix PATH : ${lib.makeBinPath runtimeDeps}${sandboxArgs}${bridgeArgs}
     '';
 
     meta = {
