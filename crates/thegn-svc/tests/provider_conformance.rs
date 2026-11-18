@@ -148,9 +148,9 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>, ledger_file: &std::path::
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp.len()
     );
-    let _ = stream.write_all(head.as_bytes()); // best-effort: client may have disconnected
-    let _ = stream.write_all(&resp); // best-effort: client may have disconnected
-    let _ = stream.flush(); // best-effort: client may have disconnected
+    stream.write_all(head.as_bytes()).unwrap_or_default(); // best-effort: client may have disconnected
+    stream.write_all(&resp).unwrap_or_default(); // best-effort: client may have disconnected
+    stream.flush().unwrap_or_default(); // best-effort: client may have disconnected
 }
 
 /// Complete the exec WebSocket handshake and answer every command with one
@@ -177,7 +177,9 @@ fn exec_websocket(mut stream: TcpStream, headers: &HashMap<String, String>) {
     let mut exit = vec![3];
     exit.extend_from_slice(b"7");
     // best-effort: the client may already have hung up.
-    let _ = socket.send(Message::Binary(exit.into()));
+    socket
+        .send(Message::Binary(exit.into()))
+        .unwrap_or_default(); // best-effort: client may have gone
 }
 
 #[tokio::test]
