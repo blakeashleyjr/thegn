@@ -123,6 +123,51 @@ fn notify_prq(
     });
 }
 
+/// The durable half of a settled PR queue transition for a pass with no UI
+/// drain (the daemon, THE-2211): the inbox row through the canonical routed
+/// emitter, and the typed `merge_landed` fact for a merge. Mirrors
+/// [`notify_prq`]'s blocking half; transient statuses record nothing.
+pub(crate) fn record_settled_step(
+    db: &Db,
+    key: &str,
+    worktree: &str,
+    number: u64,
+    branch: &str,
+    status: &str,
+    detail: &str,
+) {
+    use thegn_core::notification::NotificationKind as K;
+    let (kind, message) = match status {
+        "merged" => (K::PrQueueMerged, format!("PR #{number} ({branch}) merged")),
+        "ready" => (
+            K::PrQueueReady,
+            format!("PR #{number} ({branch}) is ready to merge"),
+        ),
+        "needs_human" => (
+            K::PrQueueNeedsHuman,
+            format!("PR #{number} needs you — {detail}"),
+        ),
+        _ => return,
+    };
+    if let Err(error) = crate::automation_events::emit(db, kind.as_str(), key, &message, worktree) {
+        tracing::debug!(target: "thegn::prq", %error, "daemon pr queue notification not recorded");
+    }
+    if status == "merged" {
+        let origin = crate::automation_events::take_merge_origin(db, worktree);
+        crate::automation_events::submit_fact(
+            thegn_core::automation::AutomationEventKind::MergeLanded,
+            format!("{key}:merged"),
+            Some(worktree.to_string()),
+            Some(message),
+            crate::automation_events::EventFacts {
+                pr_merged: Some(true),
+                origin,
+                ..Default::default()
+            },
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Off-loop spawners
 // ---------------------------------------------------------------------------
@@ -967,6 +1012,24 @@ pub(crate) fn selected_review_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_settled_step_writes_the_inbox_row_and_skips_transient_states() {
+        use thegn_core::store::NotificationStore;
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        record_settled_step(&db, "k-human", "/wt/a", 7, "b", "needs_human", "conflict");
+        assert!(
+            db.has_notification("pr_queue_needs_human", "k-human")
+                .unwrap()
+        );
+        record_settled_step(&db, "k-watch", "/wt/a", 8, "b", "watching", "");
+        assert!(
+            !db.has_notification("pr_queue_needs_human", "k-watch")
+                .unwrap()
+        );
+        assert!(!db.has_notification("pr_queue_ready", "k-watch").unwrap());
+    }
 
     fn held_db_row(
         forge: &str,

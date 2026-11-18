@@ -30,11 +30,17 @@ use crate::handlers::pr_queue::{DriveMode, PrqMsg, drive_blocking};
 /// At most this many repos are driven per PR queue tick.
 pub(crate) const MAX_REPOS_PER_TICK: usize = 16;
 
+/// Where the next tick's repo window starts, so repos past the cap rotate in.
+static REPO_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// One PR queue tick: each repo with active queued PR rows (DB), capped at
 /// [`MAX_REPOS_PER_TICK`], driven in [`DriveMode::Daemon`].
 pub(crate) fn tick_pr_queue(ctx: &TickCtx) -> TickOutcome {
     if !ctx.cfg.pr_queue.enabled {
         return TickOutcome::Skipped("pr_queue disabled");
+    }
+    if automation_paused() {
+        return TickOutcome::Skipped("automation paused");
     }
     let db = match Db::open() {
         Ok(db) => db,
@@ -50,25 +56,45 @@ pub(crate) fn tick_pr_queue(ctx: &TickCtx) -> TickOutcome {
             return TickOutcome::Skipped("pr queue rows unreadable");
         }
     };
-    // The DB handle is not needed by the drive (it opens its own).
-    drop(db);
-    let repos = queued_repos(
+    let worktrees: std::collections::HashMap<&str, &str> = rows
+        .iter()
+        .map(|r| (r.key.as_str(), r.worktree.as_deref().unwrap_or_default()))
+        .collect();
+    let (repos, next) = queued_repos(
         rows.iter()
             .map(|r| (r.repo_root.as_str(), r.status.as_str())),
+        REPO_CURSOR.load(std::sync::atomic::Ordering::Relaxed),
     );
+    REPO_CURSOR.store(next, std::sync::atomic::Ordering::Relaxed);
     if repos.is_empty() {
         return TickOutcome::Skipped("no queued PR rows");
     }
     for root in &repos {
-        drive_blocking(&ctx.cfg, root, DriveMode::Daemon, |msg| {
-            if let PrqMsg::Failed(reason) = msg {
-                tracing::warn!(
-                    target: "thegn::producers",
-                    repo = %root.display(),
-                    %reason,
-                    "daemon pr queue pass failed"
+        drive_blocking(&ctx.cfg, root, DriveMode::Daemon, |msg| match msg {
+            PrqMsg::Failed(reason) => tracing::warn!(
+                target: "thegn::producers",
+                repo = %root.display(),
+                %reason,
+                "daemon pr queue pass failed"
+            ),
+            PrqMsg::Step {
+                key,
+                number,
+                branch,
+                status,
+                detail,
+            } => {
+                let wt = worktrees.get(key.as_str()).copied().unwrap_or_default();
+                crate::handlers::pr_queue::record_settled_step(
+                    &db, &key, wt, number, &branch, &status, &detail,
                 );
             }
+            PrqMsg::Done(out) => {
+                for warning in &out.warnings {
+                    tracing::warn!(target: "thegn::producers", repo = %root.display(), %warning, "daemon pr queue pass");
+                }
+            }
+            PrqMsg::Note(_) | PrqMsg::ReviewTask { .. } => {}
         });
     }
     TickOutcome::Done { work: repos.len() }
@@ -76,8 +102,12 @@ pub(crate) fn tick_pr_queue(ctx: &TickCtx) -> TickOutcome {
 
 /// The distinct repo roots with at least one row the driver would still
 /// work on (not merged, closed or needs_human), sorted, capped at
-/// [`MAX_REPOS_PER_TICK`].
-fn queued_repos<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<PathBuf> {
+/// [`MAX_REPOS_PER_TICK`] starting at `cursor` (wrapping), plus the cursor for
+/// the next tick so every repo is eventually driven.
+fn queued_repos<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str)>,
+    cursor: usize,
+) -> (Vec<PathBuf>, usize) {
     let set: BTreeSet<&str> = rows
         .into_iter()
         .filter(|(root, status)| {
@@ -85,10 +115,18 @@ fn queued_repos<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<P
         })
         .map(|(root, _)| root)
         .collect();
-    set.into_iter()
-        .take(MAX_REPOS_PER_TICK)
-        .map(PathBuf::from)
-        .collect()
+    let all: Vec<&str> = set.into_iter().collect();
+    if all.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let start = cursor % all.len();
+    let take = MAX_REPOS_PER_TICK.min(all.len());
+    (
+        (0..take)
+            .map(|i| PathBuf::from(all[(start + i) % all.len()]))
+            .collect(),
+        (start + take) % all.len(),
+    )
 }
 
 /// One autopilot pickup the tracker tick hands over.
@@ -224,14 +262,38 @@ mod tests {
             ("", "watching"),
         ];
         assert_eq!(
-            queued_repos(rows),
+            queued_repos(rows, 0).0,
             vec![PathBuf::from("/r/a"), PathBuf::from("/r/b")]
         );
 
         let many: Vec<String> = (0..40).map(|i| format!("/r/{i:02}")).collect();
-        let picked = queued_repos(many.iter().map(|r| (r.as_str(), "watching")));
+        let (picked, next) = queued_repos(many.iter().map(|r| (r.as_str(), "watching")), 0);
         assert_eq!(picked.len(), MAX_REPOS_PER_TICK);
         assert_eq!(picked[0], PathBuf::from("/r/00"));
+        assert_eq!(next, 16);
+
+        let (picked, _) = queued_repos(many.iter().map(|r| (r.as_str(), "watching")), next);
+        assert_eq!(picked[0], PathBuf::from("/r/16"));
+
+        let (picked, _) = queued_repos(many.iter().map(|r| (r.as_str(), "watching")), 32);
+        assert!(picked.contains(&PathBuf::from("/r/39")));
+        assert!(picked.contains(&PathBuf::from("/r/00")));
+    }
+
+    #[test]
+    fn pr_queue_tick_skips_while_paused() {
+        let _state = crate::testenv::IsolatedState::new();
+        thegn_core::automation_control::set_paused(&Db::open().unwrap(), true).unwrap();
+        let mut cfg = Config::default();
+        cfg.pr_queue.enabled = true;
+        let ctx = TickCtx {
+            cfg: std::sync::Arc::new(cfg),
+            now_ms: 0,
+        };
+        assert_eq!(
+            tick_pr_queue(&ctx),
+            TickOutcome::Skipped("automation paused")
+        );
     }
 
     #[test]
