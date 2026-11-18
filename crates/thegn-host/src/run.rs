@@ -28041,8 +28041,21 @@ async fn event_loop<T: Terminal>(
                                 .replace("workspace", "project");
                             }
                             Action::DeleteWorkspace => {
-                                // Remove the *active* workspace. Same modal + path
-                                // as the sidebar "Remove workspace" action.
+                                // With the sidebar focused, remove the project the
+                                // cursor is in (the one the user selected) through
+                                // the sidebar's own remove path; the palette keeps
+                                // sidebar focus, so this is what "Remove project"
+                                // from Ctrl+Space means there.
+                                if sb.focused
+                                    && let Some(out) = sb.selected_project_removal(&model)
+                                {
+                                    let mut synth: Option<crate::keymap::Action> = None;
+                                    dispatch_sidebar_outcome!(out, &mut synth);
+                                    dirty = true;
+                                    continue;
+                                }
+                                // Otherwise remove the *active* workspace. Same
+                                // modal + path as the sidebar "Remove workspace".
                                 if session.id.is_empty() {
                                     model.status = "No project to delete".into();
                                     dirty = true;
