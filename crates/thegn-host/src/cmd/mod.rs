@@ -28,6 +28,7 @@ pub mod disk;
 pub mod dispatch;
 pub mod dispatch_commit;
 pub mod doctor;
+pub(crate) mod doctor_lead;
 pub mod env;
 pub mod env_image;
 pub mod env_reap;

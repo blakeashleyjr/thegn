@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The local database migrates forward to schema version 114 (producer leases, THE-2208); restart the daemon after upgrading.
+
 ## [0.1.0-alpha.96] — 2026-11-18
 
 ### Added

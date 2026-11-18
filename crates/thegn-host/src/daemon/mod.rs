@@ -25,6 +25,7 @@ pub(crate) mod lead_caps;
 pub(crate) mod pipeline_reaper;
 pub(crate) mod pipeline_retry;
 pub(crate) mod plugins_status;
+pub(crate) mod producers;
 mod pty_diagnostics;
 pub(crate) mod record;
 pub(crate) mod service;
@@ -1563,6 +1564,9 @@ async fn run(
     // The stage executor (b155): event-driven; `install` returns at once with
     // the supervisor off or no `[[pipeline.stages]]` (idle invariant).
     crate::daemon::stage_executor::install(svc.clone(), Arc::new(cfg.clone()));
+    // Headless producers (THE-2208): `install` returns at once unless
+    // `[daemon] headless_producers` is on AND a rule or queue needs one.
+    crate::daemon::producers::install(svc.clone(), Arc::new(cfg.clone()));
     // Answered approvals fire their effects through this handle (b155).
     approval_effects::install(&svc);
     // Lead tool surface (THE-2172): hand the event sender to the opt-in Notice
@@ -1956,11 +1960,12 @@ async fn idle_exit_loop(
         // LIVE sessions only. Tombstones deliberately do not count: a daemon
         // holding nothing but corpses has no work left, and letting them keep
         // it alive would defeat idle-exit for the whole tombstone TTL.
-        // An armed schedule producer is work too: without it the default
-        // `idle_exit_secs` would reap the daemon and silently stop cron rules.
+        // An armed schedule or producer is work too: without it the default
+        // `idle_exit_secs` would reap the daemon and silently stop cron rules
+        // and headless polling.
         let busy = daemon_busy(
             svc.sessions.lock().await.len(),
-            crate::automation_schedule::armed(),
+            crate::automation_schedule::armed() || crate::daemon::producers::armed_any(),
         );
         if busy {
             idle_since = None;
@@ -1975,9 +1980,10 @@ async fn idle_exit_loop(
     }
 }
 
-/// The idle-exit predicate: live sessions or an armed automation schedule.
-fn daemon_busy(sessions: usize, schedule_armed: bool) -> bool {
-    sessions > 0 || schedule_armed
+/// The idle-exit predicate: live sessions, an armed automation schedule, or
+/// an armed headless producer.
+fn daemon_busy(sessions: usize, schedule_or_producer_armed: bool) -> bool {
+    sessions > 0 || schedule_or_producer_armed
 }
 
 #[cfg(test)]
@@ -1985,7 +1991,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_armed_schedule_keeps_an_otherwise_idle_daemon_busy() {
+    fn an_armed_schedule_or_producer_keeps_an_otherwise_idle_daemon_busy() {
         assert!(!daemon_busy(0, false));
         assert!(daemon_busy(0, true));
         assert!(daemon_busy(2, false));
