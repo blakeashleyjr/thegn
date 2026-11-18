@@ -22,12 +22,12 @@ pub(crate) fn seed(_cfg: &thegn_core::config::Config, notes_dir: &Path) -> Resul
     if std::fs::read(&path).is_ok_and(|existing| existing == body.as_bytes()) {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        thegn_core::fsperm::ensure_private_dir(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    thegn_core::fsperm::write_owner_only_atomic(&path, body.as_bytes())
-        .with_context(|| format!("seed the Lead skill at {}", path.display()))
+    let rel = Path::new(".claude").join("skills").join(SKILL_NAME);
+    let dir = thegn_core::fsperm::ensure_private_dir_beneath(notes_dir, &rel)
+        .with_context(|| format!("create {}", notes_dir.join(&rel).display()))?;
+    dir.write_owner_only_atomic("SKILL.md", body.as_bytes())
+        .with_context(|| format!("seed the Lead skill at {}", path.display()))?;
+    Ok(())
 }
 
 fn embedded_body() -> Result<&'static str> {
