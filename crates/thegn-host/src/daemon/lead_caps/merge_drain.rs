@@ -13,7 +13,8 @@
 //! elsewhere (the CLI, another daemon) is refused too.
 //!
 //! The stage executor's unattended land (b155) starts the same drain through
-//! [`start_for_repo`] with [`DrainEnv::Scrubbed`]: the gate runs
+//! [`start_for_repo`]; both it and `merge.drain` use [`DrainEnv::Scrubbed`]
+//! (the sealed gate is required): the gate runs
 //! worker-written code, so agent sockets and every forge, tracker and model
 //! credential ([`SCRUBBED_ENV`]) are removed from the child's environment.
 //!
@@ -157,7 +158,9 @@ pub(crate) async fn drain(svc: &DaemonService, req: serde_json::Value) -> JsonRe
         let repo = crate::merge_ops::repo_root_of(Path::new(&worktree)).ok_or_else(|| {
             ControlError::FailedPrecondition(format!("{worktree}: not inside a git repository"))
         })?;
-        let pid = start(db, events, &repo, worktree, DrainEnv::Inherit)?;
+        // A Lead-reachable drain is unattended too: it scrubs the env and
+        // requires the sealed gate, exactly like the stage executor's land.
+        let pid = start(db, events, &repo, worktree, DrainEnv::Scrubbed)?;
         Ok::<_, ControlError>((repo, pid))
     })
     .await
@@ -168,10 +171,10 @@ pub(crate) async fn drain(svc: &DaemonService, req: serde_json::Value) -> JsonRe
 /// The drain child's environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DrainEnv {
-    /// The daemon's environment, as `merge.drain` always ran.
-    Inherit,
-    /// The daemon's environment minus [`SCRUBBED_ENV`]: the stage executor's
-    /// unattended land (b155), whose gate runs worker-written code.
+    /// The daemon's environment minus [`SCRUBBED_ENV`], with the sealed gate
+    /// required: the stage executor's unattended land (b155) and the
+    /// Lead-reachable `merge.drain`, whose gate runs worker-written code.
+    /// Owner-driven CLI and UI drains never come through here.
     Scrubbed,
 }
 
@@ -542,9 +545,6 @@ mod tests {
         );
         assert_eq!(scrubbed.get_program(), "thegn");
         assert_eq!(scrubbed.get_current_dir(), Some(Path::new("/repo")));
-
-        let inherit = drain_command(&argv, Path::new("/repo"), DrainEnv::Inherit);
-        assert_eq!(inherit.get_envs().count(), 0, "inherit touches nothing");
     }
 
     #[test]
