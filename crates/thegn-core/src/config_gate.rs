@@ -8,7 +8,7 @@
 //! layer, and that per-repo layer may only RAISE it ([`effective_gate_sandbox`]).
 //! Repo-authored `.thegn.*` files have no `merge_queue` table at all.
 
-use crate::config::config_enum;
+use crate::config::{config_enum, config_warn};
 
 config_enum! {
     /// `[merge_queue] gate_sandbox` — where the gate's commands run.
