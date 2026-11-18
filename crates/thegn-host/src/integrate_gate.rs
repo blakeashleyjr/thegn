@@ -7,6 +7,7 @@
 #[cfg(test)]
 use super::gate_base_for_repo;
 use super::{GateErrorClass, GatePhase, GateVerdict, gate_base, tail};
+use crate::gate_sandbox::GateExec;
 use crate::platform::gate_path::{Directory, Lock, Regular, read_regular};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
@@ -463,6 +464,9 @@ struct Workspace {
     target: Option<PathBuf>,
     target_private: bool,
     temporary_parent: Option<PathBuf>,
+    /// Where the setup and gate commands run, resolved once per gate run
+    /// before preparation (THE-2200), so setup and gate share one spec.
+    exec: GateExec,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -949,6 +953,7 @@ impl Workspace {
             target,
             target_private,
             temporary_parent,
+            exec: GateExec::Host,
         };
         workspace.verify()?;
         let mut workspace = workspace.materialize(poisoned, wait)?;
@@ -1082,8 +1087,21 @@ impl Workspace {
         Ok(())
     }
 
-    fn command_for(&self, command: &str) -> Result<(std::process::Command, bool)> {
+    fn command_for(&self, command: &str) -> Result<PreparedCommand> {
         self.verify()?;
+        if let GateExec::Sealed(spec) = &self.exec {
+            if let Some(target) = &self.target {
+                std::fs::create_dir_all(target).context("gate artifact directory unavailable")?;
+            }
+            return sealed_command(
+                spec,
+                self.checkout.worktree.path(),
+                self.target.as_deref(),
+                self.common.path(),
+                &self.oid,
+                command,
+            );
+        }
         let direct = thegn_core::shellinv::direct_argv(command);
         let inner = direct
             .clone()
@@ -1113,7 +1131,7 @@ impl Workspace {
             .env("THEGN_GATE", "1")
             .env("THEGN_WORKTREE", self.checkout.worktree.path())
             .env("THEGN_GATE_OID", &self.oid);
-        Ok((command, exec_confirmed))
+        Ok((command, exec_confirmed, None))
     }
 
     fn spawn(
@@ -1121,11 +1139,7 @@ impl Workspace {
         command: &str,
         timeout_secs: u64,
     ) -> Result<(super::super::gate_capture::CaptureResult, bool)> {
-        let (command, exec_confirmed) = self.command_for(command)?;
-        Ok((
-            super::super::gate_capture::run(command, std::time::Duration::from_secs(timeout_secs)),
-            exec_confirmed,
-        ))
+        spawn_prepared(self.command_for(command), timeout_secs)
     }
 }
 /// Native unique-worktree runner used on platforms where the descriptor-
@@ -1138,6 +1152,10 @@ struct NativeWorkspace {
     oid: String,
     target: PathBuf,
     tracked_snapshot: TrackedSnapshot,
+    /// Where the setup and gate commands run (THE-2200), resolved once per
+    /// gate run; the git common dir is recorded only for a sealed run.
+    exec: GateExec,
+    common: Option<PathBuf>,
 }
 
 impl NativeWorkspace {
@@ -1188,6 +1206,8 @@ impl NativeWorkspace {
             oid: oid.to_owned(),
             target,
             tracked_snapshot,
+            exec: GateExec::Host,
+            common: None,
         };
         this.verify()?;
         Ok(this)
@@ -1223,8 +1243,40 @@ impl NativeWorkspace {
         index_matches(&self.worktree, &self.oid)
     }
 
-    fn command_for(&self, command: &str) -> Result<(std::process::Command, bool)> {
+    /// Record where this gate's commands run. A sealed run needs the git
+    /// common dir (bound read-only); it is resolved from the checkout here,
+    /// before any configured command runs.
+    fn set_exec(&mut self, exec: GateExec) -> Result<()> {
+        if matches!(exec, GateExec::Sealed(_)) {
+            let common = probe(
+                &self.worktree,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )?;
+            let common = String::from_utf8(common).context("gate common dir is not UTF-8")?;
+            let common = PathBuf::from(common.trim_end_matches(['\n', '\r']));
+            ensure!(common.is_absolute(), "gate common dir is not absolute");
+            self.common = Some(common);
+        }
+        self.exec = exec;
+        Ok(())
+    }
+
+    fn command_for(&self, command: &str) -> Result<PreparedCommand> {
         self.verify()?;
+        if let GateExec::Sealed(spec) = &self.exec {
+            let common = self
+                .common
+                .as_deref()
+                .context("sealed gate has no git common dir")?;
+            return sealed_command(
+                spec,
+                &self.worktree,
+                Some(&self.target),
+                common,
+                &self.oid,
+                command,
+            );
+        }
         let direct = thegn_core::shellinv::direct_argv(command);
         let inner = direct
             .clone()
@@ -1250,7 +1302,7 @@ impl NativeWorkspace {
         for key in util::GIT_ENV_VARS {
             command.env_remove(key);
         }
-        Ok((command, exec_confirmed))
+        Ok((command, exec_confirmed, None))
     }
 
     fn spawn(
@@ -1258,11 +1310,7 @@ impl NativeWorkspace {
         command: &str,
         timeout_secs: u64,
     ) -> Result<(super::super::gate_capture::CaptureResult, bool)> {
-        let (command, exec_confirmed) = self.command_for(command)?;
-        Ok((
-            super::super::gate_capture::run(command, std::time::Duration::from_secs(timeout_secs)),
-            exec_confirmed,
-        ))
+        spawn_prepared(self.command_for(command), timeout_secs)
     }
     #[expect(
         clippy::disallowed_methods,
@@ -1298,17 +1346,30 @@ impl NativeWorkspace {
     }
 }
 
-fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<GateVerdict> {
+fn run_native_isolated(
+    repo: &Path,
+    oid: &str,
+    config: &MergeQueueConfig,
+    exec: GateExec,
+) -> Result<GateVerdict> {
     let _slot = crate::heavy_slot::acquire(&config.heavy_gate, "integrate gate")?;
-    let workspace = NativeWorkspace::prepare(repo, oid, config)
+    let mut workspace = NativeWorkspace::prepare(repo, oid, config)
         .with_context(|| format!("isolated gate preparation failed for {}", repo.display()))?;
+    let mode = RunMode::of(&exec);
+    if let Err(error) = workspace.set_exec(exec) {
+        workspace.verify()?;
+        workspace.cleanup()?;
+        return Ok(sandbox_unavailable(format!(
+            "the sealed merge gate cannot start: {error:#}"
+        )));
+    }
     let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
         if !config.gate_setup_command.is_empty() {
             let (output, exec_confirmed) =
                 workspace.spawn(&config.gate_setup_command, config.gate_setup_timeout_secs)?;
             let setup_passed = matches!(&output, super::super::gate_capture::CaptureResult::Completed { status, .. } if status.success());
-            let (setup_verdict, keep) = capture_verdict(output, true, exec_confirmed);
+            let (setup_verdict, keep) = capture_verdict(output, true, exec_confirmed, &mode);
             poisoned = keep;
             if keep {
                 return Ok(setup_verdict);
@@ -1323,7 +1384,7 @@ fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Res
         }
         let (output, exec_confirmed) =
             workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
-        let (verdict, keep) = capture_verdict(output, false, exec_confirmed);
+        let (verdict, keep) = capture_verdict(output, false, exec_confirmed, &mode);
         poisoned = keep;
         if !keep && let Err(error) = workspace.verify_snapshot() {
             poisoned = true;
@@ -1344,18 +1405,26 @@ fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Res
 }
 
 pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<GateVerdict> {
+    // Resolved once per gate run, before any checkout or spawn: a sealed gate
+    // that cannot resolve is an infrastructure hold, never a host run.
+    let exec = match crate::gate_sandbox::resolve_for_gate(repo, config) {
+        Ok(exec) => exec,
+        Err(reason) => return Ok(sandbox_unavailable(reason)),
+    };
     if !crate::platform::gate_path::verified_workspace_supported() {
-        return run_native_isolated(repo, oid, config);
+        return run_native_isolated(repo, oid, config, exec);
     }
     let _slot = crate::heavy_slot::acquire(&config.heavy_gate, "integrate gate")?;
-    let workspace = Workspace::prepare(repo, oid, config)?;
+    let mut workspace = Workspace::prepare(repo, oid, config)?;
+    let mode = RunMode::of(&exec);
+    workspace.exec = exec;
     let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
         if !config.gate_setup_command.is_empty() {
             let (output, exec_confirmed) =
                 workspace.spawn(&config.gate_setup_command, config.gate_setup_timeout_secs)?;
             let setup_passed = matches!(&output, super::super::gate_capture::CaptureResult::Completed { status, .. } if status.success());
-            let (setup_verdict, keep) = capture_verdict(output, true, exec_confirmed);
+            let (setup_verdict, keep) = capture_verdict(output, true, exec_confirmed, &mode);
             poisoned = keep;
             if keep {
                 if let GateVerdict::Error { reason, .. } = &setup_verdict {
@@ -1374,7 +1443,7 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
         }
         let (output, exec_confirmed) =
             workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
-        let (verdict, keep) = capture_verdict(output, false, exec_confirmed);
+        let (verdict, keep) = capture_verdict(output, false, exec_confirmed, &mode);
         poisoned = keep;
         if keep {
             if let GateVerdict::Error { reason, .. } = &verdict {
@@ -1397,19 +1466,158 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
     verdict
 }
 
+/// One prepared gate command: the command, whether its exec is confirmed
+/// (host direct argv only), and a sealed run's secret env-file guard, which
+/// must outlive the child.
+type PreparedCommand = (
+    std::process::Command,
+    bool,
+    Option<thegn_core::sandbox::SecretEnvFile>,
+);
+
+/// The sealed entry refused to build an argv: a sandbox start failure, so an
+/// infrastructure hold (`Error{Spawn}`), never branch blame.
+#[derive(Debug)]
+struct SandboxEntryRefused(String);
+
+impl std::fmt::Display for SandboxEntryRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SandboxEntryRefused {}
+
+/// The env a gate command sees, host or sealed (a sealed run carries it into
+/// the sandbox through the spec).
+fn gate_env(checkout: &Path, target: Option<&Path>, oid: &str) -> Vec<(String, String)> {
+    let mut env = Vec::with_capacity(5);
+    if let Some(target) = target {
+        env.push((
+            "CARGO_TARGET_DIR".to_owned(),
+            target.to_string_lossy().into_owned(),
+        ));
+    }
+    env.extend([
+        ("GIT_NO_REPLACE_OBJECTS".to_owned(), "1".to_owned()),
+        ("THEGN_GATE".to_owned(), "1".to_owned()),
+        (
+            "THEGN_WORKTREE".to_owned(),
+            checkout.to_string_lossy().into_owned(),
+        ),
+        ("THEGN_GATE_OID".to_owned(), oid.to_owned()),
+    ]);
+    env
+}
+
+/// A gate command inside the sealed sandbox: the guarded entry argv, run in
+/// the checkout, with the drain's credential scrub and the git-env scrub on
+/// the entry process itself. `exec_confirmed` is false: the sandbox wrapper
+/// stands between the configured command and its exit status.
+fn sealed_command(
+    spec: &thegn_core::sandbox::SandboxSpec,
+    checkout: &Path,
+    target: Option<&Path>,
+    common: &Path,
+    oid: &str,
+    command: &str,
+) -> Result<PreparedCommand> {
+    let env = gate_env(checkout, target, oid);
+    let (argv, env_file) =
+        crate::gate_sandbox::sealed_argv(spec, checkout, target, common, command, &env)
+            .map_err(|reason| anyhow::Error::new(SandboxEntryRefused(reason)))?;
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]).current_dir(checkout);
+    for key in crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV {
+        command.env_remove(key);
+    }
+    for key in util::GIT_ENV_VARS {
+        command.env_remove(key);
+    }
+    Ok((command, false, env_file))
+}
+
+/// Run a prepared gate command under the shared capture (timeout and reap).
+/// A refused sandbox entry is a spawn failure, not a preparation error.
+fn spawn_prepared(
+    prepared: Result<PreparedCommand>,
+    timeout_secs: u64,
+) -> Result<(super::super::gate_capture::CaptureResult, bool)> {
+    use super::super::gate_capture::CaptureResult;
+    let (command, exec_confirmed, env_file) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => match error.downcast::<SandboxEntryRefused>() {
+            Ok(SandboxEntryRefused(reason)) => {
+                return Ok((
+                    CaptureResult::SpawnFailed {
+                        reason,
+                        log: String::new(),
+                    },
+                    false,
+                ));
+            }
+            Err(error) => return Err(error),
+        },
+    };
+    let result =
+        super::super::gate_capture::run(command, std::time::Duration::from_secs(timeout_secs));
+    // The child is reaped (or quarantined) by the capture: only now may the
+    // secret env-file go.
+    drop(env_file);
+    Ok((result, exec_confirmed))
+}
+
+/// The verdict when the sealed gate cannot be resolved: an infrastructure
+/// hold before any spawn, never `Failed` (no branch blame, no bisect).
+fn sandbox_unavailable(reason: String) -> GateVerdict {
+    GateVerdict::Error {
+        reason,
+        log: String::new(),
+        phase: GatePhase::Preparation,
+        class: GateErrorClass::Spawn,
+    }
+}
+
+/// How the commands of one gate run execute, for verdict mapping and logs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RunMode {
+    Host,
+    /// Sealed, with the log header naming the sandbox's network.
+    Sealed {
+        header: String,
+    },
+}
+
+impl RunMode {
+    fn of(exec: &GateExec) -> Self {
+        match exec {
+            GateExec::Host => Self::Host,
+            GateExec::Sealed(spec) => Self::Sealed {
+                header: GateExec::sealed_log_header(spec),
+            },
+        }
+    }
+}
+
 fn capture_verdict(
     result: super::super::gate_capture::CaptureResult,
     setup: bool,
     exec_confirmed: bool,
+    mode: &RunMode,
 ) -> (GateVerdict, bool) {
-    let (verdict, keep) = capture_verdict_inner(result, setup, exec_confirmed);
-    (label_host_execution(verdict), keep)
+    let sealed = matches!(mode, RunMode::Sealed { .. });
+    let (verdict, keep) = capture_verdict_inner(result, setup, exec_confirmed, sealed);
+    let verdict = match mode {
+        RunMode::Host => label_execution(verdict, gate::HOST_EXECUTION_LOG_HEADER),
+        RunMode::Sealed { header } => label_execution(verdict, header),
+    };
+    (verdict, keep)
 }
 
-fn label_host_execution(verdict: GateVerdict) -> GateVerdict {
+fn label_execution(verdict: GateVerdict, header: &str) -> GateVerdict {
     match verdict {
         GateVerdict::Failed { log } => GateVerdict::Failed {
-            log: label_host_execution_log(log),
+            log: label_execution_log(log, header),
         },
         GateVerdict::Error {
             reason,
@@ -1418,7 +1626,7 @@ fn label_host_execution(verdict: GateVerdict) -> GateVerdict {
             class,
         } => GateVerdict::Error {
             reason,
-            log: label_host_execution_log(log),
+            log: label_execution_log(log, header),
             phase,
             class,
         },
@@ -1426,11 +1634,36 @@ fn label_host_execution(verdict: GateVerdict) -> GateVerdict {
     }
 }
 
-fn label_host_execution_log(log: String) -> String {
+fn label_execution_log(log: String, header: &str) -> String {
     if log.trim().is_empty() {
         log
     } else {
-        format!("{}{log}", gate::HOST_EXECUTION_LOG_HEADER)
+        format!("{header}{log}")
+    }
+}
+
+/// The exit status a sandbox entry reports when the sandbox itself refused
+/// to start (`podman run`/`bwrap` convention).
+const SANDBOX_REFUSED_EXIT: i32 = 125;
+
+/// Whether a completed run is the sandbox refusing to start rather than the
+/// configured command's own exit: only a sealed run, only exit 125.
+fn sandbox_refused(sealed: bool, code: Option<i32>) -> bool {
+    sealed && code == Some(SANDBOX_REFUSED_EXIT)
+}
+
+/// A sealed run whose sandbox refused to start says nothing about the
+/// branch: an infrastructure hold, never `Failed`, never bisected.
+fn sandbox_refused_verdict(setup: bool, log: String) -> GateVerdict {
+    GateVerdict::Error {
+        reason: format!("the gate sandbox could not start (exit {SANDBOX_REFUSED_EXIT})"),
+        log,
+        phase: if setup {
+            GatePhase::Setup
+        } else {
+            GatePhase::Gate
+        },
+        class: GateErrorClass::Spawn,
     }
 }
 
@@ -1438,9 +1671,15 @@ fn capture_verdict_inner(
     result: super::super::gate_capture::CaptureResult,
     setup: bool,
     exec_confirmed: bool,
+    sealed: bool,
 ) -> (GateVerdict, bool) {
     use super::super::gate_capture::CaptureResult as Capture;
     match result {
+        // A sealed run whose sandbox refused to start says nothing about the
+        // branch: an infrastructure hold, never `Failed`, never bisected.
+        Capture::Completed { status, log } if sandbox_refused(sealed, status.code()) => {
+            (sandbox_refused_verdict(setup, log), false)
+        }
         Capture::Completed { status, log } if setup && !status.success() => (
             GateVerdict::Error {
                 reason: format!(
