@@ -13,7 +13,10 @@
 //!   resolved, against facts only the daemon has (is the worktree registered,
 //!   what sandbox backend did the launch actually enter);
 //! - [`check_rule_open_action`] holds Lead-authored automation rules to the
-//!   same agent-by-name-only shape.
+//!   same agent-by-name-only shape;
+//! - `sessions.input` is shape-checked here (plain text and Enter only, see
+//!   [`crate::lead_input`]); the daemon then allows it only into a session the
+//!   Lead itself opened ([`ConfineRefusal::NotLeadWorker`]).
 //!
 //! Who is Lead-confined is decided from trusted state only (the pairing row's
 //! label, minted by the host, and the listener the request arrived on), never
@@ -83,7 +86,6 @@ pub enum Rule {
 const ADMIN_ONLY: &str = "operator-only (admin scope); never reachable by the Lead";
 const EXEC_ONLY: &str =
     "runs a configured command on the host (exec scope); never reachable by the Lead";
-const NO_INPUT: &str = "typing into a session is refused for the Lead: session provenance is not recorded, so it cannot tell its own workers from your shells";
 const NO_ATTACH: &str = "an interactive attach can type into the session; the Lead reads screens with sessions.snapshot";
 const NO_FORK: &str = "a fork can re-run the source session's raw command; the Lead opens a configured agent with sessions.open instead";
 const NO_SPLIT: &str = "a split launches a caller-supplied argv or a login shell on the host";
@@ -172,12 +174,12 @@ pub fn rule(verb: Verb) -> Rule {
         // THE-2197: pausing only stops automations; it takes no arguments.
         | Verb::AutomationsPause => Rule::Allow,
 
-        // Shape-checked.
-        Verb::OpenSession | Verb::DispatchesPut => Rule::AllowIf,
+        // Shape-checked. `sessions.input` is further held, in the daemon, to
+        // sessions a Lead opened.
+        Verb::OpenSession | Verb::DispatchesPut | Verb::SendInput => Rule::AllowIf,
 
         Verb::ForkSession => Rule::Refuse(NO_FORK),
         Verb::Split => Rule::Refuse(NO_SPLIT),
-        Verb::SendInput => Rule::Refuse(NO_INPUT),
         Verb::Attach | Verb::Detach | Verb::Resize => Rule::Refuse(NO_ATTACH),
         Verb::OpenWorktree | Verb::OpenEditor => Rule::Refuse(NO_HOST_UI),
         Verb::GitStage | Verb::GitCommit | Verb::WorktreeCreate => Rule::Refuse(NO_HOST_GIT),
@@ -241,6 +243,11 @@ pub enum RequestShape<'a> {
     DispatchPut {
         session_id: bool,
     },
+    /// `sessions.input`: the exact bytes that would reach the PTY (Enter
+    /// already appended), judged by [`crate::lead_input::check`].
+    Input {
+        bytes: &'a [u8],
+    },
 }
 
 /// Why a Lead-confined request was refused.
@@ -270,6 +277,11 @@ pub enum ConfineRefusal {
         backend: String,
     },
     AutomationAgent,
+    /// `sessions.input` bytes that are not plain text and Enter.
+    Input(crate::lead_input::InputRefusal),
+    /// `sessions.input` into a session the Lead did not open (or one that is
+    /// gone, or no longer the session the Lead opened under that id).
+    NotLeadWorker(String),
 }
 
 fn capability(verb: Verb) -> &'static str {
@@ -323,6 +335,12 @@ impl std::fmt::Display for ConfineRefusal {
             ConfineRefusal::AutomationAgent => f.write_str(
                 "a Lead-authored sessions.open rule must name a configured agent (`then.agent`)",
             ),
+            ConfineRefusal::Input(why) => write!(f, "sessions.input: {why}"),
+            ConfineRefusal::NotLeadWorker(session) => write!(
+                f,
+                "sessions.input into {session} is refused: the Lead may only answer a live \
+                 worker it opened itself"
+            ),
         }
     }
 }
@@ -344,6 +362,9 @@ pub fn check(verb: Verb, req: &RequestShape<'_>) -> Result<(), ConfineRefusal> {
                 } else {
                     Ok(())
                 }
+            }
+            (Verb::SendInput, RequestShape::Input { bytes }) => {
+                crate::lead_input::check(bytes).map_err(ConfineRefusal::Input)
             }
             _ => Err(ConfineRefusal::Unshaped(verb)),
         },
@@ -441,6 +462,7 @@ mod tests {
         check_rule_open_action, is_contained_backend, is_lead_label, is_lead_rule_id, rule,
     };
     use crate::control::{Scope, Verb, required_scope};
+    use crate::lead_input::{InputRefusal, MAX_LEAD_INPUT_BYTES};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Kind {
@@ -461,7 +483,7 @@ mod tests {
         (Verb::ForkSession, Refuse),
         (Verb::Attach, Refuse),
         (Verb::Detach, Refuse),
-        (Verb::SendInput, Refuse),
+        (Verb::SendInput, AllowIf),
         (Verb::Resize, Refuse),
         (Verb::Snapshot, Allow),
         (Verb::KillSession, Allow),
@@ -649,9 +671,8 @@ mod tests {
     }
 
     #[test]
-    fn session_input_split_fork_and_attach_are_refused() {
+    fn split_fork_and_attach_are_refused() {
         for verb in [
-            Verb::SendInput,
             Verb::Split,
             Verb::ForkSession,
             Verb::Attach,
@@ -666,6 +687,43 @@ mod tests {
                 "{verb:?}"
             );
         }
+    }
+
+    #[test]
+    fn session_input_is_allow_if_plain_text() {
+        assert_eq!(rule(Verb::SendInput), Rule::AllowIf);
+        assert_eq!(
+            check(
+                Verb::SendInput,
+                &RequestShape::Input {
+                    bytes: b"yes, use the second option\r"
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(Verb::SendInput, &RequestShape::Input { bytes: b"\x1b[A" }),
+            Err(ConfineRefusal::Input(InputRefusal::Escape))
+        );
+        assert_eq!(
+            check(Verb::SendInput, &RequestShape::Input { bytes: b"\x03" }),
+            Err(ConfineRefusal::Input(InputRefusal::Control(3)))
+        );
+        let big = vec![b'x'; MAX_LEAD_INPUT_BYTES + 1];
+        assert!(matches!(
+            check(Verb::SendInput, &RequestShape::Input { bytes: &big }),
+            Err(ConfineRefusal::Input(InputRefusal::TooLarge { .. }))
+        ));
+        // gRPC carries no shape: refused, not allowed.
+        assert_eq!(
+            check(Verb::SendInput, &RequestShape::Opaque),
+            Err(ConfineRefusal::Unshaped(Verb::SendInput))
+        );
+        // An input shape never satisfies another verb.
+        assert_eq!(
+            check(Verb::OpenSession, &RequestShape::Input { bytes: b"x" }),
+            Err(ConfineRefusal::Unshaped(Verb::OpenSession))
+        );
     }
 
     #[test]
@@ -944,6 +1002,8 @@ mod tests {
                 backend: "host".into(),
             },
             ConfineRefusal::AutomationAgent,
+            ConfineRefusal::Input(InputRefusal::Escape),
+            ConfineRefusal::NotLeadWorker("abc".into()),
         ];
         for refusal in all {
             let msg = refusal.to_string();

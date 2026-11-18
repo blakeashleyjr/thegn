@@ -300,7 +300,11 @@ A Lead token is confined whatever its scopes. In short:
 
 - `sessions.open` launches only a configured agent, by name, in a registered
   worktree whose launch resolves to a real sandbox. No raw `argv`, no `env`.
-- `sessions.input`, `sessions.attach`, `sessions.split`, `sessions.fork`,
+- `sessions.input` works only into a live worker a Lead opened, and only as
+  plain text plus Enter (no escape sequences or other control characters, at
+  most 16 KiB). The MCP tool also needs `--allow-session-input`, which the
+  Lead's wiring does not pass today.
+- `sessions.attach`, `sessions.split`, `sessions.fork`,
   `git.stage`, `git.commit`, `worktrees.open`, `worktrees.create`,
   `editor.open`, `worktrees.sandbox_profile_set` and every admin or exec verb
   are refused.
