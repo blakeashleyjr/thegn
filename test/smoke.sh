@@ -2557,21 +2557,17 @@ check "dev honours the same toggles" \
 
 # Closed-pipe regressions: a reader that hangs up mid-drain/land must not
 # strand a claimed row or skip the roster/DB bookkeeping after the ref moved.
-if command -v sqlite3 >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
-  PIPE_REPO="$TMP/pipe-repo"
-  PIPE_HOME="$TMP/pipe-home"
-  mkdir -p "$PIPE_REPO" "$PIPE_HOME"
-  (
-    cd "$PIPE_REPO" && git init -q -b main && git config user.email t@e && git config user.name t &&
-      git config commit.gpgsign false && echo base >base.txt && git add -A && git commit -q -m c0 &&
-      git branch pipe-feat && git checkout -q pipe-feat && echo f >f.txt && git add -A &&
-      git commit -q -m feat && git checkout -q main
-  ) >/dev/null 2>&1
-  check "merge drain with a closed stdout pipe still records the landed row" \
-    "cd '$PIPE_REPO' && env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' merge add --branch pipe-feat >/dev/null 2>&1; env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' merge drain | true; env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' merge list 2>&1 | grep -q landed"
-  check "land --worktree with a closed stdout pipe still records the landed row" \
-    "cd '$PIPE_REPO' && env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' land --worktree '$PIPE_REPO' | true; env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' merge list 2>&1 | grep -q landed"
-fi
+MP2="$("$SZ" wt new smoke-pipe-drain --repo "$R")"
+MB2="$(git -C "$MP2" symbolic-ref --short HEAD)"
+echo p >"$MP2/pipe-drain.txt"
+git -C "$MP2" add -f -A && git -C "$MP2" commit -q -m "smoke pipe drain"
+check "merge drain with a closed stdout pipe still records the landed row" \
+  "'$SZ' merge add '$MP2' >/dev/null && ('$SZ' merge drain | true); [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB2' AND status='landed'\") -eq 1 ]]"
+MP3="$("$SZ" wt new smoke-pipe-land --repo "$R")"
+echo p >"$MP3/pipe-land.txt"
+git -C "$MP3" add -f -A && git -C "$MP3" commit -q -m "smoke pipe land"
+check "land with a closed stdout pipe still advances the target" \
+  "('$SZ' land --worktree '$MP3' | true); git -C '$R' log --oneline | grep -q 'smoke pipe land'"
 
 echo
 if [[ $fail -eq 0 ]]; then
