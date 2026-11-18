@@ -457,6 +457,12 @@ pub fn audit_lead_refusal(pairing_id: &str, label: &str, verb: Verb, target: &st
     emit_audit(pairing_id, label, verb, target, AuditOutcome::LeadConfined);
 }
 
+/// Audit a Lead-confined call the daemon allowed after its own check (a
+/// `sessions.input` into a worker the Lead opened), on the same path.
+pub fn audit_lead_allowed(pairing_id: &str, label: &str, verb: Verb, target: &str) {
+    emit_audit(pairing_id, label, verb, target, AuditOutcome::Ok);
+}
+
 /// Emit an audit record for a rejected request with no resolvable caller (no
 /// or invalid credential) — the pairing id/label are empty; no secret is ever
 /// logged.
@@ -963,33 +969,54 @@ pub(super) async fn send_input(
     Path(s): Path<String>,
     body: axum::Json<InputBody>,
 ) -> Response {
-    if let Err(r) = authed_target(&state, &headers, Verb::SendInput, &s) {
-        return r;
-    }
-    let mut bytes = match (&body.b64, &body.text) {
-        (Some(b64), None) => match base64::engine::general_purpose::STANDARD.decode(b64) {
-            Ok(b) => b,
-            Err(_) => {
-                return error_json(
-                    StatusCode::BAD_REQUEST,
-                    ControlErrorCode::BadRequest,
-                    "invalid base64",
-                );
-            }
+    // Decode before the auth check so a Lead-confined caller's exact PTY
+    // bytes (Enter included) are the shape `lead_confine::check` judges; a
+    // malformed body still answers only after authentication.
+    let decoded: Result<Vec<u8>, &'static str> = match (&body.b64, &body.text) {
+        (Some(b64), None) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| "invalid base64"),
+        (None, Some(text)) => Ok(text.clone().into_bytes()),
+        _ => Err("exactly one of `b64` or `text` is required"),
+    };
+    let decoded = decoded.map(|mut bytes| {
+        if body.enter {
+            bytes.push(b'\r');
+        }
+        bytes
+    });
+    let shape = match &decoded {
+        Ok(bytes) => RequestShape::Input {
+            bytes: bytes.as_slice(),
         },
-        (None, Some(text)) => text.clone().into_bytes(),
-        _ => {
+        Err(_) => RequestShape::Opaque,
+    };
+    let ctx = match authed_shaped(&state, &headers, Verb::SendInput, &s, &shape) {
+        Ok(ctx) => ctx,
+        Err(r) => return r,
+    };
+    let bytes = match decoded {
+        Ok(bytes) => bytes,
+        Err(message) => {
             return error_json(
                 StatusCode::BAD_REQUEST,
                 ControlErrorCode::BadRequest,
-                "exactly one of `b64` or `text` is required",
+                message,
             );
         }
     };
-    if body.enter {
-        bytes.push(b'\r');
-    }
-    match state.api.send_input(&s, bytes).await {
+    let sent = if ctx.lead_confined {
+        // The bytes passed; the daemon still proves the session is a live
+        // worker a Lead opened (and audits either way) before writing.
+        let caller = super::LeadCaller {
+            pairing_id: ctx.pairing_id,
+            label: ctx.label,
+        };
+        state.api.send_input_confined(&s, bytes, caller).await
+    } else {
+        state.api.send_input(&s, bytes).await
+    };
+    match sent {
         Ok(()) => axum::Json(json!({ "sent": true })).into_response(),
         Err(e) => e.into_response(),
     }
