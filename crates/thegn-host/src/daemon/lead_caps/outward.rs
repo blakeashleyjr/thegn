@@ -109,7 +109,10 @@ pub(crate) async fn gate(
         .with_db(move |db| {
             let now = thegn_core::util::now_ms();
             let latest = db.latest_approval(&check_issue, &check_stage)?;
-            if !state_for(latest.as_ref(), &check_sha, now, ttl).is_live() {
+            let exact = latest
+                .as_ref()
+                .is_some_and(|a| a.commit_sha.trim().eq_ignore_ascii_case(&check_sha));
+            if !exact || !state_for(latest.as_ref(), &check_sha, now, ttl).is_live() {
                 return Ok(false);
             }
             Ok(db.revoke_approvals(&check_issue, &check_stage, now)? > 0)
@@ -333,6 +336,21 @@ mod tests {
             [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
             1,
             "{a:?} {b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sha_prefix_approval_does_not_admit_the_body() {
+        let (svc, _profile) = service(&[]);
+        let body = comment("ship it");
+        let ids = approval_ids("issues.comment", "linear:THE-1", &body);
+        approve(
+            &svc,
+            &(ids.0.clone(), ids.1.clone(), ids.2[..7].to_string()),
+        );
+        refused_with_request(
+            gate(&svc, "issues.comment", "linear:THE-1", body, &caller()).await,
+            &ids.2,
         );
     }
 
