@@ -667,6 +667,12 @@ fn run_tty(
     let (session, mode) = match opened {
         Ok(session) => (session, Mode::Pty),
         Err(e) => {
+            if hosts.is_none() && format!("{e:#}").contains("is not an allowed Vercel host") {
+                let line = format!("vercel: interactive host refused by the pin: {e:#}")
+                    .replace(['\n', '\r'], " ");
+                tracing::info!(target: "thegn::provider", "{line}");
+                note(&line);
+            }
             tracing::debug!(target: "thegn::provider", error = %e, "vercel /interactive unavailable");
             let session = match rt.block_on(Arc::clone(&provider).open_stream(id, &spec)) {
                 Ok(session) => session,

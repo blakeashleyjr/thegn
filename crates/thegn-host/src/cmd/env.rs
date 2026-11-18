@@ -443,7 +443,7 @@ fn deprovision(
             },
             |id| crate::agent::block_on_provider(|| async { provider.destroy(id).await }),
             |line| outln!("{line}"),
-            |line| msg::warn(line),
+            msg::warn,
         );
         outln!("{}", outcome.summary());
         return Ok(());
