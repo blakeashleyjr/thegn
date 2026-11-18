@@ -240,6 +240,19 @@ impl Db {
         {
             return Err(anyhow::Error::new(PrQueueLeased { key: entry.key }));
         }
+        for path in paths {
+            let claimed = self
+                .conn()
+                .query_row(
+                    "SELECT 1 FROM merge_queue WHERE worktree=?1 AND claim_owner IS NOT NULL",
+                    params![path],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if claimed.is_some() {
+                return Err(anyhow::Error::new(crate::store::MergeClaimActive));
+            }
+        }
         Ok(())
     }
 
