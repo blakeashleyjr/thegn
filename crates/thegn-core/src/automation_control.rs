@@ -40,6 +40,20 @@ pub fn paused_strict(store: &dyn WorkspaceStore) -> Result<bool> {
         .is_some_and(|v| v == "1"))
 }
 
+/// The pause flag for a decision that may spawn, advance, land or wake:
+/// an unreadable flag reads as PAUSED (with a warning). Every b155 decision
+/// site uses this; [`paused`] (fail-open) is only for display.
+pub fn paused_fail_closed(store: &dyn WorkspaceStore) -> bool {
+    paused_strict(store).unwrap_or_else(|error| {
+        tracing::warn!(
+            target: "thegn::automation",
+            %error,
+            "could not read the automation pause flag; treating as paused"
+        );
+        true
+    })
+}
+
 /// `automations.halt` (Admin; HTTP + CLI; b155 6f): kill every live
 /// automation-started or Lead-opened session unless `keep_sessions`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -83,6 +97,23 @@ mod tests {
         assert!(!paused(&db));
         set_paused(&db, false).unwrap();
         assert!(!paused(&db));
+    }
+
+    #[test]
+    fn paused_fail_closed_reads_an_unreadable_flag_as_paused() {
+        let db = crate::db::Db::open_memory().unwrap();
+        assert!(!paused_fail_closed(&db));
+        set_paused(&db, true).unwrap();
+        assert!(paused_fail_closed(&db));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pause.sqlite");
+        let broken = crate::db::Db::open_at(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE ui_state")
+            .unwrap();
+        assert!(!paused(&broken), "display read stays fail-open");
+        assert!(paused_fail_closed(&broken), "decision read fails closed");
     }
 
     #[test]

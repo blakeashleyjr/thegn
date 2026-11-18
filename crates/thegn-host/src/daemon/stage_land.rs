@@ -194,7 +194,7 @@ async fn enqueue(
     let (paused, budget) = svc
         .with_db(move |db| {
             Ok((
-                thegn_core::automation_control::paused(db),
+                thegn_core::automation_control::paused_fail_closed(db),
                 crate::automation_budget::admit(db, &budget_cfg, SpawnKind::NextStage)
                     .map_err(|refusal| refusal.to_string()),
             ))
@@ -209,6 +209,34 @@ async fn enqueue(
         return Ok(TerminalOutcome::Held {
             reason: format!("enqueue failed: {error}"),
         });
+    }
+    // The queue is keyed by worktree/branch, not by the reviewed commit (it
+    // has no column for it, and this batch adds no schema): re-verify the
+    // head immediately before the drain starts, and pull the row back out if
+    // it moved. The fold itself can still race a commit landing after this
+    // check (a short window, reported in THE-2171).
+    let recheck = read_head(&ctx.worktree).await;
+    if !recheck
+        .as_deref()
+        .is_some_and(|h| same_commit(h, commit_sha))
+    {
+        let dq_cfg = Arc::clone(cfg);
+        let dq_worktree = PathBuf::from(&ctx.worktree);
+        let dequeued = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let db = Db::open()?;
+            crate::merge_ops::dequeue_worktree(&dq_cfg, &db, &dq_worktree)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("dequeue task: {e}"))
+        .and_then(|r| r);
+        let reason = moved_after_enqueue_reason(recheck.as_deref(), dequeued.as_ref().err());
+        if dequeued.is_err() {
+            // The row could not be pulled back: the owner must look before
+            // any drain folds it.
+            return ask(svc, ctx, &ctx.stage, commit_sha, &reason).await;
+        }
+        super::stage_executor::kick_row(ctx.row);
+        return held(Some(reason));
     }
     let worktree = PathBuf::from(&ctx.worktree);
     let repo = tokio::task::spawn_blocking(move || crate::merge_ops::repo_root_of(&worktree))
@@ -238,6 +266,19 @@ async fn enqueue(
         None => false,
     };
     Ok(TerminalOutcome::Landed { drain_started })
+}
+
+/// Why a land was pulled back after enqueue: the head moved (or became
+/// unreadable) between review and the drain.
+fn moved_after_enqueue_reason(head: Option<&str>, dequeue_error: Option<&anyhow::Error>) -> String {
+    let what = match head {
+        Some(_) => "the lane's head moved after it was enqueued",
+        None => "the lane's head could not be re-read after it was enqueued",
+    };
+    match dequeue_error {
+        None => format!("{what}; dequeued, not drained"),
+        Some(error) => format!("{what}, and dequeue failed ({error:#}): the row is still queued"),
+    }
 }
 
 fn held(reason: Option<String>) -> anyhow::Result<TerminalOutcome> {
@@ -336,7 +377,7 @@ async fn gather_unattended(
                 .as_deref()
                 .and_then(|id| rule_standing(&db_cfg, db, id));
             let green = chain_validations_green(&db_cfg, db, &ids, &head_sha);
-            let paused = thegn_core::automation_control::paused(db);
+            let paused = thegn_core::automation_control::paused_fail_closed(db);
             let budget_ok =
                 crate::automation_budget::admit(db, &db_cfg, SpawnKind::NextStage).is_ok();
             let passed = {
@@ -708,6 +749,23 @@ mod tests {
         assert!(first_stage_terminal(Some("plan"), "review", 1));
         assert!(first_stage_terminal(None, "review", 2));
         assert!(!first_stage_terminal(Some("plan"), "review", 2));
+    }
+
+    #[test]
+    fn moved_after_enqueue_reason_names_the_dequeue_outcome() {
+        let moved = moved_after_enqueue_reason(Some("abc"), None);
+        assert!(
+            moved.contains("moved") && moved.contains("dequeued"),
+            "{moved}"
+        );
+        let unread = moved_after_enqueue_reason(None, None);
+        assert!(unread.contains("could not be re-read"), "{unread}");
+        let error = anyhow::anyhow!("locked");
+        let stuck = moved_after_enqueue_reason(Some("abc"), Some(&error));
+        assert!(
+            stuck.contains("still queued") && stuck.contains("locked"),
+            "{stuck}"
+        );
     }
 
     #[test]

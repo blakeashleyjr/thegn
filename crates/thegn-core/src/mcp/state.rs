@@ -238,7 +238,9 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                       to the server's resolved worktree when `worktree` is omitted. \
                       Additive: it never removes queue entries. Git-scoped \
                       (`--scopes git`; the narrow `merge_add` grant is for worktree-bound \
-                      route tokens and does not enable this tool); requires a running daemon.",
+                      route tokens and does not enable this tool); requires a running daemon. \
+                      Refused for a Lead: it lands only through a rule's land step or an owner \
+                      approval.",
         args: &[ArgSpec {
             name: "worktree",
             kind: ArgKind::String,
@@ -1252,7 +1254,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
     },
     StateToolSpec {
         cap: "merge.drain",
-        description: "Start the merge-queue drain for a worktree's repository. Git-scoped (`--scopes git`; the narrow `merge_add` grant is for worktree-bound route tokens and does not enable this tool); requires a running daemon.",
+        description: "Start the merge-queue drain for a worktree's repository. Git-scoped (`--scopes git`; the narrow `merge_add` grant is for worktree-bound route tokens and does not enable this tool); requires a running daemon. Refused for a Lead: it lands only through a rule's land step or an owner approval.",
         args: &[ArgSpec {
             name: "worktree",
             kind: ArgKind::String,

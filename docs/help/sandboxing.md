@@ -1102,10 +1102,12 @@ listener, as Lead-confined, whatever its scopes. A Lead-confined call:
   (`worktrees.create`, which runs git on a caller-named repo), open a worktree
   or an editor, write files from outside the sandbox (`search.replace`,
   `skills.seed`), run tools or presets, or change a worktree's sandbox profile.
+- **May not** enqueue or drain the merge queue (`merge.add`, `merge.drain`):
+  the Lead lands only through a rule's land step or an owner approval.
 - **May** read everything a read token can, kill sessions, record a session,
   file folders, work the tracker, the dispatch roster
   (without binding a session), notifications, approvals requests, its own
-  automation rules, and the merge queue when `[lead] scopes` grants it.
+  automation rules, and read the merge queue.
 
 A Lead-authored automation rule that opens a session is held to the same
 rule when it fires (and the worker it opens counts as Lead-opened). Every

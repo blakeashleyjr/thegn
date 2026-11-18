@@ -230,8 +230,10 @@ HTTP API and `thegn api call`.
 | `merge_drain`        | `git`   | Start the merge-queue drain for a worktree's repository            |
 
 `merge_drain` is gated like `merge_add`: the narrow `merge_add` grant belongs to
-worktree-bound route tokens, so an MCP caller needs `git`. Rules the Lead
-writes may only notify or open sessions.
+worktree-bound route tokens, so an MCP caller needs `git`. A Lead never gets
+either: it lands only through a rule's land step or an owner approval, so a
+Lead-confined `merge_add` or `merge_drain` is refused whatever its scopes.
+Rules the Lead writes may only notify or open sessions.
 
 ### The overview reply
 
@@ -336,9 +338,11 @@ A Lead token is confined whatever its scopes. In short:
   `git.stage`, `git.commit`, `worktrees.open`, `worktrees.create`,
   `editor.open`, `worktrees.sandbox_profile_set` and every admin or exec verb
   are refused.
+- `merge.add` and `merge.drain` are refused: the Lead lands only through a
+  rule's land step or an owner approval.
 - Reads, `sessions.kill`, the tracker, dispatches (without binding a session),
-  notifications, approvals requests, its own rules and the merge queue (with
-  `merge_add`) work as their scopes say.
+  notifications, approvals requests, its own rules and reading the merge queue
+  work as their scopes say.
 
 The full list is in [sandboxing](sandboxing.md#what-the-lead-may-ask-the-daemon-to-do).
 

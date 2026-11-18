@@ -16,10 +16,36 @@ pub(crate) fn admit(db: &Db, cfg: &Config, kind: SpawnKind) -> Result<(), Budget
     admit_at(db, &budgets, thegn_core::util::now_ms(), kind)
 }
 
+/// [`admit`] with `pending` added to the usage read: the spawns rules
+/// already kept for the same event will make (the runtime's pre-admission
+/// check, `automation_runtime::refuse_over_budget`).
+pub(crate) fn admit_with_pending(
+    db: &Db,
+    cfg: &Config,
+    kind: SpawnKind,
+    pending: &BudgetUsage,
+) -> Result<(), BudgetRefusal> {
+    let budgets = Budgets::from_config(&cfg.effective_automations());
+    let usage = db
+        .automation_budget_usage(thegn_core::util::now_ms())
+        .map(|u| with_pending(u, pending));
+    decide(&budgets, usage, kind)
+}
+
+/// Add an event's not-yet-admitted spawns to a usage read.
+fn with_pending(usage: BudgetUsage, pending: &BudgetUsage) -> BudgetUsage {
+    BudgetUsage {
+        active_lanes: usage.active_lanes.saturating_add(pending.active_lanes),
+        spawns_24h: usage.spawns_24h.saturating_add(pending.spawns_24h),
+    }
+}
+
 /// [`admit`] for a planned automation run whose own `'started'` audit row is
 /// already in the usage count: that row is subtracted (one spawn, plus one
 /// active lane for a new lane) so the run is not counted against itself.
-/// The executor callers have no started row and use [`admit`].
+/// The automation executor re-checks with this immediately before a
+/// budgeted action runs (`automation_executor::execute`); the stage
+/// executor callers have no started row and use [`admit`].
 pub(crate) fn admit_planned(db: &Db, cfg: &Config, kind: SpawnKind) -> Result<(), BudgetRefusal> {
     let budgets = Budgets::from_config(&cfg.effective_automations());
     admit_planned_at(db, &budgets, thegn_core::util::now_ms(), kind)
@@ -137,6 +163,25 @@ mod tests {
         assert_eq!(
             discount_own_row(BudgetUsage::default(), SpawnKind::NewLane),
             BudgetUsage::default()
+        );
+    }
+
+    #[test]
+    fn with_pending_adds_saturating() {
+        let u = BudgetUsage {
+            active_lanes: 1,
+            spawns_24h: u32::MAX,
+        };
+        let p = BudgetUsage {
+            active_lanes: 1,
+            spawns_24h: 1,
+        };
+        assert_eq!(
+            with_pending(u, &p),
+            BudgetUsage {
+                active_lanes: 2,
+                spawns_24h: u32::MAX
+            }
         );
     }
 

@@ -189,16 +189,21 @@ max_concurrent_lanes = 2  # automation-started lanes active at once
 max_spawns_per_day = 12   # automation spawns in a rolling 24 h window
 ```
 
-- An active lane is a tracker issue with an active dispatch row that an
-  automation rule started. Manual dispatches never count.
-- A spawn is a succeeded `pipeline.start`, `sessions.open` or `lead.wake` run
-  (a `propose` start is not a spawn: it starts nothing), plus each stage the
-  executor advances an automation lane to.
+- An active lane is a tracker issue with a dispatch row that an automation
+  rule started and that is either active or still has a running session (a
+  row marked done while its worker runs still holds its slot), plus each
+  `pipeline.start` run still in flight. Manual dispatches never count.
+- A spawn is a `pipeline.start`, `sessions.open` or `lead.wake` run that
+  succeeded or is still in flight (a `propose` start is not a spawn: it
+  starts nothing), plus each stage the executor advances an automation lane
+  to. Several rules firing on one event share the budget: each takes a slot
+  in turn, and the ones past the limit are skipped. Audit pruning never drops
+  a spawn inside the 24 h window.
 - A new lane needs both a free lane slot and a spawn; the next stage of an
   existing lane, a session and a Lead wake need only a spawn.
 - `0` in either key means automation may spawn nothing.
-- Budgets are checked when a rule fires and again before every executor advance
-  or land. A refused run is audited as skipped (`budget`) and the first refusal
+- Budgets are checked when a rule fires, again just before the action runs,
+  and before every executor advance or land. A refused run is audited as skipped (`budget`) and the first refusal
   each day files one automation notification.
 - If the usage cannot be read from the database, the spawn is refused
   ("budget unreadable"): a budget failure never lets work through.

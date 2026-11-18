@@ -3655,6 +3655,27 @@ async fn lead_confined_raw_open_is_refused_audited_and_never_dispatched() {
     );
 }
 
+/// A Lead never enqueues or drains the merge queue, whatever its scopes
+/// (b155 THE-2171): it lands only through a rule's land step or an owner
+/// approval. The API is never called.
+#[tokio::test]
+async fn lead_confined_merge_add_and_drain_are_refused_whatever_the_scopes() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write,git", LEAD_LABEL.to_string());
+    for path in ["/v1/merge/add", "/v1/merge/drain"] {
+        let (status, body) =
+            post_json(&r, path, &lead, serde_json::json!({"worktree": "/w"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        let text = refusal_text(&body);
+        assert!(
+            text.starts_with(thegn_core::lead_confine::REFUSAL_PREFIX)
+                && text.contains("owner approval"),
+            "{path}: {body}"
+        );
+    }
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+}
+
 /// Regression guard: a non-Lead Write token still opens a raw argv through
 /// the ordinary path.
 #[tokio::test]

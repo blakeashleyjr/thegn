@@ -315,25 +315,44 @@ impl AutomationStore for Db {
         now_ms: i64,
     ) -> Result<crate::automation_budget::BudgetUsage> {
         let conn = self.conn();
+        // A lane is active while its status says so OR while its session has
+        // not exited: a Lead can `dispatches.set_status` a row to done while
+        // the worker is still running, and that must not free a lane slot.
         let active: i64 = conn.query_row(
             &format!(
                 "SELECT COUNT(DISTINCT issue_id) FROM agent_dispatches \
-                 WHERE automation_rule IS NOT NULL AND status IN ({})",
+                 WHERE automation_rule IS NOT NULL \
+                   AND (status IN ({}) \
+                        OR (session_id IS NOT NULL AND session_id <> '' \
+                            AND exited_at_ms IS NULL))",
                 sql_list(&ACTIVE_DISPATCH_TOKENS)
             ),
             [],
             |row| row.get(0),
         )?;
+        let since_secs = (now_ms / 1000).saturating_sub(DAY_SECS);
+        // A `pipeline.start` run still in flight (`started`) is about to open
+        // a lane with no dispatch row yet: it holds a lane slot.
+        let lanes_in_flight: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_runs \
+             WHERE action_cap = 'pipeline.start' AND outcome = 'started' \
+               AND COALESCE(autonomy,'') <> 'propose' AND started_at >= ?1",
+            params![since_secs],
+            |row| row.get(0),
+        )?;
         // automation_runs.started_at is unix seconds (see `now()` callers and
-        // the six-hour IN_FLIGHT_WINDOW_SECS); agent_dispatches is ms.
+        // the six-hour IN_FLIGHT_WINDOW_SECS); agent_dispatches is ms. Runs
+        // still in flight (`started`) count as well as succeeded ones, so
+        // several rules on one event (or concurrent events) cannot each see
+        // the same free slot and together spawn past the limit.
         let runs: i64 = conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM automation_runs \
-                 WHERE action_cap IN ({}) AND outcome = 'succeeded' \
+                 WHERE action_cap IN ({}) AND outcome IN ('started','succeeded') \
                    AND COALESCE(autonomy,'') <> 'propose' AND started_at >= ?1",
                 sql_list(&SPAWN_CAPS)
             ),
-            params![(now_ms / 1000).saturating_sub(DAY_SECS)],
+            params![since_secs],
             |row| row.get(0),
         )?;
         let advanced: i64 = conn.query_row(
@@ -345,7 +364,7 @@ impl AutomationStore for Db {
         )?;
         let clamp = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
         Ok(crate::automation_budget::BudgetUsage {
-            active_lanes: clamp(active),
+            active_lanes: clamp(active.saturating_add(lanes_in_flight)),
             spawns_24h: clamp(runs.saturating_add(advanced)),
         })
     }
@@ -353,13 +372,22 @@ impl AutomationStore for Db {
     fn prune_automation_runs(&self, retain_per_rule: usize) -> Result<usize> {
         let retain = i64::try_from(retain_per_rule.clamp(1, MAX_RETENTION_PER_RULE))
             .unwrap_or(MAX_RETENTION_PER_RULE as i64);
+        // Never prune a row the budget still counts (6e): a spawn row inside
+        // the rolling 24 h window, or a run still in flight. Pruning one would
+        // free a budget slot that was really spent.
         let deleted = self.conn().execute(
-            "DELETE FROM automation_runs AS old \
-             WHERE (SELECT COUNT(*) FROM automation_runs AS newer \
-                    WHERE newer.rule_id=old.rule_id \
-                      AND (newer.started_at > old.started_at \
-                           OR (newer.started_at = old.started_at AND newer.id > old.id))) >= ?1",
-            params![retain],
+            &format!(
+                "DELETE FROM automation_runs AS old \
+                 WHERE (SELECT COUNT(*) FROM automation_runs AS newer \
+                        WHERE newer.rule_id=old.rule_id \
+                          AND (newer.started_at > old.started_at \
+                               OR (newer.started_at = old.started_at AND newer.id > old.id))) >= ?1 \
+                   AND old.outcome <> 'started' \
+                   AND NOT (old.action_cap IN ({}) \
+                            AND old.started_at >= CAST(strftime('%s','now') AS INTEGER) - ?2)",
+                sql_list(&SPAWN_CAPS)
+            ),
+            params![retain, DAY_SECS],
         )?;
         Ok(deleted)
     }
@@ -638,6 +666,74 @@ mod tests {
         // 3 counted runs + 2 parent-linked advances inside 24 h.
         assert_eq!(counted, 3);
         assert_eq!(usage.spawns_24h, 5);
+    }
+
+    #[test]
+    fn budget_usage_counts_in_flight_runs_and_unexited_sessions() {
+        let db = Db::open_memory().unwrap();
+        let now_ms: i64 = 10 * 86_400_000;
+        let now = now_ms / 1000;
+        // A started (in-flight) pipeline.start holds a spawn and a lane slot;
+        // a started sessions.open holds a spawn only.
+        for (cap, autonomy) in [("pipeline.start", Some("review")), ("sessions.open", None)] {
+            let mut r = run("r", &format!("inflight-{cap}"), now - 30);
+            r.action_cap = cap.into();
+            r.autonomy = autonomy.map(str::to_string);
+            db.start_automation_run(&r).unwrap();
+        }
+        // A roster row marked done whose session has not exited is active.
+        let id = budget_dispatch(&db, "THE-9", "done", Some("r"), None, now_ms - 1_000);
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET session_id='s9', exited_at_ms=NULL WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+        // The same shape with an exited session is not.
+        let gone = budget_dispatch(&db, "THE-10", "done", Some("r"), None, now_ms - 1_000);
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET session_id='s10', exited_at_ms=?1 WHERE id=?2",
+                params![now_ms - 500, gone],
+            )
+            .unwrap();
+        let usage = db.automation_budget_usage(now_ms).unwrap();
+        assert_eq!(usage.active_lanes, 2, "THE-9 plus the in-flight lane");
+        assert_eq!(usage.spawns_24h, 2, "both in-flight runs");
+    }
+
+    #[test]
+    fn prune_keeps_spawn_rows_inside_the_budget_window_and_in_flight_runs() {
+        let db = Db::open_memory().unwrap();
+        let now = crate::util::now();
+        // Recent spawn rows: never pruned even past the retention count.
+        for n in 0..3 {
+            let mut r = run("spawner", &format!("recent{n}"), now - 60 + n);
+            r.action_cap = "pipeline.start".into();
+            r.autonomy = Some("review".into());
+            let id = db.start_automation_run(&r).unwrap();
+            db.finish_automation_run(id, "succeeded", None, None, now)
+                .unwrap();
+        }
+        // An old in-flight row is kept too.
+        let mut old_started = run("spawner", "old-started", now - 3 * 86_400);
+        old_started.action_cap = "notify.push".into();
+        db.start_automation_run(&old_started).unwrap();
+        // An old finished spawn row outside the window may go.
+        let mut old = run("spawner", "old", now - 2 * 86_400);
+        old.action_cap = "pipeline.start".into();
+        let id = db.start_automation_run(&old).unwrap();
+        db.finish_automation_run(id, "succeeded", None, None, now - 2 * 86_400)
+            .unwrap();
+        assert_eq!(db.prune_automation_runs(1).unwrap(), 1);
+        let left: Vec<String> = db
+            .automation_runs(Some("spawner"), 99)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.event_id)
+            .collect();
+        assert_eq!(left.len(), 4, "{left:?}");
+        assert!(!left.iter().any(|e| e == "old"), "{left:?}");
     }
 
     fn run(rule: &str, event: &str, at: i64) -> NewAutomationRun {
