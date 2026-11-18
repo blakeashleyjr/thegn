@@ -2,6 +2,7 @@
 # Live Vercel Sandbox run (THE-2234). SPENDS REAL MONEY on the owner's Vercel
 # account when acting; with no flags it only prints the plan and exits 0.
 #
+# Neither this nor test/sprites-live.sh is in ci/ci-local/smoke.
 # NOT part of `just ci`, `ci-local` or `smoke`: nothing in justfile, the
 # workflows or the nix checks globs `test/*live*.sh`; it runs only through
 # `just vercel-live`. The token is never read or printed: only the SecretRef
@@ -43,7 +44,7 @@ while [ $# -gt 0 ]; do
     shift
     ;;
   -h | --help)
-    sed -n 2,14p "$0"
+    sed -n 2,16p "$0"
     exit 0
     ;;
   *)
@@ -69,7 +70,8 @@ Steps:
   1   create env config (temp)        2   env test (token works)
   3   provision sandbox (env up)      4   run a command in the sandbox
   5   interactive terminal open       5b  record the interactive host
-  6   commit in sandbox               6b-6e upload mode (only --with-model-login)
+  6   commit in sandbox               6b  in-sandbox curl must fail (egress)
+  6b-m..6e upload mode (only --with-model-login)
   7   env pull (fast-forward)         8   stop (env down --stop) and resume
   8b  tmpfs login dir is gone after stop/resume
   9   env down (destroy)              10  env reap (dry-run, then apply)
@@ -105,8 +107,9 @@ keyring:* | file:* | env:*) ;;
 esac
 
 TMP="$(mktemp -d)"
-export XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config"
-mkdir -p "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/thegn" "$TMP/repo"
+export XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config" THEGN_DIR="$TMP/thegn"
+unset THEGN_CONFIG_DIR
+mkdir -p "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/thegn" "$THEGN_DIR" "$TMP/repo"
 mkdir -m 700 "$TMP/run"
 export XDG_RUNTIME_DIR="$TMP/run"
 REPO="$TMP/repo"
@@ -122,6 +125,7 @@ teardown() {
   local rc=$?
   trap - EXIT INT TERM
   set +e
+  local left=0
   if [ "$CREATED" = 1 ]; then
     echo "-- teardown: env down"
     (cd "$REPO" && "$THEGN_BIN" env down --force)
@@ -132,11 +136,17 @@ teardown() {
     out="$("$THEGN_BIN" fleet list --json 2>&1)"
     echo "$out" | head -40
     if echo "$out" | grep -Eq '"id": *"'; then
+      left=1
       echo "TEARDOWN INCOMPLETE: sandbox may still exist; clean up manually: $SANDBOX_NAME (team $team_id, project $project_id)" >&2
       rc=1
     fi
   fi
-  rm -rf "$TMP"
+  if [ "$left" = 1 ]; then
+    echo "-- keeping $TMP (ownership ledger needed for a later reap); ledger files:" >&2
+    find "$TMP" -type f \( -path '*registry*' -o -name '*ledger*' \) -print -exec cat {} \; >&2 2>/dev/null
+  else
+    rm -rf "$TMP"
+  fi
   exit "$rc"
 }
 trap teardown EXIT INT TERM
@@ -163,6 +173,9 @@ in_repo() { (cd "$REPO" && "$@"); }
 
 write_config() {
   cat >"$XDG_CONFIG_HOME/thegn/config.toml" <<CFG
+[env.${ENV_NAME}]
+placement = "provider"
+
 [env.${ENV_NAME}.provider]
 provider = "vercel"
 team_id = "${team_id}"
@@ -181,7 +194,8 @@ CFG
 scratch_repo() {
   git -C "$REPO" init -q -b main &&
     git -C "$REPO" -c user.name=vx -c user.email=vx@example.invalid -c commit.gpgsign=false \
-      commit -q --allow-empty -m init
+      commit -q --allow-empty -m init &&
+    git -C "$REPO" switch -q -c vx/live-lane
 }
 
 sandbox_name_from_fleet() {
@@ -199,15 +213,16 @@ CREATED=1
 step 3 "provision sandbox (env up)" in_repo "$THEGN_BIN" env up
 sandbox_name_from_fleet
 echo "sandbox: $SANDBOX_NAME"
-step 4 "capture-mode command runs in the sandbox" in_repo "$THEGN_BIN" env show
+step 4 "command runs in the sandbox (vercel-exec)" bash -c "'$THEGN_BIN' vercel-exec '$SANDBOX_NAME' -- true </dev/null"
 echo "   run in ANOTHER terminal: XDG_STATE_HOME='$XDG_STATE_HOME' XDG_CONFIG_HOME='$XDG_CONFIG_HOME' XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR' THEGN_CHANNEL=dev $THEGN_BIN  (open $REPO)"
 echo "== step 5: open an interactive terminal pane for this worktree now (manual)"
 echo "   (a pane open runs the vercel-exec TTY bridge; then close it)"
 step 5 "interactive terminal opened (operator confirms)" ask "pane opened and closed cleanly? "
-step 5b "record the interactive host (paste the ticket/health host)" ask "host seen recorded (note it for narrowing interactive_host_suffixes)?"
+step 5b "bridge host line (stderr of the pane bridge: admitted ticket host, /health host)" ask "host line read and recorded (host only, no URL query/ticket)? "
+step 6b "in-sandbox egress is denied (curl to example.com must fail)" bash -c "! '$THEGN_BIN' vercel-exec '$SANDBOX_NAME' -- curl -m 5 https://example.com </dev/null"
 step 6 "commit inside the sandbox (operator, in the pane)" ask "committed inside the sandbox? "
 if [ "$model_login" = 1 ]; then
-  step 6b "egress policy narrowed to model hosts before upload" ask "doctor shows narrowed egress? "
+  step 6b-m "egress policy narrowed to model hosts before upload" ask "doctor shows narrowed egress? "
   step 6c "login dir exists on /dev/shm, dir 0700 files 0600" ask "stat shows tmpfs + modes ok? "
   step 6d "claude starts with only .credentials.json + synthesized .claude.json" ask "claude ran a prompt? "
   step 6e "model hosts list is complete (no blocked host in logs)" ask "no egress denials for model hosts? "
