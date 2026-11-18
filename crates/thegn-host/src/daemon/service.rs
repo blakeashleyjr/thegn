@@ -3047,6 +3047,20 @@ impl ControlApi for DaemonService {
         Box::pin(super::lead_caps::merge_drain::drain(self, req))
     }
 
+    fn automations_pause(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations_pause::pause(self, req))
+    }
+
+    fn automations_resume(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations_pause::resume(self, req))
+    }
+
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         Box::pin(async move {
             let daemon_id = self.daemon_id.clone();

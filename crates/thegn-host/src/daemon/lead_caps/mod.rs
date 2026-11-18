@@ -1,6 +1,6 @@
 //! The daemon side of the Lead tool surface (THE-2172).
 //!
-//! `DaemonService`'s eleven Lead `ControlApi` methods are one-line delegations
+//! `DaemonService`'s Lead `ControlApi` methods are one-line delegations
 //! into these modules, which take and return `serde_json::Value`; each module
 //! decodes into its owning thegn-core DTO with [`decode`] and replies with
 //! [`encode`]. The files were created as stubs by the b152 spine (lane 1) and
@@ -8,6 +8,7 @@
 
 pub(crate) mod approvals;
 pub(crate) mod automations;
+pub(crate) mod automations_pause;
 pub(crate) mod feed;
 pub(crate) mod listener;
 pub(crate) mod merge_drain;
