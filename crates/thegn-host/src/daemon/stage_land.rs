@@ -469,9 +469,10 @@ fn rule_standing(cfg: &Config, db: &Db, rule_id: &str) -> Option<RuleStanding> {
         && !rule_id.starts_with(thegn_core::automation_authoring::LEAD_RULE_PREFIX)
     {
         RuleOrigin::Config
-    } else if {
+    } else {
         use thegn_core::store::AutomationRuleStore;
-        db.lead_rules()
+        let owner_armed = db
+            .lead_rules()
             .ok()
             .and_then(|rows| rows.into_iter().find(|r| r.id == rule_id))
             .is_some_and(|row| {
@@ -482,11 +483,12 @@ fn rule_standing(cfg: &Config, db: &Db, rule_id: &str) -> Option<RuleStanding> {
                 );
                 crate::automation_arming::armed_set(db, thegn_core::util::now_ms())
                     .contains(&(rule_id.to_string(), sha))
-            })
-    } {
-        RuleOrigin::LeadApproved
-    } else {
-        RuleOrigin::Lead
+            });
+        if owner_armed {
+            RuleOrigin::LeadApproved
+        } else {
+            RuleOrigin::Lead
+        }
     };
     Some(RuleStanding {
         origin,

@@ -84,9 +84,10 @@ mod tests {
     use thegn_svc::control::{ControlError, ProfileEnvCaller};
 
     fn cfg_with_lead() -> Config {
-        let mut cfg = Config::default();
-        cfg.lead = Some(thegn_core::config_lead::LeadConfig::default());
-        cfg
+        Config {
+            lead: Some(thegn_core::config_lead::LeadConfig::default()),
+            ..Config::default()
+        }
     }
 
     fn caller(lead_label: Option<&str>, admin: bool) -> ProfileEnvCaller {
