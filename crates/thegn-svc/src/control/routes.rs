@@ -187,6 +187,18 @@ pub static ROUTES: &[Route] = &[
     route("/v1/automations/resume", &["automations.resume"], || {
         post(http_lead::automations_resume)
     }),
+    // b155 Lead spine.
+    route("/v1/approvals/redeem", &["approvals.redeem"], || {
+        post(http_lead::approvals_redeem)
+    }),
+    route("/v1/automations/halt", &["automations.halt"], || {
+        post(http_lead::automations_halt)
+    }),
+    route(
+        "/v1/mcp_proxy/profile_env",
+        &["mcp_proxy.profile_env"],
+        || post(http_lead::mcp_proxy_profile_env),
+    ),
     route("/v1/mcp_proxy/status", &["mcp_proxy.status"], || {
         get(http::mcp_proxy_status)
     }),
@@ -301,6 +313,9 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("merge.drain", "POST", "/v1/merge/drain"),
     ("automations.pause", "POST", "/v1/automations/pause"),
     ("automations.resume", "POST", "/v1/automations/resume"),
+    ("approvals.redeem", "POST", "/v1/approvals/redeem"),
+    ("automations.halt", "POST", "/v1/automations/halt"),
+    ("mcp_proxy.profile_env", "POST", "/v1/mcp_proxy/profile_env"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
     ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),
     ("plugins.status", "GET", "/v1/plugins/status"),

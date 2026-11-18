@@ -52,6 +52,9 @@ pub(crate) struct LeadMcpPlan {
     pub agent_args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub readable: Vec<std::path::PathBuf>,
+    /// The Lead listener's loopback address from `control-addr.json` (b155):
+    /// the isolated network namespace forwards exactly this port.
+    pub control_addr: Option<SocketAddr>,
 }
 
 /// Open (creating owner-only as needed) the Lead control dir beneath
@@ -430,6 +433,7 @@ fn prepare_in(
     let exe = std::env::current_exe().context("resolve the thegn executable")?;
     let exe = exe.to_string_lossy();
     let csv = scopes.to_csv();
+    let control_addr = addr;
     let addr = addr.to_string();
     let doc = thegn_core::mcp::wire::lead_entries(&thegn_core::mcp::wire::LeadEntries {
         command: &exe,
@@ -452,6 +456,7 @@ fn prepare_in(
         ],
         env: Vec::new(),
         readable: vec![dir.path().to_path_buf()],
+        control_addr: Some(control_addr),
     })
 }
 
@@ -612,6 +617,7 @@ mod tests {
             ]
         );
         assert_eq!(plan.readable, std::slice::from_ref(&dir));
+        assert_eq!(plan.control_addr, Some("127.0.0.1:4242".parse().unwrap()));
         crate::platform::test_assert_owner_only_permissions(&path, &dir);
         let doc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

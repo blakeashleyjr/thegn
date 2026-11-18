@@ -105,6 +105,8 @@ pub fn spawn(
         cors_origins: Vec::new(),
         event_streams: Default::default(),
         lead_listener: false,
+        // Implicit admin, never a Lead token: nothing to slide.
+        lead_token_ttl_secs: 0,
     };
 
     let (raw_tx, raw_rx) = mpsc::channel::<String>(RAW_BUFFER);

@@ -529,6 +529,15 @@ pub enum Verb {
     /// Resume paused automations — admin only, so a Lead that paused can never
     /// restart them; only the operator resumes.
     AutomationsResume,
+    // --- b155 Lead spine (THE-2200/2202/2222) ---
+    /// Answer an approval from the owner's phone with a single-use push nonce
+    /// (write; HTTP + CLI only; refused for a Lead-confined caller).
+    ApprovalsRedeem,
+    /// Kill every automation-started and Lead-opened session (admin).
+    AutomationsHalt,
+    /// Resolve an MCP proxy profile's server env for the Lead (read; the
+    /// daemon checks the caller's label and the profile).
+    McpProxyProfileEnv,
 }
 
 impl Verb {
@@ -640,6 +649,9 @@ impl Verb {
         Verb::MergeDrain,
         Verb::AutomationsPause,
         Verb::AutomationsResume,
+        Verb::ApprovalsRedeem,
+        Verb::AutomationsHalt,
+        Verb::McpProxyProfileEnv,
     ];
 
     /// Whether this verb produces a *stream* (pane output on attach, the event
@@ -702,6 +714,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::NotificationsList
         | Verb::AutomationsRuns
         | Verb::ApprovalsList
+        // b155 (THE-2222): the daemon returns a profile's env only to the
+        // Lead token for its own profile, or to an admin caller.
+        | Verb::McpProxyProfileEnv
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -740,7 +755,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::AutomationsEnable
         | Verb::ApprovalsRequest
         // THE-2197: stopping automations is the safe direction of the kill switch.
-        | Verb::AutomationsPause => Scope::Write,
+        | Verb::AutomationsPause
+        // b155 (6a): a phone answer needs the inbox HMAC secret AND the nonce.
+        | Verb::ApprovalsRedeem => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeClear
@@ -778,7 +795,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         // (`pipeline_approval.rs`), so it stays off every agent door.
         | Verb::ApprovalsResolve
         // THE-2197: restarting automations is the operator's call alone.
-        | Verb::AutomationsResume => Scope::Admin,
+        | Verb::AutomationsResume
+        // b155 (6f): killing sessions is the operator's kill switch.
+        | Verb::AutomationsHalt => Scope::Admin,
     }
 }
 
@@ -1191,6 +1210,7 @@ mod tests {
             NotificationsList,
             AutomationsRuns,
             ApprovalsList,
+            McpProxyProfileEnv,
         ];
         let write = [
             OpenSession,
@@ -1229,6 +1249,7 @@ mod tests {
             ApprovalsRequest,
             // Automation kill switch (THE-2197): stopping is Write.
             AutomationsPause,
+            ApprovalsRedeem,
         ];
         let git = [
             GitStage,
@@ -1263,6 +1284,7 @@ mod tests {
             ApprovalsResolve,
             // Restarting automations is the operator's call (THE-2197).
             AutomationsResume,
+            AutomationsHalt,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");

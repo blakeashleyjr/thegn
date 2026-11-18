@@ -243,6 +243,14 @@ pub trait NotificationStore {
     /// missing row and for a row no automation started (NULL column).
     fn dispatch_autonomy(&self, id: i64) -> Result<Option<String>>;
 
+    /// Record both the autonomy ceiling and the automation rule id that
+    /// started this dispatch (schema v113). `Ok(false)` when no row has `id`.
+    fn set_dispatch_automation(&self, id: i64, autonomy: &str, rule_id: &str) -> Result<bool>;
+
+    /// `(autonomy, automation_rule)` of a dispatch row; both `None` for a
+    /// missing row or a manual dispatch.
+    fn dispatch_automation(&self, id: i64) -> Result<(Option<String>, Option<String>)>;
+
     /// The dispatch row run by a daemon session id (most recent stamp wins),
     /// or `None`. The transport-retry observer's row resolution (THE-86):
     /// `session_id` is stamped at launch and re-stamped on every relaunch, so

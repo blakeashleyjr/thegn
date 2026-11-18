@@ -41,6 +41,7 @@ pub mod issue_tracker;
 pub mod kaneo;
 pub mod keys;
 pub mod land;
+pub mod lead;
 pub mod list;
 pub mod logs;
 pub mod map;

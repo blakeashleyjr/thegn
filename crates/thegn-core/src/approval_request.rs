@@ -109,6 +109,15 @@ pub struct ApprovalResolve {
     pub approver: String,
 }
 
+/// `approvals.redeem` (Write; HTTP + CLI only; b155 6a): the phone's answer,
+/// bound to a request by the single-use push nonce it carried.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRedeem {
+    pub nonce: String,
+    pub decision: Decision,
+}
+
 /// The notification source ref for a request: `approval:{issue}:{stage}@{sha}`.
 pub fn source_ref(issue_id: &str, stage: &str, commit_sha: &str) -> String {
     format!("{SOURCE_PREFIX}{issue_id}:{stage}@{commit_sha}")
@@ -219,6 +228,20 @@ mod tests {
     use super::*;
 
     const SHA: &str = "4babb0901f2c3d4e5f60718293a4b5c6d7e8f901";
+
+    #[test]
+    fn redeem_body_is_strict() {
+        let ok: ApprovalRedeem =
+            serde_json::from_str(r#"{"nonce":"abc","decision":"approve"}"#).unwrap();
+        assert_eq!(ok.decision, Decision::Approve);
+        assert!(serde_json::from_str::<ApprovalRedeem>(r#"{"nonce":"abc"}"#).is_err());
+        assert!(
+            serde_json::from_str::<ApprovalRedeem>(
+                r#"{"nonce":"abc","decision":"reject","issue_id":"x"}"#
+            )
+            .is_err()
+        );
+    }
 
     fn request() -> ApprovalRequest {
         ApprovalRequest {
