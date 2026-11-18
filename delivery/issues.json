@@ -449,6 +449,20 @@
       ]
     },
     {
+      "issue": "THE-2200",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-sandboxed-merge-gate"
+      ]
+    },
+    {
+      "issue": "THE-2208",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-lead-headless-producers"
+      ]
+    },
+    {
       "issue": "THE-2223",
       "project": "Client API & Remote Access",
       "changes": [
