@@ -542,6 +542,45 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
     errors
 }
 
+/// Warnings for provider-table settings that have no effect: sprites sizing
+/// knobs, the sprites memory note, and a provider table whose env still has a
+/// non-`provider` placement (it would run locally).
+pub fn provider_table_warnings(cfg: &crate::config::Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (env_name, env) in &cfg.env {
+        let p = &env.provider;
+        let provider = p.provider.trim().to_ascii_lowercase();
+        if provider.is_empty() {
+            continue;
+        }
+        if provider == "sprites" {
+            let size = p.size.trim();
+            if (!size.is_empty() && !size.eq_ignore_ascii_case("auto"))
+                || p.min_vcpu > 0
+                || p.gpu
+                || p.nvme
+            {
+                warnings.push(format!(
+                    "env.{env_name}.provider.size: sprites have a fixed 8 vCPU; size, min_vcpu, gpu and nvme are ignored"
+                ));
+            }
+            if p.min_ram_gb > 0 {
+                warnings.push(format!(
+                    "env.{env_name}.provider.min_ram_gb: sets the sprite memory limit to {} MiB (unit unverified)",
+                    u64::from(p.min_ram_gb) * 1024
+                ));
+            }
+        }
+        if env.placement != crate::config::PlacementMode::Provider {
+            warnings.push(format!(
+                "env.{env_name}.provider.provider: env.{env_name} has a provider table but placement is \"{}\"; add placement = \"provider\" or it runs locally",
+                env.placement.as_str()
+            ));
+        }
+    }
+    warnings
+}
+
 /// The refusal for `model_credentials` set on any provider but Vercel.
 pub const NON_VERCEL_MODEL_CREDENTIALS: &str = "model_credentials applies only to provider = \"vercel\"; \
      other providers upload agent logins through [sandbox.home] agents";
@@ -556,7 +595,7 @@ pub fn unenforced_lifetime_warnings(cfg: &crate::config::Config) -> Vec<String> 
             && !crate::config::EnvProviderKind::of(provider).lifetime_reaped()
         {
             warnings.push(format!(
-                "env.{env_name}.provider.max_lifetime_secs: not enforced for provider `{provider}` (only the Fly and VPS reapers destroy instances past a lifetime ceiling); destroy instances yourself or set it to 0"
+                "env.{env_name}.provider.max_lifetime_secs: not enforced for provider `{provider}` (only the Fly, VPS and Vercel reapers destroy instances past a lifetime ceiling); for sprites run `thegn env reap --provider sprites`, otherwise destroy instances yourself or set it to 0"
             ));
         }
     }
