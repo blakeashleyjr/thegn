@@ -51,6 +51,12 @@ fn live_digest(db: &Db, row: &LeadRuleRow, now_ms: i64) -> Option<String> {
             return None;
         }
     };
+    if !latest
+        .as_ref()
+        .is_some_and(|a| a.commit_sha.trim().eq_ignore_ascii_case(&sha))
+    {
+        return None;
+    }
     state_for(latest.as_ref(), &sha, now_ms, ARMING_MAX_AGE_SECS)
         .is_live()
         .then_some(sha)

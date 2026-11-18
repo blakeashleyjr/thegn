@@ -88,9 +88,9 @@ pub(crate) async fn put(svc: &DaemonService, req: serde_json::Value) -> JsonResu
                 Err(error) => return Err(error),
             };
             db.set_lead_rule_enabled(&id, enabled)?;
-            if previous.is_some_and(|previous| previous != body) {
-                // An edit disarms: an approval of an earlier body never
-                // comes back if the body is changed back.
+            if previous.as_deref() != Some(body.as_str()) {
+                // A new or edited body disarms: an approval granted before
+                // this exact body was stored never arms it.
                 revoke_arming(db, &id)?;
             }
             let armed = arm_sha.is_some_and(|sha| {
@@ -675,6 +675,25 @@ mod tests {
         assert_eq!(reply["awaiting_approval"], json!(true));
         assert!(find_rule(&svc, "start").await.unwrap().is_none());
         // Changing it back does not resurrect the old approval: it was revoked.
+        let reply = put(&svc, start(Some("review"))).await.unwrap();
+        assert_eq!(reply["awaiting_approval"], json!(true));
+        assert!(find_rule(&svc, "start").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_arming_granted_before_the_first_put_never_arms_it() {
+        use thegn_core::automation_autonomy::Autonomy;
+        // Learn the exact stored body from a scratch profile.
+        let (scratch, _scratch_profile) = service(true);
+        put(&scratch, start(Some("review"))).await.unwrap();
+        let body = scratch
+            .with_db(|db| Ok(db.lead_rules()?.remove(0).body_json))
+            .await
+            .unwrap();
+        let (issue, stage, sha) = rule_arm_ids("lead:start", &body, Autonomy::Review);
+
+        let (svc, _profile) = service(true);
+        grant(&svc, &issue, &stage, &sha);
         let reply = put(&svc, start(Some("review"))).await.unwrap();
         assert_eq!(reply["awaiting_approval"], json!(true));
         assert!(find_rule(&svc, "start").await.unwrap().is_none());
