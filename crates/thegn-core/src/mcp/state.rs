@@ -1142,7 +1142,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
     },
     StateToolSpec {
         cap: "automations.put",
-        description: "Create or replace a Lead-authored automation rule. Lead rules may only notify or open sessions; config rules are read-only. Write-scoped (`--scopes write`); requires a running daemon.",
+        description: "Create or replace a Lead-authored automation rule. Lead rules may only notify, open a session, wake the Lead or propose a pipeline (pipeline.start at autonomy = \"propose\" only); they never merge, and config rules are read-only. Write-scoped (`--scopes write`); requires a running daemon.",
         args: &[ArgSpec {
             name: "rule",
             kind: ArgKind::Object,
@@ -1260,6 +1260,11 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
             description: "Absolute path of a worktree in the repository to drain",
         }],
     },
+    StateToolSpec {
+        cap: "automations.pause",
+        description: "Pause every automation rule: events are still audited (as paused) but nothing executes. Only the operator can resume; resuming is an admin action that is never available over MCP. Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[],
+    },
 ];
 
 /// Host capabilities the MCP server exposes as state tools, by catalog id.
@@ -1320,6 +1325,9 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "approvals.list",
     "approvals.request",
     "merge.drain",
+    // THE-2197: pausing is the Lead's kill switch; `automations.resume` is
+    // Admin and never an MCP tool.
+    "automations.pause",
 ];
 
 /// The injected data fetch: `(capability id, tool arguments) → payload JSON`.
@@ -1493,6 +1501,8 @@ const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
     "notifications.ack",
     "approvals.request",
     "automations.enable",
+    // THE-2197: pausing only stops automations (the operator resumes).
+    "automations.pause",
 ];
 
 /// MCP `annotations` for a state tool, derived from the catalog scope. Hints
@@ -2686,6 +2696,7 @@ mod tests {
             "automations.rm",
             "automations.enable",
             "approvals.request",
+            "automations.pause",
         ];
         // Folder assignment is a repo-local worktree metadata mutation: Git.
         let git = ["folders.assign"];
@@ -2912,6 +2923,40 @@ mod tests {
                 .iter()
                 .all(|e| e["name"].as_str() != Some("approvals_resolve"))
         );
+    }
+
+    #[test]
+    fn automations_pause_is_an_mcp_tool_and_resume_never_is() {
+        // THE-2197: the Lead may pull the kill switch but never release it.
+        assert!(MCP_STATE_CAPS.contains(&"automations.pause"));
+        assert!(!MCP_STATE_CAPS.contains(&"automations.resume"));
+        assert!(STATE_TOOLS.iter().all(|t| t.cap != "automations.resume"));
+        let spec = STATE_TOOLS
+            .iter()
+            .find(|t| t.cap == "automations.pause")
+            .expect("pause spec");
+        assert!(spec.args.is_empty(), "pause takes no arguments");
+        let r = StateRouter::new(all_caps(), |_, _| Ok(json!({"paused": true})));
+        assert!(r.call("automations_resume", &json!({})).is_none());
+        let entries = r.tool_entries();
+        assert!(
+            entries
+                .iter()
+                .all(|e| e["name"].as_str() != Some("automations_resume"))
+        );
+        let pause = entries
+            .iter()
+            .find(|e| e["name"].as_str() == Some("automations_pause"))
+            .expect("automations_pause listed");
+        assert_eq!(pause["annotations"]["readOnlyHint"], json!(false));
+        assert_eq!(pause["annotations"]["destructiveHint"], json!(false));
+        // A tool with no arguments lists none as required (the key may be absent).
+        assert!(
+            pause["inputSchema"]["required"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+        assert!(r.call("automations_pause", &json!({})).is_some());
     }
 
     #[test]

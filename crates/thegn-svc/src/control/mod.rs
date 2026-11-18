@@ -1474,6 +1474,24 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async { Err(ControlError::Unimplemented("merge.drain")) })
     }
 
+    /// Pause every automation rule (`automations.pause`, THE-2197); replies
+    /// `{paused: true}`.
+    fn automations_pause(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.pause")) })
+    }
+
+    /// Resume paused automations (`automations.resume`, Admin, THE-2197);
+    /// replies `{paused: false}`.
+    fn automations_resume(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.resume")) })
+    }
+
     // --- agent orchestration (THE-57) ---------------------------------------
     // The supervisor's hands. Defaulted to `Unimplemented` so transport-only
     // impls and test fakes need no wiring (the calendar precedent); the daemon
