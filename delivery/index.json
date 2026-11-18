@@ -934,6 +934,18 @@
       "summary": "Stage and back up confirmed live upgrades; real controller migration verification remains operator-controlled."
     },
     {
+      "change": "harden-remote-sprites-journey",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2234",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Sprites ledger-before-create ownership, proof-before-delete reap, headless keep-awake hold, no background creates; live verification open."
+    },
+    {
       "change": "isolate-maintenance-regression-fixtures",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
