@@ -577,6 +577,14 @@ impl ControlApi for FakeApi {
         })
     }
 
+    fn dispatch_put_confined(
+        &self,
+        req: super::DispatchPutReq,
+        _caller: super::LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        self.dispatch_put(req)
+    }
+
     fn dispatch_set_status(
         &self,
         id: i64,

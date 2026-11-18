@@ -1658,14 +1658,19 @@ pub trait ControlApi: Send + Sync + 'static {
     }
 
     /// [`Self::dispatch_put`] for a Lead-confined caller (b155): the daemon
-    /// refuses it while automations are paused. Transport-only impls keep
-    /// the plain behavior.
+    /// refuses it while automations are paused. Fails closed by default, so
+    /// an impl that cannot apply the pause check refuses the Lead.
     fn dispatch_put_confined(
         &self,
-        req: DispatchPutReq,
+        _req: DispatchPutReq,
         _caller: LeadCaller,
     ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
-        self.dispatch_put(req)
+        Box::pin(async {
+            Err(ControlError::FailedPrecondition(format!(
+                "{}this daemon cannot apply the Lead pause check",
+                thegn_core::lead_confine::REFUSAL_PREFIX
+            )))
+        })
     }
 
     /// Advance a dispatch's status (`dispatches.set_status`).

@@ -183,11 +183,12 @@ impl AutomationStore for Db {
         }
     }
 
-    fn audit_paused_automation_event(
+    fn audit_skipped_automation_event(
         &self,
         rules: &[crate::automation::AutomationRule],
         event: &crate::automation::AutomationEvent,
         now: i64,
+        skip: crate::automation::SkipReason,
     ) -> Result<usize> {
         let mut state = crate::automation::EvaluationState::new();
         for rule in rules {
@@ -204,9 +205,10 @@ impl AutomationStore for Db {
                 );
             }
         }
-        let decisions = crate::automation::paused_decisions(crate::automation::evaluate(
-            rules, event, &state, now,
-        ));
+        let decisions = crate::automation::skipped_decisions(
+            crate::automation::evaluate(rules, event, &state, now),
+            skip,
+        );
         let mut written = 0;
         for decision in decisions {
             let crate::automation::EvaluationDecision::Skipped {
@@ -215,7 +217,7 @@ impl AutomationStore for Db {
                 reason,
             } = decision
             else {
-                // paused_decisions never returns a plan.
+                // skipped_decisions never returns a plan.
                 continue;
             };
             let run_id = self.start_automation_run(&NewAutomationRun {
@@ -382,8 +384,6 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRunRow> {
     })
 }
 
-/// The audit label of a skip reason: the variant name lowercased (`paused`,
-/// `debounced`, `onceperkey`), the vocabulary the audit log has always used.
 /// The dispatch statuses [`crate::issue::AgentDispatchStatus::is_active`]
 /// holds, as stored tokens. Pinned against `is_active` by a test.
 pub(crate) const ACTIVE_DISPATCH_TOKENS: [&str; 5] =
@@ -403,6 +403,8 @@ fn sql_list(items: &[&str]) -> String {
         .join(",")
 }
 
+/// The audit label of a skip reason: the variant name lowercased (`paused`,
+/// `debounced`, `onceperkey`), the vocabulary the audit log has always used.
 fn skip_reason_label(reason: &crate::automation::SkipReason) -> String {
     format!("{reason:?}").to_ascii_lowercase()
 }

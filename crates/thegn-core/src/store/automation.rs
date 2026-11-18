@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 
 use crate::automation::EventKey;
-use crate::automation::{AutomationEvent, AutomationRule, PlannedAction};
+use crate::automation::{AutomationEvent, AutomationRule, PlannedAction, SkipReason};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AutomationStateRow {
@@ -90,6 +90,21 @@ pub trait AutomationStore {
         rules: &[AutomationRule],
         event: &AutomationEvent,
         now: i64,
+    ) -> Result<usize> {
+        self.audit_skipped_automation_event(rules, event, now, SkipReason::Paused)
+    }
+
+    /// The general form of [`Self::audit_paused_automation_event`]: persist
+    /// NO state transition and audit every would-be plan as `reason` (a
+    /// policy skip keeps its own reason). Used for pre-admission budget
+    /// refusals so a refused rule keeps its ledger. Returns the number of
+    /// audit rows written.
+    fn audit_skipped_automation_event(
+        &self,
+        rules: &[AutomationRule],
+        event: &AutomationEvent,
+        now: i64,
+        reason: SkipReason,
     ) -> Result<usize>;
 
     /// Whether a run of `rule_id` started within the last six hours and has

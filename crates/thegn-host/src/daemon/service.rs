@@ -918,7 +918,7 @@ impl DaemonService {
     /// Lead-confined `sessions.open` / `dispatches.put` is refused.
     pub(crate) async fn refuse_while_paused(&self) -> ControlResult<()> {
         let paused = self
-            .with_db(|db| Ok(thegn_core::automation_control::paused(db)))
+            .with_db(|db| Ok(thegn_core::automation_control::paused_strict(db).unwrap_or(true)))
             .await?;
         if paused {
             Err(ControlError::FailedPrecondition(
