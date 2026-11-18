@@ -89,7 +89,7 @@ pub(crate) async fn on_resolved(svc: Arc<DaemonService>, req: ApprovalResolve) {
         return;
     }
     let paused = svc
-        .with_db(|db| Ok(thegn_core::automation_control::paused(db)))
+        .with_db(|db| Ok(thegn_core::automation_control::paused_strict(db).unwrap_or(true)))
         .await
         .unwrap_or(true);
     if paused {

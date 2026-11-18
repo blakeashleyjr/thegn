@@ -236,10 +236,10 @@ async fn process_event(
             .map_err(anyhow::Error::msg)?;
         let rules = with_lead_rules(&db, rules);
         let now = thegn_core::util::now();
-        let admissions = admit_unless_paused(&db, &rules, &event, now)?;
-        let admissions = apply_budgets(&db, admissions, now, &|kind| {
+        let rules = refuse_over_budget(&db, rules, &event, now, &|kind| {
             crate::automation_budget::admit(&db, &cfg_for_budget, kind)
         })?;
+        let admissions = admit_unless_paused(&db, &rules, &event, now)?;
         Ok((event, admissions))
     })
     .await??;
@@ -419,74 +419,68 @@ pub(crate) fn budget_kind(
     }
 }
 
-/// Hold every admitted plan to the automation budgets (6e). A refused plan
-/// is audited on its own run row as `skipped` / `budget` (the same audit
-/// table the paused path writes) and becomes a skip, so nothing executes;
-/// the first refusal of a UTC day also files one `automation_budget`
-/// notification. `admit` is injected so the policy is testable without a
-/// config.
-pub(crate) fn apply_budgets(
+/// Hold every rule to the automation budgets (6e) BEFORE admission, like
+/// the paused path: a rule whose action draws on a refused budget is audited
+/// as `skipped` / `budget` with NO ledger transition (its `once_per_key` key
+/// and rate-limit slots stay unspent) and is dropped from the rules admitted.
+/// When any refusal was audited, the first of a UTC day also files one
+/// `automation_budget` notification. `admit` is injected so the policy is
+/// testable without a config. Returns the kept rules.
+pub(crate) fn refuse_over_budget(
     db: &thegn_core::db::Db,
-    admissions: Vec<AutomationAdmission>,
+    rules: Vec<thegn_core::automation::AutomationRule>,
+    event: &AutomationEvent,
     now: i64,
     admit: &dyn Fn(
         thegn_core::automation_budget::SpawnKind,
     ) -> Result<(), thegn_core::automation_budget::BudgetRefusal>,
-) -> anyhow::Result<Vec<AutomationAdmission>> {
-    use thegn_core::store::NotificationStore;
-    let mut out = Vec::with_capacity(admissions.len());
-    for admission in admissions {
-        let (action, run_id) = match admission {
-            AutomationAdmission::Planned { action, run_id } => (action, run_id),
-            skipped @ AutomationAdmission::Skipped { .. } => {
-                out.push(skipped);
-                continue;
-            }
-        };
-        let refusal = budget_kind(&action.cap, action.autonomy).and_then(|kind| admit(kind).err());
-        let Some(refusal) = refusal else {
-            out.push(AutomationAdmission::Planned { action, run_id });
-            continue;
-        };
-        let reason =
-            format!("{:?}", thegn_core::automation::SkipReason::Budget).to_ascii_lowercase();
-        db.finish_automation_run(
-            run_id,
-            "skipped",
-            Some(&reason),
-            Some(&bounded(&refusal.to_string())),
-            now,
-        )?;
+) -> anyhow::Result<Vec<thegn_core::automation::AutomationRule>> {
+    let (refused, kept): (Vec<_>, Vec<_>) = rules.into_iter().partition(|rule| {
+        budget_kind(&rule.action.cap, rule.autonomy).is_some_and(|kind| admit(kind).is_err())
+    });
+    if refused.is_empty() {
+        return Ok(kept);
+    }
+    let audited = db.audit_skipped_automation_event(
+        &refused,
+        event,
+        now,
+        thegn_core::automation::SkipReason::Budget,
+    )?;
+    if audited > 0 {
         tracing::info!(
             target: "thegn::automation",
-            rule = %action.rule_id,
-            cap = %action.cap,
-            run_id,
+            event_key = %event.key.0,
+            audited,
             outcome = "skipped",
-            skip_reason = %reason,
+            skip_reason = "budget",
             "automation budget refused a spawn"
         );
-        let day = chrono::DateTime::from_timestamp(now, 0).map_or_else(
-            || "unknown".to_string(),
-            |at| at.format("%Y-%m-%d").to_string(),
-        );
-        // best-effort: the audit row above is the record; the notification
-        // only tells the owner, once a day (the message is fixed per day, so
-        // `put_notification_once` dedupes on it).
-        if let Err(error) = db.put_notification_once(
-            "automation_budget",
-            &format!("budget:{day}"),
-            &format!(
-                "Automation budget reached on {day}: automation spawns are skipped (audited \
-                 `budget`) until usage falls ([automations] max_concurrent_lanes / max_spawns_per_day)"
-            ),
-            "",
-        ) {
-            tracing::warn!(target: "thegn::automation", %error, "failed to file the budget notification");
-        }
-        out.push(AutomationAdmission::Skipped { run_id });
+        notify_budget_refusal(db, now);
     }
-    Ok(out)
+    Ok(kept)
+}
+
+/// File the once-a-day `automation_budget` notification. Best-effort: the
+/// audit rows are the record; the notification only tells the owner (the
+/// message is fixed per day, so `put_notification_once` dedupes on it).
+fn notify_budget_refusal(db: &thegn_core::db::Db, now: i64) {
+    use thegn_core::store::NotificationStore;
+    let day = chrono::DateTime::from_timestamp(now, 0).map_or_else(
+        || "unknown".to_string(),
+        |at| at.format("%Y-%m-%d").to_string(),
+    );
+    if let Err(error) = db.put_notification_once(
+        "automation_budget",
+        &format!("budget:{day}"),
+        &format!(
+            "Automation budget reached on {day}: automation spawns are skipped (audited \
+             `budget`) until usage falls ([automations] max_concurrent_lanes / max_spawns_per_day)"
+        ),
+        "",
+    ) {
+        tracing::warn!(target: "thegn::automation", %error, "failed to file the budget notification");
+    }
 }
 
 /// The config rules plus the enabled, still-valid Lead-authored rules
@@ -1179,7 +1173,6 @@ mod tests {
         let db = thegn_core::db::Db::open_memory().unwrap();
         let mut session = notify_rule("s");
         session.action.cap = "sessions.open".into();
-        session.once_per_key = false;
         let rules = vec![session, notify_rule("n")];
         let event = event_for_dispatch("/wt", None);
         let refuse = |_kind: thegn_core::automation_budget::SpawnKind| -> Result<
@@ -1192,29 +1185,21 @@ mod tests {
             })
         };
         let now = 1_763_337_600; // 2025-11-17T00:00:00Z
-        let admitted = admit_unless_paused(&db, &rules, &event, now).unwrap();
-        let admitted = apply_budgets(&db, admitted, now, &refuse).unwrap();
-        // The notify rule is unbudgeted and still planned; the session is a skip.
-        assert!(matches!(
-            admitted.as_slice(),
-            [
-                AutomationAdmission::Skipped { .. },
-                AutomationAdmission::Planned { .. }
-            ]
-        ));
+        let state_before = db.automation_state("s").unwrap();
+        let kept = refuse_over_budget(&db, rules.clone(), &event, now, &refuse).unwrap();
+        // The notify rule is unbudgeted and kept; the session rule is refused.
+        let ids: Vec<&str> = kept.iter().map(|rule| rule.id.as_str()).collect();
+        assert_eq!(ids, ["n"]);
         let rows = db.automation_runs(Some("s"), 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, "skipped");
         assert_eq!(rows[0].skip_reason.as_deref(), Some("budget"));
-        assert!(
-            rows[0]
-                .error
-                .as_deref()
-                .is_some_and(|e| e.contains("max_spawns_per_day"))
-        );
+        // The refusal persisted no ledger transition: the once-per-key key
+        // and the rate-limit slots are unspent.
+        assert_eq!(db.automation_state("s").unwrap(), state_before);
         // A second refusal the same day files no second notification.
-        let admitted = admit_unless_paused(&db, &rules, &event, now + 60).unwrap();
-        apply_budgets(&db, admitted, now + 60, &refuse).unwrap();
+        refuse_over_budget(&db, rules.clone(), &event, now + 60, &refuse).unwrap();
+        assert_eq!(db.automation_state("s").unwrap(), state_before);
         let budget: Vec<_> = db
             .get_unread_notifications()
             .unwrap()
@@ -1222,20 +1207,16 @@ mod tests {
             .filter(|n| n.source_ref == "budget:2025-11-17")
             .collect();
         assert_eq!(budget.len(), 1, "{budget:?}");
-        // An admitting budget changes nothing.
-        let planned = |all: &[AutomationAdmission]| {
-            all.iter()
-                .filter(|a| matches!(a, AutomationAdmission::Planned { .. }))
-                .count()
-        };
-        let admitted = admit_unless_paused(&db, &rules, &event, now + 120).unwrap();
-        let before = planned(&admitted);
-        assert_eq!(
-            before, 1,
-            "the session rule; the notify rule is once-per-key"
-        );
-        let kept = apply_budgets(&db, admitted, now + 120, &|_| Ok(())).unwrap();
-        assert_eq!(planned(&kept), before);
+        // An admitting budget keeps every rule, and the once-per-key session
+        // rule is still fresh for this event after its earlier refusals.
+        let kept = refuse_over_budget(&db, rules.clone(), &event, now + 120, &|_| Ok(())).unwrap();
+        assert_eq!(kept, rules);
+        let admitted = admit_unless_paused(&db, &kept, &event, now + 120).unwrap();
+        let planned = admitted
+            .iter()
+            .filter(|a| matches!(a, AutomationAdmission::Planned { .. }))
+            .count();
+        assert_eq!(planned, 2, "{admitted:?}");
     }
 
     #[test]

@@ -33,6 +33,13 @@ pub fn paused(store: &dyn WorkspaceStore) -> bool {
     }
 }
 
+/// The pause flag with read errors surfaced; b155 callers treat an error as paused.
+pub fn paused_strict(store: &dyn WorkspaceStore) -> Result<bool> {
+    Ok(store
+        .get_ui_state(SCOPE, PAUSED_KEY)?
+        .is_some_and(|v| v == "1"))
+}
+
 /// `automations.halt` (Admin; HTTP + CLI; b155 6f): kill every live
 /// automation-started or Lead-opened session unless `keep_sessions`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -76,6 +83,14 @@ mod tests {
         assert!(!paused(&db));
         set_paused(&db, false).unwrap();
         assert!(!paused(&db));
+    }
+
+    #[test]
+    fn strict_pause_flag_defaults_off_and_reads_set() {
+        let db = crate::db::Db::open_memory().unwrap();
+        assert!(!paused_strict(&db).unwrap());
+        set_paused(&db, true).unwrap();
+        assert!(paused_strict(&db).unwrap());
     }
 
     #[test]
