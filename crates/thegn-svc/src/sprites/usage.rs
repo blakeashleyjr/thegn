@@ -40,10 +40,11 @@ pub fn parse_usage(v: &serde_json::Value) -> Result<SpriteUsage> {
     let mut cpu = 0.0;
     let mut byte_sec = 0.0;
     for b in buckets {
-        cpu += num(b, &["cpu_seconds", "cpu_sec"]);
+        cpu += num(b, &["cpu_time_sec", "cpu_seconds", "cpu_sec"]);
         byte_sec += num(
             b,
             &[
+                "reserved_memory_byte_sec",
                 "memory_byte_seconds",
                 "reserved_byte_seconds",
                 "byte_sec",
@@ -70,8 +71,13 @@ impl crate::provider::SpritesProvider {
         start_rfc3339: &str,
     ) -> Result<Option<SpriteUsage>> {
         let http = self.sprites_http()?;
-        let mut url = reqwest::Url::parse(&format!("{}/usage/{}", http.base, name))
-            .map_err(|e| anyhow!("sprites: invalid usage URL: {e}"))?;
+        anyhow::ensure!(!name.is_empty(), "sprites: empty sprite name");
+        let mut url = reqwest::Url::parse(http.base)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("sprites: invalid usage URL"))?
+            .pop_if_empty()
+            .push("usage")
+            .push(name);
         url.query_pairs_mut().append_pair("start", start_rfc3339);
         let resp = http
             .client
@@ -102,8 +108,8 @@ mod tests {
     fn parses_two_buckets_and_partial() {
         let v = serde_json::json!({
             "buckets": [
-                {"cpu_seconds": 3600.0, "memory_byte_seconds": 1073741824.0 * 3600.0},
-                {"cpu_seconds": 1800.0, "memory_byte_seconds": 1073741824.0 * 7200.0}
+                {"cpu_time_sec": 3600.0, "reserved_memory_byte_sec": 1073741824.0 * 3600.0},
+                {"cpu_time_sec": 1800.0, "reserved_memory_byte_sec": 1073741824.0 * 7200.0}
             ],
             "partial": true
         });
@@ -111,6 +117,12 @@ mod tests {
         assert_eq!(u.cpu_seconds, 5400.0);
         assert!((u.reserved_gb_hours - 3.0).abs() < 1e-9);
         assert!(u.partial);
+        let old = serde_json::json!({
+            "buckets": [{"cpu_seconds": 10.0, "memory_byte_seconds": 1073741824.0 * 3600.0}]
+        });
+        let u = parse_usage(&old).unwrap();
+        assert_eq!(u.cpu_seconds, 10.0);
+        assert!((u.reserved_gb_hours - 1.0).abs() < 1e-9);
     }
 
     #[test]
