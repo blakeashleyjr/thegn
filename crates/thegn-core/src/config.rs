@@ -4512,12 +4512,12 @@ pub struct SandboxConfig {
     /// `isolation_floor`; the default floor always refuses.
     pub on_floor_miss: OnFloorMiss,
     pub remote: RemoteConfig,
-    /// Allow-only these hostnames for outbound connections (empty = allow all).
-    /// Enforced via a per-container DNS interceptor. Block-list is checked first
-    /// when both lists are non-empty.
+    /// Advisory hostname allow-list (empty = allow all). Not enforced by any
+    /// local backend; only the Sprites provider lowers it to its own policy
+    /// API. Block-list is checked first when both lists are non-empty.
     pub network_allow: Vec<String>,
-    /// Block outbound connections to these hostnames. Takes priority over
-    /// network_allow when a hostname matches both.
+    /// Advisory hostname block-list; takes priority over network_allow when a
+    /// hostname matches both. `"*"` lowers the sandbox to `network = "none"`.
     pub network_block: Vec<String>,
     /// Subscribe the podman `network` event stream (container network
     /// attach/detach) into the sandbox audit table. Podman backends only; not a

@@ -507,9 +507,11 @@ pub struct SandboxSpec {
     /// to swap a master key for a scoped virtual key.
     pub env_block: Vec<String>,
     pub network: Network,
-    /// Domain allow-list for the DNS filter (empty = allow all non-blocked).
+    /// Advisory hostname allow-list (not enforced by any local backend; empty
+    /// = allow all non-blocked).
     pub network_allow: Vec<String>,
-    /// Domain block-list for the DNS filter (checked before allow-list).
+    /// Advisory hostname block-list (not enforced by any local backend;
+    /// checked before the allow-list).
     pub network_block: Vec<String>,
     /// Hardening: mount the container root filesystem read-only (writable: the
     /// worktree, cache binds, and a tmpfs `/tmp`). Resolved from the active
@@ -5479,8 +5481,7 @@ fn oci_create_opts_in(
         // routable nameservers + search domains). Force-mounting the host file
         // (loopback-only on any systemd-resolved box) points DNS at the
         // container's own empty loopback → "Could not resolve host". bwrap/systemd
-        // share the host netns and keep these mounts (loopback works there); this
-        // also unshadows the `--dns` filter injection above.
+        // share the host netns and keep these mounts (loopback works there).
         if !oci_emits_mount(m) {
             continue;
         }

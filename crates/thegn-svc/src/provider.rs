@@ -1367,7 +1367,7 @@ pub(crate) fn parse_policy_rules(body: &serde_json::Value) -> Result<Vec<PolicyR
 
 /// Egress-policy translation — realizes `EgressKind::Translate`
 /// (`thegn_core::capabilities`): lower allow/block lists to the provider's own
-/// network controls, since we can't run our DNS filter inside the provider's box.
+/// network controls; thegn has no in-box egress datapath.
 pub trait ProviderEgress: Send + Sync {
     fn set_network_policy<'a>(
         &'a self,

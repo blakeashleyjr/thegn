@@ -531,7 +531,7 @@ contract-ratchets:
 
 # The full gate. `lint` now runs the treefmt fail-on-change check first, so the
 # formatting gate lives there (no separate `fmt-check` stage needed here).
-ci: lint deps-audit build check-cross check-features check-msrv test test-doc doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
+ci: lint deps-audit build check-cross check-features check-msrv test test-doc doc-check openspec-validate coverage smoke sandbox-e2e-db term-check nix-build
     @echo "ci: all green"
 
 # The local superset: everything `ci` gates plus the muse e2e suite, which is
@@ -1042,9 +1042,6 @@ sandbox-e2e: build
       echo "sandbox-e2e: podman not found, skipping (set PODMAN_E2E_FORCE=1 to fail on missing)"; \
     fi
 
-# DNS filter E2E — Tier 1, no podman needed; always runs in CI.
-sandbox-e2e-dns:
-    cargo test -p thegn-core --test sandbox_dns_e2e
 
 # DB audit trail — Tier 1, no podman; always runs in CI.
 sandbox-e2e-db:
