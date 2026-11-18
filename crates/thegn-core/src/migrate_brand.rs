@@ -34,6 +34,14 @@ use std::path::{Path, PathBuf};
 
 use crate::util;
 
+/// The pre-rename directory name under the XDG state/config/data/cache roots.
+/// Exported so code that must name the legacy locations (e.g. the Lead
+/// sandbox masks) does so through this allowlisted module, never by literal.
+pub const LEGACY_DIR_NAME: &str = "superzej";
+
+/// The pre-rename app home directory name under `$HOME`.
+pub const LEGACY_HOME_DIR_NAME: &str = ".superzej";
+
 /// What one root-pair migration decided / did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootAction {

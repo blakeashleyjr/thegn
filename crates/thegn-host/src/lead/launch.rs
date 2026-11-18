@@ -357,7 +357,7 @@ fn launch_spec_with(
             Err(_) => {}
         }
     }
-    // thegn's own state/data/cache dirs, its home, the legacy `superzej`
+    // thegn's own state/data/cache dirs, its home, the legacy pre-rename
     // dirs and the shared harness homes (THE-2221): canonical, parents
     // first. thegn's own dirs are created when missing (a dir thegn creates
     // later would otherwise show through the live root until the Lead
@@ -1335,7 +1335,10 @@ mod tests {
         );
         assert!(fx.root.join("cache/thegn").is_dir());
         assert!(
-            !fx.root.join("home/.superzej").exists(),
+            !fx.root
+                .join("home")
+                .join(thegn_core::migrate_brand::LEGACY_HOME_DIR_NAME)
+                .exists(),
             "a missing legacy dir is neither created nor masked"
         );
     }

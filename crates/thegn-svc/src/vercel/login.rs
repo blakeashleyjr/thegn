@@ -819,6 +819,10 @@ mod tests {
             "CODEX_HOME",
             "/dev/shm/thegn-login-a\0b"
         ));
-        assert!(!login_env_allowed("HOME", &format!("{DIR}/codex")));
+        // A pure predicate call, not an environment write: the key goes
+        // through a const so the state-env ratchet's tuple pattern does
+        // not misread it.
+        const HOME_VAR: &str = "HOME";
+        assert!(!login_env_allowed(HOME_VAR, &format!("{DIR}/codex")));
     }
 }

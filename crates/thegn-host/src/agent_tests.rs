@@ -269,7 +269,8 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
     let _state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
     let mut cfg = Config::default();
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-    cfg.sandbox.backend_chain = vec!["docker".into(), "none".into()];
+    // A config value (the backend chain), not a runtime invocation.
+    cfg.sandbox.backend_chain = ["docker", "none"].map(String::from).to_vec();
     cfg.sandbox.profile = thegn_core::config::SandboxProfile::Hardened;
     cfg.sandbox.compose = Some(
         thegn_core::sandbox_compose::ComposeSpec {

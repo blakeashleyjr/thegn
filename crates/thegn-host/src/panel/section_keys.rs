@@ -141,7 +141,6 @@ const ISSUES: &[SectionKey] = &[
     k('D', "D", "dispatch"),
 ];
 const NOTIFICATIONS: &[SectionKey] = &[
-    nav("↵", "jump"),
     // `x`, not `r` — the old hint advertised a key that did nothing. Labels
     // match the section body's own hint row: `x` marks read, `d` DELETES.
     k('y', "y", "approve"),
@@ -153,9 +152,12 @@ const NOTIFICATIONS: &[SectionKey] = &[
     // which are derived from the PR/CI cache rather than an inbox row), so
     // leaving it hidden made the `✋` badge look unclearable; `g` is the toggle
     // between this repo and every worktree, so without it the default scoping is
-    // invisible. The strip is capped at 6, so `space` (expand), `a` (clear
-    // all), `A` (show-read) and `/` (search) are left off — all still work, and
-    // the in-body hint row lists them.
+    // invisible. `a` is destructive (guarded by a confirm), so it must stay
+    // advertised and marked. The strip is capped at 6, so `↵` (jump, the
+    // universal activate key), `space` (expand), `A` (show-read) and `/`
+    // (search) are left off — all still work, and the in-body hint row and
+    // the help page list them.
+    danger('a', "a", "clear all"),
     k('g', "g", "scope"),
 ];
 const JOBS: &[SectionKey] = &[

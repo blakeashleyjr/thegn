@@ -350,6 +350,10 @@ pub(crate) mod open_beneath;
 /// and identity-verified cleanup); `merge_remote.rs` stays platform-free.
 pub(crate) mod bundle_custody;
 
+/// Bounded, reaped execution of an unattended validation command (unix group
+/// runner; refused off unix) so `daemon/stage_executor.rs` stays platform-free.
+pub(crate) mod bounded_validation;
+
 #[cfg(all(test, unix))]
 #[path = "../../../../test/support/owned_test_child.rs"]
 pub(crate) mod owned_test_child;

@@ -196,7 +196,15 @@ mod tests {
         let c: LeadConfig = toml::from_str("agent = \"claude\"\nnetwork = \"host\"").unwrap();
         assert_eq!(c.network, LeadNetwork::Host);
         assert_eq!(LeadNetwork::Isolated.as_str(), "isolated");
-        assert!(toml::from_str::<LeadConfig>("network = \"bridge\"").is_err());
+        // The strict parse refuses an unknown mode ...
+        assert!(LeadNetwork::from_str_validated("bridge").is_err());
+        // ... and deserialization follows the repo-wide `config_enum!`
+        // contract: warn and fall back to the default, which for the Lead is
+        // the safe `isolated` mode (never `host`). `thegn config validate`
+        // flags the unknown value through the schema enum walk.
+        let c: LeadConfig = toml::from_str("network = \"bridge\"").unwrap();
+        assert_eq!(c.network, LeadNetwork::default());
+        assert_eq!(c.network, LeadNetwork::Isolated);
     }
 
     #[test]
