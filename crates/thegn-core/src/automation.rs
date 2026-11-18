@@ -10,13 +10,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_task::{TaskVars, render_prompt};
+use crate::automation_autonomy::Autonomy;
 use crate::notification::{NotificationKind, Priority};
 
 const MAX_ONCE_KEYS: usize = 2_048;
 
-/// Catalog capabilities automation rules may target in v1.
-pub const SUPPORTED_ACTION_CAPS: &[&str] =
-    &["sessions.open", "merge.add", "notify.push", "tools.run"];
+/// Actions automation rules may target: catalog capabilities plus the
+/// [`RULE_ONLY_ACTIONS`].
+pub const SUPPORTED_ACTION_CAPS: &[&str] = &[
+    "sessions.open",
+    "merge.add",
+    "notify.push",
+    "tools.run",
+    "merge.drain",
+    "pipeline.start",
+    "lead.wake",
+];
+
+/// Actions that are not catalog capabilities; reachable only by a rule.
+/// They have no MCP tool, HTTP route, CLI verb or Lead tool of their own, so
+/// a Lead reaches them only by authoring a rule, which the autonomy policy
+/// (`automation_autonomy`) constrains.
+pub const RULE_ONLY_ACTIONS: &[&str] = &["pipeline.start", "lead.wake"];
+
+/// Longest issue title an [`IssueFacts`] carries (characters).
+pub const MAX_ISSUE_TITLE_CHARS: usize = 300;
 
 /// Event variables accepted by action parameter templates.
 pub const EVENT_TEMPLATE_VARS: &[&str] = &[
@@ -37,6 +55,41 @@ pub const EVENT_TEMPLATE_VARS: &[&str] = &[
     "pr_checks_passed",
     "pr_review_requested",
     "pr_merged",
+    "issue_id",
+    "issue_number",
+    "issue_url",
+    "issue_status",
+    "account",
+    "exit_code",
+];
+
+/// Variables a `lead.wake` prompt template may use: [`EVENT_TEMPLATE_VARS`]
+/// minus `message`. Untrusted free text (notification bodies, issue titles)
+/// reaches the Lead only inside the bounded, delimited event block, never
+/// spliced into the prompt that instructs it.
+pub const LEAD_WAKE_TEMPLATE_VARS: &[&str] = &[
+    "event_id",
+    "event_key",
+    "event_kind",
+    "event_time",
+    "workspace",
+    "repo",
+    "worktree",
+    "branch",
+    "agent_role",
+    "notification_kind",
+    "priority",
+    "source_ref",
+    "session_id",
+    "pr_checks_passed",
+    "pr_review_requested",
+    "pr_merged",
+    "issue_id",
+    "issue_number",
+    "issue_url",
+    "issue_status",
+    "account",
+    "exit_code",
 ];
 
 /// A normalized fact automation rules can consume.
@@ -52,10 +105,18 @@ pub enum AutomationEventKind {
     MergeLanded,
     WorktreeIdle,
     DiskLow,
+    /// A rule's own cron/interval schedule came due (daemon producer).
+    ScheduleDue,
+    /// A tracker refresh surfaced an issue matching an `issue_matched` rule.
+    IssueMatched,
+    /// Any daemon session exited, whatever its role or status.
+    SessionExited,
+    /// An item landed in the native inbox (no producer until phase 7).
+    InboxItem,
 }
 
 impl AutomationEventKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 13] = [
         Self::Notification,
         Self::AgentNeedsYou,
         Self::AgentFinished,
@@ -65,6 +126,10 @@ impl AutomationEventKind {
         Self::MergeLanded,
         Self::WorktreeIdle,
         Self::DiskLow,
+        Self::ScheduleDue,
+        Self::IssueMatched,
+        Self::SessionExited,
+        Self::InboxItem,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -78,6 +143,10 @@ impl AutomationEventKind {
             Self::MergeLanded => "merge_landed",
             Self::WorktreeIdle => "worktree_idle",
             Self::DiskLow => "disk_low",
+            Self::ScheduleDue => "schedule_due",
+            Self::IssueMatched => "issue_matched",
+            Self::SessionExited => "session_exited",
+            Self::InboxItem => "inbox_item",
         }
     }
 
@@ -97,6 +166,26 @@ pub struct AutomationOrigin {
     pub root_event_id: String,
     pub rule_id: String,
     pub run_id: String,
+}
+
+/// Tracker facts carried by an `issue_matched` event. Every field except
+/// `title` is structural (ids, enum-like status, labels, provenance).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueFacts {
+    pub provider: String,
+    pub account: String,
+    pub issue_id: String,
+    pub number: String,
+    pub url: String,
+    pub status: String,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+    pub project_ids: Vec<String>,
+    /// Provenance: the tracker reported the issue as assigned to the
+    /// configured account's own user. Never derived from display names.
+    pub assigned_to_me: bool,
+    /// UNTRUSTED, <= 300 chars. Reaches rules only as `message`; never a template var of its own.
+    pub title: String,
 }
 
 /// Stable, optional fields projected from existing host/daemon facts.
@@ -125,10 +214,48 @@ pub struct AutomationEvent {
     pub pr_review_requested: Option<bool>,
     pub pr_merged: Option<bool>,
     pub origin: Option<AutomationOrigin>,
+    /// Tracker facts; present only on `issue_matched` events.
+    #[serde(default)]
+    pub issue: Option<IssueFacts>,
+    /// Process exit status; present only on `session_exited` events whose
+    /// session reported one.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 impl AutomationEvent {
+    /// An event with only its identity set: every optional fact absent. The
+    /// pure producers below start here and fill what they know.
+    pub fn bare(kind: AutomationEventKind, key: impl Into<String>, occurred_at: i64) -> Self {
+        let key = key.into();
+        Self {
+            id: event_id(kind, &key, occurred_at),
+            occurred_at,
+            key: EventKey(key),
+            kind,
+            target_rule: None,
+            workspace: None,
+            repo: None,
+            worktree: None,
+            branch: None,
+            agent_role: None,
+            notification_kind: None,
+            priority: None,
+            source_ref: None,
+            message: None,
+            session_id: None,
+            pr_checks_passed: None,
+            pr_review_requested: None,
+            pr_merged: None,
+            origin: None,
+            issue: None,
+            exit_code: None,
+        }
+    }
+
     fn template_vars(&self) -> TaskVars {
+        let issue = self.issue.as_ref();
+        let issue_field = |field: fn(&IssueFacts) -> &str| issue.map(field).unwrap_or_default();
         TaskVars::new()
             .set("event_id", &self.id)
             .set("event_key", &self.key.0)
@@ -158,6 +285,17 @@ impl AutomationEvent {
                 optional_bool(self.pr_review_requested),
             )
             .set("pr_merged", optional_bool(self.pr_merged))
+            .set("issue_id", issue_field(|facts| facts.issue_id.as_str()))
+            .set("issue_number", issue_field(|facts| facts.number.as_str()))
+            .set("issue_url", issue_field(|facts| facts.url.as_str()))
+            .set("issue_status", issue_field(|facts| facts.status.as_str()))
+            .set("account", issue_field(|facts| facts.account.as_str()))
+            .set(
+                "exit_code",
+                self.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_default(),
+            )
     }
 
     /// Typed PR fixtures must carry the fact their event kind promises. This
@@ -174,6 +312,46 @@ impl AutomationEvent {
             _ => Ok(()),
         }
     }
+}
+
+/// Deterministic event id from the producer's identity: the same kind, key
+/// and instant always name the same event (FNV-1a, stable across builds).
+pub fn event_id(kind: AutomationEventKind, key: &str, occurred_at: i64) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in kind
+        .as_str()
+        .bytes()
+        .chain([0])
+        .chain(key.bytes())
+        .chain([0])
+        .chain(occurred_at.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("ae-{occurred_at}-{hash:016x}")
+}
+
+/// A daemon session exited. Always produced on a session exit, alongside the
+/// role-specific `agent_finished`/`agent_failed` facts.
+pub fn session_exited_event(
+    session: &str,
+    worktree: Option<String>,
+    exit_code: Option<i32>,
+    origin: Option<AutomationOrigin>,
+    now: i64,
+) -> AutomationEvent {
+    let mut event = AutomationEvent::bare(
+        AutomationEventKind::SessionExited,
+        format!("session:{session}:exited"),
+        now,
+    );
+    event.worktree = worktree;
+    event.session_id = Some(session.to_string());
+    event.source_ref = Some(format!("session:{session}"));
+    event.exit_code = exit_code;
+    event.origin = origin;
+    event
 }
 
 fn optional_bool(value: Option<bool>) -> &'static str {
@@ -201,6 +379,18 @@ pub struct AutomationPredicate {
     pub pr_checks_passed: Option<bool>,
     pub pr_review_requested: Option<bool>,
     pub pr_merged: Option<bool>,
+    /// Issue selectors. Each is false on an event without [`IssueFacts`].
+    /// Tracker account, exact.
+    pub account: Option<String>,
+    /// One of the issue's project/sprint/milestone ids, exact.
+    pub project: Option<String>,
+    /// One of the issue's labels, ASCII case-insensitive.
+    pub label: Option<String>,
+    /// `"me"` means the tracker's own assigned-to-me provenance; any other
+    /// value must equal one of the issue's assignees exactly.
+    pub assignee: Option<String>,
+    /// The issue status, ASCII case-insensitive.
+    pub status: Option<String>,
 }
 
 impl AutomationPredicate {
@@ -231,6 +421,35 @@ impl AutomationPredicate {
             && bool_field(self.pr_checks_passed, event.pr_checks_passed)
             && bool_field(self.pr_review_requested, event.pr_review_requested)
             && bool_field(self.pr_merged, event.pr_merged)
+            && self.matches_issue(event.issue.as_ref())
+    }
+
+    fn matches_issue(&self, issue: Option<&IssueFacts>) -> bool {
+        let has = |selector: &Option<String>, test: &dyn Fn(&IssueFacts, &str) -> bool| {
+            selector
+                .as_deref()
+                .is_none_or(|want| issue.is_some_and(|facts| test(facts, want)))
+        };
+        has(&self.account, &|facts, want| facts.account == want)
+            && has(&self.project, &|facts, want| {
+                facts.project_ids.iter().any(|id| id == want)
+            })
+            && has(&self.label, &|facts, want| {
+                facts
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case(want))
+            })
+            && has(&self.assignee, &|facts, want| {
+                if want == "me" {
+                    facts.assigned_to_me
+                } else {
+                    facts.assignees.iter().any(|who| who == want)
+                }
+            })
+            && has(&self.status, &|facts, want| {
+                facts.status.eq_ignore_ascii_case(want)
+            })
     }
 }
 
@@ -272,6 +491,13 @@ pub struct AutomationRule {
     pub once_per_key: bool,
     pub max_per_hour: u16,
     pub max_action_per_hour: u16,
+    /// The rule's own schedule; present only for `schedule_due` rules.
+    #[serde(default)]
+    pub schedule: Option<crate::automation_schedule::Schedule>,
+    /// Effective autonomy ceiling, after the policy caps of
+    /// [`crate::automation_autonomy::effective_autonomy`].
+    #[serde(default)]
+    pub autonomy: Autonomy,
 }
 
 /// Persisted/in-memory throttle state for one rule.
@@ -302,6 +528,9 @@ pub struct PlannedAction {
     pub cap: String,
     pub params: BTreeMap<String, String>,
     pub transition: StateTransition,
+    /// The rule's effective autonomy, recorded on the audit row.
+    #[serde(default)]
+    pub autonomy: Autonomy,
 }
 
 /// Why a matching rule did not produce executable work.
@@ -316,6 +545,14 @@ pub enum SkipReason {
     UnsupportedAction,
     LoopSuppressed,
     InvalidTemplate,
+    /// The runtime kill switch (`automations.pause`) was on.
+    Paused,
+    /// The rule's previous run is still live (a session it opened, or an
+    /// unfinished audit row inside the crash window).
+    PreviousRunLive,
+    /// An automation budget (`[automations] max_concurrent_lanes` /
+    /// `max_spawns_per_day`) refused the spawn (6e).
+    Budget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,7 +692,36 @@ fn evaluate_one(
             rule_id: rule.id.clone(),
             state: next,
         },
+        autonomy: rule.autonomy,
     })
+}
+
+/// The paused runtime's view of a decision list: every would-be plan becomes
+/// an explicit `Paused` skip (its ledger transition is discarded); policy
+/// skips keep their own reason. Pure, so the kill switch is testable without
+/// a database.
+pub fn paused_decisions(decisions: Vec<EvaluationDecision>) -> Vec<EvaluationDecision> {
+    skipped_decisions(decisions, SkipReason::Paused)
+}
+
+/// Every would-be plan becomes an explicit skip with `reason` (its ledger
+/// transition is discarded); policy skips keep their own reason. The general
+/// form of [`paused_decisions`], also used for pre-admission budget refusals.
+pub fn skipped_decisions(
+    decisions: Vec<EvaluationDecision>,
+    reason: SkipReason,
+) -> Vec<EvaluationDecision> {
+    decisions
+        .into_iter()
+        .map(|decision| match decision {
+            EvaluationDecision::Planned(action) => EvaluationDecision::Skipped {
+                rule_id: action.rule_id,
+                event_key: action.event_key,
+                reason: reason.clone(),
+            },
+            skipped @ EvaluationDecision::Skipped { .. } => skipped,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -483,6 +749,8 @@ mod tests {
             pr_review_requested: Some(false),
             pr_merged: Some(false),
             origin: None,
+            issue: None,
+            exit_code: None,
         }
     }
 
@@ -504,6 +772,8 @@ mod tests {
             once_per_key: false,
             max_per_hour: 30,
             max_action_per_hour: 30,
+            schedule: None,
+            autonomy: Autonomy::Review,
         }
     }
 
@@ -547,6 +817,7 @@ mod tests {
             pr_checks_passed: Some(true),
             pr_review_requested: Some(false),
             pr_merged: Some(false),
+            ..AutomationPredicate::default()
         };
         assert!(predicate.matches(&event()));
         let mut missing = event();
@@ -795,5 +1066,257 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, ["third", "first", "second"]);
+    }
+
+    #[test]
+    fn every_kind_round_trips_and_all_covers_every_name() {
+        let names: BTreeSet<&str> = AutomationEventKind::ALL
+            .into_iter()
+            .map(AutomationEventKind::as_str)
+            .collect();
+        assert_eq!(names.len(), AutomationEventKind::ALL.len());
+        for kind in AutomationEventKind::ALL {
+            assert_eq!(AutomationEventKind::parse(kind.as_str()), Some(kind));
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.as_str()));
+            assert_eq!(
+                serde_json::from_str::<AutomationEventKind>(&json).unwrap(),
+                kind
+            );
+        }
+        for name in [
+            "schedule_due",
+            "issue_matched",
+            "session_exited",
+            "inbox_item",
+        ] {
+            assert!(names.contains(name), "{name}");
+        }
+        assert_eq!(AutomationEventKind::parse("nope"), None);
+    }
+
+    fn issue_facts() -> IssueFacts {
+        IssueFacts {
+            provider: "linear".into(),
+            account: "work".into(),
+            issue_id: "linear:THE-1".into(),
+            number: "THE-1".into(),
+            url: "https://example.invalid/THE-1".into(),
+            status: "In Progress".into(),
+            labels: vec!["Bug".into(), "auto".into()],
+            assignees: vec!["Ada".into()],
+            project_ids: vec!["proj-1".into()],
+            assigned_to_me: false,
+            title: "fix the thing".into(),
+        }
+    }
+
+    #[test]
+    fn issue_selectors_match_their_fields_and_never_a_missing_issue() {
+        let mut with_issue = event();
+        with_issue.issue = Some(issue_facts());
+        let cases: [(&str, AutomationPredicate, bool); 10] = [
+            (
+                "account",
+                AutomationPredicate {
+                    account: Some("work".into()),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "account case",
+                AutomationPredicate {
+                    account: Some("Work".into()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "project",
+                AutomationPredicate {
+                    project: Some("proj-1".into()),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "project miss",
+                AutomationPredicate {
+                    project: Some("proj-2".into()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "label case",
+                AutomationPredicate {
+                    label: Some("BUG".into()),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "label miss",
+                AutomationPredicate {
+                    label: Some("feature".into()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "status case",
+                AutomationPredicate {
+                    status: Some("in progress".into()),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "status miss",
+                AutomationPredicate {
+                    status: Some("done".into()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "assignee exact",
+                AutomationPredicate {
+                    assignee: Some("Ada".into()),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "assignee case",
+                AutomationPredicate {
+                    assignee: Some("ada".into()),
+                    ..Default::default()
+                },
+                false,
+            ),
+        ];
+        for (name, predicate, expected) in cases {
+            assert_eq!(predicate.matches(&with_issue), expected, "{name}");
+            // Every issue selector is false when the event carries no issue.
+            assert!(!predicate.matches(&event()), "{name} without an issue");
+        }
+    }
+
+    #[test]
+    fn assignee_me_is_provenance_not_a_display_name() {
+        let me = AutomationPredicate {
+            assignee: Some("me".into()),
+            ..AutomationPredicate::default()
+        };
+        let mut facts = issue_facts();
+        facts.assignees = vec!["me".into()];
+        facts.assigned_to_me = false;
+        let mut e = event();
+        e.issue = Some(facts.clone());
+        assert!(
+            !me.matches(&e),
+            "a user literally named `me` is not provenance"
+        );
+        facts.assignees.clear();
+        facts.assigned_to_me = true;
+        e.issue = Some(facts);
+        assert!(me.matches(&e));
+    }
+
+    #[test]
+    fn issue_and_exit_template_vars_render_and_default_empty() {
+        let mut r = rule("a");
+        r.action.params = BTreeMap::from([(
+            "body".into(),
+            "{issue_id}|{issue_number}|{issue_url}|{issue_status}|{account}|{exit_code}".into(),
+        )]);
+        let mut e = event();
+        e.issue = Some(issue_facts());
+        e.exit_code = Some(3);
+        let decisions = evaluate(std::slice::from_ref(&r), &e, &EvaluationState::new(), 2_000);
+        assert_eq!(
+            planned(&decisions).params["body"],
+            "linear:THE-1|THE-1|https://example.invalid/THE-1|In Progress|work|3"
+        );
+        let decisions = evaluate(&[r], &event(), &EvaluationState::new(), 2_000);
+        assert_eq!(planned(&decisions).params["body"], "|||||");
+        assert!(!EVENT_TEMPLATE_VARS.contains(&"title"));
+        assert!(!LEAD_WAKE_TEMPLATE_VARS.contains(&"message"));
+        assert_eq!(LEAD_WAKE_TEMPLATE_VARS.len() + 1, EVENT_TEMPLATE_VARS.len());
+        assert!(
+            LEAD_WAKE_TEMPLATE_VARS
+                .iter()
+                .all(|var| EVENT_TEMPLATE_VARS.contains(var))
+        );
+    }
+
+    #[test]
+    fn session_exited_event_is_keyed_by_session() {
+        let e = session_exited_event("s9", Some("/wt".into()), Some(1), None, 77);
+        assert_eq!(e.kind, AutomationEventKind::SessionExited);
+        assert_eq!(e.key.0, "session:s9:exited");
+        assert_eq!(e.session_id.as_deref(), Some("s9"));
+        assert_eq!(e.worktree.as_deref(), Some("/wt"));
+        assert_eq!(e.exit_code, Some(1));
+        assert_eq!(e.occurred_at, 77);
+        assert_eq!(e.id, session_exited_event("s9", None, None, None, 77).id);
+        assert_ne!(e.id, session_exited_event("s9", None, None, None, 78).id);
+    }
+
+    #[test]
+    fn events_without_new_fields_still_deserialize() {
+        let mut json = serde_json::to_value(event()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("issue");
+        object.remove("exit_code");
+        let decoded: AutomationEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, event());
+    }
+
+    #[test]
+    fn planned_actions_carry_the_rule_autonomy() {
+        let mut r = rule("a");
+        r.autonomy = Autonomy::Propose;
+        let decisions = evaluate(&[r], &event(), &EvaluationState::new(), 2_000);
+        assert_eq!(planned(&decisions).autonomy, Autonomy::Propose);
+    }
+
+    #[test]
+    fn paused_decisions_turn_every_plan_into_a_paused_skip() {
+        let mut disabled = rule("off");
+        disabled.enabled = false;
+        let decisions = evaluate(
+            &[rule("a"), disabled],
+            &event(),
+            &EvaluationState::new(),
+            2_000,
+        );
+        let paused = paused_decisions(decisions);
+        assert_eq!(paused.len(), 2);
+        assert!(matches!(
+            &paused[0],
+            EvaluationDecision::Skipped { rule_id, reason: SkipReason::Paused, .. } if rule_id == "a"
+        ));
+        assert!(matches!(
+            &paused[1],
+            EvaluationDecision::Skipped {
+                reason: SkipReason::Disabled,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rule_only_actions_are_supported_rule_targets() {
+        for cap in RULE_ONLY_ACTIONS {
+            assert!(SUPPORTED_ACTION_CAPS.contains(cap), "{cap}");
+            assert!(
+                crate::capability::lookup(cap).is_none(),
+                "{cap} is not a catalog cap"
+            );
+        }
+        assert!(SUPPORTED_ACTION_CAPS.contains(&"merge.drain"));
     }
 }

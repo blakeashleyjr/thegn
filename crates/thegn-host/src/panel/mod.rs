@@ -794,6 +794,9 @@ pub struct PanelData {
     pub tests: Option<TestsLite>,
     /// Total tracked-file count for the files summary ("214 · 29.5k loc").
     pub file_count: Option<u64>,
+    /// State of the tracked-file listing: `Failed` must not look like a small
+    /// repository (the renderer shows an unavailable note).
+    pub files_load: crate::panel::gitui::DocLoad,
     /// All tracked files from `git ls-files` — populated while Files is open.
     /// The Files section renders this as a collapsible tree with changed-file
     /// highlights drawn from `changes`.
@@ -857,6 +860,9 @@ pub struct PanelData {
     pub alert_notifications: usize,
     /// Full notification list: every unread row plus the newest 50 read rows.
     pub notifications: Vec<thegn_core::notification::Notification>,
+    /// Trusted descriptions of approval-request rows, keyed by source ref —
+    /// resolved off-loop with the inbox (`approval_effects::describe`).
+    pub approval_descriptions: std::collections::BTreeMap<String, String>,
     /// Last committed notification-write epoch observed before inbox hydration.
     pub notifications_epoch: u64,
     /// Loop-owned optimistic changes not yet covered by a hydrated DB snapshot.

@@ -47,6 +47,7 @@ pub mod snapshot;
 mod spawn_ratchet_tests;
 pub mod state_promote;
 pub mod usage;
+pub mod vercel;
 pub mod voice;
 pub mod voice_http;
 pub mod voice_models;

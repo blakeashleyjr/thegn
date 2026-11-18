@@ -164,6 +164,29 @@ pub fn state_for(
     now_ms: i64,
     ttl_secs: u64,
 ) -> ApprovalState {
+    evaluate(approval, head_sha, now_ms, ttl_secs, false)
+}
+
+/// [`state_for`] for a lane's land approval: the approved commit must equal
+/// the head EXACTLY (case-insensitive hex), never as an abbreviation. A short
+/// approved sha would let a worker grind a commit sharing its prefix (28 bits
+/// for 7 chars) and land it unreviewed, so it reads as superseded here.
+pub fn lane_state_for(
+    approval: Option<&Approval>,
+    head_sha: &str,
+    now_ms: i64,
+    ttl_secs: u64,
+) -> ApprovalState {
+    evaluate(approval, head_sha, now_ms, ttl_secs, true)
+}
+
+fn evaluate(
+    approval: Option<&Approval>,
+    head_sha: &str,
+    now_ms: i64,
+    ttl_secs: u64,
+    exact: bool,
+) -> ApprovalState {
     let Some(a) = approval else {
         return ApprovalState::Absent;
     };
@@ -184,7 +207,12 @@ pub fn state_for(
             why: "the lane's head commit is empty or too short to identify a tree",
         };
     }
-    if !same_commit(approved, head) {
+    let matches = if exact {
+        approved.eq_ignore_ascii_case(head)
+    } else {
+        same_commit(approved, head)
+    };
+    if !matches {
         return ApprovalState::Superseded {
             approved: approved.to_string(),
             head: head.to_string(),
@@ -309,6 +337,20 @@ mod tests {
         assert!(state_for(Some(&approval("4babb0901f2c3d4")), HEAD, NOW, 0).is_live());
         // And a full approval against a short head (a caller that abbreviated).
         assert!(state_for(Some(&approval(HEAD)), "4babb0901", NOW, 0).is_live());
+    }
+
+    #[test]
+    fn a_lane_approval_matches_only_the_exact_full_head() {
+        assert!(lane_state_for(Some(&approval(HEAD)), HEAD, NOW, 0).is_live());
+        assert!(lane_state_for(Some(&approval(&HEAD.to_uppercase())), HEAD, NOW, 0).is_live());
+        for short in ["4babb09", "4babb0901f2c3d4"] {
+            let state = lane_state_for(Some(&approval(short)), HEAD, NOW, 0);
+            assert!(
+                matches!(state, ApprovalState::Superseded { .. }),
+                "{short:?} must not approve the full head, got {state:?}"
+            );
+        }
+        assert!(!lane_state_for(Some(&approval(HEAD)), "4babb0901", NOW, 0).is_live());
     }
 
     #[test]

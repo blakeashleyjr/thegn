@@ -87,7 +87,6 @@ crates/thegn-core/src/devcontainer.rs
 crates/thegn-core/src/diagnostics.rs
 crates/thegn-core/src/diff_highlight.rs
 crates/thegn-core/src/disk.rs
-crates/thegn-core/src/dns_filter.rs
 crates/thegn-core/src/envplan.rs
 crates/thegn-core/src/event_bus.rs
 crates/thegn-core/src/file_manager/yazi.rs
@@ -130,7 +129,6 @@ crates/thegn-core/tests/devcontainer_e2e.rs
 crates/thegn-core/tests/merge_guard_hook.rs
 crates/thegn-core/tests/repo_issues_overlay.rs
 crates/thegn-core/tests/sandbox_credentials.rs
-crates/thegn-core/tests/sandbox_dns_e2e.rs
 crates/thegn-core/tests/sandbox_health.rs
 crates/thegn-core/tests/sandbox_lifecycle.rs
 crates/thegn-core/tests/sandbox_network_policy.rs

@@ -46,7 +46,7 @@ the page for whatever has focus.
 - [[copy-and-select]] — selections, scrollback, registers
 - [[git-and-diffs]] — the git tab, diffs, push/pull/rollback
 - [[workflows]] — task-oriented guides: [[review-a-pr]],
-  [[merge-queue]], [[sandboxing]]
+  [[merge-queue]], [[sandboxing]], [[vercel-sandbox]]
 
 ## Beyond one machine
 

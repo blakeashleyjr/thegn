@@ -7,16 +7,13 @@
 
 #![cfg(unix)]
 
-use std::collections::HashMap;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use thegn_core::config::{FileAccess, Network, SandboxProfile};
 use thegn_core::placement::Placement;
-use thegn_core::sandbox::{
-    Backend, EnterError, Mount, RefusalClass, SandboxLimits, SandboxSpec, enter_argv,
-};
+use thegn_core::sandbox::{Backend, EnterError, Mount, RefusalClass, SandboxSpec, enter_argv};
 use thegn_core::sandbox_floor::home_gate;
 use thegn_core::sandbox_mounts::{HomeView, home_view, planned_home_view, sealed_home_allowlist};
 
@@ -57,38 +54,14 @@ fn fixture() -> tempfile::TempDir {
 fn spec(backend: Backend, home: &Path, mounts: Vec<Mount>, seal: bool) -> SandboxSpec {
     SandboxSpec {
         backend,
-        placement: Placement::Local,
-        image: None,
         worktree: home.join("wt"),
         mounts,
-        env: vec![],
-        env_overrides: HashMap::new(),
-        env_block: vec![],
         network: Network::None,
-        network_allow: vec![],
-        network_block: vec![],
         read_only_root: true,
         no_new_privileges: true,
-        pids_limit: None,
-        drop_capabilities: vec![],
-        add_capabilities: vec![],
-        file_access: FileAccess::WorktreePlusCaches,
-        ports: vec![],
-        gpu: None,
-        limits: SandboxLimits::default(),
-        volumes: vec![],
-        compose: None,
-        build: None,
-        init_script: None,
-        devenv: false,
-        devenv_path: None,
         name: "thegn-test".into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
         seal_home: seal.then(|| home.to_string_lossy().into_owned()),
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 

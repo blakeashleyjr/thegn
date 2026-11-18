@@ -68,7 +68,8 @@ fn skip_local_probe(is_local: bool, has_oci_host: bool) -> bool {
 /// Ensure `spec`'s image is present on the target runtime (a no-op for non-OCI
 /// backends and for transport-wrapped remotes the host flow already provisioned).
 pub fn prefetch_image(spec: &SandboxSpec) -> anyhow::Result<()> {
-    if !spec.backend.is_oci() {
+    // Non-OCI backends have no image; a reserved kind (smol) is never created.
+    if !spec.backend.is_oci() || spec.backend.is_reserved() {
         return Ok(());
     }
     if skip_local_probe(spec.placement.is_local(), spec.oci_host.is_some()) {
@@ -218,14 +219,20 @@ mod tests {
         assert_eq!(image_exists_subcmd(Backend::Apple), "inspect");
         assert_eq!(pull_verb(Backend::Apple), &["image", "pull"]);
         // Everyone else keeps the top-level `pull`.
-        for b in [
-            Backend::Podman,
-            Backend::PodmanRootful,
-            Backend::Docker,
-            Backend::Smol,
-        ] {
+        for b in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
             assert_eq!(pull_verb(b), &["pull"], "{b:?}");
         }
+    }
+
+    #[test]
+    fn prefetch_skips_smol() {
+        // Reserved: returns before any probe or pull is spawned.
+        let spec = SandboxSpec {
+            backend: Backend::Smol,
+            image: Some("img:latest".into()),
+            ..SandboxSpec::default()
+        };
+        assert!(prefetch_image(&spec).is_ok());
     }
 
     #[test]

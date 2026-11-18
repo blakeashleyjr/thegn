@@ -1192,6 +1192,13 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         ctx.panes.forget_spawn_time(id);
         let shutting_down = ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed);
         let interactive_close = !shutting_down && age >= CRASH_THRESHOLD;
+        if exit.group_closed || exit.tab_closed {
+            crate::lead::mcp::revoke_closed_tab_off_loop(
+                ctx.current_config,
+                &exit.name,
+                if exit.group_closed { 0 } else { exit.tab_index },
+            );
+        }
         if exit.group_closed {
             ctx.loading_state
                 .remove(&(exit.name.clone(), exit.tab_index));
@@ -1708,6 +1715,13 @@ fn close_exited_terminal(ctx: &mut DrainCtx<'_>, gi: usize, ti: usize, delete_re
         ti,
         delete_registry,
     );
+    if let Some(group) = &group_name {
+        crate::lead::mcp::revoke_closed_tab_off_loop(
+            ctx.current_config,
+            group,
+            if closed_group.is_some() { 0 } else { ti },
+        );
+    }
     if closed_group.is_none()
         && let Some(group) = group_name
     {

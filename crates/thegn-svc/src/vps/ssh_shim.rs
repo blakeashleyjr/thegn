@@ -412,6 +412,19 @@ pub fn control_socket_path() -> Option<PathBuf> {
 /// identity file; without this suffix, key rotation could appear verified by
 /// riding an old key's existing master connection.
 pub fn control_socket_path_for(key_path: &std::path::Path) -> Option<PathBuf> {
+    control_socket_path_for_on(thegn_core::sandbox_backend::host_os(), key_path)
+}
+
+/// [`control_socket_path_for`] with the host OS explicit: Win32-OpenSSH has no
+/// ControlMaster, so Windows connects without multiplexing (and creates no
+/// directory).
+pub fn control_socket_path_for_on(
+    os: thegn_core::sandbox_backend::HostOs,
+    key_path: &std::path::Path,
+) -> Option<PathBuf> {
+    if os == thegn_core::sandbox_backend::HostOs::Windows {
+        return None;
+    }
     let dir = control_dir_candidate(
         std::env::var_os("XDG_RUNTIME_DIR"),
         std::env::temp_dir(),
@@ -530,6 +543,17 @@ pub fn parse_find_listing(out: &str) -> Vec<crate::provider::FileEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_shim_windows_returns_none() {
+        assert_eq!(
+            control_socket_path_for_on(
+                thegn_core::sandbox_backend::HostOs::Windows,
+                std::path::Path::new("managed"),
+            ),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn read_tail_capped_keeps_the_last_bytes_and_counts_the_rest() {

@@ -238,7 +238,9 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                       to the server's resolved worktree when `worktree` is omitted. \
                       Additive: it never removes queue entries. Git-scoped \
                       (`--scopes git`; the narrow `merge_add` grant is for worktree-bound \
-                      route tokens and does not enable this tool); requires a running daemon.",
+                      route tokens and does not enable this tool); requires a running daemon. \
+                      Refused for a Lead: it lands only through a rule's land step or an owner \
+                      approval.",
         args: &[ArgSpec {
             name: "worktree",
             kind: ArgKind::String,
@@ -1061,6 +1063,210 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
             },
         ],
     },
+    // --- Lead tool surface (THE-2172) ---
+    StateToolSpec {
+        cap: "overview.get",
+        description: "One-call cross-workspace overview for the Lead: worktrees, agents, queues and what needs attention. Read-scoped; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "workspace",
+                kind: ArgKind::String,
+                required: false,
+                description: "Restrict the overview to one workspace (repo root)",
+            },
+            ArgSpec {
+                name: "limit",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Maximum rows per section",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "notifications.list",
+        description: "List notifications, newest first, filtered by kind, unread state, age and worktree. Read-scoped; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "kind",
+                kind: ArgKind::String,
+                required: false,
+                description: "Notification kind to match",
+            },
+            ArgSpec {
+                name: "unread",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "true for unread notifications only",
+            },
+            ArgSpec {
+                name: "since",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Only notifications at or after this Unix time (milliseconds)",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Only notifications for this worktree path",
+            },
+            ArgSpec {
+                name: "limit",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Maximum number of notifications to return",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "notifications.ack",
+        description: "Acknowledge (mark read) notifications: pass exactly one of `id`, `all: true` or `worktree`. Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "id",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "One notification id",
+            },
+            ArgSpec {
+                name: "all",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "true to acknowledge every notification",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Acknowledge every notification for this worktree path",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "automations.put",
+        description: "Create or replace a Lead-authored automation rule. Lead rules may only notify, open a session, wake the Lead or propose a pipeline (pipeline.start at autonomy = \"propose\" only); they never merge, and config rules are read-only. Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[ArgSpec {
+            name: "rule",
+            kind: ArgKind::Object,
+            required: true,
+            description: "The automation rule (the [[automations]] table shape)",
+        }],
+    },
+    StateToolSpec {
+        cap: "automations.rm",
+        description: "Remove a Lead-authored automation rule by name; config rules answer a conflict. Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[ArgSpec {
+            name: "name",
+            kind: ArgKind::String,
+            required: true,
+            description: "Rule name",
+        }],
+    },
+    StateToolSpec {
+        cap: "automations.enable",
+        description: "Enable or disable a Lead-authored automation rule by name; config rules answer a conflict. Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "name",
+                kind: ArgKind::String,
+                required: true,
+                description: "Rule name",
+            },
+            ArgSpec {
+                name: "enabled",
+                kind: ArgKind::Boolean,
+                required: true,
+                description: "true to enable, false to disable",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "automations.runs",
+        description: "Recent audited runs of an automation rule (or of every rule). Read-scoped; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "rule",
+                kind: ArgKind::String,
+                required: false,
+                description: "Rule name; omit for every rule",
+            },
+            ArgSpec {
+                name: "limit",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Maximum number of runs to return",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "approvals.list",
+        description: "Pipeline approval history and the pending approval requests. Read-scoped; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "issue_id",
+                kind: ArgKind::String,
+                required: false,
+                description: "Only approvals for this issue id",
+            },
+            ArgSpec {
+                name: "limit",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Maximum number of rows to return",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "approvals.request",
+        description: "Ask a human to approve a pipeline stage. It only asks: granting is an admin action that is never available over MCP. Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "issue_id",
+                kind: ArgKind::String,
+                required: true,
+                description: "Issue id the stage belongs to",
+            },
+            ArgSpec {
+                name: "stage",
+                kind: ArgKind::String,
+                required: true,
+                description: "Pipeline stage awaiting approval",
+            },
+            ArgSpec {
+                name: "commit_sha",
+                kind: ArgKind::String,
+                required: true,
+                description: "Commit the approval would cover",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree path the stage runs in",
+            },
+            ArgSpec {
+                name: "reason",
+                kind: ArgKind::String,
+                required: false,
+                description: "Why approval is needed, shown to the human",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "merge.drain",
+        description: "Start the merge-queue drain for a worktree's repository. Git-scoped (`--scopes git`; the narrow `merge_add` grant is for worktree-bound route tokens and does not enable this tool); requires a running daemon. Refused for a Lead: it lands only through a rule's land step or an owner approval.",
+        args: &[ArgSpec {
+            name: "worktree",
+            kind: ArgKind::String,
+            required: true,
+            description: "Absolute path of a worktree in the repository to drain",
+        }],
+    },
+    StateToolSpec {
+        cap: "automations.pause",
+        description: "Pause every automation rule: events are still audited (as paused) but nothing executes. Only the operator can resume; resuming is an admin action that is never available over MCP. Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[],
+    },
 ];
 
 /// Host capabilities the MCP server exposes as state tools, by catalog id.
@@ -1109,6 +1315,21 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "automations.list",
     "automations.test",
     "tools.run",
+    // Lead tool surface (THE-2172). `approvals.resolve` is Admin and never an
+    // MCP tool.
+    "overview.get",
+    "notifications.list",
+    "notifications.ack",
+    "automations.put",
+    "automations.rm",
+    "automations.enable",
+    "automations.runs",
+    "approvals.list",
+    "approvals.request",
+    "merge.drain",
+    // THE-2197: pausing is the Lead's kill switch; `automations.resume` is
+    // Admin and never an MCP tool.
+    "automations.pause",
 ];
 
 /// The injected data fetch: `(capability id, tool arguments) → payload JSON`.
@@ -1125,6 +1346,9 @@ pub struct StateRouter<'a> {
     /// tool-specific interlock, e.g. `--allow-session-input`).
     allowed: Vec<&'static str>,
     fetch: Box<FetchFn<'a>>,
+    /// Self-asserted caller label (`THEGN_CALLER`), audit-only: it is logged
+    /// on every mutating call and never used for authorization.
+    caller: Option<String>,
 }
 
 impl<'a> StateRouter<'a> {
@@ -1135,7 +1359,20 @@ impl<'a> StateRouter<'a> {
         Self {
             allowed,
             fetch: Box::new(fetch),
+            caller: None,
         }
+    }
+
+    /// Attach the audit-only caller label (see [`super::caller`]). Never
+    /// consulted for authorization.
+    pub fn with_caller(mut self, caller: Option<String>) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    /// The audit caller label, `-` when none was set.
+    pub fn caller(&self) -> &str {
+        self.caller.as_deref().unwrap_or("-")
     }
 
     /// The `tools/list` entries for the *allowed* tools.
@@ -1160,7 +1397,7 @@ impl<'a> StateRouter<'a> {
     pub fn call(&self, name: &str, args: &Value) -> Option<Result<Value, (i32, String)>> {
         let spec = STATE_TOOLS.iter().find(|t| tool_name(t.cap) == name)?;
         if !self.allowed.contains(&spec.cap) {
-            let scope = if spec.cap == "merge.add" {
+            let scope = if matches!(spec.cap, "merge.add" | "merge.drain") {
                 "git"
             } else {
                 lookup(spec.cap)
@@ -1185,6 +1422,7 @@ impl<'a> StateRouter<'a> {
             tracing::info!(
                 target: "thegn::mcp",
                 cap = spec.cap,
+                caller = self.caller(),
                 args = %redact_for_audit(spec.cap, args),
                 "mcp tool call",
             );
@@ -1192,10 +1430,19 @@ impl<'a> StateRouter<'a> {
         let result = (self.fetch)(spec.cap, args);
         if mutating {
             match &result {
-                Ok(_) => tracing::info!(target: "thegn::mcp", cap = spec.cap, "mcp tool call ok"),
-                Err(e) => {
-                    tracing::warn!(target: "thegn::mcp", cap = spec.cap, error = %e, "mcp tool call failed")
-                }
+                Ok(_) => tracing::info!(
+                    target: "thegn::mcp",
+                    cap = spec.cap,
+                    caller = self.caller(),
+                    "mcp tool call ok"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "thegn::mcp",
+                    cap = spec.cap,
+                    caller = self.caller(),
+                    error = %e,
+                    "mcp tool call failed"
+                ),
             }
         }
         Some(match result {
@@ -1251,6 +1498,13 @@ const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
     "sessions.resize",
     "sessions.split",
     "worktrees.open",
+    // Lead tool surface (THE-2172): acknowledging only marks rows read, a
+    // request only asks, and enabling is reversible.
+    "notifications.ack",
+    "approvals.request",
+    "automations.enable",
+    // THE-2197: pausing only stops automations (the operator resumes).
+    "automations.pause",
 ];
 
 /// MCP `annotations` for a state tool, derived from the catalog scope. Hints
@@ -2420,6 +2674,10 @@ mod tests {
             "semantic.blast_radius",
             "automations.list",
             "automations.test",
+            "overview.get",
+            "notifications.list",
+            "automations.runs",
+            "approvals.list",
         ];
         let write = [
             "editor.open",
@@ -2435,11 +2693,17 @@ mod tests {
             "dispatches.set_status",
             "issues.update",
             "issues.comment",
+            "notifications.ack",
+            "automations.put",
+            "automations.rm",
+            "automations.enable",
+            "approvals.request",
+            "automations.pause",
         ];
         // Folder assignment is a repo-local worktree metadata mutation: Git.
         let git = ["folders.assign"];
         // Merge enqueue has its own single-verb scope (which `git` implies).
-        let merge_add = ["merge.add"];
+        let merge_add = ["merge.add", "merge.drain"];
         let exec = ["tools.run"];
         for cap in read {
             let c = lookup(cap).expect("state cap in catalog");
@@ -2646,6 +2910,160 @@ mod tests {
             assert!(MCP_STATE_CAPS.contains(cap), "{cap}");
             assert_ne!(scope_of(lookup(cap).unwrap()), Scope::Read, "{cap}");
         }
+    }
+
+    #[test]
+    fn approvals_resolve_is_never_an_mcp_tool() {
+        // Granting an approval is Admin (no supervisor path may grant), so it is
+        // neither a state cap nor a declared tool, on any scope.
+        assert!(!MCP_STATE_CAPS.contains(&"approvals.resolve"));
+        assert!(STATE_TOOLS.iter().all(|t| t.cap != "approvals.resolve"));
+        let r = StateRouter::new(all_caps(), |_, _| Ok(json!(null)));
+        assert!(r.call("approvals_resolve", &json!({})).is_none());
+        assert!(
+            r.tool_entries()
+                .iter()
+                .all(|e| e["name"].as_str() != Some("approvals_resolve"))
+        );
+    }
+
+    #[test]
+    fn b155_spine_caps_are_never_mcp_tools() {
+        // The phone's answer, the operator's halt and the profile env are
+        // HTTP + CLI only, on any scope.
+        let r = StateRouter::new(all_caps(), |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        for cap in [
+            "approvals.redeem",
+            "automations.halt",
+            "mcp_proxy.profile_env",
+        ] {
+            assert!(!MCP_STATE_CAPS.contains(&cap), "{cap}");
+            assert!(STATE_TOOLS.iter().all(|t| t.cap != cap), "{cap}");
+            let tool = cap.replace('.', "_");
+            assert!(r.call(&tool, &json!({})).is_none(), "{cap}");
+            assert!(
+                entries
+                    .iter()
+                    .all(|e| e["name"].as_str() != Some(tool.as_str())),
+                "{cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn automations_pause_is_an_mcp_tool_and_resume_never_is() {
+        // THE-2197: the Lead may pull the kill switch but never release it.
+        assert!(MCP_STATE_CAPS.contains(&"automations.pause"));
+        assert!(!MCP_STATE_CAPS.contains(&"automations.resume"));
+        assert!(STATE_TOOLS.iter().all(|t| t.cap != "automations.resume"));
+        let spec = STATE_TOOLS
+            .iter()
+            .find(|t| t.cap == "automations.pause")
+            .expect("pause spec");
+        assert!(spec.args.is_empty(), "pause takes no arguments");
+        let r = StateRouter::new(all_caps(), |_, _| Ok(json!({"paused": true})));
+        assert!(r.call("automations_resume", &json!({})).is_none());
+        let entries = r.tool_entries();
+        assert!(
+            entries
+                .iter()
+                .all(|e| e["name"].as_str() != Some("automations_resume"))
+        );
+        let pause = entries
+            .iter()
+            .find(|e| e["name"].as_str() == Some("automations_pause"))
+            .expect("automations_pause listed");
+        assert_eq!(pause["annotations"]["readOnlyHint"], json!(false));
+        assert_eq!(pause["annotations"]["destructiveHint"], json!(false));
+        // A tool with no arguments lists none as required (the key may be absent).
+        assert!(
+            pause["inputSchema"]["required"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+        assert!(r.call("automations_pause", &json!({})).is_some());
+    }
+
+    #[test]
+    fn lead_tools_declare_their_args_and_annotations() {
+        let r = StateRouter::new(all_caps(), |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        let entry = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .clone()
+        };
+        for (name, read_only, destructive) in [
+            ("overview_get", true, false),
+            ("notifications_list", true, false),
+            ("notifications_ack", false, false),
+            ("automations_put", false, true),
+            ("automations_rm", false, true),
+            ("automations_enable", false, false),
+            ("automations_runs", true, false),
+            ("approvals_list", true, false),
+            ("approvals_request", false, false),
+            ("merge_drain", false, true),
+        ] {
+            let e = entry(name);
+            assert_eq!(e["annotations"]["readOnlyHint"], json!(read_only), "{name}");
+            assert_eq!(
+                e["annotations"]["destructiveHint"],
+                json!(destructive),
+                "{name}"
+            );
+            let description = e["description"].as_str().unwrap();
+            assert!(
+                description.contains("requires a running daemon"),
+                "{name}: {description}"
+            );
+        }
+        assert_eq!(
+            entry("automations_put")["inputSchema"]["required"],
+            json!(["rule"])
+        );
+        assert_eq!(
+            entry("automations_enable")["inputSchema"]["required"],
+            json!(["name", "enabled"])
+        );
+        assert_eq!(
+            entry("approvals_request")["inputSchema"]["required"],
+            json!(["issue_id", "stage", "commit_sha"])
+        );
+        assert_eq!(
+            entry("merge_drain")["inputSchema"]["required"],
+            json!(["worktree"])
+        );
+        assert_eq!(entry("overview_get")["inputSchema"]["required"], json!([]));
+        // A missing required arg never reaches the fetch closure.
+        let refused = r.call("merge_drain", &json!({})).unwrap().unwrap_err();
+        assert_eq!(refused.0, -32602);
+    }
+
+    #[test]
+    fn merge_drain_scope_hint_names_git_like_merge_add() {
+        let r = StateRouter::new(vec![], |_, _| Ok(json!(null)));
+        for name in ["merge_add", "merge_drain"] {
+            let (code, msg) = r.call(name, &json!({})).unwrap().unwrap_err();
+            assert_eq!(code, -32001);
+            assert!(msg.contains("--scopes git"), "{name}: {msg}");
+        }
+    }
+
+    #[test]
+    fn with_caller_carries_the_audit_label() {
+        let r = StateRouter::new(vec!["me"], |_, _| Ok(json!(null)));
+        assert_eq!(r.caller(), "-");
+        let r = r.with_caller(Some("lead:main".to_string()));
+        assert_eq!(r.caller(), "lead:main");
+        // The label never changes what is allowed.
+        assert!(r.call("me", &json!({})).unwrap().is_ok());
+        assert!(r.call("sessions_kill", &json!({})).unwrap().is_err());
+        let r = r.with_caller(None);
+        assert_eq!(r.caller(), "-");
     }
 
     #[test]

@@ -3,8 +3,7 @@ id: sandboxing
 title: Sandboxing
 parent: workflows
 order: 3
-contexts: [panel:sandbox#inspecting, panel:environments]
-actions: [warm-pool-increment, warm-pool-decrement, toolchain-install]
+contexts: [panel:sandbox#inspecting]
 ---
 
 # Sandboxing
@@ -14,6 +13,15 @@ container while the worktree itself **stays on the host**, bind-mounted at
 its real path. That is the whole trick: host-side git keeps working, so
 the [[panel]] diff and the [[sidebar]] state are live and unsandboxed
 while the process is contained.
+
+## Topics
+
+- [[sandbox-backends]] — backends, the enforcement matrix, the isolation floor and the git write policy
+- [[sandbox-devcontainers]] — running a worktree in the repository's devcontainer
+- [[sandbox-resources]] — CPU, memory and process limits, and caches
+- [[sandbox-network]] — network modes and the allow and block lists
+- [[environments]] — named environments, worktree toolchains, lifecycle hooks and remote worktrees
+- [[sandbox-profiles]] — pinning a profile per worktree
 
 ## Hardening profiles
 
@@ -271,738 +279,125 @@ Bwrap unsets it, and systemd panes also cannot reach `$XDG_RUNTIME_DIR/bus` or
 abstract-namespace session bus can still be reached from bwrap panes that share
 the host network, because the address is withheld but the network namespace is shared.
 
-## Backends
-
-`[sandbox] backend = "auto"` walks the chain until one works:
-`podman-rootless` → `podman-rootful` → `docker` → `apple` → `bwrap` →
-`jobobject` (Windows). There is no host fallback: with no usable backend, a
-sandboxed launch is refused under the default floor. Pin one to skip the
-probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
-`apple`, `wsl`, `none`.
-
-The outer `bwrap` and `systemd-run` launchers are resolved to absolute paths
-from thegn's own `PATH`. If either is missing there, launch is refused rather
-than resolving it from the pane environment. Loader variables such as `LD_*`
-and `DYLD_*` are withheld from the outer launcher. Under `bwrap` they are set
-again inside the sandbox; a `systemd-run` launch without `bwrap` drops them.
-
-If the systemd backend cannot create a pane's protected environment file, the
-pane still starts without those host-sourced secrets. The launch warning names
-each omitted secret key, never its value; secrets are not put on the command
-line.
-
-For local rootless Podman, the first thegn command is the `version` liveness
-probe, before container creation or the events client. The `podman events`
-client runs in its own process group, which thegn kills at shutdown and on
-stream end, reaping it when it exits within the shutdown deadline.
-A surviving `pause` process belongs to rootless Podman's user namespace and
-may outlive thegn by design.
-
-One chain serves every OS: each OS-native entry is probed only on its own OS.
-
-> **NixOS tip:** set `backend = "bwrap"` to skip the podman probes and get
-> instant panes.
-
-> **macOS tip:** `apple` is Apple's `container` CLI. Each container gets its
-> own Linux VM, so it is the strongest isolation any backend here offers.
-> Without `apple`, podman, or docker, a Mac has no backend meeting the default
-> floor, so sandboxed panes are refused. Opt out with
-> `isolation_floor = "off"`, `backend = "none"`, `enabled = false`, or run on
-> host; `bwrap`/`systemd` are Linux-only.
-
-> **Platform status:** the public alpha supports Linux on x86_64, where
-> `bwrap`, `systemd`, podman and docker are the backends to use. The `apple`
-> backend and macOS are best-effort; the Windows `jobobject` and `wsl` entries
-> are not supported in this alpha.
-
-`thegn doctor` reports which backends this machine actually has.
-
-## Devcontainers
-
-With the default `auto` mode, thegn discovers a repo's
-`.devcontainer/devcontainer.json` or `.devcontainer.json`, parses JSONC, and
-maps its supported subset onto the existing sandbox. To opt out globally or in
-a trusted overlay:
-
-```toml
-[sandbox]
-devcontainer = "off" # "auto" (default) | "off"
-```
-
-If neither primary file exists, thegn also discovers
-`.devcontainer/<name>/devcontainer.json`. One variant is unambiguous; multiple
-variants need a top-level selector in the repo's `.thegn.toml`:
-
-```toml
-devcontainer = "gpu"
-
-[sandbox]
-devcontainer = "auto"
-```
-
-The selector only picks a file. It does not approve anything in that file.
-Review pending category requests and their ids with `thegn repo trust .`, then
-approve one explicitly with `thegn repo trust . --approve <id>`.
-
-### Security boundary
-
-A repo JSON file is untrusted, just like any other cloned executable content.
-thegn records trust-on-first-use approval separately for its image, build,
-compose, mounts, ports, lifecycle, and features categories. An unapproved
-category stays pending and is not applied; the worktree still opens. Editing a
-request changes its canonical form and requires approval again.
-
-Literal `containerEnv` and `remoteEnv` values do not prompt, but host-variable
-substitution is clamped: `${localEnv:NAME}` is available only when `NAME` is in
-the effective `[sandbox] env_passthrough` list. A blocked name becomes empty
-and is reported without exposing its value.
-
-Under a named profile (`--profile <name>`), ambient credentials are denied
-by default for sandboxes, devcontainer `${localEnv:}` substitutions and
-provider placements. Only infrastructure names such as `PATH`, `HOME`,
-`TERM` and `LANG`, `LC_*`, `THEGN_*`, and names in
-`[profiles.<name>.sandbox] env_passthrough` are shared; that profile list
-replaces `[sandbox] env_passthrough`. At startup, the thegn process also unsets
-names ending in `_TOKEN`, `_SECRET`, `_PASSWORD`, `_KEY`, `_AUTH`,
-`_CREDENTIAL`/`_CREDENTIALS` or `_PASSPHRASE`, plus cloud/package names such as
-`GOOGLE_APPLICATION_CREDENTIALS` and `DOCKER_AUTH_CONFIG`. It keeps
-`SSH_AUTH_SOCK` only when the profile has `ssh/id`. Its git, gh and GnuPG
-directories are mounted read-only in
-sandboxes; a pane that needs to write them, such as `gh auth login` or GnuPG
-signing, needs an explicit `[sandbox] mounts` grant. Startup refuses if the
-profile state or credential directories cannot be created. Startup also
-refuses if `ssh/id` exists but its target is not a regular file owned by you
-with no group or other access.
-The default profile is unchanged.
-Named profile directories are created owner-only without following symlinks.
-`thegn doctor` lists denied and shared names, never values. The share list is
-read at startup.
-
-Some repo requests are never eligible for approval. `privileged`, `capAdd`,
-`securityOpt`, `runArgs`, and `init` could weaken the trusted sandbox, so thegn
-always refuses them and names the reason. Recognized fields that thegn does not
-apply — such as `hostRequirements`, port attributes, `waitFor`,
-`workspaceMount`, `overrideCommand`, `secrets`, remote-user/UID settings, and
-compose overrides — are reported as reserved. Unknown top-level keys are also
-reported and not applied; editor-only `customizations` is ignored silently.
-This is the supported subset for this thegn version, not a promise to mirror
-every current or future containers.dev field.
-
-Named volumes declared by a devcontainer carry an owner label. A volume labelled
-for another devcontainer is refused; a legacy unlabelled volume is claimed on
-first local use, while an unlabelled volume on a remote host is refused.
-Volumes configured under `[sandbox] volumes` are not owner-bound.
-
-Supported native OCI behavior includes image, Dockerfile build, compose
-service, mounts, forwarded ports, container/process environment, lifecycle
-hooks, and in-container feature installs. `overrideFeatureInstallOrder` is
-honored; fetched `installsAfter`/`dependsOn` metadata ordering, generated
-Dockerfile feature layers, and `devcontainer.metadata` image-label merging are
-reserved.
-
-The image thegn builds for a devcontainer `build` is tagged from the build
-declaration and Dockerfile contents, so changing the Dockerfile rebuilds it on
-the next launch. If the Dockerfile cannot be read for hashing, thegn warns and
-uses the declaration alone for the tag.
-
-The image tag also covers files in the build `context`: their relative paths,
-contents and symlink targets, but not file permission bits. A top-level `.git`
-directory is skipped. Editing a context file rebuilds the image on the next
-launch, and the first launch after upgrading rebuilds once because the tag
-format changed. If the context cannot be digested (more than 2048 entries, more
-than 16 MiB of file content, a path deeper than 32 levels, or an unreadable
-file), thegn warns that it could not digest the build context, names the path
-and the reason, and says the image tag covers only the Dockerfile (when
-readable) and the build declaration. The build still runs.
-
-### Lifecycle and provider fallback
-
-After lifecycle approval, `initializeCommand` uses the host-side one-time
-prepare hook. `onCreateCommand`, `updateContentCommand`, and
-`postCreateCommand` are ordered one-time provisioning steps. In particular,
-postCreate is not rerun for every pane. `postStartCommand` and
-`postAttachCommand` use the existing per-pane init script and run before each
-pane shell — thegn has no distinct attach event, so per-pane is its explicit
-per-start/attach analogue.
-
-For a local, fully approved config containing only safely applied fields, an
-installed `devcontainer` CLI may be **CLI-ready**. If that bounded provider
-probe is unavailable/degraded, the config is not safe to pass through raw, or
-`devcontainer up` fails, thegn uses its existing native OCI path for the
-supported approved subset. A non-OCI backend cannot honor an
-image/build/compose source; doctor reports that degradation instead of
-silently claiming the container shape was used. While falling back between
-backends, a backend whose launch probe failed is remembered for the same
-environment, placement, and worktree; later launches skip it with a warning that
-the earlier probe failed, while current policy and isolation checks still run.
-The memory is dropped when the config is reloaded, and for a worktree when you
-retry, start its runtime, or run it on the host. An explicitly chosen backend is
-always probed.
-
-The `devcontainer` CLI provider's trust digest covers the selected
-`devcontainer.json` and the bytes of its referenced Dockerfile and Compose
-files inside the repository. The digest is checked before `devcontainer up`
-and each exec; changing one of those files requires fresh approval. A missing,
-absolute, or repository-escaping reference refuses provider use.
-Before snapshotting the selected config and again before `devcontainer up`, the
-CLI provider checks that `devcontainer.json` is still a regular file inside the
-worktree. A symlink swap or non-regular file refuses provider use before
-`devcontainer up` runs. The first check also runs before the snapshot
-is written; if the later check refuses the CLI provider, thegn warns
-and uses its native OCI path for the supported approved subset.
-The trust digest also covers Compose `env_file`, build Dockerfile, `extends.file`
-and `include` references, following nested files up to 4 levels and 256
-references. Absolute, remote, interpolated or repository-escaping paths, and
-references beyond either limit, refuse provider use. Every provider exec and
-session lookup rechecks that both the selected config and its snapshot remain
-regular files inside the worktree; a failed check refuses exec or drops the
-session.
-
-`thegn doctor` shows the `Devcontainer support` block: mode, repo, candidates,
-selected file or selection error, provider, status, trust counts, and backend
-honorability. It reads config and approvals and may run bounded
-`devcontainer --version`; it never pulls, builds, starts, runs lifecycle code,
-or makes a network probe just to report health.
-
-The sidebar and active tab bar use `dc:<selected-path> [<state>]` (or
-`dc:[<state>]` before selection). The transient states are `off`, `ambiguous`,
-`invalid`, `pending`, `ready`, and `degraded`. `ready` means CLI-ready;
-`degraded` can still mean the supported subset is running through the native
-OCI fallback. Re-run doctor for the detailed reason.
-
-## Enforcement matrix
-
-`thegn doctor` renders one **enforcement matrix** for this host: per backend,
-what it actually enforces —
-
-| Cell      | What it means                                                                 |
-| --------- | ----------------------------------------------------------------------------- |
-| `fs`      | filesystem isolation: a separate root, unit-level protection, or the host fs  |
-| `net`     | `netns; rules DNS-only`, `only when network=none`, or `none (host net)`       |
-| `ceiling` | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none         |
-| `scoping` | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid |
-| `class`   | the honest isolation class (below) — what would have to fail for an escape    |
-
-Every cell is **derived** from the same predicates the resolver uses, so the
-matrix can never disagree with what actually launches. The ceiling cell reflects
-what is _measured_ on this host — a machine without cgroup cpu delegation shows a
-soft ceiling for the host-toolchain backends, not a hard one. Backends thegn's
-verbs were never checked against a real install are flagged `(unverified)`.
-When `systemd-run` and cgroup CPU delegation are available but no systemd user
-manager is reachable, the ceiling uses soft `nice` or no cap if `nice` is
-unavailable. With a CPU cap configured, `thegn doctor` prints a `cpu cap note`;
-`thegn doctor --json` includes the same text as `cpu_scope_note`.
-When the soft ceiling is in use, its label names missing hard-cap prerequisites:
-`systemd-run not found`, `no cgroup v2 cpu delegation`, and/or `no reachable
-systemd user manager`. `thegn doctor --json` reports the same reason as
-`cpu_soft_reason` (null when no soft cap applies).
-
-`thegn doctor` also lists sandbox execution routes such as worktree panes,
-queue agents, tests and gates, hooks, language services, and host extensions,
-with each route's admission status. `handle` means the launch carries sandbox
-admission; `admitted-no-handle` means admission passes without carrying the
-handle, and `partial` means only some spawns carry it. `own-gate` means a
-separate floor or sealed gate; `host-capped` means host execution under the
-shared resource ceiling; and `host-trust` means host execution on user trust.
-`thegn doctor --json` includes the table as `sandbox.admission_routes`, with
-`id`, `route`, `status`, and `path` fields.
-
-When `[[pipeline.stages]]` are configured, the text sandbox report ends with
-a `worker` row for the current worktree (or says there is nothing to probe
-outside a Git worktree). `ready` means the resolved sandbox lets stage workers
-write the worktree and Git metadata and reach the current `thegn` binary.
-`NOT READY` names the first failed prerequisite, such as a missing backend,
-unwritable mount or replaced binary. `NOT PROVEN` means the platform or
-backend is unsupported by this check; it is not a pass. The row is absent
-from `--json` and describes the current worktree's sandbox composition, not
-a live agent run. The check supports bwrap, podman, docker and smol.
-A stage whose agent relocates its credential home (for example `CODEX_HOME`) is also checked: a missing home directory reports
-`provider-home-unavailable`.
-
-Queue agents (merge-conflict, gate-failure and PR-queue handoffs) run through
-the same check at dispatch time: when the composed sandbox cannot write the
-worktree or Git common directory, the agent is not started, the queue entry is
-held rather than counted as a failed attempt, and the hold reason names the
-readiness class (`cannot-write-worktree` or `cannot-write-git-metadata`) and
-the backend.
-
-Agent pipeline runs make the same check after composing the sandbox. If it
-cannot write the worktree, the Git common directory or the agent's relocated
-credential home, or if the `thegn` binary was replaced since launch, the stage
-does not start and the run is refused with the readiness class
-(`cannot-write-worktree`, `cannot-write-git-metadata`, `provider-home-unavailable`
-or `callback-unavailable`) and backend. The `worker` row in `thegn doctor` is
-the same check.
-
-The honest **isolation class**, weakest to strongest:
-
-| Class              | Escape needs…                               | Backends                                             |
-| ------------------ | ------------------------------------------- | ---------------------------------------------------- |
-| `host-process`     | nothing — no boundary                       | `none`, and the Windows Job Object (scoping only)    |
-| `shared-kernel`    | a host-kernel exploit in an allowed syscall | podman/docker/bwrap/systemd                          |
-| `userspace-kernel` | a gVisor Sentry bug (`oci_runtime="runsc"`) | OCI + runsc                                          |
-| `guest-kernel`     | a VMM/KVM bug                               | `apple`, `oci_runtime="krun"`, macOS VM-mediated OCI |
-
-A Windows Job Object is process-tree lifetime + resource scoping with **no**
-filesystem or network boundary, so it is honestly `host-process`, never a
-container — it satisfies no floor at `shared-kernel` or above.
-
-## Isolation floor
-
-`backend_chain` expresses a _preference_; the isolation floor is a _demand_.
-
-```toml
-[sandbox]
-isolation_floor = "guest-kernel"   # off | shared-kernel | userspace-kernel | guest-kernel; unset = default
-on_floor_miss   = "fail"           # degrade | fail; applies only to an explicit floor
-```
-
-With `[sandbox] enabled = true` and no explicit floor, the floor is
-`shared-kernel` and a miss always refuses. `enabled = false`,
-`backend = "none"`, and the run-on-host pin bypass only that default floor.
-An explicit floor from any layer always wins, even over those settings. A
-`backend_chain` that lists `host` is not a host opt-out.
-
-The floor is compared over the **honest class** of what the launch actually
-enters, after backend selection and any `oci_runtime` degrade — so a `krun` that
-fell back to the daemon default counts as `shared-kernel`, and a macOS local OCI
-container counts as `guest-kernel`. On a miss, `degrade` launches with the
-worktree marked degraded and a warning; `fail` refuses to launch and names the
-floor, available class, and how to satisfy it. The refusal names the opt-outs:
-`isolation_floor = "off"`; with no explicit floor, `enabled = false`,
-`backend = "none"`, or `run on host` also opts out; for an explicit floor,
-`on_floor_miss = "degrade"` opts out of refusal.
-`thegn doctor` prints the effective floor, miss policy, and source, for example
-`floor         shared-kernel (on miss: fail; default)`, or the reason the
-default floor was not applied. It also prints `containment` and `file access`
-lines, including a line such as
-`requested <scope> — NOT ENFORCED on <backend>: <note>` when file access is not
-enforced. It prints separate `requested`, `resolved`, and `enforced`
-isolation lines, and `thegn doctor --json` includes the same layers in an
-`isolation` object. The floor also applies to standalone terminal tabs. If a
-terminal requests a backend with no runtime, it is refused under the default
-floor or an explicit `fail` floor; an explicit floor with `degrade` launches it
-labelled degraded. Explicit `host`/`none`/empty backend choices and ssh/mosh
-terminals are unchanged. A managed provider
-placement is out of scope (reported `provider-managed`, never counted as a
-tier). A repo-root `.thegn.toml` may only **raise** the floor, never lower it.
-With `agent_sandbox` on, a queue agent is held to at least the `[sandbox]`
-isolation floor in force (default: shared-kernel, refusing on a miss). The
-queue floor (`agent_isolation_floor`) can raise that requirement, but
-`degrade` cannot weaken it. With `agent_sandbox = false`, a fail-closed floor
-still holds the entry as an infrastructure failure and never marks the branch
-failed. Set `[sandbox] isolation_floor = "off"` or disable the sandbox to run
-queue agents uncontained.
-
-Queue agents (merge and PR fixers, CI autofix, headless review and review
-tasks) run credential-free, like autopilot. Their environment and sandbox
-passthrough drop credential-shaped variables plus `GH_CONFIG_DIR`, `GNUPGHOME`,
-`GIT_SSH_COMMAND`, `GPG_TTY`, `DBUS_SESSION_BUS_ADDRESS` and inherited `THEGN_*`
-variables (the resolver's `THEGN_SANDBOX` marker is retained). Autonomous
-sandbox specs also lose SSH identity mounts and mounts at
-or below `~/.ssh`, `~/.gnupg` and `~/.config/gh`; Git credential helpers are
-reset. Autonomous agents (queue agents and autopilot) see the repository's
-`.git/hooks` and the worktree's `config.worktree` read-only, so they cannot plant
-a hook that host-side git later runs; interactive panes are unchanged.
-`XDG_RUNTIME_DIR` and `GIT_CONFIG_GLOBAL` are kept for launcher plumbing
-and commit identity. A broad `[sandbox] mounts` entry that exposes the whole
-home still exposes these directories; they are not masked inside a broad home
-mount. With `agent_sandbox` on, a queue agent whose sandbox cannot be
-established is held; it never falls back to the host. Interactive panes are
-unchanged.
-
-### Git write policy
-
-`[sandbox.git] mode` describes what a sandboxed pane may write in the
-repository's git directory: `read-only`, `commit-only` (the default: the
-object store, the worktree's own metadata and the lane branch's ref directory
-such as `refs/heads/tg/`, with `main`, tags, hooks and config kept
-read-only), `push-lane` or `full`. `push_refs` and `deny_refs` take ref globs
-with a trailing `/*` (one level) or `/**` (any depth), and the merge target
-and default branches are always denied. Only `refs/heads/` branches are
-accepted back from a sandbox. Set it globally or per `[env.<name>.sandbox.git]`; a
-repository's `.thegn.toml` cannot set it. The keys are validated today; the
-sandbox mounts that enforce them arrive in a later release.
-
-Sandboxed and remote agents get no GitHub token by default: credentials stay
-with thegn. With the default `credential = "none"`, `GH_TOKEN` and
-`GITHUB_TOKEN` are not passed into sandboxes or provider provisioning even
-though the default `[sandbox] env_passthrough` lists them (nor are
-`GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GITLAB_TOKEN` and
-`GL_TOKEN`), and provisioning
-does not install a git token credential helper. Only `mode = "full"` with
-`credential = "repo-token"` or `"user-token"` passes the host token through.
-`ANTHROPIC_API_KEY` and other agent credentials are unaffected.
-`credential = "deploy-key"` with `deploy_key = "~/.ssh/deploy"` (local
-placements only) binds that key read-only into the sandbox and sets
-`GIT_SSH_COMMAND` to use it; the key must be a regular file you own that is
-not group or world readable, otherwise the sandbox gets no credential and a
-warning is logged. A `GIT_SSH_COMMAND` you pass through wins. `github-app`
-is not implemented yet. Only
-environment variables are filtered: a `gh` or `glab` config (with its stored
-token) that reaches the sandbox through `[sandbox.home]` dotfiles is not.
-
 ## Choosing per worktree
 
 The `Alt-w` "what to run" picker offers the sandbox choice when
 `[sandbox]` is configured, and `[[agents]]` entries can pin their own. A
 repo-root `.thegn.toml` overrides settings for that repo.
 
-## Resource limits and caches
+## The Lead's sandbox
 
-```toml
-[sandbox.limits]
-cpu    = "2"
-memory = "4g"
-heavy_slots = 2   # host-local concurrent gate slots; 0 disables
-max_load = 0.0     # absolute 1-minute load-average ceiling; 0 disables
+The Lead (`[lead]`, experimental) runs its agent under bubblewrap. Its
+`[sandbox]` settings do not apply. It always uses this fixed layout:
 
-[sandbox.volumes]          # OCI backends only
-cargo-registry = "/root/.cargo/registry"
-node-modules   = "/root/.npm"
-```
+- **Read-only:** the whole host filesystem, including every repo and worktree.
+  Writing inside a repo fails with `Read-only file system`.
+- **Writable:** the notes dir (`[lead] notes_dir`, default
+  `$XDG_STATE_HOME/thegn/lead`) and a private agent home,
+  `$XDG_STATE_HOME/thegn/lead-harness/<agent>` (`CLAUDE_CONFIG_DIR` etc. point
+  there). The Lead never writes your `~/.claude`; log in once inside the Lead.
+  The Lead starts in the notes dir.
+- **Hidden:** `$XDG_RUNTIME_DIR`, the daemon socket dir, the state `run` dir,
+  every control-socket location and `/tmp` are replaced with empty dirs. The
+  rootful docker and podman sockets and the system D-Bus socket are hidden
+  too. `THEGN_CONTROL_SOCKET`,
+  `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `DISPLAY`, `WAYLAND_DISPLAY`
+  and `XAUTHORITY` are unset.
+  `~/.ssh`, `~/.gnupg`, `~/.config/gh`, `~/.config/glab-cli`,
+  `~/.git-credentials` and `~/.netrc` are hidden too.
+- **thegn's state is hidden:** `$XDG_STATE_HOME/thegn`, `$XDG_DATA_HOME/thegn`,
+  `$XDG_CACHE_HOME/thegn`, thegn's home (`~/.thegn` or `$THEGN_DIR`) and the
+  legacy pre-rename dirs are replaced with empty dirs. That covers the
+  database, logs, scrollback, gate target dirs, provider ssh keys and other
+  workers' transcripts. Registered repos beneath them come back read-only.
+  The agent homes `~/.claude`, `~/.codex` and `~/.pi` are hidden the same way,
+  and `~/.claude.json` reads as empty. Only three things come back inside
+  them: the notes dir and the private agent home (writable), and the Lead's
+  own MCP config and token files (read-only). `$XDG_CONFIG_HOME/thegn` is
+  hidden too, except `config.toml`, which the `thegn mcp` commands inside the
+  sandbox load. Only `config.toml` itself is readable; files named by `file:`
+  secret references are hidden. A literal secret pasted into config.toml is
+  readable by the Lead.
+- **Reading state:** the Lead sees thegn's state only through its tools:
+  `overview.get`, `notifications.list`, `sessions.snapshot`,
+  `automations.runs` and `approvals.list`.
+- **Network (`[lead] network = "isolated"`, the default):** the Lead runs in
+  its own network namespace through `pasta` (from the passt package). It has
+  outbound internet, so the model API and remote MCP servers work. Host
+  loopback services are out of reach, and so are abstract unix sockets,
+  including the X11 display socket, because they belong to the host's
+  namespace. Only the Lead listener port is forwarded, at the same
+  `127.0.0.1:<port>`, so the Lead still reaches the daemon with its own scoped
+  token. A generated `resolv.conf` replaces `/etc/resolv.conf` inside the
+  sandbox and names pasta's DNS forwarder (`169.254.1.1`), which relays to
+  your host resolver. Your host's LAN address stays reachable.
+- **Network (`[lead] network = "host"`):** the Lead shares the host's network.
+  It can reach every loopback service on your machine, and every abstract
+  unix socket, including an X11 display. Any of those that trusts a local
+  caller trusts the Lead. thegn logs a warning on every launch in this mode.
+  Use it only when pasta cannot be installed.
 
-Named volumes survive container recreation, so a package cache does not
-cold-start on every build.
+The daemon's unix socket, which grants admin to any process of your user, is
+out of reach in both modes.
 
-Heavy merge and dispatch gates can share a host-local admission policy. Set
-`heavy_slots` to cap concurrent gates across thegn processes, and optionally
-set `max_load` to wait while the absolute one-minute host load average is at or
-above that value. Both default to zero (off). Locks are released automatically
-when a gate exits; after a bounded wait, the gate proceeds with a warning.
+thegn refuses to open the Lead when:
 
-`[sandbox] compiler_cache = "off"` is the default and is the only switch that
-authorizes an sccache wrapper inside containment. It removes inherited sccache
-wrappers and endpoint variables even when `[disk].sccache` or the Nix dev shell
-sets them; unrelated custom `RUSTC_WRAPPER` values are preserved. Set it to
-`"auto"` to let a local bwrap sandbox probe sccache, mount only its data
-directory, and use a sandbox-private Unix socket. A failed probe or later
-server/transport I/O error degrades visibly to plain rustc instead of failing
-the Cargo build; a real compiler error is preserved and is never retried or
-reported as cache degradation. `thegn doctor` shows the host inputs and the last contained
-reachability/write probe separately. Backends without a proven transport use
-plain rustc.
+- bwrap is missing. The error is "the Lead needs bwrap (Linux); not available
+  here". It never falls back to a host shell.
+- The network is `isolated` and pasta is missing. The error is "the Lead's
+  isolated network needs pasta (passt); install it or set [lead] network =
+  "host"". It never falls back to the host network on its own.
+- `[lead] notes_dir` or an agent state dir is inside a registered repo or
+  worktree, contains one, or is `/` or `$HOME`. Symlinks are resolved first.
+- A writable path overlaps a hidden control dir, or lies inside hidden
+  state without being the notes dir or the private agent home.
 
-## Network
+`[lead] account` is refused for now.
 
-By default a `standard` sandbox keeps networking so fetch, clone, build,
-and debuggers work; `sealed` removes it entirely. `[sandbox]` also
-carries DNS-name allow/block rules for the middle ground. These rules are not
-an egress boundary; `network = "none"` is the only enforced deny, and `*` in
-`network_block` means offline — see [[config-reference]].
-Standalone sandboxed terminals also warn when DNS-name rules apply, because
-those rules are not an egress boundary.
+### What the Lead may ask the daemon to do
 
-`[sandbox.vpn]` can put the sandbox on an overlay network (tailscale,
-headscale, wireguard, openvpn, netbird, zerotier). The `mode` decides how:
-`sidecar` (default, best isolation — a companion container owns the
-netns), `proxy` (userspace SOCKS/HTTP; **not** a containment boundary, but
-the only honest option for bwrap/systemd), `in_container`, or `netns`.
-`on_error` decides what happens when the tunnel will not come up: `fail`
-refuses to launch, `warn` launches anyway, `offline` forces
-`network=none` so nothing leaks onto the host network.
+The sandbox alone is not the boundary: the daemon runs outside it. So the
+daemon treats every call made with a Lead token, or arriving on the Lead's
+listener, as Lead-confined, whatever its scopes. A Lead-confined call:
 
-A running VPN sidecar is reused only when its tunnel configuration matches.
-Otherwise the result follows `on_error`: `fail` refuses launch, `warn`
-continues without the VPN, and `offline` forces `network=none`. The sidecar
-stays running. Stop this worktree's sandbox (close the worktree, or remove both
-the worktree container and sidecar) so both are recreated with the new
-configuration. An unlabelled sidecar from before this check counts as changed.
+- **May open a session** only by naming a configured `[[agents]]` entry (or a
+  pipeline stage of one) in a registered worktree. The daemon resolves the
+  launch the usual way and refuses it unless the worker really runs in a
+  sandbox (bwrap, podman, docker, smolmachines or apple). A worktree that
+  resolves to `host` (or `systemd`, which only caps resources) is refused with
+  a message naming the worktree and its backend. A raw `argv`, an `env`
+  override, a `cwd` outside the worktree, `widen_permissions`, a fork and
+  prompts over 64 KiB are refused.
+- **May type into a worker it opened** (`sessions.input`), to answer a worker
+  that is waiting on a question. The daemon records which sessions a
+  Lead-confined `sessions.open` launched and allows input only into a live one
+  of those; your own sessions, a finished session and an unknown id are
+  refused. Once you type into the worker yourself, the Lead can no longer type
+  into it. The input must be plain text plus Enter, at most 16 KiB: escape
+  sequences (ESC, CSI, OSC, bracketed-paste markers) and control characters
+  other than newline, carriage return and tab are refused. The record is kept
+  in the daemon's memory, so after a daemon restart the Lead cannot type into
+  anything until it opens a new worker. The MCP tool still needs
+  `thegn mcp serve --allow-session-input`.
+- **May not** attach to, resize, split or fork a session, run host git (`git.stage`, `git.commit`), create a worktree
+  (`worktrees.create`, which runs git on a caller-named repo), open a worktree
+  or an editor, write files from outside the sandbox (`search.replace`,
+  `skills.seed`), run tools or presets, or change a worktree's sandbox profile.
+- **May not** enqueue or drain the merge queue (`merge.add`, `merge.drain`):
+  the Lead lands only through a rule's land step or an owner approval. In
+  this release a rule's `merge` autonomy behaves like `review` (the land stops
+  for the owner's approval), because the merge gate still runs the lane's code
+  on the host outside any sandbox.
+- **May** read everything a read token can, kill sessions, record a session,
+  file folders, work the tracker, the dispatch roster
+  (without binding a session), notifications, approvals requests, its own
+  automation rules, and read the merge queue.
 
-Separately, `[network]` auto-detects when the machine is offline and
-pauses remote refreshes rather than hammering unreachable endpoints;
-local caches are served stale and it restores on the next success.
-
-## Environments
-
-Named `[env.<name>]` execution environments (local, container, or a cloud
-provider) appear in the panel's **system → environments** section — `↵`
-(re)binds the cursor env to the active worktree, `t` tests its provider
-token (the outcome pops as a toast and is logged), `n` opens the add
-wizard, and `x`
-removes it after a confirm (removal also forgets the stored token). An
-environment can keep a **warm spare pool** so new worktrees start
-instantly; raise or lower the active project's pool target with the
-warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable). The
-target update runs in the background: `warm pool: updating target…` appears
-while it is queued, followed by the result, and raising the target stops at
-eight spares for the workspace's environment.
-If the spare ledger cannot be read, reconciliation warns and makes no pool
-changes rather than treating the pool as empty.
-When a worktree opens and its spare ledger cannot be read, a warning appears on
-the status line and in a toast, and the worktree is provisioned fresh instead
-of claiming a spare.
-On the dev channel, before a spare is handed to a worktree, the worktree's
-network allow/block policy is verified on that spare and re-applied if it
-drifted. An unverifiable spare is quarantined (listed in `thegn doctor`) and
-the worktree is provisioned fresh. Providers without egress control and empty
-policies skip this check.
-If the current warm-pool target cannot be read, reconciliation makes no pool
-changes rather than falling back to the configured size. The warm-pool keys
-report `warm pool: cannot read the current target: ...` and save nothing.
-Reconciliation halts, such as lease, ledger, target, or spare-read failures,
-appear as a status-line toast; the same halt is shown once until it clears or
-its message changes. When deleting a worktree cannot recycle a claimed spare,
-its ledger row remains until the provider confirms destruction, so a failed
-destroy leaves it listed for a later retry.
-A stale or released spare is recycled from its base checkpoint only when the
-provider's checkpoint list confirms that checkpoint exists; if the list cannot
-be read, the spare is destroyed instead. On the dev channel, after a
-checkpoint restore, `thegn env restore` and warm-pool recycle verify an
-environment's non-empty network allow/block policy when the provider supports
-egress control. If needed, the policy is re-applied and read back. If
-verification fails, `thegn env restore` fails and reports that the sandbox is
-running without verified egress; warm-pool recycle destroys the spare. A
-successful `env restore` reports the verified counts. On the dev channel,
-opening a worktree against an existing provider sandbox with egress control
-also verifies its non-empty network policy and reapplies it if it drifted. If
-the policy cannot be verified, opening is refused and the sandbox is left in
-place; a newly created sandbox that fails verification is still destroyed.
-
-If a worktree's environment selection cannot be read from the state database,
-thegn never falls back to the default environment. `thegn env` verbs report an
-error; worktree deletion refuses before removing anything; closing a tab does
-path-only cleanup and warns that an SSH sandbox container may remain. On the
-dev channel, provider SSH connect, warm-pool operations, hibernation,
-provisioning and host placement are refused or skipped with the reason. The
-close auto-checkpoint is also skipped with a warning on the dev channel. In
-the panel's system → environments section, an unreadable selection marks
-no environment bound, adds a red `binding unreadable: <reason>` row and a
-`binding?` badge, and `↵` refuses to rebind until the state database is
-readable.
-
-When the state database exists but the worktree's recorded location cannot be
-read or is unrecognised, writes and code runs refuse instead of using the host
-checkout. This covers panel git actions, Tests and Jobs, `thegn land`, mutating
-`thegn pr` actions, `thegn ci rerun`, `thegn ci trigger` and `thegn ci cancel`,
-worktree delete, Sandbox container stop or restart, clipboard image paste and
-toolchain install. With no state database, worktrees remain local as before.
-
-If an environment selection cannot be read and a non-local `[env.*]` is
-configured (dev channel), the tab shows `env?` and the loading splash shows
-`env: unknown`. `thegn doctor` reports an unknown environment; a failed pane
-connection is not blamed on a guessed provider. Provisioning skips trust-gated
-devcontainer steps and launch skips devshell injection, with a warning. On the
-dev channel, an unreadable account selection refuses a provider pane; failed
-SSH sandbox teardown identifies the container that may still be running, and
-hibernation refuses a restore when its record cannot be read while hibernation
-is enabled. Teardown and close auto-checkpoint warnings appear on the status
-line and in a toast while the TUI runs; the CLI prints them to stderr.
-
-An unreadable recorded worktree location makes the control API's commit, review handoff,
-autopilot push or worker sandbox, `thegn issue create` and `thegn issue comment`, PR creation,
-worktree-resolving `thegn env` commands, `thegn repo trust` and submodule init refuse. Background
-fetch and merged-worktree cleanup skip it. On the dev channel, hibernation refuses and its
-bridge-key drop warns and skips; provider provisioning and attach, provider and host worktree
-pipelines, and host placement refuse too. A plain local worktree is unaffected unless a provider
-or host placement is configured. Also on the dev channel, failed agent-login uploads mark “Sync
-agent logins” Failed with one line per account but do not stop provisioning. The resident bridge
-uses the pinned environment or workspace default; if that selection is unreadable, it skips
-connecting and logs a warning.
-On the dev channel, if the worktree location cannot be read, pane launches and
-provider connections are refused when a remote placement is configured
-(`[placement]`, `[sandbox.remote]`, or a non-local or host-pinned `[env.*]`);
-without one, panes use the local path.
-On the dev channel, if the environment selection itself cannot be read while a
-remote placement is configured, the launch stops in the halt modal with the
-read error instead of using the default environment. Without a remote
-placement, a local shell is not refused for that read error. For host
-placement, if another provisioning run for the same container is active, this
-open skips provisioning; when `THEGN_LOG` is set, the warning is written to
-`thegn.log`. The next open checks again.
-
-On any channel, closing a tab whose location cannot be read tears down by path
-only and warns on the status line that a remote sandbox may remain. Idle
-hibernation also keeps the sandbox, logs a warning and retries later when it
-cannot tell whether a shell is attached.
-
-Pool state shows on the sidebar's project chip, not in this section.
-`thegn doctor` lists claimed warm-pool spares without a bound worktree and
-quarantined spares under `Warm pool (provider spares needing review)`; it will
-not destroy them on its own. `thegn doctor --json` includes the same report in
-`warm_pool`.
-`[sandbox] default_env` picks the environment new worktrees use.
-A repo's `env =` setting is only a hint; if that environment would weaken
-user policy, it is ignored with a warning.
-
-### Worktree toolchains
-
-When a worktree declares a mise or asdf toolchain, thegn adds its safe shims to
-the pane `PATH`. The optional mise environment layer is lower precedence than
-an environment bundle or devshell and is applied only after the current repo
-config set is approved. Use the command-palette action `toolchain-install` to
-run the bounded, explicit install operation; opening a pane never downloads
-tools. A `(mise ~)` token means approval is pending, while `(mise !)` means
-the provider or shims are unavailable. Remote worktrees remain responsible
-for installing their tools on the remote target.
-
-Cached flake devShell injection (`[sandbox] inject_devshell`) is off by
-default. Turn it on in your own config (globally, per project or per
-environment), or approve a repository's `.thegn.toml` request with
-`thegn repo trust . --approve <id>`; an unapproved request is listed as pending
-and changes nothing.
-
-## Lifecycle hooks and pane setup
-
-`[hooks]` commands are host-side worktree/session lifecycle jobs. They run
-outside the sandbox with a curated environment, capture stdout/stderr in the
-worktree state log, and use the event-specific repository/worktree directory;
-see [[configuration]] for the six events, ordering, trust gate, timeout, and
-failure policy. The legacy `[sandbox].prepare` list is the compatibility
-alias for `post_create`, not a second fire-and-forget path.
-
-`[sandbox].init_script` remains separate: it is a POSIX shell snippet executed
-inside the sandbox before each agent or shell pane starts. Use it for
-per-pane/container setup; use lifecycle hooks for host-side worktree setup,
-teardown, or session edges.
-
-## Remote worktrees
-
-`[sandbox.remote] host` runs worktrees on another machine. Control-plane
-work (git reads, container lifecycle) always uses ssh; the interactive
-pane uses mosh by default, so it survives network changes. `[remote]`
-tunes keepalives, timeouts, and retry backoff for flaky links.
-
-> Remote worktrees and cloud providers are **dev-channel only** — see
-> [[release-channels]].
-
-The bridge helper is uploaded to a staged file and checked by SHA-256 before
-it is moved into place. If the install cannot be verified, the bridge
-connection is skipped.
-The helper lives at `/var/tmp/thegn-bridge/<sha256>/thegn`, outside the
-worktree. Its digest is re-checked before thegn starts it through a provider's
-native exec API or for a reverse tunnel.
-A provider launch through its control command, such as a vendor CLI or SSH,
-checks the digest again before running the helper; changed bytes are refused
-with `thegn: resident bridge digest mismatch`.
-When a provider's `exec_command` uses `ssh` with a host, its checked bridge
-launch is passed to the remote shell as one quoted word.
-The resident bridge scrubs secret-shaped text, including tokens, credentials in
-URLs, and private-key blocks, from command error output before returning it;
-standard output is returned unchanged.
-
-A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
-
-On provider placements, an explicit isolation request thegn cannot enforce is
-refused before provisioning, credential access or upload. Without such a
-request, the placement runs as `provider-managed (unverified)`; `thegn doctor`
-shows that floor.
-
-A thegn-derived VPS or Fly sandbox name is bound to the worktree that created
-it. Another worktree resolving to the same name is refused before a provider
-call.
-VPS and Fly ledger records carry a credential-free fingerprint of the provider
-kind, API authority, and configured (or default) token variable name, never the
-token itself. A name recorded under another account is refused; the VPS reaper
-quarantines that record and does not delete it.
-The Fly reaper also quarantines records for another account without revoking or
-destroying them. If it cannot determine the current account, it quarantines
-every record before making provider calls.
-If the UI is running, a change to the non-empty set of resources a VPS or
-Fly reaper keeps for review raises one alert toast for that provider, naming
-the first and counting the rest. An unchanged set does not repeat it.
-A VPS or Fly `max_instances` cap
-counts sandboxes for the same provider account; records without an account or
-that cannot be read count against every account.
-On the dev channel, `max_lifetime_secs` is enforced by the Fly and VPS reapers
-(Hetzner and DigitalOcean). Providers without a lifetime reaper, such as
-machine0 and Sprites, do not enforce it; `thegn config validate` warns when it
-is set. Destroy those instances yourself or set the value to `0`.
-
-A provider env with no remote transport fails closed: it halts before
-provisioning instead of running the session on the host. Fly sessions run on
-the Fly machine over thegn's ssh bridge. Sprites headless sessions use native
-exec and start in the provisioned checkout; `interactive_command` is only used
-with `exec = "cli"`: with `exec = "auto"` or `"api"` the `exec_command` and
-`interactive_command` keys are ignored (`thegn doctor` warns), and a worktree
-whose saved transport prefix is stale is repaired on its next launch. Fly
-provisioning installs Nix even when running as root without sudo. A plain ssh
-host with `data = "in_env"` has the repo seeded at `env up` or session open into
-`$HOME/thegn-worktrees/<repo>/<worktree>`. The provider "provisioned" marker and cached sandbox home
-live in the state dir, so the CLI and daemon agree, and `.thegn-provisioned` is
-excluded from git in remote checkouts. Provisioning fails clearly when Nix is
-required but did not install, and interrupted Nix builds no longer leave the
-store broken.
-
-The Hetzner provider is experimental: its lifecycle has not been verified on a
-live account, and `thegn doctor` says so.
-
-On the dev channel, an unreadable or malformed VPS or Fly ledger record is
-refused rather than treated as absent. Destroy, retarget, address lookup,
-`vps-ssh` and managed-key selection refuse it; a refused destroy keeps SSH
-custody and tells you to fix or remove the record before retrying. SSH keys
-registered with Hetzner, DigitalOcean and machine0 use `thegn-managed-`
-followed by the first 32 hexadecimal characters of the SHA-256 digest of the
-decoded public key. An invalid OpenSSH public key is refused.
-
-On the dev channel, the Fly backend strictly parses an app's machine list and
-rejects malformed lists or duplicate machine IDs. If more than one live
-thegn-managed machine is present, it refuses to choose one.
-
-Machine0 creates and restores are serialized across thegn processes by an
-owner-only lock in the VPS registry. A create that cannot get the lock within
-the six-minute readiness budget is refused with a busy message.
-Machine0 image, SSH-key and VM lists are parsed strictly: an unrecognised
-response shape, an unidentifiable row or a duplicate entry fails the operation
-instead of being treated as an empty or shorter list. Machine0 readiness,
-status and SSH-auth waits, and Fly's sshd probe, count each in-flight request
-against their total time budget.
-Machine0 records a pending reservation before creating a VM, and reservations
-count toward `max_instances`. If the create outcome is unknown, such as after a
-lost response, the reservation remains; retrying the create, or reopening the
-worktree once machine0 lists the VM, adopts it (waits for it, applies
-provisioning, and records its SSH key) instead of creating a duplicate. The
-reservation is retired only after adoption is ready. The error says to retry
-later or destroy the sandbox to retire the reservation. A VM with that name
-and no pending create from this machine is refused. The Sprites list follows
-every page and refuses results over its page or row limit, or an ambiguous
-continuation, rather than treating a partial list as complete. Configured
-provider ids at `env.<name>.provider.id` must be lowercase for Sprites,
-Hetzner, DigitalOcean, Fly and machine0; validation refuses uppercase ids.
-
-VPS and machine0 sandboxes pin their SSH host key on first contact with
-`accept-new` in a per-instance file under `$XDG_STATE_HOME/thegn/vps/known_hosts.d/`, moved once
-from `~/.thegn/vps` (the VPS and Fly machine ledger lives beside it).
-`thegn env show` warns about risky sandbox mounts such as the runtime dir or
-profile trees. Thegn creates that directory with owner-only
-permissions before managed SSH connections, refuses a symlinked or
-non-private directory, requires the same key on later connections, and
-removes the pin when it destroys a VPS or machine0 sandbox. Creating a machine0
-VM also clears a stale pin left by an earlier VM with the same name.
-
-If local parity fails during provider provisioning, autonomous launches on
-that worktree are refused until a later provision applies parity cleanly;
-interactive panes can still open. Host-parity closure pushes use a
-per-installation signing key and are skipped with a warning rather than sent
-unsigned when signing is unavailable. The iroh call-home reach is available
-only in builds with the `iroh` feature; `thegn doctor` reports whether it is
-built in.
-
-For remote and provider worktrees, thegn reads `.gitmodules` from the remote
-commit and rechecks approved submodules before initializing them. It validates
-the remote worktree sync plan before uploading anything. A provider sandbox's
-network policy is applied and read back before its first command; a mismatch
-stops provisioning. If an existing sandbox's policy cannot be verified, thegn
-refuses to provision it and leaves it in place.
-For provider sandboxes, network allow and block entries are trimmed,
-lowercased, stripped of a trailing dot, and deduplicated before the provider
-policy request; non-ASCII entries (use `xn--` punycode), IP literals, and
-malformed domain patterns are refused with the entry named in the error. Any
-allow entry keeps the final deny-everything-else rule, even when blocks shadow
-all allow entries.
-A provider launch using `sealed-tunnel` with a VPN configured is refused before
-provisioning; if a refused launch created its provider sandbox, thegn destroys
-that sandbox.
-
-With `data = "sync"`, closing the worktree copies sandbox changes back by
-comparing each file with what the upload sent: a file the sandbox did not
-change never overwrites a local edit. A file changed in both places (or deleted
-locally and changed in the sandbox) stops the sync with a list of files; nothing
-is written locally and the sandbox is kept. Make each listed file match one
-copy and close again. Files and directories excluded by `.gitignore`, `.ignore`,
-`.git/info/exclude` or your global git excludes file are not compared or copied
-back (the upload skips them too), so build output never blocks the sync. Files
-deleted in the sandbox are not deleted locally.
+A Lead-authored automation rule that opens a session is held to the same
+rule when it fires (and the worker it opens counts as Lead-opened). Every
+refusal is logged on `thegn::control::audit` with the outcome `lead_confined`
+and the Lead's label; Lead input is logged allowed or refused with the label
+and the session id, never the text.
 
 ## Inspecting
 
@@ -1020,6 +415,11 @@ with a status for foreign containers, while `l` opens a live logs pane
 `g` widens to every container; it scopes the full table too, and Half-width
 `g` rows are selectable. When sandboxing is off, a one-line banner says so.
 Stop and restart work runs off the UI loop and reports its outcome as a toast.
+
+`[sandbox] network_audit = true` records the podman `network` event stream
+(container network attach and detach) in the sandbox audit table. It works on
+podman backends only, `thegn config validate` warns when no selectable backend
+can deliver it, and it is not a DNS-query or connection log.
 
 The machine-global view is the system monitor's **Containers** tab
 ([[system-monitor]]), which lists every backend's containers with live

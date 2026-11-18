@@ -256,18 +256,21 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
     let fake_root = tempfile::tempdir().unwrap();
     let fake_bin = fake_root.path().join("bin");
     std::fs::create_dir_all(&fake_bin).unwrap();
-    let fake_smol = fake_bin.join("smolmachines");
-    std::fs::write(&fake_smol, "#!/bin/sh\nexit 0\n").unwrap();
+    // A fake `docker` whose `version` succeeds: an OCI backend that resolves
+    // (smol, used here before, is reserved and never a candidate).
+    let fake_docker = fake_bin.join("docker");
+    std::fs::write(&fake_docker, "#!/bin/sh\nexit 0\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&fake_smol, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path = format!("{}:/usr/bin:/bin", fake_bin.display());
     let _state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
     let mut cfg = Config::default();
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-    cfg.sandbox.backend_chain = vec!["smol".into(), "none".into()];
+    // A config value (the backend chain), not a runtime invocation.
+    cfg.sandbox.backend_chain = ["docker", "none"].map(String::from).to_vec();
     cfg.sandbox.profile = thegn_core::config::SandboxProfile::Hardened;
     cfg.sandbox.compose = Some(
         thegn_core::sandbox_compose::ComposeSpec {
@@ -1571,38 +1574,12 @@ fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
 fn sandbox_with_invalid_volume() -> thegn_core::sandbox::SandboxSpec {
     thegn_core::sandbox::SandboxSpec {
         backend: thegn_core::sandbox::Backend::Podman,
-        placement: thegn_core::placement::Placement::Local,
         image: Some("img:latest".into()),
         worktree: PathBuf::from("/wt/x"),
-        mounts: Vec::new(),
-        env: Vec::new(),
-        env_overrides: std::collections::HashMap::new(),
-        env_block: Vec::new(),
-        network: thegn_core::config::Network::Nat,
-        network_allow: Vec::new(),
-        network_block: Vec::new(),
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: Vec::new(),
-        add_capabilities: Vec::new(),
         file_access: thegn_core::config::FileAccess::Worktree,
-        ports: Vec::new(),
-        gpu: None,
-        limits: thegn_core::sandbox::SandboxLimits::default(),
         volumes: vec![("/tmp/state".into(), "/mnt/state".into())],
-        compose: None,
-        build: None,
-        init_script: None,
-        devenv: false,
-        devenv_path: None,
         name: "tg-wt".into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..thegn_core::sandbox::SandboxSpec::default()
     }
 }
 

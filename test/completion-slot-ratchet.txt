@@ -12,6 +12,10 @@
 # (or regenerate with the `update_completion_slot_ratchet` test). A NEW
 # value-taking argument must be classified immediately — the drift test refuses
 # additions here.
+#
+# Exception (b154): `vercel-exec cmd` / `vercel-exec id` were added with the
+# hidden `thegn vercel-exec` bridge verb, the same precedent as `sprite-exec`:
+# a hidden self-bridge verb nobody tab-completes.
 	log_level
 agent sessions	harness
 api call	params
@@ -154,6 +158,8 @@ share start	reach
 share stop	port
 sprite-exec	cmd
 sprite-exec	id
+vercel-exec	cmd
+vercel-exec	id
 vps-ssh	cmd
 vps-ssh	name
 wt diff	file

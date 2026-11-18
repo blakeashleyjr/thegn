@@ -531,7 +531,7 @@ contract-ratchets:
 
 # The full gate. `lint` now runs the treefmt fail-on-change check first, so the
 # formatting gate lives there (no separate `fmt-check` stage needed here).
-ci: lint deps-audit build check-cross check-features check-msrv test test-doc doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
+ci: lint deps-audit build check-cross check-features check-msrv test test-doc doc-check openspec-validate coverage smoke sandbox-e2e-db term-check nix-build
     @echo "ci: all green"
 
 # The local superset: everything `ci` gates plus the muse e2e suite, which is
@@ -559,11 +559,13 @@ plugin-conformance:
     python3 test/plugin-apps.py --selftest
     python3 test/plugin-apps.py --binary target/debug/thegn || test $? -eq 77
 
-# The declared MSRV (`rust-version` in Cargo.toml) actually builds. `cargo-1.89`
+# The declared MSRV (`rust-version` in Cargo.toml) actually builds. `cargo-1.96`
 # is the flake's pinned MSRV toolchain (msrvRustToolchain) — bump both together.
+# When a lockfile bump raises a dependency's `rust-version` past this, raise it
+# here; `cargo-<ver>` must match.
 check-msrv:
-    @command -v cargo-1.89 >/dev/null 2>&1 || { echo "check-msrv: 'cargo-1.89' not found — run inside 'nix develop' (or 'direnv allow')"; exit 1; }
-    cargo-1.89 check --workspace --locked
+    @command -v cargo-1.96 >/dev/null 2>&1 || { echo "check-msrv: 'cargo-1.96' not found — run inside 'nix develop' (or 'direnv allow')"; exit 1; }
+    cargo-1.96 check --workspace --locked
 
 # --- local CI (act) -------------------------------------------------------
 # Run the GitHub Actions workflow (.github/workflows/ci.yml) locally in a
@@ -1042,9 +1044,6 @@ sandbox-e2e: build
       echo "sandbox-e2e: podman not found, skipping (set PODMAN_E2E_FORCE=1 to fail on missing)"; \
     fi
 
-# DNS filter E2E — Tier 1, no podman needed; always runs in CI.
-sandbox-e2e-dns:
-    cargo test -p thegn-core --test sandbox_dns_e2e
 
 # DB audit trail — Tier 1, no podman; always runs in CI.
 sandbox-e2e-db:
@@ -1072,6 +1071,13 @@ sandbox-e2e-full: build
 security-e2e:
     THEGN_REQUIRE_SECURITY_TESTS=1 cargo nextest run -p thegn-host --test security_e2e --test stage_worker_commit_e2e
     THEGN_REQUIRE_SECURITY_TESTS=1 cargo nextest run -p thegn-core --test sandbox_sealed_home -E 'test(real_bwrap_sealed_) | test(user_gnupg_mount_never_reaches_a_sealed_argv)'
+
+# Registry of user-namespace / confinement suites (test/userns-e2e.d/*.sh); each
+# exits 0 (pass), 77 (skip) or another status (fail). Dispatch/nightly only: a
+# step of the `security-e2e` CI job, never a pull-request gate. Set
+# THEGN_REQUIRE_SECURITY_TESTS=1 to make a skip fail.
+sandbox-userns-e2e:
+    ./test/userns-e2e.sh
 
 # Same, but against the built Nix package (verifies the wrapper + injected deps).
 smoke-pkg:
@@ -1323,6 +1329,11 @@ live level="info" size_mb="20" files="5":
 [positional-arguments]
 live-plan level="info" size_mb="20" files="5":
     python3 -B scripts/live.py --plan --level "$1" --size-mb "$2" --files "$3"
+
+# Live Vercel Sandbox run (spends money; plan-only without flags). Not in ci/smoke.
+[positional-arguments]
+vercel-live *args:
+    bash test/vercel-live.sh "$@"
 
 # Private launcher regression tests; no Cargo or live-state mutation.
 test-live:

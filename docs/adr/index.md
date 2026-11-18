@@ -15,7 +15,7 @@ they do not authorize a runtime migration.
 
 ## Shared review constraints
 
-The workspace MSRV is 1.89 (`Cargo.toml:29-33`). Target-sensitive decisions
+The workspace MSRV is 1.96 (`rust-version` in `Cargo.toml`). Target-sensitive decisions
 must preserve the Linux/musl bridge and the macOS and mingw lanes described by
 `justfile:93-143` and `flake.nix:179-189,226-255`. Dependency changes are
 reviewed with `just deps-audit` (`justfile:455-462`), whose CI job is defined

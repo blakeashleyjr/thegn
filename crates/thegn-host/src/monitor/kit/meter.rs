@@ -60,7 +60,9 @@ impl Meter {
             }
         }
         if spec.label && label_width > 0 {
-            let text = super::edge_fmt(spec.fmt).fmt(
+            let mut text = String::with_capacity(label_width);
+            super::edge_fmt(spec.fmt).fmt_into(
+                &mut text,
                 f64::from(spec.value) * 100.0,
                 Unit::Percent,
                 label_width,

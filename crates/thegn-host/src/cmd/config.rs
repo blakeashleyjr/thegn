@@ -553,6 +553,7 @@ fn clamp_notice(key: &str, clamped: &[thegn_core::channel::Feature]) -> Option<S
         ("host", _) => Feature::Providers,
         ("placement", _) => Feature::Placement,
         ("voice", _) => Feature::Voice,
+        ("lead", _) => Feature::Lead,
         _ => return None,
     };
     clamped.contains(&feature).then(|| {
@@ -806,6 +807,8 @@ mod tests {
         assert!(clamp_notice("sandbox.remote.host", &clamped).is_some());
         assert_eq!(clamp_notice("ui.language", &clamped), None);
         assert_eq!(clamp_notice("issues.provider", &clamped), None);
+        assert!(clamp_notice("lead.agent", &[Feature::Lead]).is_some());
+        assert_eq!(clamp_notice("lead.agent", &clamped), None);
         let cfg = Config::default();
         let json = serde_json::to_value(cfg.value_at("issues").unwrap()).unwrap();
         assert!(json.is_object());

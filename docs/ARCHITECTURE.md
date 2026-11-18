@@ -155,20 +155,20 @@ user-state through `testenv`, shrink-only); `just check-cross`,
 
 Every substitutable backend is a _seam_ (`openspec/specs/provider-seams`):
 
-| Seam             | Trait                                         | Impls                                                                           | Selected by                                              |
-| ---------------- | --------------------------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| forge            | `thegn_core::forge::Forge` (sync)             | GitHub: `GithubNative` → `GithubCli` ladder                                     | `[[forges]]` by origin host; GitHub default              |
-| git              | `thegn_svc::git::GitBackend`                  | `GixGit` (native reads) → `CliGit`                                              | `[git] backend` (`auto`/`gix`/`cli`)                     |
-| CI               | `thegn_svc::ci::CiProvider`                   | GitHub Actions, GitLab CI                                                       | `[ci] provider` (Drone/Woodpecker/Jenkins/Argo reserved) |
-| editor           | `thegn_core::editor::Editor`                  | template (`[editor] command`) → `[[tools]] editor` → `$VISUAL`/`$EDITOR` → `vi` | `[editor]`; placement per program or `open_in`           |
-| issues           | `thegn_svc::issue::IssueBackend`              | Linear, GitHub, Jira, Kaneo                                                     | `[[issue_accounts]]`                                     |
-| calendar         | `CalendarBackend`                             | ICS, ICS URL, CalDAV, command (plugin)                                          | `[[calendar_accounts]]`                                  |
-| media            | `thegn_media::MediaBackend`                   | MPRIS, playerctl, mpv, MPD, SMTC, MediaRemote, AppleScript                      | `[media] backend` (Jellyfin reserved)                    |
-| sandbox          | `thegn_core::sandbox::Backend` (enum)         | podman, docker, bwrap, systemd, apple, WinAppContainer, WinJobObject, none      | `[sandbox] backend` / `backend_chain` (WSL reserved)     |
-| remote providers | `RemoteProvider` (+ egress/checkpoints/files) | Daytona, Sprites, VPS (Hetzner/DO), Fly, Machine0, Iroh                         | `[env.<name>.provider]`                                  |
+| Seam             | Trait                                                                                                                  | Impls                                                                                      | Selected by                                              |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| forge            | `thegn_core::forge::Forge` (sync)                                                                                      | GitHub: `GithubNative` → `GithubCli` ladder                                                | `[[forges]]` by origin host; GitHub default              |
+| git              | `thegn_svc::git::GitBackend`                                                                                           | `GixGit` (native reads) → `CliGit`                                                         | `[git] backend` (`auto`/`gix`/`cli`)                     |
+| CI               | `thegn_svc::ci::CiProvider`                                                                                            | GitHub Actions, GitLab CI                                                                  | `[ci] provider` (Drone/Woodpecker/Jenkins/Argo reserved) |
+| editor           | `thegn_core::editor::Editor`                                                                                           | template (`[editor] command`) → `[[tools]] editor` → `$VISUAL`/`$EDITOR` → `vi`            | `[editor]`; placement per program or `open_in`           |
+| issues           | `thegn_svc::issue::IssueBackend`                                                                                       | Linear, GitHub, Jira, Kaneo                                                                | `[[issue_accounts]]`                                     |
+| calendar         | `CalendarBackend`                                                                                                      | ICS, ICS URL, CalDAV, command (plugin)                                                     | `[[calendar_accounts]]`                                  |
+| media            | `thegn_media::MediaBackend`                                                                                            | MPRIS, playerctl, mpv, MPD, SMTC, MediaRemote, AppleScript                                 | `[media] backend` (Jellyfin reserved)                    |
+| sandbox          | `Backend` - closed `Copy` enum + `BackendProfile` table (not a trait object; see `fix-truth-in-reporting`)             | podman, docker, bwrap, systemd, apple, jobobject, none (reserved: smol, wsl, appcontainer) | `[sandbox] backend` / `backend_chain`                    |
+| remote providers | `RemoteProvider` (create/destroy/list) + egress/checkpoints/files sub-traits; exec/proxy/caps via `enum Provider` arms | Daytona, Sprites, VPS (Hetzner/DO), Fly, Machine0, Iroh                                    | `[env.<name>.provider]`                                  |
 
 The shape: **object-safe trait, always** — plain `&self` when every impl is
-process-bound (forge, git, CI, sandbox, editor), `fn m<'a>(…) ->
+process-bound (forge, git, CI, editor), `fn m<'a>(…) ->
 BoxFuture<'a, R>` when callers are async (control API, issues, calendar,
 media, remote providers). Never `async fn` in a seam trait, and never a
 hand-written per-method delegation enum — dispatch is `Box<dyn T>` /
@@ -397,6 +397,12 @@ a mistaken footprint association. Structured per-profile logs keep measured
 generation bytes, planned bytes, successfully removed bytes, remaining measured
 bytes, and failures separate from whole-`target/` reclamation.
 
+**Known deviations.** Two seams do not have this shape today. The sandbox
+seam is a closed `Backend` enum with a `BackendProfile` table rather than a
+trait object (WS02 replaces it). The remote-provider seam delegates exec,
+proxy and caps through a hand-written `enum Provider` with per-method match
+arms (WS08 replaces it). New code must not extend either shape.
+
 ## 10. Sandboxing
 
 A worktree's interactive process can run in a container (podman → docker →
@@ -406,8 +412,11 @@ backends run it on another machine. Backend availability is a three-state
 probe (present / absent / unreachable) so an undecidable remote halts rather
 than silently degrading.
 
-**Gate:** `openspec/specs/sandbox` (32 requirements), `just sandbox-e2e-dns`
-/ `-db` in `just ci`.
+**Gate:** `openspec/specs/sandbox` (59 requirements at `cbf36fe3a`),
+`just sandbox-e2e-db` in `just ci`.
+
+Network: only `network = "none"` is enforced locally (reported offline);
+allow/block lists are advisory; no thegn egress datapath exists yet.
 
 The local Unix control endpoint trusts the daemon's effective uid, an owner-only
 parent, and the connected peer-uid check; the sandbox control-socket guard

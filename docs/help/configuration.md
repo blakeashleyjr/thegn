@@ -65,12 +65,19 @@ project spellings. Tracker-owned `workspace_id`, `workspace_slug`, and
 The file is watched, and every key has a reload class. Most display
 settings apply live: the sidebar, theme, bars, weather, calendar, panel,
 keys, voice and LSP. Notification routing and push sinks, `[[plugins]]`
-and `[media]` apply live too. Refresh cadences also apply live: the clock
+and `[media]` and `[metrics]` (targets restart on save) apply live too, and `[monitor]` `window_ladder`, `default_window`, `default_style` and `default_scale` take effect at the next monitor open. Refresh cadences also apply live: the clock
 and date formats, `ci.poll_interval_secs`, `pr_queue.enabled` and its poll
 interval, `git.auto_fetch` and its interval, `disk.scan_interval_secs`,
 `loc.enabled`, `loc.scan_interval_secs` and `watch.pr_interval_secs` (the
 PR refresh cadence, floored at 5 seconds; the rest of `[watch]` still needs
-a restart). The status line lists them as "refresh cadences". Some keys are read afresh each time they are used,
+a restart). The status line lists them as "refresh cadences". `[metrics]`
+applies live: saving restarts the metrics collector from the new targets, and
+removing every target clears the metrics rows. The monitor's
+`window_ladder`, `default_window`, `default_style` and `default_scale` apply
+to the next monitor open. A style, scale or window you chose in the monitor
+is kept; tabs still on the old default follow the new one, and an open
+monitor keeps its state. `monitor.processes` applies live; the other
+`[monitor]` keys need a restart. Some keys are read afresh each time they are used,
 such as `[sandbox]`, `[env.*]`, `[project.*]`, the rest of `[git]` and the
 queues, so the next worktree, launch or queue run picks them up. Daemon launches pick up `[env.*]` and
 env-selection edits without a restart; `[host.*]`, `[sandbox.profiles.*]` and
@@ -541,7 +548,7 @@ silently not applied: `[sandbox]` (and everything nested under it),
 `[clipboard]`, `[apps]`, `[skills]`, `[tasks]`, `[toolchain]`, `[limits]`,
 `[presets]`, `[profiles]`, `[worktree_templates]`, `[watch]`, `[ci]`,
 `[pr]`, `[issues]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
-`[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[pins]`,
+`[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[lead]`, `[pins]`,
 `[secrets]`, `[credentials]`, `[bundle]`, `[zone.*]`, `[observe]`,
 `[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, `[stats]`, and the
 per-project overlay

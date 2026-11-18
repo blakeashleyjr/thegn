@@ -32,6 +32,12 @@ CLI-backed-provider boundary.
    cross-seam shape suite (`thegn_svc::conformance`) already covers your
    probe — a malformed report or a factory/kind mismatch fails it.
 
+An environment provider kind (`EnvProviderKind`) declares its capabilities
+through the kind's methods in `thegn_core::config` (`files`, `checkpoints`,
+`egress_api`, `exec_api`, `scale_to_zero`); `thegn_svc::provider::ProviderCaps::for_kind`
+derives the runtime caps from them, so `Provider::caps()` never states a
+capability the kind table does not.
+
 ## The `SecretStore` seam (credential backends)
 
 The credential broker (THE-66) is a seam too: `thegn_core::secret_store`
@@ -58,3 +64,16 @@ Out-of-process instead? A plugin can _be_ an issue provider — declare an
 present; `test/smoke.sh`), `test/async-trait-ratchet.txt` (empty; any
 `#[allow(async_fn_in_trait)]` is a regression), `conformance` tests
 (probe shape / account-factory coverage).
+
+## Remote sandbox providers
+
+A remote sandbox kind (sprites, fly, machine0, vercel) follows one checklist:
+
+- Implement `RemoteProvider` and add a `Provider` enum arm.
+- Register the kind in the provider factory and `EnvProviderKind`.
+- Exec through a hidden self-bridge (`thegn <kind>-exec`) when there is no SSH;
+  keep `exec_api()` false unless the resident bridge is verified.
+- Keep an intent-before-create ledger and an account fingerprint in
+  `vps::registry` so a crash cannot leak a paid instance.
+- Add a lifetime reaper whose `tick` early-returns when no env uses the kind.
+- Refuse unsupported options (`host_cache`, `connect = "ssh"`) in admission.

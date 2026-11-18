@@ -136,6 +136,18 @@ impl ControlApi for FakeApi {
         })
     }
 
+    fn issues_comment_confined<'a>(
+        &'a self,
+        id: &'a str,
+        _body: &'a str,
+        _repo: Option<&'a str>,
+        _account: Option<&'a str>,
+        caller: super::LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        self.record(&format!("issues_comment_confined:{id}:{}", caller.label));
+        Box::pin(async { Ok(()) })
+    }
+
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
         self.record("list_sessions");
         Box::pin(async { Ok(vec![]) })
@@ -263,6 +275,22 @@ impl ControlApi for FakeApi {
             })
         })
     }
+    fn open_confined(
+        &self,
+        _spec: OpenSpec,
+        caller: super::LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        self.record(&format!("open_confined:{}", caller.label));
+        Box::pin(async {
+            Ok(SessionInfo {
+                id: "s2".into(),
+                program: "coder".into(),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+        })
+    }
     fn open(&self, _spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         self.record("open");
         Box::pin(async {
@@ -321,6 +349,19 @@ impl ControlApi for FakeApi {
         self.record("send_input");
         Box::pin(async { Ok(()) })
     }
+    fn send_input_confined<'a>(
+        &'a self,
+        session: &'a str,
+        bytes: Vec<u8>,
+        caller: super::LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        self.record(&format!(
+            "send_input_confined:{}:{session}:{}",
+            caller.label,
+            String::from_utf8_lossy(&bytes).escape_debug()
+        ));
+        Box::pin(async { Ok(()) })
+    }
     fn resize<'a>(
         &'a self,
         _session: &'a str,
@@ -338,7 +379,7 @@ impl ControlApi for FakeApi {
                 seq: 0,
                 cols: 80,
                 rows: 24,
-                bytes: b"\x1b[2J".to_vec(),
+                bytes: format!("\x1b[2Jcode {SNAPSHOT_SECRET}.").into_bytes(),
             })
         })
     }
@@ -536,6 +577,14 @@ impl ControlApi for FakeApi {
         })
     }
 
+    fn dispatch_put_confined(
+        &self,
+        req: super::DispatchPutReq,
+        _caller: super::LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        self.dispatch_put(req)
+    }
+
     fn dispatch_set_status(
         &self,
         id: i64,
@@ -580,6 +629,8 @@ fn rig(local_admin: bool) -> Rig {
         server_label: "test thegn".into(),
         cors_origins: Vec::new(),
         event_streams: Default::default(),
+        lead_listener: false,
+        lead_token_ttl_secs: 0,
     };
     Rig { api, state, db }
 }
@@ -2003,6 +2054,8 @@ async fn pairing_lifecycle_publishes_feed_frames() {
         server_label: "test thegn".into(),
         cors_origins: Vec::new(),
         event_streams: Default::default(),
+        lead_listener: false,
+        lead_token_ttl_secs: 0,
     };
     let code = auth::mint(
         TokenKind::PairingCode,
@@ -2287,6 +2340,186 @@ async fn automation_and_tool_verbs_have_catalog_routes_and_exact_scopes() {
     assert_eq!(
         r.api.calls(),
         ["automations_list", "automations_test", "tools_run"]
+    );
+}
+
+#[tokio::test]
+async fn lead_verbs_have_catalog_routes_and_exact_scopes() {
+    use thegn_core::control::{Scope, required_scope};
+    // THE-2172: every Lead verb is a POST route, an API_CALLS row and one
+    // catalog row, at exactly the batch's scope.
+    let lead = [
+        ("overview.get", "/v1/overview", Scope::Read),
+        ("notifications.list", "/v1/notifications/list", Scope::Read),
+        ("notifications.ack", "/v1/notifications/ack", Scope::Write),
+        ("automations.put", "/v1/automations/put", Scope::Write),
+        ("automations.rm", "/v1/automations/rm", Scope::Write),
+        ("automations.enable", "/v1/automations/enable", Scope::Write),
+        ("automations.runs", "/v1/automations/runs", Scope::Read),
+        ("approvals.list", "/v1/approvals/list", Scope::Read),
+        ("approvals.request", "/v1/approvals/request", Scope::Write),
+        ("approvals.resolve", "/v1/approvals/resolve", Scope::Admin),
+        ("merge.drain", "/v1/merge/drain", Scope::MergeAdd),
+    ];
+    for (capability, path, scope) in lead {
+        assert!(
+            super::routes::ROUTES
+                .iter()
+                .any(|route| route.path == path && route.caps == [capability]),
+            "missing route for {capability}"
+        );
+        assert!(
+            super::routes::API_CALLS.contains(&(capability, "POST", path)),
+            "missing POST API_CALLS row for {capability}"
+        );
+        let entry = thegn_core::capability::lookup(capability)
+            .unwrap_or_else(|| panic!("missing capability catalog row for {capability}"));
+        assert_eq!(required_scope(entry.verb), scope, "{capability}");
+    }
+    assert_eq!(
+        required_scope(
+            thegn_core::capability::lookup("approvals.resolve")
+                .unwrap()
+                .verb
+        ),
+        Scope::Admin
+    );
+
+    let r = rig(false);
+    let read = token(&r, "read");
+    let write = token(&r, "write");
+    let git = token(&r, "git");
+    let merge_add = token(&r, "merge_add");
+    let admin = token(&r, "admin");
+    let confined = token_with_label(
+        &r,
+        "read,merge_add",
+        RouteToHostTokenBinding {
+            owner: "provider/account/sandbox-a".into(),
+            worktree: "/w".into(),
+        }
+        .label(),
+    );
+    let post = |path: &'static str, bearer: String, body: &'static str| {
+        let state = r.state.clone();
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            router(state).oneshot(request).await.unwrap().status()
+        }
+    };
+    // The fake leaves every Lead method at its `Unimplemented` default, so an
+    // authorized call answers 501 and a refused one 403.
+    let authorized = StatusCode::NOT_IMPLEMENTED;
+    assert_eq!(post("/v1/overview", read.clone(), "{}").await, authorized);
+    assert_eq!(
+        post("/v1/notifications/ack", read.clone(), r#"{"all":true}"#).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post("/v1/notifications/ack", write.clone(), r#"{"all":true}"#).await,
+        authorized
+    );
+    // Granting is Admin: a write token is refused, admin passes.
+    assert_eq!(
+        post("/v1/approvals/resolve", write.clone(), "{}").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(post("/v1/approvals/resolve", admin, "{}").await, authorized);
+    // A non-object body is a 400 once authorized.
+    assert_eq!(
+        post("/v1/approvals/list", read.clone(), "[]").await,
+        StatusCode::BAD_REQUEST
+    );
+    // merge.drain: an unbound caller needs git; a naked merge_add grant fails.
+    assert_eq!(
+        post("/v1/merge/drain", git, r#"{"worktree":"/w"}"#).await,
+        authorized
+    );
+    assert_eq!(
+        post("/v1/merge/drain", merge_add, r#"{"worktree":"/w"}"#).await,
+        StatusCode::FORBIDDEN
+    );
+    // A worktree-confined route-to-host token never reaches a Lead verb, not
+    // even the cross-worktree reads its `read` grant would otherwise allow.
+    assert_eq!(
+        post("/v1/merge/drain", confined.clone(), r#"{"worktree":"/w"}"#).await,
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        post("/v1/overview", confined, "{}").await,
+        StatusCode::PRECONDITION_FAILED
+    );
+}
+
+/// THE-2197: pause is Write, resume is Admin, and a Lead token is refused
+/// resume even when it somehow holds admin scope.
+#[tokio::test]
+async fn automations_pause_is_write_and_resume_refuses_write_and_lead_tokens() {
+    use thegn_core::control::{Scope, required_scope};
+    for (capability, path, scope) in [
+        ("automations.pause", "/v1/automations/pause", Scope::Write),
+        ("automations.resume", "/v1/automations/resume", Scope::Admin),
+    ] {
+        assert!(
+            super::routes::ROUTES
+                .iter()
+                .any(|route| route.path == path && route.caps == [capability]),
+            "missing route for {capability}"
+        );
+        assert!(
+            super::routes::API_CALLS.contains(&(capability, "POST", path)),
+            "missing POST API_CALLS row for {capability}"
+        );
+        let entry = thegn_core::capability::lookup(capability).unwrap();
+        assert_eq!(required_scope(entry.verb), scope, "{capability}");
+    }
+
+    let r = rig(false);
+    let read = token(&r, "read");
+    let write = token(&r, "write");
+    let admin = token(&r, "admin");
+    let lead = token_with_label(&r, "read,write,admin", LEAD_LABEL.to_string());
+    // The fake leaves both methods at `Unimplemented`: authorized = 501.
+    let authorized = StatusCode::NOT_IMPLEMENTED;
+    let pause = "/v1/automations/pause";
+    let resume = "/v1/automations/resume";
+    let empty = serde_json::json!({});
+    assert_eq!(
+        post_json(&r, pause, &read, empty.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(&r, pause, &write, empty.clone()).await.0,
+        authorized
+    );
+    assert_eq!(
+        post_json(&r, pause, &lead, empty.clone()).await.0,
+        authorized
+    );
+    assert_eq!(
+        post_json(&r, resume, &write, empty.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(&r, resume, &admin, empty.clone()).await.0,
+        authorized
+    );
+    let (status, body) = post_json(&r, resume, &lead, empty).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let text = refusal_text(&body);
+    assert!(
+        text.starts_with(thegn_core::lead_confine::REFUSAL_PREFIX),
+        "{body}"
+    );
+    assert!(
+        text.contains("only the operator resumes automations"),
+        "{body}"
     );
 }
 
@@ -3146,4 +3379,570 @@ async fn sandbox_profile_set_shape_is_strict_and_clearing_is_explicit() {
         StatusCode::OK
     );
     assert_eq!(r.api.calls(), ["sandbox_profile_set:/w:None"]);
+}
+
+// --- Lead confinement (`thegn_core::lead_confine`) ------------------------------
+
+const LEAD_LABEL: &str = "lead:g/0";
+
+/// A pairing-code-shaped string the fake's pane snapshot shows (b155).
+const SNAPSHOT_SECRET: &str =
+    "tgp1_0123abcd_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+async fn get_json(rig: &Rig, path: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(rig.state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+fn snapshot_text(body: &serde_json::Value) -> String {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(body["ansi_b64"].as_str().unwrap())
+        .unwrap();
+    String::from_utf8(raw).unwrap()
+}
+
+/// b155 (6d): a Lead-confined `issues.comment` reaches the daemon's
+/// `issues_comment_confined` gate with the verified label; an ordinary
+/// caller still reaches the plain method.
+#[tokio::test]
+async fn lead_confined_issue_comment_routes_to_the_confined_method() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let write = token(&r, "write");
+    let (status, _) = post_json(
+        &r,
+        "/v1/issues/linear:THE-1/comment",
+        &lead,
+        serde_json::json!({ "body": "hello" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_json(
+        &r,
+        "/v1/issues/linear:THE-1/comment",
+        &write,
+        serde_json::json!({ "body": "hello" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "the fake's plain method"
+    );
+    assert_eq!(
+        r.api.calls(),
+        [
+            format!("issues_comment_confined:linear:THE-1:{LEAD_LABEL}"),
+            "issues_comment:linear:THE-1".to_string(),
+        ]
+    );
+    // A confined update reaches the defaulted confined method, which fails
+    // closed without touching the tracker.
+    let (status, _) = post_json(
+        &r,
+        "/v1/issues/linear:THE-1",
+        &lead,
+        serde_json::json!({ "title": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(r.api.issue_patches.lock().unwrap().is_empty());
+}
+
+/// b155: a Lead-confined `sessions.snapshot` has token shapes redacted; an
+/// ordinary caller sees the screen unchanged.
+#[tokio::test]
+async fn lead_confined_snapshot_is_redacted() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let read = token(&r, "read");
+    let (status, body) = get_json(&r, "/v1/sessions/s1/snapshot", &lead).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = snapshot_text(&body);
+    assert!(!text.contains(SNAPSHOT_SECRET), "{text}");
+    assert!(
+        text.contains(thegn_core::lead_confine::REDACTED_CREDENTIAL),
+        "{text}"
+    );
+    let (status, body) = get_json(&r, "/v1/sessions/s1/snapshot", &read).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(snapshot_text(&body).contains(SNAPSHOT_SECRET));
+}
+
+/// b155: redeem is Write and refused for the Lead; halt is Admin (a Write
+/// token is refused); profile_env is Read and reaches the daemon for the
+/// Lead; none of the three is an MCP surface.
+#[tokio::test]
+async fn b155_spine_verbs_scope_and_lead_rows() {
+    use thegn_core::control::{Scope, required_scope};
+    for (capability, path, scope) in [
+        ("approvals.redeem", "/v1/approvals/redeem", Scope::Write),
+        ("automations.halt", "/v1/automations/halt", Scope::Admin),
+        (
+            "mcp_proxy.profile_env",
+            "/v1/mcp_proxy/profile_env",
+            Scope::Read,
+        ),
+    ] {
+        assert!(
+            super::routes::ROUTES
+                .iter()
+                .any(|route| route.path == path && route.caps == [capability]),
+            "missing route for {capability}"
+        );
+        assert!(
+            super::routes::API_CALLS.contains(&(capability, "POST", path)),
+            "missing POST API_CALLS row for {capability}"
+        );
+        let entry = thegn_core::capability::lookup(capability).unwrap();
+        assert_eq!(required_scope(entry.verb), scope, "{capability}");
+        assert!(
+            !entry
+                .surfaces
+                .contains(thegn_core::capability::Surface::Mcp),
+            "{capability} must never be an MCP tool"
+        );
+    }
+    let r = rig(false);
+    let write = token(&r, "write");
+    let admin = token(&r, "admin");
+    let lead = token_with_label(&r, "read,write,admin", LEAD_LABEL.to_string());
+    let authorized = StatusCode::NOT_IMPLEMENTED;
+    let halt = "/v1/automations/halt";
+    let empty = serde_json::json!({});
+    assert_eq!(
+        post_json(&r, halt, &write, empty.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(&r, halt, &admin, empty.clone()).await.0,
+        authorized
+    );
+    let (status, body) = post_json(&r, halt, &lead, empty).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        refusal_text(&body).contains("only the operator halts automations"),
+        "{body}"
+    );
+    let redeem = "/v1/approvals/redeem";
+    let answer = serde_json::json!({ "nonce": "n", "decision": "approve" });
+    assert_eq!(
+        post_json(&r, redeem, &write, answer.clone()).await.0,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let (status, body) = post_json(&r, redeem, &lead, answer).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(refusal_text(&body).contains("phone"), "{body}");
+    // profile_env: the Lead passes the transport (the daemon decides).
+    let env = serde_json::json!({ "profile": "lead" });
+    assert_eq!(
+        post_json(&r, "/v1/mcp_proxy/profile_env", &lead, env)
+            .await
+            .0,
+        authorized
+    );
+}
+
+/// b155 review: a non-Lead Write token on a token-authenticated listener
+/// cannot redeem (the code alone must not approve; only the signed inbox,
+/// dispatching as implicit local admin, may). The API is never reached for
+/// the token caller; a same-uid implicit-local-admin caller reaches it.
+#[tokio::test]
+async fn approvals_redeem_refuses_token_callers_but_not_implicit_local_admin() {
+    let r = rig(false);
+    let write = token(&r, "write");
+    let answer = serde_json::json!({ "nonce": "n", "decision": "approve" });
+    let (status, body) = post_json(&r, "/v1/approvals/redeem", &write, answer).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert!(refusal_text(&body).contains("signed push inbox"), "{body}");
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+
+    let local = rig(true);
+    // The FakeApi keeps the trait's default (NOT_IMPLEMENTED), which proves
+    // the call got past the transport to the API method.
+    assert_eq!(
+        call(&local, "POST", "/v1/approvals/redeem", None).await,
+        StatusCode::NOT_IMPLEMENTED
+    );
+}
+
+async fn post_json(
+    rig: &Rig,
+    path: &str,
+    bearer: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .header("x-thegn-caller", "user")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router(rig.state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+fn refusal_text(body: &serde_json::Value) -> String {
+    body["error"].as_str().unwrap_or_default().to_string()
+}
+
+fn agent_open_body() -> serde_json::Value {
+    serde_json::json!({
+        "argv": [],
+        "rows": 24,
+        "cols": 80,
+        "worktree": "/w/feature",
+        "agent": { "agent": "coder", "prompt": "review the diff" },
+    })
+}
+
+/// A Lead token asking `sessions.open` for a raw argv (or an env override) is
+/// refused at the transport with a `lead_confined` audit record, and the API
+/// is never called.
+#[tokio::test]
+async fn lead_confined_raw_open_is_refused_audited_and_never_dispatched() {
+    let captured = audit_capture::Captured::default();
+    let _guard = tracing::subscriber::set_default(audit_capture::AuditSubscriber(captured.clone()));
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+
+    let (status, body) = post_json(
+        &r,
+        "/v1/sessions",
+        &lead,
+        serde_json::json!({"argv": ["/bin/sh", "-c", "id"], "rows": 24, "cols": 80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        refusal_text(&body).starts_with(thegn_core::lead_confine::REFUSAL_PREFIX),
+        "{body}"
+    );
+
+    let mut with_env = agent_open_body();
+    with_env["env"] = serde_json::json!([["LD_PRELOAD", "/tmp/x.so"]]);
+    let (status, _) = post_json(&r, "/v1/sessions", &lead, with_env).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+    let recs = captured.records();
+    let refused = recs
+        .iter()
+        .filter(|m| {
+            m.get("capability").map(String::as_str) == Some("sessions.open")
+                && m.get("outcome").map(String::as_str) == Some("lead_confined")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), 2, "{recs:?}");
+    assert_eq!(
+        refused[0].get("label").map(String::as_str),
+        Some(LEAD_LABEL)
+    );
+}
+
+/// A Lead never enqueues or drains the merge queue, whatever its scopes
+/// (b155 THE-2171): it lands only through a rule's land step or an owner
+/// approval. The API is never called.
+#[tokio::test]
+async fn lead_confined_merge_add_and_drain_are_refused_whatever_the_scopes() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write,git", LEAD_LABEL.to_string());
+    for path in ["/v1/merge/add", "/v1/merge/drain"] {
+        let (status, body) =
+            post_json(&r, path, &lead, serde_json::json!({"worktree": "/w"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        let text = refusal_text(&body);
+        assert!(
+            text.starts_with(thegn_core::lead_confine::REFUSAL_PREFIX)
+                && text.contains("owner approval"),
+            "{path}: {body}"
+        );
+    }
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+}
+
+/// Regression guard: a non-Lead Write token still opens a raw argv through
+/// the ordinary path.
+#[tokio::test]
+async fn a_normal_write_token_still_opens_a_raw_argv() {
+    let r = rig(false);
+    let write = token(&r, "read,write");
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions",
+        &write,
+        serde_json::json!({"argv": ["/bin/sh"], "rows": 24, "cols": 80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r.api.calls(), ["open"]);
+}
+
+/// A configured agent in a worktree passes the transport and is routed to the
+/// daemon's confined open (which proves registration and the sandbox), never
+/// the unconfined one.
+#[tokio::test]
+async fn a_lead_agent_open_goes_through_the_confined_path() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let (status, _) = post_json(&r, "/v1/sessions", &lead, agent_open_body()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r.api.calls(), [format!("open_confined:{LEAD_LABEL}")]);
+}
+
+/// Nothing in the request can lift the confinement: body fields and a
+/// caller header are ignored; only the stored label and the listener count.
+#[tokio::test]
+async fn the_confinement_cannot_be_dropped_by_the_request_body() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions",
+        &lead,
+        serde_json::json!({
+            "argv": ["/bin/sh"],
+            "rows": 24,
+            "cols": 80,
+            "lead_confined": false,
+            "label": "phone",
+            "caller": "user",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The bare `wire --lead` label is confined too.
+    let bare = token_with_label(&r, "read,write", "lead".to_string());
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions",
+        &bare,
+        serde_json::json!({"argv": ["/bin/sh"], "rows": 24, "cols": 80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+}
+
+/// Every caller on the Lead listener is confined, whatever its token's label.
+#[tokio::test]
+async fn the_lead_listener_confines_any_token() {
+    let mut r = rig(false);
+    r.state.lead_listener = true;
+    let write = token(&r, "read,write");
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions",
+        &write,
+        serde_json::json!({"argv": ["/bin/sh"], "rows": 24, "cols": 80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty());
+}
+
+/// Split, resize, fork, host git and the sandbox-profile pin are refused for
+/// a Lead caller even when its scopes would allow them; reads still work.
+/// (`sessions.input` is shape-checked instead; see the `lead_input_*` tests.)
+#[tokio::test]
+async fn lead_refused_verbs_never_reach_the_api() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write,git", LEAD_LABEL.to_string());
+    for path in [
+        "/v1/sessions/s1/split",
+        "/v1/sessions/s1/resize",
+        "/v1/git/commit",
+        "/v1/git/stage",
+        "/v1/worktrees/open",
+    ] {
+        assert_eq!(
+            call(&r, "POST", path, Some(&lead)).await,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+    }
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions/fork",
+        &lead,
+        serde_json::json!({"session": "s1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+    assert_eq!(
+        call(&r, "GET", "/v1/sessions", Some(&lead)).await,
+        StatusCode::OK
+    );
+}
+
+/// Plain-text Lead input (with Enter) passes the transport and is routed to
+/// the daemon's confined path, which proves the session is a Lead worker;
+/// never the unconfined one.
+#[tokio::test]
+async fn lead_input_goes_through_the_confined_path() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions/w1/input",
+        &lead,
+        serde_json::json!({"text": "use option 2", "enter": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        r.api.calls(),
+        [format!(
+            "send_input_confined:{LEAD_LABEL}:w1:use option 2\\r"
+        )]
+    );
+}
+
+/// Escape sequences and other control bytes from the Lead are refused at the
+/// transport, audited with the label and session id (never the text), and
+/// never reach the API, whether sent as `text` or `b64`.
+#[tokio::test]
+async fn lead_input_with_control_bytes_is_refused_audited_and_never_dispatched() {
+    use base64::Engine as _;
+    let captured = audit_capture::Captured::default();
+    let _guard = tracing::subscriber::set_default(audit_capture::AuditSubscriber(captured.clone()));
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let bodies = [
+        serde_json::json!({"text": "\u{1b}[201~secret"}),
+        serde_json::json!({"text": "secret\u{3}"}),
+        serde_json::json!({
+            "b64": base64::engine::general_purpose::STANDARD.encode(b"secret\x1b]52;c;eA==\x07")
+        }),
+        serde_json::json!({"text": "x".repeat(thegn_core::lead_input::MAX_LEAD_INPUT_BYTES + 1)}),
+        // An unparseable body carries no shape: refused for the Lead too.
+        serde_json::json!({}),
+    ];
+    let count = bodies.len();
+    for body in bodies {
+        let (status, reply) = post_json(&r, "/v1/sessions/w1/input", &lead, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+        assert!(
+            refusal_text(&reply).starts_with(thegn_core::lead_confine::REFUSAL_PREFIX),
+            "{reply}"
+        );
+    }
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+    let refused = captured
+        .records()
+        .into_iter()
+        .filter(|m| {
+            m.get("capability").map(String::as_str) == Some("sessions.input")
+                && m.get("outcome").map(String::as_str) == Some("lead_confined")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), count, "{refused:?}");
+    for rec in &refused {
+        assert_eq!(rec.get("label").map(String::as_str), Some(LEAD_LABEL));
+        assert_eq!(rec.get("resource").map(String::as_str), Some("w1"));
+        assert!(rec.values().all(|v| !v.contains("secret")), "{rec:?}");
+    }
+}
+
+/// Regression guard: a normal Write token's input (control bytes included)
+/// takes the ordinary path, untouched by the Lead rules.
+#[tokio::test]
+async fn a_normal_write_token_input_is_unaffected() {
+    use base64::Engine as _;
+    let r = rig(false);
+    let write = token(&r, "read,write");
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions/s1/input",
+        &write,
+        serde_json::json!({"b64": base64::engine::general_purpose::STANDARD.encode(b"\x1b[A\x03")}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r.api.calls(), ["send_input"]);
+}
+
+/// An API impl that does not record who opened a session types nothing for
+/// the Lead.
+#[tokio::test]
+async fn the_default_confined_input_fails_closed() {
+    let api = PluginsStatusApi {
+        reply: super::PluginsStatusReply::default(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let caller = super::LeadCaller {
+        pairing_id: "p".into(),
+        label: LEAD_LABEL.into(),
+    };
+    let err = api
+        .send_input_confined("w1", b"hi".to_vec(), caller)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, super::ControlError::FailedPrecondition(_)));
+    assert!(
+        err.to_string()
+            .contains(thegn_core::lead_confine::REFUSAL_PREFIX)
+    );
+}
+
+/// `dispatches.put` from the Lead may record a row but never bind a session.
+#[tokio::test]
+async fn lead_dispatch_put_may_not_bind_a_session() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let row = serde_json::json!({
+        "issue_id": "THE-1",
+        "worktree_path": "/w/feature",
+        "agent_name": "coder",
+        "session_id": "s9",
+    });
+    let (status, _) = post_json(&r, "/v1/dispatches", &lead, row).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty());
+    let unbound = serde_json::json!({
+        "issue_id": "THE-1",
+        "worktree_path": "/w/feature",
+        "agent_name": "coder",
+    });
+    let (status, _) = post_json(&r, "/v1/dispatches", &lead, unbound).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_eq!(r.api.calls(), ["dispatch_put:THE-1:/w/feature:coder:None"]);
+}
+
+/// An API impl that cannot prove a Lead worker's sandbox launches nothing.
+#[tokio::test]
+async fn the_default_confined_open_fails_closed() {
+    let api = PluginsStatusApi {
+        reply: super::PluginsStatusReply::default(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let caller = super::LeadCaller {
+        pairing_id: "p".into(),
+        label: LEAD_LABEL.into(),
+    };
+    let err = api
+        .open_confined(OpenSpec::default(), caller)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, super::ControlError::FailedPrecondition(_)));
+    assert!(
+        err.to_string()
+            .contains(thegn_core::lead_confine::REFUSAL_PREFIX)
+    );
 }

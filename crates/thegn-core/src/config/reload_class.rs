@@ -77,6 +77,12 @@ pub enum ReloadHook {
     Plugins,
     /// The media watcher restart + album-art toggle.
     Media,
+    /// The `[metrics]` supervisor re-arm (a fresh slot + supervisor; the old
+    /// supervisor exits on `consumer_gone`).
+    Metrics,
+    /// The monitor's per-tab defaults and window ladder
+    /// (`MonitorPrefs::reapply_config`); applies to the next monitor open.
+    Monitor,
     None,
 }
 
@@ -103,6 +109,8 @@ impl ReloadHook {
             Self::Notifications => "notifications",
             Self::Plugins => "plugins",
             Self::Media => "media",
+            Self::Metrics => "metrics",
+            Self::Monitor => "monitor",
             Self::None => "settings",
         }
     }
@@ -178,8 +186,18 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("editor.*", NextUse, H::None),
     ("theme.*", Live, H::Theme),
     ("monitor.*", Restart, H::None),
+    // The ladder and per-tab defaults are re-applied to the loop's
+    // `MonitorPrefs` (the next monitor open sees them; user-changed tabs keep
+    // their choice).
+    ("monitor.window_ladder", Live, H::Monitor),
+    ("monitor.default_window", Live, H::Monitor),
+    ("monitor.default_style", Live, H::Monitor),
+    ("monitor.default_scale", Live, H::Monitor),
+    // Read from `current_config` on every tick (`wants_process_scan`).
+    ("monitor.processes", Live, H::None),
     ("stats.*", Live, H::Bars),
-    ("metrics.*", Restart, H::None),
+    // The Metrics hook re-arms the supervisor from the reloaded section.
+    ("metrics.*", Live, H::Metrics),
     ("apps.*", Live, H::AppHost),
     ("observe.*", Restart, H::None),
     ("bars.*", Live, H::Bars),
@@ -277,6 +295,7 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     // MCP servers/proxy are wired at launch (unsure: Restart).
     ("mcp_servers.*", Restart, H::None),
     ("mcp_proxy.*", Restart, H::None),
+    ("lead.*", Restart, H::None),
     ("mcp.*", Restart, H::None),
     ("secrets.*", NextUse, H::None),
     ("credentials.*", NextUse, H::None),
@@ -612,6 +631,52 @@ mod tests {
     }
 
     #[test]
+    fn metrics_and_monitor_rows_classify() {
+        assert_eq!(class_for("metrics.interval_secs"), Some((Live, H::Metrics)));
+        assert_eq!(class_for("metrics.targets"), Some((Live, H::Metrics)));
+        assert_eq!(class_for("metrics"), Some((Live, H::Metrics)));
+        for key in [
+            "monitor.window_ladder",
+            "monitor.default_window",
+            "monitor.default_style",
+            "monitor.default_scale",
+        ] {
+            assert_eq!(class_for(key), Some((Live, H::Monitor)), "{key}");
+        }
+        assert_eq!(class_for("monitor.processes"), Some((Live, H::None)));
+        assert_eq!(class_for("monitor.proc_rows"), Some((Restart, H::None)));
+        assert_eq!(class_for("monitor.system"), Some((Restart, H::None)));
+        assert_eq!(H::Metrics.label(), "metrics");
+        assert_eq!(H::Monitor.label(), "monitor");
+    }
+
+    #[test]
+    fn plan_routes_metrics_and_monitor_hooks() {
+        let base = parse("");
+        let new = parse(
+            "[metrics]\ninterval_secs = 7.5\n\n[monitor]\ndefault_style = \"line\"\nproc_rows = 3\n",
+        );
+        let plan = plan(&base, &new);
+        assert!(plan.runs(H::Metrics), "{plan:?}");
+        assert!(plan.runs(H::Monitor), "{plan:?}");
+        assert_eq!(
+            plan.live.get(&H::Metrics).cloned().unwrap_or_default(),
+            ["metrics.interval_secs"]
+        );
+        assert_eq!(
+            plan.live.get(&H::Monitor).cloned().unwrap_or_default(),
+            ["monitor.default_style"]
+        );
+        assert!(
+            plan.restart.contains(&"monitor.proc_rows".to_string()),
+            "{plan:?}"
+        );
+        let only_rows = plan_keys(vec!["monitor.proc_rows".into()]);
+        assert!(!only_rows.runs(H::Monitor));
+        assert!(!only_rows.runs(H::Metrics));
+    }
+
+    #[test]
     fn summary_names_the_new_hook_labels() {
         let plan = plan_keys(vec![
             "ci.poll_interval_secs".into(),
@@ -675,6 +740,8 @@ mod tests {
             H::Notifications,
             H::Plugins,
             H::Media,
+            H::Metrics,
+            H::Monitor,
             H::None,
         ] {
             assert!(!hook.label().is_empty());

@@ -36,6 +36,7 @@ const T_PAIRING: u8 = 5;
 const T_SESSIONS: u8 = 6;
 const T_EXIT: u8 = 7;
 const T_LAGGED: u8 = 8;
+const T_NOTICE: u8 = 9;
 
 /// The maximum number of bytes accepted for a session filter.
 pub const MAX_FEED_SESSION_LEN: usize = 256;
@@ -46,6 +47,39 @@ pub const MAX_FEED_SESSION_LEN: usize = 256;
 /// produced by the session-attach stream, whose bootstrap and ordering
 /// contract is different from the lossy observer feed.
 pub const OBSERVER_KINDS: &[&str] = &["activity", "lease", "pairing", "sessions", "exit"];
+
+/// Opt-in Lead feed kinds (THE-2172): delivered only to subscribers whose
+/// `FeedFilter.kinds` names them, never under `kinds: None`.
+pub const NOTICE_KINDS: &[&str] = &["notification", "dispatch", "automation_run"];
+
+/// Which Lead-feed family an [`EventFrame::Notice`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    Notification,
+    Dispatch,
+    AutomationRun,
+}
+
+impl NoticeKind {
+    /// The stable wire/filter name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Notification => "notification",
+            Self::Dispatch => "dispatch",
+            Self::AutomationRun => "automation_run",
+        }
+    }
+
+    /// Parse a wire/filter name.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "notification" => Some(Self::Notification),
+            "dispatch" => Some(Self::Dispatch),
+            "automation_run" => Some(Self::AutomationRun),
+            _ => None,
+        }
+    }
+}
 
 /// Stable kinds that can appear on a session-attach stream.
 pub const PANE_ATTACH_KINDS: &[&str] = &["hello", "snapshot", "delta", "exit"];
@@ -177,6 +211,11 @@ pub enum EventFrame {
     Lagged {
         missed: u64,
     },
+    /// An opt-in Lead feed notice (`json` is a small opaque object).
+    Notice {
+        kind: NoticeKind,
+        json: String,
+    },
 }
 
 /// Per-connection narrowing options for the control event feed.
@@ -272,7 +311,7 @@ impl FeedFilter {
         if kinds.is_empty() {
             return Err(FeedFilterError::EmptyKind);
         }
-        if kinds.len() > OBSERVER_KINDS.len() {
+        if kinds.len() > OBSERVER_KINDS.len() + NOTICE_KINDS.len() {
             return Err(FeedFilterError::TooManyKinds);
         }
         let mut validated = Vec::with_capacity(kinds.len());
@@ -280,7 +319,7 @@ impl FeedFilter {
             if kind.is_empty() {
                 return Err(FeedFilterError::EmptyKind);
             }
-            if !OBSERVER_KINDS.contains(&kind.as_str()) {
+            if !OBSERVER_KINDS.contains(&kind.as_str()) && !NOTICE_KINDS.contains(&kind.as_str()) {
                 return Err(FeedFilterError::UnknownKind(kind));
             }
             if !validated.iter().any(|seen| seen == &kind) {
@@ -293,13 +332,13 @@ impl FeedFilter {
     fn parse_kinds(kinds: &str) -> Result<Option<Vec<String>>, FeedFilterError> {
         let mut parsed = Vec::new();
         for (index, kind) in kinds.split(',').map(str::trim).enumerate() {
-            if index >= OBSERVER_KINDS.len() {
+            if index >= OBSERVER_KINDS.len() + NOTICE_KINDS.len() {
                 return Err(FeedFilterError::TooManyKinds);
             }
             if kind.is_empty() {
                 return Err(FeedFilterError::EmptyKind);
             }
-            if !OBSERVER_KINDS.contains(&kind) {
+            if !OBSERVER_KINDS.contains(&kind) && !NOTICE_KINDS.contains(&kind) {
                 return Err(FeedFilterError::UnknownKind(kind.to_string()));
             }
             if !parsed.iter().any(|seen| seen == kind) {
@@ -313,10 +352,20 @@ impl FeedFilter {
     pub fn matches(&self, frame: &EventFrame) -> bool {
         // Defend the generic observer boundary even if an attach-only frame is
         // accidentally published on the shared broadcast channel.
-        if !OBSERVER_KINDS.contains(&frame.kind()) {
+        if let EventFrame::Notice { kind, .. } = frame {
+            // Opt-in: only an explicit kinds list naming this notice admits it.
+            let named = self
+                .kinds
+                .as_ref()
+                .is_some_and(|kinds| kinds.iter().any(|k| k == kind.as_str()));
+            if !named {
+                return false;
+            }
+        } else if !OBSERVER_KINDS.contains(&frame.kind()) {
             return false;
         }
         if let Some(kinds) = &self.kinds
+            && !matches!(frame, EventFrame::Notice { .. })
             && !kinds.iter().any(|kind| kind == frame.kind())
         {
             return false;
@@ -443,6 +492,7 @@ impl EventFrame {
             Self::Sessions => "sessions",
             Self::SessionExit { .. } => "exit",
             Self::Lagged { .. } => "lagged",
+            Self::Notice { kind, .. } => kind.as_str(),
         }
     }
 
@@ -537,6 +587,16 @@ impl EventFrame {
                 T_LAGGED,
                 serde_json::to_vec(&LaggedBody { missed: *missed }).expect("lagged json"),
             ),
+            EventFrame::Notice { kind, json } => {
+                let mut payload = Vec::with_capacity(1 + json.len());
+                payload.push(match kind {
+                    NoticeKind::Notification => 0,
+                    NoticeKind::Dispatch => 1,
+                    NoticeKind::AutomationRun => 2,
+                });
+                payload.extend_from_slice(json.as_bytes());
+                (T_NOTICE, payload)
+            }
         };
         let mut out = Vec::with_capacity(5 + payload.len());
         out.push(tag);
@@ -659,6 +719,22 @@ impl EventDecoder {
                     .map_err(|_| WireError::BadPayload(T_LAGGED))?;
                 EventFrame::Lagged { missed: b.missed }
             }
+            T_NOTICE => {
+                let (head, rest) = payload
+                    .split_first()
+                    .ok_or(WireError::BadPayload(T_NOTICE))?;
+                let kind = match head {
+                    0 => NoticeKind::Notification,
+                    1 => NoticeKind::Dispatch,
+                    2 => NoticeKind::AutomationRun,
+                    _ => return Err(WireError::BadPayload(T_NOTICE)),
+                };
+                EventFrame::Notice {
+                    kind,
+                    json: String::from_utf8(rest.to_vec())
+                        .map_err(|_| WireError::BadPayload(T_NOTICE))?,
+                }
+            }
             other => return Err(WireError::UnknownTag(other)),
         };
         Ok(Some(frame))
@@ -718,9 +794,27 @@ impl EventDecoder {
     }
 }
 
+/// `mcp_proxy.profile_env` (Read; HTTP + CLI; b155 THE-2222): which
+/// `[mcp_proxy.profiles]` entry's resolved server env to return.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileEnvRequest {
+    pub profile: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_env_body_is_strict() {
+        let ok: ProfileEnvRequest = serde_json::from_str(r#"{"profile":"lead"}"#).unwrap();
+        assert_eq!(ok.profile, "lead");
+        assert!(serde_json::from_str::<ProfileEnvRequest>("{}").is_err());
+        assert!(
+            serde_json::from_str::<ProfileEnvRequest>(r#"{"profile":"lead","env":{}}"#).is_err()
+        );
+    }
 
     fn roundtrip(f: EventFrame) {
         let bytes = f.encode();
@@ -1092,6 +1186,38 @@ mod tests {
     }
 
     #[test]
+    fn notice_kind_round_trips_and_frames_encode() {
+        for k in [
+            NoticeKind::Notification,
+            NoticeKind::Dispatch,
+            NoticeKind::AutomationRun,
+        ] {
+            assert_eq!(NoticeKind::parse(k.as_str()), Some(k));
+            assert!(NOTICE_KINDS.contains(&k.as_str()));
+            roundtrip(EventFrame::Notice {
+                kind: k,
+                json: "{\"id\":7}".into(),
+            });
+        }
+        assert_eq!(NoticeKind::parse("activity"), None);
+    }
+
+    #[test]
+    fn notice_is_opt_in_under_feed_filter() {
+        let frame = EventFrame::Notice {
+            kind: NoticeKind::Notification,
+            json: "{}".into(),
+        };
+        assert!(!FeedFilter::default().matches(&frame));
+        let legacy = FeedFilter::parse(Some("activity"), None, false).unwrap();
+        assert!(!legacy.matches(&frame));
+        let named = FeedFilter::parse(Some("notification"), None, false).unwrap();
+        assert!(named.matches(&frame));
+        let other = FeedFilter::parse(Some("dispatch"), None, false).unwrap();
+        assert!(!other.matches(&frame));
+    }
+
+    #[test]
     fn feed_filter_defaults_to_every_observer_frame_only() {
         let filter = FeedFilter::default();
         assert!(filter.matches(&EventFrame::Sessions));
@@ -1160,7 +1286,9 @@ mod tests {
         );
         assert_eq!(
             FeedFilter::parse(
-                Some("activity,activity,activity,activity,activity,activity,activity,activity",),
+                Some(
+                    "activity,activity,activity,activity,activity,activity,activity,activity,activity",
+                ),
                 None,
                 false
             ),
@@ -1204,7 +1332,7 @@ mod tests {
                 FeedFilterError::UnknownKind("snapshot".into()),
             ),
             (
-                vec!["activity".into(); OBSERVER_KINDS.len() + 1],
+                vec!["activity".into(); OBSERVER_KINDS.len() + NOTICE_KINDS.len() + 1],
                 FeedFilterError::TooManyKinds,
             ),
         ] {

@@ -21,6 +21,14 @@ config_enum! {
 }
 
 config_enum! {
+    /// Vercel only. What model credential reaches the sandbox; `none` sends
+    /// nothing. See docs/help/vercel-sandbox.md.
+    pub enum ModelCredentials: "model credentials" {
+        None = "none", Upload = "upload", Proxy = "proxy", Inject = "inject",
+    } default = None;
+}
+
+config_enum! {
     /// Which Nix installer the provisioner runs in a fresh sandbox:
     /// - `official` — the upstream `nixos.org/nix/install --no-daemon`
     ///   (single-user; the safe default + fallback).
@@ -260,6 +268,21 @@ pub struct EnvProviderConfig {
     /// `[lifecycle] hibernate_after_secs`.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub hibernate_idle_secs: u64,
+    /// Vercel only: the team id (`team_…`). Not secrets.
+    pub team_id: String,
+    /// Vercel only: the project id (`prj_…`). Not secrets.
+    pub project_id: String,
+    /// Vercel only: which model credential reaches the sandbox (`none`, the
+    /// default, sends nothing; `upload` copies the claude/codex login into the
+    /// sandbox's tmpfs; `proxy`/`inject` are refused). Only the user's own
+    /// config table may set it.
+    #[serde(default)]
+    pub model_credentials: ModelCredentials,
+    /// Vercel only: host suffixes the interactive WebSocket ticket URL may
+    /// point at. Empty ⇒ the built-in `vercel.run`, `vercel.sh`, `vercel.com`.
+    /// `vercel.app` (and anything under it) is never accepted.
+    #[serde(default)]
+    pub interactive_host_suffixes: Vec<String>,
 }
 
 impl EnvProviderConfig {
@@ -299,6 +322,10 @@ impl EnvProviderConfig {
             && self.max_lifetime_secs == 0
             && self.hibernate == HibernateMode::Auto
             && self.hibernate_idle_secs == 0
+            && self.team_id.is_empty()
+            && self.project_id.is_empty()
+            && self.model_credentials == ModelCredentials::None
+            && self.interactive_host_suffixes.is_empty()
     }
 
     /// Whether this env's provider is scale-to-zero (an idle sandbox self-suspends
@@ -314,6 +341,11 @@ impl EnvProviderConfig {
     /// on for commodity VPS (bills while it exists) and off for scale-to-zero
     /// providers (idle compute already ~free).
     pub fn hibernate_enabled(&self) -> bool {
+        // Vercel: no hibernation in b154. Its snapshot semantics differ, and the
+        // hibernator's background exec would resume a stopped sandbox.
+        if EnvProviderKind::of(&self.provider) == EnvProviderKind::Vercel {
+            return false;
+        }
         match self.hibernate {
             HibernateMode::On => true,
             HibernateMode::Off => false,
@@ -385,6 +417,14 @@ impl EnvProviderConfig {
             let exe = crate::util::self_exe_str();
             return vec![exe, "machine0-ssh".into(), "{id}".into(), "--".into()];
         }
+        if kind == EnvProviderKind::Vercel {
+            // Vercel has no vendor CLI and no ssh: panes AND chrome reads run
+            // through the `vercel-exec` self-bridge over the sandbox command
+            // API. Not WSS-native (`exec_api` is false), so a configured
+            // `exec_command` above still wins, like every non-WSS kind.
+            let exe = crate::util::self_exe_str();
+            return vec![exe, "vercel-exec".into(), "{id}".into(), "--".into()];
+        }
         if wss_native_provider_kind(&self.provider) {
             // WSS-native providers (sprites) have no vendor CLI. The
             // control-plane READ path (chrome git/gh/fs reads + the persisted
@@ -420,6 +460,7 @@ config_enum! {
         DigitalOcean = "digitalocean",
         Fly = "fly",
         Machine0 = "machine0",
+        Vercel = "vercel",
     } default = Custom;
 }
 
@@ -454,30 +495,119 @@ impl EnvProviderKind {
     /// (compute billed only while awake; the filesystem persists). `sprites`
     /// (~30s idle timeout, zero idle compute), `fly` (a stopped machine bills
     /// only for its rootfs), `machine0` (an idle VM `vm_suspend`s to a state
-    /// billed only for storage). Everything else is `false` on purpose: a
+    /// billed only for storage), `vercel` (a persistent sandbox stops at its
+    /// session timeout and keeps its filesystem as a snapshot; a stopped
+    /// session bills no compute). Everything else is `false` on purpose: a
     /// wrong `false` keeps the safe age-out, a wrong `true` parks billed
     /// instances forever.
     pub fn scale_to_zero(self) -> bool {
-        matches!(self, Self::Sprites | Self::Fly | Self::Machine0)
+        matches!(
+            self,
+            Self::Sprites | Self::Fly | Self::Machine0 | Self::Vercel
+        )
     }
 
     /// Self-suspends on idle without thegn's help (the warm-pool policy's
     /// "don't also age it out" case).
     pub fn self_suspends(self) -> bool {
-        matches!(self, Self::Sprites)
+        matches!(self, Self::Sprites | Self::Vercel)
     }
 
     /// Whether a reaper enforces `max_lifetime_secs` for this kind
-    /// (`fly_reaper` / `vps_reaper`).
+    /// (`fly_reaper` / `vps_reaper` / `vercel_reaper`).
     pub fn lifetime_reaped(self) -> bool {
-        matches!(self, Self::Fly) || self.is_vps()
+        matches!(self, Self::Fly | Self::Vercel) || self.is_vps()
     }
 
     /// Whether this provider's lifecycle (provision, teardown, orphan reaping,
     /// and warm pool) has not been verified against a live account. `thegn doctor`
-    /// displays this state by owner decision THE-142.
+    /// displays this state by owner decision THE-142, and for Daytona because
+    /// its upstream is in maintenance (closed-core, archived public repo).
     pub fn live_unverified(self) -> bool {
-        matches!(self, Self::Hetzner)
+        matches!(self, Self::Hetzner | Self::Daytona | Self::Vercel)
+    }
+
+    /// Credential-free kind: no host credential (agent logins, dotfiles,
+    /// atuin, git token) is ever uploaded to a sandbox of this kind. The repo
+    /// goes in as a host-built bundle and the credential-bearing provisioning
+    /// steps are stripped and refused (`provider_credentials`, enforced by
+    /// lane 5 of b154).
+    pub fn credential_free(self) -> bool {
+        matches!(self, Self::Vercel)
+    }
+
+    /// Whether the automatic session-exit pull-back (THE-2021) may call this
+    /// provider. Off for Vercel: the pull would resume a sandbox that stopped
+    /// at its timeout and bill compute with nobody at the keyboard, so Vercel
+    /// pulls are left to an explicit `thegn env pull`.
+    pub fn exit_pull_back_enabled(self) -> bool {
+        !matches!(self, Self::Vercel)
+    }
+
+    /// Whether `[lifecycle] eager = "workspace"|"all"` may create this kind's
+    /// sandbox in the background for a worktree the user has not focused. Off
+    /// for Vercel: a paid sandbox is created only from an explicit open or
+    /// provision.
+    pub fn eager_create_enabled(self) -> bool {
+        !matches!(self, Self::Vercel)
+    }
+
+    /// Lowers `network_allow` / `network_block` to a provider policy API and
+    /// reads the applied policy back before handoff. This is the static
+    /// capability of the kind; a per-worktree report replaces it later.
+    ///
+    /// | kind         | egress_api |
+    /// |--------------|------------|
+    /// | custom       | no         |
+    /// | daytona      | no         |
+    /// | sprites      | yes (`rules_from` + `egress_admit`) |
+    /// | hetzner      | no         |
+    /// | digitalocean | no         |
+    /// | fly          | no         |
+    /// | machine0     | no         |
+    /// | vercel       | yes (allow-list policy; block-only refused) |
+    pub fn egress_api(self) -> bool {
+        matches!(self, Self::Sprites | Self::Vercel)
+    }
+
+    /// Native checkpoint/restore.
+    ///
+    /// | kind         | checkpoints |
+    /// |--------------|-------------|
+    /// | custom       | no          |
+    /// | daytona      | no          |
+    /// | sprites      | yes (Sprites checkpoints) |
+    /// | hetzner      | no (a powered-off VPS still bills; recycle destroys) |
+    /// | digitalocean | no          |
+    /// | fly          | no          |
+    /// | machine0     | yes (machine0 images) |
+    /// | vercel       | no          |
+    pub fn checkpoints(self) -> bool {
+        matches!(self, Self::Sprites | Self::Machine0)
+    }
+
+    /// A files transport exists.
+    ///
+    /// | kind         | files |
+    /// |--------------|-------|
+    /// | custom       | no    |
+    /// | daytona      | no    |
+    /// | sprites      | yes (Sprites API) |
+    /// | hetzner      | yes (ssh shim) |
+    /// | digitalocean | yes (ssh shim) |
+    /// | fly          | yes (ssh to the machine's dedicated IPv4) |
+    /// | machine0     | yes (ssh) |
+    /// | vercel       | yes (fs/read + gzipped-tar fs/write) |
+    pub fn files(self) -> bool {
+        matches!(
+            self,
+            Self::Sprites
+                | Self::Hetzner
+                | Self::DigitalOcean
+                | Self::Fly
+                | Self::Machine0
+                | Self::Vercel
+        )
     }
 }
 
@@ -817,6 +947,45 @@ impl Default for PoolConfig {
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_credentials_round_trips_and_defaults_to_none() {
+        use crate::seam::Kind;
+        assert_eq!(ModelCredentials::default(), ModelCredentials::None);
+        for mode in ModelCredentials::ALL {
+            assert_eq!(
+                ModelCredentials::from_str_validated(mode.as_str()),
+                Ok(*mode)
+            );
+            let pc: EnvProviderConfig =
+                toml::from_str(&format!("model_credentials = {:?}\n", mode.as_str())).unwrap();
+            assert_eq!(pc.model_credentials, *mode);
+            let back = toml::to_string(&pc).unwrap();
+            assert!(
+                back.contains(&format!("model_credentials = \"{}\"", mode.as_str())),
+                "{back}"
+            );
+        }
+        assert!(ModelCredentials::from_str_validated("key").is_err());
+        let pc: EnvProviderConfig = toml::from_str("").unwrap();
+        assert_eq!(pc.model_credentials, ModelCredentials::None);
+        assert!(pc.interactive_host_suffixes.is_empty());
+        assert!(pc.is_default());
+    }
+
+    #[test]
+    fn new_vercel_keys_make_the_provider_table_non_default() {
+        let creds = EnvProviderConfig {
+            model_credentials: ModelCredentials::Upload,
+            ..Default::default()
+        };
+        assert!(!creds.is_default());
+        let hosts = EnvProviderConfig {
+            interactive_host_suffixes: vec!["vercel.run".into()],
+            ..Default::default()
+        };
+        assert!(!hosts.is_default());
+    }
+
     fn provider_env(name: &str) -> EnvProviderConfig {
         EnvProviderConfig {
             provider: name.into(),
@@ -1047,9 +1216,13 @@ mod tests {
             EnvProviderKind::DigitalOcean,
             EnvProviderKind::Fly,
             EnvProviderKind::Machine0,
+            EnvProviderKind::Vercel,
         ] {
             match kind {
-                EnvProviderKind::Fly | EnvProviderKind::Hetzner | EnvProviderKind::DigitalOcean => {
+                EnvProviderKind::Fly
+                | EnvProviderKind::Hetzner
+                | EnvProviderKind::DigitalOcean
+                | EnvProviderKind::Vercel => {
                     assert!(kind.lifetime_reaped(), "{kind:?} is reaped");
                 }
                 EnvProviderKind::Custom
@@ -1063,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn live_unverified_marks_only_hetzner() {
+    fn live_unverified_marks_hetzner_daytona_and_vercel() {
         for kind in [
             EnvProviderKind::Custom,
             EnvProviderKind::Daytona,
@@ -1072,13 +1245,13 @@ mod tests {
             EnvProviderKind::DigitalOcean,
             EnvProviderKind::Fly,
             EnvProviderKind::Machine0,
+            EnvProviderKind::Vercel,
         ] {
             match kind {
-                EnvProviderKind::Hetzner => {
+                EnvProviderKind::Hetzner | EnvProviderKind::Daytona | EnvProviderKind::Vercel => {
                     assert!(kind.live_unverified(), "{kind:?} is live-unverified");
                 }
                 EnvProviderKind::Custom
-                | EnvProviderKind::Daytona
                 | EnvProviderKind::Sprites
                 | EnvProviderKind::DigitalOcean
                 | EnvProviderKind::Fly
@@ -1086,6 +1259,116 @@ mod tests {
                     assert!(!kind.live_unverified(), "{kind:?} is not live-unverified");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn vercel_kind_predicates() {
+        let k = EnvProviderKind::of("vercel");
+        assert_eq!(k, EnvProviderKind::Vercel);
+        assert_eq!(EnvProviderKind::of(" vercel "), EnvProviderKind::Vercel);
+        assert_eq!(k.as_str(), "vercel");
+        assert!(!k.exec_api(), "no resident bridge / native pane path");
+        assert!(!k.ssh_reached(), "no ssh");
+        assert!(k.scale_to_zero());
+        assert!(k.self_suspends());
+        assert!(k.lifetime_reaped());
+        assert!(k.live_unverified());
+        assert!(!k.is_vps());
+        assert!(k.credential_free());
+        // Credential-free is Vercel only.
+        for other in [
+            EnvProviderKind::Custom,
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Sprites,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+        ] {
+            assert!(!other.credential_free(), "{other:?}");
+            assert!(other.exit_pull_back_enabled(), "{other:?}");
+            assert!(other.eager_create_enabled(), "{other:?}");
+        }
+        // Only an explicit `thegn env pull` may resume a stopped Vercel sandbox.
+        assert!(!k.exit_pull_back_enabled());
+        // Background eager scopes never create a paid Vercel sandbox.
+        assert!(!k.eager_create_enabled());
+        // Scale-to-zero ⇒ hibernate stays off under auto.
+        assert!(!provider_env("vercel").hibernate_enabled());
+        assert!(!wss_native_provider_kind("vercel"));
+        assert!(!ssh_reached_provider_kind("vercel"));
+        let mut on = provider_env("vercel");
+        on.hibernate = HibernateMode::On;
+        assert!(
+            !on.hibernate_enabled(),
+            "explicit on never hibernates vercel"
+        );
+    }
+
+    #[test]
+    fn vercel_control_template_is_the_vercel_exec_bridge() {
+        let tpl = provider_env("vercel").control_command_template();
+        assert_eq!(tpl.len(), 4, "{tpl:?}");
+        assert_eq!(tpl[0], crate::util::self_exe_str());
+        assert_eq!(&tpl[1..], ["vercel-exec", "{id}", "--"], "{tpl:?}");
+    }
+
+    #[test]
+    fn vercel_configured_exec_command_wins() {
+        // Not WSS-native: a configured exec_command wins under every exec mode,
+        // matching the other non-WSS kinds.
+        for mode in [
+            ProviderExecMode::Auto,
+            ProviderExecMode::Api,
+            ProviderExecMode::Cli,
+        ] {
+            let tpl = with_exec_command("vercel", mode).control_command_template();
+            assert_eq!(tpl, vendor_argv(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn vercel_ids_participate_in_is_default() {
+        let e = EnvProviderConfig {
+            team_id: "team_abc".into(),
+            ..Default::default()
+        };
+        assert!(!e.is_default());
+        let e = EnvProviderConfig {
+            project_id: "prj_abc".into(),
+            ..Default::default()
+        };
+        assert!(!e.is_default());
+    }
+
+    #[test]
+    fn env_provider_kind_capability_table() {
+        use crate::seam::Kind as _;
+        // (kind, egress_api, checkpoints, files): today's provider caps, pinned.
+        let table = [
+            (EnvProviderKind::Custom, false, false, false),
+            (EnvProviderKind::Daytona, false, false, false),
+            (EnvProviderKind::Sprites, true, true, true),
+            (EnvProviderKind::Hetzner, false, false, true),
+            (EnvProviderKind::DigitalOcean, false, false, true),
+            (EnvProviderKind::Fly, false, false, true),
+            (EnvProviderKind::Machine0, false, true, true),
+            (EnvProviderKind::Vercel, true, false, true),
+        ];
+        assert_eq!(
+            table.len(),
+            EnvProviderKind::ALL.len(),
+            "every kind is in the table"
+        );
+        for kind in EnvProviderKind::ALL.iter().copied() {
+            let row = table
+                .iter()
+                .find(|row| row.0 == kind)
+                .unwrap_or_else(|| panic!("{kind:?} missing from the table"));
+            assert_eq!(kind.egress_api(), row.1, "{kind:?} egress_api");
+            assert_eq!(kind.checkpoints(), row.2, "{kind:?} checkpoints");
+            assert_eq!(kind.files(), row.3, "{kind:?} files");
         }
     }
 }

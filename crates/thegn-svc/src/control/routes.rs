@@ -8,7 +8,7 @@
 use axum::routing::{MethodRouter, delete, get, post};
 
 use super::http::ControlState;
-use super::{http, http_ci};
+use super::{http, http_ci, http_lead};
 
 /// One path. `caps` lists every capability the method router serves (a
 /// `GET`+`POST` path serves two); unauthenticated routes (`/health`, `GET
@@ -146,6 +146,59 @@ pub static ROUTES: &[Route] = &[
         post(http::automations_test)
     }),
     route("/v1/tools/run", &["tools.run"], || post(http::tools_run)),
+    // Lead tool surface (THE-2172): every route is POST with a JSON body.
+    route("/v1/overview", &["overview.get"], || {
+        post(http_lead::overview_get)
+    }),
+    route("/v1/notifications/list", &["notifications.list"], || {
+        post(http_lead::notifications_list)
+    }),
+    route("/v1/notifications/ack", &["notifications.ack"], || {
+        post(http_lead::notifications_ack)
+    }),
+    route("/v1/automations/put", &["automations.put"], || {
+        post(http_lead::automations_put)
+    }),
+    route("/v1/automations/rm", &["automations.rm"], || {
+        post(http_lead::automations_rm)
+    }),
+    route("/v1/automations/enable", &["automations.enable"], || {
+        post(http_lead::automations_enable)
+    }),
+    route("/v1/automations/runs", &["automations.runs"], || {
+        post(http_lead::automations_runs)
+    }),
+    route("/v1/approvals/list", &["approvals.list"], || {
+        post(http_lead::approvals_list)
+    }),
+    route("/v1/approvals/request", &["approvals.request"], || {
+        post(http_lead::approvals_request)
+    }),
+    route("/v1/approvals/resolve", &["approvals.resolve"], || {
+        post(http_lead::approvals_resolve)
+    }),
+    route("/v1/merge/drain", &["merge.drain"], || {
+        post(http_lead::merge_drain)
+    }),
+    // THE-2197 automation kill switch.
+    route("/v1/automations/pause", &["automations.pause"], || {
+        post(http_lead::automations_pause)
+    }),
+    route("/v1/automations/resume", &["automations.resume"], || {
+        post(http_lead::automations_resume)
+    }),
+    // b155 Lead spine.
+    route("/v1/approvals/redeem", &["approvals.redeem"], || {
+        post(http_lead::approvals_redeem)
+    }),
+    route("/v1/automations/halt", &["automations.halt"], || {
+        post(http_lead::automations_halt)
+    }),
+    route(
+        "/v1/mcp_proxy/profile_env",
+        &["mcp_proxy.profile_env"],
+        || post(http_lead::mcp_proxy_profile_env),
+    ),
     route("/v1/mcp_proxy/status", &["mcp_proxy.status"], || {
         get(http::mcp_proxy_status)
     }),
@@ -246,6 +299,23 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("automations.list", "GET", "/v1/automations"),
     ("automations.test", "POST", "/v1/automations/test"),
     ("tools.run", "POST", "/v1/tools/run"),
+    // Lead tool surface (THE-2172).
+    ("overview.get", "POST", "/v1/overview"),
+    ("notifications.list", "POST", "/v1/notifications/list"),
+    ("notifications.ack", "POST", "/v1/notifications/ack"),
+    ("automations.put", "POST", "/v1/automations/put"),
+    ("automations.rm", "POST", "/v1/automations/rm"),
+    ("automations.enable", "POST", "/v1/automations/enable"),
+    ("automations.runs", "POST", "/v1/automations/runs"),
+    ("approvals.list", "POST", "/v1/approvals/list"),
+    ("approvals.request", "POST", "/v1/approvals/request"),
+    ("approvals.resolve", "POST", "/v1/approvals/resolve"),
+    ("merge.drain", "POST", "/v1/merge/drain"),
+    ("automations.pause", "POST", "/v1/automations/pause"),
+    ("automations.resume", "POST", "/v1/automations/resume"),
+    ("approvals.redeem", "POST", "/v1/approvals/redeem"),
+    ("automations.halt", "POST", "/v1/automations/halt"),
+    ("mcp_proxy.profile_env", "POST", "/v1/mcp_proxy/profile_env"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
     ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),
     ("plugins.status", "GET", "/v1/plugins/status"),

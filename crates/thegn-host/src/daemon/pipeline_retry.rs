@@ -158,6 +158,8 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
             if let Err(e) = stamp_dispatch_exit(&svc, stamp_session.clone(), code).await {
                 tracing::warn!(target: "thegn::daemon", session = %stamp_session, "dispatch exit stamp: {e:#}");
             }
+            // b155: the row is stamped; the stage executor re-plans its lane.
+            super::stage_executor::kick_session(&stamp_session);
         });
         return;
     };
@@ -186,6 +188,7 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
                         "dispatch exit stamp: {e:#}"
                     );
                 }
+                super::stage_executor::kick_session(&stamp_session);
             });
             return;
         }
@@ -206,6 +209,8 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
                 "transport retry: {e:#}"
             );
         }
+        // b155: stamped (and retried or parked); the executor re-plans.
+        super::stage_executor::kick_session(&session);
         obs.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -526,6 +531,25 @@ pub(crate) async fn handle_exit(
                 None => None,
             };
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            // An automation lane is never relaunched while automations are
+            // paused (b155 6f): a lane the kill switch stopped must stay
+            // stopped. The row stays parked `waiting_human` with its retry
+            // note. A read error refuses the relaunch too.
+            let row_id = row.id;
+            let (paused, automation_rule) = svc
+                .with_db(move |db| {
+                    let rule = db.dispatch_automation(row_id)?.1;
+                    Ok((thegn_core::automation_control::paused_fail_closed(db), rule))
+                })
+                .await?;
+            if relaunch_held_by_pause(paused, automation_rule.as_deref()) {
+                tracing::info!(
+                    target: "thegn::daemon",
+                    row = row.id,
+                    "transport retry: automations are paused; the automation lane stays parked"
+                );
+                return Ok(());
+            }
             // Reserve the row before opening the replacement, fenced on the
             // exact run that was parked: a re-drive during the backoff replaced
             // the session and bumped `run_gen`, so this matches nothing and the
@@ -553,7 +577,7 @@ pub(crate) async fn handle_exit(
                 );
                 return Ok(());
             }
-            match relaunch(svc, &row, native.as_deref()).await {
+            match relaunch(svc, &row, native.as_deref(), automation_rule.as_deref()).await {
                 Ok(info) => {
                     let artifact = row.artifact_path.clone().unwrap_or_default();
                     let id = row.id;
@@ -731,6 +755,7 @@ async fn relaunch(
     svc: &DaemonService,
     row: &AgentDispatch,
     native: Option<&str>,
+    automation_rule: Option<&str>,
 ) -> anyhow::Result<SessionInfo> {
     let boot = (*svc.config).clone();
     let cfg = tokio::task::spawn_blocking(move || {
@@ -741,7 +766,7 @@ async fn relaunch(
     .map_err(|error| anyhow::anyhow!("configuration refused: {error}"))?;
     crate::daemon::agent_open::harness_for_agent(&cfg, &row.agent_name)
         .with_context(|| format!("unknown agent `{}` — cannot relaunch", row.agent_name))?;
-    let spec = match exact_resume_id(&cfg, &row.agent_name, native) {
+    let mut spec = match exact_resume_id(&cfg, &row.agent_name, native) {
         Some(id) => retry_spec_for(&cfg, row, pipeline_exit::RETRY_NUDGE.to_string(), Some(id))?,
         None => {
             let prompt = format!(
@@ -751,9 +776,36 @@ async fn relaunch(
             retry_spec_for(&cfg, row, prompt, None)?
         }
     };
+    spec.automation_origin = roster_origin(row.id, automation_rule, "retry");
     svc.open(spec)
         .await
         .map_err(|e| anyhow::anyhow!("open: {e}"))
+}
+
+/// Whether the kill switch holds a transport retry: only an automation lane
+/// (its row carries an `automation_rule`) and only while paused.
+fn relaunch_held_by_pause(paused: bool, automation_rule: Option<&str>) -> bool {
+    paused && automation_rule.is_some()
+}
+
+/// The automation origin a session opened for roster row `row_id` carries
+/// when no live origin is at hand (a transport-retry relaunch, a stage
+/// advance after the parent exited): the row's rule, so the next
+/// `automations.halt` finds the session through the in-memory origin map as
+/// well as through the roster, and a `lead:` rule's session is confined like
+/// its first launch. `tag` names the path (`retry`, `advance`). Manual rows
+/// carry none.
+pub(crate) fn roster_origin(
+    row_id: i64,
+    automation_rule: Option<&str>,
+    tag: &str,
+) -> Option<thegn_svc::control::AutomationOrigin> {
+    let rule_id = automation_rule.filter(|rule| !rule.trim().is_empty())?;
+    Some(thegn_svc::control::AutomationOrigin {
+        root_event_id: format!("dispatch:{row_id}"),
+        rule_id: rule_id.to_string(),
+        run_id: format!("{tag}:{row_id}"),
+    })
 }
 
 /// Output of a resumed claude whose transcript no longer exists.
@@ -1034,6 +1086,23 @@ mod tests {
 
     /// THE-265: with no proven native id the retry is a cold start; it never
     /// selects "latest" native history.
+    #[test]
+    fn a_paused_kill_switch_holds_only_automation_relaunches() {
+        assert!(relaunch_held_by_pause(true, Some("nightly")));
+        assert!(!relaunch_held_by_pause(true, None));
+        assert!(!relaunch_held_by_pause(false, Some("nightly")));
+    }
+
+    #[test]
+    fn a_relaunch_keeps_the_rows_automation_origin() {
+        assert!(roster_origin(7, None, "retry").is_none());
+        assert!(roster_origin(7, Some("  "), "retry").is_none());
+        let origin = roster_origin(7, Some("lead:nightly"), "retry").expect("origin kept");
+        assert_eq!(origin.rule_id, "lead:nightly");
+        assert_eq!(origin.run_id, "retry:7");
+        assert_eq!(origin.root_event_id, "dispatch:7");
+    }
+
     #[test]
     fn retry_without_a_native_id_is_cold_never_continue_latest() {
         let launch = retry_open_spec(&claude_row(), "task".into(), None)

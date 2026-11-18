@@ -327,6 +327,60 @@ fn notifications_overlay_apply_covers_every_field() {
     assert_eq!(base.active_mode, "focus");
 }
 
+// ---- reserved sandbox backends (WS01-P3-01) ----
+
+fn load_capturing(body: &str) -> (Config, Vec<String>) {
+    let (cfg, warnings, _) =
+        crate::config_diagnostics::capture_quiet(|| toml::from_str::<Config>(body));
+    (cfg.expect("valid TOML"), warnings)
+}
+
+#[test]
+fn smol_config_value_warns_reserved_and_resolves_auto() {
+    for spelling in ["smol", "smolmachines"] {
+        let (cfg, warnings) = load_capturing(&format!("[sandbox]\nbackend = \"{spelling}\"\n"));
+        assert_eq!(cfg.sandbox.backend, SandboxBackend::Auto, "{spelling}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("sandbox backend \"smol\" is reserved")),
+            "{spelling}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn appcontainer_config_value_warns_reserved() {
+    for spelling in ["appcontainer", "winappcontainer"] {
+        let (cfg, warnings) = load_capturing(&format!("[sandbox]\nbackend = \"{spelling}\"\n"));
+        assert_eq!(cfg.sandbox.backend, SandboxBackend::Auto, "{spelling}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("sandbox backend \"winappcontainer\" is reserved")),
+            "{spelling}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn strict_validate_rejects_reserved_backend() {
+    for spelling in [
+        "smol",
+        "smolmachines",
+        "appcontainer",
+        "winappcontainer",
+        "wsl",
+    ] {
+        let errors =
+            crate::config_validate::validate_str(&format!("[sandbox]\nbackend = \"{spelling}\"\n"));
+        assert!(
+            errors.iter().any(|error| error.contains("reserved")),
+            "{spelling}: {errors:?}"
+        );
+    }
+}
+
 // ---- config_enum! Default + Display + from_str_validated round-trips ----
 
 #[test]
@@ -2020,13 +2074,41 @@ fn vpn_mode_and_dns_aliases() {
         VpnMode::InContainer
     );
     assert_eq!(
-        VpnDnsMode::from_str_validated("filter_front").unwrap(),
-        VpnDnsMode::FilterFront
+        VpnDnsMode::from_str_validated("filter_only").unwrap(),
+        VpnDnsMode::FilterOnly
     );
     assert_eq!(
         VpnOnError::from_str_validated("offline").unwrap(),
         VpnOnError::Offline
     );
+}
+
+#[test]
+fn filter_front_is_reserved_and_strict_rejects() {
+    assert!(VpnDnsMode::FilterFront.is_reserved());
+    assert!(!VpnDnsMode::Tunnel.is_reserved());
+    assert!(!VpnDnsMode::FilterOnly.is_reserved());
+    for spelling in ["filter-front", "filter_front"] {
+        let error = VpnDnsMode::from_str_validated(spelling).unwrap_err();
+        assert!(error.contains("reserved"), "{spelling}: {error}");
+        let errors =
+            crate::config_validate::validate_str(&format!("[sandbox.vpn]\ndns = \"{spelling}\"\n"));
+        assert!(
+            errors.iter().any(|error| error.contains("reserved")),
+            "{spelling}: {errors:?}"
+        );
+    }
+    let errors = crate::config_validate::validate_str("[sandbox.vpn]\ndns = \"filter-only\"\n");
+    assert!(
+        !errors.iter().any(|error| error.contains("reserved")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn filter_front_lenient_load_behaves_as_tunnel() {
+    let cfg: Config = toml::from_str("[sandbox.vpn]\ndns = \"filter-front\"\n").unwrap();
+    assert_eq!(cfg.sandbox.vpn.dns, VpnDnsMode::Tunnel);
 }
 
 #[test]
@@ -2036,7 +2118,7 @@ fn vpn_config_parses_from_toml_subtables() {
 [sandbox.vpn]
 provider = "headscale"
 mode = "proxy"
-dns = "filter-front"
+dns = "filter-only"
 ready_timeout_secs = 12
 ephemeral = false
 
@@ -2056,7 +2138,7 @@ config_path = "/etc/wireguard/wg0.conf"
     let v = &cfg.sandbox.vpn;
     assert_eq!(v.provider, VpnProviderKind::Headscale);
     assert_eq!(v.mode, VpnMode::Proxy);
-    assert_eq!(v.dns, VpnDnsMode::FilterFront);
+    assert_eq!(v.dns, VpnDnsMode::FilterOnly);
     assert_eq!(v.ready_timeout_secs, 12);
     assert!(!v.ephemeral);
     assert_eq!(v.tailscale.login_server, "https://headscale.example.com");

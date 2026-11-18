@@ -499,6 +499,45 @@ pub enum Verb {
     ModelProxyStart,
     /// Stop (terminate) the model proxy daemon.
     ModelProxyStop,
+    // --- Lead tool surface (THE-2172) ---
+    /// One-call cross-workspace overview for the Lead (read).
+    OverviewGet,
+    /// List notification rows with filters (read).
+    NotificationsList,
+    /// Acknowledge (mark read) notifications (write).
+    NotificationsAck,
+    /// Create or replace a Lead-authored automation rule (write).
+    AutomationsPut,
+    /// Remove a Lead-authored automation rule (write; config rules refuse).
+    AutomationsRm,
+    /// Enable or disable a Lead-authored automation rule (write).
+    AutomationsEnable,
+    /// Read an automation rule's recent run history (an audit read).
+    AutomationsRuns,
+    /// List approval history and pending approval requests (read).
+    ApprovalsList,
+    /// Ask a human to approve a pipeline stage (write; never grants).
+    ApprovalsRequest,
+    /// Grant or deny a pending approval — admin only, since no supervisor path
+    /// may grant its own approval (`pipeline_approval.rs`).
+    ApprovalsResolve,
+    /// Start the merge-queue drain for a worktree's repo (merge_add).
+    MergeDrain,
+    // --- automation kill switch (THE-2197) ---
+    /// Pause every automation rule (write; a Lead may stop automations).
+    AutomationsPause,
+    /// Resume paused automations — admin only, so a Lead that paused can never
+    /// restart them; only the operator resumes.
+    AutomationsResume,
+    // --- b155 Lead spine (THE-2200/2202/2222) ---
+    /// Answer an approval from the owner's phone with a single-use push nonce
+    /// (write; HTTP + CLI only; refused for a Lead-confined caller).
+    ApprovalsRedeem,
+    /// Kill every automation-started and Lead-opened session (admin).
+    AutomationsHalt,
+    /// Resolve an MCP proxy profile's server env for the Lead (read; the
+    /// daemon checks the caller's label and the profile).
+    McpProxyProfileEnv,
 }
 
 impl Verb {
@@ -597,6 +636,22 @@ impl Verb {
         Verb::AutopilotStatus,
         Verb::ModelProxyStart,
         Verb::ModelProxyStop,
+        Verb::OverviewGet,
+        Verb::NotificationsList,
+        Verb::NotificationsAck,
+        Verb::AutomationsPut,
+        Verb::AutomationsRm,
+        Verb::AutomationsEnable,
+        Verb::AutomationsRuns,
+        Verb::ApprovalsList,
+        Verb::ApprovalsRequest,
+        Verb::ApprovalsResolve,
+        Verb::MergeDrain,
+        Verb::AutomationsPause,
+        Verb::AutomationsResume,
+        Verb::ApprovalsRedeem,
+        Verb::AutomationsHalt,
+        Verb::McpProxyProfileEnv,
     ];
 
     /// Whether this verb produces a *stream* (pane output on attach, the event
@@ -653,6 +708,15 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
         | Verb::AutopilotStatus
+        // Lead tool surface (THE-2172): the overview, notification and approval
+        // listings, and the automation run history (an audit read).
+        | Verb::OverviewGet
+        | Verb::NotificationsList
+        | Verb::AutomationsRuns
+        | Verb::ApprovalsList
+        // b155 (THE-2222): the daemon returns a profile's env only to the
+        // Lead token for its own profile, or to an admin caller.
+        | Verb::McpProxyProfileEnv
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -683,13 +747,25 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ContainersControl
         | Verb::Split
         | Verb::RecordSession
-        | Verb::SkillsSeed => Scope::Write,
+        | Verb::SkillsSeed
+        // Lead tool surface (THE-2172). A request only asks; granting is Admin.
+        | Verb::NotificationsAck
+        | Verb::AutomationsPut
+        | Verb::AutomationsRm
+        | Verb::AutomationsEnable
+        | Verb::ApprovalsRequest
+        // THE-2197: stopping automations is the safe direction of the kill switch.
+        | Verb::AutomationsPause
+        // b155 (6a): a phone answer needs the inbox HMAC secret AND the nonce.
+        | Verb::ApprovalsRedeem => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeClear
         | Verb::WorktreeCreate
         | Verb::FolderAssign => Scope::Git,
-        Verb::MergeAdd => Scope::MergeAdd,
+        // Draining the queue folds already-enqueued branches: the same narrow
+        // grant as enqueueing one.
+        Verb::MergeAdd | Verb::MergeDrain => Scope::MergeAdd,
         // Executing configured commands is a strictly bigger power than focusing
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
         Verb::LaunchPreset | Verb::ToolsRun => Scope::Exec,
@@ -714,7 +790,14 @@ pub fn required_scope(verb: Verb) -> Scope {
         // Starting/stopping a spend-capable daemon is an admin action; the
         // Admin scope keeps it off any tool-calling door.
         | Verb::ModelProxyStart
-        | Verb::ModelProxyStop => Scope::Admin,
+        | Verb::ModelProxyStop
+        // Granting an approval is a human act: no supervisor path may grant
+        // (`pipeline_approval.rs`), so it stays off every agent door.
+        | Verb::ApprovalsResolve
+        // THE-2197: restarting automations is the operator's call alone.
+        | Verb::AutomationsResume
+        // b155 (6f): killing sessions is the operator's kill switch.
+        | Verb::AutomationsHalt => Scope::Admin,
     }
 }
 
@@ -1122,6 +1205,12 @@ mod tests {
             ModelProxyStatus,
             ModelProxyStats,
             AutopilotStatus,
+            // Lead tool surface (THE-2172).
+            OverviewGet,
+            NotificationsList,
+            AutomationsRuns,
+            ApprovalsList,
+            McpProxyProfileEnv,
         ];
         let write = [
             OpenSession,
@@ -1152,6 +1241,15 @@ mod tests {
             SearchReplace,
             ContainersControl,
             SkillsSeed,
+            // Lead tool surface (THE-2172).
+            NotificationsAck,
+            AutomationsPut,
+            AutomationsRm,
+            AutomationsEnable,
+            ApprovalsRequest,
+            // Automation kill switch (THE-2197): stopping is Write.
+            AutomationsPause,
+            ApprovalsRedeem,
         ];
         let git = [
             GitStage,
@@ -1160,7 +1258,7 @@ mod tests {
             WorktreeCreate,
             FolderAssign,
         ];
-        let merge_add = [MergeAdd];
+        let merge_add = [MergeAdd, MergeDrain];
         let exec = [LaunchPreset, ToolsRun];
         let admin = [
             MigrateSession,
@@ -1182,6 +1280,11 @@ mod tests {
             // Model-proxy lifecycle (THE-58) — start/stop a spend-capable daemon.
             ModelProxyStart,
             ModelProxyStop,
+            // Granting a pipeline approval is a human act (THE-2172).
+            ApprovalsResolve,
+            // Restarting automations is the operator's call (THE-2197).
+            AutomationsResume,
+            AutomationsHalt,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");

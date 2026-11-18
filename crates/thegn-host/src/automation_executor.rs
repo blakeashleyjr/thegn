@@ -29,10 +29,23 @@ pub async fn execute(
     timeout_secs: u64,
 ) -> Result<()> {
     anyhow::ensure!(
-        thegn_core::capability::lookup(&action.cap).is_some(),
+        action_known(&action.cap),
         "automation action {} is absent from the capability catalog",
         action.cap
     );
+    // Re-check the budget immediately before a budgeted spawn, counting the
+    // run's own `started` row out (`admit_planned`): a refusal or an
+    // unreadable usage fails the run instead of spawning past the limit.
+    if let Some(kind) = crate::automation_runtime::budget_kind(&action.cap, action.autonomy) {
+        let budget_cfg = Arc::clone(&cfg);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let db = thegn_core::db::Db::open()?;
+            crate::automation_budget::admit_planned(&db, &budget_cfg, kind)
+                .map_err(|refusal| anyhow::anyhow!("{refusal}"))
+        })
+        .await
+        .context("budget re-check task")??;
+    }
     let origin = AutomationOrigin {
         root_event_id: event
             .origin
@@ -166,8 +179,34 @@ pub async fn execute(
             );
             Ok(())
         }
+        "merge.drain" => {
+            let worktree = event
+                .worktree
+                .as_deref()
+                .context("merge.drain requires event.worktree")?;
+            client()
+                .await?
+                .call_raw(
+                    "POST",
+                    "/v1/merge/drain",
+                    Some(serde_json::json!({ "worktree": worktree })),
+                )
+                .await?;
+            Ok(())
+        }
+        "pipeline.start" => {
+            crate::automation_pipeline::start(cfg, &event, &action, wire_origin).await
+        }
+        "lead.wake" => crate::lead::wake::run(cfg, &event, &action, timeout_secs).await,
         other => anyhow::bail!("unsupported automation action {other}"),
     }
+}
+
+/// A catalog capability, or one of the rule-only actions
+/// (`automation::RULE_ONLY_ACTIONS`) that no other surface can reach.
+fn action_known(cap: &str) -> bool {
+    thegn_core::capability::lookup(cap).is_some()
+        || thegn_core::automation::RULE_ONLY_ACTIONS.contains(&cap)
 }
 
 async fn clear_merge_origin(worktree: &str) {
@@ -203,7 +242,7 @@ fn required(action: &PlannedAction, name: &str) -> Result<String> {
         .with_context(|| format!("{}.{} is required", action.cap, name))
 }
 
-async fn client() -> Result<ControlClient> {
+pub(crate) async fn client() -> Result<ControlClient> {
     let addr = tokio::task::spawn_blocking(|| -> Result<ControlAddr> {
         let db = thegn_core::db::Db::open()?;
         thegn_svc::control::client::discover(
@@ -218,5 +257,18 @@ async fn client() -> Result<ControlClient> {
         ControlAddr::Unix(_) | ControlAddr::Tcp { .. } | ControlAddr::HttpOrigin { .. } => {
             Ok(ControlClient::new(addr))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_supported_rule_action_passes_the_catalog_check() {
+        for cap in thegn_core::automation::SUPPORTED_ACTION_CAPS {
+            assert!(action_known(cap), "{cap}");
+        }
+        assert!(!action_known("shell.exec"));
     }
 }

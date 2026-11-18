@@ -143,6 +143,24 @@ transcript directory. The per-account percentages above come from the providers
 themselves and _are_ per-account accurate; the token totals are a separate,
 coarser number and are labelled as such.
 
+## From the command line
+
+`thegn usage [--json] [--tokens]` prints the same per-account snapshot the
+overlay shows, without the UI. The default is an aligned table: provider,
+account, plan, state, the busiest window's `used %`, and its reset countdown
+(an unavailable account shows its note instead). It gathers exactly as the UI
+does, so `[usage] enabled` and `[usage] allow_network` apply; there is no
+separate live-fetch flag.
+
+`--tokens` appends the host-wide token totals, with `(floor: N transcripts
+skipped)` when the transcript cap was hit and the totals are a lower bound.
+`--json` emits one document with `generated_ms`, `enabled`, `accounts[]`
+(`provider`, `account`, `plan`, `state`, `note`, `email`, `org`, `home`,
+`windows[]` of `label` / `used_pct` / `resets_at`) and `tokens`. With
+`[usage] enabled = false` the command prints
+`usage tracking is off ([usage] enabled = false)` (JSON: `enabled: false`,
+empty `accounts`) and exits 0.
+
 ## Model-proxy spend
 
 The model proxy is a separate binary, `tgproxy`. The alpha release tarball and
@@ -188,3 +206,148 @@ and finish within 300 seconds total. Streams share the first-byte limit across
 opening headers and the first usable output, then use the idle limit between
 chunks; they end after one hour even while data continues. A timed-out attempt
 can fall through to the next upstream lane.
+
+## MCP tools
+
+### Lead tool surface
+
+`thegn mcp serve` exposes eleven tools for the Lead, each gated by the scope in
+the table. Every one needs a running daemon. Granting an approval
+(`approvals.resolve`) is admin-only and is never an MCP tool: it stays on the
+HTTP API and `thegn api call`.
+
+| Tool                 | Scope   | What it does                                                       |
+| -------------------- | ------- | ------------------------------------------------------------------ |
+| `overview_get`       | `read`  | One cross-workspace overview: worktrees, agents, queues, attention |
+| `notifications_list` | `read`  | Notifications filtered by kind, unread state, age and worktree     |
+| `notifications_ack`  | `write` | Mark one notification, a worktree's, or all of them read           |
+| `automations_put`    | `write` | Create or replace a Lead-authored automation rule                  |
+| `automations_rm`     | `write` | Remove a Lead-authored rule (config rules refuse)                  |
+| `automations_enable` | `write` | Enable or disable a Lead-authored rule (config rules refuse)       |
+| `automations_runs`   | `read`  | Recent audited runs of an automation rule                          |
+| `automations_pause`  | `write` | Pause all automation (the kill flag); only you can resume          |
+| `approvals_list`     | `read`  | Approval history and pending approval requests                     |
+| `approvals_request`  | `write` | Ask a human to approve a pipeline stage (never grants)             |
+| `merge_drain`        | `git`   | Start the merge-queue drain for a worktree's repository            |
+
+`merge_drain` is gated like `merge_add`: the narrow `merge_add` grant belongs to
+worktree-bound route tokens, so an MCP caller needs `git`. A Lead never gets
+either: it lands only through a rule's land step or an owner approval, so a
+Lead-confined `merge_add` or `merge_drain` is refused whatever its scopes.
+Rules the Lead writes may only notify or open sessions.
+
+### The overview reply
+
+`overview.get` takes `{ "workspace": "<repo root>", "limit": 50 }`, both
+optional (`limit` defaults to 50, caps at 500, and bounds every section). The
+reply carries:
+
+- `worktrees`: each registered worktree with its attention `tier`
+  (`blocked`, `failure`, `waiting`, `ready`, `working`, `idle`), the `reason`,
+  `since` (epoch seconds) and `unread` count, most urgent first.
+- `roster`: active agent dispatches grouped by pipeline stage.
+- `merge_queue` and `pr_queue`: queued entries that have not landed.
+- `ci_failing`: worktrees whose latest cached CI run failed.
+- `approvals_pending`: approval requests nobody has answered.
+- `notifications`: unread total and a count per kind.
+- `calendar_today`: today's events in your home zone.
+- `partial`: one `"section: reason"` string per source that failed or is
+  approximate. A failing source never fails the call.
+
+The view is read from the database and caches only. Live state that exists
+only in the UI, such as which pane an agent has focused, is not visible, so
+activity is approximate and `partial` always says `activity: daemon-only view`.
+
+### Wiring the Lead
+
+When `[lead]` is configured, the daemon opens a second control listener on
+`127.0.0.1` with a random port. It accepts bearer tokens only: unlike the unix
+socket, it never treats a same-user caller as admin. The daemon writes the port
+to `$XDG_STATE_HOME/thegn/lead-control/control-addr.json`. Without `[lead]`, it
+opens nothing.
+
+Each time a Lead tab starts, thegn does three things:
+
+1. It revokes the previous token of the same Lead tab.
+2. It mints a new token for the Lead. The token's scopes are `[lead] scopes`,
+   clamped by `[mcp.serve] scopes`. The Lead can never hold more than
+   `[mcp.serve]` allows, and it never holds `admin` or `exec`.
+3. It writes the token into `$XDG_STATE_HOME/thegn/lead-control/mcp-<tab>.json`,
+   an owner-only file. Claude reads it with `--mcp-config ... --strict-mcp-config`,
+   so your own `~/.claude` MCP settings never apply to the Lead.
+
+`mcp.json` registers two servers:
+
+- `thegn`: `thegn mcp serve`, which reaches the daemon through the Lead
+  listener. `sessions_input` is never enabled.
+- `thegn-lead-hub`: `thegn mcp proxy --profile <[lead] mcp_profile>`. It is
+  registered only when that profile names at least one server.
+
+The servers listed in `[mcp_proxy.profiles]` are private to their profile. The
+default `thegn mcp proxy`, which every worker agent uses, leaves them out. An
+unknown `--profile` is an error. A server inside a profile still needs its own
+`proxy.tools` list, the same as any other server.
+
+```toml
+[mcp_proxy.profiles]
+lead = ["todoist"]
+```
+
+A profile's secrets come from the daemon, and only the Lead's token gets them.
+`thegn mcp proxy --profile <p>` does not read the profile's keyring entries or
+secret files itself. It asks the daemon (`mcp_proxy.profile_env`) with the
+`THEGN_CONTROL_ADDR` and `THEGN_CONTROL_TOKEN` from `mcp.json`, and the daemon
+answers only:
+
+- a Lead token, for `[lead] mcp_profile` only;
+- an admin caller, for any profile.
+
+Every other caller is refused, and so is a failed request: there is no local
+fallback. `--profile` is also refused outright inside a pipeline stage
+(`THEGN_STAGE_LAUNCH` is set) or for an `agent:` caller. A worker has no Lead
+token, so it cannot get the profile's secrets through thegn. The daemon logs
+the profile name only, never a value.
+
+The Lead's token expires. `[lead] token_ttl_secs` (default 43200, 12 hours;
+300 to 604800) sets its lifetime from the moment the tab starts. While the
+Lead keeps using it, the expiry slides: when less than half the TTL is left,
+the next request moves it to now + TTL, at most 7 days after the token was
+minted. A token that sits idle for a whole TTL stops working, and the Lead's
+calls then fail with 401. Reopen the Lead tab: it mints a fresh token. A
+revoked or expired token never slides back to life.
+
+While `[lead]` is configured, every pairing code redeemed on the
+`thegn serve` listener waits for your approval (`thegn pair approve`), as if
+`[serve] require_approval` were on. The Lead could otherwise see a pairing code
+in a pane and pair itself.
+
+The Lead needs the daemon. If the daemon is off, or `[lead]` was added after
+the daemon started, opening the Lead fails with a hint to restart the daemon.
+Only claude is supported as the Lead's agent so far.
+
+### What the Lead may ask the daemon to do
+
+A Lead token is confined whatever its scopes. In short:
+
+- `sessions.open` launches only a configured agent, by name, in a registered
+  worktree whose launch resolves to a real sandbox. No raw `argv`, no `env`.
+- `sessions.input` works only into a live worker a Lead opened, and only as
+  plain text plus Enter (no escape sequences or other control characters, at
+  most 16 KiB). The MCP tool also needs `--allow-session-input`, which the
+  Lead's wiring does not pass today.
+- `sessions.attach`, `sessions.split`, `sessions.fork`,
+  `git.stage`, `git.commit`, `worktrees.open`, `worktrees.create`,
+  `editor.open`, `worktrees.sandbox_profile_set` and every admin or exec verb
+  are refused.
+- `merge.add` and `merge.drain` are refused: the Lead lands only through a
+  rule's land step or an owner approval.
+- Reads, `sessions.kill`, the tracker, dispatches (without binding a session),
+  notifications, approvals requests, its own rules and reading the merge queue
+  work as their scopes say.
+
+The full list is in [sandboxing](sandboxing.md#what-the-lead-may-ask-the-daemon-to-do).
+
+To debug the wiring, `thegn mcp wire --lead` writes `mcp.json` and prints its
+path without starting anything. Because it mints a new token, a Lead that is
+already running must be reopened. `thegn mcp wire --lead --remove` deletes the
+file and revokes every Lead token.

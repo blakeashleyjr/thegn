@@ -10,6 +10,7 @@
 # SHRINK-ONLY. Enforced by crates/thegn-core/tests/env_overlay_coverage.rs;
 # regenerate with `just ratchet-update` (THEGN_RATCHET_UPDATE=1).
 
+# lead.* — Lead is configured per machine; no CI job flips it.
 # autopilot.* — issue pickup is a trusted file/workspace policy, not a
 # launcher/environment switch; enabling it can run commands and make forge
 # writes, so every key stays file-only.
@@ -91,6 +92,8 @@ automations.action_timeout_secs
 automations.audit_retention_per_rule
 automations.enabled
 automations.max_concurrent
+automations.max_concurrent_lanes
+automations.max_spawns_per_day
 automations.queue_capacity
 autopilot.agent
 autopilot.agent_command
@@ -203,6 +206,15 @@ issues.provider
 issues.providers
 issues.ttl_secs
 keymap_preset
+lead.account
+lead.agent
+lead.mcp_profile
+lead.network
+lead.notes_dir
+lead.outward_allow
+lead.scopes
+lead.skill
+lead.token_ttl_secs
 lifecycle.cost_ceiling_per_hour
 lifecycle.cost_per_warm_hour
 lifecycle.eager

@@ -368,7 +368,21 @@ pub fn effective_pool_target(
     repo: &str,
     env: &str,
 ) -> anyhow::Result<usize> {
+    if env_refuses_spares(cfg, env) {
+        return Ok(0);
+    }
     resolve_pool_target(db.pool_target(repo, env), cfg.lifecycle.pool.size)
+}
+
+/// Whether `env`'s provider kind never gets warm-pool spares, whatever the
+/// configured size or a runtime override says. Vercel: a spare is a sandbox
+/// created in the background, and only an explicit open/provision may create
+/// (or resume) one, so its target is always 0.
+fn env_refuses_spares(cfg: &Config, env: &str) -> bool {
+    cfg.env.get(env).is_some_and(|e| {
+        thegn_core::config::EnvProviderKind::of(&e.provider.provider)
+            == thegn_core::config::EnvProviderKind::Vercel
+    })
 }
 
 fn resolve_pool_target(
@@ -868,6 +882,16 @@ fn recycle_spare(cfg: &Config, env_name: &str, spare: &PoolSpare, current_lock: 
                 thegn_core::msg::warn(&format!("warm pool: {error:#}; destroying it instead"));
                 return false;
             }
+            if crate::egress_admit::lists_unenforced(
+                provider.caps().egress,
+                &resolved.sandbox.network_allow,
+                &resolved.sandbox.network_block,
+            ) {
+                crate::egress_admit::warn_unsupported_once(
+                    crate::egress_admit::provider_label(&provider),
+                    name,
+                );
+            }
             // Re-assert the provisioned marker: it is written AFTER the
             // checkpoint step (agent.rs), so the checkpoint a restore reverts
             // to does NOT contain it — without this, a claiming worktree would
@@ -1221,6 +1245,34 @@ mod tests {
             effective_pool_target(&db, &cfg, "/repo", "sprites").unwrap(),
             POOL_TARGET_CEILING
         );
+    }
+
+    /// Vercel never gets warm-pool spares: the target is 0 regardless of the
+    /// configured size or a runtime (hotkey) override.
+    #[test]
+    fn vercel_pool_target_is_zero_regardless_of_config() {
+        use thegn_core::config::{EnvConfig, EnvProviderConfig, PlacementMode};
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "vx".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: " vercel ".into(),
+                    auto_provision: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        cfg.lifecycle.pool.size = 3;
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "vx").unwrap(), 0);
+        db.set_pool_target("/repo", "vx", 5).unwrap();
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "vx").unwrap(), 0);
+        // Another kind with the same config still opts in.
+        cfg.env.get_mut("vx").unwrap().provider.provider = "sprites".into();
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "vx").unwrap(), 5);
     }
 
     #[test]

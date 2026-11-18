@@ -38,6 +38,8 @@ pub struct PriceRow {
 
 const FLY_PRICING: &str = "https://fly.io/docs/about/pricing/";
 const DO_PRICING: &str = "https://www.digitalocean.com/pricing/droplets";
+const VERCEL_PRICING: &str =
+    "vercel.com/docs/sandbox/pricing (iad1, Pro; upper bound = 100% active CPU + 2 GB/vCPU memory)";
 
 const fn row(
     provider: &'static str,
@@ -77,6 +79,14 @@ pub const BUNDLED_PRICES: &[PriceRow] = &[
     row("digitalocean", "s-2vcpu-2gb", 0.02679, DO_PRICING),
     row("digitalocean", "s-2vcpu-4gb", 0.03571, DO_PRICING),
     row("digitalocean", "s-4vcpu-8gb", 0.07143, DO_PRICING),
+    // Vercel Sandbox: usage-based, so these are upper bounds (n vCPU at 100%
+    // active CPU plus 2 GB/vCPU provisioned memory); a stopped state is free.
+    row("vercel", "1vcpu", 0.1704, VERCEL_PRICING),
+    row("vercel", "2vcpu", 2.0 * 0.1704, VERCEL_PRICING),
+    row("vercel", "4vcpu", 4.0 * 0.1704, VERCEL_PRICING),
+    row("vercel", "8vcpu", 8.0 * 0.1704, VERCEL_PRICING),
+    row("vercel", "16vcpu", 16.0 * 0.1704, VERCEL_PRICING),
+    row("vercel", "32vcpu", 32.0 * 0.1704, VERCEL_PRICING),
 ];
 
 /// Where a [`Rate`] came from.
@@ -673,13 +683,38 @@ mod tests {
     }
 
     #[test]
+    fn vercel_rows_priced_and_unknown_size_unpriced() {
+        let o = BTreeMap::new();
+        let r = rate_for(BUNDLED_PRICES, &o, "vercel", Some("2vcpu"), None).unwrap();
+        assert!(close(r.usd_per_hour, 0.3408));
+        assert!(matches!(r.source, RateSource::Bundled { .. }));
+        for (n, want) in [
+            ("1vcpu", 0.1704),
+            ("4vcpu", 0.6816),
+            ("8vcpu", 1.3632),
+            ("16vcpu", 2.7264),
+            ("32vcpu", 5.4528),
+        ] {
+            let r = rate_for(BUNDLED_PRICES, &o, "vercel", Some(n), None).unwrap();
+            assert!(close(r.usd_per_hour, want), "{n}");
+        }
+        assert_eq!(
+            rate_for(BUNDLED_PRICES, &o, "vercel", Some("3vcpu"), None),
+            None
+        );
+    }
+
+    #[test]
     fn bundled_table_is_well_formed() {
         for row in BUNDLED_PRICES {
             assert!(
                 row.usd_per_hour > 0.0 && row.usd_per_hour.is_finite(),
                 "{row:?}"
             );
-            assert!(row.source.starts_with("https://"), "{row:?}");
+            assert!(
+                row.source.starts_with("https://") || row.source.starts_with("vercel.com/"),
+                "{row:?}"
+            );
             assert!(!row.size.is_empty(), "{row:?}");
         }
         let fly = rate_for(

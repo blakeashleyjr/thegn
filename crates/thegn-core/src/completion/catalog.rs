@@ -321,6 +321,21 @@ pub const CATALOG: &[Slot] = &[
     slot("land", "worktree_pos", SourceKind::Worktree),
     slot("map", "worktree", SourceKind::Worktree),
     slot("merge add", "worktrees", SourceKind::Worktree),
+    slot(
+        "env create",
+        "project_id",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "env create",
+        "team_id",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "env reap",
+        "provider",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),
@@ -589,6 +604,8 @@ pub const CATALOG: &[Slot] = &[
     slot("session open", "stage", SourceKind::Stage),
     // --- automation (`[[automations.rules]]`) -----------------------------
     slot("automations test", "rule", SourceKind::Automation),
+    slot("automations rm", "rule", SourceKind::Automation),
+    slot("automations runs", "rule", SourceKind::Automation),
     // A cwd is a filesystem path; clap's structural/path completer owns it.
     slot("session fork", "cwd", SourceKind::Structural),
     // --- pipeline run-completion (THE-76) -----------------------------------
@@ -803,6 +820,12 @@ pub const CATALOG: &[Slot] = &[
     slot("session close", "session", SourceKind::Session),
     // --- mcp server (`[mcp_servers.<name>]`) -------------------------------
     slot("mcp install", "name", SourceKind::McpServer),
+    // The proxy profile is a free-form `[mcp_proxy] profiles` name.
+    slot(
+        "mcp proxy",
+        "profile",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     // --- config key --------------------------------------------------------
     // `--set` takes `KEY=VALUE`; completing the KEY half is still most of the
     // work, and prefix semantics stop as soon as the user types `=`.
@@ -832,6 +855,7 @@ pub const CATALOG: &[Slot] = &[
     slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
     slot("automations test", "fixture", SourceKind::Structural),
+    slot("automations add", "file", SourceKind::Structural),
     slot("events tail", "kinds", SourceKind::Structural),
     slot("voice setup", "kind", SourceKind::Structural),
     slot("skills seed", "worktree", SourceKind::Structural),
@@ -874,6 +898,16 @@ pub const CATALOG: &[Slot] = &[
     slot(
         "automations test",
         "at",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "automations add",
+        "json_rule",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "automations runs",
+        "limit",
         SourceKind::Reserved(Reserved::Freeform),
     ),
     slot("pr queue add", "pr", SourceKind::Reserved(Reserved::Pr)),

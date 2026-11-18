@@ -381,6 +381,14 @@ impl ControlStore for Db {
         )?;
         Ok(())
     }
+
+    fn slide_pairing_expiry(&self, pairing_id: &str, expires_at: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE pairings SET expires_at = ?2 WHERE pairing_id = ?1 AND revoked_at IS NULL",
+            params![pairing_id, expires_at],
+        )?;
+        Ok(changed > 0)
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +424,33 @@ mod tests {
             approved_at: Some(1_000),
             revoked_at: None,
         }
+    }
+
+    #[test]
+    fn slide_pairing_expiry_moves_live_rows_and_skips_revoked() {
+        let db = Db::open_memory().unwrap();
+        db.put_pairing(&pairing("live", "token", "h1", Some(5_000)))
+            .unwrap();
+        db.put_pairing(&pairing("gone", "token", "h2", Some(5_000)))
+            .unwrap();
+        db.revoke_pairing("gone", 2_000).unwrap();
+        assert!(db.slide_pairing_expiry("live", 9_000).unwrap());
+        assert!(
+            !db.slide_pairing_expiry("gone", 9_000).unwrap(),
+            "revoked stays dead"
+        );
+        assert!(!db.slide_pairing_expiry("missing", 9_000).unwrap());
+        assert!(
+            db.pairing_for_auth("live", 8_000).unwrap().is_some(),
+            "slid past 5_000"
+        );
+        let gone = db
+            .pairings()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.pairing_id == "gone")
+            .unwrap();
+        assert_eq!(gone.expires_at, Some(5_000));
     }
 
     #[test]

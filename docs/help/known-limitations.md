@@ -19,8 +19,16 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   download, set Option as Meta/Alt in your terminal, and treat CPU caps as
   unavailable; the `apple` sandbox backend has no automated runtime coverage.
   See [[terminal-compatibility]] and [[sandboxing]].
+- **The `apple` sandbox backend cannot run offline.** `network = "none"`, and
+  therefore the `sealed` profile, is refused with `network-unexpressible`; use
+  podman or docker for offline or sealed worktrees. See [[sandbox-network]].
 - **Windows is deferred, with no published binary.** Use a supported Linux
   build instead.
+- **Windows hosts: Win32-OpenSSH has no connection sharing (ControlMaster).**
+  thegn opens one ssh connection per control call there. This is not verified
+  on hardware yet. On any OS, a control socket path longer than 84 bytes (a
+  long `THEGN_DIR` or `user@host`) also turns connection sharing off, with one
+  warning; `thegn doctor` shows `multiplexing off` for such a host.
 - **Homebrew, AUR, `.deb`, `.rpm`, crates.io, and `cargo binstall` are not
   install channels yet.** Use a release archive or the Nix flake.
 

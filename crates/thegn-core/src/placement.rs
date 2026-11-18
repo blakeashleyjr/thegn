@@ -15,7 +15,7 @@
 //! byte-identical to the pre-refactor `Transport` path, so the existing remote
 //! argv tests hold unchanged.
 
-use crate::remote::ssh_base;
+use crate::remote::{control_mux, ssh_base_with};
 use crate::util;
 use sha2::{Digest, Sha256};
 
@@ -122,10 +122,11 @@ impl SshPlacement {
     }
 
     /// The multiplexed ssh argv prefix (without host). `batch` selects the
-    /// control plane (BatchMode) vs the interactive pane — see [`ssh_base`].
+    /// control plane (BatchMode) vs the interactive pane — see [`ssh_base_with`].
     /// Extra knobs are appended only when set, so a plain target is unchanged.
     pub fn ssh_base(&self, batch: bool) -> Vec<String> {
-        let mut v = ssh_base(self.port, self.forward_agent, batch);
+        let mux = control_mux(&self.host, self.port);
+        let mut v = ssh_base_with(self.port, self.forward_agent, batch, &mux);
         if let Some(cfg) = &self.ssh_config {
             v.push("-F".into());
             v.push(cfg.clone());
@@ -979,6 +980,22 @@ mod tests {
             base.windows(2)
                 .any(|w| w == ["-o", "StrictHostKeyChecking=no"])
         );
+    }
+
+    #[test]
+    fn ssh_placement_base_uses_host_mux() {
+        use crate::remote::{ControlMux, MuxOffReason, mux_args};
+        let s = SshPlacement::plain("u@h".into(), 22, false, TransportKind::Ssh);
+        let joined = s.ssh_base(true).join(" ");
+        // The placement goes through the host-aware decision, never `NoHost`.
+        let expected = control_mux("u@h", 22);
+        assert_ne!(expected, ControlMux::Off(MuxOffReason::NoHost));
+        for arg in mux_args(&expected, 0)
+            .iter()
+            .filter(|arg| arg.starts_with("Control") && !arg.starts_with("ControlPersist"))
+        {
+            assert!(joined.contains(arg.as_str()), "{arg} in {joined}");
+        }
     }
 
     #[test]

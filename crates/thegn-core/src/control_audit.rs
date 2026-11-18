@@ -22,6 +22,9 @@ pub enum AuditOutcome {
     Unauthorized,
     /// The action itself failed after authorization.
     Error,
+    /// A Lead-confined caller asked for something the Lead may not do
+    /// (`thegn_core::lead_confine`).
+    LeadConfined,
 }
 
 impl AuditOutcome {
@@ -31,6 +34,7 @@ impl AuditOutcome {
             AuditOutcome::NoScope => "no_scope",
             AuditOutcome::Unauthorized => "unauthorized",
             AuditOutcome::Error => "error",
+            AuditOutcome::LeadConfined => "lead_confined",
         }
     }
 }
@@ -125,5 +129,6 @@ mod tests {
         assert_eq!(AuditOutcome::NoScope.as_str(), "no_scope");
         assert_eq!(AuditOutcome::Unauthorized.as_str(), "unauthorized");
         assert_eq!(AuditOutcome::Error.as_str(), "error");
+        assert_eq!(AuditOutcome::LeadConfined.as_str(), "lead_confined");
     }
 }

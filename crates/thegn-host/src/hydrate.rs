@@ -2944,6 +2944,7 @@ pub(crate) fn build_model(
     // + placement engine + hibernator (snapshot-then-destroy for idle VMs).
     crate::vps_reaper::tick(&app_cfg);
     crate::fly_reaper::tick(&app_cfg);
+    crate::vercel_reaper::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
     crate::hibernator::tick(session, &app_cfg);
     let loc_count = worktree_loc(db, &cwd, &app_cfg.loc);
@@ -3247,6 +3248,41 @@ fn panel_diff_files(
         .collect()
 }
 
+/// First line of `text`, capped at 120 chars (single-line reason for the UI).
+fn first_line_capped(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(120)
+        .collect()
+}
+
+fn ls_files_spawn_error(error: &str) -> String {
+    format!("git ls-files failed: {}", first_line_capped(error))
+}
+
+fn ls_files_exit_error(code: Option<i32>, stderr: &[u8]) -> String {
+    let code = code.map_or_else(|| "by signal".to_string(), |c| c.to_string());
+    let first = first_line_capped(&String::from_utf8_lossy(stderr));
+    if first.is_empty() {
+        format!("git ls-files exited {code}")
+    } else {
+        format!("git ls-files exited {code}: {first}")
+    }
+}
+
+/// Listing state from the fan-out result: `None` = not requested.
+fn files_load_from(result: Option<Result<(), &String>>) -> crate::panel::gitui::DocLoad {
+    use crate::panel::gitui::DocLoad;
+    match result {
+        None => DocLoad::Pending,
+        Some(Ok(())) => DocLoad::Ready,
+        Some(Err(reason)) => DocLoad::Failed(reason.clone()),
+    }
+}
+
 fn ls_files_args(_remote: bool) -> &'static [&'static str] {
     &["ls-files", "-z"]
 }
@@ -3479,14 +3515,13 @@ pub(crate) fn build_panel(
         let h_ls = want_lsfiles.then(|| {
             s.spawn(|| {
                 let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-                loc.git_command(ls_files_args(loc.is_remote()))
-                    .output()
-                    .ok()
-                    .and_then(|out| {
-                        out.status
-                            .success()
-                            .then(|| tracked_files_from_ls_files(&out.stdout, true))
-                    })
+                match loc.git_command(ls_files_args(loc.is_remote())).output() {
+                    Err(error) => Err(ls_files_spawn_error(&error.to_string())),
+                    Ok(out) if out.status.success() => {
+                        Ok(tracked_files_from_ls_files(&out.stdout, true))
+                    }
+                    Ok(out) => Err(ls_files_exit_error(out.status.code(), &out.stderr)),
+                }
             })
         });
 
@@ -3506,7 +3541,7 @@ pub(crate) fn build_panel(
             h_stashes
                 .map(|h| h.join().unwrap())
                 .unwrap_or(Ok(Vec::new())),
-            h_ls.and_then(|h| h.join().unwrap()),
+            h_ls.map(|h| h.join().unwrap()),
             incoming_set,
         )
     });
@@ -3717,6 +3752,8 @@ pub(crate) fn build_panel(
     let (environments, environments_error) = crate::env_ui::env_panel(app_cfg, || {
         db.effective_env_checked(&cwd.to_string_lossy(), &scope_repo_root.to_string_lossy())
     });
+    let mut environments = environments;
+    crate::env_ui::mark_unpulled(&mut environments, app_cfg, &cwd.to_string_lossy());
     panel.environments = environments;
     panel.environments_error = environments_error;
     let toolchain_root = thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
@@ -3956,7 +3993,8 @@ pub(crate) fn build_panel(
 
     // Tracked-file list for the Files accordion — fetched in the fan-out above
     // (only while Files is open; `git ls-files` isn't free on big repos every 2s).
-    if let Some(mut files) = ls_files {
+    panel.files_load = files_load_from(ls_files.as_ref().map(|r| r.as_ref().map(|_| ())));
+    if let Some(Ok(mut files)) = ls_files {
         panel.file_count = Some(files.len() as u64);
         // Bounded: an unbounded monorepo listing made every tree rebuild a
         // visible stall. 50k rows is far past what the panel can usefully

@@ -64,6 +64,17 @@ pub(crate) fn account_home() -> Option<std::path::PathBuf> {
     None
 }
 
+/// The real `(uid, gid)` of this process. `None` where unavailable.
+#[cfg(unix)]
+pub(crate) fn current_ids() -> Option<(u32, u32)> {
+    unix::current_ids()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn current_ids() -> Option<(u32, u32)> {
+    None
+}
+
 /// Shared bounded grace interval after a PTY group receives its termination
 /// request. Windows uses an immediate Job Object terminate and needs no wait.
 #[cfg(unix)]
@@ -338,6 +349,10 @@ pub(crate) mod open_beneath;
 /// Private custody of the merge queue's temp bundle (per-OS exclusive creation
 /// and identity-verified cleanup); `merge_remote.rs` stays platform-free.
 pub(crate) mod bundle_custody;
+
+/// Bounded, reaped execution of an unattended validation command (unix group
+/// runner; refused off unix) so `daemon/stage_executor.rs` stays platform-free.
+pub(crate) mod bounded_validation;
 
 #[cfg(all(test, unix))]
 #[path = "../../../../test/support/owned_test_child.rs"]

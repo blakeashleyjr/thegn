@@ -334,6 +334,15 @@ impl SidebarState {
                 folder_id: row.folder_id?,
                 name: row.label.clone(),
             }),
+            RowKind::Terminal
+                if row
+                    .worktree_path
+                    .as_deref()
+                    .is_some_and(crate::lead::group::is_lead_group) =>
+            {
+                model.status = "The Lead can't be closed from the sidebar".into();
+                Some(SidebarOutcome::Redraw)
+            }
             RowKind::Terminal => Some(SidebarOutcome::CloseTerminal {
                 name: row.label.clone(),
             }),

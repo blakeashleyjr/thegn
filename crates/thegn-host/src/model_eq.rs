@@ -89,6 +89,9 @@ impl FrameModel {
             self.procs = std::mem::take(&mut current.procs);
             self.process_revision = current.process_revision;
             self.process_state = current.process_state;
+            // Published with the process snapshot (only while the cpu popup or
+            // monitor is open); a hydration swap must not blank it.
+            self.pane_owners = std::mem::take(&mut current.pane_owners);
         }
     }
 
@@ -306,6 +309,25 @@ mod tests {
 #[cfg(test)]
 mod revision_tests {
     use super::*;
+    #[test]
+    fn carry_monitor_state_keeps_pane_owners() {
+        let mut current = FrameModel {
+            pane_owners: std::sync::Arc::from(vec![thegn_core::cpu_attrib::PaneOwner {
+                pane_id: 7,
+                workspace: "w".into(),
+                worktree: "w/main".into(),
+                worktree_path: None,
+                tab: "1".into(),
+                program: None,
+            }]),
+            ..Default::default()
+        };
+        let mut next = FrameModel::default();
+        next.carry_monitor_state_from(&mut current);
+        assert_eq!(next.pane_owners.len(), 1);
+        assert_eq!(next.pane_owners[0].pane_id, 7);
+    }
+
     #[test]
     fn disk_revision_tracks_both_input_maps_and_never_reuses_exhausted_keys() {
         let mut prior = FrameModel::default();

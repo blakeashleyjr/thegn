@@ -76,12 +76,13 @@ pub enum Stability {
 /// The cross-cutting subsystems whose availability the release channel governs.
 ///
 /// Only subsystems that need gating appear here — the AI-free workspace shell
-/// (git, panes, sidebar, sessions, panel, CLI merge/land/integrate, sandbox
+/// (git, panes, sidebar, sessions, panel, CLI merge/land/integrate, built-in sandbox
 /// backends, …) is unconditionally [`Stable`](Stability::Stable) and is not
 /// enumerated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Feature {
-    /// Remote worktrees over SSH/mosh (`[sandbox.remote]`). The ssh-CLI path
+    /// Remote worktrees over SSH/mosh (`[sandbox.remote]`) and Kubernetes
+    /// placements (`[env.*] placement = "k8s"`). The ssh-CLI path
     /// works but the surface is young.
     Remote,
     /// Cloud execution providers (Fly / DO / VPS / Machine0 / Daytona) and the
@@ -95,18 +96,70 @@ pub enum Feature {
     Voice,
     /// Resident plugin app tabs (`AppTab` contributions, plugin ids in `[apps]`).
     PluginApps,
+    /// The Lead meta agent (`[lead]`): a hosted agent CLI in a global tab.
+    Lead,
+    /// Config-defined, shipped and recipe sandbox backends; live fork.
+    /// Added by WS00-P1-01; gating owned by WS02-P4-01 (and WS07-P5-03 for fork).
+    SandboxBackends,
+    /// Landlock + seccomp confinement helper on bwrap/systemd/landlock.
+    /// Added by WS00-P1-01; gating owned by WS03-P2-03b.
+    LinuxConfine,
+    /// `network = "allowlist"`, presets, approvals, brokering, external proxies.
+    /// Added by WS00-P1-01; gating owned by WS04-P1-09.
+    EgressProxy,
+    /// macOS Seatbelt backend. Added by WS00-P1-01; gating owned by WS05-P2-06.
+    Seatbelt,
+    /// Windows MXC isolation backend. Added by WS00-P1-01; gating owned by
+    /// WS06-P4-05.
+    WinIsolation,
+    /// Sandbox-backend plugins. Added by WS00-P1-01; gating owned by WS10-P8-04.
+    PluginBackends,
+    /// Per-agent presets applied at launch. Added by WS00-P1-01; gating owned by
+    /// WS11-P1-07.
+    AgentPresets,
+    /// Private-copy workspaces (`workspace.mode = "private-copy"`). Added by
+    /// WS00-P1-01; gating owned by WS11 (THE-791 gate 2).
+    PrivateCopy,
+    /// In-pane escalation requests. Added by WS00-P1-01; gating owned by WS11.
+    Escalation,
 }
 
 impl Feature {
     /// Every gated feature, for exhaustive iteration (e.g. the `doctor` table
     /// and the config clamp). Order is stable and display-friendly.
-    pub const ALL: [Feature; 6] = [
+    pub const ALL: [Feature; 16] = [
         Feature::Remote,
         Feature::Providers,
         Feature::Observe,
         Feature::Placement,
         Feature::Voice,
         Feature::PluginApps,
+        Feature::Lead,
+        Feature::SandboxBackends,
+        Feature::LinuxConfine,
+        Feature::EgressProxy,
+        Feature::Seatbelt,
+        Feature::WinIsolation,
+        Feature::PluginBackends,
+        Feature::AgentPresets,
+        Feature::PrivateCopy,
+        Feature::Escalation,
+    ];
+
+    /// The sandbox + remote programme features added together by WS00-P1-01.
+    /// Each stays [`Stability::Experimental`] until its owner item graduates it;
+    /// until then the clamp neutralises nothing for them and doctor reports them
+    /// as not yet implemented.
+    pub const PROGRAMME: [Feature; 9] = [
+        Feature::SandboxBackends,
+        Feature::LinuxConfine,
+        Feature::EgressProxy,
+        Feature::Seatbelt,
+        Feature::WinIsolation,
+        Feature::PluginBackends,
+        Feature::AgentPresets,
+        Feature::PrivateCopy,
+        Feature::Escalation,
     ];
 
     /// The feature's stable identifier (matches the docs / doctor output).
@@ -118,6 +171,16 @@ impl Feature {
             Feature::Placement => "placement",
             Feature::Voice => "voice",
             Feature::PluginApps => "plugin_apps",
+            Feature::Lead => "lead",
+            Feature::SandboxBackends => "sandbox_backends",
+            Feature::LinuxConfine => "linux_confine",
+            Feature::EgressProxy => "egress_proxy",
+            Feature::Seatbelt => "seatbelt",
+            Feature::WinIsolation => "win_isolation",
+            Feature::PluginBackends => "plugin_backends",
+            Feature::AgentPresets => "agent_presets",
+            Feature::PrivateCopy => "private_copy",
+            Feature::Escalation => "escalation",
         }
     }
 
@@ -126,9 +189,22 @@ impl Feature {
     pub const fn stability(self) -> Stability {
         match self {
             // The confirmed experimental set for the pre-alpha.
-            Feature::Remote | Feature::Providers | Feature::Placement | Feature::Voice => {
-                Stability::Experimental
-            }
+            Feature::Remote
+            | Feature::Providers
+            | Feature::Placement
+            | Feature::Voice
+            | Feature::Lead => Stability::Experimental,
+            // The sandbox + remote programme (WS00-P1-01): experimental until each
+            // owner item graduates its feature.
+            Feature::SandboxBackends
+            | Feature::LinuxConfine
+            | Feature::EgressProxy
+            | Feature::Seatbelt
+            | Feature::WinIsolation
+            | Feature::PluginBackends
+            | Feature::AgentPresets
+            | Feature::PrivateCopy
+            | Feature::Escalation => Stability::Experimental,
             Feature::Observe | Feature::PluginApps => Stability::Stable,
         }
     }
@@ -184,7 +260,9 @@ mod tests {
         // ALL must cover every variant so the clamp/doctor never miss one.
         // (Compile-time exhaustiveness is enforced by `stability`'s match; this
         // guards ALL against drift.)
-        assert_eq!(Feature::ALL.len(), 6);
+        assert_eq!(Feature::ALL.len(), 16);
+        assert_eq!(Feature::Lead.id(), "lead");
+        assert_eq!(Feature::Lead.stability(), Stability::Experimental);
         let mut ids: Vec<&str> = Feature::ALL.iter().map(|f| f.id()).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -214,5 +292,35 @@ mod tests {
             .filter(|f| f.allowed_in(Channel::Dev))
             .count();
         assert_eq!(allowed, Feature::ALL.len());
+    }
+
+    #[test]
+    fn new_programme_features_are_experimental() {
+        let ids: Vec<&str> = Feature::PROGRAMME.iter().map(|f| f.id()).collect();
+        assert_eq!(
+            ids,
+            [
+                "sandbox_backends",
+                "linux_confine",
+                "egress_proxy",
+                "seatbelt",
+                "win_isolation",
+                "plugin_backends",
+                "agent_presets",
+                "private_copy",
+                "escalation",
+            ]
+        );
+        for f in Feature::PROGRAMME {
+            assert_eq!(f.stability(), Stability::Experimental, "{f}");
+            assert!(
+                !f.allowed_in(Channel::Stable),
+                "{f} must be denied in stable"
+            );
+            assert!(f.allowed_in(Channel::Dev), "{f} must be allowed in dev");
+            assert!(Feature::ALL.contains(&f), "{f} must be in ALL");
+        }
+        // Display order: the seven pre-programme features come first.
+        assert_eq!(&Feature::ALL[7..], &Feature::PROGRAMME[..]);
     }
 }

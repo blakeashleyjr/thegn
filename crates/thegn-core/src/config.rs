@@ -282,14 +282,21 @@ macro_rules! config_enum {
         }
 
         impl $name {
+            /// Lenient parse: any canonical spelling or alias, reserved kinds
+            /// included; `None` on an unknown value.
+            pub fn from_str_any(s: &str) -> Option<Self> {
+                match s.trim().to_ascii_lowercase().as_str() {
+                    $( $canon $(| $alias)* => Some($name::$variant), )+
+                    _ => None,
+                }
+            }
             /// Strict parse: `Err` (with the valid set) on an unknown value.
             pub fn from_str_validated(s: &str) -> Result<Self, String> {
-                let parsed = match s.trim().to_ascii_lowercase().as_str() {
-                    $( $canon $(| $alias)* => $name::$variant, )+
-                    other => return Err(format!(
+                let Some(parsed) = $name::from_str_any(s) else {
+                    return Err(format!(
                         "unknown {} {:?}; expected one of: {}",
-                        $kind, other, [$( $canon ),+].join(", ")
-                    )),
+                        $kind, s.trim().to_ascii_lowercase(), [$( $canon ),+].join(", ")
+                    ));
                 };
                 if <$name as crate::seam::Kind>::is_reserved(parsed) {
                     return Err(format!(
@@ -453,13 +460,13 @@ config_enum! {
         Podman = "podman" | "podman-rootless" | "rootless-podman",
         PodmanRootful = "podman-rootful" | "rootful-podman",
         Docker = "docker",
-        Smol = "smol" | "smolmachines",
+        Smol = "smol" | "smolmachines" reserved,
         Bwrap = "bwrap" | "bubblewrap",
         Systemd = "systemd" | "systemd-run",
         Apple = "apple" | "container",
         // Reserved: the WSL backend is aspirational (see `sandbox.rs`).
         Wsl = "wsl" reserved,
-        WinAppContainer = "winappcontainer" | "appcontainer",
+        WinAppContainer = "winappcontainer" | "appcontainer" reserved,
         WinJobObject = "winjobobject" | "jobobject",
         None = "none" | "host",
     } default = Auto;
@@ -3996,8 +4003,8 @@ impl Config {
 
 pub use crate::config_env_tables::{
     EnvK8sConfig, EnvProviderConfig, EnvProviderKind, EnvSshConfig, MetricsConfig, MetricsTarget,
-    MetricsTargetKind, NixInstaller, ProviderConnect, ProviderExecMode, provider_scale_to_zero,
-    provider_self_suspends, ssh_reached_provider_kind, vps_provider_kind,
+    MetricsTargetKind, ModelCredentials, NixInstaller, ProviderConnect, ProviderExecMode,
+    provider_scale_to_zero, provider_self_suspends, ssh_reached_provider_kind, vps_provider_kind,
 };
 
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
@@ -4512,14 +4519,17 @@ pub struct SandboxConfig {
     /// `isolation_floor`; the default floor always refuses.
     pub on_floor_miss: OnFloorMiss,
     pub remote: RemoteConfig,
-    /// Allow-only these hostnames for outbound connections (empty = allow all).
-    /// Enforced via a per-container DNS interceptor. Block-list is checked first
-    /// when both lists are non-empty.
+    /// Advisory hostname allow-list (empty = allow all). Not enforced by any
+    /// local backend; only the Sprites and Vercel providers lower it to their
+    /// own policy API. Block-list is checked first when both lists are non-empty.
     pub network_allow: Vec<String>,
-    /// Block outbound connections to these hostnames. Takes priority over
-    /// network_allow when a hostname matches both.
+    /// Advisory hostname block-list; takes priority over network_allow when a
+    /// hostname matches both. `"*"` lowers the sandbox to `network = "none"`.
     pub network_block: Vec<String>,
-    /// Log all outbound DNS queries and connection attempts to the audit table.
+    /// Subscribe the podman `network` event stream (container network
+    /// attach/detach) into the sandbox audit table. Podman backends only; not a
+    /// DNS-query or connection log. `config validate` warns when no selectable
+    /// backend delivers the stream.
     pub network_audit: bool,
     /// `[sandbox.vpn]` — attach the worktree to its own overlay/tunnel.
     pub vpn: VpnConfig,
@@ -5595,6 +5605,10 @@ pub struct Config {
     /// tuning only; default-deny filtering means it exposes nothing until a
     /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
     pub mcp_proxy: crate::mcp::config::McpProxyConfig,
+    /// `[lead]` — the Lead meta agent (a hosted agent CLI in a global tab).
+    /// Absent = no Lead; experimental, clamped to `None` on the stable channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<crate::config_lead::LeadConfig>,
     /// `[mcp]` — thegn's own MCP endpoint settings (`thegn mcp serve`), distinct
     /// from `[mcp_servers.<name>]` above (the servers thegn hands to agents).
     #[serde(default, skip_serializing_if = "McpConfig::is_default")]
@@ -5725,6 +5739,7 @@ impl Default for Config {
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
             mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
+            lead: None,
             mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
             credentials: CredentialsConfig::default(),

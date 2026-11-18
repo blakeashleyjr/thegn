@@ -28,6 +28,12 @@
 //!   `limit` — providers whose burn reached a `[placement.fleet_budget]`
 //!   limit (empty under `fleet list --env`, which reads only one env).
 //!
+//! - `vercel_usage[]` (`fleet cost` only; absent when no `provider = "vercel"`
+//!   env is configured): `envs`, `complete`, `error`, `rows[]` with `name`,
+//!   `status`, `session_usd` (`null` = unpriced), `snapshots_usd_month`,
+//!   `snapshot_bytes`. Current session only; an estimate. Envs sharing one
+//!   Vercel account are one entry. Never resumes a stopped sandbox.
+//!
 //! All amounts are USD estimates from the bundled price table and
 //! `[placement.price]`.
 
@@ -60,6 +66,140 @@ struct FleetReport {
     generated_ms: i64,
     view: FleetView,
     cost: FleetCost,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vercel_usage: Option<Vec<VercelUsage>>,
+}
+
+/// One Vercel account's current-session accrual (`fleet cost` only).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct VercelUsage {
+    envs: Vec<String>,
+    /// The listing, the ledger and every per-sandbox read succeeded.
+    complete: bool,
+    /// Why the account could not be read at all.
+    error: Option<String>,
+    rows: Vec<VercelUsageRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct VercelUsageRow {
+    name: String,
+    status: String,
+    session_usd: Option<f64>,
+    snapshots_usd_month: f64,
+    snapshot_bytes: u64,
+}
+
+impl From<thegn_svc::vercel::usage::UsageRow> for VercelUsageRow {
+    fn from(row: thegn_svc::vercel::usage::UsageRow) -> Self {
+        VercelUsageRow {
+            session_usd: row.session.map(|a| a.cpu_usd + a.memory_usd),
+            name: row.name,
+            status: row.status,
+            snapshots_usd_month: row.snapshots_usd_month,
+            snapshot_bytes: row.snapshot_bytes,
+        }
+    }
+}
+
+/// The Vercel section's data: one entry per account (envs sharing an account
+/// fingerprint are read once). `None` when no vercel env is configured, so the
+/// rest of `fleet cost` is byte-identical. Reads only; never resumes.
+fn vercel_usage(cfg: &Config) -> Option<Vec<VercelUsage>> {
+    let mut groups: Vec<(
+        String,
+        VercelUsage,
+        Option<thegn_svc::vercel::VercelProvider>,
+    )> = Vec::new();
+    for (name, envc) in &cfg.env {
+        if envc.provider.provider.trim() != "vercel" {
+            continue;
+        }
+        let provider = crate::provider_factory::vercel_provider_for(&envc.provider, "");
+        let key = match provider.as_ref().map(|p| p.account()) {
+            Some(Ok(account)) => format!("account:{account}"),
+            _ => format!("env:{name}"),
+        };
+        if let Some((_, usage, _)) = groups.iter_mut().find(|(k, _, _)| *k == key) {
+            usage.envs.push(name.clone());
+            continue;
+        }
+        let usage = VercelUsage {
+            envs: vec![name.clone()],
+            complete: false,
+            error: None,
+            rows: Vec::new(),
+        };
+        groups.push((key, usage, provider));
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for (_, mut usage, provider) in groups {
+        match provider {
+            None => {
+                usage.error = Some(
+                    "the vercel provider could not be built (token or scope unavailable)".into(),
+                );
+            }
+            Some(provider) => {
+                match crate::agent::block_on_provider(|| async { provider.usage_report().await }) {
+                    Ok((rows, complete)) => {
+                        usage.complete = complete;
+                        usage.rows = rows.into_iter().map(VercelUsageRow::from).collect();
+                    }
+                    Err(error) => usage.error = Some(format!("{error:#}")),
+                }
+            }
+        }
+        out.push(usage);
+    }
+    Some(out)
+}
+
+/// The `fleet cost` Vercel block (pure). Appended after [`render_cost`].
+fn render_vercel(usage: &[VercelUsage]) -> String {
+    let mut out = Vec::new();
+    for account in usage {
+        out.push(format!(
+            "vercel (current session; estimate): {}",
+            account.envs.join(", ")
+        ));
+        if let Some(error) = &account.error {
+            out.push(format!("  unavailable: {error}"));
+            continue;
+        }
+        if account.rows.is_empty() {
+            out.push("  no sandboxes".into());
+        } else {
+            let mut rows = vec![
+                ["NAME", "STATUS", "SESSION $", "SNAPSHOTS $/MONTH"]
+                    .map(String::from)
+                    .to_vec(),
+            ];
+            for row in &account.rows {
+                rows.push(vec![
+                    row.name.clone(),
+                    row.status.clone(),
+                    row.session_usd
+                        .map_or_else(|| "?".to_string(), |v| usd(v, 4)),
+                    usd(row.snapshots_usd_month, 2),
+                ]);
+            }
+            for line in table(&rows).lines() {
+                out.push(format!("  {line}"));
+            }
+        }
+        if !account.complete {
+            out.push("  incomplete: some sandboxes could not be read".into());
+        }
+    }
+    out.push(
+        "earlier sessions are not included; the vercel $/H above is the if-running-flat-out bound"
+            .into(),
+    );
+    out.join("\n")
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -87,17 +227,23 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             now_ms,
         )
     };
+    let vercel = if list { None } else { vercel_usage(cfg) };
     if json {
         return super::emit_json(&FleetReport {
             generated_ms: now_ms,
             view,
             cost,
+            vercel_usage: vercel,
         });
     }
     let text = if list {
         render_list(&view, &cost, now_ms)
     } else {
-        render_cost(&view, &cost)
+        let text = render_cost(&view, &cost);
+        match vercel.as_deref() {
+            Some(usage) => format!("{text}\n\n{}", render_vercel(usage)),
+            None => text,
+        }
     };
     outln!("{text}");
     Ok(())
@@ -125,7 +271,7 @@ pub(crate) fn age(created_ms: Option<i64>, now_ms: i64) -> String {
 }
 
 /// Left-aligned columns, two spaces apart, trailing spaces trimmed.
-fn table(rows: &[Vec<String>]) -> String {
+pub(crate) fn table(rows: &[Vec<String>]) -> String {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     let widths: Vec<usize> = (0..columns)
         .map(|c| {
@@ -419,6 +565,92 @@ mod tests {
         let json = serde_json::to_value(&cost).unwrap();
         assert_eq!(json["budget"][0]["level"], "warn");
         assert_eq!(json["budget"][1]["provider"], "sprites");
+    }
+
+    fn vercel_fixture() -> Vec<VercelUsage> {
+        vec![
+            VercelUsage {
+                envs: vec!["vx".into(), "vx-alt".into()],
+                complete: true,
+                error: None,
+                rows: vec![
+                    VercelUsageRow {
+                        name: "tg-run".into(),
+                        status: "running".into(),
+                        session_usd: Some(0.0425),
+                        snapshots_usd_month: 0.16,
+                        snapshot_bytes: 2_000_000_000,
+                    },
+                    VercelUsageRow {
+                        name: "tg-gone-long".into(),
+                        status: "gone".into(),
+                        session_usd: None,
+                        snapshots_usd_month: 0.0,
+                        snapshot_bytes: 0,
+                    },
+                ],
+            },
+            VercelUsage {
+                envs: vec!["vbroken".into()],
+                complete: false,
+                error: Some("no token".into()),
+                rows: Vec::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn vercel_cost_block_renders_rows_and_unavailable_accounts() {
+        let text = render_vercel(&vercel_fixture());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0], "vercel (current session; estimate): vx, vx-alt",
+            "{text}"
+        );
+        assert!(lines[1].starts_with("  NAME"), "{text}");
+        let session_col = lines[1].find("SESSION $").unwrap();
+        assert_eq!(lines[2].find("$0.0425"), Some(session_col), "{text}");
+        assert!(
+            lines[2].contains("$0.16") && lines[2].contains("running"),
+            "{text}"
+        );
+        assert_eq!(lines[3].find("?"), Some(session_col), "unpriced: {text}");
+        assert_eq!(
+            lines[4], "vercel (current session; estimate): vbroken",
+            "{text}"
+        );
+        assert_eq!(lines[5], "  unavailable: no token", "{text}");
+        assert!(text.contains("earlier sessions are not included"), "{text}");
+        assert!(text.lines().all(|line| line == line.trim_end()));
+    }
+
+    #[test]
+    fn no_vercel_env_keeps_the_report_byte_identical() {
+        let cfg = Config::default();
+        assert!(vercel_usage(&cfg).is_none());
+        let view = view();
+        let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
+        let json = serde_json::to_value(FleetReport {
+            generated_ms: NOW,
+            view: view.clone(),
+            cost: cost.clone(),
+            vercel_usage: None,
+        })
+        .unwrap();
+        assert!(json.get("vercel_usage").is_none(), "{json}");
+        let with = serde_json::to_value(FleetReport {
+            generated_ms: NOW,
+            view,
+            cost,
+            vercel_usage: Some(vercel_fixture()),
+        })
+        .unwrap();
+        assert_eq!(with["vercel_usage"][0]["rows"][0]["name"], "tg-run");
+        assert_eq!(
+            with["vercel_usage"][0]["rows"][1]["session_usd"],
+            serde_json::Value::Null
+        );
+        assert_eq!(with["vercel_usage"][1]["error"], "no token");
     }
 
     #[test]

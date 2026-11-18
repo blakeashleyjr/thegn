@@ -7,6 +7,79 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.95] — 2026-11-17
+
+### Added
+
+- The Lead: a configured agent CLI in a global tab, pinned as the `LEAD` section at the top of the sidebar. Set `[lead] agent` (dev channel only; restart the daemon after adding it) and press `Alt i` (`jump-lead`) to open it. Each tab is its own conversation; the group survives workspace switches and detach. `[lead] account` is refused for now, and only claude is supported as the Lead's agent.
+- The Lead's tool surface over `thegn mcp serve`: `overview_get`, `notifications_list`, `notifications_ack`, `automations_put`, `automations_rm`, `automations_enable`, `automations_runs`, `automations_pause`, `approvals_list`, `approvals_request` and `merge_drain`, each gated by its scope, plus opt-in notice event frames. `automations_resume` is never a tool: only you can resume. The Lead never grants an approval.
+- Lead confinement: a Lead token may open only a configured agent in a registered, sandboxed worktree; type plain text into workers it opened; and read, work the tracker and dispatch roster, and ask for approvals. It may not call `merge.add`, `merge.drain` or `worktrees.create`, run host git, or change a sandbox profile, whatever its scopes. Outward calls (`issues.comment`, `issues.update`) ask you first unless listed in `[lead] outward_allow`.
+- The Lead's sandbox: repositories read-only, a private agent home, thegn state, config and credentials masked, and an isolated network through `pasta` (`[lead] network = "isolated"`, the default; `"host"` warns on every launch). It refuses to open without bwrap, or without pasta in isolated mode. `[mcp_proxy.profiles]` gives the Lead its own MCP servers, whose secrets only the Lead's token can fetch. The Lead's token expires after `[lead] token_ttl_secs` (default 12 hours) and slides while in use. While `[lead]` is set, every pairing code needs `thegn pair approve`.
+- Automation triggers: `schedule_due` (cron or interval, daemon only), `issue_matched` and `session_exited`; rule actions `pipeline.start` and `lead.wake`; a per-rule `autonomy` ceiling of `propose`, `review` or `merge`. `thegn automations add|rm|runs|pause|resume` and a richer `list`.
+- The stage executor drives an automation-started lane through its stages, runs validation in the lane worktree's sealed sandbox, then advances or lands it. A worktree without a sealed sandbox records an error and runs nothing.
+- Approvals appear in a group at the top of the Notifications panel: `y` approves and `n` rejects, each asking for a second press. Each new request is pushed to your phone with a single-use code; the signed push inbox answers it with `approvals.redeem` (24 hours, one use). Agents and the Lead cannot redeem.
+- Budgets: `[automations] max_concurrent_lanes` and `max_spawns_per_day` bound what automation starts on its own; `0` means nothing may spawn. `thegn lead pause` (kill switch: pauses rules, kills the sessions automation and the Lead opened, cancels executor validation; `--keep-sessions` keeps them), `thegn lead resume` and `thegn lead status [--json]`.
+- Vercel Sandbox: `provider = "vercel"` with `team_id`, `project_id` and `api_key_env`. thegn drives it over Vercel's HTTP API and a hidden `thegn vercel-exec` bridge (no SSH): terminal panes, headless agent lanes, repo copied in as a git bundle, work pulled out with `thegn env pull`. `max_instances` (default 2) and `max_lifetime_secs` (default 24 hours) cap it and a reaper stops and later deletes sandboxes; `thegn env reap --provider vercel` lists orphans (dry run) and deletes them with `--apply`. `thegn fleet cost` shows an estimated Vercel cost for the current session.
+- Vercel `model_credentials = "none" | "upload"` (default `none`; `proxy` and `inject` are refused). `upload` copies claude or codex login files into the sandbox's memory-backed storage after the egress policy is narrowed to the model hosts. `interactive_host_suffixes` pins the interactive host. When a session ends with results not pulled, a marker shows on the Environments row and in `thegn doctor`; `p` on the row pulls.
+- `thegn doctor` lists nine more release-channel features, all experimental and not yet implemented: `sandbox_backends`, `linux_confine`, `egress_proxy`, `seatbelt`, `win_isolation`, `plugin_backends`, `agent_presets`, `private_copy` and `escalation`.
+
+### Changed
+
+- The sandboxing help page is split into topic pages (backends, network, profiles, resources, devcontainers) and a new environments page; the panel environments help moved there.
+- Egress and capability reporting says only what the code does: provider capabilities derive from per-kind facts, the sandbox matrix labels the network cell advisory (Apple unverified), `network_audit` documents that it needs podman and warns without it, and a provider placement warns that hostname rules are not enforced.
+- Apple `network = "none"` is refused as not expressible. The `smol` and `appcontainer` backends are reserved: config accepts them, they are never selected. The VPN `filter-front` DNS mode is reserved and behaves as the default resolver.
+- On the stable channel, Kubernetes environments are removed.
+- `thegn doctor` marks Daytona as maintenance and unverified against a live account; Fly reach is described as plain ssh to the dedicated IPv4. ssh sharing (ControlMaster) is off on Windows and for long socket paths.
+- bubblewrap and passt ship in the Nix package as fallback runtime tools, so the Lead's sandbox and isolated network work without a system install.
+- Known limit: in this release `merge` autonomy behaves like `review`, so every land stops for your approval. The merge gate runs the lane's own code on the host, outside any sandbox, and is not sandboxed yet. Unattended validation needs a sealed sandbox.
+- Known limit: the Vercel provider has never been run against Vercel; it was built against a mock. Unverified until a live run: the interactive PTY WebSocket (panes fall back to a stream mode), sandbox resume, name and tag limits, token scopes, whether upload files stay out of the auto snapshot, 429 behaviour and snapshot deletion. The kind is experimental. Cost is an upper-bound estimate for the current session only.
+- The local database migrates forward to schema versions 112 and 113 (111 is listed above); restart the daemon after upgrading.
+
+### Fixed
+
+- Sandboxed agents could intermittently fail to commit with "cannot lock ref: unable to create directory": git removed the ref directory a running sandbox had mounted. Each writable ref carve-out now holds a hidden `.thegn-keep` directory.
+
+### Removed
+
+- The unwired DNS filter server and its gate.
+
+### Security
+
+- Lead confinement is enforced in the daemon for every call made with a Lead token, not in the Lead's sandbox alone.
+- Vercel API tokens are sent only to Vercel and never enter the VM; the interactive host is pinned to Vercel suffixes and OIDC tokens near expiry are refused.
+
+## [0.1.0-alpha.94] — 2026-11-17
+
+### Added
+
+- From the cpu/mem popup, Enter on a process opens the system monitor filtered to it, and `p` shows a worktree's or pane's processes; the monitor's process filter also applies `wt:` and `wt=` (`user`, `s` and `thr` are still not available). (THE-2025)
+- Drag a file from the Files panel onto a terminal pane to insert its quoted path; drops are refused while the center shows a splash or is dormant. (THE-135)
+- The theme builder's element view keeps the selected part of the workspace lit behind the dimmed modal. (THE-2023)
+- `thegn usage [--json] [--tokens]`. (THE-138)
+- `/` filters the git panel's Files view. (THE-787)
+- In the git panel's Files view, `S` stashes only staged changes (including partially staged files; it refuses only when nothing is staged) and `U` only unstaged changes. (THE-787)
+- `[metrics]` edits apply live: targets restart on save, with no thegn restart. (THE-2024)
+- `[monitor]` `window_ladder`, `default_window`, `default_style` and `default_scale` apply to the next monitor open after a save. (THE-2024)
+- Home Manager options for `[weather]` (except the API key) and `limits.test_nice`. (THE-428)
+- The Lead can write its own automation rules with `automations.put`, `automations.rm`, `automations.enable` and `automations.runs`. These rules may only notify or open a session; `merge.add` and `tools.run` are refused when the rule is written and again when it is evaluated. Config rules stay read-only. The local database migrates forward to schema version 111; restart the daemon after upgrading. (THE-2181)
+
+### Changed
+
+- Building from source needs Rust 1.96 or newer; the declared minimum now matches the dependencies. (THE-1989)
+- Fewer allocations when painting the system monitor and when typing in the workspace picker. (THE-898, THE-367)
+
+### Fixed
+
+- A failed `git ls-files` shows "file list unavailable" instead of a tree of only the changed files. (THE-375)
+- The system-monitor help lists the right filter fields as ignored. (THE-2025)
+- With a `/` filter in the git Files view at Half width, the diff preview and Enter follow the highlighted row. (THE-2063)
+- A landed worktree whose checkout was already removed no longer leaves its merge-queue row behind; this applies to local worktrees only, and remote (ssh/provider) rows keep the existing refusal. (THE-236)
+
+### Security
+
+- Paths containing control characters are refused for drag insertion. (THE-135)
+- The Lead can no longer run arbitrary commands through the daemon. A Lead token may open only a configured agent in a registered worktree whose launch is sandboxed, and may not type into, split or fork sessions, run host git, or change a sandbox profile; Lead-authored rules that open a session are held to the same rule. Refusals are audited as `lead_confined`. (THE-2187)
+
 ## [0.1.0-alpha.93] — 2026-11-17
 
 ### Added
@@ -3787,7 +3860,9 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.93...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...HEAD
+[0.1.0-alpha.95]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.94...v0.1.0-alpha.95
+[0.1.0-alpha.94]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.93...v0.1.0-alpha.94
 [0.1.0-alpha.93]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.92...v0.1.0-alpha.93
 [0.1.0-alpha.92]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.91...v0.1.0-alpha.92
 [0.1.0-alpha.91]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.90...v0.1.0-alpha.91
