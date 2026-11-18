@@ -3984,10 +3984,9 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 #
 # ── Fly.io machines (CLI-free — no flyctl) ─────────────────────────────────
 # A Fly machine is container-native (NOT a VPS): thegn drives the Machines
-# REST API directly and reaches INTO the machine over a WireGuard tunnel to
-# Fly's private 6PN network + `hallpass` ssh — the `fly ssh console` path,
-# without the flyctl CLI. Unlike a VPS, a stopped machine is near-free, so it is
-# treated as SCALE-TO-ZERO (idle spares park via stop/start instead of destroy).
+# REST API directly and reaches the machine over plain ssh to a per-app
+# dedicated IPv4 (no WireGuard, no flyctl). Unlike a VPS, a stopped machine
+# is near-free, so it is treated as SCALE-TO-ZERO (idle spares park via stop/start instead of destroy).
 #   1. Create a deploy/org token: `fly tokens create org` (or the dashboard).
 #   2. export FLY_API_TOKEN=...
 #
