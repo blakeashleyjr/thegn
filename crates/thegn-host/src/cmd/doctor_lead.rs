@@ -147,6 +147,7 @@ pub(crate) fn check_pasta(isolated: bool, available: bool) -> Check {
 pub(crate) struct DaemonFacts {
     pub enabled: bool,
     pub answers: bool,
+    pub channel: Option<String>,
 }
 
 pub(crate) fn check_daemon(f: &DaemonFacts) -> Check {
@@ -158,13 +159,23 @@ pub(crate) fn check_daemon(f: &DaemonFacts) -> Check {
             Some("set [daemon] enabled = true"),
         );
     }
+    if f.answers
+        && let Some(c) = f.channel.as_deref().filter(|c| *c != "dev")
+    {
+        return check(
+            "daemon",
+            Level::Fail,
+            format!("the daemon runs on the {c} channel, where [lead] is off"),
+            Some("`thegn daemon stop`, then reopen thegn with THEGN_CHANNEL=dev"),
+        );
+    }
     pass_or(
         "daemon",
         f.answers,
         Level::Fail,
         "daemon answers on its socket",
         "the daemon socket does not answer",
-        Some("start it: `thegn daemon start`"),
+        Some("open thegn (it starts the daemon); with [lead], use THEGN_CHANNEL=dev"),
     )
 }
 
@@ -254,7 +265,10 @@ pub(crate) fn check_mcp(f: &McpFacts) -> Vec<Check> {
         out.push(check(
             "mcp",
             Level::Info,
-            format!("mcp server {:?} needs the Lead MCP dir (b161)", m.name),
+            format!(
+                "mcp server {:?} runs through npx/uvx/mcp-remote: if it needs OAuth, run `thegn lead login --mcp {}`",
+                m.name, m.name
+            ),
             None,
         ));
     }
@@ -360,7 +374,7 @@ pub(crate) fn merge_reason(f: &MergeFacts) -> Option<&'static str> {
 
 pub(crate) fn check_merge(f: &MergeFacts) -> Check {
     let autonomy = match merge_reason(f) {
-        None => "merge autonomy: lands unattended".to_owned(),
+        None => "merge autonomy: can land unattended (the sealed gate sandbox is resolved for each repo at land time; any failure asks)".to_owned(),
         Some(r) => format!("merge autonomy: asks because {r}"),
     };
     check(
@@ -419,7 +433,7 @@ pub(crate) fn check_push(f: &PushFacts) -> Check {
     }
     let mut problems = Vec::new();
     if !f.token_is_secret_ref {
-        problems.push("token is not a secret ref (env:/file:)");
+        problems.push("a push topic's token is not a secret ref (env:/file:)");
     }
     if !f.inbox_enabled {
         problems.push("inbox disabled");
@@ -491,15 +505,31 @@ fn which(program: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Binaries under a masked root, unless they sit inside a re-exposed
+/// (registered repo/worktree) root.
+pub(crate) fn offending(bins: &[PathBuf], masks: &[PathBuf], reexposed: &[PathBuf]) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in bins {
+        if !under_any(b, masks) {
+            continue;
+        }
+        let canon = std::fs::canonicalize(b).unwrap_or_else(|_| b.clone());
+        if reexposed
+            .iter()
+            .any(|r| canon.starts_with(r) || b.starts_with(r))
+        {
+            continue;
+        }
+        out.push(b.display().to_string());
+    }
+    out
+}
+
 fn under_any(path: &Path, roots: &[PathBuf]) -> bool {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     roots
         .iter()
         .any(|r| canon.starts_with(r) || path.starts_with(r))
-}
-
-fn probe_daemon(cfg: &Config) -> bool {
-    super::doctor::probe_daemon_channel(cfg).is_some()
 }
 
 /// Inspect the Lead's readiness.
@@ -524,16 +554,24 @@ pub(crate) fn inspect(cfg: &Config) -> LeadReadiness {
             .ok()
             .map(|e| e.harness);
         checks.push(check_agent(&lead.agent, harness.as_deref()));
-        checks.push(check_account(lead.account.as_deref()));
+        checks.push(check_account(
+            lead.account.as_deref().filter(|a| !a.trim().is_empty()),
+        ));
         checks.push(check_bwrap(thegn_core::lead_sandbox::bwrap_available()));
         let isolated = lead.network == thegn_core::config_lead::LeadNetwork::Isolated;
         checks.push(check_pasta(
             isolated,
             thegn_core::lead_net::pasta_available(),
         ));
+        let probe = if cfg.daemon.enabled {
+            super::doctor::probe_daemon_channel(cfg)
+        } else {
+            None
+        };
         checks.push(check_daemon(&DaemonFacts {
             enabled: cfg.daemon.enabled,
-            answers: cfg.daemon.enabled && probe_daemon(cfg),
+            answers: probe.is_some(),
+            channel: probe.flatten(),
         }));
         let state = thegn_core::util::xdg_state_home();
         let addr_path = state
@@ -565,11 +603,28 @@ pub(crate) fn inspect(cfg: &Config) -> LeadReadiness {
             if let Ok(exe) = std::env::current_exe() {
                 bins.push(exe);
             }
-            for b in bins {
-                if under_any(&b, &roots) {
-                    offenders.push(b.display().to_string());
-                }
+            let mut reexposed: Vec<PathBuf> = Vec::new();
+            if let Some(d) = &db {
+                use thegn_core::store::WorkspaceStore;
+                let mut raw: Vec<PathBuf> = d
+                    .workspaces()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|w| PathBuf::from(w.repo_path))
+                    .collect();
+                raw.extend(
+                    d.worktrees()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|w| w.location.trim().is_empty())
+                        .flat_map(|w| [PathBuf::from(w.worktree), PathBuf::from(w.repo_root)]),
+                );
+                reexposed = raw
+                    .into_iter()
+                    .filter_map(|p| std::fs::canonicalize(p).ok())
+                    .collect();
             }
+            offenders = offending(&bins, &roots, &reexposed);
         }
         checks.push(check_masks(&offenders));
         let members = cfg.mcp_proxy.profiles.get(&lead.mcp_profile).map(|names| {
@@ -650,12 +705,17 @@ pub(crate) fn inspect(cfg: &Config) -> LeadReadiness {
         paused,
     }));
     let push = &cfg.notifications.push;
-    let token = push.token.trim();
+    let is_ref = |t: &str| {
+        let t = t.trim();
+        t.starts_with("env:") || t.starts_with("file:")
+    };
     checks.push(check_push(&PushFacts {
         topic_set: !push.topic.trim().is_empty(),
-        token_is_secret_ref: token.is_empty()
-            || token.starts_with("env:")
-            || token.starts_with("file:"),
+        token_is_secret_ref: is_ref(&push.token)
+            && push
+                .sinks
+                .iter()
+                .all(|s| s.topic.trim().is_empty() || is_ref(&s.token)),
         inbox_enabled: push.inbox.enabled,
         inbox_secret_set: !push.inbox.inbox_secret.trim().is_empty(),
         redeem_allowed: push.inbox.allow.iter().any(|a| a == "approvals.redeem"),
@@ -737,7 +797,7 @@ pub(crate) fn lines(r: &LeadReadiness) -> Vec<String> {
     if r.unconfigured {
         return vec![NOT_CONFIGURED.to_owned()];
     }
-    let mut out = Vec::new();
+    let mut out = vec!["Lead readiness".to_owned()];
     for c in &r.checks {
         out.push(format!("{}  {}", c.level.label(), c.text));
         if let Some(fix) = &c.fix {
@@ -749,6 +809,7 @@ pub(crate) fn lines(r: &LeadReadiness) -> Vec<String> {
 
 /// Print the text report.
 pub(crate) fn print(r: &LeadReadiness) {
+    outln!("");
     for line in lines(r) {
         outln!("{line}");
     }
@@ -815,24 +876,51 @@ mod tests {
         assert_eq!(
             lv(&check_daemon(&DaemonFacts {
                 enabled: true,
-                answers: true
+                answers: true,
+                channel: Some("dev".into()),
             })),
             Level::Ok
         );
         assert_eq!(
             lv(&check_daemon(&DaemonFacts {
-                enabled: false,
-                answers: false
+                enabled: true,
+                answers: true,
+                channel: Some("stable".into()),
             })),
             Level::Fail
         );
         assert_eq!(
             lv(&check_daemon(&DaemonFacts {
                 enabled: true,
-                answers: false
+                answers: true,
+                channel: None,
+            })),
+            Level::Ok
+        );
+        assert_eq!(
+            lv(&check_daemon(&DaemonFacts {
+                enabled: false,
+                answers: false,
+                channel: None,
             })),
             Level::Fail
         );
+        assert_eq!(
+            lv(&check_daemon(&DaemonFacts {
+                enabled: true,
+                answers: false,
+                channel: None,
+            })),
+            Level::Fail
+        );
+    }
+
+    #[test]
+    fn offending_skips_reexposed() {
+        let masks = vec![PathBuf::from("/m")];
+        let bins = vec![PathBuf::from("/m/wt/bin")];
+        assert_eq!(offending(&bins, &masks, &[]).len(), 1);
+        assert!(offending(&bins, &masks, &[PathBuf::from("/m/wt")]).is_empty());
     }
 
     #[test]
@@ -880,7 +968,7 @@ mod tests {
         });
         assert_eq!(bad[0].level, Level::Warn);
         assert_eq!(bad[1].level, Level::Info);
-        assert!(bad[1].text.contains("needs the Lead MCP dir (b161)"));
+        assert!(bad[1].text.contains("thegn lead login --mcp a"));
     }
 
     #[test]
@@ -926,7 +1014,7 @@ mod tests {
         };
         let c = check_merge(&f);
         assert_eq!(c.level, Level::Info);
-        assert!(c.text.contains("lands unattended"));
+        assert!(c.text.contains("can land unattended"));
         f.sealed = false;
         assert!(check_merge(&f).text.contains("asks because"));
         f.gate_on = false;
@@ -1007,6 +1095,7 @@ mod tests {
         assert_eq!(
             lines(&r),
             vec![
+                "Lead readiness",
                 "fail  bubblewrap (bwrap) is not available",
                 "      fix: install bubblewrap"
             ]
