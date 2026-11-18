@@ -392,6 +392,12 @@ pub fn validate_diagnostics_with_policy(
                 message,
             }
         }));
+        diagnostics.extend(network_audit_warnings(&cfg).into_iter().map(|message| {
+            ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message,
+            }
+        }));
         diagnostics.extend(
             cfg.placement
                 .fleet_budget_warnings()
@@ -403,6 +409,43 @@ pub fn validate_diagnostics_with_policy(
         );
     }
     diagnostics
+}
+
+/// `network_audit` subscribes the podman `network` event stream (container
+/// network attach/detach). Warn when no selectable backend — the explicit
+/// `backend`, or every `backend_chain` entry under `auto` — implements the
+/// events op, because then nothing is ever audited.
+fn network_audit_warnings(cfg: &Config) -> Vec<String> {
+    use crate::sandbox::Backend;
+    if !cfg.sandbox.network_audit {
+        return Vec::new();
+    }
+    let selectable: Vec<Backend> = match Backend::from_config(cfg.sandbox.backend) {
+        Some(backend) => vec![backend],
+        None => cfg
+            .sandbox
+            .backend_chain
+            .iter()
+            .filter_map(|name| Backend::parse(name))
+            .collect(),
+    };
+    if selectable
+        .iter()
+        .any(|backend| backend.profile().events == crate::sandbox_events::EventsCap::Yes)
+    {
+        return Vec::new();
+    }
+    let names: Vec<&str> = selectable.iter().map(|backend| backend.label()).collect();
+    vec![format!(
+        "sandbox.network_audit = true, but no selectable backend ({}) delivers the podman \
+         `network` event stream, so nothing is audited; network_audit records container network \
+         attach/detach on podman backends only and is not a DNS-query or connection log",
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    )]
 }
 
 /// THE-2021: `[sandbox.git]` policy warnings for the global table and every
@@ -1481,6 +1524,66 @@ fn join_key(path: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit_cfg(backend: crate::config::SandboxBackend, chain: &[&str]) -> Config {
+        let mut cfg = Config::default();
+        cfg.sandbox.network_audit = true;
+        cfg.sandbox.backend = backend;
+        if !chain.is_empty() {
+            cfg.sandbox.backend_chain = chain.iter().map(|name| name.to_string()).collect();
+        }
+        cfg
+    }
+
+    #[test]
+    fn validate_warns_network_audit_on_docker() {
+        let warnings =
+            network_audit_warnings(&audit_cfg(crate::config::SandboxBackend::Docker, &[]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("docker"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("not a DNS-query or connection log"),
+            "{warnings:?}"
+        );
+        // The same warning reaches `config validate`.
+        let diagnostics =
+            validate_diagnostics("[sandbox]\nbackend = \"docker\"\nnetwork_audit = true\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == ValidationSeverity::Warning
+                    && d.message.contains("network_audit")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_silent_network_audit_on_podman() {
+        for backend in [
+            crate::config::SandboxBackend::Podman,
+            crate::config::SandboxBackend::PodmanRootful,
+        ] {
+            assert!(network_audit_warnings(&audit_cfg(backend, &[])).is_empty());
+        }
+        // The default `auto` chain starts with podman.
+        assert!(
+            network_audit_warnings(&audit_cfg(crate::config::SandboxBackend::Auto, &[])).is_empty()
+        );
+        // Off: nothing to say, whatever the backend.
+        let mut off = audit_cfg(crate::config::SandboxBackend::Docker, &[]);
+        off.sandbox.network_audit = false;
+        assert!(network_audit_warnings(&off).is_empty());
+    }
+
+    #[test]
+    fn validate_warns_network_audit_auto_chain_without_podman() {
+        let warnings = network_audit_warnings(&audit_cfg(
+            crate::config::SandboxBackend::Auto,
+            &["docker", "bwrap"],
+        ));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("docker, bwrap"), "{warnings:?}");
+    }
 
     #[test]
     fn voice_credential_requires_tls_except_for_loopback_http() {
