@@ -523,6 +523,12 @@ pub enum Verb {
     ApprovalsResolve,
     /// Start the merge-queue drain for a worktree's repo (merge_add).
     MergeDrain,
+    // --- automation kill switch (THE-2197) ---
+    /// Pause every automation rule (write; a Lead may stop automations).
+    AutomationsPause,
+    /// Resume paused automations — admin only, so a Lead that paused can never
+    /// restart them; only the operator resumes.
+    AutomationsResume,
 }
 
 impl Verb {
@@ -632,6 +638,8 @@ impl Verb {
         Verb::ApprovalsRequest,
         Verb::ApprovalsResolve,
         Verb::MergeDrain,
+        Verb::AutomationsPause,
+        Verb::AutomationsResume,
     ];
 
     /// Whether this verb produces a *stream* (pane output on attach, the event
@@ -730,7 +738,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::AutomationsPut
         | Verb::AutomationsRm
         | Verb::AutomationsEnable
-        | Verb::ApprovalsRequest => Scope::Write,
+        | Verb::ApprovalsRequest
+        // THE-2197: stopping automations is the safe direction of the kill switch.
+        | Verb::AutomationsPause => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeClear
@@ -766,7 +776,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ModelProxyStop
         // Granting an approval is a human act: no supervisor path may grant
         // (`pipeline_approval.rs`), so it stays off every agent door.
-        | Verb::ApprovalsResolve => Scope::Admin,
+        | Verb::ApprovalsResolve
+        // THE-2197: restarting automations is the operator's call alone.
+        | Verb::AutomationsResume => Scope::Admin,
     }
 }
 
@@ -1215,6 +1227,8 @@ mod tests {
             AutomationsRm,
             AutomationsEnable,
             ApprovalsRequest,
+            // Automation kill switch (THE-2197): stopping is Write.
+            AutomationsPause,
         ];
         let git = [
             GitStage,
@@ -1247,6 +1261,8 @@ mod tests {
             ModelProxyStop,
             // Granting a pipeline approval is a human act (THE-2172).
             ApprovalsResolve,
+            // Restarting automations is the operator's call (THE-2197).
+            AutomationsResume,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");
