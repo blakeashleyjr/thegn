@@ -131,7 +131,7 @@ fn check_chain(f: &UnattendedFacts) -> Result<(), String> {
 }
 
 /// 2. That rule is loaded, enabled, effective `merge`, structural-only, and
-/// of trusted origin (config, or a Lead rule the owner armed).
+///    of trusted origin (config, or a Lead rule the owner armed).
 fn check_rule(f: &UnattendedFacts) -> Result<(), String> {
     let Some(rule) = &f.rule else {
         return Err(RULE_NOT_LOADED.into());
