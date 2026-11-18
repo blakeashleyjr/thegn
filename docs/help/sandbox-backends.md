@@ -60,13 +60,13 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 `thegn doctor` renders one **enforcement matrix** for this host: per backend,
 what it actually enforces —
 
-| Cell      | What it means                                                                 |
-| --------- | ----------------------------------------------------------------------------- |
-| `fs`      | filesystem isolation: a separate root, unit-level protection, or the host fs  |
-| `net`     | `netns; rules DNS-only`, `only when network=none`, or `none (host net)`       |
-| `ceiling` | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none         |
-| `scoping` | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid |
-| `class`   | the honest isolation class (below) — what would have to fail for an escape    |
+| Cell      | What it means                                                                                                                                                                                                    |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fs`      | filesystem isolation: a separate root, unit-level protection, or the host fs                                                                                                                                     |
+| `net`     | `netns; rules advisory` (own namespace: `network = "none"` is enforced and reported offline; allow/block lists are not enforced), `only when network=none`, `none (host net)`, or `unverified (no none)` (apple) |
+| `ceiling` | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none                                                                                                                                            |
+| `scoping` | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid                                                                                                                                    |
+| `class`   | the honest isolation class (below) — what would have to fail for an escape                                                                                                                                       |
 
 Every cell is **derived** from the same predicates the resolver uses, so the
 matrix can never disagree with what actually launches. The ceiling cell reflects
