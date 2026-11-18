@@ -393,6 +393,7 @@ pub mod share;
 pub mod shellinv;
 pub mod snapshot_meta;
 pub mod spillover;
+pub mod sprite_hold;
 pub mod ssh_creds;
 pub mod stage_land;
 pub mod startup;

@@ -1118,6 +1118,8 @@ impl ProviderEgress for VercelProvider {
 }
 
 #[cfg(test)]
+mod conformance_tests;
+#[cfg(test)]
 mod provider_tests;
 
 #[cfg(test)]
