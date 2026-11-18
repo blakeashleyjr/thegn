@@ -1743,6 +1743,9 @@ async fn run(
     // coordinator call ensures they share the same actor/process teardown as
     // the shutdown RPC before registry/lease state is retired.
     svc.shutdown_sessions().await;
+    // Give back the headless producer leases (THE-2208) so a UI resumes
+    // polling at once instead of after the TTL. A no-op when not installed.
+    let _ = tokio::task::spawn_blocking(crate::daemon::producers::release_all).await; // best-effort: lease: an unreleased lease lapses after its TTL
 
     // Cleanup: registry row + socket file. Leases stay only if sessions do —
     // a graceful shutdown killed them, so sweep ours.
