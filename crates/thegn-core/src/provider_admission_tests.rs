@@ -888,10 +888,16 @@ fn sprites_cfg(
     f: impl FnOnce(&mut crate::config::EnvProviderConfig),
 ) -> crate::config::Config {
     let mut cfg = crate::config::Config::default();
-    let mut env = crate::config::EnvConfig::default();
-    env.placement = placement;
-    env.provider.provider = "sprites".into();
-    f(&mut env.provider);
+    let mut provider = crate::config::EnvProviderConfig {
+        provider: "sprites".into(),
+        ..Default::default()
+    };
+    f(&mut provider);
+    let env = crate::config::EnvConfig {
+        placement,
+        provider,
+        ..Default::default()
+    };
     cfg.env.insert("s".into(), env);
     cfg
 }
@@ -900,7 +906,8 @@ fn sprites_cfg(
 fn sprites_fixed_size_warning_names_its_field() {
     use crate::config::PlacementMode::Provider;
     for set in [
-        (|p: &mut crate::config::EnvProviderConfig| p.size = "big".into()) as fn(&mut _),
+        (|p: &mut crate::config::EnvProviderConfig| p.size = "big".into())
+            as fn(&mut crate::config::EnvProviderConfig),
         |p| p.min_vcpu = 2,
         |p| p.gpu = true,
         |p| p.nvme = true,
