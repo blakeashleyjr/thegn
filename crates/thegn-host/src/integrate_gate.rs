@@ -1418,6 +1418,17 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
         Ok(exec) => exec,
         Err(reason) => return Ok(sandbox_unavailable(reason)),
     };
+    // A sealed gate never builds in a configured (possibly shared) target.
+    let sealed_config;
+    let config = if matches!(exec, GateExec::Sealed(_)) && !config.gate_target_dir.is_empty() {
+        sealed_config = MergeQueueConfig {
+            gate_target_dir: String::new(),
+            ..config.clone()
+        };
+        &sealed_config
+    } else {
+        config
+    };
     if !crate::platform::gate_path::verified_workspace_supported() {
         return run_native_isolated(repo, oid, config, exec);
     }
@@ -1545,7 +1556,7 @@ fn sealed_command(
             .map_err(|reason| anyhow::Error::new(SandboxEntryRefused(reason)))?;
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]).current_dir(checkout);
-    crate::gate_sandbox::scrub_sealed_env(&mut command);
+    crate::gate_sandbox::scrub_sealed_env(&mut command, &spec.env);
     Ok((command, false, env_file))
 }
 

@@ -15,14 +15,15 @@
 //!   it), and every mount the profile brings (caches included);
 //! - never mounted: the repo's main checkout and its `.git` carve-outs.
 //!
-//! Only a local bwrap sandbox with network `none` qualifies: an OCI backend
-//! would exec into a container built for the main checkout, and a remote
-//! placement would run the gate on another host.
+//! Only a local bwrap sandbox with network `none` and no host daemon socket
+//! qualifies: an OCI backend would exec into a container built for the main
+//! checkout, a remote placement would run the gate on another host, and a
+//! bound socket (the Nix daemon, a `[sandbox] mounts` socket or device) reaches
+//! a host service that `--unshare-net` does not block.
 //!
 //! The guarded entry masks the daemon socket, state run dir, runtime dir and
-//! Lead control dir; the sealed floor hides `$HOME`. The sealed command drops
-//! every credential-shaped variable from the inherited env
-//! ([`scrub_sealed_env`]).
+//! Lead control dir; the sealed floor hides `$HOME`. The sealed command
+//! inherits only an allowlisted env ([`scrub_sealed_env`]).
 
 use std::path::Path;
 
@@ -81,7 +82,16 @@ fn sealed_spec(full: &Config, repo_root: &Path) -> Result<GateExec, String> {
     match gate {
         AgentDispatch::Run(Some(spec)) if host_validation_isolated(&spec) => {
             match gate_backend_refusal(&spec) {
-                None => Ok(GateExec::Sealed(Box::new(spec))),
+                None => match spec.mounts.iter().find(|m| {
+                    m.host != "/dev/null"
+                        && std::fs::metadata(&m.host).is_ok_and(|md| !md.is_dir() && !md.is_file())
+                }) {
+                    Some(m) => Err(format!(
+                        "the sealed merge gate refuses mount '{}': it is a socket or device, which reaches a host service",
+                        m.dest
+                    )),
+                    None => Ok(GateExec::Sealed(Box::new(spec))),
+                },
                 Some(why) => Err(why),
             }
         }
@@ -94,6 +104,20 @@ fn sealed_spec(full: &Config, repo_root: &Path) -> Result<GateExec, String> {
 /// execs into a container built for the main checkout; a remote placement runs
 /// elsewhere), and the gate runs with no network. Pure.
 fn gate_backend_refusal(spec: &SandboxSpec) -> Option<String> {
+    const NIX_DAEMON: &str = "/nix/var/nix/daemon-socket";
+    let nix = Path::new(NIX_DAEMON);
+    if spec.env.iter().any(|(k, _)| k == "NIX_REMOTE")
+        || spec.mounts.iter().any(|m| {
+            let (h, d) = (Path::new(&m.host), Path::new(&m.dest));
+            h.starts_with(nix) || d.starts_with(nix) || nix.starts_with(h) || nix.starts_with(d)
+        })
+    {
+        return Some(
+            "the sealed merge gate refuses a sandbox that reaches the host Nix daemon \
+             ([sandbox] nix_daemon = true): daemon builds have network and write the host store"
+                .into(),
+        );
+    }
     let profile = spec.backend.profile();
     if profile.family == thegn_core::sandbox::BackendFamily::Bwrap
         && spec.placement.is_local()
@@ -158,39 +182,106 @@ fn load_process_config() -> Result<Config, String> {
     let mut cfg = admitted.config().clone();
     // best-effort: the clamped-feature report is for `main`'s startup status
     // note; the gate only needs the clamped config.
-    let _ = crate::channel_state::clamp_and_record(&mut cfg, crate::channel_state::current());
+    crate::channel_state::clamp_and_record(&mut cfg, crate::channel_state::current());
     Ok(cfg)
 }
 
-/// Remove from a sealed gate command's env everything a gate must never see:
-/// the drain's [`SCRUBBED_ENV`](crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV),
-/// the repo-targeting git vars, and every credential-shaped variable (local
-/// bwrap inherits the launcher's env), whether inherited or set explicitly.
-pub(crate) fn scrub_sealed_env(command: &mut std::process::Command) {
-    for var in crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV {
-        command.env_remove(var);
-    }
-    for var in thegn_core::util::GIT_ENV_VARS {
-        command.env_remove(var);
-    }
-    let sensitive = |key: &str| {
-        thegn_core::log_redact::is_sensitive_key(key)
-            || matches!(
-                key,
-                "GH_CONFIG_DIR" | "GNUPGHOME" | "GIT_SSH_COMMAND" | "GPG_TTY"
-            )
-    };
-    let explicit: Vec<std::ffi::OsString> = command
+/// Inherited variables a sealed gate may see (cargo/just/nix toolchains).
+const SEALED_ENV_EXACT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TMPDIR",
+    "SOURCE_DATE_EPOCH",
+    "IN_NIX_SHELL",
+    "XDG_DATA_DIRS",
+    "XDG_CONFIG_DIRS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "LD_LIBRARY_PATH",
+    "LIBRARY_PATH",
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "LIBCLANG_PATH",
+    "BINDGEN_EXTRA_CLANG_ARGS",
+    "PROTOC",
+    "PROTOC_INCLUDE",
+    "CC",
+    "CXX",
+    "AR",
+    "LD",
+    "RANLIB",
+    "CFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "RUSTC",
+    "RUSTDOC",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "RUST_BACKTRACE",
+    "RUST_MIN_STACK",
+    "RUST_TEST_THREADS",
+    "THEGN_GATE",
+    "THEGN_WORKTREE",
+    "THEGN_GATE_OID",
+    "THEGN_SANDBOX",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_TERMINAL_PROMPT",
+];
+const SEALED_ENV_PREFIXES: &[&str] = &[
+    "LC_",
+    "CARGO_",
+    "RUSTUP_",
+    "NIX_",
+    "PKG_CONFIG",
+    "CC_",
+    "CXX_",
+    "AR_",
+    "CFLAGS_",
+    "CXXFLAGS_",
+];
+/// Never inherited, even when allowlisted or kept.
+const SEALED_ENV_DENY: &[&str] = &[
+    "NIX_CONFIG",
+    "NIX_USER_CONF_FILES",
+    "NIX_REMOTE",
+    "NIX_DAEMON_SOCKET_PATH",
+    "NIX_SSHOPTS",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_HTTP_PROXY",
+    "THEGN_CONTROL_SOCKET",
+];
+
+fn sealed_env_allowed(key: &str, keep: &[&str]) -> bool {
+    (SEALED_ENV_EXACT.contains(&key)
+        || SEALED_ENV_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        || keep.contains(&key))
+        && !SEALED_ENV_DENY.contains(&key)
+        && !thegn_core::log_redact::is_sensitive_key(key)
+}
+
+/// A sealed gate command's env: cleared, then only allowlisted inherited
+/// or explicitly set variables (`keep`: the spec's own env keys).
+pub(crate) fn scrub_sealed_env(command: &mut std::process::Command, keep: &[(String, String)]) {
+    let keep: Vec<&str> = keep.iter().map(|(key, _)| key.as_str()).collect();
+    let explicit: Vec<(std::ffi::OsString, std::ffi::OsString)> = command
         .get_envs()
-        .filter(|(_, value)| value.is_some())
-        .map(|(key, _)| key.to_os_string())
+        .filter_map(|(key, value)| value.map(|value| (key.to_os_string(), value.to_os_string())))
         .collect();
-    let inherited = std::env::vars_os().map(|(key, _)| key);
-    for key in explicit.into_iter().chain(inherited) {
-        if let Some(k) = key.to_str()
-            && sensitive(k)
-        {
-            command.env_remove(&key);
+    command.env_clear();
+    for (key, value) in std::env::vars_os().chain(explicit) {
+        if key.to_str().is_some_and(|k| sealed_env_allowed(k, &keep)) {
+            command.env(&key, &value);
         }
     }
 }
@@ -514,6 +605,25 @@ mod tests {
         };
         let why = gate_backend_refusal(&nat).expect("nat refused");
         assert!(why.contains("network 'nat'"), "{why}");
+        let daemon_mount = SandboxSpec {
+            backend: Backend::Bwrap,
+            network: Network::None,
+            mounts: vec![Mount {
+                host: "/nix/var/nix/daemon-socket".into(),
+                dest: "/nix/var/nix/daemon-socket".into(),
+                ro: true,
+                cache: false,
+            }],
+            ..SandboxSpec::default()
+        };
+        assert!(gate_backend_refusal(&daemon_mount).is_some());
+        let daemon_env = SandboxSpec {
+            backend: Backend::Bwrap,
+            network: Network::None,
+            env: vec![("NIX_REMOTE".into(), "daemon".into())],
+            ..SandboxSpec::default()
+        };
+        assert!(gate_backend_refusal(&daemon_env).is_some());
     }
 
     #[test]
@@ -521,9 +631,18 @@ mod tests {
         let mut command = std::process::Command::new("true");
         command
             .env("FOO_API_KEY", "x")
+            .env("AWS_ACCESS_KEY_ID", "AKIA")
             .env("GIT_SSH_COMMAND", "ssh -i k")
-            .env("THEGN_GATE", "1");
-        scrub_sealed_env(&mut command);
+            .env("RUSTC_WRAPPER", "sccache")
+            .env("NIX_CONFIG", "access-tokens = x")
+            .env("CARGO_REGISTRY_TOKEN", "t")
+            .env("THEGN_GATE", "1")
+            .env("CARGO_TARGET_DIR", "/t")
+            .env("PATH", "/bin");
+        scrub_sealed_env(
+            &mut command,
+            &[("GIT_CONFIG_GLOBAL".into(), "/dev/null".into())],
+        );
         let envs: Vec<(String, Option<String>)> = command
             .get_envs()
             .map(|(k, v)| {
@@ -533,12 +652,57 @@ mod tests {
                 )
             })
             .collect();
-        let value = |key: &str| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-        assert_eq!(value("FOO_API_KEY"), Some(None), "explicit key removed");
-        assert_eq!(value("GIT_SSH_COMMAND"), Some(None));
-        assert_eq!(value("GH_TOKEN"), Some(None));
-        assert_eq!(value("GIT_DIR"), Some(None));
-        assert_eq!(value("THEGN_GATE"), Some(Some("1".into())));
+        let value = |key: &str| {
+            envs.iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, v)| v.clone())
+        };
+        for key in [
+            "FOO_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "GIT_SSH_COMMAND",
+            "RUSTC_WRAPPER",
+            "NIX_CONFIG",
+            "CARGO_REGISTRY_TOKEN",
+            "GH_TOKEN",
+            "GIT_DIR",
+        ] {
+            assert_eq!(value(key), None, "{key} must not reach the sealed gate");
+        }
+        assert_eq!(value("THEGN_GATE").as_deref(), Some("1"));
+        assert_eq!(value("CARGO_TARGET_DIR").as_deref(), Some("/t"));
+        assert_eq!(value("PATH").as_deref(), Some("/bin"));
+    }
+
+    #[test]
+    fn sealed_env_allowed_is_an_allowlist() {
+        let keep = ["GIT_CONFIG_GLOBAL", "GH_TOKEN"];
+        for key in [
+            "PATH",
+            "LC_ALL",
+            "CARGO_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "NIX_CFLAGS_COMPILE",
+            "GIT_CONFIG_GLOBAL",
+        ] {
+            assert!(sealed_env_allowed(key, &keep), "{key} allowed");
+        }
+        for key in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "NIX_CONFIG",
+            "RUSTC_WRAPPER",
+            "CARGO_REGISTRIES_X_TOKEN",
+            "SSH_AUTH_SOCK",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "THEGN_CONTROL_SOCKET",
+            "DATABASE_URL",
+            "GH_TOKEN",
+        ] {
+            assert!(!sealed_env_allowed(key, &keep), "{key} denied");
+        }
+        assert!(!sealed_env_allowed("GIT_CONFIG_GLOBAL", &[]));
     }
 
     #[test]

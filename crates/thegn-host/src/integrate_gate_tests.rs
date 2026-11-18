@@ -1948,7 +1948,7 @@ fn a_refused_sandbox_entry_spawns_nothing_and_reads_as_spawn_failure() {
 
 #[test]
 fn a_sealed_preflight_that_does_not_start_is_a_preparation_hold() {
-    use super::super::gate_capture::CaptureResult;
+    use crate::gate_capture::CaptureResult;
     let sealed = RunMode::Sealed {
         header: "sandboxed gate (network: none)\n".into(),
     };

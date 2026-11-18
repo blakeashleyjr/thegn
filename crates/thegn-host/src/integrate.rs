@@ -922,6 +922,10 @@ fn warn_driver_merge_failure(reason: &str, diagnostics: &str) {
 // off-loop: the fold runs from the CLI (`thegn integrate`) or from
 // spawn_fold's spawn_blocking (see the module doc) — never on the loop.
 #[expect(clippy::disallowed_methods)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal fold seam: each argument is a distinct fold input the two callers and tests pass positionally"
+)]
 fn regenerate_merge(
     repo_root: &Path,
     ours: &str,
@@ -1050,7 +1054,7 @@ fn regenerate_merge(
                         Ok((argv, env_file)) => {
                             let mut command = std::process::Command::new(&argv[0]);
                             command.args(&argv[1..]);
-                            crate::gate_sandbox::scrub_sealed_env(&mut command);
+                            crate::gate_sandbox::scrub_sealed_env(&mut command, &spec.env);
                             (command, env_file)
                         }
                         Err(reason) => {

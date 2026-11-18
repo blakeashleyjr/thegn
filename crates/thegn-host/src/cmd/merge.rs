@@ -1097,6 +1097,17 @@ fn sweep(cfg: &Config, force: bool, json: bool) -> Result<()> {
 fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     let root = repo_root()?;
     let mq = &cfg.repo_merge_queue(&root);
+    if std::env::var_os(crate::gate_sandbox::REQUIRE_SEALED_ENV).is_some()
+        && (!mq.gate_on || mq.gate_command.trim().is_empty())
+    {
+        let error = anyhow::anyhow!(
+            "this unattended land requires the sealed merge gate, but [merge_queue] gate_on is off or gate_command is empty for this repo"
+        );
+        if json {
+            super::emit_json(&queue_error_json(&error))?;
+        }
+        return Err(error);
+    }
     // `push` mode drains this clone locally and pushes to origin, so it skips the
     // remote-target guard; `route_to_host` keeps the fold on the target host.
     let push_mode = mq.remote_mode == thegn_core::config::MergeRemoteMode::Push;
