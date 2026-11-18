@@ -7,9 +7,48 @@ and the existing development-shell build dependencies are required.
 
 To bootstrap the helper from a reviewed worktree before it reaches `main`, use
 `python3 -B /absolute/worktree/scripts/live.py --repo /absolute/repo --plan`,
-then omit `--plan` when ready. `--repo` selects both the source checkout and its
-`target/release/thegn` installation; it cannot redirect installation around a
-migration pin.
+then omit `--plan` when ready. `--repo` selects the source checkout to build.
+The installation is chosen separately (see below) and cannot be redirected
+around a migration pin.
+
+## Where it installs
+
+The installed binary lives **outside the checkout**, so no release build in the
+repo can replace the instance you work in:
+
+- `<install-dir>/thegn`, the executable;
+- `<install-dir>/alacritty.toml`, a copy of the repo's `config/alacritty.toml`,
+  installed atomically next to the binary.
+
+`<install-dir>` is `--install-dir` if given, else `$THEGN_LIVE_INSTALL_DIR`,
+else `~/.local/lib/thegn`. `~` is the account's home from the passwd
+database, not `$HOME`, because the helper is sometimes run from a shell whose
+`HOME` is a profile directory. `XDG_DATA_HOME` is not consulted. The directory
+must be absolute and outside the checkout, and it is created on the first real
+run. `--plan` never creates it.
+
+**First run after the move.** When nothing is installed at `<install-dir>` yet
+but `<repo>/target/release/thegn` exists, that in-repo binary is treated as the
+previous installation: its processes count as this installation's, and it is the
+binary copied into the recovery directory. The new build is then installed to
+`<install-dir>`. The plan output says so. The in-repo binary is never modified
+or removed.
+
+**Launchers.** The helper does not silently change anything in `~/.local/bin`.
+`--plan`, the start of a run and the end of a run print the launcher state:
+whether `~/.local/bin/thegn` resolves to the install target, and whether `tg` and
+`tg-tui` still mention `<repo>/target/release/thegn` or `<repo>/config/alacritty.toml`.
+Pass `--relink-launchers` (for example
+`python3 -B scripts/live.py --relink-launchers`) to opt in. After the install
+it repoints the `~/.local/bin/thegn` symlink to the install target. In `tg` and
+`tg-tui` it replaces exact occurrences of those two old paths with the new ones.
+A path that merely starts with an old one is left alone. A `.bak` copy is
+written beside each wrapper first. The whole change is validated during
+preflight, before anything is stopped. The helper refuses and changes nothing
+if `~/.local/bin/thegn` is not a symlink, or if a wrapper is not a current-user
+regular UTF-8 text file. It also refuses when a wrapper mentions neither the old
+paths nor the new ones. A failure while writing, which can only happen after the
+install, is reported and does not stop the launch.
 
 `just live` is a local developer upgrade, not a merge or release command. It does
 not commit, merge queued work, switch branches, or push. A rebuild of `main` does
@@ -32,8 +71,7 @@ artifact that is copied into the installation.
    private build cache (`target/live-cache`). Each upgrade therefore recompiles
    only what changed since the last one. Only the first `just live` builds
    everything. The cache is used by `just live` alone, so it stays isolated from
-   other worktrees' Cargo output and from `target/release`, which is the
-   installation. The running instance keeps working and the installed executable
+   other worktrees' Cargo output and from `target/release`. The running instance keeps working and the installed executable
    is untouched. The finished binary is copied into a fresh stage, which is the
    checksummed artifact that gets installed. Every stage is marked as owned
    before Cargo starts, so a failed build remains available for inspection.
@@ -45,17 +83,18 @@ artifact that is copied into the installation.
    serves them. Then the pane daemon gets `thegn daemon stop`. Pane processes end
    with the daemon. Anything of this installation still running after the grace
    periods gets SIGTERM, then SIGKILL.
-   Only processes whose live `/proc/<pid>/exe` _is_ the installation target are
-   ever signalled; identity never comes from a pid file or a command-line
-   pattern. Any other visible same-user `thegn`/`tg`, such as another checkout,
-   another profile or a test fixture, blocks the upgrade with its pid and is
-   left alone. The staged build is kept, so a rerun after you stop it is quick.
-5. **Back up and install.** Check again for observable same-user processes using
-   the destination executable or database files, then acquire the database
-   schema lock. Create a private recovery directory holding an online SQLite
-   backup and a copy of the old executable, then atomically replace the
-   executable. Failures before the replacement leave the installed executable
-   unchanged.
+   Only **this installation's** processes are ever signalled (see "Which
+   processes are this installation's" below). Identity never comes from a pid
+   file or a command-line pattern. A process of this installation that cannot be
+   stopped still refuses the upgrade with its pid. The staged build is kept, so
+   a rerun after you stop it is quick.
+5. **Back up and install.** Check again for observable same-user processes of
+   this installation, and for any process holding the database or the installed
+   files open. Then acquire the database schema lock. Create a private recovery
+   directory holding an online SQLite backup and a copy of the previous
+   executable. Then atomically replace `alacritty.toml` and the executable in
+   the install directory. Failures before the replacement leave the installed
+   executable unchanged. With `--relink-launchers` the launchers are updated now.
 6. **Launch** in the foreground with profiling and rotating logs enabled.
    Database migration is performed by the normal controller startup under the
    existing migration authority. The helper does not override
@@ -91,6 +130,36 @@ stderr file is not truncated. `target/live-cache` is never pruned
 automatically; `rm -rf target/live-cache` only costs the next upgrade a full
 build.
 
+## Which processes are this installation's
+
+A same-user process named `thegn` or `tg` is attributed by two facts read from
+`/proc` at the moment of the scan:
+
+- its **state home**: `XDG_STATE_HOME` from `/proc/<pid>/environ` if absolute,
+  else `$HOME/.local/state`, which is how thegn picks it. This is the same rule
+  `inst_is_ours` in `test/lib/instance.sh` uses, extended with the `HOME`
+  fallback because the default instance does not set `XDG_STATE_HOME`;
+- its **binary**: whether `/proc/<pid>/exe` is the install target, or, on the
+  first run, the legacy in-repo binary.
+
+| State home | Binary                                               | Treatment                                                                                                 |
+| ---------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| this run's | this installation's, or any executable named `thegn` | **this installation**: stopped                                                                            |
+| this run's | something else named `tg`                            | this installation, but never signalled; blocks until you stop it                                          |
+| another    | this installation's                                  | not signalled and does not block. It keeps running the old binary until it is restarted. The plan says so |
+| another    | another                                              | another installation: listed in the plan, left alone, does not block                                      |
+| unreadable | any                                                  | never signalled; blocks the upgrade, since it cannot be told apart                                        |
+
+Every listed process is printed in the plan with its pid, executable and state
+home. Whatever its attribution, a process holding this installation's database
+or installed files open still blocks the upgrade.
+
+**Two instances.** A stable instance, which is the installed binary, and a dev
+instance, built from a checkout with `just start` or `just dev tui` under its own
+`XDG_STATE_HOME`, are separate installations. `just live` upgrades and stops only
+the stable one. A running dev instance is reported and left alone, and it no
+longer blocks the upgrade.
+
 ## Support boundary
 
 This first version upgrades an existing Linux/default-profile installation,
@@ -101,9 +170,9 @@ are reasons to stop, not reasons to broaden process matching or change policy.
 Use the normal application configuration workflow for other profiles or pins.
 Hard-linked databases are unsupported because another alias can use a different
 schema lock. Hard-linked installed binaries can be replaced without changing
-their other links. The conservative process scan also refuses other visible
-same-user `thegn`/`tg` executables. It does not infer that another instance is safe
-merely from a different state root or socket name, and it never signals one.
+their other links. Another instance is left running only when its environment
+proves a different state home. An instance whose environment cannot be read is
+never signalled and blocks the upgrade.
 The helper suppresses the legacy brand-directory rename during launch; it does
 not suppress or bypass database schema migration.
 
