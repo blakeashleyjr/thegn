@@ -64,6 +64,9 @@ pub struct ControlState {
     /// label. Set by the daemon when it builds that listener, never by a
     /// request.
     pub lead_listener: bool,
+    /// `[lead] token_ttl_secs`: a Lead-confined token in use slides its
+    /// expiry forward ([`auth::slide_lead_expiry`]). `0` = no slide.
+    pub lead_token_ttl_secs: u64,
 }
 
 /// Test-visible lifecycle counters shared by clones of one control listener.
@@ -379,8 +382,15 @@ pub(super) fn authed_shaped(
             ));
         };
         let store = state.store.lock().expect("control store lock");
-        match auth::verify(&*store, &token, now_ms()) {
-            Some(ctx) => ctx.on_listener(state.lead_listener),
+        let now = now_ms();
+        match auth::verify(&*store, &token, now) {
+            Some(ctx) => {
+                let ctx = ctx.on_listener(state.lead_listener);
+                if ctx.lead_confined && state.lead_token_ttl_secs > 0 {
+                    auth::slide_lead_expiry(&*store, &ctx, now, state.lead_token_ttl_secs);
+                }
+                ctx
+            }
             None => {
                 drop(store);
                 audit_anon(verb, target, AuditOutcome::Unauthorized);
@@ -929,9 +939,10 @@ pub(super) async fn snapshot(
     headers: HeaderMap,
     Path(s): Path<String>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::Snapshot) {
-        return r;
-    }
+    let ctx = match authed(&state, &headers, Verb::Snapshot) {
+        Ok(ctx) => ctx,
+        Err(r) => return r,
+    };
     match state.api.snapshot(&s).await {
         Ok(EventFrame::PaneSnapshot {
             session,
@@ -944,7 +955,8 @@ pub(super) async fn snapshot(
             "seq": seq,
             "cols": cols,
             "rows": rows,
-            "ansi_b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "ansi_b64": base64::engine::general_purpose::STANDARD
+                .encode(redact_for(&ctx, bytes)),
         }))
         .into_response(),
         Ok(_) => ControlError::Internal(anyhow::anyhow!("snapshot returned a non-snapshot frame"))
@@ -1440,6 +1452,27 @@ pub(super) async fn issue_get(
     }
 }
 
+/// A Lead-confined snapshot has every control-token and pairing-code shape
+/// replaced (defense in depth; the pairing-code approval park is the real
+/// fix). Bytes are only rewritten when something matched.
+fn redact_for(ctx: &AuthCtx, bytes: Vec<u8>) -> Vec<u8> {
+    if !ctx.lead_confined {
+        return bytes;
+    }
+    let redacted =
+        match thegn_core::lead_confine::redact_credentials(&String::from_utf8_lossy(&bytes)) {
+            std::borrow::Cow::Owned(redacted) => Some(redacted),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+    redacted.map_or(bytes, String::into_bytes)
+}
+
+/// The issues verbs' Lead shape: the daemon's `issues_*_confined` path
+/// applies the outward-approval gate itself (6d).
+fn issue_shape() -> RequestShape<'static> {
+    RequestShape::DaemonGated
+}
+
 pub(super) async fn issue_update(
     State(state): State<ControlState>,
     headers: HeaderMap,
@@ -1447,17 +1480,27 @@ pub(super) async fn issue_update(
     Query(q): Query<IssueRepoQuery>,
     body: axum::Json<thegn_core::issue::IssuePatch>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::IssuesUpdate) {
-        return r;
-    }
+    let ctx = match authed_shaped(&state, &headers, Verb::IssuesUpdate, &id, &issue_shape()) {
+        Ok(ctx) => ctx,
+        Err(r) => return r,
+    };
     if let Err(error) = crate::issue::validate_control_issue_id(&id) {
         return ControlError::InvalidArgument(error.to_string()).into_response();
     }
-    match state
-        .api
-        .issues_update(&id, &body.0, q.repo.as_deref(), q.account.as_deref())
-        .await
-    {
+    let (repo, account) = (q.repo.as_deref(), q.account.as_deref());
+    let updated = if ctx.lead_confined {
+        let caller = super::LeadCaller {
+            pairing_id: ctx.pairing_id,
+            label: ctx.label,
+        };
+        state
+            .api
+            .issues_update_confined(&id, &body.0, repo, account, caller)
+            .await
+    } else {
+        state.api.issues_update(&id, &body.0, repo, account).await
+    };
+    match updated {
         Ok(issue) => axum::Json(issue).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1475,17 +1518,30 @@ pub(super) async fn issue_comment(
     Query(q): Query<IssueRepoQuery>,
     body: axum::Json<CommentBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::IssuesComment) {
-        return r;
-    }
+    let ctx = match authed_shaped(&state, &headers, Verb::IssuesComment, &id, &issue_shape()) {
+        Ok(ctx) => ctx,
+        Err(r) => return r,
+    };
     if let Err(error) = crate::issue::validate_control_issue_id(&id) {
         return ControlError::InvalidArgument(error.to_string()).into_response();
     }
-    match state
-        .api
-        .issues_comment(&id, &body.0.body, q.repo.as_deref(), q.account.as_deref())
-        .await
-    {
+    let (repo, account) = (q.repo.as_deref(), q.account.as_deref());
+    let commented = if ctx.lead_confined {
+        let caller = super::LeadCaller {
+            pairing_id: ctx.pairing_id,
+            label: ctx.label,
+        };
+        state
+            .api
+            .issues_comment_confined(&id, &body.0.body, repo, account, caller)
+            .await
+    } else {
+        state
+            .api
+            .issues_comment(&id, &body.0.body, repo, account)
+            .await
+    };
+    match commented {
         Ok(()) => axum::Json(json!({ "commented": id })).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1538,10 +1594,20 @@ pub(super) async fn dispatch_put(
     let shape = RequestShape::DispatchPut {
         session_id: body.session_id.is_some(),
     };
-    if let Err(r) = authed_shaped(&state, &headers, Verb::DispatchesPut, "", &shape) {
-        return r;
-    }
-    match state.api.dispatch_put(body.0).await {
+    let ctx = match authed_shaped(&state, &headers, Verb::DispatchesPut, "", &shape) {
+        Ok(ctx) => ctx,
+        Err(r) => return r,
+    };
+    let put = if ctx.lead_confined {
+        let caller = super::LeadCaller {
+            pairing_id: ctx.pairing_id,
+            label: ctx.label,
+        };
+        state.api.dispatch_put_confined(body.0, caller).await
+    } else {
+        state.api.dispatch_put(body.0).await
+    };
+    match put {
         Ok(row) => axum::Json(row).into_response(),
         Err(e) => e.into_response(),
     }

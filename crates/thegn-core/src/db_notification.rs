@@ -598,6 +598,26 @@ impl NotificationStore for Db {
         Ok(changed > 0)
     }
 
+    fn set_dispatch_automation(&self, id: i64, autonomy: &str, rule_id: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE agent_dispatches SET autonomy=?1, automation_rule=?2 WHERE id=?3",
+            params![autonomy, rule_id, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn dispatch_automation(&self, id: i64) -> Result<(Option<String>, Option<String>)> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT autonomy, automation_rule FROM agent_dispatches WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None)))
+    }
+
     fn dispatch_autonomy(&self, id: i64) -> Result<Option<String>> {
         Ok(self
             .conn()
@@ -1449,6 +1469,21 @@ mod tests {
         assert_eq!(db.dispatch_autonomy(id).unwrap().as_deref(), Some("review"));
         assert!(!db.set_dispatch_autonomy(id + 1_000, "merge").unwrap());
         assert_eq!(db.dispatch_autonomy(id + 1_000).unwrap(), None);
+        assert_eq!(
+            db.dispatch_automation(id).unwrap(),
+            (Some("review".into()), None)
+        );
+        assert!(db.set_dispatch_automation(id, "merge", "cfg-rule").unwrap());
+        assert_eq!(
+            db.dispatch_automation(id).unwrap(),
+            (Some("merge".into()), Some("cfg-rule".into()))
+        );
+        assert_eq!(db.dispatch_autonomy(id).unwrap().as_deref(), Some("merge"));
+        assert!(
+            !db.set_dispatch_automation(id + 1_000, "merge", "x")
+                .unwrap()
+        );
+        assert_eq!(db.dispatch_automation(id + 1_000).unwrap(), (None, None));
     }
 
     #[test]

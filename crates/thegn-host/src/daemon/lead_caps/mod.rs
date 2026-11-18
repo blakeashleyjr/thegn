@@ -7,13 +7,17 @@
 //! are filled by their owning lanes.
 
 pub(crate) mod approvals;
+pub(crate) mod approvals_redeem;
 pub(crate) mod automations;
 pub(crate) mod automations_pause;
 pub(crate) mod feed;
+pub(crate) mod halt;
 pub(crate) mod listener;
 pub(crate) mod merge_drain;
 pub(crate) mod notifications;
+pub(crate) mod outward;
 pub(crate) mod overview;
+pub(crate) mod proxy_env;
 
 use thegn_svc::control::{ControlError, ControlResult};
 

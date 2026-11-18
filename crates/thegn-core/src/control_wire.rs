@@ -794,9 +794,27 @@ impl EventDecoder {
     }
 }
 
+/// `mcp_proxy.profile_env` (Read; HTTP + CLI; b155 THE-2222): which
+/// `[mcp_proxy.profiles]` entry's resolved server env to return.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileEnvRequest {
+    pub profile: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_env_body_is_strict() {
+        let ok: ProfileEnvRequest = serde_json::from_str(r#"{"profile":"lead"}"#).unwrap();
+        assert_eq!(ok.profile, "lead");
+        assert!(serde_json::from_str::<ProfileEnvRequest>("{}").is_err());
+        assert!(
+            serde_json::from_str::<ProfileEnvRequest>(r#"{"profile":"lead","env":{}}"#).is_err()
+        );
+    }
 
     fn roundtrip(f: EventFrame) {
         let bytes = f.encode();

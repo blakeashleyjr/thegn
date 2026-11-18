@@ -136,6 +136,18 @@ impl ControlApi for FakeApi {
         })
     }
 
+    fn issues_comment_confined<'a>(
+        &'a self,
+        id: &'a str,
+        _body: &'a str,
+        _repo: Option<&'a str>,
+        _account: Option<&'a str>,
+        caller: super::LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        self.record(&format!("issues_comment_confined:{id}:{}", caller.label));
+        Box::pin(async { Ok(()) })
+    }
+
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
         self.record("list_sessions");
         Box::pin(async { Ok(vec![]) })
@@ -367,7 +379,7 @@ impl ControlApi for FakeApi {
                 seq: 0,
                 cols: 80,
                 rows: 24,
-                bytes: b"\x1b[2J".to_vec(),
+                bytes: format!("\x1b[2Jcode {SNAPSHOT_SECRET}.").into_bytes(),
             })
         })
     }
@@ -565,6 +577,14 @@ impl ControlApi for FakeApi {
         })
     }
 
+    fn dispatch_put_confined(
+        &self,
+        req: super::DispatchPutReq,
+        _caller: super::LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        self.dispatch_put(req)
+    }
+
     fn dispatch_set_status(
         &self,
         id: i64,
@@ -610,6 +630,7 @@ fn rig(local_admin: bool) -> Rig {
         cors_origins: Vec::new(),
         event_streams: Default::default(),
         lead_listener: false,
+        lead_token_ttl_secs: 0,
     };
     Rig { api, state, db }
 }
@@ -2034,6 +2055,7 @@ async fn pairing_lifecycle_publishes_feed_frames() {
         cors_origins: Vec::new(),
         event_streams: Default::default(),
         lead_listener: false,
+        lead_token_ttl_secs: 0,
     };
     let code = auth::mint(
         TokenKind::PairingCode,
@@ -3362,6 +3384,197 @@ async fn sandbox_profile_set_shape_is_strict_and_clearing_is_explicit() {
 // --- Lead confinement (`thegn_core::lead_confine`) ------------------------------
 
 const LEAD_LABEL: &str = "lead:g/0";
+
+/// A pairing-code-shaped string the fake's pane snapshot shows (b155).
+const SNAPSHOT_SECRET: &str =
+    "tgp1_0123abcd_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+async fn get_json(rig: &Rig, path: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(rig.state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+fn snapshot_text(body: &serde_json::Value) -> String {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(body["ansi_b64"].as_str().unwrap())
+        .unwrap();
+    String::from_utf8(raw).unwrap()
+}
+
+/// b155 (6d): a Lead-confined `issues.comment` reaches the daemon's
+/// `issues_comment_confined` gate with the verified label; an ordinary
+/// caller still reaches the plain method.
+#[tokio::test]
+async fn lead_confined_issue_comment_routes_to_the_confined_method() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let write = token(&r, "write");
+    let (status, _) = post_json(
+        &r,
+        "/v1/issues/linear:THE-1/comment",
+        &lead,
+        serde_json::json!({ "body": "hello" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_json(
+        &r,
+        "/v1/issues/linear:THE-1/comment",
+        &write,
+        serde_json::json!({ "body": "hello" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "the fake's plain method"
+    );
+    assert_eq!(
+        r.api.calls(),
+        [
+            format!("issues_comment_confined:linear:THE-1:{LEAD_LABEL}"),
+            "issues_comment:linear:THE-1".to_string(),
+        ]
+    );
+    // A confined update reaches the defaulted confined method, which fails
+    // closed without touching the tracker.
+    let (status, _) = post_json(
+        &r,
+        "/v1/issues/linear:THE-1",
+        &lead,
+        serde_json::json!({ "title": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(r.api.issue_patches.lock().unwrap().is_empty());
+}
+
+/// b155: a Lead-confined `sessions.snapshot` has token shapes redacted; an
+/// ordinary caller sees the screen unchanged.
+#[tokio::test]
+async fn lead_confined_snapshot_is_redacted() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let read = token(&r, "read");
+    let (status, body) = get_json(&r, "/v1/sessions/s1/snapshot", &lead).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = snapshot_text(&body);
+    assert!(!text.contains(SNAPSHOT_SECRET), "{text}");
+    assert!(
+        text.contains(thegn_core::lead_confine::REDACTED_CREDENTIAL),
+        "{text}"
+    );
+    let (status, body) = get_json(&r, "/v1/sessions/s1/snapshot", &read).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(snapshot_text(&body).contains(SNAPSHOT_SECRET));
+}
+
+/// b155: redeem is Write and refused for the Lead; halt is Admin (a Write
+/// token is refused); profile_env is Read and reaches the daemon for the
+/// Lead; none of the three is an MCP surface.
+#[tokio::test]
+async fn b155_spine_verbs_scope_and_lead_rows() {
+    use thegn_core::control::{Scope, required_scope};
+    for (capability, path, scope) in [
+        ("approvals.redeem", "/v1/approvals/redeem", Scope::Write),
+        ("automations.halt", "/v1/automations/halt", Scope::Admin),
+        (
+            "mcp_proxy.profile_env",
+            "/v1/mcp_proxy/profile_env",
+            Scope::Read,
+        ),
+    ] {
+        assert!(
+            super::routes::ROUTES
+                .iter()
+                .any(|route| route.path == path && route.caps == [capability]),
+            "missing route for {capability}"
+        );
+        assert!(
+            super::routes::API_CALLS.contains(&(capability, "POST", path)),
+            "missing POST API_CALLS row for {capability}"
+        );
+        let entry = thegn_core::capability::lookup(capability).unwrap();
+        assert_eq!(required_scope(entry.verb), scope, "{capability}");
+        assert!(
+            !entry
+                .surfaces
+                .contains(thegn_core::capability::Surface::Mcp),
+            "{capability} must never be an MCP tool"
+        );
+    }
+    let r = rig(false);
+    let write = token(&r, "write");
+    let admin = token(&r, "admin");
+    let lead = token_with_label(&r, "read,write,admin", LEAD_LABEL.to_string());
+    let authorized = StatusCode::NOT_IMPLEMENTED;
+    let halt = "/v1/automations/halt";
+    let empty = serde_json::json!({});
+    assert_eq!(
+        post_json(&r, halt, &write, empty.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(&r, halt, &admin, empty.clone()).await.0,
+        authorized
+    );
+    let (status, body) = post_json(&r, halt, &lead, empty).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        refusal_text(&body).contains("only the operator halts automations"),
+        "{body}"
+    );
+    let redeem = "/v1/approvals/redeem";
+    let answer = serde_json::json!({ "nonce": "n", "decision": "approve" });
+    assert_eq!(
+        post_json(&r, redeem, &write, answer.clone()).await.0,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let (status, body) = post_json(&r, redeem, &lead, answer).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(refusal_text(&body).contains("phone"), "{body}");
+    // profile_env: the Lead passes the transport (the daemon decides).
+    let env = serde_json::json!({ "profile": "lead" });
+    assert_eq!(
+        post_json(&r, "/v1/mcp_proxy/profile_env", &lead, env)
+            .await
+            .0,
+        authorized
+    );
+}
+
+/// b155 review: a non-Lead Write token on a token-authenticated listener
+/// cannot redeem (the code alone must not approve; only the signed inbox,
+/// dispatching as implicit local admin, may). The API is never reached for
+/// the token caller; a same-uid implicit-local-admin caller reaches it.
+#[tokio::test]
+async fn approvals_redeem_refuses_token_callers_but_not_implicit_local_admin() {
+    let r = rig(false);
+    let write = token(&r, "write");
+    let answer = serde_json::json!({ "nonce": "n", "decision": "approve" });
+    let (status, body) = post_json(&r, "/v1/approvals/redeem", &write, answer).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert!(refusal_text(&body).contains("signed push inbox"), "{body}");
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+
+    let local = rig(true);
+    // The FakeApi keeps the trait's default (NOT_IMPLEMENTED), which proves
+    // the call got past the transport to the API method.
+    assert_eq!(
+        call(&local, "POST", "/v1/approvals/redeem", None).await,
+        StatusCode::NOT_IMPLEMENTED
+    );
+}
 
 async fn post_json(
     rig: &Rig,

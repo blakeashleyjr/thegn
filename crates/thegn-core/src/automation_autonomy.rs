@@ -54,6 +54,10 @@ impl Autonomy {
 pub enum RuleOrigin {
     Config,
     Lead,
+    /// A Lead rule the owner armed (6c): a live arming approval matches the
+    /// current body digest. Until b155 lane 4 fills its policy it is treated
+    /// exactly like [`RuleOrigin::Lead`] (fail closed).
+    LeadApproved,
 }
 
 /// Predicate fields that read attacker-influenced free text. Every other
@@ -122,11 +126,11 @@ pub fn effective_autonomy(
             (Autonomy::Review, Some(FREE_TEXT_CAP_NOTE))
         }
         RuleOrigin::Config => (declared, None),
-        RuleOrigin::Lead if cap.trim() == PIPELINE_START => (
+        RuleOrigin::Lead | RuleOrigin::LeadApproved if cap.trim() == PIPELINE_START => (
             Autonomy::Propose,
             (declared != Autonomy::Propose).then_some(LEAD_PIPELINE_NOTE),
         ),
-        RuleOrigin::Lead => (
+        RuleOrigin::Lead | RuleOrigin::LeadApproved => (
             declared.min(Autonomy::Review),
             (declared == Autonomy::Merge).then_some(LEAD_CAP_NOTE),
         ),
@@ -144,11 +148,15 @@ pub fn validate_autonomy(
 ) -> Result<(), String> {
     match origin {
         RuleOrigin::Config => Ok(()),
-        RuleOrigin::Lead if declared == Autonomy::Merge => Err(LEAD_MERGE_REFUSAL.into()),
-        RuleOrigin::Lead if cap.trim() == PIPELINE_START && declared != Autonomy::Propose => {
+        RuleOrigin::Lead | RuleOrigin::LeadApproved if declared == Autonomy::Merge => {
+            Err(LEAD_MERGE_REFUSAL.into())
+        }
+        RuleOrigin::Lead | RuleOrigin::LeadApproved
+            if cap.trim() == PIPELINE_START && declared != Autonomy::Propose =>
+        {
             Err(LEAD_PIPELINE_REFUSAL.into())
         }
-        RuleOrigin::Lead => Ok(()),
+        RuleOrigin::Lead | RuleOrigin::LeadApproved => Ok(()),
     }
 }
 
@@ -290,6 +298,25 @@ mod tests {
                 "{case}"
             );
             assert!(effective <= declared, "policy never raises: {case}");
+        }
+    }
+
+    #[test]
+    fn lead_approved_is_lead_until_lane_four_fills_it() {
+        for cap in ["notify.push", "pipeline.start"] {
+            for declared in Autonomy::ALL {
+                for free in [false, true] {
+                    let p = predicate(free);
+                    assert_eq!(
+                        effective_autonomy(declared, &p, cap, RuleOrigin::LeadApproved),
+                        effective_autonomy(declared, &p, cap, RuleOrigin::Lead),
+                    );
+                    assert_eq!(
+                        validate_autonomy(declared, &p, cap, RuleOrigin::LeadApproved),
+                        validate_autonomy(declared, &p, cap, RuleOrigin::Lead),
+                    );
+                }
+            }
         }
     }
 

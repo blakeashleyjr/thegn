@@ -104,6 +104,8 @@ pub struct MaintenanceReport {
     pub pruned_issue_links: usize,
     pub pruned_dispatches: usize,
     pub pruned_merge_events: usize,
+    /// Settled automation proposals and old approval push nonces (v113).
+    pub pruned_approval_effects: usize,
     pub reclaimed_pages: u64,
     pub conversion: Option<ConvertOutcome>,
 }
@@ -341,12 +343,16 @@ impl Db {
         let pruned_merge_events = self
             .prune_removed_merge_events(ORPHAN_CACHE_SWEEP_MAX_KEYS)
             .map_err(map_busy_any)?;
+        let pruned_approval_effects = self
+            .prune_approval_effects(now_secs.saturating_mul(1000))
+            .map_err(map_busy_any)?;
         let mut report = MaintenanceReport {
             pruned_notifications,
             pruned_removed_notifications,
             pruned_issue_links,
             pruned_dispatches,
             pruned_merge_events,
+            pruned_approval_effects,
             reclaimed_pages: 0,
             conversion: None,
         };

@@ -24,7 +24,9 @@
 //!
 //! Pure and platform-neutral.
 
-use crate::control::Verb;
+use std::borrow::Cow;
+
+use crate::control::{TOKEN_ID_HEX, TOKEN_SECRET_HEX, Verb};
 
 /// The pairing label of a bare Lead (`thegn mcp wire --lead`).
 pub const LEAD_PAIRING_LABEL: &str = "lead";
@@ -94,6 +96,8 @@ const NO_HOST_GIT: &str =
     "runs git on the host, which executes repository hooks and filters outside any sandbox";
 const NO_HOST_WRITE: &str = "writes into a worktree from outside the sandbox";
 const NO_RESUME: &str = "only the operator resumes automations (admin scope); the Lead may pause them, never restart them";
+const NO_REDEEM: &str = "only the owner's phone answers approvals";
+const NO_HALT: &str = "only the operator halts automations";
 
 /// The confinement table: one explicit row per verb. No wildcard arm, so a new
 /// [`Verb`] fails to compile until someone decides its row.
@@ -156,8 +160,6 @@ pub fn rule(verb: Verb) -> Rule {
         | Verb::ProjectRename
         | Verb::ProjectRemove
         | Verb::ProjectAssign
-        | Verb::IssuesUpdate
-        | Verb::IssuesComment
         | Verb::DispatchesSetStatus
         | Verb::DispatchesReport
         | Verb::DispatchesNote
@@ -177,6 +179,14 @@ pub fn rule(verb: Verb) -> Rule {
         // Shape-checked. `sessions.input` is further held, in the daemon, to
         // sessions a Lead opened.
         Verb::OpenSession | Verb::DispatchesPut | Verb::SendInput => Rule::AllowIf,
+        // b155 (6d): outward tracker writes go through the daemon's
+        // `issues_*_confined` path, which needs an owner approval per call.
+        // (THE-2222): a profile's env is returned only for the Lead's own
+        // profile; the daemon checks the label and the profile.
+        Verb::IssuesUpdate | Verb::IssuesComment | Verb::McpProxyProfileEnv => Rule::AllowIf,
+        // b155 (6a, 6f).
+        Verb::ApprovalsRedeem => Rule::Refuse(NO_REDEEM),
+        Verb::AutomationsHalt => Rule::Refuse(NO_HALT),
 
         Verb::ForkSession => Rule::Refuse(NO_FORK),
         Verb::Split => Rule::Refuse(NO_SPLIT),
@@ -248,6 +258,10 @@ pub enum RequestShape<'a> {
     Input {
         bytes: &'a [u8],
     },
+    /// The transport routes this request to a daemon path that applies the
+    /// verb's condition itself (`issues_*_confined`,
+    /// `mcp_proxy.profile_env`).
+    DaemonGated,
 }
 
 /// Why a Lead-confined request was refused.
@@ -366,6 +380,10 @@ pub fn check(verb: Verb, req: &RequestShape<'_>) -> Result<(), ConfineRefusal> {
             (Verb::SendInput, RequestShape::Input { bytes }) => {
                 crate::lead_input::check(bytes).map_err(ConfineRefusal::Input)
             }
+            (
+                Verb::IssuesUpdate | Verb::IssuesComment | Verb::McpProxyProfileEnv,
+                RequestShape::DaemonGated,
+            ) => Ok(()),
             _ => Err(ConfineRefusal::Unshaped(verb)),
         },
     }
@@ -454,12 +472,61 @@ pub fn check_rule_open_action(
     Ok(())
 }
 
+/// What replaces a credential in Lead-visible screen text.
+pub const REDACTED_CREDENTIAL: &str = "[redacted credential]";
+
+/// Replace every control token (`tgc1_<id>_<secret>`) and pairing code
+/// (`tgp1_<id>_<secret>`) in `text`, in exactly the shape
+/// [`crate::control::parse_token`] accepts, with [`REDACTED_CREDENTIAL`].
+/// Defense in depth for a Lead-confined `sessions.snapshot`; borrowed when
+/// nothing matched.
+pub fn redact_credentials(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let token_len = 5 + TOKEN_ID_HEX + 1 + TOKEN_SECRET_HEX;
+    let mut out: Option<String> = None;
+    let mut last = 0;
+    let mut i = 0;
+    while i + token_len <= bytes.len() {
+        if credential_at(bytes, i) {
+            let o = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            // `i` and `last` sit on ASCII bytes, so both are char boundaries.
+            o.push_str(&text[last..i]);
+            o.push_str(REDACTED_CREDENTIAL);
+            i += token_len;
+            last = i;
+        } else {
+            i += 1;
+        }
+    }
+    match out {
+        None => Cow::Borrowed(text),
+        Some(mut o) => {
+            o.push_str(&text[last..]);
+            Cow::Owned(o)
+        }
+    }
+}
+
+fn credential_at(b: &[u8], i: usize) -> bool {
+    let lower_hex = |s: &[u8]| {
+        s.iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+    };
+    let rest = &b[i..];
+    let id_end = 5 + TOKEN_ID_HEX;
+    (rest.starts_with(b"tgc1_") || rest.starts_with(b"tgp1_"))
+        && lower_hex(&rest[5..id_end])
+        && rest[id_end] == b'_'
+        && lower_hex(&rest[id_end + 1..id_end + 1 + TOKEN_SECRET_HEX])
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AgentShape, CONTAINED_BACKENDS, ConfineRefusal, MAX_LEAD_PROMPT_BYTES, OpenShape,
-        REFUSAL_PREFIX, RequestShape, ResolvedOpen, Rule, check, check_resolved_open,
-        check_rule_open_action, is_contained_backend, is_lead_label, is_lead_rule_id, rule,
+        REDACTED_CREDENTIAL, REFUSAL_PREFIX, RequestShape, ResolvedOpen, Rule, check,
+        check_resolved_open, check_rule_open_action, is_contained_backend, is_lead_label,
+        is_lead_rule_id, redact_credentials, rule,
     };
     use crate::control::{Scope, Verb, required_scope};
     use crate::lead_input::{InputRefusal, MAX_LEAD_INPUT_BYTES};
@@ -533,8 +600,8 @@ mod tests {
         (Verb::ProjectNewFeature, Refuse),
         (Verb::IssuesList, Allow),
         (Verb::IssuesGet, Allow),
-        (Verb::IssuesUpdate, Allow),
-        (Verb::IssuesComment, Allow),
+        (Verb::IssuesUpdate, AllowIf),
+        (Verb::IssuesComment, AllowIf),
         (Verb::DispatchesList, Allow),
         (Verb::DispatchesPut, AllowIf),
         (Verb::DispatchesSetStatus, Allow),
@@ -580,6 +647,9 @@ mod tests {
         (Verb::MergeDrain, Allow),
         (Verb::AutomationsPause, Allow),
         (Verb::AutomationsResume, Refuse),
+        (Verb::ApprovalsRedeem, Refuse),
+        (Verb::AutomationsHalt, Refuse),
+        (Verb::McpProxyProfileEnv, AllowIf),
     ];
 
     fn kind(r: Rule) -> Kind {
@@ -644,6 +714,68 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("worktrees.sandbox_profile_set"), "{msg}");
+    }
+
+    #[test]
+    fn b155_rows_redeem_and_halt_refused_outward_and_profile_env_daemon_gated() {
+        for verb in [Verb::ApprovalsRedeem, Verb::AutomationsHalt] {
+            let msg = check(verb, &RequestShape::Opaque).unwrap_err().to_string();
+            assert!(msg.starts_with(REFUSAL_PREFIX), "{msg}");
+        }
+        assert!(
+            check(Verb::ApprovalsRedeem, &RequestShape::Opaque)
+                .unwrap_err()
+                .to_string()
+                .contains("phone")
+        );
+        for verb in [
+            Verb::IssuesUpdate,
+            Verb::IssuesComment,
+            Verb::McpProxyProfileEnv,
+        ] {
+            assert_eq!(rule(verb), Rule::AllowIf, "{verb:?}");
+            assert!(check(verb, &RequestShape::DaemonGated).is_ok(), "{verb:?}");
+            assert_eq!(
+                check(verb, &RequestShape::Opaque),
+                Err(ConfineRefusal::Unshaped(verb))
+            );
+        }
+        // DaemonGated is not a pass for any other verb.
+        assert_eq!(
+            check(Verb::OpenSession, &RequestShape::DaemonGated),
+            Err(ConfineRefusal::Unshaped(Verb::OpenSession))
+        );
+    }
+
+    #[test]
+    fn redact_credentials_replaces_both_token_shapes() {
+        let id = "0123abcd";
+        let secret = "f".repeat(64);
+        let control = format!("tgc1_{id}_{secret}");
+        let code = format!("tgp1_{id}_{secret}");
+        assert!(crate::control::parse_token(&control).is_some());
+        assert!(crate::control::parse_token(&code).is_some());
+        let text = format!("token={control}\ncode:{code}{code} end é");
+        let got = redact_credentials(&text);
+        assert_eq!(
+            got,
+            format!(
+                "token={REDACTED_CREDENTIAL}\ncode:{REDACTED_CREDENTIAL}{REDACTED_CREDENTIAL} end é"
+            )
+        );
+        // Nothing to redact: borrowed, unchanged.
+        for clean in [
+            "plain text".to_string(),
+            format!("tgp1_{id}_{}", "g".repeat(64)),
+            format!("tgp1_{}_{secret}", "ABCDEF01"),
+            format!("tgc1_{id}_{}", "f".repeat(63)),
+            format!("tgx1_{id}_{secret}"),
+            "tgc1_".to_string(),
+        ] {
+            let got = redact_credentials(&clean);
+            assert!(matches!(got, std::borrow::Cow::Borrowed(_)), "{clean}");
+            assert_eq!(got, clean);
+        }
     }
 
     #[test]

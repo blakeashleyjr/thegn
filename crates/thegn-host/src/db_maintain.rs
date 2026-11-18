@@ -124,6 +124,7 @@ fn run_round_with(
                 || report.pruned_issue_links > 0
                 || report.pruned_dispatches > 0
                 || report.pruned_merge_events > 0
+                || report.pruned_approval_effects > 0
                 || report.reclaimed_pages > 0 =>
         {
             tracing::debug!(
@@ -132,6 +133,7 @@ fn run_round_with(
                 pruned_issue_links = report.pruned_issue_links,
                 pruned_dispatches = report.pruned_dispatches,
                 pruned_merge_events = report.pruned_merge_events,
+                pruned_approval_effects = report.pruned_approval_effects,
                 reclaimed_pages = report.reclaimed_pages,
                 "state database maintenance completed"
             );

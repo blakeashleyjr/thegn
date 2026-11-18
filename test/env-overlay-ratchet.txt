@@ -92,6 +92,8 @@ automations.action_timeout_secs
 automations.audit_retention_per_rule
 automations.enabled
 automations.max_concurrent
+automations.max_concurrent_lanes
+automations.max_spawns_per_day
 automations.queue_capacity
 autopilot.agent
 autopilot.agent_command
@@ -207,9 +209,12 @@ keymap_preset
 lead.account
 lead.agent
 lead.mcp_profile
+lead.network
 lead.notes_dir
+lead.outward_allow
 lead.scopes
 lead.skill
+lead.token_ttl_secs
 lifecycle.cost_ceiling_per_hour
 lifecycle.cost_per_warm_hour
 lifecycle.eager
