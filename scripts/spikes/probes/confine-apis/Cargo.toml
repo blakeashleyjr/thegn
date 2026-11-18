@@ -1,0 +1,24 @@
+[package]
+name = "confine-apis-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "WS03-P0-01 throwaway probe: landlock 0.4.7 / seccompiler 0.5.0 API check. Never merged into the workspace."
+
+# Standalone on purpose: an empty [workspace] table stops cargo from adopting
+# this crate into the thegn workspace (and from touching its Cargo.lock).
+[workspace]
+
+[features]
+# One feature per symbol under test, so a missing symbol fails to compile in
+# isolation and is recorded as "no" by scripts/spikes/ws03-p0-01.sh.
+udp = []
+resolve_unix = []
+scope_abstract = []
+scope_signal = []
+libc_open_tree_attr = []
+
+[dependencies]
+landlock = "=0.4.7"
+seccompiler = "=0.5.0"
+libc = "0.2"

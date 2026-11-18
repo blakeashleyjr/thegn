@@ -1,0 +1,23 @@
+[package]
+name = "exec-cost-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "WS03-P0-02 throwaway probe: static exec helper + interleaved spawn timer. Never merged."
+
+[workspace]
+
+[[bin]]
+name = "confine-exec-static"
+path = "src/bin/confine-exec-static.rs"
+
+[[bin]]
+name = "exec-bench"
+path = "src/bin/exec-bench.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
