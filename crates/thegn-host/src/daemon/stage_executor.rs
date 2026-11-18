@@ -24,7 +24,11 @@
 //!   unknown = live). The pure policy already holds such lanes; the executor
 //!   re-checks it before every action as a second fence;
 //! - record a validation against a tip other than the one the plan asked
-//!   for: the head is re-read after the task and a moved head records nothing.
+//!   for: the head is re-read after the task and a moved head records nothing;
+//! - run a validation on the host: validations run worker-written code, so
+//!   they run only inside the worktree's sealed sandbox
+//!   ([`host_validation_isolated`]); without one the task records an
+//!   environment error and nothing runs.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -55,9 +59,9 @@ const RECONCILE_LIMIT: usize = 512;
 const MAX_CHAIN: usize = 16;
 
 /// The `validate:` prefix on every executor job slot, so `cancel_all` and the
-/// panel can tell executor validations from a person's test runs.
-/// The job-name prefix of an executor-driven validation. `task.rs` keys the
-/// credential scrub off it (`scrubs_credentials`).
+/// panel can tell executor validations from a person's test runs. `task.rs`
+/// keys its credential scrub off it (`scrubs_credentials`); the executor's own
+/// sandboxed runs apply the same scrub directly ([`run_in_sandbox`]).
 pub(crate) const SLOT_PREFIX: &str = "validate:";
 
 struct Handles {
@@ -77,6 +81,8 @@ static INFLIGHT: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
 
 /// Executor validation job slots currently running (for `cancel_all`).
 static SLOTS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The cancel flag of each in-flight sandboxed validation, keyed by slot.
+static CANCELS: Mutex<Option<HashMap<String, Arc<AtomicBool>>>> = Mutex::new(None);
 
 /// Tasks spawned by kicks; the disabled-supervisor test asserts it stays put.
 #[cfg(test)]
@@ -493,17 +499,180 @@ fn read_head(worktree: &Path) -> Option<String> {
         .filter(|sha| !sha.is_empty())
 }
 
-fn slots_insert(slot: &str) {
+/// Register a validation slot; the returned flag is set by [`cancel_all`].
+fn slots_insert(slot: &str) -> Arc<AtomicBool> {
     let mut guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
     guard
         .get_or_insert_with(HashSet::new)
         .insert(slot.to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut flags = CANCELS.lock().unwrap_or_else(|e| e.into_inner());
+    flags
+        .get_or_insert_with(HashMap::new)
+        .insert(slot.to_owned(), Arc::clone(&cancel));
+    cancel
 }
 
 fn slots_remove(slot: &str) {
     let mut guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = guard.as_mut() {
         set.remove(slot);
+    }
+    let mut flags = CANCELS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = flags.as_mut() {
+        map.remove(slot);
+    }
+}
+
+/// The refusal an executor validation records when the worktree has no
+/// sealed sandbox to run it in: nothing runs on the host.
+const NEEDS_SEALED: &str = "unattended validation needs a sealed sandbox for this worktree";
+
+/// How one sandboxed validation ended.
+#[derive(Debug, PartialEq, Eq)]
+enum SandboxedRun {
+    /// Nothing ran (or the run could not be supervised): an environment error.
+    Refused(String),
+    /// Cancelled by pause/halt: record nothing.
+    Cancelled,
+    /// The command ran to an end (a timeout reads as exit 124).
+    Done {
+        exit_code: Option<i32>,
+        text: String,
+    },
+}
+
+/// Whether `spec` is a real isolating sandbox an unattended validation may
+/// run worker-written code in: the same sealed floor `pipeline.start` and the
+/// stage advance apply ([`floor_refusal`]). A `standard` profile that leaves
+/// `$HOME` credentials readable does not qualify. Validations run worker code
+/// (its justfile, build.rs, tests) and must never run on the host, where they
+/// could reach the daemon socket (implicit local admin) and `$HOME` secrets.
+fn host_validation_isolated(spec: &thegn_core::sandbox::SandboxSpec) -> bool {
+    floor_refusal(crate::agent_run::AgentDispatch::Run(Some(spec.clone()))).is_none()
+}
+
+/// Resolve the lane worktree's sandbox through the same floor gate a stage
+/// advance uses; `Ok` only for a sealed, isolating sandbox.
+async fn validation_sandbox(
+    h: &'static Handles,
+    worktree: &str,
+) -> Result<thegn_core::sandbox::SandboxSpec, String> {
+    use crate::agent_run::AgentDispatch;
+    let cfg = Arc::clone(&h.cfg);
+    let wt = worktree.to_owned();
+    let gate = tokio::task::spawn_blocking(move || {
+        crate::agent_run::agent_floor_gate(
+            &cfg,
+            &wt,
+            true,
+            thegn_core::config::IsolationFloor::SharedKernel,
+            thegn_core::config::OnFloorMiss::Fail,
+        )
+    })
+    .await
+    .map_err(|error| format!("floor check failed ({error})"))?;
+    match gate {
+        AgentDispatch::Run(Some(spec)) if host_validation_isolated(&spec) => Ok(spec),
+        other => Err(floor_refusal(other).unwrap_or_else(|| NEEDS_SEALED.to_owned())),
+    }
+}
+
+/// Run `command` inside `spec` (blocking): the guarded sandbox entry (which
+/// masks the daemon control socket dir, the state run dir, the runtime dir and
+/// the Lead control dir exactly as for worker panes), the `thegn.slice` CPU
+/// cap, the drain's credential scrub and a git-env scrub, in the lane's own
+/// worktree, with the configured timeout. The child's process group is owned
+/// by `run_bounded`: waited on, killed on timeout or cancel, fully reaped.
+#[cfg(unix)]
+fn run_in_sandbox(
+    spec: &thegn_core::sandbox::SandboxSpec,
+    worktree: &Path,
+    command: &str,
+    timeout_secs: u64,
+    cancel: &AtomicBool,
+) -> SandboxedRun {
+    // Keep a secret env-file alive until the bounded runner has reaped the child.
+    let (inner, _env_file) = match thegn_core::sandbox::enter_argv_guarded(spec, command) {
+        Ok(guarded) => guarded.into_parts(),
+        Err(error) => return SandboxedRun::Refused(format!("{NEEDS_SEALED} ({error})")),
+    };
+    let argv = thegn_core::sandbox_cpucap::wrap_background_argv_tagged(
+        inner,
+        &thegn_core::sandbox_cpucap::ScopeTag {
+            kind: thegn_core::sandbox_cpucap::ScopeKind::Agent,
+            worktree: worktree.display().to_string(),
+        },
+    );
+    let Some((program, args)) = argv.split_first() else {
+        return SandboxedRun::Refused(format!("{NEEDS_SEALED} (empty sandbox entry)"));
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(worktree)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for var in crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV {
+        cmd.env_remove(var);
+    }
+    for var in thegn_core::util::GIT_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let run = crate::agent_run::bounded::run_bounded(
+        &mut cmd,
+        crate::agent_run::bounded::effective_timeout(timeout_secs),
+        cancel,
+    );
+    let mut text = String::from_utf8_lossy(&run.stdout.bytes).into_owned();
+    text.push_str(&String::from_utf8_lossy(&run.stderr.bytes));
+    sandboxed_end(&run.outcome, timeout_secs, text)
+}
+
+/// No bounded group runner off unix: refuse, never run on the host.
+#[cfg(not(unix))]
+fn run_in_sandbox(
+    _spec: &thegn_core::sandbox::SandboxSpec,
+    _worktree: &Path,
+    _command: &str,
+    _timeout_secs: u64,
+    _cancel: &AtomicBool,
+) -> SandboxedRun {
+    SandboxedRun::Refused(format!("{NEEDS_SEALED} (unsupported on this platform)"))
+}
+
+/// Map a bounded run's end to a validation result.
+#[cfg(unix)]
+fn sandboxed_end(
+    outcome: &crate::agent_run::bounded::AgentRunOutcome,
+    timeout_secs: u64,
+    text: String,
+) -> SandboxedRun {
+    use crate::agent_run::bounded::AgentRunOutcome;
+    match outcome {
+        AgentRunOutcome::Exited(status) if status.code() == Some(125) => {
+            SandboxedRun::Refused("the validation sandbox refused to start (exit 125)".to_owned())
+        }
+        AgentRunOutcome::Exited(status) => SandboxedRun::Done {
+            exit_code: status.code(),
+            text,
+        },
+        AgentRunOutcome::TimedOut => SandboxedRun::Done {
+            exit_code: Some(124),
+            text: format!(
+                "validation exceeded {timeout_secs}s ([limits] test_timeout_secs) and was stopped\n{text}"
+            ),
+        },
+        AgentRunOutcome::Cancelled => SandboxedRun::Cancelled,
+        AgentRunOutcome::Spawn(error) => {
+            SandboxedRun::Refused(format!("the validation sandbox failed to spawn: {error}"))
+        }
+        AgentRunOutcome::Reap(error) => {
+            SandboxedRun::Refused(format!("the validation run could not be reaped: {error}"))
+        }
+        AgentRunOutcome::Unsettled => {
+            SandboxedRun::Refused("the validation run left an unsettled process group".to_owned())
+        }
     }
 }
 
@@ -548,42 +717,52 @@ async fn validate(
                 "validation needs [limits] test_timeout_secs > 0".to_owned(),
             ),
             Some(task) => {
-                let mut test = crate::task::test_task_from_config(&task);
+                let test = crate::task::test_task_from_config(&task);
                 let matcher = test.matcher.clone();
-                test.name = format!("{SLOT_PREFIX}{name}");
-                let slot = crate::task::job_slot(&worktree, &test.name);
-                slots_insert(&slot);
-                let limits = h.cfg.limits.clone();
-                let wt = worktree.clone();
-                let outcome = tokio::task::spawn_blocking(move || {
-                    crate::task::run_job_resolved(wt, 0, test, &limits, None)
-                })
-                .await;
-                slots_remove(&slot);
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        tracing::warn!(target: "thegn::supervise", issue, row, task = %name, %error, "validation task failed to join");
-                        return Step::Stop;
+                let slot = crate::task::job_slot(&worktree, &format!("{SLOT_PREFIX}{name}"));
+                let run = match validation_sandbox(h, &lane.row.worktree_path).await {
+                    Err(why) => {
+                        tracing::warn!(target: "thegn::supervise", issue, row, task = %name, %why, "validation refused: no sealed sandbox");
+                        SandboxedRun::Refused(NEEDS_SEALED.to_owned())
+                    }
+                    Ok(spec) => {
+                        let cancel = slots_insert(&slot);
+                        let wt = worktree.clone();
+                        let command = test.command.clone();
+                        let secs = h.cfg.limits.test_timeout_secs;
+                        let joined = tokio::task::spawn_blocking(move || {
+                            run_in_sandbox(&spec, &wt, &command, secs, &cancel)
+                        })
+                        .await;
+                        slots_remove(&slot);
+                        match joined {
+                            Ok(run) => run,
+                            Err(error) => {
+                                tracing::warn!(target: "thegn::supervise", issue, row, task = %name, %error, "validation task failed to join");
+                                return Step::Stop;
+                            }
+                        }
                     }
                 };
-                if outcome.end == crate::task::RunEnd::Stopped {
-                    // Cancelled (pause/halt): the run established nothing.
-                    log_action(issue, row, "validate", "cancelled");
-                    return Step::Stop;
+                match run {
+                    SandboxedRun::Refused(why) => (ValidationClass::EnvironmentError, None, why),
+                    SandboxedRun::Cancelled => {
+                        // Cancelled (pause/halt): the run established nothing.
+                        log_action(issue, row, "validate", "cancelled");
+                        return Step::Stop;
+                    }
+                    SandboxedRun::Done { exit_code, text } => {
+                        let class = thegn_core::pipeline_validate::classify(
+                            exit_code,
+                            false,
+                            Some(&matcher),
+                            &text,
+                        );
+                        let digest =
+                            thegn_core::pipeline_validate::digest(&text, class, Some(&matcher));
+                        (class, exit_code, digest)
+                    }
                 }
-                let class = thegn_core::pipeline_validate::classify(
-                    outcome.exit_code,
-                    false,
-                    Some(&matcher),
-                    &outcome.stdout_stderr,
-                );
-                let digest = thegn_core::pipeline_validate::digest(
-                    &outcome.stdout_stderr,
-                    class,
-                    Some(&matcher),
-                );
-                (class, outcome.exit_code, digest)
             }
         };
 
@@ -995,6 +1174,16 @@ pub(crate) fn cancel_all() -> usize {
             .map(|set| set.drain().collect())
             .unwrap_or_default()
     };
+    let flags: Vec<Arc<AtomicBool>> = {
+        let mut guard = CANCELS.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_mut()
+            .map(|map| map.drain().map(|(_, flag)| flag).collect())
+            .unwrap_or_default()
+    };
+    for flag in &flags {
+        flag.store(true, Ordering::Release);
+    }
     for slot in &slots {
         crate::task::cancel_slot(slot);
     }
@@ -1045,6 +1234,53 @@ mod tests {
             !is_terminal(&cfg, "gone"),
             "an unconfigured stage escalates"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sandboxed_validation_end_maps_timeouts_refusals_and_cancels() {
+        use crate::agent_run::bounded::AgentRunOutcome;
+        use std::os::unix::process::ExitStatusExt;
+        let exited =
+            |code: i32| AgentRunOutcome::Exited(std::process::ExitStatus::from_raw(code << 8));
+        assert_eq!(
+            sandboxed_end(&exited(0), 60, "ok".into()),
+            SandboxedRun::Done {
+                exit_code: Some(0),
+                text: "ok".into()
+            }
+        );
+        assert!(matches!(
+            sandboxed_end(&exited(125), 60, String::new()),
+            SandboxedRun::Refused(_)
+        ));
+        match sandboxed_end(&AgentRunOutcome::TimedOut, 60, "out".into()) {
+            SandboxedRun::Done { exit_code, text } => {
+                assert_eq!(exit_code, Some(124));
+                assert!(text.contains("60s") && text.ends_with("out"));
+            }
+            other => panic!("a timeout is a failed run, got {other:?}"),
+        }
+        assert_eq!(
+            sandboxed_end(&AgentRunOutcome::Cancelled, 60, String::new()),
+            SandboxedRun::Cancelled
+        );
+        assert!(matches!(
+            sandboxed_end(&AgentRunOutcome::Unsettled, 60, String::new()),
+            SandboxedRun::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn cancel_all_sets_a_sandboxed_validation_flag() {
+        let slot = "/wt/cancel-flag-test:job:validate:nextest";
+        let flag = slots_insert(slot);
+        assert!(cancel_all() >= 1);
+        assert!(
+            flag.load(Ordering::Acquire),
+            "halt must stop the sandboxed run"
+        );
+        slots_remove(slot);
     }
 
     #[test]

@@ -34,6 +34,9 @@ pub struct UnattendedFacts {
     pub gate_timeout_secs: u64,
     pub paused: bool,
     pub budget_ok: bool,
+    /// The merge gate runs inside a sandbox. While it does not, the gate runs
+    /// worker-written code on the host, so no land may skip the owner.
+    pub gate_isolated: bool,
 }
 
 /// A lane's autonomy: the minimum over every row in its chain, with a NULL
@@ -76,10 +79,12 @@ pub const GATE_UNBOUNDED: &str = "[merge_queue] gate_timeout_secs is 0, so the g
 /// Check 6's refusals.
 pub const PAUSED: &str = "automations are paused";
 pub const BUDGET_SPENT: &str = "the automation budget does not allow another land";
+/// Check 7's refusal.
+pub const GATE_NOT_ISOLATED: &str = "the merge gate is not sandboxed yet";
 
 /// `Ok` only when every unattended-land check passes; the error names the
 /// first failed check (it becomes the land approval's reason). Checks run in
-/// the documented order 1..=6.
+/// the documented order 1..=7.
 pub fn unattended_land(f: &UnattendedFacts) -> Result<(), String> {
     check_chain(f)?;
     check_rule(f)?;
@@ -101,6 +106,9 @@ pub fn unattended_land(f: &UnattendedFacts) -> Result<(), String> {
     }
     if !f.budget_ok {
         return Err(BUDGET_SPENT.into());
+    }
+    if !f.gate_isolated {
+        return Err(GATE_NOT_ISOLATED.into());
     }
     Ok(())
 }
@@ -193,6 +201,7 @@ mod tests {
             gate_timeout_secs: 600,
             paused: false,
             budget_ok: true,
+            gate_isolated: true,
         }
     }
 
@@ -298,6 +307,11 @@ mod tests {
             ("gate timeout", |f| f.gate_timeout_secs = 0, GATE_UNBOUNDED),
             ("paused", |f| f.paused = true, PAUSED),
             ("budget", |f| f.budget_ok = false, BUDGET_SPENT),
+            (
+                "gate not sandboxed",
+                |f| f.gate_isolated = false,
+                GATE_NOT_ISOLATED,
+            ),
         ];
         for (name, flip, want) in table {
             let mut f = passing();

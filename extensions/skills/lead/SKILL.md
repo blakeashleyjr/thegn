@@ -67,9 +67,13 @@ attempt to resolve it yourself.
 ## 5. Landing
 
 You never land work yourself: `merge_add` and `merge_drain` are refused for
-the Lead whatever its scopes. Work lands only through a rule's land step or
-an owner approval. To get something landed, raise an approval
-(`approvals_request`) naming the exact worktree and why.
+the Lead whatever its scopes. Work lands only through an owner approval. In
+this release `merge` autonomy behaves like `review`: every land stops for the
+owner's approval, because the merge gate still runs the lane's code on the host
+outside any sandbox. To get something landed, raise an approval
+(`approvals_request`) naming the lane's issue, its terminal stage and the full
+40-character commit that is the lane's current head (a short or stale sha is
+refused), and why.
 
 ## 6. Write rules
 

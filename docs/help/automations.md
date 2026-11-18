@@ -158,8 +158,19 @@ the API, MCP or the Lead's tool surface except by authoring a rule.
 `autonomy = "propose" | "review" | "merge"` (default `review`) is the ceiling a
 rule runs at. `propose` starts nothing: it raises an approval request instead.
 `review` and `merge` both start the pipeline today; the difference is the
-recorded ceiling, which the stage executor enforces at land. Two safety rules
-apply now:
+recorded ceiling, which the stage executor enforces at land. In this release
+`merge` behaves like `review`: it stops for your approval before landing. The
+merge queue's `gate_command` still runs on the host, outside any sandbox, and
+it runs the lane's own code (its justfile, build scripts and tests), so no land
+skips the owner until the gate itself is sandboxed. The approval's reason says
+"the merge gate is not sandboxed yet".
+
+The stage executor's validations run inside the lane worktree's sealed
+sandbox, never on the host. A worktree without a sealed sandbox records an
+environment error ("unattended validation needs a sealed sandbox for this
+worktree") and runs nothing.
+
+Two safety rules apply now:
 
 1. `merge` requires a structural-only `if`. The only free-text predicate is
    `message_regex` (for `issue_matched` the message is the issue title). A
@@ -194,7 +205,8 @@ max_spawns_per_day = 12   # automation spawns in a rolling 24 h window
   row marked done while its worker runs still holds its slot), plus each
   `pipeline.start` run still in flight. Manual dispatches never count.
 - A spawn is a `pipeline.start`, `sessions.open` or `lead.wake` run that
-  succeeded or is still in flight (a `propose` start is not a spawn: it
+  succeeded, failed, timed out or is still in flight (a failed or timed-out
+  run may still have started something; a `propose` start is not a spawn: it
   starts nothing), plus each stage the executor advances an automation lane
   to. Several rules firing on one event share the budget: each takes a slot
   in turn, and the ones past the limit are skipped. Audit pruning never drops

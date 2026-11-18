@@ -315,10 +315,12 @@ pub fn normalize_masks(masked: &[PathBuf]) -> Vec<PathBuf> {
 ///    controlling tty, matching the interactive terminal path;
 ///    `--cap-drop ALL`, then `--uid`/`--gid` when `sandbox_ids` is set);
 /// 2. `--ro-bind / /`, fresh `/dev`, `/proc` and a private `/tmp`;
-/// 3. masks (`--tmpfs` per `masked` and `state_masked` dir, parents first,
-///    then `/dev/null` over each masked file);
+/// 3. dir masks (`--tmpfs` per `masked` and `state_masked` dir, parents
+///    first);
 /// 4. read-only re-binds of `readable` files;
 /// 5. read-only `file_binds` (host file over its target);
+/// 5a. `/dev/null` over each masked file, after the re-binds so a masked
+///    file inside a re-exposed path stays hidden;
 /// 6. writable binds (after the masks; `validate` keeps them disjoint from
 ///    every control mask and allows only the re-exposures beneath a state
 ///    mask; bwrap creates their mount points inside the tmpfs);
@@ -374,14 +376,16 @@ pub fn bwrap_argv(plan: &LeadMountPlan, inner: &[String]) -> Vec<String> {
     for m in normalize_masks(&all_masks) {
         v.extend(["--tmpfs".into(), s(&m)]);
     }
-    for f in &plan.masked_files {
-        v.extend(["--ro-bind".into(), "/dev/null".into(), s(f)]);
-    }
     for r in &plan.readable {
         v.extend(["--ro-bind".into(), s(r), s(r)]);
     }
     for (src, dst) in &plan.file_binds {
         v.extend(["--ro-bind".into(), s(src), s(dst)]);
+    }
+    // After the re-binds: a masked file inside a re-exposed repo (a `file:`
+    // secret under a registered repo beneath a masked dir) stays hidden.
+    for f in &plan.masked_files {
+        v.extend(["--ro-bind".into(), "/dev/null".into(), s(f)]);
     }
     for w in &plan.writable {
         v.extend(["--bind".into(), s(w), s(w)]);
@@ -679,8 +683,8 @@ mod tests {
         let sep = pos(&v, &["--"]);
         assert!(unshare < root, "session flags first");
         assert!(root < tmp && tmp < mask_run && mask_run < mask_rt);
-        assert!(mask_rt < mask_file && mask_file < readable);
-        assert!(readable < notes && notes < claude, "writables after masks");
+        assert!(mask_rt < readable && readable < mask_file);
+        assert!(mask_file < notes && notes < claude, "writables after masks");
         assert!(claude < unset && unset < chdir && chdir < sep);
         assert_eq!(&v[sep + 1..], &inner[..], "`--` immediately precedes inner");
         assert!(
@@ -856,12 +860,39 @@ mod tests {
         let cap_drop = pos(&v, &["--cap-drop", "ALL"]);
         let first_tmpfs = v.iter().position(|a| a == "--tmpfs").unwrap();
         assert!(cap_drop < first_tmpfs, "caps are dropped before any mask");
-        assert!(mask_state < mask_file && mask_claude < mask_file);
-        assert!(
-            mask_file < token && token < resolv,
-            "file binds after masks"
+        assert!(mask_state < token && mask_claude < token);
+        assert!(token < resolv, "file binds after the dir masks");
+        assert!(resolv < mask_file, "masked files after every re-bind");
+        assert!(mask_file < notes && notes < harness && harness < sep);
+    }
+
+    #[test]
+    fn bwrap_argv_masks_a_secret_file_inside_a_reexposed_repo() {
+        let mut pl = plan();
+        pl.masked = vec![p("/home/u/.thegn")];
+        pl.readable = vec![p("/home/u/.thegn/repos/r")];
+        pl.masked_files = vec![p("/home/u/.thegn/repos/r/secret.key")];
+        let v = bwrap_argv(&pl, &["claude".to_string()]);
+        let rebind = pos(
+            &v,
+            &[
+                "--ro-bind",
+                "/home/u/.thegn/repos/r",
+                "/home/u/.thegn/repos/r",
+            ],
         );
-        assert!(resolv < notes && notes < harness && harness < sep);
+        let hide = pos(
+            &v,
+            &[
+                "--ro-bind",
+                "/dev/null",
+                "/home/u/.thegn/repos/r/secret.key",
+            ],
+        );
+        assert!(
+            rebind < hide,
+            "the secret mask must win over the repo re-bind"
+        );
     }
 
     #[test]

@@ -344,11 +344,14 @@ impl AutomationStore for Db {
         // the six-hour IN_FLIGHT_WINDOW_SECS); agent_dispatches is ms. Runs
         // still in flight (`started`) count as well as succeeded ones, so
         // several rules on one event (or concurrent events) cannot each see
-        // the same free slot and together spawn past the limit.
+        // the same free slot and together spawn past the limit. `failed` and
+        // `timed_out` runs count too: a spawning action that timed out (or
+        // failed after its side effect) may still have started a session.
         let runs: i64 = conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM automation_runs \
-                 WHERE action_cap IN ({}) AND outcome IN ('started','succeeded') \
+                 WHERE action_cap IN ({}) \
+                   AND outcome IN ('started','succeeded','failed','timed_out') \
                    AND COALESCE(autonomy,'') <> 'propose' AND started_at >= ?1",
                 sql_list(&SPAWN_CAPS)
             ),
@@ -629,8 +632,9 @@ mod tests {
             Some(root),
             now_ms - 86_400_001,
         );
-        // Runs: succeeded spawns in the window count; propose, failed, other
-        // caps and old runs do not.
+        // Runs: succeeded, failed and timed-out spawns in the window count
+        // (a failed or timed-out spawn may still have started a session);
+        // propose, other caps and old runs do not.
         let mut counted = 0;
         for (cap, outcome, autonomy, at, counts) in [
             (
@@ -649,7 +653,8 @@ mod tests {
                 now - 60,
                 false,
             ),
-            ("pipeline.start", "failed", Some("review"), now - 60, false),
+            ("pipeline.start", "failed", Some("review"), now - 60, true),
+            ("sessions.open", "timed_out", None, now - 60, true),
             ("notify.push", "succeeded", None, now - 60, false),
             ("sessions.open", "succeeded", None, now - 86_401, false),
         ] {
@@ -663,9 +668,9 @@ mod tests {
         }
         let usage = db.automation_budget_usage(now_ms).unwrap();
         assert_eq!(usage.active_lanes, 2, "THE-1 and THE-2");
-        // 3 counted runs + 2 parent-linked advances inside 24 h.
-        assert_eq!(counted, 3);
-        assert_eq!(usage.spawns_24h, 5);
+        // 5 counted runs + 2 parent-linked advances inside 24 h.
+        assert_eq!(counted, 5);
+        assert_eq!(usage.spawns_24h, 7);
     }
 
     #[test]

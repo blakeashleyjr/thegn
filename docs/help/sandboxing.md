@@ -1103,7 +1103,10 @@ listener, as Lead-confined, whatever its scopes. A Lead-confined call:
   or an editor, write files from outside the sandbox (`search.replace`,
   `skills.seed`), run tools or presets, or change a worktree's sandbox profile.
 - **May not** enqueue or drain the merge queue (`merge.add`, `merge.drain`):
-  the Lead lands only through a rule's land step or an owner approval.
+  the Lead lands only through a rule's land step or an owner approval. In
+  this release a rule's `merge` autonomy behaves like `review` (the land stops
+  for the owner's approval), because the merge gate still runs the lane's code
+  on the host outside any sandbox.
 - **May** read everything a read token can, kill sessions, record a session,
   file folders, work the tracker, the dispatch roster
   (without binding a session), notifications, approvals requests, its own
