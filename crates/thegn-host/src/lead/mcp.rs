@@ -168,6 +168,15 @@ fn revoke_lead_pairings(store: &dyn ControlStore, now: i64, label: &str) -> Resu
     revoke_pairings_where(store, now, |l| l == label)
 }
 
+/// Revoke every live token labelled `caller` (the headless `lead:wake/0`
+/// turn, once it ends). TEMPORARY b153 lane 6 wrapper: lane 9's
+/// `revoke_tab_token` supersedes it; the primary repoints the one call in
+/// `lead::wake` and drops this at merge.
+pub(crate) fn revoke_lead_caller(caller: &str) -> Result<usize> {
+    let db = thegn_core::db::Db::open()?;
+    revoke_lead_pairings(&db, now_ms(), caller)
+}
+
 /// Revoke every live Lead token, whatever its tab. Returns how many were
 /// revoked.
 fn revoke_all_lead_pairings(store: &dyn ControlStore, now: i64) -> Result<usize> {
