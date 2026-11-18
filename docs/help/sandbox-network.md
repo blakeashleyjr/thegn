@@ -13,11 +13,19 @@ Part of [[sandboxing]]. The network mode and the allow and block lists.
 
 By default a `standard` sandbox keeps networking so fetch, clone, build,
 and debuggers work; `sealed` removes it entirely. `[sandbox]` also
-carries DNS-name allow/block rules for the middle ground. These rules are not
-an egress boundary; `network = "none"` is the only enforced deny, and `*` in
-`network_block` means offline — see [[config-reference]].
-Standalone sandboxed terminals also warn when DNS-name rules apply, because
-those rules are not an egress boundary.
+carries hostname allow/block lists for the middle ground. These lists are
+advisory, not an egress boundary: no local backend enforces them, and only the
+Sprites and Vercel providers lower them to their own policy API (Vercel takes
+allow lists only). `network = "none"` is the
+only enforced deny, and `*` in `network_block` means offline — see
+[[config-reference]]. thegn warns when lists are set but not enforced: at
+launch (standalone sandboxed terminals included), at `thegn env provision`, and
+in `thegn doctor`.
+
+On the `apple` backend, `network = "none"` (and therefore `sealed`) is refused
+with `network-unexpressible` until an internal-network implementation lands:
+Apple `container` has no offline network mode. Use podman or docker (they run in
+a VM on macOS) for offline or sealed worktrees, or set `network = "nat"`.
 
 `[sandbox.vpn]` can put the sandbox on an overlay network (tailscale,
 headscale, wireguard, openvpn, netbird, zerotier). The `mode` decides how:
@@ -27,6 +35,13 @@ the only honest option for bwrap/systemd), `in_container`, or `netns`.
 `on_error` decides what happens when the tunnel will not come up: `fail`
 refuses to launch, `warn` launches anyway, `offline` forces
 `network=none` so nothing leaks onto the host network.
+A VPN is a route, not egress control: thegn never reports a tunnel as
+enforcing the allow/block lists. `dns` picks how resolution composes with the
+overlay: `tunnel` (default) lets the overlay own resolution; `filter-only`
+drops the overlay's pushed DNS (such as Tailscale MagicDNS) so the runtime's
+default resolver is used; `filter-front` is reserved, warns and behaves as
+`tunnel`, and `thegn config validate --strict` rejects it. No mode filters
+hostnames.
 
 A running VPN sidecar is reused only when its tunnel configuration matches.
 Otherwise the result follows `on_error`: `fail` refuses launch, `warn`

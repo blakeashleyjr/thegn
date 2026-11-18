@@ -87,7 +87,6 @@ crates/thegn-core/src/devcontainer.rs
 crates/thegn-core/src/diagnostics.rs
 crates/thegn-core/src/diff_highlight.rs
 crates/thegn-core/src/disk.rs
-crates/thegn-core/src/dns_filter.rs
 crates/thegn-core/src/envplan.rs
 crates/thegn-core/src/event_bus.rs
 crates/thegn-core/src/file_manager/yazi.rs

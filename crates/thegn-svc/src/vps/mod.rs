@@ -241,6 +241,16 @@ impl VpsKind {
         }
     }
 
+    /// The config provider kind this adapter implements (inverse of
+    /// [`Self::from_kind`]).
+    pub fn env_kind(self) -> thegn_core::config::EnvProviderKind {
+        use thegn_core::config::EnvProviderKind as K;
+        match self {
+            VpsKind::Hetzner => K::Hetzner,
+            VpsKind::DigitalOcean => K::DigitalOcean,
+        }
+    }
+
     pub fn api_base_default(self) -> &'static str {
         match self {
             VpsKind::Hetzner => hetzner::DEFAULT_API_BASE,

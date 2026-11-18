@@ -167,7 +167,6 @@ pub mod direnv;
 pub mod disk;
 pub mod disk_fill;
 pub mod disk_reclaim;
-pub mod dns_filter;
 pub mod editor;
 pub mod egress;
 pub mod egress_nft;

@@ -4,25 +4,25 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 
 ## 1. Capability and egress truth
 
-- [ ] 1.1 WS01-P1-01: per-kind provider facts in core (`egress_api`, `checkpoints`, `files`) and
+- [x] 1.1 WS01-P1-01: per-kind provider facts in core (`egress_api`, `checkpoints`, `files`) and
       `ProviderCaps::for_kind`
-- [ ] 1.2 WS01-P1-02: `egress_for(&EgressInputs)` and honest capability fields (`Offline`, no false
+- [x] 1.2 WS01-P1-02: `egress_for(&EgressInputs)` and honest capability fields (`Offline`, no false
       `Enforce`, VPN is `Unmanaged`)
-- [ ] 1.3 WS01-P1-03: matrix relabel (`NetIsolation::{OwnNetns, Unverified}`)
-- [ ] 1.4 WS01-P1-04: refuse Apple `network = "none"` with `network-unexpressible`
-- [ ] 1.5 WS01-P1-05: warn when provider placements ignore hostname rules
-- [ ] 1.6 WS01-P1-06: `network_audit` truth (and prior audit F14 closure)
-- [ ] 1.7 WS01-P1-07: VPN DNS mode truth (`filter-front` reserved)
-- [ ] 1.8 WS01-P1-08: stable clamp drops k8s envs
+- [x] 1.3 WS01-P1-03: matrix relabel (`NetIsolation::{OwnNetns, Unverified}`)
+- [x] 1.4 WS01-P1-04: refuse Apple `network = "none"` with `network-unexpressible`
+- [x] 1.5 WS01-P1-05: warn when provider placements ignore hostname rules
+- [x] 1.6 WS01-P1-06: `network_audit` truth (and prior audit F14 closure)
+- [x] 1.7 WS01-P1-07: VPN DNS mode truth (`filter-front` reserved)
+- [x] 1.8 WS01-P1-08: stable clamp drops k8s envs
 
 ## 2. `dns_filter` fate
 
-- [ ] 2.1 WS01-P2-01: create `thegn_core::egress::pattern` with today's semantics
-- [ ] 2.2 WS01-P2-02: delete the DNS filter server, its tests, recipe and CI run line
+- [x] 2.1 WS01-P2-01: create `thegn_core::egress::pattern` with today's semantics
+- [x] 2.2 WS01-P2-02: delete the DNS filter server, its tests, recipe and CI run line
 
 ## 3. Reserved kinds
 
-- [ ] 3.1 WS01-P3-01: reserve `smol` and `appcontainer`; reserved kinds are never runtime candidates
+- [x] 3.1 WS01-P3-01: reserve `smol` and `appcontainer`; reserved kinds are never runtime candidates
 - [ ] 3.2 WS01-P3-02: smol cleanup (labels, dead docker-clone arms, lists)
 
 ## 4. Remote truth

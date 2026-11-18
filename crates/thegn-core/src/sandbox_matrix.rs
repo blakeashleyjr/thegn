@@ -9,7 +9,9 @@
 //! - the honest class — [`Capabilities::from_parts_on`] (the same derivation the
 //!   floor and the trust ladder read);
 //! - filesystem / network / scoping — the backend's profile *family*
-//!   ([`Backend::is_oci`] / [`Backend::is_host_toolchain`] / the profile table);
+//!   ([`Backend::is_oci`] / [`Backend::is_host_toolchain`] / the profile table)
+//!   and the verified runtime facts ([`Backend::verified`]); the network cell
+//!   never reads the egress claim, so list rules are reported as advisory;
 //! - the resource ceiling — the [`CpuCap`]-shaped
 //!   rule the pane wrapper applies, overlaid with the *probed facts* when
 //!   doctor renders the host column, so a degraded ceiling shows as soft, never
@@ -22,7 +24,8 @@
 //! the enforcing predicate, the matrix can never quietly disagree with the
 //! resolver: a wrong cell requires the enforcement source itself to be wrong.
 
-use crate::capabilities::{Capabilities, EgressKind, IsolationClass};
+use crate::capabilities::{Capabilities, IsolationClass};
+use crate::config::Network;
 use crate::placement::Placement;
 use crate::sandbox::Backend;
 use crate::sandbox_backend::{HostOs, backend_runs_on};
@@ -44,15 +47,17 @@ pub enum FsIsolation {
 /// Network isolation a backend can provide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetIsolation {
-    /// An own network namespace; only `network = "none"` is an enforced deny.
-    /// `network_allow` and `network_block` hostname rules are DNS-only, not an
-    /// egress boundary (`EgressKind::Enforce`).
-    Enforceable,
+    /// An own network namespace: `network = "none"` is enforced (reported
+    /// `Offline`); `network_allow` and `network_block` lists are advisory, not
+    /// enforced.
+    OwnNetns,
     /// A network namespace is unshared **only** under `network = none`; otherwise
     /// the pane shares the host network stack.
     WhenSealed,
     /// The host network stack, always shared — no isolation available.
     HostShared,
+    /// No verified way to express `network = "none"` (Apple `container`).
+    Unverified,
 }
 
 /// The strength of the resource ceiling a backend gets. For the host-toolchain
@@ -108,9 +113,10 @@ impl FsIsolation {
 impl NetIsolation {
     pub fn as_str(self) -> &'static str {
         match self {
-            NetIsolation::Enforceable => "netns; rules DNS-only",
+            NetIsolation::OwnNetns => "netns; rules advisory",
             NetIsolation::WhenSealed => "only when network=none",
             NetIsolation::HostShared => "none (host net)",
+            NetIsolation::Unverified => "unverified (no none)",
         }
     }
 }
@@ -208,7 +214,15 @@ pub fn row(backend: Backend, os: HostOs) -> EnforcementRow {
         // The honest class straight from the capabilities derivation — the same
         // source the floor compares over — with no `oci_runtime` raise (that is a
         // config-time modifier doctor reports on its own line).
-        class: Capabilities::from_parts_on(backend, &Placement::Local, false, None, os).isolation,
+        class: Capabilities::from_parts_on(
+            backend,
+            &Placement::Local,
+            Network::Nat,
+            false,
+            None,
+            os,
+        )
+        .isolation,
     }
 }
 
@@ -232,31 +246,27 @@ fn fs_for(backend: Backend) -> FsIsolation {
     }
 }
 
-/// Network isolation, aggregating the egress predicate with the profile family:
-/// an OCI/enforceable egress means we own the datapath; the host-toolchain
+/// Network isolation, from the backend family and its verified runtime facts —
+/// never from the egress claim. OCI engines give the container its own netns
+/// (`network = "none"` enforced; lists advisory); the host-toolchain
 /// containers only unshare the netns under `network = none`; the host-process
-/// backends share the host stack outright.
-fn net_for(backend: Backend, os: HostOs) -> NetIsolation {
-    // `Placement::Local`, no VPN: exactly the egress the matrix row describes.
-    let egress = Capabilities::from_parts_on(backend, &Placement::Local, false, None, os).egress;
-    if egress == EgressKind::Enforce {
-        return NetIsolation::Enforceable;
-    }
+/// backends share the host stack outright; Apple `container` has no verified
+/// way to express `network = "none"`. Exhaustive, no wildcard. `_os` keeps the
+/// signature stable for the backend manifest (WS02).
+fn net_for(backend: Backend, _os: HostOs) -> NetIsolation {
     match backend {
+        Backend::Apple => NetIsolation::Unverified,
+        Backend::Podman
+        | Backend::PodmanRootful
+        | Backend::Docker
+        | Backend::Smol
+        | Backend::Wsl => NetIsolation::OwnNetns,
         // Namespace tools: sealed netns only under `network = none`.
         Backend::Bwrap | Backend::Systemd => NetIsolation::WhenSealed,
         // Host-process backends: the host network, always shared.
         Backend::None | Backend::WinAppContainer | Backend::WinJobObject => {
             NetIsolation::HostShared
         }
-        // OCI backends always reach `Enforce` above; a fall-through here would be
-        // a bug, but keep it honest rather than panicking.
-        Backend::Podman
-        | Backend::PodmanRootful
-        | Backend::Docker
-        | Backend::Smol
-        | Backend::Apple
-        | Backend::Wsl => NetIsolation::Enforceable,
     }
 }
 
@@ -353,10 +363,10 @@ mod tests {
         assert_eq!(bwrap.net, NetIsolation::WhenSealed);
         assert_eq!(bwrap.ceiling, CeilingStrength::HostProbed);
         assert_eq!(bwrap.scoping, Scoping::PidNamespace);
-        // OCI: isolated fs, enforceable egress, hard native cap.
+        // OCI: isolated fs, own netns (lists advisory), hard native cap.
         let podman = c(Backend::Podman);
         assert_eq!(podman.fs, FsIsolation::Isolated);
-        assert_eq!(podman.net, NetIsolation::Enforceable);
+        assert_eq!(podman.net, NetIsolation::OwnNetns);
         assert_eq!(podman.ceiling, CeilingStrength::Hard);
         assert_eq!(podman.scoping, Scoping::Engine);
         // The plain host: no fs/net isolation, host-probed cap, pgid scoping.
@@ -416,10 +426,48 @@ mod tests {
 
     #[test]
     fn oci_net_label_does_not_claim_filtering() {
-        let label = NetIsolation::Enforceable.as_str();
-        assert_eq!(label, "netns; rules DNS-only");
-        assert!(!label.contains("enforceable"));
+        let label = NetIsolation::OwnNetns.as_str();
+        assert_eq!(label, "netns; rules advisory");
+        assert!(label.contains("advisory"));
+        assert!(!label.contains("DNS"));
+        assert!(!label.contains("enforce"));
         assert!(label.len() <= 22);
+        assert_eq!(NetIsolation::Unverified.as_str(), "unverified (no none)");
+    }
+
+    #[test]
+    fn apple_net_is_unverified_on_macos() {
+        let apple = row(Backend::Apple, HostOs::MacOs);
+        assert!(apple.reachable);
+        assert_eq!(apple.net, NetIsolation::Unverified);
+    }
+
+    #[test]
+    fn net_for_is_independent_of_egress_kind() {
+        // The OCI cell says "own netns" although the egress claim for a plain
+        // `nat` launch is `Unmanaged`: the cell is the family fact, not the claim.
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows, HostOs::Other] {
+            for backend in [
+                Backend::Podman,
+                Backend::PodmanRootful,
+                Backend::Docker,
+                Backend::Smol,
+                Backend::Wsl,
+            ] {
+                let egress = Capabilities::from_parts_on(
+                    backend,
+                    &Placement::Local,
+                    Network::Nat,
+                    false,
+                    None,
+                    os,
+                )
+                .egress;
+                assert_eq!(egress, crate::capabilities::EgressKind::Unmanaged);
+                assert_eq!(row(backend, os).net, NetIsolation::OwnNetns, "{backend:?}");
+            }
+            assert_eq!(row(Backend::Apple, os).net, NetIsolation::Unverified);
+        }
     }
 
     #[test]

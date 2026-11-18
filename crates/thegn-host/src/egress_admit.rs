@@ -94,7 +94,9 @@ pub(crate) fn reverify_restored_egress(
     allow: &[String],
     block: &[String],
 ) -> Result<RestoredEgress> {
-    if egress_admission(false, caps_egress, allow, block) == EgressAdmission::Skip {
+    if let EgressAdmission::Skip | EgressAdmission::SkipUnsupported =
+        egress_admission(false, caps_egress, allow, block)
+    {
         return Ok(RestoredEgress::Skipped);
     }
 
@@ -109,7 +111,11 @@ pub(crate) fn reverify_restored_egress(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressAdmission {
+    /// No lists are declared: nothing to admit.
     Skip,
+    /// Lists are declared but the provider has no egress policy API: they are
+    /// NOT enforced. Callers proceed and warn with [`unsupported_note`].
+    SkipUnsupported,
     AdmitFresh,
     VerifyExisting,
 }
@@ -120,12 +126,48 @@ pub(crate) fn egress_admission(
     allow: &[String],
     block: &[String],
 ) -> EgressAdmission {
-    if !caps_egress || (allow.is_empty() && block.is_empty()) {
+    if allow.is_empty() && block.is_empty() {
         EgressAdmission::Skip
+    } else if !caps_egress {
+        EgressAdmission::SkipUnsupported
     } else if created {
         EgressAdmission::AdmitFresh
     } else {
         EgressAdmission::VerifyExisting
+    }
+}
+
+/// The warning for declared `network_allow`/`network_block` lists on a
+/// provider without an egress policy API: the lists are NOT enforced.
+pub(crate) fn unsupported_note(provider: &str) -> String {
+    thegn_core::sandbox::provider_rules_unenforced_note(provider)
+}
+
+/// The config kind name of a provider, for [`unsupported_note`].
+pub(crate) fn provider_label(provider: &thegn_svc::provider::Provider) -> &'static str {
+    provider.kind().map_or("iroh", |kind| kind.as_str())
+}
+
+/// Whether declared lists are unenforced on this provider (the
+/// [`EgressAdmission::SkipUnsupported`] case, independent of `created`).
+pub(crate) fn lists_unenforced(caps_egress: bool, allow: &[String], block: &[String]) -> bool {
+    egress_admission(false, caps_egress, allow, block) == EgressAdmission::SkipUnsupported
+}
+
+/// Warn once per process per (provider, sandbox) that the lists are not
+/// enforced, so a repeated launch path does not repeat the warning.
+pub(crate) fn warn_unsupported_once(provider: &str, sandbox: &str) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = format!("{provider}\u{0}{sandbox}");
+    let first = WARNED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .map(|mut warned| warned.insert(key))
+        // A poisoned set only risks a repeated warning.
+        .unwrap_or(true);
+    if first {
+        thegn_core::msg::warn(&unsupported_note(provider));
     }
 }
 
@@ -143,7 +185,7 @@ pub(crate) fn gate_handed_sandbox(
 ) -> Result<EgressAdmission> {
     let admission = egress_admission(created, caps_egress, allow, block);
     match admission {
-        EgressAdmission::Skip => {}
+        EgressAdmission::Skip | EgressAdmission::SkipUnsupported => {}
         EgressAdmission::AdmitFresh => admit_egress(steps, id, allow, block)?,
         EgressAdmission::VerifyExisting => verify_existing_egress(steps, id, allow, block)?,
     }
@@ -407,11 +449,11 @@ mod tests {
         );
         assert_eq!(
             egress_admission(false, false, &allow, &empty),
-            EgressAdmission::Skip
+            EgressAdmission::SkipUnsupported
         );
         assert_eq!(
             egress_admission(false, false, &empty, &block),
-            EgressAdmission::Skip
+            EgressAdmission::SkipUnsupported
         );
         assert_eq!(
             egress_admission(true, false, &empty, &empty),
@@ -419,11 +461,11 @@ mod tests {
         );
         assert_eq!(
             egress_admission(true, false, &allow, &empty),
-            EgressAdmission::Skip
+            EgressAdmission::SkipUnsupported
         );
         assert_eq!(
             egress_admission(true, false, &empty, &block),
-            EgressAdmission::Skip
+            EgressAdmission::SkipUnsupported
         );
         assert_eq!(
             egress_admission(false, true, &empty, &empty),
@@ -527,8 +569,43 @@ mod tests {
         let no_caps = ScriptedEgress::new(vec![], vec![]);
         assert_eq!(
             gate_handed_sandbox(&no_caps, false, false, "sandbox-1", &allow, &block).unwrap(),
-            EgressAdmission::Skip
+            EgressAdmission::SkipUnsupported
         );
         assert!(no_caps.calls().is_empty());
+    }
+
+    #[test]
+    fn egress_admission_skip_unsupported_when_lists_and_no_api() {
+        let (allow, block) = lists();
+        let empty: Vec<String> = Vec::new();
+        for created in [false, true] {
+            assert_eq!(
+                egress_admission(created, false, &allow, &block),
+                EgressAdmission::SkipUnsupported
+            );
+            assert_eq!(
+                egress_admission(created, false, &allow, &empty),
+                EgressAdmission::SkipUnsupported
+            );
+        }
+        assert!(super::lists_unenforced(false, &allow, &empty));
+        assert!(!super::lists_unenforced(true, &allow, &empty));
+        assert!(!super::lists_unenforced(false, &empty, &empty));
+        let note = super::unsupported_note("daytona");
+        assert!(note.contains("env provider 'daytona'"), "{note}");
+        assert!(note.contains("NOT enforced"), "{note}");
+    }
+
+    #[test]
+    fn egress_admission_skip_when_lists_empty() {
+        let empty: Vec<String> = Vec::new();
+        for created in [false, true] {
+            for caps in [false, true] {
+                assert_eq!(
+                    egress_admission(created, caps, &empty, &empty),
+                    EgressAdmission::Skip
+                );
+            }
+        }
     }
 }
