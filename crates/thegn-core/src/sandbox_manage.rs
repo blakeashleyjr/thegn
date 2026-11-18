@@ -430,10 +430,11 @@ fn docker_cli_managed(b: Backend) -> bool {
 }
 
 /// Every backend that can be *listed* for the Containers tab / prune discovery:
-/// the docker-CLI ones plus `smol` (docker clone, already swept by the GC) and
-/// `apple` (`container ls`). Read-only, so unverified backends are safe here.
+/// the docker-CLI ones plus `apple` (`container ls`). Read-only, so unverified
+/// backends are safe here. The reserved `smol` is never created, so there is
+/// nothing to list.
 fn listable(b: Backend) -> bool {
-    docker_cli_managed(b) || matches!(b, Backend::Smol | Backend::Apple)
+    docker_cli_managed(b) || matches!(b, Backend::Apple)
 }
 
 /// The management ops `backend` supports.
