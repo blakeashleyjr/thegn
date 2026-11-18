@@ -33,8 +33,11 @@ of claiming a spare.
 On the dev channel, before a spare is handed to a worktree, the worktree's
 network allow/block policy is verified on that spare and re-applied if it
 drifted. An unverifiable spare is quarantined (listed in `thegn doctor`) and
-the worktree is provisioned fresh. Providers without egress control and empty
-policies skip this check.
+the worktree is provisioned fresh. Empty policies skip this check. A provider
+without an egress policy API (every provider except Sprites) also skips it, and
+thegn warns that the env's network allow/block lists are NOT enforced: once
+when a worktree opens or claims a spare, in `thegn env provision` and
+`thegn env restore` output, and in `thegn doctor` (`network rules [env.<name>]`).
 If the current warm-pool target cannot be read, reconciliation makes no pool
 changes rather than falling back to the configured size. The warm-pool keys
 report `warm pool: cannot read the current target: ...` and save nothing.

@@ -606,6 +606,16 @@ pub fn claim_spare(
     let egress_provider = crate::agent::provider_for_named(&env.provider, &name);
     let egress = match egress_provider.as_ref() {
         Some(provider) => {
+            if crate::egress_admit::lists_unenforced(
+                provider.caps().egress,
+                &egress_env.sandbox.network_allow,
+                &egress_env.sandbox.network_block,
+            ) {
+                crate::egress_admit::warn_unsupported_once(
+                    crate::egress_admit::provider_label(provider),
+                    &name,
+                );
+            }
             let steps = crate::egress_admit::BlockingProviderEgress { provider };
             claim_egress_gate(
                 Some((&steps, provider.caps().egress)),
@@ -854,8 +864,11 @@ fn claim_egress_gate(
             "no provider is available to verify the claiming worktree's network egress policy on spare {name}"
         ));
     };
-    if crate::egress_admit::egress_admission(false, caps_egress, allow, block)
-        == crate::egress_admit::EgressAdmission::Skip
+    // Without an egress policy API the lists are unenforced: the caller warns
+    // and the claim proceeds.
+    if let crate::egress_admit::EgressAdmission::Skip
+    | crate::egress_admit::EgressAdmission::SkipUnsupported =
+        crate::egress_admit::egress_admission(false, caps_egress, allow, block)
     {
         return Ok(());
     }

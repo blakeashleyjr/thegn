@@ -868,6 +868,16 @@ fn recycle_spare(cfg: &Config, env_name: &str, spare: &PoolSpare, current_lock: 
                 thegn_core::msg::warn(&format!("warm pool: {error:#}; destroying it instead"));
                 return false;
             }
+            if crate::egress_admit::lists_unenforced(
+                provider.caps().egress,
+                &resolved.sandbox.network_allow,
+                &resolved.sandbox.network_block,
+            ) {
+                crate::egress_admit::warn_unsupported_once(
+                    crate::egress_admit::provider_label(&provider),
+                    name,
+                );
+            }
             // Re-assert the provisioned marker: it is written AFTER the
             // checkpoint step (agent.rs), so the checkpoint a restore reverts
             // to does NOT contain it — without this, a claiming worktree would
