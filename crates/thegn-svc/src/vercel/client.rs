@@ -756,7 +756,8 @@ impl VercelClient {
         let url = admit_ticket_url(raw_url).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
         let host = url.host_str().unwrap_or("");
         if !interactive_host_allowed(host, &self.interactive_hosts) {
-            bail!("{INTERACTIVE_HOST_REFUSAL}");
+            let shown: String = host.chars().take(253).collect();
+            bail!("{INTERACTIVE_HOST_REFUSAL} (host {shown})");
         }
         Ok(InteractiveTicket {
             url,

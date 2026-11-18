@@ -16,6 +16,9 @@
 # Exception (b154): `vercel-exec cmd` / `vercel-exec id` were added with the
 # hidden `thegn vercel-exec` bridge verb, the same precedent as `sprite-exec`:
 # a hidden self-bridge verb nobody tab-completes.
+#
+# Exception (b160): `sprite-exec hold` (the `--hold <dur>` keep-awake flag) is
+# a hidden bridge verb argument, the same precedent as `sprite-exec id/cmd`.
 	log_level
 agent sessions	harness
 api call	params
@@ -157,6 +160,7 @@ share start	port
 share start	reach
 share stop	port
 sprite-exec	cmd
+sprite-exec	hold
 sprite-exec	id
 vercel-exec	cmd
 vercel-exec	id
