@@ -7,7 +7,8 @@
 //! registered local repos through the same `hydrate_tracker::refresh_repo` the
 //! UI uses (every enabled account of each repo's tracker config, the same
 //! cache keys, so the first daemon pass of a repo diffs against the cache the
-//! UI wrote). Repos rotate round-robin by key, so none waits more than
+//! UI wrote). Repos rotate round-robin by key, and the cursor advances only
+//! past repos actually handled, so within the time budget none waits more than
 //! `ceil(repos / MAX_REPOS_PER_TICK)` ticks. Autopilot pickup inside the
 //! refresh goes through `producers::queues::daemon_pickup`, and only for a
 //! repo whose `[autopilot]` is enabled.
@@ -24,6 +25,10 @@ use crate::hydrate_tracker::{RefreshSite, refresh_repo};
 
 /// At most this many repos are refreshed per tick.
 pub(crate) const MAX_REPOS_PER_TICK: usize = 32;
+
+/// A tick stops starting new repos after this long (one cadence), so a slow
+/// tracker cannot stretch a tick past the tracker lease TTL.
+const TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The last repo key refreshed. The next tick starts strictly after it in key
 /// order (wrapping), so a repo added or removed between ticks cannot shift the
@@ -59,19 +64,22 @@ pub(crate) fn tick(ctx: &TickCtx) -> TickOutcome {
         }))
     };
     let batch = {
-        let mut cursor = CURSOR
+        let cursor = CURSOR
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let batch = next_batch(&roots, cursor.as_deref(), MAX_REPOS_PER_TICK);
-        if let Some(last) = batch.last() {
-            *cursor = Some(last.clone());
-        }
-        batch
+        next_batch(&roots, cursor.as_deref(), MAX_REPOS_PER_TICK)
     };
+    let started = std::time::Instant::now();
     let mut refreshed = 0;
     for root in &batch {
+        if started.elapsed() >= TICK_BUDGET {
+            break;
+        }
         let path = Path::new(root);
         if !path.is_dir() {
+            *CURSOR
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root.clone());
             continue;
         }
         let summary = refresh_repo(path, &ctx.cfg, None, RefreshSite::Daemon);
@@ -83,6 +91,9 @@ pub(crate) fn tick(ctx: &TickCtx) -> TickOutcome {
             events = summary.events,
             "daemon tracker refresh"
         );
+        *CURSOR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root.clone());
         refreshed += 1;
     }
     TickOutcome::Done { work: refreshed }
