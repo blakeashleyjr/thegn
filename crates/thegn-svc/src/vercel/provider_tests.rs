@@ -503,6 +503,38 @@ async fn interactive_open_never_resumes_past_the_lifetime_ceiling() {
     assert_eq!(fake.count("resume"), 1);
 }
 
+/// The `vercel-exec` login upload resumes through `resume_interactive`: past
+/// the lifetime ceiling it refuses before any resume (no compute is bought).
+#[tokio::test]
+async fn login_upload_resume_never_resumes_past_the_lifetime_ceiling() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Stopped, None)));
+    *fake.resume.lock().unwrap() = Some(view(NAME, SessionStatus::Running, Some("sess_9")));
+    let p = provider(&fake, ledger.path(), 2);
+    let error = p.resume_interactive(NAME).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("max_lifetime_secs"),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("resume"), 0, "{:?}", fake.calls());
+
+    // Inside the ceiling it resumes as `resume` would.
+    let fake = Arc::new(FakeApi::default());
+    fake.gets.lock().unwrap().push_back(Some(SandboxView {
+        created_at_ms: Some(now_ms() - 60_000),
+        ..view(NAME, SessionStatus::Stopped, None)
+    }));
+    *fake.resume.lock().unwrap() = Some(view(NAME, SessionStatus::Running, Some("sess_9")));
+    let p = provider(&fake, ledger.path(), 2);
+    p.resume_interactive(NAME).await.unwrap();
+    assert_eq!(fake.count("resume"), 1);
+}
+
 #[tokio::test]
 async fn stop_session_never_resumes() {
     let _state = thegn_core::testenv::IsolatedState::new();
