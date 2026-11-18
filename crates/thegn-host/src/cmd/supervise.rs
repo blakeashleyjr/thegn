@@ -30,7 +30,7 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus};
 use thegn_core::outln;
-use thegn_core::pipeline_approval::{ApprovalState, state_for};
+use thegn_core::pipeline_approval::{ApprovalState, lane_state_for};
 use thegn_core::pipeline_run::{self, RowLiveness};
 use thegn_core::pipeline_supervise::{self, LaneFacts, SuperviseAction, ValidationRecord};
 use thegn_core::remote::GitLoc;
@@ -286,7 +286,7 @@ fn gather(
             child_stages: children.get(&row.id).cloned().unwrap_or_default(),
             head_sha: head_sha.clone(),
         };
-        let approval = state_for(
+        let approval = lane_state_for(
             facts.approval.as_ref(),
             &head_sha,
             now_ms,
@@ -718,7 +718,7 @@ mod tests {
     use thegn_core::config_pipeline::Requirement;
     use thegn_core::config_pipeline::{Pipeline, PipelineStage};
     use thegn_core::issue::AgentDispatchStatus;
-    use thegn_core::pipeline_approval::Approval;
+    use thegn_core::pipeline_approval::{Approval, state_for};
     use thegn_core::store::NotificationStore as _;
     use unicode_width::UnicodeWidthStr;
 

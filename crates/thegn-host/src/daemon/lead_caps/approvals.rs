@@ -85,6 +85,12 @@ pub(crate) async fn list(svc: &DaemonService, req: serde_json::Value) -> JsonRes
 pub(crate) async fn request(svc: &DaemonService, req: serde_json::Value) -> JsonResult {
     let request: ApprovalRequest = decode(req)?;
     approval_request::validate_request(&request).map_err(ControlError::InvalidArgument)?;
+    if matches!(
+        thegn_core::approval_digest::effect_kind(&request.issue_id, &request.stage),
+        thegn_core::approval_digest::EffectKind::Lane
+    ) {
+        require_current_lane_head(svc, &request).await?;
+    }
     let stored = request.clone();
     let (requested, id) = svc.with_db(move |db| request_in(db, &stored)).await?;
     if requested {
@@ -92,6 +98,64 @@ pub(crate) async fn request(svc: &DaemonService, req: serde_json::Value) -> Json
     }
     after_request(svc, &request, requested).await;
     encode(&json!({ "requested": requested, "notification_id": id }))
+}
+
+/// A full (SHA-1 or SHA-256) hex commit id, never an abbreviation.
+fn full_commit_id(sha: &str) -> bool {
+    let s = sha.trim();
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A caller-raised land request must name the full current HEAD of a roster
+/// lane at that stage, so the owner never approves a sha a worker can grind a
+/// prefix collision against.
+async fn require_current_lane_head(
+    svc: &DaemonService,
+    request: &ApprovalRequest,
+) -> Result<(), ControlError> {
+    let refuse = || {
+        ControlError::FailedPrecondition(
+            "a land approval request must name the full current head of a lane at that stage"
+                .into(),
+        )
+    };
+    if !full_commit_id(&request.commit_sha) {
+        return Err(refuse());
+    }
+    let (issue, stage) = (request.issue_id.clone(), request.stage.clone());
+    let paths: Vec<String> = svc
+        .with_db(move |db| {
+            Ok(db
+                .list_dispatches()?
+                .into_iter()
+                .filter(|row| row.issue_id == issue && row.stage.as_deref() == Some(stage.as_str()))
+                .map(|row| row.worktree_path)
+                .collect())
+        })
+        .await?;
+    if paths.is_empty() {
+        return Err(refuse());
+    }
+    let heads = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(p))
+                    .git_text(&["rev-parse", "HEAD"])
+                    .map(|s| s.trim().to_owned())
+                    .map_err(|_| ())
+            })
+            .collect::<Result<Vec<String>, ()>>()
+    })
+    .await
+    .map_err(|_| refuse())?
+    .map_err(|_| refuse())?;
+    let want = request.commit_sha.trim();
+    if heads.iter().any(|h| h.eq_ignore_ascii_case(want)) {
+        Ok(())
+    } else {
+        Err(refuse())
+    }
 }
 
 /// Raise an approval from inside the daemon (the stage executor's land ask,
@@ -133,6 +197,22 @@ pub(crate) async fn after_request(svc: &DaemonService, req: &ApprovalRequest, in
     let Some(provider) = thegn_svc::push::provider_for(&svc.config.notifications.push) else {
         return;
     };
+    // An unauthenticated ntfy topic is readable (and publishable) by anyone who
+    // knows it, the Lead included: never put a redeemable nonce on one.
+    let is_ref = |t: &str| {
+        let t = t.trim();
+        t.starts_with("env:") || t.starts_with("file:")
+    };
+    let push = &svc.config.notifications.push;
+    if (!push.topic.trim().is_empty() && !is_ref(&push.token))
+        || push
+            .sinks
+            .iter()
+            .any(|s| !s.topic.trim().is_empty() && !is_ref(&s.token))
+    {
+        tracing::info!(target: "thegn::approval", "approval push skipped: a push topic has no secret-ref token (answer in the panel or CLI)");
+        return;
+    }
     let mut bytes = [0u8; push_approval::NONCE_BYTES];
     if let Err(error) = getrandom::fill(&mut bytes) {
         tracing::warn!(target: "thegn::approval", %error, "approval push skipped: no OS randomness");
@@ -340,6 +420,14 @@ mod tests {
 
     const SHA: &str = "4babb0901f2c3d4e5f60718293a4b5c6d7e8f901";
     const OTHER: &str = "deadbeefcafe0011223344556677889900aabbcc";
+
+    #[test]
+    fn full_commit_id_accepts_only_full_hex_ids() {
+        assert!(!full_commit_id("4babb09"));
+        assert!(!full_commit_id(&"g".repeat(40)));
+        assert!(full_commit_id(SHA));
+        assert!(full_commit_id(&"a1".repeat(32)));
+    }
 
     fn ask(db: &Db, sha: &str) -> (bool, i64) {
         request_in(

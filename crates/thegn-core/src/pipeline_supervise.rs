@@ -53,7 +53,7 @@
 
 use crate::config_pipeline::{Pipeline, Requirement, Supervisor};
 use crate::issue::AgentDispatchStatus;
-use crate::pipeline_approval::{Approval, state_for};
+use crate::pipeline_approval::{Approval, lane_state_for};
 use crate::pipeline_validate::ValidationClass;
 
 /// How many times a validation may be re-run for the same tip before the
@@ -643,7 +643,7 @@ fn check(
             Requirement::ValidationGreen => {
                 matches!(validation_state(lane, declared), ValidationState::AllGreen)
             }
-            Requirement::Approval => state_for(
+            Requirement::Approval => lane_state_for(
                 lane.approval.as_ref(),
                 &lane.head_sha,
                 now_ms,
@@ -1361,11 +1361,16 @@ mod tests {
     }
 
     #[test]
-    fn a_person_may_approve_with_a_short_sha() {
-        // Approvals are typed by people, who have `rev-parse --short` to hand.
+    fn a_short_sha_approval_never_advances_a_lane() {
+        // A 7-char approval could be matched by a worker-ground commit sharing
+        // its prefix, so a lane's approval must name the full head exactly.
         let mut l = lane("code");
         l.validations = vec![green("nextest", HEAD)];
         l.approval = Some(approval("4babb09"));
+        assert_ne!(one(l).token(), "advance");
+        let mut l = lane("code");
+        l.validations = vec![green("nextest", HEAD)];
+        l.approval = Some(approval(HEAD));
         assert_eq!(one(l).token(), "advance");
     }
 

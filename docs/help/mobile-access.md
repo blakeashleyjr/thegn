@@ -71,7 +71,11 @@ When push is configured, every new approval request (a lane waiting to
 land, a proposed automation start, a rule asking to be armed, an outward
 action) is pushed with the title **thegn approval**. The body is the
 daemon's own trusted description of what you are approving (never the
-requester's free-text reason) and a reply line:
+requester's free-text reason) and a reply line. Phone approval needs a
+token-protected topic: when any push topic has no `env:`/`file:` token, no
+approval is pushed and you answer in the panel or CLI instead.
+
+The reply line reads:
 
 ```text
 Reply: approvals.redeem {"nonce":"<32 hex>","decision":"approve|reject"}
