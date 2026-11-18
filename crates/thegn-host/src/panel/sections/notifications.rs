@@ -75,24 +75,64 @@ fn wrap_message(s: &str, width: usize) -> Vec<String> {
 /// re-implement this without the `worktree_path` term, so filtering by a
 /// worktree name made `d` (irreversibly) delete a different notification than
 /// the highlighted one.
+///
+/// Approval-request rows are pinned first (stable within each group), so the
+/// cursor and every key act on the rendered order.
 pub(crate) fn visible_indices(
     panel: &crate::panel::PanelData,
     ui: &crate::panel::PanelUi,
 ) -> Vec<usize> {
     let filter = ui.notifications_filter.to_lowercase();
-    panel
+    let mut idx: Vec<usize> = panel
         .notifications
         .iter()
         .enumerate()
         .filter(|(_, n)| {
             (ui.notifications_show_read || !n.read)
                 && (filter.is_empty()
-                    || n.message.to_lowercase().contains(&filter)
+                    || shown_message(&panel.approval_descriptions, n)
+                        .to_lowercase()
+                        .contains(&filter)
                     || n.source_ref.to_lowercase().contains(&filter)
                     || n.worktree_path.to_lowercase().contains(&filter))
         })
         .map(|(i, _)| i)
-        .collect()
+        .collect();
+    // `sort_by_key` is stable: false (approval) sorts before true.
+    idx.sort_by_key(|&i| !is_approval(&panel.notifications[i]));
+    idx
+}
+
+/// True for an approval-request row (`agent_attention` with a well-formed
+/// `approval:` source ref).
+pub(crate) fn is_approval(n: &Notification) -> bool {
+    n.kind == NotificationKind::AgentAttention
+        && n.source_ref
+            .starts_with(thegn_core::approval_request::SOURCE_PREFIX)
+        && thegn_core::approval_request::parse_source_ref(&n.source_ref).is_some()
+}
+
+fn approvals_header() -> PanelRow {
+    PanelRow::plain(Line::segs(vec![
+        seg(d(), "Approvals  "),
+        seg(f(), "y approve · n reject"),
+    ]))
+}
+
+/// The text a row shows: for an approval row ONLY the trusted description
+/// (never the request's own message); otherwise the message.
+pub(crate) fn shown_message<'a>(
+    descriptions: &'a std::collections::BTreeMap<String, String>,
+    n: &'a Notification,
+) -> &'a str {
+    if is_approval(n) {
+        descriptions
+            .get(&n.source_ref)
+            .map(String::as_str)
+            .unwrap_or("unverified request")
+    } else {
+        &n.message
+    }
 }
 
 /// Notifications visible under the current show_read toggle and text filter.
@@ -167,13 +207,19 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     for (i, n) in items.iter().enumerate() {
+        if i == 0 && is_approval(n) {
+            rows.push(approvals_header());
+        }
         let ago = thegn_core::util::age(n.created_at_ms);
         // Budget: 1 glyph + 1 sp + 12 ref + 1 sp + message + 1 sp + age
         let msg_budget = ctx
             .cols
             .saturating_sub(1 + 1 + 12 + 1 + 1 + ago.len().max(2));
         let expanded = ctx.ui.notifications_expanded == Some(n.id);
-        let msg = display_clip(&n.message, msg_budget.max(4));
+        let msg = display_clip(
+            shown_message(&ctx.model.panel.approval_descriptions, n),
+            msg_budget.max(4),
+        );
         let src = display_clip(&n.source_ref, 12);
 
         // Read items dim to `faint` (still legible) so they read as handled
@@ -202,7 +248,10 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         };
         rows.push(row);
         if expanded {
-            for part in wrap_message(&display_cell(&n.message), ctx.cols.saturating_sub(2)) {
+            for part in wrap_message(
+                &display_cell(shown_message(&ctx.model.panel.approval_descriptions, n)),
+                ctx.cols.saturating_sub(2),
+            ) {
                 rows.push(PanelRow {
                     line: Line::segs(vec![sp(2), seg(t(), part)]),
                     bg: None,
@@ -230,11 +279,17 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         // the highlighted row on screen, so every row stays reachable.
     }
 
-    rows.push(hint_row(&[
+    let mut hints: Vec<(&str, &str)> = vec![
         ("↵", "jump"),
         ("space", "expand"),
         ("o", "open"),
         ("/ ", "search"),
+    ];
+    if items.iter().any(|n| is_approval(n)) {
+        hints.push(("y", "approve"));
+        hints.push(("n", "reject"));
+    }
+    hints.extend([
         ("x", "read"),
         ("d", "delete"),
         ("a", "clear"),
@@ -246,7 +301,8 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 "all worktrees"
             },
         ),
-    ]));
+    ]);
+    rows.push(hint_row(&hints));
     rows
 }
 
@@ -271,12 +327,18 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     for (i, n) in items.iter().enumerate() {
+        if i == 0 && is_approval(n) {
+            rows.push(approvals_header());
+        }
         let ago = thegn_core::util::age(n.created_at_ms);
         let src = display_clip(&n.source_ref, 14);
         let msg_budget = ctx
             .cols
             .saturating_sub(kind_gh(n.kind).0.len() + 1 + src.len() + 3 + ago.len() + 1);
-        let msg = display_clip(&n.message, msg_budget.max(4));
+        let msg = display_clip(
+            shown_message(&ctx.model.panel.approval_descriptions, n),
+            msg_budget.max(4),
+        );
         let wt_base = n
             .worktree_path
             .rsplit('/')
@@ -304,7 +366,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         // retain the compact worktree and kind metadata.
         let expanded = ctx.ui.notifications_expanded == Some(n.id);
         let secondary = if i == cursor || expanded {
-            let message = display_cell(&n.message);
+            let message = display_cell(shown_message(&ctx.model.panel.approval_descriptions, n));
             let mut lines = wrap_message(&message, ctx.cols.saturating_sub(2))
                 .into_iter()
                 .map(|part| Line::segs(vec![sp(2), seg(t(), part)]))
@@ -469,7 +531,11 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     // Right column: detail for cursor item
     let detail_rows: Vec<Vec<Seg>> = if let Some(n) = items.get(cursor) {
-        notification_detail_segs(n, cols.saturating_sub(list_w + 2))
+        notification_detail_segs(
+            n,
+            shown_message(&ctx.model.panel.approval_descriptions, n),
+            cols.saturating_sub(list_w + 2),
+        )
     } else {
         vec![vec![seg(f(), "select a notification")]]
     };
@@ -497,7 +563,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-fn notification_detail_segs(n: &Notification, w: usize) -> Vec<Vec<Seg>> {
+fn notification_detail_segs(n: &Notification, shown: &str, w: usize) -> Vec<Vec<Seg>> {
     let mut out: Vec<Vec<Seg>> = Vec::new();
 
     // Kind glyph + source reference (title row)
@@ -512,7 +578,7 @@ fn notification_detail_segs(n: &Notification, w: usize) -> Vec<Vec<Seg>> {
     out.push(vec![seg(f(), n.kind.label()), seg(g(), read_tag)]);
 
     // Message
-    let message = display_cell(&n.message);
+    let message = display_cell(shown);
     for chunk in wrap_text(&message, w) {
         out.push(vec![seg(t(), chunk)]);
     }
@@ -562,6 +628,56 @@ mod tests {
         }
     }
 
+    fn approval_row(id: i64, sha: &str, msg: &str) -> Notification {
+        Notification {
+            id,
+            kind: NotificationKind::AgentAttention,
+            source_ref: thegn_core::approval_request::source_ref("linear:THE-1", "code", sha),
+            message: msg.into(),
+            created_at_ms: 1,
+            read: false,
+            worktree_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn approval_rows_partition_first_keeping_order() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.notifications = vec![
+            test_notification(NotificationKind::AgentDone, false, "done"),
+            approval_row(2, "abcdef1", "forged"),
+            test_notification(NotificationKind::AgentFailed, false, "failed"),
+            approval_row(4, "abcdef2", "forged2"),
+        ];
+        let ui = crate::panel::PanelUi {
+            open: Section::Notifications,
+            ..Default::default()
+        };
+        assert_eq!(visible_indices(&model.panel, &ui), vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn approval_row_shows_description_not_message() {
+        let n = approval_row(2, "abcdef1", "FORGED MESSAGE");
+        let mut descs = std::collections::BTreeMap::new();
+        assert_eq!(shown_message(&descs, &n), "unverified request");
+        descs.insert(n.source_ref.clone(), "land THE-1 after stage code".into());
+        assert_eq!(shown_message(&descs, &n), "land THE-1 after stage code");
+        let plain = test_notification(NotificationKind::AgentDone, false, "hello");
+        assert_eq!(shown_message(&descs, &plain), "hello");
+    }
+
+    #[test]
+    fn approval_detail_uses_the_description() {
+        let n = approval_row(2, "abcdef1", "FORGED MESSAGE");
+        let text = notification_detail_segs(&n, "land THE-1", 40)
+            .iter()
+            .flatten()
+            .map(|p| p.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("land THE-1") && !text.contains("FORGED"));
+    }
+
     #[test]
     fn truncate_adds_ellipsis() {
         assert_eq!(display_clip("hello world", 8), "hello w…");
@@ -584,7 +700,7 @@ mod tests {
             read: false,
             worktree_path: String::new(),
         };
-        let text = notification_detail_segs(&n, 40)
+        let text = notification_detail_segs(&n, &n.message, 40)
             .iter()
             .flatten()
             .map(|part| part.text.as_str())

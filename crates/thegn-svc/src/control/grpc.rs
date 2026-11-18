@@ -113,6 +113,25 @@ impl GrpcControl {
             grpc_audit(&ctx.pairing_id, &ctx.label, verb, AuditOutcome::NoScope);
             return Err(Status::from(e));
         }
+        // The Lead confinement: gRPC carries no request shape here, so the
+        // shape-checked verbs (`sessions.open`, `dispatches.put`) and the
+        // daemon-gated ones (`issues.update`/`issues.comment`, b155 6d: gRPC
+        // has no `issues_*_confined` route) are refused for a Lead caller
+        // (fail closed); the Lead uses its HTTP listener.
+        if ctx.lead_confined
+            && let Err(refusal) = thegn_core::lead_confine::check(
+                verb,
+                &thegn_core::lead_confine::RequestShape::Opaque,
+            )
+        {
+            grpc_audit(
+                &ctx.pairing_id,
+                &ctx.label,
+                verb,
+                AuditOutcome::LeadConfined,
+            );
+            return Err(Status::permission_denied(refusal.to_string()));
+        }
         Ok(ctx)
     }
 
@@ -250,6 +269,10 @@ pub fn frame_to_proto(frame: &EventFrame) -> proto::Event {
             code: *code,
         }),
         EventFrame::Lagged { missed } => Kind::Lagged(proto::Lagged { missed: *missed }),
+        EventFrame::Notice { kind, json } => Kind::Notice(proto::Notice {
+            kind: kind.as_str().to_string(),
+            json: json.clone(),
+        }),
     };
     proto::Event {
         seq: match frame {
@@ -434,9 +457,24 @@ impl Control for GrpcControl {
         &self,
         req: Request<proto::SnapshotRequest>,
     ) -> Result<Response<proto::Event>, Status> {
-        self.authed(&req, Verb::Snapshot)?;
+        let ctx = self.authed(&req, Verb::Snapshot)?;
         let r = req.into_inner();
-        let frame = self.api.snapshot(&r.session).await.map_err(Status::from)?;
+        let mut frame = self.api.snapshot(&r.session).await.map_err(Status::from)?;
+        // b155: a Lead-confined snapshot has credential shapes redacted, as
+        // on HTTP.
+        if ctx.lead_confined
+            && let EventFrame::PaneSnapshot { bytes, .. } = &mut frame
+        {
+            let redacted =
+                match thegn_core::lead_confine::redact_credentials(&String::from_utf8_lossy(bytes))
+                {
+                    std::borrow::Cow::Owned(redacted) => Some(redacted),
+                    std::borrow::Cow::Borrowed(_) => None,
+                };
+            if let Some(redacted) = redacted {
+                *bytes = redacted.into_bytes();
+            }
+        }
         Ok(Response::new(frame_to_proto(&frame)))
     }
 
@@ -1480,6 +1518,11 @@ mod tests {
                 code: x.code,
             },
             Kind::Lagged(l) => EventFrame::Lagged { missed: l.missed },
+            Kind::Notice(n) => EventFrame::Notice {
+                kind: thegn_core::control_wire::NoticeKind::parse(&n.kind)
+                    .unwrap_or(thegn_core::control_wire::NoticeKind::Notification),
+                json: n.json.clone(),
+            },
         }
     }
 
@@ -1527,6 +1570,10 @@ mod tests {
                 code: None,
             },
             EventFrame::Lagged { missed: 4 },
+            EventFrame::Notice {
+                kind: thegn_core::control_wire::NoticeKind::AutomationRun,
+                json: r#"{"rule":"r"}"#.into(),
+            },
         ];
         for f in frames {
             assert_eq!(proto_to_frame(&frame_to_proto(&f)), f, "{f:?}");

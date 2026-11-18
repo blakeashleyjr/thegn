@@ -29,7 +29,8 @@ and a merge can show `incoming files unavailable`.
 Binary and mode-only changes say so instead of showing hunks. `↵` on a file
 opens line-level staging at every width; at Normal width it widens to Half,
 and Esc retracts that drill. At Half, the inline preview follows the cursor.
-`space` stages, and `e` cycles panel width. Untracked files preview as all
+`space` stages, `/` filters the file list (stage and discard act on the
+highlighted match), and `e` cycles panel width. Untracked files preview as all
 additions and are intent-added (`add -N`) only on the first stage. In staging,
 line discard is refused in the STAGED pane (unstage with `space`) and on an
 untracked file (`d` on its Changes row deletes the file).
@@ -38,6 +39,13 @@ untracked and added files are refused, and other unavailable blame states are
 reported. An empty stash message becomes `WIP on <branch>`. A commit with
 nothing staged is refused before the message box; partially staged changes
 and merge states are allowed.
+
+Three stash keys sit in changes. `s` stashes everything, untracked files
+included. `S` stashes only the staged changes, which needs git 2.35 or newer;
+an older git refuses with a clear error. `U` stashes only the unstaged and
+untracked changes and leaves the index as it was. `S` with nothing staged
+reports `nothing staged to stash`, and `U` with nothing unstaged reports
+`no unstaged changes to stash`; neither opens the message box.
 
 For long-running `process` filters such as Git LFS, diffs reuse one filter per
 worktree and command, with at most 8 in total; a filter idle for 2 minutes is
@@ -121,7 +129,7 @@ and redo are refused; if recording fails after an operation, its result says
 ### files
 
 The worktree's file tree; `/` filters it (directories stay while any
-descendant matches; Esc clears), `↵` previews a file inline, `o` pages it
+descendant matches; Esc clears; at Half width the preview and `↵` follow the highlighted row), `S` stashes only staged changes and `U` only unstaged ones, `↵` previews a file inline, `o` pages it
 in bat, `O` opens your editor, `y` reveals it in yazi. A .docx shows its
 text (bounded, sanitized), falling back to its part listing with a note when
 the text cannot be read. A zip, jar, whl, tar, tgz or tar.gz (and other

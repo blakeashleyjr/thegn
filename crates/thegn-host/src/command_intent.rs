@@ -61,7 +61,12 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         },
         Command::Automations { action } => match action {
             cmd::automations::Action::Test { .. } => SourceInspection,
-            cmd::automations::Action::List { .. } => Configured,
+            cmd::automations::Action::List { .. }
+            | cmd::automations::Action::Add { .. }
+            | cmd::automations::Action::Rm { .. }
+            | cmd::automations::Action::Runs { .. }
+            | cmd::automations::Action::Pause
+            | cmd::automations::Action::Resume => Configured,
         },
         // Diagnostic and recovery verbs must keep working when the config
         // or the state store is what is broken: doctor/logs report it,
@@ -81,6 +86,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
             _ => Configured,
         },
         Command::Pr { .. }
+        | Command::Lead { .. }
         | Command::Voice { .. }
         | Command::Issue { .. }
         | Command::Kaneo { .. }
@@ -114,6 +120,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::Project { .. }
         | Command::Placement { .. }
         | Command::Fleet { .. }
+        | Command::Usage(..)
         | Command::Debug { .. }
         | Command::Mcp { .. }
         | Command::Agent { .. }
@@ -133,7 +140,8 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::SpriteProxy { .. }
         | Command::VpsSsh { .. }
         | Command::Machine0Ssh { .. }
-        | Command::SpriteExec { .. } => Configured,
+        | Command::SpriteExec { .. }
+        | Command::VercelExec { .. } => Configured,
     }
 }
 

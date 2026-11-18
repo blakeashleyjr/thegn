@@ -57,7 +57,7 @@ fn backend_of(label: &str) -> Option<Backend> {
         "docker" => Some(Backend::Docker),
         "podman" => Some(Backend::Podman),
         "podman-rootful" => Some(Backend::PodmanRootful),
-        "smolmachines" | "smol" => Some(Backend::Smol),
+        "smolvm" | "smolmachines" | "smol" => Some(Backend::Smol),
         "apple" => Some(Backend::Apple),
         _ => None,
     }
@@ -220,6 +220,15 @@ fn run_control(argv: &[String], timeout: Duration, label: &str) -> ActionOutcome
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn backend_of_maps_smolvm_and_legacy_labels() {
+        for label in ["smolvm", "smolmachines", "smol"] {
+            assert_eq!(backend_of(label), Some(Backend::Smol), "{label}");
+        }
+        assert_eq!(backend_of("docker"), Some(Backend::Docker));
+        assert_eq!(backend_of("bogus"), None);
+    }
 
     #[test]
     fn missing_runtime_reports_could_not_start_not_timeout() {

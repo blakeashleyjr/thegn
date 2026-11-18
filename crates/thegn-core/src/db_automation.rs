@@ -13,6 +13,9 @@ use crate::store::{
 
 const MAX_AUDIT_QUERY: usize = 1_000;
 const MAX_RETENTION_PER_RULE: usize = 10_000;
+/// A started run older than this is presumed orphaned by a crash and no
+/// longer blocks its rule (`automation_run_in_flight`).
+const IN_FLIGHT_WINDOW_SECS: i64 = 6 * 3_600;
 
 impl AutomationStore for Db {
     fn automation_state(&self, rule_id: &str) -> Result<Option<AutomationStateRow>> {
@@ -137,6 +140,7 @@ impl AutomationStore for Db {
                                 action.params.keys()
                             )),
                             started_at: now,
+                            autonomy: Some(action.autonomy.as_str().to_string()),
                         })?;
                         admitted.push(AutomationAdmission::Planned {
                             action: Box::new(action),
@@ -157,8 +161,9 @@ impl AutomationStore for Db {
                             action_cap: String::new(),
                             action_summary: String::new(),
                             started_at: now,
+                            autonomy: None,
                         })?;
-                        let reason = format!("{reason:?}").to_ascii_lowercase();
+                        let reason = skip_reason_label(&reason);
                         self.finish_automation_run(run_id, "skipped", Some(&reason), None, now)?;
                         admitted.push(AutomationAdmission::Skipped { run_id });
                     }
@@ -178,12 +183,83 @@ impl AutomationStore for Db {
         }
     }
 
+    fn audit_skipped_automation_event(
+        &self,
+        rules: &[crate::automation::AutomationRule],
+        event: &crate::automation::AutomationEvent,
+        now: i64,
+        skip: crate::automation::SkipReason,
+    ) -> Result<usize> {
+        let mut state = crate::automation::EvaluationState::new();
+        for rule in rules {
+            if let Some(row) = self.automation_state(&rule.id)? {
+                state.insert(
+                    rule.id.clone(),
+                    crate::automation::RuleState {
+                        enabled_override: row.enabled_override,
+                        last_fired_at: row.last_fired_at,
+                        recent_fires: row.recent_fires,
+                        action_fires: row.action_fires,
+                        once_keys: row.once_keys,
+                    },
+                );
+            }
+        }
+        let decisions = crate::automation::skipped_decisions(
+            crate::automation::evaluate(rules, event, &state, now),
+            skip,
+        );
+        let mut written = 0;
+        for decision in decisions {
+            let crate::automation::EvaluationDecision::Skipped {
+                rule_id,
+                event_key,
+                reason,
+            } = decision
+            else {
+                // skipped_decisions never returns a plan.
+                continue;
+            };
+            let run_id = self.start_automation_run(&NewAutomationRun {
+                rule_id,
+                event_id: event.id.clone(),
+                event_key: event_key.0,
+                trigger_kind: event.kind.as_str().into(),
+                event_summary: bounded(event.message.as_deref().unwrap_or_default()),
+                action_cap: String::new(),
+                action_summary: String::new(),
+                started_at: now,
+                autonomy: None,
+            })?;
+            self.finish_automation_run(
+                run_id,
+                "skipped",
+                Some(&skip_reason_label(&reason)),
+                None,
+                now,
+            )?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    fn automation_run_in_flight(&self, rule_id: &str, now: i64) -> Result<bool> {
+        let since = now.saturating_sub(IN_FLIGHT_WINDOW_SECS);
+        let live: i64 = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM automation_runs \
+               WHERE rule_id=?1 AND finished_at IS NULL AND started_at > ?2)",
+            params![rule_id, since],
+            |row| row.get(0),
+        )?;
+        Ok(live != 0)
+    }
+
     fn start_automation_run(&self, run: &NewAutomationRun) -> Result<i64> {
         self.conn().execute(
             "INSERT INTO automation_runs \
                (rule_id,event_id,event_key,trigger_kind,event_summary,action_cap, \
-                action_summary,outcome,started_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'started',?8)",
+                action_summary,outcome,started_at,autonomy) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'started',?8,?9)",
             params![
                 run.rule_id,
                 run.event_id,
@@ -193,6 +269,7 @@ impl AutomationStore for Db {
                 run.action_cap,
                 run.action_summary,
                 run.started_at,
+                run.autonomy,
             ],
         )?;
         Ok(self.conn().last_insert_rowid())
@@ -223,7 +300,7 @@ impl AutomationStore for Db {
             i64::try_from(limit.clamp(1, MAX_AUDIT_QUERY)).unwrap_or(MAX_AUDIT_QUERY as i64);
         let mut stmt = self.conn().prepare(
             "SELECT id,rule_id,event_id,event_key,trigger_kind,event_summary,action_cap, \
-                    action_summary,outcome,skip_reason,error,started_at,finished_at \
+                    action_summary,outcome,skip_reason,error,started_at,finished_at,autonomy \
              FROM automation_runs \
              WHERE (?1 IS NULL OR rule_id=?1) \
              ORDER BY started_at DESC, id DESC LIMIT ?2",
@@ -233,16 +310,87 @@ impl AutomationStore for Db {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    fn automation_budget_usage(
+        &self,
+        now_ms: i64,
+    ) -> Result<crate::automation_budget::BudgetUsage> {
+        let conn = self.conn();
+        // A lane is active while its status says so OR while its session has
+        // not exited: a Lead can `dispatches.set_status` a row to done while
+        // the worker is still running, and that must not free a lane slot.
+        let active: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT issue_id) FROM agent_dispatches \
+                 WHERE automation_rule IS NOT NULL \
+                   AND (status IN ({}) \
+                        OR (session_id IS NOT NULL AND session_id <> '' \
+                            AND exited_at_ms IS NULL))",
+                sql_list(&ACTIVE_DISPATCH_TOKENS)
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        let since_secs = (now_ms / 1000).saturating_sub(DAY_SECS);
+        // A `pipeline.start` run still in flight (`started`) is about to open
+        // a lane with no dispatch row yet: it holds a lane slot.
+        let lanes_in_flight: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_runs \
+             WHERE action_cap = 'pipeline.start' AND outcome = 'started' \
+               AND COALESCE(autonomy,'') <> 'propose' AND started_at >= ?1",
+            params![since_secs],
+            |row| row.get(0),
+        )?;
+        // automation_runs.started_at is unix seconds (see `now()` callers and
+        // the six-hour IN_FLIGHT_WINDOW_SECS); agent_dispatches is ms. Runs
+        // still in flight (`started`) count as well as succeeded ones, so
+        // several rules on one event (or concurrent events) cannot each see
+        // the same free slot and together spawn past the limit. `failed` and
+        // `timed_out` runs count too: a spawning action that timed out (or
+        // failed after its side effect) may still have started a session.
+        let runs: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM automation_runs \
+                 WHERE action_cap IN ({}) \
+                   AND outcome IN ('started','succeeded','failed','timed_out') \
+                   AND COALESCE(autonomy,'') <> 'propose' AND started_at >= ?1",
+                sql_list(&SPAWN_CAPS)
+            ),
+            params![since_secs],
+            |row| row.get(0),
+        )?;
+        let advanced: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_dispatches \
+             WHERE automation_rule IS NOT NULL AND parent_id IS NOT NULL \
+               AND dispatched_at_ms >= ?1",
+            params![now_ms.saturating_sub(DAY_MS)],
+            |row| row.get(0),
+        )?;
+        let clamp = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
+        Ok(crate::automation_budget::BudgetUsage {
+            active_lanes: clamp(active.saturating_add(lanes_in_flight)),
+            spawns_24h: clamp(runs.saturating_add(advanced)),
+        })
+    }
+
     fn prune_automation_runs(&self, retain_per_rule: usize) -> Result<usize> {
         let retain = i64::try_from(retain_per_rule.clamp(1, MAX_RETENTION_PER_RULE))
             .unwrap_or(MAX_RETENTION_PER_RULE as i64);
+        // Never prune a row the budget still counts (6e): a spawn row inside
+        // the rolling 24 h window, or a run still in flight. Pruning one would
+        // free a budget slot that was really spent.
         let deleted = self.conn().execute(
-            "DELETE FROM automation_runs AS old \
-             WHERE (SELECT COUNT(*) FROM automation_runs AS newer \
-                    WHERE newer.rule_id=old.rule_id \
-                      AND (newer.started_at > old.started_at \
-                           OR (newer.started_at = old.started_at AND newer.id > old.id))) >= ?1",
-            params![retain],
+            &format!(
+                "DELETE FROM automation_runs AS old \
+                 WHERE (SELECT COUNT(*) FROM automation_runs AS newer \
+                        WHERE newer.rule_id=old.rule_id \
+                          AND (newer.started_at > old.started_at \
+                               OR (newer.started_at = old.started_at AND newer.id > old.id))) >= ?1 \
+                   AND old.outcome <> 'started' \
+                   AND NOT (old.action_cap IN ({}) \
+                            AND old.started_at >= CAST(strftime('%s','now') AS INTEGER) - ?2)",
+                sql_list(&SPAWN_CAPS)
+            ),
+            params![retain, DAY_SECS],
         )?;
         Ok(deleted)
     }
@@ -263,7 +411,33 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRunRow> {
         error: row.get(10)?,
         started_at: row.get(11)?,
         finished_at: row.get(12)?,
+        autonomy: row.get(13)?,
     })
+}
+
+/// The dispatch statuses [`crate::issue::AgentDispatchStatus::is_active`]
+/// holds, as stored tokens. Pinned against `is_active` by a test.
+pub(crate) const ACTIVE_DISPATCH_TOKENS: [&str; 5] =
+    ["queued", "spawning", "running", "waiting_human", "pr_open"];
+
+/// The automation actions whose succeeded runs count as spawns (6e).
+const SPAWN_CAPS: [&str; 3] = ["pipeline.start", "sessions.open", "lead.wake"];
+
+const DAY_MS: i64 = 86_400_000;
+const DAY_SECS: i64 = 86_400;
+
+fn sql_list(items: &[&str]) -> String {
+    items
+        .iter()
+        .map(|item| format!("'{item}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The audit label of a skip reason: the variant name lowercased (`paused`,
+/// `debounced`, `onceperkey`), the vocabulary the audit log has always used.
+fn skip_reason_label(reason: &crate::automation::SkipReason) -> String {
+    format!("{reason:?}").to_ascii_lowercase()
 }
 
 fn bounded(value: &str) -> String {
@@ -299,6 +473,8 @@ mod tests {
             pr_review_requested: None,
             pr_merged: None,
             origin: None,
+            issue: None,
+            exit_code: None,
         }
     }
 
@@ -317,6 +493,8 @@ mod tests {
             once_per_key: false,
             max_per_hour: 30,
             max_action_per_hour: 30,
+            schedule: None,
+            autonomy: crate::automation_autonomy::Autonomy::Review,
         }
     }
 
@@ -355,6 +533,214 @@ mod tests {
         (planned, rows)
     }
 
+    #[test]
+    fn active_dispatch_tokens_match_is_active() {
+        use crate::issue::AgentDispatchStatus as S;
+        let all = [
+            S::Queued,
+            S::Spawning,
+            S::Running,
+            S::WaitingHuman,
+            S::PrOpen,
+            S::Merged,
+            S::Abandoned,
+            S::Done,
+            S::Failed,
+            S::Unknown,
+        ];
+        let active: Vec<&str> = all
+            .into_iter()
+            .filter(|s| s.is_active())
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(active, super::ACTIVE_DISPATCH_TOKENS);
+    }
+
+    fn budget_dispatch(
+        db: &Db,
+        issue: &str,
+        status: &str,
+        rule: Option<&str>,
+        parent: Option<i64>,
+        at_ms: i64,
+    ) -> i64 {
+        use crate::store::NotificationStore;
+        let id = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                issue_id: issue,
+                worktree_path: "/wt/budget",
+                agent_name: "codex",
+                stage: None,
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET status=?1, automation_rule=?2, parent_id=?3, \
+                 dispatched_at_ms=?4 WHERE id=?5",
+                params![status, rule, parent, at_ms, id],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn budget_usage_counts_active_lanes_and_day_spawns() {
+        let db = Db::open_memory().unwrap();
+        let now_ms: i64 = 10 * 86_400_000;
+        let now = now_ms / 1000;
+        assert_eq!(
+            db.automation_budget_usage(now_ms).unwrap(),
+            crate::automation_budget::BudgetUsage::default()
+        );
+        // Lanes: two rows of THE-1 count once; a manual row and a done row do not.
+        let root = budget_dispatch(
+            &db,
+            "THE-1",
+            "running",
+            Some("r"),
+            None,
+            now_ms - 5 * 86_400_000,
+        );
+        budget_dispatch(
+            &db,
+            "THE-1",
+            "waiting_human",
+            Some("r"),
+            Some(root),
+            now_ms - 1_000,
+        );
+        budget_dispatch(
+            &db,
+            "THE-2",
+            "queued",
+            Some("r"),
+            None,
+            now_ms - 3 * 86_400_000,
+        );
+        budget_dispatch(&db, "THE-3", "running", None, None, now_ms);
+        budget_dispatch(&db, "THE-4", "done", Some("r"), Some(root), now_ms - 2_000);
+        // An advance older than 24 h is out of the window.
+        budget_dispatch(
+            &db,
+            "THE-5",
+            "failed",
+            Some("r"),
+            Some(root),
+            now_ms - 86_400_001,
+        );
+        // Runs: succeeded, failed and timed-out spawns in the window count
+        // (a failed or timed-out spawn may still have started a session);
+        // propose, other caps and old runs do not.
+        let mut counted = 0;
+        for (cap, outcome, autonomy, at, counts) in [
+            (
+                "pipeline.start",
+                "succeeded",
+                Some("review"),
+                now - 60,
+                true,
+            ),
+            ("sessions.open", "succeeded", None, now - 60, true),
+            ("lead.wake", "succeeded", None, now - 86_400, true),
+            (
+                "pipeline.start",
+                "succeeded",
+                Some("propose"),
+                now - 60,
+                false,
+            ),
+            ("pipeline.start", "failed", Some("review"), now - 60, true),
+            ("sessions.open", "timed_out", None, now - 60, true),
+            ("notify.push", "succeeded", None, now - 60, false),
+            ("sessions.open", "succeeded", None, now - 86_401, false),
+        ] {
+            let mut r = run("r", &format!("e{at}{cap}{outcome}"), at);
+            r.action_cap = cap.into();
+            r.autonomy = autonomy.map(str::to_string);
+            let id = db.start_automation_run(&r).unwrap();
+            db.finish_automation_run(id, outcome, None, None, at)
+                .unwrap();
+            counted += usize::from(counts);
+        }
+        let usage = db.automation_budget_usage(now_ms).unwrap();
+        assert_eq!(usage.active_lanes, 2, "THE-1 and THE-2");
+        // 5 counted runs + 2 parent-linked advances inside 24 h.
+        assert_eq!(counted, 5);
+        assert_eq!(usage.spawns_24h, 7);
+    }
+
+    #[test]
+    fn budget_usage_counts_in_flight_runs_and_unexited_sessions() {
+        let db = Db::open_memory().unwrap();
+        let now_ms: i64 = 10 * 86_400_000;
+        let now = now_ms / 1000;
+        // A started (in-flight) pipeline.start holds a spawn and a lane slot;
+        // a started sessions.open holds a spawn only.
+        for (cap, autonomy) in [("pipeline.start", Some("review")), ("sessions.open", None)] {
+            let mut r = run("r", &format!("inflight-{cap}"), now - 30);
+            r.action_cap = cap.into();
+            r.autonomy = autonomy.map(str::to_string);
+            db.start_automation_run(&r).unwrap();
+        }
+        // A roster row marked done whose session has not exited is active.
+        let id = budget_dispatch(&db, "THE-9", "done", Some("r"), None, now_ms - 1_000);
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET session_id='s9', exited_at_ms=NULL WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+        // The same shape with an exited session is not.
+        let gone = budget_dispatch(&db, "THE-10", "done", Some("r"), None, now_ms - 1_000);
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET session_id='s10', exited_at_ms=?1 WHERE id=?2",
+                params![now_ms - 500, gone],
+            )
+            .unwrap();
+        let usage = db.automation_budget_usage(now_ms).unwrap();
+        assert_eq!(usage.active_lanes, 2, "THE-9 plus the in-flight lane");
+        assert_eq!(usage.spawns_24h, 2, "both in-flight runs");
+    }
+
+    #[test]
+    fn prune_keeps_spawn_rows_inside_the_budget_window_and_in_flight_runs() {
+        let db = Db::open_memory().unwrap();
+        let now = crate::util::now();
+        // Recent spawn rows: never pruned even past the retention count.
+        for n in 0..3 {
+            let mut r = run("spawner", &format!("recent{n}"), now - 60 + n);
+            r.action_cap = "pipeline.start".into();
+            r.autonomy = Some("review".into());
+            let id = db.start_automation_run(&r).unwrap();
+            db.finish_automation_run(id, "succeeded", None, None, now)
+                .unwrap();
+        }
+        // An old in-flight row is kept too.
+        let mut old_started = run("spawner", "old-started", now - 3 * 86_400);
+        old_started.action_cap = "notify.push".into();
+        db.start_automation_run(&old_started).unwrap();
+        // An old finished spawn row outside the window may go.
+        let mut old = run("spawner", "old", now - 2 * 86_400);
+        old.action_cap = "pipeline.start".into();
+        let id = db.start_automation_run(&old).unwrap();
+        db.finish_automation_run(id, "succeeded", None, None, now - 2 * 86_400)
+            .unwrap();
+        assert_eq!(db.prune_automation_runs(1).unwrap(), 1);
+        let left: Vec<String> = db
+            .automation_runs(Some("spawner"), 99)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.event_id)
+            .collect();
+        assert_eq!(left.len(), 4, "{left:?}");
+        assert!(!left.iter().any(|e| e == "old"), "{left:?}");
+    }
+
     fn run(rule: &str, event: &str, at: i64) -> NewAutomationRun {
         NewAutomationRun {
             rule_id: rule.into(),
@@ -365,6 +751,7 @@ mod tests {
             action_cap: "notify.push".into(),
             action_summary: "bounded action".into(),
             started_at: at,
+            autonomy: None,
         }
     }
 
@@ -422,6 +809,67 @@ mod tests {
         assert_eq!(row.skip_reason.as_deref(), Some("debounced"));
         assert_eq!(row.error.as_deref(), Some("detail"));
         assert_eq!(row.finished_at, Some(11));
+    }
+
+    #[test]
+    fn admission_records_the_planned_autonomy() {
+        let db = Db::open_memory().unwrap();
+        let mut rule = admission_rule("auto");
+        rule.autonomy = crate::automation_autonomy::Autonomy::Propose;
+        let admitted = db
+            .admit_automation_event(&[rule], &admission_event("e1", "k", None), 10_000)
+            .unwrap();
+        assert!(matches!(admitted[0], AutomationAdmission::Planned { .. }));
+        let row = &db.automation_runs(Some("auto"), 1).unwrap()[0];
+        assert_eq!(row.autonomy.as_deref(), Some("propose"));
+    }
+
+    #[test]
+    fn paused_audit_skips_every_plan_and_persists_no_state() {
+        let db = Db::open_memory().unwrap();
+        let mut once = admission_rule("once");
+        once.once_per_key = true;
+        let rules = vec![admission_rule("plain"), once];
+        let written = db
+            .audit_paused_automation_event(&rules, &admission_event("e1", "k", None), 10_000)
+            .unwrap();
+        assert_eq!(written, 2);
+        let rows = db.automation_runs(None, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.outcome == "skipped"
+            && row.skip_reason.as_deref() == Some("paused")
+            && row.finished_at == Some(10_000)));
+        // No ledger transition: the once key was never consumed, so a resumed
+        // runtime still admits the same event.
+        assert_eq!(db.automation_state("once").unwrap(), None);
+        let admitted = db
+            .admit_automation_event(&rules, &admission_event("e2", "k", None), 10_001)
+            .unwrap();
+        assert!(
+            admitted
+                .iter()
+                .all(|admission| matches!(admission, AutomationAdmission::Planned { .. }))
+        );
+    }
+
+    #[test]
+    fn run_in_flight_counts_only_recent_unfinished_rows() {
+        let db = Db::open_memory().unwrap();
+        let now = 100_000;
+        assert!(!db.automation_run_in_flight("r", now).unwrap());
+        let live = db.start_automation_run(&run("r", "e1", now - 60)).unwrap();
+        assert!(db.automation_run_in_flight("r", now).unwrap());
+        assert!(!db.automation_run_in_flight("other", now).unwrap());
+        db.finish_automation_run(live, "succeeded", None, None, now)
+            .unwrap();
+        assert!(!db.automation_run_in_flight("r", now).unwrap());
+        // An unfinished row older than six hours is a crash orphan.
+        db.start_automation_run(&run("r", "e2", now - 6 * 3_600))
+            .unwrap();
+        assert!(!db.automation_run_in_flight("r", now).unwrap());
+        db.start_automation_run(&run("r", "e3", now - 6 * 3_600 + 1))
+            .unwrap();
+        assert!(db.automation_run_in_flight("r", now).unwrap());
     }
 
     #[test]

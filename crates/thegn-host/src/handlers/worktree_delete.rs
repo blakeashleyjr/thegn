@@ -151,6 +151,12 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         .iter()
         .filter_map(|&gi| cx.session.worktrees.get(gi).cloned())
         .collect();
+    for group in removed_groups
+        .iter()
+        .filter(|g| g.kind == crate::session::GroupKind::Terminal)
+    {
+        crate::lead::mcp::revoke_closed_tab_off_loop(cx.cfg, &group.name, 0);
+    }
     let session_id = cx.session.id.clone();
 
     // Closing a group keeps its checkout, so the destroy worker cannot own

@@ -620,6 +620,10 @@ pub fn frame_json(frame: &EventFrame) -> Value {
             "session": session, "code": code,
         }),
         EventFrame::Lagged { missed } => json!({ "missed": missed }),
+        EventFrame::Notice { json: j, .. } => json!({
+            "event": serde_json::from_str::<Value>(j)
+                .unwrap_or_else(|_| Value::String(j.clone())),
+        }),
     };
     if let Value::Object(fields) = &mut value {
         fields.insert("kind".into(), Value::String(frame.kind().into()));
@@ -815,11 +819,41 @@ impl ControlClient {
         )?)
     }
 
+    /// Open a session. Every client path that opens one goes through here, so
+    /// this is where the daemon-skew rule (WS00-P1-11, [`super::open_fields`])
+    /// is enforced: a security-relevant field the daemon did not echo in
+    /// `honoured` kills the fresh session and refuses with `daemon-skew`.
     pub async fn open(&self, spec: &OpenSpec) -> Result<SessionInfo> {
         let v = self
             .request_long("POST", "/v1/sessions", Some(serde_json::to_value(spec)?))
             .await?;
-        Ok(serde_json::from_value(v)?)
+        let info: SessionInfo = serde_json::from_value(v)?;
+        self.refuse_on_skew(&spec.security_fields(), info).await
+    }
+
+    /// Return `info` when the daemon echoed every field in `sent`; otherwise
+    /// kill the session it just opened (the daemon reaps it) and return the
+    /// typed [`DaemonSkew`](super::open_fields::DaemonSkew) refusal.
+    async fn refuse_on_skew(
+        &self,
+        sent: &[super::open_fields::OpenField],
+        info: SessionInfo,
+    ) -> Result<SessionInfo> {
+        match super::open_fields::check_honoured(sent, &info.honoured) {
+            Ok(()) => Ok(info),
+            Err(skew) => {
+                // best-effort: the refusal stands whether or not the kill
+                // lands; a failed kill is logged so the stray is findable.
+                if let Err(error) = self.kill(&info.id).await {
+                    tracing::warn!(
+                        target: "thegn::control",
+                        session = %info.id,
+                        "daemon-skew: killing the refused session failed: {error:#}"
+                    );
+                }
+                Err(anyhow::Error::new(skew))
+            }
+        }
     }
 
     pub async fn fork(&self, spec: &ForkSpec) -> Result<SessionInfo> {
@@ -3204,6 +3238,71 @@ mod tests {
         old_request.await.unwrap().unwrap();
         old_server.await.unwrap();
         replacement_server.await.unwrap();
+    }
+
+    /// WS00-P1-11: a reply that does not echo a sent security field kills the
+    /// session it just opened and refuses with the typed `daemon-skew` error.
+    #[tokio::test]
+    async fn client_kills_session_on_skew() {
+        use super::super::open_fields::{DaemonSkew, OpenField};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A scripted daemon: answer one request and report its request line.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before sending request");
+                request.extend_from_slice(&chunk[..n]);
+                assert!(request.len() <= 64 * 1024, "request headers exceeded bound");
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        let client = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{addr}"),
+            token: "skew-token".into(),
+        });
+
+        // Nothing sent: the reply passes through untouched, with no request.
+        let info = SessionInfo {
+            id: "s-skew".into(),
+            ..Default::default()
+        };
+        let passed = client.refuse_on_skew(&[], info.clone()).await.unwrap();
+        assert_eq!(passed, info);
+
+        // An older daemon's reply (no `honoured`) to a spec that sent a field.
+        let error = client
+            .refuse_on_skew(&[OpenField::EnvScrub], info)
+            .await
+            .expect_err("an unechoed security field must refuse");
+        let skew = error
+            .downcast_ref::<DaemonSkew>()
+            .expect("the refusal stays typed");
+        assert_eq!(skew.missing, vec![OpenField::EnvScrub]);
+        assert!(error.to_string().starts_with("daemon-skew:"), "{error:#}");
+        let request_line = server.await.unwrap();
+        assert!(
+            request_line.starts_with("DELETE /v1/sessions/s-skew "),
+            "the refused session must be killed: {request_line}"
+        );
     }
 
     #[test]

@@ -39,7 +39,8 @@ pub enum EventKind {
     /// `exec` + `die`: what ran inside each container (the audit panel's
     /// command log).
     Exec,
-    /// `network`: per-connection audit rows; only subscribed when
+    /// `network`: container network attach/detach rows (podman's `network`
+    /// event stream, not per-connection or DNS rows); only subscribed when
     /// `network_audit` is configured.
     Network,
 }

@@ -39,11 +39,13 @@ name: ci
 #
 # `just ci` locally = lint (fmt + guards + ratchets) deps-audit build
 # check-cross check-features check-msrv test doc-check openspec-validate
-# coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build — and
+# coverage smoke sandbox-e2e-db term-check nix-build — and
 # `just ci-local` adds e2e. Stages NOT in the routine gate:
 #  - security-e2e (GitHub-hosted only; required mode fails on missing prerequisites).
+#    Its second step runs the user-namespace suite registry
+#    (`just sandbox-userns-e2e`, test/userns-e2e.d/); dispatch/nightly only.
 #  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
-#    the Tier-1 dns/db tests (no container runtime needed) DO run here.
+#    the Tier-1 db test (no container runtime needed) DOES run here.
 #  - macos: the aarch64-darwin build + unit tests. Opt-in per run (`extras:
 #    true`) like windows/e2e — 10x runner cost. The openspec OOM that had it
 #    hard-disabled is fixed (it runs on the lean `devShells.ci` now).
@@ -280,7 +282,7 @@ jobs:
     if: |-
       ${{ github.event_name != 'pull_request' &&
         (github.event_name != 'schedule' || github.repository == 'blakeashleyjr/thegn') }}
-    # Tier-1 only (DNS filter + DB audit trail) — no container runtime needed.
+    # Tier-1 only (DB audit trail) — no container runtime needed.
     runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 25
     steps:
@@ -288,7 +290,7 @@ jobs:
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
-      - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
+      - run: nix develop --command just sandbox-e2e-db
   security-e2e:
     # heavy: dispatch + nightly only; never on a pull request (see the header)
     if: |-
@@ -313,6 +315,7 @@ jobs:
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just security-e2e
+      - run: nix develop --command env THEGN_REQUIRE_SECURITY_TESTS=1 just sandbox-userns-e2e
   nix-build:
     # heavy: dispatch + nightly only; never on a pull request (see the header)
     if: |-

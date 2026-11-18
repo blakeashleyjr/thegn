@@ -18,9 +18,15 @@ mod agent_teardown;
 mod alerts;
 mod apps;
 mod attention_status;
+mod automation_arming;
+mod automation_budget;
 mod automation_events;
 mod automation_executor;
+mod automation_issue;
+mod automation_pipeline;
+mod automation_proposal;
 mod automation_runtime;
+mod automation_schedule;
 mod autopilot_driver;
 mod autoscale;
 mod bar_nav;
@@ -135,6 +141,7 @@ mod launch_notice;
 mod layer;
 mod layout;
 mod layout_spec;
+mod lead;
 mod lifecycle;
 mod loading;
 mod loc_scan;
@@ -329,6 +336,10 @@ mod theme_store;
 mod toast;
 mod toolchain_ui;
 mod usage_budget;
+mod vercel_bridge;
+mod vercel_login;
+mod vercel_pull_marker;
+mod vercel_reaper;
 mod voice;
 mod voice_worker;
 mod vps_bridge;
@@ -391,6 +402,11 @@ pub enum Command {
     Automations {
         #[command(subcommand)]
         action: cmd::automations::Action,
+    },
+    /// The Lead kill switch: pause (and halt), resume, or show status.
+    Lead {
+        #[command(subcommand)]
+        action: cmd::lead::Action,
     },
     /// GitHub PR data + actions for a worktree.
     Pr {
@@ -619,6 +635,8 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::fleet::Action,
     },
+    /// Per-account AI usage (rate-limit windows) as a table or JSON.
+    Usage(cmd::usage::Args),
     /// Inspect and provision `[host.<name>]` machines (the once-per-host
     /// lifecycle behind fast remote OCI sandboxes).
     Host {
@@ -867,6 +885,22 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Hidden: the Vercel Sandbox exec bridge (`vercel-exec <id> -- cmd…`) —
+    /// the exec prefix of a vercel provider env, with no vendor CLI and no
+    /// ssh. With a non-tty stdin it is the control-plane prefix (chrome
+    /// git/gh/fs reads, the persisted worktree location): runs the command
+    /// over the sandbox command API and relays its output, and never resumes
+    /// a stopped sandbox (exits 75). With a tty stdin it resumes if needed and
+    /// streams the `/interactive` PTY, falling back to stream mode. Resolves
+    /// the API token itself, in-process.
+    #[command(hide = true)]
+    VercelExec {
+        /// The Vercel sandbox name (the resolved provider id).
+        id: String,
+        /// Command to run (empty ⇒ a login shell).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
 }
 
 /// Sub-verbs of `thegn doctor`. `bundle` lives here (not under a top-level
@@ -1075,6 +1109,7 @@ fn run_main() -> anyhow::Result<()> {
                 | Command::VpsSsh { .. }
                 | Command::Machine0Ssh { .. }
                 | Command::SpriteExec { .. }
+                | Command::VercelExec { .. }
         )
     );
     if !is_stdio_bridge {
@@ -1303,6 +1338,7 @@ fn verb_manages_own_logging(command: &Command) -> bool {
             | Command::VpsSsh { .. }
             | Command::Machine0Ssh { .. }
             | Command::SpriteExec { .. }
+            | Command::VercelExec { .. }
     )
 }
 
@@ -1477,6 +1513,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     let result = match command {
         Command::Voice { action } => cmd::voice::run(&cfg, action, config_path),
         Command::Automations { action } => cmd::automations::run(&cfg, action),
+        Command::Lead { action } => cmd::lead::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action, &config_path),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
@@ -1533,6 +1570,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Fleet { action } => cmd::fleet::run(&cfg, action),
+        Command::Usage(args) => cmd::usage::run(&cfg, args),
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Sandbox { action } => cmd::sandbox::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
@@ -1651,6 +1689,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
         Command::Machine0Ssh { name, cmd } => machine0_bridge::run(&cfg, &name, &cmd),
         Command::SpriteExec { id, cmd } => sprite_bridge::run(&cfg, &id, &cmd),
+        Command::VercelExec { id, cmd } => vercel_bridge::run(&cfg, &id, &cmd),
         Command::SandboxArgv { target } => {
             // Resolve like every other worktree-scoped verb (explicit →
             // $THEGN_WORKTREE → git toplevel → cwd) — previously raw cwd only.

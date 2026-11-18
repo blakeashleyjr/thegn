@@ -190,6 +190,9 @@ pub struct AttribRow {
     /// This row's fraction (0–1) of the masthead total for the sort key.
     pub share_of_total: Option<f32>,
     pub rss: Option<u64>,
+    /// The pid for a `Proc` row and the pane id for a `Pane` row; `None`
+    /// elsewhere. Lets the host jump to the row without parsing its label.
+    pub target: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -373,13 +376,18 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
     workspaces.sort_by(|a, b| by_weight(a.usage, a.name, b.usage, b.name, sort));
 
     let mut tree_rows: Vec<AttribRow> = Vec::new();
-    let row = |depth: u8, kind: RowKind, label: String, usage: Usage| AttribRow {
-        depth,
-        kind,
-        label,
-        cpu_pct: usage.cpu_pct,
-        share_of_total: None,
-        rss: usage.rss,
+    let row_t =
+        |depth: u8, kind: RowKind, label: String, usage: Usage, target: Option<u32>| AttribRow {
+            depth,
+            kind,
+            label,
+            cpu_pct: usage.cpu_pct,
+            share_of_total: None,
+            rss: usage.rss,
+            target,
+        };
+    let row = |depth: u8, kind: RowKind, label: String, usage: Usage| {
+        row_t(depth, kind, label, usage, None)
     };
     for ws in &mut workspaces {
         tree_rows.push(row(0, RowKind::Workspace, ws.name.to_string(), ws.usage));
@@ -397,7 +405,13 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
                 tree_rows.push(row(2, RowKind::Job, kind.as_str().to_string(), *usage));
             }
             for pane in &wt.children {
-                tree_rows.push(row(2, RowKind::Pane, pane_label(pane.owner), pane.usage));
+                tree_rows.push(row_t(
+                    2,
+                    RowKind::Pane,
+                    pane_label(pane.owner),
+                    pane.usage,
+                    Some(pane.owner.pane_id),
+                ));
                 let mut procs: Vec<&TopProc> = inputs
                     .procs
                     .iter()
@@ -408,11 +422,12 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
                     by_weight(ua, &a.name, ub, &b.name, sort).then_with(|| a.pid.cmp(&b.pid))
                 });
                 for p in procs.into_iter().take(top_per_pane) {
-                    tree_rows.push(row(
+                    tree_rows.push(row_t(
                         3,
                         RowKind::Proc,
                         format!("{} ({})", p.name, p.pid),
                         proc_usage(p),
+                        Some(p.pid),
                     ));
                 }
             }
@@ -540,6 +555,7 @@ fn cap_rows(rows: Vec<AttribRow>, budget: usize) -> Vec<AttribRow> {
         cpu_pct: None,
         share_of_total: None,
         rss: None,
+        target: None,
     });
     out
 }
@@ -641,6 +657,30 @@ mod tests {
             cores: 8,
             scopes: &[],
         }
+    }
+
+    #[test]
+    fn row_targets_are_pid_for_procs_and_pane_id_for_panes() {
+        let (owners, panes, procs) = fixture();
+        let tree = build(
+            &inputs(&owners, Some(panes.as_slice()), &procs),
+            SortKey::Cpu,
+            TOP_PER_PANE,
+        );
+        assert_eq!(find(&tree.rows, "node (11)").target, Some(11));
+        assert_eq!(find(&tree.rows, "rustc (41)").target, Some(41));
+        for r in &tree.rows {
+            match r.kind {
+                RowKind::Pane => assert!(r.target.is_some_and(|id| (1..=4).contains(&id))),
+                RowKind::Proc => assert!(r.target.is_some()),
+                _ => assert_eq!(r.target, None, "{}", r.label),
+            }
+        }
+        let pane3 = tree
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Pane && r.target == Some(3));
+        assert!(pane3.is_some());
     }
 
     #[test]

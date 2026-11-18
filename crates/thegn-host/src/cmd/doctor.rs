@@ -90,7 +90,17 @@ fn isolation_of_on(
     os: thegn_core::sandbox_backend::HostOs,
 ) -> Option<IsolationClass> {
     let backend = Backend::parse(backend_name)?;
-    Some(Capabilities::from_parts_on(backend, &Placement::Local, false, oci_runtime, os).isolation)
+    Some(
+        Capabilities::from_parts_on(
+            backend,
+            &Placement::Local,
+            thegn_core::config::Network::Nat,
+            false,
+            oci_runtime,
+            os,
+        )
+        .isolation,
+    )
 }
 
 /// The configured `[sandbox] oci_runtime`, or `None` when unset (daemon default).
@@ -784,6 +794,94 @@ fn preview_renderers_json() -> serde_json::Value {
             "containment": row.containment,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// One vercel env's doctor row. `token` is the resolved token, held in memory
+/// only to classify its shape; nothing derived from its text is returned.
+fn vercel_row(
+    name: &str,
+    pc: &thegn_core::config::EnvProviderConfig,
+    token: Option<&str>,
+    now_s: i64,
+) -> serde_json::Value {
+    let disclosure = thegn_core::vercel::creds::disclosure(pc.model_credentials);
+    let token_kind = token.map(|t| {
+        thegn_core::vercel::token::describe(thegn_core::vercel::token::classify(t), now_s)
+    });
+    serde_json::json!({
+        "env": name,
+        "model_credentials": disclosure.mode,
+        "leaves_machine": disclosure.leaves_machine,
+        "token_kind": token_kind,
+    })
+}
+
+fn vercel_rows(cfg: &Config) -> Vec<serde_json::Value> {
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    cfg.env
+        .iter()
+        .filter(|(_, e)| {
+            e.placement == thegn_core::config::PlacementMode::Provider
+                && e.provider.provider.trim() == "vercel"
+        })
+        .map(|(name, e)| {
+            let key = crate::env_ui::effective_token_env(&e.provider);
+            let token = (!key.is_empty())
+                .then(|| crate::secret::resolve(&key))
+                .flatten();
+            vercel_row(name, &e.provider, token.as_deref(), now_s)
+        })
+        .collect()
+}
+
+/// `vercel` doctor object: per-env rows + the count of unpulled-result markers.
+fn vercel_json(cfg: &Config) -> serde_json::Value {
+    let rows = vercel_rows(cfg);
+    let unpulled = if rows.is_empty() {
+        0
+    } else {
+        crate::vercel_pull_marker::count()
+    };
+    serde_json::json!({ "envs": rows, "unpulled": unpulled })
+}
+
+/// Text lines for the vercel section; empty when no vercel env is configured.
+fn vercel_lines(report: &serde_json::Value) -> Vec<String> {
+    let rows = report["envs"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Vercel sandbox".to_string()];
+    for row in &rows {
+        let name = row["env"].as_str().unwrap_or("?");
+        lines.push(format!(
+            "  {name}: model credentials {} (leaves machine: {})",
+            row["model_credentials"].as_str().unwrap_or("?"),
+            row["leaves_machine"].as_str().unwrap_or("?"),
+        ));
+        lines.push(format!(
+            "  {name}: token kind {}",
+            row["token_kind"].as_str().unwrap_or("no token resolved"),
+        ));
+    }
+    lines.push(format!(
+        "  results not pulled: {}",
+        report["unpulled"].as_u64().unwrap_or(0)
+    ));
+    lines
+}
+
+fn vercel_report(cfg: &Config) {
+    let lines = vercel_lines(&vercel_json(cfg));
+    if lines.is_empty() {
+        return;
+    }
+    outln!("");
+    for line in lines {
+        outln!("{line}");
+    }
 }
 
 fn preview_renderers_report() {
@@ -1700,25 +1798,17 @@ fn probe_daemon_channel(cfg: &Config) -> Option<Option<String>> {
 fn channel_report(cfg: &Config) {
     let channel = crate::channel_state::current();
     outln!("Release channel");
-    outln!("  channel       {}", channel.as_str());
+    outln!("  channel          {}", channel.as_str());
     let daemon = probe_daemon_channel(cfg);
     outln!(
-        "  daemon        {}",
+        "  daemon           {}",
         daemon_channel_line(channel, daemon.as_ref().map(Option::as_deref))
     );
     for f in thegn_core::channel::Feature::ALL {
-        outln!(
-            "  {:<13} {}",
-            f.id(),
-            if f.allowed_in(channel) {
-                "enabled"
-            } else {
-                "disabled (dev-only)"
-            }
-        );
+        outln!("  {:<16} {}", f.id(), feature_state_line(f, channel));
     }
     outln!(
-        "  {:<13} {}",
+        "  {:<16} {}",
         "iroh reach",
         if thegn_svc::iroh_reach::BUILT {
             "built in (THEGN_IROH=1 enables it)"
@@ -1727,8 +1817,27 @@ fn channel_report(cfg: &Config) {
         }
     );
     if matches!(channel, thegn_core::channel::Channel::Stable) {
-        outln!("  note          experimental features need the dev build (`nix run .#dev`)");
-        outln!("                or THEGN_CHANNEL=dev. GitHub PR/issue viewing stays available.");
+        outln!("  note             experimental features need the dev build (`nix run .#dev`)");
+        outln!("                   or THEGN_CHANNEL=dev. GitHub PR/issue viewing stays available.");
+    }
+}
+
+/// One feature row's state text for the `doctor` release-channel table. The
+/// sandbox + remote programme features (WS00-P1-01) read "not yet implemented"
+/// until each owner item replaces the text.
+fn feature_state_line(
+    feature: thegn_core::channel::Feature,
+    channel: thegn_core::channel::Channel,
+) -> String {
+    let state = if feature.allowed_in(channel) {
+        "enabled"
+    } else {
+        "disabled (dev-only)"
+    };
+    if thegn_core::channel::Feature::PROGRAMME.contains(&feature) {
+        format!("{state}; experimental, not yet implemented")
+    } else {
+        state.to_string()
     }
 }
 
@@ -2912,6 +3021,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "toolchain": toolchain_json(cfg),
         "devcontainer": devcontainer_json(cfg),
         "preview_renderers": preview_renderers_json(),
+        "vercel": vercel_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
         "warm_pool": warm_pool_json(cfg),
@@ -3449,6 +3559,9 @@ pub fn run(
             .as_deref()
             .map_or("(none)".to_string(), |path| path.display().to_string()),
     );
+    for line in reserved_backend_lines(health.findings().map(|finding| finding.message.as_str())) {
+        outln!("  {line}");
+    }
     outln!("");
     channel_report(cfg);
     outln!("");
@@ -3601,6 +3714,8 @@ pub fn run(
 
     outln!("");
     preview_renderers_report();
+
+    vercel_report(cfg);
 
     outln!("");
     hosts_report(cfg);
@@ -3799,7 +3914,12 @@ fn master_status(placement: &thegn_core::placement::Placement) -> String {
     let thegn_core::placement::Placement::Ssh(p) = placement else {
         return String::new();
     };
-    let sock = thegn_core::remote::control_path(&p.host, p.port);
+    let sock = match thegn_core::remote::control_mux(&p.host, p.port) {
+        thegn_core::remote::ControlMux::Auto { concrete, .. } => concrete,
+        thegn_core::remote::ControlMux::Off(reason) => {
+            return format!("  (multiplexing off: {})", reason.as_str());
+        }
+    };
     if !sock.exists() {
         return "  (no ControlMaster socket)".into();
     }
@@ -3942,6 +4062,9 @@ fn provider_cache_report(cfg: &Config) {
         if let Some(note) = provider_cache_lifecycle_note(p.provider.trim()) {
             outln!("{note}");
         }
+        if let Some(note) = provider_maintenance_note(p.provider.trim()) {
+            outln!("{note}");
+        }
         if sprite_cli_required(p) && thegn_core::util::which_path("sprite").is_none() {
             outln!(
                 "               exec = \"cli\" but the `sprite` CLI is MISSING from PATH — install it, or use exec = \"auto\" (native exec, no CLI)"
@@ -3950,7 +4073,13 @@ fn provider_cache_report(cfg: &Config) {
         if let Some(warning) = ignored_cli_bridge(p) {
             outln!("               {warning}");
         }
-        if p.host_cache {
+        if is_vercel(p) {
+            let (expired, orphans) = vercel_ledger_counts(&thegn_svc::vps::registry::list());
+            for line in vercel_report_lines(p, vercel_token_resolves(p), expired, orphans) {
+                outln!("               {line}");
+            }
+        }
+        if p.host_cache && !is_vercel(p) {
             match &bridge {
                 Some(pth) => outln!("               host_cache: on (bridge {})", pth.display()),
                 None => {
@@ -3985,6 +4114,70 @@ fn sprite_cli_required(pc: &thegn_core::config::EnvProviderConfig) -> bool {
     ) && matches!(pc.exec, thegn_core::config::ProviderExecMode::Cli)
 }
 
+fn is_vercel(pc: &thegn_core::config::EnvProviderConfig) -> bool {
+    matches!(
+        EnvProviderKind::of(pc.provider.trim()),
+        EnvProviderKind::Vercel
+    )
+}
+
+/// Presence only, offline: does the env's token ref resolve? Never prints or
+/// returns the value.
+fn vercel_token_resolves(pc: &thegn_core::config::EnvProviderConfig) -> bool {
+    crate::secret::resolve_present_cached(&crate::env_ui::effective_token_env(pc))
+}
+
+/// `(expired, orphans)` over the local ledger (no network): `expired` are
+/// vercel records the lifetime reaper stopped; orphans are vercel records whose
+/// create intent never reached `ready`.
+fn vercel_ledger_counts(records: &[thegn_svc::vps::registry::VpsRecord]) -> (usize, usize) {
+    let mine = || records.iter().filter(|r| r.provider == "vercel");
+    (
+        mine().filter(|r| r.state == "expired").count(),
+        mine().filter(|r| r.state == "creating").count(),
+    )
+}
+
+/// Keys set on a vercel env that the kind ignores (no ssh, no resident bridge).
+fn vercel_ignored_keys(pc: &thegn_core::config::EnvProviderConfig) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if pc.host_cache {
+        v.push("host_cache");
+    }
+    if matches!(pc.connect, thegn_core::config::ProviderConnect::Ssh) {
+        v.push("connect = \"ssh\"");
+    }
+    // `transport` defaults to mosh, so only an explicit ssh is detectable.
+    if matches!(pc.transport, thegn_core::config::RemoteTransport::Ssh) {
+        v.push("transport");
+    }
+    v
+}
+
+fn vercel_report_lines(
+    pc: &thegn_core::config::EnvProviderConfig,
+    token_resolves: bool,
+    expired: usize,
+    orphans: usize,
+) -> Vec<String> {
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    let mut out = vec![
+        format!(
+            "team_id set: {} · project_id set: {}",
+            yn(!pc.team_id.trim().is_empty()),
+            yn(!pc.project_id.trim().is_empty())
+        ),
+        format!("token ref resolves: {}", yn(token_resolves)),
+    ];
+    for key in vercel_ignored_keys(pc) {
+        out.push(format!("warning: {key} is set but ignored for vercel"));
+    }
+    out.push(format!(
+        "ledger: {expired} expired (pull with `thegn env pull`), {orphans} orphan"
+    ));
+    out
+}
+
 /// THE-2054: a sprites env on `exec = "auto"`/`"api"` that still carries a
 /// vendor-CLI `exec_command` / `interactive_command`. Those keys are bridges for
 /// `exec = "cli"` only and are ignored otherwise; say so rather than let a stale
@@ -4005,6 +4198,17 @@ fn provider_cache_lifecycle_note(provider: &str) -> Option<&'static str> {
     EnvProviderKind::of(provider)
         .live_unverified()
         .then_some("               experimental: lifecycle not verified on a live account")
+}
+
+/// The upstream-maintenance line for a provider kind, printed after the
+/// experimental line. Daytona only (vendor documentation; not executed by
+/// thegn).
+fn provider_maintenance_note(provider: &str) -> Option<&'static str> {
+    (EnvProviderKind::of(provider) == EnvProviderKind::Daytona).then_some(
+        "               maintenance: upstream is closed-core and archived; the CLI split into \
+         `daytona-v0` (legacy) and `daytona` (v2 alpha); thegn's exec handle moves to the ssh \
+         gateway (WS08)",
+    )
 }
 
 fn provider_cache_json(cfg: &Config) -> serde_json::Value {
@@ -4031,23 +4235,36 @@ fn provider_cache_json_with(
             signer.unwrap_or(&missing),
             crate::nix_signing::host_cache_plan_facts(p.host_cache, bridge_present),
         );
-        map.insert(
-            name.clone(),
-            serde_json::json!({
-                "provider": p.provider.trim(),
-                "live_verified": !kind.live_unverified(),
-                "devshell": env_devshell(cfg, e),
-                "binary_cache_url": p.binary_cache_url.trim(),
-                "host_cache": p.host_cache,
-                "bridge_present": bridge_present,
-                "host_cache_effective": p.host_cache && bridge_present,
-                "signer": report.signer,
-                "signer_state": report.signer_state,
-                "scope": report.scope,
-                "require_sigs": report.require_sigs,
-                "require_sigs_explicit": report.require_sigs_explicit,
-            }),
-        );
+        let mut vercel = serde_json::Value::Null;
+        if is_vercel(p) {
+            let (expired, orphans) = vercel_ledger_counts(&thegn_svc::vps::registry::list());
+            vercel = serde_json::json!({
+                "team_id_set": !p.team_id.trim().is_empty(),
+                "project_id_set": !p.project_id.trim().is_empty(),
+                "token_resolves": vercel_token_resolves(p),
+                "ignored_keys": vercel_ignored_keys(p),
+                "expired": expired,
+                "orphans": orphans,
+            });
+        }
+        let mut entry = serde_json::json!({
+            "provider": p.provider.trim(),
+            "live_verified": !kind.live_unverified(),
+            "devshell": env_devshell(cfg, e),
+            "binary_cache_url": p.binary_cache_url.trim(),
+            "host_cache": p.host_cache,
+            "bridge_present": bridge_present,
+            "host_cache_effective": p.host_cache && bridge_present,
+            "signer": report.signer,
+            "signer_state": report.signer_state,
+            "scope": report.scope,
+            "require_sigs": report.require_sigs,
+            "require_sigs_explicit": report.require_sigs_explicit,
+        });
+        if !vercel.is_null() {
+            entry["vercel"] = vercel;
+        }
+        map.insert(name.clone(), entry);
     }
     serde_json::Value::Object(map)
 }
@@ -4922,6 +5139,33 @@ fn state_label(s: thegn_core::sandbox_support::BackendState) -> &'static str {
     }
 }
 
+/// Doctor lines for a reserved `backend` / `default_backend` value found by the
+/// raw config validator (the lenient load already turned it into `auto`):
+/// `sandbox backend "smol" is reserved: resolving via backend_chain`.
+fn reserved_backend_lines<'a>(messages: impl Iterator<Item = &'a str>) -> Vec<String> {
+    const MARKER: &str = "sandbox backend \"";
+    let mut lines: Vec<String> = Vec::new();
+    for message in messages {
+        let Some(index) = message.find(MARKER) else {
+            continue;
+        };
+        // The key path precedes the message (`sandbox.backend: …`,
+        // `env.<n>.sandbox.default_backend: …`).
+        let path = &message[..index];
+        if !(path.contains("sandbox.backend") || path.contains("sandbox.default_backend")) {
+            continue;
+        }
+        let Some((value, _)) = message[index + MARKER.len()..].split_once("\" is reserved") else {
+            continue;
+        };
+        let line = format!("sandbox backend \"{value}\" is reserved: resolving via backend_chain");
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
 /// Print the resolved sandbox boundary honestly: which backend(s) would run, the
 /// isolation class each one actually provides ("what would have to fail for an
 /// escape"), and the policy each hardening preset imposes.
@@ -5247,40 +5491,86 @@ pub(crate) fn home_report_lines(
 }
 
 fn network_rules_report(cfg: &Config) {
-    if cfg.sandbox.network_allow.is_empty() && cfg.sandbox.network_block.is_empty() {
-        return;
+    if !(cfg.sandbox.network_allow.is_empty() && cfg.sandbox.network_block.is_empty()) {
+        let report = thegn_core::sandbox_support::support_report(
+            &shell_chain(cfg),
+            &Placement::Local,
+            cfg_oci_runtime(cfg),
+        );
+        let backend = thegn_core::sandbox_support::first_ready(&report)
+            .map(|r| r.backend)
+            .unwrap_or(Backend::None);
+        if let Some(line) = network_rules_line(&cfg.sandbox, backend) {
+            outln!("  network rules {line}");
+        }
     }
-    let report = thegn_core::sandbox_support::support_report(
-        &shell_chain(cfg),
-        &Placement::Local,
-        cfg_oci_runtime(cfg),
-    );
-    let backend = thegn_core::sandbox_support::first_ready(&report)
-        .map(|r| r.backend)
-        .unwrap_or(Backend::None);
-    if let Some(line) = network_rules_line(&cfg.sandbox, backend) {
-        outln!("  network rules {line}");
+    for (name, env) in &cfg.env {
+        if let Some(line) = env_network_rules_line(&cfg.sandbox, env) {
+            outln!("  network rules [env.{name}] {line}");
+        }
     }
 }
 
 fn network_rules_line(sb: &thegn_core::config::SandboxConfig, backend: Backend) -> Option<String> {
-    if sb.network_allow.is_empty() && sb.network_block.is_empty() {
-        return None;
-    }
-    if thegn_core::sandbox::lower_universal_deny(sb.network, &sb.network_block)
-        == thegn_core::config::Network::None
-        && sb.network != thegn_core::config::Network::None
-    {
-        return Some("network_block contains `*` — launches are offline (network = none)".into());
-    }
-    thegn_core::sandbox::hostname_rules_note_for(
+    rules_line(
         sb.network,
         &sb.network_allow,
         &sb.network_block,
         backend,
         &Placement::Local,
     )
-    .map(|note| note.trim_start_matches("sandbox ").to_string())
+}
+
+/// The rules line for a provider env: its `[env.<n>] sandbox` lists (or the
+/// inherited `[sandbox]` lists) against the env's provider placement, so a
+/// provider without an egress policy API is reported as NOT enforcing them.
+fn env_network_rules_line(
+    base: &thegn_core::config::SandboxConfig,
+    env: &thegn_core::config::EnvConfig,
+) -> Option<String> {
+    if env.placement != thegn_core::config::PlacementMode::Provider {
+        return None;
+    }
+    let network = env.sandbox.network.unwrap_or(base.network);
+    let allow = env
+        .sandbox
+        .network_allow
+        .as_deref()
+        .unwrap_or(base.network_allow.as_slice());
+    let block = env
+        .sandbox
+        .network_block
+        .as_deref()
+        .unwrap_or(base.network_block.as_slice());
+    let placement = Placement::Provider(thegn_core::placement::ProviderPlacement {
+        provider: env.provider.provider.clone(),
+        id: String::new(),
+        interactive_prefix: Vec::new(),
+        control_prefix: Vec::new(),
+        up_command: Vec::new(),
+        down_command: Vec::new(),
+    });
+    rules_line(network, allow, block, Backend::None, &placement)
+}
+
+fn rules_line(
+    network: thegn_core::config::Network,
+    allow: &[String],
+    block: &[String],
+    backend: Backend,
+    placement: &Placement,
+) -> Option<String> {
+    if allow.is_empty() && block.is_empty() {
+        return None;
+    }
+    if thegn_core::sandbox::lower_universal_deny(network, block)
+        == thegn_core::config::Network::None
+        && network != thegn_core::config::Network::None
+    {
+        return Some("network_block contains `*` — launches are offline (network = none)".into());
+    }
+    thegn_core::sandbox::hostname_rules_note_for(network, allow, block, backend, placement)
+        .map(|note| note.trim_start_matches("sandbox ").to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6118,6 +6408,99 @@ mod tests {
             msg.contains("set but ignored") && msg.contains("exec = \"cli\""),
             "{msg}"
         );
+    }
+
+    fn vercel_pc(token_ref: &str) -> thegn_core::config::EnvProviderConfig {
+        thegn_core::config::EnvProviderConfig {
+            provider: "vercel".into(),
+            api_key_env: token_ref.into(),
+            team_id: "team_abc".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vercel_report_lines_cover_ids_token_warnings_and_ledger() {
+        let mut pc = vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_ABSENT");
+        pc.host_cache = true;
+        pc.connect = thegn_core::config::ProviderConnect::Ssh;
+        let lines = vercel_report_lines(&pc, false, 2, 1).join("\n");
+        assert!(
+            lines.contains("team_id set: yes · project_id set: no"),
+            "{lines}"
+        );
+        assert!(lines.contains("token ref resolves: no"), "{lines}");
+        assert!(
+            lines.contains("host_cache is set but ignored for vercel"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("connect = \"ssh\" is set but ignored for vercel"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("2 expired") && lines.contains("1 orphan"),
+            "{lines}"
+        );
+        let clean = vercel_report_lines(&vercel_pc(""), true, 0, 0).join("\n");
+        assert!(clean.contains("token ref resolves: yes") && !clean.contains("warning"));
+    }
+
+    #[test]
+    fn vercel_json_reports_unresolved_then_resolved_token() {
+        let _state = crate::testenv::IsolatedState::new();
+        let mut cfg = Config::default();
+        let env = thegn_core::config::EnvConfig {
+            provider: vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_TOKEN"),
+            ..Default::default()
+        };
+        cfg.env.insert("vc".into(), env);
+        let v = provider_cache_json_with(&cfg, None);
+        assert_eq!(v["vc"]["vercel"]["team_id_set"], true);
+        assert_eq!(v["vc"]["vercel"]["project_id_set"], false);
+        assert_eq!(v["vc"]["vercel"]["token_resolves"], false);
+        assert_eq!(v["vc"]["vercel"]["expired"], 0);
+        assert_eq!(v["vc"]["vercel"]["orphans"], 0);
+        // SAFETY: test-only env mutation under IsolatedState.
+        unsafe { std::env::set_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN", "x") };
+        // Different ref string so the 60s presence memo cannot mask the change.
+        let env = thegn_core::config::EnvConfig {
+            provider: vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_TOKEN2"),
+            ..Default::default()
+        };
+        // SAFETY: as above.
+        unsafe { std::env::set_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN2", "x") };
+        cfg.env.insert("vc".into(), env);
+        let v = provider_cache_json_with(&cfg, None);
+        assert_eq!(v["vc"]["vercel"]["token_resolves"], true);
+        assert!(!v.to_string().contains("\"x\""));
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN");
+            std::env::remove_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN2");
+        }
+    }
+
+    #[test]
+    fn vercel_ledger_counts_only_vercel_expired_and_creating() {
+        use thegn_svc::vps::registry::VpsRecord;
+        let rec = |provider: &str, state: &str| VpsRecord {
+            name: "n".into(),
+            provider: provider.into(),
+            state: state.into(),
+            instance_id: String::new(),
+            ip: String::new(),
+            created_at: 0,
+            owner: String::new(),
+            account: String::new(),
+        };
+        let rows = [
+            rec("vercel", "expired"),
+            rec("vercel", "creating"),
+            rec("vercel", "ready"),
+            rec("hetzner", "expired"),
+        ];
+        assert_eq!(vercel_ledger_counts(&rows), (1, 1));
     }
 
     fn row(kind: NotificationKind, source: &str, msg: &str, created: i64) -> Notification {
@@ -7519,6 +7902,7 @@ args = ["--verbose"]
             Some("               experimental: lifecycle not verified on a live account")
         );
         assert_eq!(provider_cache_lifecycle_note("sprites"), None);
+        assert_eq!(provider_maintenance_note("hetzner"), None);
         // env_devshell falls back to the global default when no override is set.
         let plain = EnvConfig {
             provider: EnvProviderConfig {
@@ -7709,7 +8093,90 @@ args = ["--verbose"]
     }
 
     #[test]
-    fn network_rules_line_says_dns_only_and_offline() {
+    fn provider_cache_lifecycle_note_daytona_has_maintenance_line() {
+        let _state = crate::testenv::IsolatedState::new();
+        assert_eq!(
+            provider_cache_lifecycle_note("daytona"),
+            Some("               experimental: lifecycle not verified on a live account")
+        );
+        let maintenance = provider_maintenance_note("daytona").expect("daytona maintenance line");
+        assert!(maintenance.contains("maintenance:"), "{maintenance}");
+        assert!(maintenance.contains("daytona-v0"), "{maintenance}");
+        for other in [
+            "hetzner",
+            "sprites",
+            "fly",
+            "machine0",
+            "digitalocean",
+            "custom",
+        ] {
+            assert_eq!(provider_maintenance_note(other), None, "{other}");
+        }
+
+        use thegn_core::config::{EnvConfig, EnvProviderConfig};
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "daytona".into(),
+            EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "daytona".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(provider_cache_json(&cfg)["daytona"]["live_verified"], false);
+    }
+
+    #[test]
+    fn doctor_prints_reserved_backend_finding() {
+        let errors = thegn_core::config_validate::validate_str("[sandbox]\nbackend = \"smol\"\n");
+        let lines = reserved_backend_lines(errors.iter().map(String::as_str));
+        assert_eq!(
+            lines,
+            ["sandbox backend \"smol\" is reserved: resolving via backend_chain"],
+            "{errors:?}"
+        );
+        // Other findings are ignored.
+        assert!(
+            reserved_backend_lines(["ci.provider: ci provider \"drone\" is reserved"].into_iter())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn network_rules_line_for_provider_env() {
+        use thegn_core::config::{EnvConfig, EnvProviderConfig, PlacementMode, SandboxOverlay};
+        let base = thegn_core::config::SandboxConfig::default();
+        let env_for = |provider: &str| EnvConfig {
+            placement: PlacementMode::Provider,
+            provider: EnvProviderConfig {
+                provider: provider.into(),
+                ..Default::default()
+            },
+            sandbox: SandboxOverlay {
+                network_allow: Some(vec!["github.com".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let daytona = env_network_rules_line(&base, &env_for("daytona"))
+            .expect("daytona lists are unenforced");
+        assert!(daytona.contains("NOT enforced"), "{daytona}");
+        assert!(daytona.contains("'daytona'"), "{daytona}");
+        assert!(env_network_rules_line(&base, &env_for("sprites")).is_none());
+        // No lists anywhere: nothing to report.
+        let mut empty = env_for("daytona");
+        empty.sandbox.network_allow = None;
+        assert!(env_network_rules_line(&base, &empty).is_none());
+        // A local env is reported by the global line, not here.
+        let mut local = env_for("daytona");
+        local.placement = PlacementMode::Local;
+        assert!(env_network_rules_line(&base, &local).is_none());
+    }
+
+    #[test]
+    fn network_rules_line_says_advisory_and_offline() {
         let blocked = thegn_core::config::SandboxConfig {
             network_block: vec!["*".into()],
             ..Default::default()
@@ -7723,8 +8190,12 @@ args = ["--verbose"]
             ..Default::default()
         };
         let note = network_rules_line(&allowed, Backend::Bwrap).unwrap();
-        assert!(note.contains("DNS-name rules only"));
-        assert!(note.contains("not applied by this backend"));
+        assert!(note.contains("are advisory"), "{note}");
+        assert!(
+            note.contains("no backend enforces hostname rules"),
+            "{note}"
+        );
+        assert!(!note.contains("DNS-only"), "{note}");
         assert!(
             network_rules_line(
                 &thegn_core::config::SandboxConfig::default(),
@@ -7931,7 +8402,7 @@ args = ["--verbose"]
             report["network_rules"]
                 .as_str()
                 .unwrap()
-                .contains("DNS-name rules only")
+                .contains("are advisory")
         );
 
         let default_cfg = Config::default();
@@ -8016,6 +8487,36 @@ args = ["--verbose"]
     #[test]
     fn iroh_reach_json_key_is_present() {
         assert!(channel_json().get("iroh_reach").is_some());
+    }
+
+    #[test]
+    fn channel_json_lists_every_feature() {
+        let report = channel_json();
+        let features = report["features"].as_object().expect("features map");
+        assert_eq!(features.len(), thegn_core::channel::Feature::ALL.len());
+        for f in thegn_core::channel::Feature::ALL {
+            assert!(features.contains_key(f.id()), "missing {}", f.id());
+        }
+    }
+
+    #[test]
+    fn programme_features_read_not_yet_implemented() {
+        use thegn_core::channel::{Channel, Feature};
+        for f in Feature::PROGRAMME {
+            assert_eq!(
+                feature_state_line(f, Channel::Stable),
+                "disabled (dev-only); experimental, not yet implemented"
+            );
+            assert!(feature_state_line(f, Channel::Dev).starts_with("enabled;"));
+        }
+        assert_eq!(
+            feature_state_line(Feature::Remote, Channel::Stable),
+            "disabled (dev-only)"
+        );
+        assert_eq!(
+            feature_state_line(Feature::Observe, Channel::Stable),
+            "enabled"
+        );
     }
 
     #[test]
@@ -8252,5 +8753,37 @@ args = ["--verbose"]
             "the live WAL must remain present and nonempty while the writer DB is open"
         );
         drop(db);
+    }
+
+    #[test]
+    fn vercel_doctor_rows_never_carry_token_text_and_json_matches_text() {
+        use thegn_core::config::{EnvProviderConfig, ModelCredentials};
+        // A JWT-shaped (OIDC) fixture token.
+        let token = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2lnLXNlY3JldC1ib2R5";
+        let pc = EnvProviderConfig {
+            provider: "vercel".into(),
+            model_credentials: ModelCredentials::Upload,
+            ..Default::default()
+        };
+        let row = vercel_row("vx", &pc, Some(token), 1_700_000_000);
+        assert_eq!(row["model_credentials"], "upload");
+        assert!(row["leaves_machine"].is_string());
+        assert!(row["token_kind"].is_string());
+        let report = serde_json::json!({ "envs": [row], "unpulled": 2 });
+        let rendered = format!("{report}\n{}", vercel_lines(&report).join("\n"));
+        assert!(!rendered.contains(token));
+        assert!(!rendered.contains("c2lnLXNlY3JldC1ib2R5"));
+        assert!(rendered.contains("model credentials upload"));
+        assert!(rendered.contains("results not pulled: 2"));
+        // No token resolved: reported as such, still no failure.
+        let none = vercel_row("vx", &pc, None, 0);
+        assert!(none["token_kind"].is_null());
+    }
+
+    #[test]
+    fn vercel_doctor_section_is_silent_without_a_vercel_env() {
+        let report = vercel_json(&Config::default());
+        assert_eq!(report["unpulled"], 0);
+        assert!(vercel_lines(&report).is_empty());
     }
 }

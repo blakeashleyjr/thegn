@@ -590,6 +590,46 @@ impl NotificationStore for Db {
         Ok(())
     }
 
+    fn set_dispatch_autonomy(&self, id: i64, autonomy: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE agent_dispatches SET autonomy=?1 WHERE id=?2",
+            params![autonomy, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn set_dispatch_automation(&self, id: i64, autonomy: &str, rule_id: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE agent_dispatches SET autonomy=?1, automation_rule=?2 WHERE id=?3",
+            params![autonomy, rule_id, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn dispatch_automation(&self, id: i64) -> Result<(Option<String>, Option<String>)> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT autonomy, automation_rule FROM agent_dispatches WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None)))
+    }
+
+    fn dispatch_autonomy(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT autonomy FROM agent_dispatches WHERE id=?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// The dispatch row currently (or most recently) run by a daemon session —
     /// the transport-retry observer's row resolution (THE-86). Same rule as
     /// [`Self::dispatch_for_worktree`]: newest stamp wins; `session_id` is
@@ -1407,6 +1447,43 @@ mod tests {
                 .take(2)
                 .all(|pair| pair[0].created_at_ms > pair[1].created_at_ms)
         );
+    }
+
+    #[test]
+    fn dispatch_autonomy_roundtrips_and_misses_cleanly() {
+        let db = Db::open_memory().unwrap();
+        let id = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                issue_id: "THE-2195",
+                worktree_path: "/wt/auto",
+                agent_name: "codex",
+                stage: None,
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        assert_eq!(db.dispatch_autonomy(id).unwrap(), None);
+        assert!(db.set_dispatch_autonomy(id, "review").unwrap());
+        assert_eq!(db.dispatch_autonomy(id).unwrap().as_deref(), Some("review"));
+        assert!(!db.set_dispatch_autonomy(id + 1_000, "merge").unwrap());
+        assert_eq!(db.dispatch_autonomy(id + 1_000).unwrap(), None);
+        assert_eq!(
+            db.dispatch_automation(id).unwrap(),
+            (Some("review".into()), None)
+        );
+        assert!(db.set_dispatch_automation(id, "merge", "cfg-rule").unwrap());
+        assert_eq!(
+            db.dispatch_automation(id).unwrap(),
+            (Some("merge".into()), Some("cfg-rule".into()))
+        );
+        assert_eq!(db.dispatch_autonomy(id).unwrap().as_deref(), Some("merge"));
+        assert!(
+            !db.set_dispatch_automation(id + 1_000, "merge", "x")
+                .unwrap()
+        );
+        assert_eq!(db.dispatch_automation(id + 1_000).unwrap(), (None, None));
     }
 
     #[test]

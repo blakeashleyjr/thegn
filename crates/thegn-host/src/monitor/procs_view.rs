@@ -7,6 +7,7 @@
 //! plus the view toggles, so it is unit-testable without a live process table.
 
 use super::{ProcSnapshotView, ProcSort};
+use thegn_core::cpu_attrib::PaneOwner;
 use thegn_metrics::{ProcOwner, ProcSample, ProcSnapshot};
 
 #[path = "procs_query.rs"]
@@ -88,9 +89,77 @@ impl procs_query::QueryRow for ProcSample {
     }
 }
 
-/// Whether a process matches the parsed query.
-fn matches(p: &ProcSample, query: &procs_query::Query) -> bool {
-    query.matches(p)
+/// `pane_id -> (worktree name, worktree path basename)`, built once per row
+/// build from the pane-owner index so `wt:` terms can resolve a pane process's
+/// worktree without parsing labels.
+type WorktreeLookup = std::collections::HashMap<u32, (String, Option<String>)>;
+
+fn worktree_lookup(owners: &[PaneOwner]) -> WorktreeLookup {
+    owners
+        .iter()
+        .map(|o| {
+            let base = o
+                .worktree_path
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .map(|n| n.to_string_lossy().into_owned());
+            (o.pane_id, (o.worktree.clone(), base))
+        })
+        .collect()
+}
+
+/// A process plus its resolved worktree, as the query language sees it.
+struct WtRow<'a> {
+    sample: &'a ProcSample,
+    wt: Option<&'a (String, Option<String>)>,
+}
+
+impl procs_query::QueryRow for WtRow<'_> {
+    fn name(&self) -> &str {
+        self.sample.name()
+    }
+    fn pid(&self) -> u32 {
+        self.sample.pid()
+    }
+    fn owner_keywords(&self) -> &str {
+        self.sample.owner_keywords()
+    }
+    fn cpu_pct(&self) -> Option<f32> {
+        self.sample.cpu_pct()
+    }
+    fn rss_bytes(&self) -> Option<u64> {
+        self.sample.rss_bytes()
+    }
+    fn age_secs(&self) -> Option<u64> {
+        self.sample.age_secs()
+    }
+    fn owner_id(&self) -> Option<u32> {
+        self.sample.owner_id()
+    }
+    fn worktree(&self) -> Option<(&str, Option<&str>)> {
+        self.wt.map(|(name, base)| (name.as_str(), base.as_deref()))
+    }
+}
+
+/// The parsed query plus the worktree lookup its rows are matched through.
+struct Matcher<'a> {
+    query: &'a procs_query::Query,
+    wts: &'a WorktreeLookup,
+}
+
+impl Matcher<'_> {
+    fn is_empty(&self) -> bool {
+        self.query.is_empty()
+    }
+
+    /// Whether a process matches the parsed query.
+    fn matches(&self, p: &ProcSample) -> bool {
+        let wt = match p.owner {
+            ProcOwner::Pane(id) => self.wts.get(&id),
+            _ => None,
+        };
+        self.query.matches(&WtRow { sample: p, wt })
+    }
 }
 
 /// Compare two samples by the active sort key in ascending order; the caller
@@ -131,6 +200,7 @@ fn row_of(p: &ProcSample, depth: usize, elided_parent: bool) -> ProcRow {
 pub(in crate::monitor) fn rows_with_invalid(
     snap: &ProcSnapshot,
     view: ProcSnapshotView,
+    owners: &[PaneOwner],
 ) -> (Vec<ProcRow>, Vec<procs_query::InvalidTerm>) {
     #[cfg(test)]
     crate::proc_workload_alloc::process_rows();
@@ -142,9 +212,14 @@ pub(in crate::monitor) fn rows_with_invalid(
     } = view;
     let query = procs_query::Query::parse(filter.trim());
     let invalid = query.invalid().to_vec();
+    let wts = worktree_lookup(owners);
+    let matcher = Matcher {
+        query: &query,
+        wts: &wts,
+    };
 
     if !tree {
-        let mut kept: Vec<&ProcSample> = snap.procs.iter().filter(|p| matches(p, &query)).collect();
+        let mut kept: Vec<&ProcSample> = snap.procs.iter().filter(|p| matcher.matches(p)).collect();
         kept.sort_by(|a, b| {
             let ord = cmp(a, b, sort);
             (if desc { ord.reverse() } else { ord }).then_with(|| a.pid.cmp(&b.pid))
@@ -152,23 +227,18 @@ pub(in crate::monitor) fn rows_with_invalid(
         return (kept.iter().map(|p| row_of(p, 0, false)).collect(), invalid);
     }
 
-    (tree_rows(snap, sort, desc, &query), invalid)
+    (tree_rows(snap, sort, desc, &matcher), invalid)
 }
 
 #[cfg(test)]
 pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
-    rows_with_invalid(snap, view).0
+    rows_with_invalid(snap, view, &[]).0
 }
 
 /// Tree flatten: build children lists over the kept set, DFS from roots in sort
 /// order, re-root anything the walk could not reach (a cycle has no root), apply
 /// the "row or a descendant matches" filter, and cap depth.
-fn tree_rows(
-    snap: &ProcSnapshot,
-    sort: ProcSort,
-    desc: bool,
-    query: &procs_query::Query,
-) -> Vec<ProcRow> {
+fn tree_rows(snap: &ProcSnapshot, sort: ProcSort, desc: bool, query: &Matcher) -> Vec<ProcRow> {
     use std::collections::HashMap;
 
     let by_pid: HashMap<u32, &ProcSample> = snap.procs.iter().map(|p| (p.pid, p)).collect();
@@ -263,7 +333,7 @@ fn walk<'a>(
 /// empty filter keeps everything.
 fn retained_set(
     by_pid: &std::collections::HashMap<u32, &ProcSample>,
-    query: &procs_query::Query,
+    query: &Matcher,
 ) -> std::collections::HashSet<u32> {
     let mut keep = std::collections::HashSet::new();
     if query.is_empty() {
@@ -272,7 +342,7 @@ fn retained_set(
     }
     // Any matching process pulls in every ancestor within the kept set.
     for p in by_pid.values() {
-        if matches(p, query) {
+        if query.matches(p) {
             let mut cur = Some(*p);
             let mut guard = 0;
             while let Some(node) = cur {
@@ -325,6 +395,38 @@ mod tests {
             filter: filter.to_string(),
             tree,
         }
+    }
+
+    #[test]
+    fn worktree_filter_resolves_a_pane_process_through_the_owner_index() {
+        let mut inside = sample(10, None, "cargo", 1.0, 1);
+        inside.owner = ProcOwner::Pane(3);
+        let outside = sample(11, None, "cargo", 1.0, 1);
+        let s = snap(vec![inside, outside]);
+        let owners = [PaneOwner {
+            pane_id: 3,
+            workspace: "alpha".into(),
+            worktree: "alpha/feat".into(),
+            worktree_path: Some("/wt/feat-dir".into()),
+            tab: "1".into(),
+            program: None,
+        }];
+        let pids = |f: &str, tree: bool| -> Vec<u32> {
+            rows_with_invalid(&s, view(f, tree), &owners)
+                .0
+                .iter()
+                .map(|r| r.pid)
+                .collect()
+        };
+        for tree in [false, true] {
+            assert_eq!(pids("wt:feat", tree), vec![10]);
+            assert_eq!(pids("wt:feat-dir", tree), vec![10]);
+            assert!(pids("wt=feat", tree).is_empty());
+            assert_eq!(pids("wt=alpha/feat", tree), vec![10]);
+        }
+        // No owners: nothing matches.
+        let none = rows_with_invalid(&s, view("wt:feat", false), &[]).0;
+        assert!(none.is_empty());
     }
 
     #[test]

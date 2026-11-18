@@ -2,7 +2,7 @@
 
 **A terminal-native Git worktree IDE that is its own multiplexer.**
 
-> **Status: public alpha** (`0.1.0-alpha.93`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.95`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon is best-effort: use the flake or source
 > setup until a release archive is published. Pull requests run lean CI checks
 > (format, lint, test, smoke); the full gate runs nightly and on demand, and
@@ -540,7 +540,7 @@ panel, PR) keep working.
   `THEGN_SANDBOX_PROFILE=sealed` to opt in.
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
-  selects them. _(SSH and managed-provider placement are **dev channel only** —
+  selects them. _(SSH, Kubernetes and managed-provider placement are **dev channel only** —
   see Channels.)_
 - **Remote** (`[sandbox.remote]`) runs worktrees on another machine — the
   interactive pane over **mosh** by default, git reads and lifecycle over

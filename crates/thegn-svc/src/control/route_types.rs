@@ -98,6 +98,46 @@ pub static ROUTE_TYPES: &[(&str, &str, &str)] = &[
         "AutomationTestReply",
     ),
     ("tools.run", "ToolRunRequest", "SessionInfo"),
+    // Lead tool surface (THE-2172). The typed DTOs live in thegn-core and are
+    // not pinned in the wire snapshot, so every cell is an inline shape.
+    ("overview.get", "{workspace, limit}", "{OverviewReply}"),
+    (
+        "notifications.list",
+        "{kind, unread, since, worktree, limit}",
+        "{notifications:[Notification], unread_total}",
+    ),
+    ("notifications.ack", "{id, all, worktree}", "{acked}"),
+    (
+        "automations.put",
+        "{rule: AutomationRuleConfig}",
+        "{id, created, inert_reason}",
+    ),
+    ("automations.rm", "{name}", "{removed}"),
+    ("automations.enable", "{name, enabled}", "{name, enabled}"),
+    (
+        "automations.runs",
+        "{rule, limit}",
+        "{runs:[AutomationRunRow]}",
+    ),
+    (
+        "approvals.list",
+        "{issue_id, limit}",
+        "{approvals:[ApprovalView], pending:[PendingApproval]}",
+    ),
+    (
+        "approvals.request",
+        "{issue_id, stage, commit_sha, worktree, reason}",
+        "{requested, notification_id}",
+    ),
+    ("approvals.resolve", "{ApprovalResolve}", "{resolved}"),
+    ("merge.drain", "{worktree}", "{started, repo, pid}"),
+    // Automation kill switch (THE-2197): no arguments.
+    ("automations.pause", "{}", "{paused}"),
+    ("automations.resume", "{}", "{paused}"),
+    // b155 Lead spine.
+    ("approvals.redeem", "{nonce, decision}", "{resolved}"),
+    ("automations.halt", "{keep_sessions}", "{paused, killed}"),
+    ("mcp_proxy.profile_env", "{profile}", "{env}"),
     (
         "mcp_proxy.status",
         "—",

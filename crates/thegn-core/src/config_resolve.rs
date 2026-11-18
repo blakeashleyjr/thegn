@@ -357,7 +357,7 @@ fn allow_entry_covered(entry: &str, trusted: &[String]) -> bool {
     }
     trusted
         .iter()
-        .any(|t| t == entry || crate::dns_filter::name_matches(entry, t))
+        .any(|t| t == entry || crate::egress::pattern::name_matches(entry, t))
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,8 +1113,11 @@ impl Config {
                     let was = !self.sandbox.remote.host.is_empty();
                     self.sandbox.remote.host.clear();
                     let env_count = self.env.len();
-                    self.env
-                        .retain(|_, env| env.placement != crate::config::PlacementMode::Ssh);
+                    // Experimental remote placements: ssh and Kubernetes.
+                    self.env.retain(|_, env| {
+                        env.placement != crate::config::PlacementMode::Ssh
+                            && env.placement != crate::config::PlacementMode::K8s
+                    });
                     was || self.env.len() != env_count
                 }
                 Feature::Providers => {
@@ -1142,6 +1145,11 @@ impl Config {
                     self.observe.enabled = false;
                     was
                 }
+                Feature::Lead => {
+                    let was = self.lead.is_some();
+                    self.lead = None;
+                    was
+                }
                 Feature::PluginApps => {
                     let default_was_plugin = self.apps.default_tab.trim().starts_with("plugin:");
                     if default_was_plugin {
@@ -1153,6 +1161,27 @@ impl Config {
                         .retain(|id| !id.trim().starts_with("plugin:"));
                     default_was_plugin || self.apps.tab_order.len() != order_len
                 }
+                // Programme features (WS00-P1-01): nothing configurable exists
+                // yet, so there is nothing to neutralise. Each owner item fills
+                // its own arm when it adds the keys the feature gates.
+                // filled by WS02-P4-01
+                Feature::SandboxBackends => false,
+                // filled by WS03-P2-03b
+                Feature::LinuxConfine => false,
+                // filled by WS04-P1-09
+                Feature::EgressProxy => false,
+                // filled by WS05-P2-06
+                Feature::Seatbelt => false,
+                // filled by WS06-P4-05
+                Feature::WinIsolation => false,
+                // filled by WS10-P8-04
+                Feature::PluginBackends => false,
+                // filled by WS11-P1-07
+                Feature::AgentPresets => false,
+                // filled by the WS11 private-copy items (WS11-P3-06c)
+                Feature::PrivateCopy => false,
+                // filled by WS11-P5-06
+                Feature::Escalation => false,
             };
             if changed {
                 clamped.push(feat);
@@ -3581,6 +3610,55 @@ mod tests {
         assert_eq!(env.name, "box");
         assert_eq!(env.sandbox.network, crate::config::Network::None);
         assert!(!resolved.events.iter().any(|event| event.key == "env"));
+    }
+
+    /// b156: `model_credentials` (and `interactive_host_suffixes`) are set
+    /// only by the user's own config table. A repo `.thegn.*` overlay can name
+    /// an env but has no route to its provider table: the overlay shape has no
+    /// such key, an overlay that tries is dropped whole, and the effective
+    /// value stays `none`.
+    #[test]
+    fn repo_overlay_cannot_set_model_credentials() {
+        use crate::config::ModelCredentials;
+        let schema =
+            serde_json::to_string(&schemars::schema_for!(crate::config_repo::RepoConfigFile))
+                .unwrap();
+        assert!(!schema.contains("model_credentials"), "{schema}");
+        assert!(!schema.contains("interactive_host_suffixes"), "{schema}");
+
+        let cfg: Config = toml::from_str(
+            r#"
+                [env.v]
+                placement = "provider"
+                [env.v.provider]
+                provider = "vercel"
+                team_id = "team_abc1"
+                project_id = "prj_Xy9"
+            "#,
+        )
+        .unwrap();
+        for overlay in [
+            "[env.v.provider]\nmodel_credentials = \"upload\"\ninteractive_host_suffixes = [\"evil.example\"]\n",
+            "env = \"v\"\n[env.v.provider]\nmodel_credentials = \"upload\"\n",
+            "env = \"v\"\nmodel_credentials = \"upload\"\n",
+            "env = \"v\"\n[sandbox]\nmodel_credentials = \"upload\"\n",
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::write(repo.path().join(".thegn.toml"), overlay).unwrap();
+            if let Some(parsed) = crate::config::load_repo_overlay(repo.path()) {
+                // Whatever survives is at most an env *name*.
+                assert!(parsed.env.is_empty() || parsed.env == "v", "{overlay}");
+            }
+            let (env, _) = resolve_fixture(repo.path(), &cfg, Some("v"));
+            assert_eq!(env.name, "v", "{overlay}");
+            let effective = &cfg.env["v"].provider;
+            assert_eq!(
+                effective.model_credentials,
+                ModelCredentials::None,
+                "{overlay}"
+            );
+            assert!(effective.interactive_host_suffixes.is_empty(), "{overlay}");
+        }
     }
 
     #[test]

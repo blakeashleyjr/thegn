@@ -2886,14 +2886,14 @@ mod tests {
         let wrapped = WrappedShell {
             argv: vec!["bwrap".into()],
             isolation: thegn_core::capabilities::IsolationClass::SharedKernel,
-            network_note: Some("DNS-name rules only; not an egress boundary".into()),
+            network_note: Some("network_allow/network_block are advisory".into()),
         };
         let mut warnings = Vec::new();
         let degraded = finish_wrapped_terminal(&wrapped, &mut warnings);
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("DNS-name rules only"))
+                .any(|warning| warning.contains("are advisory"))
         );
         assert!(!degraded);
 
@@ -2909,7 +2909,7 @@ mod tests {
         assert!(
             admit_warnings
                 .iter()
-                .any(|warning| warning.contains("DNS-name rules only"))
+                .any(|warning| warning.contains("are advisory"))
         );
 
         let no_note_wrapped = WrappedShell {

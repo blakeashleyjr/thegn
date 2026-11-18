@@ -4,9 +4,8 @@
 
 use super::*;
 use crate::config::FileAccess;
-use crate::config::Network;
 use crate::placement::Placement;
-use crate::sandbox::{Backend, Mount, SandboxLimits, SandboxSpec};
+use crate::sandbox::{Backend, Mount, SandboxSpec};
 use std::path::PathBuf;
 
 /// A spec with a worktree at `/wt/feat` and its repo's git-common dir bound —
@@ -15,7 +14,6 @@ use std::path::PathBuf;
 fn spec(backend: Backend) -> SandboxSpec {
     SandboxSpec {
         backend,
-        placement: Placement::Local,
         image: Some("img:latest".into()),
         worktree: PathBuf::from("/wt/feat"),
         mounts: vec![
@@ -32,34 +30,8 @@ fn spec(backend: Backend) -> SandboxSpec {
                 cache: false,
             },
         ],
-        env: Vec::new(),
-        env_overrides: std::collections::HashMap::new(),
-        env_block: Vec::new(),
-        network: Network::Nat,
-        network_allow: Vec::new(),
-        network_block: Vec::new(),
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: Vec::new(),
-        add_capabilities: Vec::new(),
-        ports: Vec::new(),
-        gpu: None,
-        limits: SandboxLimits::default(),
-        volumes: Vec::new(),
-        compose: None,
-        build: None,
-        init_script: None,
-        file_access: FileAccess::WorktreePlusCaches,
-        devenv: false,
-        devenv_path: None,
         name: "thegn-repo-feat".into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 

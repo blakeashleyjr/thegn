@@ -18,7 +18,7 @@ use crate::chrome::FrameModel;
 use crate::handlers::sidebar_persist::SidebarState;
 use std::sync::Arc;
 use thegn_core::config::reload_class::{ReloadHook, ReloadPlan};
-use thegn_core::config::{Config, FocusDetail, NotificationsConfig, WeatherConfig};
+use thegn_core::config::{Config, FocusDetail, MetricsConfig, NotificationsConfig, WeatherConfig};
 use thegn_core::help::HelpRegistry;
 
 /// The loop state the extracted hooks touch.
@@ -75,6 +75,17 @@ pub(crate) struct ReloadOutcome {
     pub(crate) automations: bool,
     /// Store the panel width config (`layout::set_panel_width_cfg`).
     pub(crate) panel_width: Option<PanelWidthCfg>,
+    /// Re-arm the `[metrics]` supervisor from this reloaded section: the
+    /// caller builds a fresh `metrics_slot` (reusing the loop waker) and
+    /// replaces its inbox, which drops the old consumer. The old supervisor
+    /// sees `consumer_gone` before its next target or publish and exits; it
+    /// may still sleep up to its old `interval_secs` first, but it publishes
+    /// nothing after the swap (no stop flag, no join on the loop).
+    pub(crate) metrics: Option<MetricsConfig>,
+    /// Re-apply the `[monitor]` ladder and per-tab defaults to the loop's
+    /// `MonitorPrefs` (`MonitorPrefs::reapply_config`); the next monitor open
+    /// sees them, an open monitor keeps its state.
+    pub(crate) monitor: bool,
 }
 
 /// Every changed key in the plan, whatever its class.
@@ -204,6 +215,10 @@ pub(crate) fn apply(plan: &ReloadPlan, ctx: &mut ReloadCtx<'_>) -> ReloadOutcome
         media(ctx, &mut out);
     }
     out.automations = automations_run(plan);
+    if plan.runs(ReloadHook::Metrics) {
+        out.metrics = Some(ctx.new_cfg.metrics.clone());
+    }
+    out.monitor = plan.runs(ReloadHook::Monitor);
     out
 }
 
@@ -273,6 +288,7 @@ fn sidebar(plan: &ReloadPlan, ctx: &mut ReloadCtx<'_>) {
     let ui = &ctx.new_cfg.ui;
     ctx.sb.view.workspace_sort = ui.sidebar_workspace_sort;
     ctx.sb.view.terminals_section = ui.sidebar_terminals_section;
+    ctx.sb.view.lead_enabled = crate::lead::enabled(ctx.new_cfg);
     crate::sidebar_freeze::set_enabled(ctx.sb, ui.sidebar_freeze_sort, &ctx.model.sidebar_status);
     ctx.sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(ui);
     let changed = plan
@@ -528,6 +544,22 @@ mod tests {
                 "[automations]\nenabled = true\n",
                 |_, out, _, _| out.automations,
             ),
+            (
+                ReloadHook::Metrics,
+                "[metrics]\ninterval_secs = 9.0\n\n[[metrics.targets]]\nname = \"local\"\nurl = \"http://127.0.0.1:9100/metrics\"\n",
+                |_, out, _, new| {
+                    out.metrics.as_ref().is_some_and(|m| {
+                        m.interval_secs == new.metrics.interval_secs
+                            && m.targets.len() == new.metrics.targets.len()
+                            && m.targets.len() == 1
+                    }) && !out.monitor
+                },
+            ),
+            (
+                ReloadHook::Monitor,
+                "[monitor]\ndefault_style = \"line\"\n",
+                |_, out, _, _| out.monitor && out.metrics.is_none(),
+            ),
         ];
         for (hook, edit, check) in rows {
             let old = Config::default();
@@ -570,7 +602,35 @@ mod tests {
         assert!(!out.restart_media);
         assert!(!out.automations);
         assert!(out.panel_width.is_none());
+        assert!(out.metrics.is_none());
+        assert!(!out.monitor);
         assert!(!out.dirty);
+    }
+
+    #[test]
+    fn unrelated_edits_leave_metrics_and_monitor_alone() {
+        let old = Config::default();
+        for edit in [
+            "[theme]\naccent = \"#123456\"\n",
+            "[monitor]\nproc_rows = 3\n",
+            "[monitor]\nprocesses = false\n",
+        ] {
+            let new = cfg(edit);
+            let mut fx = Fixture::new(&old);
+            let out = fx.reload(&old, &new);
+            assert!(out.metrics.is_none(), "{edit:?}");
+            assert!(!out.monitor, "{edit:?}");
+        }
+    }
+
+    #[test]
+    fn removing_every_metrics_target_hands_back_an_empty_section() {
+        let old =
+            cfg("[[metrics.targets]]\nname = \"local\"\nurl = \"http://127.0.0.1:9100/metrics\"\n");
+        let new = Config::default();
+        let mut fx = Fixture::new(&old);
+        let out = fx.reload(&old, &new);
+        assert!(out.metrics.as_ref().is_some_and(|m| m.targets.is_empty()));
     }
 
     #[test]
@@ -588,6 +648,8 @@ mod tests {
         assert!(out.restart_media);
         assert!(out.automations);
         assert!(out.panel_width.is_some());
+        assert!(out.metrics.is_some());
+        assert!(out.monitor);
         assert!(out.bars_dirty && out.dirty);
         assert!(!Arc::ptr_eq(&fx.help_registry, &help_before));
         assert!(app_host_runs(&plan));

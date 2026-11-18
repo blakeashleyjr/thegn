@@ -282,8 +282,10 @@ and new/exited values unknown until their baselines are available.
   `Backspace` to edit, `Enter` to apply, `Esc` to clear). A bare word matches
   process name, PID, or owner. Field terms include `user:blake`, `wt:feat`,
   `cpu>10`, `mem>1G`, `age<5m`, `pid:42`, `pane:3`, and `owner:thegn`; `!term` negates
-  a term. `cpu`, `mem`, `age`, `pid`, `pane`, and `owner` are the fields currently
-  applied. `user`, `wt`, `ctr`, `s`, `io`, and `thr` are recognized but
+  a term. `cpu`, `mem`, `age`, `pid`, `pane`, `owner`, and `wt` are the fields
+  currently applied. `wt:feat` matches the worktree's name or directory name
+  (contains, case-insensitive) and `wt=name` its exact name; only processes in
+  a pane have a worktree. `user`, `ctr`, `s`, `io`, and `thr` are recognized but
   currently ignored; ignored and malformed terms are listed in the header.
   `Esc` backs out of the filter first — it does not close the monitor while a
   filter is open.
@@ -467,6 +469,8 @@ Set `toast = true` to pop a toast and `notify = true` to record the alert to the
 notification inbox; both are off by default.
 
 ## Configuration
+
+The masthead cpu/mem popup that jumps here is described in [[bars]].
 
 `[monitor]` sets the starting `default_window`, `default_style` and
 `default_scale`. They are only starting points — whatever you toggle is

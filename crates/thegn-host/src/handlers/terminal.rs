@@ -30,6 +30,11 @@ pub(crate) fn taken_names(
     db_terminals: &[thegn_core::models::TerminalRow],
 ) -> Vec<String> {
     let mut taken: Vec<String> = db_terminals.iter().map(|t| t.name.clone()).collect();
+    // The Lead's name is reserved even before its registry row exists.
+    let lead = crate::lead::group::LEAD_GROUP_NAME.to_string();
+    if !taken.contains(&lead) {
+        taken.push(lead);
+    }
     for g in &session.worktrees {
         if g.kind == GroupKind::Terminal && !taken.contains(&g.name) {
             taken.push(g.name.clone());
@@ -66,7 +71,10 @@ pub(crate) fn persist(
     );
 }
 
-fn write_terminal_row(db: &thegn_core::db::Db, choice: &TerminalChoice) -> Result<(), String> {
+pub(crate) fn write_terminal_row(
+    db: &thegn_core::db::Db,
+    choice: &TerminalChoice,
+) -> Result<(), String> {
     use thegn_core::store::WorkspaceStore;
     db.put_terminal(&choice.name, &choice.kind, &choice.connection, None)
         .map_err(|error| error.to_string())?;
@@ -104,7 +112,7 @@ fn live_choices() -> &'static Mutex<HashMap<String, (String, String)>> {
 }
 
 /// Record `name`'s live `(connection, sandbox)` choice (see [`live_choices`]).
-fn remember_choice(name: &str, connection: &str, sandbox: &str) {
+pub(crate) fn remember_choice(name: &str, connection: &str, sandbox: &str) {
     if let Ok(mut m) = live_choices().lock() {
         m.insert(
             name.to_string(),
@@ -285,6 +293,12 @@ mod tests {
             )],
             active: 0,
         }
+    }
+
+    #[test]
+    fn taken_names_reserves_lead() {
+        let taken = taken_names(&test_session(), &[]);
+        assert!(taken.contains(&"lead".to_string()));
     }
 
     #[test]

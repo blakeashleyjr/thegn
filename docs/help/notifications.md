@@ -78,6 +78,16 @@ durable inbox row. Notification text can include branch names, issue titles,
 and log fragments, so route chat sinks with care. `thegn doctor` performs an
 offline configuration/request-shape probe and never posts a test message.
 
+## Approvals
+
+Approval requests raised by agents and automations are pinned at the top of the
+Notifications section in an Approvals group. Each row shows the description the
+daemon computed from its own records, never the text the requester wrote, and
+reads "unverified request" when the daemon cannot vouch for it. Press `y` to
+approve or `n` to reject the highlighted request; each asks you to press the key
+again to confirm. Answering needs the daemon running, otherwise the status line
+says "approvals need the daemon".
+
 ## Sound effects
 
 The `[notifications.sound]` table controls the audible notification channel.
@@ -155,3 +165,23 @@ entry count, and any fallback reason. Optional players and packs are
 diagnostics, not doctor failures. Terminal-bell latches are coalesced; distinct
 file jobs are queued best-effort and may be dropped if the bounded queue is
 full.
+
+## Over the tool surface
+
+Two tools expose the inbox to agents (HTTP, CLI via `thegn api call`, MCP):
+
+- `notifications.list` takes `kind`, `unread`, `since` (Unix seconds),
+  `worktree` and `limit` (default 50, max 500). An unknown `kind` is an error.
+  It returns `{notifications, unread_total}`.
+- `notifications.ack` takes exactly one of `id`, `all` or `worktree` and
+  returns `{acked}`.
+
+Live changes arrive as opt-in event frames. Subscribe with
+`thegn events tail --kinds notification,dispatch,automation_run`; a
+subscription that names no kinds never receives them. Frames carry only ids
+(`{"id": 7}`; automation runs carry `rule`, `run_id` and `outcome`), so fetch
+the details with `notifications.list`.
+
+Only notifications written by the daemon produce frames today. Notifications
+written by the UI process produce none until a later phase moves those
+producers into the daemon.

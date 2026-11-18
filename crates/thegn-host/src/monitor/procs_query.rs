@@ -30,6 +30,11 @@ pub(in crate::monitor) trait QueryRow {
     fn threads(&self) -> Option<u32> {
         None
     }
+    /// The owning worktree: `(name, path basename)`. `None` for a row that is
+    /// not in a pane (or whose pane has no known owner).
+    fn worktree(&self) -> Option<(&str, Option<&str>)> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +58,7 @@ enum Field {
     Pid,
     Owner,
     Pane,
+    Worktree,
     Unavailable,
 }
 
@@ -136,7 +142,8 @@ impl Query {
             "pid" => Field::Pid,
             "owner" => Field::Owner,
             "pane" => Field::Pane,
-            "wt" | "ctr" | "io" => Field::Unavailable,
+            "wt" => Field::Worktree,
+            "ctr" | "io" => Field::Unavailable,
             _ => {
                 self.invalid.push(InvalidTerm {
                     text: text.to_string(),
@@ -160,7 +167,9 @@ impl Query {
                 .parse::<u32>()
                 .ok()
                 .map(|n| Value::Number(f64::from(n))),
-            Field::Owner | Field::User => Some(Value::Text(raw_value.to_ascii_lowercase())),
+            Field::Owner | Field::User | Field::Worktree => {
+                Some(Value::Text(raw_value.to_ascii_lowercase()))
+            }
             Field::State if matches!(op, Op::Contains | Op::Equal) => {
                 Some(Value::States(raw_value.to_ascii_uppercase()))
             }
@@ -189,7 +198,9 @@ impl Query {
             });
             return Term::Ignored;
         }
-        if matches!(field, Field::Owner | Field::Pane) && !matches!(op, Op::Contains | Op::Equal) {
+        if matches!(field, Field::Owner | Field::Pane | Field::Worktree)
+            && !matches!(op, Op::Contains | Op::Equal)
+        {
             self.invalid.push(InvalidTerm {
                 text: text.to_string(),
                 reason: "operator not supported for field",
@@ -329,6 +340,16 @@ fn matches_term(term: &Term, row: &impl QueryRow) -> Option<bool> {
             (Field::Pane, Value::Number(expected)) => {
                 Some(row.owner_id().is_some_and(|id| f64::from(id) == *expected))
             }
+            (Field::Worktree, Value::Text(expected)) => {
+                let hit = row.worktree().is_some_and(|(name, base)| match *op {
+                    Op::Equal => name.eq_ignore_ascii_case(expected),
+                    _ => {
+                        contains_ascii_case_insensitive(name, expected)
+                            || base.is_some_and(|b| contains_ascii_case_insensitive(b, expected))
+                    }
+                });
+                Some(hit)
+            }
             (Field::Unavailable, _) => None,
             _ => Some(true),
         },
@@ -394,6 +415,7 @@ mod tests {
         state: Option<char>,
         threads: Option<u32>,
         pane: Option<u32>,
+        wt: Option<(&'static str, Option<&'static str>)>,
     }
 
     impl QueryRow for FakeRow {
@@ -436,6 +458,10 @@ mod tests {
         fn threads(&self) -> Option<u32> {
             self.threads
         }
+
+        fn worktree(&self) -> Option<(&str, Option<&str>)> {
+            self.wt
+        }
     }
 
     fn row() -> FakeRow {
@@ -450,6 +476,7 @@ mod tests {
             state: Some('D'),
             threads: Some(64),
             pane: None,
+            wt: None,
         }
     }
 
@@ -471,6 +498,30 @@ mod tests {
         assert!(!Query::parse("!pane:3").matches(&p3));
         assert!(Query::parse("!pane:4").matches(&p3));
         assert!(!Query::parse("pane:3").matches(&row()));
+    }
+
+    #[test]
+    fn worktree_field_contains_exact_negation_and_no_owner() {
+        assert!(Query::parse("wt:feat").invalid().is_empty());
+        assert_eq!(
+            Query::parse("wt>x").invalid()[0].reason,
+            "operator not supported for field"
+        );
+        let r = FakeRow {
+            pane: Some(3),
+            wt: Some(("alpha/Feat", Some("feat-dir"))),
+            ..row()
+        };
+        assert!(Query::parse("wt:feat").matches(&r));
+        assert!(Query::parse("wt:FEAT-d").matches(&r), "path basename");
+        assert!(!Query::parse("wt=feat").matches(&r));
+        assert!(Query::parse("wt=ALPHA/feat").matches(&r));
+        assert!(!Query::parse("!wt:feat").matches(&r));
+        assert!(Query::parse("!wt:zzz").matches(&r));
+        // A row with no owner (a non-pane process, or an empty owner list)
+        // never matches.
+        assert!(!Query::parse("wt:feat").matches(&row()));
+        assert!(Query::parse("!wt:feat").matches(&row()));
     }
 
     #[test]

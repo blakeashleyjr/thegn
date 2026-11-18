@@ -21,9 +21,9 @@ use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow, NotificationStore};
 use thegn_svc::control::{
     AttachKind, AttachReply, ControlApi, ControlError, ControlResult, DispatchPage, ForkSpec,
-    GitFileStatus, IssueListGap, IssueListing, OpenSpec, PreviewFetchReply, PreviewFetchRequest,
-    RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition,
-    WaitOutcome, check_pty_size,
+    GitFileStatus, IssueListGap, IssueListing, LeadCaller, OpenSpec, PreviewFetchReply,
+    PreviewFetchRequest, RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo,
+    ToolRunRequest, WaitCondition, WaitOutcome, check_pty_size,
 };
 use thegn_svc::git::{CliGit, GitBackend};
 
@@ -56,6 +56,15 @@ pub(crate) struct SessionEntry {
     /// Last-resort shutdown owner; signals only the PTY process group acquired
     /// with the child, never a pid recovered from session metadata.
     pub process: Option<crate::pane_pty::PtyProcessOwner>,
+    /// The pairing label of the Lead whose confined `sessions.open` launched
+    /// this session (`thegn_core::lead_confine`), set only after that open
+    /// passed every Lead check. The one provenance a Lead-confined
+    /// `sessions.input` is allowed on. It lives on the live entry, so it
+    /// ends with the session: a tombstone carries none, and an id reused by
+    /// a later launch gets a fresh entry with none. In memory only: lost on
+    /// a daemon restart, which fails closed (the Lead is refused). Cleared by
+    /// the first non-Lead `sessions.input` (the user took the session over).
+    pub lead_opener: Option<String>,
 }
 
 /// What a session id resolves to.
@@ -900,7 +909,26 @@ fn classify_bound_row(
     }
 }
 
+/// The refusal a Lead-confined spawn gets while automations are paused.
+pub(crate) const PAUSED_SPAWN_REFUSAL: &str =
+    "automations are paused; the Lead can read but not spawn";
+
 impl DaemonService {
+    /// `FailedPrecondition` while `automations.pause` is on (b155 6f): a
+    /// Lead-confined `sessions.open` / `dispatches.put` is refused.
+    pub(crate) async fn refuse_while_paused(&self) -> ControlResult<()> {
+        let paused = self
+            .with_db(|db| Ok(thegn_core::automation_control::paused_strict(db).unwrap_or(true)))
+            .await?;
+        if paused {
+            Err(ControlError::FailedPrecondition(
+                PAUSED_SPAWN_REFUSAL.into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Run `f` against the shared DB on a blocking thread.
     pub(crate) async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
     where
@@ -1292,48 +1320,125 @@ fn merge_issue_accounts(
     })
 }
 
-impl ControlApi for DaemonService {
-    fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
-        Box::pin(async move {
-            let daemon_id = self.daemon_id.clone();
-            let leases: Vec<LeaseRow> = self
-                .with_db(move |db| db.leases(&daemon_id))
-                .await
-                .unwrap_or_default();
-            let sessions = self.sessions.lock().await;
-            let mut out: Vec<SessionInfo> = sessions
-                .values()
-                .map(|e| {
-                    let lease = leases
-                        .iter()
-                        .find(|l| l.session_id == e.meta.id && l.kind == "relay")
-                        .and_then(|l| l.expires_at);
-                    let live = e.live.lock().expect("live meta lock");
-                    e.meta.info(&live, lease)
-                })
-                .collect();
-            drop(sessions);
-            // Recently-finished sessions belong in the roster too: a supervisor
-            // asking "which of my workers are done?" must not have to race the
-            // moment of exit. They carry `exited_at_ms`, so a caller that wants
-            // only live sessions filters on it (the split lookup below does).
-            let now = now_ms();
-            let mut tombs = self.tombs.lock().await;
-            tombs.sweep(now);
-            out.extend(tombs.iter(now).map(|(_, t)| t.info()));
-            drop(tombs);
-            out.sort_by_key(|s| s.created_at_ms);
-            Ok(out)
+/// A Lead-authored automation rule's open (`automation_origin.rule_id` is a
+/// `lead:` id) is confined like a direct Lead call. A non-Lead caller naming
+/// such a rule id only confines itself, the safe direction; a Lead transport
+/// call carrying an origin was already refused at the transport.
+fn lead_rule_caller(spec: &OpenSpec) -> Option<LeadCaller> {
+    let origin = spec.automation_origin.as_ref()?;
+    thegn_core::lead_confine::is_lead_rule_id(&origin.rule_id).then(|| LeadCaller {
+        pairing_id: format!("automation-run:{}", origin.run_id),
+        label: origin.rule_id.clone(),
+    })
+}
+
+/// Audit a daemon-side Lead `sessions.open` refusal and turn it into the
+/// caller's error.
+fn lead_refusal(
+    caller: &LeadCaller,
+    worktree: &str,
+    refusal: &thegn_core::lead_confine::ConfineRefusal,
+) -> ControlError {
+    lead_refusal_for(
+        thegn_core::control::Verb::OpenSession,
+        caller,
+        worktree,
+        refusal,
+    )
+}
+
+/// Audit a daemon-side Lead refusal of `verb` against `target` (a worktree, or
+/// a session id) and turn it into the caller's error. The audit record carries
+/// the caller's pairing id and label and the target, never request content.
+fn lead_refusal_for(
+    verb: thegn_core::control::Verb,
+    caller: &LeadCaller,
+    target: &str,
+    refusal: &thegn_core::lead_confine::ConfineRefusal,
+) -> ControlError {
+    thegn_svc::control::http::audit_lead_refusal(&caller.pairing_id, &caller.label, verb, target);
+    ControlError::FailedPrecondition(refusal.to_string())
+}
+
+/// The post-resolution half of the Lead `sessions.open` rule: the launch the
+/// daemon resolved must sit behind a contained sandbox backend. `backend` is
+/// `None` when nothing resolved through the agent path (a raw argv), which a
+/// confined open never may be.
+fn lead_open_postcheck(
+    spec: &OpenSpec,
+    backend: Option<&str>,
+    caller: &LeadCaller,
+) -> ControlResult<()> {
+    use thegn_core::lead_confine::{ConfineRefusal, ResolvedOpen, check_resolved_open};
+    let worktree = super::agent_open::spec_worktree(spec).unwrap_or_default();
+    let Some(backend) = backend else {
+        return Err(lead_refusal(caller, &worktree, &ConfineRefusal::NoAgent));
+    };
+    check_resolved_open(&ResolvedOpen {
+        worktree: &worktree,
+        registered: true,
+        backend: Some(backend),
+    })
+    .map_err(|refusal| lead_refusal(caller, &worktree, &refusal))
+}
+
+impl DaemonService {
+    /// The pre-launch half of the Lead `sessions.open` rule: the request shape
+    /// again (the automation path never crossed a transport check), then the
+    /// worktree must be registered. Runs before any side effect.
+    async fn lead_open_precheck(&self, spec: &OpenSpec, caller: &LeadCaller) -> ControlResult<()> {
+        use thegn_core::lead_confine::{RequestShape, ResolvedOpen, check, check_resolved_open};
+        let worktree = super::agent_open::spec_worktree(spec).unwrap_or_default();
+        let mut shape = thegn_svc::control::lead_open_shape(spec);
+        // A rule's ancestry is set by the daemon's own executor; a Lead
+        // transport call carrying one was refused before reaching here.
+        shape.automation_origin = false;
+        if let Err(refusal) = check(
+            thegn_core::control::Verb::OpenSession,
+            &RequestShape::Open(shape),
+        ) {
+            return Err(lead_refusal(caller, &worktree, &refusal));
+        }
+        let requested = worktree.clone();
+        let registered = self
+            .with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                let rows = db.worktrees()?;
+                Ok(rows.iter().any(|row| row.worktree == requested))
+            })
+            .await?;
+        check_resolved_open(&ResolvedOpen {
+            worktree: &worktree,
+            registered,
+            backend: None,
         })
+        .map_err(|refusal| lead_refusal(caller, &worktree, &refusal))
     }
 
-    fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+    /// `sessions.open`, for every caller. `caller` is set for a Lead-confined
+    /// transport call ([`ControlApi::open_confined`]); a Lead-authored
+    /// automation rule's open is confined the same way, keyed off its
+    /// `lead:` rule id ([`thegn_core::lead_confine::is_lead_rule_id`]).
+    fn open_with(
+        &self,
+        spec: OpenSpec,
+        caller: Option<LeadCaller>,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
             // Refuse an oversized geometry before any fence or registry work:
             // the emulator allocates rows x cols cells.
             check_pty_size(spec.rows, spec.cols)?;
             if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(ControlError::Conflict("daemon is shutting down".into()));
+            }
+            // The Lead confinement (`thegn_core::lead_confine`): a Lead
+            // transport call, or a Lead-authored rule firing. Checked before
+            // any fence, registry or launch work.
+            let confine = caller.or_else(|| lead_rule_caller(&spec));
+            if let Some(caller) = &confine {
+                // b155 (6f): while paused the Lead can read but not spawn.
+                self.refuse_while_paused().await?;
+                self.lead_open_precheck(&spec, caller).await?;
             }
             // Hold the same per-worktree gate a migration owns exclusively.
             // Keep it through registry insertion: an open is therefore either
@@ -1446,6 +1551,12 @@ impl ControlApi for DaemonService {
                     None,
                 ),
             };
+            // A Lead worker must actually have entered a sandbox: judged on
+            // the resolved launch (its argv-reconciled backend), never on the
+            // configured intent. Nothing has been spawned yet.
+            if let Some(caller) = &confine {
+                lead_open_postcheck(&spec, resolved.as_ref().map(|r| r.backend.as_str()), caller)?;
+            }
 
             // The resolved argv is already sandbox-wrapped AND CPU-capped by
             // `enter_argv`; a raw caller's argv is capped here, unless it says
@@ -1637,11 +1748,129 @@ impl ControlApi for DaemonService {
                     tracing::warn!(target: "thegn::daemon", "adopt intent for {id} failed: {e}");
                 }
             }
+            // Every Lead check passed and the worker is up: record who opened
+            // it, the only provenance a Lead-confined `sessions.input` accepts
+            // ([`DaemonService::lead_input_precheck`]).
+            if let Some(caller) = &confine {
+                self.mark_lead_opened(&info.id, &caller.label).await;
+            }
             if let Some(guard) = launch_guard {
                 guard.commit(&info);
             }
+            // The daemon-skew echo (WS00-P1-11, `thegn_svc::control::open_fields`):
+            // `info.honoured` names each security-relevant `OpenSpec` field this
+            // open applied to the spawn. None exists yet, so it stays
+            // `Vec::new()` (from `SessionMeta::info`) and is never serialised.
+            // Each field's owner pushes its name here only after applying it:
+            // `env_scrub` (WS02-P4-15), `egress_lease` (WS04-P2-09), `shell`
+            // (WS09-P5-05).
+            debug_assert!(info.honoured.is_empty());
             Ok(info)
         })
+    }
+
+    /// Record `session` as opened by the Lead labelled `label`. A session that
+    /// already exited stays unmarked (its tombstone is never inputtable).
+    async fn mark_lead_opened(&self, session: &str, label: &str) {
+        match self.sessions.lock().await.get_mut(session) {
+            Some(entry) => entry.lead_opener = Some(label.to_string()),
+            None => tracing::debug!(
+                target: "thegn::daemon",
+                session,
+                "Lead-opened session exited before it was marked"
+            ),
+        }
+    }
+
+    /// The daemon half of a Lead-confined `sessions.input`, run before any
+    /// byte reaches the PTY: the bytes again (plain text and Enter only,
+    /// [`thegn_core::lead_input::check`]), then provenance: `session` must be
+    /// a live entry marked Lead-opened by [`Self::mark_lead_opened`]. A
+    /// tombstone, an unknown id, a session the user opened, and an id reused by
+    /// a later launch are all refused alike, and audited. Any Lead may answer
+    /// any Lead-opened worker (Lead tabs share one trust level); the allowed
+    /// call is audited by the caller. Returns the live mailbox.
+    async fn lead_input_precheck(
+        &self,
+        session: &str,
+        bytes: &[u8],
+        caller: &LeadCaller,
+    ) -> ControlResult<mpsc::Sender<SessionMsg>> {
+        use thegn_core::lead_confine::{ConfineRefusal, RequestShape, check};
+        if let Err(refusal) = check(
+            thegn_core::control::Verb::SendInput,
+            &RequestShape::Input { bytes },
+        ) {
+            return Err(lead_refusal_for(
+                thegn_core::control::Verb::SendInput,
+                caller,
+                session,
+                &refusal,
+            ));
+        }
+        let lead_worker = self
+            .sessions
+            .lock()
+            .await
+            .get(session)
+            .filter(|entry| entry.lead_opener.is_some())
+            .map(|entry| entry.msg_tx.clone());
+        lead_worker.ok_or_else(|| {
+            lead_refusal_for(
+                thegn_core::control::Verb::SendInput,
+                caller,
+                session,
+                &ConfineRefusal::NotLeadWorker(session.to_string()),
+            )
+        })
+    }
+}
+
+impl ControlApi for DaemonService {
+    fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
+        Box::pin(async move {
+            let daemon_id = self.daemon_id.clone();
+            let leases: Vec<LeaseRow> = self
+                .with_db(move |db| db.leases(&daemon_id))
+                .await
+                .unwrap_or_default();
+            let sessions = self.sessions.lock().await;
+            let mut out: Vec<SessionInfo> = sessions
+                .values()
+                .map(|e| {
+                    let lease = leases
+                        .iter()
+                        .find(|l| l.session_id == e.meta.id && l.kind == "relay")
+                        .and_then(|l| l.expires_at);
+                    let live = e.live.lock().expect("live meta lock");
+                    e.meta.info(&live, lease)
+                })
+                .collect();
+            drop(sessions);
+            // Recently-finished sessions belong in the roster too: a supervisor
+            // asking "which of my workers are done?" must not have to race the
+            // moment of exit. They carry `exited_at_ms`, so a caller that wants
+            // only live sessions filters on it (the split lookup below does).
+            let now = now_ms();
+            let mut tombs = self.tombs.lock().await;
+            tombs.sweep(now);
+            out.extend(tombs.iter(now).map(|(_, t)| t.info()));
+            drop(tombs);
+            out.sort_by_key(|s| s.created_at_ms);
+            Ok(out)
+        })
+    }
+
+    fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        self.open_with(spec, None)
+    }
+
+    fn open_confined(
+        &self,
+        spec: OpenSpec,
+        caller: LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        self.open_with(spec, Some(caller))
     }
 
     fn fork(&self, spec: ForkSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
@@ -1708,7 +1937,34 @@ impl ControlApi for DaemonService {
         bytes: Vec<u8>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
+            // A non-Lead input (the user typing in an adopted pane, or any other
+            // caller) takes the session over: the Lead may no longer type into it.
+            if let Some(entry) = self.sessions.lock().await.get_mut(session)
+                && entry.lead_opener.take().is_some()
+            {
+                tracing::info!(target: "thegn::daemon", session, "non-Lead input: Lead input to this session is now refused");
+            }
             let tx = self.live_tx(session).await?;
+            tx.send(SessionMsg::Stdin(bytes))
+                .await
+                .map_err(|_| Self::not_found(session))
+        })
+    }
+
+    fn send_input_confined<'a>(
+        &'a self,
+        session: &'a str,
+        bytes: Vec<u8>,
+        caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async move {
+            let tx = self.lead_input_precheck(session, &bytes, &caller).await?;
+            thegn_svc::control::http::audit_lead_allowed(
+                &caller.pairing_id,
+                &caller.label,
+                thegn_core::control::Verb::SendInput,
+                session,
+            );
             tx.send(SessionMsg::Stdin(bytes))
                 .await
                 .map_err(|_| Self::not_found(session))
@@ -2696,40 +2952,43 @@ impl ControlApi for DaemonService {
         note: thegn_svc::control::PushedNote,
     ) -> BoxFuture<'_, ControlResult<i64>> {
         Box::pin(async move {
-            self.with_db(move |db| {
-                let kind = if note.automation_origin.is_some() {
-                    "automation"
-                } else {
-                    match note.urgency.as_deref() {
-                        Some("alert") | Some("critical") => "agent_attention",
-                        _ => "agent_done",
-                    }
-                };
-                let source = note.source.as_deref().unwrap_or("api");
-                let message = if note.body.is_empty() {
-                    note.title.clone()
-                } else {
-                    format!("{} — {}", note.title, note.body)
-                };
-                crate::automation_events::emit_with_facts(
-                    db,
-                    kind,
-                    source,
-                    &message,
-                    "",
-                    crate::automation_events::EventFacts {
-                        origin: note.automation_origin.map(|origin| {
-                            thegn_core::automation::AutomationOrigin {
-                                root_event_id: origin.root_event_id,
-                                rule_id: origin.rule_id,
-                                run_id: origin.run_id,
-                            }
-                        }),
-                        ..Default::default()
-                    },
-                )
-            })
-            .await
+            let id = self
+                .with_db(move |db| {
+                    let kind = if note.automation_origin.is_some() {
+                        "automation"
+                    } else {
+                        match note.urgency.as_deref() {
+                            Some("alert") | Some("critical") => "agent_attention",
+                            _ => "agent_done",
+                        }
+                    };
+                    let source = note.source.as_deref().unwrap_or("api");
+                    let message = if note.body.is_empty() {
+                        note.title.clone()
+                    } else {
+                        format!("{} — {}", note.title, note.body)
+                    };
+                    crate::automation_events::emit_with_facts(
+                        db,
+                        kind,
+                        source,
+                        &message,
+                        "",
+                        crate::automation_events::EventFacts {
+                            origin: note.automation_origin.map(|origin| {
+                                thegn_core::automation::AutomationOrigin {
+                                    root_event_id: origin.root_event_id,
+                                    rule_id: origin.rule_id,
+                                    run_id: origin.run_id,
+                                }
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .await?;
+            super::lead_caps::feed::notification(&self.events, id);
+            Ok(id)
         })
     }
 
@@ -2743,32 +3002,35 @@ impl ControlApi for DaemonService {
                 .compiled_rules()
                 .map_err(|errors| ControlError::Conflict(errors.join("\n")))?;
             let profile = cfg.active_profile().is_some();
-            self.with_db(move |db| {
-                use thegn_core::store::AutomationStore;
-                Ok(rules
-                    .into_iter()
-                    .map(|rule| thegn_svc::control::AutomationRuleInfo {
-                        recent_outcome: db
-                            .automation_runs(Some(&rule.id), 1)
-                            .ok()
-                            .and_then(|rows| rows.into_iter().next())
-                            .map(|row| row.outcome),
-                        name: rule.id,
-                        enabled: rule.enabled,
-                        trusted_layer: if profile { "global+profile" } else { "global" }.into(),
-                        event: rule.event.as_str().into(),
-                        action: rule.action.cap,
-                        inert_reason: if !effective.enabled {
-                            Some("automations disabled".into())
-                        } else if !rule.enabled {
-                            Some("rule disabled".into())
-                        } else {
-                            None
-                        },
-                    })
-                    .collect())
-            })
-            .await
+            let mut rows = self
+                .with_db(move |db| {
+                    use thegn_core::store::AutomationStore;
+                    Ok(rules
+                        .into_iter()
+                        .map(|rule| thegn_svc::control::AutomationRuleInfo {
+                            recent_outcome: db
+                                .automation_runs(Some(&rule.id), 1)
+                                .ok()
+                                .and_then(|rows| rows.into_iter().next())
+                                .map(|row| row.outcome),
+                            name: rule.id,
+                            enabled: rule.enabled,
+                            trusted_layer: if profile { "global+profile" } else { "global" }.into(),
+                            event: rule.event.as_str().into(),
+                            action: rule.action.cap,
+                            inert_reason: if !effective.enabled {
+                                Some("automations disabled".into())
+                            } else if !rule.enabled {
+                                Some("rule disabled".into())
+                            } else {
+                                None
+                            },
+                        })
+                        .collect::<Vec<_>>())
+                })
+                .await?;
+            rows.extend(super::lead_caps::automations::list_lead_rules(self).await?);
+            Ok(rows)
         })
     }
 
@@ -2789,12 +3051,14 @@ impl ControlApi for DaemonService {
                 .effective_automations()
                 .compiled_rules()
                 .map_err(|errors| ControlError::Conflict(errors.join("\n")))?;
-            let rule = rules
-                .into_iter()
-                .find(|rule| rule.id == request.rule)
-                .ok_or_else(|| {
-                    ControlError::NotFound(format!("automation rule {}", request.rule))
-                })?;
+            let rule = match rules.into_iter().find(|rule| rule.id == request.rule) {
+                Some(rule) => rule,
+                None => super::lead_caps::automations::find_rule(self, &request.rule)
+                    .await?
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("automation rule {}", request.rule))
+                    })?,
+            };
             let decisions = thegn_core::automation::evaluate(
                 std::slice::from_ref(&rule),
                 &event,
@@ -2841,6 +3105,159 @@ impl ControlApi for DaemonService {
                 ..Default::default()
             })
             .await
+        })
+    }
+
+    // --- Lead tool surface (THE-2172): behaviour lives in daemon/lead_caps ---
+
+    fn overview_get(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::overview::get(self, req))
+    }
+
+    fn notifications_list(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::notifications::list(self, req))
+    }
+
+    fn notifications_ack(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::notifications::ack(self, req))
+    }
+
+    fn automations_put(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations::put(self, req))
+    }
+
+    fn automations_rm(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations::rm(self, req))
+    }
+
+    fn automations_enable(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations::enable(self, req))
+    }
+
+    fn automations_runs(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations::runs(self, req))
+    }
+
+    fn approvals_list(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::approvals::list(self, req))
+    }
+
+    fn approvals_request(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::approvals::request(self, req))
+    }
+
+    fn approvals_resolve(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::approvals::resolve(self, req))
+    }
+
+    fn merge_drain(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::merge_drain::drain(self, req))
+    }
+
+    fn automations_pause(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations_pause::pause(self, req))
+    }
+
+    fn automations_resume(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations_pause::resume(self, req))
+    }
+
+    fn approvals_redeem(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::approvals_redeem::redeem(self, req))
+    }
+
+    fn automations_halt(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::halt::halt(self, req))
+    }
+
+    fn mcp_proxy_profile_env(
+        &self,
+        req: serde_json::Value,
+        caller: thegn_svc::control::ProfileEnvCaller,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::proxy_env::profile_env(self, req, caller))
+    }
+
+    fn issues_update_confined<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a thegn_core::issue::IssuePatch,
+        repo: Option<&'a str>,
+        account: Option<&'a str>,
+        caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "patch": patch,
+                "repo": repo,
+                "account": account,
+            });
+            super::lead_caps::outward::gate(self, "issues.update", id, body, &caller).await?;
+            self.issues_update(id, patch, repo, account).await
+        })
+    }
+
+    fn issues_comment_confined<'a>(
+        &'a self,
+        id: &'a str,
+        body: &'a str,
+        repo: Option<&'a str>,
+        account: Option<&'a str>,
+        caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async move {
+            let canonical = serde_json::json!({
+                "body": body,
+                "repo": repo,
+                "account": account,
+            });
+            super::lead_caps::outward::gate(self, "issues.comment", id, canonical, &caller).await?;
+            self.issues_comment(id, body, repo, account).await
         })
     }
 
@@ -3050,44 +3467,47 @@ impl ControlApi for DaemonService {
                 }
             };
             let stage_order = self.config.pipeline.stage_names();
-            self.with_db(move |db| {
-                use thegn_core::store::NotificationStore;
-                if let Some(parent_id) = req.parent_id
-                    && let Some(parent) = db.get_dispatch(parent_id)?
-                    && let Err(conflict) = thegn_core::db::check_parent_stage(
-                        &stage_order,
-                        parent.stage.as_deref(),
-                        req.stage.as_deref(),
-                    )
-                {
-                    return Err(anyhow::Error::new(thegn_core::db::ParentDispatchConflict {
-                        parent_id,
-                        reason: conflict.reason,
-                    }));
-                }
-                let id = db.put_dispatch_with_parent_check_led(
-                    thegn_core::issue::NewDispatch {
-                        issue_id: &issue_id,
-                        worktree_path: &worktree_path,
-                        agent_name: &req.agent_name,
-                        stage: req.stage.as_deref(),
-                        parent_id: req.parent_id,
-                        session_id: req.session_id.as_deref(),
-                        artifact_path: req.artifact_path.as_deref(),
-                        chunk_path: None,
-                    },
-                    req.lead
-                        .as_ref()
-                        .map_or(thegn_core::db::LeadProof::Unbound, |lead| lead.proof()),
-                )?;
-                db.get_dispatch(id)?
-                    .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
-            })
-            .await
-            .map_err(|error| match error {
-                ControlError::Internal(error) => map_dispatch_put_error(error),
-                other => other,
-            })
+            let dispatch = self
+                .with_db(move |db| {
+                    use thegn_core::store::NotificationStore;
+                    if let Some(parent_id) = req.parent_id
+                        && let Some(parent) = db.get_dispatch(parent_id)?
+                        && let Err(conflict) = thegn_core::db::check_parent_stage(
+                            &stage_order,
+                            parent.stage.as_deref(),
+                            req.stage.as_deref(),
+                        )
+                    {
+                        return Err(anyhow::Error::new(thegn_core::db::ParentDispatchConflict {
+                            parent_id,
+                            reason: conflict.reason,
+                        }));
+                    }
+                    let id = db.put_dispatch_with_parent_check_led(
+                        thegn_core::issue::NewDispatch {
+                            issue_id: &issue_id,
+                            worktree_path: &worktree_path,
+                            agent_name: &req.agent_name,
+                            stage: req.stage.as_deref(),
+                            parent_id: req.parent_id,
+                            session_id: req.session_id.as_deref(),
+                            artifact_path: req.artifact_path.as_deref(),
+                            chunk_path: None,
+                        },
+                        req.lead
+                            .as_ref()
+                            .map_or(thegn_core::db::LeadProof::Unbound, |lead| lead.proof()),
+                    )?;
+                    db.get_dispatch(id)?
+                        .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
+                })
+                .await
+                .map_err(|error| match error {
+                    ControlError::Internal(error) => map_dispatch_put_error(error),
+                    other => other,
+                })?;
+            super::lead_caps::feed::dispatch_status(&self.events, dispatch.id);
+            Ok(dispatch)
         })
     }
 
@@ -3104,7 +3524,24 @@ impl ControlApi for DaemonService {
             .map_err(|error| match error {
                 ControlError::Internal(error) => map_dispatch_status_error(error),
                 other => other,
-            })
+            })?;
+            super::lead_caps::feed::dispatch_status(&self.events, id);
+            if status == thegn_core::issue::AgentDispatchStatus::Done {
+                super::stage_executor::kick_row(id);
+            }
+            Ok(())
+        })
+    }
+
+    fn dispatch_put_confined(
+        &self,
+        req: thegn_svc::control::DispatchPutReq,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        Box::pin(async move {
+            // b155 (6f): while paused the Lead can read but not spawn.
+            self.refuse_while_paused().await?;
+            self.dispatch_put(req).await
         })
     }
 
@@ -3120,7 +3557,12 @@ impl ControlApi for DaemonService {
                 .map_err(|error| match error {
                     ControlError::Internal(error) => map_dispatch_status_error(error),
                     other => other,
-                })
+                })?;
+            super::lead_caps::feed::dispatch_status(&self.events, id);
+            if status == thegn_core::issue::AgentDispatchStatus::Done {
+                super::stage_executor::kick_row(id);
+            }
+            Ok(())
         })
     }
 
@@ -3148,6 +3590,9 @@ impl ControlApi for DaemonService {
             let outcome = self
                 .with_db(move |db| worker_report_in_db(db, id, &secret, &req.text, &mut || {}))
                 .await?;
+            if outcome.is_ok() {
+                super::stage_executor::kick_row(id);
+            }
             outcome.map_err(|refusal| {
                 tracing::warn!(target: "thegn::dispatch", dispatch_id = id, refusal = refusal.kind(), "worker dispatch capability refused");
                 if refusal == thegn_core::CapabilityRefusal::RowMissing {
@@ -3703,6 +4148,7 @@ mod tests {
             })),
             recipe: None,
             process: None,
+            lead_opener: None,
         }
     }
 
@@ -4108,6 +4554,383 @@ mod tests {
         .await
         .unwrap();
         svc
+    }
+
+    fn lead_caller() -> LeadCaller {
+        LeadCaller {
+            pairing_id: "p1".into(),
+            label: "lead:g/0".into(),
+        }
+    }
+
+    fn lead_agent_spec(worktree: &str) -> OpenSpec {
+        OpenSpec {
+            rows: 24,
+            cols: 80,
+            worktree: Some(worktree.into()),
+            agent: Some(thegn_svc::control::AgentLaunch {
+                agent: "coder".into(),
+                prompt: "review".into(),
+                headless: None,
+                bind_worktree: false,
+                resume: None,
+                continue_last: false,
+                stage: None,
+                permissions: Vec::new(),
+                widen_permissions: false,
+                fork: false,
+                native_session_id: None,
+            }),
+            ..OpenSpec::default()
+        }
+    }
+
+    fn expect_lead_refusal(result: ControlResult<SessionInfo>, needle: &str) {
+        match result {
+            Err(ControlError::FailedPrecondition(m)) => {
+                assert!(
+                    m.starts_with(thegn_core::lead_confine::REFUSAL_PREFIX) && m.contains(needle),
+                    "{m}"
+                );
+            }
+            other => panic!("expected a Lead refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_confined_open_refuses_an_unregistered_worktree_before_any_launch() {
+        let (svc, _rx) = service(0);
+        expect_lead_refusal(
+            svc.open_confined(lead_agent_spec("/not/registered"), lead_caller())
+                .await,
+            "/not/registered",
+        );
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lead_confined_open_rechecks_the_shape_in_the_daemon() {
+        let (svc, _rx) = service(0);
+        let mut raw = lead_agent_spec("/w");
+        raw.argv = vec!["/bin/sh".into()];
+        expect_lead_refusal(svc.open_confined(raw, lead_caller()).await, "raw argv");
+        let mut env = lead_agent_spec("/w");
+        env.env = vec![("K".into(), "V".into())];
+        expect_lead_refusal(svc.open_confined(env, lead_caller()).await, "env");
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    /// b155 (6f): while automations are paused the Lead can read but not
+    /// spawn: a confined open and a confined `dispatches.put` are refused
+    /// before any registry or launch work.
+    #[tokio::test]
+    async fn lead_confined_spawns_are_refused_while_paused() {
+        let (svc, _rx) = service(0);
+        svc.with_db(|db| thegn_core::automation_control::set_paused(db, true))
+            .await
+            .unwrap();
+        match svc
+            .open_confined(lead_agent_spec("/not/registered"), lead_caller())
+            .await
+        {
+            Err(ControlError::FailedPrecondition(m)) => assert_eq!(m, PAUSED_SPAWN_REFUSAL),
+            other => panic!("expected the paused refusal, got {other:?}"),
+        }
+        let put = thegn_svc::control::DispatchPutReq {
+            issue_id: "linear:THE-1".into(),
+            worktree_path: "/w".into(),
+            agent_name: "coder".into(),
+            ..Default::default()
+        };
+        match svc.dispatch_put_confined(put, lead_caller()).await {
+            Err(ControlError::FailedPrecondition(m)) => assert_eq!(m, PAUSED_SPAWN_REFUSAL),
+            other => panic!("expected the paused refusal, got {other:?}"),
+        }
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+        // Resumed, the confined open reaches its ordinary Lead checks again.
+        svc.with_db(|db| thegn_core::automation_control::set_paused(db, false))
+            .await
+            .unwrap();
+        expect_lead_refusal(
+            svc.open_confined(lead_agent_spec("/not/registered"), lead_caller())
+                .await,
+            "/not/registered",
+        );
+    }
+
+    /// A live-looking session whose stub actor records every byte written to
+    /// it, so a test can prove input did (or did not) reach the PTY.
+    async fn insert_input_probe(svc: &DaemonService, id: &str) -> Arc<Mutex<Vec<u8>>> {
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = written.clone();
+        svc.sessions
+            .lock()
+            .await
+            .insert(id.to_string(), shutdown_test_entry(msg_tx));
+        tokio::spawn(async move {
+            while let Some(msg) = msg_rx.recv().await {
+                if let SessionMsg::Stdin(bytes) = msg {
+                    sink.lock().expect("probe lock").extend_from_slice(&bytes);
+                }
+            }
+        });
+        written
+    }
+
+    /// Let the probe actor drain its mailbox.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    mod lead_audit_capture {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span;
+        use tracing::{Event, Metadata, Subscriber};
+
+        #[derive(Default, Clone)]
+        pub(super) struct Captured(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+        impl Captured {
+            pub(super) fn records(&self) -> Vec<BTreeMap<String, String>> {
+                self.0.lock().expect("capture lock").clone()
+            }
+        }
+
+        struct FieldVisitor(BTreeMap<String, String>);
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        pub(super) struct AuditSubscriber(pub(super) Captured);
+        impl Subscriber for AuditSubscriber {
+            fn enabled(&self, meta: &Metadata<'_>) -> bool {
+                meta.target() == "thegn::control::audit"
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() != "thegn::control::audit" {
+                    return;
+                }
+                let mut v = FieldVisitor(BTreeMap::new());
+                event.record(&mut v);
+                self.0.0.lock().expect("capture lock").push(v.0);
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+    }
+
+    fn input_audits(
+        captured: &lead_audit_capture::Captured,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        captured
+            .records()
+            .into_iter()
+            .filter(|m| m.get("capability").map(String::as_str) == Some("sessions.input"))
+            .collect()
+    }
+
+    fn expect_input_refusal(result: ControlResult<()>, needle: &str) {
+        match result {
+            Err(ControlError::FailedPrecondition(m)) => {
+                assert!(
+                    m.starts_with(thegn_core::lead_confine::REFUSAL_PREFIX) && m.contains(needle),
+                    "{m}"
+                );
+            }
+            other => panic!("expected a Lead input refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_input_reaches_a_session_the_lead_opened_and_is_audited() {
+        let captured = lead_audit_capture::Captured::default();
+        let _guard =
+            tracing::subscriber::set_default(lead_audit_capture::AuditSubscriber(captured.clone()));
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "w1").await;
+        svc.mark_lead_opened("w1", "lead:g/0").await;
+        svc.send_input_confined("w1", b"use option 2\r".to_vec(), lead_caller())
+            .await
+            .expect("a Lead may answer its own worker");
+        settle().await;
+        assert_eq!(*written.lock().unwrap(), b"use option 2\r".to_vec());
+        let recs = input_audits(&captured);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].get("outcome").map(String::as_str), Some("ok"));
+        assert_eq!(recs[0].get("label").map(String::as_str), Some("lead:g/0"));
+        assert_eq!(recs[0].get("resource").map(String::as_str), Some("w1"));
+        assert!(
+            recs[0].values().all(|v| !v.contains("option 2")),
+            "the audit never carries the input: {recs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lead_input_to_a_session_the_user_opened_is_refused_and_audited() {
+        let captured = lead_audit_capture::Captured::default();
+        let _guard =
+            tracing::subscriber::set_default(lead_audit_capture::AuditSubscriber(captured.clone()));
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "mine").await;
+        expect_input_refusal(
+            svc.send_input_confined("mine", b"rm -rf ~\r".to_vec(), lead_caller())
+                .await,
+            "opened itself",
+        );
+        settle().await;
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "no byte reached the PTY"
+        );
+        let recs = input_audits(&captured);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(
+            recs[0].get("outcome").map(String::as_str),
+            Some("lead_confined")
+        );
+        assert_eq!(recs[0].get("label").map(String::as_str), Some("lead:g/0"));
+        assert_eq!(recs[0].get("resource").map(String::as_str), Some("mine"));
+        assert!(recs[0].values().all(|v| !v.contains("rm -rf")), "{recs:?}");
+    }
+
+    #[tokio::test]
+    async fn lead_input_to_an_unknown_or_tombstoned_session_is_refused() {
+        let (svc, _rx) = service(0);
+        expect_input_refusal(
+            svc.send_input_confined("ghost", b"hi".to_vec(), lead_caller())
+                .await,
+            "ghost",
+        );
+        // A Lead worker that exited: its tombstone is readable but never
+        // inputtable.
+        svc.tombs.lock().await.insert(
+            "dead".into(),
+            super::super::tombstone::tests::tomb("dead", Some(0)),
+            now_ms(),
+        );
+        expect_input_refusal(
+            svc.send_input_confined("dead", b"hi".to_vec(), lead_caller())
+                .await,
+            "dead",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_session_id_is_not_lead_opened() {
+        let (svc, _rx) = service(0);
+        insert_input_probe(&svc, "w2").await;
+        svc.mark_lead_opened("w2", "lead:g/0").await;
+        // The worker ends and a later, user-opened launch lands on the same id.
+        svc.sessions.lock().await.remove("w2");
+        let written = insert_input_probe(&svc, "w2").await;
+        expect_input_refusal(
+            svc.send_input_confined("w2", b"hi".to_vec(), lead_caller())
+                .await,
+            "opened itself",
+        );
+        settle().await;
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lead_input_rechecks_the_bytes_in_the_daemon() {
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "w3").await;
+        svc.mark_lead_opened("w3", "lead:g/0").await;
+        for bytes in [&b"\x1b[201~"[..], b"\x03", b"\x1b]52;c;eA==\x07", b"a\0"] {
+            expect_input_refusal(
+                svc.send_input_confined("w3", bytes.to_vec(), lead_caller())
+                    .await,
+                "sessions.input",
+            );
+        }
+        settle().await;
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plain_send_input_ignores_lead_provenance() {
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "u1").await;
+        svc.send_input("u1", b"\x1b[A\x03".to_vec())
+            .await
+            .expect("a non-Lead caller is unaffected");
+        settle().await;
+        assert_eq!(*written.lock().unwrap(), b"\x1b[A\x03".to_vec());
+    }
+
+    #[tokio::test]
+    async fn user_input_ends_the_leads_input_right() {
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "w4").await;
+        svc.mark_lead_opened("w4", "lead:g/0").await;
+        svc.send_input("w4", b"x".to_vec()).await.unwrap();
+        expect_input_refusal(
+            svc.send_input_confined("w4", b"hi".to_vec(), lead_caller())
+                .await,
+            "opened itself",
+        );
+        settle().await;
+        assert_eq!(*written.lock().unwrap(), b"x".to_vec());
+    }
+
+    #[tokio::test]
+    async fn lead_authored_rule_opens_are_confined_on_the_plain_path() {
+        let (svc, _rx) = service(0);
+        let mut spec = lead_agent_spec("/not/registered");
+        spec.automation_origin = Some(thegn_svc::control::AutomationOrigin {
+            root_event_id: "e1".into(),
+            rule_id: "lead:nightly".into(),
+            run_id: "7".into(),
+        });
+        expect_lead_refusal(svc.open(spec).await, "/not/registered");
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn lead_rule_caller_keys_off_the_lead_rule_prefix_only() {
+        let mut spec = lead_agent_spec("/w");
+        assert!(lead_rule_caller(&spec).is_none());
+        spec.automation_origin = Some(thegn_svc::control::AutomationOrigin {
+            root_event_id: "e1".into(),
+            rule_id: "nightly".into(),
+            run_id: "7".into(),
+        });
+        assert!(lead_rule_caller(&spec).is_none());
+        if let Some(origin) = spec.automation_origin.as_mut() {
+            origin.rule_id = "lead:nightly".into();
+        }
+        let caller = lead_rule_caller(&spec).expect("a Lead rule is confined");
+        assert_eq!(caller.label, "lead:nightly");
+    }
+
+    #[test]
+    fn lead_postcheck_refuses_an_unsandboxed_resolution_naming_the_worktree() {
+        let spec = lead_agent_spec("/w/feature");
+        match lead_open_postcheck(&spec, Some("host"), &lead_caller()) {
+            Err(ControlError::FailedPrecondition(m)) => {
+                assert!(m.contains("/w/feature") && m.contains("`host`"), "{m}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(lead_open_postcheck(&spec, None, &lead_caller()).is_err());
+        assert!(lead_open_postcheck(&spec, Some("bwrap"), &lead_caller()).is_ok());
     }
 
     fn assert_uniform_miss(e: &ControlError, shown: &str) {
@@ -6012,6 +6835,8 @@ mod tests {
                 server_label: "test thegn".into(),
                 cors_origins: Vec::new(),
                 event_streams: Default::default(),
+                lead_listener: false,
+                lead_token_ttl_secs: 0,
             };
             let app = thegn_svc::control::http::router(state);
             let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -6257,6 +7082,7 @@ mod tests {
                 })),
                 recipe: None,
                 process: None,
+                lead_opener: None,
             },
         );
 
@@ -7471,6 +8297,8 @@ mod tests {
             server_label: "test thegn".into(),
             cors_origins: Vec::new(),
             event_streams: Default::default(),
+            lead_listener: false,
+            lead_token_ttl_secs: 0,
         }
     }
 
@@ -8326,6 +9154,7 @@ mod tests {
                 live,
                 recipe: None,
                 process: None,
+                lead_opener: None,
             },
         );
         tokio::spawn(async move {
@@ -8547,6 +9376,8 @@ mod tests {
             server_label: "test thegn".into(),
             cors_origins: Vec::new(),
             event_streams: Default::default(),
+            lead_listener: false,
+            lead_token_ttl_secs: 0,
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(async move {
@@ -8676,6 +9507,8 @@ mod tests {
             server_label: "test thegn".into(),
             cors_origins: Vec::new(),
             event_streams: Default::default(),
+            lead_listener: false,
+            lead_token_ttl_secs: 0,
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(

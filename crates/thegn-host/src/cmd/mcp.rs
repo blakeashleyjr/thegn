@@ -63,7 +63,12 @@ pub enum Action {
     /// `[mcp_servers.<name>]` upstream (namespaced `<upstream>__<tool>`). An
     /// agent registers this as its single MCP server. Register with e.g.
     /// `thegn mcp wire`, or `claude mcp add thegn -- thegn mcp proxy`.
-    Proxy,
+    Proxy {
+        /// Serve the hub for one named `[mcp]` profile (the Lead's scoped
+        /// tool set) instead of the default exposure.
+        #[arg(long)]
+        profile: Option<String>,
+    },
     /// Report the mcp-proxy hub's per-upstream state: exposed/hidden tools,
     /// scope, breaker/handshake. Probes the configured upstreams live.
     Status {
@@ -89,6 +94,10 @@ pub enum Action {
         /// Remove thegn's proxy entry (restores the pre-wire state).
         #[arg(long)]
         remove: bool,
+        /// Wire (or with `--remove`, unwire) the Lead's MCP entry instead of
+        /// the agents' proxy entry.
+        #[arg(long, conflicts_with_all = ["agent", "all"])]
+        lead: bool,
     },
     /// Manage keyring entries the proxy resolves at spawn (`keyring:<name>`
     /// refs). `list` names entries, never values.
@@ -126,8 +135,8 @@ pub enum Action {
         /// `sessions_input`, `sessions_kill`, `sessions_resize`, `sessions_split`,
         /// `worktrees_open`, `notify_push`, `dispatches_put`,
         /// `dispatches_set_status`, `issues_update`, `issues_comment`) additionally need
-        /// `write`, `folders_assign` needs `git`, and `merge_add` needs
-        /// `git`. Pass
+        /// `write`, `folders_assign` needs `git`, and `merge_add` and
+        /// `merge_drain` need `git`. Pass
         /// `none` (or any empty/unknown set) to serve docs tools only.
         #[arg(long, value_delimiter = ',')]
         scopes: Option<Vec<String>>,
@@ -221,12 +230,15 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
             scopes,
             allow_session_input,
         } => serve(cfg, config_path, scopes.as_deref(), allow_session_input),
-        Action::Proxy => crate::mcp_proxy::run_shim(cfg),
+        Action::Proxy { profile } => crate::lead::mcp::run_proxy(cfg, profile.as_deref()),
         Action::Status { json } => super::mcp_proxy_cmd::status(cfg, json),
         Action::Reload => super::mcp_proxy_cmd::reload(cfg),
-        Action::Wire { agent, all, remove } => {
-            super::mcp_proxy_cmd::wire(cfg, agent.as_deref(), all, remove)
-        }
+        Action::Wire {
+            lead: true, remove, ..
+        } => crate::lead::mcp::wire_cli(cfg, remove),
+        Action::Wire {
+            agent, all, remove, ..
+        } => super::mcp_proxy_cmd::wire(cfg, agent.as_deref(), all, remove),
         Action::Secret { action } => super::mcp_proxy_cmd::secret(action),
         Action::Preset { action } => super::mcp_proxy_cmd::preset(cfg, config_path, action),
     }
@@ -333,7 +345,9 @@ fn serve(
         &crate::fff_backend::fuzzy_rank,
         explain,
     )
-    .with_state(StateRouter::new(allowed, fetch));
+    .with_state(
+        StateRouter::new(allowed, fetch).with_caller(thegn_core::mcp::caller::caller_from_env()),
+    );
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -445,7 +459,7 @@ fn allowed_state_caps(
         .filter(|id| {
             lookup(id).is_some_and(|c| scopes.allows(scope_of(c)))
                 && (*id != "sessions.input" || allow_session_input)
-                && (*id != "merge.add"
+                && (!matches!(*id, "merge.add" | "merge.drain")
                     || thegn_core::control::route_to_host_token_allows_worktree(scopes, "", ""))
         })
         .collect()
@@ -729,7 +743,21 @@ async fn fetch_state(
             serde_json::to_value(reply).map_err(|e| e.to_string())
         }
         "issues.list" | "issues.get" | "dispatches.list" | "calendar.events"
-        | "calendar.clocks" => {
+        | "calendar.clocks"
+        // Lead tool surface (THE-2172): every route is POST, so the params
+        // become the JSON body unchanged.
+        | "overview.get"
+        | "notifications.list"
+        | "notifications.ack"
+        | "automations.put"
+        | "automations.rm"
+        | "automations.enable"
+        | "automations.runs"
+        | "approvals.list"
+        | "approvals.request"
+        | "merge.drain"
+        // THE-2197: the Lead's kill switch (no args; resume is never MCP).
+        | "automations.pause" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let params = args
                 .as_object()
@@ -1206,6 +1234,21 @@ mod tests {
         "semantic.blast_radius",
         "automations.list",
         "automations.test",
+        // Lead tool surface (THE-2172).
+        "overview.get",
+        "notifications.list",
+        "automations.runs",
+        "approvals.list",
+    ];
+
+    /// The Lead's write-scoped MCP tools (THE-2172).
+    const LEAD_WRITE_CAPS: &[&str] = &[
+        "notifications.ack",
+        "automations.put",
+        "automations.rm",
+        "automations.enable",
+        "approvals.request",
+        "automations.pause",
     ];
 
     #[test]
@@ -1244,7 +1287,7 @@ mod tests {
             sorted(READ_CAPS.to_vec()),
             "--scopes read"
         );
-        assert_eq!(READ_CAPS.len(), 23);
+        assert_eq!(READ_CAPS.len(), 27);
     }
 
     #[test]
@@ -1267,11 +1310,79 @@ mod tests {
         let mut expected = READ_CAPS.to_vec();
         expected.push("folders.assign");
         expected.push("merge.add");
+        expected.push("merge.drain");
         assert_eq!(
             sorted(allowed_state_caps(ScopeSet::parse("read,git"), false)),
             sorted(expected),
             "--scopes read,git"
         );
+    }
+
+    #[test]
+    fn lead_read_scope_exposes_only_the_lead_reads() {
+        let read = allowed_state_caps(ScopeSet::parse("read"), true);
+        for cap in [
+            "overview.get",
+            "notifications.list",
+            "automations.runs",
+            "approvals.list",
+        ] {
+            assert!(read.contains(&cap), "{read:?} missing {cap}");
+        }
+        for cap in LEAD_WRITE_CAPS
+            .iter()
+            .chain(&["merge.drain", "approvals.resolve"])
+        {
+            assert!(!read.contains(cap), "--scopes read must not grant {cap}");
+        }
+    }
+
+    #[test]
+    fn lead_write_scope_adds_ack_put_rm_enable_and_request() {
+        let write = allowed_state_caps(ScopeSet::parse("write"), false);
+        for cap in LEAD_WRITE_CAPS {
+            assert!(write.contains(cap), "{write:?} missing {cap}");
+            assert!(!READ_CAPS.contains(cap), "{cap} must not be read-scoped");
+        }
+        assert!(!write.contains(&"merge.drain"), "{write:?}");
+    }
+
+    #[test]
+    fn merge_drain_is_gated_exactly_like_merge_add() {
+        for scopes in ["read", "write", "merge_add", "exec", "read,write,exec"] {
+            let allowed = allowed_state_caps(ScopeSet::parse(scopes), true);
+            assert!(!allowed.contains(&"merge.drain"), "--scopes {scopes}");
+        }
+        // A naked merge_add grant is a worktree-bound route-to-host scope;
+        // unbound MCP callers need git, as for merge.add.
+        assert!(allowed_state_caps(ScopeSet::parse("merge_add"), false).is_empty());
+        for scopes in ["git", "admin"] {
+            let allowed = allowed_state_caps(ScopeSet::parse(scopes), false);
+            assert!(allowed.contains(&"merge.drain"), "--scopes {scopes}");
+            assert!(allowed.contains(&"merge.add"), "--scopes {scopes}");
+        }
+    }
+
+    #[test]
+    fn automations_resume_is_never_listed_on_any_scope() {
+        // THE-2197: resume is Admin and http+cli only; pause needs write.
+        for scopes in ["none", "read", "write", "git", "merge_add", "exec", "admin"] {
+            let allowed = allowed_state_caps(ScopeSet::parse(scopes), true);
+            assert!(
+                !allowed.contains(&"automations.resume"),
+                "--scopes {scopes}"
+            );
+        }
+        assert!(!allowed_state_caps(ScopeSet::parse("read"), true).contains(&"automations.pause"));
+        assert!(allowed_state_caps(ScopeSet::parse("write"), false).contains(&"automations.pause"));
+    }
+
+    #[test]
+    fn approvals_resolve_is_never_listed_on_any_scope() {
+        for scopes in ["none", "read", "write", "git", "merge_add", "exec", "admin"] {
+            let allowed = allowed_state_caps(ScopeSet::parse(scopes), true);
+            assert!(!allowed.contains(&"approvals.resolve"), "--scopes {scopes}");
+        }
     }
 
     #[test]

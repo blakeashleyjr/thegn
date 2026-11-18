@@ -48,7 +48,7 @@ const OMITTED: &[(&str, &str)] = &[
     ("observe", "Observe configuration is not exposed"),
     ("bars", "status bar configuration is not exposed"),
     ("calendar", "calendar sources are not exposed"),
-    ("weather", "weather configuration is not exposed"),
+    ("weather.api_key", "credentials are not exposed"),
     ("issues", "issue providers are not exposed"),
     ("ci", "CI providers are not exposed"),
     (
@@ -58,10 +58,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("database", "database migration policy is not exposed"),
     ("hooks", "lifecycle hooks are not exposed"),
     ("toolchain", "toolchain policy is not exposed"),
-    (
-        "limits.test_nice",
-        "signed i32: the numeric gate models only unsigned ranges",
-    ),
     (
         "disk.sccache_dir",
         "path-valued shared-cache directory is not exposed",
@@ -110,6 +106,7 @@ const OMITTED: &[(&str, &str)] = &[
     ("skills", "skill configuration is not exposed"),
     ("media.mpd.password", "credentials are not exposed"),
     ("voice", "voice input is not exposed"),
+    ("lead", "Lead meta agent is experimental and not exposed"),
     (
         "usage.allow_network",
         "network opt-in awaits an owner decision",
@@ -894,6 +891,7 @@ fn hm_git_enum_options_offer_only_canonical_spellings() {
 fn hm_network_media_enum_options_offer_only_canonical_spellings() {
     let expected = [
         ("networkMode", "network.mode"),
+        ("weatherUnits", "weather.units"),
         ("mediaDefaultAction", "media.default_action"),
         ("notificationsSoundMode", "notifications.sound.mode"),
     ];
@@ -951,6 +949,74 @@ fn hm_media_backend_offers_only_implemented_spellings() {
     assert_eq!(
         actual, implemented,
         "Home Manager mediaBackend must offer exactly the implemented spellings"
+    );
+}
+
+#[test]
+fn hm_weather_provider_offers_only_implemented_spellings() {
+    let enums = enum_lists(&module_src());
+    let values = enums
+        .iter()
+        .find(|(name, _)| name == "weatherProvider")
+        .map(|(_, values)| values)
+        .unwrap_or_else(|| panic!("Home Manager enum option `weatherProvider` is missing"));
+    let actual: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+    let schema = schema_field("weather.provider");
+    let mut implemented: BTreeSet<&str> = schema["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("destination `weather.provider` has no enum"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    // Reserved spellings parse but have no provider, so HM must not offer them.
+    if let Some(marker) = schema.get(thegn_core::config_validate::ENUM_MARKER) {
+        for reserved in marker["reserved"].as_array().into_iter().flatten() {
+            if let Some(spelling) = reserved.as_str() {
+                implemented.remove(spelling);
+            }
+        }
+    }
+    assert!(
+        !implemented.is_empty(),
+        "weather.provider must retain implemented spellings"
+    );
+    assert_eq!(
+        actual, implemented,
+        "Home Manager weatherProvider must offer exactly the implemented spellings"
+    );
+}
+
+#[test]
+fn hm_sandbox_backend_offers_no_reserved_spelling() {
+    let enums = enum_lists(&module_src());
+    let values = enums
+        .iter()
+        .find(|(name, _)| name == "backend")
+        .map(|(_, values)| values)
+        .unwrap_or_else(|| panic!("Home Manager enum option `backend` is missing"));
+    let schema = schema_field("sandbox.backend");
+    let reserved: BTreeSet<&str> = schema
+        .get(thegn_core::config_validate::ENUM_MARKER)
+        .map(|marker| {
+            marker["reserved"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
+    for spelling in ["smol", "wsl", "appcontainer"] {
+        assert!(
+            reserved.contains(spelling),
+            "{spelling} must be reserved: {reserved:?}"
+        );
+    }
+    assert!(
+        values
+            .iter()
+            .all(|value| !reserved.contains(value.as_str())),
+        "Home Manager `backend` offers a reserved spelling: {values:?}"
     );
 }
 
@@ -1662,6 +1728,15 @@ fn every_numeric_option_matches_its_destination_range() {
         ("activityOutputHintTtlSecs", "activity.output_hint_ttl_secs"),
         ("monitorProcRows", "monitor.proc_rows"),
         ("limitsTestMaxParallel", "limits.test_max_parallel"),
+        ("limitsTestNice", "limits.test_nice"),
+        (
+            "weatherRefreshIntervalSecs",
+            "weather.refresh_interval_secs",
+        ),
+        ("weatherStaleAfterSecs", "weather.stale_after_secs"),
+        ("weatherHardExpirySecs", "weather.hard_expiry_secs"),
+        ("weatherForecastDays", "weather.forecast_days"),
+        ("weatherTimeoutSecs", "weather.timeout_secs"),
         ("limitsTestTimeoutSecs", "limits.test_timeout_secs"),
         ("limitsDiscoverTimeoutSecs", "limits.discover_timeout_secs"),
         ("diagnosticsCrashRetention", "diagnostics.crash_retention"),
@@ -1821,6 +1896,14 @@ fn every_numeric_option_matches_its_destination_range() {
             continue;
         }
 
+        if schema.get("format").and_then(Value::as_str) == Some("int32") {
+            assert!(
+                signed_nix_type_fits_i32(&nix_type),
+                "Nix type for int32 schema field {path} must be ints.s32 or a between within i32, got {nix_type}"
+            );
+            continue;
+        }
+
         if schema.get("format").and_then(Value::as_str) == Some("uint8") {
             assert_eq!(
                 nix_type, "lib.types.ints.u8",
@@ -1870,6 +1953,79 @@ fn every_numeric_option_matches_its_destination_range() {
             .map(|(path, _, _)| *path)
             .collect::<BTreeSet<&str>>(),
         "every pinned float range must map to a rendered Nix option"
+    );
+}
+
+/// Whether a Nix integer type expression is a signed type confined to i32:
+/// `lib.types.ints.s32` or `lib.types.ints.between <lo> <hi>` within i32.
+fn signed_nix_type_fits_i32(nix_type: &str) -> bool {
+    if nix_type == "lib.types.ints.s32" {
+        return true;
+    }
+    let Some(rest) = nix_type.strip_prefix("lib.types.ints.between ") else {
+        return false;
+    };
+    let bounds: Vec<&str> = rest
+        .split_whitespace()
+        .map(|b| b.trim_matches(|c| c == '(' || c == ')'))
+        .collect();
+    let [lo, hi] = bounds[..] else {
+        return false;
+    };
+    matches!((lo.parse::<i32>(), hi.parse::<i32>()), (Ok(l), Ok(h)) if l <= h)
+}
+
+#[test]
+fn signed_range_gate_accepts_i32_types_and_rejects_others() {
+    assert!(signed_nix_type_fits_i32("lib.types.ints.s32"));
+    assert!(signed_nix_type_fits_i32("lib.types.ints.between (-20) 19"));
+    assert!(!signed_nix_type_fits_i32("lib.types.ints.unsigned"));
+    assert!(!signed_nix_type_fits_i32("lib.types.ints.u32"));
+    assert!(!signed_nix_type_fits_i32(
+        "lib.types.ints.between (-3000000000) 19"
+    ));
+    // A u64 destination must not be satisfied by the signed type.
+    let schema = schema_field("limits.test_timeout_secs");
+    assert_ne!(schema.get("format").and_then(Value::as_str), Some("int32"));
+}
+
+#[test]
+fn hm_weather_and_test_nice_are_rendered_with_api_key_omitted() {
+    let rendered = rendered_paths(&module_src());
+    for key in [
+        "enabled",
+        "provider",
+        "location",
+        "units",
+        "refresh_interval_secs",
+        "stale_after_secs",
+        "hard_expiry_secs",
+        "show_forecast",
+        "forecast_days",
+        "timeout_secs",
+    ] {
+        let path = format!("weather.{key}");
+        assert!(rendered.contains(path.as_str()), "must render {path}");
+    }
+    assert!(rendered.contains("limits.test_nice"));
+    assert!(!rendered.contains("weather.api_key"));
+    let schema = schema_field("weather");
+    for key in schema["properties"]
+        .as_object()
+        .expect("weather props")
+        .keys()
+    {
+        let path = format!("weather.{key}");
+        assert!(
+            rendered.contains(path.as_str()) || OMITTED.iter().any(|(p, _)| *p == path),
+            "{path} must be rendered or omitted"
+        );
+    }
+    assert_eq!(
+        schema_field("limits.test_nice")
+            .get("format")
+            .and_then(Value::as_str),
+        Some("int32")
     );
 }
 
@@ -2158,6 +2314,8 @@ fn every_nix_enum_matches_its_destination_enum() {
             "notificationsSoundMinPriority",
             "notifications.sound.min_priority",
         ),
+        ("weatherProvider", "weather.provider"),
+        ("weatherUnits", "weather.units"),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();

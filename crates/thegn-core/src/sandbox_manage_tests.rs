@@ -189,7 +189,14 @@ fn verified_daemon_backends_get_the_full_op_set() {
 }
 
 #[test]
-fn apple_is_list_only_and_smol_is_list_only() {
+fn manage_ops_smol_is_empty() {
+    // smol is reserved: never created, so nothing to list or manage.
+    assert_eq!(manage_ops(Backend::Smol), ManageOps::default());
+    assert!(mgmt_list_argv(Backend::Smol).is_none());
+}
+
+#[test]
+fn apple_is_list_only() {
     // Apple's `container` CLI has no `stats`/`system df` and unverified control
     // verbs — it is offered read-only listing, never a guessed destructive verb.
     let apple = manage_ops(Backend::Apple);
@@ -198,14 +205,13 @@ fn apple_is_list_only_and_smol_is_list_only() {
         mgmt_list_argv(Backend::Apple).unwrap(),
         vec!["ls", "-a", "--format", "json"]
     );
-    // smol is unverified: read-only listing only.
-    assert_eq!(manage_ops(Backend::Smol).names(), vec!["list"]);
-    // Non-container backends advertise nothing.
+    // Non-container and reserved backends advertise nothing.
     for b in [
         Backend::Bwrap,
         Backend::Systemd,
         Backend::None,
         Backend::Wsl,
+        Backend::Smol,
     ] {
         assert_eq!(manage_ops(b), ManageOps::default());
         assert!(mgmt_list_argv(b).is_none());

@@ -2312,6 +2312,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "jump-lead",
+        label: "Jump to the Lead",
+        message_key: "action-jump-lead",
+        hint: "lead",
+        default_chords: &["Alt i"],
+        palette: true,
+        keywords: &["lead", "meta", "overview", "assistant"],
+    },
+    ActionSpec {
         id: "mark-all-read",
         label: "Notifications: Mark all as read",
         message_key: "action-mark-all-read",

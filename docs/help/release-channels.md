@@ -21,14 +21,35 @@ every gated feature. Set `THEGN_CHANNEL=dev` to switch for one run.
 If you read about one of these elsewhere in this help and cannot find it,
 this is why:
 
-| Feature     | Covers                                                                     | Config                                          |
-| ----------- | -------------------------------------------------------------------------- | ----------------------------------------------- |
-| `remote`    | worktrees on another machine over SSH/mosh                                 | `[sandbox.remote]`, `[env.*] placement = "ssh"` |
-| `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs             |
-| `placement` | the multi-host placement engine                                            | `[placement]`                                   |
-| `voice`     | command-backed voice mode                                                  | `[voice]`                                       |
+| Feature     | Covers                                                                     | Config                                                     |
+| ----------- | -------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `remote`    | worktrees on another machine over SSH/mosh, and Kubernetes placement       | `[sandbox.remote]`, `[env.*] placement = "ssh"` or `"k8s"` |
+| `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs                        |
+| `placement` | the multi-host placement engine                                            | `[placement]`                                              |
+| `voice`     | command-backed voice mode                                                  | `[voice]`                                                  |
+| `lead`      | the Lead meta agent: a hosted agent CLI in a global tab                    | `[lead]`                                                   |
 
-On the stable channel, SSH and provider `[env.*]` environments are removed
+### Sandbox and remote programme features (not yet implemented)
+
+These nine features are reserved for the sandbox and remote programme. They
+are experimental, so they are dev-only, and each one reads "experimental, not
+yet implemented" in `thegn doctor` until the work that owns it lands. No config
+key turns them on yet; listing them now keeps the feature set stable while the
+programme is built.
+
+| Feature            | Covers                                                                   | Config              |
+| ------------------ | ------------------------------------------------------------------------ | ------------------- |
+| `sandbox_backends` | config-defined, shipped and recipe sandbox backends; live fork           | not yet implemented |
+| `linux_confine`    | the Landlock + seccomp confinement helper on bwrap, systemd and Landlock | not yet implemented |
+| `egress_proxy`     | `network = "allowlist"`, presets, approvals, brokering, external proxies | not yet implemented |
+| `seatbelt`         | the macOS Seatbelt backend                                               | not yet implemented |
+| `win_isolation`    | the Windows MXC isolation backend                                        | not yet implemented |
+| `plugin_backends`  | sandbox backends supplied by plugins                                     | not yet implemented |
+| `agent_presets`    | per-agent presets applied at launch                                      | not yet implemented |
+| `private_copy`     | private-copy workspaces (`workspace.mode = "private-copy"`)              | not yet implemented |
+| `escalation`       | in-pane escalation requests                                              | not yet implemented |
+
+On the stable channel, SSH, Kubernetes and provider `[env.*]` environments are removed
 when the config loads. If a worktree's `[sandbox] default_env` or selection
 names one, its pane halts by default with a hint to set `THEGN_CHANNEL=dev`;
 `failover = "ask"` prompts instead. With `failover = "auto"`, the pane falls

@@ -319,13 +319,13 @@ fn build_vpn_spec_carries_knobs_and_optional_image() {
     let mut cfg = vpn_cfg(VpnProviderKind::Wireguard);
     cfg.mode = VpnMode::Proxy;
     cfg.on_error = VpnOnError::Offline;
-    cfg.dns = VpnDnsMode::FilterFront;
+    cfg.dns = VpnDnsMode::FilterOnly;
     cfg.ready_timeout_secs = 7;
     cfg.ephemeral = false;
     let spec = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
     assert_eq!(spec.mode, VpnMode::Proxy);
     assert_eq!(spec.on_error, VpnOnError::Offline);
-    assert_eq!(spec.dns_mode, VpnDnsMode::FilterFront);
+    assert_eq!(spec.dns_mode, VpnDnsMode::FilterOnly);
     assert_eq!(spec.ready_timeout, Duration::from_secs(7));
     assert!(!spec.ephemeral);
     // Empty sidecar_image -> None; set -> Some.
@@ -395,10 +395,69 @@ fn test_win_native_sandboxes_do_not_parse_as_oci() {
     assert_eq!(Backend::WinJobObject.label(), "jobobject");
 }
 
+#[test]
+fn to_config_round_trips_from_config() {
+    use crate::seam::Kind as _;
+    for kind in SandboxBackend::ALL.iter().copied() {
+        match Backend::from_config(kind) {
+            Some(backend) => assert_eq!(backend.to_config(), kind, "{kind:?}"),
+            None => assert_eq!(kind, SandboxBackend::Auto),
+        }
+    }
+    for backend in Backend::ALL {
+        assert_eq!(Backend::from_config(backend.to_config()), Some(backend));
+    }
+}
+
+#[test]
+fn smol_profile_label_and_binary() {
+    assert_eq!(Backend::Smol.label(), "smol");
+    assert_eq!(Backend::Smol.binary(), "smolvm");
+    assert!(matches!(
+        Backend::Smol.profile().events,
+        EventsCap::Reserved(reason) if reason.contains("reserved")
+    ));
+}
+
+#[test]
+fn gc_list_argv_none_for_smol() {
+    assert_eq!(gc_list_argv(Backend::Smol), None);
+    assert!(gc_list_argv(Backend::Docker).is_some());
+}
+
+#[test]
+fn smol_is_never_a_docker_clone_in_create_opts() {
+    // No `--user` and no `--gpus`: the docker-clone arms are gone.
+    let mut s = spec(Backend::Smol);
+    s.gpu = Some("all".into());
+    let opts = oci_create_opts(&s).expect("valid volume names");
+    assert!(!opts.iter().any(|arg| arg == "--gpus"), "{opts:?}");
+    assert!(!opts.iter().any(|arg| arg == "--user"), "{opts:?}");
+}
+
+#[test]
+fn oci_runtimes_excludes_reserved() {
+    let runtimes: Vec<Backend> = Backend::oci_runtimes().collect();
+    assert!(
+        runtimes.iter().all(|backend| !backend.is_reserved()),
+        "{runtimes:?}"
+    );
+    assert!(!runtimes.contains(&Backend::Smol));
+    assert!(!runtimes.contains(&Backend::Wsl));
+    assert!(runtimes.contains(&Backend::Podman));
+    let reserved: Vec<Backend> = Backend::ALL
+        .into_iter()
+        .filter(|backend| backend.is_reserved())
+        .collect();
+    assert_eq!(
+        reserved,
+        vec![Backend::Smol, Backend::Wsl, Backend::WinAppContainer]
+    );
+}
+
 fn spec(backend: Backend) -> SandboxSpec {
     SandboxSpec {
         backend,
-        placement: Placement::Local,
         image: Some("img:latest".into()),
         worktree: PathBuf::from("/wt/feat"),
         mounts: vec![
@@ -416,18 +475,7 @@ fn spec(backend: Backend) -> SandboxSpec {
             },
         ],
         env: vec![("GH_TOKEN".into(), "abc".into())],
-        env_overrides: std::collections::HashMap::new(),
-        env_block: Vec::new(),
-        network: Network::Nat,
-        network_allow: Vec::new(),
-        network_block: Vec::new(),
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: Vec::new(),
-        add_capabilities: Vec::new(),
         ports: vec!["8080:8080".into()],
-        gpu: None,
         // Disable CPU capping so argv-shape assertions are host-independent
         // (the aggregate cap is on-by-default and would scope-wrap on a host
         // with cgroup delegation); capping itself is tested in sandbox_cpucap.
@@ -435,20 +483,9 @@ fn spec(backend: Backend) -> SandboxSpec {
             cpu_total: Some("off".into()),
             ..SandboxLimits::default()
         },
-        volumes: vec![],
-        compose: None,
-        build: None,
-        init_script: None,
         file_access: FileAccess::Worktree,
-        devenv: false,
-        devenv_path: None,
         name: "thegn-repo-feat".into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 
@@ -793,6 +830,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
         RefusalClass::ContainerOwner,
+        RefusalClass::NetworkUnexpressible,
     ] {
         let error = refusal(
             &spec,
@@ -831,6 +869,7 @@ fn refusal_remediation_every_class_has_label_and_text() {
         RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
         RefusalClass::ContainerOwner,
+        RefusalClass::NetworkUnexpressible,
     ] {
         let label = class.label();
         assert!(!label.is_empty());
@@ -1175,6 +1214,80 @@ fn oci_create_opts_map_userns_and_mounts() {
     assert!(j.contains("-v /repo/.git:/repo/.git"));
     assert!(j.contains("-e GH_TOKEN=abc"));
     assert!(j.contains("-p 8080:8080"));
+}
+
+#[test]
+fn apple_network_none_is_refused_before_argv() {
+    let mut s = spec(Backend::Apple);
+    s.network = Network::None;
+    for result in [
+        enter_argv(&s, "true").map(|_| ()),
+        launchable_with(&s, &[]).map(|_| ()),
+    ] {
+        match result {
+            Err(EnterError::Refused(refusal)) => {
+                assert_eq!(refusal.class, RefusalClass::NetworkUnexpressible);
+                assert_eq!(refusal.backend, "apple");
+                assert!(refusal.path.is_none());
+                assert!(refusal.message.contains("network = \"none\""));
+            }
+            other => panic!("expected network-unexpressible refusal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn apple_sealed_profile_is_refused() {
+    // The sealed profile forces `network = "none"`; the network refusal names
+    // the real reason ahead of the strict hardening gate.
+    let mut s = spec(Backend::Apple);
+    s.network = Network::None;
+    s.seal_home = Some("/home/test".into());
+    s.read_only_root = true;
+    s.no_new_privileges = true;
+    s.pids_limit = Some(256);
+    s.drop_capabilities = vec!["ALL".into()];
+    match launchable_with(&s, &[]) {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::NetworkUnexpressible);
+            assert_eq!(refusal.class.label(), "network-unexpressible");
+        }
+        other => panic!("expected network-unexpressible refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn apple_nat_launches() {
+    let s = spec(Backend::Apple);
+    assert_eq!(s.network, Network::Nat);
+    assert!(network_unexpressible_refusal(&s).is_none());
+    assert!(launchable_with(&s, &[]).is_ok());
+    let j = oci_create_opts(&s).expect("valid volume names").join(" ");
+    assert!(!j.contains("--network"), "{j}");
+}
+
+#[test]
+fn podman_network_none_still_emits_flag() {
+    for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+        let mut s = spec(backend);
+        s.network = Network::None;
+        assert!(network_unexpressible_refusal(&s).is_none(), "{backend:?}");
+        let j = oci_create_opts(&s).expect("valid volume names").join(" ");
+        assert!(j.contains("--network none"), "{backend:?}: {j}");
+    }
+}
+
+#[test]
+fn refusal_class_label_is_stable() {
+    assert_eq!(
+        RefusalClass::NetworkUnexpressible.label(),
+        "network-unexpressible"
+    );
+    assert!(
+        RefusalClass::NetworkUnexpressible
+            .remediation()
+            .contains("network = \"nat\"")
+    );
 }
 
 #[test]
@@ -2979,10 +3092,11 @@ fn gc_sweeps_every_oci_backend_that_can_hold_a_container() {
     // also pins its own Linux VM. Anything that holds containers must be swept.
     for b in Backend::all_oci() {
         assert!(b.is_oci(), "all_oci must not drift from is_oci: {b:?}");
-        if b == Backend::Wsl {
-            // Deliberately unswept: its command shape is unverified and this
-            // feeds a force-remove, where a wrong guess deletes real containers.
-            assert_eq!(gc_list_argv(b), None);
+        if b.is_reserved() {
+            // Deliberately unswept: a reserved kind (wsl, smol) is never
+            // created, its command shape is unverified, and this feeds a
+            // force-remove, where a wrong guess deletes real containers.
+            assert_eq!(gc_list_argv(b), None, "{b:?}");
             continue;
         }
         assert!(
@@ -3064,8 +3178,6 @@ fn remote_enter_argv_wraps_with_ssh() {
         "port flag missing: {argv:?}"
     );
 }
-
-// H4 is in dns_filter.rs (already done).
 
 // Per-profile container naming (G1).
 #[test]
@@ -5195,7 +5307,8 @@ fn hostname_rules_note_names_backend_on_every_local_backend() {
         s.network_allow = vec!["example.com".into()];
         let note = hostname_rules_note(&s).expect("active allow-list should be reported");
         assert!(note.contains(backend.label()), "{note}");
-        assert!(note.contains("DNS-name rules only"), "{note}");
+        assert!(note.contains("are advisory"), "{note}");
+        assert!(!note.contains("DNS-only"), "{note}");
 
         s.network = Network::Host;
         s.network_allow.clear();
@@ -5219,7 +5332,70 @@ fn hostname_rules_note_names_backend_on_every_local_backend() {
         up_command: vec![],
         down_command: vec![],
     });
-    assert!(hostname_rules_note(&provider).is_none());
+    // An unknown provider is the `custom` kind: no egress policy API.
+    let note = hostname_rules_note(&provider).expect("custom provider lists are unenforced");
+    assert!(note.contains("NOT enforced"), "{note}");
+}
+
+fn provider_spec_with_lists(provider: &str) -> SandboxSpec {
+    let mut s = spec(Backend::Podman);
+    s.network_allow = vec!["github.com".into()];
+    s.placement = Placement::Provider(crate::placement::ProviderPlacement {
+        provider: provider.into(),
+        id: "sandbox".into(),
+        interactive_prefix: vec![],
+        control_prefix: vec![],
+        up_command: vec![],
+        down_command: vec![],
+    });
+    s
+}
+
+#[test]
+fn note_for_daytona_provider_warns() {
+    let note = hostname_rules_note(&provider_spec_with_lists("daytona"))
+        .expect("daytona has no egress policy API");
+    assert!(note.contains("env provider 'daytona'"), "{note}");
+    assert!(note.contains("NOT enforced"), "{note}");
+    assert!(note.contains("network = \"none\""), "{note}");
+}
+
+#[test]
+fn note_for_custom_provider_warns() {
+    let note = hostname_rules_note(&provider_spec_with_lists("custom"))
+        .expect("custom has no egress policy API");
+    assert!(note.contains("NOT enforced"), "{note}");
+}
+
+#[test]
+fn note_for_sprites_provider_is_none() {
+    assert!(hostname_rules_note(&provider_spec_with_lists("sprites")).is_none());
+}
+
+#[test]
+fn local_note_says_advisory_not_dns() {
+    let mut s = spec(Backend::Bwrap);
+    s.network_block = vec!["example.com".into()];
+    let note = hostname_rules_note(&s).expect("local lists are advisory");
+    assert!(note.contains("advisory"), "{note}");
+    assert!(!note.contains("DNS"), "{note}");
+}
+
+#[test]
+fn policy_refusal_skips_only_egress_api_providers() {
+    use crate::config::EnvProviderKind;
+    use crate::seam::Kind as _;
+    for kind in EnvProviderKind::ALL.iter().copied() {
+        let s = provider_spec_with_lists(kind.as_str());
+        let refused = hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s);
+        assert_eq!(refused.is_none(), kind.egress_api(), "{kind:?}");
+        assert_eq!(
+            hostname_rules_note(&s).is_none(),
+            kind.egress_api(),
+            "{kind:?}"
+        );
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnUnenforced, &s).is_none());
+    }
 }
 
 #[test]
@@ -5233,7 +5409,7 @@ fn no_dns_flag_in_oci_create_opts() {
 
 #[test]
 fn default_hostname_policy_warns_not_refuses() {
-    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnDnsOnly);
+    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnUnenforced);
     let mut s = spec(Backend::Bwrap);
     s.network_allow = vec!["example.com".into()];
     assert!(!matches!(
@@ -5265,7 +5441,7 @@ fn refuse_policy_refuses_hostname_rules() {
         s.network = Network::None;
         assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s).is_none());
         s.network = Network::Nat;
-        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnDnsOnly, &s).is_none());
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnUnenforced, &s).is_none());
     }
 
     let mut remote = spec(Backend::Bwrap);
@@ -5288,7 +5464,9 @@ fn refuse_policy_refuses_hostname_rules() {
         up_command: vec![],
         down_command: vec![],
     });
-    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_none());
+    // A provider without an egress policy API (`test` is the custom kind)
+    // refuses under the refuse policy; only an egress-API provider is exempt.
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_some());
     placement_spec.placement = Placement::K8s(crate::placement::K8sPlacement {
         kubectl: "kubectl".into(),
         context: None,
@@ -6727,6 +6905,10 @@ fn git_policy_commit_only_binds_common_ro_then_lane_carve_outs() {
     // The plan's mkdirs ran on the host.
     assert!(fx.common.join("refs/heads/tg").is_dir());
     assert!(fx.common.join("logs/refs/heads/tg").is_dir());
+    // Each carve-out holds the keep directory, so a ref prune cannot remove
+    // the directory under a running sandbox's bind.
+    assert!(fx.common.join("refs/heads/tg/.thegn-keep").is_dir());
+    assert!(fx.common.join("logs/refs/heads/tg/.thegn-keep").is_dir());
     let argv = bwrap_git_argv(&fx, mounts.clone());
     let wt = triple_at(&argv, "--bind", &fx.wt).expect("worktree rw");
     let common_ro = triple_at(&argv, "--ro-bind", &fx.common).expect("common dir ro");
@@ -7113,4 +7295,131 @@ fn cached_git_identity_reuses_a_fresh_entry() {
     assert_eq!(first.name.as_deref(), Some("Cache Probe"));
     assert_eq!(first, second);
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[test]
+fn default_spec_is_inert() {
+    let spec = SandboxSpec::default();
+    assert_eq!(spec.backend, Backend::None);
+    assert!(spec.placement.is_local());
+    assert!(spec.image.is_none());
+    assert!(spec.worktree.as_os_str().is_empty());
+    assert!(spec.mounts.is_empty());
+    assert!(spec.env.is_empty());
+    assert!(spec.env_overrides.is_empty());
+    assert!(spec.env_block.is_empty());
+    assert_eq!(spec.network, Network::default());
+    assert!(spec.network_allow.is_empty());
+    assert!(spec.network_block.is_empty());
+    assert!(!spec.read_only_root);
+    assert!(!spec.no_new_privileges);
+    assert!(spec.pids_limit.is_none());
+    assert!(spec.drop_capabilities.is_empty());
+    assert!(spec.add_capabilities.is_empty(), "no capability is added");
+    assert_eq!(spec.file_access, FileAccess::default());
+    assert!(spec.ports.is_empty());
+    assert!(spec.gpu.is_none());
+    assert_eq!(spec.limits, SandboxLimits::default());
+    assert!(spec.volumes.is_empty());
+    assert!(spec.compose.is_none());
+    assert!(spec.build.is_none());
+    assert!(spec.init_script.is_none());
+    assert!(!spec.devenv);
+    assert!(spec.devenv_path.is_none());
+    assert!(spec.name.is_empty());
+    assert!(spec.vpn.is_none());
+    assert!(spec.oci_host.is_none());
+    assert!(spec.oci_runtime.is_none());
+    assert!(!spec.daemon_persistent);
+    assert!(spec.seal_home.is_none());
+    assert!(spec.volume_owners.is_empty());
+    assert!(spec.egress.is_none(), "no egress plan until WS04-P2-08");
+}
+
+/// Every `SandboxSpec { … }` struct-literal body in `src` (function
+/// signatures, the struct definition and `impl` headers are skipped).
+fn spec_literal_bodies(src: &str) -> Vec<&str> {
+    let mut bodies = Vec::new();
+    let mut from = 0;
+    while let Some(found) = src[from..].find("SandboxSpec {") {
+        let head = from + found;
+        let open = head + "SandboxSpec ".len();
+        from = open + 1;
+        let before = src[..head]
+            .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+            .trim_end();
+        if ["->", "struct", "for", "impl"]
+            .iter()
+            .any(|kw| before.ends_with(kw))
+        {
+            continue;
+        }
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        bodies.push(&src[open + 1..open + i]);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    bodies
+}
+
+/// WS00-P1-02: production resolution never builds a spec from
+/// `SandboxSpec::default()` or struct-update syntax, so every new security
+/// field forces an explicit decision at each production constructor.
+#[test]
+fn default_spec_not_used_in_resolution() {
+    fn production(source: &'static str) -> &'static str {
+        source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap_or(source)
+    }
+    // `sandbox.rs` keeps its tests in `sandbox_tests.rs`, so its whole source
+    // is production code apart from small `#[cfg(test)]` helpers.
+    let sandbox = include_str!("sandbox.rs");
+    assert!(
+        !spec_literal_bodies(sandbox).is_empty(),
+        "the scan must see sandbox.rs's resolution literal"
+    );
+    let sources = [
+        ("sandbox.rs", sandbox),
+        ("host.rs", production(include_str!("host.rs"))),
+        (
+            "sandbox_floor.rs",
+            production(include_str!("sandbox_floor.rs")),
+        ),
+        (
+            "sandbox_preflight.rs",
+            production(include_str!("sandbox_preflight.rs")),
+        ),
+        (
+            "sandbox_tmp_hint.rs",
+            production(include_str!("sandbox_tmp_hint.rs")),
+        ),
+        (
+            "sandbox_volume_owner.rs",
+            production(include_str!("sandbox_volume_owner.rs")),
+        ),
+    ];
+    for (name, source) in sources {
+        assert!(
+            !source.contains("SandboxSpec::default()"),
+            "{name}: production code must not build a default SandboxSpec"
+        );
+        for body in spec_literal_bodies(source) {
+            assert!(
+                !body.lines().any(|line| line.trim_start().starts_with("..")),
+                "{name}: a production SandboxSpec literal uses struct-update syntax"
+            );
+        }
+    }
 }

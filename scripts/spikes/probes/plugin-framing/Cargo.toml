@@ -1,0 +1,12 @@
+[package]
+name = "plugin-framing-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "WS10-P2-04 throwaway probe: NDJSON+base64 stream framing vs raw pipe. Never merged."
+
+[workspace]
+
+[dependencies]
+base64 = "0.22"
+serde_json = "1"

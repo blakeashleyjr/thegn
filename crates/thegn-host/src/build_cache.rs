@@ -619,41 +619,14 @@ mod tests {
     fn policy_bwrap_spec() -> SandboxSpec {
         SandboxSpec {
             backend: Backend::Bwrap,
-            placement: thegn_core::placement::Placement::Local,
-            image: None,
             worktree: std::path::PathBuf::from("/repo"),
-            mounts: Vec::new(),
-            env: Vec::new(),
-            env_overrides: std::collections::HashMap::new(),
-            env_block: Vec::new(),
-            network: thegn_core::config::Network::Nat,
-            network_allow: Vec::new(),
-            network_block: Vec::new(),
-            read_only_root: false,
-            no_new_privileges: false,
-            pids_limit: None,
-            drop_capabilities: Vec::new(),
-            add_capabilities: Vec::new(),
             file_access: thegn_core::config::FileAccess::Worktree,
-            ports: Vec::new(),
-            gpu: None,
             limits: thegn_core::sandbox::SandboxLimits {
                 cpu_total: Some("off".into()),
                 ..thegn_core::sandbox::SandboxLimits::default()
             },
-            volumes: Vec::new(),
-            compose: None,
-            build: None,
-            init_script: None,
-            devenv: false,
-            devenv_path: None,
             name: "cache-policy-test".into(),
-            vpn: None,
-            oci_host: None,
-            oci_runtime: None,
-            daemon_persistent: false,
-            seal_home: None,
-            volume_owners: Vec::new(),
+            ..SandboxSpec::default()
         }
     }
 

@@ -59,8 +59,11 @@ impl MonitorOverlay {
                             .map(|row| (row.pid, row.start_time))
                     })
                     .flatten();
-                (self.proc_rows, self.proc_invalid_terms) =
-                    procs_view::rows_with_invalid(&model.procs, self.proc_view());
+                (self.proc_rows, self.proc_invalid_terms) = procs_view::rows_with_invalid(
+                    &model.procs,
+                    self.proc_view(),
+                    &model.pane_owners,
+                );
                 super::tabs::procs::refill_family(&mut self.proc_family, &model.procs);
                 self.lists.process = Some(ProcessRowsKey::capture(self, model));
                 if let Some(identity) = selected

@@ -22,6 +22,10 @@ pub struct AuthCtx {
     pub pairing_id: String,
     pub label: String,
     pub scopes: ScopeSet,
+    /// The caller is the Lead ([`thegn_core::lead_confine`]): set only at
+    /// authentication time, from the stored pairing label the host minted or
+    /// from the listener the request arrived on. No request field reaches it.
+    pub lead_confined: bool,
 }
 
 impl AuthCtx {
@@ -32,7 +36,16 @@ impl AuthCtx {
             pairing_id: "local".into(),
             label: "local unix-socket peer".into(),
             scopes: ScopeSet::parse("admin"),
+            lead_confined: false,
         }
+    }
+
+    /// Confine this caller when it arrived on the Lead listener. Only ever
+    /// tightens: a Lead-labelled token stays confined on any listener.
+    #[must_use]
+    pub fn on_listener(mut self, lead_listener: bool) -> Self {
+        self.lead_confined |= lead_listener;
+        self
     }
 
     /// Guard a verb: `Err(NoScope)` when the caller's grant doesn't satisfy it.
@@ -151,10 +164,74 @@ pub fn verify(store: &dyn ControlStore, token: &str, now_ms: i64) -> Option<Auth
         return None;
     }
     Some(AuthCtx {
+        lead_confined: thegn_core::lead_confine::is_lead_label(&row.label),
         pairing_id: row.pairing_id,
         label: row.label,
         scopes: ScopeSet::parse(&row.scope),
     })
+}
+
+/// The Lead token's sliding refresh (b155): when a Lead-confined token is
+/// used with less than half of `ttl_secs` left, move `expires_at` to
+/// `now + ttl`, capped at `created_at + 7 days`. Best-effort; writes at most
+/// once per half-TTL.
+///
+/// Only a live row moves: the read goes through
+/// [`ControlStore::pairing_for_auth`] (unrevoked, approved, unexpired at
+/// `now_ms`) and the write through [`ControlStore::slide_pairing_expiry`]
+/// (unrevoked only), so neither a revoked nor an expired token is revived. A
+/// row with no expiry is left alone (the next spawn re-mints with one).
+pub fn slide_lead_expiry(store: &dyn ControlStore, ctx: &AuthCtx, now_ms: i64, ttl_secs: u64) {
+    // Only a Lead-labelled token slides: the Lead listener confines any
+    // token it sees, but a non-Lead token must keep its own expiry.
+    if !ctx.lead_confined || ttl_secs == 0 || !thegn_core::lead_confine::is_lead_label(&ctx.label) {
+        return;
+    }
+    let row = match store.pairing_for_auth(&ctx.pairing_id, now_ms) {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(pairing_id = %ctx.pairing_id, %error, "lead token slide: read failed");
+            return;
+        }
+    };
+    let Some(next) = slid_expiry(row.created_at, row.expires_at, now_ms, ttl_secs) else {
+        return;
+    };
+    match store.slide_pairing_expiry(&ctx.pairing_id, next) {
+        Ok(true) => {
+            tracing::debug!(pairing_id = %ctx.pairing_id, expires_at = next, "lead token slid");
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(pairing_id = %ctx.pairing_id, %error, "lead token slide: write failed");
+        }
+    }
+}
+
+/// The hard ceiling on a Lead token's lifetime, however active it is.
+pub const LEAD_TOKEN_MAX_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The pure slide decision: `Some(new expires_at)` when less than half of
+/// `ttl_secs` remains, i.e. `min(now + ttl, created_at + 7 d)`; `None` when no
+/// write is due (no expiry, above half, or the cap would not move it later).
+pub fn slid_expiry(
+    created_at: i64,
+    expires_at: Option<i64>,
+    now_ms: i64,
+    ttl_secs: u64,
+) -> Option<i64> {
+    let expires_at = expires_at?;
+    if ttl_secs == 0 || expires_at <= now_ms {
+        return None;
+    }
+    let ttl_ms = i64::try_from(ttl_secs).ok()?.checked_mul(1000)?;
+    if expires_at.checked_sub(now_ms)? >= ttl_ms / 2 {
+        return None;
+    }
+    let cap = created_at.saturating_add(LEAD_TOKEN_MAX_LIFETIME_MS);
+    let next = now_ms.saturating_add(ttl_ms).min(cap);
+    (next > expires_at).then_some(next)
 }
 
 /// Redeem a pairing code for a fresh control token (the unauthenticated
@@ -351,6 +428,31 @@ mod tests {
     }
 
     #[test]
+    fn lead_confinement_comes_from_the_stored_label_and_the_listener_only() {
+        let db = Db::open_memory().unwrap();
+        let verified = |label: &str| {
+            let m = mint(
+                TokenKind::Control,
+                ScopeSet::parse("read,write"),
+                label,
+                None,
+                None,
+                1_000,
+            );
+            db.put_pairing(&m.row).unwrap();
+            verify(&db, &m.token, 2_000).expect("live token verifies")
+        };
+        assert!(verified("lead").lead_confined);
+        assert!(verified("lead:g/0").lead_confined);
+        assert!(!verified("phone").lead_confined);
+        assert!(!verified("lead-phone").lead_confined);
+        // The listener only ever tightens.
+        assert!(verified("phone").on_listener(true).lead_confined);
+        assert!(verified("lead:g/0").on_listener(false).lead_confined);
+        assert!(!AuthCtx::local_admin().lead_confined);
+    }
+
+    #[test]
     fn local_admin_holds_every_scope() {
         let ctx = AuthCtx::local_admin();
         for s in [
@@ -363,5 +465,94 @@ mod tests {
         ] {
             assert!(ctx.require(s).is_ok());
         }
+    }
+
+    #[test]
+    fn slid_expiry_math() {
+        const TTL: u64 = 300; // 300_000 ms; half = 150_000
+        // Above half left: no slide.
+        assert_eq!(slid_expiry(0, Some(400_000), 200_000, TTL), None);
+        // Exactly half left: no slide.
+        assert_eq!(slid_expiry(0, Some(350_000), 200_000, TTL), None);
+        // Under half left: slide to now + ttl.
+        assert_eq!(slid_expiry(0, Some(300_000), 200_000, TTL), Some(500_000));
+        // Capped at created + 7 d.
+        let cap = LEAD_TOKEN_MAX_LIFETIME_MS;
+        assert_eq!(
+            slid_expiry(0, Some(cap - 10_000), cap - 20_000, TTL),
+            Some(cap)
+        );
+        // At the cap already: nothing to write.
+        assert_eq!(slid_expiry(0, Some(cap), cap - 1_000, TTL), None);
+        // Expired, no expiry, or ttl 0: never.
+        assert_eq!(slid_expiry(0, Some(100), 200, TTL), None);
+        assert_eq!(slid_expiry(0, None, 200, TTL), None);
+        assert_eq!(slid_expiry(0, Some(300_000), 200_000, 0), None);
+    }
+
+    fn lead_ctx(id: &str, confined: bool) -> AuthCtx {
+        AuthCtx {
+            pairing_id: id.into(),
+            label: "lead".into(),
+            scopes: ScopeSet::parse("read"),
+            lead_confined: confined,
+        }
+    }
+
+    fn expiry_of(db: &Db, id: &str) -> Option<i64> {
+        db.pairings()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.pairing_id == id)
+            .unwrap()
+            .expires_at
+    }
+
+    #[test]
+    fn slide_lead_expiry_moves_only_live_lead_tokens() {
+        let db = Db::open_memory().unwrap();
+        let ttl = 300u64;
+        let live = mint(
+            TokenKind::Control,
+            ScopeSet::parse("read"),
+            "lead",
+            None,
+            Some(300_000),
+            0,
+        );
+        db.put_pairing(&live.row).unwrap();
+        let id = live.row.pairing_id.clone();
+
+        // Unconfined caller, non-Lead label, or ttl 0: untouched.
+        slide_lead_expiry(&db, &lead_ctx(&id, false), 200_000, ttl);
+        let mut phone = lead_ctx(&id, true);
+        phone.label = "phone".into();
+        slide_lead_expiry(&db, &phone, 200_000, ttl);
+        slide_lead_expiry(&db, &lead_ctx(&id, true), 200_000, 0);
+        assert_eq!(expiry_of(&db, &id), Some(300_000));
+        // Above half: untouched.
+        slide_lead_expiry(&db, &lead_ctx(&id, true), 100_000, ttl);
+        assert_eq!(expiry_of(&db, &id), Some(300_000));
+        // Under half: slides.
+        slide_lead_expiry(&db, &lead_ctx(&id, true), 200_000, ttl);
+        assert_eq!(expiry_of(&db, &id), Some(500_000));
+
+        // Expired: never revived.
+        slide_lead_expiry(&db, &lead_ctx(&id, true), 600_000, ttl);
+        assert_eq!(expiry_of(&db, &id), Some(500_000));
+
+        // Revoked: untouched.
+        let gone = mint(
+            TokenKind::Control,
+            ScopeSet::parse("read"),
+            "lead",
+            None,
+            Some(300_000),
+            0,
+        );
+        db.put_pairing(&gone.row).unwrap();
+        db.revoke_pairing(&gone.row.pairing_id, 1_000).unwrap();
+        slide_lead_expiry(&db, &lead_ctx(&gone.row.pairing_id, true), 200_000, ttl);
+        assert_eq!(expiry_of(&db, &gone.row.pairing_id), Some(300_000));
     }
 }

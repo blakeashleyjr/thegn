@@ -15,11 +15,13 @@
 
 pub(crate) mod agent_error_cache;
 pub(crate) mod agent_open;
+pub(crate) mod approval_effects;
 pub(crate) mod calendar_api;
 pub(crate) mod client;
 pub(crate) mod control_publish;
 pub(crate) mod fork;
 pub(crate) mod inbox;
+pub(crate) mod lead_caps;
 pub(crate) mod pipeline_reaper;
 pub(crate) mod pipeline_retry;
 pub(crate) mod plugins_status;
@@ -27,6 +29,8 @@ mod pty_diagnostics;
 pub(crate) mod record;
 pub(crate) mod service;
 pub(crate) mod session;
+pub(crate) mod stage_executor;
+pub(crate) mod stage_land;
 pub(crate) mod stage_launch;
 pub(crate) mod tombstone;
 
@@ -1222,6 +1226,12 @@ fn registry_control_origin(
     transport.advertised_origin(actual_bind_port)
 }
 
+/// `[lead] token_ttl_secs` for a listener's sliding Lead-token refresh; `0`
+/// (no slide) without a configured Lead.
+fn lead_token_ttl_secs(cfg: &Config) -> u64 {
+    cfg.lead.as_ref().map_or(0, |lead| lead.token_ttl_secs)
+}
+
 /// Entry point for the hidden `thegn daemon` subcommand: builds the runtime
 /// and serves until shutdown. Exits 0 immediately if another daemon already
 /// owns the socket.
@@ -1547,6 +1557,17 @@ async fn run(
     // a human ran `dispatch reap`. Slow timer, blocking work off the runtime.
     pipeline_reaper::spawn(svc.clone());
     crate::automation_runtime::subscribe_daemon_events(svc.events.subscribe(), cfg);
+    // `schedule_due` producer (THE-2193): spawns nothing unless an enabled
+    // rule has a schedule.
+    crate::automation_schedule::spawn(cfg);
+    // The stage executor (b155): event-driven; `install` returns at once with
+    // the supervisor off or no `[[pipeline.stages]]` (idle invariant).
+    crate::daemon::stage_executor::install(svc.clone(), Arc::new(cfg.clone()));
+    // Answered approvals fire their effects through this handle (b155).
+    approval_effects::install(&svc);
+    // Lead tool surface (THE-2172): hand the event sender to the opt-in Notice
+    // feed so automation runs can publish without a service handle.
+    lead_caps::feed::install_global(svc.events.clone());
 
     let state = thegn_svc::control::http::ControlState {
         api: svc.clone(),
@@ -1559,6 +1580,8 @@ async fn run(
         // CORS is applied here (the allowlist rides the TCP listener below).
         cors_origins: Vec::new(),
         event_streams: Default::default(),
+        lead_listener: false,
+        lead_token_ttl_secs: lead_token_ttl_secs(cfg),
     };
     let local_grpc = thegn_svc::control::grpc::GrpcControl {
         api: svc.clone(),
@@ -1607,13 +1630,19 @@ async fn run(
             store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
             local_admin: false,
             daemon_euid: None,
-            require_approval: cfg.serve.require_approval,
+            // With `[lead]` configured every code redeemed here parks for
+            // operator approval: a pairing code the Lead read out of a pane
+            // snapshot must not mint a working token (the snapshot
+            // pairing-code hole, b155).
+            require_approval: cfg.serve.require_approval || cfg.lead.is_some(),
             server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
             // Browser-hosted thin clients opt in per `[serve] cors_origins`
             // (empty = no cross-origin access; a wildcard is refused at config
             // validation).
             cors_origins: cfg.serve.cors_origins.clone(),
             event_streams: Default::default(),
+            lead_listener: false,
+            lead_token_ttl_secs: lead_token_ttl_secs(cfg),
         };
         let grpc = thegn_svc::control::grpc::GrpcControl {
             api: svc.clone(),
@@ -1680,6 +1709,23 @@ async fn run(
             );
         }
     }
+
+    // The Lead's dedicated loopback listener (THE-2171): bearer tokens only,
+    // never implicit admin. `lead_caps::listener::spawn` starts nothing unless
+    // `[lead]` is configured, so the idle invariant holds without it.
+    let lead_state = thegn_svc::control::http::ControlState {
+        api: svc.clone(),
+        store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        require_approval: false,
+        server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
+        cors_origins: Vec::new(),
+        event_streams: Default::default(),
+        lead_listener: false,
+        lead_token_ttl_secs: lead_token_ttl_secs(cfg),
+    };
+    lead_caps::listener::spawn(cfg, lead_state);
 
     tracing::info!(target: "thegn::daemon", %daemon_id, "pane daemon serving on {}", ep.display());
     let serve = axum::serve(
@@ -1910,7 +1956,12 @@ async fn idle_exit_loop(
         // LIVE sessions only. Tombstones deliberately do not count: a daemon
         // holding nothing but corpses has no work left, and letting them keep
         // it alive would defeat idle-exit for the whole tombstone TTL.
-        let busy = !svc.sessions.lock().await.is_empty();
+        // An armed schedule producer is work too: without it the default
+        // `idle_exit_secs` would reap the daemon and silently stop cron rules.
+        let busy = daemon_busy(
+            svc.sessions.lock().await.len(),
+            crate::automation_schedule::armed(),
+        );
         if busy {
             idle_since = None;
             continue;
@@ -1924,9 +1975,22 @@ async fn idle_exit_loop(
     }
 }
 
+/// The idle-exit predicate: live sessions or an armed automation schedule.
+fn daemon_busy(sessions: usize, schedule_armed: bool) -> bool {
+    sessions > 0 || schedule_armed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_armed_schedule_keeps_an_otherwise_idle_daemon_busy() {
+        assert!(!daemon_busy(0, false));
+        assert!(daemon_busy(0, true));
+        assert!(daemon_busy(2, false));
+        assert!(daemon_busy(1, true));
+    }
 
     #[tokio::test]
     async fn daemon_shutdown_token_latches_before_graceful_shutdown_is_built() {

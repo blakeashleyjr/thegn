@@ -31,6 +31,8 @@ pub mod client;
 pub mod grpc;
 pub mod http;
 pub mod http_ci;
+pub mod http_lead;
+pub mod open_fields;
 pub mod route_docs;
 pub mod route_types;
 pub mod routes;
@@ -166,6 +168,11 @@ pub struct SessionInfo {
     /// has produced none yet, or when the daemon predates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_unix_secs: Option<i64>,
+    /// Security-relevant `OpenSpec` fields the daemon applied to this session's
+    /// spawn (the open reply only). Empty, and so never serialised, until a
+    /// field's owner fills it; see [`open_fields`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub honoured: Vec<String>,
 }
 
 /// What to run when opening a fresh session.
@@ -208,6 +215,59 @@ pub struct OpenSpec {
     /// their own rule chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation_origin: Option<AutomationOrigin>,
+}
+
+/// Who is asking for an MCP proxy profile's env (`mcp_proxy.profile_env`,
+/// THE-2222). Built by the transport from the verified token, never from the
+/// request: `lead_label` is the Lead token's pairing label when the caller is
+/// Lead-confined; `admin` is an admin-scoped or implicit-admin caller.
+#[derive(Debug, Clone)]
+pub struct ProfileEnvCaller {
+    pub lead_label: Option<String>,
+    pub admin: bool,
+}
+
+/// The authenticated Lead caller behind a [`ControlApi::open_confined`] call,
+/// for the audit record. Built by the transport from the verified token,
+/// never from the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeadCaller {
+    /// The token's public id.
+    pub pairing_id: String,
+    /// The pairing label (`lead` / `lead:<group>/<tab>`).
+    pub label: String,
+}
+
+/// The parts of an [`OpenSpec`] the Lead confinement
+/// ([`thegn_core::lead_confine::check`]) inspects. Shared by the HTTP
+/// transport and the daemon's own re-check, so both judge the same fields.
+pub fn lead_open_shape(spec: &OpenSpec) -> thegn_core::lead_confine::OpenShape<'_> {
+    use thegn_core::lead_confine::{AgentShape, OpenShape};
+    OpenShape {
+        argv_len: spec.argv.len(),
+        env_len: spec.env.len(),
+        cwd: spec.cwd.as_deref(),
+        worktree: spec.worktree.as_deref(),
+        agent: spec.agent.as_ref().map(|a| AgentShape {
+            name: a.agent.as_str(),
+            prompt_len: a.prompt.len(),
+            widen_permissions: a.widen_permissions,
+            fork: a.fork,
+            native_session_id: a.native_session_id.is_some(),
+        }),
+        already_capped: spec.already_capped,
+        automation_origin: spec.automation_origin.is_some(),
+    }
+}
+
+impl OpenSpec {
+    /// The security-relevant fields this spec sets, which the daemon must echo
+    /// in the open reply's `honoured` ([`open_fields`], WS00-P1-11). Always
+    /// empty until the first such field lands; its owner (WS02-P4-15,
+    /// WS04-P2-09, WS09-P5-05) adds the mapping here.
+    pub fn security_fields(&self) -> Vec<open_fields::OpenField> {
+        Vec::new()
+    }
 }
 
 /// Largest PTY row count the daemon accepts: an upper bound on any PTY
@@ -1086,6 +1146,26 @@ pub trait ControlApi: Send + Sync + 'static {
     /// Open a fresh session (a PTY running `spec.argv`).
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>>;
 
+    /// Open a session for a Lead-confined caller ([`thegn_core::lead_confine`]).
+    /// The transport has already checked the request's shape (a configured
+    /// agent by name, no argv/env); the impl must also refuse a worktree that
+    /// is not registered and a launch that does not resolve to a contained
+    /// sandbox backend ([`thegn_core::lead_confine::check_resolved_open`]),
+    /// auditing the refusal. The default refuses: an impl that cannot prove
+    /// both launches nothing for the Lead.
+    fn open_confined(
+        &self,
+        _spec: OpenSpec,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async {
+            Err(ControlError::FailedPrecondition(format!(
+                "{}this daemon cannot verify a Lead worker's sandbox",
+                thegn_core::lead_confine::REFUSAL_PREFIX
+            )))
+        })
+    }
+
     /// Fork a live daemon or recorded harness session. The default keeps
     /// transport-only adapters honest until they implement the spawn owner.
     fn fork(&self, _spec: ForkSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
@@ -1121,6 +1201,27 @@ pub trait ControlApi: Send + Sync + 'static {
         session: &'a str,
         bytes: Vec<u8>,
     ) -> BoxFuture<'a, ControlResult<()>>;
+
+    /// `sessions.input` for a Lead-confined caller ([`thegn_core::lead_confine`]).
+    /// The transport has already checked the bytes are plain text and Enter
+    /// ([`thegn_core::lead_input::check`]); the impl must also prove, before
+    /// writing a byte, that `session` is a live session a Lead opened (and
+    /// still the same session), auditing both outcomes with the caller's label
+    /// and the session id, never the text. The default refuses: an impl that
+    /// does not record who opened a session types nothing for the Lead.
+    fn send_input_confined<'a>(
+        &'a self,
+        session: &'a str,
+        _bytes: Vec<u8>,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async move {
+            Err(ControlError::FailedPrecondition(format!(
+                "{}this daemon does not record who opened {session}",
+                thegn_core::lead_confine::REFUSAL_PREFIX
+            )))
+        })
+    }
 
     fn resize<'a>(
         &'a self,
@@ -1327,6 +1428,148 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async { Err(ControlError::Unimplemented("tools.run")) })
     }
 
+    // --- Lead tool surface (THE-2172) ---
+    // JSON in, JSON out: each verb's typed DTOs live in its owning thegn-core
+    // module, so the trait, the routes and MCP stay independent of behaviour.
+    // Defaulted to `Unimplemented`; the daemon overrides each.
+
+    /// The cross-workspace Lead overview (`overview.get`).
+    fn overview_get(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("overview.get")) })
+    }
+
+    /// Filtered notification listing (`notifications.list`).
+    fn notifications_list(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("notifications.list")) })
+    }
+
+    /// Acknowledge notifications (`notifications.ack`).
+    fn notifications_ack(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("notifications.ack")) })
+    }
+
+    /// Create or replace a Lead-authored automation rule (`automations.put`).
+    fn automations_put(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.put")) })
+    }
+
+    /// Remove a Lead-authored automation rule (`automations.rm`).
+    fn automations_rm(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.rm")) })
+    }
+
+    /// Enable or disable a Lead-authored automation rule (`automations.enable`).
+    fn automations_enable(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.enable")) })
+    }
+
+    /// Recent audited automation runs (`automations.runs`).
+    fn automations_runs(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.runs")) })
+    }
+
+    /// Approval history and pending requests (`approvals.list`).
+    fn approvals_list(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("approvals.list")) })
+    }
+
+    /// Ask a human to approve a pipeline stage (`approvals.request`).
+    fn approvals_request(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("approvals.request")) })
+    }
+
+    /// Grant or deny a pending approval (`approvals.resolve`, Admin).
+    fn approvals_resolve(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("approvals.resolve")) })
+    }
+
+    /// Start the merge-queue drain for a worktree's repo (`merge.drain`).
+    fn merge_drain(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("merge.drain")) })
+    }
+
+    /// Pause every automation rule (`automations.pause`, THE-2197); replies
+    /// `{paused: true}`.
+    fn automations_pause(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.pause")) })
+    }
+
+    /// Resume paused automations (`automations.resume`, Admin, THE-2197);
+    /// replies `{paused: false}`.
+    fn automations_resume(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.resume")) })
+    }
+
+    // --- b155 Lead spine ------------------------------------------------------
+
+    /// Answer an approval with a single-use push nonce (`approvals.redeem`,
+    /// Write; HTTP + CLI; refused for the Lead). Body `{nonce, decision}`.
+    fn approvals_redeem(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("approvals.redeem")) })
+    }
+
+    /// Kill automation-started and Lead-opened sessions (`automations.halt`,
+    /// Admin). Body `{keep_sessions}`.
+    fn automations_halt(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.halt")) })
+    }
+
+    /// Resolve an MCP proxy profile's server env (`mcp_proxy.profile_env`,
+    /// Read). Body `{profile}`. The daemon answers only the Lead token for its
+    /// own `[lead] mcp_profile`, or an admin caller.
+    fn mcp_proxy_profile_env(
+        &self,
+        _req: serde_json::Value,
+        _caller: ProfileEnvCaller,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("mcp_proxy.profile_env")) })
+    }
+
     // --- agent orchestration (THE-57) ---------------------------------------
     // The supervisor's hands. Defaulted to `Unimplemented` so transport-only
     // impls and test fakes need no wiring (the calendar precedent); the daemon
@@ -1369,6 +1612,37 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
+    /// [`Self::issues_update`] for a Lead-confined caller (6d): the daemon
+    /// needs a live owner approval bound to this call's digest first.
+    /// Fails closed by default.
+    fn issues_update_confined<'a>(
+        &'a self,
+        _id: &'a str,
+        _patch: &'a thegn_core::issue::IssuePatch,
+        _repo: Option<&'a str>,
+        _account: Option<&'a str>,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        Box::pin(async { Err(ControlError::Unimplemented("issues.update (Lead-confined)")) })
+    }
+
+    /// [`Self::issues_comment`] for a Lead-confined caller (6d). Fails
+    /// closed by default.
+    fn issues_comment_confined<'a>(
+        &'a self,
+        _id: &'a str,
+        _body: &'a str,
+        _repo: Option<&'a str>,
+        _account: Option<&'a str>,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "issues.comment (Lead-confined)",
+            ))
+        })
+    }
+
     /// Post a comment on an issue (`issues.comment`). `account` names the
     /// configured tracker account that owns the issue; it routes by exact
     /// provider + account instead of by id prefix.
@@ -1397,6 +1671,22 @@ pub trait ControlApi: Send + Sync + 'static {
         _req: DispatchPutReq,
     ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// [`Self::dispatch_put`] for a Lead-confined caller (b155): the daemon
+    /// refuses it while automations are paused. Fails closed by default, so
+    /// an impl that cannot apply the pause check refuses the Lead.
+    fn dispatch_put_confined(
+        &self,
+        _req: DispatchPutReq,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        Box::pin(async {
+            Err(ControlError::FailedPrecondition(format!(
+                "{}this daemon cannot apply the Lead pause check",
+                thegn_core::lead_confine::REFUSAL_PREFIX
+            )))
+        })
     }
 
     /// Advance a dispatch's status (`dispatches.set_status`).
