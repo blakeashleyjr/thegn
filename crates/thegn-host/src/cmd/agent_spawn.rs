@@ -456,7 +456,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     // another live session still uses the worktree. A failure never changes
     // the agent's exit code.
     let stop_outcome = if matches!(status, WaitStatus::Exited(_)) && !keep_running {
-        stop_after_run(cfg, &client, &wt, &info.id).await
+        stop_after_run(cfg, &client, &wt, &info.id, pull).await
     } else {
         None
     };
@@ -690,6 +690,7 @@ async fn stop_after_run(
     client: &ControlClient,
     wt: &str,
     own: &str,
+    pulled: bool,
 ) -> Option<StopOutcome> {
     let target = {
         let cfg = cfg.clone();
@@ -716,8 +717,15 @@ async fn stop_after_run(
         return None;
     }
     let name = target.name.clone();
+    let cfg_owned = cfg.clone();
+    let wt_owned = wt.to_string();
     let res = tokio::task::spawn_blocking(move || {
         let StopTarget { provider, name, .. } = target;
+        if !pulled {
+            crate::provider_git::pull_back_if_provider(&cfg_owned, &wt_owned).map_err(|e| {
+                anyhow::anyhow!("left running: the pull before the stop failed: {e:#}")
+            })?;
+        }
         let Some(api) = crate::provider_factory::provider_for_named(&provider, &name) else {
             anyhow::bail!(
                 "provider {} is not configured (token unset?)",

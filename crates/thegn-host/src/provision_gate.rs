@@ -1459,6 +1459,7 @@ mod tests {
     /// and deciding that writes nothing to the DB.
     #[test]
     fn headless_claim_gate_is_false_without_a_pool_and_writes_nothing() {
+        let _state = thegn_core::testenv::IsolatedState::new();
         use thegn_core::config::{Config, EnvConfig, EnvProviderConfig, PlacementMode};
         let db = thegn_core::db::Db::open_memory().unwrap();
         let wt = "/nonexistent/b162/headless-wt";
