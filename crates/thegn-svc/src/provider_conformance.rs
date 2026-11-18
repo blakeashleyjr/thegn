@@ -13,6 +13,9 @@ use crate::provider::{InventoryReport, Provider};
 /// A probe over the fake control plane the fixture runs against.
 pub type Probe<T> = Box<dyn Fn() -> T + Send + Sync>;
 
+/// Counts the DELETE requests a fake has seen for one name.
+pub type DeleteCounter = Box<dyn Fn(&str) -> usize + Send + Sync>;
+
 /// What one provider run of the suite works against.
 pub struct Fixture {
     /// The sandbox the provider's `create` yields (and the provider owns).
@@ -29,7 +32,7 @@ pub struct Fixture {
     /// arrived (the fake records it); `None` when the fixture cannot tell.
     pub ledger_at_create: Option<Probe<Option<bool>>>,
     /// How many DELETE requests the fake has seen for a name.
-    pub deletes_for: Option<Probe<Box<dyn Fn(&str) -> usize + Send + Sync>>>,
+    pub deletes_for: Option<Probe<DeleteCounter>>,
     /// How many resume requests the fake has seen (none for sprites).
     pub resumes: Option<Probe<usize>>,
 }
