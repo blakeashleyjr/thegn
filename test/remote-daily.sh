@@ -81,21 +81,24 @@ Teardown    : trap on EXIT/INT/TERM -> env down --force, env deprovision <name>
 Steps:
   1   env test
   2   wt new rd-x --env <S>
-  3   agent run rd-x --agent hold-test --prompt x --wait --pull --json
+  3   agent run --worktree <rd-x path> --agent hold-test --prompt x --wait --pull --json
       (scripted agent: sleep 420; date>f; git commit). No per-run overlay agent
       can be added from here, so the stated fallback is used: the same script
-      run through the exec bridge (sprite-exec/vercel-exec --hold) followed by
-      env pull. If your config defines a hold-test agent, set
-      RD_HOLD_AGENT=1 to use agent run instead.
+      run through the exec bridge (sprite-exec --hold / vercel-exec) followed
+      by env pull. If your config defines a hold-test agent, set
+      RD_HOLD_AGENT=1 to use agent run instead (required for fly, which has
+      no exec bridge).
   4   (--with-model) agent run --agent claude, then --agent codex, each
       committing one file
   5   (fly only) fleet list --env shows stopped
   6   exec bridge: stat -c %a ~/.claude/.credentials.json is 600
   7   local git log has the commits
-  8   land --worktree rd-x
+  8   land --worktree <rd-x path> --release-sandbox
   9   ledger record gone, sandbox absent from the org listing
  10   env reap --provider <p> --json is clean
  A    (--with-adopt <name>) env adopt <name> --env <S> --yes; ledger record
+      is checked, then that record file is removed: the adopted sprite was
+      not created by this run and is NEVER destroyed by this script
  R    (--with-reaper) lifetime_reap on a throwaway env, hydrate cadence
 Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
 PLAN
@@ -119,6 +122,11 @@ if [ "${THEGN_CHANNEL:-}" != "dev" ]; then
   exit 2
 fi
 
+if [ "$provider" = fly ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
+  echo "fly needs RD_HOLD_AGENT=1 (no exec bridge)" >&2
+  exit 2
+fi
+
 TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
 unset THEGN_CONFIG_DIR
@@ -129,6 +137,7 @@ REPO="$TMP/repo"
 NAME="(unknown)"
 CREATED=0
 HOLD_PID=""
+WT_PATH=""
 case "$provider" in
 sprites) EXEC_BRIDGE="sprite-exec" ;;
 vercel) EXEC_BRIDGE="vercel-exec" ;;
@@ -156,6 +165,7 @@ teardown() {
   set +e
   local left=0 names n
   if [ -n "$HOLD_PID" ] && kill -0 "$HOLD_PID" 2>/dev/null; then
+    pkill -P "$HOLD_PID" 2>/dev/null
     kill "$HOLD_PID" 2>/dev/null
     sleep 2
     kill -0 "$HOLD_PID" 2>/dev/null && {
@@ -168,15 +178,17 @@ teardown() {
     echo "-- teardown: env down --force"
     (cd "$REPO" && "$THEGN_BIN" env down --force)
     for n in $names; do
+      [ "$n" = "$adopt_name" ] && continue
       case "$n" in *[!a-z0-9-]*) continue ;; esac
       if [ -f "$(ledger_dir)/$n.json" ]; then
         echo "-- teardown: env deprovision $n"
-        "$THEGN_BIN" env deprovision "$n" --env "$env_name"
+        "$THEGN_BIN" env deprovision "$n" --env "$env_name" --yes </dev/null
       fi
     done
     echo "-- teardown: daemon stop"
     "$THEGN_BIN" daemon stop
     for n in $names; do
+      [ "$n" = "$adopt_name" ] && continue
       if [ -f "$(ledger_dir)/$n.json" ]; then
         left=1
         rc=1
@@ -227,8 +239,11 @@ scratch_repo() {
 
 hold_script_fallback() { # exec-bridge fallback for the scripted hold-test agent
   [ -n "$EXEC_BRIDGE" ] || return 1
+  local hold=()
+  # Only sprite-exec has --hold; vercel-exec takes none.
+  [ "$provider" = sprites ] && hold=(--hold 10m)
   # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
-  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" --hold 10m "$NAME" -- sh -c \
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "${hold[@]}" "$NAME" -- sh -c \
     'cd "$HOME/workspace" && sleep 420 && date > rd-hold.txt && git add rd-hold.txt && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit -q -m rd-hold' &
   HOLD_PID=$!
 }
@@ -239,7 +254,7 @@ hold_wait() {
 }
 
 agent_run() { # agent_run <agent> ; each agent commits one file
-  in_repo "$THEGN_BIN" agent run rd-x --agent "$1" --prompt "create $1-rd.txt containing ok and commit it" --wait --pull --json
+  in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent "$1" --prompt "create $1-rd.txt containing ok and commit it" --wait --pull --json
 }
 
 fly_stopped() {
@@ -260,7 +275,7 @@ cred_mode() {
 
 local_log_has_commits() {
   local n want="${1:-1}"
-  n="$(git -C "$REPO" rev-list --count main..HEAD 2>/dev/null || echo 0)"
+  n="$(git -C "$WT_PATH" rev-list --count main..HEAD 2>/dev/null || echo 0)"
   echo "   commits ahead of main: $n"
   [ "$n" -ge "$want" ]
 }
@@ -281,7 +296,16 @@ reap_clean() {
 
 adopt_step() {
   "$THEGN_BIN" env adopt "$adopt_name" --env "$env_name" --yes --json &&
-    [ -f "$(ledger_dir)/$adopt_name.json" ]
+    [ -f "$(ledger_dir)/$adopt_name.json" ] || return 1
+  # Not created by this run: drop the record so no later command (teardown,
+  # reap, env down) can destroy the adopted sprite.
+  rm -f "$(ledger_dir)/$adopt_name.json"
+}
+
+resolve_wt_path() { # the worktree whose branch ends in rd-x
+  WT_PATH="$(git -C "$REPO" worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} /^branch .*rd-x$/{print p}')"
+  echo "   worktree: ${WT_PATH:-(none)}"
+  [ -n "$WT_PATH" ] && [ "$(printf '%s\n' "$WT_PATH" | wc -l)" -eq 1 ]
 }
 
 step 1 "env test" "$THEGN_BIN" env test "$env_name"
@@ -290,14 +314,15 @@ in_repo "$THEGN_BIN" env set "$env_name" >/dev/null
 CREATED=1
 step 2 "wt new rd-x --env $env_name" in_repo "$THEGN_BIN" wt new rd-x --env "$env_name"
 step 2b "exactly one ready ledger record for this run" name_from_ledger
+step 2c "resolve the rd-x worktree path" resolve_wt_path
 echo "sandbox: $NAME"
 if [ "${RD_HOLD_AGENT:-0}" = 1 ]; then
-  step 3 "agent run hold-test --wait --pull" in_repo "$THEGN_BIN" agent run rd-x --agent hold-test --prompt x --wait --pull --json
+  step 3 "agent run hold-test --wait --pull" in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent hold-test --prompt x --wait --pull --json
 else
-  echo "   (no overlay hold-test agent: using the $EXEC_BRIDGE --hold fallback + env pull)"
+  echo "   (no overlay hold-test agent: using the $EXEC_BRIDGE fallback + env pull)"
   step 3a "scripted hold starts" hold_script_fallback
   step 3b "scripted hold finishes (420 s)" hold_wait
-  step 3c "env pull" in_repo "$THEGN_BIN" env pull
+  step 3c "env pull" in_repo "$THEGN_BIN" env pull --worktree "$WT_PATH"
 fi
 if [ "$with_model" = 1 ]; then
   step 4a "agent run claude commits one file" agent_run claude
@@ -311,7 +336,7 @@ fi
 step 6 "credentials file mode is 600" cred_mode
 if [ "$with_model" = 1 ]; then want=3; else want=1; fi
 step 7 "local git log has the commits" local_log_has_commits "$want"
-step 8 "land --worktree rd-x" in_repo "$THEGN_BIN" land --worktree rd-x
+step 8 "land --worktree <rd-x> --release-sandbox" in_repo "$THEGN_BIN" land --worktree "$WT_PATH" --release-sandbox
 step 9a "ledger record gone" record_gone
 step 9b "sandbox absent from the org listing" listing_lacks_name
 step 10 "env reap --provider $provider is clean" reap_clean
