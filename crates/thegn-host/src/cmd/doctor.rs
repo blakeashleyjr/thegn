@@ -90,7 +90,17 @@ fn isolation_of_on(
     os: thegn_core::sandbox_backend::HostOs,
 ) -> Option<IsolationClass> {
     let backend = Backend::parse(backend_name)?;
-    Some(Capabilities::from_parts_on(backend, &Placement::Local, false, oci_runtime, os).isolation)
+    Some(
+        Capabilities::from_parts_on(
+            backend,
+            &Placement::Local,
+            thegn_core::config::Network::Nat,
+            false,
+            oci_runtime,
+            os,
+        )
+        .isolation,
+    )
 }
 
 /// The configured `[sandbox] oci_runtime`, or `None` when unset (daemon default).
