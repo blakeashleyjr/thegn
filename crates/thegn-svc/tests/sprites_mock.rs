@@ -723,7 +723,7 @@ fn destroy_retries_transient_500_then_succeeds() {
     // 500 twice, then 204: the teardown retry must ride out the transient errors
     // and succeed rather than leaking the sandbox — hitting DELETE exactly 3×.
     let (base, deletes) = start_delete_mock(2);
-    let (p, _ledger) = scoped(&base, "tgtest1");
+    let (p, _ledger) = recorded(&base, "tgtest1");
     rt().block_on(p.destroy("tgtest1")).unwrap();
     assert_eq!(
         *deletes.lock().unwrap(),
@@ -738,7 +738,7 @@ fn destroy_gives_up_bounded_on_persistent_500() {
     // forever, which would wedge the off-loop delete thread) and surfaces the
     // status so the warn is actionable.
     let (base, deletes) = start_delete_mock(usize::MAX);
-    let (p, _ledger) = scoped(&base, "tgtest1");
+    let (p, _ledger) = recorded(&base, "tgtest1");
     let err = rt().block_on(p.destroy("tgtest1")).unwrap_err();
     assert!(
         err.to_string().contains("500"),
@@ -947,5 +947,182 @@ fn ensure_executable_pushes_once_then_idempotent() {
     assert_eq!(
         exec_writes, 2,
         "binary should push twice, not on the no-op: {reqs:?}"
+    );
+}
+
+// ---- b160 sx-ledger-reap: the ownership ledger around create/destroy ----
+
+/// [`scoped`], with a `ready` ledger record for `name` already written (a
+/// sprite this host created), so destroy has its proof.
+fn recorded(base: &str, name: &str) -> (SpritesProvider, tempfile::TempDir) {
+    let (provider, ledger) = scoped(base, name);
+    thegn_svc::sprites::ledger::commit_at(ledger.path(), &scope(), name).unwrap();
+    (provider, ledger)
+}
+
+/// How the scripted create mock answers `POST /sprites`.
+#[derive(Clone, Copy)]
+enum CreateReply {
+    Created,
+    BadRequest,
+    /// Close the connection without answering (an ambiguous outcome).
+    Drop,
+}
+
+/// What the scripted create mock saw: POSTs, and the ledger state of the
+/// sprite's record at the moment each POST arrived (`None` = no record file).
+#[derive(Default)]
+struct CreateSeen {
+    posts: usize,
+    states_at_post: Vec<Option<String>>,
+}
+
+/// A create mock that, on each `POST /sprites`, reads `ledger/<name>.json`
+/// (so the test proves the intent was written **before** the request) and
+/// then answers per `reply`.
+fn start_ledger_create_mock(
+    ledger: std::path::PathBuf,
+    name: &'static str,
+    reply: CreateReply,
+) -> (String, Arc<Mutex<CreateSeen>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(CreateSeen::default()));
+    let shared = seen.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let shared = shared.clone();
+            let ledger = ledger.clone();
+            thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = stream;
+                let mut line = String::new();
+                if read_line(&mut reader, &mut line).is_none() {
+                    return;
+                }
+                let method = line.split_whitespace().next().unwrap_or("").to_string();
+                let mut content_length = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if read_line(&mut reader, &mut h).is_none() {
+                        break;
+                    }
+                    let t = h.trim_end();
+                    if t.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = t.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body); // best-effort: client may have disconnected
+                }
+                let (status, resp): (&str, Vec<u8>) = if method == "POST" {
+                    let state = std::fs::read(ledger.join(format!("{name}.json")))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|v| v["state"].as_str().map(str::to_string));
+                    {
+                        let mut seen = shared.lock().unwrap();
+                        seen.posts += 1;
+                        seen.states_at_post.push(state);
+                    }
+                    match reply {
+                        CreateReply::Created => (
+                            "200 OK",
+                            format!(r#"{{"id":"x","name":"{name}","status":"cold"}}"#).into_bytes(),
+                        ),
+                        CreateReply::BadRequest => {
+                            ("400 Bad Request", br#"{"error":"bad name"}"#.to_vec())
+                        }
+                        CreateReply::Drop => return, // close without a response
+                    }
+                } else {
+                    ("404 Not Found", b"no route".to_vec())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp.len()
+                );
+                let _ = writer.write_all(head.as_bytes()); // best-effort: client may have disconnected
+                let _ = writer.write_all(&resp); // best-effort: client may have disconnected
+                let _ = writer.flush(); // best-effort: client may have disconnected
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1"), seen)
+}
+
+fn ledger_state(ledger: &tempfile::TempDir, name: &str) -> Option<String> {
+    thegn_svc::vps::registry::read_checked_at(ledger.path(), name)
+        .unwrap()
+        .map(|record| record.state)
+}
+
+#[test]
+fn destroy_of_a_recorded_sprite_deletes_and_forgets_the_record() {
+    let (base, deletes) = start_delete_mock(0);
+    let (p, ledger) = recorded(&base, "tgtest1");
+    rt().block_on(p.destroy("tgtest1")).unwrap();
+    assert_eq!(*deletes.lock().unwrap(), 1);
+    assert_eq!(ledger_state(&ledger, "tgtest1"), None, "record forgotten");
+}
+
+#[test]
+fn create_writes_the_creating_record_before_the_post() {
+    let ledger = tempfile::tempdir().unwrap();
+    let (base, seen) =
+        start_ledger_create_mock(ledger.path().to_path_buf(), "sx-new", CreateReply::Created);
+    let p = SpritesProvider::new(&base, "tok", "sx-new")
+        .with_scope(scope())
+        .with_ledger_dir(ledger.path().to_path_buf());
+    assert_eq!(rt().block_on(p.create()).unwrap().id, "sx-new");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.posts, 1);
+    assert_eq!(
+        seen.states_at_post,
+        [Some("creating".to_string())],
+        "the intent existed when the POST arrived"
+    );
+    assert_eq!(ledger_state(&ledger, "sx-new").as_deref(), Some("ready"));
+}
+
+#[test]
+fn create_refused_with_400_leaves_no_record() {
+    let ledger = tempfile::tempdir().unwrap();
+    let (base, seen) = start_ledger_create_mock(
+        ledger.path().to_path_buf(),
+        "sx-new",
+        CreateReply::BadRequest,
+    );
+    let p = SpritesProvider::new(&base, "tok", "sx-new")
+        .with_scope(scope())
+        .with_ledger_dir(ledger.path().to_path_buf());
+    let err = rt().block_on(p.create()).unwrap_err();
+    assert!(err.to_string().contains("400"), "{err}");
+    assert_eq!(
+        seen.lock().unwrap().posts,
+        1,
+        "a definite 4xx is not retried"
+    );
+    assert_eq!(ledger_state(&ledger, "sx-new"), None, "no record left");
+}
+
+#[test]
+fn create_with_a_dropped_connection_keeps_the_creating_record() {
+    let ledger = tempfile::tempdir().unwrap();
+    let (base, seen) =
+        start_ledger_create_mock(ledger.path().to_path_buf(), "sx-new", CreateReply::Drop);
+    let p = SpritesProvider::new(&base, "tok", "sx-new")
+        .with_scope(scope())
+        .with_ledger_dir(ledger.path().to_path_buf());
+    rt().block_on(p.create()).unwrap_err();
+    assert!(seen.lock().unwrap().posts >= 1);
+    assert_eq!(
+        ledger_state(&ledger, "sx-new").as_deref(),
+        Some("creating"),
+        "an ambiguous create keeps its intent for the reaper"
     );
 }
