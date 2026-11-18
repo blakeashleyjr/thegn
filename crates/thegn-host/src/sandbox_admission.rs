@@ -188,13 +188,20 @@ pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
     },
     LaunchRoute {
         id: "tests-gates",
-        route: "Tests/discovery/gates/regeneration",
+        route: "Tests/discovery",
         status: RouteStatus::HostCapped,
-        path: "host commands under the shared resource ceiling (integrate_gate)",
+        path: "host commands under the shared resource ceiling (integrate_gate when [merge_queue] gate_sandbox = off)",
         anchor: Some((
             "integrate_gate.rs",
             "thegn_core::sandbox_cpucap::wrap_background_argv_tagged_reporting(",
         )),
+    },
+    LaunchRoute {
+        id: "merge-gate",
+        route: "Merge gate/setup/regeneration",
+        status: RouteStatus::OwnGate,
+        path: "merge gate/setup/regenerate: sealed spec via gate_sandbox when [merge_queue] gate_sandbox = sealed, else host-capped; local bwrap, network none, no host daemon socket, read-only caches",
+        anchor: Some(("gate_sandbox.rs", "fn resolve_for_gate(")),
     },
     LaunchRoute {
         id: "host-hooks",
@@ -246,6 +253,13 @@ pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
             "mcp_proxy/upstream.rs",
             "let wrapped = thegn_core::sandbox_cpucap::wrap_background_argv(argv.to_vec());",
         )),
+    },
+    LaunchRoute {
+        id: "lead-login",
+        route: "Lead agent/MCP login",
+        status: RouteStatus::HostTrust,
+        path: "operator-only interactive `thegn lead login` on the host, host network, Lead-private dirs (same class as mcp_proxy upstreams)",
+        anchor: Some(("lead/login.rs", "fn run(")),
     },
 ];
 
@@ -473,20 +487,22 @@ mod tests {
 
     #[test]
     fn launch_route_table_covers_the_audit_rows() {
-        const AUDIT_ROWS: [&str; 11] = [
+        const AUDIT_ROWS: [&str; 13] = [
             "Worktree shells, configured agents/tools, daemon opens",
             "Standalone terminal tabs",
             "Queue/CI/review/merge agents",
             "Autopilot",
-            "Tests/discovery/gates/regeneration",
+            "Tests/discovery",
+            "Merge gate/setup/regeneration",
             "Host lifecycle hooks/devcontainer initialize",
             "Container devcontainer lifecycle",
             "Provider-native",
             "Host Git reads/mutations",
             "Language services",
             "MCP/plugins/editors/viewer or arbitrary-command panes",
+            "Lead agent/MCP login",
         ];
-        assert_eq!(LAUNCH_ROUTES.len(), 11);
+        assert_eq!(LAUNCH_ROUTES.len(), 13);
         let mut ids = std::collections::HashSet::new();
         for route in LAUNCH_ROUTES {
             assert!(ids.insert(route.id), "duplicate route id {}", route.id);
@@ -498,6 +514,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             AUDIT_ROWS
         );
+    }
+
+    #[test]
+    fn the_merge_gate_route_is_its_own_sealed_gate() {
+        let gate = LAUNCH_ROUTES
+            .iter()
+            .find(|route| route.id == "merge-gate")
+            .expect("merge-gate route is present");
+        assert_eq!(gate.status, RouteStatus::OwnGate);
+        assert!(gate.path.contains("gate_sandbox = sealed"));
+        assert!(gate.path.contains("host-capped"));
+        let tests = LAUNCH_ROUTES
+            .iter()
+            .find(|route| route.id == "tests-gates")
+            .expect("tests-gates route is present");
+        assert_eq!(tests.status, RouteStatus::HostCapped);
+        let login = LAUNCH_ROUTES
+            .iter()
+            .find(|route| route.id == "lead-login")
+            .expect("lead-login route is present");
+        assert_eq!(login.status, RouteStatus::HostTrust);
+        assert_eq!(login.anchor, Some(("lead/login.rs", "fn run(")));
     }
 
     #[test]
@@ -521,6 +559,8 @@ mod tests {
             "hook_run.rs" => include_str!("hook_run.rs"),
             "lsp.rs" => include_str!("lsp.rs"),
             "mcp_proxy/upstream.rs" => include_str!("mcp_proxy/upstream.rs"),
+            "gate_sandbox.rs" => include_str!("gate_sandbox.rs"),
+            "lead/login.rs" => include_str!("lead/login.rs"),
             unknown => panic!("unknown route anchor file {unknown}"),
         }
     }
@@ -564,7 +604,7 @@ mod tests {
     #[test]
     fn launch_route_lines_name_every_route() {
         let lines = route_lines();
-        assert_eq!(lines.len(), 12);
+        assert_eq!(lines.len(), 14);
         for route in LAUNCH_ROUTES {
             let prefix = format!("  admission     {}: ", route.id);
             let line = lines

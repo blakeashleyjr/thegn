@@ -8778,7 +8778,7 @@ args = ["--verbose"]
         let routes = value["admission_routes"]
             .as_array()
             .expect("admission_routes is an array");
-        assert_eq!(routes.len(), 11);
+        assert_eq!(routes.len(), 13);
         for route in routes {
             assert!(route["id"].as_str().is_some());
             assert!(route["route"].as_str().is_some());
