@@ -9,7 +9,7 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 - [x] 1.2 WS01-P1-02: `egress_for(&EgressInputs)` and honest capability fields (`Offline`, no false
       `Enforce`, VPN is `Unmanaged`)
 - [x] 1.3 WS01-P1-03: matrix relabel (`NetIsolation::{OwnNetns, Unverified}`)
-- [ ] 1.4 WS01-P1-04: refuse Apple `network = "none"` with `network-unexpressible`
+- [x] 1.4 WS01-P1-04: refuse Apple `network = "none"` with `network-unexpressible`
 - [ ] 1.5 WS01-P1-05: warn when provider placements ignore hostname rules
 - [ ] 1.6 WS01-P1-06: `network_audit` truth (and prior audit F14 closure)
 - [ ] 1.7 WS01-P1-07: VPN DNS mode truth (`filter-front` reserved)
