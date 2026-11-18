@@ -128,8 +128,8 @@ fn pick_backend_with_notice(
                         &format!(
                             "sandbox backend '{}' unavailable{}; trying the chain",
                             cfg.backend,
-                            if b == Backend::WinAppContainer {
-                                " (reserved: not implemented — set [sandbox] backend to another backend, e.g. \"jobobject\" or a container runtime)"
+                            if b.is_reserved() {
+                                " (reserved: accepted by config but not implemented in this build; set [sandbox] backend to an implemented backend, e.g. \"jobobject\" or a container runtime)"
                             } else if suitable(b) {
                                 ""
                             } else {
@@ -659,9 +659,10 @@ fn available_probe(placement: &Placement, backend: Backend) -> RuntimeProbe {
             RuntimeProbe::Absent
         }
     };
-    // AppContainer is reserved: no token/ACL/network implementation exists
-    // (THE-802), so it is unavailable regardless of OS or placement.
-    if backend == Backend::WinAppContainer {
+    // A reserved kind (smol, wsl, AppContainer — THE-802) has no runtime
+    // behind it: unavailable regardless of OS or placement. No parser yields a
+    // reserved `Backend`, so this is defence in depth for direct constructors.
+    if backend.is_reserved() {
         return RuntimeProbe::Absent;
     }
     // Job Objects are OS APIs, not binaries on PATH — their presence is the OS
@@ -963,6 +964,28 @@ mod tests {
     }
 
     #[test]
+    fn reserved_backend_probe_is_absent() {
+        let ssh = Placement::Ssh(crate::placement::SshPlacement::plain(
+            "host".into(),
+            22,
+            false,
+            crate::placement::TransportKind::Ssh,
+        ));
+        for backend in [Backend::Smol, Backend::Wsl, Backend::WinAppContainer] {
+            assert!(backend.is_reserved(), "{backend:?}");
+            // The probe answers before any OS, PATH or remote check, so the
+            // answer is the same on every host OS.
+            for placement in [&Placement::Local, &ssh] {
+                assert_eq!(
+                    available_probe(placement, backend),
+                    RuntimeProbe::Absent,
+                    "{backend:?} on {placement:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn explicit_appcontainer_miss_explains_the_reserved_backend() {
         let cfg = SandboxConfig {
             backend: crate::config::SandboxBackend::WinAppContainer,
@@ -979,7 +1002,7 @@ mod tests {
         assert!(
             notices
                 .iter()
-                .any(|message| message.contains("reserved: not implemented")),
+                .any(|message| message.contains("reserved: accepted by config")),
             "explicit miss notice should explain AppContainer is reserved: {notices:?}"
         );
         assert!(

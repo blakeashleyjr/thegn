@@ -233,6 +233,29 @@ impl Backend {
         })
     }
 
+    /// The config-facing kind (exhaustive inverse of [`Backend::from_config`]).
+    pub fn to_config(self) -> SandboxBackend {
+        match self {
+            Backend::Podman => SandboxBackend::Podman,
+            Backend::PodmanRootful => SandboxBackend::PodmanRootful,
+            Backend::Docker => SandboxBackend::Docker,
+            Backend::Smol => SandboxBackend::Smol,
+            Backend::Bwrap => SandboxBackend::Bwrap,
+            Backend::Systemd => SandboxBackend::Systemd,
+            Backend::Apple => SandboxBackend::Apple,
+            Backend::Wsl => SandboxBackend::Wsl,
+            Backend::WinAppContainer => SandboxBackend::WinAppContainer,
+            Backend::WinJobObject => SandboxBackend::WinJobObject,
+            Backend::None => SandboxBackend::None,
+        }
+    }
+
+    /// Accepted by config but not implemented in this build (`smol`, `wsl`,
+    /// `appcontainer`): never a runtime candidate.
+    pub fn is_reserved(self) -> bool {
+        <SandboxBackend as crate::seam::Kind>::is_reserved(self.to_config())
+    }
+
     /// The executable to probe / invoke for this backend.
     /// The one table every `match backend` used to re-derive: label, binary,
     /// family, and the flags the argv builders branch on. Adding a backend is
@@ -389,12 +412,12 @@ impl Backend {
         )
     }
 
-    /// The OCI runtimes worth probing for a container on this host (WSL is
-    /// reserved — no runtime behind it yet).
+    /// The OCI runtimes worth probing for a container on this host (reserved
+    /// kinds — smol, wsl — have no runtime behind them).
     pub fn oci_runtimes() -> impl Iterator<Item = Backend> {
         Backend::ALL
             .into_iter()
-            .filter(|b| b.is_oci() && *b != Backend::Wsl)
+            .filter(|b| b.is_oci() && !b.is_reserved())
     }
 
     /// Every runtime backend (for tables and coverage tests).

@@ -182,8 +182,9 @@ fn requests_containment(requested: &str) -> bool {
 /// safe direction, but a wrong label all the same. Remote launches should keep
 /// the resolver's label, which the placement's own bring-up already proved.
 pub fn reconcile(requested: &str, argv: &[String]) -> Truth {
-    let want = crate::config::SandboxBackend::from_str_validated(requested.trim())
-        .ok()
+    // Lenient: a reserved request (smol, wsl, appcontainer) is still named so
+    // the warning can say why it was not honoured.
+    let want = crate::config::SandboxBackend::from_str_any(requested.trim())
         .and_then(Backend::from_config);
     // Job Object containment happens in the spawn syscall, so argv inspection
     // cannot see it. AppContainer is reserved and must be reported as host.
@@ -215,8 +216,11 @@ pub fn reconcile(requested: &str, argv: &[String]) -> Truth {
             label
         )
     };
-    if want == Some(Backend::WinAppContainer) {
-        warning.push_str(" (appcontainer is reserved and not implemented)");
+    if let Some(reserved) = want.filter(|backend| backend.is_reserved()) {
+        warning.push_str(&format!(
+            " ({} is reserved and not implemented)",
+            reserved.label()
+        ));
     }
     Truth {
         label,

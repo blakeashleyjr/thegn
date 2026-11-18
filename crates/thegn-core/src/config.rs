@@ -282,14 +282,21 @@ macro_rules! config_enum {
         }
 
         impl $name {
+            /// Lenient parse: any canonical spelling or alias, reserved kinds
+            /// included; `None` on an unknown value.
+            pub fn from_str_any(s: &str) -> Option<Self> {
+                match s.trim().to_ascii_lowercase().as_str() {
+                    $( $canon $(| $alias)* => Some($name::$variant), )+
+                    _ => None,
+                }
+            }
             /// Strict parse: `Err` (with the valid set) on an unknown value.
             pub fn from_str_validated(s: &str) -> Result<Self, String> {
-                let parsed = match s.trim().to_ascii_lowercase().as_str() {
-                    $( $canon $(| $alias)* => $name::$variant, )+
-                    other => return Err(format!(
+                let Some(parsed) = $name::from_str_any(s) else {
+                    return Err(format!(
                         "unknown {} {:?}; expected one of: {}",
-                        $kind, other, [$( $canon ),+].join(", ")
-                    )),
+                        $kind, s.trim().to_ascii_lowercase(), [$( $canon ),+].join(", ")
+                    ));
                 };
                 if <$name as crate::seam::Kind>::is_reserved(parsed) {
                     return Err(format!(
@@ -453,13 +460,13 @@ config_enum! {
         Podman = "podman" | "podman-rootless" | "rootless-podman",
         PodmanRootful = "podman-rootful" | "rootful-podman",
         Docker = "docker",
-        Smol = "smol" | "smolmachines",
+        Smol = "smol" | "smolmachines" reserved,
         Bwrap = "bwrap" | "bubblewrap",
         Systemd = "systemd" | "systemd-run",
         Apple = "apple" | "container",
         // Reserved: the WSL backend is aspirational (see `sandbox.rs`).
         Wsl = "wsl" reserved,
-        WinAppContainer = "winappcontainer" | "appcontainer",
+        WinAppContainer = "winappcontainer" | "appcontainer" reserved,
         WinJobObject = "winjobobject" | "jobobject",
         None = "none" | "host",
     } default = Auto;

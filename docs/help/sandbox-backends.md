@@ -16,7 +16,9 @@ Part of [[sandboxing]]. Which backend runs a worktree, what each one enforces, a
 `jobobject` (Windows). There is no host fallback: with no usable backend, a
 sandboxed launch is refused under the default floor. Pin one to skip the
 probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
-`apple`, `wsl`, `none`.
+`apple`, `jobobject`, `none`. Reserved (accepted by config, never selected):
+`smol`, `wsl`, `appcontainer`; a reserved value warns and resolves through
+`backend_chain`, and `thegn config validate --strict` rejects it.
 
 The outer `bwrap` and `systemd-run` launchers are resolved to absolute paths
 from thegn's own `PATH`. If either is missing there, launch is refused rather

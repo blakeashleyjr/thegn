@@ -22,7 +22,7 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 
 ## 3. Reserved kinds
 
-- [ ] 3.1 WS01-P3-01: reserve `smol` and `appcontainer`; reserved kinds are never runtime candidates
+- [x] 3.1 WS01-P3-01: reserve `smol` and `appcontainer`; reserved kinds are never runtime candidates
 - [ ] 3.2 WS01-P3-02: smol cleanup (labels, dead docker-clone arms, lists)
 
 ## 4. Remote truth

@@ -3470,6 +3470,9 @@ pub fn run(
             .as_deref()
             .map_or("(none)".to_string(), |path| path.display().to_string()),
     );
+    for line in reserved_backend_lines(health.findings().map(|finding| finding.message.as_str())) {
+        outln!("  {line}");
+    }
     outln!("");
     channel_report(cfg);
     outln!("");
@@ -4941,6 +4944,33 @@ fn state_label(s: thegn_core::sandbox_support::BackendState) -> &'static str {
         S::Unsupported => "unsupported",
         S::Unreachable => "unreachable",
     }
+}
+
+/// Doctor lines for a reserved `backend` / `default_backend` value found by the
+/// raw config validator (the lenient load already turned it into `auto`):
+/// `sandbox backend "smol" is reserved: resolving via backend_chain`.
+fn reserved_backend_lines<'a>(messages: impl Iterator<Item = &'a str>) -> Vec<String> {
+    const MARKER: &str = "sandbox backend \"";
+    let mut lines: Vec<String> = Vec::new();
+    for message in messages {
+        let Some(index) = message.find(MARKER) else {
+            continue;
+        };
+        // The key path precedes the message (`sandbox.backend: …`,
+        // `env.<n>.sandbox.default_backend: …`).
+        let path = &message[..index];
+        if !(path.contains("sandbox.backend") || path.contains("sandbox.default_backend")) {
+            continue;
+        }
+        let Some((value, _)) = message[index + MARKER.len()..].split_once("\" is reserved") else {
+            continue;
+        };
+        let line = format!("sandbox backend \"{value}\" is reserved: resolving via backend_chain");
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines
 }
 
 /// Print the resolved sandbox boundary honestly: which backend(s) would run, the
@@ -7773,6 +7803,22 @@ args = ["--verbose"]
     #[test]
     fn secret_hard_link_notes_are_empty_without_state_entries() {
         assert!(secret_hard_link_notes(tempfile::tempdir().unwrap().path()).is_empty());
+    }
+
+    #[test]
+    fn doctor_prints_reserved_backend_finding() {
+        let errors = thegn_core::config_validate::validate_str("[sandbox]\nbackend = \"smol\"\n");
+        let lines = reserved_backend_lines(errors.iter().map(String::as_str));
+        assert_eq!(
+            lines,
+            ["sandbox backend \"smol\" is reserved: resolving via backend_chain"],
+            "{errors:?}"
+        );
+        // Other findings are ignored.
+        assert!(
+            reserved_backend_lines(["ci.provider: ci provider \"drone\" is reserved"].into_iter())
+                .is_empty()
+        );
     }
 
     #[test]

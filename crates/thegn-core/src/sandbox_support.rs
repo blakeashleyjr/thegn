@@ -325,19 +325,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unverified_backend_keeps_both_its_remedy_and_its_caveat() {
-        // The reason `caveat` is a separate field: an unverified backend can
-        // also be stopped or missing. Folding it into `remedy` would drop one of
-        // the two, and which one it dropped would depend on the state.
-        let rows = support_report(&["smol".to_string()], &Placement::Local, None);
-        let row = &rows[0];
-        assert!(row.caveat.is_some(), "caveat is independent of state");
-        if row.state != BackendState::Ready {
+    fn a_reserved_backend_is_absent_and_never_a_candidate() {
+        // smol, wsl and appcontainer are reserved: a chain entry naming one
+        // parses to nothing, so the report has no row to select.
+        for name in [
+            "smol",
+            "smolmachines",
+            "wsl",
+            "appcontainer",
+            "winappcontainer",
+        ] {
             assert!(
-                row.remedy.is_some(),
-                "a non-ready row still says how to fix it: {:?}",
-                row.state
+                support_report(&[name.to_string()], &Placement::Local, None).is_empty(),
+                "{name} must not become a candidate"
             );
+        }
+        // Constructed directly, a reserved backend still probes Absent, so it
+        // is never Ready on any OS.
+        for b in [Backend::Smol, Backend::Wsl, Backend::WinAppContainer] {
+            assert!(b.is_reserved(), "{b:?}");
+            for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
+                assert_ne!(
+                    classify(b, &Placement::Local, os),
+                    BackendState::Ready,
+                    "{b:?} on {os:?}"
+                );
+            }
         }
     }
 
