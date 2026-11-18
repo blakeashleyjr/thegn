@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::daemon::service::DaemonService;
 
+pub(crate) mod inbox;
 pub(crate) mod pr;
 pub(crate) mod queues;
 pub(crate) mod tracker;
@@ -196,6 +197,8 @@ fn wanted_kinds(cfg: &Config) -> BTreeSet<ProducerKind> {
         pr_queue_enabled: cfg.pr_queue.enabled,
         github_mentions: cfg.notifications.github_mentions,
         push_configured: cfg.notifications.push.is_configured(),
+        // b163 lane 5 arms the inbox (`producer_arm::inbox_armable`).
+        inbox_any: false,
     };
     armed_kinds(&inputs).into_iter().collect()
 }
@@ -249,6 +252,18 @@ pub(crate) fn status() -> Vec<(ProducerKind, bool /*armed*/)> {
         .into_iter()
         .map(|kind| (kind, tasks.contains_key(&kind)))
         .collect()
+}
+
+/// Re-evaluate arming, coalescing bursts (b163). Stub: a no-op (filled by
+/// b163 lane 5).
+#[allow(dead_code, reason = "filled by b163 lane 5")]
+pub(crate) fn rearm_debounced() {}
+
+/// The `producers.status` reply. Blocking. Stub: the default (empty) reply
+/// (filled by b163 lane 5).
+#[allow(dead_code, reason = "filled by b163 lane 5")]
+pub(crate) fn status_reply() -> thegn_core::producer_status::ProducersStatusReply {
+    Default::default()
 }
 
 /// Release every lease this daemon holds (graceful shutdown). Blocking; a
@@ -384,6 +399,7 @@ fn dispatch(kind: ProducerKind, ctx: &TickCtx) -> TickOutcome {
         ProducerKind::PrPoll => pr::tick_pr(ctx),
         ProducerKind::Mentions => pr::tick_mentions(ctx),
         ProducerKind::PrQueue => queues::tick_pr_queue(ctx),
+        ProducerKind::Inbox => inbox::tick(ctx),
     }
 }
 
@@ -516,6 +532,26 @@ mod tests {
         let mut on = Config::default();
         on.daemon.headless_producers = true;
         assert!(install_gate(&on));
+    }
+
+    #[test]
+    fn producers_status_route_answers_the_default_reply_shape() {
+        rearm_debounced();
+        let value = serde_json::to_value(status_reply()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"installed": false, "headless": false, "kinds": [], "inbox": []})
+        );
+        assert_eq!(
+            dispatch(
+                ProducerKind::Inbox,
+                &TickCtx {
+                    cfg: Arc::new(Config::default()),
+                    now_ms: 0,
+                }
+            ),
+            TickOutcome::Skipped("not implemented")
+        );
     }
 
     #[test]

@@ -18,6 +18,17 @@ use thegn_core::issue::{AgentDispatchStatus, Issue, IssuePatch, NewDispatch};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{AutopilotStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
 
+/// The `autopilot.run` rule action (THE-2196): run autopilot for the issue
+/// an `issue_matched` event names. Returns a one-line summary. Stub: refuses
+/// (filled by b163 lane 7).
+#[allow(dead_code, reason = "filled by b163 lane 7")]
+pub(crate) fn run_from_rule(
+    _cfg: &Config,
+    _event: &thegn_core::automation::AutomationEvent,
+) -> anyhow::Result<String> {
+    anyhow::bail!("autopilot.run is not implemented")
+}
+
 /// Run the pickup/implement/PR path for one successful provider refresh.
 /// `from_assignee_me` is provenance from the authenticated provider filter;
 /// it is deliberately not inferred from display names in an issue payload.

@@ -410,6 +410,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::lead::Action,
     },
+    /// The native inbox (mail, Todoist, any command)
+    Inbox {
+        #[command(subcommand)]
+        action: cmd::inbox::Action,
+    },
     /// GitHub PR data + actions for a worktree.
     Pr {
         #[command(subcommand)]
@@ -1534,6 +1539,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Voice { action } => cmd::voice::run(&cfg, action, config_path),
         Command::Automations { action } => cmd::automations::run(&cfg, action),
         Command::Lead { action } => cmd::lead::run(&cfg, action),
+        Command::Inbox { action } => cmd::inbox::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action, &config_path),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),

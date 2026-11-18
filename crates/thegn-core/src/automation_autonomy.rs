@@ -19,10 +19,13 @@
 //! - A [`RuleOrigin::LeadApproved`] `pipeline.start` runs at its declared
 //!   level, capped at `review` when it reads free text; anything else armed
 //!   is still capped at `review`.
+//! - (b163) Any `inbox_item` rule is capped at `review`: inbox items are
+//!   third-party content. `autopilot.run` is capped at `review` for every
+//!   origin and is config-only: a Lead rule naming it is refused.
 
 use serde::{Deserialize, Serialize};
 
-use crate::automation::AutomationPredicate;
+use crate::automation::{AutomationEventKind, AutomationPredicate};
 
 /// How far an automation run may go without a human. Ordered: `Propose` <
 /// `Review` < `Merge`, so `min` is "the stricter of".
@@ -91,10 +94,25 @@ pub const STRUCTURAL_PREDICATES: &[&str] = &[
     "label",
     "assignee",
     "status",
+    "inbox_account",
+    "inbox_kind",
+    "inbox_label",
 ];
 
 /// The action whose Lead-authored form only proposes until the owner arms it.
 pub const PIPELINE_START: &str = "pipeline.start";
+
+/// The config-only rule action that runs issue autopilot (THE-2196).
+pub const AUTOPILOT_RUN: &str = "autopilot.run";
+
+/// Why an `inbox_item` rule asking for `merge` runs at `review`.
+pub const INBOX_CAP_REASON: &str = "autonomy capped at review: inbox items are third-party content";
+
+/// Why an `autopilot.run` rule asking for `merge` runs at `review`.
+pub const AUTOPILOT_CAP_NOTE: &str = "autonomy capped at review: autopilot.run never merges";
+
+/// The put-time refusal for a Lead rule naming `autopilot.run`.
+pub const AUTOPILOT_RUN_REFUSAL: &str = "autopilot.run is config-only";
 
 /// Why a config rule asking for `merge` runs at `review`.
 pub const FREE_TEXT_CAP_NOTE: &str =
@@ -121,7 +139,35 @@ pub fn uses_free_text(p: &AutomationPredicate) -> bool {
 
 /// The ceiling a rule actually runs at, plus a warning when policy lowered
 /// the declared level. Never raises: the result is always `<= declared`.
+/// `event` is the rule's `when`: every `inbox_item` rule is capped at
+/// `review` ([`INBOX_CAP_REASON`]), as is every `autopilot.run`.
 pub fn effective_autonomy(
+    declared: Autonomy,
+    event: AutomationEventKind,
+    p: &AutomationPredicate,
+    cap: &str,
+    origin: RuleOrigin,
+) -> (Autonomy, Option<&'static str>) {
+    let (level, note) = origin_autonomy(declared, p, cap, origin);
+    if level > Autonomy::Review && reads_inbox_items(event, p) {
+        return (Autonomy::Review, Some(INBOX_CAP_REASON));
+    }
+    if level > Autonomy::Review && cap.trim() == AUTOPILOT_RUN {
+        return (Autonomy::Review, Some(AUTOPILOT_CAP_NOTE));
+    }
+    (level, note)
+}
+
+/// Whether a rule fires on inbox items: an `inbox_item` rule, or a
+/// `notification` rule pinned to `notification_kind = inbox_item`.
+pub fn reads_inbox_items(event: AutomationEventKind, p: &AutomationPredicate) -> bool {
+    event == AutomationEventKind::InboxItem
+        || (event == AutomationEventKind::Notification
+            && p.notification_kind == Some(crate::notification::NotificationKind::InboxItem))
+}
+
+/// The origin/free-text half of [`effective_autonomy`].
+fn origin_autonomy(
     declared: Autonomy,
     p: &AutomationPredicate,
     cap: &str,
@@ -160,6 +206,9 @@ pub fn validate_autonomy(
 ) -> Result<(), String> {
     match origin {
         RuleOrigin::Config => Ok(()),
+        RuleOrigin::Lead | RuleOrigin::LeadApproved if cap.trim() == AUTOPILOT_RUN => {
+            Err(AUTOPILOT_RUN_REFUSAL.into())
+        }
         RuleOrigin::Lead | RuleOrigin::LeadApproved
             if declared == Autonomy::Merge && cap.trim() != PIPELINE_START =>
         {
@@ -172,6 +221,8 @@ pub fn validate_autonomy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOTE: AutomationEventKind = AutomationEventKind::Notification;
 
     #[test]
     fn autonomy_names_round_trip_and_default_is_review() {
@@ -382,7 +433,7 @@ mod tests {
             let p = predicate(free_text);
             let case = format!("{origin:?} {cap} {declared:?} free_text={free_text}");
             assert_eq!(
-                effective_autonomy(declared, &p, cap, origin),
+                effective_autonomy(declared, NOTE, &p, cap, origin),
                 (effective, note),
                 "{case}"
             );
@@ -406,9 +457,10 @@ mod tests {
             for declared in Autonomy::ALL {
                 for free in [false, true] {
                     let p = predicate(free);
-                    let lead = effective_autonomy(declared, &p, cap, RuleOrigin::Lead).0;
-                    let armed = effective_autonomy(declared, &p, cap, RuleOrigin::LeadApproved).0;
-                    let config = effective_autonomy(declared, &p, cap, RuleOrigin::Config).0;
+                    let lead = effective_autonomy(declared, NOTE, &p, cap, RuleOrigin::Lead).0;
+                    let armed =
+                        effective_autonomy(declared, NOTE, &p, cap, RuleOrigin::LeadApproved).0;
+                    let config = effective_autonomy(declared, NOTE, &p, cap, RuleOrigin::Config).0;
                     assert!(
                         lead <= armed && armed <= config,
                         "{cap} {declared:?} {free}"
@@ -434,8 +486,9 @@ mod tests {
         ] {
             for cap in ["notify.push", "pipeline.start"] {
                 for declared in Autonomy::ALL {
-                    let structural = effective_autonomy(declared, &predicate(false), cap, origin).0;
-                    let free = effective_autonomy(declared, &predicate(true), cap, origin).0;
+                    let structural =
+                        effective_autonomy(declared, NOTE, &predicate(false), cap, origin).0;
+                    let free = effective_autonomy(declared, NOTE, &predicate(true), cap, origin).0;
                     assert!(free <= structural, "{origin:?} {cap} {declared:?}");
                 }
             }
@@ -470,5 +523,126 @@ mod tests {
         }
         assert!(!uses_free_text(&AutomationPredicate::default()));
         assert!(!uses_free_text(&predicate(false)));
+    }
+
+    #[test]
+    fn inbox_item_rules_are_capped_at_review_for_every_origin() {
+        let p = predicate(false);
+        for origin in [
+            RuleOrigin::Config,
+            RuleOrigin::Lead,
+            RuleOrigin::LeadApproved,
+        ] {
+            for cap in [
+                "notify.push",
+                "pipeline.start",
+                "merge.add",
+                "sessions.open",
+            ] {
+                for declared in Autonomy::ALL {
+                    let (inbox, note) = effective_autonomy(
+                        declared,
+                        AutomationEventKind::InboxItem,
+                        &p,
+                        cap,
+                        origin,
+                    );
+                    let other = effective_autonomy(declared, NOTE, &p, cap, origin).0;
+                    assert!(inbox <= Autonomy::Review, "{origin:?} {cap} {declared:?}");
+                    assert!(inbox <= other, "never above the same rule elsewhere");
+                    if other == Autonomy::Merge {
+                        assert_eq!(note, Some(INBOX_CAP_REASON));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            effective_autonomy(
+                Autonomy::Merge,
+                AutomationEventKind::InboxItem,
+                &p,
+                "merge.add",
+                RuleOrigin::Config
+            ),
+            (Autonomy::Review, Some(INBOX_CAP_REASON))
+        );
+        assert_eq!(
+            effective_autonomy(
+                Autonomy::Propose,
+                AutomationEventKind::InboxItem,
+                &p,
+                "merge.add",
+                RuleOrigin::Config
+            ),
+            (Autonomy::Propose, None),
+            "never raises"
+        );
+    }
+
+    #[test]
+    fn inbox_item_notification_rules_are_capped_too() {
+        let pinned = AutomationPredicate {
+            notification_kind: Some(crate::notification::NotificationKind::InboxItem),
+            ..AutomationPredicate::default()
+        };
+        assert!(reads_inbox_items(NOTE, &pinned));
+        assert!(!reads_inbox_items(NOTE, &AutomationPredicate::default()));
+        assert!(!reads_inbox_items(
+            AutomationEventKind::AgentFinished,
+            &pinned
+        ));
+        assert_eq!(
+            effective_autonomy(
+                Autonomy::Merge,
+                NOTE,
+                &pinned,
+                "merge.add",
+                RuleOrigin::Config
+            ),
+            (Autonomy::Review, Some(INBOX_CAP_REASON))
+        );
+    }
+
+    #[test]
+    fn autopilot_run_is_review_capped_and_config_only() {
+        let p = predicate(false);
+        let issue = AutomationEventKind::IssueMatched;
+        assert_eq!(
+            effective_autonomy(
+                Autonomy::Merge,
+                issue,
+                &p,
+                AUTOPILOT_RUN,
+                RuleOrigin::Config
+            ),
+            (Autonomy::Review, Some(AUTOPILOT_CAP_NOTE))
+        );
+        assert_eq!(
+            effective_autonomy(
+                Autonomy::Review,
+                issue,
+                &p,
+                AUTOPILOT_RUN,
+                RuleOrigin::Config
+            ),
+            (Autonomy::Review, None)
+        );
+        for origin in [RuleOrigin::Lead, RuleOrigin::LeadApproved] {
+            for declared in Autonomy::ALL {
+                assert_eq!(
+                    validate_autonomy(declared, &p, AUTOPILOT_RUN, origin),
+                    Err(AUTOPILOT_RUN_REFUSAL.to_string()),
+                    "{origin:?} {declared:?}"
+                );
+                assert!(
+                    effective_autonomy(declared, issue, &p, AUTOPILOT_RUN, origin).0
+                        <= Autonomy::Review
+                );
+            }
+        }
+        assert_eq!(
+            validate_autonomy(Autonomy::Merge, &p, AUTOPILOT_RUN, RuleOrigin::Config),
+            Ok(())
+        );
     }
 }

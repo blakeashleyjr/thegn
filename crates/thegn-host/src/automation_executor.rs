@@ -198,6 +198,18 @@ pub async fn execute(
             crate::automation_pipeline::start(cfg, &event, &action, wire_origin).await
         }
         "lead.wake" => crate::lead::wake::run(cfg, &event, &action, timeout_secs).await,
+        "autopilot.run" => {
+            // Blocking work (tracker reads, git, the claim): off the runtime.
+            let run_cfg = Arc::clone(&cfg);
+            let run_event = event.clone();
+            let summary = tokio::task::spawn_blocking(move || {
+                crate::autopilot_driver::run_from_rule(&run_cfg, &run_event)
+            })
+            .await
+            .context("autopilot.run task")??;
+            tracing::info!(target: "thegn::automation", rule = %action.rule_id, %summary, "autopilot.run finished");
+            Ok(())
+        }
         other => anyhow::bail!("unsupported automation action {other}"),
     }
 }

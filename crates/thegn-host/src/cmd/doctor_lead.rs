@@ -769,6 +769,8 @@ fn producer_facts(cfg: &Config, db: Option<&thegn_core::db::Db>) -> ProducerFact
         pr_queue_enabled: cfg.pr_queue.enabled,
         github_mentions: cfg.notifications.github_mentions,
         push_configured: !push.topic.trim().is_empty(),
+        // b163 lane 5 arms the inbox (`producer_arm::inbox_armable`).
+        inbox_any: false,
     };
     let armed = thegn_core::producer_arm::armed_kinds(&inputs);
     let leases = db

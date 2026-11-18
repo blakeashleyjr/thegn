@@ -475,6 +475,7 @@ mod tests {
             origin: None,
             issue: None,
             exit_code: None,
+            inbox: None,
         }
     }
 

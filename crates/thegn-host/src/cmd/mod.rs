@@ -36,6 +36,7 @@ pub mod events;
 pub mod fleet;
 pub mod forward;
 pub mod host;
+pub mod inbox;
 pub mod integrate;
 pub(crate) mod integrate_order;
 pub mod issue;

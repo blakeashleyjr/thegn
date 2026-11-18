@@ -1862,6 +1862,7 @@ impl ControlApi for DaemonService {
     }
 
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        crate::daemon::producers::rearm_debounced();
         self.open_with(spec, None)
     }
 
@@ -3115,6 +3116,21 @@ impl ControlApi for DaemonService {
         req: serde_json::Value,
     ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
         Box::pin(super::lead_caps::overview::get(self, req))
+    }
+
+    // b163 (THE-2214): producer arming, leases and inbox account state.
+    fn producers_status(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async {
+            let reply = tokio::task::spawn_blocking(crate::daemon::producers::status_reply)
+                .await
+                .map_err(|e| {
+                    ControlError::Internal(anyhow::anyhow!("producers.status task: {e}"))
+                })?;
+            serde_json::to_value(reply).map_err(|e| ControlError::Internal(anyhow::anyhow!(e)))
+        })
     }
 
     fn notifications_list(

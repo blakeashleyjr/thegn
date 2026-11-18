@@ -1082,6 +1082,12 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
             },
         ],
     },
+    // b163 (THE-2214): no arguments, like a bare `overview.get`.
+    StateToolSpec {
+        cap: "producers.status",
+        description: "The daemon's headless producers: which kinds are armed, who holds each lease, and each inbox account's last poll, error (scrubbed) and item count. Read-scoped; requires a running daemon.",
+        args: &[],
+    },
     StateToolSpec {
         cap: "notifications.list",
         description: "List notifications, newest first, filtered by kind, unread state, age and worktree. Read-scoped; requires a running daemon.",
@@ -1329,7 +1335,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "merge.drain",
     // THE-2197: pausing is the Lead's kill switch; `automations.resume` is
     // Admin and never an MCP tool.
-    "automations.pause",
+    "automations.pause", // b163: producer and inbox state (read).
+    "producers.status",
 ];
 
 /// The injected data fetch: `(capability id, tool arguments) → payload JSON`.
@@ -2678,6 +2685,7 @@ mod tests {
             "notifications.list",
             "automations.runs",
             "approvals.list",
+            "producers.status",
         ];
         let write = [
             "editor.open",
@@ -3007,6 +3015,7 @@ mod tests {
             ("approvals_list", true, false),
             ("approvals_request", false, false),
             ("merge_drain", false, true),
+            ("producers_status", true, false),
         ] {
             let e = entry(name);
             assert_eq!(e["annotations"]["readOnlyHint"], json!(read_only), "{name}");
@@ -3038,6 +3047,10 @@ mod tests {
             json!(["worktree"])
         );
         assert_eq!(entry("overview_get")["inputSchema"]["required"], json!([]));
+        assert_eq!(
+            entry("producers_status")["inputSchema"]["required"],
+            json!([])
+        );
         // A missing required arg never reaches the fetch closure.
         let refused = r.call("merge_drain", &json!({})).unwrap().unwrap_err();
         assert_eq!(refused.0, -32602);
