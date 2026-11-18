@@ -730,6 +730,13 @@ fn hide_secret_file(path: &str, masked_files: &mut Vec<PathBuf>) {
     masked_files.push(path);
 }
 
+/// The roots the Lead sandbox masks, for `thegn doctor` and `thegn lead
+/// login`. Stub created by the b161 spine; b161 lane 3 fills it.
+#[allow(dead_code, reason = "filled by b161 lane 3")]
+pub(crate) fn masked_roots(_cfg: &Config) -> anyhow::Result<Vec<PathBuf>> {
+    Ok(Vec::new())
+}
+
 /// Every control-socket location: the daemon socket dir, the state run dir,
 /// the parent of every control-socket candidate, and `$XDG_RUNTIME_DIR` as a
 /// whole (it also holds the user bus and the podman/systemd sockets).

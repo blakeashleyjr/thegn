@@ -353,6 +353,7 @@ config_enum! {
 pub use crate::config_placement::FailoverMode;
 // The remote/data-placement enums + `MergeRemoteMode` live in `config_remote`
 // (re-exported), keeping `config.rs` under the god-file ratchet.
+pub use crate::config_gate::{GateSandbox, effective_gate_sandbox};
 pub use crate::config_git::SubmoduleMode;
 use crate::config_placement::{de_failover, de_failover_opt};
 pub(crate) use crate::config_remote::data_mode_from_remote;
@@ -874,6 +875,11 @@ pub struct MergeQueueConfig {
     pub gate_timeout_secs: u64,
     /// Whether to run `gate_command` at all.
     pub gate_on: bool,
+    /// Where the gate's commands run: `"off"` (default) on the host, or
+    /// `"sealed"` inside the repo's sealed sandbox (network `none`, no
+    /// credentials). Honoured only from global or trusted config; the
+    /// `[workspace.<slug>.merge_queue]` layer may only raise it (THE-2200).
+    pub gate_sandbox: GateSandbox,
     /// Reuse a stable per-repo gate worktree + `target/` between folds (warm rebuild); `false` ⇒ throwaway `/tmp` (always cold).
     pub gate_reuse_worktree: bool,
     /// `CARGO_TARGET_DIR` for the gate. Empty ⇒ `$XDG_STATE_HOME/thegn/gate/<repo>/target`.
@@ -1079,6 +1085,7 @@ impl Default for MergeQueueConfig {
             gate_setup_timeout_secs: 1800,
             gate_timeout_secs: 3600,
             gate_on: true,
+            gate_sandbox: GateSandbox::Off,
             gate_reuse_worktree: true,
             gate_target_dir: String::new(),
             bisect_on_red: true,
@@ -1197,6 +1204,9 @@ pub struct MergeQueueOverlay {
     pub gate_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_on: Option<bool>,
+    /// May only raise `off` to `sealed` (see [`effective_gate_sandbox`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_sandbox: Option<GateSandbox>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_reuse_worktree: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1304,6 +1314,7 @@ impl MergeQueueOverlay {
             && self.gate_setup_timeout_secs.is_none()
             && self.gate_timeout_secs.is_none()
             && self.gate_on.is_none()
+            && self.gate_sandbox.is_none()
             && self.gate_reuse_worktree.is_none()
             && self.gate_target_dir.is_none()
             && self.bisect_on_red.is_none()
@@ -1351,6 +1362,7 @@ impl MergeQueueOverlay {
             gate_setup_timeout_secs,
             gate_timeout_secs,
             gate_on,
+            gate_sandbox,
             gate_reuse_worktree,
             gate_target_dir,
             bisect_on_red,
@@ -1409,6 +1421,8 @@ impl MergeQueueOverlay {
         if let Some(v) = gate_on {
             base.gate_on = v;
         }
+        // Raise-only: a per-repo layer never lowers a sealed gate.
+        base.gate_sandbox = effective_gate_sandbox(base.gate_sandbox, gate_sandbox);
         if let Some(v) = gate_reuse_worktree {
             base.gate_reuse_worktree = v;
         }
