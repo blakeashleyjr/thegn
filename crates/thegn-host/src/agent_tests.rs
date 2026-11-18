@@ -256,18 +256,20 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
     let fake_root = tempfile::tempdir().unwrap();
     let fake_bin = fake_root.path().join("bin");
     std::fs::create_dir_all(&fake_bin).unwrap();
-    let fake_smol = fake_bin.join("smolmachines");
-    std::fs::write(&fake_smol, "#!/bin/sh\nexit 0\n").unwrap();
+    // A fake `docker` whose `version` succeeds: an OCI backend that resolves
+    // (smol, used here before, is reserved and never a candidate).
+    let fake_docker = fake_bin.join("docker");
+    std::fs::write(&fake_docker, "#!/bin/sh\nexit 0\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&fake_smol, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path = format!("{}:/usr/bin:/bin", fake_bin.display());
     let _state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
     let mut cfg = Config::default();
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-    cfg.sandbox.backend_chain = vec!["smol".into(), "none".into()];
+    cfg.sandbox.backend_chain = vec!["docker".into(), "none".into()];
     cfg.sandbox.profile = thegn_core::config::SandboxProfile::Hardened;
     cfg.sandbox.compose = Some(
         thegn_core::sandbox_compose::ComposeSpec {

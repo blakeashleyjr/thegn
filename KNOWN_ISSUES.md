@@ -19,6 +19,9 @@ reproducible problems that are not listed here.
   See [terminal compatibility](docs/help/terminal-compatibility.md). For a
   browser-downloaded archive, clear quarantine before first launch with
   `xattr -dr com.apple.quarantine ./thegn`.
+- **The `apple` sandbox backend cannot run offline.** `network = "none"`, and
+  therefore the `sealed` profile, is refused with `network-unexpressible`; use
+  podman or docker for offline or sealed worktrees.
 - **Windows is deferred.** No Windows binary is published.
 - **Homebrew and AUR publication are pending owner setup.** They are not
   install channels yet; see [RELEASING.md](RELEASING.md#deferred-release-channels).

@@ -319,13 +319,13 @@ fn build_vpn_spec_carries_knobs_and_optional_image() {
     let mut cfg = vpn_cfg(VpnProviderKind::Wireguard);
     cfg.mode = VpnMode::Proxy;
     cfg.on_error = VpnOnError::Offline;
-    cfg.dns = VpnDnsMode::FilterFront;
+    cfg.dns = VpnDnsMode::FilterOnly;
     cfg.ready_timeout_secs = 7;
     cfg.ephemeral = false;
     let spec = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
     assert_eq!(spec.mode, VpnMode::Proxy);
     assert_eq!(spec.on_error, VpnOnError::Offline);
-    assert_eq!(spec.dns_mode, VpnDnsMode::FilterFront);
+    assert_eq!(spec.dns_mode, VpnDnsMode::FilterOnly);
     assert_eq!(spec.ready_timeout, Duration::from_secs(7));
     assert!(!spec.ephemeral);
     // Empty sidecar_image -> None; set -> Some.
@@ -393,6 +393,40 @@ fn test_win_native_sandboxes_do_not_parse_as_oci() {
     assert!(Backend::WinJobObject.is_host_toolchain());
     assert_eq!(Backend::WinAppContainer.label(), "appcontainer");
     assert_eq!(Backend::WinJobObject.label(), "jobobject");
+}
+
+#[test]
+fn to_config_round_trips_from_config() {
+    use crate::seam::Kind as _;
+    for kind in SandboxBackend::ALL.iter().copied() {
+        match Backend::from_config(kind) {
+            Some(backend) => assert_eq!(backend.to_config(), kind, "{kind:?}"),
+            None => assert_eq!(kind, SandboxBackend::Auto),
+        }
+    }
+    for backend in Backend::ALL {
+        assert_eq!(Backend::from_config(backend.to_config()), Some(backend));
+    }
+}
+
+#[test]
+fn oci_runtimes_excludes_reserved() {
+    let runtimes: Vec<Backend> = Backend::oci_runtimes().collect();
+    assert!(
+        runtimes.iter().all(|backend| !backend.is_reserved()),
+        "{runtimes:?}"
+    );
+    assert!(!runtimes.contains(&Backend::Smol));
+    assert!(!runtimes.contains(&Backend::Wsl));
+    assert!(runtimes.contains(&Backend::Podman));
+    let reserved: Vec<Backend> = Backend::ALL
+        .into_iter()
+        .filter(|backend| backend.is_reserved())
+        .collect();
+    assert_eq!(
+        reserved,
+        vec![Backend::Smol, Backend::Wsl, Backend::WinAppContainer]
+    );
 }
 
 fn spec(backend: Backend) -> SandboxSpec {
@@ -770,6 +804,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
         RefusalClass::ContainerOwner,
+        RefusalClass::NetworkUnexpressible,
     ] {
         let error = refusal(
             &spec,
@@ -808,6 +843,7 @@ fn refusal_remediation_every_class_has_label_and_text() {
         RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
         RefusalClass::ContainerOwner,
+        RefusalClass::NetworkUnexpressible,
     ] {
         let label = class.label();
         assert!(!label.is_empty());
@@ -1152,6 +1188,80 @@ fn oci_create_opts_map_userns_and_mounts() {
     assert!(j.contains("-v /repo/.git:/repo/.git"));
     assert!(j.contains("-e GH_TOKEN=abc"));
     assert!(j.contains("-p 8080:8080"));
+}
+
+#[test]
+fn apple_network_none_is_refused_before_argv() {
+    let mut s = spec(Backend::Apple);
+    s.network = Network::None;
+    for result in [
+        enter_argv(&s, "true").map(|_| ()),
+        launchable_with(&s, &[]).map(|_| ()),
+    ] {
+        match result {
+            Err(EnterError::Refused(refusal)) => {
+                assert_eq!(refusal.class, RefusalClass::NetworkUnexpressible);
+                assert_eq!(refusal.backend, "apple");
+                assert!(refusal.path.is_none());
+                assert!(refusal.message.contains("network = \"none\""));
+            }
+            other => panic!("expected network-unexpressible refusal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn apple_sealed_profile_is_refused() {
+    // The sealed profile forces `network = "none"`; the network refusal names
+    // the real reason ahead of the strict hardening gate.
+    let mut s = spec(Backend::Apple);
+    s.network = Network::None;
+    s.seal_home = Some("/home/test".into());
+    s.read_only_root = true;
+    s.no_new_privileges = true;
+    s.pids_limit = Some(256);
+    s.drop_capabilities = vec!["ALL".into()];
+    match launchable_with(&s, &[]) {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::NetworkUnexpressible);
+            assert_eq!(refusal.class.label(), "network-unexpressible");
+        }
+        other => panic!("expected network-unexpressible refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn apple_nat_launches() {
+    let s = spec(Backend::Apple);
+    assert_eq!(s.network, Network::Nat);
+    assert!(network_unexpressible_refusal(&s).is_none());
+    assert!(launchable_with(&s, &[]).is_ok());
+    let j = oci_create_opts(&s).expect("valid volume names").join(" ");
+    assert!(!j.contains("--network"), "{j}");
+}
+
+#[test]
+fn podman_network_none_still_emits_flag() {
+    for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+        let mut s = spec(backend);
+        s.network = Network::None;
+        assert!(network_unexpressible_refusal(&s).is_none(), "{backend:?}");
+        let j = oci_create_opts(&s).expect("valid volume names").join(" ");
+        assert!(j.contains("--network none"), "{backend:?}: {j}");
+    }
+}
+
+#[test]
+fn refusal_class_label_is_stable() {
+    assert_eq!(
+        RefusalClass::NetworkUnexpressible.label(),
+        "network-unexpressible"
+    );
+    assert!(
+        RefusalClass::NetworkUnexpressible
+            .remediation()
+            .contains("network = \"nat\"")
+    );
 }
 
 #[test]
@@ -3041,8 +3151,6 @@ fn remote_enter_argv_wraps_with_ssh() {
         "port flag missing: {argv:?}"
     );
 }
-
-// H4 is in dns_filter.rs (already done).
 
 // Per-profile container naming (G1).
 #[test]
@@ -5172,7 +5280,8 @@ fn hostname_rules_note_names_backend_on_every_local_backend() {
         s.network_allow = vec!["example.com".into()];
         let note = hostname_rules_note(&s).expect("active allow-list should be reported");
         assert!(note.contains(backend.label()), "{note}");
-        assert!(note.contains("DNS-name rules only"), "{note}");
+        assert!(note.contains("are advisory"), "{note}");
+        assert!(!note.contains("DNS-only"), "{note}");
 
         s.network = Network::Host;
         s.network_allow.clear();
@@ -5196,7 +5305,70 @@ fn hostname_rules_note_names_backend_on_every_local_backend() {
         up_command: vec![],
         down_command: vec![],
     });
-    assert!(hostname_rules_note(&provider).is_none());
+    // An unknown provider is the `custom` kind: no egress policy API.
+    let note = hostname_rules_note(&provider).expect("custom provider lists are unenforced");
+    assert!(note.contains("NOT enforced"), "{note}");
+}
+
+fn provider_spec_with_lists(provider: &str) -> SandboxSpec {
+    let mut s = spec(Backend::Podman);
+    s.network_allow = vec!["github.com".into()];
+    s.placement = Placement::Provider(crate::placement::ProviderPlacement {
+        provider: provider.into(),
+        id: "sandbox".into(),
+        interactive_prefix: vec![],
+        control_prefix: vec![],
+        up_command: vec![],
+        down_command: vec![],
+    });
+    s
+}
+
+#[test]
+fn note_for_daytona_provider_warns() {
+    let note = hostname_rules_note(&provider_spec_with_lists("daytona"))
+        .expect("daytona has no egress policy API");
+    assert!(note.contains("env provider 'daytona'"), "{note}");
+    assert!(note.contains("NOT enforced"), "{note}");
+    assert!(note.contains("network = \"none\""), "{note}");
+}
+
+#[test]
+fn note_for_custom_provider_warns() {
+    let note = hostname_rules_note(&provider_spec_with_lists("custom"))
+        .expect("custom has no egress policy API");
+    assert!(note.contains("NOT enforced"), "{note}");
+}
+
+#[test]
+fn note_for_sprites_provider_is_none() {
+    assert!(hostname_rules_note(&provider_spec_with_lists("sprites")).is_none());
+}
+
+#[test]
+fn local_note_says_advisory_not_dns() {
+    let mut s = spec(Backend::Bwrap);
+    s.network_block = vec!["example.com".into()];
+    let note = hostname_rules_note(&s).expect("local lists are advisory");
+    assert!(note.contains("advisory"), "{note}");
+    assert!(!note.contains("DNS"), "{note}");
+}
+
+#[test]
+fn policy_refusal_skips_only_egress_api_providers() {
+    use crate::config::EnvProviderKind;
+    use crate::seam::Kind as _;
+    for kind in EnvProviderKind::ALL.iter().copied() {
+        let s = provider_spec_with_lists(kind.as_str());
+        let refused = hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s);
+        assert_eq!(refused.is_none(), kind.egress_api(), "{kind:?}");
+        assert_eq!(
+            hostname_rules_note(&s).is_none(),
+            kind.egress_api(),
+            "{kind:?}"
+        );
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnUnenforced, &s).is_none());
+    }
 }
 
 #[test]
@@ -5210,7 +5382,7 @@ fn no_dns_flag_in_oci_create_opts() {
 
 #[test]
 fn default_hostname_policy_warns_not_refuses() {
-    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnDnsOnly);
+    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnUnenforced);
     let mut s = spec(Backend::Bwrap);
     s.network_allow = vec!["example.com".into()];
     assert!(!matches!(
@@ -5242,7 +5414,7 @@ fn refuse_policy_refuses_hostname_rules() {
         s.network = Network::None;
         assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s).is_none());
         s.network = Network::Nat;
-        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnDnsOnly, &s).is_none());
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnUnenforced, &s).is_none());
     }
 
     let mut remote = spec(Backend::Bwrap);
@@ -5265,7 +5437,9 @@ fn refuse_policy_refuses_hostname_rules() {
         up_command: vec![],
         down_command: vec![],
     });
-    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_none());
+    // A provider without an egress policy API (`test` is the custom kind)
+    // refuses under the refuse policy; only an egress-API provider is exempt.
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_some());
     placement_spec.placement = Placement::K8s(crate::placement::K8sPlacement {
         kubectl: "kubectl".into(),
         context: None,

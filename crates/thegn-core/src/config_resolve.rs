@@ -357,7 +357,7 @@ fn allow_entry_covered(entry: &str, trusted: &[String]) -> bool {
     }
     trusted
         .iter()
-        .any(|t| t == entry || crate::dns_filter::name_matches(entry, t))
+        .any(|t| t == entry || crate::egress::pattern::name_matches(entry, t))
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,8 +1113,11 @@ impl Config {
                     let was = !self.sandbox.remote.host.is_empty();
                     self.sandbox.remote.host.clear();
                     let env_count = self.env.len();
-                    self.env
-                        .retain(|_, env| env.placement != crate::config::PlacementMode::Ssh);
+                    // Experimental remote placements: ssh and Kubernetes.
+                    self.env.retain(|_, env| {
+                        env.placement != crate::config::PlacementMode::Ssh
+                            && env.placement != crate::config::PlacementMode::K8s
+                    });
                     was || self.env.len() != env_count
                 }
                 Feature::Providers => {

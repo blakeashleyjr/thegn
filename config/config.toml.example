@@ -1574,8 +1574,8 @@ command = "git diff"
 #
 # [zone.clientA]
 # env_bundles   = ["clientA-secrets"]           # bundles bound at the zone scope
-# network_allow = ["*.clienta.com", "github.com"]  # DNS-name rules only (not an egress boundary)
-# network_block = ["telemetry.example.com"]     # DNS-name rules only; `*` makes launches offline
+# network_allow = ["*.clienta.com", "github.com"]  # advisory (not an egress boundary)
+# network_block = ["telemetry.example.com"]     # advisory; `*` makes launches offline
 # sandbox_floor = "standard"                     # members may only be >= this hardening
 # placement_floor = "dedicated"                  # placement-mode FLOOR for members: a
 #                                                #   member's requested mode may only be
@@ -2793,7 +2793,9 @@ profile = "standard"
 # ── Backend selection ────────────────────────────────────────────────────────
 # Which containment backend to use. "auto" walks backend_chain until one works.
 #   auto | podman-rootless | podman-rootful | docker | bwrap | bubblewrap |
-#   systemd | systemd-run | apple | container | wsl | none | host
+#   systemd | systemd-run | apple | container | jobobject | none | host
+# Reserved (accepted by config, never selected; warns and resolves via
+# backend_chain): smol, wsl, appcontainer.
 # NixOS tip: set "bwrap" here to skip the podman probes and get instant panes.
 #
 # "Available" means the runtime ANSWERS, not merely that its client is on PATH:
@@ -2868,13 +2870,15 @@ network = "nat"
 # ports = ["3000:3000", "8080:8080"]
 ports = []
 
-# Outbound hostname rules apply to DNS lookups only. They are not an egress
-# boundary and are not applied by local backends. Set network = "none" to deny
-# egress; remove the lists to stop reporting DNS-name rules. A block entry "*"
-# lowers the sandbox to network = "none" (offline).
+# Outbound hostname rules are advisory: no local backend enforces them; only
+# the Sprites and Vercel providers translate them to their own policy API. Set
+# network = "none" to deny egress. A block entry "*" lowers the sandbox to
+# network = "none" (offline).
 network_allow = []
 network_block = []
-# Log outbound DNS queries to the audit table (not a connection log).
+# Subscribe the podman `network` event stream (container network attach/detach)
+# into the sandbox audit table. Podman backends only; NOT a DNS-query or
+# connection log.
 network_audit = false
 
 # ── Filesystem ───────────────────────────────────────────────────────────────
@@ -3415,13 +3419,11 @@ ready_timeout_secs = 30
 #   offline — force network=none so nothing leaks onto the host network.
 on_error = "fail"
 # DNS composition:
-#   tunnel       — the overlay owns resolution (MagicDNS / pushed DNS); the
-#                  network_allow/network_block filter is bypassed (default).
-#   filter-front — chain the allow/block DNS filter in front of the tunnel's
-#                  resolver (preserves auditing). NOTE: with a sidecar tunnel the
-#                  filter can't yet reach the sidecar's netns, so this currently
-#                  behaves like `tunnel`; the resolver-chaining seam exists.
-#   filter-only  — ignore the overlay's pushed DNS, keep the filter only.
+#   tunnel       — the overlay owns resolution (MagicDNS / pushed DNS) (default).
+#   filter-only  — drop the overlay's pushed DNS; the runtime's default
+#                  resolver is used. No hostname filter exists in any mode.
+#   filter-front — reserved: warns and behaves as `tunnel`;
+#                  `thegn config validate --strict` rejects it.
 dns = "tunnel"
 # Request an ephemeral node identity where supported (Tailscale/Headscale/
 # NetBird) so the device auto-deregisters from the control plane on teardown.

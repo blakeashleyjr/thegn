@@ -16,7 +16,9 @@ Part of [[sandboxing]]. Which backend runs a worktree, what each one enforces, a
 `jobobject` (Windows). There is no host fallback: with no usable backend, a
 sandboxed launch is refused under the default floor. Pin one to skip the
 probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
-`apple`, `wsl`, `none`.
+`apple`, `jobobject`, `none`. Reserved (accepted by config, never selected):
+`smol`, `wsl`, `appcontainer`; a reserved value warns and resolves through
+`backend_chain`, and `thegn config validate --strict` rejects it.
 
 The outer `bwrap` and `systemd-run` launchers are resolved to absolute paths
 from thegn's own `PATH`. If either is missing there, launch is refused rather
@@ -47,6 +49,10 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > floor, so sandboxed panes are refused. Opt out with
 > `isolation_floor = "off"`, `backend = "none"`, `enabled = false`, or run on
 > host; `bwrap`/`systemd` are Linux-only.
+>
+> apple: `network = "none"` (and therefore `sealed`) is refused with
+> `network-unexpressible` until an internal-network implementation lands; use
+> podman or docker for offline or sealed worktrees on a Mac.
 
 > **Platform status:** the public alpha supports Linux on x86_64, where
 > `bwrap`, `systemd`, podman and docker are the backends to use. The `apple`
@@ -60,13 +66,13 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 `thegn doctor` renders one **enforcement matrix** for this host: per backend,
 what it actually enforces —
 
-| Cell      | What it means                                                                 |
-| --------- | ----------------------------------------------------------------------------- |
-| `fs`      | filesystem isolation: a separate root, unit-level protection, or the host fs  |
-| `net`     | `netns; rules DNS-only`, `only when network=none`, or `none (host net)`       |
-| `ceiling` | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none         |
-| `scoping` | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid |
-| `class`   | the honest isolation class (below) — what would have to fail for an escape    |
+| Cell      | What it means                                                                                                                                                                                                    |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fs`      | filesystem isolation: a separate root, unit-level protection, or the host fs                                                                                                                                     |
+| `net`     | `netns; rules advisory` (own namespace: `network = "none"` is enforced and reported offline; allow/block lists are not enforced), `only when network=none`, `none (host net)`, or `unverified (no none)` (apple) |
+| `ceiling` | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none                                                                                                                                            |
+| `scoping` | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid                                                                                                                                    |
+| `class`   | the honest isolation class (below) — what would have to fail for an escape                                                                                                                                       |
 
 Every cell is **derived** from the same predicates the resolver uses, so the
 matrix can never disagree with what actually launches. The ceiling cell reflects

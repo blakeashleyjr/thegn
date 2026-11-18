@@ -58,15 +58,17 @@ config_enum! {
     } default = Fail;
 }
 config_enum! {
-    /// How DNS resolution inside the sandbox composes with the overlay.
-    ///  - `tunnel` (default): the provider owns resolution (MagicDNS / pushed
-    ///    resolvers); the `network_allow`/`network_block` filter is bypassed.
-    ///  - `filter-front`: chain the allow/block DNS filter in front, forwarding
-    ///    to the tunnel's resolver (preserves auditing).
-    ///  - `filter-only`: ignore the overlay's pushed DNS, keep the filter only.
+    /// How DNS resolution inside the sandbox composes with the overlay. No
+    /// hostname filter exists in any mode.
+    ///  - `tunnel` (default): the overlay owns resolution (MagicDNS / pushed
+    ///    resolvers).
+    ///  - `filter-only`: drop the overlay's pushed DNS (e.g. Tailscale
+    ///    MagicDNS); the runtime's default resolver is used.
+    ///  - `filter-front`: reserved. A lenient load warns and behaves as
+    ///    `tunnel`; `config validate --strict` rejects it.
     pub enum VpnDnsMode: "vpn dns" {
         Tunnel = "tunnel",
-        FilterFront = "filter-front" | "filter_front",
+        FilterFront = "filter-front" | "filter_front" reserved,
         FilterOnly = "filter-only" | "filter_only",
     } default = Tunnel;
 }

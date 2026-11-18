@@ -406,8 +406,8 @@ backends run it on another machine. Backend availability is a three-state
 probe (present / absent / unreachable) so an undecidable remote halts rather
 than silently degrading.
 
-**Gate:** `openspec/specs/sandbox` (32 requirements), `just sandbox-e2e-dns`
-/ `-db` in `just ci`.
+**Gate:** `openspec/specs/sandbox` (32 requirements), `just sandbox-e2e-db`
+in `just ci`.
 
 The local Unix control endpoint trusts the daemon's effective uid, an owner-only
 parent, and the connected peer-uid check; the sandbox control-socket guard

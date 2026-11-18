@@ -882,8 +882,9 @@ fn requirements_for(spec: &VpnSpec) -> Requirements {
 }
 
 fn dns_for(spec: &VpnSpec) -> DnsConfig {
-    // Only meaningful for `tunnel`/`filter-front` DNS modes; `filter-only`
-    // suppresses the overlay's pushed DNS.
+    // `tunnel` keeps the overlay's pushed DNS; `filter-only` suppresses it
+    // (the runtime's default resolver is used). `filter-front` is reserved and
+    // loads as `tunnel`. No mode filters hostnames.
     if spec.dns_mode == VpnDnsMode::FilterOnly {
         return DnsConfig::default();
     }

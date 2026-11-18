@@ -634,6 +634,12 @@ fn provision(cfg: &Config, worktree: Option<String>) -> Result<()> {
             block,
         )?;
     }
+    if crate::egress_admit::lists_unenforced(provider.caps().egress, allow, block) {
+        outln!(
+            "{}",
+            crate::egress_admit::unsupported_note(crate::egress_admit::provider_label(&provider))
+        );
+    }
     outln!("created sandbox: {}", handle.id);
     match handle.exec {
         thegn_svc::provider::ExecKind::Command(argv) => {
@@ -746,6 +752,16 @@ fn restore(cfg: &Config, worktree: Option<String>, cp: &str) -> Result<()> {
         &env.sandbox.network_block,
     )?;
     outln!("restored {id} to checkpoint {cp}");
+    if crate::egress_admit::lists_unenforced(
+        provider.caps().egress,
+        &env.sandbox.network_allow,
+        &env.sandbox.network_block,
+    ) {
+        outln!(
+            "{}",
+            crate::egress_admit::unsupported_note(crate::egress_admit::provider_label(&provider))
+        );
+    }
     if egress == crate::egress_admit::RestoredEgress::Verified {
         outln!(
             "verified network policy: {} allow, {} block",
@@ -1599,6 +1615,7 @@ fn env_isolation(
             thegn_core::capabilities::Capabilities::from_parts(
                 thegn_core::sandbox::Backend::None,
                 &env.placement,
+                thegn_core::config::Network::Nat,
                 false,
                 None,
             )
@@ -1612,6 +1629,7 @@ fn env_isolation(
                 thegn_core::capabilities::Capabilities::from_parts(
                     backend,
                     &env.placement,
+                    thegn_core::config::Network::Nat,
                     false,
                     runtime,
                 )

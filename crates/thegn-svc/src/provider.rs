@@ -1285,8 +1285,8 @@ fn canonical_domain(entry: &str) -> std::result::Result<Option<String>, PolicyRu
 /// network policy. **Pure** (unit-tested). Order encodes the precedence:
 /// deny rules first (a block beats an allow), then allow rules, then a trailing
 /// default-`deny *` **only when an allow-list is present** (an allow-list means
-/// "deny everything else") — exactly the local DNS-filter semantics
-/// ([`thegn_core::dns_filter`]). Empty + empty ⇒ no rules (allow all).
+/// "deny everything else") — exactly the host-pattern semantics
+/// ([`thegn_core::egress::pattern::HostRules`]). Empty + empty ⇒ no rules (allow all).
 pub fn rules_from(
     allow: &[String],
     block: &[String],
@@ -1367,7 +1367,7 @@ pub(crate) fn parse_policy_rules(body: &serde_json::Value) -> Result<Vec<PolicyR
 
 /// Egress-policy translation — realizes `EgressKind::Translate`
 /// (`thegn_core::capabilities`): lower allow/block lists to the provider's own
-/// network controls, since we can't run our DNS filter inside the provider's box.
+/// network controls; thegn has no in-box egress datapath.
 pub trait ProviderEgress: Send + Sync {
     fn set_network_policy<'a>(
         &'a self,
@@ -2450,6 +2450,19 @@ pub struct ProviderCaps {
     /// `thegn_core::config::provider_scale_to_zero` by kind — the warm pool
     /// parks scale-to-zero spares indefinitely instead of aging them out.
     pub scale_to_zero: bool,
+}
+
+impl ProviderCaps {
+    /// Static caps of a provider kind: the one source `Provider::caps()` reads.
+    pub fn for_kind(kind: thegn_core::config::EnvProviderKind) -> ProviderCaps {
+        ProviderCaps {
+            files: kind.files(),
+            checkpoints: kind.checkpoints(),
+            egress: kind.egress_api(),
+            exec_api: kind.exec_api(),
+            scale_to_zero: kind.scale_to_zero(),
+        }
+    }
 }
 
 /// Whether the named provider has a native exec API (PTY-over-WebSocket), so an
@@ -3589,10 +3602,10 @@ pub enum Provider {
     /// over plain ssh. No checkpoints by construction: a powered-off VPS still
     /// bills, so the only free state is destroyed (see `crate::vps`).
     Vps(crate::vps::VpsProvider),
-    /// Fly.io machines (CLI-free) — Machines REST lifecycle, reachability over a
-    /// WireGuard tunnel into Fly's 6PN mesh (`fly ssh console` without flyctl).
+    /// Fly.io machines (CLI-free) — Machines REST lifecycle; exec and files
+    /// over ssh to the machine's dedicated IPv4 (vps ssh shim).
     /// Container-native, so it's not a `VpsKind`; scale-to-zero via stop/start
-    /// (see `crate::fly`). Exec/attach is the reachability spike boundary.
+    /// (see `crate::fly`).
     Fly(crate::fly::FlyProvider),
     /// machine0 (`machine0.io`) VMs — lifecycle/images/keys over machine0's
     /// remote **MCP** endpoint (no `machine0` CLI), exec/files over plain ssh
@@ -3625,65 +3638,43 @@ fn iroh_exec_only(op: &str) -> anyhow::Error {
 
 impl Provider {
     /// What this provider supports beyond lifecycle.
+    ///
+    /// Derived from the provider kind's facts in core
+    /// ([`ProviderCaps::for_kind`]), so a capability claim and the warnings
+    /// that read the same fact can never disagree. Per kind: Sprites has every
+    /// axis; a VPS has files via the ssh shim and no checkpoints (a powered-off
+    /// VPS still bills, so recycle destroys); Fly has files over ssh to the
+    /// machine's dedicated IPv4 (vps ssh shim) and scale-to-zero via
+    /// stop/start; machine0 has files over ssh, checkpoints via images and
+    /// scale-to-zero via `vm_suspend`; Vercel has files over fs/read + a
+    /// gzipped-tar fs/write, egress via its allow-list policy, no checkpoints,
+    /// and no native exec (the pane rides the `vercel-exec` self-bridge).
     pub fn caps(&self) -> ProviderCaps {
-        // Single source of truth for the scale-to-zero classification (core), so
-        // the runtime caps and the warm-pool policy can never disagree.
-        let scale_to_zero = thegn_core::config::provider_scale_to_zero(self.name());
-        match self {
-            Provider::Daytona(_) => ProviderCaps {
-                scale_to_zero,
-                ..ProviderCaps::default()
-            },
-            // Flags flip on as each Sprites axis lands.
-            Provider::Sprites(_) => ProviderCaps {
-                egress: true,
-                checkpoints: true,
-                files: true,
-                exec_api: true,
-                scale_to_zero,
-            },
-            // files via the ssh shim; checkpoints deliberately absent (no
-            // suspend on a VPS — the recycle path must destroy, not restore).
-            Provider::Vps(_) => ProviderCaps {
-                files: true,
-                scale_to_zero,
-                ..ProviderCaps::default()
-            },
-            // files over the WireGuard/hallpass transport; scale-to-zero via
-            // stop/start; no checkpoints, no native WSS exec/egress API.
-            Provider::Fly(_) => ProviderCaps {
-                files: true,
-                scale_to_zero,
-                ..ProviderCaps::default()
-            },
-            // files over ssh; checkpoints via machine0 images; scale-to-zero via
-            // vm_suspend. No egress translation / no native WSS exec (pane rides
-            // ssh, same as VPS).
-            Provider::Machine0(_) => ProviderCaps {
-                files: true,
-                checkpoints: true,
-                scale_to_zero,
-                ..ProviderCaps::default()
-            },
-            // files over fs/read + a gzipped-tar fs/write; egress via the
-            // user-defined allow list; no checkpoints in b154. `exec_api` stays
-            // false: the pane rides the `vercel-exec` self-bridge, not the
-            // resident bridge / native pane path.
-            Provider::Vercel(_) => ProviderCaps {
-                files: true,
-                egress: true,
-                checkpoints: false,
-                exec_api: false,
-                scale_to_zero,
-            },
+        match self.kind() {
+            Some(kind) => ProviderCaps::for_kind(kind),
             // Exec-only: no files/checkpoints/egress of its own (those go through
             // the underlying provider that created the sandbox).
-            Provider::Iroh { .. } => ProviderCaps {
+            None => ProviderCaps {
                 exec_api: true,
-                scale_to_zero,
+                scale_to_zero: false,
                 ..ProviderCaps::default()
             },
         }
+    }
+
+    /// The config provider kind of this variant; `None` for the exec-only
+    /// iroh reach (not a config kind).
+    pub fn kind(&self) -> Option<thegn_core::config::EnvProviderKind> {
+        use thegn_core::config::EnvProviderKind as K;
+        Some(match self {
+            Provider::Daytona(_) => K::Daytona,
+            Provider::Sprites(_) => K::Sprites,
+            Provider::Vps(p) => p.spec().kind.env_kind(),
+            Provider::Fly(_) => K::Fly,
+            Provider::Machine0(_) => K::Machine0,
+            Provider::Vercel(_) => K::Vercel,
+            Provider::Iroh { .. } => return None,
+        })
     }
 
     pub async fn create(&self) -> Result<SandboxHandle> {
@@ -5508,6 +5499,87 @@ mod tests {
     fn sprites_has_native_exec_capability() {
         assert!(Provider::Sprites(sprites()).caps().exec_api);
         assert!(!Provider::Daytona(provider()).caps().exec_api);
+    }
+
+    #[test]
+    fn caps_match_for_kind_for_every_constructible_variant() {
+        use thegn_core::config::EnvProviderKind as K;
+        let vps = |kind: crate::vps::VpsKind| {
+            Provider::Vps(crate::vps::VpsProvider::new(crate::vps::VpsSpec {
+                kind,
+                api_base: String::new(),
+                token: "t".into(),
+                name: "tg-vps-1".into(),
+                region: String::new(),
+                size: String::new(),
+                image: String::new(),
+                max_instances: 0,
+                max_lifetime_secs: 0,
+                key_path: "/k".into(),
+                pubkey: String::new(),
+                skip_ready_wait: true,
+            }))
+        };
+        let fly = Provider::Fly(crate::fly::FlyProvider::new(crate::fly::FlySpec {
+            api_base: String::new(),
+            graphql_url: String::new(),
+            token: "t".into(),
+            org_slug: String::new(),
+            name: "tg-fly-1".into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: "/k".into(),
+            pubkey: String::new(),
+            iroh: None,
+            skip_ready_wait: true,
+        }));
+        let machine0 = Provider::Machine0(crate::machine0::Machine0Provider::new(
+            crate::machine0::Machine0Spec {
+                endpoint: String::new(),
+                api_key: "k".into(),
+                name: "tg-m0-1".into(),
+                image: String::new(),
+                size: String::new(),
+                size_req: crate::machine0::SizeReq::default(),
+                region: String::new(),
+                provision_flake: String::new(),
+                ssh_user: String::new(),
+                key_path: "/k".into(),
+                pubkey: String::new(),
+                max_instances: 0,
+                max_lifetime_secs: 0,
+                skip_ready_wait: true,
+            },
+        ));
+        let cases = [
+            (Provider::Daytona(provider()), K::Daytona),
+            (Provider::Sprites(sprites()), K::Sprites),
+            (vps(crate::vps::VpsKind::Hetzner), K::Hetzner),
+            (vps(crate::vps::VpsKind::DigitalOcean), K::DigitalOcean),
+            (fly, K::Fly),
+            (machine0, K::Machine0),
+        ];
+        for (p, kind) in &cases {
+            assert_eq!(p.kind(), Some(*kind));
+            assert_eq!(p.caps(), ProviderCaps::for_kind(*kind), "{kind:?}");
+        }
+        // Today's table, byte-identical to the old per-variant literals.
+        let caps = |files, checkpoints, egress, exec_api, scale_to_zero| ProviderCaps {
+            files,
+            checkpoints,
+            egress,
+            exec_api,
+            scale_to_zero,
+        };
+        assert_eq!(cases[0].0.caps(), caps(false, false, false, false, false));
+        assert_eq!(cases[1].0.caps(), caps(true, true, true, true, true));
+        assert_eq!(cases[2].0.caps(), caps(true, false, false, false, false));
+        assert_eq!(cases[3].0.caps(), caps(true, false, false, false, false));
+        assert_eq!(cases[4].0.caps(), caps(true, false, false, false, true));
+        assert_eq!(cases[5].0.caps(), caps(true, true, false, false, true));
     }
 
     #[test]

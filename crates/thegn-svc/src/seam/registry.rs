@@ -542,6 +542,16 @@ fn sandbox_probes(cfg: &Config) -> Vec<ProbeReport> {
                 .backend_chain
                 .iter()
                 .map(|name| {
+                    // A reserved chain entry (smol, wsl, appcontainer) is never
+                    // a candidate; name it reserved rather than unknown.
+                    if let Some(reserved) =
+                        SandboxBackend::from_str_any(name).filter(|kind| kind.is_reserved())
+                    {
+                        return ProbeReport::reserved("sandbox", name).note(format!(
+                            "[sandbox] backend_chain entry ({})",
+                            reserved.as_str()
+                        ));
+                    }
                     match SandboxBackend::from_str_validated(name)
                         .ok()
                         .and_then(Backend::from_config)
@@ -552,9 +562,7 @@ fn sandbox_probes(cfg: &Config) -> Vec<ProbeReport> {
                         None => ProbeReport::new(
                             "sandbox",
                             name.clone(),
-                            Availability::Unavailable(
-                                "unknown or reserved backend_chain entry".into(),
-                            ),
+                            Availability::Unavailable("unknown backend_chain entry".into()),
                         ),
                     }
                 })
@@ -784,6 +792,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sandbox_probes_reports_reserved_chain_entry() {
+        let mut cfg = hermetic_config();
+        cfg.sandbox.enabled = true;
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["smol".into(), "appcontainer".into(), "bogus".into()];
+        let reports = sandbox_probes(&cfg);
+        crate::conformance::assert_report_invariants(&reports);
+        assert_eq!(reports.len(), 3, "{reports:?}");
+        for (report, name) in reports.iter().zip(["smol", "appcontainer"]) {
+            assert_eq!(report.id, name);
+            assert!(
+                matches!(&report.availability, Availability::Unavailable(text) if text.contains("is reserved")),
+                "{report:?}"
+            );
+        }
+        assert!(
+            matches!(&reports[2].availability, Availability::Unavailable(text) if text.contains("unknown")),
+            "{:?}",
+            reports[2]
+        );
     }
 
     #[test]

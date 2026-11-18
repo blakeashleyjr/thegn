@@ -21,13 +21,13 @@ every gated feature. Set `THEGN_CHANNEL=dev` to switch for one run.
 If you read about one of these elsewhere in this help and cannot find it,
 this is why:
 
-| Feature     | Covers                                                                     | Config                                          |
-| ----------- | -------------------------------------------------------------------------- | ----------------------------------------------- |
-| `remote`    | worktrees on another machine over SSH/mosh                                 | `[sandbox.remote]`, `[env.*] placement = "ssh"` |
-| `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs             |
-| `placement` | the multi-host placement engine                                            | `[placement]`                                   |
-| `voice`     | command-backed voice mode                                                  | `[voice]`                                       |
-| `lead`      | the Lead meta agent: a hosted agent CLI in a global tab                    | `[lead]`                                        |
+| Feature     | Covers                                                                     | Config                                                     |
+| ----------- | -------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `remote`    | worktrees on another machine over SSH/mosh, and Kubernetes placement       | `[sandbox.remote]`, `[env.*] placement = "ssh"` or `"k8s"` |
+| `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs                        |
+| `placement` | the multi-host placement engine                                            | `[placement]`                                              |
+| `voice`     | command-backed voice mode                                                  | `[voice]`                                                  |
+| `lead`      | the Lead meta agent: a hosted agent CLI in a global tab                    | `[lead]`                                                   |
 
 ### Sandbox and remote programme features (not yet implemented)
 
@@ -49,7 +49,7 @@ programme is built.
 | `private_copy`     | private-copy workspaces (`workspace.mode = "private-copy"`)              | not yet implemented |
 | `escalation`       | in-pane escalation requests                                              | not yet implemented |
 
-On the stable channel, SSH and provider `[env.*]` environments are removed
+On the stable channel, SSH, Kubernetes and provider `[env.*]` environments are removed
 when the config loads. If a worktree's `[sandbox] default_env` or selection
 names one, its pane halts by default with a hint to set `THEGN_CHANNEL=dev`;
 `failover = "ask"` prompts instead. With `failover = "auto"`, the pane falls

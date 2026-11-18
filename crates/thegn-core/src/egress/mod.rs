@@ -5,7 +5,10 @@
 //! - [`plan`]: the egress plan a sandbox launch carries (`SandboxSpec.egress`);
 //!   owned by WS04-P2-08 after WS00.
 //!
-//! Later items add their own submodules here: WS01-P2-01 adds `pattern` (host
+//! - [`pattern`]: host patterns with the DNS filter's semantics (`network_allow`,
+//!   `network_block`, zone/clamp); created by WS01-P2-01, extended by WS04-P1-01.
+//!
+//! Later items add their own submodules here: WS01-P2-01 added `pattern` (host
 //! patterns, today's semantics) and WS04 adds `policy`, `preset`, `resolve` and
 //! `wire`. The reporting enum [`EgressKind`](crate::capabilities::EgressKind)
 //! stays in `capabilities`; its semantics are owned by WS01-P1-02.
@@ -13,8 +16,10 @@
 //! - [`preset_names`]: the THE-791 network preset names (alignment T6); added
 //!   by WS00-P1-14, owned by WS04-P1-05.
 //!
-//! Nothing here carries behaviour yet: no constructor, no caller, no I/O.
+//! Apart from the pure `pattern` matcher, nothing here carries behaviour yet:
+//! no I/O.
 
+pub mod pattern;
 pub mod plan;
 
 /// The built-in network preset names of THE-791 (alignment T6). They replace

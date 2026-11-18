@@ -540,7 +540,7 @@ panel, PR) keep working.
   `THEGN_SANDBOX_PROFILE=sealed` to opt in.
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
-  selects them. _(SSH and managed-provider placement are **dev channel only** —
+  selects them. _(SSH, Kubernetes and managed-provider placement are **dev channel only** —
   see Channels.)_
 - **Remote** (`[sandbox.remote]`) runs worktrees on another machine — the
   interactive pane over **mosh** by default, git reads and lifecycle over

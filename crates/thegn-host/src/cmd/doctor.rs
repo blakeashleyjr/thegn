@@ -90,7 +90,17 @@ fn isolation_of_on(
     os: thegn_core::sandbox_backend::HostOs,
 ) -> Option<IsolationClass> {
     let backend = Backend::parse(backend_name)?;
-    Some(Capabilities::from_parts_on(backend, &Placement::Local, false, oci_runtime, os).isolation)
+    Some(
+        Capabilities::from_parts_on(
+            backend,
+            &Placement::Local,
+            thegn_core::config::Network::Nat,
+            false,
+            oci_runtime,
+            os,
+        )
+        .isolation,
+    )
 }
 
 /// The configured `[sandbox] oci_runtime`, or `None` when unset (daemon default).
@@ -3549,6 +3559,9 @@ pub fn run(
             .as_deref()
             .map_or("(none)".to_string(), |path| path.display().to_string()),
     );
+    for line in reserved_backend_lines(health.findings().map(|finding| finding.message.as_str())) {
+        outln!("  {line}");
+    }
     outln!("");
     channel_report(cfg);
     outln!("");
@@ -5107,6 +5120,33 @@ fn state_label(s: thegn_core::sandbox_support::BackendState) -> &'static str {
     }
 }
 
+/// Doctor lines for a reserved `backend` / `default_backend` value found by the
+/// raw config validator (the lenient load already turned it into `auto`):
+/// `sandbox backend "smol" is reserved: resolving via backend_chain`.
+fn reserved_backend_lines<'a>(messages: impl Iterator<Item = &'a str>) -> Vec<String> {
+    const MARKER: &str = "sandbox backend \"";
+    let mut lines: Vec<String> = Vec::new();
+    for message in messages {
+        let Some(index) = message.find(MARKER) else {
+            continue;
+        };
+        // The key path precedes the message (`sandbox.backend: …`,
+        // `env.<n>.sandbox.default_backend: …`).
+        let path = &message[..index];
+        if !(path.contains("sandbox.backend") || path.contains("sandbox.default_backend")) {
+            continue;
+        }
+        let Some((value, _)) = message[index + MARKER.len()..].split_once("\" is reserved") else {
+            continue;
+        };
+        let line = format!("sandbox backend \"{value}\" is reserved: resolving via backend_chain");
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
 /// Print the resolved sandbox boundary honestly: which backend(s) would run, the
 /// isolation class each one actually provides ("what would have to fail for an
 /// escape"), and the policy each hardening preset imposes.
@@ -5432,40 +5472,86 @@ pub(crate) fn home_report_lines(
 }
 
 fn network_rules_report(cfg: &Config) {
-    if cfg.sandbox.network_allow.is_empty() && cfg.sandbox.network_block.is_empty() {
-        return;
+    if !(cfg.sandbox.network_allow.is_empty() && cfg.sandbox.network_block.is_empty()) {
+        let report = thegn_core::sandbox_support::support_report(
+            &shell_chain(cfg),
+            &Placement::Local,
+            cfg_oci_runtime(cfg),
+        );
+        let backend = thegn_core::sandbox_support::first_ready(&report)
+            .map(|r| r.backend)
+            .unwrap_or(Backend::None);
+        if let Some(line) = network_rules_line(&cfg.sandbox, backend) {
+            outln!("  network rules {line}");
+        }
     }
-    let report = thegn_core::sandbox_support::support_report(
-        &shell_chain(cfg),
-        &Placement::Local,
-        cfg_oci_runtime(cfg),
-    );
-    let backend = thegn_core::sandbox_support::first_ready(&report)
-        .map(|r| r.backend)
-        .unwrap_or(Backend::None);
-    if let Some(line) = network_rules_line(&cfg.sandbox, backend) {
-        outln!("  network rules {line}");
+    for (name, env) in &cfg.env {
+        if let Some(line) = env_network_rules_line(&cfg.sandbox, env) {
+            outln!("  network rules [env.{name}] {line}");
+        }
     }
 }
 
 fn network_rules_line(sb: &thegn_core::config::SandboxConfig, backend: Backend) -> Option<String> {
-    if sb.network_allow.is_empty() && sb.network_block.is_empty() {
-        return None;
-    }
-    if thegn_core::sandbox::lower_universal_deny(sb.network, &sb.network_block)
-        == thegn_core::config::Network::None
-        && sb.network != thegn_core::config::Network::None
-    {
-        return Some("network_block contains `*` — launches are offline (network = none)".into());
-    }
-    thegn_core::sandbox::hostname_rules_note_for(
+    rules_line(
         sb.network,
         &sb.network_allow,
         &sb.network_block,
         backend,
         &Placement::Local,
     )
-    .map(|note| note.trim_start_matches("sandbox ").to_string())
+}
+
+/// The rules line for a provider env: its `[env.<n>] sandbox` lists (or the
+/// inherited `[sandbox]` lists) against the env's provider placement, so a
+/// provider without an egress policy API is reported as NOT enforcing them.
+fn env_network_rules_line(
+    base: &thegn_core::config::SandboxConfig,
+    env: &thegn_core::config::EnvConfig,
+) -> Option<String> {
+    if env.placement != thegn_core::config::PlacementMode::Provider {
+        return None;
+    }
+    let network = env.sandbox.network.unwrap_or(base.network);
+    let allow = env
+        .sandbox
+        .network_allow
+        .as_deref()
+        .unwrap_or(base.network_allow.as_slice());
+    let block = env
+        .sandbox
+        .network_block
+        .as_deref()
+        .unwrap_or(base.network_block.as_slice());
+    let placement = Placement::Provider(thegn_core::placement::ProviderPlacement {
+        provider: env.provider.provider.clone(),
+        id: String::new(),
+        interactive_prefix: Vec::new(),
+        control_prefix: Vec::new(),
+        up_command: Vec::new(),
+        down_command: Vec::new(),
+    });
+    rules_line(network, allow, block, Backend::None, &placement)
+}
+
+fn rules_line(
+    network: thegn_core::config::Network,
+    allow: &[String],
+    block: &[String],
+    backend: Backend,
+    placement: &Placement,
+) -> Option<String> {
+    if allow.is_empty() && block.is_empty() {
+        return None;
+    }
+    if thegn_core::sandbox::lower_universal_deny(network, block)
+        == thegn_core::config::Network::None
+        && network != thegn_core::config::Network::None
+    {
+        return Some("network_block contains `*` — launches are offline (network = none)".into());
+    }
+    thegn_core::sandbox::hostname_rules_note_for(network, allow, block, backend, placement)
+        .map(|note| note.trim_start_matches("sandbox ").to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7987,7 +8073,54 @@ args = ["--verbose"]
     }
 
     #[test]
-    fn network_rules_line_says_dns_only_and_offline() {
+    fn doctor_prints_reserved_backend_finding() {
+        let errors = thegn_core::config_validate::validate_str("[sandbox]\nbackend = \"smol\"\n");
+        let lines = reserved_backend_lines(errors.iter().map(String::as_str));
+        assert_eq!(
+            lines,
+            ["sandbox backend \"smol\" is reserved: resolving via backend_chain"],
+            "{errors:?}"
+        );
+        // Other findings are ignored.
+        assert!(
+            reserved_backend_lines(["ci.provider: ci provider \"drone\" is reserved"].into_iter())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn network_rules_line_for_provider_env() {
+        use thegn_core::config::{EnvConfig, EnvProviderConfig, PlacementMode, SandboxOverlay};
+        let base = thegn_core::config::SandboxConfig::default();
+        let env_for = |provider: &str| EnvConfig {
+            placement: PlacementMode::Provider,
+            provider: EnvProviderConfig {
+                provider: provider.into(),
+                ..Default::default()
+            },
+            sandbox: SandboxOverlay {
+                network_allow: Some(vec!["github.com".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let daytona = env_network_rules_line(&base, &env_for("daytona"))
+            .expect("daytona lists are unenforced");
+        assert!(daytona.contains("NOT enforced"), "{daytona}");
+        assert!(daytona.contains("'daytona'"), "{daytona}");
+        assert!(env_network_rules_line(&base, &env_for("sprites")).is_none());
+        // No lists anywhere: nothing to report.
+        let mut empty = env_for("daytona");
+        empty.sandbox.network_allow = None;
+        assert!(env_network_rules_line(&base, &empty).is_none());
+        // A local env is reported by the global line, not here.
+        let mut local = env_for("daytona");
+        local.placement = PlacementMode::Local;
+        assert!(env_network_rules_line(&base, &local).is_none());
+    }
+
+    #[test]
+    fn network_rules_line_says_advisory_and_offline() {
         let blocked = thegn_core::config::SandboxConfig {
             network_block: vec!["*".into()],
             ..Default::default()
@@ -8001,8 +8134,12 @@ args = ["--verbose"]
             ..Default::default()
         };
         let note = network_rules_line(&allowed, Backend::Bwrap).unwrap();
-        assert!(note.contains("DNS-name rules only"));
-        assert!(note.contains("not applied by this backend"));
+        assert!(note.contains("are advisory"), "{note}");
+        assert!(
+            note.contains("no backend enforces hostname rules"),
+            "{note}"
+        );
+        assert!(!note.contains("DNS-only"), "{note}");
         assert!(
             network_rules_line(
                 &thegn_core::config::SandboxConfig::default(),
@@ -8209,7 +8346,7 @@ args = ["--verbose"]
             report["network_rules"]
                 .as_str()
                 .unwrap()
-                .contains("DNS-name rules only")
+                .contains("are advisory")
         );
 
         let default_cfg = Config::default();

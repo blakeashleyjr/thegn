@@ -233,6 +233,29 @@ impl Backend {
         })
     }
 
+    /// The config-facing kind (exhaustive inverse of [`Backend::from_config`]).
+    pub fn to_config(self) -> SandboxBackend {
+        match self {
+            Backend::Podman => SandboxBackend::Podman,
+            Backend::PodmanRootful => SandboxBackend::PodmanRootful,
+            Backend::Docker => SandboxBackend::Docker,
+            Backend::Smol => SandboxBackend::Smol,
+            Backend::Bwrap => SandboxBackend::Bwrap,
+            Backend::Systemd => SandboxBackend::Systemd,
+            Backend::Apple => SandboxBackend::Apple,
+            Backend::Wsl => SandboxBackend::Wsl,
+            Backend::WinAppContainer => SandboxBackend::WinAppContainer,
+            Backend::WinJobObject => SandboxBackend::WinJobObject,
+            Backend::None => SandboxBackend::None,
+        }
+    }
+
+    /// Accepted by config but not implemented in this build (`smol`, `wsl`,
+    /// `appcontainer`): never a runtime candidate.
+    pub fn is_reserved(self) -> bool {
+        <SandboxBackend as crate::seam::Kind>::is_reserved(self.to_config())
+    }
+
     /// The executable to probe / invoke for this backend.
     /// The one table every `match backend` used to re-derive: label, binary,
     /// family, and the flags the argv builders branch on. Adding a backend is
@@ -389,12 +412,12 @@ impl Backend {
         )
     }
 
-    /// The OCI runtimes worth probing for a container on this host (WSL is
-    /// reserved — no runtime behind it yet).
+    /// The OCI runtimes worth probing for a container on this host (reserved
+    /// kinds — smol, wsl — have no runtime behind them).
     pub fn oci_runtimes() -> impl Iterator<Item = Backend> {
         Backend::ALL
             .into_iter()
-            .filter(|b| b.is_oci() && *b != Backend::Wsl)
+            .filter(|b| b.is_oci() && !b.is_reserved())
     }
 
     /// Every runtime backend (for tables and coverage tests).
@@ -507,9 +530,11 @@ pub struct SandboxSpec {
     /// to swap a master key for a scoped virtual key.
     pub env_block: Vec<String>,
     pub network: Network,
-    /// Domain allow-list for the DNS filter (empty = allow all non-blocked).
+    /// Advisory hostname allow-list (not enforced by any local backend; empty
+    /// = allow all non-blocked).
     pub network_allow: Vec<String>,
-    /// Domain block-list for the DNS filter (checked before allow-list).
+    /// Advisory hostname block-list (not enforced by any local backend;
+    /// checked before the allow-list).
     pub network_block: Vec<String>,
     /// Hardening: mount the container root filesystem read-only (writable: the
     /// worktree, cache binds, and a tmpfs `/tmp`). Resolved from the active
@@ -696,6 +721,9 @@ pub enum RefusalClass {
     StrictUnsupported,
     /// A container with this lossy name belongs to another worktree or its owner could not be read.
     ContainerOwner,
+    /// The backend has no verified way to express the requested network mode
+    /// (Apple `container` and `network = "none"`).
+    NetworkUnexpressible,
 }
 
 impl RefusalClass {
@@ -716,6 +744,7 @@ impl RefusalClass {
             Self::ControlSocketReachable => "control-socket-reachable",
             Self::StrictUnsupported => "strict-unsupported",
             Self::ContainerOwner => "container-owner",
+            Self::NetworkUnexpressible => "network-unexpressible",
         }
     }
 
@@ -764,6 +793,9 @@ impl RefusalClass {
             }
             Self::ContainerOwner => {
                 "another worktree's sandbox container has this container's name (worktree paths that differ only in punctuation or case share one): close that worktree's sandbox first, or rename one worktree directory"
+            }
+            Self::NetworkUnexpressible => {
+                "Apple `container` cannot express `network = \"none\"` yet: use podman or docker (they run in a VM on macOS) for offline or sealed worktrees, or set `network = \"nat\"`"
             }
         }
     }
@@ -1037,6 +1069,18 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
     std::borrow::Cow::Owned(v)
 }
 
+/// The refusal message when the backend cannot express the spec's network
+/// mode: Apple `container` with `network = "none"` (which the `sealed`
+/// profile sets). WS05 removes this when Apple internal networks land.
+pub(crate) fn network_unexpressible_refusal(spec: &SandboxSpec) -> Option<String> {
+    (spec.backend == Backend::Apple && spec.network == Network::None).then(|| {
+        format!(
+            "the `{}` backend cannot express `network = \"none\"` (Apple `container run` has no offline network mode); refusing to launch with an unknown network",
+            spec.backend.label()
+        )
+    })
+}
+
 /// Every launch gate in one place: volume admission, the sealed deny filter and
 /// `$HOME` gate, and the OCI `-v` path syntax check.
 fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
@@ -1058,6 +1102,18 @@ fn launchable_guarded<'a>(
     }
     if let Some(message) = hostname_policy_refusal_with(HOSTNAME_RULES, spec) {
         return Err(refusal(spec, RefusalClass::HostnamePolicy, None, message));
+    }
+    // Apple `container run` takes `--network <name>` only: `--network none`
+    // names a network rather than removing it. Refuse before any argv (and
+    // before the sealed strict gate, so a sealed Apple launch names the real
+    // reason) instead of launching with an unknown network.
+    if let Some(message) = network_unexpressible_refusal(spec) {
+        return Err(refusal(
+            spec,
+            RefusalClass::NetworkUnexpressible,
+            None,
+            message,
+        ));
     }
     if let Some(message) = crate::sandbox_floor::strict_gate(spec) {
         return Err(refusal(
@@ -1301,12 +1357,34 @@ fn compose_cannot_enforce(spec: &SandboxSpec) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostnameRulesPolicy {
-    WarnDnsOnly,
+    /// Launch, and warn that the lists are not enforced.
+    WarnUnenforced,
     Refuse,
 }
 
-/// SD-3 (THE-799): flip to `Refuse` for the audit design; one line.
-pub const HOSTNAME_RULES: HostnameRulesPolicy = HostnameRulesPolicy::WarnDnsOnly;
+/// SD-3 (THE-799, owner decision O14 still open): hostname lists warn as
+/// unenforced and the launch proceeds. Flip to `Refuse` for the audit design;
+/// one line.
+pub const HOSTNAME_RULES: HostnameRulesPolicy = HostnameRulesPolicy::WarnUnenforced;
+
+/// Whether a placement lowers `network_allow`/`network_block` to a provider
+/// egress policy API (Sprites, Vercel). Every other placement leaves the lists
+/// unenforced.
+fn placement_lowers_hostname_rules(placement: &Placement) -> bool {
+    match placement {
+        Placement::Provider(p) => crate::config::EnvProviderKind::of(&p.provider).egress_api(),
+        Placement::Local | Placement::Ssh(_) | Placement::K8s(_) => false,
+    }
+}
+
+/// The warning for a provider environment whose kind has no egress policy
+/// API, so its `network_allow`/`network_block` lists are not enforced.
+pub fn provider_rules_unenforced_note(provider: &str) -> String {
+    format!(
+        "env provider '{provider}': network_allow/network_block are NOT enforced: this provider \
+         has no egress policy API; set `network = \"none\"` in the env sandbox or remove the lists"
+    )
+}
 
 pub fn lower_universal_deny(network: Network, block: &[String]) -> Network {
     if block.iter().any(|rule| rule.trim() == "*") {
@@ -1330,14 +1408,18 @@ pub fn hostname_rules_note_for(
     if !hostname_rules_active(network, allow, block) {
         return None;
     }
-    // Provider placements lower these rules to provider egress policy (THE-534).
-    if matches!(placement, Placement::Provider(_)) {
+    // Only a provider with an egress policy API lowers these rules (THE-534);
+    // it applies and reads the policy back before handoff.
+    if placement_lowers_hostname_rules(placement) {
         return None;
     }
+    if let Placement::Provider(p) = placement {
+        return Some(provider_rules_unenforced_note(&p.provider));
+    }
     Some(format!(
-        "sandbox {}: network_allow/network_block are DNS-name rules only — not an egress boundary, and not \
-         applied by this backend (direct IPs and other resolvers bypass them); set `network = \"none\"` \
-         to deny egress, or remove the lists",
+        "sandbox {}: network_allow/network_block are advisory: no backend enforces hostname \
+         rules (direct IPs and other resolvers are unaffected); set `network = \"none\"` to deny \
+         egress, or remove the lists",
         backend.label()
     ))
 }
@@ -1353,15 +1435,19 @@ pub fn hostname_rules_note(spec: &SandboxSpec) -> Option<String> {
 }
 
 fn hostname_policy_refusal_with(policy: HostnameRulesPolicy, spec: &SandboxSpec) -> Option<String> {
-    if policy == HostnameRulesPolicy::WarnDnsOnly
+    if policy == HostnameRulesPolicy::WarnUnenforced
         || !hostname_rules_active(spec.network, &spec.network_allow, &spec.network_block)
-        || matches!(spec.placement, Placement::Provider(_) | Placement::K8s(_))
+        || placement_lowers_hostname_rules(&spec.placement)
+        || matches!(spec.placement, Placement::K8s(_))
     {
         return None;
     }
+    if let Placement::Provider(p) = &spec.placement {
+        return Some(provider_rules_unenforced_note(&p.provider));
+    }
     Some(format!(
-        "`network_allow`/`network_block` are DNS-name rules, which are not an egress boundary and are not \
-         enforced by the `{}` backend; set `network = \"none\"` or remove the lists",
+        "`network_allow`/`network_block` are advisory hostname rules, which are not enforced by the \
+         `{}` backend; set `network = \"none\"` or remove the lists",
         spec.backend.label()
     ))
 }
@@ -5394,6 +5480,16 @@ fn oci_create_opts_in(
     } else {
         match spec.network {
             Network::Host => v.extend(["--network".into(), "host".into()]),
+            // Apple reads `--network none` as a network NAME; the launch gate
+            // refuses this combination (`network-unexpressible`) before any
+            // argv, so emit nothing rather than attach to a network called
+            // `none`.
+            Network::None if spec.backend == Backend::Apple => {
+                debug_assert!(
+                    network_unexpressible_refusal(spec).is_none(),
+                    "apple + network=none is refused before argv (network-unexpressible)"
+                );
+            }
             Network::None => v.extend(["--network".into(), "none".into()]),
             Network::Nat => {}
         }
@@ -5419,8 +5515,7 @@ fn oci_create_opts_in(
         // routable nameservers + search domains). Force-mounting the host file
         // (loopback-only on any systemd-resolved box) points DNS at the
         // container's own empty loopback → "Could not resolve host". bwrap/systemd
-        // share the host netns and keep these mounts (loopback works there); this
-        // also unshadows the `--dns` filter injection above.
+        // share the host netns and keep these mounts (loopback works there).
         if !oci_emits_mount(m) {
             continue;
         }

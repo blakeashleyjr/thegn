@@ -987,6 +987,40 @@ fn hm_weather_provider_offers_only_implemented_spellings() {
 }
 
 #[test]
+fn hm_sandbox_backend_offers_no_reserved_spelling() {
+    let enums = enum_lists(&module_src());
+    let values = enums
+        .iter()
+        .find(|(name, _)| name == "backend")
+        .map(|(_, values)| values)
+        .unwrap_or_else(|| panic!("Home Manager enum option `backend` is missing"));
+    let schema = schema_field("sandbox.backend");
+    let reserved: BTreeSet<&str> = schema
+        .get(thegn_core::config_validate::ENUM_MARKER)
+        .map(|marker| {
+            marker["reserved"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
+    for spelling in ["smol", "wsl", "appcontainer"] {
+        assert!(
+            reserved.contains(spelling),
+            "{spelling} must be reserved: {reserved:?}"
+        );
+    }
+    assert!(
+        values
+            .iter()
+            .all(|value| !reserved.contains(value.as_str())),
+        "Home Manager `backend` offers a reserved spelling: {values:?}"
+    );
+}
+
+#[test]
 fn hm_search_and_palette_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["search", "palette"] {
