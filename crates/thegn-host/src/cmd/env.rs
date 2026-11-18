@@ -88,7 +88,8 @@ pub enum Action {
         target: super::target::WorktreeTarget,
     },
     /// Destroy managed-sandbox(es) via the env's API provider. Pass an `id`, or
-    /// `--all` to destroy every sandbox the provider can see. `--env <name>`
+    /// `--all` to destroy every listed sandbox thegn can prove it created (the
+    /// rest are skipped with a warning). `--env <name>`
     /// targets a named env's provider instead of the worktree's resolved one.
     Deprovision {
         id: Option<String>,
@@ -368,7 +369,8 @@ fn remove(name: &str) -> Result<()> {
 }
 
 /// Destroy managed sandbox(es). With `--all`, list every sandbox the provider
-/// can see and destroy each (best-effort per id — a failed destroy warns and the
+/// can see and destroy each one thegn can prove it created (best-effort per id:
+/// an unproven name is skipped with a warning, a failed destroy warns and the
 /// rest continue). `--env <name>` targets that env's provider; otherwise the
 /// worktree's resolved env. Without `--all`, an explicit `id` is required.
 fn deprovision(
@@ -417,12 +419,14 @@ fn deprovision(
             outln!("no managed sandboxes to destroy");
             return Ok(());
         }
-        // `--all` destroys EVERY sandbox on the provider account (not just this
-        // repo's), which is irreversible — gate it on an explicit confirmation.
-        // `--yes` bypasses; without a TTY and without `--yes`, refuse rather than
-        // silently blocking on a stdin read a script can't answer.
+        // `--all` lists every sandbox on the provider account (not just this
+        // repo's); the provider destroys only the ones it can prove this host
+        // created, which is still irreversible, so gate it on an explicit
+        // confirmation. `--yes` bypasses; without a TTY and without `--yes`,
+        // refuse rather than silently blocking on a stdin read a script can't
+        // answer.
         if !yes {
-            let prompt = format!("Destroy ALL {} managed sandbox(es)?", ids.len());
+            let prompt = destroy_all_prompt(ids.len());
             if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 anyhow::bail!("{prompt} refusing without a TTY — pass --yes to confirm");
             }
@@ -431,25 +435,17 @@ fn deprovision(
                 return Ok(());
             }
         }
-        let mut destroyed = 0usize;
-        for id in &ids {
-            if let Err(e) =
+        let outcome = destroy_all(
+            &ids,
+            |id| {
                 crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, id, None)
-            {
-                msg::warn(&format!(
-                    "destroy {id} refused: route-to-host credential revocation failed: {e:#}"
-                ));
-                continue;
-            }
-            match crate::agent::block_on_provider(|| async { provider.destroy(id).await }) {
-                Ok(()) => {
-                    destroyed += 1;
-                    outln!("destroyed sandbox: {id}");
-                }
-                Err(e) => msg::warn(&format!("destroy {id} failed: {e}")),
-            }
-        }
-        outln!("destroyed {destroyed}/{} sandbox(es)", ids.len());
+                    .map(|_| ())
+            },
+            |id| crate::agent::block_on_provider(|| async { provider.destroy(id).await }),
+            |line| outln!("{line}"),
+            msg::warn,
+        );
+        outln!("{}", outcome.summary());
         return Ok(());
     }
     let id = id.ok_or_else(|| anyhow::anyhow!("provide a sandbox id, or pass --all"))?;
@@ -459,6 +455,80 @@ fn deprovision(
         .map_err(|e| anyhow::anyhow!("destroy {id} failed: {e}"))?;
     outln!("destroyed sandbox: {id}");
     Ok(())
+}
+
+/// The `deprovision --all` confirmation prompt.
+fn destroy_all_prompt(listed: usize) -> String {
+    format!("Destroy every sandbox thegn can prove it created ({listed} listed)?")
+}
+
+/// Whether a destroy error is the provider refusing a name this host cannot
+/// prove it created (the sprites ledger, the Vercel controller tag), as opposed
+/// to a failed delete. Both providers word the refusal "refusing to delete".
+fn is_ownership_refusal(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("refusing to delete")
+}
+
+/// The tally of a `deprovision --all` run.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DestroyAllOutcome {
+    destroyed: usize,
+    /// Names the provider refused because no ownership record proves them.
+    skipped: usize,
+    /// Revocation or delete failures (warned, not fatal).
+    failed: usize,
+}
+
+impl DestroyAllOutcome {
+    fn summary(&self) -> String {
+        let mut line = format!(
+            "destroyed {}, skipped {} (no ownership record)",
+            self.destroyed, self.skipped
+        );
+        if self.failed > 0 {
+            line.push_str(&format!(", failed {}", self.failed));
+        }
+        line
+    }
+}
+
+/// Destroy each listed sandbox: revoke its route-to-host credential first (a
+/// failed revocation leaves the sandbox intact), then delete. An unproven name
+/// is a warning and a skip, never an error exit.
+fn destroy_all(
+    ids: &[String],
+    mut revoke: impl FnMut(&str) -> Result<()>,
+    mut destroy: impl FnMut(&str) -> Result<()>,
+    mut out: impl FnMut(&str),
+    mut warn: impl FnMut(&str),
+) -> DestroyAllOutcome {
+    let mut outcome = DestroyAllOutcome::default();
+    for id in ids {
+        if let Err(e) = revoke(id) {
+            warn(&format!(
+                "destroy {id} refused: route-to-host credential revocation failed: {e:#}"
+            ));
+            outcome.failed += 1;
+            continue;
+        }
+        match destroy(id) {
+            Ok(()) => {
+                outcome.destroyed += 1;
+                out(&format!("destroyed sandbox: {id}"));
+            }
+            Err(e) if is_ownership_refusal(&e) => {
+                outcome.skipped += 1;
+                warn(&format!(
+                    "skipped {id}: thegn has no ownership record proving it created this sandbox"
+                ));
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                warn(&format!("destroy {id} failed: {e:#}"));
+            }
+        }
+    }
+    outcome
 }
 
 /// Verify a provider env's token by listing its sandboxes (a cheap control call).
@@ -800,9 +870,11 @@ enum Lifecycle {
 const UP_RESUME_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Provider kinds whose `Provider::suspend` actually parks the sandbox
-/// (`fly` stop, `machine0` suspend); every other kind's suspend is a no-op.
+/// (`fly` stop, `machine0` suspend, `vercel` stop-session: compute to $0, the
+/// filesystem persists, and `resume` starts a new session); every other kind's
+/// suspend is a no-op.
 fn provider_has_stop(kind: &str) -> bool {
-    matches!(kind.trim(), "fly" | "machine0")
+    matches!(kind.trim(), "fly" | "machine0" | "vercel")
 }
 
 /// The `env down --stop` refusal for a provider without a stop.
@@ -2492,10 +2564,12 @@ mod down_tests {
     }
 
     #[test]
-    fn only_fly_and_machine0_can_stop() {
+    fn only_fly_machine0_and_vercel_can_stop() {
         for (kind, expected) in [
             ("fly", true),
             ("machine0", true),
+            ("vercel", true),
+            (" vercel ", true),
             (" fly ", true),
             ("sprites", false),
             ("daytona", false),
@@ -2519,6 +2593,10 @@ mod down_tests {
             ("fly", "sbx-1", false, false),
             ("fly", "", true, false),
             ("sprites", "sbx-1", true, false),
+            // Vercel parks via stop-session: resumed only with the local marker.
+            ("vercel", "tg-wt-1", true, true),
+            ("vercel", "tg-wt-1", false, false),
+            ("vercel", "", true, false),
         ] {
             assert_eq!(
                 resume_on_up(kind, id, provisioned),
@@ -2526,6 +2604,79 @@ mod down_tests {
                 "{kind} {id:?} provisioned={provisioned}"
             );
         }
+    }
+
+    #[test]
+    fn destroy_all_prompt_names_the_listed_count() {
+        assert_eq!(
+            super::destroy_all_prompt(3),
+            "Destroy every sandbox thegn can prove it created (3 listed)?"
+        );
+    }
+
+    #[test]
+    fn destroy_all_skips_an_unproven_name_with_a_warning() {
+        let ids: Vec<String> = ["mine", "theirs", "broken"].map(String::from).to_vec();
+        let mut deleted = Vec::new();
+        let (mut out, mut warns) = (Vec::new(), Vec::new());
+        let outcome = super::destroy_all(
+            &ids,
+            |_| Ok(()),
+            |id| match id {
+                "theirs" => Err(anyhow::anyhow!("no ledger record")
+                    .context("sprites: refusing to delete theirs")),
+                "broken" => Err(anyhow::anyhow!("sprites destroy failed (500)")),
+                other => {
+                    deleted.push(other.to_string());
+                    Ok(())
+                }
+            },
+            |line| out.push(line.to_string()),
+            |line| warns.push(line.to_string()),
+        );
+        assert_eq!(deleted, ["mine"]);
+        assert_eq!(
+            outcome,
+            super::DestroyAllOutcome {
+                destroyed: 1,
+                skipped: 1,
+                failed: 1,
+            }
+        );
+        assert_eq!(
+            outcome.summary(),
+            "destroyed 1, skipped 1 (no ownership record), failed 1"
+        );
+        assert_eq!(out, ["destroyed sandbox: mine"]);
+        assert!(
+            warns.iter().any(|w| w.starts_with("skipped theirs:")),
+            "{warns:?}"
+        );
+        assert!(
+            warns.iter().any(|w| w.starts_with("destroy broken failed")),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn destroy_all_never_deletes_when_revocation_fails() {
+        let ids = vec!["sbx-1".to_string()];
+        let mut deletes = 0;
+        let outcome = super::destroy_all(
+            &ids,
+            |_| Err(anyhow::anyhow!("db locked")),
+            |_| {
+                deletes += 1;
+                Ok(())
+            },
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(deletes, 0);
+        assert_eq!(
+            outcome.summary(),
+            "destroyed 0, skipped 0 (no ownership record), failed 1"
+        );
     }
 
     /// A scripted `provider.list()`: each call pops the next answer.
