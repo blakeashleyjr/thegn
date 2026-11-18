@@ -2555,6 +2555,24 @@ check "stable honours observe toggles" \
 check "dev honours the same toggles" \
   "env THEGN_CHANNEL=dev '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = true'"
 
+# Closed-pipe regressions: a reader that hangs up mid-drain/land must not
+# strand a claimed row or skip the roster/DB bookkeeping after the ref moved.
+if command -v sqlite3 >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+  PIPE_REPO="$TMP/pipe-repo"
+  PIPE_HOME="$TMP/pipe-home"
+  mkdir -p "$PIPE_REPO" "$PIPE_HOME"
+  (
+    cd "$PIPE_REPO" && git init -q -b main && git config user.email t@e && git config user.name t &&
+      git config commit.gpgsign false && echo base >base.txt && git add -A && git commit -q -m c0 &&
+      git branch pipe-feat && git checkout -q pipe-feat && echo f >f.txt && git add -A &&
+      git commit -q -m feat && git checkout -q main
+  ) >/dev/null 2>&1
+  check "merge drain with a closed stdout pipe still records the landed row" \
+    "cd '$PIPE_REPO' && env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' merge add --branch pipe-feat >/dev/null 2>&1; env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' merge drain | true; env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' merge list 2>&1 | grep -q landed"
+  check "land --worktree with a closed stdout pipe still records the landed row" \
+    "cd '$PIPE_REPO' && env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' land --worktree '$PIPE_REPO' | true; env HOME='$PIPE_HOME' XDG_DATA_HOME='$PIPE_HOME/data' '$SZ' merge list 2>&1 | grep -q landed"
+fi
+
 echo
 if [[ $fail -eq 0 ]]; then
   printf '\033[32mall smoke checks passed\033[0m\n'
