@@ -1,14 +1,20 @@
 //! One declared description of what a *resolved* sandbox can do, so the UI and
-//! policy engine can degrade gracefully instead of special-casing each backend
-//! (grey out a snapshot affordance, show the weaker egress guarantee honestly,
-//! pick the right projection lifecycle).
+//! policy engine can degrade gracefully instead of special-casing each backend:
+//! grey out a snapshot affordance (only provider kinds whose
+//! [`EnvProviderKind::checkpoints`] fact holds can snapshot; no local backend
+//! can), show the weaker egress guarantee honestly ([`egress_for`] never claims
+//! more than the code enforces), and pick the right projection lifecycle.
 //!
 //! This module owns **no new policy**. Every field is an *aggregation* of the
 //! existing source-of-truth predicates that already live next to the thing they
 //! describe:
-//! - the isolation engine — [`Backend::is_oci`](crate::sandbox::Backend::is_oci),
+//! - the isolation engine — the backend's profile table
+//!   ([`Backend::profile`](crate::sandbox::Backend::profile): family, events op)
+//!   and [`Backend::verified`](crate::sandbox::Backend::verified),
 //! - the execution placement — the `Placement` variant,
-//! - the hardening preset — the [`SandboxProfile`](crate::config::SandboxProfile) methods,
+//! - the provider kind's facts — [`EnvProviderKind`] (`egress_api`,
+//!   `checkpoints`, `scale_to_zero`),
+//! - the network mode — [`Network`] (`[sandbox] network`),
 //! - the tunnel attachment — [`SandboxSpec::vpn`](crate::sandbox::SandboxSpec).
 //!
 //! Those remain the source of truth; [`Capabilities`] just reads them back as one
@@ -16,8 +22,11 @@
 //! rest of the system asks `spec.capabilities()` instead of re-deriving the same
 //! booleans in every call site.
 
+use crate::config::{EnvProviderKind, Network};
+use crate::egress::plan::{EgressPath, EgressPlan};
 use crate::placement::Placement;
-use crate::sandbox::{Backend, SandboxSpec};
+use crate::sandbox::{Backend, BackendFamily, SandboxSpec};
+use crate::sandbox_events::EventsCap;
 
 /// How the worktree is made available inside the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,47 +43,152 @@ pub enum ProjectionMode {
     InEnv,
 }
 
-/// How the single egress policy is realized for this sandbox.
-///
-/// The five variants are the programme's one egress vocabulary (resolutions
-/// B11). `PortPinned` and `Offline` were added by WS00-P1-03 and nothing
-/// constructs them yet; their semantics, and the `egress_for` rules that will
-/// produce them, are owned by WS01-P1-02.
+/// How the single egress policy is realized for this sandbox — the
+/// programme's one egress vocabulary (resolutions B11). [`egress_for`] is the
+/// only producer, and it under-promises: no code path reports `Enforce` until a
+/// thegn egress datapath exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressKind {
-    /// thegn owns egress directly — the DNS filter, the VPN sidecar, and the
-    /// `tgproxy` chokepoint all run on a host we control.
-    ///
-    /// B11 meaning (WS01-P1-02): a thegn egress datapath with a live,
-    /// authenticated lease is the only route out.
+    /// A thegn egress datapath with a live, authenticated lease is the only
+    /// route out, on a path the backend's manifest declares and verifies
+    /// (`NetnsBridge`, `SidecarNetns`, `LoopbackPort` on Seatbelt,
+    /// `InternalRelay` with engine evidence, `WfpProxyOnly` with a proxy-peer
+    /// identity). Unreachable until the backend manifest (WS02-P2-02) and the
+    /// egress plan builder (WS04-P2-08) land. DNS filtering and a VPN sidecar
+    /// are never reported as `Enforce`.
     Enforce,
-    /// The policy is *lowered* to a managed provider's own controls (CIDR rules,
-    /// credential injection); we cannot run our own datapath inside their box.
-    ///
-    /// B11 meaning (WS01-P1-02): provider- or VMM-native controls that applied
-    /// (and were read back where the provider can), or a manifest-native egress.
+    /// The policy is lowered to provider- or VMM-native controls that applied
+    /// (and were read back where possible), or a manifest-native egress.
+    /// Provider arm today: the placement's kind has
+    /// [`EnvProviderKind::egress_api`] (Sprites, whose policy is applied and
+    /// verified before handoff).
     Translate,
     /// Proxy env plus a kernel pin to the lease port on any address (a
-    /// Landlock-only TCP pin; MXC proxy-only without peer identity). Never a
-    /// boundary; a sealed profile refuses it. Stub variant (WS00-P1-03);
-    /// semantics owned by WS01-P1-02.
+    /// Landlock-only TCP pin; a WFP proxy-only filter without peer identity).
+    /// Not a boundary; a sealed profile refuses it.
     PortPinned,
-    /// `network = "none"` on a backend whose net isolation is its own network
-    /// namespace or a VM, and verified. `network = "none"` is never reported as
-    /// `Enforce`. Stub variant (WS00-P1-03); semantics owned by WS01-P1-02.
+    /// `network = "none"` on a verified backend with its own network namespace
+    /// (or VM): there is no route out. `network = "none"` is never reported as
+    /// `Enforce`.
     Offline,
-    /// No egress controls are available for this combination (e.g. the plain
-    /// `none` backend with no tunnel).
+    /// Everything else: `network_allow`/`network_block` lists without
+    /// enforcement, `nat`/`host`, a VPN alone, unverified backends, and every
+    /// provider without an egress policy API.
     Unmanaged,
+}
+
+/// The inputs of [`egress_for`]. Built only through [`EgressInputs::local`]
+/// and the builders, so a new input (the provider egress report, WS08-P7-01)
+/// never changes `egress_for`'s signature.
+#[derive(Debug, Clone, Copy)]
+pub struct EgressInputs<'a> {
+    backend: Backend,
+    placement: &'a Placement,
+    network: Network,
+    plan: Option<&'a EgressPlan>,
+}
+
+impl<'a> EgressInputs<'a> {
+    /// The inputs of a launch with no egress plan.
+    pub fn local(backend: Backend, placement: &'a Placement, network: Network) -> Self {
+        EgressInputs {
+            backend,
+            placement,
+            network,
+            plan: None,
+        }
+    }
+
+    /// The launch's egress plan (`SandboxSpec.egress`), if any.
+    pub fn with_plan(self, plan: Option<&'a EgressPlan>) -> Self {
+        EgressInputs { plan, ..self }
+    }
+}
+
+/// The honest egress kind of a launch (resolutions B11). Rules, in order:
+/// 1. a provider placement is `Translate` iff its kind has an egress policy
+///    API ([`EnvProviderKind::egress_api`]), else `Unmanaged`;
+/// 2. `network = "none"` is `Offline` on a verified backend with its own
+///    network namespace placed locally or over ssh, else `Unmanaged` — never
+///    `Enforce`;
+/// 3. otherwise a lease plan decides by its path; with no plan the launch is
+///    `Unmanaged`.
+pub fn egress_for(i: &EgressInputs<'_>) -> EgressKind {
+    if let Placement::Provider(p) = i.placement {
+        return if EnvProviderKind::of(&p.provider).egress_api() {
+            EgressKind::Translate
+        } else {
+            EgressKind::Unmanaged
+        };
+    }
+    match i.network {
+        Network::None => offline_or_unmanaged(i.backend, i.placement),
+        Network::Nat | Network::Host => match i.plan {
+            Some(plan) => plan_kind(i.backend, plan),
+            None => EgressKind::Unmanaged,
+        },
+    }
+}
+
+/// Rule 2: `network = "none"` is `Offline` only where the backend owns a
+/// network namespace (or VM) we placed and its verbs are verified.
+fn offline_or_unmanaged(backend: Backend, placement: &Placement) -> EgressKind {
+    let own_netns_when_none = match backend.profile().family {
+        // Apple `network = "none"` is not expressible yet (refused at launch).
+        BackendFamily::Oci => backend != Backend::Apple,
+        BackendFamily::Bwrap | BackendFamily::Systemd => true,
+        // Host process, Job Object, AppContainer: the host network stack.
+        BackendFamily::WinAppContainer | BackendFamily::WinJobObject | BackendFamily::Host => false,
+    };
+    // A k8s pod's network namespace is not ours; a provider is rule 1.
+    let placed = matches!(placement, Placement::Local | Placement::Ssh(_));
+    if own_netns_when_none && placed && backend.verified() {
+        EgressKind::Offline
+    } else {
+        EgressKind::Unmanaged
+    }
+}
+
+/// Rule 3: the kind a lease plan earns, by its datapath.
+fn plan_kind(backend: Backend, plan: &EgressPlan) -> EgressKind {
+    match plan.path {
+        EgressPath::PortPin => EgressKind::PortPinned,
+        // B42: `Enforce` only with a proxy-peer identity. The plan carries
+        // none yet, so a WFP proxy-only filter is at best port-pinned.
+        EgressPath::WfpProxyOnly => EgressKind::PortPinned,
+        // Without per-engine evidence the launch is refused elsewhere; the
+        // claim is `Unmanaged`.
+        EgressPath::InternalRelay if !proxy_path_credited(backend, EgressPath::InternalRelay) => {
+            EgressKind::Unmanaged
+        }
+        path if proxy_path_credited(backend, path) => EgressKind::Enforce,
+        _ => EgressKind::Unmanaged,
+    }
+}
+
+/// Whether the backend's manifest lists `path` as a verified proxy datapath
+/// (B11, B22). WS02-P2-02 replaces this body with the manifest read (no
+/// signature change). Until then no path is credited.
+fn proxy_path_credited(_backend: Backend, _path: EgressPath) -> bool {
+    false
+}
+
+/// The provider kind of a provider placement.
+fn provider_kind(placement: &Placement) -> Option<EnvProviderKind> {
+    match placement {
+        Placement::Provider(p) => Some(EnvProviderKind::of(&p.provider)),
+        Placement::Local | Placement::Ssh(_) | Placement::K8s(_) => None,
+    }
 }
 
 /// How much structured observability this sandbox can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObsLevel {
-    /// A full structured event stream we instrument ourselves (OCI engines expose
-    /// `events`; the host also synthesizes pane exec/die for every backend).
+    /// A full structured event stream we instrument ourselves: the backend's
+    /// events op is implemented (`EventsCap::Yes`, podman today) on a local or
+    /// ssh placement.
     Instrumented,
-    /// We normalize the provider's own event/file/process stream into the timeline.
+    /// Reserved: no provider event normaliser exists, so nothing reports this.
     ProviderStream,
     /// Only coarse host-side signals (CPU-activity FSM); no per-process events.
     StatsOnly,
@@ -132,9 +246,30 @@ impl Capabilities {
         Self::from_parts(
             spec.backend,
             &spec.placement,
+            spec.network,
             spec.vpn.is_some(),
             spec.oci_runtime.as_deref(),
         )
+        .with_plan(
+            spec.backend,
+            &spec.placement,
+            effective_network(spec.network, spec.vpn.is_some()),
+            spec.egress.as_ref(),
+        )
+    }
+
+    /// Recompute `egress` with the launch's egress plan.
+    fn with_plan(
+        self,
+        backend: Backend,
+        placement: &Placement,
+        network: Network,
+        plan: Option<&EgressPlan>,
+    ) -> Self {
+        Capabilities {
+            egress: egress_for(&EgressInputs::local(backend, placement, network).with_plan(plan)),
+            ..self
+        }
     }
 
     /// The pure derivation, factored out of [`SandboxSpec`] so it is trivially
@@ -148,15 +283,20 @@ impl Capabilities {
     /// `oci_runtime` is the resolved `[sandbox] oci_runtime` (e.g. `"runsc"`,
     /// `"krun"`); it raises the honest isolation class for OCI backends that run
     /// under a stronger runtime, and is ignored by non-OCI backends.
+    ///
+    /// `network` is the resolved `[sandbox] network`; callers that read only
+    /// `isolation` pass [`Network::Nat`].
     pub fn from_parts(
         backend: Backend,
         placement: &Placement,
+        network: Network,
         has_vpn: bool,
         oci_runtime: Option<&str>,
     ) -> Self {
         Self::from_parts_on(
             backend,
             placement,
+            network,
             has_vpn,
             oci_runtime,
             crate::sandbox_backend::host_os(),
@@ -170,28 +310,36 @@ impl Capabilities {
     pub fn from_parts_on(
         backend: Backend,
         placement: &Placement,
+        network: Network,
         has_vpn: bool,
         oci_runtime: Option<&str>,
         os: crate::sandbox_backend::HostOs,
     ) -> Self {
-        let is_provider = matches!(placement, Placement::Provider(_));
-        // podman can checkpoint/restore a container (CRIU) — a real snapshot.
-        let podman_checkpoint = matches!(backend, Backend::Podman | Backend::PodmanRootful);
+        let kind = provider_kind(placement);
+        let network = effective_network(network, has_vpn);
         Capabilities {
             isolation: isolation_for(backend, placement, oci_runtime, os),
             projection: projection_for(placement),
-            egress: egress_for(backend, placement, has_vpn),
+            egress: egress_for(&EgressInputs::local(backend, placement, network)),
             observability: obs_for(backend, placement),
-            // Managed providers expose native snapshot/suspend; local podman adds
-            // snapshot via checkpoint (but not live suspend/resume).
-            can_snapshot: is_provider || podman_checkpoint,
-            can_suspend_resume: is_provider,
+            // Only a provider kind with native checkpoints can snapshot; no
+            // local backend can (nothing runs `podman checkpoint`).
+            can_snapshot: kind.is_some_and(EnvProviderKind::checkpoints),
+            can_suspend_resume: kind.is_some_and(EnvProviderKind::scale_to_zero),
             // The proxy meters model traffic for every sandbox, but that is a
             // property of the proxy, not the sandbox backend; here `meters_cost`
-            // means the *backend itself* bills (providers do).
-            meters_cost: is_provider,
+            // means the *backend itself* bills (every provider kind with a
+            // lifecycle API does; an `exec_command`-only custom provider does not).
+            meters_cost: kind.is_some_and(|k| k != EnvProviderKind::Custom),
         }
     }
+}
+
+/// The network the egress rules see. A VPN sidecar join replaces
+/// `--network none` with `--network container:<sidecar>`, so a VPN is a route
+/// out: never `Offline`, never `Enforce`.
+fn effective_network(network: Network, has_vpn: bool) -> Network {
+    if has_vpn { Network::Nat } else { network }
 }
 
 fn isolation_for(
@@ -277,32 +425,14 @@ fn projection_for(placement: &Placement) -> ProjectionMode {
     }
 }
 
-fn egress_for(backend: Backend, placement: &Placement, has_vpn: bool) -> EgressKind {
-    if matches!(placement, Placement::Provider(_)) {
-        // We cannot run our DNS filter / proxy inside a managed provider's box;
-        // the policy is translated to their controls.
-        return EgressKind::Translate;
-    }
-    // OCI containers provide a network namespace; hostname rules are DNS-only.
-    // A VPN attachment can carry the only route.
-    if backend.is_oci() || has_vpn {
-        EgressKind::Enforce
-    } else {
-        EgressKind::Unmanaged
-    }
-}
-
 fn obs_for(backend: Backend, placement: &Placement) -> ObsLevel {
-    if matches!(placement, Placement::Provider(_)) {
-        return ObsLevel::ProviderStream;
-    }
-    if backend.is_oci() {
-        // The OCI engine's `events` stream (exec/die/network) feeds the timeline.
+    // Only a backend whose events op is implemented (podman) feeds the
+    // timeline a structured stream, and only where we run its engine. Docker
+    // and Apple have a reserved events op; providers have no normaliser.
+    let placed = matches!(placement, Placement::Local | Placement::Ssh(_));
+    if placed && backend.profile().events == EventsCap::Yes {
         ObsLevel::Instrumented
     } else {
-        // bwrap/systemd/none: only the host-side CPU-activity FSM today. The
-        // timeline phase synthesizes pane exec/die for these from the host, which
-        // is what lifts them toward `Instrumented` in practice.
         ObsLevel::StatsOnly
     }
 }
@@ -406,7 +536,22 @@ impl std::fmt::Display for ObsLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::plan::{LeaseId, LeaseToken, ProxyAuth, ProxyEndpoint};
     use crate::placement::{K8sPlacement, ProviderPlacement, SshPlacement, TransportKind};
+    use crate::sandbox_backend::HostOs;
+    use crate::seam::Kind as _;
+
+    const ALL_OS: [HostOs; 4] = [HostOs::Linux, HostOs::MacOs, HostOs::Windows, HostOs::Other];
+    const ALL_PATHS: [EgressPath; 8] = [
+        EgressPath::NetnsBridge,
+        EgressPath::SidecarNetns,
+        EgressPath::InternalRelay,
+        EgressPath::LoopbackPort,
+        EgressPath::PortPin,
+        EgressPath::WfpProxyOnly,
+        EgressPath::ProviderNative,
+        EgressPath::External,
+    ];
 
     fn ssh() -> Placement {
         Placement::Ssh(SshPlacement::plain(
@@ -427,9 +572,9 @@ mod tests {
             image: None,
         })
     }
-    fn provider() -> Placement {
+    fn provider_named(name: &str) -> Placement {
         Placement::Provider(ProviderPlacement {
-            provider: "e2b".into(),
+            provider: name.into(),
             id: "abc".into(),
             interactive_prefix: vec![],
             control_prefix: vec![],
@@ -437,98 +582,401 @@ mod tests {
             down_command: vec![],
         })
     }
-
-    #[test]
-    fn local_oci_binds_enforces_and_is_instrumented() {
-        let c = Capabilities::from_parts(Backend::Podman, &Placement::Local, false, None);
-        assert_eq!(c.projection, ProjectionMode::Bind);
-        assert_eq!(c.egress, EgressKind::Enforce);
-        assert_eq!(c.observability, ObsLevel::Instrumented);
-        // podman can checkpoint → snapshot, but no live suspend and no native billing.
-        assert!(c.can_snapshot);
-        assert!(!c.can_suspend_resume);
-        assert!(!c.meters_cost);
+    /// An `exec_command`-only provider (unknown name: the `custom` kind).
+    fn provider() -> Placement {
+        provider_named("e2b")
+    }
+    fn provider_of(kind: EnvProviderKind) -> Placement {
+        provider_named(kind.as_str())
+    }
+    fn plan(path: EgressPath) -> EgressPlan {
+        EgressPlan {
+            lease: LeaseId([0; 16]),
+            path,
+            endpoint: ProxyEndpoint::Relay {
+                host: "relay.internal".into(),
+                port: 3128,
+            },
+            auth: ProxyAuth::Token {
+                lease_user: "lease-0000".into(),
+                token: LeaseToken::new("t".into()),
+            },
+            env: vec![],
+            binds: vec![],
+            policy_digest: [0; 32],
+        }
+    }
+    fn caps(backend: Backend, placement: &Placement, network: Network, vpn: bool) -> Capabilities {
+        Capabilities::from_parts_on(backend, placement, network, vpn, None, HostOs::Linux)
+    }
+    fn egress_with_plan(backend: Backend, path: EgressPath) -> EgressKind {
+        let plan = plan(path);
+        egress_for(
+            &EgressInputs::local(backend, &Placement::Local, Network::Nat).with_plan(Some(&plan)),
+        )
     }
 
     #[test]
-    fn bwrap_cannot_snapshot_but_podman_can() {
-        let bwrap = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, false, None);
-        assert!(!bwrap.can_snapshot);
-        let podman = Capabilities::from_parts(Backend::Podman, &Placement::Local, false, None);
-        assert!(podman.can_snapshot);
+    fn local_oci_nat_is_unmanaged_and_podman_instrumented() {
+        for backend in [Backend::Podman, Backend::PodmanRootful] {
+            let c = caps(backend, &Placement::Local, Network::Nat, false);
+            assert_eq!(c.projection, ProjectionMode::Bind);
+            assert_eq!(c.egress, EgressKind::Unmanaged, "{backend:?}");
+            assert_eq!(c.observability, ObsLevel::Instrumented, "{backend:?}");
+            assert!(!c.can_snapshot);
+            assert!(!c.can_suspend_resume);
+            assert!(!c.meters_cost);
+        }
+        let over_ssh = caps(Backend::Podman, &ssh(), Network::Nat, false);
+        assert_eq!(over_ssh.projection, ProjectionMode::Sshfs);
+        assert_eq!(over_ssh.egress, EgressKind::Unmanaged);
+        assert_eq!(over_ssh.observability, ObsLevel::Instrumented);
+    }
+
+    #[test]
+    fn docker_apple_are_stats_only_events_reserved() {
+        for backend in [Backend::Docker, Backend::Apple] {
+            let c = caps(backend, &Placement::Local, Network::Nat, false);
+            assert_eq!(c.observability, ObsLevel::StatsOnly, "{backend:?}");
+            assert_eq!(c.egress, EgressKind::Unmanaged, "{backend:?}");
+        }
+        // No backend or placement reports the reserved provider stream.
+        for backend in Backend::ALL {
+            for placement in [Placement::Local, ssh(), k8s(), provider()] {
+                let c = caps(backend, &placement, Network::Nat, false);
+                assert_ne!(c.observability, ObsLevel::ProviderStream);
+            }
+        }
+        // A k8s pod's engine is not ours, even for podman.
+        assert_eq!(
+            caps(Backend::Podman, &k8s(), Network::Nat, false).observability,
+            ObsLevel::StatsOnly
+        );
+    }
+
+    #[test]
+    fn network_none_is_offline_on_verified_own_netns_backends() {
+        for backend in [
+            Backend::Podman,
+            Backend::PodmanRootful,
+            Backend::Docker,
+            Backend::Bwrap,
+            Backend::Systemd,
+        ] {
+            for placement in [Placement::Local, ssh()] {
+                assert_eq!(
+                    caps(backend, &placement, Network::None, false).egress,
+                    EgressKind::Offline,
+                    "{backend:?} on {placement:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn network_none_unmanaged_on_apple_host_process_reserved_and_k8s() {
+        for backend in [
+            Backend::Apple,
+            Backend::None,
+            Backend::WinJobObject,
+            Backend::WinAppContainer,
+            Backend::Smol,
+            Backend::Wsl,
+        ] {
+            assert_eq!(
+                caps(backend, &Placement::Local, Network::None, false).egress,
+                EgressKind::Unmanaged,
+                "{backend:?}"
+            );
+        }
+        assert_eq!(
+            caps(Backend::Podman, &k8s(), Network::None, false).egress,
+            EgressKind::Unmanaged
+        );
+    }
+
+    #[test]
+    fn vpn_never_enforce_nor_offline() {
+        for backend in Backend::ALL {
+            for network in Network::ALL.iter().copied() {
+                for placement in [Placement::Local, ssh(), k8s()] {
+                    let egress = caps(backend, &placement, network, true).egress;
+                    assert_eq!(
+                        egress,
+                        EgressKind::Unmanaged,
+                        "{backend:?} {network:?} {placement:?} with a VPN"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bwrap_with_vpn_is_unmanaged() {
+        // A tunnel is not an exclusive route: it governs nothing.
+        let c = caps(Backend::Bwrap, &Placement::Local, Network::Nat, true);
+        assert_eq!(c.egress, EgressKind::Unmanaged);
     }
 
     #[test]
     fn host_toolchain_local_is_stats_only_unmanaged() {
-        // bwrap with no OCI container and no tunnel: no egress hooks, stats only.
-        let c = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, false, None);
+        let c = caps(Backend::Bwrap, &Placement::Local, Network::Nat, false);
         assert_eq!(c.projection, ProjectionMode::Bind);
         assert_eq!(c.egress, EgressKind::Unmanaged);
         assert_eq!(c.observability, ObsLevel::StatsOnly);
-    }
-
-    #[test]
-    fn host_toolchain_with_vpn_can_enforce() {
-        // A tunnel gives a route to govern even without an OCI container.
-        let c = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, true, None);
-        assert_eq!(c.egress, EgressKind::Enforce);
-    }
-
-    #[test]
-    fn plain_none_backend_is_unmanaged_stats_only() {
-        let c = Capabilities::from_parts(Backend::None, &Placement::Local, false, None);
-        assert_eq!(c.egress, EgressKind::Unmanaged);
-        assert_eq!(c.observability, ObsLevel::StatsOnly);
-    }
-
-    #[test]
-    fn ssh_placement_projects_via_sshfs_and_enforces_for_oci() {
-        let c = Capabilities::from_parts(Backend::Podman, &ssh(), false, None);
-        assert_eq!(c.projection, ProjectionMode::Sshfs);
-        assert_eq!(c.egress, EgressKind::Enforce);
-        assert_eq!(c.observability, ObsLevel::Instrumented);
+        let none = caps(Backend::None, &Placement::Local, Network::Nat, false);
+        assert_eq!(none.egress, EgressKind::Unmanaged);
+        assert_eq!(none.observability, ObsLevel::StatsOnly);
     }
 
     #[test]
     fn k8s_placement_is_in_env() {
-        let c = Capabilities::from_parts(Backend::Podman, &k8s(), false, None);
+        let c = caps(Backend::Podman, &k8s(), Network::Nat, false);
         assert_eq!(c.projection, ProjectionMode::InEnv);
-        assert_eq!(c.egress, EgressKind::Enforce);
+        assert_eq!(c.egress, EgressKind::Unmanaged);
     }
 
     #[test]
-    fn provider_translates_streams_and_snapshots() {
-        // Provider overrides backend: translate egress, provider-stream obs,
-        // sync projection, and native snapshot/suspend/metering.
-        let c = Capabilities::from_parts(Backend::Podman, &provider(), false, None);
+    fn port_pin_plan_is_port_pinned() {
+        for backend in Backend::ALL {
+            assert_eq!(
+                egress_with_plan(backend, EgressPath::PortPin),
+                EgressKind::PortPinned
+            );
+        }
+    }
+
+    #[test]
+    fn wfp_without_peer_is_port_pinned() {
+        for backend in Backend::ALL {
+            assert_eq!(
+                egress_with_plan(backend, EgressPath::WfpProxyOnly),
+                EgressKind::PortPinned
+            );
+        }
+    }
+
+    #[test]
+    fn internal_relay_without_evidence_is_unmanaged() {
+        for backend in Backend::ALL {
+            assert_eq!(
+                egress_with_plan(backend, EgressPath::InternalRelay),
+                EgressKind::Unmanaged
+            );
+        }
+    }
+
+    #[test]
+    fn uncredited_proxy_path_is_unmanaged() {
+        for backend in Backend::ALL {
+            for path in [
+                EgressPath::NetnsBridge,
+                EgressPath::SidecarNetns,
+                EgressPath::LoopbackPort,
+                EgressPath::ProviderNative,
+                EgressPath::External,
+            ] {
+                assert_eq!(
+                    egress_with_plan(backend, path),
+                    EgressKind::Unmanaged,
+                    "{backend:?} {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_with_network_none_stays_offline_or_unmanaged() {
+        // `network = "none"` decides before any plan: no route, no proxy.
+        let plan = plan(EgressPath::PortPin);
+        let kind = egress_for(
+            &EgressInputs::local(Backend::Bwrap, &Placement::Local, Network::None)
+                .with_plan(Some(&plan)),
+        );
+        assert_eq!(kind, EgressKind::Offline);
+    }
+
+    #[test]
+    fn sprites_translates() {
+        let sprites = provider_of(EnvProviderKind::Sprites);
+        for network in Network::ALL.iter().copied() {
+            for vpn in [false, true] {
+                assert_eq!(
+                    caps(Backend::Podman, &sprites, network, vpn).egress,
+                    EgressKind::Translate,
+                    "{network:?} vpn={vpn}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_without_egress_api_is_unmanaged() {
+        for kind in [
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+            EnvProviderKind::Custom,
+        ] {
+            assert_eq!(
+                caps(Backend::Podman, &provider_of(kind), Network::Nat, false).egress,
+                EgressKind::Unmanaged,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            caps(Backend::Podman, &provider(), Network::Nat, false).egress,
+            EgressKind::Unmanaged
+        );
+    }
+
+    #[test]
+    fn egress_api_kinds_are_exactly_translate_kinds() {
+        for kind in EnvProviderKind::ALL.iter().copied() {
+            let egress = caps(Backend::None, &provider_of(kind), Network::Nat, false).egress;
+            assert_eq!(
+                egress == EgressKind::Translate,
+                kind.egress_api(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sprites_provider_snapshots_suspends_meters() {
+        let c = caps(
+            Backend::Podman,
+            &provider_of(EnvProviderKind::Sprites),
+            Network::Nat,
+            false,
+        );
         assert_eq!(c.projection, ProjectionMode::Sync);
-        assert_eq!(c.egress, EgressKind::Translate);
-        assert_eq!(c.observability, ObsLevel::ProviderStream);
+        assert_eq!(c.observability, ObsLevel::StatsOnly);
         assert!(c.can_snapshot);
         assert!(c.can_suspend_resume);
         assert!(c.meters_cost);
     }
 
     #[test]
+    fn daytona_provider_no_snapshot_no_suspend_meters() {
+        let c = caps(
+            Backend::Podman,
+            &provider_of(EnvProviderKind::Daytona),
+            Network::Nat,
+            false,
+        );
+        assert!(!c.can_snapshot);
+        assert!(!c.can_suspend_resume);
+        assert!(c.meters_cost);
+    }
+
+    #[test]
+    fn fly_provider_suspends_no_snapshot() {
+        let c = caps(
+            Backend::Podman,
+            &provider_of(EnvProviderKind::Fly),
+            Network::Nat,
+            false,
+        );
+        assert!(!c.can_snapshot);
+        assert!(c.can_suspend_resume);
+        assert!(c.meters_cost);
+    }
+
+    #[test]
+    fn machine0_provider_snapshots_and_suspends() {
+        let c = caps(
+            Backend::Podman,
+            &provider_of(EnvProviderKind::Machine0),
+            Network::Nat,
+            false,
+        );
+        assert!(c.can_snapshot);
+        assert!(c.can_suspend_resume);
+        assert!(c.meters_cost);
+    }
+
+    #[test]
+    fn custom_provider_does_not_meter() {
+        let c = caps(Backend::Podman, &provider(), Network::Nat, false);
+        assert!(!c.can_snapshot);
+        assert!(!c.can_suspend_resume);
+        assert!(!c.meters_cost);
+    }
+
+    #[test]
+    fn podman_local_cannot_snapshot() {
+        // No local backend can snapshot (B25): nothing runs `podman checkpoint`.
+        for backend in Backend::ALL {
+            for placement in [Placement::Local, ssh(), k8s()] {
+                let c = caps(backend, &placement, Network::Nat, false);
+                assert!(!c.can_snapshot, "{backend:?} {placement:?}");
+                assert!(!c.can_suspend_resume, "{backend:?} {placement:?}");
+                assert!(!c.meters_cost, "{backend:?} {placement:?}");
+            }
+        }
+    }
+
+    /// The regression gate: nothing reports `Enforce` until a thegn egress
+    /// datapath exists. WS02-P2-02 and WS04-P2-08 edit this gate deliberately.
+    #[test]
+    fn no_backend_or_placement_reports_enforce() {
+        let mut placements = vec![Placement::Local, ssh(), k8s(), provider()];
+        placements.extend(EnvProviderKind::ALL.iter().copied().map(provider_of));
+        let plans: Vec<Option<EgressPlan>> = std::iter::once(None)
+            .chain(ALL_PATHS.iter().map(|path| Some(plan(*path))))
+            .collect();
+        for backend in Backend::ALL {
+            for placement in &placements {
+                for vpn in [false, true] {
+                    for network in Network::ALL.iter().copied() {
+                        for plan in &plans {
+                            for os in ALL_OS {
+                                let c = Capabilities::from_parts_on(
+                                    backend, placement, network, vpn, None, os,
+                                )
+                                .with_plan(
+                                    backend,
+                                    placement,
+                                    effective_network(network, vpn),
+                                    plan.as_ref(),
+                                );
+                                assert_ne!(
+                                    c.egress,
+                                    EgressKind::Enforce,
+                                    "{backend:?} {placement:?} vpn={vpn} {network:?} {plan:?} {os:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn oci_runtime_raises_isolation_class_honestly() {
-        use crate::sandbox_backend::HostOs;
         // gVisor: userspace kernel. libkrun: guest kernel. Both keep the local
-        // container's path-preserving bind + our own egress enforcement — the
-        // whole point of a runtime modifier vs a remote provider.
+        // container's path-preserving bind — the whole point of a runtime
+        // modifier vs a remote provider.
         let runsc = Capabilities::from_parts_on(
             Backend::Podman,
             &Placement::Local,
+            Network::Nat,
             false,
             Some("runsc"),
             HostOs::Linux,
         );
         assert_eq!(runsc.isolation, IsolationClass::UserspaceKernel);
         assert_eq!(runsc.projection, ProjectionMode::Bind);
-        assert_eq!(runsc.egress, EgressKind::Enforce);
+        assert_eq!(runsc.egress, EgressKind::Unmanaged);
 
         let krun = Capabilities::from_parts_on(
             Backend::Docker,
             &Placement::Local,
+            Network::Nat,
             false,
             Some("krun"),
             HostOs::Linux,
@@ -541,6 +989,7 @@ mod tests {
             Capabilities::from_parts_on(
                 Backend::Podman,
                 &Placement::Local,
+                Network::Nat,
                 false,
                 Some("crun"),
                 HostOs::Linux,
@@ -552,6 +1001,7 @@ mod tests {
             Capabilities::from_parts_on(
                 Backend::Bwrap,
                 &Placement::Local,
+                Network::Nat,
                 false,
                 Some("krun"),
                 HostOs::Linux,
@@ -561,7 +1011,14 @@ mod tests {
         );
         // A managed provider still owns the boundary regardless of runtime.
         assert_eq!(
-            Capabilities::from_parts(Backend::Podman, &provider(), false, Some("krun")).isolation,
+            Capabilities::from_parts(
+                Backend::Podman,
+                &provider(),
+                Network::Nat,
+                false,
+                Some("krun")
+            )
+            .isolation,
             IsolationClass::ProviderManaged
         );
     }
@@ -571,6 +1028,8 @@ mod tests {
         assert_eq!(ProjectionMode::Sync.as_str(), "sync");
         assert_eq!(EgressKind::Translate.to_string(), "translate");
         assert_eq!(ObsLevel::StatsOnly.to_string(), "stats_only");
+        assert_eq!(ObsLevel::ProviderStream.to_string(), "provider_stream");
+        assert_eq!(ObsLevel::Instrumented.to_string(), "instrumented");
         assert_eq!(IsolationClass::GuestKernel.to_string(), "guest-kernel");
     }
 
@@ -589,11 +1048,10 @@ mod tests {
         }
     }
 
-    /// WS00-P1-03 adds `PortPinned` and `Offline` as vocabulary only: until
-    /// WS01-P1-02 gives them semantics, no production code may construct them
-    /// (a stub mistaken for enforcement would mislabel a sandbox).
+    /// `egress_for` is the only producer of an egress claim: no other
+    /// production source in this crate constructs `PortPinned` or `Offline`.
     #[test]
-    fn no_stub_variant_constructed_in_ws00() {
+    fn egress_kinds_constructed_only_in_capabilities() {
         use crate::test_support::ratchet::{code_only, sources};
         fn production(body: &str) -> &str {
             body.split_once("\n#[cfg(test)]\nmod tests {")
@@ -601,21 +1059,15 @@ mod tests {
                 .unwrap_or(body)
         }
         for (key, body) in sources(env!("CARGO_MANIFEST_DIR"), &[]) {
-            if key.ends_with("_tests.rs") {
+            if key.ends_with("_tests.rs") || key == "capabilities.rs" {
                 continue;
             }
             let code = code_only(production(&body));
-            for stub in ["EgressKind::PortPinned", "EgressKind::Offline"] {
-                let allowed = if key == "capabilities.rs" {
-                    // The `EgressKind::as_str` arm.
-                    1
-                } else {
-                    0
-                };
+            for kind in ["EgressKind::PortPinned", "EgressKind::Offline"] {
                 assert_eq!(
-                    code.matches(stub).count(),
-                    allowed,
-                    "{key}: {stub} is a WS00 stub; only WS01-P1-02 may construct it"
+                    code.matches(kind).count(),
+                    0,
+                    "{key}: {kind} is produced only by capabilities::egress_for"
                 );
             }
         }
@@ -623,13 +1075,10 @@ mod tests {
 
     #[test]
     fn isolation_class_is_honest_per_backend() {
-        use crate::sandbox_backend::HostOs;
         // Pinned to Linux so this asserts a FACT about the classifier rather
         // than a property of whatever machine runs the suite — on macOS a local
         // OCI container is behind a VM and correctly reports guest-kernel.
-        let on_linux = |b| {
-            Capabilities::from_parts_on(b, &Placement::Local, false, None, HostOs::Linux).isolation
-        };
+        let on_linux = |b| caps(b, &Placement::Local, Network::Nat, false).isolation;
         // Containers — including a fully-sealed one — are honestly a shared kernel.
         for b in [
             Backend::Podman,
@@ -651,9 +1100,10 @@ mod tests {
 
     #[test]
     fn macos_local_oci_is_guest_kernel_behind_the_vm() {
-        use crate::sandbox_backend::HostOs;
-        let on =
-            |b, os| Capabilities::from_parts_on(b, &Placement::Local, false, None, os).isolation;
+        let on = |b, os| {
+            Capabilities::from_parts_on(b, &Placement::Local, Network::Nat, false, None, os)
+                .isolation
+        };
         // There is no Linux kernel on a Mac to share: podman/docker run the
         // container in a VM, so relative to the Mac the boundary is a guest
         // kernel. Reporting shared-kernel here UNDER-promises.
@@ -677,12 +1127,8 @@ mod tests {
         assert_eq!(
             Capabilities::from_parts_on(
                 Backend::Podman,
-                &Placement::Ssh(crate::placement::SshPlacement::plain(
-                    "box".into(),
-                    22,
-                    false,
-                    crate::placement::TransportKind::Ssh,
-                )),
+                &ssh(),
+                Network::Nat,
                 false,
                 None,
                 HostOs::MacOs,
@@ -695,6 +1141,7 @@ mod tests {
             Capabilities::from_parts_on(
                 Backend::Podman,
                 &Placement::Local,
+                Network::Nat,
                 false,
                 Some("runsc"),
                 HostOs::MacOs,
@@ -708,51 +1155,42 @@ mod tests {
     fn isolation_class_lets_placement_own_the_boundary() {
         // A provider runs the workload in its own infra — not a boundary we control.
         assert_eq!(
-            Capabilities::from_parts(Backend::Podman, &provider(), false, None).isolation,
+            caps(Backend::Podman, &provider(), Network::Nat, false).isolation,
             IsolationClass::ProviderManaged
         );
         // A k8s pod shares its node's kernel regardless of the local backend value.
         assert_eq!(
-            Capabilities::from_parts(Backend::Podman, &k8s(), false, None).isolation,
+            caps(Backend::Podman, &k8s(), Network::Nat, false).isolation,
             IsolationClass::SharedKernel
         );
         // SSH falls through to the backend running on the remote host.
         assert_eq!(
-            Capabilities::from_parts(Backend::Podman, &ssh(), false, None).isolation,
+            caps(Backend::Podman, &ssh(), Network::Nat, false).isolation,
             IsolationClass::SharedKernel
         );
     }
 
     #[test]
     fn windows_jobobject_is_a_host_process_never_a_container() {
-        use crate::sandbox_backend::HostOs;
         // A kill-on-close Job Object is process-tree lifetime + resource scoping,
         // with no filesystem or network namespace — so it is honestly a host
         // process, and MUST NOT be reported as a shared-kernel container (the
         // over-report this change fixes). It satisfies no floor at shared-kernel+.
-        assert_eq!(
-            Capabilities::from_parts_on(
-                Backend::WinJobObject,
-                &Placement::Local,
-                false,
-                None,
-                HostOs::Windows,
-            )
-            .isolation,
-            IsolationClass::HostProcess,
-        );
-        // AppContainer is still a plain host process until its enforcement ships.
-        assert_eq!(
-            Capabilities::from_parts_on(
-                Backend::WinAppContainer,
-                &Placement::Local,
-                false,
-                None,
-                HostOs::Windows,
-            )
-            .isolation,
-            IsolationClass::HostProcess,
-        );
+        for backend in [Backend::WinJobObject, Backend::WinAppContainer] {
+            assert_eq!(
+                Capabilities::from_parts_on(
+                    backend,
+                    &Placement::Local,
+                    Network::Nat,
+                    false,
+                    None,
+                    HostOs::Windows,
+                )
+                .isolation,
+                IsolationClass::HostProcess,
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]

@@ -1542,6 +1542,7 @@ fn env_isolation(
             thegn_core::capabilities::Capabilities::from_parts(
                 thegn_core::sandbox::Backend::None,
                 &env.placement,
+                thegn_core::config::Network::Nat,
                 false,
                 None,
             )
@@ -1555,6 +1556,7 @@ fn env_isolation(
                 thegn_core::capabilities::Capabilities::from_parts(
                     backend,
                     &env.placement,
+                    thegn_core::config::Network::Nat,
                     false,
                     runtime,
                 )

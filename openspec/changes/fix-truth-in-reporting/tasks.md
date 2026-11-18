@@ -6,7 +6,7 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 
 - [x] 1.1 WS01-P1-01: per-kind provider facts in core (`egress_api`, `checkpoints`, `files`) and
       `ProviderCaps::for_kind`
-- [ ] 1.2 WS01-P1-02: `egress_for(&EgressInputs)` and honest capability fields (`Offline`, no false
+- [x] 1.2 WS01-P1-02: `egress_for(&EgressInputs)` and honest capability fields (`Offline`, no false
       `Enforce`, VPN is `Unmanaged`)
 - [ ] 1.3 WS01-P1-03: matrix relabel (`NetIsolation::{OwnNetns, Unverified}`)
 - [ ] 1.4 WS01-P1-04: refuse Apple `network = "none"` with `network-unexpressible`

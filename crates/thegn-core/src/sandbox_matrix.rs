@@ -23,6 +23,7 @@
 //! resolver: a wrong cell requires the enforcement source itself to be wrong.
 
 use crate::capabilities::{Capabilities, EgressKind, IsolationClass};
+use crate::config::Network;
 use crate::placement::Placement;
 use crate::sandbox::Backend;
 use crate::sandbox_backend::{HostOs, backend_runs_on};
@@ -208,7 +209,15 @@ pub fn row(backend: Backend, os: HostOs) -> EnforcementRow {
         // The honest class straight from the capabilities derivation — the same
         // source the floor compares over — with no `oci_runtime` raise (that is a
         // config-time modifier doctor reports on its own line).
-        class: Capabilities::from_parts_on(backend, &Placement::Local, false, None, os).isolation,
+        class: Capabilities::from_parts_on(
+            backend,
+            &Placement::Local,
+            Network::Nat,
+            false,
+            None,
+            os,
+        )
+        .isolation,
     }
 }
 
@@ -238,7 +247,9 @@ fn fs_for(backend: Backend) -> FsIsolation {
 /// backends share the host stack outright.
 fn net_for(backend: Backend, os: HostOs) -> NetIsolation {
     // `Placement::Local`, no VPN: exactly the egress the matrix row describes.
-    let egress = Capabilities::from_parts_on(backend, &Placement::Local, false, None, os).egress;
+    let egress =
+        Capabilities::from_parts_on(backend, &Placement::Local, Network::Nat, false, None, os)
+            .egress;
     if egress == EgressKind::Enforce {
         return NetIsolation::Enforceable;
     }

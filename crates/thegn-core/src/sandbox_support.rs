@@ -149,7 +149,14 @@ pub fn support_report(
                 name: name.clone(),
                 state,
                 isolation: Some(
-                    Capabilities::from_parts(backend, placement, false, oci_runtime).isolation,
+                    Capabilities::from_parts(
+                        backend,
+                        placement,
+                        crate::config::Network::Nat,
+                        false,
+                        oci_runtime,
+                    )
+                    .isolation,
                 ),
                 remedy: remedy_for(backend, state),
                 caveat: caveat_for(backend, state),
