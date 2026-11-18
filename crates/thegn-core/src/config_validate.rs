@@ -387,6 +387,14 @@ pub fn validate_diagnostics_with_policy(
                     message,
                 }),
         );
+        diagnostics.extend(
+            crate::provider_admission::provider_table_warnings(&cfg)
+                .into_iter()
+                .map(|message| ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message,
+                }),
+        );
         diagnostics.extend(sandbox_git_warnings(&cfg).into_iter().map(|message| {
             ValidationDiagnostic {
                 severity: ValidationSeverity::Warning,

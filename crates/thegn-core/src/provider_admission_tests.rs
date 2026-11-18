@@ -882,3 +882,63 @@ fn interactive_host_suffixes_admission_per_provider() {
         assert_eq!(labelled(&errors, LABEL).len(), 1, "{bad}: {errors:?}");
     }
 }
+
+fn sprites_cfg(
+    placement: crate::config::PlacementMode,
+    f: impl FnOnce(&mut crate::config::EnvProviderConfig),
+) -> crate::config::Config {
+    let mut cfg = crate::config::Config::default();
+    let mut env = crate::config::EnvConfig::default();
+    env.placement = placement;
+    env.provider.provider = "sprites".into();
+    f(&mut env.provider);
+    cfg.env.insert("s".into(), env);
+    cfg
+}
+
+#[test]
+fn sprites_fixed_size_warning_names_its_field() {
+    use crate::config::PlacementMode::Provider;
+    for set in [
+        (|p: &mut crate::config::EnvProviderConfig| p.size = "big".into()) as fn(&mut _),
+        |p| p.min_vcpu = 2,
+        |p| p.gpu = true,
+        |p| p.nvme = true,
+    ] {
+        let w = provider_table_warnings(&sprites_cfg(Provider, set));
+        assert_eq!(labelled(&w, "env.s.provider.size:").len(), 1, "{w:?}");
+        assert!(w[0].contains("fixed 8 vCPU"));
+    }
+}
+
+#[test]
+fn sprites_min_ram_note_and_clean_env() {
+    use crate::config::PlacementMode::Provider;
+    let w = provider_table_warnings(&sprites_cfg(Provider, |p| p.min_ram_gb = 16));
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].starts_with("env.s.provider.min_ram_gb:") && w[0].contains("16384 MiB"));
+    let w = provider_table_warnings(&sprites_cfg(Provider, |p| p.size = "auto".into()));
+    assert!(w.is_empty(), "{w:?}");
+}
+
+#[test]
+fn provider_table_with_local_placement_warns() {
+    use crate::config::PlacementMode::Local;
+    let w = provider_table_warnings(&sprites_cfg(Local, |_| {}));
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("runs locally") && w[0].contains("\"local\""));
+    let w = provider_table_warnings(&vercel_cred_cfg(
+        "vercel",
+        crate::config::ModelCredentials::None,
+    ));
+    assert_eq!(labelled(&w, "env.e.provider.provider:").len(), 1, "{w:?}");
+}
+
+#[test]
+fn sprites_lifetime_warning_points_at_env_reap() {
+    let cfg = sprites_cfg(crate::config::PlacementMode::Provider, |p| {
+        p.max_lifetime_secs = 60
+    });
+    let w = unenforced_lifetime_warnings(&cfg);
+    assert!(w[0].contains("thegn env reap --provider sprites"), "{w:?}");
+}
