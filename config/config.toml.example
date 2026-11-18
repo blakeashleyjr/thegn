@@ -2748,7 +2748,9 @@ profile = "standard"
 # ── Backend selection ────────────────────────────────────────────────────────
 # Which containment backend to use. "auto" walks backend_chain until one works.
 #   auto | podman-rootless | podman-rootful | docker | bwrap | bubblewrap |
-#   systemd | systemd-run | apple | container | wsl | none | host
+#   systemd | systemd-run | apple | container | jobobject | none | host
+# Reserved (accepted by config, never selected; warns and resolves via
+# backend_chain): smol, wsl, appcontainer.
 # NixOS tip: set "bwrap" here to skip the podman probes and get instant panes.
 #
 # "Available" means the runtime ANSWERS, not merely that its client is on PATH:

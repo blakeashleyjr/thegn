@@ -67,7 +67,7 @@ self: {
         description = "Run each worktree's interactive process in a container/sandbox. Unset (null) = the binary's default.";
       };
       backend = lib.mkOption {
-        type = lib.types.nullOr (lib.types.enum ["auto" "podman" "docker" "bwrap" "systemd" "apple" "wsl" "none"]);
+        type = lib.types.nullOr (lib.types.enum ["auto" "podman" "docker" "bwrap" "systemd" "apple" "none"]);
         default = null;
         description = "Sandbox backend; \"auto\" walks backendChain. Unset (null) = the binary's default.";
       };

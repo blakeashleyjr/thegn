@@ -327,6 +327,60 @@ fn notifications_overlay_apply_covers_every_field() {
     assert_eq!(base.active_mode, "focus");
 }
 
+// ---- reserved sandbox backends (WS01-P3-01) ----
+
+fn load_capturing(body: &str) -> (Config, Vec<String>) {
+    let (cfg, warnings, _) =
+        crate::config_diagnostics::capture_quiet(|| toml::from_str::<Config>(body));
+    (cfg.expect("valid TOML"), warnings)
+}
+
+#[test]
+fn smol_config_value_warns_reserved_and_resolves_auto() {
+    for spelling in ["smol", "smolmachines"] {
+        let (cfg, warnings) = load_capturing(&format!("[sandbox]\nbackend = \"{spelling}\"\n"));
+        assert_eq!(cfg.sandbox.backend, SandboxBackend::Auto, "{spelling}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("sandbox backend \"smol\" is reserved")),
+            "{spelling}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn appcontainer_config_value_warns_reserved() {
+    for spelling in ["appcontainer", "winappcontainer"] {
+        let (cfg, warnings) = load_capturing(&format!("[sandbox]\nbackend = \"{spelling}\"\n"));
+        assert_eq!(cfg.sandbox.backend, SandboxBackend::Auto, "{spelling}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("sandbox backend \"winappcontainer\" is reserved")),
+            "{spelling}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn strict_validate_rejects_reserved_backend() {
+    for spelling in [
+        "smol",
+        "smolmachines",
+        "appcontainer",
+        "winappcontainer",
+        "wsl",
+    ] {
+        let errors =
+            crate::config_validate::validate_str(&format!("[sandbox]\nbackend = \"{spelling}\"\n"));
+        assert!(
+            errors.iter().any(|error| error.contains("reserved")),
+            "{spelling}: {errors:?}"
+        );
+    }
+}
+
 // ---- config_enum! Default + Display + from_str_validated round-trips ----
 
 #[test]

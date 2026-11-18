@@ -395,6 +395,40 @@ fn test_win_native_sandboxes_do_not_parse_as_oci() {
     assert_eq!(Backend::WinJobObject.label(), "jobobject");
 }
 
+#[test]
+fn to_config_round_trips_from_config() {
+    use crate::seam::Kind as _;
+    for kind in SandboxBackend::ALL.iter().copied() {
+        match Backend::from_config(kind) {
+            Some(backend) => assert_eq!(backend.to_config(), kind, "{kind:?}"),
+            None => assert_eq!(kind, SandboxBackend::Auto),
+        }
+    }
+    for backend in Backend::ALL {
+        assert_eq!(Backend::from_config(backend.to_config()), Some(backend));
+    }
+}
+
+#[test]
+fn oci_runtimes_excludes_reserved() {
+    let runtimes: Vec<Backend> = Backend::oci_runtimes().collect();
+    assert!(
+        runtimes.iter().all(|backend| !backend.is_reserved()),
+        "{runtimes:?}"
+    );
+    assert!(!runtimes.contains(&Backend::Smol));
+    assert!(!runtimes.contains(&Backend::Wsl));
+    assert!(runtimes.contains(&Backend::Podman));
+    let reserved: Vec<Backend> = Backend::ALL
+        .into_iter()
+        .filter(|backend| backend.is_reserved())
+        .collect();
+    assert_eq!(
+        reserved,
+        vec![Backend::Smol, Backend::Wsl, Backend::WinAppContainer]
+    );
+}
+
 fn spec(backend: Backend) -> SandboxSpec {
     SandboxSpec {
         backend,
