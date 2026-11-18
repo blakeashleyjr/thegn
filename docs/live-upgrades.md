@@ -32,14 +32,23 @@ but `<repo>/target/release/thegn` exists, that in-repo binary is treated as the
 previous installation: its processes count as this installation's, and it is the
 binary copied into the recovery directory. The new build is then installed to
 `<install-dir>`. The plan output says so. The in-repo binary is never modified
-or removed.
+or removed. Unless the launchers already follow the install target, a first run
+needs `--relink-launchers` (see below); `just live` cannot pass it, so run
+`python3 -B scripts/live.py --relink-launchers` once.
 
 **Launchers.** The helper does not silently change anything in `~/.local/bin`.
 `--plan`, the start of a run and the end of a run print the launcher state:
 whether `~/.local/bin/thegn` resolves to the install target, and whether `tg` and
 `tg-tui` still mention `<repo>/target/release/thegn` or `<repo>/config/alacritty.toml`.
-Pass `--relink-launchers` (for example
-`python3 -B scripts/live.py --relink-launchers`) to opt in. After the install
+A run without `--relink-launchers` refuses, before anything is built or
+stopped, while a launcher still runs the checkout: the `~/.local/bin/thegn`
+symlink resolves anywhere but the install target, or `tg`/`tg-tui` mentions one
+of those two old paths. Otherwise every later start, and every `thegn` call from
+the panes, would run the in-repo binary that any release build replaces. This
+applies to every run, not only the first; `--plan` prints the same line as a
+warning. Pass `--relink-launchers` (for example
+`python3 -B scripts/live.py --relink-launchers`) to opt in, or relink them
+yourself. After the install
 it repoints the `~/.local/bin/thegn` symlink to the install target. In `tg` and
 `tg-tui` it replaces exact occurrences of those two old paths with the new ones.
 A path that merely starts with an old one is left alone. A `.bak` copy is

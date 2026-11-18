@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import sqlite3
@@ -50,15 +51,15 @@ class LiveTests(unittest.TestCase):
         self.addCleanup(self.ancestor_patch.stop)
         self.unmapped_ancestors = unmapped
         self.repo = self.root / "repo"
-        self.state = self.root / "state/thegn"
+        # The account home comes from passwd; never the real one in tests.
+        self.home = self.root / "home"
+        self.state = self.home / ".local/state/thegn"
         self.config = self.root / "config/thegn/config.toml"
         self.state.mkdir(parents=True, mode=0o700)
         (self.repo / "target/release").mkdir(parents=True)
         (self.repo / "config").mkdir()
         (self.repo / "config/alacritty.toml").write_text("[font]\nsize = 11\n")
         self.config.parent.mkdir(parents=True)
-        # The account home comes from passwd; never the real one in tests.
-        self.home = self.root / "home"
         self.install = self.home / ".local/lib/thegn"
         self.install.mkdir(parents=True)
         self.home_patch = patch.object(live, "real_home", return_value=self.home)
@@ -684,6 +685,39 @@ class LiveTests(unittest.TestCase):
             self.home_patch.start()
         self.assertEqual(paths["install_dir"], self.home / ".local/lib/thegn")
 
+    def test_profile_HOME_without_XDG_STATE_HOME_is_refused(self):
+        profile = self.root / "profile-home"
+        (profile / ".local/state/thegn").mkdir(parents=True, mode=0o700)
+        shutil.copy2(self.db, profile / ".local/state/thegn/thegn.db")
+        env = {"HOME": str(profile), "XDG_CONFIG_HOME": self.env["XDG_CONFIG_HOME"]}
+        with self.assertRaisesRegex(live.Refusal, "set XDG_STATE_HOME to the account's state home or pass --install-dir") as caught:
+            live.settings(self.repo, env)
+        self.assertIn(str(profile / ".local/state"), str(caught.exception))
+        self.assertIn(str(self.home / ".local/state"), str(caught.exception))
+        # An explicit install directory (flag or environment) is the opt-out.
+        self.assertEqual(live.settings(self.repo, env, str(self.install))["state"], profile / ".local/state/thegn")
+        self.assertEqual(live.settings(self.repo, dict(env, THEGN_LIVE_INSTALL_DIR=str(self.install)))["target"], self.target)
+
+    def test_noexec_install_dir_is_refused(self):
+        real_statvfs = os.statvfs
+        seen = []
+
+        def noexec(path):
+            seen.append(Path(path))
+            result = real_statvfs(path)
+            return type("V", (), {"f_flag": result.f_flag | os.ST_NOEXEC})()
+
+        with patch.object(live.os, "statvfs", side_effect=noexec), self.assertRaisesRegex(live.Refusal, "noexec"):
+            self.settings()
+        self.assertEqual(seen, [self.install])
+        shutil.rmtree(self.install)  # not yet created: its nearest existing ancestor is checked
+        self.legacy.write_bytes(b"legacy executable")
+        self.legacy.chmod(0o755)
+        seen.clear()
+        with patch.object(live.os, "statvfs", side_effect=noexec), self.assertRaisesRegex(live.Refusal, "noexec"):
+            self.settings()
+        self.assertEqual(seen, [self.home / ".local/lib"])
+
     def test_install_places_alacritty_config_beside_the_binary(self):
         with patch.object(live, "settings", return_value=self.paths), patch.object(live, "quiescent"):
             live.install(self.paths, self.binary, self.record, self.env)
@@ -855,8 +889,52 @@ class LiveTests(unittest.TestCase):
         self.assertFalse(any(name.endswith(".bak") for name in self._tree(bin_dir)))
         self.assertEqual(before["tg-tui"], self._tree(bin_dir)["tg-tui"])
 
+    def _follow_target(self, bin_dir):
+        (bin_dir / "thegn").unlink()
+        (bin_dir / "thegn").symlink_to(self.target)
+        (bin_dir / "tg").write_text(f"#!/bin/sh\nexec alacritty --config-file {self.install / 'alacritty.toml'} -e {bin_dir}/tg-tui\n")
+        (bin_dir / "tg-tui").write_text(f"#!/bin/sh\nexec {self.target} \"$@\"\n")
+
+    def _main_mocks(self, recovery):
+        class Child:
+            def wait(self):
+                return 0
+
+        return (patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40),
+                patch.object(live, "survey", return_value=[]), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)),
+                patch.object(live, "install", return_value=recovery), patch.object(live.sys.stdin, "isatty", return_value=True),
+                patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None),
+                patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"),
+                patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()))
+
+    def test_launchers_on_the_checkout_refuse_a_run_without_relink(self):
+        bin_dir = self._launchers()
+        before = self._tree(bin_dir)
+        recovery = self.state / "private-recovery"
+        recovery.mkdir(mode=0o700)
+        stale = f"launchers still run {self.legacy}; rerun with `python3 -B scripts/live.py --relink-launchers`"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.ExitStack() as stack:
+            mocks = [stack.enter_context(item) for item in self._main_mocks(recovery)]
+            build, stop = mocks[3], mocks[9]
+            self.assertEqual(live.main(["--plan", "--repo", str(self.repo)]), 0)
+            self.assertIn(f"WARNING: {stale}", out.getvalue())
+            with self.assertRaisesRegex(live.Refusal, re.escape(stale)):
+                live.main(["--repo", str(self.repo)])
+            # A wrapper alone (symlink already relinked) still refuses.
+            (bin_dir / "thegn").unlink()
+            (bin_dir / "thegn").symlink_to(self.target)
+            with self.assertRaisesRegex(live.Refusal, "launchers still run"):
+                live.main(["--repo", str(self.repo)])
+        build.assert_not_called()
+        stop.assert_not_called()
+        (bin_dir / "thegn").unlink()
+        (bin_dir / "thegn").symlink_to(self.legacy)
+        self.assertEqual(self._tree(bin_dir), before)
+
     def test_run_without_relink_never_touches_launchers(self):
         bin_dir = self._launchers()
+        self._follow_target(bin_dir)
         before = self._tree(bin_dir)
         recovery = self.state / "private-recovery"
         recovery.mkdir(mode=0o700)
@@ -876,12 +954,15 @@ class LiveTests(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.ExitStack() as stack:
             for item in common():
                 stack.enter_context(item)
-            self.assertEqual(live.main(["--repo", str(self.repo)]), 0)
             self.assertEqual(live.main(["--plan", "--relink-launchers", "--repo", str(self.repo)]), 0)
+            # Launchers that already follow the install target pass through.
+            self.assertEqual(live.main(["--repo", str(self.repo)]), 0)
         self.assertEqual(self._tree(bin_dir), before)
         self.assertIn("Launchers are not changed without --relink-launchers.", out.getvalue())
-        self.assertIn("--relink-launchers will change 3 launcher(s)", out.getvalue())
-        # With the flag, the same run relinks after the install.
+        self.assertIn("--relink-launchers: launchers already follow the install target", out.getvalue())
+        # With the flag, a run relinks stale launchers after the install.
+        shutil.rmtree(bin_dir)
+        bin_dir = self._launchers()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.ExitStack() as stack:
             for item in common():
                 stack.enter_context(item)
