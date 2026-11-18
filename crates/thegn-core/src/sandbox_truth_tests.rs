@@ -368,3 +368,11 @@ fn appcontainer_request_on_plain_shell_is_degraded() {
         warning.contains("appcontainer") && warning.contains("reserved")
     }));
 }
+
+#[test]
+fn truth_observed_maps_smolvm_and_legacy_word() {
+    for word in ["smolvm", "smolmachines"] {
+        let argv = vec![word.to_string(), "run".into(), "img".into()];
+        assert_eq!(observed(&argv), Backend::Smol, "{word}");
+    }
+}

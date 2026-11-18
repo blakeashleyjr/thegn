@@ -346,6 +346,8 @@ pub fn mount_failure(p: &MountProbe<'_>, have: &dyn Fn(&str) -> bool) -> MountFa
     let already_shared = PODMAN_DEFAULT_SHARES.contains(&root);
 
     let remedy = match (p.os, p.backend) {
+        // Reserved: never selected or created, so no runtime remedy applies.
+        (_, Backend::Smol) => "smol is reserved (not implemented)".to_string(),
         // A root bind inside a VM-backed runtime binds the VM's root, not the
         // Mac's — a different bug with a different fix, so diagnose it as itself
         // rather than sending someone to widen a share that is irrelevant.
@@ -367,11 +369,11 @@ pub fn mount_failure(p: &MountProbe<'_>, have: &dyn Fn(&str) -> bool) -> MountFa
              the VM itself with `podman machine ssh ls {}`.",
             p.worktree
         ),
-        (HostOs::MacOs, Backend::Docker | Backend::Smol) if have("colima") => format!(
+        (HostOs::MacOs, Backend::Docker) if have("colima") => format!(
             "colima shares only $HOME by default. Restart it with {root} shared: \
              `colima stop && colima start -V {root}:w`."
         ),
-        (HostOs::MacOs, Backend::Docker | Backend::Smol) => format!(
+        (HostOs::MacOs, Backend::Docker) => format!(
             "Docker Desktop shares /Users, /Volumes, /private and /tmp. Add {root} under \
              Settings → Resources → File Sharing, then restart Docker."
         ),

@@ -285,12 +285,14 @@ impl Backend {
                     "docker has a daemon event stream but its JSON schema differs — not implemented",
                 ),
             },
+            // Reserved (never probed or created): the profile names the real
+            // smolvm binary so WS07 can rebuild it as a shipped backend.
             Backend::Smol => &BackendProfile {
-                label: "smolmachines",
-                binary: "smolmachines",
+                label: "smol",
+                binary: "smolvm",
                 family: BackendFamily::Oci,
                 rootful: false,
-                events: EventsCap::Reserved("unverified runtime — see Backend::verified"),
+                events: EventsCap::Reserved("reserved: rebuilt as a shipped smolvm backend (WS07)"),
             },
             Backend::Bwrap => &BackendProfile {
                 label: "bwrap",
@@ -384,13 +386,12 @@ impl Backend {
 
     /// Have thegn's verbs for this backend been checked against the real runtime?
     ///
-    /// `smol` and `wsl` are **not**. They parse, sit in [`Backend::oci_runtimes`],
-    /// answer `true` from [`Backend::is_oci`], and are treated as docker clones
-    /// for `--user`/`--gpus` — a complete-looking surface with nothing behind it.
-    /// The private `liveness_argv` returns `None` for both, so they fall back to a
-    /// bare
-    /// PATH probe: **"the binary exists" stands in for "the runtime works"**,
-    /// which is exactly the defect `06ec12ff` fixed for docker and Apple, where a
+    /// `smol` and `wsl` are **not**, and both are reserved kinds
+    /// ([`Backend::is_reserved`]): no parser yields them, they are not in
+    /// [`Backend::oci_runtimes`], and their probe answers absent. The private
+    /// `liveness_argv` returns `None` for both; a bare PATH probe would let
+    /// **"the binary exists" stand in for "the runtime works"**, which is
+    /// exactly the defect `06ec12ff` fixed for docker and Apple, where a
     /// stopped daemon was selected and then failed every pane.
     ///
     /// Neither is in `config_defaults::default_backend_chain`, so
@@ -440,7 +441,7 @@ impl Backend {
 /// eleven variants, so the OCI backends share one arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendFamily {
-    /// `podman` / `docker` / `smolmachines` / Apple `container` / WSL: a
+    /// `podman` / `docker` / Apple `container` (and the reserved smol / WSL): a
     /// container image with the worktree bind-mounted at its real path.
     Oci,
     /// bubblewrap namespace, host toolchain.
@@ -5461,7 +5462,7 @@ fn oci_create_opts_in(
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
-        Backend::Docker | Backend::Smol => {
+        Backend::Docker => {
             if spec.placement.is_local()
                 && let Some((uid, gid)) = local_uid_gid()
             {
@@ -5573,7 +5574,7 @@ fn oci_create_opts_in(
     }
 
     if let Some(gpu) = &spec.gpu {
-        if spec.backend == Backend::Docker || spec.backend == Backend::Smol {
+        if spec.backend == Backend::Docker {
             v.extend(["--gpus".into(), gpu.clone()]);
         } else if spec.backend == Backend::Podman {
             v.extend(["--device".into(), "nvidia.com/gpu=all".into()]);
@@ -5705,7 +5706,7 @@ fn oci_create_opts_with_keep_id_and_remote_stdin_secrets(
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
-        Backend::Docker | Backend::Smol => {
+        Backend::Docker => {
             if spec.placement.is_local()
                 && let Some((uid, gid)) = local_uid_gid()
             {
@@ -6101,10 +6102,11 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
 /// `wsl` is deliberately absent: its command shape is unverified, and this feeds
 /// a **force-remove**. A wrong guess here deletes someone's container, so it
 /// waits for someone who can check it against the real runtime.
-/// Smol and Apple are list-only until their label-filter semantics are verified.
+/// Apple is list-only until its label-filter semantics are verified; Smol is
+/// reserved (never created), so there is nothing to sweep.
 pub(crate) fn gc_list_argv(backend: Backend) -> Option<Vec<&'static str>> {
     match backend {
-        Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol => {
+        Backend::Podman | Backend::PodmanRootful | Backend::Docker => {
             Some(vec!["ps", "-a", "--format", "{{.Names}}"])
         }
         Backend::Apple => Some(vec!["ls", "-a", "--format", "json"]),

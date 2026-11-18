@@ -410,6 +410,32 @@ fn to_config_round_trips_from_config() {
 }
 
 #[test]
+fn smol_profile_label_and_binary() {
+    assert_eq!(Backend::Smol.label(), "smol");
+    assert_eq!(Backend::Smol.binary(), "smolvm");
+    assert!(matches!(
+        Backend::Smol.profile().events,
+        EventsCap::Reserved(reason) if reason.contains("reserved")
+    ));
+}
+
+#[test]
+fn gc_list_argv_none_for_smol() {
+    assert_eq!(gc_list_argv(Backend::Smol), None);
+    assert!(gc_list_argv(Backend::Docker).is_some());
+}
+
+#[test]
+fn smol_is_never_a_docker_clone_in_create_opts() {
+    // No `--user` and no `--gpus`: the docker-clone arms are gone.
+    let mut s = spec(Backend::Smol);
+    s.gpu = Some("all".into());
+    let opts = oci_create_opts(&s).expect("valid volume names");
+    assert!(!opts.iter().any(|arg| arg == "--gpus"), "{opts:?}");
+    assert!(!opts.iter().any(|arg| arg == "--user"), "{opts:?}");
+}
+
+#[test]
 fn oci_runtimes_excludes_reserved() {
     let runtimes: Vec<Backend> = Backend::oci_runtimes().collect();
     assert!(
@@ -3066,10 +3092,11 @@ fn gc_sweeps_every_oci_backend_that_can_hold_a_container() {
     // also pins its own Linux VM. Anything that holds containers must be swept.
     for b in Backend::all_oci() {
         assert!(b.is_oci(), "all_oci must not drift from is_oci: {b:?}");
-        if b == Backend::Wsl {
-            // Deliberately unswept: its command shape is unverified and this
-            // feeds a force-remove, where a wrong guess deletes real containers.
-            assert_eq!(gc_list_argv(b), None);
+        if b.is_reserved() {
+            // Deliberately unswept: a reserved kind (wsl, smol) is never
+            // created, its command shape is unverified, and this feeds a
+            // force-remove, where a wrong guess deletes real containers.
+            assert_eq!(gc_list_argv(b), None, "{b:?}");
             continue;
         }
         assert!(

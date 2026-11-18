@@ -3627,14 +3627,18 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 #
 # Example 3 — a hosted agent sandbox provider (e.g. Daytona). Two modes:
 # (a) static/CLI — `exec_command` is an argv template, `{id}` → the sandbox id:
-# [env.datonya]
+# [env.daytona]
 # placement = "provider"
-# [env.datonya.provider]
+# [env.daytona.provider]
 # provider = "daytona"
 # id = "sb-1234"
-# exec_command = ["daytona", "ssh", "{id}", "--"]
-# up_command = ["daytona", "create", "--id", "{id}"]   # run by `thegn env up`
 # down_command = ["daytona", "delete", "{id}"]         # run by `thegn env down`
+# # Daytona is in maintenance (closed-core upstream). Its CLI split into
+# # `daytona-v0` (legacy) and `daytona` (v2 alpha); thegn ships no verified CLI
+# # recipe. Vendor-documented legacy verbs, not executed by thegn's tests:
+# # exec_command = ["daytona-v0", "exec", "{id}", "--"]
+# # up_command = ["daytona-v0", "create", "--name", "{id}"]
+# # down_command = ["daytona-v0", "delete", "{id}"]
 # # (b) API — `thegn env provision` creates a sandbox over Daytona's REST API
 # # (then set `id` to attach); `thegn env deprovision <id>` destroys it:
 # # api_base = "https://app.daytona.io/api"
@@ -4025,10 +4029,9 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 #
 # ── Fly.io machines (CLI-free — no flyctl) ─────────────────────────────────
 # A Fly machine is container-native (NOT a VPS): thegn drives the Machines
-# REST API directly and reaches INTO the machine over a WireGuard tunnel to
-# Fly's private 6PN network + `hallpass` ssh — the `fly ssh console` path,
-# without the flyctl CLI. Unlike a VPS, a stopped machine is near-free, so it is
-# treated as SCALE-TO-ZERO (idle spares park via stop/start instead of destroy).
+# REST API directly and reaches the machine over plain ssh to a per-app
+# dedicated IPv4 (no WireGuard, no flyctl). Unlike a VPS, a stopped machine
+# is near-free, so it is treated as SCALE-TO-ZERO (idle spares park via stop/start instead of destroy).
 #   1. Create a deploy/org token: `fly tokens create org` (or the dashboard).
 #   2. export FLY_API_TOKEN=...
 #
