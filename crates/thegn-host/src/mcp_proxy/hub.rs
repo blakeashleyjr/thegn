@@ -56,13 +56,25 @@ impl Hub {
             cfg,
             ctx,
             &ServerSelection::default_for(&cfg.mcp_proxy.profiles),
+            &EnvSource::Local,
         )
     }
 
     /// [`Hub::build`] restricted to `selection`: the default hub excludes every
     /// profiled server, a `--profile` hub serves only that profile's servers.
     /// Default-deny (`proxy.tools`) still applies inside either.
-    pub fn build_selected(cfg: &Config, ctx: &WorktreeContext, selection: &ServerSelection) -> Hub {
+    ///
+    /// `env` says where each server's env comes from: resolved here
+    /// ([`EnvSource::Local`], the default hub) or handed over by the daemon
+    /// ([`EnvSource::Daemon`], a `--profile` hub, THE-2222) — in which case
+    /// nothing is resolved locally and a server the daemon did not answer
+    /// for is reported as an error, never spawned with a local fallback.
+    pub fn build_selected(
+        cfg: &Config,
+        ctx: &WorktreeContext,
+        selection: &ServerSelection,
+        env_source: &EnvSource,
+    ) -> Hub {
         let pcfg = &cfg.mcp_proxy;
         let breaker_cfg = pcfg.breaker_config();
         let timeout = Duration::from_secs(pcfg.request_timeout_secs.max(1));
@@ -99,35 +111,28 @@ impl Hub {
             };
 
             // Resolve env secret-refs at spawn — the agent never sees them.
-            let mut env = BTreeMap::new();
-            let mut secret_err = None;
-            for (k, v) in &spec.env {
-                let consumer = format!("mcp:{name}:{k}");
-                match crate::secret::resolve_mcp_env(v, &consumer) {
-                    Ok(val) => {
-                        env.insert(k.clone(), val);
-                    }
-                    Err(e) => {
-                        secret_err = Some(format!("env `{k}`: {e}"));
-                        break;
-                    }
+            let resolved = match env_source {
+                EnvSource::Local => super::resolve_server_env(name, &spec.env),
+                EnvSource::Daemon(reply) => reply.env_for(name),
+            };
+            let env = match resolved {
+                Ok(env) => env,
+                Err(e) => {
+                    reports.push(UpstreamReport {
+                        name: name.clone(),
+                        scope,
+                        partition_key: Some(spec.partition_key.clone()),
+                        running: false,
+                        breaker: "n/a".into(),
+                        health_age_ms: None,
+                        exposed: Vec::new(),
+                        hidden: Vec::new(),
+                        withheld_reason: None,
+                        error: Some(e),
+                    });
+                    continue;
                 }
-            }
-            if let Some(e) = secret_err {
-                reports.push(UpstreamReport {
-                    name: name.clone(),
-                    scope,
-                    partition_key: Some(spec.partition_key.clone()),
-                    running: false,
-                    breaker: "n/a".into(),
-                    health_age_ms: None,
-                    exposed: Vec::new(),
-                    hidden: Vec::new(),
-                    withheld_reason: None,
-                    error: Some(e),
-                });
-                continue;
-            }
+            };
 
             match Upstream::spawn(
                 name,
@@ -291,6 +296,15 @@ impl Hub {
     }
 }
 
+/// Where a hub's upstream env comes from.
+#[derive(Debug, Clone)]
+pub enum EnvSource {
+    /// Resolve each server's secret refs in this process (the default hub).
+    Local,
+    /// The daemon's `mcp_proxy.profile_env` answer (a `--profile` hub).
+    Daemon(super::ProfileEnvReply),
+}
+
 /// Which configured servers one hub serves (`[mcp_proxy.profiles]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerSelection {
@@ -380,8 +394,9 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerSelection, effective_global_instances};
+    use super::{EnvSource, Hub, ServerSelection, effective_global_instances};
     use std::collections::BTreeMap;
+    use thegn_core::mcp::proxy::partition::WorktreeContext;
 
     fn profiles() -> BTreeMap<String, Vec<String>> {
         BTreeMap::from([
@@ -456,5 +471,35 @@ mod tests {
             .map(|(n, _)| n.as_str())
             .collect();
         assert_eq!(exposed, ["todoist"]);
+    }
+
+    #[test]
+    fn a_daemon_env_hub_never_resolves_or_spawns_an_unanswered_server() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.mcp_servers.insert(
+            "todoist".into(),
+            serde_json::from_value(serde_json::json!({
+                "command": ["true"],
+                "env": { "TOKEN": "keyring:todoist" },
+                "proxy": { "tools": ["*"] },
+            }))
+            .unwrap(),
+        );
+        cfg.mcp_proxy.profiles = BTreeMap::from([("lead".to_string(), vec!["todoist".into()])]);
+        let sel = ServerSelection::resolve(&cfg.mcp_proxy.profiles, Some("lead")).unwrap();
+        let hub = Hub::build_selected(
+            &cfg,
+            &WorktreeContext::default(),
+            &sel,
+            &EnvSource::Daemon(super::super::ProfileEnvReply::default()),
+        );
+        let reports = hub.reports(0);
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].running);
+        assert_eq!(
+            reports[0].error.as_deref(),
+            Some("the daemon returned no env for this server")
+        );
+        assert_eq!(hub.tool_count(), 0);
     }
 }
