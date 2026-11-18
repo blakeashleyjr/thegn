@@ -1947,6 +1947,44 @@ fn a_refused_sandbox_entry_spawns_nothing_and_reads_as_spawn_failure() {
 }
 
 #[test]
+fn a_sealed_preflight_that_does_not_start_is_a_preparation_hold() {
+    use super::super::gate_capture::CaptureResult;
+    let sealed = RunMode::Sealed {
+        header: "sandboxed gate (network: none)\n".into(),
+    };
+    let started = CaptureResult::Completed {
+        status: std::process::ExitStatus::default(),
+        log: String::new(),
+    };
+    assert!(preflight_verdict(started, &sealed).is_none());
+    for result in [
+        CaptureResult::SpawnFailed {
+            reason: "bwrap: Can't chdir".into(),
+            log: "bwrap: Can't chdir to /state/gate/wt".into(),
+        },
+        CaptureResult::Timeout {
+            log: "stuck".into(),
+        },
+    ] {
+        let (verdict, keep) = preflight_verdict(result, &sealed).expect("held");
+        assert!(!keep);
+        match verdict {
+            GateVerdict::Error {
+                reason,
+                phase,
+                class,
+                ..
+            } => {
+                assert_eq!(reason, "the gate sandbox could not start (preflight)");
+                assert!(matches!(phase, GatePhase::Preparation));
+                assert!(matches!(class, GateErrorClass::Spawn));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
 fn gate_logs_are_headed_by_their_execution_mode() {
     let sealed = RunMode::Sealed {
         header: "sandboxed gate (network: none)\n".into(),

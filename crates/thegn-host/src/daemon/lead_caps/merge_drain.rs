@@ -284,6 +284,8 @@ fn drain_command(argv: &[String], repo: &Path, env: DrainEnv) -> std::process::C
         for var in SCRUBBED_ENV {
             command.env_remove(var);
         }
+        // An unattended land was approved as isolated: the gate must be sealed.
+        command.env(crate::gate_sandbox::REQUIRE_SEALED_ENV, "1");
     }
     command
 }
@@ -531,6 +533,13 @@ mod tests {
         ] {
             assert!(SCRUBBED_ENV.contains(&must), "{must}");
         }
+        assert!(
+            scrubbed
+                .get_envs()
+                .any(|(k, v)| k == "THEGN_GATE_REQUIRE_SEALED"
+                    && v == Some(std::ffi::OsStr::new("1"))),
+            "a scrubbed drain requires the sealed gate"
+        );
         assert_eq!(scrubbed.get_program(), "thegn");
         assert_eq!(scrubbed.get_current_dir(), Some(Path::new("/repo")));
 

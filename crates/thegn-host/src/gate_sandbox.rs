@@ -9,12 +9,20 @@
 //! host run and never branch blame.
 //!
 //! What a sealed gate may touch:
-//! - writable: the gate checkout (`spec.worktree`) and its `CARGO_TARGET_DIR`;
-//! - read-only: the repo's git common dir (the checkout's `.git` points into it);
-//! - the profile's own read-only root and mounts.
+//! - writable: the gate checkout (`spec.worktree`) and its `CARGO_TARGET_DIR`
+//!   only;
+//! - read-only: the repo's git common dir (the checkout's `.git` points into
+//!   it), and every mount the profile brings (caches included);
+//! - never mounted: the repo's main checkout and its `.git` carve-outs.
+//!
+//! Only a local bwrap sandbox with network `none` qualifies: an OCI backend
+//! would exec into a container built for the main checkout, and a remote
+//! placement would run the gate on another host.
 //!
 //! The guarded entry masks the daemon socket, state run dir, runtime dir and
-//! Lead control dir; the sealed floor hides `$HOME`.
+//! Lead control dir; the sealed floor hides `$HOME`. The sealed command drops
+//! every credential-shaped variable from the inherited env
+//! ([`scrub_sealed_env`]).
 
 use std::path::Path;
 
@@ -23,6 +31,10 @@ use thegn_core::sandbox::{Mount, SandboxSpec, SecretEnvFile};
 
 /// The resolve error when the floor gate refuses without a reason of its own.
 const NEEDS_SEALED: &str = "the merge gate needs a sealed sandbox for this repo";
+
+/// Set on an unattended drain child (the land was approved as isolated): the
+/// gate it runs must be sealed, whatever the reloaded config says.
+pub(crate) const REQUIRE_SEALED_ENV: &str = "THEGN_GATE_REQUIRE_SEALED";
 
 /// How a gate command is executed.
 pub(crate) enum GateExec {
@@ -68,10 +80,33 @@ fn sealed_spec(full: &Config, repo_root: &Path) -> Result<GateExec, String> {
     );
     match gate {
         AgentDispatch::Run(Some(spec)) if host_validation_isolated(&spec) => {
-            Ok(GateExec::Sealed(Box::new(spec)))
+            match gate_backend_refusal(&spec) {
+                None => Ok(GateExec::Sealed(Box::new(spec))),
+                Some(why) => Err(why),
+            }
         }
         other => Err(floor_refusal(other).unwrap_or_else(|| NEEDS_SEALED.to_owned())),
     }
+}
+
+/// Why `spec` cannot carry the sealed gate, or `None`. Only a local bwrap
+/// sandbox honours the gate's re-rooted mounts and worktree (an OCI backend
+/// execs into a container built for the main checkout; a remote placement runs
+/// elsewhere), and the gate runs with no network. Pure.
+fn gate_backend_refusal(spec: &SandboxSpec) -> Option<String> {
+    let profile = spec.backend.profile();
+    if profile.family == thegn_core::sandbox::BackendFamily::Bwrap
+        && spec.placement.is_local()
+        && spec.network == Network::None
+    {
+        return None;
+    }
+    Some(format!(
+        "the sealed merge gate needs a local bwrap sandbox with network none; \
+         this repo resolves to backend '{}', network '{}'",
+        profile.label,
+        spec.network.as_str()
+    ))
 }
 
 /// Resolve the gate execution from the repo's effective `[merge_queue]`
@@ -89,23 +124,93 @@ pub(crate) fn resolve_for_gate(
 /// [`resolve_for_gate`] from the mode alone (the fold's `regenerate_command`
 /// carries only the mode, not the whole `[merge_queue]`).
 pub(crate) fn resolve_mode(repo_root: &Path, mode: GateSandbox) -> Result<GateExec, String> {
-    resolve_for_gate_with(repo_root, mode, load_process_config, sealed_spec)
+    resolve_for_gate_with(
+        repo_root,
+        mode,
+        std::env::var_os(REQUIRE_SEALED_ENV).is_some(),
+        load_process_config,
+        sealed_spec,
+    )
 }
 
+/// The process's current admitted configuration (startup admission, the
+/// channel clamp), as `config_source::fresh` loads it. Never the tolerant
+/// layered loader: the gate's sandbox is authority-bearing.
 fn load_process_config() -> Result<Config, String> {
-    Config::try_load_layered(&thegn_core::config::ProcessEnv, &[], None)
-        .map_err(|error| format!("the sealed merge gate cannot load the config: {error}"))
+    use crate::config_startup::ReloadOutcome;
+    if crate::config_startup::store().is_none() {
+        return Err("the sealed merge gate has no admitted configuration".into());
+    }
+    let admitted = match crate::config_startup::reload() {
+        ReloadOutcome::Published(admitted) => admitted,
+        // Another reload published first: use whatever is current now.
+        ReloadOutcome::Superseded | ReloadOutcome::Unavailable => {
+            crate::config_startup::display().ok_or("configuration store is unavailable")?
+        }
+        ReloadOutcome::Failed(error) => return Err(error.to_string()),
+        ReloadOutcome::FailedCoalesced => {
+            return Err(crate::config_startup::banner().unwrap_or_else(|| {
+                "configuration reload failed; the last admitted generation is display-only".into()
+            }));
+        }
+    };
+    crate::config_startup::require_launchable(&admitted)?;
+    let mut cfg = admitted.config().clone();
+    // best-effort: the clamped-feature report is for `main`'s startup status
+    // note; the gate only needs the clamped config.
+    let _ = crate::channel_state::clamp_and_record(&mut cfg, crate::channel_state::current());
+    Ok(cfg)
+}
+
+/// Remove from a sealed gate command's env everything a gate must never see:
+/// the drain's [`SCRUBBED_ENV`](crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV),
+/// the repo-targeting git vars, and every credential-shaped variable (local
+/// bwrap inherits the launcher's env), whether inherited or set explicitly.
+pub(crate) fn scrub_sealed_env(command: &mut std::process::Command) {
+    for var in crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV {
+        command.env_remove(var);
+    }
+    for var in thegn_core::util::GIT_ENV_VARS {
+        command.env_remove(var);
+    }
+    let sensitive = |key: &str| {
+        thegn_core::log_redact::is_sensitive_key(key)
+            || matches!(
+                key,
+                "GH_CONFIG_DIR" | "GNUPGHOME" | "GIT_SSH_COMMAND" | "GPG_TTY"
+            )
+    };
+    let explicit: Vec<std::ffi::OsString> = command
+        .get_envs()
+        .filter(|(_, value)| value.is_some())
+        .map(|(key, _)| key.to_os_string())
+        .collect();
+    let inherited = std::env::vars_os().map(|(key, _)| key);
+    for key in explicit.into_iter().chain(inherited) {
+        if let Some(k) = key.to_str()
+            && sensitive(k)
+        {
+            command.env_remove(&key);
+        }
+    }
 }
 
 /// [`resolve_for_gate`] with the config loader and sealed resolver injected
 /// (tests prove `off` never loads config). `mode` is authoritative: a
 /// `sealed` gate stays sealed even if the reloaded config reads `off`.
+/// `require_sealed` (an unattended land approved as isolated) refuses `off`.
 fn resolve_for_gate_with(
     repo_root: &Path,
     mode: GateSandbox,
+    require_sealed: bool,
     load: impl FnOnce() -> Result<Config, String>,
     sealed: impl FnOnce(&Config, &Path) -> Result<GateExec, String>,
 ) -> Result<GateExec, String> {
+    if require_sealed && mode == GateSandbox::Off {
+        return Err("this unattended land requires the sealed merge gate, but \
+                    [merge_queue] gate_sandbox is off for this repo"
+            .into());
+    }
     match mode {
         GateSandbox::Off => Ok(GateExec::Host),
         GateSandbox::Sealed => {
@@ -120,10 +225,11 @@ fn under(path: &Path, root: &Path) -> bool {
     !root.as_os_str().is_empty() && path.starts_with(root)
 }
 
-/// The sealed spec for one gate command: `spec` re-rooted at `checkout`, with
-/// the target dir bound read-write (unless it is inside the checkout) and the
-/// git common dir bound read-only (unless a read-only mount already covers
-/// it). Pure.
+/// The sealed spec for one gate command: `spec` re-rooted at `checkout`.
+/// The repo's own mounts (its main checkout, anything above it, its `.git`
+/// carve-outs) are dropped, every remaining profile mount becomes read-only,
+/// and only the checkout and the target dir (unless inside the checkout) are
+/// writable; the git common dir is bound read-only, last. Pure.
 pub(crate) fn gate_spec(
     spec: &SandboxSpec,
     checkout: &Path,
@@ -131,8 +237,28 @@ pub(crate) fn gate_spec(
     common_git: &Path,
     extra_env: &[(String, String)],
 ) -> SandboxSpec {
+    let original = spec.worktree.clone();
     let mut spec = spec.clone();
+    spec.mounts.retain(|m| {
+        let (h, d) = (Path::new(&m.host), Path::new(&m.dest));
+        !(under(h, &original)
+            || under(d, &original)
+            || under(&original, h)
+            || under(&original, d)
+            || under(h, common_git)
+            || under(d, common_git))
+    });
+    for m in &mut spec.mounts {
+        m.ro = true;
+    }
     spec.worktree = checkout.to_path_buf();
+    let checkout_str = checkout.to_string_lossy().into_owned();
+    spec.mounts.push(Mount {
+        host: checkout_str.clone(),
+        dest: checkout_str,
+        ro: false,
+        cache: false,
+    });
     if let Some(target) = target
         && !under(target, checkout)
     {
@@ -144,21 +270,13 @@ pub(crate) fn gate_spec(
             cache: false,
         });
     }
-    // A covering read-write mount does not count: the nested read-only bind
-    // is pushed last, so it overlays it.
-    let common_covered = spec
-        .mounts
-        .iter()
-        .any(|mount| mount.ro && under(common_git, Path::new(&mount.host)));
-    if !common_covered {
-        let common = common_git.to_string_lossy().into_owned();
-        spec.mounts.push(Mount {
-            host: common.clone(),
-            dest: common,
-            ro: true,
-            cache: false,
-        });
-    }
+    let common = common_git.to_string_lossy().into_owned();
+    spec.mounts.push(Mount {
+        host: common.clone(),
+        dest: common,
+        ro: true,
+        cache: false,
+    });
     spec.env.extend(extra_env.iter().cloned());
     if spec.network == Network::None {
         spec.env
@@ -263,8 +381,13 @@ mod tests {
             .expect("common git bind");
         assert!(common.ro);
         assert_eq!(common.dest, "/repo/.git");
-        // Nothing else became writable: exactly one rw bind (the target).
-        assert_eq!(spec.mounts.iter().filter(|m| !m.ro).count(), 1);
+        // Nothing else became writable: the checkout and the target only.
+        assert_eq!(spec.mounts.iter().filter(|m| !m.ro).count(), 2);
+        assert!(
+            spec.mounts
+                .iter()
+                .any(|m| !m.ro && m.host == "/state/gate/wt" && m.dest == "/state/gate/wt")
+        );
     }
 
     #[test]
@@ -277,26 +400,145 @@ mod tests {
             &gate_env(),
         );
         assert!(!spec.mounts.iter().any(|m| m.host.ends_with("target")));
-        assert_eq!(spec.mounts.len(), 1, "only the common git bind");
+        assert_eq!(
+            spec.mounts.len(),
+            2,
+            "the checkout (rw) and the common git (ro) only"
+        );
+    }
+
+    fn mount(path: &str, ro: bool, cache: bool) -> Mount {
+        Mount {
+            host: path.into(),
+            dest: path.into(),
+            ro,
+            cache,
+        }
     }
 
     #[test]
-    fn a_read_only_mount_covering_the_common_git_is_not_duplicated() {
+    fn the_main_checkout_git_carveouts_and_caches_are_not_writable() {
         let mut spec = base();
-        spec.mounts.push(Mount {
-            host: "/repo".into(),
-            dest: "/repo".into(),
-            ro: true,
-            cache: false,
-        });
-        let spec = gate_spec(
+        spec.mounts = vec![
+            mount("/repo", false, false),
+            mount("/repo/.git/refs/heads/x", false, false),
+            mount("/home/u/.cargo/registry", false, true),
+        ];
+        let gated = gate_spec(
             &spec,
             Path::new("/state/gate/wt"),
-            None,
+            Some(Path::new("/state/gate/target")),
             Path::new("/repo/.git"),
             &gate_env(),
         );
-        assert_eq!(spec.mounts.len(), 1);
+        let (last, rest) = gated.mounts.split_last().unwrap();
+        assert_eq!((last.host.as_str(), last.ro), ("/repo/.git", true));
+        assert!(
+            rest.iter()
+                .all(|m| !m.host.starts_with("/repo") && !m.dest.starts_with("/repo")),
+            "{rest:?}"
+        );
+        let cargo = gated
+            .mounts
+            .iter()
+            .find(|m| m.host == "/home/u/.cargo/registry")
+            .expect("cache mount kept");
+        assert!(cargo.ro);
+        let mut writable: Vec<&str> = gated
+            .mounts
+            .iter()
+            .filter(|m| !m.ro)
+            .map(|m| m.host.as_str())
+            .collect();
+        writable.sort_unstable();
+        assert_eq!(writable, ["/state/gate/target", "/state/gate/wt"]);
+
+        // A read-only parent of the main checkout is dropped too.
+        let mut nested = SandboxSpec {
+            worktree: PathBuf::from("/srv/repo"),
+            ..base()
+        };
+        nested.mounts = vec![mount("/srv", true, false), mount("/srv/repo", false, false)];
+        let gated = gate_spec(
+            &nested,
+            Path::new("/state/gate/wt"),
+            None,
+            Path::new("/srv/repo/.git"),
+            &gate_env(),
+        );
+        assert!(
+            gated
+                .mounts
+                .iter()
+                .all(|m| m.host != "/srv" && m.host != "/srv/repo"),
+            "{:?}",
+            gated.mounts
+        );
+        assert_eq!(gated.mounts.len(), 2);
+    }
+
+    #[test]
+    fn only_a_local_bwrap_sandbox_without_network_carries_the_gate() {
+        use thegn_core::placement::{Placement, SshPlacement, TransportKind};
+        use thegn_core::sandbox::Backend;
+        let ok = SandboxSpec {
+            backend: Backend::Bwrap,
+            network: Network::None,
+            ..SandboxSpec::default()
+        };
+        assert_eq!(gate_backend_refusal(&ok), None);
+        let podman = SandboxSpec {
+            backend: Backend::Podman,
+            network: Network::None,
+            ..SandboxSpec::default()
+        };
+        let why = gate_backend_refusal(&podman).expect("podman refused");
+        assert!(why.contains("local bwrap"), "{why}");
+        assert!(why.contains("network 'none'"), "{why}");
+        let remote = SandboxSpec {
+            backend: Backend::Bwrap,
+            network: Network::None,
+            placement: Placement::Ssh(SshPlacement::plain(
+                "box".into(),
+                22,
+                false,
+                TransportKind::Ssh,
+            )),
+            ..SandboxSpec::default()
+        };
+        assert!(gate_backend_refusal(&remote).is_some());
+        let nat = SandboxSpec {
+            backend: Backend::Bwrap,
+            network: Network::Nat,
+            ..SandboxSpec::default()
+        };
+        let why = gate_backend_refusal(&nat).expect("nat refused");
+        assert!(why.contains("network 'nat'"), "{why}");
+    }
+
+    #[test]
+    fn the_sealed_env_scrub_drops_explicit_and_listed_credentials() {
+        let mut command = std::process::Command::new("true");
+        command
+            .env("FOO_API_KEY", "x")
+            .env("GIT_SSH_COMMAND", "ssh -i k")
+            .env("THEGN_GATE", "1");
+        scrub_sealed_env(&mut command);
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let value = |key: &str| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        assert_eq!(value("FOO_API_KEY"), Some(None), "explicit key removed");
+        assert_eq!(value("GIT_SSH_COMMAND"), Some(None));
+        assert_eq!(value("GH_TOKEN"), Some(None));
+        assert_eq!(value("GIT_DIR"), Some(None));
+        assert_eq!(value("THEGN_GATE"), Some(Some("1".into())));
     }
 
     #[test]
@@ -383,6 +625,7 @@ mod tests {
         let resolved = resolve_for_gate_with(
             Path::new("/nonexistent"),
             MergeQueueConfig::default().gate_sandbox,
+            false,
             || {
                 loaded.set(true);
                 Ok(Config::default())
@@ -394,6 +637,26 @@ mod tests {
     }
 
     #[test]
+    fn a_required_seal_refuses_off_without_loading_config() {
+        let loaded = Cell::new(false);
+        let resolved = resolve_for_gate_with(
+            Path::new("/nonexistent"),
+            GateSandbox::Off,
+            true,
+            || {
+                loaded.set(true);
+                Ok(Config::default())
+            },
+            |_, _| panic!("off never resolves a sealed spec"),
+        );
+        let why = resolved
+            .err()
+            .expect("off refused when sealing is required");
+        assert!(why.contains("requires the sealed merge gate"), "{why}");
+        assert!(!loaded.get());
+    }
+
+    #[test]
     fn sealed_loads_config_and_never_falls_back_to_the_host() {
         let sealed = GateSandbox::Sealed;
         let loaded = Cell::new(false);
@@ -401,6 +664,7 @@ mod tests {
         let resolved = resolve_for_gate_with(
             Path::new("/nonexistent"),
             sealed,
+            false,
             || {
                 loaded.set(true);
                 Ok(Config::default())
@@ -413,6 +677,7 @@ mod tests {
         let unreadable = resolve_for_gate_with(
             Path::new("/nonexistent"),
             sealed,
+            false,
             || Err("bad toml".into()),
             |_, _| panic!("no spec without a config"),
         );

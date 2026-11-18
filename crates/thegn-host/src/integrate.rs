@@ -1050,12 +1050,7 @@ fn regenerate_merge(
                         Ok((argv, env_file)) => {
                             let mut command = std::process::Command::new(&argv[0]);
                             command.args(&argv[1..]);
-                            for key in crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV {
-                                command.env_remove(key);
-                            }
-                            for key in thegn_core::util::GIT_ENV_VARS {
-                                command.env_remove(key);
-                            }
+                            crate::gate_sandbox::scrub_sealed_env(&mut command);
                             (command, env_file)
                         }
                         Err(reason) => {
