@@ -1270,7 +1270,16 @@ mod tests {
     /// are off, every other kind is on.
     #[test]
     fn eager_create_is_off_only_for_paid_sandbox_kinds() {
-        for kind in EnvProviderKind::ALL.iter().copied() {
+        for kind in [
+            EnvProviderKind::Custom,
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Sprites,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+            EnvProviderKind::Vercel,
+        ] {
             let paid = matches!(kind, EnvProviderKind::Vercel | EnvProviderKind::Sprites);
             assert_eq!(kind.eager_create_enabled(), !paid, "{kind:?}");
         }
@@ -1381,7 +1390,16 @@ mod tests {
             EnvProviderKind::ALL.len(),
             "every kind is in the table"
         );
-        for kind in EnvProviderKind::ALL.iter().copied() {
+        for kind in [
+            EnvProviderKind::Custom,
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Sprites,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+            EnvProviderKind::Vercel,
+        ] {
             let row = table
                 .iter()
                 .find(|row| row.0 == kind)
