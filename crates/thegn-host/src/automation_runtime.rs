@@ -32,6 +32,21 @@ pub fn clear_session_origin(session: &str) {
     }
 }
 
+/// Whether a session an automation run of `rule_id` opened is still live.
+/// `register_session_origin` records each automation-opened session and the
+/// session-exit path removes it, so this is the in-process view of "the
+/// previous run is still going" (`SkipReason::PreviousRunLive`).
+#[allow(dead_code, reason = "consumed by b153 lanes 2 and 5 (PreviousRunLive)")]
+pub(crate) fn rule_has_live_session(rule_id: &str) -> bool {
+    SESSION_ORIGINS.get().is_some_and(|origins| {
+        origins
+            .lock()
+            .expect("automation session origin lock")
+            .values()
+            .any(|origin| origin.rule_id == rule_id)
+    })
+}
+
 fn session_origin(session: &str) -> Option<thegn_core::automation::AutomationOrigin> {
     SESSION_ORIGINS
         .get_or_init(Default::default)
@@ -163,6 +178,7 @@ fn audit_dropped(event: AutomationEvent) -> Option<std::thread::JoinHandle<anyho
                 action_cap: String::new(),
                 action_summary: String::new(),
                 started_at: now,
+                autonomy: None,
             })?;
             db.finish_automation_run(id, "dropped", Some("queue_overflow"), None, now)?;
             Ok(())
@@ -220,7 +236,7 @@ async fn process_event(
             .map_err(anyhow::Error::msg)?;
         let rules = with_lead_rules(&db, rules);
         let now = thegn_core::util::now();
-        let admissions = db.admit_automation_event(&rules, &event, now)?;
+        let admissions = admit_unless_paused(&db, &rules, &event, now)?;
         Ok((event, admissions))
     })
     .await??;
@@ -355,6 +371,33 @@ async fn process_event(
         }
     }
     Ok(())
+}
+
+/// Admission behind the kill switch (THE-2192). Paused: evaluate purely and
+/// audit every would-be plan as `SkipReason::Paused` through the same audit
+/// table admission writes skips to, persist no ledger transition, and admit
+/// nothing, so no action executes. A resumed runtime therefore still sees an
+/// event it skipped while paused as fresh (`once_per_key` was not consumed).
+fn admit_unless_paused(
+    db: &thegn_core::db::Db,
+    rules: &[thegn_core::automation::AutomationRule],
+    event: &AutomationEvent,
+    now: i64,
+) -> anyhow::Result<Vec<AutomationAdmission>> {
+    if thegn_core::automation_control::paused(db) {
+        let audited = db.audit_paused_automation_event(rules, event, now)?;
+        if audited > 0 {
+            tracing::info!(
+                target: "thegn::automation",
+                event_key = %event.key.0,
+                audited,
+                outcome = "paused",
+                "automations paused; matching rules skipped"
+            );
+        }
+        return Ok(Vec::new());
+    }
+    db.admit_automation_event(rules, event, now)
 }
 
 /// The config rules plus the enabled, still-valid Lead-authored rules
@@ -613,11 +656,19 @@ pub fn subscribe_daemon_events(
                                 crate::automation_events::submit_fact(
                                     if succeeded { AutomationEventKind::AgentFinished } else { AutomationEventKind::AgentFailed },
                                     format!("session:{session}:exit"),
-                                    worktree,
+                                    worktree.clone(),
                                     Some(format!("session exited ({})", code.map_or_else(|| "unknown".into(), |c| c.to_string()))),
-                                    crate::automation_events::EventFacts { session_id: Some(session.clone()), origin, ..Default::default() },
+                                    crate::automation_events::EventFacts { session_id: Some(session.clone()), origin: origin.clone(), ..Default::default() },
                                 );
                             }
+                            // Every exit, whatever the role or final state.
+                            submit(thegn_core::automation::session_exited_event(
+                                session,
+                                worktree,
+                                *code,
+                                origin,
+                                thegn_core::util::now(),
+                            ));
                         }
                         _ => {}
                     }
@@ -650,6 +701,8 @@ pub fn subscribe_daemon_events(
                             pr_review_requested: None,
                             pr_merged: None,
                             origin,
+                            issue: None,
+                            exit_code: None,
                         });
                     }
                 }
@@ -705,6 +758,8 @@ mod tests {
             pr_review_requested: None,
             pr_merged: None,
             origin: None,
+            issue: None,
+            exit_code: None,
         };
         enrich_event(&db, &mut event);
         assert_eq!(event.workspace.as_deref(), Some("product"));
@@ -735,6 +790,8 @@ mod tests {
             pr_review_requested: None,
             pr_merged: None,
             origin: None,
+            issue: None,
+            exit_code: None,
         }
     }
 
@@ -959,6 +1016,61 @@ mod tests {
         assert_eq!(with_lead_rules(&db, config.clone()), config);
     }
 
+    fn notify_rule(id: &str) -> thegn_core::automation::AutomationRule {
+        thegn_core::automation::AutomationRule {
+            id: id.into(),
+            enabled: true,
+            event: thegn_core::automation::AutomationEventKind::AgentFinished,
+            predicate: thegn_core::automation::AutomationPredicate::default(),
+            action: thegn_core::automation::ActionTemplate {
+                cap: "notify.push".into(),
+                params: BTreeMap::from([("body".into(), "done".into())]),
+            },
+            debounce_secs: 0,
+            idle_secs: None,
+            once_per_key: true,
+            max_per_hour: 30,
+            max_action_per_hour: 30,
+            schedule: None,
+            autonomy: thegn_core::automation_autonomy::Autonomy::Review,
+        }
+    }
+
+    #[test]
+    fn a_paused_runtime_admits_nothing_and_audits_paused() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let rules = vec![notify_rule("r")];
+        let event = event_for_dispatch("/wt", None);
+        thegn_core::automation_control::set_paused(&db, true).unwrap();
+        let admitted = admit_unless_paused(&db, &rules, &event, 100).unwrap();
+        assert!(admitted.is_empty(), "{admitted:?}");
+        let rows = db.automation_runs(Some("r"), 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "skipped");
+        assert_eq!(rows[0].skip_reason.as_deref(), Some("paused"));
+
+        thegn_core::automation_control::set_paused(&db, false).unwrap();
+        let admitted = admit_unless_paused(&db, &rules, &event, 101).unwrap();
+        assert!(matches!(
+            admitted.as_slice(),
+            [AutomationAdmission::Planned { .. }]
+        ));
+    }
+
+    #[test]
+    fn live_session_tracking_is_per_rule() {
+        let origin = |rule: &str| thegn_core::automation::AutomationOrigin {
+            root_event_id: "root".into(),
+            rule_id: rule.into(),
+            run_id: "1".into(),
+        };
+        register_session_origin("live-test-session", origin("live-test-rule"));
+        assert!(rule_has_live_session("live-test-rule"));
+        assert!(!rule_has_live_session("live-test-other-rule"));
+        clear_session_origin("live-test-session");
+        assert!(!rule_has_live_session("live-test-rule"));
+    }
+
     #[test]
     fn runtime_gate_arms_for_a_configured_lead_without_config_rules() {
         assert!(thegn_core::automation_authoring::runtime_armed(
@@ -996,6 +1108,8 @@ mod tests {
             pr_review_requested: None,
             pr_merged: None,
             origin: None,
+            issue: None,
+            exit_code: None,
         })
         .unwrap();
         let dropped = AutomationEvent {
@@ -1018,6 +1132,8 @@ mod tests {
             pr_review_requested: None,
             pr_merged: None,
             origin: None,
+            issue: None,
+            exit_code: None,
         };
         try_submit(&tx, dropped)
             .expect("overflow starts durable audit")

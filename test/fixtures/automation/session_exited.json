@@ -1,0 +1,22 @@
+{
+  "id": "ae-1700000000-fixture-session-exited",
+  "occurred_at": 1700000000,
+  "key": "session:daemon-session-1:exited",
+  "kind": "session_exited",
+  "workspace": null,
+  "repo": null,
+  "worktree": "/code/product/thegn",
+  "branch": null,
+  "agent_role": null,
+  "notification_kind": null,
+  "priority": null,
+  "source_ref": "session:daemon-session-1",
+  "message": null,
+  "session_id": "daemon-session-1",
+  "pr_checks_passed": null,
+  "pr_review_requested": null,
+  "pr_merged": null,
+  "origin": null,
+  "issue": null,
+  "exit_code": 0
+}

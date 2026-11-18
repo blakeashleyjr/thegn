@@ -13,6 +13,9 @@ use crate::store::{
 
 const MAX_AUDIT_QUERY: usize = 1_000;
 const MAX_RETENTION_PER_RULE: usize = 10_000;
+/// A started run older than this is presumed orphaned by a crash and no
+/// longer blocks its rule (`automation_run_in_flight`).
+const IN_FLIGHT_WINDOW_SECS: i64 = 6 * 3_600;
 
 impl AutomationStore for Db {
     fn automation_state(&self, rule_id: &str) -> Result<Option<AutomationStateRow>> {
@@ -137,6 +140,7 @@ impl AutomationStore for Db {
                                 action.params.keys()
                             )),
                             started_at: now,
+                            autonomy: Some(action.autonomy.as_str().to_string()),
                         })?;
                         admitted.push(AutomationAdmission::Planned {
                             action: Box::new(action),
@@ -157,8 +161,9 @@ impl AutomationStore for Db {
                             action_cap: String::new(),
                             action_summary: String::new(),
                             started_at: now,
+                            autonomy: None,
                         })?;
-                        let reason = format!("{reason:?}").to_ascii_lowercase();
+                        let reason = skip_reason_label(&reason);
                         self.finish_automation_run(run_id, "skipped", Some(&reason), None, now)?;
                         admitted.push(AutomationAdmission::Skipped { run_id });
                     }
@@ -178,12 +183,81 @@ impl AutomationStore for Db {
         }
     }
 
+    fn audit_paused_automation_event(
+        &self,
+        rules: &[crate::automation::AutomationRule],
+        event: &crate::automation::AutomationEvent,
+        now: i64,
+    ) -> Result<usize> {
+        let mut state = crate::automation::EvaluationState::new();
+        for rule in rules {
+            if let Some(row) = self.automation_state(&rule.id)? {
+                state.insert(
+                    rule.id.clone(),
+                    crate::automation::RuleState {
+                        enabled_override: row.enabled_override,
+                        last_fired_at: row.last_fired_at,
+                        recent_fires: row.recent_fires,
+                        action_fires: row.action_fires,
+                        once_keys: row.once_keys,
+                    },
+                );
+            }
+        }
+        let decisions = crate::automation::paused_decisions(crate::automation::evaluate(
+            rules, event, &state, now,
+        ));
+        let mut written = 0;
+        for decision in decisions {
+            let crate::automation::EvaluationDecision::Skipped {
+                rule_id,
+                event_key,
+                reason,
+            } = decision
+            else {
+                // paused_decisions never returns a plan.
+                continue;
+            };
+            let run_id = self.start_automation_run(&NewAutomationRun {
+                rule_id,
+                event_id: event.id.clone(),
+                event_key: event_key.0,
+                trigger_kind: event.kind.as_str().into(),
+                event_summary: bounded(event.message.as_deref().unwrap_or_default()),
+                action_cap: String::new(),
+                action_summary: String::new(),
+                started_at: now,
+                autonomy: None,
+            })?;
+            self.finish_automation_run(
+                run_id,
+                "skipped",
+                Some(&skip_reason_label(&reason)),
+                None,
+                now,
+            )?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    fn automation_run_in_flight(&self, rule_id: &str, now: i64) -> Result<bool> {
+        let since = now.saturating_sub(IN_FLIGHT_WINDOW_SECS);
+        let live: i64 = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM automation_runs \
+               WHERE rule_id=?1 AND finished_at IS NULL AND started_at > ?2)",
+            params![rule_id, since],
+            |row| row.get(0),
+        )?;
+        Ok(live != 0)
+    }
+
     fn start_automation_run(&self, run: &NewAutomationRun) -> Result<i64> {
         self.conn().execute(
             "INSERT INTO automation_runs \
                (rule_id,event_id,event_key,trigger_kind,event_summary,action_cap, \
-                action_summary,outcome,started_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'started',?8)",
+                action_summary,outcome,started_at,autonomy) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'started',?8,?9)",
             params![
                 run.rule_id,
                 run.event_id,
@@ -193,6 +267,7 @@ impl AutomationStore for Db {
                 run.action_cap,
                 run.action_summary,
                 run.started_at,
+                run.autonomy,
             ],
         )?;
         Ok(self.conn().last_insert_rowid())
@@ -223,7 +298,7 @@ impl AutomationStore for Db {
             i64::try_from(limit.clamp(1, MAX_AUDIT_QUERY)).unwrap_or(MAX_AUDIT_QUERY as i64);
         let mut stmt = self.conn().prepare(
             "SELECT id,rule_id,event_id,event_key,trigger_kind,event_summary,action_cap, \
-                    action_summary,outcome,skip_reason,error,started_at,finished_at \
+                    action_summary,outcome,skip_reason,error,started_at,finished_at,autonomy \
              FROM automation_runs \
              WHERE (?1 IS NULL OR rule_id=?1) \
              ORDER BY started_at DESC, id DESC LIMIT ?2",
@@ -263,7 +338,14 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRunRow> {
         error: row.get(10)?,
         started_at: row.get(11)?,
         finished_at: row.get(12)?,
+        autonomy: row.get(13)?,
     })
+}
+
+/// The audit label of a skip reason: the variant name lowercased (`paused`,
+/// `debounced`, `onceperkey`), the vocabulary the audit log has always used.
+fn skip_reason_label(reason: &crate::automation::SkipReason) -> String {
+    format!("{reason:?}").to_ascii_lowercase()
 }
 
 fn bounded(value: &str) -> String {
@@ -299,6 +381,8 @@ mod tests {
             pr_review_requested: None,
             pr_merged: None,
             origin: None,
+            issue: None,
+            exit_code: None,
         }
     }
 
@@ -317,6 +401,8 @@ mod tests {
             once_per_key: false,
             max_per_hour: 30,
             max_action_per_hour: 30,
+            schedule: None,
+            autonomy: crate::automation_autonomy::Autonomy::Review,
         }
     }
 
@@ -365,6 +451,7 @@ mod tests {
             action_cap: "notify.push".into(),
             action_summary: "bounded action".into(),
             started_at: at,
+            autonomy: None,
         }
     }
 
@@ -422,6 +509,67 @@ mod tests {
         assert_eq!(row.skip_reason.as_deref(), Some("debounced"));
         assert_eq!(row.error.as_deref(), Some("detail"));
         assert_eq!(row.finished_at, Some(11));
+    }
+
+    #[test]
+    fn admission_records_the_planned_autonomy() {
+        let db = Db::open_memory().unwrap();
+        let mut rule = admission_rule("auto");
+        rule.autonomy = crate::automation_autonomy::Autonomy::Propose;
+        let admitted = db
+            .admit_automation_event(&[rule], &admission_event("e1", "k", None), 10_000)
+            .unwrap();
+        assert!(matches!(admitted[0], AutomationAdmission::Planned { .. }));
+        let row = &db.automation_runs(Some("auto"), 1).unwrap()[0];
+        assert_eq!(row.autonomy.as_deref(), Some("propose"));
+    }
+
+    #[test]
+    fn paused_audit_skips_every_plan_and_persists_no_state() {
+        let db = Db::open_memory().unwrap();
+        let mut once = admission_rule("once");
+        once.once_per_key = true;
+        let rules = vec![admission_rule("plain"), once];
+        let written = db
+            .audit_paused_automation_event(&rules, &admission_event("e1", "k", None), 10_000)
+            .unwrap();
+        assert_eq!(written, 2);
+        let rows = db.automation_runs(None, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.outcome == "skipped"
+            && row.skip_reason.as_deref() == Some("paused")
+            && row.finished_at == Some(10_000)));
+        // No ledger transition: the once key was never consumed, so a resumed
+        // runtime still admits the same event.
+        assert_eq!(db.automation_state("once").unwrap(), None);
+        let admitted = db
+            .admit_automation_event(&rules, &admission_event("e2", "k", None), 10_001)
+            .unwrap();
+        assert!(
+            admitted
+                .iter()
+                .all(|admission| matches!(admission, AutomationAdmission::Planned { .. }))
+        );
+    }
+
+    #[test]
+    fn run_in_flight_counts_only_recent_unfinished_rows() {
+        let db = Db::open_memory().unwrap();
+        let now = 100_000;
+        assert!(!db.automation_run_in_flight("r", now).unwrap());
+        let live = db.start_automation_run(&run("r", "e1", now - 60)).unwrap();
+        assert!(db.automation_run_in_flight("r", now).unwrap());
+        assert!(!db.automation_run_in_flight("other", now).unwrap());
+        db.finish_automation_run(live, "succeeded", None, None, now)
+            .unwrap();
+        assert!(!db.automation_run_in_flight("r", now).unwrap());
+        // An unfinished row older than six hours is a crash orphan.
+        db.start_automation_run(&run("r", "e2", now - 6 * 3_600))
+            .unwrap();
+        assert!(!db.automation_run_in_flight("r", now).unwrap());
+        db.start_automation_run(&run("r", "e3", now - 6 * 3_600 + 1))
+            .unwrap();
+        assert!(db.automation_run_in_flight("r", now).unwrap());
     }
 
     #[test]

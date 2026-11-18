@@ -2507,6 +2507,28 @@ pub(crate) fn verify_v111_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v112: autonomy on agent_dispatches and automation_runs (THE-2195).
+/// Additive; both columns are NULL by default (rows written before the
+/// automation autonomy ceiling existed carry no recorded level).
+pub(crate) fn migrate_v112(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "autonomy") {
+        conn.execute("ALTER TABLE agent_dispatches ADD COLUMN autonomy TEXT", [])?;
+    }
+    if !has_column(conn, "automation_runs", "autonomy") {
+        conn.execute("ALTER TABLE automation_runs ADD COLUMN autonomy TEXT", [])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v112_schema(conn: &Connection) -> Result<()> {
+    for table in ["agent_dispatches", "automation_runs"] {
+        if !has_column(conn, table, "autonomy") {
+            bail!("schema v112 migration did not add {table}.autonomy");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4692,7 +4714,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 111);
         let conn = Connection::open_in_memory().unwrap();
         assert!(super::verify_v111_schema(&conn).is_err());
         conn.execute_batch(
@@ -4732,6 +4753,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!((enabled, author.as_str()), (1, ""));
+    }
+
+    #[test]
+    fn v112_adds_autonomy_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v112_schema(fresh.conn()).unwrap();
+        let version: i64 = fresh
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 112);
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, issue_id TEXT);
+             CREATE TABLE automation_runs (id INTEGER PRIMARY KEY, rule_id TEXT);
+             INSERT INTO agent_dispatches (id, issue_id) VALUES (1, 'kept');
+             INSERT INTO automation_runs (id, rule_id) VALUES (1, 'r');",
+        )
+        .unwrap();
+        assert!(super::verify_v112_schema(&conn).is_err());
+        super::migrate_v112(&conn).unwrap();
+        super::migrate_v112(&conn).unwrap();
+        super::verify_v112_schema(&conn).unwrap();
+        let (kept, autonomy): (String, Option<String>) = conn
+            .query_row(
+                "SELECT issue_id, autonomy FROM agent_dispatches WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, "kept", "v112 is additive");
+        assert_eq!(autonomy, None, "existing rows carry no autonomy");
+    }
+
+    #[test]
+    fn v112_upgrades_a_real_v111_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v111.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE agent_dispatches DROP COLUMN autonomy;
+                     ALTER TABLE automation_runs DROP COLUMN autonomy;
+                     PRAGMA user_version=111;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v112_schema(upgraded.conn()).unwrap();
     }
 
     #[test]
