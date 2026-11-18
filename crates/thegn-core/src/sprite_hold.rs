@@ -105,6 +105,8 @@ cleanup() {
 on_signal() {
     if [ -n "$child" ]; then
         kill -s "$1" "$child" 2>/dev/null
+        # An async child ignores INT (POSIX); escalate so an interrupt ends it.
+        if [ "$1" = INT ]; then kill -s TERM "$child" 2>/dev/null; fi
         wait "$child"
         rc=$?
         child=
@@ -436,6 +438,19 @@ mod tests {
             return;
         };
         assert_eq!(ran.code, Some(128 + 15), "stderr: {}", ran.stderr);
+        assert_put_then_delete(&ran);
+    }
+
+    #[test]
+    fn int_ends_the_child_and_drops_the_hold() {
+        // An async child ignores INT, so the wrapper escalates to TERM.
+        let Some(ran) = run_wrapped(
+            HELD,
+            &["/bin/sh", "-c", "kill -INT \"$PPID\"; exec sleep 30"],
+        ) else {
+            return;
+        };
+        assert_eq!(ran.code, Some(143), "stderr: {}", ran.stderr);
         assert_put_then_delete(&ran);
     }
 }
