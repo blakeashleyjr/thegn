@@ -13,7 +13,7 @@
 //! 2. the compiled-in default: the `dev` Cargo feature ⇒ [`Channel::Dev`],
 //!    otherwise [`Channel::Stable`].
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use thegn_core::channel::{Channel, Feature};
 use thegn_core::config::EnvSource;
@@ -23,9 +23,10 @@ static CHANNEL: AtomicU8 = AtomicU8::new(0);
 // One bit per feature in `Feature::ALL`. Clamp results are cumulative for the
 // lifetime of this process because later config refreshes must not erase the
 // explanation for the config generation already in use.
-static CLAMPED: AtomicU8 = AtomicU8::new(0);
+static CLAMPED: AtomicU32 = AtomicU32::new(0);
 
-const fn feature_bit(feature: Feature) -> u8 {
+// `u32` since WS00-P1-01: the sixteen features no longer fit a `u8`.
+const fn feature_bit(feature: Feature) -> u32 {
     match feature {
         Feature::Remote => 1 << 0,
         Feature::Providers => 1 << 1,
@@ -34,10 +35,19 @@ const fn feature_bit(feature: Feature) -> u8 {
         Feature::Voice => 1 << 4,
         Feature::PluginApps => 1 << 5,
         Feature::Lead => 1 << 6,
+        Feature::SandboxBackends => 1 << 7,
+        Feature::LinuxConfine => 1 << 8,
+        Feature::EgressProxy => 1 << 9,
+        Feature::Seatbelt => 1 << 10,
+        Feature::WinIsolation => 1 << 11,
+        Feature::PluginBackends => 1 << 12,
+        Feature::AgentPresets => 1 << 13,
+        Feature::PrivateCopy => 1 << 14,
+        Feature::Escalation => 1 << 15,
     }
 }
 
-fn record_into(cell: &AtomicU8, features: &[Feature]) {
+fn record_into(cell: &AtomicU32, features: &[Feature]) {
     let bits = features
         .iter()
         .fold(0, |bits, feature| bits | feature_bit(*feature));
@@ -191,6 +201,18 @@ mod tests {
     fn unset_or_bad_env_falls_back_to_default() {
         assert_eq!(resolve(&Env(None)), default_channel());
         assert_eq!(resolve(&Env(Some("garbage"))), default_channel());
+    }
+
+    #[test]
+    fn feature_bits_are_distinct_and_fit() {
+        let mut seen = 0u32;
+        for feature in Feature::ALL {
+            let bit = feature_bit(feature);
+            assert_eq!(bit.count_ones(), 1, "{feature} must own exactly one bit");
+            assert_eq!(seen & bit, 0, "{feature} shares a bit with another feature");
+            seen |= bit;
+        }
+        assert_eq!(seen.count_ones() as usize, Feature::ALL.len());
     }
 
     #[test]

@@ -7,10 +7,8 @@
 //! sentinel data that cannot be mistaken for an ordinary fixture path.
 
 use super::{credential_free_env, credential_free_spec_at};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use thegn_core::config::{FileAccess, Network};
-use thegn_core::placement::Placement;
+use thegn_core::config::FileAccess;
 use thegn_core::sandbox::{Backend, Mount, SandboxLimits, SandboxSpec, enter_argv};
 use thegn_core::testenv::{EnvGuard, IsolatedState};
 
@@ -59,42 +57,17 @@ fn redteam_spec(home: &Path, worktree: &Path) -> SandboxSpec {
 
     SandboxSpec {
         backend: Backend::Bwrap,
-        placement: Placement::Local,
-        image: None,
         worktree: worktree.to_path_buf(),
         mounts: credential_mounts.collect(),
         env,
-        env_overrides: HashMap::new(),
-        env_block: Vec::new(),
-        network: Network::Nat,
-        network_allow: Vec::new(),
-        network_block: Vec::new(),
-        read_only_root: false,
-        no_new_privileges: false,
-        pids_limit: None,
-        drop_capabilities: Vec::new(),
-        add_capabilities: Vec::new(),
         file_access: FileAccess::Worktree,
-        ports: Vec::new(),
-        gpu: None,
         limits: SandboxLimits {
             // Keep the test independent of host cgroup delegation.
             cpu_total: Some("off".into()),
             ..SandboxLimits::default()
         },
-        volumes: Vec::new(),
-        compose: None,
-        build: None,
-        init_script: None,
-        devenv: false,
-        devenv_path: None,
         name: "thegn-redteam-agent".into(),
-        vpn: None,
-        oci_host: None,
-        oci_runtime: None,
-        daemon_persistent: false,
-        seal_home: None,
-        volume_owners: Vec::new(),
+        ..SandboxSpec::default()
     }
 }
 

@@ -191,6 +191,8 @@ pub fn policy_fingerprint(spec: &SandboxSpec, vpn_join: bool) -> String {
     // init_script is per-launch initialization, not the admitted OCI policy.
     // limits.cpu_total/memory_total are aggregate slice limits, not container policy.
     // compose specs return before the OCI reuse probe.
+    // egress is always None until WS04-P2-08, which fingerprints it (v3) when
+    // it first sets it (WS00-P1-03 pins the v2 value in the tests below).
 
     let digest = Sha256::digest(encoded);
     let mut hex = String::with_capacity(64);
@@ -204,7 +206,7 @@ pub fn policy_fingerprint(spec: &SandboxSpec, vpn_join: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::policy_fingerprint;
-    use crate::config::{FileAccess, Network};
+    use crate::config::Network;
     use crate::config::{VpnDnsMode, VpnMode, VpnOnError, VpnProviderKind};
     use crate::placement::{Placement, SshPlacement, TransportKind};
     use crate::sandbox::{Backend, Mount, SandboxLimits, SandboxSpec, VpnParams, VpnSpec};
@@ -215,7 +217,6 @@ mod tests {
     fn spec() -> SandboxSpec {
         SandboxSpec {
             backend: Backend::Podman,
-            placement: Placement::Local,
             image: Some("img:latest".into()),
             worktree: PathBuf::from("/wt/feat"),
             mounts: vec![Mount {
@@ -224,34 +225,8 @@ mod tests {
                 ro: false,
                 cache: false,
             }],
-            env: Vec::new(),
-            env_overrides: std::collections::HashMap::new(),
-            env_block: Vec::new(),
-            network: Network::Nat,
-            network_allow: Vec::new(),
-            network_block: Vec::new(),
-            read_only_root: false,
-            no_new_privileges: false,
-            pids_limit: None,
-            drop_capabilities: Vec::new(),
-            add_capabilities: Vec::new(),
-            file_access: FileAccess::WorktreePlusCaches,
-            ports: Vec::new(),
-            gpu: None,
-            limits: SandboxLimits::default(),
-            volumes: Vec::new(),
-            compose: None,
-            build: None,
-            init_script: None,
-            devenv: false,
-            devenv_path: None,
             name: "thegn-repo-feat".into(),
-            vpn: None,
-            oci_host: None,
-            oci_runtime: None,
-            daemon_persistent: false,
-            seal_home: None,
-            volume_owners: Vec::new(),
+            ..SandboxSpec::default()
         }
     }
 
@@ -478,6 +453,20 @@ mod tests {
         assert_eq!(
             policy_fingerprint(&original, false),
             policy_fingerprint(&changed, false)
+        );
+    }
+
+    /// WS00-P1-03: adding `SandboxSpec.egress` (always `None`) must not move
+    /// any fingerprint, or every retained container would look policy-changed
+    /// and be recreated. The hex is the v2 value of `spec()` from before the
+    /// field existed.
+    #[test]
+    fn policy_fingerprint_unchanged_with_egress_none() {
+        let spec = spec();
+        assert!(spec.egress.is_none());
+        assert_eq!(
+            policy_fingerprint(&spec, false),
+            "cceb45a9c14b9028436f44518f525de0693a6e8195c5b8ca3b7e15f665256e7f"
         );
     }
 

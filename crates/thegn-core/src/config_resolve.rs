@@ -1158,6 +1158,27 @@ impl Config {
                         .retain(|id| !id.trim().starts_with("plugin:"));
                     default_was_plugin || self.apps.tab_order.len() != order_len
                 }
+                // Programme features (WS00-P1-01): nothing configurable exists
+                // yet, so there is nothing to neutralise. Each owner item fills
+                // its own arm when it adds the keys the feature gates.
+                // filled by WS02-P4-01
+                Feature::SandboxBackends => false,
+                // filled by WS03-P2-03b
+                Feature::LinuxConfine => false,
+                // filled by WS04-P1-09
+                Feature::EgressProxy => false,
+                // filled by WS05-P2-06
+                Feature::Seatbelt => false,
+                // filled by WS06-P4-05
+                Feature::WinIsolation => false,
+                // filled by WS10-P8-04
+                Feature::PluginBackends => false,
+                // filled by WS11-P1-07
+                Feature::AgentPresets => false,
+                // filled by the WS11 private-copy items (WS11-P3-06c)
+                Feature::PrivateCopy => false,
+                // filled by WS11-P5-06
+                Feature::Escalation => false,
             };
             if changed {
                 clamped.push(feat);

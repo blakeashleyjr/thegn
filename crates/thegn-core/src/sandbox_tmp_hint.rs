@@ -106,9 +106,7 @@ pub fn warning_lines(env_name: &str, paths: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Network;
-    use crate::placement::Placement;
-    use crate::sandbox::{Backend, Mount, SandboxLimits};
+    use crate::sandbox::{Backend, Mount};
     use std::path::PathBuf;
 
     #[test]
@@ -253,7 +251,6 @@ mod tests {
     fn spec(backend: Backend, file_access: FileAccess, read_only_root: bool) -> SandboxSpec {
         SandboxSpec {
             backend,
-            placement: Placement::Local,
             image: Some("img:latest".into()),
             worktree: PathBuf::from("/wt/feat"),
             mounts: vec![Mount {
@@ -262,34 +259,10 @@ mod tests {
                 ro: false,
                 cache: false,
             }],
-            env: Vec::new(),
-            env_overrides: std::collections::HashMap::new(),
-            env_block: Vec::new(),
-            network: Network::Nat,
-            network_allow: Vec::new(),
-            network_block: Vec::new(),
             read_only_root,
-            no_new_privileges: false,
-            pids_limit: None,
-            drop_capabilities: Vec::new(),
-            add_capabilities: Vec::new(),
             file_access,
-            ports: Vec::new(),
-            gpu: None,
-            limits: SandboxLimits::default(),
-            volumes: Vec::new(),
-            compose: None,
-            build: None,
-            init_script: None,
-            devenv: false,
-            devenv_path: None,
             name: "thegn-test".into(),
-            vpn: None,
-            oci_host: None,
-            oci_runtime: None,
-            daemon_persistent: false,
-            seal_home: None,
-            volume_owners: Vec::new(),
+            ..SandboxSpec::default()
         }
     }
 }
