@@ -266,7 +266,7 @@ mod tests {
         )
         .await;
         refused_with_request(first, &ids.2);
-        assert_eq!(pending(&svc).await, [ids.clone()]);
+        assert_eq!(pending(&svc).await, std::slice::from_ref(&ids));
         assert_eq!(
             describe(&ids.0, &ids.1, &ids.2).as_deref(),
             Some("issues.comment on linear:THE-1: ship it")
