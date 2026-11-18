@@ -468,17 +468,22 @@ fn refresh_repo_inner(
         return summary;
     }
     let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+    // Only the background producer yields; an explicit refresh (report set) runs as before.
+    let yield_to_daemon = site == RefreshSite::Ui
+        && report.is_none()
+        && crate::producer_yield::daemon_owns(thegn_core::producer_lease::ProducerKind::Tracker);
+    let plugin_accounts: std::collections::HashSet<String> =
+        crate::plugin_providers::issue_backends()
+            .into_iter()
+            .map(|(account, _)| account)
+            .collect();
     if site == RefreshSite::Ui {
         // The daemon refreshes each repo's main checkout, so it only keeps
         // THIS cache key warm when the UI is on that checkout; a linked
         // worktree's own key still needs the UI's pass. Plugin issue
         // providers live only in the UI process (the daemon cannot reach
         // them), so a UI with any keeps its own pass too.
-        let daemon_covers = repo_root == cwd
-            && crate::plugin_providers::issue_backends().is_empty()
-            && crate::producer_yield::daemon_owns(
-                thegn_core::producer_lease::ProducerKind::Tracker,
-            );
+        let daemon_covers = yield_to_daemon && repo_root == cwd && plugin_accounts.is_empty();
         if !should_fetch(site, daemon_covers) {
             if let Some(w) = waker {
                 let _ = w.wake(); // best-effort: waker pulse: the hydration pass re-reads the daemon-written cache
@@ -549,6 +554,11 @@ fn refresh_repo_inner(
     let mut changed = false;
     let shared = shared_issue_ids(&per_provider);
     for (account, provider, result) in per_provider {
+        // The daemon produces non-plugin accounts while it holds the lease.
+        let daemon_produces = yield_to_daemon && !plugin_accounts.contains(&account);
+        if daemon_produces && repo_root == cwd {
+            continue; // the daemon writes and diffs this cache row
+        }
         let issues = match result {
             Ok(issues) => {
                 any_success = true;
@@ -629,19 +639,21 @@ fn refresh_repo_inner(
                 summary.events += 1;
             }
         }
-        crate::automation_issue::emit_matched(
-            &db,
-            &crate::automation_issue::IssueRefresh {
-                cfg: app_cfg,
-                repo_key: &repo_key,
-                provider,
-                account: &account,
-                assignee_me: cfg.filter_assignee_me,
-                had_cache,
-            },
-            &old_issues,
-            &issues,
-        );
+        if !daemon_produces {
+            crate::automation_issue::emit_matched(
+                &db,
+                &crate::automation_issue::IssueRefresh {
+                    cfg: app_cfg,
+                    repo_key: &repo_key,
+                    provider,
+                    account: &account,
+                    assignee_me: cfg.filter_assignee_me,
+                    had_cache,
+                },
+                &old_issues,
+                &issues,
+            );
+        }
         // Overdue is re-derived (not diffed) each refresh; the store-side
         // emit-once (`put_notification_once`) keeps it to one row per
         // (issue, due date).
@@ -661,21 +673,23 @@ fn refresh_repo_inner(
         // on `spawn_blocking`); autopilot claims here but schedules each slow
         // agent on its own bounded background worker. It receives filter
         // provenance rather than guessing consent from issue display fields.
-        route_pickup(
-            site,
-            &PickupArgs {
-                cfg: app_cfg,
-                repo_root: &repo_root,
-                cwd: &cwd,
-                account: &account,
-                provider,
-                issues: &issues,
-                from_assignee_me: cfg.filter_assignee_me,
-            },
-            &ui_pickup,
-            &daemon_pickup,
-            &repo_autopilot_enabled,
-        );
+        if !daemon_produces {
+            route_pickup(
+                site,
+                &PickupArgs {
+                    cfg: app_cfg,
+                    repo_root: &repo_root,
+                    cwd: &cwd,
+                    account: &account,
+                    provider,
+                    issues: &issues,
+                    from_assignee_me: cfg.filter_assignee_me,
+                },
+                &ui_pickup,
+                &daemon_pickup,
+                &repo_autopilot_enabled,
+            );
+        }
     }
     let failure_only = !any_success && !failures.is_empty();
     if failure_only {
@@ -1437,5 +1451,13 @@ mod tests {
             let at = body.find(call).unwrap_or_else(|| panic!("{call} missing"));
             assert!(yield_at < at && ret_at < at, "{call} runs before the yield");
         }
+        let owns_at = body.find(concat!("daemon_", "owns(")).unwrap();
+        let router_at = body
+            .find(concat!("IssueRouter::", "from_config_at("))
+            .unwrap();
+        assert!(
+            owns_at < router_at,
+            "the lease check runs after the router is built"
+        );
     }
 }
