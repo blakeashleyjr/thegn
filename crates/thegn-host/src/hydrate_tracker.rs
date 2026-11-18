@@ -1424,7 +1424,8 @@ mod tests {
         assert!(should_fetch(RefreshSite::Ui, false));
         assert!(should_fetch(RefreshSite::Daemon, true));
         assert!(should_fetch(RefreshSite::Daemon, false));
-        assert!(RefreshSummary::YIELDED.yielded);
+        let yielded = RefreshSummary::YIELDED;
+        assert!(yielded.yielded);
         assert_eq!(RefreshSummary::YIELDED.accounts_ok, 0);
         assert_eq!(RefreshSummary::YIELDED.events, 0);
     }
