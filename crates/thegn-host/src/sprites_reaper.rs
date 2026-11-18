@@ -10,9 +10,10 @@
 //!   all for that account (an absent sprite cannot be judged);
 //! - only ledger records under this host's scope are considered (a sprite with
 //!   no record of ours is never touched);
-//! - a `ready` record older than the ceiling by **its own** `created_at` (adopt
-//!   writes `now`, so lifetime counts from adoption) whose sprite is listed
-//!   with a known status other than `running` is destroyed through
+//! - a `ready` record older than the ceiling, aged from the later of the API
+//!   `created_at` and its own (adopt writes `now`, so lifetime counts from
+//!   adoption), whose sprite is listed
+//!   with status `cold` or `warm` is destroyed through
 //!   `SpritesProvider::destroy` (which proves ownership again itself);
 //! - a `running` one is skipped and warned about once per sprite per process;
 //! - a `creating` record over an hour old whose sprite is absent, and a
@@ -233,9 +234,9 @@ pub(crate) enum Decision {
 /// partial or unknown one is never classified: the pass skips the account).
 /// `row` is the record's sprite in the listing, if listed. Mirrors
 /// `cmd::env_reap::sprites::reap`'s record branch (a private module there;
-/// copied rather than widened), except that age is the record's
-/// `created_at`, not the API's, so an adopted sprite's lifetime starts at
-/// adoption.
+/// copied rather than widened). A listed sprite is aged from the later of the
+/// API `created_at` and the record's (as `env reap`), so an adopted sprite's
+/// lifetime starts at adoption.
 pub(crate) fn classify(
     record: &VpsRecord,
     row: Option<&SandboxInfo>,
@@ -250,6 +251,18 @@ pub(crate) fn classify(
     };
     match row {
         Some(row) => {
+            let record_ms = if record.created_at > 0 {
+                record.created_at.checked_mul(1000)
+            } else {
+                None
+            };
+            let start_ms = match (row.created_at_ms, record_ms) {
+                (Some(api), Some(rec)) => Some(api.max(rec)),
+                (api, rec) => api.or(rec),
+            };
+            let age_secs = start_ms
+                .and_then(|start| now_ms.checked_sub(start))
+                .map(|ms| ms.div_euclid(1000));
             // A `creating` record with a listed sprite is a create in flight
             // (or one that crashed after the POST): never judged here.
             if record.state != "ready" {
@@ -263,8 +276,14 @@ pub(crate) fn classify(
             }
             match row.state.as_deref().map(str::trim) {
                 Some(status) if status.eq_ignore_ascii_case("running") => Decision::SkipRunning,
-                Some(status) if !status.is_empty() => Decision::Destroy,
-                // Unknown status: not proven idle.
+                // Only a status known to be idle is reaped; anything else is not
+                // proven idle.
+                Some(status)
+                    if status.eq_ignore_ascii_case("cold")
+                        || status.eq_ignore_ascii_case("warm") =>
+                {
+                    Decision::Destroy
+                }
                 _ => Decision::Keep,
             }
         }
@@ -501,6 +520,33 @@ mod tests {
                 Some(row("a", None)),
                 3600,
                 Decision::Keep,
+            ),
+            (
+                "unrecognised status kept",
+                rec("a", "ready", old),
+                Some(row("a", Some("starting"))),
+                3600,
+                Decision::Keep,
+            ),
+            (
+                "old sprite adopted recently kept",
+                rec("a", "ready", NOW_S - 600),
+                Some(SandboxInfo {
+                    created_at_ms: Some(NOW_MS - 50 * 3_600_000),
+                    ..row("a", Some("warm"))
+                }),
+                3600,
+                Decision::Keep,
+            ),
+            (
+                "api and record both old destroyed",
+                rec("a", "ready", old),
+                Some(SandboxInfo {
+                    created_at_ms: Some(NOW_MS - 50 * 3_600_000),
+                    ..row("a", Some("warm"))
+                }),
+                3600,
+                Decision::Destroy,
             ),
             (
                 "unknown record age kept",
