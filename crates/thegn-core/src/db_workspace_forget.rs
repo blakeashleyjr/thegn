@@ -199,8 +199,7 @@ impl Db {
             .list_dispatches()?
             .into_iter()
             .filter(|dispatch| {
-                !dispatch.status.is_terminal()
-                    && paths.iter().any(|path| *path == dispatch.worktree_path)
+                !dispatch.status.is_terminal() && paths.contains(&dispatch.worktree_path)
             })
             .map(|dispatch| (dispatch.id, dispatch.status))
             .collect())

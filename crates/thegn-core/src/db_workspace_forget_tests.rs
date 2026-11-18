@@ -94,7 +94,7 @@ fn seed(db: &Db, repo: &str, slug: &str) -> (String, i64) {
             params![format!("approval-{slug}"), repo],
         )
         .unwrap();
-    let key = AutopilotIssueKey::new("linear", "work", &format!("AP-{slug}"));
+    let key = AutopilotIssueKey::new("linear", "work", format!("AP-{slug}"));
     assert!(matches!(
         db.claim_autopilot(&key, repo, 5, 5, 1).unwrap(),
         ClaimOutcome::Claimed(_)
