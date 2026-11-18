@@ -9498,7 +9498,10 @@ async fn event_loop<T: Terminal>(
                 crate::perf_log::emit(log_stats);
             }
         }
-        if session.worktrees.is_empty() {
+        // A landing switch in flight (the active project was just removed)
+        // leaves the session empty until the next project loads — that is
+        // not "last worktree closed".
+        if session.worktrees.is_empty() && !pending_switch.in_flight() {
             shutdown_shares(&mut share_supervisor);
             return Ok(()); // last worktree closed
         }
@@ -10321,7 +10324,7 @@ async fn event_loop<T: Terminal>(
         // launch splash is up (dormant) nothing is forked — the first
         // keypress/center click clears `center_dormant` and the next loop turn
         // materializes the shell.
-        if !center_dormant && first_frame_logged {
+        if !center_dormant && first_frame_logged && !session.worktrees.is_empty() {
             let (name, path, ti, is_terminal) = {
                 let g = &mut session.worktrees[session.active];
                 let ti = g.active_tab.min(g.tabs.len().saturating_sub(1));
@@ -10600,7 +10603,7 @@ async fn event_loop<T: Terminal>(
             crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
         }
-        if session.worktrees.is_empty() {
+        if session.worktrees.is_empty() && !pending_switch.in_flight() {
             return Ok(());
         }
 
