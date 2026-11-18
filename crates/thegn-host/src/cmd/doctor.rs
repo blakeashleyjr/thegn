@@ -2178,6 +2178,48 @@ fn doctor_json_exposes_monitor_collector_health_for_every_id() {
     );
 }
 
+#[cfg(test)]
+#[test]
+fn doctor_json_reports_the_instance_identity() {
+    let config_dir = std::env::temp_dir().join("thegn-doctor-instance-config");
+    let config_dir_str = config_dir.to_str().expect("temp dir is UTF-8").to_string();
+    let state = crate::testenv::IsolatedState::with_env(&[(
+        thegn_core::util::THEGN_CONFIG_DIR_ENV,
+        config_dir_str.as_str(),
+    )]);
+    let report = doctor_json(&Config::default());
+    let instance = report["instance"].as_object().expect("instance object");
+    for key in [
+        "binary",
+        "config_dir",
+        "state_dir",
+        "thegn_dir",
+        "channel",
+        "daemon_socket",
+    ] {
+        assert!(instance[key].is_string(), "{key}: {}", instance[key]);
+    }
+    assert_eq!(instance["config_dir"], config_dir_str.as_str());
+    assert_eq!(
+        instance["state_dir"],
+        state
+            .state_home()
+            .join("thegn")
+            .display()
+            .to_string()
+            .as_str()
+    );
+    assert_eq!(
+        instance["thegn_dir"],
+        state.thegn_dir().display().to_string().as_str()
+    );
+    assert_eq!(
+        instance["channel"],
+        crate::channel_state::current().as_str()
+    );
+    instance_report(&Config::default());
+}
+
 /// `--json` twin of [`system_metrics_report`]: one object keyed by family with
 /// `available` and, when absent, a `reason`.
 fn system_metrics_json(cfg: &Config) -> serde_json::Value {
@@ -2836,6 +2878,63 @@ fn build_parity_lines() {
     }
 }
 
+/// Which thegn instance this is: the paths that tell a stable and a dev
+/// instance apart on one machine (binary, config dir, state dir, `THEGN_DIR`,
+/// channel, daemon socket). Read-only path resolution: never fails.
+struct InstanceInfo {
+    binary: String,
+    config_dir: String,
+    state_dir: String,
+    thegn_dir: String,
+    channel: String,
+    daemon_socket: String,
+}
+
+fn instance_info(cfg: &Config) -> InstanceInfo {
+    let binary = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("(unknown: {error})"));
+    InstanceInfo {
+        binary,
+        config_dir: thegn_core::util::thegn_config_dir().display().to_string(),
+        state_dir: thegn_core::util::xdg_state_home()
+            .join("thegn")
+            .display()
+            .to_string(),
+        thegn_dir: thegn_core::util::thegn_dir().display().to_string(),
+        channel: crate::channel_state::current().as_str().to_string(),
+        daemon_socket: crate::daemon::socket_path(&cfg.daemon)
+            .display()
+            .to_string(),
+    }
+}
+
+/// Human `doctor` block for [`instance_info`].
+fn instance_report(cfg: &Config) {
+    let info = instance_info(cfg);
+    outln!("Instance");
+    outln!("  binary        {}", info.binary);
+    outln!("  config dir    {}", info.config_dir);
+    outln!("  state dir     {}", info.state_dir);
+    outln!("  THEGN_DIR     {}", info.thegn_dir);
+    outln!("  channel       {}", info.channel);
+    outln!("  daemon socket {}", info.daemon_socket);
+    outln!("");
+}
+
+/// `doctor --json` `instance` object for [`instance_info`].
+fn instance_json(cfg: &Config) -> serde_json::Value {
+    let info = instance_info(cfg);
+    serde_json::json!({
+        "binary": info.binary,
+        "config_dir": info.config_dir,
+        "state_dir": info.state_dir,
+        "thegn_dir": info.thegn_dir,
+        "channel": info.channel,
+        "daemon_socket": info.daemon_socket,
+    })
+}
+
 /// Report thegn's own identity: version, channel, build, OS, the daemon's
 /// version + reachability, the `[log]` sinks with sizes/caps, and recent crash
 /// reports — the first questions any bug report needs answered.
@@ -2973,6 +3072,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
     let probe = crate::probe::probe_outer_terminal_cli();
     let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
     serde_json::json!({
+        "instance": instance_json(cfg),
         "identification": identification_json(cfg),
         "channel": channel_json(),
         "completions": completions_json(),
@@ -3516,6 +3616,7 @@ pub fn run(
     let show = |k: &str, v: &Option<String>| {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
+    instance_report(cfg);
     identification_report(cfg);
     let voice = super::voice::status(&cfg.voice);
     outln!("Voice");
@@ -4425,6 +4526,7 @@ fn paths_report(cfg: &Config) {
     for (label, var) in [
         ("XDG_STATE_HOME", "XDG_STATE_HOME"),
         ("XDG_CONFIG_HOME", "XDG_CONFIG_HOME"),
+        ("THEGN_CONFIG_DIR", "THEGN_CONFIG_DIR"),
         ("THEGN_DIR", "THEGN_DIR"),
         ("THEGN_PROFILE", "THEGN_PROFILE"),
     ] {

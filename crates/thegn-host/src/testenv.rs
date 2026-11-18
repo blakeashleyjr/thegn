@@ -136,6 +136,17 @@ impl IsolatedState {
             }
         }
         vars.push(("THEGN_DIR", temp.path().join(".thegn")));
+        // An empty value is ignored, so the config dir follows the isolated
+        // config home even when the ambient shell sets one.
+        if !extra
+            .iter()
+            .any(|(key, _)| *key == thegn_core::util::THEGN_CONFIG_DIR_ENV)
+        {
+            vars.push((
+                thegn_core::util::THEGN_CONFIG_DIR_ENV,
+                std::path::PathBuf::new(),
+            ));
+        }
         if runtime_dir {
             vars.push(("XDG_RUNTIME_DIR", temp.path().to_path_buf()));
         }
