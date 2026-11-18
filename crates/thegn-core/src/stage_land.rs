@@ -65,7 +65,7 @@ pub const RULE_ORIGIN: &str =
 pub const NOT_REVIEWED: &str =
     "no reviewed stage passed: the terminal stage is the chart's first stage";
 pub const TERMINAL_NOT_DONE: &str = "the terminal stage's row is not done";
-pub const REPORT_INVALID: &str = "the terminal stage's report is missing or invalid";
+pub const REPORT_INVALID: &str = "the terminal stage's report is missing, invalid or not PASS";
 pub const VALIDATIONS_NOT_GREEN: &str = "not every stage's validation is green at the current head";
 /// Check 4's refusal.
 pub const HEAD_MOVED: &str = "the lane's head moved since it was planned";
