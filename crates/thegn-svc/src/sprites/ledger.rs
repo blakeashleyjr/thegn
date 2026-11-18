@@ -151,10 +151,10 @@ pub fn prove_owned(scope: &OwnerScope, name: &str, legacy_ids: &[String]) -> Res
 ///
 /// - a sprites record under `scope` → [`Proof::Ledger`];
 /// - any other record (another controller, account or provider) → refused;
-/// - no record, and `name` is in `legacy_ids` or (for the host's own ledger
-///   directory only) a worktree location row in the state DB names it → a
-///   `ready` record is written (adopted) and
-///   [`Proof::Legacy`] returned;
+/// - no record, and (for the host's own ledger directory only) the one-time
+///   [`adopt_legacy_once_at`] adopted it from a pre-ledger worktree row, or
+///   `name` is in `legacy_ids` (a `ready` record is written) →
+///   [`Proof::Legacy`];
 /// - otherwise refused. An unreadable record or ledger refuses too.
 pub fn prove_owned_at(
     dir: &Path,
@@ -177,14 +177,25 @@ pub fn prove_owned_at(
         Some(_) => bail!(
             "sprites: {name} is recorded by another controller/account; refusing to treat it as ours"
         ),
-        None => {}
+        None => {
+            // The state DB backs only the host's own ledger, and only the
+            // worktree rows that existed at the first ledger use (adopted
+            // once): a row written later (user config can name any sprite)
+            // proves nothing. An explicit ledger directory (tests, a foreign
+            // root) is proven by `legacy_ids` alone.
+            if dir == registry::state_dir().as_path() {
+                adopt_legacy_once_at(dir, scope).context(
+                    "sprites: cannot adopt pre-ledger sprites from worktree rows; refusing",
+                )?;
+                if let Some(r) = registry::read_checked_at(dir, name)?
+                    && in_scope(&r, scope)
+                {
+                    return Ok(Proof::Legacy);
+                }
+            }
+        }
     }
-    // The state DB backs only the host's own ledger: an explicit ledger
-    // directory (tests, a foreign root) is proven by `legacy_ids` alone.
-    // `state_dir` is a pure path (no legacy promotion side effect); a ledger
-    // still served from the legacy location just gets no DB proof (fail closed).
-    let legacy = legacy_ids.iter().any(|id| id == name)
-        || (dir == registry::state_dir().as_path() && db_names_sprite(name));
+    let legacy = legacy_ids.iter().any(|id| id == name);
     if !legacy {
         bail!(
             "sprites: thegn has no record of creating {name}; refusing to delete it. Delete it in the Sprites dashboard if it is yours."
@@ -203,16 +214,38 @@ pub fn prove_owned_at(
     Ok(Proof::Legacy)
 }
 
-/// Whether a worktree location row in this host's state DB names sprite
-/// `name`. Any DB failure is "not proven" (fail closed), logged once per call.
-fn db_names_sprite(name: &str) -> bool {
-    match legacy_ids_from_db() {
-        Ok(ids) => ids.iter().any(|id| id == name),
-        Err(error) => {
-            tracing::warn!(target: "thegn::sprites", error = %format!("{error:#}"), "sprites: cannot read worktree locations for the legacy ownership proof");
-            false
+/// Adopt every sprite this host's worktree rows name into the ledger, once
+/// per ledger directory (a marker file records it). Rows written after the
+/// first adoption prove nothing.
+pub fn adopt_legacy_once(scope: &OwnerScope) -> Result<()> {
+    adopt_legacy_once_at(&registry::dir(), scope)
+}
+
+/// [`adopt_legacy_once`] against an explicit ledger directory. A store error
+/// leaves the marker unwritten (the next call retries).
+pub fn adopt_legacy_once_at(dir: &Path, scope: &OwnerScope) -> Result<()> {
+    if std::fs::symlink_metadata(dir.join(registry::SPRITES_LEGACY_MARKER)).is_ok() {
+        return Ok(());
+    }
+    let ids = legacy_ids_from_db()?;
+    for id in ids {
+        if registry::read_checked_at(dir, &id)?.is_some() {
+            continue;
+        }
+        match registry::reserve_at(
+            dir,
+            &record(scope, &id, "ready", thegn_core::util::now()),
+            usize::MAX,
+            ReserveScope::Provider(LEDGER_PROVIDER),
+        ) {
+            Ok(())
+            | Err(ReserveError::OwnedByOther { .. })
+            | Err(ReserveError::OtherAccount { .. })
+            | Err(ReserveError::AtCap { .. }) => {}
+            Err(ReserveError::Store(e)) => return Err(e),
         }
     }
+    registry::open_lock_at(dir, registry::SPRITES_LEGACY_MARKER).map(drop)
 }
 
 /// The sprite names this host's worktree location rows name (the legacy
@@ -498,6 +531,17 @@ mod tests {
             Proof::Legacy
         );
         assert!(prove_owned_at(&host, &scope(), "sx-other", &[]).is_err());
+        // A row written after the one-time adoption proves nothing.
+        let late = serde_json::json!({
+            "control_prefix": ["/nix/store/x/bin/thegn", "sprite-exec", "sx-late", "--"],
+            "path": "/workspace",
+        })
+        .to_string();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/late", "feat", Some(&late), None)
+            .unwrap();
+        drop(db);
+        assert!(prove_owned_at(&host, &scope(), "sx-late", &[]).is_err());
     }
 
     #[test]

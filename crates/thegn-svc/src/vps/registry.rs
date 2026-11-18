@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 pub const RESERVE_LOCK: &str = ".reserve.lock";
 pub const MACHINE0_CREATE_LOCK: &str = ".machine0-create.lock";
+pub const SPRITES_LEGACY_MARKER: &str = ".sprites-legacy-adopted";
 pub const BAKE_NAME_PREFIX: &str = "tg-bake-";
 
 #[derive(Debug, Default)]
@@ -304,7 +305,10 @@ fn open_root(d: &Path, create: bool) -> Result<Option<thegn_core::fsperm::Privat
 /// Open a supported registry lock file without following symlinks.
 pub fn open_lock_at(d: &Path, lock_name: &str) -> Result<std::fs::File> {
     anyhow::ensure!(
-        matches!(lock_name, RESERVE_LOCK | MACHINE0_CREATE_LOCK),
+        matches!(
+            lock_name,
+            RESERVE_LOCK | MACHINE0_CREATE_LOCK | SPRITES_LEGACY_MARKER
+        ),
         "vps registry: unsupported lock name"
     );
     let root = open_root(d, true)?.ok_or_else(|| {

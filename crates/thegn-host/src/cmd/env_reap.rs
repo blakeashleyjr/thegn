@@ -642,7 +642,21 @@ mod sprites {
         } else {
             None
         };
-        let legacy = ledger::legacy_ids_from_db().map_err(|error| format!("{error:#}"));
+        // Adopt pre-ledger sprites once (they then prove as `ledger`); a
+        // worktree row written later proves nothing.
+        let mut adopt_error: Option<String> = None;
+        for env in &envs {
+            if let Some(scope) = env.api.as_deref().and_then(|api| api.scope())
+                && let Err(error) = ledger::adopt_legacy_once(&scope)
+                && adopt_error.is_none()
+            {
+                adopt_error = Some(format!("{error:#}"));
+            }
+        }
+        let legacy = match adopt_error {
+            Some(error) => Err(error),
+            None => Ok(Vec::new()),
+        };
         let mut ask = |prompt: &str| super::tty_prompt(prompt);
         let report = reap(
             &envs,
@@ -834,6 +848,11 @@ mod sprites {
                     }
                     // Absence is evidence only from a complete listing.
                     None if whole => {
+                        // A record written after the listing (a create that
+                        // committed meanwhile) is not evidence of absence.
+                        if record.created_at.saturating_mul(1000) >= now_ms.saturating_sub(60_000) {
+                            continue;
+                        }
                         let created = record_ms(record);
                         let class = if record.state == "creating" {
                             let age_secs = (now_ms / 1000).saturating_sub(record.created_at);
@@ -1017,13 +1036,26 @@ mod sprites {
         }
     }
 
+    /// A terminal-safe table cell: control characters (API text is
+    /// untrusted) become `?`, capped at 64 characters.
+    fn cell(s: &str) -> String {
+        s.chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .take(64)
+            .collect()
+    }
+
     /// The text report (pure).
     pub(super) fn render(report: &SpritesReport) -> String {
         let mut out = Vec::new();
         for account in &report.accounts {
             let envs = account.envs.join(", ");
             out.push(match &account.reason {
-                Some(reason) => format!("sprites ({envs}): listing {}: {reason}", account.listing),
+                Some(reason) => format!(
+                    "sprites ({envs}): listing {}: {}",
+                    account.listing,
+                    cell(reason)
+                ),
                 None => format!("sprites ({envs})"),
             });
             out.push(format!(
@@ -1054,13 +1086,13 @@ mod sprites {
             ];
             for e in &account.entries {
                 rows.push(vec![
-                    e.name.clone(),
+                    cell(&e.name),
                     e.class.label().into(),
-                    e.status.clone(),
+                    cell(&e.status),
                     e.age.clone(),
                     e.proof.into(),
                     e.class.action().unwrap_or("never deleted").into(),
-                    e.note.clone().unwrap_or_default(),
+                    e.note.as_deref().map(cell).unwrap_or_default(),
                 ]);
             }
             for line in crate::cmd::fleet::table(&rows).lines() {
@@ -1093,8 +1125,8 @@ mod sprites {
             for r in &report.results {
                 let what = r.class.action().unwrap_or("skip");
                 match &r.error {
-                    None => out.push(format!("{what}: {}", r.name)),
-                    Some(error) => out.push(format!("failed {what} {}: {error}", r.name)),
+                    None => out.push(format!("{what}: {}", cell(&r.name))),
+                    Some(error) => out.push(format!("failed {what} {}: {error}", cell(&r.name))),
                 }
             }
             out.push(format!(
@@ -1301,6 +1333,24 @@ mod sprites {
             assert!(registry::read_checked("sx-stale").unwrap().is_none());
             assert!(registry::read_checked("sx-fresh").unwrap().is_some());
             assert!(registry::read_checked("sx-young").unwrap().is_some());
+        }
+
+        #[test]
+        fn sprites_reap_spares_a_ready_record_committed_after_the_listing() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            write("sx-just-made", "ready", NOW_MS / 1000, "ctl-a");
+            let fake = fake(Listing::Complete(Vec::new()));
+            let report = reap(
+                &envs(&fake, 3600),
+                Ok(Vec::new()),
+                APPLY_YES,
+                &mut no_tty,
+                NOW_MS,
+            )
+            .unwrap();
+            assert!(report.accounts[0].entries.is_empty(), "{report:?}");
+            assert!(report.results.is_empty());
+            assert!(registry::read_checked("sx-just-made").unwrap().is_some());
         }
 
         #[test]
