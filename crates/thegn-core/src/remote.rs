@@ -85,7 +85,8 @@ impl SshTarget {
     /// [`crate::placement::SshPlacement::ssh_base`], so a placement and a target
     /// built from the same host produce the same command.
     pub fn ssh_base(&self, batch: bool) -> Vec<String> {
-        let mut v = ssh_base(self.port, self.forward_agent, batch);
+        let mux = control_mux(&self.host, self.port);
+        let mut v = ssh_base_with(self.port, self.forward_agent, batch, &mux);
         if let Some(cfg) = &self.ssh_config {
             v.extend(["-F".to_string(), cfg.clone()]);
         }
@@ -100,14 +101,139 @@ impl SshTarget {
     }
 }
 
-/// The ssh argv prefix (without the host) for `port`, with ControlMaster
-/// multiplexing so the panel's frequent git polls reuse one connection.
+/// Whether ssh connection sharing (ControlMaster) is used for one host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlMux {
+    /// Share one master: `template` is the readable ControlPath handed to ssh
+    /// (`ssh-%r@%h:%p`), `concrete` its expansion for this host (master
+    /// hygiene, doctor).
+    Auto {
+        template: PathBuf,
+        concrete: PathBuf,
+    },
+    /// No sharing: `ControlMaster=no`, `ControlPath=none`.
+    Off(MuxOffReason),
+}
+
+/// Why connection sharing is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxOffReason {
+    /// Win32-OpenSSH has no ControlMaster, and the template's `:` is not a
+    /// valid Windows path character.
+    WindowsOpenSsh,
+    /// The socket path would exceed [`SUN_PATH_BUDGET`].
+    PathTooLong,
+    /// The caller knows no host (the bare [`ssh_base`] wrapper).
+    NoHost,
+}
+
+impl MuxOffReason {
+    /// The reason in words, for doctor.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MuxOffReason::WindowsOpenSsh => "Win32-OpenSSH has no ControlMaster",
+            MuxOffReason::PathTooLong => "control socket path too long",
+            MuxOffReason::NoHost => "no host",
+        }
+    }
+}
+
+/// The longest control socket path thegn hands ssh: macOS `sun_path` is 104
+/// bytes including the NUL, ssh appends a 17-byte temporary suffix while
+/// binding, and 2 bytes of margin. Stricter than Linux's 108.
+pub const SUN_PATH_BUDGET: usize = 84;
+
+/// The multiplexing decision for `user`@`host`:`port` on `os`, with sockets
+/// under `run_dir`. Pure. Windows is always off; on Unix a concrete socket
+/// path over [`SUN_PATH_BUDGET`] bytes is off (warned once per process),
+/// otherwise the readable template is used.
+pub fn control_mux_on(
+    os: crate::sandbox_backend::HostOs,
+    run_dir: &Path,
+    user: &str,
+    host: &str,
+    port: u16,
+) -> ControlMux {
+    if os == crate::sandbox_backend::HostOs::Windows {
+        return ControlMux::Off(MuxOffReason::WindowsOpenSsh);
+    }
+    let concrete = run_dir.join(format!("ssh-{user}@{host}:{port}"));
+    if concrete.as_os_str().len() > SUN_PATH_BUDGET {
+        static LONG_PATH_WARN: std::sync::Once = std::sync::Once::new();
+        LONG_PATH_WARN.call_once(|| {
+            tracing::warn!(
+                target: "thegn::ssh",
+                host,
+                budget = SUN_PATH_BUDGET,
+                "ssh control socket path too long; connection sharing is off"
+            );
+        });
+        return ControlMux::Off(MuxOffReason::PathTooLong);
+    }
+    ControlMux::Auto {
+        template: run_dir.join("ssh-%r@%h:%p"),
+        concrete,
+    }
+}
+
+/// [`control_mux_on`] for this host: `user_at_host` is `user@host` or a bare
+/// host (the local `$USER` stands in for `%r`, as ssh's own expansion does in
+/// the common case), sockets under `<thegn_dir>/run`.
+pub fn control_mux(user_at_host: &str, port: u16) -> ControlMux {
+    let (user, bare_host) = match user_at_host.split_once('@') {
+        Some((u, h)) => (u.to_string(), h),
+        None => (std::env::var("USER").unwrap_or_default(), user_at_host),
+    };
+    control_mux_on(
+        crate::sandbox_backend::host_os(),
+        &util::thegn_dir().join("run"),
+        &user,
+        bare_host,
+        port,
+    )
+}
+
+/// The ssh options for a multiplexing decision.
+pub fn mux_args(mux: &ControlMux, persist_secs: u64) -> Vec<String> {
+    match mux {
+        ControlMux::Auto { template, .. } => vec![
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}", template.display()),
+            "-o".into(),
+            format!("ControlPersist={persist_secs}"),
+        ],
+        ControlMux::Off(_) => vec![
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            "ControlPath=none".into(),
+        ],
+    }
+}
+
+/// The ssh argv prefix (without the host) for `port`, with no connection
+/// sharing (the caller knows no host). Every caller that knows its host goes
+/// through [`SshTarget::ssh_base`] or
+/// [`crate::placement::SshPlacement::ssh_base`], which multiplex.
+pub fn ssh_base(port: u16, forward_agent: bool, batch: bool) -> Vec<String> {
+    ssh_base_with(
+        port,
+        forward_agent,
+        batch,
+        &ControlMux::Off(MuxOffReason::NoHost),
+    )
+}
+
+/// The ssh argv prefix (without the host) for `port`, with the multiplexing
+/// decision `mux` so the panel's frequent git polls reuse one connection.
 ///
 /// `batch` is for the *control plane* (git/gh reads, container lifecycle): it adds
 /// `BatchMode=yes` so a missing key fails fast instead of prompting for a password
 /// on a captured (non-interactive) channel and stealing the pane's stdin. The
 /// interactive pane (mosh/ssh) passes `batch = false` so auth prompts still work.
-pub fn ssh_base(port: u16, forward_agent: bool, batch: bool) -> Vec<String> {
+pub fn ssh_base_with(port: u16, forward_agent: bool, batch: bool, mux: &ControlMux) -> Vec<String> {
     let tune = crate::remote_tune::ssh_tune();
     let mut v = vec!["ssh".to_string()];
     if port != 22 {
@@ -134,45 +260,38 @@ pub fn ssh_base(port: u16, forward_agent: bool, batch: bool) -> Vec<String> {
     // at startup, but a headless CLI (`thegn host provision`, `pr`, `diff`, …)
     // can run before that ever happens — ensure it once so ssh can bind the socket
     // (otherwise ControlMaster fails with "cannot bind to path … No such file").
-    {
+    if let ControlMux::Auto { template, .. } = mux {
         static RUN_DIR_ONCE: std::sync::Once = std::sync::Once::new();
-        let rd = util::thegn_dir().join("run");
+        let rd = template
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| util::thegn_dir().join("run"));
         // best-effort: if the mkdir fails, ssh reports the bind error as before.
         RUN_DIR_ONCE.call_once(move || {
             let _ = std::fs::create_dir_all(rd);
         });
     }
-    v.push("-o".into());
-    v.push("ControlMaster=auto".into());
-    v.push("-o".into());
-    v.push(format!("ControlPath={}", control_path_template().display()));
-    v.push("-o".into());
-    v.push(format!("ControlPersist={}", tune.control_persist_secs));
+    v.extend(mux_args(mux, u64::from(tune.control_persist_secs)));
     v
-}
-
-/// The ControlPath *template* handed to ssh (`%r@%h:%p` placeholders intact).
-fn control_path_template() -> PathBuf {
-    util::thegn_dir().join("run").join("ssh-%r@%h:%p")
 }
 
 /// The concrete ControlMaster socket path for a `user@host` + port pair —
 /// the expansion of the `ssh-%r@%h:%p` template ssh binds. Used by master
 /// hygiene (`ssh -O check` / stale-socket unlink); must stay in lockstep with
-/// [`ssh_base`]'s ControlPath.
+/// [`control_mux`]'s ControlPath.
 ///
 /// `host` may be `user@host` or a bare host; ssh expands `%r` to the *remote
 /// user*, which for a bare host is the local username — matching ssh's own
 /// expansion there would require resolving ssh_config, so callers pass the
 /// same `user@host` string they hand to ssh and we mirror the common case.
-pub fn control_path(host: &str, port: u16) -> PathBuf {
-    let (user, bare_host) = match host.split_once('@') {
-        Some((u, h)) => (u.to_string(), h),
-        None => (std::env::var("USER").unwrap_or_default(), host),
-    };
-    util::thegn_dir()
-        .join("run")
-        .join(format!("ssh-{user}@{bare_host}:{port}"))
+///
+/// `None` when connection sharing is off for this host ([`control_mux`]):
+/// there is no socket to check or clear.
+pub fn control_path(host: &str, port: u16) -> Option<PathBuf> {
+    match control_mux(host, port) {
+        ControlMux::Auto { concrete, .. } => Some(concrete),
+        ControlMux::Off(_) => None,
+    }
 }
 
 /// Resolve the remote `$HOME` over ssh, so we can store absolute remote paths
@@ -1437,9 +1556,19 @@ fn tagged_git_path_read_result(
 mod tests {
     use super::*;
 
+    use crate::sandbox_backend::HostOs;
+
+    fn short_run() -> PathBuf {
+        PathBuf::from("/r")
+    }
+
     #[test]
     fn ssh_base_has_keepalives_and_multiplexing() {
-        let joined = ssh_base(22, false, true).join(" ");
+        // A real (short) run dir: the Auto arm creates it once.
+        let dir = tempfile::tempdir().unwrap();
+        let mux = control_mux_on(HostOs::Linux, dir.path(), "u", "h", 22);
+        assert!(matches!(mux, ControlMux::Auto { .. }), "{mux:?}");
+        let joined = ssh_base_with(22, false, true, &mux).join(" ");
         // Keepalives (the flaky-link hardening) ride every control-plane ssh.
         assert!(joined.contains("-o ServerAliveInterval="), "{joined}");
         assert!(joined.contains("-o ServerAliveCountMax="), "{joined}");
@@ -1454,24 +1583,111 @@ mod tests {
     }
 
     #[test]
+    fn no_host_wrapper_is_off() {
+        let joined = ssh_base(22, false, true).join(" ");
+        assert!(joined.contains("-o ServerAliveInterval="), "{joined}");
+        assert!(joined.contains("-o BatchMode=yes"), "{joined}");
+        assert!(joined.contains("-o ControlMaster=no"), "{joined}");
+        assert!(joined.contains("-o ControlPath=none"), "{joined}");
+        assert!(!joined.contains("ControlMaster=auto"), "{joined}");
+        assert!(!joined.contains("ControlPersist="), "{joined}");
+    }
+
+    #[test]
+    fn windows_mux_off_and_no_colon_path() {
+        let mux = control_mux_on(HostOs::Windows, &short_run(), "u", "h", 22);
+        assert_eq!(mux, ControlMux::Off(MuxOffReason::WindowsOpenSsh));
+        let joined = ssh_base_with(22, false, true, &mux).join(" ");
+        assert!(joined.contains("-o ControlMaster=no"), "{joined}");
+        assert!(joined.contains("-o ControlPath=none"), "{joined}");
+        assert!(!joined.contains("%r@%h:%p"), "{joined}");
+    }
+
+    #[test]
+    fn long_run_dir_disables_mux() {
+        // A 90-byte socket path: over the 84-byte budget.
+        let run = PathBuf::from(format!("/{}", "d".repeat(72)));
+        let mux = control_mux_on(HostOs::Linux, &run, "user", "host", 22);
+        assert_eq!(mux, ControlMux::Off(MuxOffReason::PathTooLong));
+        let joined = mux_args(&mux, 300).join(" ");
+        assert!(joined.contains("ControlMaster=no"), "{joined}");
+        // A path of exactly the budget still multiplexes.
+        let exact = PathBuf::from(format!("/{}", "d".repeat(SUN_PATH_BUDGET - 1 - 17)));
+        let concrete = exact.join("ssh-user@host:22");
+        assert_eq!(concrete.as_os_str().len(), SUN_PATH_BUDGET);
+        assert!(matches!(
+            control_mux_on(HostOs::MacOs, &exact, "user", "host", 22),
+            ControlMux::Auto { .. }
+        ));
+    }
+
+    #[test]
+    fn short_path_keeps_readable_template() {
+        let mux = control_mux_on(HostOs::Linux, &short_run(), "u", "h", 2222);
+        assert_eq!(
+            mux,
+            ControlMux::Auto {
+                template: PathBuf::from("/r/ssh-%r@%h:%p"),
+                concrete: PathBuf::from("/r/ssh-u@h:2222"),
+            }
+        );
+        let joined = mux_args(&mux, 300).join(" ");
+        assert!(joined.contains("ControlPath=/r/ssh-%r@%h:%p"), "{joined}");
+        assert!(joined.contains("ControlPersist=300"), "{joined}");
+    }
+
+    #[test]
+    fn control_path_none_when_off() {
+        // Mirrors `control_path`: Some iff the decision is Auto.
+        let auto = control_mux_on(HostOs::Linux, &short_run(), "u", "h", 22);
+        let off = control_mux_on(HostOs::Windows, &short_run(), "u", "h", 22);
+        let path_of = |mux: &ControlMux| match mux {
+            ControlMux::Auto { concrete, .. } => Some(concrete.clone()),
+            ControlMux::Off(_) => None,
+        };
+        assert_eq!(path_of(&auto), Some(PathBuf::from("/r/ssh-u@h:22")));
+        assert_eq!(path_of(&off), None);
+        assert_eq!(
+            MuxOffReason::WindowsOpenSsh.as_str(),
+            "Win32-OpenSSH has no ControlMaster"
+        );
+    }
+
+    #[test]
     fn control_path_expands_the_template() {
-        // user@host form mirrors ssh's %r@%h:%p expansion exactly.
-        let p = control_path("targe@ageless-studio", 22);
-        assert!(
-            p.to_string_lossy()
-                .ends_with("run/ssh-targe@ageless-studio:22"),
-            "{}",
-            p.display()
-        );
-        // Non-default port lands in the :%p slot.
-        let p = control_path("u@h", 2222);
-        assert!(
-            p.to_string_lossy().ends_with("run/ssh-u@h:2222"),
-            "{}",
-            p.display()
-        );
-        // Same parent dir as the template ssh_base hands out.
-        assert_eq!(p.parent(), control_path_template().parent());
+        // On a real host the decision depends on `thegn_dir()`'s length and
+        // the OS; when sharing is on, the path mirrors ssh's %r@%h:%p.
+        if let Some(p) = control_path("targe@ageless-studio", 22) {
+            assert!(
+                p.to_string_lossy()
+                    .ends_with("run/ssh-targe@ageless-studio:22"),
+                "{}",
+                p.display()
+            );
+            assert_eq!(p.parent(), Some(util::thegn_dir().join("run").as_path()));
+        }
+        if let Some(p) = control_path("u@h", 2222) {
+            assert!(
+                p.to_string_lossy().ends_with("run/ssh-u@h:2222"),
+                "{}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_target_base_uses_host_mux() {
+        let target = SshTarget::plain("u@h".into(), 22, false);
+        let joined = target.ssh_base(true).join(" ");
+        // The target goes through the host-aware decision, never `NoHost`.
+        let expected = control_mux("u@h", 22);
+        assert_ne!(expected, ControlMux::Off(MuxOffReason::NoHost));
+        for arg in mux_args(&expected, 0)
+            .iter()
+            .filter(|arg| arg.starts_with("Control") && !arg.starts_with("ControlPersist"))
+        {
+            assert!(joined.contains(arg.as_str()), "{arg} in {joined}");
+        }
     }
 
     #[test]

@@ -29,11 +29,11 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 
 - [x] 4.1 WS01-P4-01: Daytona maintenance flag, doctor line and config example
 - [x] 4.2 WS01-P4-02: Fly stale comments and config text
-- [ ] 4.3 WS01-P4-03: ssh `ControlMux` (Windows off, long paths off)
+- [x] 4.3 WS01-P4-03: ssh `ControlMux` (Windows off, long paths off)
 
 ## 5. Docs, spec and posture
 
-- [ ] 5.1 WS01-P5-01: `docs/ARCHITECTURE.md` truth (seam deviations, gate line)
+- [x] 5.1 WS01-P5-01: `docs/ARCHITECTURE.md` truth (seam deviations, gate line)
 - [ ] 5.2 WS01-P5-02: help, README, config-example and wording sweep
 - [ ] 5.3 WS01-P5-04: fold and archive `mark-unverified-backends` and append its reconciling MODIFIED block
 - [ ] 5.4 WS01-P5-05: security-model help page

@@ -19,7 +19,10 @@ pub(crate) fn master_hygiene(placement: &Placement) {
     let Placement::Ssh(p) = placement else {
         return;
     };
-    let sock = control_path(&p.host, p.port);
+    // Connection sharing off for this host (Windows, long path): no master.
+    let Some(sock) = control_path(&p.host, p.port) else {
+        return;
+    };
     if !sock.exists() {
         return; // nothing to check; ssh will build a fresh master
     }
