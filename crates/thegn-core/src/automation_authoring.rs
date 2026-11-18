@@ -1154,7 +1154,8 @@ mod tests {
                 .map(|level| armed_for(&stored, level))
                 .unwrap_or_default();
             let case = format!("{cap} {declared:?} free={free} armed={armed_at:?}");
-            let (rules, invalid) = compile_lead_rows_armed(&[stored.clone()], &[], &armed);
+            let (rules, invalid) =
+                compile_lead_rows_armed(std::slice::from_ref(&stored), &[], &armed);
             match expected {
                 Some(level) => {
                     assert!(invalid.is_empty(), "{case}: {invalid:?}");

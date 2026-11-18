@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::config_enum;
+use crate::config::{config_enum, config_warn};
 use crate::control::{Scope, ScopeSet};
 
 config_enum! {

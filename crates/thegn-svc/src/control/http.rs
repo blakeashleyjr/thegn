@@ -126,7 +126,7 @@ impl Drop for EventStreamGuard {
 /// rejection.
 pub(super) struct RequestAuth {
     headers: HttpHeaderMap,
-    peer: Option<PeerIdentity>,
+    pub(super) peer: Option<PeerIdentity>,
     admitted_capability: Option<String>,
 }
 

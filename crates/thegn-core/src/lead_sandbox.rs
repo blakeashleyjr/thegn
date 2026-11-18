@@ -319,8 +319,8 @@ pub fn normalize_masks(masked: &[PathBuf]) -> Vec<PathBuf> {
 ///    first);
 /// 4. read-only re-binds of `readable` files;
 /// 5. read-only `file_binds` (host file over its target);
-/// 5a. `/dev/null` over each masked file, after the re-binds so a masked
-///    file inside a re-exposed path stays hidden;
+/// 5. (continued) `/dev/null` over each masked file, after the re-binds, so a
+///    masked file inside a re-exposed path stays hidden;
 /// 6. writable binds (after the masks; `validate` keeps them disjoint from
 ///    every control mask and allows only the re-exposures beneath a state
 ///    mask; bwrap creates their mount points inside the tmpfs);
