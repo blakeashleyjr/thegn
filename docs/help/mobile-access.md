@@ -109,9 +109,11 @@ An answer needs both halves: the inbox secret (to sign) and the nonce (only
 in the push topic). An unknown, used or expired nonce is refused with
 "unknown, used or expired approval code", so a replayed envelope cannot
 resolve twice even across a daemon restart. The decision is recorded with
-approver `push` and has the same effect as `approvals.resolve`. Agents and
-the Lead cannot redeem: the capability is HTTP and CLI only (never MCP) and
-refused for a Lead-confined caller.
+approver `push` and has the same effect as `approvals.resolve`. Agents
+cannot redeem: the capability is never exposed over MCP, and every token
+caller over HTTP, the Lead included, is refused. The only remote path is
+the signed inbox envelope. Never let an agent read the inbox secret: thegn
+hides `env:` and `file:` refs for it and the push tokens from the Lead.
 
 ## A terminal on your phone (mosh)
 

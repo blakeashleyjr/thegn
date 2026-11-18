@@ -181,6 +181,34 @@ mod tests {
     }
 
     #[test]
+    fn a_nonce_dies_when_its_request_is_resolved_elsewhere() {
+        let db = Db::open_memory().unwrap();
+        let now = thegn_core::util::now_ms();
+        store(&db, NONCE, now, now + 60_000);
+        super::super::approvals::resolve_in(
+            &db,
+            &ApprovalResolve {
+                issue_id: "linear:THE-1".into(),
+                stage: "code".into(),
+                commit_sha: SHA.into(),
+                decision: Decision::Reject,
+                approver: "panel".into(),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(
+            redeem_in(&db, &body(NONCE, Decision::Approve), now + 1)
+                .unwrap()
+                .is_none()
+        );
+        let latest = db.latest_approval("linear:THE-1", "code").unwrap();
+        assert!(
+            !thegn_core::pipeline_approval::state_for(latest.as_ref(), SHA, now + 1, 0).is_live()
+        );
+    }
+
+    #[test]
     fn redeem_matches_by_hash_never_by_plaintext() {
         let db = Db::open_memory().unwrap();
         let now = thegn_core::util::now_ms();
