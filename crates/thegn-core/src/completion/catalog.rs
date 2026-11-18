@@ -509,6 +509,9 @@ pub const CATALOG: &[Slot] = &[
     slot("program assign", "repo", SourceKind::Repo),
     slot("repo trust", "path", SourceKind::Repo),
     slot("repo provenance", "path", SourceKind::Repo),
+    // `repo forget`: the workspaces to forget, or (`--keep`) the ones to keep.
+    slot("repo forget", "paths", SourceKind::Repo),
+    slot("repo forget", "keep", SourceKind::Repo),
     // The hidden legacy top-level alias of `repo trust`.
     slot("repo-trust", "path", SourceKind::Repo),
     slot("wt new", "repo", SourceKind::Repo),

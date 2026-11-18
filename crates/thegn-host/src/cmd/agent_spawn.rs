@@ -37,6 +37,8 @@ pub(crate) struct RunArgs {
     pub vars: Vec<String>,
     pub track: Option<String>,
     pub wait: bool,
+    /// `--pull`: fetch sandbox commits back after the observed exit.
+    pub pull: bool,
     pub timeout_secs: u64,
     pub json: bool,
 }
@@ -346,6 +348,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         vars,
         track,
         wait,
+        pull,
         timeout_secs,
         json,
     } = args;
@@ -391,7 +394,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             .await
             .map_err(|e| anyhow::anyhow!("agent run env pin task failed: {e}"))??
     };
-    crate::cmd::env::provision_for_headless_open(cfg, wt).await?;
+    crate::cmd::env::provision_for_headless_open(cfg, wt.clone()).await?;
     let started = Instant::now();
     let (info, row) = crate::cmd::session::open_plain(
         cfg,
@@ -429,8 +432,23 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         observe_until_exit(&client, &info.id, Duration::from_secs(timeout_secs)).await?;
     let duration_ms = thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
     let tail = output_tail(&raw);
+    // `--pull`: only once the agent actually exited (a timed-out session is
+    // still running); a failure never changes the agent's exit code.
+    let pull_outcome = if pull && matches!(status, WaitStatus::Exited(_)) {
+        let cfg = cfg.clone();
+        let wt = wt.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            crate::provider_git::pull_back_if_provider(&cfg, &wt)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("agent run pull task failed: {e}"))
+        .and_then(|r| r);
+        Some(pull_result(res.map(|r| r.map(|rep| rep.summary()))))
+    } else {
+        None
+    };
     if json {
-        crate::cmd::emit_json(&serde_json::json!({
+        let mut obj = serde_json::json!({
             "session": info.id,
             "row": row,
             "env": pinned,
@@ -438,7 +456,11 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             "exit_code": status.exit_code(),
             "output_tail": tail,
             "duration_ms": duration_ms,
-        }))?;
+        });
+        if let (Some(p), Some(map)) = (&pull_outcome, obj.as_object_mut()) {
+            map.insert("pull".to_string(), p.json());
+        }
+        crate::cmd::emit_json(&obj)?;
     } else {
         if !tail.is_empty() {
             outln!("{tail}");
@@ -457,8 +479,58 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         if let Some(row) = row {
             outln!("dispatch {row} tracked");
         }
+        if let Some(p) = &pull_outcome {
+            outln!("{}", p.line());
+        }
     }
     Ok(process_exit_code(status))
+}
+
+/// What `--pull` did after the agent exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullOutcome {
+    pub ok: bool,
+    /// The pull summary (`fast-forwarded …`, `up to date`, or a note that
+    /// there was nothing to pull); `None` on failure.
+    pub reference: Option<String>,
+    pub error: Option<String>,
+}
+
+impl PullOutcome {
+    /// `{"ok":bool,"ref":…,"error":…}`.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "ok": self.ok, "ref": self.reference, "error": self.error })
+    }
+
+    /// The single line printed in text mode.
+    pub(crate) fn line(&self) -> String {
+        match (&self.error, &self.reference) {
+            (Some(e), _) => format!("[agent run: pull failed: {e}]"),
+            (None, Some(r)) => format!("[agent run: pull: {r}]"),
+            (None, None) => "[agent run: pull: nothing to pull]".to_string(),
+        }
+    }
+}
+
+/// Fold a pull result (`Ok(None)` = not provider-bound) into a [`PullOutcome`].
+pub(crate) fn pull_result(res: Result<Option<String>>) -> PullOutcome {
+    match res {
+        Ok(Some(summary)) => PullOutcome {
+            ok: true,
+            reference: Some(summary),
+            error: None,
+        },
+        Ok(None) => PullOutcome {
+            ok: true,
+            reference: None,
+            error: None,
+        },
+        Err(e) => PullOutcome {
+            ok: false,
+            reference: None,
+            error: Some(format!("{e:#}")),
+        },
+    }
 }
 
 /// Exit code of `agent result` while the session is still running.
@@ -698,8 +770,8 @@ async fn observe_until_exit(
 mod tests {
     use super::{
         DEFAULT_TIMEOUT_SECS, EnvChoice, PIPELINE_ENV, TAIL_BYTES, TAIL_LINES, TailRing,
-        WaitStatus, env_choice, output_tail, pin_env_for_run, process_exit_code, strip_ansi,
-        tail_lines,
+        WaitStatus, env_choice, output_tail, pin_env_for_run, process_exit_code, pull_result,
+        strip_ansi, tail_lines,
     };
     use thegn_core::config::Config;
     use thegn_core::db::Db;
@@ -964,6 +1036,7 @@ mod tests {
             wait,
             timeout,
             json,
+            ..
         } = action
         else {
             panic!("expected agent run");
@@ -1212,5 +1285,50 @@ mod tests {
             }
             _ => panic!("expected agent result"),
         }
+    }
+
+    #[test]
+    fn pull_requires_wait_and_parses() {
+        let base = [
+            "thegn",
+            "agent",
+            "run",
+            "--agent",
+            "codex",
+            "--worktree",
+            "/w",
+            "--prompt",
+            "x",
+        ];
+        let mut bad = base.to_vec();
+        bad.push("--pull");
+        assert!(
+            parse(&bad).is_err(),
+            "--pull without --wait must be refused"
+        );
+        let mut ok = base.to_vec();
+        ok.extend(["--wait", "--pull"]);
+        match parse(&ok).expect("parse") {
+            crate::cmd::agent::Action::Run { pull, wait, .. } => assert!(pull && wait),
+            _ => panic!("expected agent run"),
+        }
+    }
+
+    #[test]
+    fn pull_outcome_json_shape_and_line() {
+        let ok = pull_result(Ok(Some("up to date".into())));
+        assert_eq!(
+            ok.json(),
+            serde_json::json!({"ok": true, "ref": "up to date", "error": null})
+        );
+        assert_eq!(ok.line(), "[agent run: pull: up to date]");
+        let none = pull_result(Ok(None));
+        assert!(none.ok && none.reference.is_none());
+        let bad = pull_result(Err(anyhow::anyhow!("boom")));
+        assert_eq!(
+            bad.json(),
+            serde_json::json!({"ok": false, "ref": null, "error": "boom"})
+        );
+        assert_eq!(bad.line(), "[agent run: pull failed: boom]");
     }
 }

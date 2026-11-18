@@ -1,0 +1,26 @@
+//! Sprites (`sprites.dev`) lifecycle pieces that sit beside the
+//! [`SpritesProvider`](crate::provider::SpritesProvider) REST client:
+//!
+//! - [`ledger`]: ownership. A `creating` record is written to the file ledger
+//!   (`vps::registry`, provider `sprites`) **before** `POST /v1/sprites`, and
+//!   `destroy` refuses a sprite this host cannot prove it created.
+//! - [`resources`]: the memory policy (`min_ram_gb` × 1024 MiB).
+//! - [`usage`]: CPU and reserved GB-hours from the Sprites usage API.
+//! - [`hold_api`]: the keep-awake Tasks-API hold constants.
+
+pub mod hold_api;
+pub mod ledger;
+pub mod resources;
+pub mod usage;
+
+/// The borrowed HTTP context one sprite's API calls need: built by
+/// [`SpritesProvider::sprites_http`](crate::provider::SpritesProvider) after the
+/// API base has been validated, so the submodules never see an unchecked base.
+// The resources/usage lanes read every field; the spine stubs read only some.
+#[allow(dead_code)]
+pub(crate) struct SpritesHttp<'a> {
+    pub client: &'a reqwest::Client,
+    pub base: &'a str,
+    pub token: &'a str,
+    pub name: &'a str,
+}
