@@ -61,7 +61,12 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         },
         Command::Automations { action } => match action {
             cmd::automations::Action::Test { .. } => SourceInspection,
-            cmd::automations::Action::List { .. } => Configured,
+            cmd::automations::Action::List { .. }
+            | cmd::automations::Action::Add { .. }
+            | cmd::automations::Action::Rm { .. }
+            | cmd::automations::Action::Runs { .. }
+            | cmd::automations::Action::Pause
+            | cmd::automations::Action::Resume => Configured,
         },
         // Diagnostic and recovery verbs must keep working when the config
         // or the state store is what is broken: doctor/logs report it,
