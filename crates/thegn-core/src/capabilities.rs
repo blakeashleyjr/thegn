@@ -35,14 +35,34 @@ pub enum ProjectionMode {
 }
 
 /// How the single egress policy is realized for this sandbox.
+///
+/// The five variants are the programme's one egress vocabulary (resolutions
+/// B11). `PortPinned` and `Offline` were added by WS00-P1-03 and nothing
+/// constructs them yet; their semantics, and the `egress_for` rules that will
+/// produce them, are owned by WS01-P1-02.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressKind {
     /// thegn owns egress directly — the DNS filter, the VPN sidecar, and the
     /// `tgproxy` chokepoint all run on a host we control.
+    ///
+    /// B11 meaning (WS01-P1-02): a thegn egress datapath with a live,
+    /// authenticated lease is the only route out.
     Enforce,
     /// The policy is *lowered* to a managed provider's own controls (CIDR rules,
     /// credential injection); we cannot run our own datapath inside their box.
+    ///
+    /// B11 meaning (WS01-P1-02): provider- or VMM-native controls that applied
+    /// (and were read back where the provider can), or a manifest-native egress.
     Translate,
+    /// Proxy env plus a kernel pin to the lease port on any address (a
+    /// Landlock-only TCP pin; MXC proxy-only without peer identity). Never a
+    /// boundary; a sealed profile refuses it. Stub variant (WS00-P1-03);
+    /// semantics owned by WS01-P1-02.
+    PortPinned,
+    /// `network = "none"` on a backend whose net isolation is its own network
+    /// namespace or a VM, and verified. `network = "none"` is never reported as
+    /// `Enforce`. Stub variant (WS00-P1-03); semantics owned by WS01-P1-02.
+    Offline,
     /// No egress controls are available for this combination (e.g. the plain
     /// `none` backend with no tunnel).
     Unmanaged,
@@ -356,6 +376,8 @@ impl EgressKind {
         match self {
             EgressKind::Enforce => "enforce",
             EgressKind::Translate => "translate",
+            EgressKind::PortPinned => "port-pinned",
+            EgressKind::Offline => "offline",
             EgressKind::Unmanaged => "unmanaged",
         }
     }
@@ -550,6 +572,53 @@ mod tests {
         assert_eq!(EgressKind::Translate.to_string(), "translate");
         assert_eq!(ObsLevel::StatsOnly.to_string(), "stats_only");
         assert_eq!(IsolationClass::GuestKernel.to_string(), "guest-kernel");
+    }
+
+    #[test]
+    fn egress_kind_strings() {
+        let all = [
+            (EgressKind::Enforce, "enforce"),
+            (EgressKind::Translate, "translate"),
+            (EgressKind::PortPinned, "port-pinned"),
+            (EgressKind::Offline, "offline"),
+            (EgressKind::Unmanaged, "unmanaged"),
+        ];
+        for (kind, text) in all {
+            assert_eq!(kind.as_str(), text);
+            assert_eq!(kind.to_string(), text);
+        }
+    }
+
+    /// WS00-P1-03 adds `PortPinned` and `Offline` as vocabulary only: until
+    /// WS01-P1-02 gives them semantics, no production code may construct them
+    /// (a stub mistaken for enforcement would mislabel a sandbox).
+    #[test]
+    fn no_stub_variant_constructed_in_ws00() {
+        use crate::test_support::ratchet::{code_only, sources};
+        fn production(body: &str) -> &str {
+            body.split_once("\n#[cfg(test)]\nmod tests {")
+                .map(|(production, _)| production)
+                .unwrap_or(body)
+        }
+        for (key, body) in sources(env!("CARGO_MANIFEST_DIR"), &[]) {
+            if key.ends_with("_tests.rs") {
+                continue;
+            }
+            let code = code_only(production(&body));
+            for stub in ["EgressKind::PortPinned", "EgressKind::Offline"] {
+                let allowed = if key == "capabilities.rs" {
+                    // The `EgressKind::as_str` arm.
+                    1
+                } else {
+                    0
+                };
+                assert_eq!(
+                    code.matches(stub).count(),
+                    allowed,
+                    "{key}: {stub} is a WS00 stub; only WS01-P1-02 may construct it"
+                );
+            }
+        }
     }
 
     #[test]

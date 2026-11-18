@@ -171,6 +171,9 @@ impl SessionMeta {
             recording: live.recording.clone(),
             forked_from: self.forked_from.clone(),
             last_output_unix_secs: live.last_output_unix_secs,
+            // The open handler's `honoured` echo (WS00-P1-11); listing rows
+            // never carry one.
+            honoured: Vec::new(),
         }
     }
 }
