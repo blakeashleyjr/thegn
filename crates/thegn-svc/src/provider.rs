@@ -1205,7 +1205,6 @@ impl RemoteProvider for SpritesProvider {
                         Err(_) => false,
                     };
                     if gone {
-                        self.forget_record(&dir, id).await;
                         return Ok(());
                     }
                     return Err(refusal.context(format!("sprites: refusing to delete {id}")));
