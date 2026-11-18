@@ -429,11 +429,14 @@ fn run_once(request: RefreshRequest) {
             continue;
         };
         // Diff old vs new for this account to emit notifications first.
-        let old_issues: Vec<thegn_core::issue::Issue> = db
+        let cached = db
             .get_issue_cache(&repo_key, provider, &account)
             .ok()
-            .flatten()
-            .and_then(|(j, _)| IssueCacheEntry::parse(&j).map(|entry| entry.issues))
+            .flatten();
+        let parsed = cached.and_then(|(j, _)| IssueCacheEntry::parse(&j));
+        let had_cache = parsed.is_some();
+        let old_issues: Vec<thegn_core::issue::Issue> = parsed
+            .map(|entry| entry.issues)
             .unwrap_or_default()
             .into_iter()
             .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())
@@ -442,6 +445,19 @@ fn run_once(request: RefreshRequest) {
             let msg = account_qualified(msg, &source_ref, &shared, &account);
             let _ = crate::automation_events::emit(&db, kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
+        crate::automation_issue::emit_matched(
+            &db,
+            &crate::automation_issue::IssueRefresh {
+                cfg: &app_cfg,
+                repo_key: &repo_key,
+                provider,
+                account: &account,
+                assignee_me: cfg.filter_assignee_me,
+                had_cache,
+            },
+            &old_issues,
+            &issues,
+        );
         // Overdue is re-derived (not diffed) each refresh; the store-side
         // emit-once (`put_notification_once`) keeps it to one row per
         // (issue, due date).
