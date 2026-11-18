@@ -20,9 +20,11 @@ tools.run` action/parameter schema.
 
 ## 2. Remaining typed producers
 
-- [ ] 2.1 Add typed `session_state_changed` and `session_exited` kinds and
-      authoritative edge producers using the existing envelope/origin/audit
-      model.
+- [x] 2.1 Add the typed `session_exited` kind and its authoritative edge
+      producer (every daemon session exit, THE-2192) using the existing
+      envelope/origin/audit model.
+- [ ] 2.1b Add the typed `session_state_changed` kind and its authoritative
+      edge producer using the same model.
 - [ ] 2.2 Add a scheduled-due producer with deterministic no-catch-up and
       skip-while-running auditing; dispatch only through the existing runtime.
 

@@ -234,6 +234,15 @@ pub trait NotificationStore {
     /// stamper, and it never touches the status toward a terminal state.
     fn stamp_dispatch_note(&self, id: i64, note: &str) -> Result<()>;
 
+    /// Record the autonomy ceiling (`propose`/`review`/`merge`, schema v112)
+    /// an automation started this dispatch under. `Ok(false)` when no row has
+    /// `id`. The stage executor enforces the ceiling at land (THE-2195).
+    fn set_dispatch_autonomy(&self, id: i64, autonomy: &str) -> Result<bool>;
+
+    /// The recorded autonomy ceiling of a dispatch row. `None` both for a
+    /// missing row and for a row no automation started (NULL column).
+    fn dispatch_autonomy(&self, id: i64) -> Result<Option<String>>;
+
     /// The dispatch row run by a daemon session id (most recent stamp wins),
     /// or `None`. The transport-retry observer's row resolution (THE-86):
     /// `session_id` is stamped at launch and re-stamped on every relaunch, so
