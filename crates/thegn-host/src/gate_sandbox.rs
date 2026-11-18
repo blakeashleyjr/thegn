@@ -18,8 +18,9 @@
 //! Only a local bwrap sandbox with network `none` and no host daemon socket
 //! qualifies: an OCI backend would exec into a container built for the main
 //! checkout, a remote placement would run the gate on another host, and a
-//! bound socket (the Nix daemon, a `[sandbox] mounts` socket or device) reaches
-//! a host service that `--unshare-net` does not block.
+//! bound socket (the Nix daemon, a `[sandbox] mounts` socket or device, or a
+//! mounted `/run`, `/var/run` or `/dev` tree) reaches a host service that
+//! `--unshare-net` does not block.
 //!
 //! The guarded entry masks the daemon socket, state run dir, runtime dir and
 //! Lead control dir; the sealed floor hides `$HOME`. The sealed command
@@ -84,10 +85,12 @@ fn sealed_spec(full: &Config, repo_root: &Path) -> Result<GateExec, String> {
             match gate_backend_refusal(&spec) {
                 None => match spec.mounts.iter().find(|m| {
                     m.host != "/dev/null"
-                        && std::fs::metadata(&m.host).is_ok_and(|md| !md.is_dir() && !md.is_file())
+                        && (reaches_host_services(&m.host)
+                            || std::fs::metadata(&m.host)
+                                .is_ok_and(|md| !md.is_dir() && !md.is_file()))
                 }) {
                     Some(m) => Err(format!(
-                        "the sealed merge gate refuses mount '{}': it is a socket or device, which reaches a host service",
+                        "the sealed merge gate refuses mount '{}': it is, or contains, a host socket or device, which reaches a host service",
                         m.dest
                     )),
                     None => Ok(GateExec::Sealed(Box::new(spec))),
@@ -97,6 +100,26 @@ fn sealed_spec(full: &Config, repo_root: &Path) -> Result<GateExec, String> {
         }
         other => Err(floor_refusal(other).unwrap_or_else(|| NEEDS_SEALED.to_owned())),
     }
+}
+
+/// Whether a mount's host path is, lies under, or is an ancestor of a host
+/// tree holding system service sockets or devices (`/run/docker.sock`,
+/// `/run/podman`, the system bus, `/dev/*`). Compares the raw and the
+/// canonical spelling (`/var/run` -> `/run`). `/run/current-system` (a
+/// store symlink) is exempt.
+fn reaches_host_services(host: &str) -> bool {
+    const SERVICE_TREES: &[&str] = &["/run", "/var/run", "/dev"];
+    let raw = Path::new(host);
+    if raw.starts_with("/run/current-system") {
+        return false;
+    }
+    let real = std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf());
+    [raw, real.as_path()].iter().any(|p| {
+        SERVICE_TREES
+            .iter()
+            .map(Path::new)
+            .any(|tree| p.starts_with(tree) || tree.starts_with(p))
+    })
 }
 
 /// Why `spec` cannot carry the sealed gate, or `None`. Only a local bwrap
@@ -410,6 +433,30 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::path::PathBuf;
+
+    #[test]
+    fn host_service_trees_are_refused_but_the_system_profile_is_not() {
+        for host in [
+            "/run",
+            "/var/run",
+            "/run/docker",
+            "/run/podman",
+            "/dev",
+            "/var",
+            "/",
+        ] {
+            assert!(reaches_host_services(host), "{host} refused");
+        }
+        for host in [
+            "/run/current-system",
+            "/nix/store",
+            "/usr",
+            "/etc/static",
+            "/home/u/.cargo/registry",
+        ] {
+            assert!(!reaches_host_services(host), "{host} allowed");
+        }
+    }
 
     fn env(spec: &SandboxSpec, key: &str) -> Option<String> {
         spec.env
