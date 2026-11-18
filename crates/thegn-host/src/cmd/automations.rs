@@ -297,14 +297,16 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         .map_err(|errors| anyhow::anyhow!(errors.join("\n")))?;
     let db = thegn_core::db::Db::open().ok();
     let names: Vec<String> = compiled.iter().map(|r| r.id.clone()).collect();
-    let lead_rules = db
+    // b155 (6c): armed escalations compile; unarmed ones are listed as
+    // awaiting the owner's approval rather than hidden.
+    let (lead_rules, awaiting) = db
         .as_ref()
         .map(|db| {
-            thegn_core::automation_authoring::compile_lead_rows(
-                &db.lead_rules().unwrap_or_default(),
-                &names,
-            )
-            .0
+            let stored = db.lead_rules().unwrap_or_default();
+            let armed = crate::automation_arming::armed_set(db, thegn_core::util::now_ms());
+            let (rules, invalid) =
+                thegn_core::automation_authoring::compile_lead_rows_armed(&stored, &names, &armed);
+            (rules, awaiting_rows(&stored, invalid))
         })
         .unwrap_or_default();
     let daemon_available = db.as_ref().is_some_and(|db| {
@@ -366,6 +368,7 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
                 recent_outcome,
             }
         })
+        .chain(awaiting)
         .collect();
     if json {
         return super::emit_json(&rows);
@@ -392,6 +395,38 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The stored Lead rules waiting for their arming approval, as list rows
+/// whose inert column names the approval to grant. Other invalid rows stay
+/// out of this list (`automations.list` over the daemon shows them).
+fn awaiting_rows(
+    stored: &[thegn_core::store::LeadRuleRow],
+    invalid: Vec<(String, Vec<String>)>,
+) -> Vec<RuleRow> {
+    use thegn_core::automation_authoring as authoring;
+    invalid
+        .into_iter()
+        .filter(|(_, errors)| authoring::is_awaiting_arming(errors))
+        .filter_map(|(id, mut errors)| {
+            let row = stored.iter().find(|row| row.id == id)?;
+            let body: thegn_core::config_automations::AutomationRuleConfig =
+                serde_json::from_str(&row.body_json).ok()?;
+            let requested = authoring::needs_arming(&body)?;
+            let (event, action) = authoring::stored_shape(&row.body_json);
+            Some(RuleRow {
+                name: id,
+                enabled: row.enabled,
+                trusted_layer: "lead",
+                event,
+                action,
+                schedule: None,
+                autonomy: format!("propose (asks for {})", requested.as_str()),
+                inert_reason: errors.pop(),
+                recent_outcome: None,
+            })
+        })
+        .collect()
 }
 
 fn inert_reason(
@@ -534,6 +569,50 @@ mod tests {
         let ok = dir.path().join("ok.toml");
         std::fs::write(&ok, "a = 1").unwrap();
         assert_eq!(read_rule_file(&ok).unwrap(), "a = 1");
+    }
+
+    #[test]
+    fn awaiting_rows_list_unarmed_escalations_only() {
+        use thegn_core::automation_authoring::awaiting_arming_reason;
+        let stored = vec![
+            thegn_core::store::LeadRuleRow {
+                id: "lead:start".into(),
+                body_json: serde_json::json!({
+                    "name": "lead:start",
+                    "when": "issue_matched",
+                    "autonomy": "merge",
+                    "then": {"cap": "pipeline.start", "stage": "code", "agent": "codex"}
+                })
+                .to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+            thegn_core::store::LeadRuleRow {
+                id: "lead:bad".into(),
+                body_json: "{}".into(),
+                ..Default::default()
+            },
+        ];
+        let invalid = vec![
+            (
+                "lead:start".to_string(),
+                vec![awaiting_arming_reason("lead:start")],
+            ),
+            ("lead:bad".to_string(), vec!["not a rule".to_string()]),
+            (
+                "lead:gone".to_string(),
+                vec![awaiting_arming_reason("lead:gone")],
+            ),
+        ];
+        let rows = awaiting_rows(&stored, invalid);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "lead:start");
+        assert_eq!(rows[0].action, "pipeline.start");
+        assert_eq!(rows[0].autonomy, "propose (asks for merge)");
+        assert_eq!(
+            rows[0].inert_reason.as_deref(),
+            Some("awaiting owner approval (rule:lead:start arm)")
+        );
     }
 
     #[test]
