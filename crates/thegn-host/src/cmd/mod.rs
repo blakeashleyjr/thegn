@@ -30,6 +30,7 @@ pub mod dispatch_commit;
 pub mod doctor;
 pub(crate) mod doctor_lead;
 pub mod env;
+pub mod env_adopt;
 pub mod env_image;
 pub mod env_reap;
 pub mod events;

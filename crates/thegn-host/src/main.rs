@@ -307,6 +307,7 @@ mod snapshot_slot;
 #[cfg(test)]
 mod spawn_ratchet_tests;
 mod sprite_bridge;
+mod sprites_reaper;
 mod ssh_seed;
 mod ssh_shim;
 mod stage_prompt;
@@ -546,6 +547,11 @@ pub enum Command {
         target: cmd::target::WorktreeTarget,
         #[command(flatten)]
         trust_gate: cmd::target::TrustGateArgs,
+        /// Destroy a provider worktree's sandbox after landing (once its commits
+        /// are local). By default the sandbox is kept: it may hold state that
+        /// exists nowhere else.
+        #[arg(long)]
+        release_sandbox: bool,
     },
     /// Agent-driven merge queue: assign branches (`merge add`) and drain them one
     /// by one (`merge drain`), dispatching a headless CLI agent to resolve
@@ -1567,9 +1573,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             json,
         } => cmd::map::run(&cfg, worktree, budget, file, json),
         Command::Integrate { args } => cmd::integrate::run(&cfg, &args),
-        Command::Land { target, trust_gate } => {
-            cmd::land::run(&cfg, target.get(), trust_gate.trust_gate)
-        }
+        Command::Land {
+            target,
+            trust_gate,
+            release_sandbox,
+        } => cmd::land::run(&cfg, target.get(), trust_gate.trust_gate, release_sandbox),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
         Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),

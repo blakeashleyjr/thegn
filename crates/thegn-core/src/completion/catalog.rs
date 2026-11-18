@@ -336,6 +336,13 @@ pub const CATALOG: &[Slot] = &[
         "provider",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    // A sprite name as the Sprites API lists it: listing would be a network
+    // call on <TAB>, so it stays free text.
+    slot(
+        "env adopt",
+        "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),
@@ -584,6 +591,7 @@ pub const CATALOG: &[Slot] = &[
     // `env create name` is deliberately absent: it names a NEW env, so
     // completing the existing ones would be actively misleading.
     slot("agent run", "env", SourceKind::Env),
+    slot("env adopt", "env", SourceKind::Env),
     slot("env deprovision", "env", SourceKind::Env),
     slot("env rm", "name", SourceKind::Env),
     slot("env set", "name", SourceKind::Env),

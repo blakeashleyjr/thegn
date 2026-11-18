@@ -39,6 +39,9 @@ pub(crate) struct RunArgs {
     pub wait: bool,
     /// `--pull`: fetch sandbox commits back after the observed exit.
     pub pull: bool,
+    /// `--keep-running`: Fly/machine0 machines are not stopped after the
+    /// observed exit.
+    pub keep_running: bool,
     pub timeout_secs: u64,
     pub json: bool,
 }
@@ -349,6 +352,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         track,
         wait,
         pull,
+        keep_running: _keep_running,
         timeout_secs,
         json,
     } = args;
