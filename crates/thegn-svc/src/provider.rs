@@ -3602,10 +3602,10 @@ pub enum Provider {
     /// over plain ssh. No checkpoints by construction: a powered-off VPS still
     /// bills, so the only free state is destroyed (see `crate::vps`).
     Vps(crate::vps::VpsProvider),
-    /// Fly.io machines (CLI-free) — Machines REST lifecycle; exec and files
-    /// over ssh to the machine's dedicated IPv4 (vps ssh shim).
-    /// Container-native, so it's not a `VpsKind`; scale-to-zero via stop/start
-    /// (see `crate::fly`).
+    /// Fly.io machines (CLI-free): Machines REST lifecycle; reach is plain ssh
+    /// to the app's dedicated IPv4 with thegn's managed key via the vps ssh
+    /// shim; optional iroh call-home (`fly/mod.rs`). Scale-to-zero via
+    /// stop/start. Container-native, so it's not a `VpsKind` (see `crate::fly`).
     Fly(crate::fly::FlyProvider),
     /// machine0 (`machine0.io`) VMs — lifecycle/images/keys over machine0's
     /// remote **MCP** endpoint (no `machine0` CLI), exec/files over plain ssh
