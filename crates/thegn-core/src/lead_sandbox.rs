@@ -69,6 +69,25 @@ pub fn harness_state_paths(
     }
 }
 
+/// The env var that relocates a harness's state dir when the harness has no
+/// credential [`crate::harness::HomeSpec`] of its own (`Harness::home()` is
+/// `None`). The Lead points it at a private dir so the harness never writes
+/// its shared host state from inside the sandbox (and its sessions, skills
+/// and settings stay apart from the worker sessions' copy).
+///
+/// - `pi` → `PI_CODING_AGENT_DIR`.
+/// - `aider` keeps no login and writes its history and cache files into its
+///   cwd, which for the Lead is the notes dir (already writable): it needs no
+///   relocation.
+/// - Every other harness without a home spec: `None` (the notes dir is its
+///   only writable path).
+pub fn private_home_env(harness_id: &str) -> Option<&'static str> {
+    match harness_id.trim() {
+        "pi" => Some("PI_CODING_AGENT_DIR"),
+        _ => None,
+    }
+}
+
 /// `a` equals `b` or lies beneath it, component-wise.
 fn within(a: &Path, b: &Path) -> bool {
     a.starts_with(b)
@@ -320,6 +339,21 @@ mod tests {
             harness_state_paths("codex", &home, &blank),
             vec![p("/home/u/.codex")]
         );
+    }
+
+    #[test]
+    fn private_home_env_covers_pi_only() {
+        assert_eq!(private_home_env("pi"), Some("PI_CODING_AGENT_DIR"));
+        assert_eq!(private_home_env(" pi "), Some("PI_CODING_AGENT_DIR"));
+        assert_eq!(private_home_env("aider"), None, "aider writes into its cwd");
+        // A harness with a credential home spec uses that, never this table.
+        assert_eq!(private_home_env("claude"), None);
+        assert_eq!(private_home_env("codex"), None);
+        assert_eq!(private_home_env(""), None);
+        // The table agrees with the state paths the sandbox already knows.
+        let home = p(HOME);
+        let e = env(&[("PI_CODING_AGENT_DIR", "/private/pi")]);
+        assert_eq!(harness_state_paths("pi", &home, &e), vec![p("/private/pi")]);
     }
 
     #[test]
