@@ -131,6 +131,9 @@ pub static ROUTE_TYPES: &[(&str, &str, &str)] = &[
     ),
     ("approvals.resolve", "{ApprovalResolve}", "{resolved}"),
     ("merge.drain", "{worktree}", "{started, repo, pid}"),
+    // Automation kill switch (THE-2197): no arguments.
+    ("automations.pause", "{}", "{paused}"),
+    ("automations.resume", "{}", "{paused}"),
     (
         "mcp_proxy.status",
         "—",
