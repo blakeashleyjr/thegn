@@ -85,6 +85,7 @@ pub enum Rule {
     Refuse(&'static str),
 }
 
+const NO_LAND: &str = "the Lead lands only through a rule's land step or an owner approval; it cannot enqueue or drain the merge queue";
 const ADMIN_ONLY: &str = "operator-only (admin scope); never reachable by the Lead";
 const EXEC_ONLY: &str =
     "runs a configured command on the host (exec scope); never reachable by the Lead";
@@ -171,8 +172,6 @@ pub fn rule(verb: Verb) -> Rule {
         | Verb::ApprovalsRequest
         | Verb::MergeClear
         | Verb::FolderAssign
-        | Verb::MergeAdd
-        | Verb::MergeDrain
         // THE-2197: pausing only stops automations; it takes no arguments.
         | Verb::AutomationsPause => Rule::Allow,
 
@@ -187,6 +186,10 @@ pub fn rule(verb: Verb) -> Rule {
         // b155 (6a, 6f).
         Verb::ApprovalsRedeem => Rule::Refuse(NO_REDEEM),
         Verb::AutomationsHalt => Rule::Refuse(NO_HALT),
+        // b155 (THE-2171): landing is never a Lead call. The stage executor
+        // enqueues and drains with its own (unconfined) authority after a
+        // rule's land step or an owner approval.
+        Verb::MergeAdd | Verb::MergeDrain => Rule::Refuse(NO_LAND),
 
         Verb::ForkSession => Rule::Refuse(NO_FORK),
         Verb::Split => Rule::Refuse(NO_SPLIT),
@@ -565,7 +568,7 @@ mod tests {
         (Verb::GitStage, Refuse),
         (Verb::GitCommit, Refuse),
         (Verb::MergeList, Allow),
-        (Verb::MergeAdd, Allow),
+        (Verb::MergeAdd, Refuse),
         (Verb::MergeClear, Allow),
         (Verb::CalendarEvents, Allow),
         (Verb::CalendarClocks, Allow),
@@ -644,7 +647,7 @@ mod tests {
         (Verb::ApprovalsList, Allow),
         (Verb::ApprovalsRequest, Allow),
         (Verb::ApprovalsResolve, Refuse),
-        (Verb::MergeDrain, Allow),
+        (Verb::MergeDrain, Refuse),
         (Verb::AutomationsPause, Allow),
         (Verb::AutomationsResume, Refuse),
         (Verb::ApprovalsRedeem, Refuse),

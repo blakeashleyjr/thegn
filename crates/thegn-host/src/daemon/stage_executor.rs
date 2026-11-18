@@ -56,7 +56,9 @@ const MAX_CHAIN: usize = 16;
 
 /// The `validate:` prefix on every executor job slot, so `cancel_all` and the
 /// panel can tell executor validations from a person's test runs.
-const SLOT_PREFIX: &str = "validate:";
+/// The job-name prefix of an executor-driven validation. `task.rs` keys the
+/// credential scrub off it (`scrubs_credentials`).
+pub(crate) const SLOT_PREFIX: &str = "validate:";
 
 struct Handles {
     svc: Arc<DaemonService>,
@@ -353,7 +355,7 @@ async fn drive(h: &'static Handles, issue: &str) {
         let planned = tokio::task::spawn_blocking(
             move || -> anyhow::Result<Option<Vec<(Lane, SuperviseAction)>>> {
                 let db = Db::open()?;
-                if thegn_core::automation_control::paused(&db) {
+                if thegn_core::automation_control::paused_fail_closed(&db) {
                     return Ok(None);
                 }
                 let lanes = crate::cmd::supervise::gather_lane(&cfg, &db, &want)?;
@@ -507,7 +509,7 @@ fn slots_remove(slot: &str) {
 
 fn paused_now() -> bool {
     match Db::open() {
-        Ok(db) => thegn_core::automation_control::paused(&db),
+        Ok(db) => thegn_core::automation_control::paused_fail_closed(&db),
         // An unopenable DB cannot record anything either: treat as a stop.
         Err(_) => true,
     }
@@ -709,7 +711,7 @@ async fn advance(h: &'static Handles, lane: &Lane, row: i64, next: &str) -> Step
     let (n_next, n_wt) = (next.to_owned(), worktree.clone());
     let admission = tokio::task::spawn_blocking(move || -> anyhow::Result<Admission> {
         let db = Db::open()?;
-        if thegn_core::automation_control::paused(&db) {
+        if thegn_core::automation_control::paused_fail_closed(&db) {
             return Ok(Admission::Paused);
         }
         match crate::automation_budget::admit(
@@ -792,8 +794,12 @@ async fn advance(h: &'static Handles, lane: &Lane, row: i64, next: &str) -> Step
     }
 
     // 3. Open the next stage, parented on the row. The parent's automation
-    // origin rides along while its session is still registered.
-    let origin = lane
+    // origin rides along while its session is still registered; once that
+    // session has exited (its origin is gone) the row's `automation_rule`
+    // stands in, so the child is never an origin-less automation session
+    // (`automations.halt` and Lead-rule confinement both key off it). A
+    // roster read error stops the advance.
+    let live_origin = lane
         .row
         .session_id
         .as_deref()
@@ -803,6 +809,25 @@ async fn advance(h: &'static Handles, lane: &Lane, row: i64, next: &str) -> Step
             rule_id: o.rule_id,
             run_id: o.run_id,
         });
+    let origin = match live_origin {
+        Some(origin) => Some(origin),
+        None => {
+            let rule = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+                Ok(Db::open()?.dispatch_automation(row)?.1)
+            })
+            .await;
+            match rule {
+                Ok(Ok(rule)) => {
+                    crate::daemon::pipeline_retry::roster_origin(row, rule.as_deref(), "advance")
+                }
+                _ => {
+                    tracing::warn!(target: "thegn::supervise", %issue, row, "stage advance could not read the lane's automation rule");
+                    log_action(&issue, row, "advance", "origin_unreadable");
+                    return Step::Stop;
+                }
+            }
+        }
+    };
     let client = match crate::automation_executor::client().await {
         Ok(client) => client,
         Err(error) => {

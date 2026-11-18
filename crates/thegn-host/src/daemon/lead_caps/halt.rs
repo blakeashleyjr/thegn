@@ -80,15 +80,16 @@ pub(crate) async fn halt(svc: &DaemonService, req: serde_json::Value) -> JsonRes
     let mut killed = Vec::new();
     let mut lanes_unreadable = false;
     if !keep_sessions {
-        // Active automation lanes from the roster: the origin map is
-        // in-memory only. A read error never skips the kill.
+        // Automation lanes from the roster: the origin map is in-memory
+        // only. No status filter: a Lead can `dispatches.set_status` a row
+        // to done while its worker still runs, and `halt_targets` keeps only
+        // sessions that are live. A read error never skips the kill.
         let lane_sessions = match svc
             .with_db(|db| {
                 use thegn_core::store::NotificationStore;
                 let mut out = BTreeSet::new();
                 for row in db.list_dispatches()? {
-                    if row.status.is_active()
-                        && let Some(sid) = row.session_id.clone()
+                    if let Some(sid) = row.session_id.clone()
                         && db.dispatch_automation(row.id)?.1.is_some()
                     {
                         out.insert(sid);

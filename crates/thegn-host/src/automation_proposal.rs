@@ -177,7 +177,7 @@ pub(crate) async fn on_approved(
 /// touch the filesystem).
 fn revalidate(cfg: &Config, row: &ProposalRow) -> anyhow::Result<Revalidated> {
     let db = Db::open()?;
-    if thegn_core::automation_control::paused(&db) {
+    if thegn_core::automation_control::paused_fail_closed(&db) {
         bail!("automations are paused");
     }
     crate::automation_budget::admit(&db, cfg, SpawnKind::NewLane)

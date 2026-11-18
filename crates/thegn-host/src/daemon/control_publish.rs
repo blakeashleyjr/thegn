@@ -11,6 +11,20 @@ pub(crate) fn run_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("run")
 }
 
+/// The Lead control dir (`$XDG_STATE_HOME/thegn/lead-control`: Lead bearer
+/// tokens, MCP files and the Lead listener address) for `state_dir`
+/// (`$XDG_STATE_HOME/thegn`). Published as a masked CONTROL dir for every
+/// worker sandbox: under the default `standard` sandbox a worker could
+/// otherwise read a Lead token and call the Lead listener on loopback. The
+/// Lead's own launch builds its own plan (`lead::launch`) and re-exposes only
+/// its own MCP file and the address file, read-only.
+pub(crate) fn lead_control_dir(state_dir: &Path) -> PathBuf {
+    match state_dir.parent() {
+        Some(state_home) => state_home.join(crate::lead::mcp::CONTROL_DIR_REL),
+        None => state_dir.join("lead-control"),
+    }
+}
+
 pub(crate) fn publish(socket: &Path, state_dir: &Path) {
     publish_socket_to(&mut GuardSink, socket, state_dir);
 }
@@ -36,6 +50,7 @@ fn publish_to(sink: &mut dyn PublishSink, socket: &Path, state_dir: &Path) {
     if let Some(dir) = socket_dir(socket) {
         sink.control_socket_dir(dir);
     }
+    sink.control_socket_dir(lead_control_dir(state_dir));
     sink.protected_state_dir(run_dir(state_dir));
 }
 
@@ -137,13 +152,20 @@ pub(crate) fn ensure_run_dir(state_dir: &Path) -> std::io::Result<thegn_core::fs
 
 pub(crate) fn prepare_run_dir(state_dir: &Path) -> std::io::Result<()> {
     let _run_dir = ensure_run_dir(state_dir)?;
+    // The Lead control dir must exist before any worker launches: bwrap masks
+    // a control dir only when it is present, and the daemon writes the Lead
+    // listener address into it later.
+    if let Some(state_home) = state_dir.parent() {
+        let _lead_control = crate::lead::mcp::control_dir_in(state_home)
+            .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        control_socket_candidates_from, prepare_run_dir, publish_candidates_at,
+        control_socket_candidates_from, lead_control_dir, prepare_run_dir, publish_candidates_at,
         publish_for_socket_at, publish_socket_candidates_to, run_dir, socket_dir,
     };
     use std::path::{Path, PathBuf};
@@ -188,9 +210,11 @@ mod tests {
     #[test]
     fn prepare_run_dir_creates_the_directory() {
         let state = tempfile::tempdir_in("/tmp").unwrap();
-        prepare_run_dir(state.path()).unwrap();
-        assert!(state.path().join("run").is_dir());
-        prepare_run_dir(state.path()).unwrap();
+        let state_dir = state.path().join("thegn");
+        prepare_run_dir(&state_dir).unwrap();
+        assert!(state_dir.join("run").is_dir());
+        assert!(state_dir.join("lead-control").is_dir());
+        prepare_run_dir(&state_dir).unwrap();
     }
 
     #[test]
@@ -201,8 +225,38 @@ mod tests {
         let mut sink = RecordingSink::default();
         publish_for_socket_at(&socket, &state_dir, &mut sink);
         assert!(run_dir(&state_dir).is_dir());
+        assert!(lead_control_dir(&state_dir).is_dir());
         assert_eq!(sink.protected, vec![run_dir(&state_dir)]);
-        assert_eq!(sink.sockets, vec![state.path().join("runtime")]);
+        assert_eq!(
+            sink.sockets,
+            vec![state.path().join("runtime"), lead_control_dir(&state_dir)]
+        );
+    }
+
+    #[test]
+    fn the_lead_control_dir_is_published_as_a_masked_control_dir() {
+        assert_eq!(
+            lead_control_dir(Path::new("/home/u/.local/state/thegn")),
+            PathBuf::from("/home/u/.local/state/thegn/lead-control")
+        );
+        let mut sink = RecordingSink::default();
+        publish_socket_candidates_to(
+            &mut sink,
+            PathBuf::from("/run/user/1000/thegn/daemon.sock"),
+            PathBuf::from("/tmp/thegn-1000-abcd/daemon.sock"),
+            Path::new("/home/u/.local/state/thegn"),
+        );
+        assert!(
+            sink.sockets
+                .contains(&PathBuf::from("/home/u/.local/state/thegn/lead-control")),
+            "{sink:?}"
+        );
+        assert!(
+            !sink
+                .protected
+                .contains(&PathBuf::from("/home/u/.local/state/thegn/lead-control")),
+            "masked, not merely write-protected: {sink:?}"
+        );
     }
 
     #[test]
@@ -261,6 +315,7 @@ mod tests {
         let mut expected_sockets = vec![
             PathBuf::from("/tmp/thegn-1000-abcd"),
             PathBuf::from("/tmp/thegn-1000-abcd-0123456789abcdef0123456789abcdef"),
+            lead_control_dir(&state_dir),
         ];
         let mut expected_protected = vec![run_dir(&state_dir)];
         expected_sockets.sort();

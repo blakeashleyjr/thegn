@@ -1756,6 +1756,9 @@ mod tests {
         // create.
         // 106 → 107 (THE-2220): `[lead] network` (LeadNetwork) — the Lead
         // sandbox's network namespace (isolated via pasta, or host).
+        // MERGE NOTE (b155): a parallel Vercel batch also adds one definition
+        // from 106. When both land, the merged pin is the SUM of both moves
+        // (108), not either side's value.
         assert_eq!(
             defs.len(),
             107,

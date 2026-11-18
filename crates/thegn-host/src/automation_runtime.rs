@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 
 static SENDER: OnceLock<Mutex<Option<mpsc::Sender<AutomationEvent>>>> = OnceLock::new();
 static PENDING: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+/// Serialises the budget check with admission across concurrently processed
+/// events (see `process_event`).
+static BUDGET_ADMISSION: Mutex<()> = Mutex::new(());
 static SESSION_ORIGINS: OnceLock<
     Mutex<BTreeMap<String, thegn_core::automation::AutomationOrigin>>,
 > = OnceLock::new();
@@ -46,7 +49,6 @@ pub(crate) fn rule_has_live_session(rule_id: &str) -> bool {
     })
 }
 
-pub(crate) fn session_origin(session: &str) -> Option<thegn_core::automation::AutomationOrigin> {
 /// Ids of every live session an automation run opened (the kill switch's
 /// view, `automations.halt`).
 pub(crate) fn origin_session_ids() -> std::collections::BTreeSet<String> {
@@ -62,7 +64,7 @@ pub(crate) fn origin_session_ids() -> std::collections::BTreeSet<String> {
         })
 }
 
-fn session_origin(session: &str) -> Option<thegn_core::automation::AutomationOrigin> {
+pub(crate) fn session_origin(session: &str) -> Option<thegn_core::automation::AutomationOrigin> {
     SESSION_ORIGINS
         .get_or_init(Default::default)
         .lock()
@@ -252,8 +254,15 @@ async fn process_event(
             .map_err(anyhow::Error::msg)?;
         let rules = with_lead_rules(&db, rules);
         let now = thegn_core::util::now();
-        let rules = refuse_over_budget(&db, rules, &event, now, &|kind| {
-            crate::automation_budget::admit(&db, &cfg_for_budget, kind)
+        // One budget check per event, BEFORE admission, under a process-wide
+        // lock held through admission: admission writes each planned run's
+        // `started` row, which the next event's usage read counts, so two
+        // events processed concurrently cannot both see the same free slot.
+        let _admission = BUDGET_ADMISSION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rules = refuse_over_budget(&db, rules, &event, now, &|kind, pending| {
+            crate::automation_budget::admit_with_pending(&db, &cfg_for_budget, kind, pending)
         })?;
         let admissions = admit_unless_paused(&db, &rules, &event, now)?;
         Ok((event, admissions))
@@ -403,7 +412,7 @@ fn admit_unless_paused(
     event: &AutomationEvent,
     now: i64,
 ) -> anyhow::Result<Vec<AutomationAdmission>> {
-    if thegn_core::automation_control::paused(db) {
+    if thegn_core::automation_control::paused_fail_closed(db) {
         let audited = db.audit_paused_automation_event(rules, event, now)?;
         if audited > 0 {
             tracing::info!(
@@ -441,19 +450,35 @@ pub(crate) fn budget_kind(
 /// and rate-limit slots stay unspent) and is dropped from the rules admitted.
 /// When any refusal was audited, the first of a UTC day also files one
 /// `automation_budget` notification. `admit` is injected so the policy is
-/// testable without a config. Returns the kept rules.
+/// testable without a config; its second argument is the usage the rules
+/// already kept for THIS event will add, so several budgeted rules on one
+/// event cannot each take the same last slot. Returns the kept rules.
 pub(crate) fn refuse_over_budget(
     db: &thegn_core::db::Db,
     rules: Vec<thegn_core::automation::AutomationRule>,
     event: &AutomationEvent,
     now: i64,
-    admit: &dyn Fn(
-        thegn_core::automation_budget::SpawnKind,
-    ) -> Result<(), thegn_core::automation_budget::BudgetRefusal>,
+    admit: &BudgetAdmit<'_>,
 ) -> anyhow::Result<Vec<thegn_core::automation::AutomationRule>> {
-    let (refused, kept): (Vec<_>, Vec<_>) = rules.into_iter().partition(|rule| {
-        budget_kind(&rule.action.cap, rule.autonomy).is_some_and(|kind| admit(kind).is_err())
-    });
+    use thegn_core::automation_budget::{BudgetUsage, SpawnKind};
+    let mut pending = BudgetUsage::default();
+    let mut refused = Vec::new();
+    let mut kept = Vec::new();
+    for rule in rules {
+        let Some(kind) = budget_kind(&rule.action.cap, rule.autonomy) else {
+            kept.push(rule);
+            continue;
+        };
+        if admit(kind, &pending).is_err() {
+            refused.push(rule);
+            continue;
+        }
+        pending.spawns_24h = pending.spawns_24h.saturating_add(1);
+        if kind == SpawnKind::NewLane {
+            pending.active_lanes = pending.active_lanes.saturating_add(1);
+        }
+        kept.push(rule);
+    }
     if refused.is_empty() {
         return Ok(kept);
     }
@@ -476,6 +501,14 @@ pub(crate) fn refuse_over_budget(
     }
     Ok(kept)
 }
+
+/// The injected budget policy of [`refuse_over_budget`]: one spawn of a kind
+/// on top of the usage this event's kept rules already add.
+pub(crate) type BudgetAdmit<'a> = dyn Fn(
+        thegn_core::automation_budget::SpawnKind,
+        &thegn_core::automation_budget::BudgetUsage,
+    ) -> Result<(), thegn_core::automation_budget::BudgetRefusal>
+    + 'a;
 
 /// File the once-a-day `automation_budget` notification. Best-effort: the
 /// audit rows are the record; the notification only tells the owner (the
@@ -1192,10 +1225,9 @@ mod tests {
         session.action.cap = "sessions.open".into();
         let rules = vec![session, notify_rule("n")];
         let event = event_for_dispatch("/wt", None);
-        let refuse = |_kind: thegn_core::automation_budget::SpawnKind| -> Result<
-            (),
-            thegn_core::automation_budget::BudgetRefusal,
-        > {
+        let refuse = |_kind: thegn_core::automation_budget::SpawnKind,
+                      _pending: &thegn_core::automation_budget::BudgetUsage|
+         -> Result<(), thegn_core::automation_budget::BudgetRefusal> {
             Err(thegn_core::automation_budget::BudgetRefusal::SpawnsPerDay {
                 limit: 12,
                 used: 12,
@@ -1226,7 +1258,8 @@ mod tests {
         assert_eq!(budget.len(), 1, "{budget:?}");
         // An admitting budget keeps every rule, and the once-per-key session
         // rule is still fresh for this event after its earlier refusals.
-        let kept = refuse_over_budget(&db, rules.clone(), &event, now + 120, &|_| Ok(())).unwrap();
+        let kept =
+            refuse_over_budget(&db, rules.clone(), &event, now + 120, &|_, _| Ok(())).unwrap();
         assert_eq!(kept, rules);
         let admitted = admit_unless_paused(&db, &kept, &event, now + 120).unwrap();
         let planned = admitted
@@ -1234,6 +1267,48 @@ mod tests {
             .filter(|a| matches!(a, AutomationAdmission::Planned { .. }))
             .count();
         assert_eq!(planned, 2, "{admitted:?}");
+    }
+
+    #[test]
+    fn many_budgeted_rules_on_one_event_cannot_spawn_past_the_limit() {
+        use thegn_core::automation_budget::{BudgetUsage, Budgets, SpawnKind, check};
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let rules: Vec<_> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|id| {
+                let mut rule = notify_rule(id);
+                rule.action.cap = "sessions.open".into();
+                rule
+            })
+            .collect();
+        let event = event_for_dispatch("/wt", None);
+        // Two spawns left in the day: base usage 10 of 12.
+        let budgets = Budgets {
+            max_concurrent_lanes: 2,
+            max_spawns_per_day: 12,
+        };
+        let base = BudgetUsage {
+            active_lanes: 0,
+            spawns_24h: 10,
+        };
+        let admit = |kind: SpawnKind, pending: &BudgetUsage| {
+            let usage = BudgetUsage {
+                active_lanes: base.active_lanes.saturating_add(pending.active_lanes),
+                spawns_24h: base.spawns_24h.saturating_add(pending.spawns_24h),
+            };
+            check(&budgets, &usage, kind)
+        };
+        let kept = refuse_over_budget(&db, rules, &event, 1_763_337_600, &admit).unwrap();
+        let ids: Vec<&str> = kept.iter().map(|rule| rule.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        let skipped: Vec<String> = db
+            .automation_runs(None, 10)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.skip_reason.as_deref() == Some("budget"))
+            .map(|row| row.rule_id)
+            .collect();
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
     }
 
     #[test]

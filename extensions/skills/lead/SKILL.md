@@ -64,10 +64,12 @@ For anything outward-facing call `approvals_request` with a short reason and the
 exact action. Then stop and wait; `approvals_list` shows its state. Never
 attempt to resolve it yourself.
 
-## 5. Drain the queue
+## 5. Landing
 
-When granted, `merge_drain` drains the merge queue. It only spawns work on
-request, so call it deliberately and only for items already approved.
+You never land work yourself: `merge_add` and `merge_drain` are refused for
+the Lead whatever its scopes. Work lands only through a rule's land step or
+an owner approval. To get something landed, raise an approval
+(`approvals_request`) naming the exact worktree and why.
 
 ## 6. Write rules
 

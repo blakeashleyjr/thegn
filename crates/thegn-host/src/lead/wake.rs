@@ -99,7 +99,7 @@ pub(crate) async fn wake_escalation(
     let prompt = escalation_prompt(row, issue_id, stage, reason_token)?;
     let paused = tokio::task::spawn_blocking(|| {
         thegn_core::db::Db::open()
-            .map(|db| thegn_core::automation_control::paused(&db))
+            .map(|db| thegn_core::automation_control::paused_fail_closed(&db))
             // Fail closed: an unreadable pause flag reads as paused.
             .unwrap_or(true)
     })
