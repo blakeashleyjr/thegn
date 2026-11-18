@@ -770,8 +770,8 @@ async fn observe_until_exit(
 mod tests {
     use super::{
         DEFAULT_TIMEOUT_SECS, EnvChoice, PIPELINE_ENV, TAIL_BYTES, TAIL_LINES, TailRing,
-        WaitStatus, env_choice, output_tail, pin_env_for_run, process_exit_code, strip_ansi,
-        tail_lines,
+        WaitStatus, env_choice, output_tail, pin_env_for_run, process_exit_code, pull_result,
+        strip_ansi, tail_lines,
     };
     use thegn_core::config::Config;
     use thegn_core::db::Db;
