@@ -34,6 +34,12 @@
 //!   `snapshot_bytes`. Current session only; an estimate. Envs sharing one
 //!   Vercel account are one entry. Never resumes a stopped sandbox.
 //!
+//! - `sprites_usage[]` (`fleet cost` only; absent when no `provider = "sprites"`
+//!   env is configured): `envs`, `error`, `rows[]` with `name`, `status`,
+//!   `cpu_hours`, `gb_hours`, `partial`, `usd` (`null` = unpriced; priced only
+//!   when `[placement.price]` has a `sprites` entry). Only sprites this host
+//!   proves it owns (the ledger); usage comes from the Sprites API.
+//!
 //! All amounts are USD estimates from the bundled price table and
 //! `[placement.price]`.
 
@@ -68,6 +74,175 @@ struct FleetReport {
     cost: FleetCost,
     #[serde(skip_serializing_if = "Option::is_none")]
     vercel_usage: Option<Vec<VercelUsage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sprites_usage: Option<Vec<SpritesUsage>>,
+}
+
+/// One sprites env's per-sprite usage (`fleet cost` only).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct SpritesUsage {
+    env: String,
+    /// Why the env could not be read at all.
+    error: Option<String>,
+    rows: Vec<SpritesUsageRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct SpritesUsageRow {
+    name: String,
+    status: String,
+    cpu_hours: f64,
+    gb_hours: f64,
+    partial: bool,
+    /// `None` = unpriced.
+    usd: Option<f64>,
+    /// The API had no usage for this sprite (404).
+    unavailable: bool,
+}
+
+fn unix_to_rfc3339(secs: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// The Sprites section's data. `None` when no sprites env is configured, so
+/// the rest of `fleet cost` is byte-identical. Only the explicit verb calls
+/// the API; only ledger-proven sprites are read.
+fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
+    let price = cfg
+        .placement
+        .price
+        .get("sprites")
+        .copied()
+        .filter(|p| p.is_finite() && *p >= 0.0);
+    let mut out = Vec::new();
+    for (name, envc) in &cfg.env {
+        if envc.provider.provider.trim() != "sprites" {
+            continue;
+        }
+        let mut usage = SpritesUsage {
+            env: name.clone(),
+            error: None,
+            rows: Vec::new(),
+        };
+        match crate::provider_factory::provider_for_named(&envc.provider, "") {
+            Some(thegn_svc::provider::Provider::Sprites(provider)) => {
+                match provider.scope().cloned() {
+                    None => {
+                        usage.error = Some("no ownership scope (controller id unavailable)".into())
+                    }
+                    Some(scope) => match thegn_svc::sprites::ledger::owned(&scope) {
+                        Err(error) => usage.error = Some(format!("{error:#}")),
+                        Ok(view) => {
+                            for rec in view.recorded {
+                                let start = unix_to_rfc3339(rec.created_at);
+                                let read = crate::agent::block_on_provider(|| async {
+                                    provider.usage_since(&rec.name, &start).await
+                                });
+                                usage.rows.push(match read {
+                                    Ok(Some(u)) => sprites_row(&rec.name, &rec.state, &u, price),
+                                    Ok(None) => SpritesUsageRow {
+                                        name: rec.name.clone(),
+                                        status: rec.state.clone(),
+                                        cpu_hours: 0.0,
+                                        gb_hours: 0.0,
+                                        partial: false,
+                                        usd: None,
+                                        unavailable: true,
+                                    },
+                                    Err(error) => {
+                                        usage.error = Some(format!("{error:#}"));
+                                        break;
+                                    }
+                                });
+                            }
+                        }
+                    },
+                }
+            }
+            _ => {
+                usage.error =
+                    Some("the sprites provider could not be built (token unavailable)".into())
+            }
+        }
+        out.push(usage);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn sprites_row(
+    name: &str,
+    status: &str,
+    u: &thegn_svc::sprites::usage::SpriteUsage,
+    price: Option<f64>,
+) -> SpritesUsageRow {
+    let cpu_hours = u.cpu_seconds / 3600.0;
+    let cpu_hours = if cpu_hours.is_finite() {
+        cpu_hours
+    } else {
+        0.0
+    };
+    let gb_hours = if u.reserved_gb_hours.is_finite() {
+        u.reserved_gb_hours
+    } else {
+        0.0
+    };
+    SpritesUsageRow {
+        name: name.to_string(),
+        status: status.to_string(),
+        cpu_hours,
+        gb_hours,
+        partial: u.partial,
+        usd: price.map(|p| cpu_hours * p).filter(|v| v.is_finite()),
+        unavailable: false,
+    }
+}
+
+/// The `fleet cost` Sprites block (pure). Appended after [`render_cost`].
+fn render_sprites(usage: &[SpritesUsage]) -> String {
+    let mut out = Vec::new();
+    for env in usage {
+        out.push(format!(
+            "sprites (usage from the Sprites API; unpriced): {}",
+            env.env
+        ));
+        if let Some(error) = &env.error {
+            out.push(format!("  unavailable: {error}"));
+            continue;
+        }
+        if env.rows.is_empty() {
+            out.push("  no sandboxes recorded by this host".into());
+            continue;
+        }
+        let mut rows = vec![
+            ["NAME", "STATUS", "CPU H", "GB H", "PARTIAL", "USD"]
+                .map(String::from)
+                .to_vec(),
+        ];
+        for row in &env.rows {
+            let (cpu, gb) = if row.unavailable {
+                ("?".to_string(), "?".to_string())
+            } else {
+                (
+                    format!("{:.2}", row.cpu_hours),
+                    format!("{:.2}", row.gb_hours),
+                )
+            };
+            rows.push(vec![
+                row.name.clone(),
+                row.status.clone(),
+                cpu,
+                gb,
+                if row.partial { "yes" } else { "no" }.to_string(),
+                row.usd.map_or_else(|| "-".to_string(), |v| usd(v, 4)),
+            ]);
+        }
+        for line in table(&rows).lines() {
+            out.push(format!("  {line}"));
+        }
+    }
+    out.join("\n")
 }
 
 /// One Vercel account's current-session accrual (`fleet cost` only).
@@ -228,20 +403,26 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         )
     };
     let vercel = if list { None } else { vercel_usage(cfg) };
+    let sprites = if list { None } else { sprites_usage(cfg) };
     if json {
         return super::emit_json(&FleetReport {
             generated_ms: now_ms,
             view,
             cost,
             vercel_usage: vercel,
+            sprites_usage: sprites,
         });
     }
     let text = if list {
         render_list(&view, &cost, now_ms)
     } else {
         let text = render_cost(&view, &cost);
-        match vercel.as_deref() {
+        let text = match vercel.as_deref() {
             Some(usage) => format!("{text}\n\n{}", render_vercel(usage)),
+            None => text,
+        };
+        match sprites.as_deref() {
+            Some(usage) => format!("{text}\n\n{}", render_sprites(usage)),
             None => text,
         }
     };
@@ -635,6 +816,7 @@ mod tests {
             view: view.clone(),
             cost: cost.clone(),
             vercel_usage: None,
+            sprites_usage: None,
         })
         .unwrap();
         assert!(json.get("vercel_usage").is_none(), "{json}");
@@ -643,6 +825,7 @@ mod tests {
             view,
             cost,
             vercel_usage: Some(vercel_fixture()),
+            sprites_usage: None,
         })
         .unwrap();
         assert_eq!(with["vercel_usage"][0]["rows"][0]["name"], "tg-run");
@@ -651,6 +834,84 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(with["vercel_usage"][1]["error"], "no token");
+    }
+
+    fn sprites_fixture() -> Vec<SpritesUsage> {
+        vec![SpritesUsage {
+            env: "sp".into(),
+            error: None,
+            rows: vec![
+                sprites_row(
+                    "tg-a",
+                    "ready",
+                    &thegn_svc::sprites::usage::SpriteUsage {
+                        cpu_seconds: 5400.0,
+                        reserved_gb_hours: 3.0,
+                        partial: true,
+                    },
+                    None,
+                ),
+                sprites_row(
+                    "tg-b",
+                    "ready",
+                    &thegn_svc::sprites::usage::SpriteUsage {
+                        cpu_seconds: 3600.0,
+                        reserved_gb_hours: 1.0,
+                        partial: false,
+                    },
+                    Some(0.5),
+                ),
+            ],
+        }]
+    }
+
+    #[test]
+    fn sprites_cost_block_renders_usage_and_price() {
+        let text = render_sprites(&sprites_fixture());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0], "sprites (usage from the Sprites API; unpriced): sp",
+            "{text}"
+        );
+        assert!(lines[1].starts_with("  NAME"), "{text}");
+        assert!(
+            lines[2].contains("1.50") && lines[2].contains("3.00") && lines[2].contains("yes"),
+            "{text}"
+        );
+        assert!(lines[3].contains("$0.5000"), "{text}");
+        assert!(!text.contains("NaN"), "{text}");
+    }
+
+    #[test]
+    fn sprites_json_shape_and_absent_without_env() {
+        let cfg = Config::default();
+        assert!(sprites_usage(&cfg).is_none());
+        let view = view();
+        let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
+        let without = serde_json::to_value(FleetReport {
+            generated_ms: NOW,
+            view: view.clone(),
+            cost: cost.clone(),
+            vercel_usage: None,
+            sprites_usage: None,
+        })
+        .unwrap();
+        assert!(without.get("sprites_usage").is_none());
+        let with = serde_json::to_value(FleetReport {
+            generated_ms: NOW,
+            view,
+            cost,
+            vercel_usage: None,
+            sprites_usage: Some(sprites_fixture()),
+        })
+        .unwrap();
+        assert_eq!(with["sprites_usage"][0]["rows"][0]["name"], "tg-a");
+        assert_eq!(with["sprites_usage"][0]["rows"][0]["partial"], true);
+        assert_eq!(
+            with["sprites_usage"][0]["rows"][0]["usd"],
+            serde_json::Value::Null
+        );
+        assert_eq!(with["sprites_usage"][0]["rows"][1]["usd"], 0.5);
     }
 
     #[test]
