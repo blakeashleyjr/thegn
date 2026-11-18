@@ -189,13 +189,14 @@ fn install_login_files(from: &Path, to: &thegn_core::fsperm::PrivateDir) -> anyh
 /// placeholder-expanded argv, the env with its secret refs resolved by the
 /// same function the daemon's `mcp_proxy.profile_env` uses, package caches in
 /// a fresh tempdir (the Lead can write its own caches, so a planted package
-/// there must never run on the host), and `MCP_REMOTE_CONFIG_DIR` at the
-/// private MCP dir's `mcp-auth` (token data only, so the Lead can use the
-/// login). The tempdir is held until the login ends.
+/// there must never run on the host), and `MCP_REMOTE_CONFIG_DIR` in the same
+/// fresh tempdir (the Lead can write its own `mcp-auth`, so a planted symlink,
+/// lock or client info there must never steer the host login). The token data
+/// is installed afterwards by `install_mcp_auth`. The tempdir is held until
+/// the login ends.
 fn mcp_login(
     cfg: &Config,
     server: &str,
-    state_home: &Path,
 ) -> anyhow::Result<(Vec<String>, BTreeMap<String, String>, tempfile::TempDir)> {
     check_mcp_member(cfg, server)?;
     let srv = cfg
@@ -221,12 +222,55 @@ fn mcp_login(
     env.insert("npm_config_cache".to_string(), at("npm"));
     env.insert("UV_CACHE_DIR".to_string(), at("uv"));
     env.insert("BUN_INSTALL_CACHE_DIR".to_string(), at("bun"));
-    let dir = crate::lead::launch::ensure_mcp_dir(state_home)?;
-    env.insert(
-        "MCP_REMOTE_CONFIG_DIR".to_string(),
-        dir.join("mcp-auth").to_string_lossy().into_owned(),
-    );
+    env.insert("MCP_REMOTE_CONFIG_DIR".to_string(), at("mcp-auth"));
     Ok((spec.argv, env, tmp))
+}
+
+/// Copy the login's mcp-remote token data from `from` (the fresh
+/// `MCP_REMOTE_CONFIG_DIR`) into the Lead's private MCP dir's `mcp-auth`:
+/// only `*_tokens.json` and `*_client_info.json` regular files inside real
+/// `mcp-remote-*` directories. No lock, verifier or log is copied and no
+/// symlink is followed.
+fn install_mcp_auth(from: &Path, state_home: &Path) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(from) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", from.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", from.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("mcp-remote-") {
+            continue;
+        }
+        let sub = entry.path();
+        if !std::fs::symlink_metadata(&sub).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let rel = Path::new("thegn")
+            .join(thegn_core::lead_sandbox::HARNESS_HOME_DIR)
+            .join("mcp")
+            .join("mcp-auth")
+            .join(name);
+        let dest = thegn_core::fsperm::ensure_private_dir_beneath(state_home, &rel)
+            .context("creating the Lead's private mcp-auth dir")?;
+        for file in std::fs::read_dir(&sub).with_context(|| format!("reading {}", sub.display()))? {
+            let file = file.with_context(|| format!("reading {}", sub.display()))?;
+            let file_name = file.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if !(file_name.ends_with("_tokens.json") || file_name.ends_with("_client_info.json")) {
+                continue;
+            }
+            if let Some(bytes) = read_regular(&sub, file_name)? {
+                dest.write_owner_only_atomic(file_name, &bytes)
+                    .with_context(|| format!("installing the Lead's {name}/{file_name}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Inherit stdin/stdout/stderr so an OAuth URL or a login prompt reaches the
@@ -265,7 +309,7 @@ pub(crate) fn run(cfg: &Config, mcp: Option<&str>) -> anyhow::Result<()> {
             install_login_files(login.tmp.path(), &dest)
         }
         Some(server) => {
-            let (argv, env, tmp) = mcp_login(cfg, server, &state_home)?;
+            let (argv, env, tmp) = mcp_login(cfg, server)?;
             let (prog, rest) = argv.split_first().context("no MCP server command")?;
             // No shell: the configured argv as is.
             let mut cmd = std::process::Command::new(prog);
@@ -276,7 +320,8 @@ pub(crate) fn run(cfg: &Config, mcp: Option<&str>) -> anyhow::Result<()> {
                 "running MCP server {server:?} for its login; open the URL it prints, then press \
                  Ctrl-C"
             );
-            let result = wait_interactive(cmd);
+            let result = wait_interactive(cmd)
+                .and_then(|()| install_mcp_auth(&tmp.path().join("mcp-auth"), &state_home));
             drop(tmp);
             result
         }
@@ -289,6 +334,10 @@ pub(crate) fn run(cfg: &Config, mcp: Option<&str>) -> anyhow::Result<()> {
 fn wait_interactive(mut cmd: std::process::Command) -> anyhow::Result<()> {
     let _interrupt = crate::platform::InterruptGuard::install();
     let mut child = cmd.spawn().context("start the login")?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an interactive operator-terminal login owns its child and blocks the CLI on it"
+    )]
     let status = child.wait().context("wait for the login")?;
     tracing::info!(target: "thegn::lead", code = ?status.code(), "lead login: ended");
     Ok(())
@@ -385,18 +434,21 @@ mod tests {
             .profiles
             .insert(profile, vec!["todoist".into()]);
         let state = tempfile::tempdir().unwrap();
-        let (argv, env, tmp) = mcp_login(&cfg, "todoist", state.path()).unwrap();
+        let (argv, env, tmp) = mcp_login(&cfg, "todoist").unwrap();
         assert_eq!(argv, ["npx", "-y", "todoist-mcp"]);
         assert_eq!(env.get("A").map(String::as_str), Some("b"));
-        let dir = std::fs::canonicalize(state.path().join("thegn/lead-harness/mcp")).unwrap();
-        assert_eq!(
-            env.get("MCP_REMOTE_CONFIG_DIR").map(String::as_str),
-            Some(dir.join("mcp-auth").to_string_lossy().as_ref())
-        );
-        // The package caches are fresh, never the Lead-writable ones.
+        // The package caches and the mcp-remote config dir are fresh, never
+        // the Lead-writable ones.
         let lead_harness = state.path().join("thegn/lead-harness");
-        let canon_harness = std::fs::canonicalize(&lead_harness).unwrap();
-        for var in ["npm_config_cache", "UV_CACHE_DIR", "BUN_INSTALL_CACHE_DIR"] {
+        let canon_harness = std::fs::canonicalize(state.path())
+            .unwrap()
+            .join("thegn/lead-harness");
+        for var in [
+            "npm_config_cache",
+            "UV_CACHE_DIR",
+            "BUN_INSTALL_CACHE_DIR",
+            "MCP_REMOTE_CONFIG_DIR",
+        ] {
             let v = std::path::PathBuf::from(env.get(var).expect(var));
             assert!(
                 !v.starts_with(&lead_harness) && !v.starts_with(&canon_harness),
@@ -406,6 +458,32 @@ mod tests {
             assert!(v.starts_with(tmp.path()), "{var}: {}", v.display());
         }
         assert!(!env.contains_key("THEGN_LEAD_MCP_HOME"));
+    }
+
+    #[test]
+    fn login_mcp_installs_only_regular_token_files() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("mcp-auth");
+        let sub = from.join("mcp-remote-0.1");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x_tokens.json"), "tokens").unwrap();
+        std::fs::write(sub.join("x_lock.json"), "{\"pid\":1,\"port\":1}").unwrap();
+        let secret = root.path().join("secret");
+        std::fs::write(&secret, "owner secret").unwrap();
+        let linked =
+            thegn_core::fsperm::create_symlink(&secret, &sub.join("y_tokens.json"), false).is_ok();
+        let state = root.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        install_mcp_auth(&from, &state).unwrap();
+        let dest = state.join("thegn/lead-harness/mcp/mcp-auth/mcp-remote-0.1");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("x_tokens.json")).unwrap(),
+            "tokens"
+        );
+        assert!(!dest.join("x_lock.json").exists());
+        if linked {
+            assert!(std::fs::symlink_metadata(dest.join("y_tokens.json")).is_err());
+        }
     }
 
     #[test]
