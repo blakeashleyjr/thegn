@@ -1018,21 +1018,58 @@ The Lead (`[lead]`, experimental) runs its agent under bubblewrap. Its
   The Lead starts in the notes dir.
 - **Hidden:** `$XDG_RUNTIME_DIR`, the daemon socket dir, the state `run` dir,
   every control-socket location and `/tmp` are replaced with empty dirs. The
-  rootful docker and podman sockets are hidden too. `THEGN_CONTROL_SOCKET`,
-  `DBUS_SESSION_BUS_ADDRESS` and `SSH_AUTH_SOCK` are unset.
+  rootful docker and podman sockets and the system D-Bus socket are hidden
+  too. `THEGN_CONTROL_SOCKET`,
+  `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `DISPLAY`, `WAYLAND_DISPLAY`
+  and `XAUTHORITY` are unset.
   `~/.ssh`, `~/.gnupg`, `~/.config/gh`, `~/.config/glab-cli`,
   `~/.git-credentials` and `~/.netrc` are hidden too.
-- **Network:** shared with the host, so the Lead reaches the daemon's loopback
-  listener. It authenticates with its own scoped token. The unix socket, which
-  grants admin to any process of your user, is out of reach.
+- **thegn's state is hidden:** `$XDG_STATE_HOME/thegn`, `$XDG_DATA_HOME/thegn`,
+  `$XDG_CACHE_HOME/thegn`, thegn's home (`~/.thegn` or `$THEGN_DIR`) and the
+  legacy `superzej` dirs are replaced with empty dirs. That covers the
+  database, logs, scrollback, gate target dirs, provider ssh keys and other
+  workers' transcripts. Registered repos beneath them come back read-only.
+  The agent homes `~/.claude`, `~/.codex` and `~/.pi` are hidden the same way,
+  and `~/.claude.json` reads as empty. Only three things come back inside
+  them: the notes dir and the private agent home (writable), and the Lead's
+  own MCP config and token files (read-only). `$XDG_CONFIG_HOME/thegn` is
+  hidden too, except `config.toml`, which the `thegn mcp` commands inside the
+  sandbox load. Only `config.toml` itself is readable; files named by `file:`
+  secret references are hidden. A literal secret pasted into config.toml is
+  readable by the Lead.
+- **Reading state:** the Lead sees thegn's state only through its tools:
+  `overview.get`, `notifications.list`, `sessions.snapshot`,
+  `automations.runs` and `approvals.list`.
+- **Network (`[lead] network = "isolated"`, the default):** the Lead runs in
+  its own network namespace through `pasta` (from the passt package). It has
+  outbound internet, so the model API and remote MCP servers work. Host
+  loopback services are out of reach, and so are abstract unix sockets,
+  including the X11 display socket, because they belong to the host's
+  namespace. Only the Lead listener port is forwarded, at the same
+  `127.0.0.1:<port>`, so the Lead still reaches the daemon with its own scoped
+  token. A generated `resolv.conf` replaces `/etc/resolv.conf` inside the
+  sandbox and names pasta's DNS forwarder (`169.254.1.1`), which relays to
+  your host resolver. Your host's LAN address stays reachable.
+- **Network (`[lead] network = "host"`):** the Lead shares the host's network.
+  It can reach every loopback service on your machine, and every abstract
+  unix socket, including an X11 display. Any of those that trusts a local
+  caller trusts the Lead. thegn logs a warning on every launch in this mode.
+  Use it only when pasta cannot be installed.
+
+The daemon's unix socket, which grants admin to any process of your user, is
+out of reach in both modes.
 
 thegn refuses to open the Lead when:
 
 - bwrap is missing. The error is "the Lead needs bwrap (Linux); not available
   here". It never falls back to a host shell.
+- The network is `isolated` and pasta is missing. The error is "the Lead's
+  isolated network needs pasta (passt); install it or set [lead] network =
+  "host"". It never falls back to the host network on its own.
 - `[lead] notes_dir` or an agent state dir is inside a registered repo or
   worktree, contains one, or is `/` or `$HOME`. Symlinks are resolved first.
-- A writable path overlaps a hidden control dir.
+- A writable path overlaps a hidden control dir, or lies inside hidden
+  state without being the notes dir or the private agent home.
 
 `[lead] account` is refused for now.
 
