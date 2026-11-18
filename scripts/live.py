@@ -162,13 +162,25 @@ def settings(repo, env, install_override=None):
         raise Refusal("Schema downgrade opt-in is unsupported")
     directories(state, private=True)
     install_dir = install_dir_for(env, install_override)
+    account_state = real_home() / ".local/state"
+    if not install_override and not env.get(INSTALL_ENV, "").strip() and state.parent != account_state:
+        # A profile HOME without XDG_STATE_HOME would "upgrade" the profile's
+        # state while replacing the account's binary under its running instance.
+        raise Refusal(f"State home {state.parent} is not the account's state home {account_state}, but the default "
+                      f"install directory {install_dir} is the account's; set XDG_STATE_HOME to the account's state "
+                      "home or pass --install-dir")
     if install_dir == repo or repo in install_dir.parents:
         raise Refusal(f"Install directory {install_dir} is inside the checkout {repo}; a release build there "
                       "would replace the installation. Choose a directory outside it")
     if os.path.lexists(install_dir):
         directories(install_dir)
+        existing = install_dir
     else:
-        directories(_nearest_existing(install_dir))  # Created only by a real run.
+        existing = _nearest_existing(install_dir)
+        directories(existing)  # Created only by a real run.
+    if os.statvfs(existing).f_flag & os.ST_NOEXEC:
+        raise Refusal(f"Install directory {install_dir} is on a noexec filesystem ({existing}); the installed "
+                      "binary could not be launched. Choose another directory")
     target, database = install_dir / "thegn", state / "thegn.db"
     alacritty, alacritty_source = install_dir / "alacritty.toml", repo / "config/alacritty.toml"
     legacy = repo / "target/release/thegn"
@@ -1130,6 +1142,26 @@ def launcher_state(paths, home):
     return lines
 
 
+def launchers_run_checkout(paths, home):
+    """True when ~/.local/bin/thegn, tg or tg-tui still runs the checkout's binary or config."""
+    bin_dir = home / LAUNCHER_DIR
+    link = bin_dir / "thegn"
+    if link.is_symlink() and Path(os.path.realpath(link)) != paths["target"]:
+        return True
+    old = (_exact(paths["repo"] / "target/release/thegn"), _exact(paths["alacritty_source"]))
+    for name in WRAPPERS:
+        wrapper = bin_dir / name
+        if not os.path.lexists(wrapper):
+            continue
+        try:
+            text, _mode = _read_wrapper(wrapper)
+        except (OSError, Refusal):
+            continue
+        if any(pattern.search(text) for pattern in old):
+            return True
+    return False
+
+
 def relink_plan(paths, home):
     """Validate every launcher change up front; [] or Refusal, changing nothing."""
     bin_dir = home / LAUNCHER_DIR
@@ -1240,6 +1272,14 @@ def main(argv=None):
             print(f"  {path}")
     elif not args.plan:
         print("Launchers are not changed without --relink-launchers.")
+    if not args.relink_launchers and launchers_run_checkout(paths, home):
+        # Otherwise every later start (and every `thegn` CLI call from the
+        # panes) still runs the in-repo binary, which any release build replaces.
+        stale = (f"launchers still run {paths['repo'] / 'target/release/thegn'}; rerun with "
+                 "`python3 -B scripts/live.py --relink-launchers` (or relink them yourself)")
+        if not args.plan:
+            raise Refusal(stale)
+        print(f"WARNING: {stale}")
     if args.plan:
         return 0
     # The terminal check comes FIRST, before the relaunch below: a script or an
@@ -1268,6 +1308,9 @@ def main(argv=None):
         step(3, "Validate the configuration with the NEW build")
         validate_config(binary, env)
         step(4, "Stop the running thegn (controllers, then the pane daemon)")
+        # Re-surveyed after the build: show exactly what is about to be stopped.
+        for line in report_processes(survey(paths)):
+            print(line)
         if not args.yes:
             countdown(STOP_COUNTDOWN)
         stop_running(paths, env)
