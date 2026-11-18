@@ -154,6 +154,22 @@ impl Db {
             .optional()?)
     }
 
+    /// Burn every unused nonce bound to a triple once that request is answered
+    /// elsewhere, so a stale phone push cannot re-resolve it later.
+    pub fn void_push_nonces(
+        &self,
+        issue: &str,
+        stage: &str,
+        sha: &str,
+        now_ms: i64,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE approval_push_nonces SET used_at_ms=?4 \
+             WHERE issue_id=?1 AND stage=?2 AND commit_sha=?3 AND used_at_ms IS NULL",
+            params![issue, stage, sha, now_ms],
+        )?)
+    }
+
     /// Retention: settled proposals older than 30 days and nonces older than
     /// 2 days. Pending proposals are never pruned here (expiry marks them).
     pub(crate) fn prune_approval_effects(&self, now_ms: i64) -> Result<usize> {
@@ -261,6 +277,28 @@ mod tests {
             "expired at the bound"
         );
         assert_eq!(db.consume_push_nonce("nope", 1).unwrap(), None);
+    }
+
+    #[test]
+    fn voiding_a_triple_burns_only_its_nonces() {
+        let db = Db::open_memory().unwrap();
+        db.put_push_nonce("a1", "linear:THE-1", "coder", "abc1234", 100, 1_000)
+            .unwrap();
+        db.put_push_nonce("a2", "linear:THE-1", "coder", "abc1234", 110, 1_000)
+            .unwrap();
+        db.put_push_nonce("b1", "linear:THE-2", "coder", "abc1234", 100, 1_000)
+            .unwrap();
+        assert_eq!(
+            db.void_push_nonces("linear:THE-1", "coder", "abc1234", 150)
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.consume_push_nonce("a1", 160).unwrap(), None);
+        assert_eq!(db.consume_push_nonce("a2", 160).unwrap(), None);
+        assert_eq!(
+            db.consume_push_nonce("b1", 160).unwrap(),
+            Some(("linear:THE-2".into(), "coder".into(), "abc1234".into()))
+        );
     }
 
     #[test]
