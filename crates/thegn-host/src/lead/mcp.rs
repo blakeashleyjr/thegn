@@ -85,7 +85,7 @@ pub(crate) fn write_control_addr(state_home: &Path, addr: SocketAddr) -> Result<
 
 /// Parse `control-addr.json`, refusing anything but a loopback address (the
 /// token must never be sent off-host because of a tampered file).
-fn parse_control_addr(bytes: &[u8]) -> Result<SocketAddr> {
+pub(crate) fn parse_control_addr(bytes: &[u8]) -> Result<SocketAddr> {
     #[derive(serde::Deserialize)]
     struct File {
         addr: String,
