@@ -293,6 +293,17 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     claim_spare(cfg, worktree, &repo_root, &env_name, branch.as_deref()).is_some()
 }
 
+/// Headless warm start: before `provision_headless_blocking` provisions a
+/// worktree, claim a `ready` pool spare for the same (repo, env) and lockfile
+/// through [`try_claim_spare`]. `true` means a spare now serves `worktree` and
+/// provisioning is skipped. Never creates: the pool stays opt-in
+/// (`[lifecycle.pool] size`). Off-loop only.
+///
+/// b162 spine stub: lane 5 fills this in; until then it never claims.
+pub(crate) fn claim_spare_for_headless(_cfg: &thegn_core::config::Config, _worktree: &str) -> bool {
+    false
+}
+
 /// The provisioning-gate halt for an attach: `Some` when `worktree` resolves to a
 /// provider env whose sandbox has NOT finished provisioning (no LOCAL marker — set
 /// at provision completion in `provision_provider_env_named`). Refusing the raw

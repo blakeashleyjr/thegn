@@ -177,7 +177,16 @@ fn land_branch_pinned_with_options(
     Ok((branch, target, outcome))
 }
 
-pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<()> {
+/// `release_sandbox` (`--release-sandbox`): destroy a provider worktree's
+/// proven sandbox after a successful land. Off by default: a sandbox holds
+/// gitignored state that exists nowhere else, so landing alone never deletes it.
+/// b162 spine: lane 4 wires the release; until then it is ignored.
+pub fn run(
+    cfg: &Config,
+    worktree: Option<String>,
+    trust_gate: bool,
+    _release_sandbox: bool,
+) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
     let root = integrate::main_checkout(&wt).context("not inside a git repository")?;
     let mq = cfg.repo_merge_queue(&root);
