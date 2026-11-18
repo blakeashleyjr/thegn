@@ -221,6 +221,7 @@ fn regenerate_merge_does_not_fire_hooks() {
         "true",
         Duration::from_secs(30),
         &[],
+        Default::default(),
     );
     assert!(result.is_some());
     assert!(!fixture.sentinel.exists());

@@ -59,7 +59,7 @@ fn replacement_refs_never_change_gate_materialization_or_inherited_git_view() {
     }
     let workspace = f.prepare(&f.first);
     for command in ["printf setup", "printf gate"] {
-        let (command, _) = workspace.command_for(command).unwrap();
+        let (command, _, _) = workspace.command_for(command).unwrap();
         assert_explicit_no_replace(&command);
     }
 }
@@ -1861,4 +1861,241 @@ fn shared_gate_target_defaults_unchanged() {
 #[test]
 fn shared_gate_target_reused_requires_repository_base_name() {
     assert!(gate_target_for("/cache/gate", Some(Path::new("/")), Path::new("/tmp/p")).is_err());
+}
+
+// THE-2200: the sealed merge gate.
+
+#[test]
+fn a_sealed_gate_that_cannot_resolve_is_an_error_never_failed() {
+    let verdict = sandbox_unavailable("no sandbox runtime".into());
+    match verdict {
+        GateVerdict::Error {
+            reason,
+            phase,
+            class,
+            ..
+        } => {
+            assert_eq!(reason, "no sandbox runtime");
+            assert_eq!(phase, GatePhase::Preparation);
+            assert_eq!(class, GateErrorClass::Spawn);
+        }
+        other => panic!("a sandbox resolve error must not blame the branch: {other:?}"),
+    }
+}
+
+#[test]
+fn exit_125_in_sealed_mode_is_a_spawn_error() {
+    assert!(sandbox_refused(true, Some(125)));
+    assert!(
+        !sandbox_refused(false, Some(125)),
+        "host gates keep today's mapping"
+    );
+    assert!(!sandbox_refused(true, Some(1)));
+    assert!(!sandbox_refused(true, None));
+    for setup in [false, true] {
+        match sandbox_refused_verdict(setup, "bwrap: setting up uid map".into()) {
+            GateVerdict::Error {
+                phase, class, log, ..
+            } => {
+                assert_eq!(class, GateErrorClass::Spawn);
+                assert_eq!(
+                    phase,
+                    if setup {
+                        GatePhase::Setup
+                    } else {
+                        GatePhase::Gate
+                    }
+                );
+                assert!(log.contains("uid map"));
+            }
+            other => panic!("expected an infrastructure hold: {other:?}"),
+        }
+    }
+    // On the host, 125 is the command's own exit: a red gate, as today.
+    assert_eq!(
+        thegn_core::gate::classify_exit(Some(125), false),
+        thegn_core::gate::GateClass::Failed
+    );
+}
+
+#[test]
+fn a_refused_sandbox_entry_spawns_nothing_and_reads_as_spawn_failure() {
+    let refused: Result<PreparedCommand> = Err(anyhow::Error::new(SandboxEntryRefused(
+        "the sealed merge gate cannot start: runtime missing".into(),
+    )));
+    let (result, exec_confirmed) = spawn_prepared(refused, 10).unwrap();
+    assert!(!exec_confirmed);
+    let (verdict, keep) = capture_verdict(
+        result,
+        false,
+        exec_confirmed,
+        &RunMode::Sealed {
+            header: "sandboxed gate (network: none)\n".into(),
+        },
+    );
+    assert!(!keep);
+    assert!(matches!(
+        verdict,
+        GateVerdict::Error {
+            class: GateErrorClass::Spawn,
+            ..
+        }
+    ));
+    // Any other preparation error stays an error, not a spawn.
+    let other: Result<PreparedCommand> = Err(anyhow::anyhow!("checkout moved"));
+    assert!(spawn_prepared(other, 10).is_err());
+}
+
+#[test]
+fn a_sealed_preflight_that_does_not_start_is_a_preparation_hold() {
+    use crate::gate_capture::CaptureResult;
+    let sealed = RunMode::Sealed {
+        header: "sandboxed gate (network: none)\n".into(),
+    };
+    let started = CaptureResult::Completed {
+        status: std::process::ExitStatus::default(),
+        log: String::new(),
+    };
+    assert!(preflight_verdict(started, &sealed).is_none());
+    for result in [
+        CaptureResult::SpawnFailed {
+            reason: "bwrap: Can't chdir".into(),
+            log: "bwrap: Can't chdir to /state/gate/wt".into(),
+        },
+        CaptureResult::Timeout {
+            log: "stuck".into(),
+        },
+    ] {
+        let (verdict, keep) = preflight_verdict(result, &sealed).expect("held");
+        assert!(!keep);
+        match verdict {
+            GateVerdict::Error {
+                reason,
+                phase,
+                class,
+                ..
+            } => {
+                assert_eq!(reason, "the gate sandbox could not start (preflight)");
+                assert!(matches!(phase, GatePhase::Preparation));
+                assert!(matches!(class, GateErrorClass::Spawn));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn gate_logs_are_headed_by_their_execution_mode() {
+    let sealed = RunMode::Sealed {
+        header: "sandboxed gate (network: none)\n".into(),
+    };
+    let red = GateVerdict::Failed {
+        log: "error: could not download crate".into(),
+    };
+    match label_execution(
+        red.clone(),
+        match &sealed {
+            RunMode::Sealed { header } => header,
+            RunMode::Host => unreachable!(),
+        },
+    ) {
+        GateVerdict::Failed { log } => {
+            assert!(log.starts_with("sandboxed gate (network: none)\n"));
+            assert!(!log.contains(thegn_core::gate::HOST_EXECUTION_LOG_HEADER));
+        }
+        other => panic!("{other:?}"),
+    }
+    match label_execution(red, thegn_core::gate::HOST_EXECUTION_LOG_HEADER) {
+        GateVerdict::Failed { log } => {
+            assert!(log.starts_with(thegn_core::gate::HOST_EXECUTION_LOG_HEADER));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(RunMode::of(&GateExec::Host), RunMode::Host);
+}
+
+#[test]
+fn the_gate_env_is_the_same_host_or_sealed() {
+    let env = gate_env(
+        Path::new("/state/gate/wt"),
+        Some(Path::new("/state/gate/target")),
+        "abc",
+    );
+    let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    assert_eq!(get("CARGO_TARGET_DIR"), Some("/state/gate/target"));
+    assert_eq!(get("THEGN_GATE"), Some("1"));
+    assert_eq!(get("THEGN_WORKTREE"), Some("/state/gate/wt"));
+    assert_eq!(get("THEGN_GATE_OID"), Some("abc"));
+    assert_eq!(get("GIT_NO_REPLACE_OBJECTS"), Some("1"));
+    assert_eq!(
+        gate_env(Path::new("/wt"), None, "abc")
+            .iter()
+            .filter(|(k, _)| k == "CARGO_TARGET_DIR")
+            .count(),
+        0
+    );
+}
+
+/// Host mode is byte-for-byte today's gate: the cpucap-wrapped direct argv
+/// in the checkout with the four gate env assignments and the git-env scrub,
+/// no sandbox entry and no credential scrub.
+#[test]
+fn host_mode_gate_command_is_unchanged() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    let workspace = f.prepare(&f.first);
+    assert!(matches!(workspace.exec, GateExec::Host));
+    let (command, exec_confirmed, env_file) = workspace.command_for("printf gate").unwrap();
+    assert!(env_file.is_none());
+    let (expected, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_tagged_reporting(
+        thegn_core::shellinv::direct_argv("printf gate").unwrap(),
+        &thegn_core::sandbox_cpucap::ScopeTag {
+            kind: thegn_core::sandbox_cpucap::ScopeKind::Gate,
+            worktree: workspace.repo.root.path().to_string_lossy().into_owned(),
+        },
+    );
+    assert_eq!(
+        exec_confirmed,
+        wrap != thegn_core::sandbox_cpucap::BackgroundWrap::Wrapped
+    );
+    let mut actual = vec![command.get_program().to_string_lossy().into_owned()];
+    actual.extend(
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    );
+    assert_eq!(actual, expected);
+    assert_eq!(
+        command.get_current_dir(),
+        Some(workspace.checkout.worktree.path())
+    );
+    let envs: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    let set = |key: &str| {
+        envs.iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.clone())
+    };
+    assert_eq!(set("THEGN_GATE").as_deref(), Some("1"));
+    assert_eq!(set("GIT_NO_REPLACE_OBJECTS").as_deref(), Some("1"));
+    assert_eq!(set("THEGN_GATE_OID").as_deref(), Some(f.first.as_str()));
+    assert!(set("CARGO_TARGET_DIR").is_some());
+    for key in thegn_core::util::GIT_ENV_VARS {
+        assert!(envs.iter().any(|(k, v)| k == key && v.is_none()));
+    }
+    // The host gate does not apply the sealed credential scrub.
+    assert!(
+        !envs
+            .iter()
+            .any(|(k, v)| k == "SSH_AUTH_SOCK" && v.is_none())
+    );
 }

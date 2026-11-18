@@ -844,7 +844,15 @@ fn drive_queue_with(
         tracing::warn!(target: "thegn::merge", "{msg}");
         out.warnings.push(msg);
     }
-    let use_agent = wants_agent && agent_cmd.is_some();
+    let use_agent = wants_agent
+        && agent_cmd.is_some()
+        && std::env::var_os(crate::gate_sandbox::REQUIRE_SEALED_ENV).is_none();
+    if wants_agent && !use_agent && agent_cmd.is_some() {
+        out.warnings.push(
+            "an unattended drain never hands a conflict or a red gate to the merge-queue agent; deferred for the owner"
+                .into(),
+        );
+    }
     let target = match integrate::resolve_target_checked(cfg, repo_root) {
         Ok(target) => target,
         Err(error) => {
