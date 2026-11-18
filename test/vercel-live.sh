@@ -54,6 +54,11 @@ while [ $# -gt 0 ]; do
       echo "--login-home-claude: not a directory" >&2
       exit 2
     }
+    case "$login_home_claude" in *[\"\\]* | *$'\n'*)
+      echo "--login-home-claude: path must not contain a quote, backslash or newline" >&2
+      exit 2
+      ;;
+    esac
     model_login=1
     headless=1
     shift 2
@@ -68,6 +73,8 @@ while [ $# -gt 0 ]; do
     ;;
   esac
 done
+# --with-headless provisions a second sandbox (step 7w); the cap must allow it.
+if [ "$headless" = 1 ]; then MAX_INSTANCES=2; fi
 
 print_plan() {
   cat <<PLAN
@@ -92,8 +99,9 @@ Steps:
   8b  tmpfs login dir is gone after stop/resume
   7h  (--with-headless) agent run --wait --pull with model_credentials =
       "upload" (+ optional --login-home-claude <dir> -> login_homes), then
-      7l land --worktree and 7r release check (sandbox kept unless
-      --release-sandbox; the run then destroys it itself in step 9)
+      7l land --worktree <vx-h path> --release-sandbox and 7r release
+      check (only the first sandbox's ledger record remains); needs a
+      second sandbox, so max_instances = 2 with --with-headless
   9   env down (destroy)              10  env reap dry-run, 10a apply
 Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
 PLAN
@@ -226,6 +234,14 @@ egress_denied() {
   case "$out" in *curl_rc=0* | *curl_rc=127*) return 1 ;; *curl_rc=*) return 0 ;; *) return 1 ;; esac
 }
 
+VX_PATH=""
+resolve_vx_path() { # the worktree whose branch ends in vx-h
+  VX_PATH="$(git -C "$REPO" worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} /^branch .*vx-h$/{print p}')"
+  echo "   worktree: ${VX_PATH:-(none)}"
+  [ -n "$VX_PATH" ] && [ "$(printf '%s\n' "$VX_PATH" | wc -l)" -eq 1 ]
+}
+released_headless() { [ "$(run_records vercel | wc -l)" -eq 1 ]; }
+
 write_config() {
   cat >"$XDG_CONFIG_HOME/thegn/config.toml" <<CFG
 [env.${ENV_NAME}]
@@ -284,9 +300,10 @@ fi
 step 7 "env pull fast-forwards the lane branch" in_repo "$THEGN_BIN" env pull
 if [ "$headless" = 1 ]; then
   step 7w "wt new vx-h" in_repo "$THEGN_BIN" wt new vx-h --env "$ENV_NAME"
-  step 7h "headless agent run --wait --pull (upload credentials)" in_repo "$THEGN_BIN" agent run vx-h --agent claude --prompt "create vx.txt containing ok and commit it" --wait --pull --json
-  step 7l "land the headless worktree" in_repo "$THEGN_BIN" land --worktree vx-h
-  step 7r "release check: land kept the sandbox (no --release-sandbox)" in_repo "$THEGN_BIN" env test "$ENV_NAME"
+  step 7p "resolve the vx-h worktree path" resolve_vx_path
+  step 7h "headless agent run --wait --pull (upload credentials)" in_repo "$THEGN_BIN" agent run --worktree "$VX_PATH" --agent claude --prompt "create vx.txt containing ok and commit it" --wait --pull --json
+  step 7l "land the headless worktree" in_repo "$THEGN_BIN" land --worktree "$VX_PATH" --release-sandbox
+  step 7r "release check: land released the headless sandbox" released_headless
 fi
 step 8 "stop (env down --stop)" in_repo "$THEGN_BIN" env down --stop
 step 8a "resume (env up)" in_repo "$THEGN_BIN" env up
