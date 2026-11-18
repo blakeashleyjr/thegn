@@ -340,9 +340,8 @@ pub(crate) fn provider_for_named_with_key(
 /// id cannot be loaded the scope stays unset, so create and destroy refuse
 /// rather than act on an unrecorded sprite.
 ///
-/// The legacy ids (worktree location rows naming a sprite) are left empty:
-/// this factory is called on the event loop, so the DB read happens inside
-/// `sprites::ledger::prove_owned` instead.
+/// The legacy ids are left empty: only a ledger record this host wrote before
+/// the create proves a sprite ours (a worktree location row proves nothing).
 pub(crate) fn sprites_policy(
     provider: SpritesProvider,
     pc: &thegn_core::config::EnvProviderConfig,
