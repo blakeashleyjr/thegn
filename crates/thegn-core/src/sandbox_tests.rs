@@ -3118,8 +3118,6 @@ fn remote_enter_argv_wraps_with_ssh() {
     );
 }
 
-// H4 is in dns_filter.rs (already done).
-
 // Per-profile container naming (G1).
 #[test]
 fn container_name_with_profile_adds_slug() {

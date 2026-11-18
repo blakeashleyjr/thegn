@@ -230,7 +230,7 @@ mod tests {
         );
     }
 
-    // Moved verbatim from `dns_filter.rs` (WS01-P2-01); `DnsPolicy` became
+    // Moved verbatim from the deleted DNS filter module (WS01-P2-01); its policy became
     // `HostRules`.
 
     #[test]

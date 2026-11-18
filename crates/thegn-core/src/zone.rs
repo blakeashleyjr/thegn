@@ -26,8 +26,9 @@ pub struct ZoneConfig {
     /// worktree, below workspace/worktree bindings).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env_bundles: Vec<String>,
-    /// Egress **ceiling**: member `network_allow` intersects down into this set
-    /// (empty ⇒ no zone ceiling). Enforced via the per-container DNS filter.
+    /// Advisory **ceiling**: member `network_allow` lists are intersected down
+    /// into this set (empty ⇒ no zone ceiling). Like every hostname list, it is
+    /// not enforced by any local backend.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub network_allow: Vec<String>,
     /// Extra egress blocks appended to every member (deny wins).
