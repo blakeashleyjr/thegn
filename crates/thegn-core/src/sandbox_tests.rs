@@ -6727,6 +6727,10 @@ fn git_policy_commit_only_binds_common_ro_then_lane_carve_outs() {
     // The plan's mkdirs ran on the host.
     assert!(fx.common.join("refs/heads/tg").is_dir());
     assert!(fx.common.join("logs/refs/heads/tg").is_dir());
+    // Each carve-out holds the keep directory, so a ref prune cannot remove
+    // the directory under a running sandbox's bind.
+    assert!(fx.common.join("refs/heads/tg/.thegn-keep").is_dir());
+    assert!(fx.common.join("logs/refs/heads/tg/.thegn-keep").is_dir());
     let argv = bwrap_git_argv(&fx, mounts.clone());
     let wt = triple_at(&argv, "--bind", &fx.wt).expect("worktree rw");
     let common_ro = triple_at(&argv, "--ro-bind", &fx.common).expect("common dir ro");
