@@ -3372,13 +3372,11 @@ ready_timeout_secs = 30
 #   offline — force network=none so nothing leaks onto the host network.
 on_error = "fail"
 # DNS composition:
-#   tunnel       — the overlay owns resolution (MagicDNS / pushed DNS); the
-#                  network_allow/network_block filter is bypassed (default).
-#   filter-front — chain the allow/block DNS filter in front of the tunnel's
-#                  resolver (preserves auditing). NOTE: with a sidecar tunnel the
-#                  filter can't yet reach the sidecar's netns, so this currently
-#                  behaves like `tunnel`; the resolver-chaining seam exists.
-#   filter-only  — ignore the overlay's pushed DNS, keep the filter only.
+#   tunnel       — the overlay owns resolution (MagicDNS / pushed DNS) (default).
+#   filter-only  — drop the overlay's pushed DNS; the runtime's default
+#                  resolver is used. No hostname filter exists in any mode.
+#   filter-front — reserved: warns and behaves as `tunnel`;
+#                  `thegn config validate --strict` rejects it.
 dns = "tunnel"
 # Request an ephemeral node identity where supported (Tailscale/Headscale/
 # NetBird) so the device auto-deregisters from the control plane on teardown.
