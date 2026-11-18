@@ -30,6 +30,10 @@ pub(crate) fn close_pane(cx: &mut CloseCtx<'_>) {
         .active_tab()
         .map(|t| t.center.pane_ids().len())
         .unwrap_or(0);
+    // A Lead tab's token is per TAB (every pane of the tab was spawned from
+    // the same launch spec, `lead:<group>/<tab>`), and this path never closes
+    // a tab's last pane, so a pane close never revokes: the tab's other panes
+    // still use the token. `close_tab` revokes.
     if pane_count <= 1 {
         cx.model.status = "Only one pane — use Close tab to close the tab".into();
     } else {
@@ -96,19 +100,26 @@ pub(crate) fn close_tab(
         .session
         .active
         .min(cx.session.worktrees.len().saturating_sub(1));
-    let target = cx
-        .session
-        .worktrees
-        .get(gi)
-        .map(|g| (g.name.clone(), g.path.clone(), gi, g.active_tab));
+    let target = cx.session.worktrees.get(gi).map(|g| {
+        (
+            g.name.clone(),
+            g.path.clone(),
+            gi,
+            g.active_tab,
+            g.kind == crate::session::GroupKind::Terminal,
+        )
+    });
     let mut session_end_error = None;
     match cx.session.close_active_tab() {
         crate::session::CloseResult::Tab(tab) => {
             for id in tab.center.pane_ids() {
                 cx.panes.table.remove(&id);
             }
-            if let Some((name, path, gi, ti)) = target {
+            if let Some((name, path, gi, ti, is_terminal)) = target {
                 tab_state.on_tab_closed(&name, gi, ti);
+                if is_terminal {
+                    crate::lead::mcp::revoke_closed_tab_off_loop(cx.lifecycle_cfg, &name, ti);
+                }
                 if !path.is_empty()
                     && cx
                         .session

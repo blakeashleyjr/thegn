@@ -167,7 +167,7 @@ fn launch_spec_with(
 
     crate::lead::skill::seed(cfg, &notes)?;
     let caller = match &mode {
-        LeadMode::Interactive { group, tab } => format!("lead:{group}/{tab}"),
+        LeadMode::Interactive { group, tab } => crate::lead::mcp::tab_caller(group, *tab),
         LeadMode::Headless { .. } => HEADLESS_CALLER.to_string(),
     };
 
