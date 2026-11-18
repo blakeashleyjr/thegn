@@ -1651,6 +1651,10 @@ _The multi-wave programme that makes sandbox and egress reporting truthful, adds
 
 - [~] 763. Sandbox + remote programme (W0 contracts and W1 truth-in-reporting shipped: nine release-channel features, help-page split, honest egress and capability reporting, kubernetes clamp on stable, reserved smol/appcontainer backends and vpn dns mode, DNS filter removed, wave-0 spike scripts; later waves pending) — see the programme record above; overlaps AC 365/372 and AJ 434 (egress truth, WS01), AB/AE (sandbox and provider seams)
 
+### BC. Jobs and hosted execution
+
+- [ ] 764. Add bounded Jobs alongside Sessions. Ship local execution, then SSH and Fly against the public contract. The separately released hosted service consumes that contract after the OSS portability gate. See the [architecture and delivery gates](docs/rfcs/jobs.md) and [draft v0 spec](docs/rfcs/job-spec-v0.md). Coordinate launch admission, providers and remote workers with BB 763.
+
 ### AI-free mode (audience-widener)
 
 - [~] 511. AI-free mode — run as a pure terminal workspace/worktree manager, no agents/proxy/LLM
