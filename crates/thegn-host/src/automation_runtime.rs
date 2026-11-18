@@ -36,7 +36,6 @@ pub fn clear_session_origin(session: &str) {
 /// `register_session_origin` records each automation-opened session and the
 /// session-exit path removes it, so this is the in-process view of "the
 /// previous run is still going" (`SkipReason::PreviousRunLive`).
-#[allow(dead_code, reason = "consumed by b153 lanes 2 and 5 (PreviousRunLive)")]
 pub(crate) fn rule_has_live_session(rule_id: &str) -> bool {
     SESSION_ORIGINS.get().is_some_and(|origins| {
         origins
@@ -404,7 +403,7 @@ fn admit_unless_paused(
 /// (THE-2181). Every stored row is re-validated and `merge_rules` filters the
 /// action allowlist again, so a stored rule can never reach `merge.add` or
 /// `tools.run`. A DB error keeps the config rules only.
-fn with_lead_rules(
+pub(crate) fn with_lead_rules(
     db: &thegn_core::db::Db,
     rules: Vec<thegn_core::automation::AutomationRule>,
 ) -> Vec<thegn_core::automation::AutomationRule> {
