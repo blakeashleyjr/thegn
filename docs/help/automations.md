@@ -179,6 +179,61 @@ command, path, branch name, scope, rule or autonomy level.
 `list`. A Lead may pause; `thegn automations resume` is operator-only (never
 available over MCP), so the Lead can stop rules but not restart them.
 
+## Budgets
+
+Two `[automations]` keys bound how much work automation may start on its own:
+
+```toml
+[automations]
+max_concurrent_lanes = 2  # automation-started lanes active at once
+max_spawns_per_day = 12   # automation spawns in a rolling 24 h window
+```
+
+- An active lane is a tracker issue with an active dispatch row that an
+  automation rule started. Manual dispatches never count.
+- A spawn is a succeeded `pipeline.start`, `sessions.open` or `lead.wake` run
+  (a `propose` start is not a spawn: it starts nothing), plus each stage the
+  executor advances an automation lane to.
+- A new lane needs both a free lane slot and a spawn; the next stage of an
+  existing lane, a session and a Lead wake need only a spawn.
+- `0` in either key means automation may spawn nothing.
+- Budgets are checked when a rule fires and again before every executor advance
+  or land. A refused run is audited as skipped (`budget`) and the first refusal
+  each day files one automation notification.
+- If the usage cannot be read from the database, the spawn is refused
+  ("budget unreadable"): a budget failure never lets work through.
+
+The per-rule rate limits still apply on top: `max_per_hour` (fires of one rule)
+and `max_action_per_hour` (runs of the same action capability across rules),
+both default 30.
+
+`thegn lead status` shows usage against both limits.
+
+## Kill switch
+
+`thegn lead pause` is the stop button for everything automation and the Lead
+started:
+
+- it sets the pause flag (as `thegn automations pause` does), so rules are
+  audited `paused`, the stage executor and approval effects do nothing, and a
+  Lead's `sessions.open` and `dispatches.put` are refused;
+- it kills every live session an automation rule opened or a Lead opened;
+- it cancels in-flight executor validations;
+- it prints what it stopped.
+
+`--keep-sessions` sets the flag but leaves running sessions alone. The Lead
+tab itself stays open: it is your chat. A headless Lead turn (a `lead.wake`
+with no tab open) cannot be cancelled yet; it ends at its own timeout, and
+every spawn it asks for while paused is refused.
+
+`thegn lead resume` clears the flag. Sessions the pause killed are not
+restarted. The Lead can pause, but it cannot halt sessions or resume: both
+are operator-only (admin scope, never over MCP).
+
+`thegn lead status [--json]` prints the flag, budget usage, pending approvals
+and live automation lanes. It reads the database directly, so it still answers
+with the daemon down (pending approvals then show as unavailable).
+
 ## Rules vs `[autopilot]`
 
 Both exist. `[autopilot]` is a complete UI-process supervisor with durable
