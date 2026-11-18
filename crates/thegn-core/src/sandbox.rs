@@ -1332,12 +1332,34 @@ fn compose_cannot_enforce(spec: &SandboxSpec) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostnameRulesPolicy {
-    WarnDnsOnly,
+    /// Launch, and warn that the lists are not enforced.
+    WarnUnenforced,
     Refuse,
 }
 
-/// SD-3 (THE-799): flip to `Refuse` for the audit design; one line.
-pub const HOSTNAME_RULES: HostnameRulesPolicy = HostnameRulesPolicy::WarnDnsOnly;
+/// SD-3 (THE-799, owner decision O14 still open): hostname lists warn as
+/// unenforced and the launch proceeds. Flip to `Refuse` for the audit design;
+/// one line.
+pub const HOSTNAME_RULES: HostnameRulesPolicy = HostnameRulesPolicy::WarnUnenforced;
+
+/// Whether a placement lowers `network_allow`/`network_block` to a provider
+/// egress policy API (Sprites). Every other placement leaves the lists
+/// unenforced.
+fn placement_lowers_hostname_rules(placement: &Placement) -> bool {
+    match placement {
+        Placement::Provider(p) => crate::config::EnvProviderKind::of(&p.provider).egress_api(),
+        Placement::Local | Placement::Ssh(_) | Placement::K8s(_) => false,
+    }
+}
+
+/// The warning for a provider environment whose kind has no egress policy
+/// API, so its `network_allow`/`network_block` lists are not enforced.
+pub fn provider_rules_unenforced_note(provider: &str) -> String {
+    format!(
+        "env provider '{provider}': network_allow/network_block are NOT enforced: this provider \
+         has no egress policy API; set `network = \"none\"` in the env sandbox or remove the lists"
+    )
+}
 
 pub fn lower_universal_deny(network: Network, block: &[String]) -> Network {
     if block.iter().any(|rule| rule.trim() == "*") {
@@ -1361,14 +1383,18 @@ pub fn hostname_rules_note_for(
     if !hostname_rules_active(network, allow, block) {
         return None;
     }
-    // Provider placements lower these rules to provider egress policy (THE-534).
-    if matches!(placement, Placement::Provider(_)) {
+    // Only a provider with an egress policy API lowers these rules (THE-534);
+    // it applies and reads the policy back before handoff.
+    if placement_lowers_hostname_rules(placement) {
         return None;
     }
+    if let Placement::Provider(p) = placement {
+        return Some(provider_rules_unenforced_note(&p.provider));
+    }
     Some(format!(
-        "sandbox {}: network_allow/network_block are DNS-name rules only — not an egress boundary, and not \
-         applied by this backend (direct IPs and other resolvers bypass them); set `network = \"none\"` \
-         to deny egress, or remove the lists",
+        "sandbox {}: network_allow/network_block are advisory: no backend enforces hostname \
+         rules (direct IPs and other resolvers are unaffected); set `network = \"none\"` to deny \
+         egress, or remove the lists",
         backend.label()
     ))
 }
@@ -1384,15 +1410,19 @@ pub fn hostname_rules_note(spec: &SandboxSpec) -> Option<String> {
 }
 
 fn hostname_policy_refusal_with(policy: HostnameRulesPolicy, spec: &SandboxSpec) -> Option<String> {
-    if policy == HostnameRulesPolicy::WarnDnsOnly
+    if policy == HostnameRulesPolicy::WarnUnenforced
         || !hostname_rules_active(spec.network, &spec.network_allow, &spec.network_block)
-        || matches!(spec.placement, Placement::Provider(_) | Placement::K8s(_))
+        || placement_lowers_hostname_rules(&spec.placement)
+        || matches!(spec.placement, Placement::K8s(_))
     {
         return None;
     }
+    if let Placement::Provider(p) = &spec.placement {
+        return Some(provider_rules_unenforced_note(&p.provider));
+    }
     Some(format!(
-        "`network_allow`/`network_block` are DNS-name rules, which are not an egress boundary and are not \
-         enforced by the `{}` backend; set `network = \"none\"` or remove the lists",
+        "`network_allow`/`network_block` are advisory hostname rules, which are not enforced by the \
+         `{}` backend; set `network = \"none\"` or remove the lists",
         spec.backend.label()
     ))
 }

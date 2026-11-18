@@ -13,11 +13,13 @@ Part of [[sandboxing]]. The network mode and the allow and block lists.
 
 By default a `standard` sandbox keeps networking so fetch, clone, build,
 and debuggers work; `sealed` removes it entirely. `[sandbox]` also
-carries DNS-name allow/block rules for the middle ground. These rules are not
-an egress boundary; `network = "none"` is the only enforced deny, and `*` in
-`network_block` means offline — see [[config-reference]].
-Standalone sandboxed terminals also warn when DNS-name rules apply, because
-those rules are not an egress boundary.
+carries hostname allow/block lists for the middle ground. These lists are
+advisory, not an egress boundary: no local backend enforces them, and only the
+Sprites provider lowers them to its own policy API. `network = "none"` is the
+only enforced deny, and `*` in `network_block` means offline — see
+[[config-reference]]. thegn warns when lists are set but not enforced: at
+launch (standalone sandboxed terminals included), at `thegn env provision`, and
+in `thegn doctor`.
 
 On the `apple` backend, `network = "none"` (and therefore `sealed`) is refused
 with `network-unexpressible` until an internal-network implementation lands:

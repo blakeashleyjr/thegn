@@ -5248,7 +5248,8 @@ fn hostname_rules_note_names_backend_on_every_local_backend() {
         s.network_allow = vec!["example.com".into()];
         let note = hostname_rules_note(&s).expect("active allow-list should be reported");
         assert!(note.contains(backend.label()), "{note}");
-        assert!(note.contains("DNS-name rules only"), "{note}");
+        assert!(note.contains("are advisory"), "{note}");
+        assert!(!note.contains("DNS-only"), "{note}");
 
         s.network = Network::Host;
         s.network_allow.clear();
@@ -5272,7 +5273,70 @@ fn hostname_rules_note_names_backend_on_every_local_backend() {
         up_command: vec![],
         down_command: vec![],
     });
-    assert!(hostname_rules_note(&provider).is_none());
+    // An unknown provider is the `custom` kind: no egress policy API.
+    let note = hostname_rules_note(&provider).expect("custom provider lists are unenforced");
+    assert!(note.contains("NOT enforced"), "{note}");
+}
+
+fn provider_spec_with_lists(provider: &str) -> SandboxSpec {
+    let mut s = spec(Backend::Podman);
+    s.network_allow = vec!["github.com".into()];
+    s.placement = Placement::Provider(crate::placement::ProviderPlacement {
+        provider: provider.into(),
+        id: "sandbox".into(),
+        interactive_prefix: vec![],
+        control_prefix: vec![],
+        up_command: vec![],
+        down_command: vec![],
+    });
+    s
+}
+
+#[test]
+fn note_for_daytona_provider_warns() {
+    let note = hostname_rules_note(&provider_spec_with_lists("daytona"))
+        .expect("daytona has no egress policy API");
+    assert!(note.contains("env provider 'daytona'"), "{note}");
+    assert!(note.contains("NOT enforced"), "{note}");
+    assert!(note.contains("network = \"none\""), "{note}");
+}
+
+#[test]
+fn note_for_custom_provider_warns() {
+    let note = hostname_rules_note(&provider_spec_with_lists("custom"))
+        .expect("custom has no egress policy API");
+    assert!(note.contains("NOT enforced"), "{note}");
+}
+
+#[test]
+fn note_for_sprites_provider_is_none() {
+    assert!(hostname_rules_note(&provider_spec_with_lists("sprites")).is_none());
+}
+
+#[test]
+fn local_note_says_advisory_not_dns() {
+    let mut s = spec(Backend::Bwrap);
+    s.network_block = vec!["example.com".into()];
+    let note = hostname_rules_note(&s).expect("local lists are advisory");
+    assert!(note.contains("advisory"), "{note}");
+    assert!(!note.contains("DNS"), "{note}");
+}
+
+#[test]
+fn policy_refusal_skips_only_egress_api_providers() {
+    use crate::config::EnvProviderKind;
+    use crate::seam::Kind as _;
+    for kind in EnvProviderKind::ALL.iter().copied() {
+        let s = provider_spec_with_lists(kind.as_str());
+        let refused = hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s);
+        assert_eq!(refused.is_none(), kind.egress_api(), "{kind:?}");
+        assert_eq!(
+            hostname_rules_note(&s).is_none(),
+            kind.egress_api(),
+            "{kind:?}"
+        );
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnUnenforced, &s).is_none());
+    }
 }
 
 #[test]
@@ -5286,7 +5350,7 @@ fn no_dns_flag_in_oci_create_opts() {
 
 #[test]
 fn default_hostname_policy_warns_not_refuses() {
-    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnDnsOnly);
+    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnUnenforced);
     let mut s = spec(Backend::Bwrap);
     s.network_allow = vec!["example.com".into()];
     assert!(!matches!(
@@ -5318,7 +5382,7 @@ fn refuse_policy_refuses_hostname_rules() {
         s.network = Network::None;
         assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s).is_none());
         s.network = Network::Nat;
-        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnDnsOnly, &s).is_none());
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnUnenforced, &s).is_none());
     }
 
     let mut remote = spec(Backend::Bwrap);
@@ -5341,7 +5405,9 @@ fn refuse_policy_refuses_hostname_rules() {
         up_command: vec![],
         down_command: vec![],
     });
-    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_none());
+    // A provider without an egress policy API (`test` is the custom kind)
+    // refuses under the refuse policy; only an egress-API provider is exempt.
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_some());
     placement_spec.placement = Placement::K8s(crate::placement::K8sPlacement {
         kubectl: "kubectl".into(),
         context: None,

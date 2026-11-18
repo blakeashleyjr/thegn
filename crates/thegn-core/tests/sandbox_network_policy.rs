@@ -59,12 +59,8 @@ fn g1_hostname_rules_do_not_inject_dns_flag() {
     force_rm(name);
     let mut spec = spec_with_network_block(name, vec!["blocked.internal".into()]);
     spec.network_allow = vec!["allowed.example".into()];
-    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnDnsOnly);
-    assert!(
-        hostname_rules_note(&spec)
-            .unwrap()
-            .contains("DNS-name rules only")
-    );
+    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnUnenforced);
+    assert!(hostname_rules_note(&spec).unwrap().contains("are advisory"));
     ensure(&spec).expect("ensure failed");
     let out = run_in(&spec, "true");
     force_rm(name);

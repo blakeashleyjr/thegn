@@ -2899,6 +2899,12 @@ pub fn provision_provider_env_named(
     let block = &resolved.sandbox.network_block;
     let admission =
         crate::egress_admit::egress_admission(created, provider.caps().egress, allow, block);
+    if admission == crate::egress_admit::EgressAdmission::SkipUnsupported {
+        crate::egress_admit::warn_unsupported_once(
+            crate::egress_admit::provider_label(&provider),
+            &id,
+        );
+    }
     if let crate::egress_admit::EgressAdmission::AdmitFresh
     | crate::egress_admit::EgressAdmission::VerifyExisting = admission
     {
@@ -3996,7 +4002,7 @@ fn auto_provision_sandbox(
             let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
             let allow = &resolved.sandbox.network_allow;
             let block = &resolved.sandbox.network_block;
-            crate::egress_admit::gate_handed_sandbox(
+            let admission = crate::egress_admit::gate_handed_sandbox(
                 &crate::egress_admit::BlockingProviderEgress {
                     provider: &provider,
                 },
@@ -4006,6 +4012,12 @@ fn auto_provision_sandbox(
                 allow,
                 block,
             )?;
+            if admission == crate::egress_admit::EgressAdmission::SkipUnsupported {
+                crate::egress_admit::warn_unsupported_once(
+                    crate::egress_admit::provider_label(&provider),
+                    &name,
+                );
+            }
             if created {
                 thegn_core::msg::info(&format!("provisioned sandbox {provisioned_name}"));
             }
