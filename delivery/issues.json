@@ -433,6 +433,34 @@
       "changes": [
         "add-programme-features"
       ]
+    },
+    {
+      "issue": "THE-2172",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-lead-tool-surface"
+      ]
+    },
+    {
+      "issue": "THE-2173",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-lead-tab"
+      ]
+    },
+    {
+      "issue": "THE-2223",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "add-vercel-sandbox-provider"
+      ]
+    },
+    {
+      "issue": "THE-2233",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "vercel-sandbox-agent-credentials"
+      ]
     }
   ]
 }

@@ -167,6 +167,31 @@
       "summary": "Launch admission contract for the sandbox + remote programme; authored in W0, implemented by WS02-P5 items."
     },
     {
+      "change": "add-lead-tab",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2173",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "The Lead: a sandboxed supervising agent tab with a confined tool surface; shipped behind the dev channel."
+    },
+    {
+      "change": "add-lead-tool-surface",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2172",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Bird's-eye capabilities for the Lead: overview, notifications, automation authoring, approvals and merge drain.",
+      "delivered_at": "2026-11-18"
+    },
+    {
       "change": "add-localization",
       "lifecycle": "archived",
       "disposition": "superseded-retire",
@@ -416,6 +441,18 @@
         }
       ],
       "summary": "Wire the bounded PanelSection contribution end to end without promising arbitrary UI."
+    },
+    {
+      "change": "add-vercel-sandbox-provider",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2223",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Vercel Sandbox as a remote provider; implemented and tested against a fake server, never run against Vercel."
     },
     {
       "change": "add-viewers-and-quick-open",
@@ -1391,6 +1428,18 @@
       ],
       "summary": "Admit bounded tracker identities before provider paths, options, caches, and control transport. Reviewed and verified with 107 distinct native tests and a 24-case redirect supplement; source/artifact mapping and limitations are in the maintenance08 audit.",
       "archive_path": "openspec/changes/archive/2026-09-30-validate-tracker-identifiers/"
+    },
+    {
+      "change": "vercel-sandbox-agent-credentials",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2233",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Opt-in per-env model credential mode for Vercel sandboxes; none and upload implemented, proxy and inject refused."
     },
     {
       "change": "verify-gate-workspace",
