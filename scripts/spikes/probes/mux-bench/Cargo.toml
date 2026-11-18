@@ -1,0 +1,8 @@
+[package]
+name = "mux-bench-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "WS09-P0-04 throwaway probe: minimal mux framing, credit window, optimistic OPEN. Never merged."
+
+[workspace]
