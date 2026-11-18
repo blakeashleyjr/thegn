@@ -62,6 +62,18 @@ async fn lead_post(
     if RouteToHostTokenBinding::parse_label(&ctx.label).is_some() {
         return ControlError::FailedPrecondition("confined token".into()).into_response();
     }
+    if matches!(verb, Verb::ApprovalsRedeem)
+        && !super::auth::implicit_local_admin(
+            state.local_admin,
+            state.daemon_euid,
+            headers.peer.as_ref(),
+        )
+    {
+        return ControlError::FailedPrecondition(
+            "approvals.redeem is answered only through the signed push inbox".into(),
+        )
+        .into_response();
+    }
     if matches!(verb, Verb::MergeDrain)
         && !thegn_core::control::route_to_host_token_allows_worktree(
             ctx.scopes, &ctx.label, &target,
