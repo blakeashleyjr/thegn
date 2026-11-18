@@ -479,6 +479,56 @@ impl EnvProviderKind {
     pub fn live_unverified(self) -> bool {
         matches!(self, Self::Hetzner)
     }
+
+    /// Lowers `network_allow` / `network_block` to a provider policy API and
+    /// reads the applied policy back before handoff. This is the static
+    /// capability of the kind; a per-worktree report replaces it later.
+    ///
+    /// | kind         | egress_api |
+    /// |--------------|------------|
+    /// | custom       | no         |
+    /// | daytona      | no         |
+    /// | sprites      | yes (`rules_from` + `egress_admit`) |
+    /// | hetzner      | no         |
+    /// | digitalocean | no         |
+    /// | fly          | no         |
+    /// | machine0     | no         |
+    pub fn egress_api(self) -> bool {
+        matches!(self, Self::Sprites)
+    }
+
+    /// Native checkpoint/restore.
+    ///
+    /// | kind         | checkpoints |
+    /// |--------------|-------------|
+    /// | custom       | no          |
+    /// | daytona      | no          |
+    /// | sprites      | yes (Sprites checkpoints) |
+    /// | hetzner      | no (a powered-off VPS still bills; recycle destroys) |
+    /// | digitalocean | no          |
+    /// | fly          | no          |
+    /// | machine0     | yes (machine0 images) |
+    pub fn checkpoints(self) -> bool {
+        matches!(self, Self::Sprites | Self::Machine0)
+    }
+
+    /// A files transport exists.
+    ///
+    /// | kind         | files |
+    /// |--------------|-------|
+    /// | custom       | no    |
+    /// | daytona      | no    |
+    /// | sprites      | yes (Sprites API) |
+    /// | hetzner      | yes (ssh shim) |
+    /// | digitalocean | yes (ssh shim) |
+    /// | fly          | yes (ssh to the machine's dedicated IPv4) |
+    /// | machine0     | yes (ssh) |
+    pub fn files(self) -> bool {
+        matches!(
+            self,
+            Self::Sprites | Self::Hetzner | Self::DigitalOcean | Self::Fly | Self::Machine0
+        )
+    }
 }
 
 /// Whether `name` names a commodity-VPS provider kind. See
@@ -1086,6 +1136,35 @@ mod tests {
                     assert!(!kind.live_unverified(), "{kind:?} is not live-unverified");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn env_provider_kind_capability_table() {
+        use crate::seam::Kind as _;
+        // (kind, egress_api, checkpoints, files): today's provider caps, pinned.
+        let table = [
+            (EnvProviderKind::Custom, false, false, false),
+            (EnvProviderKind::Daytona, false, false, false),
+            (EnvProviderKind::Sprites, true, true, true),
+            (EnvProviderKind::Hetzner, false, false, true),
+            (EnvProviderKind::DigitalOcean, false, false, true),
+            (EnvProviderKind::Fly, false, false, true),
+            (EnvProviderKind::Machine0, false, true, true),
+        ];
+        assert_eq!(
+            table.len(),
+            EnvProviderKind::ALL.len(),
+            "every kind is in the table"
+        );
+        for kind in EnvProviderKind::ALL.iter().copied() {
+            let row = table
+                .iter()
+                .find(|row| row.0 == kind)
+                .unwrap_or_else(|| panic!("{kind:?} missing from the table"));
+            assert_eq!(kind.egress_api(), row.1, "{kind:?} egress_api");
+            assert_eq!(kind.checkpoints(), row.2, "{kind:?} checkpoints");
+            assert_eq!(kind.files(), row.3, "{kind:?} files");
         }
     }
 }
