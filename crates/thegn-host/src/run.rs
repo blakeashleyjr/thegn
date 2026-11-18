@@ -184,6 +184,16 @@ fn lookup_workspace_slug_read_only(root: &Path) -> Option<String> {
     }
 }
 
+/// The loop's "last worktree closed → quit" test. An empty session with no
+/// project (`id` cleared by removing the active project) stays up on the
+/// splash, as does one whose landing switch is still loading.
+fn session_closed_last_worktree(
+    session: &crate::session::Session,
+    pending_switch: &crate::workspace_switch_prep::PendingSwitch,
+) -> bool {
+    session.worktrees.is_empty() && !session.id.is_empty() && !pending_switch.in_flight()
+}
+
 fn delete_workspace_slug(
     session: &crate::session::Session,
     repo_path: &str,
@@ -9498,10 +9508,12 @@ async fn event_loop<T: Terminal>(
                 crate::perf_log::emit(log_stats);
             }
         }
-        // A landing switch in flight (the active project was just removed)
-        // leaves the session empty until the next project loads — that is
-        // not "last worktree closed".
-        if session.worktrees.is_empty() && !pending_switch.in_flight() {
+        // Quit only when the user closed the last worktree of a project that
+        // still exists. Removing the active project clears `session.id` too:
+        // that empty session is the splash (loading / no projects) while a
+        // landing switch loads — or indefinitely when no project remains —
+        // never a quit.
+        if session_closed_last_worktree(&session, &pending_switch) {
             shutdown_shares(&mut share_supervisor);
             return Ok(()); // last worktree closed
         }
@@ -10603,7 +10615,7 @@ async fn event_loop<T: Terminal>(
             crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
         }
-        if session.worktrees.is_empty() && !pending_switch.in_flight() {
+        if session_closed_last_worktree(&session, &pending_switch) {
             return Ok(());
         }
 
