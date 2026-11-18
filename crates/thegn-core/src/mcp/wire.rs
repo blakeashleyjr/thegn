@@ -190,7 +190,8 @@ pub fn lead_entries(e: &LeadEntries<'_>) -> Value {
         LEAD_SERVE_KEY.to_string(),
         json!({
             "command": e.command,
-            "args": ["mcp", "serve", "--scopes", scopes],
+            // safe for the Lead: the daemon confines Lead input to sessions the Lead opened
+            "args": ["mcp", "serve", "--scopes", scopes, "--allow-session-input"],
             "env": {
                 "THEGN_CONTROL_ADDR": e.control_addr,
                 "THEGN_CONTROL_TOKEN": e.control_token,
@@ -236,7 +237,13 @@ mod tests {
         assert_eq!(serve["command"], "/bin/thegn");
         assert_eq!(
             serve["args"],
-            json!(["mcp", "serve", "--scopes", "read,write"])
+            json!([
+                "mcp",
+                "serve",
+                "--scopes",
+                "read,write",
+                "--allow-session-input"
+            ])
         );
         let env = serve["env"].as_object().unwrap();
         let mut keys: Vec<&str> = env.keys().map(String::as_str).collect();
@@ -246,8 +253,6 @@ mod tests {
             ["THEGN_CALLER", "THEGN_CONTROL_ADDR", "THEGN_CONTROL_TOKEN"]
         );
         assert_eq!(env["THEGN_CONTROL_TOKEN"], "tgc_secret");
-        // `sessions_input` is never opted into.
-        assert!(!serve["args"].to_string().contains("allow-session-input"));
         let hub = &servers[LEAD_HUB_KEY];
         assert_eq!(hub["args"], json!(["mcp", "proxy", "--profile", "lead"]));
         assert!(hub.get("env").is_none(), "the hub entry is secret-free");
@@ -269,7 +274,7 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(
             servers[LEAD_SERVE_KEY]["args"],
-            json!(["mcp", "serve", "--scopes", "none"])
+            json!(["mcp", "serve", "--scopes", "none", "--allow-session-input"])
         );
         assert!(lead(None)["mcpServers"].get(LEAD_HUB_KEY).is_none());
     }
