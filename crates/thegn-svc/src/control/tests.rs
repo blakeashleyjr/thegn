@@ -3538,7 +3538,7 @@ async fn b155_spine_verbs_scope_and_lead_rows() {
     let answer = serde_json::json!({ "nonce": "n", "decision": "approve" });
     assert_eq!(
         post_json(&r, redeem, &write, answer.clone()).await.0,
-        authorized
+        StatusCode::PRECONDITION_FAILED
     );
     let (status, body) = post_json(&r, redeem, &lead, answer).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -3550,6 +3550,29 @@ async fn b155_spine_verbs_scope_and_lead_rows() {
             .await
             .0,
         authorized
+    );
+}
+
+/// b155 review: a non-Lead Write token on a token-authenticated listener
+/// cannot redeem (the code alone must not approve; only the signed inbox,
+/// dispatching as implicit local admin, may). The API is never reached for
+/// the token caller; a same-uid implicit-local-admin caller reaches it.
+#[tokio::test]
+async fn approvals_redeem_refuses_token_callers_but_not_implicit_local_admin() {
+    let r = rig(false);
+    let write = token(&r, "write");
+    let answer = serde_json::json!({ "nonce": "n", "decision": "approve" });
+    let (status, body) = post_json(&r, "/v1/approvals/redeem", &write, answer).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert!(refusal_text(&body).contains("signed push inbox"), "{body}");
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+
+    let local = rig(true);
+    // The FakeApi keeps the trait's default (NOT_IMPLEMENTED), which proves
+    // the call got past the transport to the API method.
+    assert_eq!(
+        call(&local, "POST", "/v1/approvals/redeem", None).await,
+        StatusCode::NOT_IMPLEMENTED
     );
 }
 
