@@ -755,7 +755,9 @@ async fn fetch_state(
         | "automations.runs"
         | "approvals.list"
         | "approvals.request"
-        | "merge.drain" => {
+        | "merge.drain"
+        // THE-2197: the Lead's kill switch (no args; resume is never MCP).
+        | "automations.pause" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let params = args
                 .as_object()
@@ -1246,6 +1248,7 @@ mod tests {
         "automations.rm",
         "automations.enable",
         "approvals.request",
+        "automations.pause",
     ];
 
     #[test]
@@ -1358,6 +1361,20 @@ mod tests {
             assert!(allowed.contains(&"merge.drain"), "--scopes {scopes}");
             assert!(allowed.contains(&"merge.add"), "--scopes {scopes}");
         }
+    }
+
+    #[test]
+    fn automations_resume_is_never_listed_on_any_scope() {
+        // THE-2197: resume is Admin and http+cli only; pause needs write.
+        for scopes in ["none", "read", "write", "git", "merge_add", "exec", "admin"] {
+            let allowed = allowed_state_caps(ScopeSet::parse(scopes), true);
+            assert!(
+                !allowed.contains(&"automations.resume"),
+                "--scopes {scopes}"
+            );
+        }
+        assert!(!allowed_state_caps(ScopeSet::parse("read"), true).contains(&"automations.pause"));
+        assert!(allowed_state_caps(ScopeSet::parse("write"), false).contains(&"automations.pause"));
     }
 
     #[test]
