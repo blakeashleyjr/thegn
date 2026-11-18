@@ -230,8 +230,10 @@ HTTP API and `thegn api call`.
 | `merge_drain`        | `git`   | Start the merge-queue drain for a worktree's repository            |
 
 `merge_drain` is gated like `merge_add`: the narrow `merge_add` grant belongs to
-worktree-bound route tokens, so an MCP caller needs `git`. Rules the Lead
-writes may only notify or open sessions.
+worktree-bound route tokens, so an MCP caller needs `git`. A Lead never gets
+either: it lands only through a rule's land step or an owner approval, so a
+Lead-confined `merge_add` or `merge_drain` is refused whatever its scopes.
+Rules the Lead writes may only notify or open sessions.
 
 ### The overview reply
 
@@ -290,6 +292,34 @@ unknown `--profile` is an error. A server inside a profile still needs its own
 lead = ["todoist"]
 ```
 
+A profile's secrets come from the daemon, and only the Lead's token gets them.
+`thegn mcp proxy --profile <p>` does not read the profile's keyring entries or
+secret files itself. It asks the daemon (`mcp_proxy.profile_env`) with the
+`THEGN_CONTROL_ADDR` and `THEGN_CONTROL_TOKEN` from `mcp.json`, and the daemon
+answers only:
+
+- a Lead token, for `[lead] mcp_profile` only;
+- an admin caller, for any profile.
+
+Every other caller is refused, and so is a failed request: there is no local
+fallback. `--profile` is also refused outright inside a pipeline stage
+(`THEGN_STAGE_LAUNCH` is set) or for an `agent:` caller. A worker has no Lead
+token, so it cannot get the profile's secrets through thegn. The daemon logs
+the profile name only, never a value.
+
+The Lead's token expires. `[lead] token_ttl_secs` (default 43200, 12 hours;
+300 to 604800) sets its lifetime from the moment the tab starts. While the
+Lead keeps using it, the expiry slides: when less than half the TTL is left,
+the next request moves it to now + TTL, at most 7 days after the token was
+minted. A token that sits idle for a whole TTL stops working, and the Lead's
+calls then fail with 401. Reopen the Lead tab: it mints a fresh token. A
+revoked or expired token never slides back to life.
+
+While `[lead]` is configured, every pairing code redeemed on the
+`thegn serve` listener waits for your approval (`thegn pair approve`), as if
+`[serve] require_approval` were on. The Lead could otherwise see a pairing code
+in a pane and pair itself.
+
 The Lead needs the daemon. If the daemon is off, or `[lead]` was added after
 the daemon started, opening the Lead fails with a hint to restart the daemon.
 Only claude is supported as the Lead's agent so far.
@@ -308,9 +338,11 @@ A Lead token is confined whatever its scopes. In short:
   `git.stage`, `git.commit`, `worktrees.open`, `worktrees.create`,
   `editor.open`, `worktrees.sandbox_profile_set` and every admin or exec verb
   are refused.
+- `merge.add` and `merge.drain` are refused: the Lead lands only through a
+  rule's land step or an owner approval.
 - Reads, `sessions.kill`, the tracker, dispatches (without binding a session),
-  notifications, approvals requests, its own rules and the merge queue (with
-  `merge_add`) work as their scopes say.
+  notifications, approvals requests, its own rules and reading the merge queue
+  work as their scopes say.
 
 The full list is in [sandboxing](sandboxing.md#what-the-lead-may-ask-the-daemon-to-do).
 

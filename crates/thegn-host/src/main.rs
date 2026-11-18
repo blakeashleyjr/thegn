@@ -18,10 +18,13 @@ mod agent_teardown;
 mod alerts;
 mod apps;
 mod attention_status;
+mod automation_arming;
+mod automation_budget;
 mod automation_events;
 mod automation_executor;
 mod automation_issue;
 mod automation_pipeline;
+mod automation_proposal;
 mod automation_runtime;
 mod automation_schedule;
 mod autopilot_driver;
@@ -395,6 +398,11 @@ pub enum Command {
     Automations {
         #[command(subcommand)]
         action: cmd::automations::Action,
+    },
+    /// The Lead kill switch: pause (and halt), resume, or show status.
+    Lead {
+        #[command(subcommand)]
+        action: cmd::lead::Action,
     },
     /// GitHub PR data + actions for a worktree.
     Pr {
@@ -1483,6 +1491,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     let result = match command {
         Command::Voice { action } => cmd::voice::run(&cfg, action, config_path),
         Command::Automations { action } => cmd::automations::run(&cfg, action),
+        Command::Lead { action } => cmd::lead::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action, &config_path),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),

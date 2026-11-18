@@ -6,12 +6,19 @@
 //! before it is stored on the compiled rule, so every consumer reads the
 //! effective ceiling, never the request.
 //!
-//! The policy (filled by b153 lane 4):
+//! The policy (b153 lane 4, b155 lane 4):
 //! - `merge` requires a structural-only `if`. The only free-text predicate is
 //!   `message_regex`; a config rule using it is capped at `review` with a
-//!   warning, and a Lead rule asking for `merge` is refused.
-//! - An `origin = lead` rule is never `merge`, and `pipeline.start` from a
-//!   Lead rule runs at `propose` only.
+//!   warning.
+//! - An `origin = lead` rule is never `merge` unless it is a `pipeline.start`
+//!   the owner armed ([`RuleOrigin::LeadApproved`]); a Lead rule asking for
+//!   `merge` on any other action is refused.
+//! - An unarmed Lead `pipeline.start` runs at `propose` only. Asking above
+//!   that is not refused: the rule is stored disarmed and raises an arming
+//!   approval (b155 6c, `automation_authoring::needs_arming`).
+//! - A [`RuleOrigin::LeadApproved`] `pipeline.start` runs at its declared
+//!   level, capped at `review` when it reads free text; anything else armed
+//!   is still capped at `review`.
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +61,9 @@ impl Autonomy {
 pub enum RuleOrigin {
     Config,
     Lead,
+    /// A Lead rule the owner armed (6c): a live arming approval matches the
+    /// current body digest. Only a `pipeline.start` gains anything from it.
+    LeadApproved,
 }
 
 /// Predicate fields that read attacker-influenced free text. Every other
@@ -83,8 +93,8 @@ pub const STRUCTURAL_PREDICATES: &[&str] = &[
     "status",
 ];
 
-/// The action whose Lead-authored form may only propose.
-const PIPELINE_START: &str = "pipeline.start";
+/// The action whose Lead-authored form only proposes until the owner arms it.
+pub const PIPELINE_START: &str = "pipeline.start";
 
 /// Why a config rule asking for `merge` runs at `review`.
 pub const FREE_TEXT_CAP_NOTE: &str =
@@ -117,16 +127,20 @@ pub fn effective_autonomy(
     cap: &str,
     origin: RuleOrigin,
 ) -> (Autonomy, Option<&'static str>) {
+    let pipeline = cap.trim() == PIPELINE_START;
+    let free_text_merge = declared == Autonomy::Merge && uses_free_text(p);
     match origin {
-        RuleOrigin::Config if declared == Autonomy::Merge && uses_free_text(p) => {
+        RuleOrigin::Config if free_text_merge => (Autonomy::Review, Some(FREE_TEXT_CAP_NOTE)),
+        RuleOrigin::Config => (declared, None),
+        RuleOrigin::LeadApproved if pipeline && free_text_merge => {
             (Autonomy::Review, Some(FREE_TEXT_CAP_NOTE))
         }
-        RuleOrigin::Config => (declared, None),
-        RuleOrigin::Lead if cap.trim() == PIPELINE_START => (
+        RuleOrigin::LeadApproved if pipeline => (declared, None),
+        RuleOrigin::Lead if pipeline => (
             Autonomy::Propose,
             (declared != Autonomy::Propose).then_some(LEAD_PIPELINE_NOTE),
         ),
-        RuleOrigin::Lead => (
+        RuleOrigin::Lead | RuleOrigin::LeadApproved => (
             declared.min(Autonomy::Review),
             (declared == Autonomy::Merge).then_some(LEAD_CAP_NOTE),
         ),
@@ -136,6 +150,8 @@ pub fn effective_autonomy(
 /// Refuse a declaration policy forbids outright (checked at put/validate).
 /// Config rules are never refused here: a config error disables the whole
 /// runtime, so the free-text cap is a warning from [`effective_autonomy`].
+/// A Lead `pipeline.start` above `propose` is not refused either: it is
+/// stored disarmed and waits for the owner's arming approval.
 pub fn validate_autonomy(
     declared: Autonomy,
     _p: &AutomationPredicate,
@@ -144,11 +160,12 @@ pub fn validate_autonomy(
 ) -> Result<(), String> {
     match origin {
         RuleOrigin::Config => Ok(()),
-        RuleOrigin::Lead if declared == Autonomy::Merge => Err(LEAD_MERGE_REFUSAL.into()),
-        RuleOrigin::Lead if cap.trim() == PIPELINE_START && declared != Autonomy::Propose => {
-            Err(LEAD_PIPELINE_REFUSAL.into())
+        RuleOrigin::Lead | RuleOrigin::LeadApproved
+            if declared == Autonomy::Merge && cap.trim() != PIPELINE_START =>
+        {
+            Err(LEAD_MERGE_REFUSAL.into())
         }
-        RuleOrigin::Lead => Ok(()),
+        RuleOrigin::Lead | RuleOrigin::LeadApproved => Ok(()),
     }
 }
 
@@ -183,7 +200,7 @@ mod tests {
     #[test]
     fn the_full_policy_table() {
         use Autonomy::{Merge, Propose, Review};
-        use RuleOrigin::{Config, Lead};
+        use RuleOrigin::{Config, Lead, LeadApproved};
         type Row = (
             RuleOrigin,
             &'static str,
@@ -245,7 +262,8 @@ mod tests {
                 Some(LEAD_CAP_NOTE),
                 Err(LEAD_MERGE_REFUSAL),
             ),
-            // Lead pipeline.start: propose, always.
+            // Unarmed Lead pipeline.start: propose; asking higher is not
+            // refused (the rule is stored disarmed and asks to be armed).
             (Lead, "pipeline.start", Propose, false, Propose, None, ok),
             (Lead, " pipeline.start ", Propose, true, Propose, None, ok),
             (
@@ -255,7 +273,7 @@ mod tests {
                 false,
                 Propose,
                 Some(LEAD_PIPELINE_NOTE),
-                Err(LEAD_PIPELINE_REFUSAL),
+                ok,
             ),
             (
                 Lead,
@@ -264,7 +282,7 @@ mod tests {
                 true,
                 Propose,
                 Some(LEAD_PIPELINE_NOTE),
-                Err(LEAD_PIPELINE_REFUSAL),
+                ok,
             ),
             (
                 Lead,
@@ -273,6 +291,90 @@ mod tests {
                 false,
                 Propose,
                 Some(LEAD_PIPELINE_NOTE),
+                ok,
+            ),
+            (
+                Lead,
+                "pipeline.start",
+                Merge,
+                true,
+                Propose,
+                Some(LEAD_PIPELINE_NOTE),
+                ok,
+            ),
+            // Armed Lead pipeline.start: declared, free text capped at review.
+            (
+                LeadApproved,
+                "pipeline.start",
+                Propose,
+                false,
+                Propose,
+                None,
+                ok,
+            ),
+            (
+                LeadApproved,
+                "pipeline.start",
+                Review,
+                false,
+                Review,
+                None,
+                ok,
+            ),
+            (
+                LeadApproved,
+                "pipeline.start",
+                Review,
+                true,
+                Review,
+                None,
+                ok,
+            ),
+            (
+                LeadApproved,
+                " pipeline.start ",
+                Merge,
+                false,
+                Merge,
+                None,
+                ok,
+            ),
+            (
+                LeadApproved,
+                "pipeline.start",
+                Merge,
+                true,
+                Review,
+                Some(FREE_TEXT_CAP_NOTE),
+                ok,
+            ),
+            // Armed anything else: still never merge.
+            (LeadApproved, "notify.push", Review, false, Review, None, ok),
+            (
+                LeadApproved,
+                "notify.push",
+                Propose,
+                true,
+                Propose,
+                None,
+                ok,
+            ),
+            (
+                LeadApproved,
+                "lead.wake",
+                Merge,
+                false,
+                Review,
+                Some(LEAD_CAP_NOTE),
+                Err(LEAD_MERGE_REFUSAL),
+            ),
+            (
+                LeadApproved,
+                "sessions.open",
+                Merge,
+                true,
+                Review,
+                Some(LEAD_CAP_NOTE),
                 Err(LEAD_MERGE_REFUSAL),
             ),
         ];
@@ -294,8 +396,42 @@ mod tests {
     }
 
     #[test]
+    fn arming_only_ever_raises_pipeline_start() {
+        for cap in [
+            "notify.push",
+            "sessions.open",
+            "lead.wake",
+            "pipeline.start",
+        ] {
+            for declared in Autonomy::ALL {
+                for free in [false, true] {
+                    let p = predicate(free);
+                    let lead = effective_autonomy(declared, &p, cap, RuleOrigin::Lead).0;
+                    let armed = effective_autonomy(declared, &p, cap, RuleOrigin::LeadApproved).0;
+                    let config = effective_autonomy(declared, &p, cap, RuleOrigin::Config).0;
+                    assert!(
+                        lead <= armed && armed <= config,
+                        "{cap} {declared:?} {free}"
+                    );
+                    if cap != PIPELINE_START {
+                        assert_eq!(lead, armed, "{cap} {declared:?} {free}");
+                        assert_eq!(
+                            validate_autonomy(declared, &p, cap, RuleOrigin::LeadApproved),
+                            validate_autonomy(declared, &p, cap, RuleOrigin::Lead),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn free_text_never_raises_autonomy() {
-        for origin in [RuleOrigin::Config, RuleOrigin::Lead] {
+        for origin in [
+            RuleOrigin::Config,
+            RuleOrigin::Lead,
+            RuleOrigin::LeadApproved,
+        ] {
             for cap in ["notify.push", "pipeline.start"] {
                 for declared in Autonomy::ALL {
                     let structural = effective_autonomy(declared, &predicate(false), cap, origin).0;

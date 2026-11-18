@@ -139,4 +139,7 @@ pub trait ControlStore {
     /// same UPDATE so a racing second redeem gets `None` (no TOCTOU).
     fn redeem_pairing_code(&self, pairing_id: &str, now_ms: i64) -> Result<Option<PairingRow>>;
     fn revoke_pairing(&self, pairing_id: &str, now_ms: i64) -> Result<()>;
+    /// Move a live pairing's `expires_at` (the Lead token's sliding refresh,
+    /// b155). Only an unrevoked row moves; `Ok(false)` otherwise.
+    fn slide_pairing_expiry(&self, pairing_id: &str, expires_at: i64) -> Result<bool>;
 }

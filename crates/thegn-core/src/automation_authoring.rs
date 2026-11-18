@@ -1,25 +1,33 @@
 //! Lead-authored automation rules (`automations.put` / `rm` / `enable` /
 //! `runs`, THE-2181): the put-time validation, the `origin = lead` action
-//! allowlist ([`LEAD_ALLOWED_ACTIONS`]), the autonomy ceiling (never `merge`;
-//! `pipeline.start` at `propose` only, THE-2195), and the merge that puts Lead
-//! rules beside the trusted config rules at evaluation time.
+//! allowlist ([`LEAD_ALLOWED_ACTIONS`]), the autonomy ceiling (THE-2195), the
+//! owner arming of a Lead `pipeline.start` above `propose` (b155 6c,
+//! THE-2204), and the merge that puts Lead rules beside the trusted config
+//! rules at evaluation time.
 //!
 //! This is the escalation boundary. `automations.put` is a Write-scoped verb,
 //! so a rule it stores must never reach an Exec-scoped (`tools.run`) or
-//! MergeAdd-scoped (`merge.add`, `merge.drain`) action, never run at `merge`,
-//! and never start a pipeline (`pipeline.start` only proposes). The allowlist
-//! is enforced twice: [`validate_lead_rule`] refuses at put time, and every
-//! load re-validates the stored body ([`compile_lead_rows`]) before
-//! [`merge_rules`] filters again. The autonomy ceiling is refused at put and
-//! capped (never refused) on every load and again in [`merge_rules`]. A row
-//! written straight into SQLite therefore still cannot escalate.
+//! MergeAdd-scoped (`merge.add`, `merge.drain`) action, and never runs above
+//! the Lead ceiling on its own. The one escalation is owner-held: a
+//! `pipeline.start` asking for `review` or `merge` ([`needs_arming`]) is stored
+//! disarmed and compiles as [`RuleOrigin::LeadApproved`] only while a live
+//! arming approval matches the digest of the stored body
+//! ([`crate::approval_digest::rule_arm_ids`]); until then it is inert. Editing
+//! the body changes the digest and disarms it. The allowlist is enforced
+//! twice: [`validate_lead_rule`] refuses at put time, and every load
+//! re-validates the stored body ([`compile_lead_rows_armed`]) before
+//! [`merge_rules_armed`] filters and re-caps again. A row written straight
+//! into SQLite therefore still cannot escalate: it has no arming approval.
 
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::approval_digest::{RULE_PREFIX, rule_arm_ids};
 use crate::automation::{AutomationEventKind, AutomationRule};
-use crate::automation_autonomy::{Autonomy, RuleOrigin, effective_autonomy, validate_autonomy};
+use crate::automation_autonomy::{
+    Autonomy, PIPELINE_START, RuleOrigin, effective_autonomy, validate_autonomy,
+};
 use crate::config_automations::{AutomationRuleConfig, compile_one};
 use crate::store::{AutomationRunRow, LeadRuleRow};
 
@@ -27,9 +35,8 @@ use crate::store::{AutomationRunRow, LeadRuleRow};
 /// never share a throttle/audit key with a config rule.
 pub const LEAD_RULE_PREFIX: &str = "lead:";
 
-/// The only actions a Lead-authored rule may target. `pipeline.start` is
-/// admitted only at `autonomy = "propose"` ([`validate_autonomy`]), so a Lead
-/// rule raises an approval and never starts a pipeline itself.
+/// The only actions a Lead-authored rule may target. `pipeline.start` runs at
+/// `propose` unless the owner armed the rule ([`needs_arming`]).
 pub const LEAD_ALLOWED_ACTIONS: &[&str] = &[
     "notify.push",
     "sessions.open",
@@ -57,6 +64,33 @@ const MAX_SLUG_LEN: usize = 48;
 
 /// Why a `worktree_idle` Lead rule is stored but never fires in this release.
 pub const LEAD_IDLE_INERT: &str = "worktree_idle Lead rules arm in a later release";
+
+/// The inert reason of a rule waiting for its arming approval (prefix of
+/// [`awaiting_arming_reason`]).
+pub const AWAITING_ARMING: &str = "awaiting owner approval";
+
+/// Lead rules stay armed this long after the owner's approval (6c).
+pub const ARMING_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// `awaiting owner approval (rule:<id> arm)`: names the triple to approve.
+pub fn awaiting_arming_reason(rule_id: &str) -> String {
+    format!("{AWAITING_ARMING} ({RULE_PREFIX}{rule_id} arm)")
+}
+
+/// Whether a compile error list is the "waiting to be armed" reason rather
+/// than a validation failure.
+pub fn is_awaiting_arming(errors: &[String]) -> bool {
+    matches!(errors, [only] if only.starts_with(AWAITING_ARMING))
+}
+
+/// The autonomy a Lead rule asks the owner to arm it at: `Some(declared)` for
+/// a `pipeline.start` declared above `propose` (an omitted level is the
+/// default, `review`). `None` for everything else, which runs under the plain
+/// Lead ceiling and needs no approval.
+pub fn needs_arming(rule: &AutomationRuleConfig) -> Option<Autonomy> {
+    let declared = declared_autonomy(rule);
+    (rule.then.cap.trim() == PIPELINE_START && declared > Autonomy::Propose).then_some(declared)
+}
 
 /// Normalize a Lead rule name to its stored id: `lead:<slug>`, with the slug
 /// matching `[a-z0-9_-]{1,48}`. The prefix is added when missing and is never
@@ -96,9 +130,10 @@ fn rate_caps() -> (u16, u16) {
 ///
 /// Refuses: an invalid name, a name colliding with a config rule (either as
 /// written or as its `lead:` id), any action outside [`LEAD_ALLOWED_ACTIONS`],
-/// an autonomy [`validate_autonomy`] forbids for a Lead rule (`merge`, or a
-/// `pipeline.start` above `propose`), and anything the config validator
-/// refuses. The compiled rule carries the Lead-capped effective autonomy.
+/// an autonomy [`validate_autonomy`] forbids for a Lead rule (`merge` on
+/// anything but `pipeline.start`), and anything the config validator refuses.
+/// A `pipeline.start` above `propose` is accepted ([`needs_arming`]); the
+/// compiled rule carries the unarmed Lead-capped autonomy (`propose`).
 pub fn validate_lead_rule(
     rule: &AutomationRuleConfig,
     config_names: &[String],
@@ -115,14 +150,10 @@ fn declared_autonomy(rule: &AutomationRuleConfig) -> Autonomy {
         .unwrap_or_default()
 }
 
-/// Cap a Lead rule's autonomy through the Lead policy. Never raises.
-fn cap_lead(rule: &mut AutomationRule, declared: Autonomy) {
-    let (effective, _) = effective_autonomy(
-        declared,
-        &rule.predicate,
-        &rule.action.cap,
-        RuleOrigin::Lead,
-    );
+/// Cap a Lead rule's autonomy through the Lead policy for `origin`. Never
+/// raises.
+fn cap_lead(rule: &mut AutomationRule, declared: Autonomy, origin: RuleOrigin) {
+    let (effective, _) = effective_autonomy(declared, &rule.predicate, &rule.action.cap, origin);
     rule.autonomy = effective;
 }
 
@@ -184,7 +215,7 @@ fn validate_lead(
             if !errors.is_empty() {
                 return Err(errors);
             }
-            cap_lead(&mut compiled, declared);
+            cap_lead(&mut compiled, declared, RuleOrigin::Lead);
             Ok(compiled)
         }
         Err(more) => {
@@ -204,12 +235,26 @@ pub fn normalize(rule: &AutomationRuleConfig, id: &str) -> AutomationRuleConfig 
     normalized
 }
 
+/// [`merge_rules_armed`] with nothing armed: every Lead rule is re-capped
+/// under the plain Lead policy.
+pub fn merge_rules(config: Vec<AutomationRule>, lead: Vec<AutomationRule>) -> Vec<AutomationRule> {
+    merge_rules_armed(config, lead, &BTreeSet::new())
+}
+
 /// Config rules first; then the enabled Lead rules that still pass the
 /// allowlist, carry the `lead:` prefix and do not shadow a config id, with
 /// their rates and autonomy re-capped. Defense in depth: a Lead rule that
 /// slipped past put time (a hand-written row, an older build) still cannot
-/// escalate here.
-pub fn merge_rules(config: Vec<AutomationRule>, lead: Vec<AutomationRule>) -> Vec<AutomationRule> {
+/// escalate here. Only a `pipeline.start` whose id has a live arming approval
+/// in `armed` (the `(rule id, digest)` set [`compile_lead_rows_armed`] read)
+/// is re-capped as [`RuleOrigin::LeadApproved`]; everything else under the
+/// plain Lead policy, so an unarmed `pipeline.start` leaves here at
+/// `propose`.
+pub fn merge_rules_armed(
+    config: Vec<AutomationRule>,
+    lead: Vec<AutomationRule>,
+    armed: &BTreeSet<(String, String)>,
+) -> Vec<AutomationRule> {
     let (max_rule, max_action) = rate_caps();
     let config_ids: BTreeSet<String> = config.iter().map(|rule| rule.id.clone()).collect();
     let mut seen = BTreeSet::new();
@@ -226,23 +271,44 @@ pub fn merge_rules(config: Vec<AutomationRule>, lead: Vec<AutomationRule>) -> Ve
         rule.max_per_hour = rule.max_per_hour.min(max_rule);
         rule.max_action_per_hour = rule.max_action_per_hour.min(max_action);
         let declared = rule.autonomy;
-        cap_lead(&mut rule, declared);
+        let origin = if rule.action.cap.trim() == PIPELINE_START
+            && armed.iter().any(|(id, _)| *id == rule.id)
+        {
+            RuleOrigin::LeadApproved
+        } else {
+            RuleOrigin::Lead
+        };
+        cap_lead(&mut rule, declared, origin);
         merged.push(rule);
     }
     merged
 }
 
-/// Decode and re-validate stored rows. The row's `enabled` column is the
-/// effective switch. Rows that no longer validate are returned as
-/// `(id, errors)` so callers can log or surface them; they never run.
+/// [`compile_lead_rows_armed`] with nothing armed: a rule waiting for its
+/// arming approval is listed inert.
 pub fn compile_lead_rows(
     rows: &[LeadRuleRow],
     config_names: &[String],
 ) -> (Vec<AutomationRule>, Vec<(String, Vec<String>)>) {
+    compile_lead_rows_armed(rows, config_names, &BTreeSet::new())
+}
+
+/// Decode and re-validate stored rows with the owner's arming approvals
+/// (6c). The row's `enabled` column is the effective switch. Rows that no
+/// longer validate are returned as `(id, errors)` so callers can log or
+/// surface them; they never run. A row that [`needs_arming`] compiles as
+/// [`RuleOrigin::LeadApproved`] only when `armed` holds `(rule id, digest of
+/// the stored body)`; otherwise it is returned inert with
+/// [`awaiting_arming_reason`].
+pub fn compile_lead_rows_armed(
+    rows: &[LeadRuleRow],
+    config_names: &[String],
+    armed: &BTreeSet<(String, String)>,
+) -> (Vec<AutomationRule>, Vec<(String, Vec<String>)>) {
     let mut rules = Vec::with_capacity(rows.len());
     let mut invalid = Vec::new();
     for row in rows {
-        match compile_lead_row(row, config_names) {
+        match compile_lead_row_armed(row, config_names, armed) {
             Ok(rule) => rules.push(rule),
             Err(errors) => invalid.push((row.id.clone(), errors)),
         }
@@ -250,13 +316,40 @@ pub fn compile_lead_rows(
     (rules, invalid)
 }
 
+/// One row of [`compile_lead_rows_armed`].
+pub fn compile_lead_row_armed(
+    row: &LeadRuleRow,
+    config_names: &[String],
+    armed: &BTreeSet<(String, String)>,
+) -> Result<AutomationRule, Vec<String>> {
+    let (body, mut rule) = decode_row(row, config_names)?;
+    if let Some(requested) = needs_arming(&body) {
+        let (_, _, sha) = rule_arm_ids(&row.id, &row.body_json, requested);
+        if !armed.contains(&(row.id.clone(), sha)) {
+            return Err(vec![awaiting_arming_reason(&row.id)]);
+        }
+        cap_lead(&mut rule, requested, RuleOrigin::LeadApproved);
+    }
+    Ok(rule)
+}
+
 /// Decode and re-validate one stored row. The allowlist still refuses; the
 /// autonomy is capped through the Lead policy instead (a hand-written
 /// `"autonomy":"merge"` row runs at `review`, a `pipeline.start` at `propose`).
+/// Arming is ignored here; whatever decides what runs uses
+/// [`compile_lead_row_armed`], which leaves an unarmed escalation inert.
 pub fn compile_lead_row(
     row: &LeadRuleRow,
     config_names: &[String],
 ) -> Result<AutomationRule, Vec<String>> {
+    decode_row(row, config_names).map(|(_, rule)| rule)
+}
+
+/// The stored body and its Lead-capped compiled rule.
+fn decode_row(
+    row: &LeadRuleRow,
+    config_names: &[String],
+) -> Result<(AutomationRuleConfig, AutomationRule), Vec<String>> {
     let body: AutomationRuleConfig = serde_json::from_str(&row.body_json)
         .map_err(|error| vec![format!("stored rule body is not a rule: {error}")])?;
     let mut rule = validate_lead(&body, config_names, false)?;
@@ -267,7 +360,7 @@ pub fn compile_lead_row(
         )]);
     }
     rule.enabled = row.enabled;
-    Ok(rule)
+    Ok((body, rule))
 }
 
 /// The automation runtime arms when automations are enabled and there is
@@ -832,8 +925,11 @@ mod tests {
 
     #[test]
     fn lead_autonomy_is_refused_at_put() {
-        // Merge is refused on every allowed action.
-        for cap in LEAD_ALLOWED_ACTIONS {
+        // Merge is refused on every allowed action but pipeline.start.
+        for cap in LEAD_ALLOWED_ACTIONS
+            .iter()
+            .filter(|cap| **cap != PIPELINE_START)
+        {
             let errors =
                 validate_lead_rule(&with_autonomy(rule("ping", cap), "merge"), &[]).unwrap_err();
             assert!(
@@ -843,20 +939,15 @@ mod tests {
                 "{cap}: {errors:?}"
             );
         }
-        // pipeline.start: review (explicit or defaulted) is refused, propose is accepted.
+        // pipeline.start: every level is accepted (above propose it is
+        // stored disarmed) and compiles at the unarmed ceiling, propose.
         let start = rule("ping", "pipeline.start");
-        for declared in [Some("review"), None] {
+        for declared in [Some("propose"), Some("review"), Some("merge"), None] {
             let mut at = start.clone();
             at.autonomy = declared.map(str::to_string);
-            let errors = validate_lead_rule(&at, &[]).unwrap_err();
-            assert_eq!(
-                errors,
-                [crate::automation_autonomy::LEAD_PIPELINE_REFUSAL],
-                "{declared:?}"
-            );
+            let compiled = validate_lead_rule(&at, &[]).unwrap();
+            assert_eq!(compiled.autonomy, Autonomy::Propose, "{declared:?}");
         }
-        let compiled = validate_lead_rule(&start, &[]).unwrap();
-        assert_eq!(compiled.autonomy, Autonomy::Propose);
         // Other actions keep a declared propose/review; the default is review.
         let compiled = validate_lead_rule(&rule("ping", "notify.push"), &[]).unwrap();
         assert_eq!(compiled.autonomy, Autonomy::Review);
@@ -910,18 +1001,29 @@ mod tests {
             row("lead:review", &review_start, true),
         ];
         let (rules, invalid) = compile_lead_rows(&rows, &[]);
-        assert!(invalid.is_empty(), "{invalid:?}");
         let levels: Vec<(&str, Autonomy)> = rules
             .iter()
             .map(|rule| (rule.id.as_str(), rule.autonomy))
             .collect();
+        assert_eq!(levels, [("lead:loud", Autonomy::Review)]);
+        // A hand-written escalation has no arming approval: inert.
         assert_eq!(
-            levels,
+            invalid,
             [
-                ("lead:loud", Autonomy::Review),
-                ("lead:start", Autonomy::Propose),
-                ("lead:review", Autonomy::Propose),
+                (
+                    "lead:start".to_string(),
+                    vec![awaiting_arming_reason("lead:start")]
+                ),
+                (
+                    "lead:review".to_string(),
+                    vec![awaiting_arming_reason("lead:review")]
+                ),
             ]
+        );
+        // The arming-blind single-row compile still caps at propose.
+        assert_eq!(
+            compile_lead_row(&rows[1], &[]).unwrap().autonomy,
+            Autonomy::Propose
         );
         // The raw JSON shape a hand-edit would produce.
         let raw = LeadRuleRow {
@@ -973,5 +1075,153 @@ mod tests {
 
     fn compiled_start(name: &str) -> AutomationRule {
         compile_one(&rule(name, "pipeline.start")).unwrap()
+    }
+
+    fn armed_for(row: &LeadRuleRow, level: Autonomy) -> BTreeSet<(String, String)> {
+        BTreeSet::from([(
+            row.id.clone(),
+            rule_arm_ids(&row.id, &row.body_json, level).2,
+        )])
+    }
+
+    #[test]
+    fn needs_arming_is_pipeline_start_above_propose_only() {
+        for (cap, level, expected) in [
+            ("pipeline.start", Some("propose"), None),
+            ("pipeline.start", Some("review"), Some(Autonomy::Review)),
+            ("pipeline.start", Some("merge"), Some(Autonomy::Merge)),
+            ("pipeline.start", None, Some(Autonomy::Review)),
+            ("notify.push", Some("review"), None),
+            ("notify.push", Some("merge"), None),
+            ("lead.wake", None, None),
+            ("merge.add", Some("merge"), None),
+        ] {
+            let mut at = rule("x", cap);
+            at.autonomy = level.map(str::to_string);
+            assert_eq!(needs_arming(&at), expected, "{cap} {level:?}");
+        }
+    }
+
+    #[test]
+    fn awaiting_reason_names_the_triple() {
+        let reason = awaiting_arming_reason("lead:x");
+        assert_eq!(reason, "awaiting owner approval (rule:lead:x arm)");
+        assert!(is_awaiting_arming(std::slice::from_ref(&reason)));
+        assert!(!is_awaiting_arming(&[]));
+        assert!(!is_awaiting_arming(&["invalid".to_string()]));
+        assert!(!is_awaiting_arming(&[reason.clone(), reason]));
+    }
+
+    /// origin × cap × declared × free text × armed, through the stored-row path.
+    #[test]
+    fn arming_table() {
+        use Autonomy::{Merge, Propose, Review};
+        // (cap, declared, free text, armed at, Ok(level) | Err(awaiting))
+        type Row = (
+            &'static str,
+            Autonomy,
+            bool,
+            Option<Autonomy>,
+            Option<Autonomy>,
+        );
+        let table: &[Row] = &[
+            // Unarmed escalations are inert; propose needs nothing.
+            ("pipeline.start", Propose, false, None, Some(Propose)),
+            ("pipeline.start", Review, false, None, None),
+            ("pipeline.start", Merge, false, None, None),
+            ("pipeline.start", Merge, true, None, None),
+            // Armed at the requested level: LeadApproved.
+            ("pipeline.start", Review, false, Some(Review), Some(Review)),
+            ("pipeline.start", Review, true, Some(Review), Some(Review)),
+            ("pipeline.start", Merge, false, Some(Merge), Some(Merge)),
+            // Free text still caps an armed merge at review.
+            ("pipeline.start", Merge, true, Some(Merge), Some(Review)),
+            // An approval for another level is a different digest.
+            ("pipeline.start", Merge, false, Some(Review), None),
+            ("pipeline.start", Review, false, Some(Merge), None),
+            // Arming never lifts anything else.
+            ("notify.push", Review, false, Some(Review), Some(Review)),
+            ("lead.wake", Propose, true, Some(Review), Some(Propose)),
+        ];
+        for &(cap, declared, free, armed_at, expected) in table {
+            let mut body = rule("t", cap);
+            body.autonomy = Some(declared.as_str().into());
+            if free {
+                body.predicate.message_regex = Some("deploy".into());
+            }
+            let stored = row("lead:t", &normalize(&body, "lead:t"), true);
+            let armed = armed_at
+                .map(|level| armed_for(&stored, level))
+                .unwrap_or_default();
+            let case = format!("{cap} {declared:?} free={free} armed={armed_at:?}");
+            let (rules, invalid) = compile_lead_rows_armed(&[stored.clone()], &[], &armed);
+            match expected {
+                Some(level) => {
+                    assert!(invalid.is_empty(), "{case}: {invalid:?}");
+                    assert_eq!(rules[0].autonomy, level, "{case}");
+                    // merge_rules re-caps to the same level.
+                    let merged = merge_rules_armed(Vec::new(), rules, &armed);
+                    assert_eq!(merged[0].autonomy, level, "{case}");
+                }
+                None => {
+                    assert!(rules.is_empty(), "{case}");
+                    assert_eq!(
+                        invalid,
+                        [("lead:t".to_string(), vec![awaiting_arming_reason("lead:t")])],
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn editing_an_armed_body_disarms_it() {
+        let mut body = with_autonomy(rule("t", "pipeline.start"), "merge");
+        let stored = row("lead:t", &normalize(&body, "lead:t"), true);
+        let armed = armed_for(&stored, Autonomy::Merge);
+        let (rules, _) = compile_lead_rows_armed(&[stored], &[], &armed);
+        assert_eq!(rules[0].autonomy, Autonomy::Merge);
+        body.then.stage = Some("deploy".into());
+        let edited = row("lead:t", &normalize(&body, "lead:t"), true);
+        let (rules, invalid) = compile_lead_rows_armed(&[edited], &[], &armed);
+        assert!(rules.is_empty());
+        assert!(is_awaiting_arming(&invalid[0].1));
+        // An approval for another rule id does not arm this one.
+        let mut other = armed.clone();
+        other.insert(("lead:u".into(), armed.iter().next().unwrap().1.clone()));
+        let renamed = row("lead:u", &normalize(&body, "lead:u"), true);
+        assert!(
+            compile_lead_rows_armed(&[renamed], &[], &other)
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn merge_rules_armed_only_lifts_armed_pipeline_starts() {
+        let mut start = compiled_start("lead:start");
+        start.autonomy = Autonomy::Merge;
+        let mut loud = compiled("lead:loud", "notify.push");
+        loud.autonomy = Autonomy::Merge;
+        let mut stray = compiled_start("lead:stray");
+        stray.autonomy = Autonomy::Merge;
+        let armed = BTreeSet::from([
+            ("lead:start".to_string(), "a".repeat(40)),
+            ("lead:loud".to_string(), "b".repeat(40)),
+        ]);
+        let merged = merge_rules_armed(Vec::new(), vec![start, loud, stray], &armed);
+        let levels: Vec<(&str, Autonomy)> = merged
+            .iter()
+            .map(|rule| (rule.id.as_str(), rule.autonomy))
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                ("lead:start", Autonomy::Merge),
+                ("lead:loud", Autonomy::Review),
+                ("lead:stray", Autonomy::Propose),
+            ]
+        );
     }
 }

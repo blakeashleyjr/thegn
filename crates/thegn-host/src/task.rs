@@ -311,6 +311,21 @@ pub fn test_slot(worktree: &Path) -> String {
     format!("{}:test", worktree.display())
 }
 
+/// Whether a job runs with the credential scrub: only the stage executor's
+/// validations (their job name carries its slot prefix).
+fn scrubs_credentials(job_name: &str) -> bool {
+    job_name.starts_with(crate::daemon::stage_executor::SLOT_PREFIX)
+}
+
+/// Remove the drain's scrubbed variables from a local executor validation.
+fn scrub_credentials(cmd: &mut Command, job_name: &str, remote: bool) {
+    if scrubs_credentials(job_name) && !remote {
+        for var in crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV {
+            cmd.env_remove(var);
+        }
+    }
+}
+
 pub fn job_slot(worktree: &Path, name: &str) -> String {
     format!("{}:job:{name}", worktree.display())
 }
@@ -537,6 +552,12 @@ fn run_capped_argv(
     let with_tail = live || keep_end;
 
     let mut cmd = task_command(loc, inner, worktree, limits);
+    // Executor-driven validation runs worker-written code unattended: it
+    // gets the same credential scrub as the executor's drain (agent and
+    // keyring sockets, forge/tracker tokens, model keys). Local runs only: a
+    // remote run's environment is the remote side's, and its transport (ssh)
+    // needs the agent socket.
+    scrub_credentials(&mut cmd, &run.label.1, loc.is_remote());
     let cancel = Arc::new(AtomicBool::new(false));
     if let Ok(mut map) = registry().lock() {
         map.insert(run.slot.clone(), (run.generation, Arc::clone(&cancel)));
@@ -1824,6 +1845,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn executor_validation_jobs_scrub_the_drain_credentials() {
+        let removed = |cmd: &Command| -> Vec<String> {
+            cmd.get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect()
+        };
+        let mut validation = Command::new("true");
+        scrub_credentials(&mut validation, "validate:test", false);
+        let gone = removed(&validation);
+        for var in crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV {
+            assert!(gone.iter().any(|g| g == var), "{var} kept: {gone:?}");
+        }
+        let mut user_job = Command::new("true");
+        scrub_credentials(&mut user_job, "test", false);
+        assert!(removed(&user_job).is_empty());
+        let mut remote = Command::new("true");
+        scrub_credentials(&mut remote, "validate:test", true);
+        assert!(
+            removed(&remote).is_empty(),
+            "remote transport keeps its env"
+        );
     }
 
     #[test]

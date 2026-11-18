@@ -3,12 +3,21 @@
 //! `automations.test` call to see Lead rules beside config rules.
 //!
 //! The escalation boundary: these verbs are Write-scoped (`runs` is Read), so a
-//! rule stored here may only target `notify.push` or `sessions.open`
+//! rule stored here may only target the Lead allowlist
 //! (`thegn_core::automation_authoring`). Config rules stay read-only: `rm` and
 //! `enable` on one answer `Conflict`.
+//!
+//! A `pipeline.start` asking for `review` or `merge` is stored disarmed and
+//! raises an arming approval (b155 6c, THE-2204); the Lead can ask but never
+//! answer (`approvals.resolve` is Admin and never MCP). Editing or removing
+//! the rule revokes any earlier arming approval.
+
+use std::collections::BTreeSet;
 
 use super::{JsonResult, decode, encode};
 use crate::daemon::service::DaemonService;
+use thegn_core::approval_digest::{ARM_STAGE, RULE_PREFIX, rule_arm_ids};
+use thegn_core::approval_request::ApprovalRequest;
 use thegn_core::automation_authoring::{
     self as authoring, AutomationRunsQuery, AutomationRunsReply, LEAD_AUTHOR, LeadRuleEnable,
     LeadRuleEnableReply, LeadRulePut, LeadRulePutReply, LeadRuleRm, LeadRuleRmReply,
@@ -60,8 +69,17 @@ pub(crate) async fn put(svc: &DaemonService, req: serde_json::Value) -> JsonResu
         serde_json::to_string(&stored).map_err(|error| ControlError::Internal(error.into()))?;
     let id = compiled.id.clone();
     let enabled = compiled.enabled;
+    // b155 (6c): the triple an owner approves to arm this exact body.
+    let arming = authoring::needs_arming(&rule)
+        .map(|level| (level, rule_arm_ids(&compiled.id, &body, level)));
+    let arm_sha = arming.as_ref().map(|(_, (_, _, sha))| sha.clone());
     let outcome = svc
         .with_db(move |db| {
+            let previous = db
+                .lead_rules()?
+                .into_iter()
+                .find(|row| row.id == id)
+                .map(|row| row.body_json);
             let created = match db.put_lead_rule(&id, &body, LEAD_AUTHOR, thegn_core::util::now()) {
                 Ok(created) => created,
                 Err(error) if error.downcast_ref::<LeadRuleLimitReached>().is_some() => {
@@ -70,23 +88,74 @@ pub(crate) async fn put(svc: &DaemonService, req: serde_json::Value) -> JsonResu
                 Err(error) => return Err(error),
             };
             db.set_lead_rule_enabled(&id, enabled)?;
-            Ok(Ok(created))
+            if previous.as_deref() != Some(body.as_str()) {
+                // A new or edited body disarms: an approval granted before
+                // this exact body was stored never arms it.
+                revoke_arming(db, &id)?;
+            }
+            let armed = arm_sha.is_some_and(|sha| {
+                crate::automation_arming::armed_set(db, thegn_core::util::now_ms())
+                    .contains(&(id.clone(), sha))
+            });
+            Ok(Ok((created, armed)))
         })
         .await?;
-    let created = outcome.map_err(|limit| ControlError::ResourceExhausted(limit.to_string()))?;
+    let (created, already_armed) =
+        outcome.map_err(|limit| ControlError::ResourceExhausted(limit.to_string()))?;
     // A stored rule may add or change a schedule (THE-2193).
     crate::automation_schedule::rearm();
     let (automations_enabled, armed) = runtime_state(svc);
-    encode(&LeadRulePutReply {
+    let awaiting = arming.is_some() && !already_armed;
+    let inert_reason = if awaiting {
+        Some(authoring::awaiting_arming_reason(&compiled.id))
+    } else {
+        authoring::lead_inert_reason(automations_enabled, armed, enabled, Some(compiled.event))
+    };
+    if let Some((level, (issue_id, stage, commit_sha))) = arming.filter(|_| awaiting) {
+        let request = ApprovalRequest {
+            issue_id,
+            stage,
+            commit_sha,
+            worktree: None,
+            reason: Some(format!(
+                "Lead rule {} asks for autonomy {}",
+                compiled.id,
+                level.as_str()
+            )),
+        };
+        if let Err(error) = super::approvals::raise(svc, request).await {
+            tracing::warn!(
+                target: "thegn::automation",
+                rule = %compiled.id,
+                %error,
+                "failed to raise the arming approval; the rule stays disarmed (re-put to retry)"
+            );
+        }
+    }
+    let mut reply = encode(&LeadRulePutReply {
         id: compiled.id,
         created,
-        inert_reason: authoring::lead_inert_reason(
-            automations_enabled,
-            armed,
-            enabled,
-            Some(compiled.event),
-        ),
-    })
+        inert_reason,
+    })?;
+    if awaiting && let Some(object) = reply.as_object_mut() {
+        object.insert("awaiting_approval".into(), serde_json::Value::Bool(true));
+    }
+    Ok(reply)
+}
+
+/// Withdraw every arming approval for the Lead rule `id`.
+fn revoke_arming(db: &thegn_core::db::Db, id: &str) -> anyhow::Result<()> {
+    db.revoke_approvals(
+        &format!("{RULE_PREFIX}{id}"),
+        ARM_STAGE,
+        thegn_core::util::now_ms(),
+    )?;
+    Ok(())
+}
+
+/// The `(rule id, digest)` pairs armed right now.
+fn armed_now(db: &thegn_core::db::Db) -> BTreeSet<(String, String)> {
+    crate::automation_arming::armed_set(db, thegn_core::util::now_ms())
 }
 
 /// Answer `automations.rm`; config rules answer `Conflict`, unknown names
@@ -95,7 +164,16 @@ pub(crate) async fn rm(svc: &DaemonService, req: serde_json::Value) -> JsonResul
     let LeadRuleRm { name } = decode(req)?;
     let id = lead_target(svc, &name)?;
     let target = id.clone();
-    let removed = svc.with_db(move |db| db.delete_lead_rule(&target)).await?;
+    let removed = svc
+        .with_db(move |db| {
+            let removed = db.delete_lead_rule(&target)?;
+            if removed {
+                // A rule re-created under the same id asks again.
+                revoke_arming(db, &target)?;
+            }
+            Ok(removed)
+        })
+        .await?;
     if !removed {
         return Err(ControlError::NotFound(format!("automation rule {name}")));
     }
@@ -138,6 +216,7 @@ pub(crate) async fn list_lead_rules(svc: &DaemonService) -> ControlResult<Vec<Au
     let (automations_enabled, armed) = runtime_state(svc);
     svc.with_db(move |db| {
         let rows = db.lead_rules()?;
+        let armed_rules = armed_now(db);
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -146,7 +225,7 @@ pub(crate) async fn list_lead_rules(svc: &DaemonService) -> ControlResult<Vec<Au
                     .ok()
                     .and_then(|runs| runs.into_iter().next())
                     .map(|run| run.outcome);
-                match authoring::compile_lead_row(&row, &names) {
+                match authoring::compile_lead_row_armed(&row, &names, &armed_rules) {
                     Ok(rule) => AutomationRuleInfo {
                         inert_reason: authoring::lead_inert_reason(
                             automations_enabled,
@@ -163,13 +242,18 @@ pub(crate) async fn list_lead_rules(svc: &DaemonService) -> ControlResult<Vec<Au
                     },
                     Err(errors) => {
                         let (event, action) = authoring::stored_shape(&row.body_json);
+                        let inert_reason = if authoring::is_awaiting_arming(&errors) {
+                            errors.join("; ")
+                        } else {
+                            format!("invalid: {}", errors.join("; "))
+                        };
                         AutomationRuleInfo {
                             name: row.id,
                             enabled: row.enabled,
                             trusted_layer: "lead".into(),
                             event,
                             action,
-                            inert_reason: Some(format!("invalid: {}", errors.join("; "))),
+                            inert_reason: Some(inert_reason),
                             recent_outcome,
                         }
                     }
@@ -182,7 +266,8 @@ pub(crate) async fn list_lead_rules(svc: &DaemonService) -> ControlResult<Vec<Au
 
 /// A Lead-authored rule by name (`ping` or `lead:ping`), the `automations.test`
 /// fallback when no config rule matches. Only a rule that still validates —
-/// and so still passes the action allowlist — is returned.
+/// and so still passes the action allowlist, and is armed when it asks to
+/// be — is returned.
 pub(crate) async fn find_rule(
     svc: &DaemonService,
     name: &str,
@@ -196,7 +281,7 @@ pub(crate) async fn find_rule(
             .lead_rules()?
             .into_iter()
             .find(|row| row.id == id)
-            .and_then(|row| authoring::compile_lead_row(&row, &names).ok()))
+            .and_then(|row| authoring::compile_lead_row_armed(&row, &names, &armed_now(db)).ok()))
     })
     .await
 }
@@ -460,37 +545,158 @@ mod tests {
     #[tokio::test]
     async fn lead_autonomy_ceiling_is_enforced_at_put() {
         let (svc, _profile) = service(true);
-        let refused = |result: JsonResult, needle: &str| match result {
-            Err(ControlError::InvalidArgument(message)) => {
-                assert!(message.contains(needle), "{message}")
-            }
-            other => panic!("{needle}: {other:?}"),
-        };
         let mut merge = ping("notify.push");
         merge["rule"]["autonomy"] = json!("merge");
-        refused(
-            put(&svc, merge).await,
-            thegn_core::automation_autonomy::LEAD_MERGE_REFUSAL,
-        );
-        refused(
-            put(&svc, start(Some("merge"))).await,
-            thegn_core::automation_autonomy::LEAD_MERGE_REFUSAL,
-        );
-        for review in [Some("review"), None] {
-            refused(
-                put(&svc, start(review)).await,
-                thegn_core::automation_autonomy::LEAD_PIPELINE_REFUSAL,
-            );
+        match put(&svc, merge).await {
+            Err(ControlError::InvalidArgument(message)) => assert!(
+                message.contains(thegn_core::automation_autonomy::LEAD_MERGE_REFUSAL),
+                "{message}"
+            ),
+            other => panic!("{other:?}"),
         }
         assert!(list_lead_rules(&svc).await.unwrap().is_empty());
 
         let reply = put(&svc, start(Some("propose"))).await.unwrap();
         assert_eq!(reply["id"], json!("lead:start"));
+        assert_eq!(reply.get("awaiting_approval"), None);
         let found = find_rule(&svc, "start").await.unwrap().unwrap();
         assert_eq!(
             found.autonomy,
             thegn_core::automation_autonomy::Autonomy::Propose
         );
+        // A propose rule raises no arming request.
+        let pending = svc
+            .with_db(|db| {
+                crate::daemon::lead_caps::approvals::pending_with_ttl(
+                    db,
+                    thegn_core::util::now_ms(),
+                    0,
+                    50,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
+    }
+
+    fn grant(svc: &DaemonService, issue: &str, stage: &str, sha: &str) {
+        let db = svc.db.lock().unwrap();
+        db.grant_approval(&thegn_core::pipeline_approval::Approval {
+            issue_id: issue.into(),
+            stage: stage.into(),
+            commit_sha: sha.into(),
+            approver: "owner".into(),
+            note: None,
+            granted_at_ms: thegn_core::util::now_ms(),
+            expires_at_ms: None,
+            revoked_at_ms: None,
+        })
+        .unwrap();
+    }
+
+    async fn pending_arms(svc: &DaemonService) -> Vec<(String, String, String)> {
+        svc.with_db(|db| {
+            crate::daemon::lead_caps::approvals::pending_with_ttl(
+                db,
+                thegn_core::util::now_ms(),
+                0,
+                50,
+            )
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.stage == "arm")
+        .map(|p| (p.issue_id, p.stage, p.commit_sha))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn an_escalating_start_is_stored_disarmed_and_armed_by_the_owner() {
+        use thegn_core::automation_autonomy::Autonomy;
+        let (svc, _profile) = service(true);
+        for (level, expected) in [
+            (Some("review"), Autonomy::Review),
+            (None, Autonomy::Review),
+            (Some("merge"), Autonomy::Merge),
+        ] {
+            let reply = put(&svc, start(level)).await.unwrap();
+            assert_eq!(reply["awaiting_approval"], json!(true), "{level:?}");
+            assert_eq!(
+                reply["inert_reason"],
+                json!("awaiting owner approval (rule:lead:start arm)")
+            );
+            // Stored, inert, and listed as awaiting rather than invalid.
+            assert!(find_rule(&svc, "start").await.unwrap().is_none());
+            let listed = list_lead_rules(&svc).await.unwrap();
+            assert_eq!(
+                listed[0].inert_reason.as_deref(),
+                Some("awaiting owner approval (rule:lead:start arm)")
+            );
+            // A pending arming request for exactly the stored body (earlier
+            // rounds' requests may also still be unread).
+            let body = svc
+                .with_db(|db| Ok(db.lead_rules()?.remove(0).body_json))
+                .await
+                .unwrap();
+            let (issue, stage, sha) = rule_arm_ids("lead:start", &body, expected);
+            assert_eq!((issue.as_str(), stage.as_str()), ("rule:lead:start", "arm"));
+            let pending = pending_arms(&svc).await;
+            assert!(
+                pending.contains(&(issue.clone(), stage.clone(), sha.clone())),
+                "{level:?}: {pending:?}"
+            );
+
+            // The owner approves: armed at the requested level.
+            grant(&svc, &issue, &stage, &sha);
+            let found = find_rule(&svc, "start").await.unwrap().unwrap();
+            assert_eq!(found.autonomy, expected, "{level:?}");
+            assert_eq!(list_lead_rules(&svc).await.unwrap()[0].inert_reason, None);
+            // Re-putting the identical body keeps it armed and asks nothing.
+            let reply = put(&svc, start(level)).await.unwrap();
+            assert_eq!(reply.get("awaiting_approval"), None, "{level:?}");
+            assert!(find_rule(&svc, "start").await.unwrap().is_some());
+            // Removing it revokes the arming, so the next put asks again.
+            rm(&svc, json!({"name": "start"})).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn editing_an_armed_rule_disarms_it_for_good() {
+        let (svc, _profile) = service(true);
+        put(&svc, start(Some("review"))).await.unwrap();
+        let (issue, stage, sha) = pending_arms(&svc).await.remove(0);
+        grant(&svc, &issue, &stage, &sha);
+        assert!(find_rule(&svc, "start").await.unwrap().is_some());
+
+        let mut edited = start(Some("review"));
+        edited["rule"]["then"]["stage"] = json!("deploy");
+        let reply = put(&svc, edited).await.unwrap();
+        assert_eq!(reply["awaiting_approval"], json!(true));
+        assert!(find_rule(&svc, "start").await.unwrap().is_none());
+        // Changing it back does not resurrect the old approval: it was revoked.
+        let reply = put(&svc, start(Some("review"))).await.unwrap();
+        assert_eq!(reply["awaiting_approval"], json!(true));
+        assert!(find_rule(&svc, "start").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_arming_granted_before_the_first_put_never_arms_it() {
+        use thegn_core::automation_autonomy::Autonomy;
+        // Learn the exact stored body from a scratch profile.
+        let (scratch, _scratch_profile) = service(true);
+        put(&scratch, start(Some("review"))).await.unwrap();
+        let body = scratch
+            .with_db(|db| Ok(db.lead_rules()?.remove(0).body_json))
+            .await
+            .unwrap();
+        let (issue, stage, sha) = rule_arm_ids("lead:start", &body, Autonomy::Review);
+
+        let (svc, _profile) = service(true);
+        grant(&svc, &issue, &stage, &sha);
+        let reply = put(&svc, start(Some("review"))).await.unwrap();
+        assert_eq!(reply["awaiting_approval"], json!(true));
+        assert!(find_rule(&svc, "start").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -526,10 +732,7 @@ mod tests {
             loud.autonomy,
             thegn_core::automation_autonomy::Autonomy::Review
         );
-        let start = find_rule(&svc, "start").await.unwrap().unwrap();
-        assert_eq!(
-            start.autonomy,
-            thegn_core::automation_autonomy::Autonomy::Propose
-        );
+        // A hand-written escalation has no arming approval: inert.
+        assert!(find_rule(&svc, "start").await.unwrap().is_none());
     }
 }

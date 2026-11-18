@@ -909,7 +909,26 @@ fn classify_bound_row(
     }
 }
 
+/// The refusal a Lead-confined spawn gets while automations are paused.
+pub(crate) const PAUSED_SPAWN_REFUSAL: &str =
+    "automations are paused; the Lead can read but not spawn";
+
 impl DaemonService {
+    /// `FailedPrecondition` while `automations.pause` is on (b155 6f): a
+    /// Lead-confined `sessions.open` / `dispatches.put` is refused.
+    pub(crate) async fn refuse_while_paused(&self) -> ControlResult<()> {
+        let paused = self
+            .with_db(|db| Ok(thegn_core::automation_control::paused_strict(db).unwrap_or(true)))
+            .await?;
+        if paused {
+            Err(ControlError::FailedPrecondition(
+                PAUSED_SPAWN_REFUSAL.into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Run `f` against the shared DB on a blocking thread.
     pub(crate) async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
     where
@@ -1417,6 +1436,8 @@ impl DaemonService {
             // any fence, registry or launch work.
             let confine = caller.or_else(|| lead_rule_caller(&spec));
             if let Some(caller) = &confine {
+                // b155 (6f): while paused the Lead can read but not spawn.
+                self.refuse_while_paused().await?;
                 self.lead_open_precheck(&spec, caller).await?;
             }
             // Hold the same per-worktree gate a migration owns exclusively.
@@ -3180,6 +3201,66 @@ impl ControlApi for DaemonService {
         Box::pin(super::lead_caps::automations_pause::resume(self, req))
     }
 
+    fn approvals_redeem(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::approvals_redeem::redeem(self, req))
+    }
+
+    fn automations_halt(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::halt::halt(self, req))
+    }
+
+    fn mcp_proxy_profile_env(
+        &self,
+        req: serde_json::Value,
+        caller: thegn_svc::control::ProfileEnvCaller,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::proxy_env::profile_env(self, req, caller))
+    }
+
+    fn issues_update_confined<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a thegn_core::issue::IssuePatch,
+        repo: Option<&'a str>,
+        account: Option<&'a str>,
+        caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "patch": patch,
+                "repo": repo,
+                "account": account,
+            });
+            super::lead_caps::outward::gate(self, "issues.update", id, body, &caller).await?;
+            self.issues_update(id, patch, repo, account).await
+        })
+    }
+
+    fn issues_comment_confined<'a>(
+        &'a self,
+        id: &'a str,
+        body: &'a str,
+        repo: Option<&'a str>,
+        account: Option<&'a str>,
+        caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async move {
+            let canonical = serde_json::json!({
+                "body": body,
+                "repo": repo,
+                "account": account,
+            });
+            super::lead_caps::outward::gate(self, "issues.comment", id, canonical, &caller).await?;
+            self.issues_comment(id, body, repo, account).await
+        })
+    }
+
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         Box::pin(async move {
             let daemon_id = self.daemon_id.clone();
@@ -3445,7 +3526,22 @@ impl ControlApi for DaemonService {
                 other => other,
             })?;
             super::lead_caps::feed::dispatch_status(&self.events, id);
+            if status == thegn_core::issue::AgentDispatchStatus::Done {
+                super::stage_executor::kick_row(id);
+            }
             Ok(())
+        })
+    }
+
+    fn dispatch_put_confined(
+        &self,
+        req: thegn_svc::control::DispatchPutReq,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        Box::pin(async move {
+            // b155 (6f): while paused the Lead can read but not spawn.
+            self.refuse_while_paused().await?;
+            self.dispatch_put(req).await
         })
     }
 
@@ -3463,6 +3559,9 @@ impl ControlApi for DaemonService {
                     other => other,
                 })?;
             super::lead_caps::feed::dispatch_status(&self.events, id);
+            if status == thegn_core::issue::AgentDispatchStatus::Done {
+                super::stage_executor::kick_row(id);
+            }
             Ok(())
         })
     }
@@ -3491,6 +3590,9 @@ impl ControlApi for DaemonService {
             let outcome = self
                 .with_db(move |db| worker_report_in_db(db, id, &secret, &req.text, &mut || {}))
                 .await?;
+            if outcome.is_ok() {
+                super::stage_executor::kick_row(id);
+            }
             outcome.map_err(|refusal| {
                 tracing::warn!(target: "thegn::dispatch", dispatch_id = id, refusal = refusal.kind(), "worker dispatch capability refused");
                 if refusal == thegn_core::CapabilityRefusal::RowMissing {
@@ -4516,6 +4618,44 @@ mod tests {
         env.env = vec![("K".into(), "V".into())];
         expect_lead_refusal(svc.open_confined(env, lead_caller()).await, "env");
         assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    /// b155 (6f): while automations are paused the Lead can read but not
+    /// spawn: a confined open and a confined `dispatches.put` are refused
+    /// before any registry or launch work.
+    #[tokio::test]
+    async fn lead_confined_spawns_are_refused_while_paused() {
+        let (svc, _rx) = service(0);
+        svc.with_db(|db| thegn_core::automation_control::set_paused(db, true))
+            .await
+            .unwrap();
+        match svc
+            .open_confined(lead_agent_spec("/not/registered"), lead_caller())
+            .await
+        {
+            Err(ControlError::FailedPrecondition(m)) => assert_eq!(m, PAUSED_SPAWN_REFUSAL),
+            other => panic!("expected the paused refusal, got {other:?}"),
+        }
+        let put = thegn_svc::control::DispatchPutReq {
+            issue_id: "linear:THE-1".into(),
+            worktree_path: "/w".into(),
+            agent_name: "coder".into(),
+            ..Default::default()
+        };
+        match svc.dispatch_put_confined(put, lead_caller()).await {
+            Err(ControlError::FailedPrecondition(m)) => assert_eq!(m, PAUSED_SPAWN_REFUSAL),
+            other => panic!("expected the paused refusal, got {other:?}"),
+        }
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+        // Resumed, the confined open reaches its ordinary Lead checks again.
+        svc.with_db(|db| thegn_core::automation_control::set_paused(db, false))
+            .await
+            .unwrap();
+        expect_lead_refusal(
+            svc.open_confined(lead_agent_spec("/not/registered"), lead_caller())
+                .await,
+            "/not/registered",
+        );
     }
 
     /// A live-looking session whose stub actor records every byte written to
@@ -6696,6 +6836,7 @@ mod tests {
                 cors_origins: Vec::new(),
                 event_streams: Default::default(),
                 lead_listener: false,
+                lead_token_ttl_secs: 0,
             };
             let app = thegn_svc::control::http::router(state);
             let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -8157,6 +8298,7 @@ mod tests {
             cors_origins: Vec::new(),
             event_streams: Default::default(),
             lead_listener: false,
+            lead_token_ttl_secs: 0,
         }
     }
 
@@ -9235,6 +9377,7 @@ mod tests {
             cors_origins: Vec::new(),
             event_streams: Default::default(),
             lead_listener: false,
+            lead_token_ttl_secs: 0,
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(async move {
@@ -9365,6 +9508,7 @@ mod tests {
             cors_origins: Vec::new(),
             event_streams: Default::default(),
             lead_listener: false,
+            lead_token_ttl_secs: 0,
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(

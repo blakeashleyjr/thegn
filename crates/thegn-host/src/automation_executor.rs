@@ -33,6 +33,19 @@ pub async fn execute(
         "automation action {} is absent from the capability catalog",
         action.cap
     );
+    // Re-check the budget immediately before a budgeted spawn, counting the
+    // run's own `started` row out (`admit_planned`): a refusal or an
+    // unreadable usage fails the run instead of spawning past the limit.
+    if let Some(kind) = crate::automation_runtime::budget_kind(&action.cap, action.autonomy) {
+        let budget_cfg = Arc::clone(&cfg);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let db = thegn_core::db::Db::open()?;
+            crate::automation_budget::admit_planned(&db, &budget_cfg, kind)
+                .map_err(|refusal| anyhow::anyhow!("{refusal}"))
+        })
+        .await
+        .context("budget re-check task")??;
+    }
     let origin = AutomationOrigin {
         root_event_id: event
             .origin

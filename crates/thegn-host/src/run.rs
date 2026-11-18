@@ -24825,6 +24825,34 @@ async fn event_loop<T: Terminal>(
                                 },
                             )
                         }
+                        // `y` / `n` approve / reject the cursor row when it is an
+                        // approval request (b155 6a); `y`/`n` were free here.
+                        (Section::Notifications, KeyCode::Char(c @ ('y' | 'n'))) => {
+                            let picked = crate::panel::sections::notifications::visible_indices(
+                                &model.panel,
+                                &panel_ui,
+                            )
+                            .get(panel_ui.notifications_cursor)
+                            .and_then(|&i| model.panel.notifications.get(i))
+                            .filter(|n| crate::panel::sections::notifications::is_approval(n))
+                            .cloned();
+                            match picked {
+                                Some(n) => crate::handlers::approvals::request_resolve(
+                                    &mut model,
+                                    &mut confirm_guard,
+                                    &n,
+                                    if c == 'y' {
+                                        thegn_core::approval_request::Decision::Approve
+                                    } else {
+                                        thegn_core::approval_request::Decision::Reject
+                                    },
+                                    &refresh_tx,
+                                    &waker,
+                                ),
+                                None => model.status = "not an approval request".into(),
+                            }
+                            true
+                        }
                         // `x` dismisses the cursor row (mark read) — the one
                         // dismiss key shared with the unified overlay.
                         (Section::Notifications, KeyCode::Char('x')) => {

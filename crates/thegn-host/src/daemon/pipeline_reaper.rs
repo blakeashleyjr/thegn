@@ -263,6 +263,8 @@ fn reap_running(
                         row = r.id,
                         "reaped: artifact committed and report filed — closing done"
                     );
+                    // b155: the stage executor re-plans the lane.
+                    super::stage_executor::kick_row(r.id);
                 }
             }
             ReapVerdict::MarkFailed { why } => {

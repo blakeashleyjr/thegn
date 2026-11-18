@@ -35,6 +35,14 @@ pub(crate) fn account_home() -> Option<std::path::PathBuf> {
         .map(|u| u.dir)
 }
 
+/// The real uid and gid of this process.
+pub(crate) fn current_ids() -> Option<(u32, u32)> {
+    Some((
+        nix::unistd::getuid().as_raw(),
+        nix::unistd::getgid().as_raw(),
+    ))
+}
+
 #[cfg(test)]
 mod termwiz_regression {
     use std::os::fd::AsRawFd;

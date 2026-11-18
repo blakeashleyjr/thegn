@@ -50,7 +50,9 @@ pub(crate) fn emit_matched(
     let lead_rules = match db.lead_rules() {
         Ok(rows) if !rows.is_empty() => {
             let names: Vec<String> = config_rules.iter().map(|r| r.id.clone()).collect();
-            thegn_core::automation_authoring::compile_lead_rows(&rows, &names).0
+            // b155 (6c): an armed escalation counts; an unarmed one is inert.
+            let armed = crate::automation_arming::armed_set(db, thegn_core::util::now_ms());
+            thegn_core::automation_authoring::compile_lead_rows_armed(&rows, &names, &armed).0
         }
         _ => Vec::new(),
     };

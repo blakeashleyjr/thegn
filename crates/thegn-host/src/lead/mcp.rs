@@ -52,6 +52,9 @@ pub(crate) struct LeadMcpPlan {
     pub agent_args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub readable: Vec<std::path::PathBuf>,
+    /// The Lead listener's loopback address from `control-addr.json` (b155):
+    /// the isolated network namespace forwards exactly this port.
+    pub control_addr: Option<SocketAddr>,
 }
 
 /// Open (creating owner-only as needed) the Lead control dir beneath
@@ -332,11 +335,16 @@ pub(crate) fn mcp_file_name(caller: &str) -> String {
 
 /// Mint one Lead tab's control token (approved at mint: the host is trusted),
 /// revoking that tab's older tokens first. Returns the bearer token.
+///
+/// The token expires `ttl_secs` after mint (`[lead] token_ttl_secs`, b155);
+/// active use slides it forward (`auth::slide_lead_expiry`), capped at
+/// mint + 7 days. `0` (only reachable from tests) mints without an expiry.
 fn mint_lead_token(
     store: &dyn ControlStore,
     scopes: ScopeSet,
     now: i64,
     label: &str,
+    ttl_secs: u64,
 ) -> Result<String> {
     revoke_lead_pairings(store, now, label)?;
     let minted = thegn_svc::control::auth::mint(
@@ -344,11 +352,21 @@ fn mint_lead_token(
         scopes,
         label,
         None,
-        None,
+        lead_token_expiry(now, ttl_secs),
         now,
     );
     store.put_pairing(&minted.row)?;
     Ok(minted.token)
+}
+
+/// `now + ttl` in unix ms, or `None` for a zero TTL.
+fn lead_token_expiry(now: i64, ttl_secs: u64) -> Option<i64> {
+    (ttl_secs > 0).then(|| {
+        let ttl_ms = i64::try_from(ttl_secs)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        now.saturating_add(ttl_ms)
+    })
 }
 
 fn now_ms() -> i64 {
@@ -377,8 +395,14 @@ pub(crate) fn prepare(cfg: &Config, notes_dir: &Path, caller: &str) -> Result<Le
         caller,
         &thegn_core::util::xdg_state_home(),
         &|scopes, label| {
+            let ttl = cfg
+                .lead
+                .as_ref()
+                .map_or(thegn_core::config_lead::DEFAULT_TOKEN_TTL_SECS, |l| {
+                    l.token_ttl_secs
+                });
             let db = thegn_core::db::Db::open()?;
-            mint_lead_token(&db, scopes, now_ms(), label)
+            mint_lead_token(&db, scopes, now_ms(), label, ttl)
         },
     )
 }
@@ -430,6 +454,7 @@ fn prepare_in(
     let exe = std::env::current_exe().context("resolve the thegn executable")?;
     let exe = exe.to_string_lossy();
     let csv = scopes.to_csv();
+    let control_addr = addr;
     let addr = addr.to_string();
     let doc = thegn_core::mcp::wire::lead_entries(&thegn_core::mcp::wire::LeadEntries {
         command: &exe,
@@ -452,6 +477,7 @@ fn prepare_in(
         ],
         env: Vec::new(),
         readable: vec![dir.path().to_path_buf()],
+        control_addr: Some(control_addr),
     })
 }
 
@@ -596,9 +622,11 @@ mod tests {
             .insert("lead".into(), vec!["todoist".into()]);
         let db = thegn_core::db::Db::open_memory().unwrap();
         // An older Lead token, which the new mint must revoke.
-        let old = mint_lead_token(&db, ScopeSet::of(&[Scope::Read]), 1, "lead").unwrap();
+        let old = mint_lead_token(&db, ScopeSet::of(&[Scope::Read]), 1, "lead", 0).unwrap();
         assert!(!old.is_empty());
-        let mint = |scopes: ScopeSet, label: &str| mint_lead_token(&db, scopes, now_ms(), label);
+        let ttl = cfg.lead.as_ref().unwrap().token_ttl_secs;
+        let mint =
+            |scopes: ScopeSet, label: &str| mint_lead_token(&db, scopes, now_ms(), label, ttl);
         let plan = prepare_in(&cfg, notes.path(), "lead", state.path(), &mint).unwrap();
 
         let dir = state.path().join(CONTROL_DIR_REL);
@@ -612,6 +640,7 @@ mod tests {
             ]
         );
         assert_eq!(plan.readable, std::slice::from_ref(&dir));
+        assert_eq!(plan.control_addr, Some("127.0.0.1:4242".parse().unwrap()));
         crate::platform::test_assert_owner_only_permissions(&path, &dir);
         let doc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -630,6 +659,13 @@ mod tests {
         assert_eq!(live[0].label, PAIRING_LABEL);
         assert_eq!(live[0].scope, "read", "clamped by the read-only ceiling");
         assert!(live[0].approved_at.is_some());
+        let ttl_ms = i64::try_from(ttl).unwrap() * 1000;
+        let expires = live[0].expires_at.expect("a Lead token carries an expiry");
+        assert_eq!(
+            expires - live[0].created_at,
+            ttl_ms,
+            "expires at mint + ttl"
+        );
         assert_eq!(rows.len(), 2);
     }
 
@@ -673,7 +709,7 @@ mod tests {
         let db = thegn_core::db::Db::open_memory().unwrap();
         let ro = ScopeSet::of(&[Scope::Read]);
         for label in ["lead:lead/0", "lead:lead/1", "lead:lead/2", PAIRING_LABEL] {
-            mint_lead_token(&db, ro, 1, label).unwrap();
+            mint_lead_token(&db, ro, 1, label, 0).unwrap();
         }
         let dir = control_dir_in(state.path()).unwrap();
         for label in ["lead:lead/0", "lead:lead/1", "lead:lead/2"] {

@@ -550,6 +550,9 @@ pub enum SkipReason {
     /// The rule's previous run is still live (a session it opened, or an
     /// unfinished audit row inside the crash window).
     PreviousRunLive,
+    /// An automation budget (`[automations] max_concurrent_lanes` /
+    /// `max_spawns_per_day`) refused the spawn (6e).
+    Budget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -698,13 +701,23 @@ fn evaluate_one(
 /// skips keep their own reason. Pure, so the kill switch is testable without
 /// a database.
 pub fn paused_decisions(decisions: Vec<EvaluationDecision>) -> Vec<EvaluationDecision> {
+    skipped_decisions(decisions, SkipReason::Paused)
+}
+
+/// Every would-be plan becomes an explicit skip with `reason` (its ledger
+/// transition is discarded); policy skips keep their own reason. The general
+/// form of [`paused_decisions`], also used for pre-admission budget refusals.
+pub fn skipped_decisions(
+    decisions: Vec<EvaluationDecision>,
+    reason: SkipReason,
+) -> Vec<EvaluationDecision> {
     decisions
         .into_iter()
         .map(|decision| match decision {
             EvaluationDecision::Planned(action) => EvaluationDecision::Skipped {
                 rule_id: action.rule_id,
                 event_key: action.event_key,
-                reason: SkipReason::Paused,
+                reason: reason.clone(),
             },
             skipped @ EvaluationDecision::Skipped { .. } => skipped,
         })

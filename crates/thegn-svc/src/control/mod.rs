@@ -217,6 +217,16 @@ pub struct OpenSpec {
     pub automation_origin: Option<AutomationOrigin>,
 }
 
+/// Who is asking for an MCP proxy profile's env (`mcp_proxy.profile_env`,
+/// THE-2222). Built by the transport from the verified token, never from the
+/// request: `lead_label` is the Lead token's pairing label when the caller is
+/// Lead-confined; `admin` is an admin-scoped or implicit-admin caller.
+#[derive(Debug, Clone)]
+pub struct ProfileEnvCaller {
+    pub lead_label: Option<String>,
+    pub admin: bool,
+}
+
 /// The authenticated Lead caller behind a [`ControlApi::open_confined`] call,
 /// for the audit record. Built by the transport from the verified token,
 /// never from the request.
@@ -1529,6 +1539,37 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async { Err(ControlError::Unimplemented("automations.resume")) })
     }
 
+    // --- b155 Lead spine ------------------------------------------------------
+
+    /// Answer an approval with a single-use push nonce (`approvals.redeem`,
+    /// Write; HTTP + CLI; refused for the Lead). Body `{nonce, decision}`.
+    fn approvals_redeem(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("approvals.redeem")) })
+    }
+
+    /// Kill automation-started and Lead-opened sessions (`automations.halt`,
+    /// Admin). Body `{keep_sessions}`.
+    fn automations_halt(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.halt")) })
+    }
+
+    /// Resolve an MCP proxy profile's server env (`mcp_proxy.profile_env`,
+    /// Read). Body `{profile}`. The daemon answers only the Lead token for its
+    /// own `[lead] mcp_profile`, or an admin caller.
+    fn mcp_proxy_profile_env(
+        &self,
+        _req: serde_json::Value,
+        _caller: ProfileEnvCaller,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("mcp_proxy.profile_env")) })
+    }
+
     // --- agent orchestration (THE-57) ---------------------------------------
     // The supervisor's hands. Defaulted to `Unimplemented` so transport-only
     // impls and test fakes need no wiring (the calendar precedent); the daemon
@@ -1571,6 +1612,37 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
+    /// [`Self::issues_update`] for a Lead-confined caller (6d): the daemon
+    /// needs a live owner approval bound to this call's digest first.
+    /// Fails closed by default.
+    fn issues_update_confined<'a>(
+        &'a self,
+        _id: &'a str,
+        _patch: &'a thegn_core::issue::IssuePatch,
+        _repo: Option<&'a str>,
+        _account: Option<&'a str>,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        Box::pin(async { Err(ControlError::Unimplemented("issues.update (Lead-confined)")) })
+    }
+
+    /// [`Self::issues_comment`] for a Lead-confined caller (6d). Fails
+    /// closed by default.
+    fn issues_comment_confined<'a>(
+        &'a self,
+        _id: &'a str,
+        _body: &'a str,
+        _repo: Option<&'a str>,
+        _account: Option<&'a str>,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "issues.comment (Lead-confined)",
+            ))
+        })
+    }
+
     /// Post a comment on an issue (`issues.comment`). `account` names the
     /// configured tracker account that owns the issue; it routes by exact
     /// provider + account instead of by id prefix.
@@ -1599,6 +1671,22 @@ pub trait ControlApi: Send + Sync + 'static {
         _req: DispatchPutReq,
     ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// [`Self::dispatch_put`] for a Lead-confined caller (b155): the daemon
+    /// refuses it while automations are paused. Fails closed by default, so
+    /// an impl that cannot apply the pause check refuses the Lead.
+    fn dispatch_put_confined(
+        &self,
+        _req: DispatchPutReq,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        Box::pin(async {
+            Err(ControlError::FailedPrecondition(format!(
+                "{}this daemon cannot apply the Lead pause check",
+                thegn_core::lead_confine::REFUSAL_PREFIX
+            )))
+        })
     }
 
     /// Advance a dispatch's status (`dispatches.set_status`).
