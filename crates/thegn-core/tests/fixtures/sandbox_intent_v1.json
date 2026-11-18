@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "profile": "sealed",
+  "floor": "shared-kernel",
+  "backend": "bwrap",
+  "git_mode": "read-only",
+  "mounts": [
+    { "role": "worktree", "rw": true },
+    { "role": "caches" },
+    { "role": "user-mount", "name": "datasets", "rw": false }
+  ],
+  "network": "allowlist",
+  "egress_preset": "agent@1",
+  "agent_groups": ["claude"],
+  "agent_preset": "claude@1",
+  "limits": { "cpus": "2", "memory": "4g", "pids": 512 }
+}

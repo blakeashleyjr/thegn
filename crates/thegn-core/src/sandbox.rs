@@ -572,6 +572,62 @@ pub struct SandboxSpec {
     pub seal_home: Option<String>,
     /// Named volumes bound to a devcontainer owner id; empty for every non-devcontainer launch.
     pub volume_owners: Vec<(String, String)>,
+    /// The launch's egress plan: the ONLY egress field on the spec (B11).
+    /// Added by WS00-P1-03 and always `None` until WS04-P2-08 sets it (and
+    /// fingerprints it, policy fingerprint v3, when it first does).
+    pub egress: Option<crate::egress::plan::EgressPlan>,
+}
+
+/// An inert spec for tests and struct-update syntax (WS00-P1-02; the spec's
+/// shape is owned by WS02): backend `None`, placement `Local`, network
+/// `Network::default()`, file access `FileAccess::default()`, limits
+/// `SandboxLimits::default()`, every collection empty, every `Option` `None`,
+/// every flag false.
+///
+/// **Not for production.** A default spec with backend `None` is a plain host
+/// process. Production resolution (`resolve_placed_with`, the agent handoff,
+/// the build-cache probe, …) keeps constructing every field explicitly so each
+/// new security field forces a conscious decision there; the
+/// `default_spec_not_used_in_resolution` test enforces that.
+impl Default for SandboxSpec {
+    fn default() -> Self {
+        SandboxSpec {
+            backend: Backend::None,
+            placement: Placement::Local,
+            image: None,
+            worktree: PathBuf::new(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+            env_overrides: std::collections::HashMap::new(),
+            env_block: Vec::new(),
+            network: Network::default(),
+            network_allow: Vec::new(),
+            network_block: Vec::new(),
+            read_only_root: false,
+            no_new_privileges: false,
+            pids_limit: None,
+            drop_capabilities: Vec::new(),
+            add_capabilities: Vec::new(),
+            file_access: FileAccess::default(),
+            ports: Vec::new(),
+            gpu: None,
+            limits: SandboxLimits::default(),
+            volumes: Vec::new(),
+            compose: None,
+            build: None,
+            init_script: None,
+            devenv: false,
+            devenv_path: None,
+            name: String::new(),
+            vpn: None,
+            oci_host: None,
+            oci_runtime: None,
+            daemon_persistent: false,
+            seal_home: None,
+            volume_owners: Vec::new(),
+            egress: None,
+        }
+    }
 }
 
 /// Why a programmatic/configured named volume was refused. The error carries
@@ -2436,6 +2492,8 @@ fn resolve_placed_with(
         // (the host's launch-spec builder) flips it on for daemon-backed panes.
         daemon_persistent: false,
         seal_home,
+        // WS00-P1-03 stub: no egress plan until WS04-P2-08 resolves one.
+        egress: None,
     })
 }
 

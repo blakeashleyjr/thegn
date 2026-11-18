@@ -1,0 +1,303 @@
+---
+id: environments
+title: Environments
+parent: sandboxing
+order: 5
+actions: [warm-pool-increment, warm-pool-decrement, toolchain-install]
+contexts: [panel:environments]
+---
+
+# Environments
+
+Part of [[sandboxing]]. Named environments, worktree toolchains, lifecycle hooks and remote worktrees.
+
+## Environments
+
+Named `[env.<name>]` execution environments (local, container, or a cloud
+provider) appear in the panel's **system → environments** section — `↵`
+(re)binds the cursor env to the active worktree, `t` tests its provider
+token (the outcome pops as a toast and is logged), `n` opens the add
+wizard, and `x`
+removes it after a confirm (removal also forgets the stored token). An
+environment can keep a **warm spare pool** so new worktrees start
+instantly; raise or lower the active project's pool target with the
+warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable). The
+target update runs in the background: `warm pool: updating target…` appears
+while it is queued, followed by the result, and raising the target stops at
+eight spares for the workspace's environment.
+If the spare ledger cannot be read, reconciliation warns and makes no pool
+changes rather than treating the pool as empty.
+When a worktree opens and its spare ledger cannot be read, a warning appears on
+the status line and in a toast, and the worktree is provisioned fresh instead
+of claiming a spare.
+On the dev channel, before a spare is handed to a worktree, the worktree's
+network allow/block policy is verified on that spare and re-applied if it
+drifted. An unverifiable spare is quarantined (listed in `thegn doctor`) and
+the worktree is provisioned fresh. Providers without egress control and empty
+policies skip this check.
+If the current warm-pool target cannot be read, reconciliation makes no pool
+changes rather than falling back to the configured size. The warm-pool keys
+report `warm pool: cannot read the current target: ...` and save nothing.
+Reconciliation halts, such as lease, ledger, target, or spare-read failures,
+appear as a status-line toast; the same halt is shown once until it clears or
+its message changes. When deleting a worktree cannot recycle a claimed spare,
+its ledger row remains until the provider confirms destruction, so a failed
+destroy leaves it listed for a later retry.
+A stale or released spare is recycled from its base checkpoint only when the
+provider's checkpoint list confirms that checkpoint exists; if the list cannot
+be read, the spare is destroyed instead. On the dev channel, after a
+checkpoint restore, `thegn env restore` and warm-pool recycle verify an
+environment's non-empty network allow/block policy when the provider supports
+egress control. If needed, the policy is re-applied and read back. If
+verification fails, `thegn env restore` fails and reports that the sandbox is
+running without verified egress; warm-pool recycle destroys the spare. A
+successful `env restore` reports the verified counts. On the dev channel,
+opening a worktree against an existing provider sandbox with egress control
+also verifies its non-empty network policy and reapplies it if it drifted. If
+the policy cannot be verified, opening is refused and the sandbox is left in
+place; a newly created sandbox that fails verification is still destroyed.
+
+If a worktree's environment selection cannot be read from the state database,
+thegn never falls back to the default environment. `thegn env` verbs report an
+error; worktree deletion refuses before removing anything; closing a tab does
+path-only cleanup and warns that an SSH sandbox container may remain. On the
+dev channel, provider SSH connect, warm-pool operations, hibernation,
+provisioning and host placement are refused or skipped with the reason. The
+close auto-checkpoint is also skipped with a warning on the dev channel. In
+the panel's system → environments section, an unreadable selection marks
+no environment bound, adds a red `binding unreadable: <reason>` row and a
+`binding?` badge, and `↵` refuses to rebind until the state database is
+readable.
+
+When the state database exists but the worktree's recorded location cannot be
+read or is unrecognised, writes and code runs refuse instead of using the host
+checkout. This covers panel git actions, Tests and Jobs, `thegn land`, mutating
+`thegn pr` actions, `thegn ci rerun`, `thegn ci trigger` and `thegn ci cancel`,
+worktree delete, Sandbox container stop or restart, clipboard image paste and
+toolchain install. With no state database, worktrees remain local as before.
+
+If an environment selection cannot be read and a non-local `[env.*]` is
+configured (dev channel), the tab shows `env?` and the loading splash shows
+`env: unknown`. `thegn doctor` reports an unknown environment; a failed pane
+connection is not blamed on a guessed provider. Provisioning skips trust-gated
+devcontainer steps and launch skips devshell injection, with a warning. On the
+dev channel, an unreadable account selection refuses a provider pane; failed
+SSH sandbox teardown identifies the container that may still be running, and
+hibernation refuses a restore when its record cannot be read while hibernation
+is enabled. Teardown and close auto-checkpoint warnings appear on the status
+line and in a toast while the TUI runs; the CLI prints them to stderr.
+
+An unreadable recorded worktree location makes the control API's commit, review handoff,
+autopilot push or worker sandbox, `thegn issue create` and `thegn issue comment`, PR creation,
+worktree-resolving `thegn env` commands, `thegn repo trust` and submodule init refuse. Background
+fetch and merged-worktree cleanup skip it. On the dev channel, hibernation refuses and its
+bridge-key drop warns and skips; provider provisioning and attach, provider and host worktree
+pipelines, and host placement refuse too. A plain local worktree is unaffected unless a provider
+or host placement is configured. Also on the dev channel, failed agent-login uploads mark “Sync
+agent logins” Failed with one line per account but do not stop provisioning. The resident bridge
+uses the pinned environment or workspace default; if that selection is unreadable, it skips
+connecting and logs a warning.
+On the dev channel, if the worktree location cannot be read, pane launches and
+provider connections are refused when a remote placement is configured
+(`[placement]`, `[sandbox.remote]`, or a non-local or host-pinned `[env.*]`);
+without one, panes use the local path.
+On the dev channel, if the environment selection itself cannot be read while a
+remote placement is configured, the launch stops in the halt modal with the
+read error instead of using the default environment. Without a remote
+placement, a local shell is not refused for that read error. For host
+placement, if another provisioning run for the same container is active, this
+open skips provisioning; when `THEGN_LOG` is set, the warning is written to
+`thegn.log`. The next open checks again.
+
+On any channel, closing a tab whose location cannot be read tears down by path
+only and warns on the status line that a remote sandbox may remain. Idle
+hibernation also keeps the sandbox, logs a warning and retries later when it
+cannot tell whether a shell is attached.
+
+Pool state shows on the sidebar's project chip, not in this section.
+`thegn doctor` lists claimed warm-pool spares without a bound worktree and
+quarantined spares under `Warm pool (provider spares needing review)`; it will
+not destroy them on its own. `thegn doctor --json` includes the same report in
+`warm_pool`.
+`[sandbox] default_env` picks the environment new worktrees use.
+A repo's `env =` setting is only a hint; if that environment would weaken
+user policy, it is ignored with a warning.
+
+### Worktree toolchains
+
+When a worktree declares a mise or asdf toolchain, thegn adds its safe shims to
+the pane `PATH`. The optional mise environment layer is lower precedence than
+an environment bundle or devshell and is applied only after the current repo
+config set is approved. Use the command-palette action `toolchain-install` to
+run the bounded, explicit install operation; opening a pane never downloads
+tools. A `(mise ~)` token means approval is pending, while `(mise !)` means
+the provider or shims are unavailable. Remote worktrees remain responsible
+for installing their tools on the remote target.
+
+Cached flake devShell injection (`[sandbox] inject_devshell`) is off by
+default. Turn it on in your own config (globally, per project or per
+environment), or approve a repository's `.thegn.toml` request with
+`thegn repo trust . --approve <id>`; an unapproved request is listed as pending
+and changes nothing.
+
+## Lifecycle hooks and pane setup
+
+`[hooks]` commands are host-side worktree/session lifecycle jobs. They run
+outside the sandbox with a curated environment, capture stdout/stderr in the
+worktree state log, and use the event-specific repository/worktree directory;
+see [[configuration]] for the six events, ordering, trust gate, timeout, and
+failure policy. The legacy `[sandbox].prepare` list is the compatibility
+alias for `post_create`, not a second fire-and-forget path.
+
+`[sandbox].init_script` remains separate: it is a POSIX shell snippet executed
+inside the sandbox before each agent or shell pane starts. Use it for
+per-pane/container setup; use lifecycle hooks for host-side worktree setup,
+teardown, or session edges.
+
+## Remote worktrees
+
+`[sandbox.remote] host` runs worktrees on another machine. Control-plane
+work (git reads, container lifecycle) always uses ssh; the interactive
+pane uses mosh by default, so it survives network changes. `[remote]`
+tunes keepalives, timeouts, and retry backoff for flaky links.
+
+> Remote worktrees and cloud providers are **dev-channel only** — see
+> [[release-channels]].
+
+The bridge helper is uploaded to a staged file and checked by SHA-256 before
+it is moved into place. If the install cannot be verified, the bridge
+connection is skipped.
+The helper lives at `/var/tmp/thegn-bridge/<sha256>/thegn`, outside the
+worktree. Its digest is re-checked before thegn starts it through a provider's
+native exec API or for a reverse tunnel.
+A provider launch through its control command, such as a vendor CLI or SSH,
+checks the digest again before running the helper; changed bytes are refused
+with `thegn: resident bridge digest mismatch`.
+When a provider's `exec_command` uses `ssh` with a host, its checked bridge
+launch is passed to the remote shell as one quoted word.
+The resident bridge scrubs secret-shaped text, including tokens, credentials in
+URLs, and private-key blocks, from command error output before returning it;
+standard output is returned unchanged.
+
+A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
+
+On provider placements, an explicit isolation request thegn cannot enforce is
+refused before provisioning, credential access or upload. Without such a
+request, the placement runs as `provider-managed (unverified)`; `thegn doctor`
+shows that floor.
+
+A thegn-derived VPS or Fly sandbox name is bound to the worktree that created
+it. Another worktree resolving to the same name is refused before a provider
+call.
+VPS and Fly ledger records carry a credential-free fingerprint of the provider
+kind, API authority, and configured (or default) token variable name, never the
+token itself. A name recorded under another account is refused; the VPS reaper
+quarantines that record and does not delete it.
+The Fly reaper also quarantines records for another account without revoking or
+destroying them. If it cannot determine the current account, it quarantines
+every record before making provider calls.
+If the UI is running, a change to the non-empty set of resources a VPS or
+Fly reaper keeps for review raises one alert toast for that provider, naming
+the first and counting the rest. An unchanged set does not repeat it.
+A VPS or Fly `max_instances` cap
+counts sandboxes for the same provider account; records without an account or
+that cannot be read count against every account.
+On the dev channel, `max_lifetime_secs` is enforced by the Fly and VPS reapers
+(Hetzner and DigitalOcean). Providers without a lifetime reaper, such as
+machine0 and Sprites, do not enforce it; `thegn config validate` warns when it
+is set. Destroy those instances yourself or set the value to `0`.
+
+A provider env with no remote transport fails closed: it halts before
+provisioning instead of running the session on the host. Fly sessions run on
+the Fly machine over thegn's ssh bridge. Sprites headless sessions use native
+exec and start in the provisioned checkout; `interactive_command` is only used
+with `exec = "cli"`: with `exec = "auto"` or `"api"` the `exec_command` and
+`interactive_command` keys are ignored (`thegn doctor` warns), and a worktree
+whose saved transport prefix is stale is repaired on its next launch. Fly
+provisioning installs Nix even when running as root without sudo. A plain ssh
+host with `data = "in_env"` has the repo seeded at `env up` or session open into
+`$HOME/thegn-worktrees/<repo>/<worktree>`. The provider "provisioned" marker and cached sandbox home
+live in the state dir, so the CLI and daemon agree, and `.thegn-provisioned` is
+excluded from git in remote checkouts. Provisioning fails clearly when Nix is
+required but did not install, and interrupted Nix builds no longer leave the
+store broken.
+
+The Hetzner provider is experimental: its lifecycle has not been verified on a
+live account, and `thegn doctor` says so.
+
+On the dev channel, an unreadable or malformed VPS or Fly ledger record is
+refused rather than treated as absent. Destroy, retarget, address lookup,
+`vps-ssh` and managed-key selection refuse it; a refused destroy keeps SSH
+custody and tells you to fix or remove the record before retrying. SSH keys
+registered with Hetzner, DigitalOcean and machine0 use `thegn-managed-`
+followed by the first 32 hexadecimal characters of the SHA-256 digest of the
+decoded public key. An invalid OpenSSH public key is refused.
+
+On the dev channel, the Fly backend strictly parses an app's machine list and
+rejects malformed lists or duplicate machine IDs. If more than one live
+thegn-managed machine is present, it refuses to choose one.
+
+Machine0 creates and restores are serialized across thegn processes by an
+owner-only lock in the VPS registry. A create that cannot get the lock within
+the six-minute readiness budget is refused with a busy message.
+Machine0 image, SSH-key and VM lists are parsed strictly: an unrecognised
+response shape, an unidentifiable row or a duplicate entry fails the operation
+instead of being treated as an empty or shorter list. Machine0 readiness,
+status and SSH-auth waits, and Fly's sshd probe, count each in-flight request
+against their total time budget.
+Machine0 records a pending reservation before creating a VM, and reservations
+count toward `max_instances`. If the create outcome is unknown, such as after a
+lost response, the reservation remains; retrying the create, or reopening the
+worktree once machine0 lists the VM, adopts it (waits for it, applies
+provisioning, and records its SSH key) instead of creating a duplicate. The
+reservation is retired only after adoption is ready. The error says to retry
+later or destroy the sandbox to retire the reservation. A VM with that name
+and no pending create from this machine is refused. The Sprites list follows
+every page and refuses results over its page or row limit, or an ambiguous
+continuation, rather than treating a partial list as complete. Configured
+provider ids at `env.<name>.provider.id` must be lowercase for Sprites,
+Hetzner, DigitalOcean, Fly and machine0; validation refuses uppercase ids.
+
+VPS and machine0 sandboxes pin their SSH host key on first contact with
+`accept-new` in a per-instance file under `$XDG_STATE_HOME/thegn/vps/known_hosts.d/`, moved once
+from `~/.thegn/vps` (the VPS and Fly machine ledger lives beside it).
+`thegn env show` warns about risky sandbox mounts such as the runtime dir or
+profile trees. Thegn creates that directory with owner-only
+permissions before managed SSH connections, refuses a symlinked or
+non-private directory, requires the same key on later connections, and
+removes the pin when it destroys a VPS or machine0 sandbox. Creating a machine0
+VM also clears a stale pin left by an earlier VM with the same name.
+
+If local parity fails during provider provisioning, autonomous launches on
+that worktree are refused until a later provision applies parity cleanly;
+interactive panes can still open. Host-parity closure pushes use a
+per-installation signing key and are skipped with a warning rather than sent
+unsigned when signing is unavailable. The iroh call-home reach is available
+only in builds with the `iroh` feature; `thegn doctor` reports whether it is
+built in.
+
+For remote and provider worktrees, thegn reads `.gitmodules` from the remote
+commit and rechecks approved submodules before initializing them. It validates
+the remote worktree sync plan before uploading anything. A provider sandbox's
+network policy is applied and read back before its first command; a mismatch
+stops provisioning. If an existing sandbox's policy cannot be verified, thegn
+refuses to provision it and leaves it in place.
+For provider sandboxes, network allow and block entries are trimmed,
+lowercased, stripped of a trailing dot, and deduplicated before the provider
+policy request; non-ASCII entries (use `xn--` punycode), IP literals, and
+malformed domain patterns are refused with the entry named in the error. Any
+allow entry keeps the final deny-everything-else rule, even when blocks shadow
+all allow entries.
+A provider launch using `sealed-tunnel` with a VPN configured is refused before
+provisioning; if a refused launch created its provider sandbox, thegn destroys
+that sandbox.
+
+With `data = "sync"`, closing the worktree copies sandbox changes back by
+comparing each file with what the upload sent: a file the sandbox did not
+change never overwrites a local edit. A file changed in both places (or deleted
+locally and changed in the sandbox) stops the sync with a list of files; nothing
+is written locally and the sandbox is kept. Make each listed file match one
+copy and close again. Files and directories excluded by `.gitignore`, `.ignore`,
+`.git/info/exclude` or your global git excludes file are not compared or copied
+back (the upload skips them too), so build output never blocks the sync. Files
+deleted in the sandbox are not deleted locally.

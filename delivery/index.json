@@ -11,7 +11,9 @@
     "Workspace Product & Observability",
     "Runtime Security & Host Architecture",
     "Cross-Platform Support & Verification",
-    "Proposal Retirement & Cleanup"
+    "Proposal Retirement & Cleanup",
+    "Sandbox & Remote 00: Shared contracts",
+    "Sandbox & Remote 01: Truth and fixes"
   ],
   "entries": [
     {
@@ -153,6 +155,18 @@
       "summary": "Tracker-driven worktree and optional agent launch remain unstarted."
     },
     {
+      "change": "add-launch-admission",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-2080",
+          "project": "Sandbox & Remote 00: Shared contracts"
+        }
+      ],
+      "summary": "Launch admission contract for the sandbox + remote programme; authored in W0, implemented by WS02-P5 items."
+    },
+    {
       "change": "add-localization",
       "lifecycle": "archived",
       "disposition": "superseded-retire",
@@ -281,6 +295,30 @@
         }
       ],
       "summary": "Synced viewed-file state and commit-by-commit review remain unstarted."
+    },
+    {
+      "change": "add-private-workspaces",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-2080",
+          "project": "Sandbox & Remote 00: Shared contracts"
+        }
+      ],
+      "summary": "Private-workspace (private-copy) contract for the programme; authored in W0, implemented by WS11-P3 items."
+    },
+    {
+      "change": "add-programme-features",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-2083",
+          "project": "Sandbox & Remote 00: Shared contracts"
+        }
+      ],
+      "summary": "Nine experimental programme release-channel features; stubs landed in W0, each filled by its owning item."
     },
     {
       "change": "add-remote-provision-hooks",
@@ -796,6 +834,18 @@
       ],
       "summary": "Static CLI startup boundary delivered on local main c0d3d860a22db0a7fddafb3d338bf40b25248ade with scoped native/counterfactual and strict lint/source evidence. Checked admission/source workers remain separate.",
       "archive_path": "openspec/changes/archive/2026-09-30-fix-static-cli-startup/"
+    },
+    {
+      "change": "fix-truth-in-reporting",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-2067",
+          "project": "Sandbox & Remote 01: Truth and fixes"
+        }
+      ],
+      "summary": "Sandbox reporting must never claim more enforcement than is applied; authored in W0, implemented by WS01 items."
     },
     {
       "change": "harden-live-diagnostics-and-forge",
