@@ -66,6 +66,8 @@ pub struct ForgetEnv<'a> {
     pub stamp: &'a str,
     /// `Some(reason)` when this instance is running.
     pub running: &'a dyn Fn() -> Option<String>,
+    /// A backup the caller already took; `None` makes [`forget`] take one.
+    pub backup: Option<&'a Path>,
 }
 
 pub fn run(cfg: &Config, args: ForgetArgs) -> Result<()> {
@@ -76,16 +78,50 @@ pub fn run(cfg: &Config, args: ForgetArgs) -> Result<()> {
     }
     let state_dir = thegn_core::util::xdg_state_home().join("thegn");
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let db = Db::open()?;
-    let report = forget(
-        &db,
-        &args,
-        &ForgetEnv {
-            state_dir: &state_dir,
-            stamp: &stamp,
-            running: &running,
-        },
-    )?;
+    let Some(reader) = Db::open_read_only_current()? else {
+        bail!(
+            "no state database at {}; nothing was changed",
+            state_dir.join("thegn.db").display()
+        )
+    };
+    let version = reader.user_version()?;
+    if version != thegn_core::db::SCHEMA_VERSION {
+        bail!(
+            "state database is schema v{version}, this build expects v{}; use the matching build. Nothing was changed.",
+            thegn_core::db::SCHEMA_VERSION
+        );
+    }
+    let report = if args.apply {
+        let backup = state_dir
+            .join(format!("forget-backup-{stamp}"))
+            .join("thegn.db");
+        reader
+            .backup_to(&backup)
+            .context("database backup failed; nothing was forgotten")?;
+        drop(reader);
+        let db = Db::open()?;
+        forget(
+            &db,
+            &args,
+            &ForgetEnv {
+                state_dir: &state_dir,
+                stamp: &stamp,
+                running: &running,
+                backup: Some(&backup),
+            },
+        )?
+    } else {
+        forget(
+            &reader,
+            &args,
+            &ForgetEnv {
+                state_dir: &state_dir,
+                stamp: &stamp,
+                running: &running,
+                backup: None,
+            },
+        )?
+    };
     if args.json {
         return super::emit_json(&report);
     }
@@ -221,12 +257,18 @@ pub fn forget(db: &Db, args: &ForgetArgs, env: &ForgetEnv<'_>) -> Result<ForgetR
         return Ok(report);
     }
 
-    let backup = env
-        .state_dir
-        .join(format!("forget-backup-{}", env.stamp))
-        .join("thegn.db");
-    db.backup_to(&backup)
-        .context("database backup failed; nothing was forgotten")?;
+    let backup = match env.backup {
+        Some(taken) => taken.to_path_buf(),
+        None => {
+            let backup = env
+                .state_dir
+                .join(format!("forget-backup-{}", env.stamp))
+                .join("thegn.db");
+            db.backup_to(&backup)
+                .context("database backup failed; nothing was forgotten")?;
+            backup
+        }
+    };
     let backup_text = backup.display().to_string();
     report.backup = Some(backup_text.clone());
     for entry in &mut report.forgotten {

@@ -93,6 +93,7 @@ fn run_forget(db: &Db, state: &IsolatedState, args: &ForgetArgs) -> anyhow::Resu
             state_dir: &state_dir,
             stamp: "20261118T000000Z",
             running: &not_running,
+            backup: None,
         },
     )
 }
@@ -427,6 +428,7 @@ fn a_running_instance_refuses_and_changes_nothing() {
             state_dir: &state_dir,
             stamp: "20261118T000000Z",
             running: &running,
+            backup: None,
         },
     )
     .unwrap_err();
