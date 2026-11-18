@@ -2829,7 +2829,9 @@ ports = []
 # network = "none" (offline).
 network_allow = []
 network_block = []
-# Log outbound DNS queries to the audit table (not a connection log).
+# Subscribe the podman `network` event stream (container network attach/detach)
+# into the sandbox audit table. Podman backends only; NOT a DNS-query or
+# connection log.
 network_audit = false
 
 # ── Filesystem ───────────────────────────────────────────────────────────────

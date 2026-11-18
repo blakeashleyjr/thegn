@@ -302,6 +302,11 @@ with a status for foreign containers, while `l` opens a live logs pane
 `g` rows are selectable. When sandboxing is off, a one-line banner says so.
 Stop and restart work runs off the UI loop and reports its outcome as a toast.
 
+`[sandbox] network_audit = true` records the podman `network` event stream
+(container network attach and detach) in the sandbox audit table. It works on
+podman backends only, `thegn config validate` warns when no selectable backend
+can deliver it, and it is not a DNS-query or connection log.
+
 The machine-global view is the system monitor's **Containers** tab
 ([[system-monitor]]), which lists every backend's containers with live
 stats and lifecycle actions on the thegn-owned ones.

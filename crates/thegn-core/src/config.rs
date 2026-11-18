@@ -4519,7 +4519,10 @@ pub struct SandboxConfig {
     /// Block outbound connections to these hostnames. Takes priority over
     /// network_allow when a hostname matches both.
     pub network_block: Vec<String>,
-    /// Log all outbound DNS queries and connection attempts to the audit table.
+    /// Subscribe the podman `network` event stream (container network
+    /// attach/detach) into the sandbox audit table. Podman backends only; not a
+    /// DNS-query or connection log. `config validate` warns when no selectable
+    /// backend delivers the stream.
     pub network_audit: bool,
     /// `[sandbox.vpn]` — attach the worktree to its own overlay/tunnel.
     pub vpn: VpnConfig,
