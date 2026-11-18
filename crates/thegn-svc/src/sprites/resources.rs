@@ -100,7 +100,7 @@ mod tests {
             for body in responses {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 8192];
-                let _ = sock.read(&mut buf).await;
+                sock.read(&mut buf).await.unwrap_or_default(); // best-effort: drain the request
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
