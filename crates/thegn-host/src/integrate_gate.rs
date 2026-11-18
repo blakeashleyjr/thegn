@@ -1365,6 +1365,13 @@ fn run_native_isolated(
     }
     let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
+        if matches!(mode, RunMode::Sealed { .. }) {
+            let (probe, _) = workspace.spawn("true", PREFLIGHT_TIMEOUT_SECS)?;
+            if let Some((probe_verdict, keep)) = preflight_verdict(probe, &mode) {
+                poisoned = keep;
+                return Ok(probe_verdict);
+            }
+        }
         if !config.gate_setup_command.is_empty() {
             let (output, exec_confirmed) =
                 workspace.spawn(&config.gate_setup_command, config.gate_setup_timeout_secs)?;
@@ -1420,6 +1427,16 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
     workspace.exec = exec;
     let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
+        if matches!(mode, RunMode::Sealed { .. }) {
+            let (probe, _) = workspace.spawn("true", PREFLIGHT_TIMEOUT_SECS)?;
+            if let Some((probe_verdict, keep)) = preflight_verdict(probe, &mode) {
+                poisoned = keep;
+                if keep && let GateVerdict::Error { reason, .. } = &probe_verdict {
+                    workspace.poison(reason);
+                }
+                return Ok(probe_verdict);
+            }
+        }
         if !config.gate_setup_command.is_empty() {
             let (output, exec_confirmed) =
                 workspace.spawn(&config.gate_setup_command, config.gate_setup_timeout_secs)?;
@@ -1511,8 +1528,8 @@ fn gate_env(checkout: &Path, target: Option<&Path>, oid: &str) -> Vec<(String, S
 }
 
 /// A gate command inside the sealed sandbox: the guarded entry argv, run in
-/// the checkout, with the drain's credential scrub and the git-env scrub on
-/// the entry process itself. `exec_confirmed` is false: the sandbox wrapper
+/// the checkout, with the sealed credential and git-env scrub on the entry
+/// process itself. `exec_confirmed` is false: the sandbox wrapper
 /// stands between the configured command and its exit status.
 fn sealed_command(
     spec: &thegn_core::sandbox::SandboxSpec,
@@ -1528,12 +1545,7 @@ fn sealed_command(
             .map_err(|reason| anyhow::Error::new(SandboxEntryRefused(reason)))?;
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]).current_dir(checkout);
-    for key in crate::daemon::lead_caps::merge_drain::SCRUBBED_ENV {
-        command.env_remove(key);
-    }
-    for key in util::GIT_ENV_VARS {
-        command.env_remove(key);
-    }
+    crate::gate_sandbox::scrub_sealed_env(&mut command);
     Ok((command, false, env_file))
 }
 
@@ -1597,6 +1609,40 @@ impl RunMode {
             },
         }
     }
+}
+
+/// How long the sealed gate's sandbox preflight (`true`) may take.
+const PREFLIGHT_TIMEOUT_SECS: u64 = 120;
+
+/// The verdict of a sealed gate's sandbox preflight, or `None` when the
+/// sandbox started cleanly. bwrap reports its own setup failures (a bad bind,
+/// a failed chdir) as exit 1, not 125, so any non-success here is an
+/// infrastructure hold, never `Failed`. The `bool` is the poison flag.
+fn preflight_verdict(
+    result: super::super::gate_capture::CaptureResult,
+    mode: &RunMode,
+) -> Option<(GateVerdict, bool)> {
+    let started = matches!(&result, super::super::gate_capture::CaptureResult::Completed { status, .. } if status.success());
+    let (probe_verdict, keep) = capture_verdict(result, true, false, mode);
+    if keep {
+        return Some((probe_verdict, true));
+    }
+    if started {
+        return None;
+    }
+    let log = match probe_verdict {
+        GateVerdict::Error { log, .. } | GateVerdict::Failed { log } => log,
+        _ => String::new(),
+    };
+    Some((
+        GateVerdict::Error {
+            reason: "the gate sandbox could not start (preflight)".into(),
+            log,
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Spawn,
+        },
+        false,
+    ))
 }
 
 fn capture_verdict(
