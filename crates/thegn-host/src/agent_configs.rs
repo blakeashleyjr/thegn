@@ -606,20 +606,153 @@ fn phase2_allowed(agent: &str, rel: &str) -> bool {
     }
 }
 
-/// Upload just the auth-critical files (Phase 1) for `agents` into the sandbox
-/// `$HOME` at `base`, preserving the executable bit. Returns `(ok, failed)`.
-/// Small (~5 tiny files per agent) + best-effort — the shared core of the
-/// initial login sync and the connect-time [`resync_agent_auth`] refresh.
-/// SOURCE path for an agent-config path `rel` (relative to `$HOME`): re-rooted
-/// at the provider's relocated credential home (`CLAUDE_CONFIG_DIR` /
-/// `CODEX_HOME`) when set. The host's LIVE login may be a relocated home (e.g.
-/// a claude-profiles dir) while the default `~/.claude` fossilizes — the login
-/// sync uploading the fossil gave every sprite a stale identity. The sandbox
-/// TARGET keeps the default rel path (in-sandbox agents run without the
-/// relocation env).
-fn agent_source_path(host_home: &str, rel: &str) -> std::path::PathBuf {
-    relocated_source(rel, &|k| std::env::var(k).ok())
-        .unwrap_or_else(|| Path::new(host_home).join(rel))
+/// Where an agent's login files are read from on this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoginSource {
+    /// No `login_homes` entry: the live host login (`$HOME`, re-rooted at the
+    /// relocated home when `CLAUDE_CONFIG_DIR` / `CODEX_HOME` is set).
+    Live,
+    /// `[env.<n>.provider] login_homes.<key>`: a dedicated account's home (the
+    /// claude config dir / the `CODEX_HOME` root). Only files under it are read.
+    Dedicated {
+        key: &'static str,
+        root: std::path::PathBuf,
+    },
+}
+
+/// The `login_homes` key an agent kind reads (`None` ⇒ no dedicated home).
+fn login_home_key(agent: &str) -> Option<&'static str> {
+    match agent.trim() {
+        "claude" | "claude-code" => Some("claude"),
+        "codex" => Some("codex"),
+        _ => None,
+    }
+}
+
+/// Resolve each agent's [`LoginSource`]. A `login_homes` dir that does not
+/// exist drops that agent with one `warn` line: the live login is never read
+/// in its place, so a dedicated-account intent is not silently replaced.
+fn resolve_login_sources(
+    agents: &[String],
+    login_homes: &std::collections::BTreeMap<String, String>,
+    host_home: &Path,
+    warn: &mut dyn FnMut(&str),
+) -> Vec<(String, LoginSource)> {
+    let mut out = Vec::with_capacity(agents.len());
+    for agent in agents {
+        let dedicated = login_home_key(agent).and_then(|key| {
+            login_homes
+                .get(key)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(|v| {
+                    (
+                        key,
+                        std::path::PathBuf::from(thegn_core::util::expand_tilde_in(v, host_home)),
+                    )
+                })
+        });
+        match dedicated {
+            None => out.push((agent.clone(), LoginSource::Live)),
+            Some((key, root)) if root.is_dir() => {
+                out.push((agent.clone(), LoginSource::Dedicated { key, root }));
+            }
+            Some((key, root)) => warn(&format!(
+                "login_homes.{key} = {} is not a directory; {} login not synced \
+                 (the live host login is not used in its place)",
+                root.display(),
+                agent.trim()
+            )),
+        }
+    }
+    out
+}
+
+/// SOURCE path for an agent-config path `rel` (relative to `$HOME`), or `None`
+/// when `source` has no such file to offer.
+///
+/// [`LoginSource::Live`]: re-rooted at the provider's relocated credential home
+/// (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`) when set. The host's LIVE login may be a
+/// relocated home (e.g. a claude-profiles dir) while the default `~/.claude`
+/// fossilizes — the login sync uploading the fossil gave every sprite a stale
+/// identity. [`LoginSource::Dedicated`]: re-rooted at the `login_homes` dir;
+/// a path outside it is never read from `$HOME`. The sandbox TARGET keeps the
+/// default rel path (in-sandbox agents run without the relocation env).
+fn agent_source_path(
+    host_home: &str,
+    rel: &str,
+    source: &LoginSource,
+) -> Option<std::path::PathBuf> {
+    match source {
+        LoginSource::Live => Some(
+            relocated_source(rel, &|k| std::env::var(k).ok())
+                .unwrap_or_else(|| Path::new(host_home).join(rel)),
+        ),
+        LoginSource::Dedicated { key, root } => dedicated_source(key, root, rel),
+    }
+}
+
+/// `rel` re-rooted at a dedicated `login_homes` dir for provider `key`, with
+/// claude's `.claude.json` inside-then-beside rule. `None` ⇒ not under it.
+fn dedicated_source(key: &str, root: &Path, rel: &str) -> Option<std::path::PathBuf> {
+    let p = thegn_core::account::provider(key)?;
+    if rel == p.default_dir {
+        return Some(root.to_path_buf());
+    }
+    if let Some(rest) = rel.strip_prefix(p.default_dir)
+        && let Some(rest) = rest.strip_prefix('/')
+    {
+        return Some(root.join(rest));
+    }
+    if key == "claude" && rel == ".claude.json" {
+        return claude_json_near(root);
+    }
+    None
+}
+
+/// claude's top-level `.claude.json` rides beside the config dir: with
+/// `CLAUDE_CONFIG_DIR` set claude keeps it INSIDE that dir; a claude-profiles
+/// home keeps it at the profile root (the dir's parent). First existing wins.
+fn claude_json_near(root: &Path) -> Option<std::path::PathBuf> {
+    let inside = root.join(".claude.json");
+    if inside.is_file() {
+        return Some(inside);
+    }
+    root.parent()
+        .map(|d| d.join(".claude.json"))
+        .filter(|beside| beside.is_file())
+}
+
+/// Read a host file and whether it is executable. `None` ⇒ absent/unreadable.
+fn read_host_file(path: &Path) -> Option<(Vec<u8>, bool)> {
+    let data = std::fs::read(path).ok()?;
+    let exec = std::fs::metadata(path)
+        .map(|md| is_executable(&md))
+        .unwrap_or(false);
+    Some((data, exec))
+}
+
+/// The Phase 1 (auth-critical) files for `sources` as `(rel, data, exec)`,
+/// pure over a `read` seam. Absent files are skipped silently.
+fn collect_auth_critical(
+    sources: &[(String, LoginSource)],
+    host_home: &str,
+    read: &mut dyn FnMut(&Path) -> Option<(Vec<u8>, bool)>,
+) -> Vec<(String, Vec<u8>, bool)> {
+    let mut out = Vec::new();
+    for (agent, source) in sources {
+        for f in thegn_core::envplan::agent_auth_critical_files(agent) {
+            let Some(src) = agent_source_path(host_home, &f, source) else {
+                continue;
+            };
+            let Some((data, exec)) = read(&src) else {
+                continue; // file absent on this host — skip silently
+            };
+            let data = strip_sandbox_hooks(&f, data);
+            out.push((f, data, exec));
+        }
+    }
+    out
 }
 
 /// The relocation core, pure over an env lookup (unit-tested without touching
@@ -641,20 +774,12 @@ fn relocated_source(rel: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<s
         {
             return Some(root.join(rest));
         }
-        // claude's top-level `.claude.json` rides beside the config dir: with
-        // `CLAUDE_CONFIG_DIR` set claude keeps it INSIDE that dir; a
-        // claude-profiles home keeps it at the profile root (the dir's
-        // parent). First existing wins; neither ⇒ fall back to `$HOME`.
-        if p.id == "claude" && rel == ".claude.json" {
-            let inside = root.join(".claude.json");
-            if inside.is_file() {
-                return Some(inside);
-            }
-            if let Some(beside) = root.parent().map(|d| d.join(".claude.json"))
-                && beside.is_file()
-            {
-                return Some(beside);
-            }
+        // Neither `.claude.json` beside nor inside ⇒ fall back to `$HOME`.
+        if p.id == "claude"
+            && rel == ".claude.json"
+            && let Some(found) = claude_json_near(&root)
+        {
+            return Some(found);
         }
     }
     None
@@ -687,50 +812,48 @@ pub(crate) fn push_host_git_identity(repo_root: &Path, exec_env: &mut Vec<(Strin
     }
 }
 
+/// Upload just the auth-critical files (Phase 1) for `sources` into the sandbox
+/// `$HOME` at `base`: owner-only (`write_private`, mode 0600 where the provider
+/// supports it), or `write_exec` for an executable source. Returns
+/// `(ok, failed)`. Small (~5 tiny files per agent) + best-effort — the shared
+/// core of the initial login sync and the connect-time [`resync_agent_auth`]
+/// refresh. Errors and logs name the path only, never file content.
 fn sync_agent_auth_critical(
     provider: &thegn_svc::provider::Provider,
     id: &str,
     base: &str,
-    agents: &[String],
+    sources: &[(String, LoginSource)],
 ) -> (usize, usize) {
     let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let mut ok = 0usize;
     let mut failed = 0usize;
-    for agent in agents {
-        for f in thegn_core::envplan::agent_auth_critical_files(agent) {
-            let src = agent_source_path(&host_home, &f);
-            let Ok(data) = std::fs::read(&src) else {
-                continue; // file absent on this host — skip silently
+    for (f, data, exec) in collect_auth_critical(sources, &host_home, &mut read_host_file) {
+        let dest = format!("{base}/{f}");
+        match block_on_provider(|| async {
+            let write = async {
+                if exec {
+                    provider.write_exec(id, &dest, &data).await
+                } else {
+                    provider.write_private(id, &dest, &data).await
+                }
             };
-            let data = strip_sandbox_hooks(&f, data);
-            let exec = std::fs::metadata(&src)
-                .map(|md| is_executable(&md))
-                .unwrap_or(false);
-            let dest = format!("{base}/{f}");
-            match block_on_provider(|| async {
-                match tokio::time::timeout(
-                    AGENT_CONFIG_UPLOAD_TIMEOUT,
-                    write_preserving_mode(provider, id, &dest, &data, exec),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "upload timed out after {}s",
-                        AGENT_CONFIG_UPLOAD_TIMEOUT.as_secs()
-                    )),
-                }
-            }) {
-                Ok(()) => ok += 1,
-                Err(e) => {
-                    failed += 1;
-                    tracing::warn!(
-                        target: "thegn::startup",
-                        dest = %dest,
-                        error = %e,
-                        "agent-config auth-critical upload failed (best-effort)"
-                    );
-                }
+            match tokio::time::timeout(AGENT_CONFIG_UPLOAD_TIMEOUT, write).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "upload timed out after {}s",
+                    AGENT_CONFIG_UPLOAD_TIMEOUT.as_secs()
+                )),
+            }
+        }) {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    target: "thegn::startup",
+                    dest = %dest,
+                    error = %e,
+                    "agent-config auth-critical upload failed (best-effort)"
+                );
             }
         }
     }
@@ -787,6 +910,21 @@ pub(crate) fn resync_agent_auth(
     if agents.is_empty() {
         return;
     }
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let no_homes = std::collections::BTreeMap::new();
+    let login_homes = cfg
+        .env
+        .get(env_name)
+        .map_or(&no_homes, |e| &e.provider.login_homes);
+    let sources = resolve_login_sources(
+        &agents,
+        login_homes,
+        Path::new(&host_home),
+        &mut thegn_core::msg::warn,
+    );
+    if sources.is_empty() {
+        return;
+    }
     // Resolve the sandbox `$HOME` (where the auth files must land) the same way
     // `run_provisioning` does — a tiny non-tty exec.
     let sprite_home = block_on_provider(|| async {
@@ -808,7 +946,7 @@ pub(crate) fn resync_agent_auth(
     .map(|(_, out)| out.trim().to_string())
     .unwrap_or_else(|| "/root".to_string());
     let (ok, failed) =
-        sync_agent_auth_critical(provider, id, sprite_home.trim_end_matches('/'), &agents);
+        sync_agent_auth_critical(provider, id, sprite_home.trim_end_matches('/'), &sources);
     tracing::debug!(
         target: "thegn::startup",
         id, ok, failed,
@@ -826,16 +964,25 @@ pub(crate) fn upload_agent_configs(
     id: &str,
     sandbox_home: &str,
     agents: &[String],
+    login_homes: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let base = sandbox_home.trim_end_matches('/');
+    // `login_homes` (a dedicated account) replaces the live login per agent; a
+    // missing dir drops that agent with one warning.
+    let sources = resolve_login_sources(
+        agents,
+        login_homes,
+        Path::new(&host_home),
+        &mut thegn_core::msg::warn,
+    );
 
     // -----------------------------------------------------------------------
     // Phase 1: auth-critical files — explicit allowlist, always uploaded,
     // no deadline. Even a slow provider finishes these in a few seconds.
     // The agent is guaranteed to be logged-in after this phase completes.
     // -----------------------------------------------------------------------
-    let (auth_ok, auth_failed) = sync_agent_auth_critical(provider, id, base, agents);
+    let (auth_ok, auth_failed) = sync_agent_auth_critical(provider, id, base, &sources);
 
     // -----------------------------------------------------------------------
     // Phase 2: full config tree — walk directories, skip bulky-state dirs,
@@ -846,7 +993,7 @@ pub(crate) fn upload_agent_configs(
     // Build the full upload list synchronously before entering async.
     // Dedup against the auth-critical set so we don't double-upload.
     let mut already_uploaded: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for agent in agents {
+    for (agent, _) in &sources {
         for f in thegn_core::envplan::agent_auth_critical_files(agent) {
             already_uploaded.insert(f);
         }
@@ -855,24 +1002,25 @@ pub(crate) fn upload_agent_configs(
     // `rel` is relative to the sandbox `$HOME` (`base`): packing and the
     // per-file fallback both join it to `base` themselves.
     let mut all_uploads: Vec<PackEntry> = Vec::new();
-    for agent in agents {
+    for (agent, source) in &sources {
         let (files, dirs) = thegn_core::envplan::agent_config_paths(agent);
         for f in files {
             if already_uploaded.contains(&f) {
                 continue;
             }
-            let src = agent_source_path(&host_home, &f);
-            let Ok(data) = std::fs::read(&src) else {
+            let Some(src) = agent_source_path(&host_home, &f, source) else {
+                continue;
+            };
+            let Some((data, exec)) = read_host_file(&src) else {
                 continue;
             };
             let data = strip_sandbox_hooks(&f, data);
-            let exec = std::fs::metadata(&src)
-                .map(|md| is_executable(&md))
-                .unwrap_or(false);
             all_uploads.push((f, data, exec));
         }
         for d in dirs {
-            let src = agent_source_path(&host_home, &d);
+            let Some(src) = agent_source_path(&host_home, &d, source) else {
+                continue;
+            };
             if !src.is_dir() {
                 continue;
             }
@@ -1861,6 +2009,157 @@ mod tests {
         // Prefix must be a path component: `.claudeX` is not `.claude`.
         assert_eq!(relocated_source(".claudeX/y", &env), None);
         let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    fn homes(pairs: &[(&str, &Path)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    fn put(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn login_homes_reroot_claude_and_codex_and_never_read_the_live_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("home");
+        // The live login: must never be read once `login_homes` is set.
+        put(&live.join(".claude/.credentials.json"), b"LIVE");
+        put(&live.join(".claude.json"), b"LIVE");
+        put(&live.join(".codex/auth.json"), b"LIVE");
+        put(&live.join(".config/codex/config.json"), b"LIVE");
+        // The dedicated accounts: a claude profile (`.claude.json` beside the
+        // config dir) and a codex home.
+        let claude = tmp.path().join("acct/claude/.claude");
+        put(&claude.join(".credentials.json"), b"DEDICATED-CLAUDE");
+        put(
+            &tmp.path().join("acct/claude/.claude.json"),
+            b"DEDICATED-JSON",
+        );
+        let codex = tmp.path().join("acct/codex");
+        put(&codex.join("auth.json"), b"DEDICATED-CODEX");
+        put(&codex.join("config.toml"), b"model = \"x\"");
+
+        let agents = ["claude".to_string(), "codex".to_string()];
+        let mut warned = Vec::new();
+        let sources = resolve_login_sources(
+            &agents,
+            &homes(&[("claude", claude.as_path()), ("codex", codex.as_path())]),
+            &live,
+            &mut |m: &str| warned.push(m.to_string()),
+        );
+        assert!(warned.is_empty(), "{warned:?}");
+        assert_eq!(
+            sources[1].1,
+            LoginSource::Dedicated {
+                key: "codex",
+                root: codex.clone()
+            }
+        );
+
+        let home_s = live.to_string_lossy().into_owned();
+        let mut reads = Vec::new();
+        let got = collect_auth_critical(&sources, &home_s, &mut |p: &Path| {
+            reads.push(p.to_path_buf());
+            read_host_file(p)
+        });
+        assert!(
+            reads.iter().all(|p| !p.starts_with(&live)),
+            "the live home was read: {reads:?}"
+        );
+        let by_rel: std::collections::BTreeMap<&str, &[u8]> = got
+            .iter()
+            .map(|(rel, data, _)| (rel.as_str(), data.as_slice()))
+            .collect();
+        assert_eq!(by_rel[".claude/.credentials.json"], b"DEDICATED-CLAUDE");
+        assert_eq!(by_rel[".claude.json"], b"DEDICATED-JSON");
+        assert_eq!(by_rel[".codex/auth.json"], b"DEDICATED-CODEX");
+        assert_eq!(by_rel[".codex/config.toml"], b"model = \"x\"");
+        // Outside the codex home ⇒ never read from `$HOME`.
+        assert!(
+            !by_rel.contains_key(".config/codex/config.json"),
+            "{by_rel:?}"
+        );
+        // The pure path rules.
+        let src = &sources[0].1;
+        assert_eq!(
+            agent_source_path(&home_s, ".claude", src),
+            Some(claude.clone())
+        );
+        assert_eq!(agent_source_path(&home_s, ".claudeX/y", src), None);
+    }
+
+    #[test]
+    fn a_missing_login_home_skips_the_agent_with_one_warning_and_no_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("home");
+        put(&live.join(".claude/.credentials.json"), b"LIVE");
+        put(&live.join(".claude.json"), b"LIVE");
+        let gone = tmp.path().join("no-such-account");
+        let agents = ["claude".to_string()];
+        let mut warned = Vec::new();
+        let sources = resolve_login_sources(
+            &agents,
+            &homes(&[("claude", gone.as_path())]),
+            &live,
+            &mut |m: &str| warned.push(m.to_string()),
+        );
+        assert!(sources.is_empty(), "{sources:?}");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("login_homes.claude"), "{}", warned[0]);
+        assert!(!warned[0].contains("LIVE"), "{}", warned[0]);
+        let mut read_count = 0usize;
+        let got = collect_auth_critical(&sources, &live.to_string_lossy(), &mut |p: &Path| {
+            read_count += 1;
+            read_host_file(p)
+        });
+        assert!(got.is_empty());
+        assert_eq!(
+            read_count, 0,
+            "no live-login read in place of a missing home"
+        );
+    }
+
+    #[test]
+    fn login_homes_leave_other_agents_on_the_live_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("home");
+        let claude = tmp.path().join("acct");
+        std::fs::create_dir_all(&claude).unwrap();
+        let agents = ["codex".to_string(), "pi".to_string()];
+        let mut warned = Vec::new();
+        let sources = resolve_login_sources(
+            &agents,
+            &homes(&[("claude", claude.as_path())]),
+            &live,
+            &mut |m: &str| warned.push(m.to_string()),
+        );
+        assert!(warned.is_empty());
+        assert!(
+            sources.iter().all(|(_, s)| *s == LoginSource::Live),
+            "{sources:?}"
+        );
+        // A `~` login home expands against the host home.
+        let tilde = [("codex".to_string(), "~/acct".to_string())]
+            .into_iter()
+            .collect();
+        let sources = resolve_login_sources(
+            &["codex".to_string()],
+            &tilde,
+            tmp.path(),
+            &mut |m: &str| warned.push(m.to_string()),
+        );
+        assert_eq!(
+            sources[0].1,
+            LoginSource::Dedicated {
+                key: "codex",
+                root: claude
+            }
+        );
     }
 
     #[test]
