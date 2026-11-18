@@ -235,6 +235,18 @@ pub fn run(
         crate::provider_git::PreLand::NotProvider
     };
     let provider_land = pre_land_plan(&pre_land)?;
+    let release_sandbox = if release_sandbox
+        && matches!(
+            pre_land,
+            crate::provider_git::PreLand::Ready { report: None }
+        ) {
+        outln!(
+            "! --release-sandbox ignored: no pull ran for this worktree (read-only git policy, or not a provider env); the sandbox is kept"
+        );
+        false
+    } else {
+        release_sandbox
+    };
     let branch_loc_override = provider_land
         .is_some()
         .then(|| thegn_core::remote::GitLoc::Local(wt.clone()));
@@ -451,6 +463,22 @@ impl SandboxRelease for LiveRelease<'_> {
 
     // off-loop: `thegn land` is a CLI; the destroy blocks on the provider.
     fn destroy(&self, worktree: &str, env: &str) -> std::result::Result<(), String> {
+        let pc = &self
+            .cfg
+            .env
+            .get(env)
+            .ok_or_else(|| format!("env {env} is not configured"))?
+            .provider;
+        let name = crate::provider_factory::provider_sandbox_name_checked(self.cfg, worktree, env)
+            .map_err(|error| format!("{error:#}"))?
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("env {env} has no sandbox for {worktree}"))?;
+        if crate::provider_factory::provider_for_named(pc, &name).is_none() {
+            return Err(format!(
+                "provider {} is not configured (token unset?)",
+                pc.provider
+            ));
+        }
         crate::agent_teardown::destroy_provider_sandbox_with(self.cfg, worktree, env)
     }
 

@@ -1750,8 +1750,8 @@ mod tests {
         let first = pull_lock_in(dir.path(), wt, Duration::from_secs(5)).expect("first lock");
         let path = dir.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
         let waiter = std::thread::spawn(move || {
-            let started = Instant::now();
             let lock = pull_lock_in(&path, wt, Duration::from_secs(30));
             tx.send(()).unwrap();
             (lock.map(drop), started.elapsed())
