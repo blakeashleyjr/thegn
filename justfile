@@ -1140,14 +1140,14 @@ start-dev name="dev": build
 # Start the DEV instance: an isolated thegn built from this checkout, beside the
 # stable one. Own state, runtime, THEGN_DIR and config dir (~/.config/thegn-dev,
 # which you must seed yourself; secrets are never copied). See `thegn help two-instances`.
-dev: build
+devel: build
     #!/usr/bin/env sh
     set -eu
     home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
     [ -n "$home" ] || home="$HOME"
     root="$home/.thegn-devel"; state="$root/state"; run="$root/run"; cfg="$home/.config/thegn-dev"
     if [ ! -d "$cfg" ]; then
-      echo "just dev: $cfg does not exist; seed it first: cp -r '$home/.config/thegn' '$cfg' (review it for secrets)" >&2
+      echo "just devel: $cfg does not exist; seed it first: cp -r '$home/.config/thegn' '$cfg' (review it for secrets)" >&2
       exit 1
     fi
     pidfile="$run/thegn.pid"; mkdir -p "$state" "$run" "$root/home"
@@ -1163,8 +1163,8 @@ dev: build
       "$PWD/{{bin}}"
 
 # Print the dev instance's environment as `export` lines (no side effects):
-# `eval "$(just dev-env)"` targets the dev instance with CLI calls.
-dev-env:
+# `eval "$(just devel-env)"` targets the dev instance with CLI calls.
+devel-env:
     #!/usr/bin/env sh
     set -eu
     home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)

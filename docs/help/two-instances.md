@@ -13,7 +13,7 @@ can be rebuilt and restarted freely without touching the stable one.
 | Item        | stable                                                              | dev                                        |
 | ----------- | ------------------------------------------------------------------- | ------------------------------------------ |
 | Binary      | the installed binary (`~/.local/lib/thegn/thegn` after `just live`) | `target/debug/thegn` in the checkout       |
-| Launch      | `thegn`, or `just live` to update it                                | `just dev`                                 |
+| Launch      | `thegn`, or `just live` to update it                                | `just devel`                               |
 | Config dir  | `~/.config/thegn`                                                   | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`) |
 | State       | the default state dir                                               | `~/.thegn-devel/state` (`XDG_STATE_HOME`)  |
 | Runtime     | the default runtime dir                                             | `~/.thegn-devel/run` (`XDG_RUNTIME_DIR`)   |
@@ -26,10 +26,10 @@ Each instance has its own daemon, database, worktrees and config.
 
 ## Set it up
 
-1. Seed the dev config dir once. `just dev` refuses to start without it and
+1. Seed the dev config dir once. `just devel` refuses to start without it and
    never copies anything for you: `cp -r ~/.config/thegn ~/.config/thegn-dev`.
    Review the copy before you keep it: it may hold secrets.
-2. Run `just dev`. It builds the debug binary and starts the dev instance,
+2. Run `just devel`. It builds the debug binary and starts the dev instance,
    restarting only the previous dev instance.
 3. Register the thegn repo in the dev instance only, so you edit thegn from
    there.
@@ -54,10 +54,10 @@ binary, config dir, state dir, `THEGN_DIR`, channel and daemon socket that pane 
 
 ## CLI calls against the dev instance
 
-`just dev-env` prints `export` lines for the dev instance and changes nothing:
+`just devel-env` prints `export` lines for the dev instance and changes nothing:
 
 ```
-eval "$(just dev-env)"
+eval "$(just devel-env)"
 ```
 
 After that, `thegn` commands in that shell target the dev instance. See also
