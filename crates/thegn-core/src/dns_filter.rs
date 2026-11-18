@@ -17,6 +17,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::egress::pattern::norm;
+
 /// A logged DNS query, queued in the ring-buffer.
 #[derive(Debug, Clone)]
 pub struct DnsEvent {
@@ -41,66 +43,13 @@ pub struct DnsPolicy {
 }
 
 impl DnsPolicy {
+    /// Delegates to [`crate::egress::pattern::HostRules::allows`].
     pub fn allows(&self, name: &str) -> bool {
-        let name = norm(name);
-        if self.block.iter().any(|pattern| {
-            let Some(pattern) = norm(pattern) else {
-                return false;
-            };
-            matches_normalized(name.as_deref(), &pattern)
-        }) {
-            return false;
+        crate::egress::pattern::HostRules {
+            allow: self.allow.clone(),
+            block: self.block.clone(),
         }
-        if self.allow.is_empty() {
-            return true;
-        }
-        self.allow.iter().any(|pattern| {
-            let Some(pattern) = norm(pattern) else {
-                return false;
-            };
-            matches_normalized(name.as_deref(), &pattern)
-        })
-    }
-}
-
-pub(crate) fn name_matches(name: &str, pattern: &str) -> bool {
-    let Some(pattern) = norm(pattern) else {
-        return false;
-    };
-    matches_normalized(norm(name).as_deref(), &pattern)
-}
-
-fn norm(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let without_dot = trimmed.strip_suffix('.').unwrap_or(trimmed);
-    if without_dot.is_empty()
-        || without_dot.chars().any(char::is_whitespace)
-        || without_dot.split('.').any(str::is_empty)
-    {
-        return None;
-    }
-    let mut normalized = without_dot.to_string();
-    normalized.make_ascii_lowercase();
-    Some(normalized)
-}
-
-fn matches_normalized(name: Option<&str>, pattern: &str) -> bool {
-    // Universal block: `*` matches every name. Used by the config-resolution
-    // engine to encode a repo overlay's "deny-all egress" request (an empty
-    // `network_allow` at the repo layer) as `network_block += ["*"]` — a
-    // DNS-level deny that needs no change to `SandboxConfig`'s shape.
-    if pattern == "*" {
-        return true;
-    }
-    let Some(name) = name else {
-        return false;
-    };
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        // Wildcard matches only strict subdomains: *.example.com matches
-        // foo.example.com but NOT example.com itself.
-        name.ends_with(&format!(".{suffix}"))
-    } else {
-        name == pattern || name.ends_with(&format!(".{pattern}"))
+        .allows(name)
     }
 }
 
@@ -367,62 +316,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_allows_all_when_lists_empty() {
-        let p = DnsPolicy {
-            allow: vec![],
-            block: vec![],
-            upstream: None,
-        };
-        assert!(p.allows("anything.example.com"));
-    }
-
-    #[test]
-    fn policy_block_list_only() {
-        let p = DnsPolicy {
-            allow: vec![],
-            block: vec!["evil.com".into()],
-            upstream: None,
-        };
-        assert!(p.allows("good.com"));
-        assert!(!p.allows("evil.com"));
-        assert!(!p.allows("sub.evil.com"));
-    }
-
-    #[test]
-    fn policy_allow_list_restricts() {
-        let p = DnsPolicy {
-            allow: vec!["api.anthropic.com".into(), "github.com".into()],
-            block: vec![],
-            upstream: None,
-        };
-        assert!(p.allows("api.anthropic.com"));
-        assert!(p.allows("sub.github.com"));
-        assert!(!p.allows("evil.com"));
-    }
-
-    #[test]
-    fn policy_block_beats_allow() {
-        let p = DnsPolicy {
-            allow: vec!["example.com".into()],
-            block: vec!["example.com".into()],
-            upstream: None,
-        };
-        assert!(!p.allows("example.com"));
-    }
-
-    #[test]
-    fn wildcard_pattern() {
-        let p = DnsPolicy {
-            allow: vec!["*.internal.example.com".into()],
-            block: vec![],
-            upstream: None,
-        };
-        assert!(p.allows("foo.internal.example.com"));
-        assert!(!p.allows("internal.example.com")); // wildcard doesn't match root
-        assert!(!p.allows("external.example.com"));
-    }
-
-    #[test]
     fn extract_name_parses_simple_query() {
         let mut packet = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
@@ -468,148 +361,6 @@ mod tests {
             b'o', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
         ];
         assert_eq!(extract_query_name(&packet), Some("foo.example.com".into()));
-    }
-
-    #[test]
-    fn name_matches_trailing_dots_normalised() {
-        // The pattern's trailing dot is stripped inside name_matches (the query's
-        // trailing dot is normalised earlier, in DnsPolicy::allows).
-        assert!(name_matches("example.com", "example.com."));
-        assert!(name_matches("sub.example.com", "example.com."));
-        assert!(name_matches("sub.example.com", "example.com"));
-        assert!(!name_matches("notexample.com", "example.com"));
-    }
-
-    #[test]
-    fn name_matches_exact_and_suffix() {
-        assert!(name_matches("example.com", "example.com"));
-        assert!(name_matches("a.b.example.com", "example.com"));
-        // suffix must be on a label boundary
-        assert!(!name_matches("fooexample.com", "example.com"));
-    }
-
-    #[test]
-    fn name_matches_universal_star() {
-        // `*` is the deny-all pattern the resolution engine emits.
-        assert!(name_matches("example.com", "*"));
-        assert!(name_matches("anything.internal", "*"));
-        assert!(name_matches("a.b.c.d", "*"));
-        // Blocking `*` denies every query even against an allow list.
-        let p = DnsPolicy {
-            allow: vec!["example.com".into()],
-            block: vec!["*".into()],
-            upstream: None,
-        };
-        assert!(!p.allows("example.com"));
-        assert!(!p.allows("sub.example.com"));
-    }
-
-    #[test]
-    fn block_is_case_insensitive() {
-        let policy = DnsPolicy {
-            allow: vec![],
-            block: vec!["blocked.test".into()],
-            upstream: None,
-        };
-        assert!(!policy.allows("BLOCKED.TEST"));
-        assert!(!policy.allows("Blocked.Test."));
-        assert!(!policy.allows("sub.BLOCKED.test"));
-    }
-
-    #[test]
-    fn pattern_case_is_normalised() {
-        let policy = DnsPolicy {
-            allow: vec![],
-            block: vec!["Blocked.TEST.".into()],
-            upstream: None,
-        };
-        assert!(!policy.allows("blocked.test"));
-    }
-
-    #[test]
-    fn allows_normalizes_subdomain_and_wildcard_pattern_case() {
-        let suffix = DnsPolicy {
-            allow: vec![],
-            block: vec!["Blocked.TEST".into()],
-            upstream: None,
-        };
-        assert!(!suffix.allows("sub.blocked.test."));
-        let wildcard = DnsPolicy {
-            allow: vec![],
-            block: vec!["*.Example.COM.".into()],
-            upstream: None,
-        };
-        assert!(!wildcard.allows("a.example.com"));
-        let universal = DnsPolicy {
-            allow: vec![],
-            block: vec!["*".into()],
-            upstream: None,
-        };
-        assert!(!universal.allows("any."));
-    }
-
-    #[test]
-    fn wildcard_and_universal_case_insensitive() {
-        let wildcard = DnsPolicy {
-            allow: vec![],
-            block: vec!["*.Example.COM".into()],
-            upstream: None,
-        };
-        assert!(!wildcard.allows("a.example.com."));
-        assert!(name_matches("A.Example.COM.", "*.example.com"));
-        let universal = DnsPolicy {
-            allow: vec![],
-            block: vec!["*".into()],
-            upstream: None,
-        };
-        assert!(!universal.allows("ANY."));
-        assert!(name_matches("ANY.", "*"));
-    }
-
-    #[test]
-    fn mixed_case_matches_exact_subdomain_and_wildcard_patterns() {
-        for (name, pattern) in [
-            ("BLOCKED.TEST", "blocked.test"),
-            ("BLOCKED.TEST.", "blocked.test."),
-            ("sub.BLOCKED.TEST", "blocked.test"),
-            ("sub.BLOCKED.TEST.", "blocked.test."),
-            ("a.Example.COM", "*.example.com"),
-            ("a.Example.COM.", "*.example.com."),
-            ("ANY", "*"),
-            ("ANY.", "*."),
-            ("blocked.test", "Blocked.Test"),
-            ("blocked.test.", "Blocked.Test."),
-            ("sub.blocked.test", "Blocked.Test"),
-            ("sub.blocked.test.", "Blocked.Test."),
-            ("a.example.com", "*.Example.COM"),
-            ("a.example.com.", "*.Example.COM."),
-            ("anything", "*"),
-            ("anything.", "*."),
-        ] {
-            assert!(name_matches(name, pattern), "{name:?} against {pattern:?}");
-        }
-    }
-
-    #[test]
-    fn malformed_patterns_never_match() {
-        for pattern in ["", "a..b", "a b", "."] {
-            assert!(!name_matches("a.b", pattern), "pattern {pattern:?}");
-            let policy = DnsPolicy {
-                allow: vec![],
-                block: vec![pattern.into()],
-                upstream: None,
-            };
-            assert!(policy.allows("a.b"), "malformed block {pattern:?}");
-        }
-        assert!(name_matches("", "*"));
-        assert!(!name_matches("a..b", "a.b"));
-    }
-
-    #[test]
-    fn norm_trims_whitespace_and_one_trailing_dot() {
-        assert_eq!(norm("  A.Test.  "), Some("a.test".into()));
-        assert_eq!(norm("a.."), None);
-        assert_eq!(norm("a\tb"), None);
     }
 
     #[test]
@@ -697,29 +448,6 @@ mod tests {
             upstream: None,
         });
         assert_ne!(without_upstream.stable_id(), first);
-    }
-
-    #[test]
-    fn policy_trims_trailing_dot_on_query() {
-        let p = DnsPolicy {
-            allow: vec!["example.com".into()],
-            block: vec![],
-            upstream: None,
-        };
-        assert!(p.allows("example.com."));
-        assert!(p.allows("sub.example.com."));
-    }
-
-    #[test]
-    fn wildcard_does_not_match_unrelated_suffix() {
-        let p = DnsPolicy {
-            allow: vec!["*.example.com".into()],
-            block: vec![],
-            upstream: None,
-        };
-        assert!(p.allows("a.example.com"));
-        assert!(!p.allows("example.com"));
-        assert!(!p.allows("a.other.com"));
     }
 
     #[test]
