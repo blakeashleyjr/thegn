@@ -1,8 +1,11 @@
-//! `thegn env reap --provider vercel [--apply] [--yes] [--json]`: find Vercel
-//! sandboxes this host's controller created (tag proof) that the local ledger
-//! no longer records. Dry-run unless `--apply`; never runs automatically.
+//! `thegn env reap --provider vercel|sprites [--apply] [--yes] [--json]`.
 //!
-//! Safety, in order:
+//! Vercel: find sandboxes this host's controller created (tag proof) that the
+//! local ledger no longer records. Sprites: see [`sprites`] (ledger proof;
+//! unrecorded sprites are reported, never deleted). Dry-run unless `--apply`;
+//! never runs automatically.
+//!
+//! Vercel safety, in order:
 //! - Only sandboxes the listing shows tagged for this controller are
 //!   candidates (the listing itself filters on the tag).
 //! - The ledger is read **after** the listing (a create writes its intent
@@ -139,11 +142,12 @@ struct Opts {
 }
 
 pub fn run(cfg: &Config, provider: &str, apply: bool, yes: bool, json: bool) -> Result<()> {
-    if !provider.trim().eq_ignore_ascii_case(KIND) {
-        bail!(
-            "env reap supports --provider vercel only (got {:?})",
-            provider.trim()
-        );
+    let kind = provider.trim();
+    if kind.eq_ignore_ascii_case(sprites::KIND) {
+        return sprites::run(cfg, apply, yes, json);
+    }
+    if !kind.eq_ignore_ascii_case(KIND) {
+        bail!("env reap supports --provider vercel, sprites (got {kind:?})");
     }
     let mut envs: Vec<(String, Option<Box<dyn ReapApi>>)> = Vec::new();
     for (name, envc) in &cfg.env {
@@ -442,6 +446,980 @@ fn render(report: &ReapReport) -> String {
         ));
     }
     out.join("\n")
+}
+
+/// `env reap --provider sprites`: reconcile the sprites ownership ledger
+/// (`vps::registry`, `provider = "sprites"`) against each account's listing.
+///
+/// Classes (one row per sprite or record):
+/// - `orphan-record`: a ready record under this host's scope whose sprite the
+///   (complete) listing no longer shows → `--apply` removes the record only.
+/// - `stale-creating`: a `creating` record older than an hour with no sprite →
+///   `--apply` removes the record.
+/// - `over-lifetime`: a sprite with a ledger record under this host's scope
+///   older than the env's `max_lifetime_secs` (age from the API `created_at`,
+///   else the record's) → `--apply` destroys it through
+///   `SpritesProvider::destroy`, which proves ownership again itself.
+/// - `unrecorded`: in the account with no record of this host (including one
+///   a worktree location row names, and every pre-ledger sprite) → reported,
+///   **never** deleted.
+///
+/// A `Partial`/`Unknown` listing, an env with no ownership scope, or one whose
+/// provider cannot be built refuses `--apply`; an unreadable ledger refuses
+/// the command. Records of other providers in the shared registry are never
+/// read as sprites.
+mod sprites {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use anyhow::{Result, bail};
+    use thegn_core::config::Config;
+    use thegn_core::outln;
+    use thegn_svc::provider::{InventoryReport, Provider, RemoteProvider, SandboxInfo};
+    use thegn_svc::sprites::ledger::{self, LEDGER_PROVIDER, OwnerScope};
+    use thegn_svc::vps::registry::{self, VpsRecord};
+
+    use super::{Ask, Listing, Opts};
+
+    pub(super) const KIND: &str = "sprites";
+    /// A `creating` record with no sprite older than this is stale.
+    const STALE_CREATING_SECS: i64 = 3600;
+
+    /// The provider calls the sprites reap makes. Production wraps a scoped
+    /// [`thegn_svc::provider::SpritesProvider`]; tests use a fake.
+    pub(super) trait SpritesReapApi {
+        /// The ownership scope (`None` = no controller id or account).
+        fn scope(&self) -> Option<OwnerScope>;
+        /// The account's sprites, every page.
+        fn listing(&self) -> Listing;
+        /// `SpritesProvider::destroy`: its own ownership proof, then DELETE.
+        fn destroy(&self, name: &str) -> Result<()>;
+    }
+
+    struct LiveSprites(thegn_svc::provider::SpritesProvider);
+
+    impl SpritesReapApi for LiveSprites {
+        fn scope(&self) -> Option<OwnerScope> {
+            self.0.scope().cloned()
+        }
+
+        fn listing(&self) -> Listing {
+            match crate::agent::block_on_provider(|| async { self.0.sandbox_inventory().await }) {
+                Ok(InventoryReport::Complete(rows)) => Listing::Complete(rows),
+                Ok(InventoryReport::Partial { rows, reason }) => Listing::Partial { rows, reason },
+                Err(error) => Listing::Unknown(format!("{error:#}")),
+            }
+        }
+
+        fn destroy(&self, name: &str) -> Result<()> {
+            crate::agent::block_on_provider(|| async { self.0.destroy(name).await })
+        }
+    }
+
+    /// One configured sprites env.
+    pub(super) struct SpritesEnv {
+        pub name: String,
+        pub api: Option<Box<dyn SpritesReapApi>>,
+        pub max_lifetime_secs: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub(super) enum Class {
+        OrphanRecord,
+        StaleCreating,
+        OverLifetime,
+        Unrecorded,
+    }
+
+    impl Class {
+        fn label(self) -> &'static str {
+            match self {
+                Class::OrphanRecord => "orphan-record",
+                Class::StaleCreating => "stale-creating",
+                Class::OverLifetime => "over-lifetime",
+                Class::Unrecorded => "unrecorded",
+            }
+        }
+
+        /// What `--apply` does to this class (`None` = nothing, ever).
+        fn action(self) -> Option<&'static str> {
+            match self {
+                Class::OrphanRecord | Class::StaleCreating => Some("remove record"),
+                Class::OverLifetime => Some("destroy sprite"),
+                Class::Unrecorded => None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    pub(super) struct Entry {
+        pub name: String,
+        pub class: Class,
+        /// The sprite's API status, else the ledger record's state.
+        pub status: String,
+        pub created_ms: Option<i64>,
+        pub age: String,
+        /// `ledger` or `none`.
+        pub proof: &'static str,
+        pub note: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    pub(super) struct AccountReport {
+        pub envs: Vec<String>,
+        /// `complete`, `partial`, `unknown` or `unavailable`.
+        pub listing: String,
+        pub reason: Option<String>,
+        /// The ceiling applied (`0` = none).
+        pub max_lifetime_secs: u64,
+        /// Ledger records under this host's scope.
+        pub recorded: usize,
+        pub entries: Vec<Entry>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    pub(super) struct ActionResult {
+        pub name: String,
+        pub class: Class,
+        pub ok: bool,
+        pub error: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    pub(super) struct SpritesReport {
+        pub provider: &'static str,
+        pub apply: bool,
+        pub complete: bool,
+        pub accounts: Vec<AccountReport>,
+        pub results: Vec<ActionResult>,
+        pub refused: Option<String>,
+        /// Non-fatal caveats (e.g. unreadable ledger records left alone).
+        pub notes: Vec<String>,
+    }
+
+    impl SpritesReport {
+        pub(super) fn count(&self, class: Class) -> usize {
+            self.accounts
+                .iter()
+                .flat_map(|a| &a.entries)
+                .filter(|e| e.class == class)
+                .count()
+        }
+
+        pub(super) fn failed(&self) -> usize {
+            self.results.iter().filter(|r| !r.ok).count()
+        }
+    }
+
+    pub(super) fn run(cfg: &Config, apply: bool, yes: bool, json: bool) -> Result<()> {
+        let mut envs = Vec::new();
+        for (name, envc) in &cfg.env {
+            if envc.provider.provider.trim() != KIND {
+                continue;
+            }
+            let api = match crate::provider_factory::provider_for_inventory(&envc.provider) {
+                Ok(Provider::Sprites(provider)) => {
+                    Some(Box::new(LiveSprites(provider)) as Box<dyn SpritesReapApi>)
+                }
+                _ => None,
+            };
+            envs.push(SpritesEnv {
+                name: name.clone(),
+                api,
+                max_lifetime_secs: envc.provider.max_lifetime_secs,
+            });
+        }
+        if envs.is_empty() {
+            bail!(
+                "no [env.<name>] with provider = \"sprites\" is configured (see `thegn env list`)"
+            );
+        }
+        let _lease = if apply {
+            match crate::reaper_policy::try_reaper_lease(KIND) {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => bail!("another thegn process is reconciling sprites; retry shortly"),
+                Err(reason) => bail!("env reap: {reason}"),
+            }
+        } else {
+            None
+        };
+        let mut ask = |prompt: &str| super::tty_prompt(prompt);
+        let report = reap(
+            &envs,
+            Opts { apply, yes },
+            &mut ask,
+            thegn_core::util::now_ms(),
+        )?;
+        if json {
+            crate::cmd::emit_json(&report)?;
+        } else {
+            outln!("{}", render(&report));
+        }
+        if let Some(refused) = &report.refused
+            && apply
+        {
+            bail!("{refused}");
+        }
+        let failed = report.failed();
+        if failed > 0 {
+            bail!(
+                "{failed} of {} sprites reap actions failed",
+                report.results.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// The group's ceiling: none when any env sharing the account has none
+    /// (a record carries no env, so the most permissive policy wins); an
+    /// unsupported value is no ceiling.
+    fn group_lifetime(lifetimes: &[u64]) -> u64 {
+        if lifetimes
+            .iter()
+            .any(|&l| l == 0 || l > thegn_core::time_policy::MAX_DURATION_SECS)
+        {
+            return 0;
+        }
+        lifetimes.iter().copied().max().unwrap_or(0)
+    }
+
+    fn over(created_ms: Option<i64>, lifetime_secs: u64, now_ms: i64) -> bool {
+        let Some(created) = created_ms else {
+            return false;
+        };
+        let lifetime_ms = i64::try_from(lifetime_secs)
+            .ok()
+            .and_then(|s| s.checked_mul(1000));
+        lifetime_secs > 0 && lifetime_ms.is_some_and(|limit| now_ms.saturating_sub(created) > limit)
+    }
+
+    fn record_ms(record: &VpsRecord) -> Option<i64> {
+        if record.created_at > 0 {
+            record.created_at.checked_mul(1000)
+        } else {
+            None
+        }
+    }
+
+    /// The reap pass (testable core: no stdout, no tty, no config). The ledger
+    /// is the process registry dir (tests isolate it with `IsolatedState`).
+    pub(super) fn reap(
+        envs: &[SpritesEnv],
+        opts: Opts,
+        ask: Ask<'_>,
+        now_ms: i64,
+    ) -> Result<SpritesReport> {
+        // 1. Group envs by account (an env with no scope is its own group).
+        struct Group<'a> {
+            envs: Vec<String>,
+            lifetimes: Vec<u64>,
+            api: Option<&'a dyn SpritesReapApi>,
+            scope: Option<OwnerScope>,
+        }
+        let mut groups: BTreeMap<String, Group<'_>> = BTreeMap::new();
+        for env in envs {
+            let scope = env.api.as_deref().and_then(|api| api.scope());
+            let key = match &scope {
+                Some(scope) => format!("account:{}", scope.account),
+                None => format!("env:{}", env.name),
+            };
+            let group = groups.entry(key).or_insert_with(|| Group {
+                envs: Vec::new(),
+                lifetimes: Vec::new(),
+                api: env.api.as_deref(),
+                scope: scope.clone(),
+            });
+            group.envs.push(env.name.clone());
+            group.lifetimes.push(env.max_lifetime_secs);
+        }
+
+        // 2. List every account first, so a create racing this pass has
+        //    already written its intent when the ledger is read below.
+        let mut listed = Vec::new();
+        for (_, group) in groups {
+            let listing = match (group.api, &group.scope) {
+                (Some(api), Some(_)) => api.listing(),
+                (Some(_), None) => Listing::Unknown(
+                    "no ownership scope (controller id or account fingerprint unavailable)".into(),
+                ),
+                (None, _) => Listing::Unknown(
+                    "the sprites provider could not be built (token unavailable)".into(),
+                ),
+            };
+            listed.push((group, listing));
+        }
+
+        // 3. The ledger (all providers: a name another provider records is
+        //    never treated as an unclaimed sprite record).
+        let view = registry::list_checked().map_err(|error| {
+            anyhow::anyhow!(
+                "env reap: the ledger is unreadable ({error:#}); refusing to judge sprites"
+            )
+        })?;
+        let unreadable: BTreeSet<String> = view.unreadable.iter().cloned().collect();
+        let mut notes = Vec::new();
+        if !unreadable.is_empty() {
+            notes.push(format!(
+                "{} unreadable ledger record(s) left alone: {}",
+                unreadable.len(),
+                unreadable.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+
+        let mut complete = true;
+        let mut accounts = Vec::new();
+        let mut targets: Vec<(usize, String, Class)> = Vec::new();
+        for (group, listing) in listed {
+            let unavailable = group.api.is_none();
+            let (state, reason, rows, whole) = match listing {
+                Listing::Complete(rows) => ("complete", None, rows, true),
+                Listing::Partial { rows, reason } => ("partial", Some(reason), rows, false),
+                Listing::Unknown(reason) => {
+                    let state = if unavailable {
+                        "unavailable"
+                    } else {
+                        "unknown"
+                    };
+                    (state, Some(reason), Vec::new(), false)
+                }
+            };
+            complete &= whole;
+            let lifetime = group_lifetime(&group.lifetimes);
+            let mine: Vec<&VpsRecord> = match &group.scope {
+                Some(scope) => view
+                    .records
+                    .iter()
+                    .filter(|r| {
+                        r.provider == LEDGER_PROVIDER
+                            && r.owner == scope.owner
+                            && r.account == scope.account
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            let by_name: BTreeMap<&str, &SandboxInfo> =
+                rows.iter().map(|row| (row.id.as_str(), row)).collect();
+            let recorded_names: BTreeSet<&str> = mine.iter().map(|r| r.name.as_str()).collect();
+            let any_record: BTreeSet<&str> = view.records.iter().map(|r| r.name.as_str()).collect();
+            let index = accounts.len();
+            let mut entries = Vec::new();
+
+            // Our records.
+            for record in &mine {
+                match by_name.get(record.name.as_str()) {
+                    Some(row) => {
+                        let created = row.created_at_ms.or_else(|| record_ms(record));
+                        if over(created, lifetime, now_ms) {
+                            entries.push(Entry {
+                                name: record.name.clone(),
+                                class: Class::OverLifetime,
+                                status: row.state.clone().unwrap_or_else(|| "?".into()),
+                                created_ms: created,
+                                age: crate::cmd::fleet::age(created, now_ms),
+                                proof: "ledger",
+                                note: None,
+                            });
+                        }
+                    }
+                    // Absence is evidence only from a complete listing.
+                    None if whole => {
+                        // A record written after the listing (a create that
+                        // committed meanwhile) is not evidence of absence.
+                        if record.created_at.saturating_mul(1000) >= now_ms.saturating_sub(60_000) {
+                            continue;
+                        }
+                        let created = record_ms(record);
+                        let class = if record.state == "creating" {
+                            let age_secs = (now_ms / 1000).saturating_sub(record.created_at);
+                            if age_secs <= STALE_CREATING_SECS {
+                                continue; // a create in flight
+                            }
+                            Class::StaleCreating
+                        } else {
+                            Class::OrphanRecord
+                        };
+                        entries.push(Entry {
+                            name: record.name.clone(),
+                            class,
+                            status: record.state.clone(),
+                            created_ms: created,
+                            age: crate::cmd::fleet::age(created, now_ms),
+                            proof: "ledger",
+                            note: Some("the sprite is gone".into()),
+                        });
+                    }
+                    None => {}
+                }
+            }
+
+            // Sprites in the account with no record of ours.
+            let mut seen = BTreeSet::new();
+            for row in &rows {
+                if recorded_names.contains(row.id.as_str()) || !seen.insert(row.id.clone()) {
+                    continue;
+                }
+                let status = row.state.clone().unwrap_or_else(|| "?".into());
+                let age = crate::cmd::fleet::age(row.created_at_ms, now_ms);
+                let note = if unreadable.contains(&row.id) {
+                    "its ledger record is unreadable"
+                } else if any_record.contains(row.id.as_str()) {
+                    "recorded by another controller, account or provider"
+                } else {
+                    "not recorded by this host"
+                };
+                entries.push(Entry {
+                    name: row.id.clone(),
+                    class: Class::Unrecorded,
+                    status,
+                    created_ms: row.created_at_ms,
+                    age,
+                    proof: "none",
+                    note: Some(note.into()),
+                });
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            for entry in &entries {
+                if entry.class.action().is_some() {
+                    targets.push((index, entry.name.clone(), entry.class));
+                }
+            }
+            accounts.push((
+                AccountReport {
+                    envs: group.envs,
+                    listing: state.into(),
+                    reason,
+                    max_lifetime_secs: lifetime,
+                    recorded: mine.len(),
+                    entries,
+                },
+                group.api,
+                group.scope,
+            ));
+        }
+
+        let handles: Vec<(Option<&dyn SpritesReapApi>, Option<OwnerScope>)> = accounts
+            .iter()
+            .map(|(_, api, scope)| (*api, scope.clone()))
+            .collect();
+        let mut report = SpritesReport {
+            provider: KIND,
+            apply: opts.apply,
+            complete,
+            accounts: accounts.into_iter().map(|(a, _, _)| a).collect(),
+            results: Vec::new(),
+            refused: None,
+            notes,
+        };
+        if !opts.apply {
+            return Ok(report);
+        }
+        if !complete {
+            report.refused = Some(
+                "env reap: a sprites listing is incomplete; refusing --apply (an absent sprite cannot be judged)"
+                    .into(),
+            );
+            return Ok(report);
+        }
+        if targets.is_empty() {
+            return Ok(report);
+        }
+        if !opts.yes {
+            let destroys = targets
+                .iter()
+                .filter(|(_, _, c)| *c == Class::OverLifetime)
+                .count();
+            let prompt = format!(
+                "type yes to destroy {destroys} sprite(s) and remove {} stale record(s)",
+                targets.len() - destroys
+            );
+            match ask(&prompt) {
+                None => {
+                    report.refused = Some(
+                        "env reap --apply: refusing without a TTY; pass --yes to confirm".into(),
+                    );
+                    return Ok(report);
+                }
+                Some(answer) if answer.trim() == "yes" => {}
+                Some(_) => {
+                    report.refused = Some("env reap --apply: aborted (not confirmed)".into());
+                    return Ok(report);
+                }
+            }
+        }
+        for (index, name, class) in targets {
+            let (api, scope) = &handles[index];
+            let result = match class {
+                Class::OverLifetime => match api {
+                    Some(api) => api.destroy(&name).map_err(|e| format!("{e:#}")),
+                    None => Err("provider unavailable".into()),
+                },
+                Class::OrphanRecord | Class::StaleCreating => {
+                    remove_record(&name, scope.as_ref(), class)
+                }
+                Class::Unrecorded => Err("never deleted".into()),
+            };
+            report.results.push(ActionResult {
+                name,
+                class,
+                ok: result.is_ok(),
+                error: result.err(),
+            });
+        }
+        Ok(report)
+    }
+
+    /// Remove a record the pass judged stale, after re-reading it: it must
+    /// still be a sprites record of this scope in the same state.
+    fn remove_record(
+        name: &str,
+        scope: Option<&OwnerScope>,
+        class: Class,
+    ) -> std::result::Result<(), String> {
+        let Some(scope) = scope else {
+            return Err("no ownership scope".into());
+        };
+        match registry::read_checked(name) {
+            Ok(Some(record))
+                if record.provider == LEDGER_PROVIDER
+                    && record.owner == scope.owner
+                    && record.account == scope.account
+                    && (record.state == "creating") == (class == Class::StaleCreating) =>
+            {
+                ledger::forget(name);
+                Ok(())
+            }
+            Ok(Some(_)) => Err("the record changed; left alone".into()),
+            Ok(None) => Ok(()),
+            Err(error) => Err(format!("ledger unreadable ({error:#}); left alone")),
+        }
+    }
+
+    /// A terminal-safe table cell: control characters (API text is
+    /// untrusted) become `?`, capped at 64 characters.
+    fn cell(s: &str) -> String {
+        s.chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .take(64)
+            .collect()
+    }
+
+    /// The text report (pure).
+    pub(super) fn render(report: &SpritesReport) -> String {
+        let mut out = Vec::new();
+        for account in &report.accounts {
+            let envs = account.envs.join(", ");
+            out.push(match &account.reason {
+                Some(reason) => format!(
+                    "sprites ({envs}): listing {}: {}",
+                    account.listing,
+                    cell(reason)
+                ),
+                None => format!("sprites ({envs})"),
+            });
+            out.push(format!(
+                "  {} recorded by this host; lifetime {}",
+                account.recorded,
+                if account.max_lifetime_secs == 0 {
+                    "unlimited".to_string()
+                } else {
+                    format!("{}s", account.max_lifetime_secs)
+                }
+            ));
+            if account.entries.is_empty() {
+                out.push("  nothing to reap".into());
+                continue;
+            }
+            let mut rows = vec![
+                [
+                    "NAME",
+                    "CLASS",
+                    "STATUS",
+                    "AGE",
+                    "PROOF",
+                    "ON --apply",
+                    "NOTE",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ];
+            for e in &account.entries {
+                rows.push(vec![
+                    cell(&e.name),
+                    e.class.label().into(),
+                    cell(&e.status),
+                    e.age.clone(),
+                    e.proof.into(),
+                    e.class.action().unwrap_or("never deleted").into(),
+                    e.note.as_deref().map(cell).unwrap_or_default(),
+                ]);
+            }
+            for line in crate::cmd::fleet::table(&rows).lines() {
+                out.push(format!("  {line}"));
+            }
+        }
+        for note in &report.notes {
+            out.push(format!("note: {note}"));
+        }
+        if !report.complete {
+            out.push("listing incomplete: --apply is refused".into());
+        }
+        let unrecorded = report.count(Class::Unrecorded);
+        if unrecorded > 0 {
+            out.push(format!(
+                "{unrecorded} sprite(s) not recorded by this host: never deleted by thegn; delete them in the Sprites dashboard if they are yours"
+            ));
+        }
+        if !report.apply {
+            out.push(format!(
+                "{} over-lifetime, {} orphan record(s), {} stale creating record(s)",
+                report.count(Class::OverLifetime),
+                report.count(Class::OrphanRecord),
+                report.count(Class::StaleCreating)
+            ));
+            out.push("dry run: nothing deleted; re-run with --apply".into());
+        } else if let Some(refused) = &report.refused {
+            out.push(format!("{refused}; nothing deleted"));
+        } else {
+            for r in &report.results {
+                let what = r.class.action().unwrap_or("skip");
+                match &r.error {
+                    None => out.push(format!("{what}: {}", cell(&r.name))),
+                    Some(error) => out.push(format!("failed {what} {}: {error}", cell(&r.name))),
+                }
+            }
+            out.push(format!(
+                "{}/{} action(s) succeeded",
+                report.results.len() - report.failed(),
+                report.results.len()
+            ));
+        }
+        out.join("\n")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        const HOUR_MS: i64 = 3_600_000;
+        const NOW_MS: i64 = 1_800_000_000_000;
+
+        struct Fake {
+            scope: Option<OwnerScope>,
+            listing: Mutex<Option<Listing>>,
+            destroys: Mutex<Vec<String>>,
+        }
+
+        impl SpritesReapApi for Arc<Fake> {
+            fn scope(&self) -> Option<OwnerScope> {
+                self.scope.clone()
+            }
+            fn listing(&self) -> Listing {
+                self.listing
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("listed once per account")
+            }
+            fn destroy(&self, name: &str) -> Result<()> {
+                self.destroys.lock().unwrap().push(name.to_string());
+                Ok(())
+            }
+        }
+
+        fn scope() -> OwnerScope {
+            OwnerScope {
+                owner: "ctl-a".into(),
+                account: "acct1-a".into(),
+            }
+        }
+
+        fn fake(listing: Listing) -> Arc<Fake> {
+            Arc::new(Fake {
+                scope: Some(scope()),
+                listing: Mutex::new(Some(listing)),
+                destroys: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn envs(fake: &Arc<Fake>, lifetime: u64) -> Vec<SpritesEnv> {
+            vec![SpritesEnv {
+                name: "sx".into(),
+                api: Some(Box::new(fake.clone()) as Box<dyn SpritesReapApi>),
+                max_lifetime_secs: lifetime,
+            }]
+        }
+
+        fn row(name: &str, created_ms: Option<i64>) -> SandboxInfo {
+            SandboxInfo {
+                id: name.into(),
+                name: Some(name.into()),
+                state: Some("warm".into()),
+                size: None,
+                region: None,
+                created_at_ms: created_ms,
+            }
+        }
+
+        fn write(name: &str, state: &str, created_secs: i64, owner: &str) {
+            registry::write(&VpsRecord {
+                name: name.into(),
+                provider: LEDGER_PROVIDER.into(),
+                state: state.into(),
+                instance_id: String::new(),
+                ip: String::new(),
+                created_at: created_secs,
+                owner: owner.into(),
+                account: "acct1-a".into(),
+            })
+            .unwrap();
+        }
+
+        fn no_tty(_: &str) -> Option<String> {
+            None
+        }
+
+        const DRY: Opts = Opts {
+            apply: false,
+            yes: false,
+        };
+        const APPLY_YES: Opts = Opts {
+            apply: true,
+            yes: true,
+        };
+
+        fn classes(report: &SpritesReport) -> Vec<(String, Class)> {
+            report.accounts[0]
+                .entries
+                .iter()
+                .map(|e| (e.name.clone(), e.class))
+                .collect()
+        }
+
+        /// Every class in one account: an old recorded sprite, a gone ready
+        /// record, a stale and a fresh `creating` record, a foreign sprite.
+        fn seed() -> Arc<Fake> {
+            let now_s = NOW_MS / 1000;
+            write("sx-old", "ready", now_s - 10, "ctl-a"); // API created_at says old
+            write("sx-gone", "ready", now_s - 100, "ctl-a");
+            write("sx-stale", "creating", now_s - 7200, "ctl-a");
+            write("sx-fresh", "creating", now_s - 60, "ctl-a");
+            write("sx-young", "ready", now_s - 60, "ctl-a");
+            fake(Listing::Complete(vec![
+                row("sx-old", Some(NOW_MS - 5 * HOUR_MS)),
+                row("sx-young", Some(NOW_MS - 60_000)),
+                row("owner-personal", Some(NOW_MS - 50 * HOUR_MS)),
+            ]))
+        }
+
+        #[test]
+        fn sprites_reap_classifies_and_dry_run_deletes_nothing() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let fake = seed();
+            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
+            assert!(fake.destroys.lock().unwrap().is_empty(), "dry run");
+            assert_eq!(
+                classes(&report),
+                [
+                    ("owner-personal".to_string(), Class::Unrecorded),
+                    ("sx-gone".to_string(), Class::OrphanRecord),
+                    ("sx-old".to_string(), Class::OverLifetime),
+                    ("sx-stale".to_string(), Class::StaleCreating),
+                ]
+            );
+            // Nothing was removed from the ledger on a dry run.
+            assert!(registry::read_checked("sx-gone").unwrap().is_some());
+            assert!(registry::read_checked("sx-stale").unwrap().is_some());
+            let text = render(&report);
+            assert!(text.contains("dry run: nothing deleted"), "{text}");
+            assert!(text.contains("never deleted by thegn"), "{text}");
+            assert_eq!(report.accounts[0].recorded, 5);
+        }
+
+        #[test]
+        fn sprites_reap_over_lifetime_uses_the_api_created_at() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let now_s = NOW_MS / 1000;
+            // The record says young; the API says 5 h old → over a 1 h ceiling.
+            write("sx-old", "ready", now_s - 10, "ctl-a");
+            // The record says 5 h old; the API says young → not over.
+            write("sx-new", "ready", now_s - 5 * 3600, "ctl-a");
+            // No API time: the record's 5 h decides.
+            write("sx-notime", "ready", now_s - 5 * 3600, "ctl-a");
+            let fake = fake(Listing::Complete(vec![
+                row("sx-old", Some(NOW_MS - 5 * HOUR_MS)),
+                row("sx-new", Some(NOW_MS - 60_000)),
+                row("sx-notime", None),
+            ]));
+            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
+            assert_eq!(
+                classes(&report),
+                [
+                    ("sx-notime".to_string(), Class::OverLifetime),
+                    ("sx-old".to_string(), Class::OverLifetime),
+                ]
+            );
+            assert_eq!(report.accounts[0].entries[1].age, "5h0m");
+            // Lifetime 0 = no ceiling.
+            let fake0 = self::fake(Listing::Complete(vec![row(
+                "sx-old",
+                Some(NOW_MS - 5 * HOUR_MS),
+            )]));
+            let report = reap(&envs(&fake0, 0), DRY, &mut no_tty, NOW_MS).unwrap();
+            assert!(report.accounts[0].entries.is_empty());
+        }
+
+        #[test]
+        fn sprites_reap_apply_never_deletes_unrecorded() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let fake = seed();
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            assert_eq!(*fake.destroys.lock().unwrap(), ["sx-old"]);
+            assert!(report.results.iter().all(|r| r.name != "owner-personal"));
+            assert_eq!(report.failed(), 0, "{:?}", report.results);
+            // The orphan and stale records are removed; the rest stay.
+            assert!(registry::read_checked("sx-gone").unwrap().is_none());
+            assert!(registry::read_checked("sx-stale").unwrap().is_none());
+            assert!(registry::read_checked("sx-fresh").unwrap().is_some());
+            assert!(registry::read_checked("sx-young").unwrap().is_some());
+        }
+
+        #[test]
+        fn sprites_reap_spares_a_ready_record_committed_after_the_listing() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            write("sx-just-made", "ready", NOW_MS / 1000, "ctl-a");
+            let fake = fake(Listing::Complete(Vec::new()));
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            assert!(report.accounts[0].entries.is_empty(), "{report:?}");
+            assert!(report.results.is_empty());
+            assert!(registry::read_checked("sx-just-made").unwrap().is_some());
+        }
+
+        #[test]
+        fn sprites_reap_partial_listing_refuses_apply() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let now_s = NOW_MS / 1000;
+            write("sx-gone", "ready", now_s - 100, "ctl-a");
+            write("sx-old", "ready", now_s - 5 * 3600, "ctl-a");
+            let fake = fake(Listing::Partial {
+                rows: vec![row("sx-old", Some(NOW_MS - 5 * HOUR_MS))],
+                reason: "inventory exceeds the page cap".into(),
+            });
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            assert!(!report.complete);
+            assert!(report.refused.as_deref().unwrap().contains("incomplete"));
+            assert!(fake.destroys.lock().unwrap().is_empty());
+            assert!(report.results.is_empty());
+            // A partial listing never makes a missing sprite an orphan.
+            assert!(
+                report.accounts[0]
+                    .entries
+                    .iter()
+                    .all(|e| e.class != Class::OrphanRecord)
+            );
+            assert!(registry::read_checked("sx-gone").unwrap().is_some());
+        }
+
+        #[test]
+        fn sprites_reap_without_a_scope_refuses_apply() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let unscoped = Arc::new(Fake {
+                scope: None,
+                listing: Mutex::new(None),
+                destroys: Mutex::new(Vec::new()),
+            });
+            let report = reap(&envs(&unscoped, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            assert_eq!(report.accounts[0].listing, "unknown");
+            assert!(report.refused.is_some());
+            assert!(unscoped.destroys.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn sprites_reap_pre_ledger_and_foreign_sprites_are_never_deleted() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let now_s = NOW_MS / 1000;
+            // Another controller's record: never ours, never deleted.
+            write("sx-theirs", "ready", now_s - 5 * 3600, "ctl-b");
+            // A worktree location row naming a sprite proves nothing.
+            {
+                use thegn_core::store::WorkspaceStore;
+                let db = thegn_core::db::Db::open().unwrap();
+                let blob = serde_json::json!({
+                    "control_prefix": ["/nix/store/x/bin/thegn", "sprite-exec", "sx-legacy", "--"],
+                    "path": "/workspace",
+                })
+                .to_string();
+                db.put_worktree("tab", "/repo", "/wt/l", "feat", Some(&blob), None)
+                    .unwrap();
+            }
+            let fake = fake(Listing::Complete(vec![
+                row("sx-legacy", Some(NOW_MS - 5 * HOUR_MS)),
+                row("sx-theirs", Some(NOW_MS - 5 * HOUR_MS)),
+            ]));
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            assert_eq!(
+                classes(&report),
+                [
+                    ("sx-legacy".to_string(), Class::Unrecorded),
+                    ("sx-theirs".to_string(), Class::Unrecorded),
+                ]
+            );
+            assert_eq!(
+                report.accounts[0].entries[0].note.as_deref(),
+                Some("not recorded by this host")
+            );
+            assert!(fake.destroys.lock().unwrap().is_empty());
+            assert!(report.results.is_empty());
+            assert!(registry::read_checked("sx-legacy").unwrap().is_none());
+        }
+
+        #[test]
+        fn sprites_reap_ignores_other_providers_records() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            registry::write(&VpsRecord {
+                name: "vx-a".into(),
+                provider: "vercel".into(),
+                state: "ready".into(),
+                instance_id: "vx-a".into(),
+                ip: String::new(),
+                created_at: 1,
+                owner: "ctl-a".into(),
+                account: "acct1-a".into(),
+            })
+            .unwrap();
+            let fake = fake(Listing::Complete(Vec::new()));
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            assert!(report.accounts[0].entries.is_empty());
+            assert!(registry::read_checked("vx-a").unwrap().is_some());
+        }
+
+        #[test]
+        fn sprites_reap_apply_needs_confirmation_without_yes() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let fake = seed();
+            let opts = Opts {
+                apply: true,
+                yes: false,
+            };
+            let report = reap(&envs(&fake, 3600), opts, &mut no_tty, NOW_MS).unwrap();
+            assert!(report.refused.as_deref().unwrap().contains("--yes"));
+            assert!(fake.destroys.lock().unwrap().is_empty());
+            assert!(registry::read_checked("sx-gone").unwrap().is_some());
+        }
+
+        #[test]
+        fn sprites_reap_json_shape() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let fake = seed();
+            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(json["provider"], "sprites");
+            assert_eq!(json["complete"], true);
+            assert_eq!(json["accounts"][0]["entries"][0]["class"], "unrecorded");
+            assert_eq!(json["accounts"][0]["max_lifetime_secs"], 3600);
+            assert_eq!(json["results"], serde_json::json!([]));
+        }
+    }
 }
 
 #[cfg(test)]

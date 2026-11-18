@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn repo forget` removes projects from a stopped instance's registry, for splitting one instance into two (see the `two-instances` help page). Name the projects to forget, or pass `--keep <PATH>` to forget every other one. It is a dry run unless you pass `--apply`, which backs the database up first. It refuses while the instance is running and never touches files, git worktrees or branches.
+
 ### Changed
 
 - The local database migrates forward to schema version 114 (producer leases, THE-2208); restart the daemon after upgrading.
