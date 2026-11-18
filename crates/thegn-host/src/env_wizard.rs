@@ -35,6 +35,14 @@ const KINDS: &[&str] = &[
     "daytona",
     "sprites",
     "machine0",
+    "vercel",
+];
+
+/// Read-only note shown for the vercel kind. The wizard never writes
+/// `model_credentials`; the user sets it in their own config.
+const VERCEL_MODEL_CREDENTIALS_NOTE: [&str; 2] = [
+    "model credentials: none (nothing is sent).",
+    "To change: config model_credentials; F1 vercel-sandbox",
 ];
 
 /// Probe keyring availability on a detached thread, returning the shared
@@ -66,6 +74,8 @@ pub enum Field {
     Token,
     Region,
     Size,
+    TeamId,
+    ProjectId,
     Template,
     SshHost,
     Sandbox,
@@ -110,6 +120,8 @@ pub struct EnvWizard {
     token: String,
     region: String,
     size: String,
+    team_id: String,
+    project_id: String,
     template: String,
     ssh_host: String,
     /// `(backend_key, label)` cycle rows for a `local` env.
@@ -139,6 +151,8 @@ impl EnvWizard {
             token: String::new(),
             region: String::new(),
             size: String::new(),
+            team_id: String::new(),
+            project_id: String::new(),
             template: String::new(),
             ssh_host: String::new(),
             sandbox_rows,
@@ -171,6 +185,14 @@ impl EnvWizard {
         match self.kind() {
             "local" => f.push(Field::Sandbox),
             "ssh" => f.push(Field::SshHost),
+            "vercel" => f.extend([
+                Field::Token,
+                Field::TeamId,
+                Field::ProjectId,
+                Field::Region,
+                Field::Size,
+                Field::Template,
+            ]),
             _ => f.extend([Field::Token, Field::Region, Field::Size, Field::Template]),
         }
         f
@@ -182,6 +204,8 @@ impl EnvWizard {
             Field::Token => Some(&mut self.token),
             Field::Region => Some(&mut self.region),
             Field::Size => Some(&mut self.size),
+            Field::TeamId => Some(&mut self.team_id),
+            Field::ProjectId => Some(&mut self.project_id),
             Field::Template => Some(&mut self.template),
             Field::SshHost => Some(&mut self.ssh_host),
             _ => None,
@@ -288,6 +312,8 @@ impl EnvWizard {
             provider: self.kind().to_string(),
             region: Self::opt(&self.region),
             size: Self::opt(&self.size),
+            team_id: Self::opt(&self.team_id),
+            project_id: Self::opt(&self.project_id),
             template: Self::opt(&self.template),
             max_instances: None,
             max_lifetime: None,
@@ -306,7 +332,7 @@ impl EnvWizard {
             title: "new environment".to_string(),
             badge: Some(" env ".into()),
             cols: 60,
-            rows: fields.len() + 2,
+            rows: fields.len() + 2 + if self.kind() == "vercel" { 2 } else { 0 },
             anchor: Anchor::Center,
             ..LayerSpec::default()
         };
@@ -330,6 +356,18 @@ impl EnvWizard {
                 _ => self.text_row(*f, focused),
             };
             seg::draw_line(surface, inner.x, y, inner.cols, &line, panel);
+        }
+        if self.kind() == "vercel" {
+            for (i, text) in VERCEL_MODEL_CREDENTIALS_NOTE.iter().enumerate() {
+                seg::draw_line(
+                    surface,
+                    inner.x,
+                    inner.y + fields.len() + i,
+                    inner.cols,
+                    &Line::segs(vec![seg(Tok::Slot(S::Faint), (*text).to_string())]),
+                    panel,
+                );
+            }
         }
         // Footer: token-storage hint (cloud kinds) + key legend.
         let store_hint = if self.is_cloud() {
@@ -367,6 +405,13 @@ impl EnvWizard {
             ),
             Field::Region => ("region  ", &self.region, "· provider default", false),
             Field::Size => ("size    ", &self.size, "· provider default", false),
+            Field::TeamId => ("team    ", &self.team_id, "team_… (Vercel team id)", false),
+            Field::ProjectId => (
+                "project ",
+                &self.project_id,
+                "prj_… (Vercel project id)",
+                false,
+            ),
             Field::Template => (
                 "image   ",
                 &self.template,
@@ -462,6 +507,28 @@ mod tests {
     }
 
     #[test]
+    fn vercel_kind_asks_for_team_and_project() {
+        let mut w = wiz();
+        w.kind_sel = KINDS.iter().position(|k| *k == "vercel").unwrap();
+        assert!(w.fields().contains(&Field::TeamId));
+        assert!(w.fields().contains(&Field::ProjectId));
+        w.focus = Field::Name;
+        typ(&mut w, "vc");
+        w.focus = Field::TeamId;
+        typ(&mut w, "team_abc");
+        w.focus = Field::ProjectId;
+        typ(&mut w, "prj_abc");
+        match w.submit() {
+            Outcome::Submit(a) => {
+                assert_eq!(a.provider, "vercel");
+                assert_eq!(a.team_id.as_deref(), Some("team_abc"));
+                assert_eq!(a.project_id.as_deref(), Some("prj_abc"));
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
     fn ssh_and_local_kinds_change_fields() {
         let mut w = wiz();
         w.kind_sel = 1; // ssh
@@ -499,5 +566,24 @@ mod tests {
             v <= 2,
             "keyring tri-state is one of probing/available/unavailable"
         );
+    }
+
+    #[test]
+    fn vercel_note_is_read_only_and_never_writes_model_credentials() {
+        let mut w = EnvWizard::with_kind(&Config::default(), "vercel");
+        assert_eq!(w.kind(), "vercel");
+        assert!(VERCEL_MODEL_CREDENTIALS_NOTE[0].starts_with("model credentials: none"));
+        w.focus = Field::Name;
+        typ(&mut w, "vx");
+        w.focus = Field::TeamId;
+        typ(&mut w, "team_abc");
+        w.focus = Field::ProjectId;
+        typ(&mut w, "prj_abc");
+        match w.submit() {
+            Outcome::Submit(args) => {
+                assert!(!format!("{args:?}").contains("model_credentials"));
+            }
+            _ => panic!("expected submit"),
+        }
     }
 }

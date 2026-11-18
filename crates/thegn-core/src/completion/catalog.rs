@@ -321,6 +321,21 @@ pub const CATALOG: &[Slot] = &[
     slot("land", "worktree_pos", SourceKind::Worktree),
     slot("map", "worktree", SourceKind::Worktree),
     slot("merge add", "worktrees", SourceKind::Worktree),
+    slot(
+        "env create",
+        "project_id",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "env create",
+        "team_id",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "env reap",
+        "provider",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),

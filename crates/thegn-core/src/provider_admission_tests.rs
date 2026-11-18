@@ -714,7 +714,14 @@ fn config_validation_uses_the_same_grammar() {
 
 #[test]
 fn configured_provider_ids_must_be_lowercase_for_managed_kinds() {
-    for provider in ["sprites", "hetzner", "digitalocean", "fly", "machine0"] {
+    for provider in [
+        "sprites",
+        "hetzner",
+        "digitalocean",
+        "fly",
+        "machine0",
+        "vercel",
+    ] {
         let mut cfg = crate::config::Config::default();
         let mut env = crate::config::EnvConfig::default();
         env.provider.provider = provider.into();
@@ -782,4 +789,96 @@ fn base64_decoding_is_strict_and_canonical() {
         decode_base64(&encode(b"thegn")).as_deref(),
         Some(&b"thegn"[..])
     );
+}
+
+#[test]
+fn vercel_lifetime_ceiling_is_reaped_so_not_warned() {
+    let mut cfg = crate::config::Config::default();
+    let mut env = crate::config::EnvConfig::default();
+    env.provider.provider = "vercel".into();
+    env.provider.max_lifetime_secs = 3600;
+    cfg.env.insert("v".into(), env);
+    assert!(unenforced_lifetime_warnings(&cfg).is_empty());
+}
+
+fn vercel_cred_cfg(provider: &str, mode: crate::config::ModelCredentials) -> crate::config::Config {
+    let mut cfg = crate::config::Config::default();
+    let env = crate::config::EnvConfig {
+        provider: crate::config::EnvProviderConfig {
+            provider: provider.into(),
+            team_id: "team_abc1".into(),
+            project_id: "prj_Xy9".into(),
+            model_credentials: mode,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.env.insert("e".into(), env);
+    cfg
+}
+
+fn labelled<'a>(errors: &'a [String], label: &str) -> Vec<&'a String> {
+    errors
+        .iter()
+        .filter(|error| error.starts_with(label))
+        .collect()
+}
+
+#[test]
+fn model_credentials_admission_per_provider_and_mode() {
+    use crate::config::ModelCredentials;
+    const LABEL: &str = "env.e.provider.model_credentials:";
+    // Vercel: none and upload pass; proxy and inject are refused by label.
+    for mode in [ModelCredentials::None, ModelCredentials::Upload] {
+        let errors = validate_config(&vercel_cred_cfg("vercel", mode));
+        assert!(labelled(&errors, LABEL).is_empty(), "{mode}: {errors:?}");
+    }
+    for (mode, reason) in [
+        (ModelCredentials::Proxy, crate::vercel::admit::PROXY_REFUSAL),
+        (
+            ModelCredentials::Inject,
+            crate::vercel::admit::INJECT_REFUSAL,
+        ),
+    ] {
+        let errors = validate_config(&vercel_cred_cfg("vercel", mode));
+        assert_eq!(
+            labelled(&errors, LABEL),
+            vec![&format!("{LABEL} {reason}")],
+            "{mode}"
+        );
+    }
+    // Any other kind: every mode but none is refused with the shared message.
+    for provider in ["fly", "sprites", "hetzner", "daytona", ""] {
+        let errors = validate_config(&vercel_cred_cfg(provider, ModelCredentials::None));
+        assert!(
+            labelled(&errors, LABEL).is_empty(),
+            "{provider}: {errors:?}"
+        );
+        let errors = validate_config(&vercel_cred_cfg(provider, ModelCredentials::Upload));
+        assert_eq!(
+            labelled(&errors, LABEL),
+            vec![&format!("{LABEL} {NON_VERCEL_MODEL_CREDENTIALS}")],
+            "{provider}"
+        );
+    }
+}
+
+#[test]
+fn interactive_host_suffixes_admission_per_provider() {
+    const LABEL: &str = "env.e.provider.interactive_host_suffixes:";
+    let with = |provider: &str, suffixes: &[&str]| {
+        let mut cfg = vercel_cred_cfg(provider, crate::config::ModelCredentials::None);
+        cfg.env
+            .get_mut("e")
+            .unwrap()
+            .provider
+            .interactive_host_suffixes = suffixes.iter().map(|s| (*s).to_string()).collect();
+        validate_config(&cfg)
+    };
+    assert!(labelled(&with("vercel", &["vercel.run"]), LABEL).is_empty());
+    assert_eq!(labelled(&with("fly", &["vercel.run"]), LABEL).len(), 1);
+    for bad in ["vercel.app", "*.vercel.run", ".vercel.run"] {
+        let errors = with("vercel", &[bad]);
+        assert_eq!(labelled(&errors, LABEL).len(), 1, "{bad}: {errors:?}");
+    }
 }

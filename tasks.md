@@ -9,7 +9,7 @@
 > (`openspec/changes/archive/2026-08-14-*`), not from live code. The generic
 > `[[agents]]` picker and the `[merge_queue] agent_command` fold-actor were kept.
 
-**770 numbered items across 54 groups (A–BB)** (739 distinct numbers; a few numbers repeat across groups). The list is **two tracks joined by one
+**772 numbered items across 54 groups (A–BB)** (741 distinct numbers; a few numbers repeat across groups). The list is **two tracks joined by one
 keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**. The
 control plane has **two layers** (see
 `docs/superpowers/specs/2026-06-24-acp-two-layer-control-plane-design.md`): the
@@ -657,6 +657,8 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
 - [ ] 134. Bandwidth-adaptive rendering
 - [x] 134a. Clipboard image paste → remote file drop (THE-24) _(explicit-action paste: clipboard PNG → size-gated drop over the worktree's existing GitLoc ssh channel; `[clipboard]`, `paste-image`; `openspec/changes/add-remote-image-paste`, `handlers/paste_image.rs`, `thegn_core::paste_drop`)_
+- [~] 766. Vercel Sandbox as a remote provider (THE-2223) _(provider kind, HTTP client, `thegn vercel-exec` bridge, bundle-in / `env pull`-out transfer, reaper and caps; never run against Vercel yet: live check is THE-2234)_
+- [~] 765. Vercel sandbox model credentials (THE-2233) _(per-env `model_credentials` = `none`/`upload`/`proxy`/`inject`; only `none` and `upload` are accepted, upload is claude/codex login files into tmpfs after egress narrowing; `thegn env reap --provider vercel`, unpulled marker; openspec `vercel-sandbox-agent-credentials`)_
 
 ### K. Adaptive / mobile UI
 

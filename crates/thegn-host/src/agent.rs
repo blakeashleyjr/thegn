@@ -2246,11 +2246,30 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
 /// to a bare one; the focused materialize provisions it). Off-loop (network);
 /// `false` for non-provider envs, a tokenless/unbuilt provider, or a list error.
 pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
+    provision_check(cfg, worktree) != ProvisionCheck::Ready
+}
+
+/// What [`provision_check`] found for a worktree's provider sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionCheck {
+    /// Nothing to do: not a provider env, provisioned, or unknown (a list error).
+    Ready,
+    /// Missing, or present but bare (no provision marker).
+    Pending,
+    /// A Vercel sandbox that exists but is not running: probing its marker
+    /// would resume it (buying compute), so it is left parked. Prewarm still
+    /// skips it ([`provision_pending`] is true); the eager provisioner and the
+    /// spare claim do not act on it (only an explicit open resumes).
+    Parked,
+}
+
+/// [`provision_pending`] with the parked-Vercel case split out.
+pub fn provision_check(cfg: &Config, worktree: &str) -> ProvisionCheck {
     let loc = match GitLoc::for_worktree_op(Path::new(worktree), "provision check") {
         Ok(loc) => loc,
         Err(error) => {
             tracing::warn!(target: "thegn::provider", worktree, %error, "provision check skipped");
-            return false;
+            return ProvisionCheck::Ready;
         }
     };
     let repo_root: PathBuf = Db::open()
@@ -2263,33 +2282,33 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
     let read =
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
     let Some(selected_env) = env_selection_or_refuse(worktree, "provision check", read) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     if !matches!(
         environment.placement,
         thegn_core::placement::Placement::Provider(_)
     ) {
-        return false;
+        return ProvisionCheck::Ready;
     }
     let Some(envc) = cfg.env.get(&environment.name) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     // Bound-aware name: a worktree that CLAIMED a pool spare is checked against
     // the SPARE (whose marker is present ⇒ not pending), not the derived id —
     // else eager would re-provision a sprite the worktree no longer uses.
     let Some(id) = provider_sandbox_name(cfg, worktree, &environment.name) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     let Some(provider) = provider_for_named(&envc.provider, &id) else {
-        return false;
+        return ProvisionCheck::Ready;
     };
     match block_on_provider(|| async { provider.list().await }) {
         // Missing ⇒ needs create + a full provision.
-        Ok(names) if !names.iter().any(|n| n == &id) => true,
+        Ok(names) if !names.iter().any(|n| n == &id) => ProvisionCheck::Pending,
         // Exists — but is the TOOLCHAIN actually provisioned? `launch_spec`'s
         // `auto_provision` only `ensure_exists`es a BARE sprite (no nix/direnv/
         // agents), and a destroyed+recreated sprite is bare too. If we gate only on
@@ -2301,11 +2320,26 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
         // scope only the worktree we're opening anyway — so it doesn't wake idle
         // sandboxes wholesale.
         Ok(_) => {
+            // A Vercel marker read resumes a stopped sandbox: probe its status
+            // with the never-resuming GET first and leave a parked one alone.
+            if let thegn_svc::provider::Provider::Vercel(vercel) = &provider {
+                let live = block_on_provider(|| async { vercel.reaper_view(&id).await })
+                    .ok()
+                    .flatten()
+                    .is_some_and(|view| !crate::vercel_bridge::needs_resume(view.status));
+                if !live {
+                    return ProvisionCheck::Parked;
+                }
+            }
             let workdir = crate::provider_workdir::resolve(&envc.provider, &id);
             let marker = thegn_core::envplan::EnvPlan::marker_path(&workdir);
-            block_on_provider(|| async { provider.read(&id, &marker).await }).is_err()
+            if block_on_provider(|| async { provider.read(&id, &marker).await }).is_err() {
+                ProvisionCheck::Pending
+            } else {
+                ProvisionCheck::Ready
+            }
         }
-        Err(_) => false,
+        Err(_) => ProvisionCheck::Ready,
     }
 }
 
@@ -2792,6 +2826,27 @@ pub fn provision_provider_env_named(
         return Ok((false, None));
     };
     let pc = &env.provider;
+    // Credential-free kinds (Vercel): the repo goes in only as a host bundle and
+    // no host credential is uploaded. Refuse BEFORE anything billable exists
+    // when the bundle seed is impossible — never fall back to an origin clone.
+    let (force_bundle, credential_free) =
+        provision_credential_policy(thegn_core::config::EnvProviderKind::of(&pc.provider));
+    if force_bundle {
+        // off-loop: provisioning entry (see the branch lookup below).
+        #[expect(clippy::disallowed_methods)]
+        let on_branch = thegn_core::util::git_cmd(Path::new(worktree))
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .is_some_and(|b| !b.is_empty() && b != "HEAD");
+        credential_free_seed_precheck(
+            name_override.is_some(),
+            Path::new(worktree).join(".git").exists(),
+            on_branch,
+        )?;
+    }
     let id = match name_override {
         Some(name) => Some(name.to_string()),
         None => crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, env_name)?,
@@ -2939,7 +2994,11 @@ pub fn provision_provider_env_named(
     // provision-time snapshot goes stale and the in-sandbox agent 401s.
     if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
         crate::provider_workdir::mark_provisioned(&id);
-        crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, &loc, env_name);
+        // A credential-free kind never receives agent auth, and never holds a
+        // route-to-host bearer (`false` revokes + removes any installed one).
+        if !credential_free {
+            crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, &loc, env_name);
+        }
         crate::remote_enqueue_auth::reconcile_provider_credential(
             cfg,
             &provider,
@@ -2947,7 +3006,7 @@ pub fn provision_provider_env_named(
             &id,
             &repo_root,
             worktree,
-            name_override.is_none(),
+            name_override.is_none() && !credential_free,
         )?;
         return Ok((true, None));
     }
@@ -2960,8 +3019,13 @@ pub fn provision_provider_env_named(
     // credential = "repo-token" | "user-token"); by default credentials stay
     // with thegn. Remote-safe (no host-local socket vars).
     let repo_sandbox = cfg.repo_sandbox(&repo_root);
-    let git_token = repo_sandbox.git.admits_git_token();
+    // A credential-free kind never gets a git token, and its provisioning
+    // commands carry no host passthrough secret (only terminal/locale/devshell).
+    let git_token = repo_sandbox.git.admits_git_token() && !credential_free;
     let mut exec_env = repo_sandbox.passthrough_env_remote();
+    if credential_free {
+        exec_env = credential_free_exec_env(exec_env);
+    }
     crate::agent_configs::push_host_git_identity(&repo_root, &mut exec_env);
     // The generic, declarative personal layer ([sandbox.home]) — applied to every
     // sandbox so it feels like local. Resolve it PER-ENV (the env overlay may set a
@@ -2973,6 +3037,10 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"));
     let (dotfiles, mut home_store_roots) = resolve_personal_dotfiles(&host_home, &home, env_name);
+    if credential_free {
+        // No host closure reaches a credential-free sandbox, by any transport.
+        home_store_roots.clear();
+    }
     // Host-parity transport selection. With no hosted binary cache configured but
     // `connect = "ssh"`, push the host store straight into the sandbox over the WSS
     // ssh tunnel (the host *is* the cache — no signing key, no hosted cache), then
@@ -3040,26 +3108,42 @@ pub fn provision_provider_env_named(
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|b| !b.is_empty() && b != "HEAD")
     };
-    if snapshot_restore.is_some() {
-        crate::hibernator::mark_restoring(worktree);
-    }
     // Credential-free transport (THE-2021): a real worktree whose local checkout
     // is a git worktree on a branch is seeded from a host-side `git bundle`
     // uploaded over the files API, instead of cloning origin inside the sandbox
     // (which needs an ssh key or token there). A SPARE (branch `None`) keeps the
     // origin clone: it is generic until a claim rebranches it. `[sandbox.git]
     // transport = "clone"` (per env) opts out of the bundle seed.
+    // A credential-free kind (Vercel) ALWAYS bundle-seeds, whatever the
+    // transport config says, and has no origin URL in the sandbox.
     let bundle_seed = branch
         .as_ref()
-        .filter(|_| resolved.sandbox.git.transport == thegn_core::config::GitTransport::Bundle)
+        .filter(|_| {
+            force_bundle
+                || resolved.sandbox.git.transport == thegn_core::config::GitTransport::Bundle
+        })
         .filter(|_| name_override.is_none() && Path::new(worktree).join(".git").exists())
         .map(|b| envplan::BundleSeed {
             worktree: worktree.to_string(),
             branch: b.clone(),
         });
+    // Refused before the hibernation row flips to `restoring`.
+    if force_bundle && bundle_seed.is_none() {
+        anyhow::bail!(
+            "vercel: the repo can only reach the sandbox as a host bundle; this worktree has no \
+             checked-out branch to bundle"
+        );
+    }
+    if snapshot_restore.is_some() {
+        crate::hibernator::mark_restoring(worktree);
+    }
     let opts = PlanOpts {
         workdir: workdir.clone(),
-        origin: local_origin(&repo_root),
+        origin: if credential_free {
+            None
+        } else {
+            local_origin(&repo_root)
+        },
         branch,
         dotfiles,
         tools: home.tools.clone(),
@@ -3153,7 +3237,19 @@ pub fn provision_provider_env_named(
         git_token,
         bundle_seed,
     };
-    let plan = envplan::plan(&req, &opts);
+    let mut plan = envplan::plan(&req, &opts);
+    if credential_free {
+        // Labels only (fixed kind names): never a path, dotfile or store root.
+        let removed = thegn_core::provider_credentials::strip_credential_steps(&mut plan);
+        if !removed.is_empty() {
+            tracing::info!(
+                target: "thegn::sandbox",
+                provider = %pc.provider,
+                removed = ?removed,
+                "credential-free provider: stripped credential-bearing provision steps"
+            );
+        }
+    }
 
     // Host-parity (Phase 2): push the host's home-shell closure to the configured
     // binary cache so the in-sandbox `home_closure` step can substitute it and the
@@ -3208,6 +3304,11 @@ pub fn provision_provider_env_named(
         let step_t0 = std::time::Instant::now();
         tracing::info!(target: "thegn::startup", step = %step.id, "provision step start");
 
+        // Defence in depth behind the strip above: a credential-bearing step
+        // never runs against a credential-free provider.
+        if let Some(refusal) = credential_step_refusal(credential_free, step) {
+            return Err(refusal);
+        }
         let result: anyhow::Result<()> = match &step.kind {
             StepKind::Exec(script) => {
                 // `/bin/sh -lc` + PATH-prefix + `2>&1` — see `provision_recover`.
@@ -3396,6 +3497,7 @@ pub fn provision_provider_env_named(
     // captured in a reusable image/artifact. This is a fatal provisioning
     // boundary: route mode must not open a remote shell that could silently
     // enqueue into a sprite-local queue.
+    // A credential-free kind never holds a route-to-host bearer; `false` revokes and removes one.
     crate::remote_enqueue_auth::reconcile_provider_credential(
         cfg,
         &provider,
@@ -3403,7 +3505,7 @@ pub fn provision_provider_env_named(
         &id,
         &repo_root,
         worktree,
-        name_override.is_none(),
+        name_override.is_none() && !credential_free,
     )?;
 
     // Drop the marker (+ local mirror for the attach gate) so a later open skips it.
@@ -3760,6 +3862,143 @@ pub(crate) fn default_dotfiles() -> Vec<String> {
 // (kept flat); the provision loop calls them via these re-exports.
 pub(crate) use crate::agent_configs::{upload_atuin_creds, upload_dotfiles};
 
+/// The provisioning policy for a provider kind: `(force_bundle, strip)`.
+/// `force_bundle` seeds the repo only from a host-built `git bundle` (never an
+/// in-sandbox origin clone); `strip` removes and refuses every
+/// credential-bearing step (and the git token, passthrough secrets and agent
+/// auth resync). Both are true exactly for credential-free kinds (Vercel).
+fn provision_credential_policy(kind: thegn_core::config::EnvProviderKind) -> (bool, bool) {
+    let credential_free = kind.credential_free();
+    (credential_free, credential_free)
+}
+
+/// Refuse a credential-free provision that cannot bundle-seed: a SPARE
+/// (`name_override`), a worktree without a local git dir, or one not on a
+/// branch (detached HEAD). There is no origin clone fallback.
+fn credential_free_seed_precheck(
+    is_spare: bool,
+    has_git_dir: bool,
+    on_branch: bool,
+) -> anyhow::Result<()> {
+    if is_spare || !has_git_dir {
+        anyhow::bail!(
+            "vercel: the repo can only reach the sandbox as a host bundle; this worktree has no local git dir"
+        );
+    }
+    if !on_branch {
+        anyhow::bail!(
+            "vercel: the repo can only reach the sandbox as a host bundle; this worktree has no \
+             checked-out branch to bundle"
+        );
+    }
+    Ok(())
+}
+
+/// The applier's refusal for a credential-bearing step on a credential-free
+/// provider (`None` = the step may run).
+fn credential_step_refusal(
+    credential_free: bool,
+    step: &thegn_core::envplan::ProvisionStep,
+) -> Option<anyhow::Error> {
+    (credential_free && thegn_core::provider_credentials::refuses_step(&step.kind)).then(|| {
+        anyhow::anyhow!(
+            "refused: {} would upload host credentials to a credential-free provider",
+            step.label
+        )
+    })
+}
+
+/// The provisioning exec env for a credential-free provider: only terminal,
+/// locale and devshell selection survive; every other passthrough (API keys,
+/// tokens, credential locators) is dropped.
+fn credential_free_exec_env(env: Vec<(String, String)>) -> Vec<(String, String)> {
+    env.into_iter()
+        .filter(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "TERM" | "COLORTERM" | "LANG" | "LC_ALL" | "LC_CTYPE" | "THEGN_DEVSHELL"
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod credential_policy_tests {
+    use super::*;
+    use thegn_core::config::EnvProviderKind;
+    use thegn_core::envplan::{ProvisionStep, StepKind};
+
+    #[test]
+    fn vercel_forces_bundle_and_strips() {
+        assert_eq!(
+            provision_credential_policy(EnvProviderKind::of("vercel")),
+            (true, true)
+        );
+        for other in ["sprites", "fly", "machine0", "hetzner", "custom-thing"] {
+            assert_eq!(
+                provision_credential_policy(EnvProviderKind::of(other)),
+                (false, false),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_precheck_refuses_spares_and_missing_git_dir() {
+        assert!(credential_free_seed_precheck(false, true, true).is_ok());
+        for (spare, git, on_branch) in [
+            (true, true, true),
+            (false, false, true),
+            (true, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            let err = credential_free_seed_precheck(spare, git, on_branch).expect_err("refused");
+            assert!(
+                format!("{err}").contains("only reach the sandbox as a host bundle"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn applier_refuses_credential_steps_only_when_credential_free() {
+        let step = |kind| ProvisionStep {
+            id: "s".into(),
+            label: "Upload agent configs".into(),
+            kind,
+        };
+        for kind in [
+            StepKind::AgentConfigs(vec!["claude".into()]),
+            StepKind::Dotfiles(vec![".gitconfig".into()]),
+            StepKind::AtuinSync,
+            StepKind::HomeClosurePush(vec!["/nix/store/x".into()]),
+        ] {
+            let s = step(kind);
+            let err = credential_step_refusal(true, &s).expect("refused");
+            assert!(
+                format!("{err}").starts_with("refused: Upload agent configs"),
+                "{err}"
+            );
+            assert!(credential_step_refusal(false, &s).is_none());
+        }
+        assert!(credential_step_refusal(true, &step(StepKind::Exec("true".into()))).is_none());
+        assert!(credential_step_refusal(true, &step(StepKind::Checkpoint)).is_none());
+    }
+
+    #[test]
+    fn credential_free_exec_env_drops_secrets() {
+        let env = credential_free_exec_env(vec![
+            ("TERM".into(), "xterm-256color".into()),
+            ("ANTHROPIC_API_KEY".into(), "sk-x".into()),
+            ("GH_TOKEN".into(), "ghp_x".into()),
+            ("THEGN_DEVSHELL".into(), "build".into()),
+        ]);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["TERM", "THEGN_DEVSHELL"]);
+    }
+}
+
 /// Last `n` non-empty lines of command output, for a compact error message.
 fn tail_lines(out: &str, n: usize) -> String {
     let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -3779,6 +4018,11 @@ pub fn ensure_remote_bridge(
     binary: &Path,
 ) -> Option<crate::bridge_sup::ResidentBridge> {
     let (provider, id, _) = provider_sync_target(cfg, env_name)?;
+    // Vercel never runs a resident bridge (exec rides `vercel-exec`), and the
+    // install's file calls would resume a stopped sandbox on every switch.
+    if matches!(provider, thegn_svc::provider::Provider::Vercel(_)) {
+        return None;
+    }
     let data = match std::fs::read(binary) {
         Ok(d) => d,
         Err(e) => {
@@ -4037,6 +4281,14 @@ fn provision_provider_repo(
     loc: &GitLoc,
     branch: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Credential-free kinds (Vercel) get the repo only as a host bundle from
+    // provision_provider_env_named: never an in-sandbox origin clone, and never
+    // the host passthrough env.
+    if cfg.env.get(env_name).is_some_and(|e| {
+        thegn_core::config::EnvProviderKind::of(&e.provider.provider).credential_free()
+    }) {
+        return Ok(());
+    }
     let id = match crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, env_name) {
         Ok(id) => id.filter(|id| !id.is_empty()),
         Err(error) => {

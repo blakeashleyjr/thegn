@@ -30,6 +30,7 @@ pub mod dispatch_commit;
 pub mod doctor;
 pub mod env;
 pub mod env_image;
+pub mod env_reap;
 pub mod events;
 pub mod fleet;
 pub mod forward;

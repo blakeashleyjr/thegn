@@ -786,6 +786,94 @@ fn preview_renderers_json() -> serde_json::Value {
     })
 }
 
+/// One vercel env's doctor row. `token` is the resolved token, held in memory
+/// only to classify its shape; nothing derived from its text is returned.
+fn vercel_row(
+    name: &str,
+    pc: &thegn_core::config::EnvProviderConfig,
+    token: Option<&str>,
+    now_s: i64,
+) -> serde_json::Value {
+    let disclosure = thegn_core::vercel::creds::disclosure(pc.model_credentials);
+    let token_kind = token.map(|t| {
+        thegn_core::vercel::token::describe(thegn_core::vercel::token::classify(t), now_s)
+    });
+    serde_json::json!({
+        "env": name,
+        "model_credentials": disclosure.mode,
+        "leaves_machine": disclosure.leaves_machine,
+        "token_kind": token_kind,
+    })
+}
+
+fn vercel_rows(cfg: &Config) -> Vec<serde_json::Value> {
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    cfg.env
+        .iter()
+        .filter(|(_, e)| {
+            e.placement == thegn_core::config::PlacementMode::Provider
+                && e.provider.provider.trim() == "vercel"
+        })
+        .map(|(name, e)| {
+            let key = crate::env_ui::effective_token_env(&e.provider);
+            let token = (!key.is_empty())
+                .then(|| crate::secret::resolve(&key))
+                .flatten();
+            vercel_row(name, &e.provider, token.as_deref(), now_s)
+        })
+        .collect()
+}
+
+/// `vercel` doctor object: per-env rows + the count of unpulled-result markers.
+fn vercel_json(cfg: &Config) -> serde_json::Value {
+    let rows = vercel_rows(cfg);
+    let unpulled = if rows.is_empty() {
+        0
+    } else {
+        crate::vercel_pull_marker::count()
+    };
+    serde_json::json!({ "envs": rows, "unpulled": unpulled })
+}
+
+/// Text lines for the vercel section; empty when no vercel env is configured.
+fn vercel_lines(report: &serde_json::Value) -> Vec<String> {
+    let rows = report["envs"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Vercel sandbox".to_string()];
+    for row in &rows {
+        let name = row["env"].as_str().unwrap_or("?");
+        lines.push(format!(
+            "  {name}: model credentials {} (leaves machine: {})",
+            row["model_credentials"].as_str().unwrap_or("?"),
+            row["leaves_machine"].as_str().unwrap_or("?"),
+        ));
+        lines.push(format!(
+            "  {name}: token kind {}",
+            row["token_kind"].as_str().unwrap_or("no token resolved"),
+        ));
+    }
+    lines.push(format!(
+        "  results not pulled: {}",
+        report["unpulled"].as_u64().unwrap_or(0)
+    ));
+    lines
+}
+
+fn vercel_report(cfg: &Config) {
+    let lines = vercel_lines(&vercel_json(cfg));
+    if lines.is_empty() {
+        return;
+    }
+    outln!("");
+    for line in lines {
+        outln!("{line}");
+    }
+}
+
 fn preview_renderers_report() {
     let report = preview_renderers_json();
     outln!("Document preview renderers");
@@ -2923,6 +3011,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "toolchain": toolchain_json(cfg),
         "devcontainer": devcontainer_json(cfg),
         "preview_renderers": preview_renderers_json(),
+        "vercel": vercel_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
         "warm_pool": warm_pool_json(cfg),
@@ -3613,6 +3702,8 @@ pub fn run(
     outln!("");
     preview_renderers_report();
 
+    vercel_report(cfg);
+
     outln!("");
     hosts_report(cfg);
 
@@ -3961,7 +4052,13 @@ fn provider_cache_report(cfg: &Config) {
         if let Some(warning) = ignored_cli_bridge(p) {
             outln!("               {warning}");
         }
-        if p.host_cache {
+        if is_vercel(p) {
+            let (expired, orphans) = vercel_ledger_counts(&thegn_svc::vps::registry::list());
+            for line in vercel_report_lines(p, vercel_token_resolves(p), expired, orphans) {
+                outln!("               {line}");
+            }
+        }
+        if p.host_cache && !is_vercel(p) {
             match &bridge {
                 Some(pth) => outln!("               host_cache: on (bridge {})", pth.display()),
                 None => {
@@ -3994,6 +4091,70 @@ fn sprite_cli_required(pc: &thegn_core::config::EnvProviderConfig) -> bool {
         EnvProviderKind::of(pc.provider.trim()),
         EnvProviderKind::Sprites
     ) && matches!(pc.exec, thegn_core::config::ProviderExecMode::Cli)
+}
+
+fn is_vercel(pc: &thegn_core::config::EnvProviderConfig) -> bool {
+    matches!(
+        EnvProviderKind::of(pc.provider.trim()),
+        EnvProviderKind::Vercel
+    )
+}
+
+/// Presence only, offline: does the env's token ref resolve? Never prints or
+/// returns the value.
+fn vercel_token_resolves(pc: &thegn_core::config::EnvProviderConfig) -> bool {
+    crate::secret::resolve_present_cached(&crate::env_ui::effective_token_env(pc))
+}
+
+/// `(expired, orphans)` over the local ledger (no network): `expired` are
+/// vercel records the lifetime reaper stopped; orphans are vercel records whose
+/// create intent never reached `ready`.
+fn vercel_ledger_counts(records: &[thegn_svc::vps::registry::VpsRecord]) -> (usize, usize) {
+    let mine = || records.iter().filter(|r| r.provider == "vercel");
+    (
+        mine().filter(|r| r.state == "expired").count(),
+        mine().filter(|r| r.state == "creating").count(),
+    )
+}
+
+/// Keys set on a vercel env that the kind ignores (no ssh, no resident bridge).
+fn vercel_ignored_keys(pc: &thegn_core::config::EnvProviderConfig) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if pc.host_cache {
+        v.push("host_cache");
+    }
+    if matches!(pc.connect, thegn_core::config::ProviderConnect::Ssh) {
+        v.push("connect = \"ssh\"");
+    }
+    // `transport` defaults to mosh, so only an explicit ssh is detectable.
+    if matches!(pc.transport, thegn_core::config::RemoteTransport::Ssh) {
+        v.push("transport");
+    }
+    v
+}
+
+fn vercel_report_lines(
+    pc: &thegn_core::config::EnvProviderConfig,
+    token_resolves: bool,
+    expired: usize,
+    orphans: usize,
+) -> Vec<String> {
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    let mut out = vec![
+        format!(
+            "team_id set: {} · project_id set: {}",
+            yn(!pc.team_id.trim().is_empty()),
+            yn(!pc.project_id.trim().is_empty())
+        ),
+        format!("token ref resolves: {}", yn(token_resolves)),
+    ];
+    for key in vercel_ignored_keys(pc) {
+        out.push(format!("warning: {key} is set but ignored for vercel"));
+    }
+    out.push(format!(
+        "ledger: {expired} expired (pull with `thegn env pull`), {orphans} orphan"
+    ));
+    out
 }
 
 /// THE-2054: a sprites env on `exec = "auto"`/`"api"` that still carries a
@@ -4042,23 +4203,36 @@ fn provider_cache_json_with(
             signer.unwrap_or(&missing),
             crate::nix_signing::host_cache_plan_facts(p.host_cache, bridge_present),
         );
-        map.insert(
-            name.clone(),
-            serde_json::json!({
-                "provider": p.provider.trim(),
-                "live_verified": !kind.live_unverified(),
-                "devshell": env_devshell(cfg, e),
-                "binary_cache_url": p.binary_cache_url.trim(),
-                "host_cache": p.host_cache,
-                "bridge_present": bridge_present,
-                "host_cache_effective": p.host_cache && bridge_present,
-                "signer": report.signer,
-                "signer_state": report.signer_state,
-                "scope": report.scope,
-                "require_sigs": report.require_sigs,
-                "require_sigs_explicit": report.require_sigs_explicit,
-            }),
-        );
+        let mut vercel = serde_json::Value::Null;
+        if is_vercel(p) {
+            let (expired, orphans) = vercel_ledger_counts(&thegn_svc::vps::registry::list());
+            vercel = serde_json::json!({
+                "team_id_set": !p.team_id.trim().is_empty(),
+                "project_id_set": !p.project_id.trim().is_empty(),
+                "token_resolves": vercel_token_resolves(p),
+                "ignored_keys": vercel_ignored_keys(p),
+                "expired": expired,
+                "orphans": orphans,
+            });
+        }
+        let mut entry = serde_json::json!({
+            "provider": p.provider.trim(),
+            "live_verified": !kind.live_unverified(),
+            "devshell": env_devshell(cfg, e),
+            "binary_cache_url": p.binary_cache_url.trim(),
+            "host_cache": p.host_cache,
+            "bridge_present": bridge_present,
+            "host_cache_effective": p.host_cache && bridge_present,
+            "signer": report.signer,
+            "signer_state": report.signer_state,
+            "scope": report.scope,
+            "require_sigs": report.require_sigs,
+            "require_sigs_explicit": report.require_sigs_explicit,
+        });
+        if !vercel.is_null() {
+            entry["vercel"] = vercel;
+        }
+        map.insert(name.clone(), entry);
     }
     serde_json::Value::Object(map)
 }
@@ -6129,6 +6303,99 @@ mod tests {
             msg.contains("set but ignored") && msg.contains("exec = \"cli\""),
             "{msg}"
         );
+    }
+
+    fn vercel_pc(token_ref: &str) -> thegn_core::config::EnvProviderConfig {
+        thegn_core::config::EnvProviderConfig {
+            provider: "vercel".into(),
+            api_key_env: token_ref.into(),
+            team_id: "team_abc".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vercel_report_lines_cover_ids_token_warnings_and_ledger() {
+        let mut pc = vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_ABSENT");
+        pc.host_cache = true;
+        pc.connect = thegn_core::config::ProviderConnect::Ssh;
+        let lines = vercel_report_lines(&pc, false, 2, 1).join("\n");
+        assert!(
+            lines.contains("team_id set: yes · project_id set: no"),
+            "{lines}"
+        );
+        assert!(lines.contains("token ref resolves: no"), "{lines}");
+        assert!(
+            lines.contains("host_cache is set but ignored for vercel"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("connect = \"ssh\" is set but ignored for vercel"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("2 expired") && lines.contains("1 orphan"),
+            "{lines}"
+        );
+        let clean = vercel_report_lines(&vercel_pc(""), true, 0, 0).join("\n");
+        assert!(clean.contains("token ref resolves: yes") && !clean.contains("warning"));
+    }
+
+    #[test]
+    fn vercel_json_reports_unresolved_then_resolved_token() {
+        let _state = crate::testenv::IsolatedState::new();
+        let mut cfg = Config::default();
+        let env = thegn_core::config::EnvConfig {
+            provider: vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_TOKEN"),
+            ..Default::default()
+        };
+        cfg.env.insert("vc".into(), env);
+        let v = provider_cache_json_with(&cfg, None);
+        assert_eq!(v["vc"]["vercel"]["team_id_set"], true);
+        assert_eq!(v["vc"]["vercel"]["project_id_set"], false);
+        assert_eq!(v["vc"]["vercel"]["token_resolves"], false);
+        assert_eq!(v["vc"]["vercel"]["expired"], 0);
+        assert_eq!(v["vc"]["vercel"]["orphans"], 0);
+        // SAFETY: test-only env mutation under IsolatedState.
+        unsafe { std::env::set_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN", "x") };
+        // Different ref string so the 60s presence memo cannot mask the change.
+        let env = thegn_core::config::EnvConfig {
+            provider: vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_TOKEN2"),
+            ..Default::default()
+        };
+        // SAFETY: as above.
+        unsafe { std::env::set_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN2", "x") };
+        cfg.env.insert("vc".into(), env);
+        let v = provider_cache_json_with(&cfg, None);
+        assert_eq!(v["vc"]["vercel"]["token_resolves"], true);
+        assert!(!v.to_string().contains("\"x\""));
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN");
+            std::env::remove_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN2");
+        }
+    }
+
+    #[test]
+    fn vercel_ledger_counts_only_vercel_expired_and_creating() {
+        use thegn_svc::vps::registry::VpsRecord;
+        let rec = |provider: &str, state: &str| VpsRecord {
+            name: "n".into(),
+            provider: provider.into(),
+            state: state.into(),
+            instance_id: String::new(),
+            ip: String::new(),
+            created_at: 0,
+            owner: String::new(),
+            account: String::new(),
+        };
+        let rows = [
+            rec("vercel", "expired"),
+            rec("vercel", "creating"),
+            rec("vercel", "ready"),
+            rec("hetzner", "expired"),
+        ];
+        assert_eq!(vercel_ledger_counts(&rows), (1, 1));
     }
 
     fn row(kind: NotificationKind, source: &str, msg: &str, created: i64) -> Notification {
@@ -8293,5 +8560,37 @@ args = ["--verbose"]
             "the live WAL must remain present and nonempty while the writer DB is open"
         );
         drop(db);
+    }
+
+    #[test]
+    fn vercel_doctor_rows_never_carry_token_text_and_json_matches_text() {
+        use thegn_core::config::{EnvProviderConfig, ModelCredentials};
+        // A JWT-shaped (OIDC) fixture token.
+        let token = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2lnLXNlY3JldC1ib2R5";
+        let pc = EnvProviderConfig {
+            provider: "vercel".into(),
+            model_credentials: ModelCredentials::Upload,
+            ..Default::default()
+        };
+        let row = vercel_row("vx", &pc, Some(token), 1_700_000_000);
+        assert_eq!(row["model_credentials"], "upload");
+        assert!(row["leaves_machine"].is_string());
+        assert!(row["token_kind"].is_string());
+        let report = serde_json::json!({ "envs": [row], "unpulled": 2 });
+        let rendered = format!("{report}\n{}", vercel_lines(&report).join("\n"));
+        assert!(!rendered.contains(token));
+        assert!(!rendered.contains("c2lnLXNlY3JldC1ib2R5"));
+        assert!(rendered.contains("model credentials upload"));
+        assert!(rendered.contains("results not pulled: 2"));
+        // No token resolved: reported as such, still no failure.
+        let none = vercel_row("vx", &pc, None, 0);
+        assert!(none["token_kind"].is_null());
+    }
+
+    #[test]
+    fn vercel_doctor_section_is_silent_without_a_vercel_env() {
+        let report = vercel_json(&Config::default());
+        assert_eq!(report["unpulled"], 0);
+        assert!(vercel_lines(&report).is_empty());
     }
 }
