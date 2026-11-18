@@ -210,7 +210,9 @@ fn upload_plan(cfg: &Config, envc: &EnvConfig) -> Option<UploadPlan> {
 }
 
 /// Read the host logins, resume, then narrow egress and upload. The sandbox
-/// is resumed here (the TTY open would resume it anyway).
+/// is resumed here (the TTY open would resume it anyway), through the same
+/// lifetime-ceiling check an interactive open uses: past `max_lifetime_secs`
+/// nothing is resumed and nothing is uploaded (the caller prints one line).
 async fn upload_login(
     provider: &VercelProvider,
     id: &str,
@@ -228,7 +230,7 @@ async fn upload_login(
         };
         anyhow::bail!("{why}");
     }
-    provider.resume(id).await?;
+    provider.resume_interactive(id).await?;
     provider
         .ensure_login(id, &payloads, &plan.user_domains, plan.install_agents)
         .await
@@ -356,6 +358,28 @@ pub(crate) fn keep_alive_due(
 /// The keep-alive cadence.
 pub(crate) fn keep_alive_interval() -> Duration {
     Duration::from_secs(thegn_core::vercel::policy::EXTEND_CHECK_SECS)
+}
+
+/// The one line reporting where the interactive PTY went: the admitted
+/// ticket host and its `/health` host, or the refused host. Hosts only (the
+/// provider never hands back the URL query or the ticket). `None` when no
+/// ticket was admitted (nothing to report).
+pub(crate) fn interactive_host_line(
+    hosts: Option<&thegn_svc::vercel::pty::InteractiveHosts>,
+    admitted: bool,
+) -> Option<String> {
+    let hosts = hosts?;
+    Some(if admitted {
+        format!(
+            "vercel: interactive host {} (health {})",
+            hosts.ticket_host, hosts.health_host
+        )
+    } else {
+        format!(
+            "vercel: interactive host {} refused; using stream mode",
+            hosts.ticket_host
+        )
+    })
 }
 
 /// The one line written when the stream is lost for good.
@@ -635,7 +659,12 @@ fn run_tty(
     };
 
     // Open BEFORE raw mode so an open failure never leaves the tty altered.
-    let (session, mode) = match rt.block_on(provider.open_exec(id, &spec)) {
+    let (hosts, opened) = rt.block_on(provider.open_exec_reported(id, &spec));
+    if let Some(line) = interactive_host_line(hosts.as_ref(), opened.is_ok()) {
+        tracing::info!(target: "thegn::provider", "{line}");
+        note(&line);
+    }
+    let (session, mode) = match opened {
         Ok(session) => (session, Mode::Pty),
         Err(e) => {
             tracing::debug!(target: "thegn::provider", error = %e, "vercel /interactive unavailable");
@@ -895,6 +924,31 @@ mod tests {
         );
         let lost = lost_line("tg-a");
         assert!(lost.contains("tg-a") && !lost.contains('\n'), "{lost}");
+    }
+
+    #[test]
+    fn interactive_host_line_names_hosts_only() {
+        use thegn_svc::vercel::pty::InteractiveHosts;
+        let hosts = InteractiveHosts {
+            ticket_host: "sb-1.vercel.run".into(),
+            health_host: "sb-1.vercel.run:443".into(),
+        };
+        let ok = interactive_host_line(Some(&hosts), true).expect("line");
+        assert_eq!(
+            ok,
+            "vercel: interactive host sb-1.vercel.run (health sb-1.vercel.run:443)"
+        );
+        let refused = interactive_host_line(Some(&hosts), false).expect("line");
+        assert_eq!(
+            refused,
+            "vercel: interactive host sb-1.vercel.run refused; using stream mode"
+        );
+        for line in [&ok, &refused] {
+            assert!(!line.contains('?') && !line.contains("token"), "{line}");
+            assert!(!line.contains('\n'), "{line}");
+        }
+        assert_eq!(interactive_host_line(None, false), None);
+        assert_eq!(interactive_host_line(None, true), None);
     }
 
     #[test]
