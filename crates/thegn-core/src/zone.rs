@@ -97,7 +97,7 @@ pub fn apply_zone_ceilings(
                 if zc
                     .network_allow
                     .iter()
-                    .any(|z| z == &entry || crate::dns_filter::name_matches(&entry, z))
+                    .any(|z| z == &entry || crate::egress::pattern::name_matches(&entry, z))
                 {
                     kept.push(entry);
                 } else {

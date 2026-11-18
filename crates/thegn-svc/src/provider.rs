@@ -1285,8 +1285,8 @@ fn canonical_domain(entry: &str) -> std::result::Result<Option<String>, PolicyRu
 /// network policy. **Pure** (unit-tested). Order encodes the precedence:
 /// deny rules first (a block beats an allow), then allow rules, then a trailing
 /// default-`deny *` **only when an allow-list is present** (an allow-list means
-/// "deny everything else") — exactly the local DNS-filter semantics
-/// ([`thegn_core::dns_filter`]). Empty + empty ⇒ no rules (allow all).
+/// "deny everything else") — exactly the host-pattern semantics
+/// ([`thegn_core::egress::pattern::HostRules`]). Empty + empty ⇒ no rules (allow all).
 pub fn rules_from(
     allow: &[String],
     block: &[String],

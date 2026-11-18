@@ -357,7 +357,7 @@ fn allow_entry_covered(entry: &str, trusted: &[String]) -> bool {
     }
     trusted
         .iter()
-        .any(|t| t == entry || crate::dns_filter::name_matches(entry, t))
+        .any(|t| t == entry || crate::egress::pattern::name_matches(entry, t))
 }
 
 // ---------------------------------------------------------------------------

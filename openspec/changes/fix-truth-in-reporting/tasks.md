@@ -17,7 +17,7 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 
 ## 2. `dns_filter` fate
 
-- [ ] 2.1 WS01-P2-01: create `thegn_core::egress::pattern` with today's semantics
+- [x] 2.1 WS01-P2-01: create `thegn_core::egress::pattern` with today's semantics
 - [ ] 2.2 WS01-P2-02: delete the DNS filter server, its tests, recipe and CI run line
 
 ## 3. Reserved kinds
