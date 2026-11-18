@@ -980,12 +980,6 @@ async fn sprite_proxy_relay(
     }
 }
 
-/// The quit-detached exit line. Printed AFTER the compositor tore down the
-/// alt screen (a raw-mode UI can't print an exit line) — stderr is the only
-/// sink that reaches the user, hence the local allow. Daemon-backed panes
-/// live in the daemon's process group, so the process::exit doesn't touch
-/// them.
-#[allow(clippy::disallowed_macros)]
 /// `sprite-exec --hold`: a cy-style duration (`90s`, `30m`, `1h30m`) or bare
 /// seconds, through the same parser the replay search uses. Zero is refused;
 /// the 24h cap is applied where the ceiling is computed.
@@ -999,6 +993,12 @@ fn parse_hold_duration(raw: &str) -> Result<std::time::Duration, String> {
     }
 }
 
+/// The quit-detached exit line. Printed AFTER the compositor tore down the
+/// alt screen (a raw-mode UI can't print an exit line) — stderr is the only
+/// sink that reaches the user, hence the local allow. Daemon-backed panes
+/// live in the daemon's process group, so the process::exit doesn't touch
+/// them.
+#[allow(clippy::disallowed_macros)]
 fn report_kept_sessions(kept: usize) {
     if kept > 0 {
         eprintln!(
