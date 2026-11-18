@@ -1,4 +1,4 @@
-//! SQLite persistence for producer leases (schema v114, THE-2208). See
+//! SQLite persistence for producer leases (schema v114/v116, THE-2208). See
 //! `producer_lease.rs` for the protocol.
 
 use anyhow::Result;
@@ -235,11 +235,35 @@ mod tests {
         assert_eq!(
             kinds,
             [
+                ProducerKind::Inbox,
                 ProducerKind::Mentions,
                 ProducerKind::PrPoll,
                 ProducerKind::PrQueue,
                 ProducerKind::Tracker,
             ]
         );
+    }
+
+    #[test]
+    fn skips_rows_this_build_does_not_know() {
+        let db = Db::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+                 VALUES ('from_a_newer_build','daemon',1,0,99)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.try_acquire_producer_lease(ProducerKind::Inbox, DAEMON_HOLDER, 1, 0, TTL)
+                .unwrap()
+        );
+        let kinds: Vec<_> = db
+            .producer_leases()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(kinds, [ProducerKind::Inbox]);
     }
 }

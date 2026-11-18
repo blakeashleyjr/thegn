@@ -238,7 +238,8 @@ mod db_open_memo;
 /// v112: autonomy on agent_dispatches and automation_runs (THE-2195).
 /// v113: lane rule id, automation proposals, approval push nonces (THE-2200/2202).
 /// v114: producer leases (single headless producer per kind, THE-2208).
-pub const SCHEMA_VERSION: i64 = 114;
+/// v116: producer kinds beyond the four (the CHECK list dropped; ProducerKind::parse gates rows) and inbox account state (THE-2214).
+pub const SCHEMA_VERSION: i64 = 116;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1893,6 +1894,9 @@ impl Db {
                     crate::db_migrate::verify_v112_schema(&conn)?;
                     crate::db_migrate::verify_v113_schema(&conn)?;
                     crate::db_migrate::verify_v114_schema(&conn)?;
+                    // Read-only: a plain open takes no write lock. The
+                    // insert probe runs on the migration path below.
+                    crate::db_migrate::verify_v116_shape(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2591,6 +2595,7 @@ impl Db {
         crate::db_migrate::migrate_v112(&conn)?;
         crate::db_migrate::migrate_v113(&conn)?;
         crate::db_migrate::migrate_v114(&conn)?;
+        crate::db_migrate::migrate_v116(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2643,6 +2648,7 @@ impl Db {
             crate::db_migrate::verify_v112_schema(&conn)?;
             crate::db_migrate::verify_v113_schema(&conn)?;
             crate::db_migrate::verify_v114_schema(&conn)?;
+            crate::db_migrate::verify_v116_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

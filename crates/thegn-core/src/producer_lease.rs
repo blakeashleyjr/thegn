@@ -1,5 +1,5 @@
-//! Producer leases (schema v114, THE-2208): at most one headless producer
-//! per kind polls the network at a time.
+//! Producer leases (schema v114, THE-2208; v116 added `inbox`, THE-2214): at
+//! most one headless producer per kind polls the network at a time.
 //!
 //! The daemon's producer owner acquires or renews a kind's lease every tick
 //! (holder [`DAEMON_HOLDER`], TTL [`ttl_ms`]). A UI producer reads the lease
@@ -8,7 +8,9 @@
 //! resumes polling. Persistence lives in `db_producer_lease.rs`.
 
 /// One headless producer kind. The stored string ([`ProducerKind::as_str`])
-/// is pinned by the `producer_leases.producer` CHECK constraint.
+/// is the `producer_leases.producer` value. Since v116 the column's CHECK
+/// bounds only its length (1..=32); [`ProducerKind::parse`] is what gates
+/// rows, so a name this build does not know is skipped on read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProducerKind {
     /// The tracker poll (issue events, autopilot pickup).
@@ -19,15 +21,18 @@ pub enum ProducerKind {
     Mentions,
     /// The PR queue drive.
     PrQueue,
+    /// The native inbox poll (THE-2214).
+    Inbox,
 }
 
 impl ProducerKind {
     /// Every kind, in a stable order.
-    pub const ALL: [ProducerKind; 4] = [
+    pub const ALL: [ProducerKind; 5] = [
         ProducerKind::Tracker,
         ProducerKind::PrPoll,
         ProducerKind::Mentions,
         ProducerKind::PrQueue,
+        ProducerKind::Inbox,
     ];
 
     /// The stored name (the `producer_leases.producer` value).
@@ -37,6 +42,7 @@ impl ProducerKind {
             ProducerKind::PrPoll => "pr_poll",
             ProducerKind::Mentions => "mentions",
             ProducerKind::PrQueue => "pr_queue",
+            ProducerKind::Inbox => "inbox",
         }
     }
 
@@ -86,7 +92,14 @@ mod tests {
         assert_eq!(ProducerKind::parse("Tracker"), None);
         assert_eq!(ProducerKind::parse(""), None);
         let names: Vec<_> = ProducerKind::ALL.iter().map(|k| k.as_str()).collect();
-        assert_eq!(names, ["tracker", "pr_poll", "mentions", "pr_queue"]);
+        assert_eq!(
+            names,
+            ["tracker", "pr_poll", "mentions", "pr_queue", "inbox"]
+        );
+        assert!(
+            names.iter().all(|n| (1..=32).contains(&n.len())),
+            "fits the v116 CHECK"
+        );
     }
 
     #[test]
