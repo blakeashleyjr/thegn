@@ -192,26 +192,27 @@ pub(crate) fn kick_session(session: &str) {
 /// Re-plan every lane of tracker issue `issue_id`.
 pub(crate) fn kick_issue(issue_id: &str) {
     let Some(h) = active() else { return };
-    if !claim(issue_id) {
+    let key = flight_key(issue_id);
+    if !claim(&key) {
         return;
     }
     let issue = issue_id.to_owned();
     note_spawn();
-    h.rt.spawn(async move { run_claimed(h, issue).await });
+    h.rt.spawn(async move { run_claimed(h, key, issue).await });
 }
 
-/// Take the single flight for `issue`. `false` = already being driven; the
+/// Take the single flight for `key` (see [`flight_key`]). `false` = already being driven; the
 /// driver was told to run once more.
-fn claim(issue: &str) -> bool {
+fn claim(key: &str) -> bool {
     let mut guard = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
-    match map.get_mut(issue) {
+    match map.get_mut(key) {
         Some(dirty) => {
             *dirty = true;
             false
         }
         None => {
-            map.insert(issue.to_owned(), false);
+            map.insert(key.to_owned(), false);
             true
         }
     }
@@ -219,25 +220,25 @@ fn claim(issue: &str) -> bool {
 
 /// End one pass for a claimed issue: `true` = a kick arrived meanwhile, run
 /// again (the claim is kept); `false` = released.
-fn finish_pass(issue: &str) -> bool {
+fn finish_pass(key: &str) -> bool {
     let mut guard = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
-    match map.get_mut(issue) {
+    match map.get_mut(key) {
         Some(dirty) if *dirty => {
             *dirty = false;
             true
         }
         _ => {
-            map.remove(issue);
+            map.remove(key);
             false
         }
     }
 }
 
-async fn run_claimed(h: &'static Handles, issue: String) {
+async fn run_claimed(h: &'static Handles, key: String, issue: String) {
     loop {
         drive(h, &issue).await;
-        if !finish_pass(&issue) {
+        if !finish_pass(&key) {
             break;
         }
     }
@@ -284,8 +285,9 @@ async fn reconcile() {
     };
     tracing::info!(target: "thegn::supervise", lanes = issues.len(), "stage executor reconcile");
     for issue in issues {
-        if claim(&issue) {
-            run_claimed(h, issue).await;
+        let key = flight_key(&issue);
+        if claim(&key) {
+            run_claimed(h, key, issue).await;
         }
     }
 }
@@ -305,6 +307,38 @@ enum Step {
     Unchanged,
     /// Stop driving this issue (paused, refused, cancelled).
     Stop,
+}
+
+/// Whether `path` is a local worktree in thegn's registry.
+fn registered_local_worktree(path: &str) -> bool {
+    use thegn_core::store::WorkspaceStore as _;
+    let Ok(db) = Db::open() else { return false };
+    let Ok(rows) = db.worktrees() else {
+        return false;
+    };
+    matches_registered(&rows, path, |p| std::fs::canonicalize(p).ok())
+}
+
+/// Pure row match for [`registered_local_worktree`]: a local row whose path
+/// equals `path`, or canonicalizes to the same place.
+fn matches_registered(
+    rows: &[thegn_core::models::WorktreeRow],
+    path: &str,
+    canon: impl Fn(&str) -> Option<PathBuf>,
+) -> bool {
+    let want = canon(path);
+    rows.iter().any(|r| {
+        let loc = r.location.trim();
+        (loc.is_empty() || loc == "local")
+            && (r.worktree == path || (want.is_some() && canon(&r.worktree) == want))
+    })
+}
+
+/// Single-flight key: one per issue, whatever the provider spelling.
+fn flight_key(issue: &str) -> String {
+    thegn_core::pipeline_identity::split_issue_id(issue.trim())
+        .1
+        .to_ascii_lowercase()
 }
 
 fn log_action(issue: &str, row: i64, action: &str, outcome: &str) {
@@ -376,6 +410,16 @@ async fn act(h: &'static Handles, lane: &Lane, action: &SuperviseAction) -> Step
         );
     if !acts {
         return Step::Unchanged;
+    }
+    // Only act in a local worktree thegn registered: a roster row's path is
+    // caller-supplied, so an arbitrary git dir must never run tasks.
+    let wt = lane.row.worktree_path.clone();
+    let registered = tokio::task::spawn_blocking(move || registered_local_worktree(&wt))
+        .await
+        .unwrap_or(false);
+    if !registered {
+        log_action(issue, row, token, "unregistered_worktree");
+        return Step::Stop;
     }
     // Second fence over the policy's own `worker_live` hold: never touch a
     // lane a worker may still be writing (unknown maps to live).
@@ -496,6 +540,11 @@ async fn validate(
                 None,
                 "task not configured".to_owned(),
             ),
+            Some(_) if h.cfg.limits.test_timeout_secs == 0 => (
+                ValidationClass::EnvironmentError,
+                None,
+                "validation needs [limits] test_timeout_secs > 0".to_owned(),
+            ),
             Some(task) => {
                 let mut test = crate::task::test_task_from_config(&task);
                 let matcher = test.matcher.clone();
@@ -540,6 +589,10 @@ async fn validate(
         let head = tokio::task::spawn_blocking(move || read_head(&wt))
             .await
             .unwrap_or(None);
+        if head.is_none() {
+            log_action(issue, row, "validate", "head_unreadable");
+            return Step::Stop;
+        }
         if validation_decision(commit_sha, head.as_deref()) == ValidationDecision::HeadMoved {
             log_action(issue, row, "validate", "head_moved");
             return Step::Changed;
@@ -1049,6 +1102,30 @@ mod tests {
         assert!(!finish_pass(issue), "then the claim is released");
         assert!(claim(issue), "released claims can be taken again");
         assert!(!finish_pass(issue));
+    }
+
+    #[test]
+    fn single_flight_key_spans_issue_spellings() {
+        let key = flight_key("linear:THE-9-flight-key-test");
+        assert!(claim(&key));
+        assert!(!claim(&flight_key("THE-9-flight-key-test")));
+        assert!(finish_pass(&key));
+        assert!(!finish_pass(&key));
+    }
+
+    #[test]
+    fn unregistered_worktree_is_refused() {
+        use thegn_core::store::WorkspaceStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("registry.db")).unwrap();
+        let rows = db.worktrees().unwrap();
+        let lead_repo = dir.path().join("notes");
+        std::fs::create_dir_all(&lead_repo).unwrap();
+        assert!(!matches_registered(
+            &rows,
+            lead_repo.to_str().unwrap(),
+            |p| std::fs::canonicalize(p).ok()
+        ));
     }
 
     #[test]
