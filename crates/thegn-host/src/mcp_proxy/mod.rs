@@ -138,7 +138,7 @@ fn fetch_profile_env(addr: String, token: String, profile: &str) -> Result<Profi
 
 /// One server's slot in a `mcp_proxy.profile_env` reply: its resolved env, or
 /// why it could not be resolved (never a value).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerEnv {
     #[serde(default)]
@@ -148,11 +148,30 @@ pub struct ServerEnv {
 }
 
 /// The `mcp_proxy.profile_env` reply: `{servers: {name: {env}}}`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileEnvReply {
     #[serde(default)]
     pub servers: BTreeMap<String, ServerEnv>,
+}
+
+/// Prints env keys only: the values are resolved secrets.
+impl std::fmt::Debug for ServerEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerEnv")
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+/// Prints server names and env keys only (via [`ServerEnv`]'s `Debug`).
+impl std::fmt::Debug for ProfileEnvReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileEnvReply")
+            .field("servers", &self.servers)
+            .finish()
+    }
 }
 
 impl ProfileEnvReply {

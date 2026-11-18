@@ -165,7 +165,8 @@ pub struct LeadEntries<'a> {
     pub scopes_csv: &'a str,
     /// `127.0.0.1:<port>` of the daemon's Lead listener.
     pub control_addr: &'a str,
-    /// The scoped bearer token (the only secret in the file).
+    /// The scoped bearer token (the only secret in the file; carried by the
+    /// serve and hub entries).
     pub control_token: &'a str,
     /// Audit-only caller label (`THEGN_CALLER`); never used for authorization.
     pub caller: &'a str,
@@ -177,8 +178,9 @@ pub struct LeadEntries<'a> {
 ///
 /// Unlike [`proxy_entry`] (written into a user's agent settings, so never any
 /// `env`), this goes to a private owner-only file only the Lead's agent reads,
-/// and its single secret is the scoped Lead token on the `thegn` entry. The hub
-/// entry is argv only: upstream secrets still resolve at spawn in the hub.
+/// and its single secret is the scoped Lead token, on the `thegn` entry and the
+/// hub entry. The hub fetches its upstreams' env from the daemon with that
+/// token (`mcp_proxy.profile_env`).
 pub fn lead_entries(e: &LeadEntries<'_>) -> Value {
     let scopes = if e.scopes_csv.is_empty() {
         "none"

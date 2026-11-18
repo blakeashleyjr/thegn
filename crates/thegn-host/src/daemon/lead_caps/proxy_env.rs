@@ -22,6 +22,7 @@ pub(crate) async fn profile_env(
 ) -> JsonResult {
     let request: ProfileEnvRequest = decode(req)?;
     let profile = request.profile;
+    validate_profile_name(&profile)?;
     let kind = authorize(&svc.config, &caller, &profile)?;
     let cfg = std::sync::Arc::clone(&svc.config);
     let name = profile.clone();
@@ -37,6 +38,15 @@ pub(crate) async fn profile_env(
         "mcp_proxy.profile_env served"
     );
     encode(&reply)
+}
+
+/// Refuse a profile name that is empty, longer than 128 bytes, or carries a
+/// control character: it reaches the served and refused log lines verbatim.
+fn validate_profile_name(profile: &str) -> Result<(), ControlError> {
+    if profile.is_empty() || profile.len() > 128 || profile.chars().any(char::is_control) {
+        return Err(ControlError::InvalidArgument("invalid profile name".into()));
+    }
+    Ok(())
 }
 
 /// Who may read `profile`'s env: an admin caller (any profile), or a
@@ -69,7 +79,7 @@ fn authorize(
 
 #[cfg(test)]
 mod tests {
-    use super::authorize;
+    use super::{authorize, validate_profile_name};
     use thegn_core::config::Config;
     use thegn_svc::control::{ControlError, ProfileEnvCaller};
 
@@ -135,5 +145,16 @@ mod tests {
             &caller(Some("lead"), false),
             "lead"
         )));
+    }
+
+    #[test]
+    fn profile_env_rejects_invalid_profile_names() {
+        assert!(validate_profile_name("lead").is_ok());
+        for bad in ["", "lead\nforged line", &"x".repeat(129)] {
+            assert!(matches!(
+                validate_profile_name(bad),
+                Err(ControlError::InvalidArgument(_))
+            ));
+        }
     }
 }

@@ -226,7 +226,7 @@ pub fn slid_expiry(
         return None;
     }
     let ttl_ms = i64::try_from(ttl_secs).ok()?.checked_mul(1000)?;
-    if expires_at - now_ms >= ttl_ms / 2 {
+    if expires_at.checked_sub(now_ms)? >= ttl_ms / 2 {
         return None;
     }
     let cap = created_at.saturating_add(LEAD_TOKEN_MAX_LIFETIME_MS);
