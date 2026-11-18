@@ -1139,3 +1139,24 @@ fn create_with_a_dropped_connection_keeps_the_creating_record() {
         "an ambiguous create keeps its intent for the reaper"
     );
 }
+
+#[test]
+fn write_private_uses_0600_mode() {
+    // b162 credential custody: an agent login file lands owner-only.
+    let mock = start_mock();
+    let p = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "tgtest1"));
+    rt().block_on(p.write_private("tgtest1", "/root/.codex/auth.json", b"{}"))
+        .unwrap();
+    let reqs = mock.recorded.lock().unwrap().clone();
+    let w = reqs
+        .iter()
+        .find(|r| r.method == "PUT" && r.path.contains("/fs/write"))
+        .expect("a write request");
+    assert!(
+        w.path.contains("mode=0600"),
+        "a private write must be 0600: {}",
+        w.path
+    );
+    assert!(!w.path.contains("mode=0644"), "{}", w.path);
+    assert_eq!(w.body, b"{}");
+}

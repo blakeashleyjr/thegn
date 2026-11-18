@@ -2032,6 +2032,19 @@ pub trait ProviderFiles: Send + Sync {
         Box::pin(async move { self.write(id, path, data).await })
     }
 
+    /// Write `data` readable by its owner only (mode 0600 where the provider's
+    /// file API supports a mode): agent login files (OAuth tokens). Providers
+    /// whose file API takes no mode keep their default; the dir is the user's
+    /// own VM.
+    fn write_private<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.write(id, path, data).await })
+    }
+
     /// Recursively upload `local` into the sandbox at `remote` (skips `.git`).
     fn upload_dir<'a>(
         &'a self,
@@ -2546,7 +2559,8 @@ impl SpritesProvider {
         }
     }
     /// PUT `/fs/write` with an explicit unix `mode` (octal string). `write`
-    /// uses `0644`; `write_exec` uses `0755` so a pushed binary is runnable.
+    /// uses `0644`; `write_exec` uses `0755` so a pushed binary is runnable;
+    /// `write_private` uses `0600` for login files.
     async fn write_with_mode(&self, id: &str, path: &str, data: &[u8], mode: &str) -> Result<()> {
         let _permit = TRANSFER_GATE.acquire(&self.authority()?).await?;
         anyhow::ensure!(
@@ -2626,6 +2640,15 @@ impl ProviderFiles for SpritesProvider {
         data: &'a [u8],
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move { self.write_with_mode(id, path, data, "0755").await })
+    }
+
+    fn write_private<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.write_with_mode(id, path, data, "0600").await })
     }
 
     fn list_dir<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
@@ -4176,6 +4199,15 @@ impl Provider {
         self.files_ops()
             .ok_or_else(|| self.no_files())?
             .write_exec(id, path, data)
+            .await
+    }
+
+    /// Write an owner-only file into the sandbox fs (mode 0600 where supported;
+    /// see [`ProviderFiles::write_private`]).
+    pub async fn write_private(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
+        self.files_ops()
+            .ok_or_else(|| self.no_files())?
+            .write_private(id, path, data)
             .await
     }
 
