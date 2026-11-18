@@ -59,10 +59,12 @@ impl Api for FakeApi {
             self.bodies.lock().unwrap().push(body.clone());
             match self.create.lock().unwrap().clone() {
                 Some(Ok(view)) => {
-                    self.by_name
-                        .lock()
-                        .unwrap()
-                        .insert(view.name.clone(), view.clone());
+                    if self.ledger_probe.lock().unwrap().is_some() {
+                        self.by_name
+                            .lock()
+                            .unwrap()
+                            .insert(view.name.clone(), view.clone());
+                    }
                     Ok(view)
                 }
                 Some(Err(text)) => Err(anyhow!(text)),
