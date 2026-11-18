@@ -334,11 +334,26 @@ impl HostRunner for CloudRunner {
                 let token = self.token()?.to_string();
                 let api_base = self.reach.api_base.clone();
                 let template = self.reach.template.clone();
+                let credential_ref = match self.reach.api_key_env.trim() {
+                    "" => "SPRITES_TOKEN".to_string(),
+                    configured => configured.to_string(),
+                };
                 block_on(async {
-                    let p = Provider::Sprites(SpritesProvider::new(&api_base, &token, &template));
-                    p.ensure_exists(&template)
-                        .await
-                        .map(|_created| ())
+                    let registered: anyhow::Result<()> = async {
+                        let listed =
+                            Provider::Sprites(SpritesProvider::new(&api_base, &token, &template));
+                        if listed.list().await?.iter().any(|n| n == &template) {
+                            return Ok(());
+                        }
+                        // Ownership-scoped like every other sprites create: the
+                        // template sprite is recorded in the ledger before the
+                        // POST. Resolved only when a create is needed.
+                        let scoped = SpritesProvider::new(&api_base, &token, &template)
+                            .with_host_scope(&credential_ref)?;
+                        Provider::Sprites(scoped).create().await.map(|_handle| ())
+                    }
+                    .await;
+                    registered
                         .map_err(|e| format!("sprites: register template sprite {template:?}: {e}"))
                 })??;
             }
