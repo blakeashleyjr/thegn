@@ -14,17 +14,18 @@
 //!   applies). Any failed check, any other autonomy, and any re-plan that is
 //!   not `Enqueue` raises the owner's land approval instead. No path writes an
 //!   approval on anyone's behalf.
-//! - In this release `merge` behaves like `review`: the merge queue's
-//!   `gate_command` still runs on the host, outside any sandbox, so the land
-//!   rule's seventh check (`gate_isolated`, backed by [`merge_gate_isolated`],
-//!   false until the gate is sandboxed) always fails and every `merge` land
-//!   stops for the owner's approval with "the merge gate is not sandboxed yet".
+//! - The land rule's seventh check (`gate_isolated`, backed by
+//!   [`merge_gate_isolated`]) passes only when `[merge_queue] gate_sandbox =
+//!   "sealed"` and the sealed spec resolves for the lane's repo right now
+//!   (THE-2200). With the host gate (`off`, the default) `merge` behaves like
+//!   `review`: every land stops for the owner's approval with "the merge gate
+//!   is not sandboxed"; a sealed gate that cannot start asks with its cause.
 //!
 //! Other escalations ([`on_escalate`]) ring the owner (and the Lead) once
 //! per (row, head, reason), only for `on_blocked = "escalate"` stages or an
 //! approval-gated advance.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thegn_core::approval_request::{ApprovalRequest, MAX_REASON};
@@ -402,6 +403,17 @@ async fn gather_unattended(
         .and_then(|s| s.stage_name())
         .map(str::to_string);
     let mq = &cfg.merge_queue;
+    let worktree = PathBuf::from(&ctx.worktree);
+    let repo = tokio::task::spawn_blocking(move || crate::merge_ops::repo_root_of(&worktree))
+        .await
+        .ok()
+        .flatten();
+    let isolation = match repo {
+        Some(repo) => merge_gate_isolated(cfg, &repo).await,
+        None => Err(thegn_core::stage_land::gate_cannot_start(
+            "the lane's repository could not be resolved",
+        )),
+    };
     Ok(UnattendedFacts {
         chain_autonomy: chain.iter().map(|(a, _)| a.clone()).collect(),
         chain_rule: chain.iter().map(|(_, r)| r.clone()).collect(),
@@ -416,17 +428,36 @@ async fn gather_unattended(
         gate_timeout_secs: mq.gate_timeout_secs,
         paused,
         budget_ok,
-        gate_isolated: merge_gate_isolated(),
+        gate_isolated: isolation.is_ok(),
+        gate_isolation_refusal: isolation.err(),
     })
 }
 
-/// Whether the merge queue's `gate_command` runs inside a sandbox. It does
-/// not yet: the drain runs it on the host (scrubbed env only), so an
-/// unattended `merge` land would run worker-written code (justfile, build.rs,
-/// tests) outside any sandbox with no human involved. Until the gate is
-/// sandboxed every `merge` land raises the owner's approval, as `review` does.
-fn merge_gate_isolated() -> bool {
-    false
+/// Whether the merge queue's gate for `repo_root` runs inside a sandbox: `Ok`
+/// only for `[merge_queue] gate_sandbox = "sealed"` whose sealed spec resolves
+/// for the repo now (the same resolve the drain's gate makes). Otherwise the
+/// gate would run worker-written code (justfile, build.rs, tests) on the host
+/// with no human involved, so the land asks the owner with this reason.
+async fn merge_gate_isolated(cfg: &Arc<Config>, repo_root: &Path) -> Result<(), String> {
+    // Off resolves to the host at once (no sandbox ensure, no preflight);
+    // the overlay read and a sealed resolve are blocking, so both run here.
+    let full = Arc::clone(cfg);
+    let root = repo_root.to_path_buf();
+    let resolved = tokio::task::spawn_blocking(move || crate::gate_sandbox::resolve(&full, &root))
+        .await
+        .unwrap_or_else(|error| Err(format!("the sandbox resolve failed ({error})")));
+    isolation_from(resolved)
+}
+
+/// The seventh check from a gate resolve. Pure.
+fn isolation_from(resolved: Result<crate::gate_sandbox::GateExec, String>) -> Result<(), String> {
+    match resolved {
+        Ok(crate::gate_sandbox::GateExec::Sealed(_)) => Ok(()),
+        Ok(crate::gate_sandbox::GateExec::Host) => {
+            Err(thegn_core::stage_land::GATE_NOT_ISOLATED.to_owned())
+        }
+        Err(why) => Err(thegn_core::stage_land::gate_cannot_start(&why)),
+    }
 }
 
 /// The terminal stage's report states PASS and carries gate evidence. A
@@ -787,14 +818,46 @@ mod tests {
 
     #[test]
     fn a_merge_lane_asks_while_the_merge_gate_is_not_sandboxed() {
-        assert!(
-            !merge_gate_isolated(),
-            "the merge gate is not sandboxed yet"
-        );
-        let reason = thegn_core::stage_land::GATE_NOT_ISOLATED.to_string();
+        use crate::gate_sandbox::GateExec;
+        let reason = isolation_from(Ok(GateExec::Host)).unwrap_err();
+        assert_eq!(reason, thegn_core::stage_land::GATE_NOT_ISOLATED);
+        assert!(reason.contains("gate_sandbox = \"sealed\""));
         assert_eq!(
             terminal_decision(Autonomy::Merge, Err(reason.clone()), None),
             Decision::Ask(reason)
+        );
+        // A sealed gate that cannot start asks with its cause.
+        let cannot = isolation_from(Err("no sandbox runtime".into())).unwrap_err();
+        assert_eq!(
+            cannot,
+            "the sealed merge gate cannot start: no sandbox runtime"
+        );
+        assert_eq!(
+            terminal_decision(Autonomy::Merge, Err(cannot.clone()), None),
+            Decision::Ask(cannot)
+        );
+    }
+
+    #[test]
+    fn a_merge_lane_with_a_sealed_gate_lands_unattended() {
+        use crate::gate_sandbox::GateExec;
+        let sealed = isolation_from(Ok(GateExec::Sealed(Box::default())));
+        assert_eq!(sealed, Ok(()));
+        let enq = enqueue_action();
+        assert_eq!(
+            terminal_decision(Autonomy::Merge, sealed, Some(&enq)),
+            Decision::Enqueue {
+                commit_sha: SHA.into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_off_gate_is_not_isolated_without_resolving() {
+        let cfg = Arc::new(Config::default());
+        assert_eq!(
+            merge_gate_isolated(&cfg, Path::new("/nonexistent")).await,
+            Err(thegn_core::stage_land::GATE_NOT_ISOLATED.to_owned())
         );
     }
 
