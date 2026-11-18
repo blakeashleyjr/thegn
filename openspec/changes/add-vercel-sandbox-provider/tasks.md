@@ -22,3 +22,7 @@
 
 - [x] 5.1 `thegn env pull` support and admission refusals (host_cache, ssh connect)
 - [x] 5.2 Help page, provider-impl checklist, config example
+
+## 6. Live verification
+
+- [ ] 6.1 Run `test/vercel-live.sh` against a real Vercel account (THE-2234) and settle the unverified API facts
