@@ -32,6 +32,12 @@ CLI-backed-provider boundary.
    cross-seam shape suite (`thegn_svc::conformance`) already covers your
    probe — a malformed report or a factory/kind mismatch fails it.
 
+An environment provider kind (`EnvProviderKind`) declares its capabilities
+through the kind's methods in `thegn_core::config` (`files`, `checkpoints`,
+`egress_api`, `exec_api`, `scale_to_zero`); `thegn_svc::provider::ProviderCaps::for_kind`
+derives the runtime caps from them, so `Provider::caps()` never states a
+capability the kind table does not.
+
 ## The `SecretStore` seam (credential backends)
 
 The credential broker (THE-66) is a seam too: `thegn_core::secret_store`

@@ -4,7 +4,7 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 
 ## 1. Capability and egress truth
 
-- [ ] 1.1 WS01-P1-01: per-kind provider facts in core (`egress_api`, `checkpoints`, `files`) and
+- [x] 1.1 WS01-P1-01: per-kind provider facts in core (`egress_api`, `checkpoints`, `files`) and
       `ProviderCaps::for_kind`
 - [ ] 1.2 WS01-P1-02: `egress_for(&EgressInputs)` and honest capability fields (`Offline`, no false
       `Enforce`, VPN is `Unmanaged`)
