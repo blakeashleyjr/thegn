@@ -640,6 +640,10 @@ const HOME_CREDENTIALS: &[&str] = &[
     ".config/glab-cli",
     ".git-credentials",
     ".netrc",
+    // The owner's mcp-remote OAuth tokens (the Lead has its own) and npm
+    // registry auth tokens (read by npx inside the Lead).
+    ".mcp-auth",
+    ".npmrc",
 ];
 
 /// The private MCP dir beneath the harness homes (`lead-harness/mcp`): the
@@ -1793,11 +1797,13 @@ mod tests {
             "thegn-home",
             "home/.claude",
             "home/.ssh",
+            "home/.mcp-auth",
             "run-sock",
         ] {
             std::fs::create_dir_all(fx.root.join(dir)).unwrap();
         }
         std::fs::write(home.join(".netrc"), "machine x").unwrap();
+        std::fs::write(home.join(".npmrc"), "//registry/:_authToken=x").unwrap();
         let masks = fixture_masks(&fx, vec![fx.root.join("run-sock")]);
         for dir in [
             "state/thegn",
@@ -1814,6 +1820,8 @@ mod tests {
         assert!(masks.dirs.contains(&home.join(".ssh")), "{masks:?}");
         assert!(masks.dirs.contains(&fx.root.join("run-sock")));
         assert!(masks.files.contains(&home.join(".netrc")));
+        assert!(masks.dirs.contains(&home.join(".mcp-auth")), "{masks:?}");
+        assert!(masks.files.contains(&home.join(".npmrc")), "{masks:?}");
         let roots = masks.roots();
         for p in [
             home.join(".ssh"),
@@ -1923,11 +1931,6 @@ mod tests {
                 spec.env.iter().any(|(k, v)| *k == var && *v == dir_s),
                 "{command}: {:?}",
                 spec.env
-            );
-            let (_, login_env) = crate::lead::login::agent_login(&fx.cfg, &state).unwrap();
-            assert!(
-                login_env.iter().any(|(k, v)| *k == var && *v == dir_s),
-                "{command}: {login_env:?}"
             );
         }
     }

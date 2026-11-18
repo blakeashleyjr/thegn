@@ -4,8 +4,9 @@
 //! The Lead keeps a private harness home and a private MCP dir (`lead::launch`),
 //! so a login done in the operator's own `~/.claude` never reaches it, and the
 //! sandbox's read-only root refuses an OAuth flow inside. This verb runs the
-//! same agent command (or the named `[mcp_servers.<server>]` argv) on the host,
-//! with host network, its env pointed at those private dirs, and waits on it.
+//! agent binary (or the named `[mcp_servers.<server>]` argv) on the host, with
+//! host network and a fresh throwaway config/cache dir (never a dir the Lead
+//! can write), waits on it, then installs only the resulting credentials.
 //! Nothing is minted and no sandbox is built: it is a host-trust act, the same
 //! class as the `mcp_proxy` upstreams, and it is refused anywhere but an
 //! operator's own terminal (a Lead, a worker, a pipeline stage, a pipe).
@@ -87,43 +88,115 @@ pub(crate) fn check_mcp_member(cfg: &Config, server: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-/// The configured Lead agent's interactive command and the env overlay a
-/// login runs it with: the agent's secret-expanded env, then the private
-/// harness home (created), exactly as the Lead launch sets them.
-pub(crate) fn agent_login(
-    cfg: &Config,
-    state_home: &Path,
-) -> anyhow::Result<(String, Vec<(String, String)>)> {
+/// The Lead agent's login program and its env overlay, run in a fresh,
+/// throwaway config dir: never the Lead's private harness home, which the
+/// sandboxed Lead can write (a planted hook or MCP server there would run on
+/// the host, unsandboxed). The tempdir is held until the login ends.
+pub(crate) struct AgentLogin {
+    /// The agent's binary (resolved on `PATH`), run with no arguments.
+    pub prog: String,
+    /// The agent's secret-expanded env plus `CLAUDE_CONFIG_DIR=<tmp>`.
+    pub env: Vec<(String, String)>,
+    /// The fresh config dir the login writes into.
+    pub tmp: tempfile::TempDir,
+}
+
+/// The configured Lead agent's login: its binary alone (the first word of
+/// its interactive command, no shell and no flags, so none of the Lead's
+/// permission-bypass flags run on the host), with a fresh config dir.
+pub(crate) fn agent_login(cfg: &Config) -> anyhow::Result<AgentLogin> {
     let lead = cfg
         .lead
         .as_ref()
         .context("[lead] is not configured (or is clamped off on this channel)")?;
     let eff = thegn_core::agent_task::effective_agent(cfg, &lead.agent, None)
         .map_err(|e| anyhow::anyhow!("[lead] agent: {e}"))?;
+    if eff.harness != "claude" {
+        bail!("`thegn lead login` supports claude only for now");
+    }
     let command = eff
         .interactive_command()
         .map_err(|e| anyhow::anyhow!("[lead] agent: {e}"))?;
+    let word = command
+        .split_whitespace()
+        .next()
+        .context("[lead] agent has an empty command")?;
+    let prog = thegn_core::util::which_path(word)
+        .with_context(|| format!("[lead] agent: {word:?} was not found on PATH"))?;
+    let tmp = tempfile::Builder::new()
+        .prefix("thegn-lead-login-")
+        .tempdir()
+        .context("creating a fresh config dir for the login")?;
     let mut env = eff.expanded_env();
-    match crate::lead::launch::ensure_harness_home(cfg, state_home)? {
-        Some((var, dir)) => env.push((var, dir.to_string_lossy().into_owned())),
-        None => bail!(
-            "[lead] agent {:?} runs {}, which has no private home to log in to",
-            lead.agent,
-            eff.harness
-        ),
+    env.push((
+        "CLAUDE_CONFIG_DIR".to_string(),
+        tmp.path().to_string_lossy().into_owned(),
+    ));
+    Ok(AgentLogin { prog, env, tmp })
+}
+
+/// The Lead's private harness home as a held handle (created owner-only).
+fn harness_home_dir(
+    cfg: &Config,
+    state_home: &Path,
+) -> anyhow::Result<thegn_core::fsperm::PrivateDir> {
+    let (_, dir) = crate::lead::launch::harness_home_env(cfg, state_home)
+        .context("the Lead agent has no private home to log in to")?;
+    let rel = dir
+        .strip_prefix(state_home)
+        .context("the Lead's private harness home is outside $XDG_STATE_HOME")?;
+    thegn_core::fsperm::ensure_private_dir_beneath(state_home, rel)
+        .context("creating the Lead's private harness home")
+}
+
+/// Read `from/name` as a regular file, never following a symlink; `None` when
+/// it is absent or not a regular file.
+fn read_regular(from: &Path, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let path = from.join(name);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+        return Ok(None);
     }
-    Ok((command, env))
+    let mut file = thegn_core::fsperm::open_regular_file_nofollow(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+/// Copy the login's `.credentials.json` (required) into the Lead's private
+/// home `to`, and its `.claude.json` only when `to` has none. Nothing else is
+/// copied and no symlink is followed.
+fn install_login_files(from: &Path, to: &thegn_core::fsperm::PrivateDir) -> anyhow::Result<()> {
+    let Some(creds) = read_regular(from, ".credentials.json")? else {
+        bail!("no credentials were written: run /login before exiting");
+    };
+    to.write_owner_only_atomic(".credentials.json", &creds)
+        .context("installing the Lead's credentials")?;
+    if !to
+        .entry_exists_nofollow(".claude.json")
+        .context("checking the Lead's .claude.json")?
+        && let Some(state) = read_regular(from, ".claude.json")?
+    {
+        to.write_owner_only_atomic(".claude.json", &state)
+            .context("installing the Lead's .claude.json")?;
+    }
+    Ok(())
 }
 
 /// The argv and env overlay of `[mcp_servers.<server>]` for a login: the
 /// placeholder-expanded argv, the env with its secret refs resolved by the
-/// same function the daemon's `mcp_proxy.profile_env` uses, then the private
-/// MCP dir's cache and auth env (created).
+/// same function the daemon's `mcp_proxy.profile_env` uses, package caches in
+/// a fresh tempdir (the Lead can write its own caches, so a planted package
+/// there must never run on the host), and `MCP_REMOTE_CONFIG_DIR` at the
+/// private MCP dir's `mcp-auth` (token data only, so the Lead can use the
+/// login). The tempdir is held until the login ends.
 fn mcp_login(
     cfg: &Config,
     server: &str,
     state_home: &Path,
-) -> anyhow::Result<(Vec<String>, BTreeMap<String, String>)> {
+) -> anyhow::Result<(Vec<String>, BTreeMap<String, String>, tempfile::TempDir)> {
     check_mcp_member(cfg, server)?;
     let srv = cfg
         .mcp_servers
@@ -140,9 +213,28 @@ fn mcp_login(
     }
     let mut env = crate::mcp_proxy::resolve_server_env(server, &spec.env)
         .map_err(|e| anyhow::anyhow!("MCP server {server:?}: {e}"))?;
+    let tmp = tempfile::Builder::new()
+        .prefix("thegn-lead-login-")
+        .tempdir()
+        .context("creating fresh package caches for the login")?;
+    let at = |sub: &str| tmp.path().join(sub).to_string_lossy().into_owned();
+    env.insert("npm_config_cache".to_string(), at("npm"));
+    env.insert("UV_CACHE_DIR".to_string(), at("uv"));
+    env.insert("BUN_INSTALL_CACHE_DIR".to_string(), at("bun"));
     let dir = crate::lead::launch::ensure_mcp_dir(state_home)?;
-    env.extend(crate::lead::launch::mcp_dir_env(&dir));
-    Ok((spec.argv, env))
+    env.insert(
+        "MCP_REMOTE_CONFIG_DIR".to_string(),
+        dir.join("mcp-auth").to_string_lossy().into_owned(),
+    );
+    Ok((spec.argv, env, tmp))
+}
+
+/// Inherit stdin/stdout/stderr so an OAuth URL or a login prompt reaches the
+/// operator.
+fn inherit_stdio(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
 }
 
 /// Run the login. Refused unless this is an operator's own terminal.
@@ -151,57 +243,51 @@ pub(crate) fn run(cfg: &Config, mcp: Option<&str>) -> anyhow::Result<()> {
         bail!(why);
     }
     if cfg.lead.is_none() {
-        bail!("the Lead is not configured: add a [lead] section naming an [[agents]] entry");
+        bail!(
+            "the Lead is not configured, or this release channel clamps [lead] off: add a [lead] \
+             section, and run with THEGN_CHANNEL=dev"
+        );
     }
     let state_home = thegn_core::util::xdg_state_home();
-    let mut cmd = match mcp {
+    match mcp {
         None => {
-            let (command, env) = agent_login(cfg, &state_home)?;
-            let argv = thegn_core::shellinv::exec_argv(&thegn_core::util::shell(), &command);
-            let (prog, rest) = argv.split_first().context("no shell to run the agent")?;
-            let mut cmd = std::process::Command::new(prog);
-            cmd.args(rest).envs(env);
+            let login = agent_login(cfg)?;
+            let dest = harness_home_dir(cfg, &state_home)?;
+            // No shell, no flags: the agent binary alone, in the fresh dir so
+            // no project `.claude/` of the operator's cwd is loaded either.
+            let mut cmd = std::process::Command::new(&login.prog);
+            cmd.envs(login.env.iter().map(|(k, v)| (k, v)))
+                .current_dir(login.tmp.path());
+            inherit_stdio(&mut cmd);
             tracing::info!(target: "thegn::lead", "lead login: running the Lead agent on the host");
             thegn_core::outln!("log in with /login, then exit");
-            cmd
+            wait_interactive(cmd)?;
+            install_login_files(login.tmp.path(), &dest)
         }
         Some(server) => {
-            let (argv, env) = mcp_login(cfg, server, &state_home)?;
+            let (argv, env, tmp) = mcp_login(cfg, server, &state_home)?;
             let (prog, rest) = argv.split_first().context("no MCP server command")?;
             // No shell: the configured argv as is.
             let mut cmd = std::process::Command::new(prog);
             cmd.args(rest).envs(env);
+            inherit_stdio(&mut cmd);
             tracing::info!(target: "thegn::lead", server, "lead login: running the Lead MCP server on the host");
             thegn_core::outln!(
                 "running MCP server {server:?} for its login; open the URL it prints, then press \
                  Ctrl-C"
             );
-            cmd
+            let result = wait_interactive(cmd);
+            drop(tmp);
+            result
         }
-    };
-    // Inherit stdin/stdout/stderr so an OAuth URL or a login prompt reaches
-    // the operator.
-    cmd.stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-    wait_interactive(cmd)
+    }
 }
 
-/// Spawn `cmd` and wait for it. On unix, SIGINT is caught for the duration so
-/// Ctrl-C ends the child (it shares the terminal's foreground process group)
-/// and thegn still reaps it.
+/// Spawn `cmd` and wait for it. Ctrl-C is caught for the duration so it ends
+/// the child (it shares the terminal's foreground process group) and thegn
+/// still reaps it; the disposition is restored on drop.
 fn wait_interactive(mut cmd: std::process::Command) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("start the signal runtime")?;
-    #[cfg(unix)]
-    let _interrupt = {
-        let _entered = rt.enter();
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .context("catch Ctrl-C for the login")?
-    };
+    let _interrupt = crate::platform::InterruptGuard::install();
     let mut child = cmd.spawn().context("start the login")?;
     let status = child.wait().context("wait for the login")?;
     tracing::info!(target: "thegn::lead", code = ?status.code(), "lead login: ended");
@@ -299,33 +385,71 @@ mod tests {
             .profiles
             .insert(profile, vec!["todoist".into()]);
         let state = tempfile::tempdir().unwrap();
-        let (argv, env) = mcp_login(&cfg, "todoist", state.path()).unwrap();
+        let (argv, env, tmp) = mcp_login(&cfg, "todoist", state.path()).unwrap();
         assert_eq!(argv, ["npx", "-y", "todoist-mcp"]);
         assert_eq!(env.get("A").map(String::as_str), Some("b"));
         let dir = std::fs::canonicalize(state.path().join("thegn/lead-harness/mcp")).unwrap();
         assert_eq!(
-            env.get("THEGN_LEAD_MCP_HOME").map(String::as_str),
-            Some(dir.to_string_lossy().as_ref())
+            env.get("MCP_REMOTE_CONFIG_DIR").map(String::as_str),
+            Some(dir.join("mcp-auth").to_string_lossy().as_ref())
         );
-        assert_eq!(
-            env.get("npm_config_cache").map(String::as_str),
-            Some(dir.join("npm").to_string_lossy().as_ref())
-        );
+        // The package caches are fresh, never the Lead-writable ones.
+        let lead_harness = state.path().join("thegn/lead-harness");
+        let canon_harness = std::fs::canonicalize(&lead_harness).unwrap();
+        for var in ["npm_config_cache", "UV_CACHE_DIR", "BUN_INSTALL_CACHE_DIR"] {
+            let v = std::path::PathBuf::from(env.get(var).expect(var));
+            assert!(
+                !v.starts_with(&lead_harness) && !v.starts_with(&canon_harness),
+                "{var}: {}",
+                v.display()
+            );
+            assert!(v.starts_with(tmp.path()), "{var}: {}", v.display());
+        }
+        assert!(!env.contains_key("THEGN_LEAD_MCP_HOME"));
     }
 
     #[test]
-    fn login_agent_env_uses_the_launch_harness_home() {
-        let cfg = lead_cfg();
-        let state = tempfile::tempdir().unwrap();
-        let state_home = std::fs::canonicalize(state.path()).unwrap();
-        let (command, env) = agent_login(&cfg, &state_home).unwrap();
-        assert!(command.starts_with("claude"), "{command}");
-        let (var, dir) = crate::lead::launch::harness_home_env(&cfg, &state_home).unwrap();
-        assert!(
-            env.iter()
-                .any(|(k, v)| *k == var && *v == dir.to_string_lossy()),
-            "{env:?}"
+    fn login_installs_only_the_credentials_and_a_missing_claude_json() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("from");
+        std::fs::create_dir(&from).unwrap();
+        let to =
+            thegn_core::fsperm::ensure_private_dir_beneath(root.path(), Path::new("to")).unwrap();
+        // A missing .credentials.json is an error.
+        let err = install_login_files(&from, &to).unwrap_err().to_string();
+        assert!(err.contains("no credentials were written"), "{err}");
+        // A symlinked .credentials.json is refused, not followed.
+        let secret = root.path().join("secret");
+        std::fs::write(&secret, "owner secret").unwrap();
+        if thegn_core::fsperm::create_symlink(&secret, &from.join(".credentials.json"), false)
+            .is_ok()
+        {
+            assert!(install_login_files(&from, &to).is_err());
+            assert!(!to.entry_exists_nofollow(".credentials.json").unwrap());
+            std::fs::remove_file(from.join(".credentials.json")).unwrap();
+        }
+        // The credentials are copied; an existing .claude.json is kept; no
+        // other file is copied.
+        std::fs::write(from.join(".credentials.json"), "creds").unwrap();
+        std::fs::write(from.join(".claude.json"), "new").unwrap();
+        std::fs::write(from.join("settings.json"), "{\"hooks\":{}}").unwrap();
+        std::fs::write(to.path().join(".claude.json"), "old").unwrap();
+        install_login_files(&from, &to).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(to.path().join(".credentials.json")).unwrap(),
+            "creds"
         );
-        assert!(dir.is_dir(), "the login creates the private home");
+        assert_eq!(
+            std::fs::read_to_string(to.path().join(".claude.json")).unwrap(),
+            "old"
+        );
+        assert!(!to.path().join("settings.json").exists());
+        // With none at the destination, .claude.json is copied.
+        std::fs::remove_file(to.path().join(".claude.json")).unwrap();
+        install_login_files(&from, &to).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(to.path().join(".claude.json")).unwrap(),
+            "new"
+        );
     }
 }
