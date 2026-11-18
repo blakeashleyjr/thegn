@@ -3504,16 +3504,22 @@ fn clamp_to_channel_drops_ssh_and_provider_envs_in_stable() {
                 },
             ),
         ]),
+        host: BTreeMap::from([(
+            "builder".to_string(),
+            crate::host_config::HostConfig::default(),
+        )]),
         ..Default::default()
     };
 
     let clamped = cfg.clamp_to_channel(Channel::Stable);
     assert_eq!(
         cfg.env.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["plain", "pod"]
+        ["plain"]
     );
     assert!(clamped.contains(&Feature::Remote));
     assert!(clamped.contains(&Feature::Providers));
+    // The Providers arm clears `[host.*]` (WS09-P1-05 relies on it).
+    assert!(cfg.host.is_empty());
 
     let mut dev = Config {
         env: BTreeMap::from([
@@ -3562,6 +3568,41 @@ fn clamp_to_channel_drops_ssh_and_provider_envs_in_stable() {
     };
     assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
     assert_eq!(dev.env.len(), 5);
+}
+
+fn k8s_only_config() -> Config {
+    use crate::config::{EnvConfig, PlacementMode};
+    Config {
+        env: BTreeMap::from([(
+            "k".to_string(),
+            EnvConfig {
+                placement: PlacementMode::K8s,
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn clamp_removes_k8s_envs_in_stable() {
+    use crate::channel::{Channel, Feature};
+    let mut cfg = k8s_only_config();
+    let clamped = cfg.clamp_to_channel(Channel::Stable);
+    assert!(
+        cfg.env.is_empty(),
+        "{:?}",
+        cfg.env.keys().collect::<Vec<_>>()
+    );
+    assert!(clamped.contains(&Feature::Remote), "{clamped:?}");
+}
+
+#[test]
+fn clamp_keeps_k8s_envs_in_dev() {
+    use crate::channel::Channel;
+    let mut cfg = k8s_only_config();
+    assert!(cfg.clamp_to_channel(Channel::Dev).is_empty());
+    assert!(cfg.env.contains_key("k"));
 }
 
 #[test]

@@ -1113,8 +1113,11 @@ impl Config {
                     let was = !self.sandbox.remote.host.is_empty();
                     self.sandbox.remote.host.clear();
                     let env_count = self.env.len();
-                    self.env
-                        .retain(|_, env| env.placement != crate::config::PlacementMode::Ssh);
+                    // Experimental remote placements: ssh and Kubernetes.
+                    self.env.retain(|_, env| {
+                        env.placement != crate::config::PlacementMode::Ssh
+                            && env.placement != crate::config::PlacementMode::K8s
+                    });
                     was || self.env.len() != env_count
                 }
                 Feature::Providers => {

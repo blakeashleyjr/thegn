@@ -81,7 +81,8 @@ pub enum Stability {
 /// enumerated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Feature {
-    /// Remote worktrees over SSH/mosh (`[sandbox.remote]`). The ssh-CLI path
+    /// Remote worktrees over SSH/mosh (`[sandbox.remote]`) and Kubernetes
+    /// placements (`[env.*] placement = "k8s"`). The ssh-CLI path
     /// works but the surface is young.
     Remote,
     /// Cloud execution providers (Fly / DO / VPS / Machine0 / Daytona) and the
