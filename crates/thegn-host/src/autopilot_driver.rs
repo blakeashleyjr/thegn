@@ -30,6 +30,55 @@ pub(crate) fn pickup(
     issues: &[Issue],
     from_assignee_me: bool,
 ) {
+    pickup_inner(
+        cfg,
+        repo_root,
+        cwd,
+        account,
+        provider,
+        issues,
+        from_assignee_me,
+    );
+}
+
+/// The daemon's entry to the same pickup path (THE-2211). The tracker tick
+/// holds the tracker lease while it calls this, so the UI's own [`pickup`]
+/// does not run for the same refresh; the durable `claim_autopilot_slots`
+/// CAS still makes a racing pickup a no-op. The worker keeps the sealed
+/// autopilot sandbox (`sealed_autopilot_sandbox`), exactly like the UI entry.
+/// Note (THE-2196): autopilot runs are not counted against any budget today,
+/// from either entry; this entry deliberately does not change that.
+pub(crate) fn pickup_from_daemon(
+    cfg: &Config,
+    repo_root: &Path,
+    cwd: &Path,
+    account: &str,
+    provider: &str,
+    issues: &[Issue],
+    from_assignee_me: bool,
+) {
+    pickup_inner(
+        cfg,
+        repo_root,
+        cwd,
+        account,
+        provider,
+        issues,
+        from_assignee_me,
+    );
+}
+
+/// The shared pickup body: hold check, then a background permit, then the
+/// durable claim, in that order, for every entry.
+fn pickup_inner(
+    cfg: &Config,
+    repo_root: &Path,
+    cwd: &Path,
+    account: &str,
+    provider: &str,
+    issues: &[Issue],
+    from_assignee_me: bool,
+) {
     let policy = cfg.repo_autopilot(repo_root);
     if !policy.enabled {
         return;
@@ -1140,14 +1189,37 @@ mod tests {
     fn autopilot_pickup_hold_runs_before_any_claim() {
         let source = include_str!("autopilot_driver.rs");
         let production = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap().0;
-        let pickup_start = production.find("pub(crate) fn pickup(").unwrap();
-        let pickup_end = production[pickup_start..].find("\n}\n").unwrap() + pickup_start;
-        let pickup = &production[pickup_start..pickup_end];
+        fn fn_body<'a>(production: &'a str, signature: &str) -> &'a str {
+            let start = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} not found"));
+            let end = production[start..].find("\n}\n").unwrap() + start;
+            &production[start..end]
+        }
+        let body = |signature: &str| fn_body(production, signature);
+        // Both entries (UI and daemon) go through the one shared body, and
+        // neither reaches a permit or a claim on its own.
+        for entry in [
+            "pub(crate) fn pickup(",
+            concat!("pub(crate) fn pickup_", "from_daemon("),
+        ] {
+            let entry_body = body(entry);
+            assert!(
+                entry_body.contains(concat!("pickup_", "inner(")),
+                "{entry} must delegate to the shared pickup body"
+            );
+            assert!(!entry_body.contains(concat!("bg_", "permit()")), "{entry}");
+            assert!(
+                !entry_body.contains(concat!("claim_autopilot_", "slots(")),
+                "{entry}"
+            );
+        }
+        let pickup = body(concat!("fn pickup_", "inner("));
         let hold = pickup.find(concat!("autopilot_", "pickup_hold()")).unwrap();
         let permit = pickup.find(concat!("bg_", "permit()")).unwrap();
         let claim = pickup.find(concat!("claim_autopilot_", "slots(")).unwrap();
         assert!(hold < permit);
-        assert!(hold < claim);
+        assert!(permit < claim);
     }
 
     #[test]
