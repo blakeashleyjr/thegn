@@ -1181,13 +1181,35 @@ impl RemoteProvider for SpritesProvider {
             })?;
             let dir = self.ledger_dir();
             {
-                let (dir, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
-                tokio::task::spawn_blocking(move || {
-                    crate::sprites::ledger::prove_owned_at(&dir, &scope, &name, &legacy)
+                let (ledger, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
+                let proof = tokio::task::spawn_blocking(move || {
+                    crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
                 })
                 .await
-                .context("sprites: ledger worker failed")?
-                .with_context(|| format!("sprites: refusing to delete {id}"))?;
+                .context("sprites: ledger worker failed")?;
+                if let Err(refusal) = proof {
+                    // No proof. Teardown stays idempotent: a record dropped by an
+                    // earlier destroy or by `env reap --apply` must not turn a
+                    // second teardown into an error. One non-mutating GET decides;
+                    // only a definite 404 (nothing to delete) is OK. The DELETE is
+                    // never sent on this path.
+                    let gone = match self
+                        .client
+                        .get(self.sprite_name_url(id)?)
+                        .bearer_auth(&self.token)
+                        .timeout(CONTROL_TIMEOUT)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => resp.status() == reqwest::StatusCode::NOT_FOUND,
+                        Err(_) => false,
+                    };
+                    if gone {
+                        self.forget_record(&dir, id).await;
+                        return Ok(());
+                    }
+                    return Err(refusal.context(format!("sprites: refusing to delete {id}")));
+                }
             }
             let _permit = CONTROL_GATE.acquire_priority(&self.authority()?).await?;
             // Validate custody before the irreversible remote delete. A corrupt
