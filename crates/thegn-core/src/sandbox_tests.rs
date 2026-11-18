@@ -319,13 +319,13 @@ fn build_vpn_spec_carries_knobs_and_optional_image() {
     let mut cfg = vpn_cfg(VpnProviderKind::Wireguard);
     cfg.mode = VpnMode::Proxy;
     cfg.on_error = VpnOnError::Offline;
-    cfg.dns = VpnDnsMode::FilterFront;
+    cfg.dns = VpnDnsMode::FilterOnly;
     cfg.ready_timeout_secs = 7;
     cfg.ephemeral = false;
     let spec = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
     assert_eq!(spec.mode, VpnMode::Proxy);
     assert_eq!(spec.on_error, VpnOnError::Offline);
-    assert_eq!(spec.dns_mode, VpnDnsMode::FilterFront);
+    assert_eq!(spec.dns_mode, VpnDnsMode::FilterOnly);
     assert_eq!(spec.ready_timeout, Duration::from_secs(7));
     assert!(!spec.ephemeral);
     // Empty sidecar_image -> None; set -> Some.

@@ -34,6 +34,13 @@ the only honest option for bwrap/systemd), `in_container`, or `netns`.
 `on_error` decides what happens when the tunnel will not come up: `fail`
 refuses to launch, `warn` launches anyway, `offline` forces
 `network=none` so nothing leaks onto the host network.
+A VPN is a route, not egress control: thegn never reports a tunnel as
+enforcing the allow/block lists. `dns` picks how resolution composes with the
+overlay: `tunnel` (default) lets the overlay own resolution; `filter-only`
+drops the overlay's pushed DNS (such as Tailscale MagicDNS) so the runtime's
+default resolver is used; `filter-front` is reserved, warns and behaves as
+`tunnel`, and `thegn config validate --strict` rejects it. No mode filters
+hostnames.
 
 A running VPN sidecar is reused only when its tunnel configuration matches.
 Otherwise the result follows `on_error`: `fail` refuses launch, `warn`

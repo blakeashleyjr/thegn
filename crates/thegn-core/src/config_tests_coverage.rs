@@ -2020,13 +2020,41 @@ fn vpn_mode_and_dns_aliases() {
         VpnMode::InContainer
     );
     assert_eq!(
-        VpnDnsMode::from_str_validated("filter_front").unwrap(),
-        VpnDnsMode::FilterFront
+        VpnDnsMode::from_str_validated("filter_only").unwrap(),
+        VpnDnsMode::FilterOnly
     );
     assert_eq!(
         VpnOnError::from_str_validated("offline").unwrap(),
         VpnOnError::Offline
     );
+}
+
+#[test]
+fn filter_front_is_reserved_and_strict_rejects() {
+    assert!(VpnDnsMode::FilterFront.is_reserved());
+    assert!(!VpnDnsMode::Tunnel.is_reserved());
+    assert!(!VpnDnsMode::FilterOnly.is_reserved());
+    for spelling in ["filter-front", "filter_front"] {
+        let error = VpnDnsMode::from_str_validated(spelling).unwrap_err();
+        assert!(error.contains("reserved"), "{spelling}: {error}");
+        let errors =
+            crate::config_validate::validate_str(&format!("[sandbox.vpn]\ndns = \"{spelling}\"\n"));
+        assert!(
+            errors.iter().any(|error| error.contains("reserved")),
+            "{spelling}: {errors:?}"
+        );
+    }
+    let errors = crate::config_validate::validate_str("[sandbox.vpn]\ndns = \"filter-only\"\n");
+    assert!(
+        !errors.iter().any(|error| error.contains("reserved")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn filter_front_lenient_load_behaves_as_tunnel() {
+    let cfg: Config = toml::from_str("[sandbox.vpn]\ndns = \"filter-front\"\n").unwrap();
+    assert_eq!(cfg.sandbox.vpn.dns, VpnDnsMode::Tunnel);
 }
 
 #[test]
@@ -2036,7 +2064,7 @@ fn vpn_config_parses_from_toml_subtables() {
 [sandbox.vpn]
 provider = "headscale"
 mode = "proxy"
-dns = "filter-front"
+dns = "filter-only"
 ready_timeout_secs = 12
 ephemeral = false
 
@@ -2056,7 +2084,7 @@ config_path = "/etc/wireguard/wg0.conf"
     let v = &cfg.sandbox.vpn;
     assert_eq!(v.provider, VpnProviderKind::Headscale);
     assert_eq!(v.mode, VpnMode::Proxy);
-    assert_eq!(v.dns, VpnDnsMode::FilterFront);
+    assert_eq!(v.dns, VpnDnsMode::FilterOnly);
     assert_eq!(v.ready_timeout_secs, 12);
     assert!(!v.ephemeral);
     assert_eq!(v.tailscale.login_server, "https://headscale.example.com");
