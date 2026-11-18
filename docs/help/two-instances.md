@@ -15,12 +15,14 @@ can be rebuilt and restarted freely without touching the stable one.
 | Binary      | the installed binary (`~/.local/lib/thegn/thegn` after `just live`) | `target/debug/thegn` in the checkout       |
 | Launch      | `thegn`, or `just live` to update it                                | `just dev`                                 |
 | Config dir  | `~/.config/thegn`                                                   | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`) |
-| State       | the default state dir                                               | `~/.thegn-dev/state` (`XDG_STATE_HOME`)    |
-| Runtime     | the default runtime dir                                             | `~/.thegn-dev/run` (`XDG_RUNTIME_DIR`)     |
-| `THEGN_DIR` | `~/.thegn`                                                          | `~/.thegn-dev/home`                        |
+| State       | the default state dir                                               | `~/.thegn-devel/state` (`XDG_STATE_HOME`)  |
+| Runtime     | the default runtime dir                                             | `~/.thegn-devel/run` (`XDG_RUNTIME_DIR`)   |
+| `THEGN_DIR` | `~/.thegn`                                                          | `~/.thegn-devel/home`                      |
 | Channel     | stable                                                              | dev (`THEGN_CHANNEL=dev`)                  |
 
 Each instance has its own daemon, database, worktrees and config.
+
+`just start` and `just start-dev` remain throwaway instances with their own state but the shared config.
 
 ## Set it up
 
@@ -48,7 +50,7 @@ These are not separated, and you should know it:
 ## Which instance is this?
 
 `thegn doctor` prints an instance block: run it in a pane to see the
-state, runtime and config directories that pane belongs to.
+binary, config dir, state dir, `THEGN_DIR`, channel and daemon socket that pane belongs to.
 
 ## CLI calls against the dev instance
 
