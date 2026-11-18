@@ -1166,6 +1166,8 @@ mod tests {
         assert!(!eager_allows(false, Some("vercel")));
         assert!(eager_allows(true, Some("vercel")));
         assert!(eager_allows(false, Some("daytona")));
+        assert!(!eager_allows(false, Some("sprites")));
+        assert!(eager_allows(true, Some("sprites")));
         assert!(eager_allows(false, None));
     }
 
