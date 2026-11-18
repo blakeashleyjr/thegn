@@ -770,6 +770,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
         RefusalClass::ContainerOwner,
+        RefusalClass::NetworkUnexpressible,
     ] {
         let error = refusal(
             &spec,
@@ -808,6 +809,7 @@ fn refusal_remediation_every_class_has_label_and_text() {
         RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
         RefusalClass::ContainerOwner,
+        RefusalClass::NetworkUnexpressible,
     ] {
         let label = class.label();
         assert!(!label.is_empty());
@@ -1152,6 +1154,80 @@ fn oci_create_opts_map_userns_and_mounts() {
     assert!(j.contains("-v /repo/.git:/repo/.git"));
     assert!(j.contains("-e GH_TOKEN=abc"));
     assert!(j.contains("-p 8080:8080"));
+}
+
+#[test]
+fn apple_network_none_is_refused_before_argv() {
+    let mut s = spec(Backend::Apple);
+    s.network = Network::None;
+    for result in [
+        enter_argv(&s, "true").map(|_| ()),
+        launchable_with(&s, &[]).map(|_| ()),
+    ] {
+        match result {
+            Err(EnterError::Refused(refusal)) => {
+                assert_eq!(refusal.class, RefusalClass::NetworkUnexpressible);
+                assert_eq!(refusal.backend, "apple");
+                assert!(refusal.path.is_none());
+                assert!(refusal.message.contains("network = \"none\""));
+            }
+            other => panic!("expected network-unexpressible refusal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn apple_sealed_profile_is_refused() {
+    // The sealed profile forces `network = "none"`; the network refusal names
+    // the real reason ahead of the strict hardening gate.
+    let mut s = spec(Backend::Apple);
+    s.network = Network::None;
+    s.seal_home = Some("/home/test".into());
+    s.read_only_root = true;
+    s.no_new_privileges = true;
+    s.pids_limit = Some(256);
+    s.drop_capabilities = vec!["ALL".into()];
+    match launchable_with(&s, &[]) {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::NetworkUnexpressible);
+            assert_eq!(refusal.class.label(), "network-unexpressible");
+        }
+        other => panic!("expected network-unexpressible refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn apple_nat_launches() {
+    let s = spec(Backend::Apple);
+    assert_eq!(s.network, Network::Nat);
+    assert!(network_unexpressible_refusal(&s).is_none());
+    assert!(launchable_with(&s, &[]).is_ok());
+    let j = oci_create_opts(&s).expect("valid volume names").join(" ");
+    assert!(!j.contains("--network"), "{j}");
+}
+
+#[test]
+fn podman_network_none_still_emits_flag() {
+    for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+        let mut s = spec(backend);
+        s.network = Network::None;
+        assert!(network_unexpressible_refusal(&s).is_none(), "{backend:?}");
+        let j = oci_create_opts(&s).expect("valid volume names").join(" ");
+        assert!(j.contains("--network none"), "{backend:?}: {j}");
+    }
+}
+
+#[test]
+fn refusal_class_label_is_stable() {
+    assert_eq!(
+        RefusalClass::NetworkUnexpressible.label(),
+        "network-unexpressible"
+    );
+    assert!(
+        RefusalClass::NetworkUnexpressible
+            .remediation()
+            .contains("network = \"nat\"")
+    );
 }
 
 #[test]

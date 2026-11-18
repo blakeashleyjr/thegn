@@ -19,6 +19,11 @@ an egress boundary; `network = "none"` is the only enforced deny, and `*` in
 Standalone sandboxed terminals also warn when DNS-name rules apply, because
 those rules are not an egress boundary.
 
+On the `apple` backend, `network = "none"` (and therefore `sealed`) is refused
+with `network-unexpressible` until an internal-network implementation lands:
+Apple `container` has no offline network mode. Use podman or docker (they run in
+a VM on macOS) for offline or sealed worktrees, or set `network = "nat"`.
+
 `[sandbox.vpn]` can put the sandbox on an overlay network (tailscale,
 headscale, wireguard, openvpn, netbird, zerotier). The `mode` decides how:
 `sidecar` (default, best isolation — a companion container owns the

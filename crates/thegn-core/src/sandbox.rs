@@ -696,6 +696,9 @@ pub enum RefusalClass {
     StrictUnsupported,
     /// A container with this lossy name belongs to another worktree or its owner could not be read.
     ContainerOwner,
+    /// The backend has no verified way to express the requested network mode
+    /// (Apple `container` and `network = "none"`).
+    NetworkUnexpressible,
 }
 
 impl RefusalClass {
@@ -716,6 +719,7 @@ impl RefusalClass {
             Self::ControlSocketReachable => "control-socket-reachable",
             Self::StrictUnsupported => "strict-unsupported",
             Self::ContainerOwner => "container-owner",
+            Self::NetworkUnexpressible => "network-unexpressible",
         }
     }
 
@@ -764,6 +768,9 @@ impl RefusalClass {
             }
             Self::ContainerOwner => {
                 "another worktree's sandbox container has this container's name (worktree paths that differ only in punctuation or case share one): close that worktree's sandbox first, or rename one worktree directory"
+            }
+            Self::NetworkUnexpressible => {
+                "Apple `container` cannot express `network = \"none\"` yet: use podman or docker (they run in a VM on macOS) for offline or sealed worktrees, or set `network = \"nat\"`"
             }
         }
     }
@@ -1037,6 +1044,18 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
     std::borrow::Cow::Owned(v)
 }
 
+/// The refusal message when the backend cannot express the spec's network
+/// mode: Apple `container` with `network = "none"` (which the `sealed`
+/// profile sets). WS05 removes this when Apple internal networks land.
+pub(crate) fn network_unexpressible_refusal(spec: &SandboxSpec) -> Option<String> {
+    (spec.backend == Backend::Apple && spec.network == Network::None).then(|| {
+        format!(
+            "the `{}` backend cannot express `network = \"none\"` (Apple `container run` has no offline network mode); refusing to launch with an unknown network",
+            spec.backend.label()
+        )
+    })
+}
+
 /// Every launch gate in one place: volume admission, the sealed deny filter and
 /// `$HOME` gate, and the OCI `-v` path syntax check.
 fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
@@ -1058,6 +1077,18 @@ fn launchable_guarded<'a>(
     }
     if let Some(message) = hostname_policy_refusal_with(HOSTNAME_RULES, spec) {
         return Err(refusal(spec, RefusalClass::HostnamePolicy, None, message));
+    }
+    // Apple `container run` takes `--network <name>` only: `--network none`
+    // names a network rather than removing it. Refuse before any argv (and
+    // before the sealed strict gate, so a sealed Apple launch names the real
+    // reason) instead of launching with an unknown network.
+    if let Some(message) = network_unexpressible_refusal(spec) {
+        return Err(refusal(
+            spec,
+            RefusalClass::NetworkUnexpressible,
+            None,
+            message,
+        ));
     }
     if let Some(message) = crate::sandbox_floor::strict_gate(spec) {
         return Err(refusal(
@@ -5383,6 +5414,16 @@ fn oci_create_opts_in(
     } else {
         match spec.network {
             Network::Host => v.extend(["--network".into(), "host".into()]),
+            // Apple reads `--network none` as a network NAME; the launch gate
+            // refuses this combination (`network-unexpressible`) before any
+            // argv, so emit nothing rather than attach to a network called
+            // `none`.
+            Network::None if spec.backend == Backend::Apple => {
+                debug_assert!(
+                    network_unexpressible_refusal(spec).is_none(),
+                    "apple + network=none is refused before argv (network-unexpressible)"
+                );
+            }
             Network::None => v.extend(["--network".into(), "none".into()]),
             Network::Nat => {}
         }

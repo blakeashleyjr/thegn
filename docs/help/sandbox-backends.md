@@ -47,6 +47,10 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > floor, so sandboxed panes are refused. Opt out with
 > `isolation_floor = "off"`, `backend = "none"`, `enabled = false`, or run on
 > host; `bwrap`/`systemd` are Linux-only.
+>
+> apple: `network = "none"` (and therefore `sealed`) is refused with
+> `network-unexpressible` until an internal-network implementation lands; use
+> podman or docker for offline or sealed worktrees on a Mac.
 
 > **Platform status:** the public alpha supports Linux on x86_64, where
 > `bwrap`, `systemd`, podman and docker are the backends to use. The `apple`
