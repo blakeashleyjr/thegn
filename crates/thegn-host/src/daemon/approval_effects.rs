@@ -152,8 +152,8 @@ pub(crate) fn describe(db: &Db, issue: &str, stage: &str, sha: &str) -> String {
             .and_then(|rule| crate::automation_arming::describe(db, rule, sha)),
         EffectKind::Proposal => crate::automation_proposal::describe(db, issue, stage, sha),
         EffectKind::Lane => lane_description(db, issue, stage, &sha7),
-        // Lane 4 owns the outward description (from the stored call).
-        EffectKind::Outward => None,
+        // Built by the outward gate from the call itself (lane 4).
+        EffectKind::Outward => super::lead_caps::outward::describe(issue, stage, sha),
     };
     trusted.unwrap_or_else(|| format!("unverified request: {issue} {stage} @ {sha7}"))
 }
