@@ -11,6 +11,11 @@
 //! The registry directory is shared with VPS/Fly/Vercel records: every read
 //! here filters on `provider == "sprites"`, and nothing here removes or
 //! rewrites another provider's record.
+//!
+//! [`adopt`] is the one exception to "only a record written before the create
+//! proves a sprite": adoption is the only way a sprite not created by this host
+//! becomes provable; it needs an explicit, confirmed user action
+//! (`thegn env adopt`, which asks the user to type the sprite's name).
 
 use std::path::Path;
 
@@ -117,6 +122,53 @@ pub fn reserve_at(dir: &Path, scope: &OwnerScope, name: &str, cap: usize) -> Res
     registry::reserve_at(dir, &intent, cap, ReserveScope::Provider(LEDGER_PROVIDER))
         .map_err(|error| reserve_error(name, error))?;
     Ok(IntentGuard::at(dir, name))
+}
+
+/// What [`adopt`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptOutcome {
+    /// A new `ready` record now proves the sprite ours.
+    Adopted,
+    /// A record under this scope already existed; nothing was written.
+    AlreadyOurs,
+}
+
+/// Record an existing sprite (one this host did not create) as ours, so a
+/// later destroy can prove it. Only `thegn env adopt`, after the user confirmed
+/// the sprite's name, may call this. `cap` 0 = no cap.
+pub fn adopt(scope: &OwnerScope, name: &str, cap: usize) -> Result<AdoptOutcome> {
+    adopt_at(&registry::dir(), scope, name, cap)
+}
+
+/// [`adopt`] against an explicit ledger directory.
+///
+/// - a record for another provider, controller or account → refused;
+/// - a sprites record under `scope` → [`AdoptOutcome::AlreadyOurs`] (no write);
+/// - no record → a `ready` record with `created_at = now` (the lifetime counts
+///   from adoption), reserved under the sprites cap.
+pub fn adopt_at(dir: &Path, scope: &OwnerScope, name: &str, cap: usize) -> Result<AdoptOutcome> {
+    registry::checked_name(name).context("sprites: invalid sprite name")?;
+    if scope.owner.is_empty() || scope.account.is_empty() {
+        bail!("sprites: no owner scope; refusing to adopt {name}");
+    }
+    let existing = registry::read_checked_at(dir, name)
+        .with_context(|| format!("sprites: cannot read the ledger record for {name}"))?;
+    match existing {
+        Some(existing) if existing.provider != LEDGER_PROVIDER => bail!(
+            "sprites: the name {name} is recorded by another provider ({}); refusing to adopt it",
+            existing.provider
+        ),
+        Some(existing) if in_scope(&existing, scope) => return Ok(AdoptOutcome::AlreadyOurs),
+        Some(_) => {
+            bail!("sprites: {name} is recorded by another controller/account; refusing to adopt it")
+        }
+        None => {}
+    }
+    let cap = if cap == 0 { usize::MAX } else { cap };
+    let adopted = record(scope, name, "ready", thegn_core::util::now());
+    registry::reserve_at(dir, &adopted, cap, ReserveScope::Provider(LEDGER_PROVIDER))
+        .map_err(|error| reserve_error(name, error))?;
+    Ok(AdoptOutcome::Adopted)
 }
 
 /// Mark `name` `ready` after a successful create.
@@ -468,6 +520,103 @@ mod tests {
             registry::read_checked_at(dir.path(), "vx-a")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn adopt_writes_a_ready_record_that_proves_ownership() {
+        let (_state, dir) = ledger();
+        assert!(prove_owned_at(dir.path(), &scope(), "sx-adopt", &[]).is_err());
+        let before = thegn_core::util::now();
+        assert_eq!(
+            adopt_at(dir.path(), &scope(), "sx-adopt", 0).unwrap(),
+            AdoptOutcome::Adopted
+        );
+        let rec = registry::read_checked_at(dir.path(), "sx-adopt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.provider, "sprites");
+        assert_eq!(rec.state, "ready");
+        assert_eq!(rec.instance_id, "sx-adopt");
+        assert_eq!(rec.owner, "ctl-a");
+        assert_eq!(rec.account, "acct1-a");
+        assert!(rec.created_at >= before, "lifetime counts from adoption");
+        assert_eq!(
+            prove_owned_at(dir.path(), &scope(), "sx-adopt", &[]).unwrap(),
+            Proof::Ledger
+        );
+    }
+
+    #[test]
+    fn adopt_an_already_recorded_sprite_is_a_no_op() {
+        let (_state, dir) = ledger();
+        reserve_at(dir.path(), &scope(), "sx-a", 0)
+            .unwrap()
+            .preserve();
+        let before = registry::read_checked_at(dir.path(), "sx-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            adopt_at(dir.path(), &scope(), "sx-a", 1).unwrap(),
+            AdoptOutcome::AlreadyOurs
+        );
+        let after = registry::read_checked_at(dir.path(), "sx-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after, "an existing record is not rewritten");
+    }
+
+    #[test]
+    fn adopt_refuses_foreign_owner_account_and_provider() {
+        let (_state, dir) = ledger();
+        reserve_at(dir.path(), &other_owner(), "sx-b", 0)
+            .unwrap()
+            .preserve();
+        reserve_at(dir.path(), &other_account(), "sx-c", 0)
+            .unwrap()
+            .preserve();
+        for name in ["sx-b", "sx-c"] {
+            let error = adopt_at(dir.path(), &scope(), name, 0).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("another controller/account"), "{text}");
+            assert!(!text.contains("acct1-"), "{text}");
+        }
+        let mut vercel = record(&scope(), "vx-a", "ready", 1);
+        vercel.provider = "vercel".into();
+        registry::write_at(dir.path(), &vercel).unwrap();
+        let error = adopt_at(dir.path(), &scope(), "vx-a", 0).unwrap_err();
+        assert!(format!("{error:#}").contains("another provider"));
+        assert_eq!(
+            registry::read_checked_at(dir.path(), "vx-a")
+                .unwrap()
+                .unwrap()
+                .provider,
+            "vercel",
+            "the vercel record is untouched"
+        );
+    }
+
+    #[test]
+    fn adopt_refuses_at_cap_and_an_empty_scope() {
+        let (_state, dir) = ledger();
+        adopt_at(dir.path(), &scope(), "sx-a", 1).unwrap();
+        let error = adopt_at(dir.path(), &scope(), "sx-b", 1).unwrap_err();
+        assert!(format!("{error:#}").contains("max_instances"), "{error:#}");
+        assert!(
+            registry::read_checked_at(dir.path(), "sx-b")
+                .unwrap()
+                .is_none()
+        );
+        let empty = OwnerScope {
+            owner: String::new(),
+            account: String::new(),
+        };
+        assert!(adopt_at(dir.path(), &empty, "sx-c", 0).is_err());
+        assert!(adopt_at(dir.path(), &scope(), "", 0).is_err());
+        assert!(
+            registry::read_checked_at(dir.path(), "sx-c")
+                .unwrap()
+                .is_none()
         );
     }
 
