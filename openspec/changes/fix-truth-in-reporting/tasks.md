@@ -23,12 +23,12 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 ## 3. Reserved kinds
 
 - [x] 3.1 WS01-P3-01: reserve `smol` and `appcontainer`; reserved kinds are never runtime candidates
-- [ ] 3.2 WS01-P3-02: smol cleanup (labels, dead docker-clone arms, lists)
+- [x] 3.2 WS01-P3-02: smol cleanup (labels, dead docker-clone arms, lists)
 
 ## 4. Remote truth
 
-- [ ] 4.1 WS01-P4-01: Daytona maintenance flag, doctor line and config example
-- [ ] 4.2 WS01-P4-02: Fly stale comments and config text
+- [x] 4.1 WS01-P4-01: Daytona maintenance flag, doctor line and config example
+- [x] 4.2 WS01-P4-02: Fly stale comments and config text
 - [ ] 4.3 WS01-P4-03: ssh `ControlMux` (Windows off, long paths off)
 
 ## 5. Docs, spec and posture

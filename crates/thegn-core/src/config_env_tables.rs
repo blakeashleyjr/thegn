@@ -521,9 +521,10 @@ impl EnvProviderKind {
 
     /// Whether this provider's lifecycle (provision, teardown, orphan reaping,
     /// and warm pool) has not been verified against a live account. `thegn doctor`
-    /// displays this state by owner decision THE-142.
+    /// displays this state by owner decision THE-142, and for Daytona because
+    /// its upstream is in maintenance (closed-core, archived public repo).
     pub fn live_unverified(self) -> bool {
-        matches!(self, Self::Hetzner | Self::Vercel)
+        matches!(self, Self::Hetzner | Self::Daytona | Self::Vercel)
     }
 
     /// Credential-free kind: no host credential (agent logins, dotfiles,
@@ -1235,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn live_unverified_marks_hetzner_and_vercel() {
+    fn live_unverified_marks_hetzner_daytona_and_vercel() {
         for kind in [
             EnvProviderKind::Custom,
             EnvProviderKind::Daytona,
@@ -1247,11 +1248,10 @@ mod tests {
             EnvProviderKind::Vercel,
         ] {
             match kind {
-                EnvProviderKind::Hetzner | EnvProviderKind::Vercel => {
+                EnvProviderKind::Hetzner | EnvProviderKind::Daytona | EnvProviderKind::Vercel => {
                     assert!(kind.live_unverified(), "{kind:?} is live-unverified");
                 }
                 EnvProviderKind::Custom
-                | EnvProviderKind::Daytona
                 | EnvProviderKind::Sprites
                 | EnvProviderKind::DigitalOcean
                 | EnvProviderKind::Fly

@@ -64,7 +64,7 @@ pub fn classify_worker(facts: &WorkerFacts<'_>) -> WorkerReadiness {
     }
     if !matches!(
         facts.backend,
-        Backend::Bwrap | Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol
+        Backend::Bwrap | Backend::Podman | Backend::PodmanRootful | Backend::Docker
     ) {
         return WorkerReadiness::UnsupportedBackend;
     }
@@ -247,6 +247,17 @@ mod tests {
         };
 
         assert_eq!(classify_worker(&facts), WorkerReadiness::ContainmentAbsent);
+    }
+
+    #[test]
+    fn worker_ready_smol_not_proven() {
+        let mounts = [m("/work/tree", false)];
+        let facts = WorkerFacts {
+            backend: Backend::Smol,
+            ..facts(&mounts, Path::new("/work/tree"))
+        };
+
+        assert_eq!(classify_worker(&facts), WorkerReadiness::UnsupportedBackend);
     }
 
     #[test]

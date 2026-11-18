@@ -406,6 +406,8 @@ fn isolation_for(
         }
         // Apple's `container` runs each container in its own lightweight VM.
         Backend::Apple => IsolationClass::GuestKernel,
+        // The reserved smol and wsl under-promise as shared-kernel; neither is
+        // ever selected.
         Backend::Podman
         | Backend::PodmanRootful
         | Backend::Docker

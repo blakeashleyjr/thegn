@@ -142,7 +142,8 @@ pub fn observed(argv: &[String]) -> Backend {
             "systemd-run" => return Backend::Systemd,
             // Apple's runtime CLI is literally `container`.
             "container" => return Backend::Apple,
-            "smolmachines" => return Backend::Smol,
+            // The reserved smol: the real smolvm binary and the legacy word.
+            "smolvm" | "smolmachines" => return Backend::Smol,
             "wsl.exe" => return Backend::Wsl,
             _ => {}
         }
