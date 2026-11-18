@@ -1139,3 +1139,27 @@ fn create_with_a_dropped_connection_keeps_the_creating_record() {
         "an ambiguous create keeps its intent for the reaper"
     );
 }
+
+#[test]
+fn destroy_of_an_adopted_sprite_sends_one_delete() {
+    let (base, deletes) = start_delete_mock(0);
+    let (p, ledger) = scoped(&base, "sx-adopted");
+    // Not ours until adopted: no DELETE.
+    rt().block_on(p.destroy("sx-adopted")).unwrap_err();
+    assert_eq!(*deletes.lock().unwrap(), 0);
+    assert_eq!(
+        thegn_svc::sprites::ledger::adopt_at(ledger.path(), &scope(), "sx-adopted", 0).unwrap(),
+        thegn_svc::sprites::ledger::AdoptOutcome::Adopted
+    );
+    assert_eq!(
+        ledger_state(&ledger, "sx-adopted").as_deref(),
+        Some("ready")
+    );
+    rt().block_on(p.destroy("sx-adopted")).unwrap();
+    assert_eq!(*deletes.lock().unwrap(), 1, "exactly one DELETE");
+    assert_eq!(
+        ledger_state(&ledger, "sx-adopted"),
+        None,
+        "record forgotten"
+    );
+}
