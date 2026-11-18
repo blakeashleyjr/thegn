@@ -134,7 +134,7 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
     let tx = tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        drive_blocking(&cfg, &any_path, |m: PrqMsg| {
+        drive_blocking(&cfg, &any_path, DriveMode::Ui, |m: PrqMsg| {
             if tx.send(m).is_ok() {
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
@@ -142,9 +142,71 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
     });
 }
 
-/// The blocking body of [`spawn_drive`], separated so the entry gates are
-/// testable without a runtime.
-fn drive_blocking(cfg: &Config, any_path: &std::path::Path, send: impl Fn(PrqMsg)) {
+/// Who runs a PR queue pass (THE-2211).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriveMode {
+    /// The UI's ticker / `D` / palette pass. Unchanged behaviour, except that
+    /// while the daemon owns the PR queue producer it only reloads.
+    Ui,
+    /// The daemon's headless producer pass: an agent handoff happens only when
+    /// `[pr_queue] agent_sandbox` is on and the agent clears a shared-kernel
+    /// (or stricter) floor with a fail-closed miss; otherwise the blocker is
+    /// reported, never fixed (the notify degrade).
+    Daemon,
+}
+
+/// Whether a UI pass yields to the daemon: it skips every remote call and only
+/// reloads the panel from the DB cache the daemon writes.
+fn ui_yields_to_daemon(mode: DriveMode, daemon_owns: bool) -> bool {
+    mode == DriveMode::Ui && daemon_owns
+}
+
+/// The queue policy a daemon pass runs under, from the repo-resolved policy
+/// `pq` and the global `[pr_queue]` block. Pure.
+///
+/// - Agent sandbox off (globally or for the repo): no agent is resolved
+///   (`agent` and `agent_command` cleared), so the driver reports the blocker
+///   and never dispatches — it degrades to notify. A daemon pass never runs an
+///   agent on the host.
+/// - Agent sandbox on: the floor is the strictest of the global floor, the
+///   repo floor and shared-kernel, and a miss fails closed (the driver's
+///   `agent_floor_gate` holds the entry; no agent starts).
+fn daemon_queue_policy(
+    global: &thegn_core::config::PrQueueConfig,
+    pq: &thegn_core::config::PrQueueConfig,
+) -> thegn_core::config::PrQueueConfig {
+    use thegn_core::config::{IsolationFloor, OnFloorMiss};
+    let mut out = pq.clone();
+    if !(global.agent_sandbox && pq.agent_sandbox) {
+        out.agent.clear();
+        out.agent_command.clear();
+        out.agent_sandbox = false;
+        return out;
+    }
+    let rank = |floor: IsolationFloor| floor.required_rank().unwrap_or(0);
+    let floor = [
+        global.agent_isolation_floor,
+        pq.agent_isolation_floor,
+        IsolationFloor::SharedKernel,
+    ]
+    .into_iter()
+    .max_by_key(|floor| rank(*floor))
+    .unwrap_or(IsolationFloor::SharedKernel);
+    out.agent_sandbox = true;
+    out.agent_isolation_floor = floor;
+    out.agent_on_floor_miss = OnFloorMiss::Fail;
+    out
+}
+
+/// The blocking body of a PR queue pass: [`spawn_drive`] runs it in
+/// [`DriveMode::Ui`], the daemon's PR queue producer in [`DriveMode::Daemon`].
+/// Separated so the entry gates are testable without a runtime.
+pub(crate) fn drive_blocking(
+    cfg: &Config,
+    any_path: &std::path::Path,
+    mode: DriveMode,
+    send: impl Fn(PrqMsg),
+) {
     {
         let Some(root) = crate::integrate::main_checkout(any_path) else {
             send(PrqMsg::Failed("not inside a git repository".into()));
@@ -165,6 +227,20 @@ fn drive_blocking(cfg: &Config, any_path: &std::path::Path, send: impl Fn(PrqMsg
             send(PrqMsg::Done(Box::default()));
             return;
         }
+        // THE-2211: while the daemon holds the PR queue lease, a UI pass makes
+        // no forge call and dispatches nothing; `Done` reloads the panel from
+        // the DB rows the daemon writes.
+        if ui_yields_to_daemon(
+            mode,
+            crate::producer_yield::daemon_owns(thegn_core::producer_lease::ProducerKind::PrQueue),
+        ) {
+            send(PrqMsg::Done(Box::default()));
+            return;
+        }
+        let pq = match mode {
+            DriveMode::Ui => pq,
+            DriveMode::Daemon => daemon_queue_policy(&cfg.pr_queue, &pq),
+        };
         let db = match Db::open() {
             Ok(d) => d,
             Err(e) => {
@@ -1072,13 +1148,86 @@ mod tests {
         cfg.workspace.insert("acme".into(), Default::default());
         cfg.workspace.insert("ACME".into(), Default::default());
         let sent = std::cell::RefCell::new(Vec::new());
-        drive_blocking(&cfg, &repo, |m| sent.borrow_mut().push(m));
+        drive_blocking(&cfg, &repo, DriveMode::Ui, |m| sent.borrow_mut().push(m));
         let sent = sent.into_inner();
         assert_eq!(sent.len(), 1);
         assert!(
             matches!(&sent[0], PrqMsg::Failed(m) if m.contains("refused") && m.contains("`ACME`")),
             "refusal must be reported, not a drive pass"
         );
+    }
+
+    fn agent_queue(sandbox: bool) -> thegn_core::config::PrQueueConfig {
+        thegn_core::config::PrQueueConfig {
+            enabled: true,
+            agent_command: "fixer {prompt}".into(),
+            agent: "claude".into(),
+            agent_sandbox: sandbox,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn daemon_mode_without_agent_sandbox_degrades_to_notify() {
+        // Off globally, or off for the repo: no agent resolves, so the driver
+        // reports the blocker and dispatches nothing.
+        for (global, repo) in [(false, false), (false, true), (true, false)] {
+            let policy = daemon_queue_policy(&agent_queue(global), &agent_queue(repo));
+            assert!(!policy.agent_sandbox);
+            assert!(policy.agent.is_empty() && policy.agent_command.is_empty());
+            assert_eq!(
+                thegn_core::agent_task::resolve_agent(
+                    &Config::default(),
+                    &policy.agent,
+                    &policy.agent_command
+                ),
+                None,
+                "global={global} repo={repo}: a daemon pass must not resolve an agent"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_mode_with_agent_sandbox_demands_shared_kernel_and_fails_closed() {
+        use thegn_core::config::{IsolationFloor, OnFloorMiss};
+        let policy = daemon_queue_policy(&agent_queue(true), &agent_queue(true));
+        assert!(policy.agent_sandbox);
+        assert_eq!(policy.agent_command, "fixer {prompt}");
+        assert_eq!(policy.agent_isolation_floor, IsolationFloor::SharedKernel);
+        assert_eq!(policy.agent_on_floor_miss, OnFloorMiss::Fail);
+
+        // A stricter configured floor (global or repo) is kept, never lowered.
+        let mut strict = agent_queue(true);
+        strict.agent_isolation_floor = IsolationFloor::GuestKernel;
+        let policy = daemon_queue_policy(&agent_queue(true), &strict);
+        assert_eq!(policy.agent_isolation_floor, IsolationFloor::GuestKernel);
+        let policy = daemon_queue_policy(&strict, &agent_queue(true));
+        assert_eq!(policy.agent_isolation_floor, IsolationFloor::GuestKernel);
+    }
+
+    #[test]
+    fn ui_pass_yields_only_while_the_daemon_owns_the_queue() {
+        assert!(ui_yields_to_daemon(DriveMode::Ui, true));
+        assert!(!ui_yields_to_daemon(DriveMode::Ui, false));
+        // The daemon's own pass never yields to itself.
+        assert!(!ui_yields_to_daemon(DriveMode::Daemon, true));
+        assert!(!ui_yields_to_daemon(DriveMode::Daemon, false));
+    }
+
+    #[test]
+    fn ui_yield_and_daemon_policy_precede_any_forge_work() {
+        let source = include_str!("pr_queue.rs");
+        let production = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap().0;
+        let start = production.find("pub(crate) fn drive_blocking(").unwrap();
+        let end = production[start..].find("\n}\n").unwrap() + start;
+        let body = &production[start..end];
+        let yield_at = body.find(concat!("ui_yields_", "to_daemon(")).unwrap();
+        let policy_at = body.find(concat!("daemon_queue_", "policy(")).unwrap();
+        let db_at = body.find(concat!("Db::", "open()")).unwrap();
+        let forge_at = body.find(concat!("forge_handle::", "get()")).unwrap();
+        let drive_at = body.find(concat!("pr_driver::", "drive_queue(")).unwrap();
+        assert!(yield_at < db_at && yield_at < forge_at);
+        assert!(policy_at < drive_at);
     }
 
     #[test]
@@ -1091,7 +1240,7 @@ mod tests {
         ws.pr_queue.enabled = Some(false);
         cfg.workspace.insert("acme".into(), ws);
         let sent = std::cell::RefCell::new(Vec::new());
-        drive_blocking(&cfg, &repo, |m| sent.borrow_mut().push(m));
+        drive_blocking(&cfg, &repo, DriveMode::Ui, |m| sent.borrow_mut().push(m));
         let sent = sent.into_inner();
         assert_eq!(sent.len(), 1);
         match &sent[0] {
