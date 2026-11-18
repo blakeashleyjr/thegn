@@ -43,6 +43,15 @@ issue that is already active. Then:
 
 Concurrency is your judgement; start small.
 
+### Answering a blocked worker
+
+When the overview or a snapshot (`sessions_snapshot`, `sessions_wait`) shows a
+worker you opened waiting on a question, answer it with `sessions_input`: plain
+text, with `enter` set to send it. Only workers you opened accept your input,
+and only plain text (no escape sequences or control keys). If the tool is not
+available, or the question needs a human decision, request an approval or
+leave a note instead of guessing.
+
 ## 3. Hand to review
 
 When a worker reports done, open a review session with `sessions_open` (a
