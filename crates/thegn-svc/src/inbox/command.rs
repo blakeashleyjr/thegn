@@ -567,7 +567,7 @@ fn map_run_error(scrub: &SecretScrub, e: PluginError) -> InboxError {
 
 /// Turn a finished run into a page, or the error that fails it.
 fn finish(run: StreamRun<ItemSink>, resumed: bool) -> Result<InboxPage, InboxError> {
-    let sink = run.sink;
+    let mut sink = run.sink;
     for j in &sink.junk {
         tracing::warn!(
             target: TARGET,
@@ -575,7 +575,7 @@ fn finish(run: StreamRun<ItemSink>, resumed: bool) -> Result<InboxPage, InboxErr
             "inbox command wrote a non-JSON line to stdout — diagnostics belong on stderr or in a `log` message"
         );
     }
-    if let Some(e) = sink.error {
+    if let Some(e) = sink.error.take() {
         return Err(match e {
             InboxError::Parse(text) => InboxError::Parse(format!("{text}{}", sink.junk_suffix())),
             other => other,
