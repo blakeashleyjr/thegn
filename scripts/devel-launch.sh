@@ -9,7 +9,7 @@ root="$home/.thegn-devel"
 state="$root/state"
 run="$root/run"
 cfg="$home/.config/thegn-dev"
-bin="${THEGN_DEVEL_BIN:-$checkout/target/debug/thegn}"
+bin="${THEGN_DEVEL_BIN:-$root/bin/thegn}"
 pane_vars="THEGN_SESSION_ID THEGN_CONTROL_SOCKET THEGN_WORKTREE THEGN_BRANCH THEGN_WORKSPACE THEGN_REPO_ROOT THEGN_SANDBOX THEGN_SANDBOX_NETWORK THEGN_SANDBOX_ENABLED THEGN_FORKED_FROM THEGN_FORK_SCROLLBACK THEGN_ROUTE_TOKEN THEGN_ROUTE_ORIGIN THEGN_PROMPT THEGN_EVENT THEGN_BIN"
 
 host_session_env() {
@@ -87,13 +87,101 @@ standalone() {
 
 check_launch() {
   if [ ! -x "$bin" ]; then
-    echo "devel-launch: $bin is missing; build it first with 'just devel' (builds and starts) or 'cargo build'" >&2
+    echo "devel-launch: $bin is missing; build it with 'just live' (release) or 'just devel' (debug)" >&2
     exit 1
   fi
-  if [ ! -d "$cfg" ]; then
-    echo "just devel: $cfg does not exist; seed it first: cp -r '$home/.config/thegn' '$cfg' (review it for secrets)" >&2
+  seed_config
+}
+
+dev_ports() {
+  awk '
+  function close_table() {
+    if (table == "serve" && !table_done) print "bind = \"127.0.0.1:5381\""
+    if (table == "model_proxy" && !table_done) print "listen = \"127.0.0.1:8384\""
+  }
+  function shifted_port(line,    port) {
+    if (match(line, /:[0-9]+"/)) {
+      port = substr(line, RSTART + 1, RLENGTH - 2)
+      return substr(line, 1, RSTART) (port + 1) "\"" substr(line, RSTART + RLENGTH)
+    }
+    return line
+  }
+  function warn(message) {
+    print message | "cat >&2"
+    close("cat >&2")
+  }
+  {
+    if ($0 ~ /^[ \t]*model_proxy[ \t]*[.=]/) model_proxy_key = 1
+    if ($0 ~ /^[ \t]*serve[ \t]*[.=]/) serve_key = 1
+
+    if ($0 ~ /^[ \t]*\[\[/) {
+      close_table()
+      table = ""
+      table_done = 0
+      print
+      next
+    }
+    if ($0 ~ /^[ \t]*\[[^]]*\][ \t]*(#.*)?$/) {
+      close_table()
+      table = $0
+      sub(/^[ \t]*\[/, "", table)
+      sub(/\][ \t]*(#.*)?$/, "", table)
+      gsub(/[ \t]/, "", table)
+      table_done = 0
+      if (table == "serve") serve_seen = 1
+      if (table == "model_proxy") model_proxy_seen = 1
+      print
+      next
+    }
+    if (table == "serve" && !table_done && $0 ~ /^[ \t]*bind[ \t]*=/) {
+      table_done = 1
+      print shifted_port($0)
+      next
+    }
+    if (table == "model_proxy" && !table_done && $0 ~ /^[ \t]*listen[ \t]*=/) {
+      table_done = 1
+      print shifted_port($0)
+      next
+    }
+    print
+  }
+  END {
+    close_table()
+    if (!serve_seen) {
+      if (serve_key) warn("devel-launch: set the dev [serve] bind port by hand")
+      else {
+        print ""
+        print "[serve]"
+        print "bind = \"127.0.0.1:5381\""
+      }
+    }
+    if (!model_proxy_seen) {
+      if (model_proxy_key) warn("devel-launch: set the dev [model_proxy] listen port by hand")
+      else {
+        print ""
+        print "[model_proxy]"
+        print "listen = \"127.0.0.1:8384\""
+      }
+    }
+  }'
+}
+
+seed_config() {
+  [ -d "$cfg" ] && return 0
+  src="$home/.config/thegn/config.toml"
+  if ! mkdir -m 700 "$cfg" 2>/dev/null; then
+    [ -d "$cfg" ] && return 0
+    echo "devel-launch: cannot create $cfg" >&2
     exit 1
   fi
+  tmp="$cfg/.config.toml.seed"
+  {
+    printf '# DEV instance config, seeded %s by scripts/devel-launch.sh from %s.\n' "$(date -u +%Y-%m-%d)" "$src"
+    printf '# Only the dev instance reads it (THEGN_CONFIG_DIR). Ports are shifted by one; secrets/ and nix-signing/ were not copied.\n'
+    if [ -r "$src" ]; then dev_ports <"$src"; else dev_ports </dev/null; fi
+  } >"$tmp" || { rm -f "$tmp"; exit 1; }
+  chmod 600 "$tmp" && mv -f "$tmp" "$cfg/config.toml"
+  echo "devel-launch: seeded $cfg/config.toml from $src (review it; the keyring service is shared)" >&2
 }
 
 launch() {
