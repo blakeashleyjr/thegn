@@ -300,6 +300,7 @@ fn run_once(request: RefreshRequest) {
         waker.as_ref(),
         RefreshSite::Ui,
         report.as_ref(),
+        &ListMemo::default(),
     );
 }
 
@@ -342,6 +343,156 @@ impl RefreshSummary {
         events: 0,
         yielded: true,
     };
+}
+
+/// One account's list outcome in a cloneable form, so a tick memo can hand
+/// the same answer to every repo that shares the account.
+#[derive(Clone, Debug)]
+pub(crate) enum ListOutcome {
+    Ok(Vec<thegn_core::issue::Issue>),
+    /// A bounded listing stopped early; never cached as complete.
+    Partial {
+        issues: Vec<thegn_core::issue::Issue>,
+        reason: &'static str,
+    },
+    /// The list call failed. `transient` is a dropped link (offline evidence).
+    Failed {
+        message: String,
+        transient: bool,
+    },
+}
+
+impl ListOutcome {
+    fn from_result(
+        result: Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
+    ) -> Self {
+        match result {
+            Ok(issues) => Self::Ok(issues),
+            Err(thegn_svc::issue::IssueError::PartialList { issues, reason }) => {
+                Self::Partial { issues, reason }
+            }
+            Err(error) => Self::Failed {
+                message: error.to_string(),
+                transient: error.is_transient(),
+            },
+        }
+    }
+
+    fn issues(&self) -> &[thegn_core::issue::Issue] {
+        match self {
+            Self::Ok(issues) | Self::Partial { issues, .. } => issues,
+            Self::Failed { .. } => &[],
+        }
+    }
+}
+
+/// One account's list result plus the provider id that produced it.
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderListResult {
+    pub(crate) provider: String,
+    pub(crate) outcome: ListOutcome,
+}
+
+/// Per-tick memo of list results, keyed by account name + provider + a digest
+/// of the account's config entry + the filter (see [`list_memo_key`]). The
+/// daemon tick shares one across every repo it refreshes, so N repos sharing a
+/// tracker account make one list call per tick instead of N. Errors are
+/// memoized too: one failing account is not retried once per repo.
+#[derive(Default)]
+pub(crate) struct ListMemo(Mutex<HashMap<String, ProviderListResult>>);
+
+impl ListMemo {
+    fn get(&self, key: &str) -> Option<ProviderListResult> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    fn put(&self, key: String, value: ProviderListResult) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, value);
+    }
+}
+
+/// The memo key for one account under one filter. The account's config entry
+/// (token included) is folded into an in-memory digest, never written out.
+/// A GitHub account with no explicit repo scope resolves against the worktree
+/// (`gh` runs in `cwd`), so its key includes `cwd`.
+fn list_memo_key(
+    account: &thegn_core::config::IssueAccount,
+    filter: &thegn_core::issue::IssueFilter,
+    cwd: &std::path::Path,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(account)
+        .unwrap_or_else(|_| format!("{account:?}"))
+        .hash(&mut hasher);
+    let mut keyed_filter = filter.clone();
+    if account.provider != thegn_core::config::IssueProviderKind::Github {
+        keyed_filter.repo = None;
+    }
+    let filter_json =
+        serde_json::to_string(&keyed_filter).unwrap_or_else(|_| format!("{keyed_filter:?}"));
+    let anchor = if account.provider == thegn_core::config::IssueProviderKind::Github
+        && filter.repo.is_none()
+    {
+        cwd.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+    format!(
+        "{}\u{0}{}\u{0}{:016x}\u{0}{filter_json}\u{0}{anchor}",
+        account.name,
+        account.provider.as_str(),
+        hasher.finish()
+    )
+}
+
+/// Pure memo driver: answer every account from `memo` where it can, and call
+/// `fetch` once with the misses (or with none when `always_fetch`, e.g. live
+/// plugin providers that are never memoized). `fetch` returns
+/// `(account, result)` rows; rows for memo-miss accounts are stored. Returns
+/// rows in account order, then any extra rows `fetch` produced (plugins), or
+/// `None` when `fetch` could not run at all (nothing memoized then).
+fn fetch_memoized(
+    accounts: &[(thegn_core::config::IssueAccount, String)],
+    memo: &ListMemo,
+    always_fetch: bool,
+    fetch: &mut dyn FnMut(
+        Vec<thegn_core::config::IssueAccount>,
+    ) -> Option<Vec<(String, ProviderListResult)>>,
+) -> Option<Vec<(String, ProviderListResult)>> {
+    let mut hits: Vec<Option<ProviderListResult>> = Vec::with_capacity(accounts.len());
+    let mut misses = Vec::new();
+    for (account, key) in accounts {
+        let hit = memo.get(key);
+        if hit.is_none() {
+            misses.push(account.clone());
+        }
+        hits.push(hit);
+    }
+    let mut fetched = if misses.is_empty() && !always_fetch {
+        Vec::new()
+    } else {
+        fetch(misses)?
+    };
+    let mut out = Vec::with_capacity(accounts.len() + fetched.len());
+    for ((account, key), hit) in accounts.iter().zip(hits) {
+        if let Some(hit) = hit {
+            out.push((account.name.clone(), hit));
+        } else if let Some(at) = fetched.iter().position(|(name, _)| *name == account.name) {
+            let row = fetched.remove(at);
+            memo.put(key.clone(), row.1.clone());
+            out.push(row);
+        }
+    }
+    out.extend(fetched);
+    Some(out)
 }
 
 /// Pure: does this pass reach the network? Only a UI pass whose cache the
@@ -435,7 +586,19 @@ pub(crate) fn refresh_repo(
     waker: Option<&TerminalWaker>,
     site: RefreshSite,
 ) -> RefreshSummary {
-    refresh_repo_inner(cwd, app_cfg, waker, site, None)
+    refresh_repo_inner(cwd, app_cfg, waker, site, None, &ListMemo::default())
+}
+
+/// [`refresh_repo`] sharing a caller-owned [`ListMemo`]: the daemon tick
+/// passes one memo for every repo it refreshes, so an account shared by N
+/// repos is listed once per tick. The cache diff and emit stay per repo.
+pub(crate) fn refresh_repo_memo(
+    cwd: &std::path::Path,
+    app_cfg: &thegn_core::config::Config,
+    site: RefreshSite,
+    memo: &ListMemo,
+) -> RefreshSummary {
+    refresh_repo_inner(cwd, app_cfg, None, site, None, memo)
 }
 
 fn refresh_repo_inner(
@@ -444,6 +607,7 @@ fn refresh_repo_inner(
     waker: Option<&TerminalWaker>,
     site: RefreshSite,
     report: Option<&RefreshReportTarget>,
+    memo: &ListMemo,
 ) -> RefreshSummary {
     use thegn_core::issue::IssueFilter;
     use thegn_svc::issue::IssueRouter;
@@ -492,10 +656,8 @@ fn refresh_repo_inner(
         }
     }
     let cfg = app_cfg.repo_issues(Some(&repo_root));
-    let mut router = IssueRouter::from_config_at(&cfg, Some(&cwd));
-    // Provider-as-plugin: append live plugin issue providers.
-    crate::plugin_providers::extend_issue_router(&mut router);
-    if !router.is_configured() {
+    let accounts = cfg.active_accounts();
+    if accounts.is_empty() && plugin_accounts.is_empty() {
         if let Some(report) = report {
             send_tracker_toast(
                 &report.tx,
@@ -520,21 +682,55 @@ fn refresh_repo_inner(
     };
     // Fetch every configured account; cache and diff each under its own
     // `(repo_root, provider, account)` key so trackers (and multiple
-    // accounts of one provider) aggregate without clobbering.
-    let per_provider = match thegn_svc::issue::block_on_tracker(router.list_per_provider(&filter)) {
-        Ok(per_provider) => per_provider,
-        Err(_) => {
-            record_tracker_failure(&cwd, "could not start tracker runtime", waker);
-            if let Some(report) = report {
-                send_tracker_toast(
-                    &report.tx,
-                    &report.waker,
-                    "Issue refresh failed — could not start the tracker runtime".to_owned(),
-                    thegn_core::notification::Priority::Alert,
-                );
-            }
-            return summary;
+    // accounts of one provider) aggregate without clobbering. Accounts the
+    // memo already answered this tick (another repo sharing the account and
+    // filter) are not listed again; live plugin providers are never memoized.
+    let keyed: Vec<_> = accounts
+        .into_iter()
+        .map(|account| {
+            let key = list_memo_key(&account, &filter, &cwd);
+            (account, key)
+        })
+        .collect();
+    let mut fetch_misses = |misses: Vec<thegn_core::config::IssueAccount>| {
+        let mut scoped = cfg.clone();
+        scoped.issue_accounts = misses;
+        // An empty miss list must mean no accounts, not the legacy synthesis.
+        scoped.accounts_restricted = true;
+        let mut router = IssueRouter::from_config_at(&scoped, Some(&cwd));
+        // Provider-as-plugin: append live plugin issue providers.
+        crate::plugin_providers::extend_issue_router(&mut router);
+        if !router.is_configured() {
+            return Some(Vec::new());
         }
+        let rows = thegn_svc::issue::block_on_tracker(router.list_per_provider(&filter)).ok()?;
+        Some(
+            rows.into_iter()
+                .map(|(account, provider, result)| {
+                    (
+                        account,
+                        ProviderListResult {
+                            provider: provider.to_owned(),
+                            outcome: ListOutcome::from_result(result),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let Some(per_provider) =
+        fetch_memoized(&keyed, memo, !plugin_accounts.is_empty(), &mut fetch_misses)
+    else {
+        record_tracker_failure(&cwd, "could not start tracker runtime", waker);
+        if let Some(report) = report {
+            send_tracker_toast(
+                &report.tx,
+                &report.waker,
+                "Issue refresh failed — could not start the tracker runtime".to_owned(),
+                thegn_core::notification::Priority::Alert,
+            );
+        }
+        return summary;
     };
     let mut failures = Vec::new();
     let mut any_success = false;
@@ -553,21 +749,22 @@ fn refresh_repo_inner(
         .collect();
     let mut changed = false;
     let shared = shared_issue_ids(&per_provider);
-    for (account, provider, result) in per_provider {
+    for (account, ProviderListResult { provider, outcome }) in per_provider {
+        let provider: &str = &provider;
         // The daemon produces non-plugin accounts while it holds the lease.
         let daemon_produces = yield_to_daemon && !plugin_accounts.contains(&account);
         if daemon_produces && repo_root == cwd {
             continue; // the daemon writes and diffs this cache row
         }
-        let issues = match result {
-            Ok(issues) => {
+        let issues = match outcome {
+            ListOutcome::Ok(issues) => {
                 any_success = true;
                 summary.accounts_ok += 1;
                 // Reached the tracker — online evidence for the app-wide holder.
                 thegn_core::connectivity::report_success();
                 issues
             }
-            Err(thegn_svc::issue::IssueError::PartialList { issues, reason }) => {
+            ListOutcome::Partial { issues, reason } => {
                 tracing::warn!(account = %account, provider, reason, "tracker issue list was partial");
                 summary.accounts_failed += 1;
                 failures.push((format!("{provider}/{account}"), reason.to_owned()));
@@ -601,16 +798,16 @@ fn refresh_repo_inner(
                 changed = true;
                 continue;
             }
-            Err(e) => {
+            ListOutcome::Failed { message, transient } => {
                 // The arm was silent, so a permanently-failing account (bad
                 // token, 400) showed as an empty tracker forever with no
                 // trace anywhere (THE-72). One warn; the ring picks it up
                 // for crash reports/bundles even with no sink installed.
-                tracing::warn!(account = %account, provider, error = %e, "tracker refresh failed");
+                tracing::warn!(account = %account, provider, error = %message, "tracker refresh failed");
                 summary.accounts_failed += 1;
-                failures.push((format!("{provider}/{account}"), e.to_string()));
+                failures.push((format!("{provider}/{account}"), message));
                 // Only a dropped link is offline evidence (not a bad token).
-                if e.is_transient() {
+                if transient {
                     thegn_core::connectivity::report_failure();
                 }
                 continue; // a failing account leaves its prior cache intact
@@ -900,23 +1097,13 @@ pub(crate) fn overdue_notifications(
         .collect()
 }
 
-type ProviderIssueResultRow<'a> = (
-    String,
-    &'a str,
-    Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
-);
-
 pub(crate) fn shared_issue_ids(
-    per_provider: &[ProviderIssueResultRow<'_>],
+    per_account: &[(String, ProviderListResult)],
 ) -> std::collections::HashSet<String> {
-    let rows = per_provider.iter().flat_map(|(_, _, result)| {
-        let issues = match result {
-            Ok(issues) | Err(thegn_svc::issue::IssueError::PartialList { issues, .. }) => {
-                issues.as_slice()
-            }
-            Err(_) => &[],
-        };
-        issues
+    let rows = per_account.iter().flat_map(|(_, result)| {
+        result
+            .outcome
+            .issues()
             .iter()
             .map(|issue| (issue.id.as_str(), issue.account.as_deref()))
     });
@@ -1001,14 +1188,22 @@ mod tests {
 
     #[test]
     fn shared_issue_ids_covers_ok_and_partial_accounts() {
+        use super::{ListOutcome, ProviderListResult};
         use thegn_core::issue::Issue;
-        use thegn_svc::issue::IssueError;
 
-        let per_provider = vec![
+        let row = |account: &str, outcome| {
             (
-                "work".to_owned(),
-                "linear",
-                Ok(vec![
+                account.to_owned(),
+                ProviderListResult {
+                    provider: "linear".to_owned(),
+                    outcome,
+                },
+            )
+        };
+        let per_provider = vec![
+            row(
+                "work",
+                ListOutcome::Ok(vec![
                     Issue {
                         id: "linear:ENG-1".into(),
                         account: Some("work".into()),
@@ -1020,25 +1215,294 @@ mod tests {
                     },
                 ]),
             ),
-            (
-                "home".to_owned(),
-                "linear",
-                Err(IssueError::PartialList {
+            row(
+                "home",
+                ListOutcome::Partial {
                     issues: vec![Issue {
                         id: "linear:ENG-1".into(),
                         account: Some("home".into()),
                         ..Default::default()
                     }],
                     reason: "page cap",
-                }),
+                },
             ),
-            ("x".to_owned(), "linear", Err(IssueError::NotConfigured)),
+            row(
+                "x",
+                ListOutcome::Failed {
+                    message: "not configured".into(),
+                    transient: false,
+                },
+            ),
         ];
 
         assert_eq!(
             shared_issue_ids(&per_provider),
             std::collections::HashSet::from(["linear:ENG-1".to_owned()])
         );
+    }
+
+    mod list_memo {
+        use super::super::{
+            ListMemo, ListOutcome, ProviderListResult, fetch_memoized, list_memo_key,
+        };
+        use std::cell::Cell;
+        use std::path::Path;
+        use thegn_core::config::{IssueAccount, IssueProviderKind};
+        use thegn_core::issue::{Issue, IssueFilter};
+
+        type Rows = Vec<(String, ProviderListResult)>;
+
+        fn account(name: &str, provider: IssueProviderKind) -> IssueAccount {
+            IssueAccount {
+                name: name.to_owned(),
+                provider,
+                token: "env:TRACKER_TOKEN".to_owned(),
+                ..IssueAccount::default()
+            }
+        }
+
+        #[test]
+        fn repo_scope_only_splits_the_key_for_github() {
+            let f = |r: &str| IssueFilter {
+                repo: Some(r.into()),
+                ..IssueFilter::default()
+            };
+            let lin = account("lin", IssueProviderKind::Linear);
+            assert_eq!(
+                list_memo_key(&lin, &f("o/a"), Path::new("/repo/a")),
+                list_memo_key(&lin, &f("o/b"), Path::new("/repo/b"))
+            );
+            let gh = account("gh", IssueProviderKind::Github);
+            assert_ne!(
+                list_memo_key(&gh, &f("o/a"), Path::new("/repo/a")),
+                list_memo_key(&gh, &f("o/b"), Path::new("/repo/b"))
+            );
+        }
+
+        fn keyed(
+            accounts: &[IssueAccount],
+            filter: &IssueFilter,
+            cwd: &str,
+        ) -> Vec<(IssueAccount, String)> {
+            accounts
+                .iter()
+                .map(|a| (a.clone(), list_memo_key(a, filter, Path::new(cwd))))
+                .collect()
+        }
+
+        /// A fake router: counts list calls (one per fetch with misses) and
+        /// answers every requested account with `outcome`.
+        fn fake(
+            calls: &Cell<usize>,
+            listed: &Cell<usize>,
+            outcome: ListOutcome,
+        ) -> impl FnMut(Vec<IssueAccount>) -> Option<Rows> {
+            move |misses| {
+                calls.set(calls.get() + 1);
+                listed.set(listed.get() + misses.len());
+                Some(
+                    misses
+                        .into_iter()
+                        .map(|a| {
+                            (
+                                a.name.clone(),
+                                ProviderListResult {
+                                    provider: a.provider.as_str().to_owned(),
+                                    outcome: outcome.clone(),
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+            }
+        }
+
+        fn ok_issue() -> ListOutcome {
+            ListOutcome::Ok(vec![Issue {
+                id: "linear:ENG-1".into(),
+                ..Default::default()
+            }])
+        }
+
+        #[test]
+        fn two_repos_sharing_an_account_make_one_list_call_per_tick() {
+            let accounts = [account("work", IssueProviderKind::Linear)];
+            let filter = IssueFilter {
+                assignee_me: true,
+                limit: 100,
+                ..IssueFilter::default()
+            };
+            let memo = ListMemo::default();
+            let (calls, listed) = (Cell::new(0), Cell::new(0));
+            let mut fetch = fake(&calls, &listed, ok_issue());
+            let a = fetch_memoized(
+                &keyed(&accounts, &filter, "/repo/a"),
+                &memo,
+                false,
+                &mut fetch,
+            )
+            .unwrap();
+            let b = fetch_memoized(
+                &keyed(&accounts, &filter, "/repo/b"),
+                &memo,
+                false,
+                &mut fetch,
+            )
+            .unwrap();
+            assert_eq!(calls.get(), 1, "the second repo reused the tick memo");
+            assert_eq!(listed.get(), 1);
+            assert_eq!(a.len(), 1);
+            assert_eq!(b.len(), 1);
+            assert_eq!(b[0].0, "work");
+            assert_eq!(b[0].1.provider, "linear");
+            assert_eq!(b[0].1.outcome.issues().len(), 1);
+        }
+
+        #[test]
+        fn different_filters_make_two_list_calls() {
+            let accounts = [account("work", IssueProviderKind::Linear)];
+            let mine = IssueFilter {
+                assignee_me: true,
+                ..IssueFilter::default()
+            };
+            let everyone = IssueFilter {
+                assignee_me: false,
+                ..IssueFilter::default()
+            };
+            let memo = ListMemo::default();
+            let (calls, listed) = (Cell::new(0), Cell::new(0));
+            let mut fetch = fake(&calls, &listed, ok_issue());
+            fetch_memoized(
+                &keyed(&accounts, &mine, "/repo/a"),
+                &memo,
+                false,
+                &mut fetch,
+            )
+            .unwrap();
+            fetch_memoized(
+                &keyed(&accounts, &everyone, "/repo/b"),
+                &memo,
+                false,
+                &mut fetch,
+            )
+            .unwrap();
+            assert_eq!(calls.get(), 2);
+        }
+
+        #[test]
+        fn a_changed_account_entry_is_not_a_memo_hit() {
+            let filter = IssueFilter::default();
+            let team_a = IssueAccount {
+                team_id: "A".into(),
+                ..account("work", IssueProviderKind::Linear)
+            };
+            let team_b = IssueAccount {
+                team_id: "B".into(),
+                ..account("work", IssueProviderKind::Linear)
+            };
+            assert_ne!(
+                list_memo_key(&team_a, &filter, Path::new("/repo/a")),
+                list_memo_key(&team_b, &filter, Path::new("/repo/a")),
+            );
+        }
+
+        #[test]
+        fn an_unscoped_github_account_is_keyed_per_worktree() {
+            let gh = account("gh", IssueProviderKind::Github);
+            let unscoped = IssueFilter::default();
+            assert_ne!(
+                list_memo_key(&gh, &unscoped, Path::new("/repo/a")),
+                list_memo_key(&gh, &unscoped, Path::new("/repo/b")),
+            );
+            let scoped = IssueFilter {
+                repo: Some("o/r".into()),
+                ..IssueFilter::default()
+            };
+            assert_eq!(
+                list_memo_key(&gh, &scoped, Path::new("/repo/a")),
+                list_memo_key(&gh, &scoped, Path::new("/repo/b")),
+            );
+        }
+
+        #[test]
+        fn an_error_is_memoized() {
+            let accounts = [account("work", IssueProviderKind::Linear)];
+            let filter = IssueFilter::default();
+            let memo = ListMemo::default();
+            let (calls, listed) = (Cell::new(0), Cell::new(0));
+            let failed = ListOutcome::Failed {
+                message: "401 bad token".into(),
+                transient: false,
+            };
+            let mut fetch = fake(&calls, &listed, failed);
+            for repo in ["/repo/a", "/repo/b", "/repo/c"] {
+                let rows =
+                    fetch_memoized(&keyed(&accounts, &filter, repo), &memo, false, &mut fetch)
+                        .unwrap();
+                assert!(matches!(
+                    &rows[0].1.outcome,
+                    ListOutcome::Failed { message, .. } if message == "401 bad token"
+                ));
+            }
+            assert_eq!(calls.get(), 1, "a failing account is not retried per repo");
+        }
+
+        #[test]
+        fn a_runtime_failure_memoizes_nothing() {
+            let accounts = [account("work", IssueProviderKind::Linear)];
+            let filter = IssueFilter::default();
+            let memo = ListMemo::default();
+            let calls = Cell::new(0);
+            let mut down = |_: Vec<IssueAccount>| -> Option<Rows> {
+                calls.set(calls.get() + 1);
+                None
+            };
+            let rows = keyed(&accounts, &filter, "/repo/a");
+            assert!(fetch_memoized(&rows, &memo, false, &mut down).is_none());
+            assert!(fetch_memoized(&rows, &memo, false, &mut down).is_none());
+            assert_eq!(calls.get(), 2);
+        }
+
+        #[test]
+        fn plugin_rows_are_always_fetched_and_never_memoized() {
+            let accounts = [account("work", IssueProviderKind::Linear)];
+            let filter = IssueFilter::default();
+            let memo = ListMemo::default();
+            let calls = Cell::new(0);
+            let mut fetch = |misses: Vec<IssueAccount>| -> Option<Rows> {
+                calls.set(calls.get() + 1);
+                let mut rows: Rows = misses
+                    .into_iter()
+                    .map(|a| {
+                        (
+                            a.name,
+                            ProviderListResult {
+                                provider: "linear".into(),
+                                outcome: ok_issue(),
+                            },
+                        )
+                    })
+                    .collect();
+                rows.push((
+                    "plug".into(),
+                    ProviderListResult {
+                        provider: "plugin:demo".into(),
+                        outcome: ListOutcome::Ok(Vec::new()),
+                    },
+                ));
+                Some(rows)
+            };
+            let first =
+                fetch_memoized(&keyed(&accounts, &filter, "/a"), &memo, true, &mut fetch).unwrap();
+            let second =
+                fetch_memoized(&keyed(&accounts, &filter, "/b"), &memo, true, &mut fetch).unwrap();
+            assert_eq!(calls.get(), 2);
+            let names = |rows: &Rows| rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+            assert_eq!(names(&first), ["work", "plug"]);
+            // The second pass took `work` from the memo; only the plugin was listed.
+            assert_eq!(names(&second), ["work", "plug"]);
+            assert_eq!(memo.0.lock().unwrap().len(), 1);
+        }
     }
 
     #[test]
