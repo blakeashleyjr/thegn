@@ -273,7 +273,7 @@ fn status(worktree: Option<String>) -> Result<()> {
     let json = serde_json::to_string(&panel).unwrap_or_default();
     if let Ok(db) = Db::open() {
         // Host-path cache key — matches the panel's reader (never `loc.path()`).
-        let _ = db.put_pr_cache(&GitLoc::worktree_cache_key(&wt), &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        let _ = db.put_pr_cache_if(&GitLoc::worktree_cache_key(&wt), &panel.branch, &json, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     print_summary(&panel);
     Ok(())
@@ -1149,5 +1149,18 @@ mod tests {
         std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
         let result = super::mutation_loc(Some(repo.display().to_string()), "pr merge");
         assert!(matches!(result, Err(error) if format!("{error:#}").contains("pr merge refused")));
+    }
+
+    #[test]
+    fn status_only_seeds_a_missing_pr_cache_row() {
+        // `thegn pr status` emits no PR events, so it must never move a row the
+        // producers diff against: insert-if-absent only (THE-2214).
+        let src = include_str!("pr.rs");
+        let start = src.find("fn status(").unwrap();
+        let end = start + src[start..].find("fn print_summary(").unwrap();
+        let body = &src[start..end];
+        assert!(body.contains(".put_pr_cache_if("));
+        assert!(body.contains("&json, None)"));
+        assert!(!body.contains(".put_pr_cache("));
     }
 }
