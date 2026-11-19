@@ -117,7 +117,7 @@ fn oci_runtime_status(rt: &str) -> String {
         return String::new(); // runc/crun/unknown: no extra requirement to report.
     };
     let binary_present = thegn_core::util::which_path(req.binary).is_some();
-    let kvm_present = std::path::Path::new("/dev/kvm").exists();
+    let kvm_present = thegn_core::host_probe::kvm_accessible();
     match decide(Some(rt), binary_present, kvm_present) {
         RuntimeDecision::Keep => " (available)".to_string(),
         RuntimeDecision::Degrade(reason) => format!(" (unavailable — {reason})"),
