@@ -13,7 +13,8 @@
 //!
 //! URL shapes mirror `thegn_core::vercel::api::{sandbox_url, session_url}`
 //! (`/v2/sandboxes/{name}` and `/v2/sandboxes/sessions/{id}{tail}`, scoped by
-//! `teamId`/`projectId`). They are built here on the parsed, validated base
+//! `teamId` and with `projectId` on sandbox-scoped calls). They are built here
+//! on the parsed, validated base
 //! with escaped path segments, because the core builders admit `https` only and
 //! the loopback mock needs the `http`-for-loopback rule `validate_api_base`
 //! already enforces.
@@ -378,6 +379,7 @@ impl VercelClient {
         let mut extra: Vec<(&str, &str)> = vec![("project", self.scope.project_id.as_str())];
         if !name_prefix.is_empty() {
             extra.push(("namePrefix", name_prefix));
+            extra.push(("sortBy", "name"));
         }
         if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
             extra.push(("cursor", cursor));
@@ -410,8 +412,8 @@ impl VercelClient {
         self.ok(resp, p.op, true).await.map(drop)
     }
 
-    /// Extend the session timeout by `ms`. A non-transient 4xx means the plan
-    /// ceiling ([`ExtendOutcome::AtCeiling`]).
+    /// Extend the session timeout by `ms`. Only documented plan-ceiling
+    /// responses (400 and 422) map to [`ExtendOutcome::AtCeiling`].
     pub async fn extend(&self, session: &str, ms: u64) -> Result<ExtendOutcome> {
         let p = retried("extend session");
         let url = self.session_url(session, &["extend-timeout"])?;
@@ -420,9 +422,19 @@ impl VercelClient {
             .send(p, || Ok(self.http.post(url.clone()).json(&body)))
             .await?;
         let status = resp.status();
-        if status.is_client_error() && !transient_status(status) {
-            drain_quietly(resp).await;
-            return Ok(ExtendOutcome::AtCeiling);
+        match status {
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                drain_quietly(resp).await;
+                return Ok(ExtendOutcome::AtCeiling);
+            }
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE => {
+                drain_quietly(resp).await;
+                bail!(
+                    "{PROVIDER}: extend session: session no longer exists (HTTP {})",
+                    status.as_u16()
+                );
+            }
+            _ => {}
         }
         self.ok(resp, p.op, false).await?;
         Ok(ExtendOutcome::Extended)
@@ -430,10 +442,41 @@ impl VercelClient {
 
     pub async fn set_network_policy(&self, name: &str, body: &serde_json::Value) -> Result<()> {
         let p = policy("set network policy");
-        let url = self.url(&["v2", "sandboxes", checked_name(name)?], &[], true)?;
+        let name = checked_name(name)?;
+        let url = self.url(&["v2", "sandboxes", name], &[], true)?;
         let body = self.json_body(&serde_json::json!({ "networkPolicy": body }), p.op)?;
         let resp = self
             .send(p, || Ok(self.http.patch(url.clone()).json(&body)))
+            .await?;
+        self.ok(resp, p.op, false).await?;
+
+        let Some(view) = self.get(name, false).await? else {
+            return Ok(());
+        };
+        if view.status == thegn_core::vercel::api::SessionStatus::Running
+            && let Some(session) = view.session_id.as_deref()
+        {
+            let policy = body.get("networkPolicy").ok_or_else(|| {
+                anyhow!("{PROVIDER}: {}: request body has no networkPolicy", p.op)
+            })?;
+            self.set_session_network_policy(session, policy).await?;
+        }
+        Ok(())
+    }
+
+    /// Apply the policy to a running session. OpenAPI: POST
+    /// `/v2/sandboxes/sessions/{sessionId}/network-policy`, with the policy
+    /// object as the whole request body.
+    pub async fn set_session_network_policy(
+        &self,
+        session: &str,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        let p = policy("set session network policy");
+        let url = self.session_url(session, &["network-policy"])?;
+        let body = self.json_body(body, p.op)?;
+        let resp = self
+            .send(p, || Ok(self.http.post(url.clone()).json(&body)))
             .await?;
         self.ok(resp, p.op, false).await.map(drop)
     }
@@ -470,6 +513,7 @@ impl VercelClient {
         match body.as_object_mut() {
             Some(map) => {
                 map.insert("wait".into(), serde_json::Value::Bool(true));
+                map.insert("logs".into(), serde_json::Value::Bool(true));
             }
             None => bail!("{PROVIDER}: {}: body must be a JSON object", p.op),
         }
@@ -616,7 +660,7 @@ impl VercelClient {
                 cmd,
             ],
             &[("wait", "true")],
-            true,
+            false,
         )?;
         let until = tokio::time::Instant::now() + deadline;
         let mut polls: u32 = 0;
@@ -806,28 +850,36 @@ impl VercelClient {
 
     // --- snapshots ------------------------------------------------------------
 
-    /// Snapshot ids recorded for sandbox `name`.
+    /// Snapshot ids recorded for sandbox `name`, following pagination.
     pub async fn snapshots_for(&self, name: &str) -> Result<Vec<String>> {
         let p = retried("list snapshots");
         let name = checked_name(name)?;
-        let url = self.url(
-            &["v2", "sandboxes", "snapshots"],
-            &[("project", self.scope.project_id.as_str()), ("name", name)],
-            false,
-        )?;
-        let resp = self.send(p, || Ok(self.http.get(url.clone()))).await?;
-        let resp = self.ok(resp, p.op, false).await?;
-        let v = response_json(resp, PROVIDER, p.op).await?;
-        let items = v
-            .get("snapshots")
-            .and_then(|s| s.as_array())
-            .ok_or_else(|| anyhow!("{PROVIDER}: {}: response has no snapshots array", p.op))?;
-        Ok(items
-            .iter()
-            .filter_map(|s| s.get("id").and_then(|id| id.as_str()))
-            .filter(|id| valid_id(id))
-            .map(str::to_string)
-            .collect())
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _page in 0..SNAPSHOT_PAGE_CAP {
+            let mut extra: Vec<(&str, &str)> =
+                vec![("project", self.scope.project_id.as_str()), ("name", name)];
+            if let Some(c) = cursor.as_deref() {
+                extra.push(("cursor", c));
+            }
+            let url = self.url(&["v2", "sandboxes", "snapshots"], &extra, false)?;
+            let resp = self.send(p, || Ok(self.http.get(url.clone()))).await?;
+            let resp = self.ok(resp, p.op, false).await?;
+            let v = response_json(resp, PROVIDER, p.op).await?;
+            let (items, next) =
+                parse_snapshots(&v).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+            out.extend(
+                items
+                    .into_iter()
+                    .map(|snapshot| snapshot.id)
+                    .filter(|id| valid_id(id)),
+            );
+            match next {
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Delete one snapshot. 404 = Ok.
@@ -884,7 +936,7 @@ impl VercelClient {
             checked_id(session, "session")?,
         ];
         segments.extend_from_slice(tail);
-        self.url(&segments, &[], true)
+        self.url(&segments, &[], false)
     }
 
     /// Clone a caller's JSON body, refusing one that carries the token.
