@@ -176,7 +176,7 @@ been verified live against the real Sprites API yet.
   default. `--apply` destroys only recorded sprites past their lifetime, and
   removes ledger records whose sprite is gone. It spares records younger than
   60 seconds, skips unrecorded sprites, and refuses on a partial listing. There is
-  no background sprites reaper; nothing deletes a sprite unless you run it.
+  no background reaper unless you opt in with `lifetime_reap` (below).
   `thegn env down --all` keeps its prompt, destroys only recorded sprites, and
   says how many it skipped.
 - **No background creates.** `eager = "workspace"` or `"all"` never creates a
@@ -205,6 +205,55 @@ been verified live against the real Sprites API yet.
   unpriced".
 - **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
   also runs `env pull` after the agent exits and reports it in text and `--json`.
+
+### Adopt, the daily loop and release
+
+Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
+
+- **Adopt.** `thegn env adopt <sprite> --env <S> [--yes] [--json]` records a
+  sprite you made elsewhere so thegn may manage it. It reads the sprite (a 404
+  refuses) and prints its name, status, API `created_at`, this host's
+  controller id and the account fingerprint, then says thegn will be able to
+  destroy it on `env down`, `env reap`, `land`, worktree delete and the opt-in
+  reaper, and that it counts toward `max_instances`. On a tty you type the
+  sprite name back; with no tty you need `--yes`. It writes a `ready` record
+  with `created_at` set to now, so lifetime counts from adoption. It refuses a
+  record owned by another controller, account or provider, refuses when
+  `max_instances` is reached, and says "already recorded" if the sprite is
+  already yours. It never touches the sprite itself.
+- **Daily loop.** `thegn agent run --wait --pull` runs the agent, pulls the
+  commits back and, on a Fly or machine0 env that bills while started,
+  stops the machine and prints `stopped <name> (it bills while started)`.
+  `--keep-running` (needs `--wait`) skips the stop. Sprites and Vercel
+  self-suspend and are untouched. A stop is skipped while another live session
+  is bound to the worktree. Pulls of one worktree are serialised across
+  processes by a lock; a second caller waits up to 120 seconds, then reports
+  `up to date` or "another pull of <worktree> is running".
+- **Land.** `thegn land` on a provider worktree first pulls the sandbox's
+  branch, then lands the local branch. A diverged or dirty pull refuses and
+  names the kept ref; a missing sandbox lands the local branch. The sandbox is
+  kept, because it holds gitignored state that exists nowhere else:
+  `sandbox <name> kept (thegn land --release-sandbox, or env reap, removes it)`.
+  `--release-sandbox` destroys the proven sandbox after a successful land and
+  prints `released sandbox <name>`; a failure there is a warning, not an error.
+  `merge drain` is unchanged.
+- **`lifetime_reap`.** `[env.<n>.provider] lifetime_reap = true` (sprites only,
+  default false, needs `max_lifetime_secs > 0`) lets a running client destroy
+  recorded sprites past their lifetime, checked every 300 seconds. It lists the
+  org once per account and deletes nothing on a partial or unknown listing. A
+  sprite whose API status is `running` is skipped and reported once. It never
+  creates, resumes or execs. With no env opting in it does no I/O at idle.
+- **`login_homes`.** `[env.<n>.provider] login_homes = { claude = "<dir>", codex = "<dir>" }`
+  (your own config only, like `model_credentials`) makes the sprite login copy
+  and resync read that directory instead of your live host login, so a
+  dedicated account can be used. Auth files are written with mode 0600 where the
+  file API supports a mode. The codex list is `.codex/auth.json` and
+  `.codex/config.toml`, plus the two older json paths.
+
+Unverified: whether a Claude refresh token shared between host and sprite is
+invalidated when one side refreshes; whether a Sprites checkpoint can be cloned
+to a new sprite (checkpoints restore in place only, so there is no warm
+golden image); the Fly IPv4 cost; and which login files pi needs.
 
 The live scripts `test/sprites-live.sh` and `test/vercel-live.sh` spend real
 money. They need `THEGN_CHANNEL=dev` and `--i-accept-spend`, and touch only
