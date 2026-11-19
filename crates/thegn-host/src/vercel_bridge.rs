@@ -1120,6 +1120,8 @@ mod tests {
             env.provider.provider = "vercel".into();
             cfg.env.insert(name.into(), env);
         }
+        assert!(first_vercel_provider(&cfg, "sb-1").is_err());
+        assert!(only_vercel_env(&cfg).is_none());
         let error = refusal("sb-1", &cfg).to_string();
         assert!(error.contains("sb-1"), "{error}");
         assert!(error.contains("vx-a") && error.contains("vx-b"), "{error}");
