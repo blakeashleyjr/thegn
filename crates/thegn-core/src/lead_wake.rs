@@ -161,6 +161,13 @@ fn facts(event: &AutomationEvent, text: usize, items: usize) -> serde_json::Valu
         put_str(&mut i, "title", Some(&issue.title), text);
         m.insert("issue".into(), serde_json::Value::Object(i));
     }
+    // Inbox facts: structural fields only. The item's title is untrusted and
+    // already rides in the bounded `message` below; it is not repeated here.
+    if let Some(inbox) = &event.inbox {
+        put_str(&mut m, "inbox_kind", Some(&inbox.kind), FIELD_BYTES);
+        put_str(&mut m, "inbox_account", Some(&inbox.account), FIELD_BYTES);
+        put_str(&mut m, "inbox_item_id", Some(&inbox.item_id), FIELD_BYTES);
+    }
     put_str(&mut m, "message", event.message.as_deref(), text);
     serde_json::Value::Object(m)
 }
@@ -326,6 +333,28 @@ mod tests {
         // The data is preserved, only encoded.
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert!(v["message"].as_str().unwrap().contains("</thegn-event>"));
+    }
+
+    #[test]
+    fn event_block_renders_inbox_ids_but_not_the_title() {
+        let mut e = AutomationEvent::bare(AutomationEventKind::InboxItem, "inbox:work:m1", 1);
+        e.message = Some("[work] hello".into());
+        e.inbox = Some(crate::automation::InboxFacts {
+            kind: "command".into(),
+            account: "work".into(),
+            item_id: "m1".into(),
+            url: "https://e.com".into(),
+            labels: vec!["l".into()],
+            title: "SECRET-TITLE".into(),
+        });
+        let block = event_block(&e);
+        let v: serde_json::Value = serde_json::from_str(inner(&block)).unwrap();
+        assert_eq!(v["inbox_kind"], "command");
+        assert_eq!(v["inbox_account"], "work");
+        assert_eq!(v["inbox_item_id"], "m1");
+        assert_eq!(v["message"], "[work] hello");
+        assert!(!block.contains("SECRET-TITLE"), "{block}");
+        assert!(v.get("inbox").is_none());
     }
 
     #[test]
