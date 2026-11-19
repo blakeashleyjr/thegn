@@ -1625,7 +1625,7 @@ fn agents_install_script(agents: &[String]) -> String {
         "have() { command -v \"$1\" >/dev/null 2>&1; }".to_string(),
         "log=\"$HOME/.cache/thegn-agent-install.log\"".to_string(),
         "mkdir -p \"$HOME/.cache\" 2>/dev/null".to_string(),
-        ": >\"$log\" 2>/dev/null || log=/dev/null".to_string(),
+        "true 2>/dev/null >\"$log\" || log=/dev/null".to_string(),
         "npm_g() { if ! have npm; then echo \"npm not found: cannot install $1\" >>\"$log\"; return 1; fi; npm install -g \"$1\" >>\"$log\" 2>&1; }".to_string(),
         "missing=\"\"".to_string(),
     ];
@@ -2950,6 +2950,7 @@ mod tests {
     #[test]
     fn agents_installer_logs_failures_and_lists_missing() {
         let s = agents_install_script(&["codex".into()]);
+        assert!(!s.contains(": >"), "special built-in redirection exits sh");
         assert!(s.contains("thegn-agent-install.log"));
         assert!(s.contains("npm not found"));
         assert!(s.contains("agent CLI not installed"));
