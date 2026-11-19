@@ -1,9 +1,14 @@
 use super::*;
-use crate::store::MergeOutcomeOperation;
 use crate::store::WorkspaceStore;
+use crate::store::{LandedProvenance, MergeOutcomeOperation};
 
 const WORKTREE: &str = "/private/repo/feature";
 const REPO: &str = "/private/repo";
+const OID_A40: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OID_B40: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const OID_B64: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const OID_C40: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const OID_D40: &str = "dddddddddddddddddddddddddddddddddddddd";
 
 fn outcome(status: MergeFinalStatus) -> MergeFinalOutcome<'static> {
     MergeFinalOutcome {
@@ -17,6 +22,7 @@ fn outcome(status: MergeFinalStatus) -> MergeFinalOutcome<'static> {
         result_oid: (status == MergeFinalStatus::Landed).then_some("verified-commit"),
         conflict_paths: None,
         error_detail: None,
+        provenance: None,
     }
 }
 
@@ -479,6 +485,105 @@ fn queue_aware_land_records_one_transition_event() {
     assert_eq!(event.new_status.as_deref(), Some("landed"));
     assert_eq!(event.result_oid.as_deref(), Some("verified-commit"));
     assert!(event.actor.starts_with("thegn pid "));
+}
+
+#[test]
+fn landed_outcome_persists_source_and_target_base() {
+    let db = Db::open_memory().unwrap();
+    let mut final_outcome = outcome(MergeFinalStatus::Landed);
+    final_outcome.provenance = Some(LandedProvenance {
+        source_oid: OID_A40,
+        target_base_oid: Some(OID_B64),
+    });
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+
+    db.persist_merge_outcome(&observed, &final_outcome).unwrap();
+    let saved: (Option<String>, Option<String>) = db
+        .conn()
+        .query_row(
+            "SELECT landed_source_oid, landed_target_base_oid FROM merge_queue WHERE worktree=?1",
+            [WORKTREE],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(saved.0.as_deref(), Some(OID_A40));
+    assert_eq!(saved.1.as_deref(), Some(OID_B64));
+}
+
+#[test]
+fn provenance_on_a_non_landed_outcome_is_refused() {
+    let db = Db::open_memory().unwrap();
+    let mut final_outcome = outcome(MergeFinalStatus::Deferred);
+    final_outcome.provenance = Some(LandedProvenance {
+        source_oid: OID_A40,
+        target_base_oid: None,
+    });
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+
+    assert!(db.persist_merge_outcome(&observed, &final_outcome).is_err());
+}
+
+#[test]
+fn malformed_provenance_oid_is_refused() {
+    let db = Db::open_memory().unwrap();
+    let mut final_outcome = outcome(MergeFinalStatus::Landed);
+    final_outcome.provenance = Some(LandedProvenance {
+        source_oid: "not-an-oid",
+        target_base_oid: None,
+    });
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+
+    assert!(db.persist_merge_outcome(&observed, &final_outcome).is_err());
+}
+
+#[test]
+fn repeated_land_keeps_the_first_provenance() {
+    let db = Db::open_memory().unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    let mut first = outcome(MergeFinalStatus::Landed);
+    first.provenance = Some(LandedProvenance {
+        source_oid: OID_A40,
+        target_base_oid: Some(OID_B40),
+    });
+    db.persist_merge_outcome(&observed, &first).unwrap();
+
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    let mut second = outcome(MergeFinalStatus::Landed);
+    second.provenance = Some(LandedProvenance {
+        source_oid: OID_C40,
+        target_base_oid: Some(OID_D40),
+    });
+    db.persist_merge_outcome(&observed, &second).unwrap();
+    let saved: (Option<String>, Option<String>) = db
+        .conn()
+        .query_row(
+            "SELECT landed_source_oid, landed_target_base_oid FROM merge_queue WHERE worktree=?1",
+            [WORKTREE],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(saved.0.as_deref(), Some(OID_A40));
+    assert_eq!(saved.1.as_deref(), Some(OID_B40));
+}
+
+#[test]
+fn landed_event_carries_the_gated_source_and_base() {
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+    db.update_merge_status(WORKTREE, "ready", None, None, None)
+        .unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    let mut final_outcome = outcome(MergeFinalStatus::Landed);
+    final_outcome.provenance = Some(LandedProvenance {
+        source_oid: OID_A40,
+        target_base_oid: Some(OID_B40),
+    });
+
+    db.persist_merge_outcome(&observed, &final_outcome).unwrap();
+    let events = db.merge_queue_events(WORKTREE, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].candidate_oid.as_deref(), Some(OID_A40));
+    assert_eq!(events[0].target_base_oid.as_deref(), Some(OID_B40));
 }
 
 #[test]

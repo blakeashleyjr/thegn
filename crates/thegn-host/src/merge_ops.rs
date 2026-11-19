@@ -16,9 +16,9 @@ use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::models::WorktreeRow;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{
-    MergeCandidate, MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
-    MergeOutcomeObservation, MergeOutcomeOperation, MergeOutcomeWrite, WorkspaceStore,
-    WorktreeAuxStore,
+    LandedProvenance, MergeCandidate, MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome,
+    MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeOperation, MergeOutcomeWrite,
+    WorkspaceStore, WorktreeAuxStore,
 };
 #[cfg(test)]
 use thegn_core::store::{MergeClaimRequest, MergeStatusFields};
@@ -492,6 +492,10 @@ pub(crate) fn record_ready_land(
         result_oid: Some(record.result_oid),
         conflict_paths: None,
         error_detail: record.up_to_date.then_some("already merged"),
+        provenance: Some(LandedProvenance {
+            source_oid: &admission.candidate_oid,
+            target_base_oid: None,
+        }),
     };
     match db.persist_merge_outcome(&admission.observed, &outcome)? {
         MergeOutcomeWrite::Written => Ok(()),

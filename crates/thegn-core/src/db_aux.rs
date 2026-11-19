@@ -153,6 +153,27 @@ fn validate_merge_outcome(
         },
         "merge outcome result OID is inconsistent with final status"
     );
+    if let Some(provenance) = outcome.provenance {
+        anyhow::ensure!(
+            outcome.status == MergeFinalStatus::Landed,
+            "landed provenance is only valid for a landed merge outcome"
+        );
+        ensure_landed_provenance_oid(provenance.source_oid, "source")?;
+        if let Some(target_base_oid) = provenance.target_base_oid {
+            ensure_landed_provenance_oid(target_base_oid, "target base")?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_landed_provenance_oid(oid: &str, label: &str) -> Result<()> {
+    anyhow::ensure!(
+        (oid.len() == 40 || oid.len() == 64)
+            && oid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase() && byte <= b'f'),
+        "landed {label} provenance OID must be 40 or 64 lowercase hexadecimal characters"
+    );
     Ok(())
 }
 
@@ -998,54 +1019,109 @@ impl WorktreeAuxStore for Db {
                 .as_ref()
                 .is_none_or(|row| row.status != outcome.status.as_str());
         let candidate_oid = if records_event {
-            tx.query_row(
-                "SELECT candidate_oid FROM merge_queue WHERE worktree=?1",
-                [outcome.worktree],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
+            if let Some(provenance) = outcome.provenance {
+                Some(provenance.source_oid.to_owned())
+            } else {
+                tx.query_row(
+                    "SELECT candidate_oid FROM merge_queue WHERE worktree=?1",
+                    [outcome.worktree],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+            }
         } else {
             None
         };
-        let upsert = if has_claim_owner {
-            "INSERT INTO merge_queue \
-                (worktree,branch,target_branch,status,queued_at,updated_at,\
-                 result_oid,conflict_paths,error_detail,location,agent_attempts) \
-             VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,0) \
-             ON CONFLICT(worktree) DO UPDATE SET \
-                branch=excluded.branch,target_branch=excluded.target_branch,\
-                status=excluded.status,updated_at=excluded.updated_at,\
-                result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
-                landed_source_oid=NULL,landed_target_base_oid=NULL,\
-                error_detail=excluded.error_detail,location=excluded.location \
-             WHERE merge_queue.claim_owner IS NULL"
+        let landed_source_oid = outcome.provenance.map(|provenance| provenance.source_oid);
+        let landed_target_base_oid = outcome
+            .provenance
+            .and_then(|provenance| provenance.target_base_oid);
+        let changed = if has_current_events {
+            let upsert = if has_claim_owner {
+                "INSERT INTO merge_queue \
+                    (worktree,branch,target_branch,status,queued_at,updated_at,\
+                     result_oid,conflict_paths,landed_source_oid,landed_target_base_oid,\
+                     error_detail,location,agent_attempts) \
+                 VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,?10,?11,0) \
+                 ON CONFLICT(worktree) DO UPDATE SET \
+                    branch=excluded.branch,target_branch=excluded.target_branch,\
+                    status=excluded.status,updated_at=excluded.updated_at,\
+                    result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
+                    landed_source_oid=excluded.landed_source_oid,\
+                    landed_target_base_oid=excluded.landed_target_base_oid,\
+                    error_detail=excluded.error_detail,location=excluded.location \
+                 WHERE merge_queue.claim_owner IS NULL"
+            } else {
+                "INSERT INTO merge_queue \
+                    (worktree,branch,target_branch,status,queued_at,updated_at,\
+                     result_oid,conflict_paths,landed_source_oid,landed_target_base_oid,\
+                     error_detail,location,agent_attempts) \
+                 VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,?10,?11,0) \
+                 ON CONFLICT(worktree) DO UPDATE SET \
+                    branch=excluded.branch,target_branch=excluded.target_branch,\
+                    status=excluded.status,updated_at=excluded.updated_at,\
+                    result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
+                    landed_source_oid=excluded.landed_source_oid,\
+                    landed_target_base_oid=excluded.landed_target_base_oid,\
+                    error_detail=excluded.error_detail,location=excluded.location"
+            };
+            tx.execute(
+                upsert,
+                params![
+                    outcome.worktree,
+                    outcome.branch,
+                    outcome.target_branch,
+                    outcome.status.as_str(),
+                    util::now(),
+                    outcome.result_oid,
+                    outcome.conflict_paths,
+                    landed_source_oid,
+                    landed_target_base_oid,
+                    outcome.error_detail,
+                    location,
+                ],
+            )?
         } else {
-            "INSERT INTO merge_queue \
-                (worktree,branch,target_branch,status,queued_at,updated_at,\
-                 result_oid,conflict_paths,error_detail,location,agent_attempts) \
-             VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,0) \
-             ON CONFLICT(worktree) DO UPDATE SET \
-                branch=excluded.branch,target_branch=excluded.target_branch,\
-                status=excluded.status,updated_at=excluded.updated_at,\
-                result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
-                landed_source_oid=NULL,landed_target_base_oid=NULL,\
-                error_detail=excluded.error_detail,location=excluded.location"
+            let upsert = if has_claim_owner {
+                "INSERT INTO merge_queue \
+                    (worktree,branch,target_branch,status,queued_at,updated_at,\
+                     result_oid,conflict_paths,error_detail,location,agent_attempts) \
+                 VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,0) \
+                 ON CONFLICT(worktree) DO UPDATE SET \
+                    branch=excluded.branch,target_branch=excluded.target_branch,\
+                    status=excluded.status,updated_at=excluded.updated_at,\
+                    result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
+                    landed_source_oid=NULL,landed_target_base_oid=NULL,\
+                    error_detail=excluded.error_detail,location=excluded.location \
+                 WHERE merge_queue.claim_owner IS NULL"
+            } else {
+                "INSERT INTO merge_queue \
+                    (worktree,branch,target_branch,status,queued_at,updated_at,\
+                     result_oid,conflict_paths,error_detail,location,agent_attempts) \
+                 VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,0) \
+                 ON CONFLICT(worktree) DO UPDATE SET \
+                    branch=excluded.branch,target_branch=excluded.target_branch,\
+                    status=excluded.status,updated_at=excluded.updated_at,\
+                    result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
+                    landed_source_oid=NULL,landed_target_base_oid=NULL,\
+                    error_detail=excluded.error_detail,location=excluded.location"
+            };
+            tx.execute(
+                upsert,
+                params![
+                    outcome.worktree,
+                    outcome.branch,
+                    outcome.target_branch,
+                    outcome.status.as_str(),
+                    util::now(),
+                    outcome.result_oid,
+                    outcome.conflict_paths,
+                    outcome.error_detail,
+                    location,
+                ],
+            )?
         };
-        let changed = tx.execute(
-            upsert,
-            params![
-                outcome.worktree,
-                outcome.branch,
-                outcome.target_branch,
-                outcome.status.as_str(),
-                util::now(),
-                outcome.result_oid,
-                outcome.conflict_paths,
-                outcome.error_detail,
-                location,
-            ],
-        )?;
         if has_claim_owner && changed == 0 {
             return Ok(MergeOutcomeWrite::Claimed);
         }
@@ -1067,7 +1143,10 @@ impl WorktreeAuxStore for Db {
                     row_updated_at: prior.map_or(0, |row| row.updated_at),
                     candidate_oid,
                     result_oid: outcome.result_oid.map(str::to_owned),
-                    target_base_oid: None,
+                    target_base_oid: outcome
+                        .provenance
+                        .and_then(|provenance| provenance.target_base_oid)
+                        .map(str::to_owned),
                     actor: format!("thegn pid {}", std::process::id()),
                     at_ms: util::now_ms(),
                 },
