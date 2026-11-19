@@ -651,15 +651,15 @@ impl PaneEmulator for AlacrittyEmulator {
             }
         }
 
-        if newest.len() < max_lines {
-            if let Some(logical) = current {
-                collect_scrollback_line(
-                    &mut newest,
-                    &mut skipping_trailing_blanks,
-                    logical,
-                    max_lines,
-                );
-            }
+        if newest.len() < max_lines
+            && let Some(logical) = current
+        {
+            collect_scrollback_line(
+                &mut newest,
+                &mut skipping_trailing_blanks,
+                logical,
+                max_lines,
+            );
         }
 
         newest.reverse();
@@ -935,9 +935,9 @@ mod tests {
         for i in 1..=11 {
             e.advance(format!("history{i}\r\n").as_bytes());
         }
-        e.advance(b"\x1b[Hspinner\r\nstatus");
+        e.advance(b"spinner\r\nstatus");
         for _ in 0..50 {
-            e.advance(b"\x1b[2A\x1b[Jspinner\r\nstatus");
+            e.advance(b"\r\x1b[1A\x1b[Jspinner\r\nstatus");
         }
 
         let lines = e.scrollback_text(100, true).expect("grid history");
@@ -945,6 +945,13 @@ mod tests {
             lines
                 .iter()
                 .filter(|line| line.as_str() == "spinner")
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "status")
                 .count(),
             1
         );
@@ -963,7 +970,13 @@ mod tests {
     #[test]
     fn scrollback_text_is_unavailable_on_the_alt_screen() {
         let mut e = AlacrittyEmulator::new(10, 80, 100);
-        e.advance(b"history\r\n");
+        for i in 0..20 {
+            e.advance(format!("history{i}\r\n").as_bytes());
+        }
+        assert!(
+            e.scrollback_text(100, true).is_some(),
+            "primary screen has grid history"
+        );
         e.advance(b"\x1b[?1049h");
 
         assert_eq!(e.scrollback_text(100, true), None);
