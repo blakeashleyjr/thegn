@@ -5984,4 +5984,124 @@ mod tests {
         assert!(!on.iter().any(|r| r.0 == RowKind::BatchGroup));
         assert_eq!(on, shape(0), "no batch token: grouping changes nothing");
     }
+
+    // ── b164 lane 2: batch folding through build_rows ──────────────────────
+
+    /// The owner's 50 real worktrees in the `thegn` workspace: three plain
+    /// names (with the synthesized `home`, four singles) and five batches.
+    fn owner_db_rows() -> Vec<DbWorktree> {
+        let mut branches: Vec<String> = vec![
+            "merry-stream".into(),
+            "tg/b137-the-2001-fix".into(),
+            "tg/hardy-onyx".into(),
+        ];
+        for (b, n) in [(158, 5), (160, 11), (161, 11), (162, 10), (163, 10)] {
+            branches.extend((0..n).map(|i| format!("tg/b{b}-b{b}-lane{i:02}")));
+        }
+        assert_eq!(branches.len(), 50);
+        branches.iter().map(|b| db_row("thegn", b)).collect()
+    }
+
+    fn thegn_ws() -> Vec<(String, String, String, String)> {
+        vec![(
+            "thegn".to_string(),
+            "thegn".to_string(),
+            "repo".to_string(),
+            "/repos/thegn".to_string(),
+        )]
+    }
+
+    #[test]
+    fn build_rows_folds_the_owner_list_to_seven() {
+        let view = ViewState {
+            display: crate::sidebar_view::SidebarDisplay {
+                batch_group_min: 2,
+                group_row_limit: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s = session(vec![], 0);
+        let rows = build_rows(
+            &s,
+            &thegn_ws(),
+            &view,
+            &no_activity(),
+            &owner_db_rows(),
+            &[],
+            &[],
+        );
+        let shown: Vec<(RowKind, &str)> = rows
+            .iter()
+            .filter(|r| r.visible && r.depth == 1 && r.kind != RowKind::ShowMore)
+            .map(|r| (r.kind, r.label.as_str()))
+            .collect();
+        let batches: Vec<&str> = shown
+            .iter()
+            .filter(|r| r.0 == RowKind::BatchGroup)
+            .map(|r| r.1)
+            .collect();
+        assert_eq!(shown.len(), 7, "{shown:?}");
+        assert_eq!(batches, vec!["b163", "b162", "b161"]);
+        assert!(
+            shown[..4].iter().all(|r| r.0 == RowKind::Worktree),
+            "singles first: {shown:?}"
+        );
+        let more: Vec<&SidebarRow> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::ShowMore)
+            .collect();
+        assert_eq!(more.len(), 1);
+        assert_eq!(more[0].child_count, 2, "b160 and b158 fold");
+        let all: Vec<&SidebarRow> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::BatchGroup)
+            .collect();
+        assert_eq!(all.len(), 5);
+        assert!(all.iter().all(|r| r.collapsed), "every batch collapsed");
+        assert!(all.iter().all(|r| r.group_stats.is_some()));
+        assert!(
+            rows.iter()
+                .filter(|r| r.depth == 2)
+                .all(|r| !r.visible && r.batch_prefix.is_some()),
+            "members hide under their collapsed batch"
+        );
+        let member = rows
+            .iter()
+            .find(|r| r.label == "tg/b161-b161-lane03")
+            .expect("member");
+        assert_eq!(member.pin_key, "thegn/tg/b161-b161-lane03");
+        assert_eq!(member.batch_prefix.as_deref(), Some("tg/b161-b161-"));
+    }
+
+    #[test]
+    fn build_rows_never_batches_in_the_flat_layout() {
+        let view = ViewState {
+            flat: true,
+            display: crate::sidebar_view::SidebarDisplay {
+                batch_group_min: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s = session(vec![], 0);
+        let rows = build_rows(
+            &s,
+            &thegn_ws(),
+            &view,
+            &no_activity(),
+            &owner_db_rows(),
+            &[],
+            &[],
+        );
+        assert!(!rows.iter().any(|r| r.kind == RowKind::BatchGroup));
+        assert!(rows.iter().all(|r| r.batch_prefix.is_none()));
+        let labels: HashSet<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Worktree)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert!(labels.contains("tg/b161-b161-lane03"));
+        assert!(labels.len() >= 50, "every worktree is its own row");
+    }
 }
