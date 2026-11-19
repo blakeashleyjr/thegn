@@ -52,6 +52,31 @@ enum AnsiEvent {
     Alt(bool),
 }
 
+/// Length of `bytes` minus an incomplete trailing UTF-8 sequence (at most 3 bytes).
+fn utf8_flush_cut(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    for back in 1..=len.min(3) {
+        let b = bytes[len - back];
+        if b & 0xC0 == 0x80 {
+            continue;
+        }
+        // 0xF8..=0xFF can never start a sequence: nothing to wait for.
+        let need = if b >= 0xF8 {
+            1
+        } else if b >= 0xF0 {
+            4
+        } else if b >= 0xE0 {
+            3
+        } else if b >= 0xC0 {
+            2
+        } else {
+            1
+        };
+        return if need > back { len - back } else { len };
+    }
+    len
+}
+
 impl AnsiStripper {
     /// Strip ANSI escape sequences from `input`, appending visible bytes to
     /// `out`. Call repeatedly with successive chunks; state carries over.
@@ -63,6 +88,8 @@ impl AnsiStripper {
                     AnsiEvent::Spaces(count) => {
                         out.extend(std::iter::repeat_n(b' ', count));
                     }
+                    AnsiEvent::Newline => out.push(b'\n'),
+                    AnsiEvent::CarriageReturn => out.push(b'\r'),
                     _ => {}
                 }
             }
@@ -179,7 +206,6 @@ impl AnsiStripper {
                     }
                 }
                 AnsiEvent::CarriageReturn => {
-                    partial.push(b'\r');
                     self.cr_pending = true;
                 }
                 AnsiEvent::Newline => {
@@ -222,12 +248,7 @@ impl AnsiStripper {
     }
 
     fn flush_partial(&mut self, partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
-        let cut = match std::str::from_utf8(partial) {
-            Ok(_) => partial.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(error) if error.valid_up_to() > 0 => error.valid_up_to(),
-            Err(_) => 1,
-        };
+        let cut = utf8_flush_cut(partial);
         if cut == 0 {
             return;
         }
@@ -241,10 +262,11 @@ impl AnsiStripper {
     }
 
     fn store_line(&mut self, line: String, buf: &mut HistoryBuffer) {
-        if self.rewind > 0 {
-            let _ = buf.replace_from_end(self.rewind, line);
+        if self.rewind > 0 && self.rewind <= buf.len() {
+            buf.replace_from_end(self.rewind, line);
             self.rewind -= 1;
         } else {
+            self.rewind = 0;
             buf.push_line(line);
         }
     }
@@ -296,14 +318,15 @@ impl HistoryBuffer {
     }
 
     /// Replace the `k`-th stored line from the end (`k = 1` is newest).
-    /// Returns `false` when `k` is out of range; replacements do not affect
-    /// the monotonic pushed-line count.
+    /// Returns `false` when `k` is out of range. A replacement counts as one
+    /// line write in `total_pushed`, so new-line consumers rescan it.
     pub fn replace_from_end(&mut self, k: usize, line: String) -> bool {
         if k == 0 || k > self.lines.len() {
             return false;
         }
         let index = self.lines.len() - k;
         self.lines[index] = line;
+        self.total += 1;
         true
     }
 
@@ -321,7 +344,8 @@ impl HistoryBuffer {
         self.lines.is_empty()
     }
 
-    /// Monotonic count of all lines ever pushed (survives ring eviction).
+    /// Monotonic count of completed line writes (pushes and replacements);
+    /// survives ring eviction.
     pub fn total_pushed(&self) -> u64 {
         self.total
     }
@@ -504,16 +528,17 @@ mod tests {
     }
 
     #[test]
-    fn replace_from_end_replaces_without_changing_total() {
+    fn replace_from_end_replaces_and_counts_as_a_line_write() {
         let mut buf = make_buf(10);
         buf.push_line("first".into());
         buf.push_line("second".into());
         let total = buf.total_pushed();
         assert!(buf.replace_from_end(1, "new second".into()));
         assert_eq!(buf.get(1), Some("new second"));
-        assert_eq!(buf.total_pushed(), total);
+        assert_eq!(buf.total_pushed(), total + 1);
         assert!(!buf.replace_from_end(0, "nope".into()));
         assert!(!buf.replace_from_end(3, "nope".into()));
+        assert_eq!(buf.total_pushed(), total + 1);
     }
 
     // ── feed_bytes_to_history ─────────────────────────────────────────────────
@@ -544,6 +569,16 @@ mod tests {
         feed_str(&big, &mut buf, &mut partial, &mut st);
         assert_eq!(buf.len(), 1, "force-flushed at 4096");
         assert!(partial.is_empty(), "partial cleared after force-flush");
+    }
+
+    #[test]
+    fn non_utf8_output_still_flushes_in_4096_byte_lines() {
+        let mut buf = make_buf(10);
+        let mut partial = Vec::new();
+        let mut st = AnsiStripper::default();
+        feed_bytes_to_history(&[0xffu8; 5000], &mut buf, &mut partial, &mut st);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(partial.len(), 5000 - 4096);
     }
 
     #[test]
