@@ -193,6 +193,7 @@ fn gather_where(
                         .recorded
                         .into_iter()
                         .map(|record| record.name)
+                        .chain(owned.unreadable)
                         .collect()
                 })
                 .map_err(|error| {
@@ -217,7 +218,10 @@ fn gather_where(
 }
 
 fn sprites_ours(names: Option<&BTreeSet<String>>, row: &fleet_cost::FleetRow) -> Option<bool> {
-    (row.provider == "sprites").then(|| names.is_some_and(|names| names.contains(&row.id)))
+    if row.provider != "sprites" {
+        return None;
+    }
+    names.map(|names| names.contains(&row.id))
 }
 
 /// Shape one env's read. `Err` carries the reason (build or read failure).
