@@ -3692,6 +3692,145 @@ fn provider_pane_loc_is_local_without_a_state_db() {
     assert!(!state.state_home().join("thegn/thegn.db").exists());
 }
 
+fn env_with_placement(
+    placement: thegn_core::config::PlacementMode,
+) -> thegn_core::config::EnvConfig {
+    thegn_core::config::EnvConfig {
+        placement,
+        ..Default::default()
+    }
+}
+
+fn cfg_with_envs(envs: &[(&str, thegn_core::config::PlacementMode)]) -> Config {
+    Config {
+        env: envs
+            .iter()
+            .map(|(name, placement)| ((*name).to_string(), env_with_placement(*placement)))
+            .collect(),
+        ..Config::default()
+    }
+}
+
+#[test]
+fn provider_envs_configured_is_true_only_for_a_provider_placement() {
+    use thegn_core::config::PlacementMode;
+
+    let cases: &[(&[(&str, PlacementMode)], bool)] = &[
+        (&[], false),
+        (&[("home", PlacementMode::Local)], false),
+        (&[("box", PlacementMode::Ssh)], false),
+        (&[("kube", PlacementMode::K8s)], false),
+        (
+            &[("box", PlacementMode::Ssh), ("kube", PlacementMode::K8s)],
+            false,
+        ),
+        (&[("cloud", PlacementMode::Provider)], true),
+        (
+            &[
+                ("box", PlacementMode::Ssh),
+                ("cloud", PlacementMode::Provider),
+            ],
+            true,
+        ),
+    ];
+    for (envs, expected) in cases {
+        assert_eq!(
+            provider_envs_configured(&cfg_with_envs(envs)),
+            *expected,
+            "{envs:?}"
+        );
+    }
+}
+
+/// Write a worktree row whose recorded location is a provider sandbox.
+fn record_provider_worktree() -> (tempfile::TempDir, String) {
+    use thegn_core::store::WorkspaceStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let location = GitLoc::provider_db_string(&["sprite".into(), "exec".into()], "/workspace");
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some(&location), None)
+        .unwrap();
+    drop(db);
+    (dir, wt)
+}
+
+#[test]
+fn native_exec_without_a_provider_env_is_unavailable_like_the_full_resolution() {
+    use thegn_core::config::PlacementMode;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let (_dir, wt) = record_provider_worktree();
+    let cfg = cfg_with_envs(&[("box", PlacementMode::Ssh), ("home", PlacementMode::Local)]);
+    assert!(!provider_envs_configured(&cfg));
+
+    // The fast path.
+    assert!(matches!(
+        native_shell_exec_for_pane(&cfg, &wt),
+        PaneNativeExec::Unavailable
+    ));
+    assert!(provider_proxy_target(&cfg, &wt).is_none());
+    assert!(sprite_ssh_connect(&cfg, &wt).is_none());
+
+    // The old resolution path, run in full: even with the DB recording a
+    // provider location, no selection (none, each configured env, an
+    // undefined one) resolves a provider placement, so the old code returned
+    // `Unavailable` at its placement check too.
+    let loc = provider_pane_loc(&wt, "native exec").expect("location readable");
+    assert!(matches!(loc, GitLoc::Provider { .. }));
+    let repo_root = std::path::PathBuf::from(&wt);
+    for selected in [None, Some("box"), Some("home"), Some("cloud")] {
+        let selection = selection_with_profile(&wt, &repo_root, selected.map(str::to_string))
+            .expect("selection readable");
+        let environment = cfg.resolve_env(&repo_root, &loc, Path::new(&wt), &selection);
+        assert!(
+            !environment.placement.is_provider(),
+            "{selected:?} resolved a provider placement without a provider env"
+        );
+    }
+}
+
+#[test]
+fn native_exec_opens_the_database_once_with_a_provider_env_and_never_without() {
+    use thegn_core::config::PlacementMode;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let (_dir, wt) = record_provider_worktree();
+
+    // A provider-configured fixture: location, repo root, env selection and
+    // profile all read through ONE handle (was four to five opens).
+    let provider_cfg = cfg_with_envs(&[("cloud", PlacementMode::Provider)]);
+    let before = thegn_core::db_open_stats::total_opens();
+    let _ = native_exec_for(&provider_cfg, &wt, None);
+    assert_eq!(thegn_core::db_open_stats::total_opens() - before, 1);
+
+    // No provider env: the config-only fast path opens nothing.
+    let plain_cfg = cfg_with_envs(&[("box", PlacementMode::Ssh)]);
+    let before = thegn_core::db_open_stats::total_opens();
+    let _ = native_exec_for(&plain_cfg, &wt, None);
+    let _ = provider_proxy_target(&plain_cfg, &wt);
+    let _ = sprite_ssh_connect(&plain_cfg, &wt);
+    assert_eq!(thegn_core::db_open_stats::total_opens() - before, 0);
+}
+
+#[test]
+fn provider_pane_loc_in_matches_provider_pane_loc() {
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let (_dir, wt) = record_provider_worktree();
+    let db = Db::open().unwrap();
+    assert!(matches!(
+        provider_pane_loc_in(&db, &wt, "native exec"),
+        Some(GitLoc::Provider { .. })
+    ));
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    assert!(provider_pane_loc_in(&db, &wt, "native exec").is_none());
+    assert!(provider_pane_loc(&wt, "native exec").is_none());
+}
+
 #[test]
 fn provider_proxy_refusal_names_an_unreadable_location() {
     use thegn_core::store::WorkspaceStore;
