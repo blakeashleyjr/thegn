@@ -40,6 +40,10 @@ mod claim;
 #[path = "merge_driver_claim_tests.rs"]
 mod claim_tests;
 
+#[cfg(test)]
+#[path = "merge_driver_recovery_tests.rs"]
+mod recovery_tests;
+
 /// A worktree branch to drain, as read from the `merge_queue` cache.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueItem {
