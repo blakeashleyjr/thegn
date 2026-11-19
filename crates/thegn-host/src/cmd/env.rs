@@ -1164,6 +1164,13 @@ fn destroy_provider_sandbox(
     steps: DownSteps<'_>,
 ) -> Result<()> {
     if down_inventory_decision((steps.list)(), id) == DownInventoryDecision::AlreadyGone {
+        (steps.teardown)()?;
+        (steps.revoke)()?;
+        if let Err(e) = (steps.destroy)() {
+            msg::warn(&format!(
+                "sandbox {id} is already gone, but its provider records could not be cleared: {e:#}; `thegn env reap` finishes them"
+            ));
+        }
         (steps.forget)();
         outln!("env {env_name}: sandbox {id} is already gone; nothing to pull back or destroy");
         return Ok(());
@@ -2825,29 +2832,29 @@ mod down_tests {
     }
 
     #[test]
-    fn already_gone_skips_pull_and_destroy_and_forgets_state() {
+    fn already_gone_skips_pull_and_revokes_then_forgets() {
         let calls = RefCell::new(Vec::new());
-        let mut pull = || {
+        let mut pull = || -> anyhow::Result<PullReport> {
             calls.borrow_mut().push("pull");
             Ok(report(PullOutcome::UpToDate))
         };
-        let mut teardown = || {
+        let mut teardown = || -> anyhow::Result<()> {
             calls.borrow_mut().push("teardown");
             Ok(())
         };
-        let mut suspend = || {
+        let mut suspend = || -> anyhow::Result<()> {
             calls.borrow_mut().push("suspend");
             Ok(())
         };
-        let mut revoke = || {
+        let mut revoke = || -> anyhow::Result<()> {
             calls.borrow_mut().push("revoke");
             Ok(())
         };
-        let mut destroy_call = || {
+        let mut destroy_call = || -> anyhow::Result<()> {
             calls.borrow_mut().push("destroy");
             Ok(())
         };
-        let mut list = || {
+        let mut list = || -> anyhow::Result<InventoryReport> {
             calls.borrow_mut().push("list");
             Ok(inventory(&[]))
         };
@@ -2869,7 +2876,10 @@ mod down_tests {
             },
         )
         .expect("already-gone down succeeds");
-        assert_eq!(*calls.borrow(), ["list", "forget"]);
+        assert_eq!(
+            *calls.borrow(),
+            ["list", "teardown", "revoke", "destroy", "forget"]
+        );
     }
 
     #[test]
