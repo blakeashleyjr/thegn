@@ -18,6 +18,22 @@ use serde_json::{Value, json};
 use thegn_core::mcp::proxy::breaker::{Breaker, BreakerConfig, BreakerState};
 use thegn_core::mcp::proxy::route;
 
+/// The variables an upstream inherits from the hub's own env. The package
+/// cache and mcp-remote auth dirs are set by thegn only in the Lead's env
+/// (its private MCP dir), so the daemon's own hub passes them through unset.
+const UPSTREAM_BASE_ENV: [&str; 10] = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "SystemRoot",
+    "npm_config_cache",
+    "UV_CACHE_DIR",
+    "BUN_INSTALL_CACHE_DIR",
+    "MCP_REMOTE_CONFIG_DIR",
+];
+
 /// A protocol-level round-trip failure.
 enum RpcFail {
     /// Timed out, or the child's pipe closed — a *transport* failure that feeds
@@ -66,7 +82,7 @@ impl Upstream {
         // Minimal base env + only the declared (resolved) env — a compromised
         // upstream must not inherit the daemon's whole environment.
         cmd.env_clear();
-        for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SystemRoot"] {
+        for key in UPSTREAM_BASE_ENV {
             if let Ok(v) = std::env::var(key) {
                 cmd.env(key, v);
             }
@@ -277,5 +293,26 @@ impl Drop for Upstream {
         // best-effort: kill the child; the reader thread then sees EOF and exits.
         let _ = self.child.kill();
         let _ = self.child.wait(); // best-effort: teardown: the child may already have exited or been reaped
+    }
+}
+
+#[cfg(test)]
+mod base_env_tests {
+    use super::UPSTREAM_BASE_ENV;
+
+    #[test]
+    fn upstream_base_env_passes_the_lead_mcp_cache_and_auth_dirs() {
+        for key in [
+            "npm_config_cache",
+            "UV_CACHE_DIR",
+            "BUN_INSTALL_CACHE_DIR",
+            "MCP_REMOTE_CONFIG_DIR",
+        ] {
+            assert!(UPSTREAM_BASE_ENV.contains(&key), "{key}");
+        }
+        // Still a minimal allowlist: no secrets-bearing or Lead-marker var.
+        for key in ["THEGN_LEAD_MCP_HOME", "GITHUB_TOKEN", "SSH_AUTH_SOCK"] {
+            assert!(!UPSTREAM_BASE_ENV.contains(&key), "{key}");
+        }
     }
 }
