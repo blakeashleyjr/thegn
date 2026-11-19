@@ -33,8 +33,8 @@ The proposed id is new: `fleet.list` — **UNVERIFIED on BASE** (no such id is
 present in the BASE catalog). A dedicated read verb should resolve through
 `required_scope(verb)` to `Scope::Read`.
 
-| Capability | Required scope | Declared surfaces | Projection |
-| --- | --- | --- | --- |
+| Capability   | Required scope                     | Declared surfaces            | Projection               |
+| ------------ | ---------------------------------- | ---------------------------- | ------------------------ |
 | `fleet.list` | `Scope::Read` via `required_scope` | HTTP, gRPC, CLI, MCP, plugin | Cached view and estimate |
 
 The initial surface plan is:
@@ -69,12 +69,12 @@ already serializable and are the types at
 
 `fleet.list` returns this list-only envelope:
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `generated_ms` | integer | Time at which this estimate was produced |
-| `view` | `FleetView` JSON | Rows, joins, partial, missing, down, orphan, and unrecorded state |
-| `cost` | `FleetCost` JSON | Estimates, projections, unpriced, and budget fields |
-| `agents` | object | Existing optional dispatch summaries |
+| Field          | Type             | Meaning                                                           |
+| -------------- | ---------------- | ----------------------------------------------------------------- |
+| `generated_ms` | integer          | Time at which this estimate was produced                          |
+| `view`         | `FleetView` JSON | Rows, joins, partial, missing, down, orphan, and unrecorded state |
+| `cost`         | `FleetCost` JSON | Estimates, projections, unpriced, and budget fields               |
+| `agents`       | object           | Existing optional dispatch summaries                              |
 
 The list response omits `vercel_usage` and `sprites_usage`. Those are explicit
 `fleet cost` usage calls and are not part of this capability. Existing CLI JSON
@@ -134,13 +134,13 @@ The read path has these hard behavior bounds:
 The implementation is complete only when each existing projection and its
 ratchet moves together.
 
-| Ratchet | Required change |
-| --- | --- |
-| `api_calls_mirror_routes` | Add the HTTP method/path row beside the route. |
-| `coverage_problems` | Add the row and verify all five surface ledgers. |
-| `test/surface-gaps-ratchet.txt` | Pin the two temporary gRPC/plugin gap reasons. |
-| API snapshots | Update `docs/api/control-v1.json` and its test snapshot. |
-| MCP tool list | Add `fleet.list` to `MCP_STATE_CAPS`, `STATE_TOOLS`, and list assertions. |
+| Ratchet                         | Required change                                                           |
+| ------------------------------- | ------------------------------------------------------------------------- |
+| `api_calls_mirror_routes`       | Add the HTTP method/path row beside the route.                            |
+| `coverage_problems`             | Add the row and verify all five surface ledgers.                          |
+| `test/surface-gaps-ratchet.txt` | Pin the two temporary gRPC/plugin gap reasons.                            |
+| API snapshots                   | Update `docs/api/control-v1.json` and its test snapshot.                  |
+| MCP tool list                   | Add `fleet.list` to `MCP_STATE_CAPS`, `STATE_TOOLS`, and list assertions. |
 
 The HTTP route and API-call row must be one response shape, and MCP must use
 the same catalog id even though its tool-name projection is `fleet_list`.
@@ -150,18 +150,18 @@ the same catalog id even though its tool-name projection is `fleet_list`.
 The following is the smallest coherent implementation slice. It keeps policy in
 core, transport projection in the service, and provider work in the host.
 
-| File | Change |
-| --- | --- |
-| `crates/thegn-core/src/control.rs` | Add a fleet-list verb and map it to `Scope::Read`. |
-| `crates/thegn-core/src/capability.rs` | Add the row and two temporary surface gaps. |
-| `crates/thegn-svc/src/control/routes.rs` | Add `GET /v1/fleet`, `API_CALLS`, and assertions. |
-| `crates/thegn-host/src/daemon/service.rs` | Implement the cached host `ControlApi` handler off-loop. |
-| `crates/thegn-host/src/daemon/mod.rs` | Wire the shared cache if construction needs it. |
-| `crates/thegn-core/src/mcp/state.rs` | Add `STATE_TOOLS`, `MCP_STATE_CAPS`, and dispatch. |
-| `crates/thegn-host/src/cmd/fleet.rs` | Share sanitization without changing CLI JSON. |
-| `crates/thegn-host/src/fleet_read.rs` | Share the read and serialization path. |
-| `docs/api/control-v1.json` | Version the response and nested JSON definitions. |
-| `test/surface-gaps-ratchet.txt` | Pin only the two temporary surface gaps until gRPC and plugin land. |
+| File                                      | Change                                                              |
+| ----------------------------------------- | ------------------------------------------------------------------- |
+| `crates/thegn-core/src/control.rs`        | Add a fleet-list verb and map it to `Scope::Read`.                  |
+| `crates/thegn-core/src/capability.rs`     | Add the row and two temporary surface gaps.                         |
+| `crates/thegn-svc/src/control/routes.rs`  | Add `GET /v1/fleet`, `API_CALLS`, and assertions.                   |
+| `crates/thegn-host/src/daemon/service.rs` | Implement the cached host `ControlApi` handler off-loop.            |
+| `crates/thegn-host/src/daemon/mod.rs`     | Wire the shared cache if construction needs it.                     |
+| `crates/thegn-core/src/mcp/state.rs`      | Add `STATE_TOOLS`, `MCP_STATE_CAPS`, and dispatch.                  |
+| `crates/thegn-host/src/cmd/fleet.rs`      | Share sanitization without changing CLI JSON.                       |
+| `crates/thegn-host/src/fleet_read.rs`     | Share the read and serialization path.                              |
+| `docs/api/control-v1.json`                | Version the response and nested JSON definitions.                   |
+| `test/surface-gaps-ratchet.txt`           | Pin only the two temporary surface gaps until gRPC and plugin land. |
 
 No help-page edit is included; the help-page decision belongs to lane 18.
 
@@ -171,21 +171,21 @@ The following checks were run with `git grep` against BASE (`f08a9aa5`). A
 proposed symbol that does not exist yet is called out rather than presented as
 an existing implementation fact.
 
-| Reference | BASE result |
-| --- | --- |
-| `thegn_core::capability::CATALOG` | Found in core and control projections. |
-| `required_scope` and `Scope::Read` | Found in core; read verbs resolve to `Scope::Read`. |
-| `FleetReport` at host `cmd/fleet.rs:76` | Found; private wrapper for `generated_ms`, `view`, `cost`, usage, and `agents`. |
-| `FleetView` / `FleetCost` | Found in `crates/thegn-core/src/placement/fleet_cost.rs`. |
-| `crate::vps::INVENTORY_BUDGET` | Found; declared at `crates/thegn-svc/src/vps/mod.rs:46`. |
-| `reads_never_resume` | Found in provider conformance and the Sprites conformance test. |
-| `api_calls_mirror_routes` | Found in `crates/thegn-svc/src/control/routes.rs:760`. |
-| `coverage_problems` | Found in `crates/thegn-core/src/capability.rs:1513`. |
-| `test/surface-gaps-ratchet.txt` | Found and pinned by the capability tests and ARCHITECTURE.md §6. |
-| `mcp::state::StateRouter` / `MCP_STATE_CAPS` | Found in `crates/thegn-core/src/mcp/state.rs` and the MCP command. |
-| `sanitize_text` | Found at `cmd/fleet.rs:129`; private, so it must be shared or extracted. |
-| `fleet.list` | **UNVERIFIED on BASE**; this RFC proposes the id. |
-| `FleetList` / a fleet control handler | **UNVERIFIED on BASE**; no dedicated verb or handler exists yet. |
+| Reference                                    | BASE result                                                                     |
+| -------------------------------------------- | ------------------------------------------------------------------------------- |
+| `thegn_core::capability::CATALOG`            | Found in core and control projections.                                          |
+| `required_scope` and `Scope::Read`           | Found in core; read verbs resolve to `Scope::Read`.                             |
+| `FleetReport` at host `cmd/fleet.rs:76`      | Found; private wrapper for `generated_ms`, `view`, `cost`, usage, and `agents`. |
+| `FleetView` / `FleetCost`                    | Found in `crates/thegn-core/src/placement/fleet_cost.rs`.                       |
+| `crate::vps::INVENTORY_BUDGET`               | Found; declared at `crates/thegn-svc/src/vps/mod.rs:46`.                        |
+| `reads_never_resume`                         | Found in provider conformance and the Sprites conformance test.                 |
+| `api_calls_mirror_routes`                    | Found in `crates/thegn-svc/src/control/routes.rs:760`.                          |
+| `coverage_problems`                          | Found in `crates/thegn-core/src/capability.rs:1513`.                            |
+| `test/surface-gaps-ratchet.txt`              | Found and pinned by the capability tests and ARCHITECTURE.md §6.                |
+| `mcp::state::StateRouter` / `MCP_STATE_CAPS` | Found in `crates/thegn-core/src/mcp/state.rs` and the MCP command.              |
+| `sanitize_text`                              | Found at `cmd/fleet.rs:129`; private, so it must be shared or extracted.        |
+| `fleet.list`                                 | **UNVERIFIED on BASE**; this RFC proposes the id.                               |
+| `FleetList` / a fleet control handler        | **UNVERIFIED on BASE**; no dedicated verb or handler exists yet.                |
 
 ## Unverified
 
