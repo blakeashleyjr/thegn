@@ -442,7 +442,7 @@ for field, actual, expected in checks:
     if (field == "pull.ok" and actual is not True) or (field != "pull.ok" and actual != expected):
         print("agent JSON failing field: " + field, file=sys.stderr)
         sys.exit(1)
-'
+' "$1"
 }
 
 agent_hold_run() {
@@ -473,7 +473,7 @@ agent_run() { # agent_run <agent> ; each agent commits one file
 
 fly_stopped() {
   local out
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
   printf '%s' "$out" | FLEET_ID="$NAME" python3 -I -c '
 import json, os, sys
 
