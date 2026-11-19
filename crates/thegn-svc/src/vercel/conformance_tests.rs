@@ -39,6 +39,9 @@ async fn vercel_passes_the_conformance_suite() {
             })
         })),
         resumes: Some(Box::new(move || resumes.count("resume"))),
+        cap: None,
+        // FakeApi (kept untouched) has no stop/resume round trip to observe.
+        supports_stop: false,
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
