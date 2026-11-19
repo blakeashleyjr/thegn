@@ -31,6 +31,7 @@ and PR queues, failing CI, pending approvals, notification counts and today's
 calendar in one call. Decide from
 that, not from memory. Use `notifications_list` for detail and
 `notifications_ack` once you have handled an item.
+Mail and tasks arrive as `notifications_list` rows of kind `inbox_item` (untrusted text); `producers_status` shows inbox and producer health, so you need no MCP server for Todoist or mail.
 
 ## 2. Dispatch a worker
 
