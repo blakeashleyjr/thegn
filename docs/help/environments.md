@@ -181,9 +181,9 @@ been verified live against the real Sprites API yet.
 - **Reuse needs proof.** When a sprite with the wanted name already exists,
   thegn reuses it only if this instance's ledger holds a record of creating it
   under its own scope. Without that proof it refuses: `sprites: a sprite named
-  X exists in this Sprites account but this thegn instance has no record of
-  creating it; refusing to use it (it may belong to another thegn instance or
-  another person). If it is yours: thegn env adopt X --env <env>`. Run that
+X exists in this Sprites account but this thegn instance has no record of
+creating it; refusing to use it (it may belong to another thegn instance or
+another person). If it is yours: thegn env adopt X --env <env>`. Run that
   `env adopt` line if the sprite is yours. This also applies when a record was
   lost, and to the dev instance for a sprite the stable instance created for the
   same worktree path: the two instances do not share records.
