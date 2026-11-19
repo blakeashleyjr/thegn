@@ -993,6 +993,23 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     // Whole-list parity, not window-local: the paint below starts at `scroll`,
     // and a window-local count would flip a block's tint as the list scrolled.
     let parity = block_parity(&visible);
+    // Ancestor guide bits, once over the whole visible list (not the window),
+    // so a guide never breaks where the scroll window starts. Section-opening
+    // headers (folder, Other, Pipelines, project) scan as depth 0: they keep
+    // their own layout and interrupt the line, so no pipe dangles into them.
+    let guide_depths: Vec<u8> = visible
+        .iter()
+        .map(|r| match r.kind {
+            RowKind::Worktree
+            | RowKind::BatchGroup
+            | RowKind::ShowMore
+            | RowKind::Terminal
+            | RowKind::PipelineWorktree
+            | RowKind::EmptyHint => r.depth,
+            _ => 0,
+        })
+        .collect();
+    let guides = ancestor_guides(&guide_depths);
 
     let geom = sidebar_geom_from(model, rect, &visible);
     let SidebarGeom {
@@ -1074,6 +1091,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
                 content_cols,
                 &mut mq_geometry,
                 &model.sidebar_display,
+                guides[i],
             )
         };
         // The lead gap — a section banner's breathing space — comes from
@@ -1515,7 +1533,9 @@ fn row_bg(
     let header = matches!(row.kind, RowKind::Workspace | RowKind::TerminalHost);
     if i == cursor {
         Tok::Slot(S::Panel2)
-    } else if row.active {
+    } else if row.active && row.kind != RowKind::BatchGroup {
+        // A batch header's `active` only means "holds the active worktree"
+        // (its label goes Focus); the member row carries the tint.
         Tok::SelAccent
     } else if model.sidebar_marked.contains(&i) {
         Tok::Slot(S::Raise)
@@ -1766,21 +1786,79 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     }
 }
 
-/// The indent + connector segments for a tree row at `depth` (worktree = 1,
-/// folder child = 2). Two cells of indent per ancestor level, then a `└`/`├`
-/// connector in a ghost tone so the nesting is visible at a glance.
-fn tree_lead(depth: u8, is_last: bool) -> Vec<crate::seg::Seg> {
+/// Per visible row, bit k-1 set = a later row at depth k follows before the tree steps above k.
+///
+/// One reverse scan: `seen[k-1]` records "a row at depth k lies ahead and
+/// nothing shallower than k sits between it and here". A row at depth `d`
+/// clears every deeper level (it steps the tree above them) and marks its
+/// own; depth 0 (a project header) resets all of them. Depths past 8 have no
+/// bit and only clear.
+fn ancestor_guides(depths: &[u8]) -> Vec<u8> {
+    let mut seen = [false; 8];
+    let mut out = vec![0u8; depths.len()];
+    for (i, &d) in depths.iter().enumerate().rev() {
+        out[i] = seen
+            .iter()
+            .enumerate()
+            .fold(0u8, |acc, (k, &s)| if s { acc | (1 << k) } else { acc });
+        let d = usize::from(d);
+        // Levels deeper than `d` (index >= d) are stepped above here.
+        for s in seen.iter_mut().skip(d) {
+            *s = false;
+        }
+        if (1..=8).contains(&d) {
+            seen[d - 1] = true;
+        }
+    }
+    out
+}
+
+/// The ancestor indent of a tree row at `depth`: one 2-cell step per level
+/// `k < depth`, carrying a ghost `tree_pipe` in its first cell when bit `k-1`
+/// of `guides` is set (a later row at depth `k` still follows), else blank.
+/// Always `(depth-1)*2` cells wide.
+fn guide_indent(depth: u8, guides: u8) -> Vec<crate::seg::Seg> {
     use crate::seg::{Tok, seg, sp};
     let gl = crate::caps::active_glyphs();
-    let indent = (depth.saturating_sub(1)) as usize * 2;
+    let levels = usize::from(depth.saturating_sub(1));
+    let mut out = Vec::new();
+    let mut blank = 0usize;
+    for k in 1..=levels {
+        if k <= 8 && guides & (1 << (k - 1)) != 0 {
+            if blank > 0 {
+                out.push(sp(blank));
+            }
+            out.push(seg(Tok::Slot(S::Ghost2), gl.tree_pipe));
+            blank = 1;
+        } else {
+            blank += 2;
+        }
+    }
+    // With no pipe this is the single `sp((depth-1)*2)` it always was.
+    if out.is_empty() || blank > 0 {
+        out.push(sp(blank));
+    }
+    out
+}
+
+/// The indent + connector segments for a tree row at `depth` (worktree = 1,
+/// folder child = 2). Two cells of indent per ancestor level (ancestor guides
+/// per [`ancestor_guides`]), then a `└`/`├` connector in a ghost tone so the
+/// nesting is visible at a glance.
+fn tree_lead(depth: u8, is_last: bool, guides: u8) -> Vec<crate::seg::Seg> {
+    use crate::seg::{Tok, seg};
+    let gl = crate::caps::active_glyphs();
     let conn = if is_last { gl.tree_corner } else { gl.tree_tee }; // └ / ├
-    vec![sp(indent), seg(Tok::Slot(S::Ghost2), format!("{conn} "))]
+    let mut out = guide_indent(depth, guides);
+    out.push(seg(Tok::Slot(S::Ghost2), format!("{conn} ")));
+    out
 }
 
 /// The lead of a worktree row's detail line: the same indent as the first
-/// line, with a ghost tree pipe under the row's own tee connector (blank under a corner). Returns
-/// the segments and their display width (`4 + (depth-1)*2 + 4`).
-fn detail_tree_lead(depth: u8, is_last: bool) -> (Vec<crate::seg::Seg>, usize) {
+/// line (ancestor guides included), with a ghost tree pipe under the row's own
+/// tee connector (blank under a corner). Returns the segments and their
+/// display width (`4 + (depth-1)*2 + 4`).
+fn detail_tree_lead(depth: u8, is_last: bool, guides: u8) -> (Vec<crate::seg::Seg>, usize) {
     use crate::seg::{Tok, seg, sp};
     let gl = crate::caps::active_glyphs();
     let pad = 4 + (depth.saturating_sub(1) as usize) * 2;
@@ -1789,10 +1867,107 @@ fn detail_tree_lead(depth: u8, is_last: bool) -> (Vec<crate::seg::Seg>, usize) {
     } else {
         format!("{} ", gl.tree_pipe)
     };
-    (
-        vec![sp(pad), seg(Tok::Slot(S::Ghost2), guide), sp(2)],
-        pad + 4,
-    )
+    let indent = guide_indent(depth, guides);
+    let mut lead = Vec::with_capacity(indent.len() + 3);
+    if indent.len() == 1 {
+        // No ancestor pipe: one pad segment, as before.
+        lead.push(sp(pad));
+    } else {
+        lead.push(sp(4));
+        lead.extend(indent);
+    }
+    lead.push(seg(Tok::Slot(S::Ghost2), guide));
+    lead.push(sp(2));
+    (lead, pad + 4)
+}
+
+/// The worktree name's tone and weight (the tone ladder): the active worktree
+/// is Focus; a row that needs you (attention `Blocked`, or activity `Failed`)
+/// is Text + bold; a working, building or finished-unread row, or the cursor
+/// row, is Text; a seen or idle row is Dim.
+fn name_tone(row: &crate::sidebar::SidebarRow, is_cursor: bool) -> (crate::seg::Tok, bool) {
+    use crate::seg::Tok;
+    use crate::sidebar::ActivityState;
+    if row.active {
+        return (Tok::Slot(S::Focus), false);
+    }
+    if row_is_blocked(row) || matches!(row.activity, ActivityState::Failed) {
+        return (Tok::Slot(S::Text), true);
+    }
+    match row.activity {
+        ActivityState::Active | ActivityState::Loading | ActivityState::Waiting => {
+            (Tok::Slot(S::Text), false)
+        }
+        _ if is_cursor => (Tok::Slot(S::Text), false),
+        _ => (Tok::Slot(S::Dim), false),
+    }
+}
+
+/// A batch member's on-screen name: `label` without the shared batch
+/// `prefix`, but only when the label starts with it and something is left.
+fn shown_name<'a>(label: &'a str, prefix: Option<&str>) -> &'a str {
+    match prefix {
+        Some(p) if !p.is_empty() => match label.strip_prefix(p) {
+            Some(rest) if !rest.is_empty() => rest,
+            _ => label,
+        },
+        _ => label,
+    }
+}
+
+/// The right cluster of a batch row: `N need(s) you`, `N active`, `N done`,
+/// joined by a ghost middot, keeping whole parts from the left (priority
+/// order) while they fit in `avail` cells — a part is dropped, never clipped.
+fn batch_right_cluster(
+    stats: &crate::sidebar::fold::GroupStats,
+    avail: usize,
+) -> Vec<crate::seg::Seg> {
+    use crate::seg::{Seg, Tok, seg, seg_width};
+    let gl = crate::caps::active_glyphs();
+    let mut parts: Vec<Seg> = Vec::new();
+    if stats.blocked > 0 {
+        let verb = if stats.blocked == 1 {
+            "needs you"
+        } else {
+            "need you"
+        };
+        parts.push(
+            seg(
+                Tok::Slot(S::ActivityWaiting),
+                format!("{} {verb}", stats.blocked),
+            )
+            .bold(),
+        );
+    }
+    if stats.active > 0 {
+        parts.push(seg(
+            Tok::Slot(S::ActivityActive),
+            format!("{} active", stats.active),
+        ));
+    }
+    if stats.done > 0 {
+        parts.push(seg(
+            Tok::Slot(S::ActivityDone),
+            format!("{} done", stats.done),
+        ));
+    }
+    let mut out: Vec<Seg> = Vec::new();
+    for part in parts {
+        let sep = seg(Tok::Slot(S::Ghost), format!(" {} ", gl.middot));
+        let extra = if out.is_empty() {
+            crate::seg::cells(&part.text)
+        } else {
+            crate::seg::cells(&sep.text) + crate::seg::cells(&part.text)
+        };
+        if seg_width(&out) + extra > avail {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(sep);
+        }
+        out.push(part);
+    }
+    out
 }
 
 /// The activity dot glyph (item 20): filled while active/waiting, hollow once
@@ -1951,6 +2126,9 @@ fn compose_row_lines(
     content_cols: usize,
     mq_geometry: &mut Option<(usize, usize)>,
     disp: &SidebarDisplay,
+    // This row's ancestor guide bits ([`ancestor_guides`]); read by the
+    // Worktree, BatchGroup and ShowMore arms only.
+    guides: u8,
 ) -> Vec<crate::seg::Line> {
     use crate::seg::{Line, Seg, Tok, seg, sp};
     use crate::sidebar::{ActivityState, RowKind};
@@ -2030,12 +2208,14 @@ fn compose_row_lines(
         // The row-limit toggle: indented at its group's child depth (under
         // the entries it reveals) and in the focus colour so it reads as a
         // control, not as one more entry.
-        RowKind::ShowMore => vec![Line::Segs(vec![
-            sp(1),
-            sp(3),
-            sp(usize::from(row.depth.saturating_sub(1)) * 2 + 2),
-            seg(Tok::Slot(S::Focus), show_more_text(row)),
-        ])],
+        // It closes its group with the corner connector, carrying any
+        // ancestor guides; the text column is unchanged.
+        RowKind::ShowMore => {
+            let mut l = vec![sp(1), sp(3)];
+            l.extend(tree_lead(row.depth, true, guides));
+            l.push(seg(Tok::Slot(S::Focus), show_more_text(row)));
+            vec![Line::Segs(l)]
+        }
         // A derived `Pipelines` group under a workspace: caret + name + how
         // many lanes it holds. It reads like a folder because it behaves like
         // one (collapse/expand), and is toned plain rather than bold so a
@@ -2078,7 +2258,7 @@ fn compose_row_lines(
             // `tree_lead` indents by depth, landing the connector under its
             // lane row's caret.
             let mut l = vec![sp(1), sp(2)];
-            l.extend(tree_lead(row.depth, is_last));
+            l.extend(tree_lead(row.depth, is_last, 0));
             let tok = if row.tab_target.is_some() {
                 Tok::Slot(S::Dim)
             } else {
@@ -2100,15 +2280,51 @@ fn compose_row_lines(
             seg(Tok::Slot(S::Ghost), format!(" ({})", row.child_count)),
         ])],
         // A derived batch row (loose worktrees sharing a batch token): caret,
-        // label and member count, at its members' guide column.
+        // rollup marker, label and member count at its members' guide column;
+        // the right cluster counts who needs you, who is working, who is done.
+        // `row.active` is set by the fold pass when any member is the active
+        // worktree (`visible_index_of_active` skips `BatchGroup`).
         RowKind::BatchGroup => {
+            let stats = row.group_stats.unwrap_or_default();
             let mut l = vec![sp(1), sp(3)];
-            l.extend(tree_lead(row.depth, is_last));
+            // Open, the next row is its own member: close the connector when no
+            // later sibling at this depth follows (the guide bit for this level).
+            let closes =
+                is_last || (1..=8).contains(&row.depth) && guides & (1u8 << (row.depth - 1)) == 0;
+            l.extend(tree_lead(row.depth, closes, guides));
             l.push(seg(Tok::Slot(S::Faint), caret(row.collapsed)));
             l.push(sp(1));
-            l.push(seg(Tok::Slot(S::Text), display_cell(&row.label)));
+            if matches!(stats.marker, ActivityState::None) {
+                l.push(sp(1));
+            } else {
+                l.push(seg(
+                    activity_dot_tok(stats.marker, stats.marker_blocked),
+                    activity_dot_glyph(stats.marker),
+                ));
+            }
+            l.push(sp(1));
+            let tone = if row.active {
+                Tok::Slot(S::Focus)
+            } else {
+                Tok::Slot(S::Text)
+            };
+            let label = seg(tone, display_cell(&row.label));
+            l.push(if stats.blocked > 0 {
+                label.bold()
+            } else {
+                label
+            });
             l.push(seg(Tok::Slot(S::Faint), format!(" ({})", row.child_count)));
-            vec![Line::Segs(l)]
+
+            // The label and count win: the right cluster gets only what the
+            // whole left cluster leaves, dropping parts rather than clipping.
+            let left_w = crate::seg::seg_width(&l);
+            let r = batch_right_cluster(&stats, content_cols.saturating_sub(left_w + 1));
+            if r.is_empty() {
+                vec![Line::Segs(l)]
+            } else {
+                vec![Line::SplitMinLeft { l, r, min_l: 16 }]
+            }
         }
         RowKind::Folder => {
             // Label = bare folder name (rename/delete seed from it); the
@@ -2140,7 +2356,7 @@ fn compose_row_lines(
                 gl.host_local
             };
             let mut l = vec![sp(1)];
-            l.extend(tree_lead(row.depth, is_last));
+            l.extend(tree_lead(row.depth, is_last, 0));
             l.push(seg(Tok::Slot(S::Dim), format!("{host} ")));
             l.push(seg(Tok::Slot(S::Dim), display_cell(&row.label)));
             vec![Line::Segs(l)]
@@ -2153,7 +2369,7 @@ fn compose_row_lines(
                 Some(n) => seg(Tok::Slot(S::Faint), format!(" {n} ")),
                 None => sp(3), // reserve digit gutter → tree connectors stay aligned (#10+, dormant)
             });
-            left.extend(tree_lead(row.depth, is_last));
+            left.extend(tree_lead(row.depth, is_last, guides));
             if matches!(row.activity, ActivityState::None) {
                 left.push(sp(2)); // keep names aligned with dotted rows
             } else {
@@ -2169,13 +2385,7 @@ fn compose_row_lines(
             if let Some(tag) = stage_tag(row) {
                 left.push(seg(Tok::Slot(S::Faint), tag));
             }
-            let name_fg = if row.active {
-                Tok::Slot(S::Focus)
-            } else if is_cursor {
-                Tok::Slot(S::Text)
-            } else {
-                Tok::Slot(S::Dim)
-            };
+            let (name_fg, name_bold) = name_tone(row, is_cursor);
             // Flat cross-workspace layout tags each row with its repo, dim, so
             // a cross-repo list still shows which workspace a worktree is in.
             if let Some(prefix) = &row.repo_prefix {
@@ -2186,8 +2396,14 @@ fn compose_row_lines(
             }
             // Main line is the dynamic name (OSC window title) or the branch; PR
             // moves to a compact right-cluster chip + the focused detail line.
+            // `label` (the full title) feeds the echo compare; the screen
+            // shows a batch member without its shared batch prefix.
             let label = row_title(window_title, row);
-            left.push(seg(name_fg, display_cell(&label)));
+            let name = seg(
+                name_fg,
+                display_cell(shown_name(&label, row.batch_prefix.as_deref())),
+            );
+            left.push(if name_bold { name.bold() } else { name });
             if let Some(meta) = row.branch_meta.as_ref() {
                 if disp.show_commits
                     && let Some(count) = meta.ahead_base
@@ -2366,7 +2582,7 @@ fn compose_row_lines(
             }];
             if show_detail
                 && let Some(detail) = {
-                    let (lead, lead_cols) = detail_tree_lead(row.depth, is_last);
+                    let (lead, lead_cols) = detail_tree_lead(row.depth, is_last, guides);
                     crate::sidebar_detail::compose_detail_line_guided(
                         row,
                         disp,
@@ -2449,6 +2665,23 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
         ]),
         // Hints carry no identity worth a rail row; render an empty line.
         RowKind::EmptyHint => Line::Blank,
+        // A batch row: its rollup marker (a ghost middot when quiet) and a
+        // dim initial, in the worktree rows' dot/letter columns.
+        RowKind::BatchGroup => {
+            let marker = row.group_stats.map(|s| (s.marker, s.marker_blocked));
+            let dot = match marker {
+                Some((state, blocked)) if !matches!(state, ActivityState::None) => {
+                    seg(activity_dot_tok(state, blocked), activity_dot_glyph(state))
+                }
+                _ => seg(Tok::Slot(S::Ghost2), gl.middot),
+            };
+            Line::Segs(vec![
+                sp(1),
+                dot,
+                sp(1),
+                seg(Tok::Slot(S::Dim), initial(&display_cell(&row.label))),
+            ])
+        }
         // The row-limit toggle: an ellipsis in the focus colour (a click
         // still flips it).
         RowKind::ShowMore => Line::Segs(vec![
@@ -2926,7 +3159,7 @@ mod tests {
         let mut ws = crate::sidebar::SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha");
         ws.dir = false;
         let lines = compose_row_lines(
-            &ws, None, None, false, false, true, None, None, 40, &mut None, &disp,
+            &ws, None, None, false, false, true, None, None, 40, &mut None, &disp, 0,
         );
         let Line::Segs(segs) = &lines[0] else {
             panic!(
@@ -2946,7 +3179,7 @@ mod tests {
         let mut folder = crate::sidebar::SidebarRow::base(RowKind::Folder, 1, "Merged", "alpha");
         folder.child_count = 3;
         let lines = compose_row_lines(
-            &folder, None, None, false, false, true, None, None, 40, &mut None, &disp,
+            &folder, None, None, false, false, true, None, None, 40, &mut None, &disp, 0,
         );
         let Line::Segs(segs) = &lines[0] else {
             panic!("folder row composes to one Segs line, got {:?}", lines[0])
@@ -2980,7 +3213,7 @@ mod tests {
         });
         let text = |display: &SidebarDisplay| -> String {
             compose_row_lines(
-                &row, None, None, false, false, true, None, None, 40, &mut None, display,
+                &row, None, None, false, false, true, None, None, 40, &mut None, display, 0,
             )
             .into_iter()
             .flat_map(|line| match line {
@@ -3011,7 +3244,7 @@ mod tests {
         });
         let texts = |row: &SidebarRow, display: &SidebarDisplay| -> Vec<String> {
             compose_row_lines(
-                row, None, None, false, false, true, None, None, 40, &mut None, display,
+                row, None, None, false, false, true, None, None, 40, &mut None, display, 0,
             )
             .into_iter()
             .flat_map(|line| match line {
@@ -3073,6 +3306,7 @@ mod tests {
             40,
             &mut None,
             &SidebarDisplay::default(),
+            0,
         );
         let Line::Split { r, .. } = &wide[0] else {
             panic!("queue and warm tokens must use a split line")
@@ -3096,6 +3330,7 @@ mod tests {
             12,
             &mut None,
             &SidebarDisplay::default(),
+            0,
         );
         let Line::Split { r, .. } = &narrow[0] else {
             panic!("marker fallback still uses a split line")
@@ -3711,7 +3946,7 @@ mod tests {
         let disp = SidebarDisplay::default();
         let text = |row: &SidebarRow| -> String {
             compose_row_lines(
-                row, None, None, false, false, true, None, None, 40, &mut None, &disp,
+                row, None, None, false, false, true, None, None, 40, &mut None, &disp, 0,
             )
             .into_iter()
             .flat_map(|l| match l {
@@ -3985,6 +4220,7 @@ mod tests {
                 40,
                 &mut None,
                 &SidebarDisplay::default(),
+                0,
             )
             .into_iter()
             .flat_map(|line| match line {
@@ -4069,6 +4305,7 @@ mod tests {
             24,
             &mut None,
             &SidebarDisplay::default(),
+            0,
         )
         .into_iter()
         .next()
@@ -4114,7 +4351,7 @@ mod tests {
             ..SidebarDisplay::default()
         };
         let line = compose_row_lines(
-            &row, None, None, false, false, true, None, None, 32, &mut None, &display,
+            &row, None, None, false, false, true, None, None, 32, &mut None, &display, 0,
         )
         .into_iter()
         .next()
@@ -4145,7 +4382,7 @@ mod tests {
         row.branch_meta = Some(BranchMeta::default());
         let render = |row: &crate::sidebar::SidebarRow, display: &SidebarDisplay| {
             compose_row_lines(
-                row, None, None, false, false, true, None, None, 40, &mut None, display,
+                row, None, None, false, false, true, None, None, 40, &mut None, display, 0,
             )
             .into_iter()
             .flat_map(|line| match line {
@@ -4195,6 +4432,7 @@ mod tests {
                 40,
                 &mut mq_geometry,
                 display,
+                0,
             )
             .into_iter()
             .flat_map(|line| match line {
@@ -4233,6 +4471,7 @@ mod tests {
                 ahead_base: Some(3),
                 ..BranchMeta::default()
             });
+            rows[index].disk_bytes = Some(1024);
         }
         let model = FrameModel {
             sidebar_rows: rows,
@@ -4283,6 +4522,7 @@ mod tests {
                     cols,
                     &mut mq_geometry,
                     &display,
+                    0,
                 );
                 for line in lines {
                     let segs = match line {
@@ -4316,7 +4556,7 @@ mod tests {
             ..SidebarDisplay::default()
         };
         let line = compose_row_lines(
-            &row, None, None, false, false, true, None, None, 40, &mut None, &display,
+            &row, None, None, false, false, true, None, None, 40, &mut None, &display, 0,
         );
         let text = line
             .into_iter()
@@ -4386,18 +4626,18 @@ mod tests {
     fn detail_tree_lead_puts_the_guide_under_the_connector() {
         let gl = crate::caps::active_glyphs();
         // depth 1: 4 cols of gutter, the guide, 2 cols of pad.
-        let (lead, cols) = detail_tree_lead(1, false);
+        let (lead, cols) = detail_tree_lead(1, false, 0);
         assert_eq!(cols, 8);
         assert_eq!(lead.len(), 3);
         assert_eq!(lead[0].text, " ".repeat(4));
         assert_eq!(lead[1].text, format!("{} ", gl.tree_pipe));
         assert_eq!(lead[1].fg, crate::seg::Tok::Slot(S::Ghost2));
         // Last child: blank under the corner connector.
-        let (lead, cols) = detail_tree_lead(1, true);
+        let (lead, cols) = detail_tree_lead(1, true, 0);
         assert_eq!(cols, 8);
         assert_eq!(lead[1].text, "  ");
         // Folder child: one more indent step.
-        let (lead, cols) = detail_tree_lead(2, false);
+        let (lead, cols) = detail_tree_lead(2, false, 0);
         assert_eq!(cols, 10);
         assert_eq!(lead[0].text, " ".repeat(6));
     }
@@ -4408,17 +4648,20 @@ mod tests {
         use crate::sidebar::SidebarRow;
         let mut rows = vec![SidebarRow::base(RowKind::Workspace, 0, "ws", "ws")];
         for (i, d) in depths.iter().enumerate() {
-            rows.push(SidebarRow::base(
-                RowKind::Worktree,
-                *d,
-                format!("feat-{i}"),
-                "ws",
-            ));
+            let mut row = SidebarRow::base(RowKind::Worktree, *d, format!("feat-{i}"), "ws");
+            row.worktree_path = Some(format!("/w/feat-{i}"));
+            row.disk_bytes = Some(1024);
+            rows.push(row);
         }
         let mut model = FrameModel {
             sidebar_rows: rows,
             ..FrameModel::default()
         };
+        for i in 0..depths.len() {
+            model
+                .sidebar_window_titles
+                .insert(format!("/w/feat-{i}"), format!("title {i}"));
+        }
         model.sidebar_display = SidebarDisplay {
             focus_detail: thegn_core::config::FocusDetail::All,
             detail_when: thegn_core::config::DetailWhen::Always,
@@ -4481,6 +4724,22 @@ mod tests {
         let pipe = crate::caps::active_glyphs().tree_pipe;
         let (t, _) = guide_cell(&mut s, &frame, 2, 4 + 2);
         assert_eq!(t, pipe);
+        // The depth-1 sibling after the two children keeps the level-1 guide
+        // running through them (b164: continuous ancestor guides).
+        let (t, _) = guide_cell(&mut s, &frame, 2, 4);
+        assert_eq!(t, pipe);
+        // The last child's own column is blank under its corner; the
+        // ancestor guide still runs.
+        let (t, _) = guide_cell(&mut s, &frame, 3, 4 + 2);
+        assert_eq!(t.trim(), "");
+        let (t, _) = guide_cell(&mut s, &frame, 3, 4);
+        assert_eq!(t, pipe);
+    }
+
+    #[test]
+    fn detail_line_guide_stops_when_no_shallower_sibling_follows() {
+        // No depth-1 row after the children: nothing to continue into.
+        let (mut s, frame) = guide_fixture(&[1, 2, 2]);
         let (t, _) = guide_cell(&mut s, &frame, 2, 4);
         assert_eq!(t.trim(), "");
     }
@@ -4491,8 +4750,14 @@ mod tests {
         let model = FrameModel {
             sidebar_rows: vec![
                 SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
-                SidebarRow::base(RowKind::Worktree, 1, "feat-0", "ws"),
-                SidebarRow::base(RowKind::Worktree, 1, "feat-1", "ws"),
+                SidebarRow {
+                    disk_bytes: Some(1024),
+                    ..SidebarRow::base(RowKind::Worktree, 1, "feat-0", "ws")
+                },
+                SidebarRow {
+                    disk_bytes: Some(1024),
+                    ..SidebarRow::base(RowKind::Worktree, 1, "feat-1", "ws")
+                },
             ],
             sidebar_selected: 1,
             sidebar_display: SidebarDisplay {
@@ -4626,6 +4891,506 @@ mod tests {
         assert_eq!(lead, 6, "aligned with a depth-1 row's label");
     }
 
+    // ---- b164 lane 4: continuous guides, tone ladder, batch rows ----
+
+    #[test]
+    fn ancestor_guides_table() {
+        // (depths, expected guide bits per row). Bit k-1 = a later row at
+        // depth k follows before anything shallower than k.
+        let cases: &[(&[u8], &[u8])] = &[
+            (&[], &[]),
+            (&[0, 1, 1, 1], &[1, 1, 1, 0]),
+            // Children of the middle row carry the level-1 guide to the
+            // following depth-1 sibling (bit 0) and their own run (bit 1).
+            (&[0, 1, 2, 2, 1], &[1, 3, 3, 1, 0]),
+            // No later depth-1 row: the children carry no level-1 bit.
+            (&[0, 1, 2, 2], &[1, 2, 2, 0]),
+            // Depth 0 resets: the next project's rows do not leak upward.
+            (&[0, 1, 2, 0, 1], &[1, 2, 0, 1, 0]),
+            // Three levels.
+            (&[1, 2, 3, 2, 1], &[3, 7, 3, 1, 0]),
+            // A shallower row steps the tree above deeper levels.
+            (&[2, 1, 2], &[1, 2, 0]),
+        ];
+        for (depths, want) in cases {
+            assert_eq!(&ancestor_guides(depths), want, "depths {depths:?}");
+        }
+    }
+
+    /// ws, wt (detail), wt (no detail), open batch, 2 members, wt, ShowMore.
+    fn continuous_guide_model() -> FrameModel {
+        use crate::sidebar::{SidebarRow, fold::GroupStats};
+        let mut detail = SidebarRow::base(RowKind::Worktree, 1, "feat-a", "ws");
+        detail.worktree_path = Some("/w/feat-a".into());
+        let plain = SidebarRow::base(RowKind::Worktree, 1, "feat-b", "ws");
+        let batch = SidebarRow {
+            collapsed: false,
+            child_count: 2,
+            group_stats: Some(GroupStats {
+                lanes: 2,
+                ..GroupStats::default()
+            }),
+            ..SidebarRow::base(RowKind::BatchGroup, 1, "b161", "ws")
+        };
+        let member = |name: &str| SidebarRow {
+            batch_prefix: Some("tg/b161-".into()),
+            ..SidebarRow::base(RowKind::Worktree, 2, format!("tg/b161-{name}"), "ws")
+        };
+        let more = SidebarRow {
+            pin_key: crate::sidebar::show_more_key("ws"),
+            collapsed: true,
+            child_count: 3,
+            ..SidebarRow::base(RowKind::ShowMore, 1, "", "ws")
+        };
+        let mut model = FrameModel {
+            sidebar_rows: vec![
+                SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
+                detail,
+                plain,
+                batch,
+                member("spine"),
+                member("view"),
+                SidebarRow::base(RowKind::Worktree, 1, "feat-c", "ws"),
+                more,
+            ],
+            sidebar_selected: 1,
+            sidebar_focused: true,
+            ..FrameModel::default()
+        };
+        // A window title that differs from the branch keeps the cursor row's
+        // detail line (the branch) from echoing the title away.
+        model
+            .sidebar_window_titles
+            .insert("/w/feat-a".into(), "agent at work".into());
+        model.sidebar_display = SidebarDisplay {
+            focus_detail: thegn_core::config::FocusDetail::Cursor,
+            detail_when: thegn_core::config::DetailWhen::Always,
+            detail_branch: true,
+            ..SidebarDisplay::default()
+        };
+        model
+    }
+
+    /// The column-4 cell of every painted line from the first child to the
+    /// ShowMore row, plus that ShowMore cell.
+    fn guide_column(model: &FrameModel) -> (Vec<String>, String) {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let mut s = Surface::new(40, 30);
+        draw_sidebar(&mut s, rect, model);
+        let frame = build_sidebar(model, rect, 0);
+        let cells = s.screen_cells();
+        let mut col4 = Vec::new();
+        let mut show_more = String::new();
+        for p in frame
+            .rows
+            .iter()
+            .filter(|p| (1..=7).contains(&p.visible_index))
+        {
+            for dy in p.lead_gap..p.height {
+                col4.push(cells[p.y + dy][4].str().to_string());
+            }
+            if p.visible_index == 7 {
+                show_more = cells[p.y + p.lead_gap][4].str().to_string();
+            }
+        }
+        (col4, show_more)
+    }
+
+    #[test]
+    fn the_guide_is_continuous_through_one_and_two_line_rows_and_an_open_batch() {
+        let model = continuous_guide_model();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let heights = sidebar_geom(&model, rect).heights;
+        assert_eq!(heights[1], 2, "the cursor row carries a detail line");
+        assert_eq!(heights[2], 1, "the next row is one line");
+        let (col4, show_more) = guide_column(&model);
+        assert!(col4.len() >= 8, "{col4:?}");
+        for (i, c) in col4.iter().enumerate() {
+            assert!(!c.trim().is_empty(), "line {i} breaks the guide: {col4:?}");
+        }
+        assert_eq!(show_more, crate::caps::active_glyphs().tree_corner);
+    }
+
+    #[test]
+    fn the_last_open_batch_closes_with_a_corner() {
+        use crate::sidebar::{SidebarRow, fold::GroupStats};
+        let batch = SidebarRow {
+            collapsed: false,
+            child_count: 2,
+            group_stats: Some(GroupStats {
+                lanes: 2,
+                ..GroupStats::default()
+            }),
+            ..SidebarRow::base(RowKind::BatchGroup, 1, "b161", "ws")
+        };
+        let member = |name: &str| SidebarRow {
+            batch_prefix: Some("tg/b161-".into()),
+            ..SidebarRow::base(RowKind::Worktree, 2, format!("tg/b161-{name}"), "ws")
+        };
+        let model = FrameModel {
+            sidebar_rows: vec![
+                SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
+                SidebarRow::base(RowKind::Worktree, 1, "feat-a", "ws"),
+                batch,
+                member("spine"),
+                member("view"),
+            ],
+            ..FrameModel::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let mut s = Surface::new(40, 30);
+        draw_sidebar(&mut s, rect, &model);
+        let frame = build_sidebar(&model, rect, 0);
+        let p = frame
+            .rows
+            .iter()
+            .find(|p| p.visible_index == 2)
+            .expect("batch row painted");
+        let cell = s.screen_cells()[p.y + p.lead_gap][4].str().to_string();
+        assert_eq!(cell, crate::caps::active_glyphs().tree_corner);
+    }
+
+    #[test]
+    fn the_guide_is_continuous_through_one_and_two_line_rows_and_an_open_batch_under_the_ascii_glyph_set()
+     {
+        use thegn_core::termcaps::UnicodeLevel;
+        crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+            let (col4, show_more) = guide_column(&continuous_guide_model());
+            for (i, c) in col4.iter().enumerate() {
+                assert!(c == "|" || c == "+", "line {i}: {col4:?}");
+            }
+            assert_eq!(show_more, "+");
+        });
+    }
+
+    #[test]
+    fn name_tone_ladder() {
+        use crate::seg::Tok;
+        use crate::sidebar::{ActivityState, SidebarRow};
+        use thegn_core::attention::AttentionTier;
+        let row = |activity: ActivityState| SidebarRow {
+            activity,
+            ..SidebarRow::base(RowKind::Worktree, 1, "wt", "ws")
+        };
+        // Active worktree: Focus, whatever else holds.
+        let mut active = row(ActivityState::Failed);
+        active.active = true;
+        assert_eq!(name_tone(&active, false), (Tok::Slot(S::Focus), false));
+        // Needs you: blocked attention or a failed bring-up.
+        let mut blocked = row(ActivityState::Waiting);
+        blocked.attention = Some(thegn_core::attention::AttentionScore {
+            tier: AttentionTier::Blocked,
+            ..Default::default()
+        });
+        assert_eq!(name_tone(&blocked, false), (Tok::Slot(S::Text), true));
+        assert_eq!(
+            name_tone(&row(ActivityState::Failed), false),
+            (Tok::Slot(S::Text), true)
+        );
+        // Working, building, finished-unread, or the cursor row.
+        for state in [
+            ActivityState::Active,
+            ActivityState::Loading,
+            ActivityState::Waiting,
+        ] {
+            assert_eq!(
+                name_tone(&row(state), false),
+                (Tok::Slot(S::Text), false),
+                "{state:?}"
+            );
+        }
+        assert_eq!(
+            name_tone(&row(ActivityState::None), true),
+            (Tok::Slot(S::Text), false)
+        );
+        // Seen or idle.
+        for state in [ActivityState::Read, ActivityState::None] {
+            assert_eq!(
+                name_tone(&row(state), false),
+                (Tok::Slot(S::Dim), false),
+                "{state:?}"
+            );
+        }
+    }
+
+    fn line_text(lines: &[crate::seg::Line]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs.clone(),
+                crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.iter().chain(r).cloned().collect()
+                }
+                _ => Vec::new(),
+            })
+            .map(|segment| segment.text)
+            .collect()
+    }
+
+    #[test]
+    fn batch_members_hide_the_shared_prefix() {
+        assert_eq!(
+            shown_name("tg/b161-b161-spine", Some("tg/b161-b161-")),
+            "spine"
+        );
+        // Nothing left after the prefix, or no match: the full label.
+        assert_eq!(shown_name("tg/b161-", Some("tg/b161-")), "tg/b161-");
+        assert_eq!(
+            shown_name("tg/hardy-onyx", Some("tg/b161-")),
+            "tg/hardy-onyx"
+        );
+        assert_eq!(shown_name("main", None), "main");
+        let row = crate::sidebar::SidebarRow {
+            batch_prefix: Some("tg/b161-b161-".into()),
+            ..crate::sidebar::SidebarRow::base(RowKind::Worktree, 2, "tg/b161-b161-spine", "ws")
+        };
+        let lines = compose_row_lines(
+            &row,
+            None,
+            None,
+            false,
+            false,
+            true,
+            None,
+            None,
+            40,
+            &mut None,
+            &SidebarDisplay::default(),
+            0,
+        );
+        let text = line_text(&lines);
+        assert!(text.contains("spine"), "{text:?}");
+        assert!(!text.contains("b161"), "{text:?}");
+    }
+
+    fn batch_row(stats: crate::sidebar::fold::GroupStats) -> crate::sidebar::SidebarRow {
+        crate::sidebar::SidebarRow {
+            collapsed: true,
+            child_count: stats.lanes,
+            group_stats: Some(stats),
+            ..crate::sidebar::SidebarRow::base(RowKind::BatchGroup, 1, "b161", "ws")
+        }
+    }
+
+    fn batch_line_at(row: crate::sidebar::SidebarRow, cols: usize) -> (String, FrameModel) {
+        let model = FrameModel {
+            sidebar_rows: vec![
+                crate::sidebar::SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
+                row,
+            ],
+            ..FrameModel::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows: 12,
+        };
+        let mut s = Surface::new(cols, 12);
+        draw_sidebar(&mut s, rect, &model);
+        let frame = build_sidebar(&model, rect, 0);
+        let p = frame.rows.iter().find(|p| p.visible_index == 1).unwrap();
+        let text = s.screen_chars_to_string();
+        let line = text.lines().nth(p.y + p.lead_gap).unwrap().to_string();
+        (line, model)
+    }
+
+    #[test]
+    fn batch_row_reads_label_count_and_states_at_40_cols() {
+        use crate::sidebar::{ActivityState, fold::GroupStats};
+        let gl = crate::caps::active_glyphs();
+        let stats = GroupStats {
+            lanes: 5,
+            active: 2,
+            done: 1,
+            blocked: 1,
+            marker: ActivityState::Waiting,
+            marker_blocked: true,
+        };
+        let (line, model) = batch_line_at(batch_row(stats), 40);
+        assert!(line.contains("b161 (5)"), "{line:?}");
+        assert!(line.contains("1 needs you"), "{line:?}");
+        assert!(
+            !line.contains(gl.ellipsis),
+            "nothing clipped mid-word: {line:?}"
+        );
+        // The caret sits where the hit model says it does.
+        let hits = hit_rows(
+            &model,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 40,
+                rows: 12,
+            },
+        );
+        let caret_x = hits.iter().find(|h| h.visible_index == 1).unwrap().caret_x;
+        let caret_x = caret_x.expect("batch rows advertise a caret");
+        let caret: String = line.chars().skip(caret_x).take(1).collect();
+        assert_eq!(caret, gl.caret_closed);
+        // Several blocked: the plural, and the right cluster in priority order.
+        let wide = GroupStats {
+            blocked: 2,
+            ..stats
+        };
+        let (line, _) = batch_line_at(batch_row(wide), 60);
+        let needs = line.find("2 need you").expect("plural");
+        let active = line.find("2 active").expect("active part at 60 cols");
+        let done = line.find("1 done").expect("done part at 60 cols");
+        assert!(needs < active && active < done, "{line:?}");
+        assert!(line.contains(gl.middot), "{line:?}");
+    }
+
+    #[test]
+    fn batch_row_right_cluster_drops_whole_parts_from_the_right() {
+        use crate::sidebar::fold::GroupStats;
+        let stats = GroupStats {
+            lanes: 4,
+            active: 2,
+            done: 1,
+            blocked: 1,
+            ..GroupStats::default()
+        };
+        let text = |avail| -> String {
+            batch_right_cluster(&stats, avail)
+                .into_iter()
+                .map(|s| s.text)
+                .collect()
+        };
+        assert_eq!(text(9), "");
+        assert_eq!(text(11), "1 needs you");
+        assert_eq!(text(21), "1 needs you");
+        assert!(text(22).ends_with("2 active"));
+        assert!(text(40).ends_with("1 done"));
+        let first = &batch_right_cluster(&stats, 40)[0];
+        assert!(first.bold);
+        assert_eq!(first.fg, crate::seg::Tok::Slot(S::ActivityWaiting));
+    }
+
+    #[test]
+    fn batch_row_survives_ascii_and_has_no_color_literal() {
+        use crate::sidebar::{ActivityState, fold::GroupStats};
+        use thegn_core::termcaps::UnicodeLevel;
+        let row = batch_row(GroupStats {
+            lanes: 3,
+            active: 1,
+            done: 1,
+            blocked: 1,
+            marker: ActivityState::Active,
+            marker_blocked: false,
+        });
+        for level in [UnicodeLevel::Full, UnicodeLevel::Ascii] {
+            crate::caps::test_override::with_unicode(level, || {
+                for cols in [24, 40, 60] {
+                    let mut lines = compose_row_lines(
+                        &row,
+                        None,
+                        None,
+                        false,
+                        false,
+                        false,
+                        None,
+                        None,
+                        cols,
+                        &mut None,
+                        &SidebarDisplay::default(),
+                        1,
+                    );
+                    lines.push(compose_rail_line(&row));
+                    for line in &lines {
+                        let segs: Vec<crate::seg::Seg> = match line {
+                            crate::seg::Line::Segs(segs) => segs.clone(),
+                            crate::seg::Line::Split { l, r }
+                            | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                                l.iter().chain(r).cloned().collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        for segment in &segs {
+                            assert!(
+                                !matches!(segment.fg, crate::seg::Tok::Rgb(..)),
+                                "{segment:?}"
+                            );
+                            if matches!(level, UnicodeLevel::Ascii) {
+                                assert!(segment.text.is_ascii(), "{level:?} {cols}: {segs:?}");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn heights_pass_agrees_with_compose_for_batch_and_echo_rows() {
+        use crate::sidebar::{SidebarRow, fold::GroupStats};
+        let echo = |label: &str| SidebarRow {
+            // Branch equal to the title: the detail branch echoes it.
+            branch: Some(label.to_string()),
+            batch_prefix: Some("tg/b161-".into()),
+            ..SidebarRow::base(RowKind::Worktree, 2, label, "ws")
+        };
+        let model = FrameModel {
+            sidebar_rows: vec![
+                SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
+                SidebarRow::base(RowKind::Worktree, 1, "solo", "ws"),
+                SidebarRow {
+                    collapsed: false,
+                    child_count: 2,
+                    group_stats: Some(GroupStats {
+                        lanes: 2,
+                        active: 1,
+                        ..GroupStats::default()
+                    }),
+                    ..SidebarRow::base(RowKind::BatchGroup, 1, "b161", "ws")
+                },
+                echo("tg/b161-spine"),
+                echo("tg/b161-view"),
+            ],
+            sidebar_display: SidebarDisplay {
+                focus_detail: thegn_core::config::FocusDetail::All,
+                detail_when: thegn_core::config::DetailWhen::Always,
+                detail_branch: true,
+                ..SidebarDisplay::default()
+            },
+            ..FrameModel::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let heights = sidebar_geom(&model, rect).heights;
+        // `build_sidebar` debug-asserts the lockstep per row; check it here
+        // explicitly too.
+        let frame = build_sidebar(&model, rect, 0);
+        for p in &frame.rows {
+            assert_eq!(
+                p.lines.len().max(1),
+                heights[p.visible_index],
+                "row {}",
+                p.visible_index
+            );
+        }
+        assert_eq!(heights[2], 1, "a batch row is one line");
+    }
+
     fn zone_ws(zone: Option<crate::sidebar::ZoneTag>) -> crate::sidebar::SidebarRow {
         let mut ws = crate::sidebar::SidebarRow::base(
             crate::sidebar::RowKind::Workspace,
@@ -4641,7 +5406,7 @@ mod tests {
         use crate::seg::Line;
         let disp = SidebarDisplay::default();
         let lines = compose_row_lines(
-            ws, None, None, false, false, true, None, None, cols, &mut None, &disp,
+            ws, None, None, false, false, true, None, None, cols, &mut None, &disp, 0,
         );
         match lines.into_iter().next().unwrap() {
             Line::Segs(s) => s,
