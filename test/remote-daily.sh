@@ -5,19 +5,20 @@
 #
 # Not in ci/ci-local/smoke: runs only through `just remote-daily`. Reads the
 # owner's REAL config read-only (secrets are never read or printed) with a fresh
-# XDG_STATE_HOME, XDG_RUNTIME_DIR and THEGN_DIR, its own daemon and a scratch
-# repo on branch rd/daily-lane.
+# XDG_STATE_HOME and THEGN_DIR (the login runtime dir is kept so sandbox masks
+# cover every instance's control socket; daemon sockets are hashed per state
+# dir), its own daemon and a scratch repo on branch rd/daily-lane.
 #
 # Usage:
 #   test/remote-daily.sh                                   # print plan, no network
 #   THEGN_CHANNEL=dev test/remote-daily.sh --env <name> --i-accept-spend \
 #     [--provider sprites|fly|vercel] [--with-model] [--with-adopt <sprite>] \
-#     [--with-reaper] [--keep-going]
+#     [--with-reaper] [--with-pool] [--keep-going]
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
 
-env_name="" accept=0 provider="sprites" with_model=0 adopt_name="" with_reaper=0 keep_going=0
+env_name="" accept=0 provider="sprites" with_model=0 adopt_name="" with_reaper=0 with_pool=0 keep_going=0
 while [ $# -gt 0 ]; do
   case "$1" in
   --env)
@@ -50,6 +51,10 @@ while [ $# -gt 0 ]; do
     with_reaper=1
     shift
     ;;
+  --with-pool)
+    with_pool=1
+    shift
+    ;;
   --i-accept-spend)
     accept=1
     shift
@@ -69,21 +74,30 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "$with_pool" = 1 ] && [ "$provider" != sprites ]; then
+  echo "--with-pool is supported only with --provider sprites" >&2
+  exit 2
+fi
+
 print_plan() {
   cat <<PLAN
 remote-daily plan (nothing is created without both --env <name> and
 --i-accept-spend, plus THEGN_CHANNEL=dev)
 
 Will create : ONE sandbox/machine via the named [env.<name>] from your real
-              config (read-only), in a fresh state/runtime/THEGN_DIR with its own
-              daemon and a scratch git repo on branch rd/daily-lane.
+              config (read-only), in a fresh XDG_STATE_HOME and THEGN_DIR (the
+              login runtime dir is kept so sandbox masks cover every instance's
+              control socket; daemon sockets are hashed per state dir), with its
+              own daemon and a scratch git repo on branch rd/daily-lane.
 Max spend   : one sandbox for about 10 minutes (a 420 s scripted hold); more
-              with --with-model (two real model runs). Teardown destroys it.
+              with --with-model (two real model runs) or --with-pool (one
+              warm spare). Teardown destroys it.
 Options     : --keep-going alone is plan-only and does not bypass
               --i-accept-spend; with it, the run continues and prints
-              FAILED STEPS: <ids> before exiting non-zero.
+              FAILED STEPS: <ids> before exiting non-zero. --with-pool is
+              sprites-only and runs the opt-in P steps below.
 Teardown    : trap on EXIT/INT/TERM -> env down --force, env deprovision <name>
-              for each name in THIS run's ledger (rd-x's and rd-y's), daemon
+              for each name in THIS run's ledger (rd-x's, rd-y's and rd-p's), daemon
               stop; fails (keeps the ledger) if any of this run's names remain
               in the ledger or the org listing.
 The preflight prints which credentials enter the sandbox.
@@ -122,6 +136,13 @@ Steps:
       then wt rm <rd-y path> --force exits 0 (the worktree-delete teardown,
       which confirms the destroy)     11c its record is gone and the org
       listing lacks it
+ P0  (--with-pool) wt new rd-p --env <S>, then resolve its worktree path
+ P1  (--with-pool) snapshot the ledger, env pool-fill --worktree <rd-p>
+     --size 1 --json, and verify exactly one filled spare
+ P2  (--with-pool) exactly one new ledger record is the filled spare
+ P3  (--with-pool) agent run on rd-p claims the spare without a new record; needs RD_HOLD_AGENT=1
+ P4  (--with-pool) env pool-fill --worktree <rd-p> --size 0 --json
+ P5  (--with-pool) wt rm <rd-p> --force, then verify the spare is gone
  A    (--with-adopt <name>) env adopt <name> --env <S> --yes; ledger record
       is checked, then that record file is removed: the adopted sprite was
       not created by this run and is NEVER destroyed by this script
@@ -153,6 +174,10 @@ fi
 
 if [ "$provider" = fly ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
   echo "fly needs RD_HOLD_AGENT=1 (no exec bridge)" >&2
+  exit 2
+fi
+if [ "$with_pool" = 1 ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
+  echo "--with-pool needs RD_HOLD_AGENT=1 (P3 claims the spare through agent run hold-test)" >&2
   exit 2
 fi
 
@@ -222,8 +247,6 @@ TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
 unset THEGN_CONFIG_DIR
 mkdir -p "$XDG_STATE_HOME" "$THEGN_DIR" "$TMP/repo"
-mkdir -m 700 "$TMP/run"
-export XDG_RUNTIME_DIR="$TMP/run"
 REPO="$TMP/repo"
 NAME="(unknown)"
 CREATED=0
@@ -232,6 +255,8 @@ HOLD_PID=""
 WT_PATH=""
 RDY_NAME=""
 RDY_PATH=""
+POOL_SPARE=""
+POOL_PATH=""
 case "$provider" in
 sprites) EXEC_BRIDGE="sprite-exec" ;;
 vercel) EXEC_BRIDGE="vercel-exec" ;;
@@ -328,6 +353,9 @@ teardown() {
     names="$(run_records)"
     if [ -n "$RDY_NAME" ] && ! printf '%s\n' "$names" | grep -Fxq "$RDY_NAME"; then
       names="$names $RDY_NAME"
+    fi
+    if [ -n "$POOL_SPARE" ] && ! printf '%s\n' "$names" | grep -Fxq "$POOL_SPARE"; then
+      names="$names $POOL_SPARE"
     fi
     echo "-- teardown: env down --force"
     (cd "$REPO" && "$THEGN_BIN" env down --force)
@@ -455,6 +483,53 @@ agent_hold_run() {
   fi
 }
 
+pool_fill_one() {
+  snapshot_records
+  in_repo "$THEGN_BIN" env pool-fill --worktree "$POOL_PATH" --size 1 --json >"$TMP/p1.json" || return 1
+  POOL_SPARE="$(python3 -I -c '
+import json, re, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        result = json.load(stream)
+except (OSError, TypeError, ValueError):
+    print("pool-fill JSON is invalid", file=sys.stderr)
+    sys.exit(1)
+filled = result.get("filled") if isinstance(result, dict) else None
+if not isinstance(filled, list) or len(filled) != 1:
+    print("pool-fill JSON must contain exactly one filled name", file=sys.stderr)
+    sys.exit(1)
+name = filled[0]
+if not isinstance(name, str) or re.fullmatch(r"[a-z0-9-]+", name) is None:
+    print("pool-fill returned an invalid filled name", file=sys.stderr)
+    sys.exit(1)
+print(name)
+' "$TMP/p1.json")" || return 1
+  echo "   filled pool spare: $POOL_SPARE"
+}
+
+pool_claim_run() {
+  if in_repo "$THEGN_BIN" agent run --worktree "$POOL_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/p3.json"; then
+    agent_json_ok "$TMP/p3.json" || return 1
+  else
+    local rc="$?"
+    agent_json_ok "$TMP/p3.json" || true
+    return "$rc"
+  fi
+  local after
+  after="$(run_records)"
+  echo "   ledger records after pool claim: ${after:-(none)}"
+  [ "$after" = "$RECORDS_BEFORE" ]
+}
+
+pool_new_record() { [ -n "$POOL_SPARE" ] && one_new_record "$POOL_SPARE"; }
+
+pool_remove() {
+  no_stdin in_repo "$THEGN_BIN" wt rm "$POOL_PATH" --force || return 1
+  record_gone "$POOL_SPARE" || return 1
+  listing_lacks_name "$POOL_SPARE"
+}
+
 agent_run() { # agent_run <agent> ; each agent commits one file
   local json_id
   case "$1" in
@@ -533,7 +608,7 @@ rdy_gone() { record_gone "$RDY_NAME" && listing_lacks_name "$RDY_NAME"; }
 RECORDS_BEFORE=""
 snapshot_records() { RECORDS_BEFORE="$(run_records)"; }
 one_new_record() { # exactly one ready ledger record that was not there before
-  local n new=""
+  local expected="${1:-}" n new=""
   for n in $(run_records); do
     printf '%s\n' "$RECORDS_BEFORE" | grep -Fxq "$n" || new="$new $n"
   done
@@ -541,8 +616,9 @@ one_new_record() { # exactly one ready ledger record that was not there before
   echo "   new ledger records: ${new:-(none)}"
   [ -n "$new" ] || return 1
   case "$new" in *' '* | *[!a-z0-9-]*) return 1 ;; esac
+  [ -z "$expected" ] || [ "$new" = "$expected" ] || return 1
   grep -Eq '"state": *"ready"' "$(ledger_dir)/$new.json" || return 1
-  RDY_NAME="$new"
+  [ -n "$expected" ] || RDY_NAME="$new"
 }
 
 reap_clean() {
@@ -573,6 +649,11 @@ resolve_rdy_path() { # the worktree whose branch ends in rd-y
   RDY_PATH="$(wt_path_for rd-y)"
   echo "   worktree: ${RDY_PATH:-(none)}"
   [ -n "$RDY_PATH" ] && [ "$(printf '%s\n' "$RDY_PATH" | wc -l)" -eq 1 ]
+}
+resolve_pool_path() { # the worktree whose branch ends in rd-p
+  POOL_PATH="$(wt_path_for rd-p)"
+  echo "   worktree: ${POOL_PATH:-(none)}"
+  [ -n "$POOL_PATH" ] && [ "$(printf '%s\n' "$POOL_PATH" | wc -l)" -eq 1 ]
 }
 rdy_commit() {
   # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
@@ -651,6 +732,16 @@ fi
 # --force only here: rd-y is this run's scratch worktree.
 step 11r "wt rm <rd-y path> --force exits 0" no_stdin in_repo "$THEGN_BIN" wt rm "$RDY_PATH" --force
 step 11c "rd-y's ledger record is gone and the org listing lacks it" rdy_gone
+if [ "$with_pool" = 1 ]; then
+  step P0 "wt new rd-p --env $env_name" in_repo "$THEGN_BIN" wt new rd-p --env "$env_name"
+  step P0p "resolve the rd-p worktree path" resolve_pool_path
+  step P1 "fill one warm pool spare" pool_fill_one
+  step P2 "exactly one new ledger record is the pool spare" pool_new_record
+  snapshot_records
+  step P3 "agent run claims the pool spare without a new ledger record" pool_claim_run
+  step P4 "pool-fill target 0 exits 0" in_repo "$THEGN_BIN" env pool-fill --worktree "$POOL_PATH" --size 0 --json
+  step P5 "wt rm rd-p destroys the spare and removes its record" pool_remove
+fi
 if [ -n "$adopt_name" ]; then
   step A "env adopt $adopt_name" adopt_step
 fi
