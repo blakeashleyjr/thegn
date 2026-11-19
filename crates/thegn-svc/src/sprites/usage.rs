@@ -30,13 +30,14 @@ fn num(bucket: &serde_json::Value, keys: &[&str]) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Parse a usage response: `{"buckets":[{cpu_seconds, memory_byte_seconds}…],
-/// "partial": bool}`. Buckets are summed.
+/// Parse a usage response: `{"usage":[{cpu_time_sec,
+/// reserved_memory_byte_sec}…], "partial": bool}`. Buckets are summed.
 pub fn parse_usage(v: &serde_json::Value) -> Result<SpriteUsage> {
     let buckets = v
-        .get("buckets")
+        .get("usage")
+        .or_else(|| v.get("buckets"))
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow!("sprites usage response has no buckets array"))?;
+        .ok_or_else(|| anyhow!("sprites usage response has no usage or buckets array"))?;
     let mut cpu = 0.0;
     let mut byte_sec = 0.0;
     for b in buckets {
@@ -107,9 +108,26 @@ mod tests {
     #[test]
     fn parses_two_buckets_and_partial() {
         let v = serde_json::json!({
-            "buckets": [
-                {"cpu_time_sec": 3600.0, "reserved_memory_byte_sec": 1073741824.0 * 3600.0},
-                {"cpu_time_sec": 1800.0, "reserved_memory_byte_sec": 1073741824.0 * 7200.0}
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-01-01T02:00:00Z",
+            "interval": "hour",
+            "usage": [
+                {
+                    "start": "2026-01-01T00:00:00Z",
+                    "end": "2026-01-01T01:00:00Z",
+                    "last_recorded_at": "2026-01-01T01:00:00Z",
+                    "cpu_time_sec": 3600.0,
+                    "reserved_memory_byte_sec": 1073741824.0 * 3600.0,
+                    "sprite_ref": "sprite-a"
+                },
+                {
+                    "start": "2026-01-01T01:00:00Z",
+                    "end": "2026-01-01T02:00:00Z",
+                    "last_recorded_at": "2026-01-01T02:00:00Z",
+                    "cpu_time_sec": 1800.0,
+                    "reserved_memory_byte_sec": 1073741824.0 * 7200.0,
+                    "sprite_ref": "sprite-a"
+                }
             ],
             "partial": true
         });
@@ -117,6 +135,18 @@ mod tests {
         assert_eq!(u.cpu_seconds, 5400.0);
         assert!((u.reserved_gb_hours - 3.0).abs() < 1e-9);
         assert!(u.partial);
+    }
+
+    #[test]
+    fn empty_usage_parses_as_zero() {
+        let u = parse_usage(&serde_json::json!({"usage": []})).unwrap();
+
+        assert_eq!(u.cpu_seconds, 0.0);
+        assert_eq!(u.reserved_gb_hours, 0.0);
+    }
+
+    #[test]
+    fn legacy_buckets_shape_still_parses() {
         let old = serde_json::json!({
             "buckets": [{"cpu_seconds": 10.0, "memory_byte_seconds": 1073741824.0 * 3600.0}]
         });
@@ -136,7 +166,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_buckets_is_an_error() {
-        assert!(parse_usage(&serde_json::json!({})).is_err());
+    fn missing_usage_and_buckets_is_an_error() {
+        let error = parse_usage(&serde_json::json!({})).unwrap_err().to_string();
+
+        assert!(error.contains("usage"));
+        assert!(error.contains("buckets"));
     }
 }
