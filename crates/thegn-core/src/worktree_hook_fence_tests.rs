@@ -39,7 +39,9 @@ impl Fixture {
     }
 
     fn clear_canary(&self) {
-        let _ = std::fs::remove_file(&self.canary);
+        if self.canary.exists() {
+            std::fs::remove_file(&self.canary).unwrap();
+        }
     }
 
     fn assert_no_hook(&self) {
