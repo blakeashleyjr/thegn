@@ -366,6 +366,10 @@ pub mod sandbox_policy_fp;
 pub mod sandbox_prefetch;
 pub mod sandbox_preflight;
 pub mod sandbox_runtime;
+#[allow(
+    rustdoc::private_intra_doc_links,
+    reason = "frozen file (CONTRIBUTING B7) links a pub(crate) fn; remove when the freeze lifts"
+)]
 pub mod sandbox_runtime_escape;
 pub mod sandbox_support;
 pub mod sandbox_tmp_hint;
