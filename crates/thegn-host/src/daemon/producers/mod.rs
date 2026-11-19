@@ -282,7 +282,11 @@ struct TickSlot(ProducerKind);
 
 impl TickSlot {
     fn try_take(kind: ProducerKind) -> Option<Self> {
-        lock(&TICKING).insert(kind).then_some(Self(kind))
+        // Release the guard before building the slot: an eager
+        // `then_some(Self(kind))` drops the refused slot while `TICKING` is
+        // still locked, and its `Drop` re-locks it (self-deadlock).
+        let inserted = lock(&TICKING).insert(kind);
+        inserted.then(|| Self(kind))
     }
 }
 
@@ -635,12 +639,24 @@ mod tests {
 
     #[test]
     fn ticks_of_one_kind_never_overlap() {
-        let first = TickSlot::try_take(ProducerKind::PrQueue).expect("free slot");
-        assert!(TickSlot::try_take(ProducerKind::PrQueue).is_none());
-        let other = TickSlot::try_take(ProducerKind::PrPoll).expect("per kind");
-        drop(first);
-        assert!(TickSlot::try_take(ProducerKind::PrQueue).is_some());
-        drop(other);
+        // Run on a thread with a bounded wait so a lock regression fails fast.
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let first = TickSlot::try_take(ProducerKind::PrQueue).expect("free slot");
+            assert!(TickSlot::try_take(ProducerKind::PrQueue).is_none());
+            assert!(
+                lock(&TICKING).contains(&ProducerKind::PrQueue),
+                "a refused take must not free the holder's slot"
+            );
+            let other = TickSlot::try_take(ProducerKind::PrPoll).expect("per kind");
+            drop(first);
+            assert!(TickSlot::try_take(ProducerKind::PrQueue).is_some());
+            drop(other);
+            done.send(()).unwrap_or_default(); // best-effort: the receiver times out on its own
+        });
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("TickSlot deadlocked or panicked (no completion within 5s)");
     }
 
     #[tokio::test]
