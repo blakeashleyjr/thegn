@@ -10,6 +10,9 @@
 //! The error type, its classes and the probes are full; the backends are
 //! stubs that fail closed (filled by b163 lane 4).
 
+pub mod imap;
+pub mod imap_proto;
+
 use futures_util::future::BoxFuture;
 use thegn_core::config::{Config, InboxAccount, InboxKind};
 use thegn_core::inbox::InboxPage;
@@ -115,7 +118,8 @@ pub fn backend_for(account: &InboxAccount) -> Result<Box<dyn InboxBackend>, Inbo
         return Err(InboxError::NotConfigured);
     }
     match account.kind {
-        InboxKind::Command | InboxKind::Todoist | InboxKind::Imap => {
+        InboxKind::Imap => Ok(Box::new(imap::ImapBackend::from_account(account)?)),
+        InboxKind::Command | InboxKind::Todoist => {
             Err(InboxError::Unsupported("inbox backends (b163 lane 4)"))
         }
         InboxKind::Gmail | InboxKind::Jmap | InboxKind::Outlook | InboxKind::Slack => {
@@ -151,6 +155,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
                     };
                     ProbeReport::new("inbox", id, availability)
                 }
+                InboxKind::Imap => imap::probe(account, id),
                 _ => ProbeReport::new("inbox", id, Availability::Ready)
                     .note("network provider; not probed offline"),
             };
