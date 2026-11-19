@@ -18,6 +18,26 @@ use std::time::Duration;
 use thegn_svc::provider::{
     Provider, ProviderCheckpoints, ProviderEgress, ProviderFiles, RemoteProvider, SpritesProvider,
 };
+use thegn_svc::sprites::ledger::OwnerScope;
+
+/// A fixed ownership scope for the mock (never the host's real controller id).
+fn scope() -> OwnerScope {
+    OwnerScope {
+        owner: "ctl-sprites-mock".into(),
+        account: "acct1-sprites-mock".into(),
+    }
+}
+
+/// A provider that may create and destroy: scoped, with a private ledger
+/// directory (the returned guard keeps it alive) so no test touches the real
+/// state directory.
+fn scoped(base: &str, name: &str) -> (SpritesProvider, tempfile::TempDir) {
+    let ledger = tempfile::tempdir().unwrap();
+    let provider = SpritesProvider::new(base, "tok", name)
+        .with_scope(scope())
+        .with_ledger_dir(ledger.path().to_path_buf());
+    (provider, ledger)
+}
 
 /// A tiny stateful fs the mock serves so `/fs/write` → `/fs/read` round-trips
 /// (needed for SHA-256 verification in `ensure_executable`). Paths are decoded
@@ -388,6 +408,63 @@ fn start_delete_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
     (format!("http://127.0.0.1:{port}/v1"), deletes)
 }
 
+/// A mock for destroy-without-proof: `GET /v1/sprites/<name>` answers
+/// `get_status`, every `DELETE` answers `204`. GETs and DELETEs are counted
+/// separately, so a test can assert the probe ran and the delete never did.
+fn start_probe_delete_mock(
+    get_status: &'static str,
+) -> (String, Arc<Mutex<usize>>, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let gets = Arc::new(Mutex::new(0usize));
+    let deletes = Arc::new(Mutex::new(0usize));
+    let (g, d) = (gets.clone(), deletes.clone());
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (g, d) = (g.clone(), d.clone());
+            thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = stream;
+                let mut line = String::new();
+                if read_line(&mut reader, &mut line).is_none() {
+                    return;
+                }
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                loop {
+                    let mut h = String::new();
+                    if read_line(&mut reader, &mut h).is_none() {
+                        break;
+                    }
+                    if h.trim_end().is_empty() {
+                        break;
+                    }
+                }
+                let (status, body): (&str, &[u8]) = match method.as_str() {
+                    "GET" if path.starts_with("/v1/sprites/") => {
+                        *g.lock().unwrap() += 1;
+                        (get_status, b"{}")
+                    }
+                    "DELETE" => {
+                        *d.lock().unwrap() += 1;
+                        ("204 No Content", b"")
+                    }
+                    _ => ("404 Not Found", b"no route"),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = writer.write_all(head.as_bytes()); // best-effort: client may have disconnected
+                let _ = writer.write_all(body); // best-effort: client may have disconnected
+                let _ = writer.flush(); // best-effort: client may have disconnected
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1"), gets, deletes)
+}
+
 /// A mock that answers `POST /sprites` (create) with `500` for the first
 /// `fail_first` calls, then a valid create body — the create analogue of
 /// [`start_delete_mock`], for the transient-create retry (a cold-booting control
@@ -513,7 +590,7 @@ fn create_retries_transient_500_then_succeeds() {
     // 500 twice, then 200: create must ride out the transient errors (a cold
     // control plane) and succeed — hitting POST /sprites exactly 3×.
     let (base, posts) = start_create_mock(2);
-    let p = SpritesProvider::new(&base, "tok", "newone");
+    let (p, _ledger) = scoped(&base, "newone");
     let h = rt().block_on(p.create()).unwrap();
     assert_eq!(h.id, "newone");
     assert_eq!(
@@ -528,7 +605,7 @@ fn create_gives_up_bounded_on_persistent_500() {
     // Always 500: create errors after a BOUNDED attempt budget (never hangs the
     // provisioning thread) and surfaces the status.
     let (base, posts) = start_create_mock(usize::MAX);
-    let p = SpritesProvider::new(&base, "tok", "newone");
+    let (p, _ledger) = scoped(&base, "newone");
     let err = rt().block_on(p.create()).unwrap_err();
     assert!(err.to_string().contains("500"), "surfaced status: {err}");
     assert_eq!(
@@ -536,6 +613,43 @@ fn create_gives_up_bounded_on_persistent_500() {
         3,
         "exactly the bounded number of attempts, then give up"
     );
+}
+
+#[test]
+fn create_without_a_scope_is_refused_before_any_request() {
+    // No controller id ⇒ no ledger record ⇒ no create: refused with zero HTTP
+    // requests, so an unrecorded (unreapable, undeletable) sprite never exists.
+    let (base, posts) = start_create_mock(0);
+    let unscoped = SpritesProvider::new(&base, "tok", "newone");
+    let err = rt().block_on(unscoped.create()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no controller id; refusing to create an unrecorded sprite"),
+        "{err}"
+    );
+    assert_eq!(*posts.lock().unwrap(), 0, "refused before any request");
+}
+
+#[test]
+fn create_with_a_scope_sends_exactly_one_post() {
+    let (base, posts) = start_create_mock(0);
+    let (p, _ledger) = scoped(&base, "newone");
+    let handle = rt().block_on(p.create()).unwrap();
+    assert_eq!(handle.id, "newone");
+    assert_eq!(*posts.lock().unwrap(), 1, "one POST /sprites");
+}
+
+#[test]
+fn destroy_without_a_scope_is_refused_before_any_request() {
+    // No scope ⇒ no ownership proof ⇒ no DELETE.
+    let (base, deletes) = start_delete_mock(0);
+    let unscoped = SpritesProvider::new(&base, "tok", "tgtest1");
+    let err = rt().block_on(unscoped.destroy("tgtest1")).unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to delete tgtest1"),
+        "{err}"
+    );
+    assert_eq!(*deletes.lock().unwrap(), 0, "refused before any request");
 }
 
 #[test]
@@ -579,11 +693,37 @@ fn wait_ready_polls_past_a_transient_failure() {
 }
 
 #[test]
+fn destroy_of_an_unrecorded_sprite_that_is_gone_is_ok_without_a_delete() {
+    // No ownership proof, but the sprite is already gone (404): teardown stays
+    // idempotent and returns Ok, after one GET and zero DELETEs.
+    let (base, gets, deletes) = start_probe_delete_mock("404 Not Found");
+    let (p, _ledger) = scoped(&base, "unrecorded");
+    rt().block_on(p.destroy("unrecorded"))
+        .expect("an already-gone unrecorded sprite is not an error");
+    assert_eq!(*gets.lock().unwrap(), 1, "one non-mutating probe");
+    assert_eq!(*deletes.lock().unwrap(), 0, "never DELETE without proof");
+}
+
+#[test]
+fn destroy_of_an_unrecorded_sprite_that_exists_is_refused_without_a_delete() {
+    // No ownership proof and the sprite exists (200): refused, zero DELETEs.
+    let (base, gets, deletes) = start_probe_delete_mock("200 OK");
+    let (p, _ledger) = scoped(&base, "unrecorded");
+    let err = rt().block_on(p.destroy("unrecorded")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("refusing to delete unrecorded"),
+        "{err:#}"
+    );
+    assert_eq!(*gets.lock().unwrap(), 1, "one non-mutating probe");
+    assert_eq!(*deletes.lock().unwrap(), 0, "never DELETE without proof");
+}
+
+#[test]
 fn destroy_retries_transient_500_then_succeeds() {
     // 500 twice, then 204: the teardown retry must ride out the transient errors
     // and succeed rather than leaking the sandbox — hitting DELETE exactly 3×.
     let (base, deletes) = start_delete_mock(2);
-    let p = SpritesProvider::new(&base, "tok", "tgtest1");
+    let (p, _ledger) = scoped(&base, "tgtest1");
     rt().block_on(p.destroy("tgtest1")).unwrap();
     assert_eq!(
         *deletes.lock().unwrap(),
@@ -598,7 +738,7 @@ fn destroy_gives_up_bounded_on_persistent_500() {
     // forever, which would wedge the off-loop delete thread) and surfaces the
     // status so the warn is actionable.
     let (base, deletes) = start_delete_mock(usize::MAX);
-    let p = SpritesProvider::new(&base, "tok", "tgtest1");
+    let (p, _ledger) = scoped(&base, "tgtest1");
     let err = rt().block_on(p.destroy("tgtest1")).unwrap_err();
     assert!(
         err.to_string().contains("500"),
@@ -614,7 +754,7 @@ fn destroy_gives_up_bounded_on_persistent_500() {
 #[test]
 fn full_provider_flow_against_recorded_api() {
     let mock = start_mock();
-    let p = SpritesProvider::new(&mock.base_url, "tok", "tgtest1");
+    let (p, _ledger) = scoped(&mock.base_url, "tgtest1");
     let rt = rt();
 
     // ---- response parsing (real fixtures) ----
@@ -706,7 +846,8 @@ fn full_provider_flow_against_recorded_api() {
 #[test]
 fn provider_enum_dispatch_against_mock() {
     let mock = start_mock();
-    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "tgtest1"));
+    let (sprites, _ledger) = scoped(&mock.base_url, "tgtest1");
+    let prov = Provider::Sprites(sprites);
     let rt = rt();
     // The generic enum dispatch reaches the same Sprites impls.
     assert_eq!(rt.block_on(prov.create()).unwrap().id, "tgtest1");
@@ -733,7 +874,8 @@ fn ensure_exists_skips_when_present_creates_when_absent() {
         "present ⇒ no create"
     );
     // …and for an unknown name it creates (the create fixture).
-    let absent = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "newone"));
+    let (newone, _ledger) = scoped(&mock.base_url, "newone");
+    let absent = Provider::Sprites(newone);
     assert!(
         rt.block_on(absent.ensure_exists("newone")).unwrap(),
         "absent ⇒ create"

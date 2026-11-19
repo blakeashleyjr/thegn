@@ -192,10 +192,12 @@ pub(crate) fn provider_for_inventory(
             };
             let token = crate::secret::resolve_for(key, "provider:sprites")
                 .ok_or_else(|| format!("API token {key} could not be resolved"))?;
-            Ok(Provider::Sprites(
+            Ok(Provider::Sprites(sprites_policy(
                 SpritesProvider::new(&pc.api_base, &token, "")
                     .with_custody_accounts(managed_custody_accounts(pc)),
-            ))
+                pc,
+                key,
+            )))
         }
         K::Daytona => {
             let key = pc.api_key_env.trim();
@@ -303,10 +305,12 @@ pub(crate) fn provider_for_named_with_key(
                 pc.api_key_env.trim()
             };
             let token = crate::secret::resolve_for(key, "provider:sprites")?;
-            Some(Provider::Sprites(
+            Some(Provider::Sprites(sprites_policy(
                 SpritesProvider::new(&pc.api_base, &token, name)
                     .with_custody_accounts(managed_custody_accounts(pc)),
-            ))
+                pc,
+                key,
+            )))
         }
         K::Daytona => {
             let token = crate::secret::resolve_for(pc.api_key_env.trim(), "provider:daytona")?;
@@ -327,6 +331,42 @@ pub(crate) fn provider_for_named_with_key(
         K::Vercel => vercel_provider_for(pc, name).map(Provider::Vercel),
         // exec_command-driven: no lifecycle API to build a provider for.
         K::Custom => None,
+    }
+}
+
+/// The ownership scope, memory policy and instance cap every sprites provider
+/// carries. The scope is the controller id plus the credential-free account
+/// fingerprint of `credential_ref` (the Vercel derivation); when the controller
+/// id cannot be loaded the scope stays unset, so create and destroy refuse
+/// rather than act on an unrecorded sprite.
+///
+/// The legacy ids (worktree location rows naming a sprite) are left empty:
+/// this factory is called on the event loop, so the DB read happens inside
+/// `sprites::ledger::prove_owned` instead.
+pub(crate) fn sprites_policy(
+    provider: SpritesProvider,
+    pc: &thegn_core::config::EnvProviderConfig,
+    credential_ref: &str,
+) -> SpritesProvider {
+    let provider = provider
+        .with_memory_limit_mb(pc.min_ram_gb.saturating_mul(1024))
+        .with_max_instances(pc.max_instances)
+        .with_legacy(Vec::new());
+    let owner = match thegn_svc::vps::controller::controller_id() {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::warn!(target: "thegn::sprites", %error, "sprites: no controller id; create and destroy will refuse");
+            return provider;
+        }
+    };
+    match provider.account(credential_ref) {
+        Ok(account) => {
+            provider.with_scope(thegn_svc::sprites::ledger::OwnerScope { owner, account })
+        }
+        Err(error) => {
+            tracing::warn!(target: "thegn::sprites", %error, "sprites: no account fingerprint; create and destroy will refuse");
+            provider
+        }
     }
 }
 
@@ -851,6 +891,42 @@ mod tests {
         };
         assert!(provider_for_inventory(&vercel("team_A1", "prj_B2")).is_ok());
         assert!(provider_for_inventory(&vercel("", "")).is_err());
+    }
+
+    #[test]
+    fn sprites_factory_scopes_and_sizes_the_provider() {
+        let _state =
+            crate::testenv::IsolatedState::with_env(&[("TG_TEST_SPRITES_SCOPE_TOKEN", "tok")]);
+        let pc = thegn_core::config::EnvProviderConfig {
+            provider: "sprites".into(),
+            api_key_env: "TG_TEST_SPRITES_SCOPE_TOKEN".into(),
+            min_ram_gb: 2,
+            ..Default::default()
+        };
+        let Some(Provider::Sprites(named)) = provider_for_named(&pc, "tg-sprite-a") else {
+            panic!("a sprites provider");
+        };
+        let scope = named
+            .scope()
+            .expect("the factory scopes every sprites provider");
+        assert_eq!(
+            scope.owner,
+            thegn_svc::vps::controller::controller_id().unwrap()
+        );
+        assert_eq!(
+            scope.account,
+            named.account("TG_TEST_SPRITES_SCOPE_TOKEN").unwrap()
+        );
+        assert!(scope.account.starts_with("acct1-"), "{}", scope.account);
+        assert_eq!(named.memory_limit_mb(), 2048, "GiB x 1024");
+        let Ok(Provider::Sprites(inventory)) = provider_for_inventory(&pc) else {
+            panic!("a sprites inventory provider");
+        };
+        assert_eq!(
+            inventory.scope(),
+            Some(scope),
+            "one scope for both factory paths"
+        );
     }
 
     #[test]
