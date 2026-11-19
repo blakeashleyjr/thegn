@@ -295,7 +295,6 @@ fn an_unresolved_ref_spawns_nothing() {
     assert_eq!(RUNS.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_timeout_kills_the_process_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -406,7 +405,7 @@ fn log_lines_go_to_tracing_only() {
     let records = captured.0.lock().unwrap();
     assert!(records.iter().any(|record| {
         record
-            .get("message")
+            .get("text")
             .is_some_and(|value| value.contains("from the command <redacted>"))
     }));
     assert!(records.iter().all(|record| {
