@@ -1054,11 +1054,13 @@ impl SpritesProvider {
             }
             let response = match tokio::time::timeout_at(
                 deadline,
-                self.client
-                    .get(self.sprite_name_url(id)?)
-                    .bearer_auth(&self.token)
-                    .timeout(CONTROL_TIMEOUT)
-                    .send(),
+                Box::pin(
+                    self.client
+                        .get(self.sprite_name_url(id)?)
+                        .bearer_auth(&self.token)
+                        .timeout(CONTROL_TIMEOUT)
+                        .send(),
+                ),
             )
             .await
             {
@@ -3586,7 +3588,7 @@ impl SpritesProvider {
     /// runtime until the socket closes or `ExecControl::Close` is sent.
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         let url = exec_ws_url(self.base()?, id, spec)?;
-        self.start_session(url, spec.tty, None).await
+        Box::pin(self.start_session(url, spec.tty, None)).await
     }
 
     async fn open_exec_capturing(
@@ -3596,9 +3598,8 @@ impl SpritesProvider {
     ) -> Result<(ExecSession, StderrSink)> {
         let url = exec_ws_url(self.base()?, id, spec)?;
         let stderr = Arc::new(Mutex::new(StderrTail::default()));
-        let session = self
-            .start_session(url, spec.tty, Some(Arc::clone(&stderr)))
-            .await?;
+        let session =
+            Box::pin(self.start_session(url, spec.tty, Some(Arc::clone(&stderr)))).await?;
         Ok((session, stderr))
     }
 
@@ -3612,7 +3613,7 @@ impl SpritesProvider {
         rows: u16,
     ) -> Result<ExecSession> {
         let url = attach_ws_url(self.base()?, id, session, cols, rows)?;
-        self.connect_exec(url, true, false, None).await
+        Box::pin(self.connect_exec(url, true, false, None)).await
     }
 
     /// Run a one-shot command in the sprite over the WSS exec API (NON-tty) and
@@ -3627,8 +3628,7 @@ impl SpritesProvider {
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<(i32, String)> {
-        self.run_exec_within(id, argv, cwd, env, RUN_EXEC_DEADLINE)
-            .await
+        Box::pin(self.run_exec_within(id, argv, cwd, env, RUN_EXEC_DEADLINE)).await
     }
 
     /// Run one-shot exec with an overall deadline covering open and output.
@@ -3650,7 +3650,9 @@ impl SpritesProvider {
         };
         let until = tokio::time::Instant::now() + deadline;
         let (mut sess, stderr) =
-            match tokio::time::timeout_at(until, self.open_exec_capturing(id, &spec)).await {
+            match tokio::time::timeout_at(until, Box::pin(self.open_exec_capturing(id, &spec)))
+                .await
+            {
                 Ok(session) => session?,
                 Err(_) => {
                     return Err(anyhow!(
@@ -3659,11 +3661,11 @@ impl SpritesProvider {
                     ));
                 }
             };
-        let collected = match collect_exec_output_until(
+        let collected = match Box::pin(collect_exec_output_until(
             &mut sess.frames,
             crate::vps::ssh_shim::EXEC_OUTPUT_CAP,
             until,
-        )
+        ))
         .await
         {
             Some(collected) => collected,
@@ -3696,7 +3698,7 @@ impl SpritesProvider {
         tty: bool,
         stderr: Option<StderrSink>,
     ) -> Result<ExecSession> {
-        self.connect_exec(url, tty, true, stderr).await
+        Box::pin(self.connect_exec(url, tty, true, stderr)).await
     }
 
     // Fresh exec can wait for cold boot. Reattach is already retried by the
@@ -3739,7 +3741,11 @@ impl SpritesProvider {
             };
             match tokio::time::timeout(
                 attempt_timeout,
-                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false),
+                Box::pin(tokio_tungstenite::connect_async_with_config(
+                    req,
+                    Some(exec_ws_config()),
+                    false,
+                )),
             )
             .await
             {
@@ -3781,7 +3787,9 @@ impl SpritesProvider {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<ExecControl>(256);
         let (sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
 
-        tokio::spawn(drive_exec(ws, tty, frames_tx, control_rx, sid_tx, stderr));
+        tokio::spawn(Box::pin(drive_exec(
+            ws, tty, frames_tx, control_rx, sid_tx, stderr,
+        )));
 
         Ok(ExecSession {
             frames: frames_rx,
@@ -3809,7 +3817,7 @@ impl SpritesProvider {
         let (from_srv_tx, from_srv_rx) =
             tokio::sync::mpsc::channel::<Vec<u8>>(EXEC_CHANNEL_CAPACITY);
         let (end_tx, end_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(drive_proxy(ws, to_srv_rx, from_srv_tx, end_tx));
+        tokio::spawn(Box::pin(drive_proxy(ws, to_srv_rx, from_srv_tx, end_tx)));
         Ok(ProxyStream {
             rx: from_srv_rx,
             tx: to_srv_tx,
@@ -3828,17 +3836,20 @@ async fn connect_proxy_ws(
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
 
-    let result = tokio::time::timeout(deadline, async move {
-        let (mut ws, _resp) =
-            tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false)
+    let result = tokio::time::timeout(
+        deadline,
+        Box::pin(async move {
+            let (mut ws, _resp) =
+                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false)
+                    .await
+                    .context("sprites: proxy ws connect")?;
+            // The init frame selects the target; after it, the socket is a raw relay.
+            ws.send(Message::Text(init.into()))
                 .await
-                .context("sprites: proxy ws connect")?;
-        // The init frame selects the target; after it, the socket is a raw relay.
-        ws.send(Message::Text(init.into()))
-            .await
-            .context("sprites: proxy init")?;
-        Ok::<_, anyhow::Error>(ws)
-    })
+                .context("sprites: proxy init")?;
+            Ok::<_, anyhow::Error>(ws)
+        }),
+    )
     .await;
     match result {
         Ok(result) => result,
@@ -4244,10 +4255,13 @@ impl Provider {
     }
 
     pub async fn destroy(&self, id: &str) -> Result<()> {
-        self.remote()
-            .ok_or_else(|| iroh_exec_only("destroy"))?
-            .destroy(id)
-            .await
+        Box::pin(async move {
+            self.remote()
+                .ok_or_else(|| iroh_exec_only("destroy"))?
+                .destroy(id)
+                .await
+        })
+        .await
     }
 
     pub async fn list(&self) -> Result<Vec<String>> {
@@ -4482,10 +4496,13 @@ impl Provider {
 
     /// Write a file into the sandbox fs.
     pub async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.files_ops()
-            .ok_or_else(|| self.no_files())?
-            .write(id, path, data)
-            .await
+        Box::pin(async move {
+            self.files_ops()
+                .ok_or_else(|| self.no_files())?
+                .write(id, path, data)
+                .await
+        })
+        .await
     }
 
     /// Write an executable into the sandbox fs (mode 0755 where supported).
@@ -4499,10 +4516,13 @@ impl Provider {
     /// Write an owner-only file into the sandbox fs (mode 0600 where supported;
     /// see [`ProviderFiles::write_private`]).
     pub async fn write_private(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.files_ops()
-            .ok_or_else(|| self.no_files())?
-            .write_private(id, path, data)
-            .await
+        Box::pin(async move {
+            self.files_ops()
+                .ok_or_else(|| self.no_files())?
+                .write_private(id, path, data)
+                .await
+        })
+        .await
     }
 
     /// Idempotently install the executable `data` at `path` in the sandbox.
@@ -4530,28 +4550,27 @@ impl Provider {
         let lease_id = id.to_string();
         let lease_path_for_acquire = lease_path.clone();
         let owner_for_acquire = owner.clone();
-        let acquired = install_executable_verified(
+        let acquired = Box::pin(install_executable_verified(
             files,
             id,
             path,
             data,
             move || async move {
-                let (code, output) = self
-                    .run_exec(
-                        &lease_id,
-                        &install_shell_argv(
-                            "thegn-install-lease",
-                            INSTALL_LEASE_ACQUIRE_SCRIPT,
-                            &[
-                                &lease_path_for_acquire,
-                                &owner_for_acquire,
-                                INSTALL_LEASE_TTL_MINUTES,
-                            ],
-                        ),
-                        None,
-                        &[],
-                    )
-                    .await?;
+                let (code, output) = Box::pin(self.run_exec(
+                    &lease_id,
+                    &install_shell_argv(
+                        "thegn-install-lease",
+                        INSTALL_LEASE_ACQUIRE_SCRIPT,
+                        &[
+                            &lease_path_for_acquire,
+                            &owner_for_acquire,
+                            INSTALL_LEASE_TTL_MINUTES,
+                        ],
+                    ),
+                    None,
+                    &[],
+                ))
+                .await?;
                 match code {
                     0 => Ok(true),
                     75 => Ok(false),
@@ -4563,18 +4582,17 @@ impl Provider {
                 let lease_path = lease_path.clone();
                 let owner = owner.clone();
                 move || async move {
-                    let (code, output) = self
-                        .run_exec(
-                            &lease_id,
-                            &install_shell_argv(
-                                "thegn-install-release",
-                                INSTALL_LEASE_RELEASE_SCRIPT,
-                                &[&lease_path, &owner],
-                            ),
-                            None,
-                            &[],
-                        )
-                        .await?;
+                    let (code, output) = Box::pin(self.run_exec(
+                        &lease_id,
+                        &install_shell_argv(
+                            "thegn-install-release",
+                            INSTALL_LEASE_RELEASE_SCRIPT,
+                            &[&lease_path, &owner],
+                        ),
+                        None,
+                        &[],
+                    ))
+                    .await?;
                     if code == 0 {
                         Ok(())
                     } else {
@@ -4587,18 +4605,17 @@ impl Provider {
                 let previous_path = previous_path.clone();
                 let target_path = path.to_string();
                 move || async move {
-                    let (code, output) = self
-                        .run_exec(
-                            &previous_id,
-                            &install_shell_argv(
-                                "thegn-install-preserve",
-                                INSTALL_PRESERVE_SCRIPT,
-                                &[&target_path, &previous_path],
-                            ),
-                            None,
-                            &[],
-                        )
-                        .await?;
+                    let (code, output) = Box::pin(self.run_exec(
+                        &previous_id,
+                        &install_shell_argv(
+                            "thegn-install-preserve",
+                            INSTALL_PRESERVE_SCRIPT,
+                            &[&target_path, &previous_path],
+                        ),
+                        None,
+                        &[],
+                    ))
+                    .await?;
                     if code == 0 {
                         Ok(())
                     } else {
@@ -4609,21 +4626,20 @@ impl Provider {
                 }
             },
             |stage, dest| async move {
-                let (code, output) = self
-                    .run_exec(
-                        id,
-                        &[
-                            "/bin/sh".into(),
-                            "-c".into(),
-                            "mv -f -- \"$1\" \"$2\"".into(),
-                            "thegn-install-publish".into(),
-                            stage,
-                            dest,
-                        ],
-                        None,
-                        &[],
-                    )
-                    .await?;
+                let (code, output) = Box::pin(self.run_exec(
+                    id,
+                    &[
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "mv -f -- \"$1\" \"$2\"".into(),
+                        "thegn-install-publish".into(),
+                        stage,
+                        dest,
+                    ],
+                    None,
+                    &[],
+                ))
+                .await?;
                 if code != 0 {
                     let mut tail_start = output.len().saturating_sub(200);
                     while !output.is_char_boundary(tail_start) {
@@ -4638,18 +4654,17 @@ impl Provider {
                 let previous_path = previous_path.clone();
                 let target_path = path.to_string();
                 move || async move {
-                    let (code, output) = self
-                        .run_exec(
-                            &rollback_id,
-                            &install_shell_argv(
-                                "thegn-install-restore",
-                                INSTALL_RESTORE_SCRIPT,
-                                &[&target_path, &previous_path],
-                            ),
-                            None,
-                            &[],
-                        )
-                        .await?;
+                    let (code, output) = Box::pin(self.run_exec(
+                        &rollback_id,
+                        &install_shell_argv(
+                            "thegn-install-restore",
+                            INSTALL_RESTORE_SCRIPT,
+                            &[&target_path, &previous_path],
+                        ),
+                        None,
+                        &[],
+                    ))
+                    .await?;
                     if code == 0 {
                         Ok(())
                     } else {
@@ -4662,18 +4677,17 @@ impl Provider {
             {
                 let cleanup_id = id.to_string();
                 move || async move {
-                    let (code, output) = self
-                        .run_exec(
-                            &cleanup_id,
-                            &install_shell_argv(
-                                "thegn-install-cleanup",
-                                INSTALL_REMOVE_PREVIOUS_SCRIPT,
-                                &[&previous_path],
-                            ),
-                            None,
-                            &[],
-                        )
-                        .await?;
+                    let (code, output) = Box::pin(self.run_exec(
+                        &cleanup_id,
+                        &install_shell_argv(
+                            "thegn-install-cleanup",
+                            INSTALL_REMOVE_PREVIOUS_SCRIPT,
+                            &[&previous_path],
+                        ),
+                        None,
+                        &[],
+                    ))
+                    .await?;
                     if code == 0 {
                         Ok(())
                     } else {
@@ -4683,7 +4697,7 @@ impl Provider {
                     }
                 }
             },
-        )
+        ))
         .await?;
         Ok(acquired)
     }
@@ -4691,9 +4705,8 @@ impl Provider {
     /// Create and validate private directories before installing an executable.
     /// Symlinks, non-directories and directories owned by another user refuse.
     pub async fn ensure_private_exec_dir(&self, id: &str, root: &str, dir: &str) -> Result<()> {
-        let (code, output) = self
-            .run_exec(id, &private_exec_dir_argv(root, dir), None, &[])
-            .await?;
+        let (code, output) =
+            Box::pin(self.run_exec(id, &private_exec_dir_argv(root, dir), None, &[])).await?;
         if code != 0 {
             let mut tail_start = output.len().saturating_sub(200);
             while !output.is_char_boundary(tail_start) {
@@ -4790,8 +4803,7 @@ impl Provider {
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<(i32, String)> {
-        self.run_exec_within(id, argv, cwd, env, RUN_EXEC_DEADLINE)
-            .await
+        Box::pin(self.run_exec_within(id, argv, cwd, env, RUN_EXEC_DEADLINE)).await
     }
 
     /// Run one-shot exec with a provider-specific overall deadline.
@@ -4811,48 +4823,59 @@ impl Provider {
             )
         };
         match self {
-            Provider::Sprites(p) => p.run_exec_within(id, argv, cwd, env, deadline).await,
-            Provider::Vps(p) => tokio::time::timeout(deadline, p.run_exec(id, argv, cwd, env))
-                .await
-                .map_err(|_| timeout_error())?,
-            Provider::Fly(p) => tokio::time::timeout(deadline, p.run_exec(id, argv, cwd, env))
-                .await
-                .map_err(|_| timeout_error())?,
-            Provider::Machine0(p) => tokio::time::timeout(deadline, p.run_exec(id, argv, cwd, env))
-                .await
-                .map_err(|_| timeout_error())?,
+            Provider::Sprites(p) => Box::pin(p.run_exec_within(id, argv, cwd, env, deadline)).await,
+            Provider::Vps(p) => {
+                tokio::time::timeout(deadline, Box::pin(p.run_exec(id, argv, cwd, env)))
+                    .await
+                    .map_err(|_| timeout_error())?
+            }
+            Provider::Fly(p) => {
+                tokio::time::timeout(deadline, Box::pin(p.run_exec(id, argv, cwd, env)))
+                    .await
+                    .map_err(|_| timeout_error())?
+            }
+            Provider::Machine0(p) => {
+                tokio::time::timeout(deadline, Box::pin(p.run_exec(id, argv, cwd, env)))
+                    .await
+                    .map_err(|_| timeout_error())?
+            }
             Provider::Vercel(p) => tokio::time::timeout(
                 deadline,
-                p.run_exec(id, argv, cwd, env, crate::vercel::Wake::Allow),
+                Box::pin(p.run_exec(id, argv, cwd, env, crate::vercel::Wake::Allow)),
             )
             .await
             .map_err(|_| timeout_error())?,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
             // One-shot capture over iroh: open a non-tty exec and drain it.
-            Provider::Iroh { home, .. } => tokio::time::timeout(deadline, async {
-                let spec = ExecSpec {
-                    argv: argv.to_vec(),
-                    tty: false,
-                    cols: 80,
-                    rows: 24,
-                    env: env.to_vec(),
-                    cwd: cwd.map(str::to_string),
-                };
-                let mut session = home.open_exec(id, spec).await?;
-                let collected =
-                    collect_exec_output(&mut session.frames, crate::vps::ssh_shim::EXEC_OUTPUT_CAP)
-                        .await;
-                let Some(code) = collected.code else {
-                    return Err(anyhow!("exec stream ended without an exit status"));
-                };
-                Ok((
-                    code,
-                    crate::vps::ssh_shim::render_capped_output(
-                        &collected.output,
-                        collected.dropped,
-                    ),
-                ))
-            })
+            Provider::Iroh { home, .. } => tokio::time::timeout(
+                deadline,
+                Box::pin(async {
+                    let spec = ExecSpec {
+                        argv: argv.to_vec(),
+                        tty: false,
+                        cols: 80,
+                        rows: 24,
+                        env: env.to_vec(),
+                        cwd: cwd.map(str::to_string),
+                    };
+                    let mut session = Box::pin(home.open_exec(id, spec)).await?;
+                    let collected = Box::pin(collect_exec_output(
+                        &mut session.frames,
+                        crate::vps::ssh_shim::EXEC_OUTPUT_CAP,
+                    ))
+                    .await;
+                    let Some(code) = collected.code else {
+                        return Err(anyhow!("exec stream ended without an exit status"));
+                    };
+                    Ok((
+                        code,
+                        crate::vps::ssh_shim::render_capped_output(
+                            &collected.output,
+                            collected.dropped,
+                        ),
+                    ))
+                }),
+            )
             .await
             .map_err(|_| timeout_error())?,
         }
@@ -4917,6 +4940,23 @@ mod tests {
 
     fn sprites() -> SpritesProvider {
         SpritesProvider::new("https://api.sprites.dev/v1/", "tok", "my-sprite")
+    }
+
+    #[test]
+    fn sprites_ensure_executable_future_stays_small() {
+        let provider = Provider::Sprites(sprites());
+        let future = provider.ensure_executable("sprite", "/workspace/.tg/thegn", b"binary");
+        assert!(std::mem::size_of_val(&future) < 16 * 1024);
+        drop(future);
+    }
+
+    #[test]
+    fn provider_run_exec_future_stays_small() {
+        let provider = Provider::Sprites(sprites());
+        let argv = vec!["/bin/true".to_string()];
+        let future = provider.run_exec("sprite", &argv, None, &[]);
+        assert!(std::mem::size_of_val(&future) < 16 * 1024);
+        drop(future);
     }
 
     async fn list_response(status: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
