@@ -429,7 +429,8 @@ interactive_line_breaks() {
 import os, re, sys
 lines = os.environ["INTERACTIVE_OUT"].replace("\r", "").splitlines()
 tty = next((i for i, line in enumerate(lines) if re.search(r"/dev/pts/[0-9]+", line)), None)
-ok = next((i for i, line in enumerate(lines) if re.search(r"(^|\s)ok(\s|$)", line)), None)
+# The server can send the tty path with no line ending, so "ok" may follow it directly ("/dev/pts/0ok").
+ok = next((i for i, line in enumerate(lines) if re.search(r"(^|\s|/dev/pts/[0-9]+)ok(\s|$)", line)), None)
 if tty is None or ok is None:
     print("fail")
 elif tty != ok:
