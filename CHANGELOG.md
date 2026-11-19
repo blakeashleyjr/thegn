@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.98] — 2026-11-19
+
 ### Added
 
 - `thegn env adopt <sprite> --env <S>` records an existing sprite after you confirm it, so thegn can manage it. `[env.<n>.provider] lifetime_reap = true` lets a running client destroy recorded sprites past `max_lifetime_secs`. `thegn land` on a provider worktree now pulls and lands the local branch and keeps the sandbox; `--release-sandbox` destroys it. `agent run --wait` stops a Fly or machine0 machine afterwards unless `--keep-running`. `login_homes` selects a dedicated login for Sprites and Vercel `upload`. Not yet verified live.
@@ -3899,7 +3901,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.97...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...HEAD
+[0.1.0-alpha.98]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.97...v0.1.0-alpha.98
 [0.1.0-alpha.97]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.96...v0.1.0-alpha.97
 [0.1.0-alpha.96]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...v0.1.0-alpha.96
 [0.1.0-alpha.95]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.94...v0.1.0-alpha.95
