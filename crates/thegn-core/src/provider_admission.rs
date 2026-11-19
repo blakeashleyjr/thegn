@@ -498,9 +498,25 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
             ));
         }
         if provider != "vercel" {
-            if env.provider.model_credentials != crate::config::ModelCredentials::None {
+            let invalid_model_credentials = if provider == "sprites" {
+                match env.provider.model_credentials {
+                    crate::config::ModelCredentials::None
+                    | crate::config::ModelCredentials::Upload => None,
+                    crate::config::ModelCredentials::Proxy => {
+                        Some("model_credentials = \"proxy\" is not offered for sprites")
+                    }
+                    crate::config::ModelCredentials::Inject => {
+                        Some("model_credentials = \"inject\" is not offered for sprites")
+                    }
+                }
+            } else if env.provider.model_credentials != crate::config::ModelCredentials::None {
+                Some(NON_VERCEL_MODEL_CREDENTIALS)
+            } else {
+                None
+            };
+            if let Some(reason) = invalid_model_credentials {
                 errors.push(format!(
-                    "env.{env_name}.provider.model_credentials: {NON_VERCEL_MODEL_CREDENTIALS}"
+                    "env.{env_name}.provider.model_credentials: {reason}"
                 ));
             }
             if !env.provider.interactive_host_suffixes.is_empty() {
@@ -606,6 +622,13 @@ pub fn provider_table_warnings(cfg: &crate::config::Config) -> Vec<String> {
             continue;
         }
         if provider == "sprites" {
+            if p.model_credentials == crate::config::ModelCredentials::None
+                && !p.model_credentials_is_explicit()
+            {
+                warnings.push(format!(
+                    "env.{env_name}.provider.model_credentials: credentials are forwarded by default on this env; set model_credentials = \"none\" in [env.{env_name}.provider] to turn them off"
+                ));
+            }
             let size = p.size.trim();
             if (!size.is_empty() && !size.eq_ignore_ascii_case("auto"))
                 || p.min_vcpu > 0
@@ -633,8 +656,8 @@ pub fn provider_table_warnings(cfg: &crate::config::Config) -> Vec<String> {
     warnings
 }
 
-/// The refusal for `model_credentials` set on any provider but Vercel.
-pub const NON_VERCEL_MODEL_CREDENTIALS: &str = "model_credentials applies only to provider = \"vercel\"; \
+/// The refusal for `model_credentials` set on any provider but Vercel/Sprites.
+pub const NON_VERCEL_MODEL_CREDENTIALS: &str = "model_credentials applies only to provider = \"vercel\" or \"sprites\"; \
      other providers upload agent logins through [sandbox.home] agents";
 
 /// Warn when a configured lifetime ceiling has no scheduled destroy reaper.

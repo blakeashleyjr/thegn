@@ -7,6 +7,95 @@
 
 use crate::envplan::{EnvPlan, StepKind};
 
+/// Host env names that carry a model credential. Fixed list; user-added
+/// passthrough names are not in it.
+pub const MODEL_CREDENTIAL_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelGrant {
+    pub env_keys: bool,
+    pub login_files: bool,
+}
+
+/// The model-credential grant for a provider env. Vercel keeps its own
+/// TTY-upload path (`vercel_bridge` decides); Sprites are explicit: `upload`
+/// grants both channels and `none` grants neither. Every other kind retains
+/// the existing behavior for this batch.
+pub fn model_grant(
+    kind: crate::config::EnvProviderKind,
+    mode: crate::config::ModelCredentials,
+) -> ModelGrant {
+    match kind {
+        crate::config::EnvProviderKind::Vercel => ModelGrant {
+            env_keys: false,
+            login_files: false,
+        },
+        crate::config::EnvProviderKind::Sprites => match mode {
+            crate::config::ModelCredentials::Upload => ModelGrant {
+                env_keys: true,
+                login_files: true,
+            },
+            crate::config::ModelCredentials::None
+            | crate::config::ModelCredentials::Proxy
+            | crate::config::ModelCredentials::Inject => ModelGrant {
+                env_keys: false,
+                login_files: false,
+            },
+        },
+        _ => ModelGrant {
+            env_keys: true,
+            login_files: true,
+        },
+    }
+}
+
+/// Drop fixed model-credential names, returning the kept env and sorted names
+/// only. Values never appear in the returned disclosure list.
+pub fn strip_model_env(env: Vec<(String, String)>) -> (Vec<(String, String)>, Vec<String>) {
+    let mut dropped = Vec::new();
+    let kept = env
+        .into_iter()
+        .filter(|(key, _)| {
+            if MODEL_CREDENTIAL_ENV.contains(&key.as_str()) {
+                dropped.push(key.clone());
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    dropped.sort();
+    dropped.dedup();
+    (kept, dropped)
+}
+
+/// One-line disclosure for a Sprites env.
+pub fn sprites_disclosure(mode: crate::config::ModelCredentials) -> &'static str {
+    match mode {
+        crate::config::ModelCredentials::None => {
+            "nothing: no model API key or agent login is sent; set model_credentials = \"upload\" to send them"
+        }
+        crate::config::ModelCredentials::Upload => {
+            "your agent login files and model API keys from env_passthrough are sent at provision and refreshed on reuse"
+        }
+        crate::config::ModelCredentials::Proxy => {
+            "proxy model credentials are not offered for sprites"
+        }
+        crate::config::ModelCredentials::Inject => {
+            "inject model credentials are not offered for sprites"
+        }
+    }
+}
+
 /// The fixed, value-free label for a credential-bearing step kind, or `None`
 /// when the kind carries no host credential. The label is safe to log: it
 /// never names a path, dotfile or store root.
@@ -48,7 +137,73 @@ pub fn refuses_step(kind: &StepKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{EnvProviderKind, ModelCredentials};
     use crate::envplan::{ProvisionStep, Tier};
+
+    #[test]
+    fn model_grant_is_explicit_for_sprites_and_unchanged_elsewhere() {
+        for (kind, mode, expected) in [
+            (
+                EnvProviderKind::Sprites,
+                ModelCredentials::None,
+                ModelGrant {
+                    env_keys: false,
+                    login_files: false,
+                },
+            ),
+            (
+                EnvProviderKind::Sprites,
+                ModelCredentials::Upload,
+                ModelGrant {
+                    env_keys: true,
+                    login_files: true,
+                },
+            ),
+            (
+                EnvProviderKind::Vercel,
+                ModelCredentials::Upload,
+                ModelGrant {
+                    env_keys: false,
+                    login_files: false,
+                },
+            ),
+            (
+                EnvProviderKind::Fly,
+                ModelCredentials::Upload,
+                ModelGrant {
+                    env_keys: true,
+                    login_files: true,
+                },
+            ),
+        ] {
+            assert_eq!(model_grant(kind, mode), expected, "{kind:?} {mode}");
+        }
+    }
+
+    #[test]
+    fn strip_model_env_keeps_non_model_names_and_returns_names_only() {
+        let (kept, dropped) = strip_model_env(vec![
+            ("OPENAI_API_KEY".into(), "sentinel".into()),
+            ("MY_TOKEN".into(), "user-value".into()),
+            ("TERM".into(), "xterm-256color".into()),
+            ("ANTHROPIC_API_KEY".into(), "another-sentinel".into()),
+        ]);
+        assert_eq!(
+            kept,
+            vec![
+                ("MY_TOKEN".into(), "user-value".into()),
+                ("TERM".into(), "xterm-256color".into()),
+            ]
+        );
+        assert_eq!(
+            dropped,
+            vec![
+                "ANTHROPIC_API_KEY".to_string(),
+                "OPENAI_API_KEY".to_string()
+            ]
+        );
+        assert!(!dropped.iter().any(|name| name.contains("sentinel")));
+    }
 
     fn step(id: &str, kind: StepKind) -> ProvisionStep {
         ProvisionStep {

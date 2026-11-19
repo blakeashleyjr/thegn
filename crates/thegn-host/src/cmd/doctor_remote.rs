@@ -146,11 +146,30 @@ pub(crate) fn json_with(
             };
             let sandbox = env_sandbox(cfg, env);
             let credential_free = kind.credential_free();
+            let mode = if kind == EnvProviderKind::Sprites
+                && !pc.model_credentials_is_explicit()
+            {
+                thegn_core::config::ModelCredentials::Upload
+            } else {
+                pc.model_credentials
+            };
+            let grant = thegn_core::provider_credentials::model_grant(
+                kind,
+                mode,
+            );
             let forwarded: Vec<String> = if credential_free {
                 Vec::new()
             } else {
-                sandbox
+                let forwarded = sandbox
                     .passthrough_env_remote()
+                    .into_iter();
+                let forwarded = if grant.env_keys {
+                    forwarded.collect::<Vec<_>>()
+                } else {
+                    thegn_core::provider_credentials::strip_model_env(forwarded.collect())
+                        .0
+                };
+                forwarded
                     .into_iter()
                     .map(|(k, _)| clean(&k))
                     .collect::<BTreeSet<_>>()
@@ -158,10 +177,21 @@ pub(crate) fn json_with(
                     .collect()
             };
             let login_upload = if credential_free {
-                pc.model_credentials.as_str().to_string()
+                mode.as_str().to_string()
+            } else if kind == EnvProviderKind::Sprites && !grant.login_files {
+                "none".to_string()
             } else {
                 let agents = login_agents(cfg, env);
                 if agents.is_empty() { "none".to_string() } else { clean(&agents.join(",")) }
+            };
+            let credentials_warning = if kind == EnvProviderKind::Sprites
+                && !pc.model_credentials_is_explicit()
+            {
+                format!(
+                    "credentials are forwarded by default on this env; set model_credentials = \"none\" in [env.{name}.provider] to turn them off"
+                )
+            } else {
+                String::new()
             };
             serde_json::json!({
                 "env": clean(name),
@@ -177,6 +207,7 @@ pub(crate) fn json_with(
                 "forwarded_env": forwarded,
                 "git_token": !credential_free && sandbox.git.admits_git_token(),
                 "login_upload": login_upload,
+                "credentials_warning": credentials_warning,
             })
         })
         .collect::<Vec<_>>();
@@ -245,6 +276,9 @@ pub(crate) fn report(cfg: &Config) {
             yn(&row["git_token"]),
             s("login_upload")
         );
+        if !s("credentials_warning").is_empty() {
+            outln!("               warning: {}", s("credentials_warning"));
+        }
     }
 }
 
@@ -307,7 +341,8 @@ mod tests {
                 "unbound",
                 "forwarded_env",
                 "git_token",
-                "login_upload"
+                "login_upload",
+                "credentials_warning"
             ])
         );
         let unbound: BTreeSet<&str> = row["unbound"]
@@ -345,12 +380,76 @@ mod tests {
 
         let mut sprites = cfg_with("sprites");
         sprites.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        sprites.sandbox.home.agents = vec!["claude".into()];
         let out = json_with(&sprites, None, &[], 0);
         assert!(
             out[0]["forwarded_env"]
                 .to_string()
                 .contains("ANTHROPIC_API_KEY")
         );
+        assert_eq!(out[0]["login_upload"], "claude");
+        assert!(
+            out[0]["credentials_warning"]
+                .as_str()
+                .unwrap()
+                .contains("model_credentials = \"none\"")
+        );
         assert!(!out.to_string().contains("sentinel"));
+    }
+
+    #[test]
+    fn sprites_upload_forwards_model_env_and_reports_upload() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut vars: Vec<(String, String)> = thegn_core::testenv::state_env_all(temp.path())
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.display().to_string()))
+            .collect();
+        vars.push((
+            "THEGN_DIR".into(),
+            temp.path().join(".thegn").display().to_string(),
+        ));
+        vars.push(("ANTHROPIC_API_KEY".into(), "sentinel-b167".into()));
+        let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let _env = EnvGuard::set(&pairs);
+        let mut cfg = cfg_with("sprites");
+        cfg.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        cfg.sandbox.home.agents = vec!["claude".into()];
+        let provider = &mut cfg.env.get_mut("remote").unwrap().provider;
+        provider.model_credentials = thegn_core::config::ModelCredentials::Upload;
+        provider.mark_model_credentials_explicit();
+        let out = json_with(&cfg, None, &[], 0);
+        assert!(
+            out[0]["forwarded_env"]
+                .to_string()
+                .contains("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(out[0]["login_upload"], "claude");
+        assert!(!out.to_string().contains("sentinel-b167"));
+    }
+
+    #[test]
+    fn sprites_none_withholds_model_env_and_has_no_default_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut vars: Vec<(String, String)> = thegn_core::testenv::state_env_all(temp.path())
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.display().to_string()))
+            .collect();
+        vars.push((
+            "THEGN_DIR".into(),
+            temp.path().join(".thegn").display().to_string(),
+        ));
+        vars.push(("ANTHROPIC_API_KEY".into(), "sentinel-b167".into()));
+        let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let _env = EnvGuard::set(&pairs);
+        let mut cfg = cfg_with("sprites");
+        cfg.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        let provider = &mut cfg.env.get_mut("remote").unwrap().provider;
+        provider.model_credentials = thegn_core::config::ModelCredentials::None;
+        provider.mark_model_credentials_explicit();
+        let out = json_with(&cfg, None, &[], 0);
+        assert_eq!(out[0]["forwarded_env"], serde_json::json!([]));
+        assert_eq!(out[0]["login_upload"], "none");
+        assert_eq!(out[0]["credentials_warning"], "");
+        assert!(!out.to_string().contains("sentinel-b167"));
     }
 }

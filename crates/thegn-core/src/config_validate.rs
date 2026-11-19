@@ -297,7 +297,10 @@ pub fn validate_diagnostics_with_policy(
         severity: ValidationSeverity::Error,
         message,
     }));
-    if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
+    if let Ok(mut cfg) = toml::from_str::<Config>(&normalized.body) {
+        if let Ok(raw) = toml::from_str::<serde_json::Value>(&normalized.body) {
+            crate::config_env_tables::mark_model_credentials_explicit(&mut cfg, &raw);
+        }
         diagnostics.extend(float_range_warnings(&cfg).into_iter().map(|message| {
             ValidationDiagnostic {
                 severity: ValidationSeverity::Warning,
@@ -2611,6 +2614,25 @@ template = "image:registry.example/dev:1"
             "{warnings:?}"
         );
         assert!(validate_diagnostics("[stats]\nrefresh_rates = []\n").is_empty());
+    }
+
+    #[test]
+    fn sprites_model_credentials_explicitness_reaches_validate_diagnostics() {
+        let explicit = "[env.s]\nplacement = \"provider\"\n[env.s.provider]\nprovider = \"sprites\"\nmodel_credentials = \"none\"\n";
+        let implicit =
+            "[env.s]\nplacement = \"provider\"\n[env.s.provider]\nprovider = \"sprites\"\n";
+        assert!(
+            !validate_diagnostics(explicit)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("forwarded by default"))
+        );
+        assert_eq!(
+            validate_diagnostics(implicit)
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("forwarded by default"))
+                .count(),
+            1
+        );
     }
 
     #[test]
