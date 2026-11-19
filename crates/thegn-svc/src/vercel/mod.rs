@@ -866,12 +866,17 @@ impl VercelProvider {
         let deadline = tokio::time::Instant::now() + self.destroy_budget;
         let budget_secs = self.destroy_budget.as_secs();
         loop {
-            let Some(view) = self.api().get(name, false).await? else {
+            let Some(view) = self.api().get(name, false).await.with_context(|| {
+                format!(
+                    "vercel: delete of {name} was accepted but its absence could not be confirmed; its ledger record is kept; retry thegn env down or thegn env reap --provider vercel --apply"
+                )
+            })?
+            else {
                 return Ok(());
             };
             if tokio::time::Instant::now() >= deadline {
                 bail!(
-                    "vercel: delete of {name} was accepted but the sandbox is still present after {}s (status {}); its ledger record is kept; retry thegn env down or thegn env reap --provider vercel",
+                    "vercel: delete of {name} was accepted but the sandbox is still present after {}s (status {}); its ledger record is kept; retry thegn env down or thegn env reap --provider vercel --apply",
                     budget_secs,
                     status_text(view.status)
                 );

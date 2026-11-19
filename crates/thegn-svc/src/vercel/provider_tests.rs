@@ -393,6 +393,7 @@ async fn failure_after_create_with_landed_delete_clears_the_record() {
         .lock()
         .unwrap()
         .push_back(Some(tagged(NAME, &controller)));
+    fake.gets.lock().unwrap().push_back(None);
     *fake.create.lock().unwrap() = Some(Err("vercel: request timed out".into()));
     provider(&fake, ledger.path(), 2)
         .create()
