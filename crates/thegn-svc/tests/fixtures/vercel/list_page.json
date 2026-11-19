@@ -1,0 +1,40 @@
+{
+  "sandboxes": [
+    {
+      "name": "tg-fixture-1",
+      "status": "running",
+      "currentSessionId": "sess_abc123",
+      "resources": {
+        "vcpus": 2,
+        "memory": 4096
+      },
+      "region": "iad1",
+      "createdAt": 1763500000000,
+      "cwd": "/vercel/sandbox",
+      "tags": {
+        "thegn-controller": "ctl-fixture",
+        "thegn-owner": "",
+        "thegn-host": ""
+      }
+    },
+    {
+      "name": "tg-fixture-1",
+      "status": "stopped",
+      "resources": {
+        "vcpus": 2,
+        "memory": 4096
+      },
+      "region": "iad1",
+      "createdAt": 1763500000000,
+      "cwd": "/vercel/sandbox",
+      "tags": {
+        "thegn-controller": "ctl-fixture",
+        "thegn-owner": "",
+        "thegn-host": ""
+      }
+    }
+  ],
+  "pagination": {
+    "next": "cur_2"
+  }
+}

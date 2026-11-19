@@ -40,6 +40,37 @@ use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provide
 /// its `cause:remote-exec-lost` field on it.
 pub(crate) const EXIT_REMOTE_LOST: i32 = 75;
 
+pub(crate) const WAKE_NOTICE_AFTER: Duration = Duration::from_secs(3);
+
+/// Await `fut`; if it is still pending after `after`, call `notice` once and
+/// keep awaiting.
+pub(crate) async fn with_slow_notice<F: std::future::Future>(
+    fut: F,
+    after: Duration,
+    notice: impl FnOnce(),
+) -> F::Output {
+    tokio::pin!(fut);
+    tokio::select! {
+        out = &mut fut => out,
+        () = tokio::time::sleep(after) => {
+            notice();
+            fut.await
+        }
+    }
+}
+
+pub(crate) fn sprite_wake_line(id: &str) -> String {
+    let id: String = id.chars().filter(|ch| !ch.is_control()).take(64).collect();
+    format!("thegn: waiting for sprite {id} to start (a cold sprite can take up to 90 s)...")
+}
+
+fn stderr_line(line: &str) {
+    let mut stderr = std::io::stderr();
+    if writeln!(stderr, "{line}").is_err() {
+        tracing::debug!(target: "thegn::provider", "sprite-exec: stderr gone");
+    }
+}
+
 /// Reattach attempts after a dropped stream (one per [`reconnect_delays`] slot).
 const REATTACH_ATTEMPTS: usize = 5;
 
@@ -397,17 +428,19 @@ fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
     let (cols, rows) = pty_size(size.cols, size.rows);
 
     let rt = crate::agent::provider_runtime()?;
+    let spec = ExecSpec {
+        argv,
+        tty: true,
+        cols,
+        rows,
+        env: vec![],
+        cwd: None,
+    };
     // Open BEFORE raw mode so an open failure never leaves the tty altered.
-    let session = rt.block_on(provider.open_exec(
-        id,
-        &ExecSpec {
-            argv,
-            tty: true,
-            cols,
-            rows,
-            env: vec![],
-            cwd: None,
-        },
+    let session = rt.block_on(with_slow_notice(
+        provider.open_exec(id, &spec),
+        WAKE_NOTICE_AFTER,
+        || stderr_line(&sprite_wake_line(id)),
     ))?;
 
     term.set_raw_mode().context("raw mode")?;
@@ -571,10 +604,12 @@ fn tty_loop<T: Terminal>(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXIT_REMOTE_LOST, FromTty, REATTACH_BUDGET_RESET, RemoteModes, attempts_after_stream,
-        encode_input, hold_ceiling, hold_task_from, lost_line, pick_sprites_env, pty_size,
-        reconnect_delays, should_reattach,
+        EXIT_REMOTE_LOST, FromTty, REATTACH_BUDGET_RESET, RemoteModes, WAKE_NOTICE_AFTER,
+        attempts_after_stream, encode_input, hold_ceiling, hold_task_from, lost_line,
+        pick_sprites_env, pty_size, reconnect_delays, should_reattach, sprite_wake_line,
+        with_slow_notice,
     };
+    use std::cell::Cell;
     use std::time::Duration;
     use termwiz::input::{KeyCode, KeyEvent, Modifiers};
     use thegn_core::sprite_hold::{HOLD_ENV, HOLD_MAX_CEILING_SECS, HOLD_SCRIPT, wrap_argv};
@@ -614,6 +649,35 @@ mod tests {
         );
         assert!(!lost_line("a", "b").contains('\n'));
         assert_eq!(EXIT_REMOTE_LOST, 75);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_future_prints_the_notice_once() {
+        let notices = Cell::new(0);
+        let output = with_slow_notice(
+            async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                "done"
+            },
+            WAKE_NOTICE_AFTER,
+            || notices.set(notices.get() + 1),
+        )
+        .await;
+
+        assert_eq!(output, "done");
+        assert_eq!(notices.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn fast_future_prints_nothing() {
+        let notices = Cell::new(0);
+        let output = with_slow_notice(async { "done" }, WAKE_NOTICE_AFTER, || {
+            notices.set(notices.get() + 1)
+        })
+        .await;
+
+        assert_eq!(output, "done");
+        assert_eq!(notices.get(), 0);
     }
 
     #[test]
