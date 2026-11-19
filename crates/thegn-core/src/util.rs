@@ -436,6 +436,7 @@ fn bounded_stdout_with(
     let limits = thegn_proc::Limits {
         stdout: thegn_proc::Stream::HeadOrFail { cap: max_bytes },
         stderr: thegn_proc::Stream::Null,
+        reader_grace: Duration::from_millis(100),
         ..thegn_proc::Limits::silent(IDENTITY_PROBE_DEADLINE)
     };
     let cancel = AtomicBool::new(false);

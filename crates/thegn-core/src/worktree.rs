@@ -120,8 +120,15 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
         &["worktree", "list", "--porcelain", "-z"],
         MAX_GIT_IDENTITY_OUTPUT,
     )
-    .map_err(|_| IdentityError::GitProbeFailed {
-        operation: "git worktree list --porcelain -z",
+    .map_err(|error| {
+        tracing::debug!(
+            target: "thegn::worktree",
+            %error,
+            "git identity probe failed"
+        );
+        IdentityError::GitProbeFailed {
+            operation: "git worktree list --porcelain -z",
+        }
     })?;
     let entry = registered_entry(&parse_worktree_identity_records(&porcelain)?, &requested)?;
     let common_dir = repo::canonical_common_dir(entry.path.as_path())?;
