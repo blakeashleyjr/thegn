@@ -2,7 +2,7 @@
 
 **A terminal-native Git worktree IDE that is its own multiplexer.**
 
-> **Status: public alpha** (`0.1.0-alpha.96`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.97`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon is best-effort: use the flake or source
 > setup until a release archive is published. Pull requests run lean CI checks
 > (format, lint, test, smoke); the full gate runs nightly and on demand, and
@@ -602,7 +602,7 @@ settled. See
 [`docs/testing-with-muse.md`](docs/testing-with-muse.md) for driving and
 testing the TUI itself — by hand, in CI, or from an agent.
 
-Contributor docs: [`CLAUDE.md`](CLAUDE.md) (architecture + invariants),
+Contributor docs: [agent workflow](AGENTS.md), [development reference](DEVELOPMENT.md) (architecture + invariants),
 [`docs/PORTFOLIO.md`](docs/PORTFOLIO.md) (live alpha projects and issue/spec
 links), [`tasks.md`](tasks.md) (long-horizon roadmap), `openspec/specs/`
 (accepted behavior), and `docs/superpowers/{plans,specs}/` (design docs per

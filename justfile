@@ -498,6 +498,7 @@ openspec-validate:
 # tracker credentials; this command has no network client and never mutates Linear.
 delivery-check:
     python3 scripts/delivery_state.py validate
+    python3 scripts/test_agent_workflow.py
     env -u LINEAR_API_KEY -u LINEAR_TOKEN python3 scripts/delivery_state.py fixtures
 
 # Derive portfolio totals from the index and task files. An optional JSON export
@@ -505,6 +506,62 @@ delivery-check:
 # command never fetches or writes tracker data itself.
 delivery-report *args:
     python3 scripts/delivery_state.py report {{args}}
+
+# Show issue-specific project memory. Works offline in fresh worktrees.
+[positional-arguments]
+agent-context issue:
+    @python3 scripts/delivery_state.py context "$1"
+
+# Each worktree owns its symbol index. The MCP server watches while connected.
+graph-sync:
+    @if [ ! -f .codegraph/codegraph.db ]; then codegraph init .; fi
+    @codegraph sync .
+
+# Read-only freshness check for this checkout after a fold or tool upgrade.
+graph-check:
+    #!/usr/bin/env python3
+    import json
+    from pathlib import Path
+    import subprocess
+    import sys
+    report = json.loads(subprocess.check_output(["codegraph", "status", "--json", "."]))
+    index = report.get("index", {})
+    if not report.get("initialized") or Path(report["projectPath"]).resolve() != Path.cwd().resolve():
+        sys.exit("No CodeGraph index for this worktree. Run just graph-sync.")
+    if index.get("reindexRecommended"):
+        sys.exit("The extractor changed. Run codegraph index . and recheck.")
+    if (index.get("state") != "complete" or report.get("worktreeMismatch")
+            or any(report["pendingChanges"].values())):
+        sys.exit("CodeGraph has pending changes or an incomplete index. Run just graph-sync.")
+    print(f"Current CodeGraph index: {report['fileCount']} files, {report['nodeCount']} symbols and nodes.")
+
+[positional-arguments]
+graph-find +query: graph-sync
+    @codegraph explore --path . --max-files 3 -- "$@"
+
+[positional-arguments]
+memory-check *args:
+    @python3 scripts/check_agent_memory.py "$@"
+
+# Run on the integrator's checkout as soon as the two dependent lane tips meet.
+[positional-arguments]
+integration-check crate filter first_tip second_tip:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for tip in "$3" "$4"; do
+      sha=$(git rev-parse --verify --end-of-options "${tip}^{commit}")
+      git merge-base --is-ancestor "$sha" HEAD || { echo "HEAD does not contain $sha" >&2; exit 1; }
+    done
+    git log -1 --format='Combined checkout HEAD: %H'
+    if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+      echo "Local edits are included in this check. Repeat on the clean combined commit for handoff evidence."
+    fi
+    cargo clippy -p "$1" -- -D warnings
+    cargo nextest run -p "$1" --no-tests=fail -E "$2"
+
+[positional-arguments]
+agent-metrics csv:
+    @python3 scripts/agent_metrics.py "$1"
 
 # These generated/runtime ratchets deliberately name their owning capability on
 # failure. They are also selected by the full workspace test below, but keeping
