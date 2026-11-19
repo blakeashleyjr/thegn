@@ -400,7 +400,7 @@ memory_reported() { # INFO only: the guest's MemTotal; the Sprites policy is not
 policy_read_back() { # fleet inspect --policy reflects min_ram_gb=N as N*1024 MiB
   local err
   err="$TMP/5c.stderr"
-  if ! "$THEGN_BIN" "" fleet inspect "$SPRITE_NAME" --env "$env_name" --policy --json >"$TMP/5c.json" 2>"$err"; then
+  if ! "$THEGN_BIN" "${MIN_RAM_SET[@]}" fleet inspect "$SPRITE_NAME" --env "$env_name" --policy --json >"$TMP/5c.json" 2>"$err"; then
     echo "fleet inspect stderr:" >&2
     sed 's/^/  /' "$err" >&2
     return 1
