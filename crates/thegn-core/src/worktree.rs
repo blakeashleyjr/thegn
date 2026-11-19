@@ -967,7 +967,7 @@ pub fn add_checked_with_state(
             });
         }
     };
-    let out = util::git_cmd(root)
+    let out = crate::git_run::fenced_git_cmd(root)
         // Worktree creation runs on a worker, but Git must still fail fast if
         // a remote credential helper would otherwise prompt for input.
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1076,7 +1076,7 @@ fn git_destructive(root: &Path, args: &[&str]) -> Result<(), DestructiveError> {
         #[cfg(test)]
         WORKTREE_DESTRUCTIVE_ATTEMPTS.set(attempt);
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let outcome = crate::git_run::git_run(root, args, &destructive_policy(), &cancel);
+        let outcome = crate::git_run::git_run_fenced(root, args, &destructive_policy(), &cancel);
         match outcome {
             outcome if outcome.is_success() => return Ok(()),
             crate::git_run::GitOutcome::Exit { stderr_tail, .. } => {
@@ -1589,6 +1589,10 @@ pub fn rename(
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+
+#[cfg(test)]
+#[path = "worktree_hook_fence_tests.rs"]
+mod hook_fence_tests;
 
 #[cfg(test)]
 mod tests {
