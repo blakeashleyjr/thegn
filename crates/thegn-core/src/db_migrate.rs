@@ -2589,6 +2589,32 @@ pub(crate) fn verify_v113_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v114: producer leases (single headless producer per kind, THE-2208).
+/// Additive: at most one row per producer kind (four), written only by the
+/// daemon's producer owner, so no vacuum entry.
+pub(crate) fn migrate_v114(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS producer_leases (
+           producer TEXT PRIMARY KEY
+             CHECK (producer IN ('tracker','pr_poll','mentions','pr_queue')),
+           holder TEXT NOT NULL,
+           holder_pid INTEGER NOT NULL,
+           acquired_at_ms INTEGER NOT NULL,
+           expires_at_ms INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v114_schema(conn: &Connection) -> Result<()> {
+    conn.prepare(
+        "SELECT producer, holder, holder_pid, acquired_at_ms, expires_at_ms \
+         FROM producer_leases LIMIT 0",
+    )
+    .map_err(|e| anyhow::anyhow!("schema v114 incomplete: producer_leases unusable ({e})"))?;
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4824,7 +4850,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 113);
+        assert_eq!(version, 114);
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, issue_id TEXT);
@@ -4925,6 +4951,55 @@ mod tests {
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
         super::verify_v113_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v114_adds_producer_leases_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v114_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v114_schema(&conn).is_err());
+        super::migrate_v114(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+             VALUES ('tracker','daemon',1,1,2)",
+            [],
+        )
+        .unwrap();
+        super::migrate_v114(&conn).unwrap();
+        super::verify_v114_schema(&conn).unwrap();
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM producer_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "re-running v114 keeps existing leases");
+        let bad = conn.execute(
+            "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+             VALUES ('bogus','daemon',1,1,2)",
+            [],
+        );
+        assert!(bad.is_err(), "producer is CHECK-constrained");
+    }
+
+    #[test]
+    fn v114_upgrades_a_real_v113_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v113.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE producer_leases;
+                     PRAGMA user_version=113;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v114_schema(upgraded.conn()).unwrap();
     }
 
     #[test]
