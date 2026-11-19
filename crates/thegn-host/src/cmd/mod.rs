@@ -29,6 +29,7 @@ pub mod dispatch;
 pub mod dispatch_commit;
 pub mod doctor;
 pub(crate) mod doctor_lead;
+pub mod doctor_remote;
 pub mod env;
 pub mod env_adopt;
 pub mod env_image;
