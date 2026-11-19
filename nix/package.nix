@@ -81,7 +81,10 @@
     else "tg";
   desktopItem = makeDesktopItem {
     name = binName;
-    desktopName = if isDev then "thegn (dev channel)" else "thegn";
+    desktopName =
+      if isDev
+      then "thegn (dev channel)"
+      else "thegn";
     genericName = "Git Worktree IDE";
     comment = "Terminal-native git-worktree IDE";
     exec = "${binName}-standalone";
@@ -192,7 +195,6 @@ in
       # (git/lazygit/delta/gh/gdu) regardless of the user's PATH.
       wrapProgram $out/bin/${binName} \
         --set THEGN_YAZI_BIN ${yazi}/bin/yazi \
-        ${lib.optionalString stdenv.hostPlatform.isLinux "--set-default THEGN_ALACRITTY_CONFIG $out/share/thegn/alacritty.toml"} \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}${sandboxArgs}${bridgeArgs}
     '';
 

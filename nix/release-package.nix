@@ -89,13 +89,14 @@ in
 
       wrapProgram $out/bin/thegn \
         --set THEGN_YAZI_BIN ${yazi}/bin/yazi \
-        --set-default THEGN_ALACRITTY_CONFIG $out/share/thegn/alacritty.toml \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}${sandboxArgs}
     '';
 
     doInstallCheck = true;
     installCheckPhase = ''
-      $out/bin/thegn --version | grep -F -- "${version}"
+      runHook preInstallCheck
+      test "$($out/bin/thegn --version)" = "thegn ${version}"
+      runHook postInstallCheck
     '';
 
     meta = {
