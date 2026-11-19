@@ -435,7 +435,9 @@ fn remove_record(
                 && record.account == scope.account
                 && (record.state == "creating") == creating =>
         {
-            ledger::forget(name);
+            // Re-checks owner and state under the ledger lock, so a record that
+            // changed since the read above is left alone.
+            ledger::forget_reaped(scope, name, creating).map_err(|error| format!("{error:#}"))?;
             Ok(true)
         }
         Ok(Some(_)) => Err("the record changed; left alone".into()),
