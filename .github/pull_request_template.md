@@ -26,3 +26,4 @@ e.g. `feat(sidebar): ...` or `fix(merge): ...`.
 ## Notes for reviewers
 
 <!-- Anything reviewers should focus on, known follow-ups, screenshots, etc. -->
+<!-- For shared contracts, cite the early combined SHA and focused test. When agent commands, instruction paths, or delivery ownership change, update AGENTS.md or its linked guide in this PR. -->

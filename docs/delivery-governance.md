@@ -9,6 +9,16 @@ schemas are [`delivery/schema.json`](../delivery/schema.json) and
 back-references, and repository state. Linear remains the workflow tracker, but
 an unavailable tracker must never make a source-tree gate unavailable.
 
+## Choosing Linear or OpenSpec
+
+Use Linear for requests, assignment, sequencing, acceptance criteria and closure. A tracking epic can point to child issues that own the behavior. For documentation, investigation, or a fix that restores an existing requirement, link the evidence and existing contract. A reviewed active inventory entry can carry a `no_spec_rationale` when it has no owning change. Check for an existing change before opening one.
+
+Use OpenSpec when the accepted behavior itself changes. Keep its requirements, scenarios and delta with the implementation so a reviewer can compare two commits offline and the strict validator can catch drift. Put a link to the change in Linear. Keep priority, assignee, backlog commentary and sprint status there. The checked-in lifecycle describes delivery of the change, which can differ from the state of a multi-change issue.
+
+**Evaluation on 2026-11-18.** The offline validator passed for 66 reviewed active issues. Ten had explicit reasons for having no spec. THE-41 is a tracking epic whose children own the contracts. THE-21 links to the typed-event automation change and its checked and outstanding tasks. These are examples of two different units of work. A Linear-only workflow would need a replacement for versioned behavior, offline validation, and branch-by-branch review. Making OpenSpec own the backlog would duplicate the team's existing triage and lose the issue relationships people use. Keep the split and use `just agent-context <issue>` to navigate it. This evaluation used the checked-in inventory and prior [Linear reconciliation](audits/linear-reconciliation-2026-09-08.md).
+
+At wave close, the integrator checks for duplicated acceptance text or spec changes that only track status, records examples in the owning issue, and runs the read-only reconciliation below against a fresh export when available. Revisit the split if a representative wave can preserve all three properties with fewer handoffs.
+
 ## What the ledger means
 
 Every directory directly under `openspec/changes/` has exactly one entry. An
