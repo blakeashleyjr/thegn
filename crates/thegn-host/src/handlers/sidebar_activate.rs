@@ -195,6 +195,7 @@ pub(crate) fn activate_row_target(
             // target's — no reaping, so an editor/server keeps running across
             // the switch. Cold results remap restored ids before their layout
             // is persisted, so they cannot alias a parked workspace.
+            let groups_before = session.worktrees.len();
             match switch_workspace(
                 &repo_path,
                 group.as_deref(),
@@ -213,6 +214,9 @@ pub(crate) fn activate_row_target(
                 }
                 SwitchStart::Switched => {}
             }
+            // Landing recreated a lost home group: persist the layout, not
+            // only the active pointer, so it survives a restart.
+            structural = session.id == repo_path && session.worktrees.len() != groups_before;
             workspace_switched = true;
         }
     }

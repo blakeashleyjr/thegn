@@ -786,7 +786,7 @@ mod tests {
                 .name(name.into())
                 .spawn(move || {
                     barrier.wait();
-                    let _ = sender.send(run());
+                    sender.send(run()).unwrap_or_default(); // best-effort: the joiner may have timed out
                 })
                 .unwrap();
             (name, receiver)
