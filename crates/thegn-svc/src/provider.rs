@@ -19,6 +19,7 @@ use futures_util::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use thegn_core::remote::SshTarget;
 
 /// Build the shared reqwest client for a provider. The default `Client::new()`
@@ -150,6 +151,13 @@ mod sessions;
 /// with their separate policy. Capping control calls turns an infinite stall
 /// into a fast, retryable error.
 pub(crate) const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const DESTROY_CONFIRM_BUDGET: Duration = Duration::from_secs(30);
+const DESTROY_CONFIRM_POLL: Duration = Duration::from_secs(2);
+
+/// Overall ceiling for one-shot exec (THE-533); above the 30 min per-step
+/// provisioning ceiling.
+pub const RUN_EXEC_DEADLINE: Duration = Duration::from_secs(31 * 60);
 
 /// Bounds simultaneous provider control calls across provider instances.
 ///
@@ -1029,6 +1037,150 @@ impl SpritesProvider {
             "--".into(),
         ])
     }
+
+    /// After an accepted DELETE, poll until the control plane gives definite
+    /// proof that the sprite is gone. The caller holds the priority permit for
+    /// the DELETE and this confirmation, so the GET must not acquire another.
+    async fn confirm_sprite_gone(
+        &self,
+        id: &str,
+        budget: Duration,
+        poll: Duration,
+    ) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let response = match tokio::time::timeout_at(
+                deadline,
+                self.client
+                    .get(self.sprite_name_url(id)?)
+                    .bearer_auth(&self.token)
+                    .timeout(CONTROL_TIMEOUT)
+                    .send(),
+            )
+            .await
+            {
+                Ok(response) => response.context("sprites: GET /sprites/{name} after DELETE")?,
+                Err(_) => return Ok(false),
+            };
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(true);
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(poll.min(deadline - now)).await;
+        }
+    }
+
+    async fn destroy_confirmed(&self, id: &str, budget: Duration, poll: Duration) -> Result<()> {
+        // Ownership before the irreversible delete: thegn never deletes a
+        // sprite it cannot prove it created.
+        let scope = self.scope.clone().ok_or_else(|| {
+            anyhow!("sprites: no controller id; refusing to delete {id}, which this host cannot prove it created")
+        })?;
+        let dir = self.ledger_dir();
+        {
+            let (ledger, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
+            let proof = tokio::task::spawn_blocking(move || {
+                crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
+            })
+            .await
+            .context("sprites: ledger worker failed")?;
+            if let Err(refusal) = proof {
+                // No proof. Teardown stays idempotent: a record dropped by an
+                // earlier destroy or by `env reap --apply` must not turn a
+                // second teardown into an error. One non-mutating GET decides;
+                // only a definite 404 (nothing to delete) is OK. The DELETE is
+                // never sent on this path.
+                let gone = match self
+                    .client
+                    .get(self.sprite_name_url(id)?)
+                    .bearer_auth(&self.token)
+                    .timeout(CONTROL_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp.status() == reqwest::StatusCode::NOT_FOUND,
+                    Err(_) => false,
+                };
+                if gone {
+                    return Ok(());
+                }
+                return Err(refusal.context(format!("sprites: refusing to delete {id}")));
+            }
+        }
+        let _permit = CONTROL_GATE.acquire_priority(&self.authority()?).await?;
+        // Validate custody before the irreversible remote delete. A corrupt
+        // row may be the only evidence of an authorized key and must never
+        // be collapsed into "missing" by lifecycle cleanup.
+        let custody_account = self.custody_account(id)?;
+        // A deleted worktree must not keep billing, so a transient 5xx/429/408 on
+        // teardown (the observed "sprites destroy failed (500)") is retried a few
+        // times with a short backoff rather than immediately leaking a paid
+        // sandbox. 404 (already gone) and 2xx are terminal-OK; other 4xx are the
+        // caller's fault and won't change on retry, so we stop early.
+        const ATTEMPTS: u32 = 3;
+        let mut last_status = None;
+        for attempt in 0..ATTEMPTS {
+            let resp = self
+                .client
+                .delete(self.sprite_name_url(id)?)
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+                .context("sprites: DELETE /sprites/{name}")?;
+            let status = resp.status();
+            // 404 = already gone — idempotent teardown.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if let Some(account) = custody_account.as_deref() {
+                    thegn_core::managed_ssh::record_revoked("sprites", account, id)
+                        .context("sprites: retire managed SSH custody")?;
+                }
+                self.forget_record(&dir, id).await;
+                return Ok(());
+            }
+            if status.is_success() {
+                let confirmed = match self.confirm_sprite_gone(id, budget, poll).await {
+                    Ok(confirmed) => confirmed,
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::sprites", %error, "sprites: delete confirmation GET failed");
+                        false
+                    }
+                };
+                if confirmed {
+                    if let Some(account) = custody_account.as_deref() {
+                        thegn_core::managed_ssh::record_revoked("sprites", account, id)
+                            .context("sprites: retire managed SSH custody")?;
+                    }
+                    self.forget_record(&dir, id).await;
+                    return Ok(());
+                }
+                return Err(anyhow!(
+                    "sprites: DELETE for {id} was accepted but the sprite still exists after {}s; its ledger record is kept so `thegn wt rm` or `thegn env reap --provider sprites` can finish it",
+                    budget.as_secs()
+                ));
+            }
+            last_status = Some(status);
+            if !transient_status(status) {
+                break;
+            }
+            if attempt + 1 < ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        Err(anyhow!(
+            "sprites destroy failed ({})",
+            last_status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "no response".into())
+        ))
+    }
 }
 
 impl RemoteProvider for SpritesProvider {
@@ -1184,89 +1336,7 @@ impl RemoteProvider for SpritesProvider {
     }
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            // Ownership before the irreversible delete: thegn never deletes a
-            // sprite it cannot prove it created.
-            let scope = self.scope.clone().ok_or_else(|| {
-                anyhow!("sprites: no controller id; refusing to delete {id}, which this host cannot prove it created")
-            })?;
-            let dir = self.ledger_dir();
-            {
-                let (ledger, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
-                let proof = tokio::task::spawn_blocking(move || {
-                    crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
-                })
-                .await
-                .context("sprites: ledger worker failed")?;
-                if let Err(refusal) = proof {
-                    // No proof. Teardown stays idempotent: a record dropped by an
-                    // earlier destroy or by `env reap --apply` must not turn a
-                    // second teardown into an error. One non-mutating GET decides;
-                    // only a definite 404 (nothing to delete) is OK. The DELETE is
-                    // never sent on this path.
-                    let gone = match self
-                        .client
-                        .get(self.sprite_name_url(id)?)
-                        .bearer_auth(&self.token)
-                        .timeout(CONTROL_TIMEOUT)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => resp.status() == reqwest::StatusCode::NOT_FOUND,
-                        Err(_) => false,
-                    };
-                    if gone {
-                        return Ok(());
-                    }
-                    return Err(refusal.context(format!("sprites: refusing to delete {id}")));
-                }
-            }
-            let _permit = CONTROL_GATE.acquire_priority(&self.authority()?).await?;
-            // Validate custody before the irreversible remote delete. A corrupt
-            // row may be the only evidence of an authorized key and must never
-            // be collapsed into "missing" by lifecycle cleanup.
-            let custody_account = self.custody_account(id)?;
-            // A deleted worktree must not keep billing, so a transient 5xx/429/408 on
-            // teardown (the observed "sprites destroy failed (500)") is retried a few
-            // times with a short backoff rather than immediately leaking a paid
-            // sandbox. 404 (already gone) and 2xx are terminal-OK; other 4xx are the
-            // caller's fault and won't change on retry, so we stop early.
-            const ATTEMPTS: u32 = 3;
-            let mut last_status = None;
-            for attempt in 0..ATTEMPTS {
-                let resp = self
-                    .client
-                    .delete(self.sprite_name_url(id)?)
-                    .bearer_auth(&self.token)
-                    .timeout(CONTROL_TIMEOUT)
-                    .send()
-                    .await
-                    .context("sprites: DELETE /sprites/{name}")?;
-                let status = resp.status();
-                // 404 = already gone — idempotent teardown.
-                if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                    if let Some(account) = custody_account.as_deref() {
-                        thegn_core::managed_ssh::record_revoked("sprites", account, id)
-                            .context("sprites: retire managed SSH custody")?;
-                    }
-                    self.forget_record(&dir, id).await;
-                    return Ok(());
-                }
-                last_status = Some(status);
-                if !transient_status(status) {
-                    break;
-                }
-                if attempt + 1 < ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-            Err(anyhow!(
-                "sprites destroy failed ({})",
-                last_status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "no response".into())
-            ))
-        })
+        Box::pin(self.destroy_confirmed(id, DESTROY_CONFIRM_BUDGET, DESTROY_CONFIRM_POLL))
     }
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
@@ -3029,6 +3099,38 @@ pub(crate) struct ExecCollected {
     pub(crate) dropped: u64,
 }
 
+fn collect_exec_frame(
+    frame: ExecFrame,
+    cap: usize,
+    output: &mut std::collections::VecDeque<u8>,
+    code: &mut Option<i32>,
+    dropped: &mut u64,
+) -> bool {
+    match frame {
+        ExecFrame::Stdout(bytes) if cap == 0 => {
+            *dropped = dropped.saturating_add(bytes.len() as u64);
+        }
+        ExecFrame::Stdout(bytes) if bytes.len() >= cap => {
+            *dropped = dropped
+                .saturating_add(output.len() as u64)
+                .saturating_add((bytes.len() - cap) as u64);
+            output.clear();
+            output.extend(&bytes[bytes.len() - cap..]);
+        }
+        ExecFrame::Stdout(bytes) => {
+            let excess = output.len().saturating_add(bytes.len()).saturating_sub(cap);
+            output.drain(..excess);
+            *dropped = dropped.saturating_add(excess as u64);
+            output.extend(bytes);
+        }
+        ExecFrame::Exit(exit_code) => {
+            *code = Some(exit_code);
+            return true;
+        }
+    }
+    false
+}
+
 /// Drain one-shot exec frames while retaining only the last `cap` stdout bytes.
 pub(crate) async fn collect_exec_output(
     frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
@@ -3038,27 +3140,8 @@ pub(crate) async fn collect_exec_output(
     let mut code = None;
     let mut dropped = 0_u64;
     while let Some(frame) = frames.recv().await {
-        match frame {
-            ExecFrame::Stdout(bytes) if cap == 0 => {
-                dropped = dropped.saturating_add(bytes.len() as u64);
-            }
-            ExecFrame::Stdout(bytes) if bytes.len() >= cap => {
-                dropped = dropped
-                    .saturating_add(output.len() as u64)
-                    .saturating_add((bytes.len() - cap) as u64);
-                output.clear();
-                output.extend(&bytes[bytes.len() - cap..]);
-            }
-            ExecFrame::Stdout(bytes) => {
-                let excess = output.len().saturating_add(bytes.len()).saturating_sub(cap);
-                output.drain(..excess);
-                dropped = dropped.saturating_add(excess as u64);
-                output.extend(bytes);
-            }
-            ExecFrame::Exit(exit_code) => {
-                code = Some(exit_code);
-                break;
-            }
+        if collect_exec_frame(frame, cap, &mut output, &mut code, &mut dropped) {
+            break;
         }
     }
     ExecCollected {
@@ -3066,6 +3149,33 @@ pub(crate) async fn collect_exec_output(
         output: output.into_iter().collect(),
         dropped,
     }
+}
+
+/// Pure seam: collect one-shot exec output until an absolute deadline. `None`
+/// means the deadline fired before the stream ended or reported an exit.
+pub(crate) async fn collect_exec_output_until(
+    frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
+    cap: usize,
+    until: tokio::time::Instant,
+) -> Option<ExecCollected> {
+    let mut output = std::collections::VecDeque::new();
+    let mut code = None;
+    let mut dropped = 0_u64;
+    loop {
+        let frame = match tokio::time::timeout_at(until, frames.recv()).await {
+            Ok(frame) => frame,
+            Err(_) => return None,
+        };
+        let Some(frame) = frame else { break };
+        if collect_exec_frame(frame, cap, &mut output, &mut code, &mut dropped) {
+            break;
+        }
+    }
+    Some(ExecCollected {
+        code,
+        output: output.into_iter().collect(),
+        dropped,
+    })
 }
 
 /// One client→server control message for a native exec session.
@@ -3434,6 +3544,19 @@ impl SpritesProvider {
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<(i32, String)> {
+        self.run_exec_within(id, argv, cwd, env, RUN_EXEC_DEADLINE)
+            .await
+    }
+
+    /// Run one-shot exec with an overall deadline covering open and output.
+    pub async fn run_exec_within(
+        &self,
+        id: &str,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        deadline: Duration,
+    ) -> Result<(i32, String)> {
         let spec = ExecSpec {
             argv: argv.to_vec(),
             tty: false,
@@ -3442,9 +3565,34 @@ impl SpritesProvider {
             env: env.to_vec(),
             cwd: cwd.map(str::to_string),
         };
-        let mut sess = self.open_exec(id, &spec).await?;
-        let collected =
-            collect_exec_output(&mut sess.frames, crate::vps::ssh_shim::EXEC_OUTPUT_CAP).await;
+        let until = tokio::time::Instant::now() + deadline;
+        let mut sess = match tokio::time::timeout_at(until, self.open_exec(id, &spec)).await {
+            Ok(session) => session?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "sprites: exec exceeded its {}s deadline; the session was closed",
+                    deadline.as_secs()
+                ));
+            }
+        };
+        let collected = match collect_exec_output_until(
+            &mut sess.frames,
+            crate::vps::ssh_shim::EXEC_OUTPUT_CAP,
+            until,
+        )
+        .await
+        {
+            Some(collected) => collected,
+            None => {
+                if let Err(error) = sess.control.send(ExecControl::Close).await {
+                    tracing::debug!(target: "thegn::provider", %error, "best-effort exec close after deadline failed");
+                }
+                return Err(anyhow!(
+                    "sprites: exec exceeded its {}s deadline; the session was closed",
+                    deadline.as_secs()
+                ));
+            }
+        };
         if let Err(error) = sess.control.send(ExecControl::Close).await {
             tracing::debug!(target: "thegn::provider", %error, "best-effort exec close failed");
         }
@@ -4507,18 +4655,46 @@ impl Provider {
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<(i32, String)> {
+        self.run_exec_within(id, argv, cwd, env, RUN_EXEC_DEADLINE)
+            .await
+    }
+
+    /// Run one-shot exec with a provider-specific overall deadline.
+    pub async fn run_exec_within(
+        &self,
+        id: &str,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        deadline: Duration,
+    ) -> Result<(i32, String)> {
+        let timeout_error = || {
+            anyhow!(
+                "provider '{}' exec exceeded its {}s deadline",
+                self.name(),
+                deadline.as_secs()
+            )
+        };
         match self {
-            Provider::Sprites(p) => p.run_exec(id, argv, cwd, env).await,
-            Provider::Vps(p) => p.run_exec(id, argv, cwd, env).await,
-            Provider::Fly(p) => p.run_exec(id, argv, cwd, env).await,
-            Provider::Machine0(p) => p.run_exec(id, argv, cwd, env).await,
-            Provider::Vercel(p) => {
-                p.run_exec(id, argv, cwd, env, crate::vercel::Wake::Allow)
-                    .await
-            }
+            Provider::Sprites(p) => p.run_exec_within(id, argv, cwd, env, deadline).await,
+            Provider::Vps(p) => tokio::time::timeout(deadline, p.run_exec(id, argv, cwd, env))
+                .await
+                .map_err(|_| timeout_error())?,
+            Provider::Fly(p) => tokio::time::timeout(deadline, p.run_exec(id, argv, cwd, env))
+                .await
+                .map_err(|_| timeout_error())?,
+            Provider::Machine0(p) => tokio::time::timeout(deadline, p.run_exec(id, argv, cwd, env))
+                .await
+                .map_err(|_| timeout_error())?,
+            Provider::Vercel(p) => tokio::time::timeout(
+                deadline,
+                p.run_exec(id, argv, cwd, env, crate::vercel::Wake::Allow),
+            )
+            .await
+            .map_err(|_| timeout_error())?,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
             // One-shot capture over iroh: open a non-tty exec and drain it.
-            Provider::Iroh { home, .. } => {
+            Provider::Iroh { home, .. } => tokio::time::timeout(deadline, async {
                 let spec = ExecSpec {
                     argv: argv.to_vec(),
                     tty: false,
@@ -4541,7 +4717,9 @@ impl Provider {
                         collected.dropped,
                     ),
                 ))
-            }
+            })
+            .await
+            .map_err(|_| timeout_error())?,
         }
     }
 
@@ -4660,6 +4838,68 @@ mod tests {
             request_lines
         });
         (format!("http://{address}"), server)
+    }
+
+    type HttpResponse = (String, String);
+    type HttpSequence = tokio::task::JoinHandle<Vec<String>>;
+
+    async fn http_sequence_server(
+        responses: Vec<HttpResponse>,
+        repeat: Option<HttpResponse>,
+    ) -> (String, HttpSequence) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request_lines = Vec::new();
+            let mut responses = responses.into_iter();
+            loop {
+                let response = match responses.next() {
+                    Some(response) => response,
+                    None => match repeat.clone() {
+                        Some(response) => response,
+                        None => return request_lines,
+                    },
+                };
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "request ended before headers completed");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                request_lines.push(
+                    String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .expect("HTTP request must contain a request line")
+                        .to_string(),
+                );
+                let (status, body) = response;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn ledgered_sprites(base: &str, ledger_dir: &Path, name: &str) -> SpritesProvider {
+        let scope = crate::sprites::ledger::OwnerScope {
+            owner: "test-owner".into(),
+            account: "test-account".into(),
+        };
+        let mut intent = crate::sprites::ledger::reserve_at(ledger_dir, &scope, name, 0).unwrap();
+        intent.preserve();
+        drop(intent);
+        crate::sprites::ledger::commit_at(ledger_dir, &scope, name).unwrap();
+        SpritesProvider::new(base, "tok", name)
+            .with_scope(scope)
+            .with_ledger_dir(ledger_dir.to_path_buf())
     }
 
     #[test]
@@ -5919,6 +6159,170 @@ mod tests {
         // 404 is handled as already-gone before this is consulted, but for safety
         // it is not itself "retryable".
         assert!(!transient_status(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn sprites_destroy_confirms_accepted_delete_before_forgetting_record() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) = http_sequence_server(
+            vec![
+                ("202 Accepted".into(), String::new()),
+                ("200 OK".into(), r#"{"name":"sprite"}"#.into()),
+                ("404 Not Found".into(), String::new()),
+            ],
+            None,
+        )
+        .await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite");
+
+        provider
+            .destroy_confirmed("sprite", Duration::from_secs(1), Duration::ZERO)
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                "DELETE /sprites/sprite HTTP/1.1",
+                "GET /sprites/sprite HTTP/1.1",
+                "GET /sprites/sprite HTTP/1.1",
+            ]
+        );
+        assert!(
+            crate::sprites::ledger::prove_owned_at(
+                ledger.path(),
+                &crate::sprites::ledger::OwnerScope {
+                    owner: "test-owner".into(),
+                    account: "test-account".into(),
+                },
+                "sprite",
+                &[],
+            )
+            .is_err(),
+            "confirmed deletion must forget the ledger record"
+        );
+    }
+
+    #[tokio::test]
+    async fn sprites_destroy_keeps_record_and_custody_when_confirmation_times_out() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) = http_sequence_server(
+            vec![
+                ("202 Accepted".into(), String::new()),
+                ("200 OK".into(), r#"{"name":"sprite"}"#.into()),
+            ],
+            Some(("200 OK".into(), r#"{"name":"sprite"}"#.into())),
+        )
+        .await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite")
+            .with_custody_accounts(["test-custody".into()]);
+        thegn_core::managed_ssh::record_authorized(
+            "sprites",
+            "test-custody",
+            "sprite",
+            Path::new("/tmp/thegn-test-key"),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn",
+        )
+        .unwrap();
+
+        let error = provider
+            .destroy_confirmed(
+                "sprite",
+                Duration::from_millis(30),
+                Duration::from_millis(15),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sprite still exists"));
+        assert!(
+            crate::sprites::ledger::prove_owned_at(
+                ledger.path(),
+                &crate::sprites::ledger::OwnerScope {
+                    owner: "test-owner".into(),
+                    account: "test-account".into(),
+                },
+                "sprite",
+                &[],
+            )
+            .is_ok(),
+            "an unproven deletion must keep the ledger record"
+        );
+        assert!(
+            thegn_core::managed_ssh::read("sprites", "test-custody", "sprite")
+                .unwrap()
+                .is_some(),
+            "an unproven deletion must keep managed SSH custody"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn sprites_second_destroy_retries_after_kept_record_and_proves_absence() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) = http_sequence_server(
+            vec![
+                ("202 Accepted".into(), String::new()),
+                ("200 OK".into(), r#"{"name":"sprite"}"#.into()),
+                ("202 Accepted".into(), String::new()),
+                ("404 Not Found".into(), String::new()),
+            ],
+            None,
+        )
+        .await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite");
+        let first = provider
+            .destroy_confirmed("sprite", Duration::from_nanos(1), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(first.to_string().contains("still exists"));
+        provider
+            .destroy_confirmed("sprite", Duration::from_secs(1), Duration::ZERO)
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("DELETE "))
+                .count(),
+            2,
+            "a kept record must permit a second DELETE"
+        );
+        assert!(
+            crate::sprites::ledger::prove_owned_at(
+                ledger.path(),
+                &crate::sprites::ledger::OwnerScope {
+                    owner: "test-owner".into(),
+                    account: "test-account".into(),
+                },
+                "sprite",
+                &[],
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn sprites_destroy_404_forgets_record_without_confirmation_get() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) =
+            http_sequence_server(vec![("404 Not Found".into(), String::new())], None).await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite");
+        provider
+            .destroy_confirmed("sprite", Duration::ZERO, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            vec!["DELETE /sprites/sprite HTTP/1.1"]
+        );
     }
 
     #[test]
@@ -7770,6 +8174,34 @@ mod tests {
         assert_eq!(collected.code, Some(0));
         assert_eq!(collected.output, b"");
         assert_eq!(rx.try_recv().unwrap(), ExecFrame::Stdout(b"late".to_vec()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_exec_output_until_returns_none_at_deadline_without_exit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(ExecFrame::Stdout(b"kept".to_vec())).await.unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert!(collect_exec_output_until(&mut rx, 8, until).await.is_none());
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_exec_output_until_returns_exit_before_deadline() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(ExecFrame::Exit(0)).await.unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        let collected = collect_exec_output_until(&mut rx, 8, until)
+            .await
+            .expect("exit arrived before deadline");
+        assert_eq!(collected.code, Some(0));
+        drop(tx);
+    }
+
+    #[test]
+    fn run_exec_deadline_exceeds_host_provision_step_timeout() {
+        // The host's provision_step_timeout ceiling is 1800 s; one-shot exec
+        // has a larger overall deadline so the host's shorter timeout wins.
+        const _: () = assert!(RUN_EXEC_DEADLINE.as_secs() > 1800);
     }
 
     struct SwappingProvider {
