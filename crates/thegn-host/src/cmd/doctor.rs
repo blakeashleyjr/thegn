@@ -2288,14 +2288,44 @@ fn path_thegn_note_uses_first_existing_path_entry() {
     let exists = |path: &std::path::Path| path == std::path::Path::new("/first/thegn");
 
     assert_eq!(
-        path_thegn_note(Some(path_var), "/first/thegn", &exists),
+        path_thegn_note(
+            Some(path_var),
+            "/first/thegn",
+            &exists,
+            &|path: &std::path::Path| path.to_path_buf(),
+        ),
         None
     );
     assert_eq!(
-        path_thegn_note(Some(path_var), "/current/thegn", &exists).as_deref(),
+        path_thegn_note(
+            Some(path_var),
+            "/current/thegn",
+            &exists,
+            &|path: &std::path::Path| path.to_path_buf(),
+        )
+        .as_deref(),
         Some("`thegn` on PATH is /first/thegn, not this binary (/current/thegn)")
     );
-    assert_eq!(path_thegn_note(None, "/current/thegn", &exists), None);
+    assert_eq!(
+        path_thegn_note(
+            None,
+            "/current/thegn",
+            &exists,
+            &|path: &std::path::Path| path.to_path_buf(),
+        ),
+        None
+    );
+    let resolve = |path: &std::path::Path| {
+        if path == std::path::Path::new("/first/thegn") {
+            std::path::PathBuf::from("/current/thegn")
+        } else {
+            path.to_path_buf()
+        }
+    };
+    assert_eq!(
+        path_thegn_note(Some(path_var), "/current/thegn", &exists, &resolve),
+        None
+    );
 }
 
 #[cfg(test)]
@@ -3031,7 +3061,7 @@ struct InstanceInfo {
 
 const INSTANCE_SHARED: [&str; 2] = ["thegn.slice CPU/memory cap", "keyring service \"thegn\""];
 
-fn clean_instance_note(text: String) -> String {
+fn clean_instance_value(text: &str) -> String {
     text.chars()
         .filter(|character| !character.is_control())
         .take(160)
@@ -3045,9 +3075,11 @@ fn pane_instance_note(pane_socket: Option<&str>, own_socket: &str) -> Option<Str
     if pane_socket == own_socket {
         return None;
     }
-    Some(clean_instance_note(format!(
-        "this shell is a pane of another thegn instance (control socket {pane_socket}); this binary uses {own_socket}: in a dev pane run $THEGN_BIN or put ~/.thegn-devel/bin first on PATH"
-    )))
+    Some(format!(
+        "this shell is a pane of another thegn instance (control socket {}); this binary uses {}: in a dev pane run $THEGN_BIN or put ~/.thegn-devel/bin first on PATH",
+        clean_instance_value(pane_socket),
+        clean_instance_value(own_socket),
+    ))
 }
 
 /// The first `thegn` on `path_var` that `exists` accepts, when it is not
@@ -3056,18 +3088,20 @@ fn path_thegn_note(
     path_var: Option<&str>,
     current_exe: &str,
     exists: &dyn Fn(&std::path::Path) -> bool,
+    resolve: &dyn Fn(&std::path::Path) -> std::path::PathBuf,
 ) -> Option<String> {
     let path_var = path_var.filter(|path| !path.is_empty())?;
     let path = std::env::split_paths(path_var)
         .map(|directory| directory.join("thegn"))
         .find(|path| exists(path))?;
-    let path = path.display().to_string();
-    if path == current_exe {
+    if resolve(&path) == resolve(std::path::Path::new(current_exe)) {
         return None;
     }
-    Some(clean_instance_note(format!(
-        "`thegn` on PATH is {path}, not this binary ({current_exe})"
-    )))
+    Some(format!(
+        "`thegn` on PATH is {}, not this binary ({})",
+        clean_instance_value(&path.display().to_string()),
+        clean_instance_value(current_exe),
+    ))
 }
 
 fn read_controller_id() -> Option<String> {
@@ -3158,6 +3192,7 @@ fn instance_info(cfg: &Config) -> InstanceInfo {
         std::env::var("PATH").ok().as_deref(),
         &binary,
         &|path| path.exists(),
+        &|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
     ))
     .collect();
     InstanceInfo {
