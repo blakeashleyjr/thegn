@@ -59,6 +59,10 @@ struct Mock {
 }
 
 fn start_mock() -> Mock {
+    start_mock_with_restore_error(false)
+}
+
+fn start_mock_with_restore_error(restore_error: bool) -> Mock {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -68,7 +72,7 @@ fn start_mock() -> Mock {
         for stream in listener.incoming().flatten() {
             let rec = rec.clone();
             let fs = fs.clone();
-            thread::spawn(move || handle(stream, rec, fs));
+            thread::spawn(move || handle(stream, rec, fs, restore_error));
         }
     });
     Mock {
@@ -84,7 +88,7 @@ fn query_path(target: &str) -> Option<String> {
         .find_map(|(key, value)| (key == "path").then(|| value.into_owned()))
 }
 
-fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
+fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState, restore_error: bool) {
     // Request line.
     let mut line = String::new();
     let mut stream = stream;
@@ -149,7 +153,7 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
             None => ("404 Not Found", "text/plain", b"missing".to_vec()),
         }
     } else {
-        route(&method, &path)
+        route(&method, &path, restore_error)
     };
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -286,7 +290,7 @@ fn handle_exec_websocket(
 }
 
 /// The recorded real responses, keyed by (method, path-without-query).
-fn route(method: &str, target: &str) -> (&'static str, &'static str, Vec<u8>) {
+fn route(method: &str, target: &str, restore_error: bool) -> (&'static str, &'static str, Vec<u8>) {
     let path = target.split('?').next().unwrap_or(target);
     let json = "application/json";
     match (method, path) {
@@ -324,6 +328,13 @@ fn route(method: &str, target: &str) -> (&'static str, &'static str, Vec<u8>) {
             br#"{"path":"/workspace","entries":[{"name":"a.txt","path":"/workspace/a.txt","type":"file","size":5,"mode":"644","isDir":false}],"count":1}"#
                 .to_vec(),
         ),
+        ("DELETE", "/v1/sprites/tgtest1/fs/delete") => (
+            // UNVERIFIED which form the server honours; the handler records and
+            // accepts both the legacy query and documented JSON body.
+            "200 OK",
+            json,
+            br#"{"deleted":[],"count":0}"#.to_vec(),
+        ),
         ("POST", "/v1/sprites/tgtest1/checkpoint") => (
             "200 OK",
             "application/x-ndjson",
@@ -334,6 +345,12 @@ fn route(method: &str, target: &str) -> (&'static str, &'static str, Vec<u8>) {
             json,
             br#"[{"id":"Current","create_time":"2026-06-27T05:08:24Z","is_auto":false},{"id":"v1","create_time":"2026-06-27T05:19:29Z","is_auto":false}]"#
                 .to_vec(),
+        ),
+        ("POST", "/v1/sprites/tgtest1/checkpoints/v1/restore") if restore_error => (
+            "200 OK",
+            "application/x-ndjson",
+            br#"{"type":"error","error":"boom","time":"t"}
+"#.to_vec(),
         ),
         ("POST", "/v1/sprites/tgtest1/checkpoints/v1/restore") => (
             "200 OK",
@@ -487,6 +504,13 @@ fn start_probe_delete_mock(
 /// plane can 5xx before it settles; an unretried create strands provisioning).
 /// Returns the base URL and a shared counter of create POSTs seen.
 fn start_create_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
+    start_create_mock_with_echo(fail_first, "newone")
+}
+
+fn start_create_mock_with_echo(
+    fail_first: usize,
+    echoed_name: &'static str,
+) -> (String, Arc<Mutex<usize>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let posts = Arc::new(Mutex::new(0usize));
@@ -526,7 +550,12 @@ fn start_create_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
                     if *n <= fail_first {
                         ("500 Internal Server Error", b"boom")
                     } else {
-                        ("200 OK", br#"{"id":"x","name":"newone","status":"cold"}"#)
+                        let response: &'static [u8] = match echoed_name {
+                            "newone" => br#"{"id":"x","name":"newone","status":"cold"}"#,
+                            "other" => br#"{"id":"x","name":"other","status":"cold"}"#,
+                            _ => br#"{"id":"x","name":"unexpected","status":"cold"}"#,
+                        };
+                        ("200 OK", response)
                     }
                 } else {
                     ("404 Not Found", b"no route")
@@ -830,8 +859,9 @@ fn full_provider_flow_against_recorded_api() {
     let star = body.find(r#""domain":"*""#).expect("default-deny rule");
     assert!(evil < gh && gh < star, "rule order wrong: {body}");
 
-    // fs write is PUT with the path + mkdirParents as query params, body = bytes.
+    // fs write is PUT with the path + both mkdir query params, body = bytes.
     let w = find("PUT", "/fs/write");
+    assert!(w.path.contains("mkdir=true"), "write query: {}", w.path);
     assert!(
         w.path.contains("mkdirParents=true"),
         "write query: {}",
@@ -860,9 +890,71 @@ fn full_provider_flow_against_recorded_api() {
 }
 
 #[test]
+fn restore_reports_a_stream_error() {
+    let mock = start_mock_with_restore_error(true);
+    let (p, _ledger) = recorded(&mock.base_url, "tgtest1");
+    let err = rt().block_on(p.restore("tgtest1", "v1")).unwrap_err();
+    assert!(err.to_string().contains("boom"), "{err:#}");
+}
+
+#[test]
+fn checkpoint_and_restore_refuse_an_unrecorded_sprite() {
+    let mock = start_mock();
+    let (p, _ledger) = scoped(&mock.base_url, "tgtest1");
+    let checkpoint = rt().block_on(p.checkpoint("tgtest1", None)).unwrap_err();
+    assert!(
+        checkpoint.to_string().contains("thegn env adopt"),
+        "{checkpoint:#}"
+    );
+    let restore = rt().block_on(p.restore("tgtest1", "v1")).unwrap_err();
+    assert!(
+        restore.to_string().contains("thegn env adopt"),
+        "{restore:#}"
+    );
+    let requests = mock.recorded.lock().unwrap();
+    assert!(
+        requests.iter().all(|request| request.method != "POST"),
+        "ownership refusal must send no POST: {requests:?}"
+    );
+}
+
+#[test]
+fn fs_delete_sends_the_documented_json_body() {
+    let mock = start_mock();
+    let p = SpritesProvider::new(&mock.base_url, "tok", "tgtest1");
+    rt().block_on(p.delete("tgtest1", "/workspace/a.txt"))
+        .unwrap();
+    let requests = mock.recorded.lock().unwrap();
+    let delete = requests
+        .iter()
+        .find(|request| {
+            request.method == "DELETE" && request.path.contains("/v1/sprites/tgtest1/fs/delete")
+        })
+        .unwrap_or_else(|| panic!("no documented fs delete request: {requests:?}"));
+    let body: serde_json::Value = serde_json::from_slice(&delete.body).unwrap();
+    assert_eq!(body["recursive"], true);
+    assert_eq!(body["asRoot"], false);
+    assert!(
+        delete.path.contains("path="),
+        "query path missing: {}",
+        delete.path
+    );
+    assert!(
+        delete.path.contains("workingDir="),
+        "query workingDir missing: {}",
+        delete.path
+    );
+    assert!(
+        delete.path.contains("recursive=true"),
+        "query recursive missing: {}",
+        delete.path
+    );
+}
+
+#[test]
 fn provider_enum_dispatch_against_mock() {
     let mock = start_mock();
-    let (sprites, _ledger) = scoped(&mock.base_url, "tgtest1");
+    let (sprites, _ledger) = recorded(&mock.base_url, "tgtest1");
     let prov = Provider::Sprites(sprites);
     let rt = rt();
     // The generic enum dispatch reaches the same Sprites impls.
@@ -1184,6 +1276,18 @@ fn create_with_a_dropped_connection_keeps_the_creating_record() {
         Some("creating"),
         "an ambiguous create keeps its intent for the reaper"
     );
+}
+
+#[test]
+fn create_refuses_an_echoed_name_that_differs() {
+    let ledger = tempfile::tempdir().unwrap();
+    let (base, _posts) = start_create_mock_with_echo(0, "other");
+    let p = SpritesProvider::new(&base, "tok", "newone")
+        .with_scope(scope())
+        .with_ledger_dir(ledger.path().to_path_buf());
+    let err = rt().block_on(p.create()).unwrap_err();
+    assert!(err.to_string().contains("not the requested"), "{err:#}");
+    assert_eq!(ledger_state(&ledger, "newone"), None);
 }
 
 #[test]

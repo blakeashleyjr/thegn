@@ -901,7 +901,7 @@ impl SpritesProvider {
 
     /// The create body — sprites are named by the caller.
     fn create_body(name: &str) -> serde_json::Value {
-        serde_json::json!({ "name": name })
+        serde_json::json!({ "name": name, "url_settings": { "auth": "sprite" } })
     }
 
     /// Pull a sprite name from a create/list element (`{ "name": … }`, tolerating
@@ -1291,6 +1291,7 @@ impl RemoteProvider for SpritesProvider {
             let mut last: Option<String> = None;
             let mut refused = false;
             let mut created: Option<String> = None;
+            let mut ambiguous = false;
             for attempt in 0..CONTROL_ATTEMPTS {
                 match self
                     .client
@@ -1305,9 +1306,22 @@ impl RemoteProvider for SpritesProvider {
                         let status = resp.status();
                         if status.is_success() {
                             let body = response_json(resp, "sprites", "POST /sprites").await?;
-                            // The server echoes the name; fall back to the requested one.
-                            created =
-                                Some(Self::parse_name(&body).unwrap_or_else(|| self.name.clone()));
+                            if let Some(echoed) = Self::parse_name(&body) {
+                                if echoed != self.name {
+                                    self.forget_record(&dir, &self.name).await;
+                                    let shown = echoed
+                                        .chars()
+                                        .filter(|character| !character.is_control())
+                                        .take(64)
+                                        .collect::<String>();
+                                    return Err(anyhow!(
+                                        "sprites: create answered with sprite name {shown:?}, not the requested {requested}; refusing it (if a sprite was made, thegn env reap --provider sprites --unrecorded lists it)",
+                                        requested = self.name
+                                    ));
+                                }
+                            }
+                            // The server may omit the name; use the requested one then.
+                            created = Some(self.name.clone());
                             break;
                         }
                         if status == reqwest::StatusCode::CONFLICT {
@@ -1319,12 +1333,21 @@ impl RemoteProvider for SpritesProvider {
                             // Someone else's name: drop the fresh intent so it
                             // can never prove a foreign sprite ours.
                             self.forget_record(&dir, &self.name).await;
+                            let ambiguity = if ambiguous {
+                                " (an earlier attempt in this create may have made it: thegn env reap --provider sprites --unrecorded lists it, and thegn env adopt records it)"
+                            } else {
+                                ""
+                            };
                             return Err(anyhow!(
-                                "sprites: a sprite named {} already exists and is not recorded by this host; refusing to adopt it",
-                                self.name
+                                "sprites: a sprite named {} already exists and is not recorded by this host; refusing to adopt it{}",
+                                self.name,
+                                ambiguity
                             ));
                         }
                         last = Some(status.to_string());
+                        if transient_status(status) {
+                            ambiguous = true;
+                        }
                         if !transient_status(status) {
                             // A definite 4xx: nothing was created.
                             refused = status.is_client_error();
@@ -1332,6 +1355,7 @@ impl RemoteProvider for SpritesProvider {
                         }
                     }
                     Err(e) => {
+                        ambiguous = true;
                         last = Some(e.to_string());
                         if !transient_err(&e) {
                             break;
@@ -1903,6 +1927,36 @@ impl SpritesProvider {
         }
         from_complete
     }
+
+    /// The outcome of a Sprites NDJSON operation stream (POST /checkpoint,
+    /// POST …/restore): `Err(text)` for the first `{"type":"error"}` event
+    /// (its `error` field, control characters dropped, clipped to 200), else
+    /// `Ok(true)` when a `{"type":"complete"}` event arrived, `Ok(false)` when
+    /// none did. Unparseable lines are skipped.
+    fn stream_outcome(body: &str) -> std::result::Result<bool, String> {
+        let mut complete = false;
+        for line in body.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            match value.get("type").and_then(serde_json::Value::as_str) {
+                Some("error") => {
+                    let error = value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .take(200)
+                        .collect();
+                    return Err(error);
+                }
+                Some("complete") => complete = true,
+                _ => {}
+            }
+        }
+        Ok(complete)
+    }
 }
 
 impl ProviderCheckpoints for SpritesProvider {
@@ -1912,6 +1966,7 @@ impl ProviderCheckpoints for SpritesProvider {
         label: Option<&'a str>,
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
+            self.prove_listed_sprite(id).await?;
             let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let mut body = serde_json::Map::new();
             if let Some(l) = label.map(str::trim).filter(|l| !l.is_empty()) {
@@ -1931,6 +1986,15 @@ impl ProviderCheckpoints for SpritesProvider {
                 return Err(anyhow!("sprites checkpoint failed ({status})"));
             }
             let text = response_text(resp, "sprites", "POST /checkpoint").await?;
+            match Self::stream_outcome(&text) {
+                Err(error) => return Err(anyhow!("sprites checkpoint failed: {error}")),
+                Ok(false) => {
+                    return Err(anyhow!(
+                        "sprites checkpoint stream ended without a completion event"
+                    ));
+                }
+                Ok(true) => {}
+            }
             Self::parse_checkpoint_stream(&text)
                 .ok_or_else(|| anyhow!("sprites checkpoint response did not contain an id"))
         })
@@ -1995,6 +2059,7 @@ impl ProviderCheckpoints for SpritesProvider {
 
     fn restore<'a>(&'a self, id: &'a str, checkpoint: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            self.prove_listed_sprite(id).await?;
             let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
@@ -2005,7 +2070,14 @@ impl ProviderCheckpoints for SpritesProvider {
                 .await
                 .context("sprites: POST /checkpoints/{id}/restore")?;
             if resp.status().is_success() {
-                Ok(())
+                let text = response_text(resp, "sprites", "POST /checkpoints/{id}/restore").await?;
+                match Self::stream_outcome(&text) {
+                    Err(error) => Err(anyhow!("sprites restore failed: {error}")),
+                    Ok(false) => Err(anyhow!(
+                        "sprites restore of {checkpoint} ended without a completion event; the sprite's state is unknown"
+                    )),
+                    Ok(true) => Ok(()),
+                }
             } else {
                 Err(anyhow!("sprites restore failed ({})", resp.status()))
             }
@@ -2712,6 +2784,9 @@ impl SpritesProvider {
                 ("path", path),
                 ("workingDir", "/"),
                 ("mode", mode),
+                // The published parameter (openapi PUT /v1/sprites/{name}/fs/write).
+                ("mkdir", "true"),
+                // Kept: the live API created nested parents with it (agent_configs.rs:1702).
                 ("mkdirParents", "true"),
             ])
             .header("Content-Type", "application/octet-stream")
@@ -2821,7 +2896,15 @@ impl ProviderFiles for SpritesProvider {
                 .delete(self.fs_op_url(id, "delete")?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
+                // UNVERIFIED which form the server honours; send both the live
+                // query parameters and the documented JSON body.
                 .query(&[("path", path), ("workingDir", "/"), ("recursive", "true")])
+                .json(&serde_json::json!({
+                    "path": path,
+                    "workingDir": "/",
+                    "recursive": true,
+                    "asRoot": false,
+                }))
                 .send()
                 .await
                 .context("sprites: DELETE /fs/delete")?;
@@ -5935,7 +6018,7 @@ mod tests {
     fn sprites_create_body_names_the_sprite() {
         assert_eq!(
             SpritesProvider::create_body("dev"),
-            serde_json::json!({"name": "dev"})
+            serde_json::json!({"name": "dev", "url_settings": {"auth": "sprite"}})
         );
     }
 
@@ -7670,6 +7753,29 @@ mod tests {
             Some("v7")
         );
         assert!(SpritesProvider::parse_checkpoint_stream("garbage").is_none());
+    }
+
+    #[test]
+    fn stream_outcome_reads_error_complete_and_absent() {
+        let body = "{\"type\":\"info\",\"data\":\"Creating checkpoint...\"}\n{\"type\":\"info\",\"data\":\"  ID: v1\"}\n{\"type\":\"complete\",\"data\":\"Checkpoint v1 created successfully\"}\n";
+        assert_eq!(SpritesProvider::stream_outcome(body), Ok(true));
+
+        let error = SpritesProvider::stream_outcome(
+            r#"{"type":"error","error":"Checkpoint failed: disk full","time":"t"}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("disk full"));
+        assert_eq!(
+            SpritesProvider::stream_outcome(
+                "{\"type\":\"info\",\"data\":\"still working\"}\ngarbage",
+            ),
+            Ok(false)
+        );
+        let error = SpritesProvider::stream_outcome(
+            "{\"type\":\"error\",\"error\":\"bad\\u0007news\",\"time\":\"t\"}",
+        )
+        .unwrap_err();
+        assert_eq!(error, "badnews");
     }
 
     #[test]
