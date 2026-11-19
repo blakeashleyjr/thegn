@@ -179,7 +179,8 @@ impl Theme {
     /// Like [`Theme::load_thegn_config`], but reports exactly what happened.
     ///
     /// Supported precedence (and nothing else): the single file
-    /// `$XDG_CONFIG_HOME/thegn/config.toml` (or `~/.config/thegn/config.toml`),
+    /// `$XDG_CONFIG_HOME/thegn/config.toml` (or `~/.config/thegn/config.toml`;
+    /// an absolute `THEGN_CONFIG_DIR` replaces the `.../thegn` directory),
     /// with `[theme] preset` as the base and `[theme] accent` / `focus_border`
     /// / `[theme.colors]` / `[theme.hues]` `#rrggbb` overrides on top.
     /// NOT supported: `--config`, the `THEGN_*` env layer, `THEGN_PROFILE`
@@ -565,13 +566,28 @@ impl Theme {
     }
 }
 
+/// `$THEGN_CONFIG_DIR/config.toml` when that is an absolute path, else
 /// `$XDG_CONFIG_HOME/thegn/config.toml`, or `~/.config/thegn/...`.
 fn config_path() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    config_path_from(&|key| std::env::var_os(key))
+}
+
+/// Pure form of [`config_path`]. The same rule as
+/// `thegn_core::util::thegn_config_dir` (an absolute `THEGN_CONFIG_DIR` wins;
+/// a relative or empty one is ignored), kept local because tg-kit depends on
+/// thegn-core only behind the optional `host-presets` feature.
+fn config_path_from(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = env("THEGN_CONFIG_DIR")
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-        })?;
+        .filter(|dir| dir.is_absolute())
+    {
+        return Some(dir.join("config.toml"));
+    }
+    let base = env("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
     Some(base.join("thegn").join("config.toml"))
 }
 
@@ -655,6 +671,38 @@ struct HuesSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_path_honours_an_absolute_thegn_config_dir() {
+        let absolute = std::env::temp_dir().join("tg-kit-config");
+        let absolute_os = absolute.clone().into_os_string();
+        let lookup = |overlay: Option<std::ffi::OsString>| {
+            move |key: &str| match key {
+                "THEGN_CONFIG_DIR" => overlay.clone(),
+                "XDG_CONFIG_HOME" => Some(std::ffi::OsString::from("/cfg")),
+                _ => None,
+            }
+        };
+        let fallback = Some(std::path::PathBuf::from("/cfg/thegn/config.toml"));
+        assert_eq!(
+            config_path_from(&lookup(Some(absolute_os))),
+            Some(absolute.join("config.toml"))
+        );
+        assert_eq!(config_path_from(&lookup(None)), fallback);
+        assert_eq!(config_path_from(&lookup(Some("rel/dir".into()))), fallback);
+        assert_eq!(
+            config_path_from(&lookup(Some(std::ffi::OsString::new()))),
+            fallback
+        );
+        let home_only = |key: &str| (key == "HOME").then(|| std::ffi::OsString::from("/home/t"));
+        assert_eq!(
+            config_path_from(&home_only),
+            Some(std::path::PathBuf::from(
+                "/home/t/.config/thegn/config.toml"
+            ))
+        );
+        assert_eq!(config_path_from(&|_: &str| None), None);
+    }
 
     #[test]
     fn parse_hex_round_trips_and_rejects_garbage() {
