@@ -1113,9 +1113,10 @@ impl SpritesProvider {
         .await
         .context("sprites: ledger worker failed")?;
         proof.map(|_| ()).map_err(|refusal| {
-            refusal.context(format!(
+            tracing::debug!(target: "thegn::sprites", sprite = %error_name, "reuse refused: {refusal:#}");
+            anyhow!(
                 "sprites: a sprite named {error_name} exists in this Sprites account but this thegn instance has no record of creating it; refusing to use it (it may belong to another thegn instance or another person). If it is yours: thegn env adopt {error_name} --env <env>"
-            ))
+            )
         })
     }
 
