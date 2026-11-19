@@ -220,9 +220,19 @@ been verified live against the real Sprites API yet.
   reserved GB-hours per recorded sprite, read from the Sprites usage API only
   when you run that verb. It is priced only when `[placement.price]` has a
   `sprites` entry; otherwise it is labelled "usage from the Sprites API;
-  unpriced".
+  unpriced". The usage window starts at the ledger `created_at` floored to its
+  UTC hour. A sprite whose usage rows carry no `last_recorded_at` shows "no
+  usage reported yet" (JSON `reported: false`) rather than 0.00, and a failed
+  usage request marks that row only.
 - **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
   also runs `env pull` after the agent exits and reports it in text and `--json`.
+
+### Interactive output quirk (THE-2450)
+
+Interactive exec can print `/dev/pts/<n>` and the next output on one line: the
+Sprites server sends the tty line without its line ending, and thegn forwards
+bytes as received. Live step 6c reports this as a WARN, not a failure. To make an
+upstream report, run `python3 -B test/sprites_exec_repro.py <sprite> --run`.
 
 ### Live script
 
