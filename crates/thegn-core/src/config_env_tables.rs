@@ -257,8 +257,9 @@ pub struct EnvProviderConfig {
     pub max_instances: u32,
     /// Fly and VPS providers: ceiling on any instance's lifetime in seconds;
     /// their reaper destroys older ones (a VPS bills until destroyed — there is
-    /// no free suspended state). Sprites: reported by `thegn env reap
-    /// --provider sprites`, not reaped in the background. Other provider kinds
+    /// no free suspended state). Sprites: enforced in the background only with
+    /// `lifetime_reap = true`; otherwise reported by `thegn env reap
+    /// --provider sprites`. Other provider kinds
     /// have no lifetime reaper: `config validate` warns when this is set. `0` ⇒
     /// no ceiling.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
@@ -287,6 +288,15 @@ pub struct EnvProviderConfig {
     /// `vercel.app` (and anything under it) is never accepted.
     #[serde(default)]
     pub interactive_host_suffixes: Vec<String>,
+    /// Sprites only, opt-in: destroy proven sprites older than `max_lifetime_secs`
+    /// in the background (never a `running` one). Off by default.
+    #[serde(default)]
+    pub lifetime_reap: bool,
+    /// `claude` / `codex` only: a host directory whose login is uploaded into a
+    /// sandbox instead of the live host login (a dedicated account). Only the
+    /// user's own config table may set it.
+    #[serde(default)]
+    pub login_homes: std::collections::BTreeMap<String, String>,
 }
 
 impl EnvProviderConfig {
@@ -330,6 +340,8 @@ impl EnvProviderConfig {
             && self.project_id.is_empty()
             && self.model_credentials == ModelCredentials::None
             && self.interactive_host_suffixes.is_empty()
+            && !self.lifetime_reap
+            && self.login_homes.is_empty()
     }
 
     /// Whether this env's provider is scale-to-zero (an idle sandbox self-suspends
@@ -988,6 +1000,47 @@ mod tests {
             ..Default::default()
         };
         assert!(!hosts.is_default());
+    }
+
+    #[test]
+    fn lifetime_reap_and_login_homes_round_trip_and_default_off() {
+        let pc: EnvProviderConfig = toml::from_str("").unwrap();
+        assert!(!pc.lifetime_reap);
+        assert!(pc.login_homes.is_empty());
+        assert!(pc.is_default());
+
+        let pc: EnvProviderConfig = toml::from_str(
+            "lifetime_reap = true\nlogin_homes = { claude = \"/srv/a\", codex = \"/srv/b\" }\n",
+        )
+        .unwrap();
+        assert!(pc.lifetime_reap);
+        assert_eq!(
+            pc.login_homes.get("claude").map(String::as_str),
+            Some("/srv/a")
+        );
+        assert_eq!(
+            pc.login_homes.get("codex").map(String::as_str),
+            Some("/srv/b")
+        );
+        let back: EnvProviderConfig = toml::from_str(&toml::to_string(&pc).unwrap()).unwrap();
+        assert!(back.lifetime_reap);
+        assert_eq!(back.login_homes, pc.login_homes);
+    }
+
+    #[test]
+    fn lifetime_reap_and_login_homes_make_the_provider_table_non_default() {
+        let reap = EnvProviderConfig {
+            lifetime_reap: true,
+            ..Default::default()
+        };
+        assert!(!reap.is_default());
+        let homes = EnvProviderConfig {
+            login_homes: [("claude".to_string(), "/srv/a".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!homes.is_default());
     }
 
     fn provider_env(name: &str) -> EnvProviderConfig {
