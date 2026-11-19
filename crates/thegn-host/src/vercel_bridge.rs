@@ -18,6 +18,7 @@
 //! The exec environment is `TERM` plus [`ENV_ALLOWLIST`] only: no token, no
 //! `VERCEL_*`, no other host variable reaches the sandbox.
 
+use std::cell::Cell;
 use std::io::{IsTerminal as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -32,7 +33,9 @@ use thegn_core::vercel::api::SessionStatus;
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec};
 use thegn_svc::vercel::{VercelProvider, Wake};
 
-use crate::sprite_bridge::{FromTty, RemoteModes, encode_input, pty_size};
+use crate::sprite_bridge::{
+    FromTty, RemoteModes, WAKE_NOTICE_AFTER, encode_input, pty_size, with_slow_notice,
+};
 
 /// Exit code for a stopped sandbox (capture) and a lost stream (tty):
 /// `EX_TEMPFAIL`, the same code `sprite-exec` uses for a lost stream, which
@@ -164,6 +167,13 @@ fn note(line: &str) {
     if writeln!(err, "{line}").is_err() {
         tracing::debug!(target: "thegn::provider", "vercel-exec: stderr gone");
     }
+}
+
+pub(crate) fn vercel_wake_line(id: &str) -> String {
+    let id: String = id.chars().filter(|ch| !ch.is_control()).take(64).collect();
+    format!(
+        "thegn: waiting for Vercel sandbox {id} (resuming a stopped sandbox can take up to 120 s)..."
+    )
 }
 
 /// The env for sandbox `id`, plus a warning line when none can be picked.
@@ -666,6 +676,7 @@ fn run_tty(
 
     let rt = bridge_runtime()?;
     let done = Arc::new(AtomicBool::new(false));
+    let wake_noticed = Cell::new(false);
     // With an upload planned, SIGTERM/SIGHUP are caught from before the first
     // credential byte leaves, so the bridge always reaches the login removal
     // below instead of dying with the dir still in the sandbox.
@@ -675,19 +686,26 @@ fn run_tty(
     }
     // `model_credentials = "upload"`: resume, narrow egress, upload, BEFORE the
     // PTY opens. A failure is one line; the session still opens without it.
-    let login =
-        upload.as_ref().and_then(
-            |plan| match rt.block_on(upload_login(&provider, id, plan)) {
-                Ok(handle) => Some(handle),
-                Err(e) => {
-                    let reason = format!("{e:#}").replace(['\n', '\r'], " ");
-                    note(&format!(
-                        "model login not uploaded: {reason}; continuing without it"
-                    ));
-                    None
+    let login = upload.as_ref().and_then(|plan| {
+        match rt.block_on(with_slow_notice(
+            upload_login(&provider, id, plan),
+            WAKE_NOTICE_AFTER,
+            || {
+                if !wake_noticed.replace(true) {
+                    note(&vercel_wake_line(id));
                 }
             },
-        );
+        )) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                let reason = format!("{e:#}").replace(['\n', '\r'], " ");
+                note(&format!(
+                    "model login not uploaded: {reason}; continuing without it"
+                ));
+                None
+            }
+        }
+    });
     let spec = ExecSpec {
         argv,
         tty: true,
@@ -698,7 +716,15 @@ fn run_tty(
     };
 
     // Open BEFORE raw mode so an open failure never leaves the tty altered.
-    let (hosts, opened) = rt.block_on(provider.open_exec_reported(id, &spec));
+    let (hosts, opened) = rt.block_on(with_slow_notice(
+        provider.open_exec_reported(id, &spec),
+        WAKE_NOTICE_AFTER,
+        || {
+            if !wake_noticed.replace(true) {
+                note(&vercel_wake_line(id));
+            }
+        },
+    ));
     if let Some(line) = interactive_host_line(hosts.as_ref(), opened.is_ok()) {
         tracing::info!(target: "thegn::provider", "{line}");
         note(&line);
@@ -969,6 +995,19 @@ mod tests {
         );
         let lost = lost_line("tg-a");
         assert!(lost.contains("tg-a") && !lost.contains('\n'), "{lost}");
+    }
+
+    #[test]
+    fn wake_lines_name_the_sandbox_and_drop_controls() {
+        let id = "sb-\u{0000}1\n";
+        assert_eq!(
+            crate::sprite_bridge::sprite_wake_line(id),
+            "thegn: waiting for sprite sb-1 to start (a cold sprite can take up to 90 s)..."
+        );
+        assert_eq!(
+            vercel_wake_line(id),
+            "thegn: waiting for Vercel sandbox sb-1 (resuming a stopped sandbox can take up to 120 s)..."
+        );
     }
 
     #[test]
