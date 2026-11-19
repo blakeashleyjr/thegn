@@ -1,6 +1,5 @@
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::AtomicBool,
     time::Duration,
 };
@@ -74,17 +73,8 @@ fn plain_git_status_runs_the_fsmonitor_program() {
         return;
     }
     let fixture = Fixture::new("plain");
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "positive control must bypass thegn's Git runner"
-    )]
-    let status = Command::new("git")
-        .args([
-            "-C",
-            fixture.root.to_str().unwrap(),
-            "status",
-            "--porcelain",
-        ])
+    let status = util::git_cmd(&fixture.root)
+        .args(["diff-index", "--quiet", "HEAD", "--"])
         .status()
         .unwrap();
     assert!(status.success(), "plain Git status failed: {status}");
