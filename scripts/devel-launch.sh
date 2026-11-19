@@ -9,7 +9,8 @@ root="$home/.thegn-devel"
 state="$root/state"
 run="$root/run"
 cfg="$home/.config/thegn-dev"
-bin="$checkout/target/debug/thegn"
+bin="${THEGN_DEVEL_BIN:-$checkout/target/debug/thegn}"
+pane_vars="THEGN_SESSION_ID THEGN_CONTROL_SOCKET THEGN_WORKTREE THEGN_BRANCH THEGN_WORKSPACE THEGN_REPO_ROOT THEGN_SANDBOX THEGN_SANDBOX_NETWORK THEGN_SANDBOX_ENABLED THEGN_FORKED_FROM THEGN_FORK_SCROLLBACK THEGN_ROUTE_TOKEN THEGN_ROUTE_ORIGIN THEGN_PROMPT THEGN_EVENT THEGN_BIN"
 
 host_session_env() {
   real_run=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
@@ -31,8 +32,9 @@ host_session_env() {
 
 print_env() {
   host_session_env
+  printf 'unset %s\n' "$pane_vars"
   printf "export %s='%s'\n" XDG_STATE_HOME "$state"
-  printf "export %s='%s'\n" XDG_RUNTIME_DIR "$run"
+  printf "export %s='%s'\n" XDG_RUNTIME_DIR "$real_run"
   printf "export %s='%s'\n" THEGN_DIR "$root/home"
   printf "export %s='%s'\n" THEGN_CONFIG_DIR "$cfg"
   printf "export %s='%s'\n" THEGN_NO_MIGRATE 1
@@ -83,7 +85,7 @@ standalone() {
     -e "$checkout/scripts/devel-launch.sh"
 }
 
-launch() {
+check_launch() {
   if [ ! -x "$bin" ]; then
     echo "devel-launch: $bin is missing; build it first with 'just devel' (builds and starts) or 'cargo build'" >&2
     exit 1
@@ -92,16 +94,24 @@ launch() {
     echo "just devel: $cfg does not exist; seed it first: cp -r '$home/.config/thegn' '$cfg' (review it for secrets)" >&2
     exit 1
   fi
+}
+
+launch() {
+  check_launch
   host_session_env
   pidfile="$run/thegn.pid"
   mkdir -p "$state" "$run" "$root/home"
   # shellcheck source=test/lib/instance.sh disable=SC1091 # resolved at run time from the checkout
   . "$checkout/test/lib/instance.sh"
   INST_STATE="$state" inst_restart "$pidfile" $$ || exit 1
-  set -- \
+  set --
+  for pane_var in $pane_vars; do
+    set -- "$@" -u "$pane_var"
+  done
+  set -- "$@" \
     "THEGN_ALACRITTY_CONFIG=$checkout/config/alacritty.toml" \
     "XDG_STATE_HOME=$state" \
-    "XDG_RUNTIME_DIR=$run" \
+    "XDG_RUNTIME_DIR=$real_run" \
     "THEGN_DIR=$root/home" \
     "THEGN_CONFIG_DIR=$cfg" \
     "THEGN_NO_MIGRATE=1" \
@@ -113,6 +123,36 @@ launch() {
     set -- "$@" "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
   fi
   exec env "$@" "$bin"
+}
+
+daemon() {
+  check_launch
+  host_session_env
+  mkdir -p "$state" "$run" "$root/home"
+  set --
+  for pane_var in $pane_vars; do
+    set -- "$@" -u "$pane_var"
+  done
+  set -- "$@" \
+    "THEGN_ALACRITTY_CONFIG=$checkout/config/alacritty.toml" \
+    "XDG_STATE_HOME=$state" \
+    "XDG_RUNTIME_DIR=$real_run" \
+    "THEGN_DIR=$root/home" \
+    "THEGN_CONFIG_DIR=$cfg" \
+    "THEGN_NO_MIGRATE=1" \
+    "THEGN_CHANNEL=dev"
+  if [ "${WAYLAND_DISPLAY+x}" = x ]; then
+    set -- "$@" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+  fi
+  if [ "${DBUS_SESSION_BUS_ADDRESS+x}" = x ]; then
+    set -- "$@" "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+  fi
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f env "$@" "$bin" daemon >"$root/daemon.out" 2>&1 </dev/null
+  else
+    nohup env "$@" "$bin" daemon >"$root/daemon.out" 2>&1 </dev/null &
+  fi
+  echo "devel-launch: dev daemon started; log $root/daemon.out" >&2
 }
 
 case "${1-}" in
@@ -136,6 +176,13 @@ case "${1-}" in
     exit 2
   }
   standalone
+  ;;
+--daemon)
+  [ "$#" -eq 1 ] || {
+    echo "devel-launch: --daemon takes no arguments" >&2
+    exit 2
+  }
+  daemon
   ;;
 '')
   launch
