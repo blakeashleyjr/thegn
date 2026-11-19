@@ -18,7 +18,7 @@ fn clean_part(value: &str) -> String {
         out.push(c);
     }
     if chars.next().is_some() {
-        out.push('…');
+        out.push_str(crate::caps::active_glyphs().ellipsis);
     }
     out
 }
@@ -58,9 +58,8 @@ pub(crate) fn build_search_sources<'a>(
     scope: thegn_core::search::SearchScope,
     session: &crate::session::Session,
     panes: &'a Panes,
-    focused: u32,
+    _focused: u32,
 ) -> Vec<(u32, String, &'a thegn_core::history::HistoryBuffer)> {
-    let _ = focused;
     let mut out = Vec::new();
     let mut push = |pane_id: u32, worktree: Option<&str>, tab_title: &str| {
         if let Some(pane) = panes.table.get(&pane_id) {
@@ -176,9 +175,12 @@ mod tests {
     fn pane_display_name_strips_controls_and_truncates() {
         let title = format!("title\u{1b}[31m{}", "x".repeat(40));
         let name = pane_display_name(Some(title), "bash");
-        assert_eq!(name.chars().count(), 32);
+        assert_eq!(
+            name.chars().count(),
+            31 + crate::caps::active_glyphs().ellipsis.chars().count()
+        );
         assert!(!name.chars().any(char::is_control));
-        assert!(name.ends_with('…'));
+        assert!(name.ends_with(crate::caps::active_glyphs().ellipsis));
     }
 
     #[test]
