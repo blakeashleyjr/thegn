@@ -51,6 +51,8 @@ every action. [[keybindings]] is generated from your config, including rebinds.
 | `Ctrl-Alt-/`                    | Search pane history                                   |
 | `Ctrl-/`                        | Search across panes                                   |
 | `Alt+f` (in search)             | Toggle literal / fuzzy matching                       |
+| `Alt+c` / `Alt+w` / `Alt+r`     | In search: exact case / whole word / regex            |
+| `Ctrl+r` (in search)            | In search: cycle recent queries                       |
 | `Tab` / `Shift-Tab` (in search) | Widen / narrow scope (pane, tab, worktree, workspace) |
 | `Ctrl-g`                        | Lock keybinds and pass every chord to the pane        |
 | `F1`                            | Open help                                             |
