@@ -8,6 +8,8 @@
 # (XDG_CONFIG_HOME as given; the sprites token is never read or printed) with a
 # fresh XDG_STATE_HOME, XDG_RUNTIME_DIR and THEGN_DIR and a scratch repo.
 #
+# The daily headless/land/reap run lives in test/remote-daily.sh (just remote-daily).
+#
 # Usage:
 #   test/sprites-live.sh                       # print plan, no network
 #   THEGN_CHANNEL=dev test/sprites-live.sh --env <name> --i-accept-spend
@@ -37,7 +39,7 @@ while [ $# -gt 0 ]; do
     shift
     ;;
   -h | --help)
-    sed -n 2,13p "$0"
+    sed -n 2,15p "$0"
     exit 0
     ;;
   *)
