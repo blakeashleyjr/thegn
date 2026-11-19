@@ -949,3 +949,132 @@ fn sprites_lifetime_warning_points_at_env_reap() {
     let w = unenforced_lifetime_warnings(&cfg);
     assert!(w[0].contains("thegn env reap --provider sprites"), "{w:?}");
 }
+
+#[test]
+fn sprites_lifetime_warning_names_lifetime_reap_and_clears_when_opted_in() {
+    use crate::config::PlacementMode::Provider;
+    let w = unenforced_lifetime_warnings(&sprites_cfg(Provider, |p| p.max_lifetime_secs = 60));
+    assert_eq!(
+        labelled(&w, "env.s.provider.max_lifetime_secs:").len(),
+        1,
+        "{w:?}"
+    );
+    assert!(w[0].contains("lifetime_reap = true"), "{w:?}");
+    let w = unenforced_lifetime_warnings(&sprites_cfg(Provider, |p| {
+        p.max_lifetime_secs = 60;
+        p.lifetime_reap = true;
+    }));
+    assert!(w.is_empty(), "{w:?}");
+}
+
+fn homes(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+#[test]
+fn login_homes_admission_refuses_unknown_keys_and_relative_paths() {
+    const LABEL: &str = "env.s.provider.login_homes:";
+    let errors_for = |pairs: &[(&str, &str)]| {
+        let map = homes(pairs);
+        validate_config(&sprites_cfg(crate::config::PlacementMode::Provider, |p| {
+            p.login_homes = map;
+        }))
+    };
+    // Absolute and `~`-relative dirs for both known keys pass.
+    let errors = errors_for(&[("claude", "/srv/acct/.claude"), ("codex", "~/acct/codex")]);
+    assert!(labelled(&errors, LABEL).is_empty(), "{errors:?}");
+    // An unknown key is refused by label and names the key.
+    let errors = errors_for(&[("pi", "/srv/pi")]);
+    let hits = labelled(&errors, LABEL);
+    assert_eq!(hits.len(), 1, "{errors:?}");
+    assert!(
+        hits[0].contains("unknown key `pi`") && hits[0].contains("claude and codex"),
+        "{hits:?}"
+    );
+    // A relative (or empty) dir is refused.
+    for bad in ["acct/codex", "", "./codex"] {
+        let errors = errors_for(&[("codex", bad)]);
+        let hits = labelled(&errors, LABEL);
+        assert_eq!(hits.len(), 1, "{bad:?}: {errors:?}");
+        assert!(hits[0].contains("not an absolute path"), "{hits:?}");
+    }
+}
+
+#[test]
+fn login_homes_on_a_non_provider_env_warns() {
+    use crate::config::PlacementMode::{Local, Provider};
+    const LABEL: &str = "env.s.provider.login_homes:";
+    let set = |p: &mut crate::config::EnvProviderConfig| {
+        p.login_homes = homes(&[("claude", "/srv/acct")]);
+    };
+    assert!(labelled(&provider_table_warnings(&sprites_cfg(Provider, set)), LABEL).is_empty());
+    let w = provider_table_warnings(&sprites_cfg(Local, set));
+    assert_eq!(labelled(&w, LABEL).len(), 1, "{w:?}");
+    // No provider at all: still warned (the table would be ignored).
+    let w = provider_table_warnings(&sprites_cfg(Provider, |p| {
+        p.provider = String::new();
+        set(p);
+    }));
+    assert_eq!(labelled(&w, LABEL).len(), 1, "{w:?}");
+    assert!(w[0].contains("not a provider env"), "{w:?}");
+}
+
+#[test]
+fn lifetime_reap_warnings_name_their_field() {
+    use crate::config::PlacementMode::Provider;
+    const LABEL: &str = "env.s.provider.lifetime_reap:";
+    // Sprites with a ceiling: the opt-in does its job, no warning.
+    let w = provider_table_warnings(&sprites_cfg(Provider, |p| {
+        p.lifetime_reap = true;
+        p.max_lifetime_secs = 3600;
+    }));
+    assert!(labelled(&w, LABEL).is_empty(), "{w:?}");
+    // Sprites without a ceiling: does nothing.
+    let w = provider_table_warnings(&sprites_cfg(Provider, |p| p.lifetime_reap = true));
+    let hits = labelled(&w, LABEL);
+    assert_eq!(
+        hits,
+        vec![&format!(
+            "{LABEL} lifetime_reap does nothing without max_lifetime_secs"
+        )],
+        "{w:?}"
+    );
+    // Any other kind: ignored, warned.
+    for provider in ["fly", "vercel", "hetzner"] {
+        let w = provider_table_warnings(&sprites_cfg(Provider, |p| {
+            p.provider = provider.into();
+            p.lifetime_reap = true;
+            p.max_lifetime_secs = 3600;
+        }));
+        let hits = labelled(&w, LABEL);
+        assert_eq!(hits.len(), 1, "{provider}: {w:?}");
+        assert!(
+            hits[0].contains("only to provider = \"sprites\""),
+            "{hits:?}"
+        );
+    }
+}
+
+/// `login_homes` and `lifetime_reap` are user-config only: a repo overlay has
+/// no route to them (the overlay schema has no such key, and an overlay that
+/// tries never reaches the effective table admission checks).
+#[test]
+fn login_homes_and_lifetime_reap_are_refused_from_a_repo_overlay() {
+    let schema =
+        serde_json::to_string(&schemars::schema_for!(crate::config_repo::RepoConfigFile)).unwrap();
+    assert!(!schema.contains("login_homes"), "{schema}");
+    assert!(!schema.contains("lifetime_reap"), "{schema}");
+    for overlay in [
+        "[env.s.provider]\nlogin_homes = { claude = \"/tmp/evil\" }\n",
+        "env = \"s\"\n[env.s.provider]\nlifetime_reap = true\n",
+    ] {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".thegn.toml"), overlay).unwrap();
+        if let Some(parsed) = crate::config::load_repo_overlay(repo.path()) {
+            assert!(parsed.env.is_empty() || parsed.env == "s", "{overlay}");
+        }
+    }
+}

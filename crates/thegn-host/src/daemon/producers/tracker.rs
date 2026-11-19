@@ -4,14 +4,15 @@
 //! `spawn_blocking`.
 //!
 //! Each tick refreshes the main checkout of up to [`MAX_REPOS_PER_TICK`]
-//! registered local repos through the same `hydrate_tracker::refresh_repo` the
+//! registered local repos through the same `hydrate_tracker` refresh the
 //! UI uses (every enabled account of each repo's tracker config, the same
 //! cache keys, so the first daemon pass of a repo diffs against the cache the
 //! UI wrote). Repos rotate round-robin by key, and the cursor advances only
 //! past repos actually handled, so within the time budget none waits more than
 //! `ceil(repos / MAX_REPOS_PER_TICK)` ticks. Autopilot pickup inside the
 //! refresh goes through `producers::queues::daemon_pickup`, and only for a
-//! repo whose `[autopilot]` is enabled.
+//! repo whose `[autopilot]` is enabled. One `ListMemo` per tick means an
+//! account shared by several repos is listed once per tick, not once per repo.
 #![allow(dead_code, reason = "the tick is driven by the b161 lane 5 owner")]
 
 use std::collections::{BTreeSet, HashMap};
@@ -21,7 +22,7 @@ use std::sync::Mutex;
 use thegn_core::store::WorkspaceStore;
 
 use super::{TickCtx, TickOutcome};
-use crate::hydrate_tracker::{RefreshSite, refresh_repo};
+use crate::hydrate_tracker::{ListMemo, RefreshSite, refresh_repo_memo};
 
 /// At most this many repos are refreshed per tick.
 pub(crate) const MAX_REPOS_PER_TICK: usize = 32;
@@ -71,6 +72,9 @@ pub(crate) fn tick(ctx: &TickCtx) -> TickOutcome {
     };
     let started = std::time::Instant::now();
     let mut refreshed = 0;
+    // One list call per (account, filter) per tick: repos sharing a tracker
+    // account reuse its answer (errors included) for the rest of this tick.
+    let memo = ListMemo::default();
     for root in &batch {
         if started.elapsed() >= TICK_BUDGET {
             break;
@@ -82,7 +86,7 @@ pub(crate) fn tick(ctx: &TickCtx) -> TickOutcome {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root.clone());
             continue;
         }
-        let summary = refresh_repo(path, &ctx.cfg, None, RefreshSite::Daemon);
+        let summary = refresh_repo_memo(path, &ctx.cfg, RefreshSite::Daemon, &memo);
         tracing::debug!(
             target: "thegn::producers",
             repo = %root,

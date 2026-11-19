@@ -208,6 +208,8 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("bars.date_format", Live, H::Schedule),
     ("calendar.*", Live, H::Calendar),
     ("weather.*", Live, H::Weather),
+    // The daemon arms the inbox producer at install (THE-2214).
+    ("inbox.*", Restart, H::None),
     ("pr.*", NextUse, H::None),
     ("issues.*", NextUse, H::None),
     ("ci.*", NextUse, H::None),

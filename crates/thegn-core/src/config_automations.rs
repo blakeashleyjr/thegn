@@ -232,6 +232,13 @@ pub struct AutomationPredicateConfig {
     /// `"me"` = assigned to the tracker account's own user (provenance).
     pub assignee: Option<String>,
     pub status: Option<String>,
+    /// Inbox selectors: valid on any rule, but they only ever match
+    /// `inbox_item` events. The `[[inbox.accounts]]` name, exact.
+    pub inbox_account: Option<String>,
+    /// The inbox account kind (`command`, `todoist`, `imap`), exact.
+    pub inbox_kind: Option<String>,
+    /// One of the inbox item's labels, ASCII case-insensitive.
+    pub inbox_label: Option<String>,
 }
 
 /// `cap` is the only action discriminator. Explicit optional fields keep the
@@ -437,6 +444,27 @@ fn validate_rule(rule: &AutomationRuleConfig, key: &str, errors: &mut Vec<String
             "{key}.then.cap: pipeline.start needs an issue; use when = \"issue_matched\""
         ));
     }
+    if rule.then.cap.trim() == "autopilot.run" && event != Some(AutomationEventKind::IssueMatched) {
+        errors.push(format!(
+            "{key}.then.cap: autopilot.run needs an issue; use when = \"issue_matched\""
+        ));
+    }
+    // Inbox item text is third-party content: it may not reach a spawn.
+    if event.is_some_and(|kind| {
+        crate::automation_autonomy::reads_inbox_items(kind, &compile_predicate(&rule.predicate))
+    }) && matches!(
+        rule.then.cap.trim(),
+        "pipeline.start" | "sessions.open" | "lead.wake"
+    ) && rule
+        .then
+        .params()
+        .values()
+        .any(|value| value.contains("{message}"))
+    {
+        errors.push(format!(
+            "{key}.then: inbox_item rules may not put {{message}} into a spawn"
+        ));
+    }
     if let Some(declared) = rule.autonomy.as_deref() {
         match Autonomy::parse(declared.trim()) {
             None => errors.push(format!(
@@ -519,6 +547,9 @@ fn validate_predicate(predicate: &AutomationPredicateConfig, key: &str, errors: 
         ("label", &predicate.label),
         ("assignee", &predicate.assignee),
         ("status", &predicate.status),
+        ("inbox_account", &predicate.inbox_account),
+        ("inbox_kind", &predicate.inbox_kind),
+        ("inbox_label", &predicate.inbox_label),
     ] {
         if value
             .as_ref()
@@ -574,6 +605,7 @@ fn validate_action(action: &AutomationActionConfig, key: &str, errors: &mut Vec<
         "merge.drain" => (&[], &[]),
         "pipeline.start" => (&["stage", "agent"], &[]),
         "lead.wake" => (&["prompt"], &["prompt"]),
+        "autopilot.run" => (&[], &[]),
         _ => unreachable!("cap checked above"),
     };
     for name in params.keys() {
@@ -644,7 +676,8 @@ fn compile_rule(rule: &AutomationRuleConfig) -> AutomationRule {
         .as_deref()
         .and_then(|value| Autonomy::parse(value.trim()))
         .unwrap_or_default();
-    let (autonomy, warning) = effective_autonomy(declared, &predicate, &cap, RuleOrigin::Config);
+    let (autonomy, warning) =
+        effective_autonomy(declared, event, &predicate, &cap, RuleOrigin::Config);
     if let Some(warning) = warning {
         tracing::warn!(
             target: "thegn::automation",
@@ -700,6 +733,9 @@ fn compile_predicate(predicate: &AutomationPredicateConfig) -> AutomationPredica
         label: predicate.label.clone(),
         assignee: predicate.assignee.clone(),
         status: predicate.status.clone(),
+        inbox_account: predicate.inbox_account.clone(),
+        inbox_kind: predicate.inbox_kind.clone(),
+        inbox_label: predicate.inbox_label.clone(),
     }
 }
 
@@ -1122,6 +1158,136 @@ stage = "code"
         assert_eq!(rule.predicate.assignee.as_deref(), Some("me"));
         let errors = crate::config_validate::validate_str(body);
         assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn inbox_selectors_compile_and_match_the_committed_fixture() {
+        use crate::automation::{AutomationEvent, EvaluationDecision, EvaluationState, evaluate};
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test/fixtures/automation/inbox_item.json"),
+        )
+        .unwrap();
+        let event: AutomationEvent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(event.kind, AutomationEventKind::InboxItem);
+        assert_eq!(event.message.as_deref(), Some("[work] fixture item"));
+        let facts = event.inbox.as_ref().expect("fixture carries inbox facts");
+        assert_eq!(
+            (facts.account.as_str(), facts.kind.as_str()),
+            ("work", "command")
+        );
+        let mut cfg = rule_with(
+            "inbox_item",
+            AutomationActionConfig {
+                cap: "notify.push".into(),
+                body: Some("{inbox_kind}/{inbox_account}: {message}".into()),
+                ..AutomationActionConfig::default()
+            },
+        );
+        cfg.rules[0].predicate.inbox_account = Some("work".into());
+        cfg.rules[0].predicate.inbox_kind = Some("command".into());
+        cfg.rules[0].predicate.inbox_label = Some("URGENT".into());
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        let rules = cfg.compiled_rules().unwrap();
+        assert_eq!(rules[0].predicate.inbox_label.as_deref(), Some("URGENT"));
+        let decisions = evaluate(&rules, &event, &EvaluationState::new(), event.occurred_at);
+        match decisions.as_slice() {
+            [EvaluationDecision::Planned(action)] => {
+                assert_eq!(action.params["body"], "command/work: [work] fixture item");
+            }
+            other => panic!("expected one plan, got {other:?}"),
+        }
+        cfg.rules[0].predicate.inbox_account = Some("x".repeat(MAX_NAME_LEN + 1));
+        assert!(
+            cfg.validate()
+                .join("\n")
+                .contains("if.inbox_account: must be at most")
+        );
+    }
+
+    #[test]
+    fn inbox_item_rules_may_not_spawn_with_message() {
+        let open = |prompt: &str| AutomationActionConfig {
+            cap: "sessions.open".into(),
+            agent: Some("codex".into()),
+            prompt: Some(prompt.into()),
+            ..AutomationActionConfig::default()
+        };
+        let refused = rule_with("inbox_item", open("triage {message}"));
+        assert!(
+            refused
+                .validate()
+                .join("\n")
+                .contains("inbox_item rules may not put {message} into a spawn"),
+            "{:?}",
+            refused.validate()
+        );
+        assert!(
+            rule_with("inbox_item", open("triage {inbox_account}"))
+                .validate()
+                .is_empty()
+        );
+        // A notification rule pinned to inbox_item is held to the same rule.
+        let mut pinned = rule_with("notification", open("triage {message}"));
+        pinned.rules[0].predicate.notification_kind = Some("inbox_item".into());
+        assert!(
+            pinned
+                .validate()
+                .join("\n")
+                .contains("inbox_item rules may not put {message} into a spawn")
+        );
+        // The same template on another event is fine, and a notify is fine.
+        assert!(
+            rule_with("agent_finished", open("triage {message}"))
+                .validate()
+                .is_empty()
+        );
+        let notify = AutomationActionConfig {
+            cap: "notify.push".into(),
+            body: Some("{message}".into()),
+            ..AutomationActionConfig::default()
+        };
+        assert!(rule_with("inbox_item", notify).validate().is_empty());
+        // inbox_item + merge is capped at review with the reason.
+        let mut merge = rule_with(
+            "inbox_item",
+            AutomationActionConfig {
+                cap: "merge.add".into(),
+                ..AutomationActionConfig::default()
+            },
+        );
+        merge.rules[0].autonomy = Some("merge".into());
+        assert!(merge.validate().is_empty(), "{:?}", merge.validate());
+        assert_eq!(
+            merge.compiled_rules().unwrap()[0].autonomy,
+            Autonomy::Review
+        );
+    }
+
+    #[test]
+    fn autopilot_run_needs_issue_matched() {
+        let run = AutomationActionConfig {
+            cap: "autopilot.run".into(),
+            ..AutomationActionConfig::default()
+        };
+        assert!(
+            rule_with("agent_finished", run.clone())
+                .validate()
+                .join("\n")
+                .contains("autopilot.run needs an issue; use when = \"issue_matched\"")
+        );
+        let mut ok = rule_with("issue_matched", run.clone());
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+        ok.rules[0].autonomy = Some("merge".into());
+        assert_eq!(ok.compiled_rules().unwrap()[0].autonomy, Autonomy::Review);
+        let mut extra = run;
+        extra.name = Some("x".into());
+        assert!(
+            rule_with("issue_matched", extra)
+                .validate()
+                .join("\n")
+                .contains("name: not valid for autopilot.run")
+        );
     }
 
     #[test]
