@@ -4,7 +4,7 @@
 //!
 //! The name is pushed as one percent-encoded path segment (a `/` in it can
 //! never address another route), the body read is bounded and the request
-//! carries [`CONTROL_TIMEOUT`]. Errors name the sprite, never the token or the
+//! carries `CONTROL_TIMEOUT`. Errors name the sprite, never the token or the
 //! request URL.
 
 use anyhow::{Context, Result, anyhow, bail};

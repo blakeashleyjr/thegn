@@ -116,6 +116,9 @@ Steps:
 11p   resolve the rd-y worktree path
 11u   env up (provision rd-y)
 11b   exactly one new ledger record
+11m   (sprites/vercel only) commit inside rd-y through the exec bridge
+11k   (sprites/vercel only) land rd-y without --release-sandbox (sandbox kept)
+11j   (sprites/vercel only) rd-y's record is still ready and the listing has it
       then wt rm <rd-y path> --force exits 0 (the worktree-delete teardown,
       which confirms the destroy)     11c its record is gone and the org
       listing lacks it
@@ -275,6 +278,35 @@ listing_lacks_name() { # listing_lacks_name [name]: defaults to rd-x's sandbox; 
   echo "   org listing for $n: $s"
   [ "$s" = absent ]
 }
+listing_has_name() { # listing_has_name <name>: only a complete listing proves presence
+  local out
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>/dev/null)" || return 1
+  printf '%s' "$out" | LISTED_NAME="$1" python3 -I -c '
+import json, os, sys
+
+try:
+    listing = json.load(sys.stdin)
+    view = listing["view"]
+except (KeyError, TypeError, ValueError):
+    print("fleet list JSON is invalid or missing view", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(view, dict):
+    print("fleet list JSON view is not an object", file=sys.stderr)
+    sys.exit(1)
+if view.get("partial"):
+    print("fleet list is partial; cannot prove sandbox presence", file=sys.stderr)
+    sys.exit(1)
+rows = view.get("rows")
+if not isinstance(rows, list):
+    print("fleet list JSON view.rows is not an array", file=sys.stderr)
+    sys.exit(1)
+name = os.environ["LISTED_NAME"]
+if not any(isinstance(row, dict) and (row.get("id") == name or row.get("name") == name) for row in rows):
+    print("fleet list has no row for " + name, file=sys.stderr)
+    sys.exit(1)
+print("   org listing contains " + name)
+'
+}
 
 teardown() {
   local rc=$?
@@ -385,14 +417,87 @@ hold_wait() {
   HOLD_PID=""
 }
 
+agent_json_ok() { # agent_json_ok <file>: validate a completed, pulled agent run
+  python3 -I -c '
+import json, sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as stream:
+        result = json.load(stream)
+except (OSError, TypeError, ValueError):
+    print("agent JSON failing field: json", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(result, dict):
+    print("agent JSON failing field: json", file=sys.stderr)
+    sys.exit(1)
+checks = [
+    ("status", result.get("status"), "exited"),
+    ("exit_code", result.get("exit_code"), 0),
+]
+pull = result.get("pull")
+checks.append(("pull.ok", pull.get("ok") if isinstance(pull, dict) else None, True))
+for field, actual, expected in checks:
+    if (field == "pull.ok" and actual is not True) or (field != "pull.ok" and actual != expected):
+        print("agent JSON failing field: " + field, file=sys.stderr)
+        sys.exit(1)
+' "$1"
+}
+
+agent_hold_run() {
+  if in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/3.json"; then
+    agent_json_ok "$TMP/3.json"
+  else
+    local rc=$?
+    agent_json_ok "$TMP/3.json" || true
+    return "$rc"
+  fi
+}
+
 agent_run() { # agent_run <agent> ; each agent commits one file
-  in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent "$1" --prompt "create $1-rd.txt containing ok and commit it" --wait --pull --json
+  local json_id
+  case "$1" in
+  claude) json_id=4a ;;
+  codex) json_id=4b ;;
+  *) return 2 ;;
+  esac
+  if in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent "$1" --prompt "create $1-rd.txt containing ok and commit it" --wait --pull --json >"$TMP/$json_id.json"; then
+    agent_json_ok "$TMP/$json_id.json"
+  else
+    local rc=$?
+    agent_json_ok "$TMP/$json_id.json" || true
+    return "$rc"
+  fi
 }
 
 fly_stopped() {
   local out
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
-  printf '%s' "$out" | grep -Eqi '"stopped"|"suspended"'
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
+  printf '%s' "$out" | FLEET_ID="$NAME" python3 -I -c '
+import json, os, sys
+
+try:
+    listing = json.load(sys.stdin)
+    view = listing["view"]
+    rows = view["rows"]
+except (KeyError, TypeError, ValueError):
+    print("fleet list JSON is invalid or missing view.rows", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(view, dict) or not isinstance(rows, list):
+    print("fleet list JSON view.rows is not an array", file=sys.stderr)
+    sys.exit(1)
+name = os.environ["FLEET_ID"]
+row = next((item for item in rows if isinstance(item, dict) and item.get("id") == name), None)
+if row is None:
+    print("fleet list has no row for " + name, file=sys.stderr)
+    sys.exit(1)
+state = row.get("state")
+if not isinstance(state, str) or state.lower() not in ("stopped", "suspended"):
+    print("fleet row " + name + " is not stopped: " + repr(state), file=sys.stderr)
+    sys.exit(1)
+print("   fleet truth: " + name + " is " + state)
+'
 }
 
 cred_mode() {
@@ -469,6 +574,25 @@ resolve_rdy_path() { # the worktree whose branch ends in rd-y
   echo "   worktree: ${RDY_PATH:-(none)}"
   [ -n "$RDY_PATH" ] && [ "$(printf '%s\n' "$RDY_PATH" | wc -l)" -eq 1 ]
 }
+rdy_commit() {
+  # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
+    'cd "$HOME/workspace" && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit --allow-empty -qm rd-y'
+}
+rdy_land_keep() {
+  local out
+  if out="$(in_repo "$THEGN_BIN" land --worktree "$RDY_PATH" 2>&1)"; then
+    printf '%s\n' "$out"
+  else
+    local rc=$?
+    printf '%s\n' "$out"
+    return "$rc"
+  fi
+  printf '%s' "$out" | grep -Fq "sandbox $RDY_NAME kept"
+}
+rdy_ready_and_listed() {
+  grep -Eq '"state": *"ready"' "$(ledger_dir)/$RDY_NAME.json" && listing_has_name "$RDY_NAME"
+}
 
 # fly envs have no remote_live row (doctor covers sprites and vercel).
 if [ "$provider" = fly ]; then preflight_check "$env_name" 0; else preflight_check "$env_name"; fi
@@ -483,7 +607,7 @@ step 2u "env up (provision rd-x)" no_stdin "$THEGN_BIN" env up --worktree "$WT_P
 step 2b "exactly one ready ledger record for this run" name_from_ledger
 echo "sandbox: $NAME"
 if [ "${RD_HOLD_AGENT:-0}" = 1 ]; then
-  step 3 "agent run hold-test --wait --pull" in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent hold-test --prompt x --wait --pull --json
+  step 3 "agent run hold-test --wait --pull" agent_hold_run
 else
   echo "   (no overlay hold-test agent: using the $EXEC_BRIDGE fallback + env pull)"
   step 3a "scripted hold starts" hold_script_fallback
@@ -519,6 +643,11 @@ step 11p "resolve the rd-y worktree path" resolve_rdy_path
 step 11u "env up (provision rd-y)" no_stdin "$THEGN_BIN" env up --worktree "$RDY_PATH"
 step 11b "exactly one new ledger record for rd-y" one_new_record
 echo "sandbox (rd-y): $RDY_NAME"
+if [ -n "$EXEC_BRIDGE" ]; then
+  step 11m "commit inside rd-y" rdy_commit
+  step 11k "land rd-y without --release-sandbox keeps the sandbox" rdy_land_keep
+  step 11j "rd-y's record is still ready and the listing has it" rdy_ready_and_listed
+fi
 # --force only here: rd-y is this run's scratch worktree.
 step 11r "wt rm <rd-y path> --force exits 0" no_stdin in_repo "$THEGN_BIN" wt rm "$RDY_PATH" --force
 step 11c "rd-y's ledger record is gone and the org listing lacks it" rdy_gone
