@@ -359,6 +359,15 @@ fn rt() -> tokio::runtime::Runtime {
 /// the base URL and a shared counter of DELETEs seen, so tests can assert the
 /// retry budget is exactly what the code intends (bounded, not infinite).
 fn start_delete_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
+    start_delete_mock_get(fail_first, "404 Not Found")
+}
+
+/// Like `start_delete_mock`, but answers every non-DELETE request (the
+/// read-only existence probe) with `get_status`.
+fn start_delete_mock_get(
+    fail_first: usize,
+    get_status: &'static str,
+) -> (String, Arc<Mutex<usize>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let deletes = Arc::new(Mutex::new(0usize));
@@ -392,8 +401,10 @@ fn start_delete_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
                     } else {
                         ("204 No Content", b"")
                     }
+                } else if get_status.starts_with("200") {
+                    (get_status, b"{}")
                 } else {
-                    ("404 Not Found", b"no route")
+                    (get_status, b"no route")
                 };
                 let head = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1127,5 +1138,30 @@ fn create_with_a_dropped_connection_keeps_the_creating_record() {
         ledger_state(&ledger, "sx-new").as_deref(),
         Some("creating"),
         "an ambiguous create keeps its intent for the reaper"
+    );
+}
+
+#[test]
+fn destroy_of_an_adopted_sprite_sends_one_delete() {
+    // The sprite exists (probe GET answers 200) but is not ours until adopted.
+    let (base, deletes) = start_delete_mock_get(0, "200 OK");
+    let (p, ledger) = scoped(&base, "sx-adopted");
+    // Not ours until adopted: no DELETE.
+    rt().block_on(p.destroy("sx-adopted")).unwrap_err();
+    assert_eq!(*deletes.lock().unwrap(), 0);
+    assert_eq!(
+        thegn_svc::sprites::ledger::adopt_at(ledger.path(), &scope(), "sx-adopted", 0).unwrap(),
+        thegn_svc::sprites::ledger::AdoptOutcome::Adopted
+    );
+    assert_eq!(
+        ledger_state(&ledger, "sx-adopted").as_deref(),
+        Some("ready")
+    );
+    rt().block_on(p.destroy("sx-adopted")).unwrap();
+    assert_eq!(*deletes.lock().unwrap(), 1, "exactly one DELETE");
+    assert_eq!(
+        ledger_state(&ledger, "sx-adopted"),
+        None,
+        "record forgotten"
     );
 }
