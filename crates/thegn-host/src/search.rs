@@ -139,7 +139,7 @@ impl SearchOverlay {
 
         let max_rows = (screen.rows * 2 / 3).saturating_sub(4);
         let shown = matches.len().min(max_rows).max(3);
-        let width = screen.cols.saturating_sub(4).min(120).max(40);
+        let width = screen.cols.saturating_sub(4).clamp(40, 120);
         // rows: prompt(1) + rule(1) + results(shown) + rule(1) + footer(1)
         let content_rows = 4 + shown.max(1);
 
@@ -381,19 +381,23 @@ fn window_around(line: &str, span: (usize, usize), avail: usize) -> (bool, &str,
     }
     let budget = avail - hit_w;
     let post_w = UnicodeWidthStr::width(post);
-    let right_budget = budget / 2;
+    let pre_w = UnicodeWidthStr::width(pre);
+    let right_budget = budget - pre_w.min(budget / 2);
     let (post_out, rcut) = if post_w <= right_budget {
         (post, false)
+    } else if right_budget == 0 {
+        ("", false)
     } else {
-        (take_prefix(post, right_budget.saturating_sub(1)), true)
+        (take_prefix(post, right_budget - 1), true)
     };
     let used_right = UnicodeWidthStr::width(post_out) + usize::from(rcut);
     let left_budget = budget - used_right;
-    let pre_w = UnicodeWidthStr::width(pre);
     let (pre_out, lcut) = if pre_w <= left_budget {
         (pre, false)
+    } else if left_budget == 0 {
+        ("", false)
     } else {
-        (take_suffix(pre, left_budget.saturating_sub(1)), true)
+        (take_suffix(pre, left_budget - 1), true)
     };
     (lcut, pre_out, hit, post_out, rcut)
 }
@@ -620,8 +624,15 @@ mod tests {
         let mut ov = overlay(1);
         typed(&mut ov, "NEEDLE", &srcs);
         let out = draw(&ov, 120, 30);
-        assert!(out.contains("NEEDLE"));
-        assert!(out.contains('…'));
+        let row = out
+            .lines()
+            .find(|l| l.contains("NEEDLE"))
+            .expect("hit row drawn");
+        let at = row.find("NEEDLE").expect("hit");
+        assert!(
+            row[..at].contains('…'),
+            "left cut ellipsis before the hit: {row}"
+        );
     }
 
     #[test]
@@ -677,5 +688,12 @@ mod tests {
         assert!(l && r);
         assert!(a.len() + b.len() > 0);
         let _ = window_around(line, (0, 0), 0);
+    }
+
+    #[test]
+    fn window_around_uses_full_width_without_hit() {
+        let (l, pre, hit, s, r) = window_around(&"a".repeat(100), (0, 0), 40);
+        assert_eq!((l, pre, hit, r), (false, "", "", true));
+        assert_eq!(s.len(), 39);
     }
 }
