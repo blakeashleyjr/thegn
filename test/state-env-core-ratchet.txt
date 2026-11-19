@@ -11,5 +11,4 @@ log_trace.rs
 migrate_brand.rs
 profile.rs
 sandbox_tests.rs
-startup.rs
 util.rs
