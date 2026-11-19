@@ -2,7 +2,7 @@
 //! `<config_dir>/plugins/<dir>/plugin.toml` directories, each checked against
 //! the host contract before anything runs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -263,6 +263,24 @@ fn digest_bytes(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
+/// Read one plugin.toml through a no-follow, regular-file-checked descriptor,
+/// bounded to MAX_MANIFEST_BYTES. Returns (text, source digest).
+fn read_manifest(path: &Path) -> Result<(String, String), String> {
+    let file =
+        thegn_core::fsperm::open_regular_file_nofollow(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(format!("plugin.toml exceeds {MAX_MANIFEST_BYTES} bytes"));
+    }
+    let source_digest = digest_bytes(&bytes);
+    String::from_utf8(bytes)
+        .map(|text| (text, source_digest))
+        .map_err(|error| error.to_string())
+}
+
 impl std::fmt::Display for SpecProblem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.plugin, self.problem)
@@ -401,26 +419,11 @@ fn discover_with_digests(
             }
             _ => {}
         }
-        let parsed = std::fs::File::open(&manifest_path)
-            .map_err(|error| error.to_string())
-            .and_then(|file| {
-                let mut bytes = Vec::new();
-                file.take(MAX_MANIFEST_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| error.to_string())?;
-                if bytes.len() > MAX_MANIFEST_BYTES {
-                    return Err(format!("plugin.toml exceeds {MAX_MANIFEST_BYTES} bytes"));
-                }
-                let source_digest = digest_bytes(&bytes);
-                String::from_utf8(bytes)
-                    .map(|text| (text, source_digest))
-                    .map_err(|error| error.to_string())
-            })
-            .and_then(|(text, source_digest)| {
-                toml::from_str::<PluginSpec>(&text)
-                    .map(|spec| (spec, source_digest))
-                    .map_err(|error| error.to_string())
-            });
+        let parsed = read_manifest(&manifest_path).and_then(|(text, source_digest)| {
+            toml::from_str::<PluginSpec>(&text)
+                .map(|spec| (spec, source_digest))
+                .map_err(|error| error.to_string())
+        });
         match parsed {
             Ok((mut spec, source_digest)) => {
                 let trusted_native_ignored = spec.trusted_native;
@@ -618,6 +621,16 @@ fn check_spec_fields(p: &LoadedPlugin) -> Vec<SpecProblem> {
             ));
         }
     }
+    let mut capabilities: BTreeSet<&str> = BTreeSet::new();
+    let mut duplicate_capabilities: BTreeSet<&str> = BTreeSet::new();
+    for cap in &p.spec.manifest.capabilities {
+        if !capabilities.insert(cap.as_str()) {
+            duplicate_capabilities.insert(cap.as_str());
+        }
+    }
+    for cap in duplicate_capabilities {
+        push(format!("duplicate capability {}", quoted_prefix(cap)));
+    }
     for contribution in &p.spec.manifest.contributions {
         if !valid_routing_id(contribution.id.as_str()) || contribution.id.as_str().contains(':') {
             push(format!(
@@ -810,6 +823,46 @@ mod tests {
             .contributions
             .push(interval_contribution(&format!("{id}.interval"), millis));
         plugin
+    }
+
+    #[test]
+    fn read_manifest_refuses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real.toml");
+        let link = tmp.path().join("link.toml");
+        std::fs::write(&real, b"manifest = true").unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&real, &link, false) {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                return;
+            }
+            panic!("could not create symlink: {error}");
+        }
+
+        let error = read_manifest(&link).unwrap_err();
+        assert!(error.contains("symlink"), "error: {error}");
+    }
+
+    #[test]
+    fn read_manifest_reads_a_regular_file_and_digests_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("real.toml");
+        let bytes = b"manifest = true\n";
+        std::fs::write(&path, bytes).unwrap();
+
+        let (text, digest) = read_manifest(&path).unwrap();
+        assert_eq!(text.as_bytes(), bytes);
+        assert_eq!(digest, digest_bytes(bytes));
+    }
+
+    #[test]
+    fn read_manifest_refuses_over_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("over-limit.toml");
+        let bytes = vec![b'x'; MAX_MANIFEST_BYTES + 1];
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = read_manifest(&path).unwrap_err();
+        assert!(error.contains("exceeds"), "error: {error}");
     }
 
     #[test]
@@ -1223,6 +1276,31 @@ cadence = { kind = "interval", millis = 250 }
                 .all(|problem| !problem.problem.contains("invalid capability"))
             );
         }
+    }
+
+    #[test]
+    fn check_spec_rejects_duplicate_capabilities() {
+        let mut plugin = spec("caps", vec!["true".into()]);
+        plugin
+            .manifest
+            .capabilities
+            .push(Capability::new("surface", "statusbar"));
+        plugin
+            .manifest
+            .capabilities
+            .push(Capability::new("surface", "statusbar"));
+        let problems = check_spec(&LoadedPlugin {
+            spec: plugin,
+            dir: None,
+            trusted_native_ignored: false,
+        });
+
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.problem == "duplicate capability \"surface:statusbar\""),
+            "duplicate capability should be rejected: {problems:?}"
+        );
     }
 
     #[test]
