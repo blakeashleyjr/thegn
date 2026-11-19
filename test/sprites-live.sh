@@ -6,7 +6,9 @@
 # justfile, workflows or nix checks globs `test/*live*.sh`; it runs only through
 # `just sprites-live`. It reads the owner's REAL config read-only
 # (XDG_CONFIG_HOME as given; the sprites token is never read or printed) with a
-# fresh XDG_STATE_HOME, XDG_RUNTIME_DIR and THEGN_DIR and a scratch repo.
+# fresh XDG_STATE_HOME and THEGN_DIR and a scratch repo. The login runtime dir
+# is kept so sandbox masks and the control guard cover every instance's control
+# directory.
 #
 # The daily headless/land/reap run lives in test/remote-daily.sh (just remote-daily).
 #
@@ -213,8 +215,6 @@ TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
 unset THEGN_CONFIG_DIR
 mkdir -p "$XDG_STATE_HOME" "$THEGN_DIR" "$TMP/repo"
-mkdir -m 700 "$TMP/run"
-export XDG_RUNTIME_DIR="$TMP/run"
 REPO="$TMP/repo"
 SPRITE_NAME="(unknown)"
 CREATED=0
