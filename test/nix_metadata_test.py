@@ -351,16 +351,40 @@ def validate_release_texts(
     return problems
 
 
+def validate_release_package(release: str, package: str) -> list[str]:
+    problems: list[str] = []
+    runtime_deps = "runtimeDeps = [git fzf gum lazygit yazi delta gh gdu coreutils] ++ yaziDeps;"
+    if runtime_deps not in release:
+        problems.append("nix/release-package.nix runtimeDeps drifted from nix/package.nix")
+    if runtime_deps not in package:
+        problems.append("nix/package.nix runtimeDeps is missing or drifted")
+    if not re.search(r"installCheckPhase\s*=\s*.*--version", release, re.DOTALL):
+        problems.append("nix/release-package.nix lacks an installCheckPhase --version check")
+    if "share/applications" not in release:
+        problems.append("nix/release-package.nix does not install a desktop entry")
+    if "share/applications" not in package:
+        problems.append("nix/package.nix does not install a desktop entry")
+    return problems
+
+
 def validate(root: Path = ROOT) -> list[str]:
     cargo_text = (root / "Cargo.toml").read_text()
     flake = (root / "flake.nix").read_text()
+    package = (root / "nix/package.nix").read_text()
     nix_problems = validate_texts(
         cargo_text,
         flake,
-        (root / "nix/package.nix").read_text(),
+        package,
         (root / "nix/source.nix").read_text(),
         {name for name in LICENSE_FILES if (root / name).is_file()},
     )
+    nix_problems += validate_release_package(
+        (root / "nix/release-package.nix").read_text(), package
+    )
+    if "legacyPackages" not in flake or "releasePackage" not in flake:
+        nix_problems.append("flake.nix lacks the legacyPackages.releasePackage output")
+    if "manageConfig" not in (root / "nix/hm-module.nix").read_text():
+        nix_problems.append("nix/hm-module.nix lacks the manageConfig option")
     templates = {
         name: (root / path).read_text()
         for name, (path, _, _) in RELEASE_TEMPLATES.items()
@@ -655,6 +679,26 @@ def self_test() -> int:
     if problems:
         print(f"SELF-TEST FAIL: good release fixture rejected: {problems}")
         return 1
+    release_package_good = (
+        "runtimeDeps = [git fzf gum lazygit yazi delta gh gdu coreutils] ++ yaziDeps;\n"
+        "installCheckPhase = ''$out/bin/thegn --version | grep -F -- \\\"1.0.0\\\"'';\n"
+        "install -Dm644 $out/share/applications/thegn.desktop\n"
+    )
+    package_good = (
+        "runtimeDeps = [git fzf gum lazygit yazi delta gh gdu coreutils] ++ yaziDeps;\n"
+        "install -Dm644 $out/share/applications/thegn.desktop\n"
+    )
+    problems = validate_release_package(release_package_good, package_good)
+    if problems:
+        print(f"SELF-TEST FAIL: good release package fixture rejected: {problems}")
+        return 1
+    problems = validate_release_package(
+        release_package_good.replace("installCheckPhase", "checkPhase", 1), package_good
+    )
+    if not any("installCheckPhase" in problem for problem in problems):
+        print(f"SELF-TEST FAIL: missing release install check was not reported: {problems}")
+        return 1
+    print("SELF-TEST OK: accepted release package fixture and rejected missing install check")
     spaced_include = release_good[1].replace(
         "LICENSE-MIT,LICENSE-APACHE", "LICENSE-MIT, LICENSE-APACHE"
     )

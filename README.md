@@ -192,23 +192,38 @@ tarball (once published; see [Prebuilt binary](#prebuilt-binary-no-nix)).
 `nix profile install` works from any Git ref.
 
 ```nix
-# flake.nix inputs
-thegn.url = "github:blakeashleyjr/thegn";
+# flake.nix inputs: pin the SAME release tag in both (the latest release tag)
+thegn.url = "github:blakeashleyjr/thegn/v<version>";
+thegn-release.url = "github:blakeashleyjr/thegn/v<version>";
 
 # home-manager config
 imports = [ inputs.thegn.homeManagerModules.default ];
 programs.thegn = {
   enable = true;
+  manageConfig = false;  # keep your hand-edited ~/.config/thegn/config.toml
+  package = inputs.thegn-release.legacyPackages.${pkgs.stdenv.hostPlatform.system}.releasePackage;
   worktreesDir = "/home/you/worktrees";
   repoRoots = [ "/home/you/code" "/home/you/src" ];  # scanned by the repo picker
   baseBranch = "auto";
-  agents = [
-    { name = "claude"; command = "claude"; }
-    { name = "aider";  command = "aider --model sonnet"; }
-    { name = "shell";  command = "__shell__"; }
-  ];
 };
 ```
+
+`releasePackage` is the gnu release archive of a PUBLISHED release (not a
+draft). With `manageConfig = false` the module installs the package and desktop
+entry but does not generate or overwrite the config; leave it at its default
+(`true`) to have home-manager generate the config from the options above
+(`agents`, `keymap` and the rest).
+
+To move to a new release, bump the tag in both inputs and rebuild:
+
+```sh
+nix flake lock --override-input thegn github:blakeashleyjr/thegn/v<version> \
+  --override-input thegn-release github:blakeashleyjr/thegn/v<version>
+sudo nixos-rebuild switch --flake .#<host>
+```
+
+The module installs a desktop entry, so the app launcher starts the stable
+`thegn`. The release archive is x86_64 Linux only; gate it in your system flake.
 
 Or just the binary: `nix profile install github:blakeashleyjr/thegn`.
 
