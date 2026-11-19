@@ -87,6 +87,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         },
         Command::Pr { .. }
         | Command::Lead { .. }
+        | Command::Inbox { .. }
         | Command::Voice { .. }
         | Command::Issue { .. }
         | Command::Kaneo { .. }

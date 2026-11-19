@@ -1,7 +1,7 @@
 {
   "id": "ae-1700000000-fixture-inbox-item",
   "occurred_at": 1700000000,
-  "key": "inbox:item-1",
+  "key": "inbox:work:item-1",
   "kind": "inbox_item",
   "workspace": null,
   "repo": null,
@@ -10,13 +10,21 @@
   "agent_role": null,
   "notification_kind": null,
   "priority": "Notice",
-  "source_ref": "inbox:item-1",
-  "message": "an inbox item (no producer until phase 7)",
+  "source_ref": "inbox:work:item-1",
+  "message": "[work] fixture item",
   "session_id": null,
   "pr_checks_passed": null,
   "pr_review_requested": null,
   "pr_merged": null,
   "origin": null,
   "issue": null,
-  "exit_code": null
+  "exit_code": null,
+  "inbox": {
+    "kind": "command",
+    "account": "work",
+    "item_id": "item-1",
+    "url": "https://example.invalid/item-1",
+    "labels": ["urgent"],
+    "title": "fixture item"
+  }
 }

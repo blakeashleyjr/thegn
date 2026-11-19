@@ -747,6 +747,8 @@ async fn fetch_state(
         // Lead tool surface (THE-2172): every route is POST, so the params
         // become the JSON body unchanged.
         | "overview.get"
+        // b163: producer and inbox state (no args).
+        | "producers.status"
         | "notifications.list"
         | "notifications.ack"
         | "automations.put"
@@ -1239,6 +1241,8 @@ mod tests {
         "notifications.list",
         "automations.runs",
         "approvals.list",
+        // b163.
+        "producers.status",
     ];
 
     /// The Lead's write-scoped MCP tools (THE-2172).
@@ -1287,7 +1291,7 @@ mod tests {
             sorted(READ_CAPS.to_vec()),
             "--scopes read"
         );
-        assert_eq!(READ_CAPS.len(), 27);
+        assert_eq!(READ_CAPS.len(), 28);
     }
 
     #[test]

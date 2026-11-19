@@ -186,6 +186,9 @@ pub(crate) struct UploadPlan {
     pub agents: Vec<String>,
     pub user_domains: Vec<String>,
     pub install_agents: bool,
+    /// `[env.<n>.provider] login_homes`: dedicated login dirs read instead of
+    /// the live host login.
+    pub login_homes: std::collections::BTreeMap<String, String>,
 }
 
 /// The upload plan for `envc`, or `None` unless its mode is `upload`.
@@ -206,6 +209,7 @@ fn upload_plan(cfg: &Config, envc: &EnvConfig) -> Option<UploadPlan> {
         install_agents: false, // the TTY open never installs; provisioning sets its own policy
         agents,
         user_domains,
+        login_homes: envc.provider.login_homes.clone(),
     })
 }
 
@@ -218,7 +222,8 @@ async fn upload_login(
     id: &str,
     plan: &UploadPlan,
 ) -> Result<thegn_svc::vercel::login::LoginHandle> {
-    let (payloads, skipped) = crate::vercel_login::read_host_logins(&plan.agents);
+    let (payloads, skipped) =
+        crate::vercel_login::read_host_logins(&plan.agents, &plan.login_homes);
     for line in &skipped {
         tracing::debug!(target: "thegn::provider", skipped = %line, "vercel login agent skipped");
     }
