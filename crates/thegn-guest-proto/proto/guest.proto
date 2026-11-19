@@ -1,0 +1,17 @@
+syntax = "proto3";
+package thegn.guest.v0;
+
+message Hello {
+  string agent_version = 1;
+  repeated uint32 protocol_versions = 2;
+  repeated string spec_versions = 3;
+  repeated string capabilities = 4;
+  uint32 max_frame_bytes = 5;
+}
+
+// Keep tags stable as new message kinds are added.
+message Envelope {
+  oneof body {
+    Hello hello = 1;
+  }
+}
