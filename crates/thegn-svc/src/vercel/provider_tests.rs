@@ -393,6 +393,7 @@ async fn failure_after_create_with_landed_delete_clears_the_record() {
         .lock()
         .unwrap()
         .push_back(Some(tagged(NAME, &controller)));
+    fake.gets.lock().unwrap().push_back(None);
     *fake.create.lock().unwrap() = Some(Err("vercel: request timed out".into()));
     provider(&fake, ledger.path(), 2)
         .create()
@@ -470,6 +471,7 @@ async fn destroy_deletes_the_snapshots() {
         .lock()
         .unwrap()
         .push_back(Some(tagged(NAME, &controller)));
+    fake.gets.lock().unwrap().push_back(None);
     provider(&fake, ledger.path(), 2)
         .destroy(NAME)
         .await
@@ -479,12 +481,57 @@ async fn destroy_deletes_the_snapshots() {
         [
             format!("get {NAME}"),
             format!("delete {NAME}"),
+            format!("get {NAME}"),
             format!("snapshots {NAME}"),
             "delete_snapshot snap_1".to_string(),
             "delete_snapshot snap_2".to_string(),
         ]
     );
     assert!(registry::read_at(ledger.path(), NAME).is_none());
+}
+
+#[tokio::test]
+async fn destroy_keeps_the_record_while_the_sandbox_is_still_listed() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let controller = crate::vps::controller::controller_id().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    registry::write_at(ledger.path(), &ledger_record(NAME, "ready")).unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(tagged(NAME, &controller)));
+
+    let error = provider(&fake, ledger.path(), 2)
+        .destroy(NAME)
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("still present"), "{error:#}");
+    assert!(registry::read_at(ledger.path(), NAME).is_some());
+    assert_eq!(fake.count("snapshots"), 0, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn destroy_confirms_absence_before_forgetting() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let controller = crate::vps::controller::controller_id().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    registry::write_at(ledger.path(), &ledger_record(NAME, "ready")).unwrap();
+    let fake = Arc::new(FakeApi::default());
+    let mut gets = fake.gets.lock().unwrap();
+    gets.push_back(Some(tagged(NAME, &controller)));
+    gets.push_back(Some(tagged(NAME, &controller)));
+    gets.push_back(None);
+    drop(gets);
+
+    provider(&fake, ledger.path(), 2)
+        .destroy(NAME)
+        .await
+        .unwrap();
+
+    assert!(registry::read_at(ledger.path(), NAME).is_none());
+    assert_eq!(fake.count("get"), 3, "{:?}", fake.calls());
 }
 
 #[tokio::test]
@@ -885,6 +932,7 @@ async fn created_tags_prove_ownership_to_destroy_and_the_reaper_check() {
         [TEMPLATED]
     );
     fake.gets.lock().unwrap().push_back(Some(echoed));
+    fake.gets.lock().unwrap().push_back(None);
     p.destroy(TEMPLATED).await.expect("destroy recognises ours");
     assert_eq!(fake.count("delete"), 1, "{:?}", fake.calls());
     assert!(registry::read_at(ledger.path(), TEMPLATED).is_none());
