@@ -350,7 +350,7 @@ egress_denied() {
 response_shapes_parsed() {
   local out
   out="$("$THEGN_BIN" fleet list --env "$ENV_NAME" --json)" || return 1
-  printf '%s' "$out" | FLEET_JSON="$out" FLEET_SANDBOX="$SANDBOX_NAME" python3 -I -c '
+  FLEET_JSON="$out" FLEET_SANDBOX="$SANDBOX_NAME" python3 -I -c '
 import json, os, sys
 
 try:
@@ -389,14 +389,14 @@ print("   Vercel response shape: " + json.dumps(row, sort_keys=True))
 
 exit_status_and_stderr_reach_caller() {
   local out rc
-  if out="$("$THEGN_BIN" vercel-exec "$SANDBOX_NAME" -- sh -c 'echo boom >&2; exit 3' 2>&1)"; then
+  if out="$(no_stdin "$THEGN_BIN" vercel-exec "$SANDBOX_NAME" -- sh -c 'echo boom >&2; exit 3' 2>&1)"; then
     rc=0
   else
     rc=$?
   fi
   printf '%s\n' "$out"
   echo "   vercel-exec exit status: $rc"
-  [ "$rc" -eq 3 ] && [[ "$out" == *boom* ]]
+  [ "$rc" -eq 3 ] && [[ $out == *boom* ]]
 }
 
 usage_shapes_parsed() {
