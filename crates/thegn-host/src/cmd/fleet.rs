@@ -300,7 +300,7 @@ fn render_sprites(usage: &[SpritesUsage]) -> String {
         let unreported: Vec<&str> = env
             .rows
             .iter()
-            .filter(|row| !row.reported)
+            .filter(|row| !row.reported && !row.unavailable && row.error.is_none())
             .map(|row| row.name.as_str())
             .collect();
         if !unreported.is_empty() {
@@ -476,7 +476,7 @@ fn remote_agents_with(
             continue;
         };
         agents.insert(
-            sanitize_text(worktree, 32),
+            sanitize_text(worktree, 4096),
             FleetAgent {
                 agent: sanitize_text(&dispatch.agent_name, 32),
                 status: sanitize_text(dispatch.status.as_str(), 32),
@@ -1202,6 +1202,7 @@ mod tests {
             text.contains("usage error: tg-bad: request failed"),
             "{text}"
         );
+        assert!(!text.contains("no usage reported yet"), "{text}");
     }
 
     #[test]
