@@ -253,6 +253,30 @@
       "summary": "Program storage exists; multi-repository navigation and feature-set workflows remain."
     },
     {
+      "change": "add-native-inbox",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2178",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2214",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2215",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2216",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Daemon-only native inbox (IMAP, Todoist, command), sanitized untrusted items, secret-ref credentials, baseline first poll, inbox_item rules and producers.status; live verification open."
+    },
+    {
       "change": "add-observability-dashboards",
       "lifecycle": "active",
       "disposition": "strategic-unstarted",
@@ -917,6 +941,18 @@
       "summary": "Sandbox reporting must never claim more enforcement than is applied; authored in W0, implemented by WS01 items."
     },
     {
+      "change": "fold-autopilot-into-rules",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2196",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "autopilot.run rule action, synthesized autopilot:<repo> rule and budgets counting autopilot and Lead manual spawns; live verification open."
+    },
+    {
       "change": "harden-live-diagnostics-and-forge",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1175,6 +1211,18 @@
       "archive_path": "openspec/changes/archive/2026-09-30-reduce-process-monitor-idle-work/"
     },
     {
+      "change": "remote-daily-loop",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2234",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Sprites adopt, opt-in lifetime reaper, land-local-then-release, pull single-flight, credential custody and conformance slice 2; live verification open."
+    },
+    {
       "change": "repair-kitty-stream-parser",
       "archive_path": "openspec/changes/archive/2026-10-21-repair-kitty-stream-parser/",
       "lifecycle": "archived",
@@ -1403,6 +1451,18 @@
       ],
       "summary": "Typed FRP serialization, validation before secret resolution, strict reparse and equality verified by 16 focused FRP tests plus strict all-target lint. Credential transport and filesystem custody remain THE-325/THE-328.",
       "archive_path": "openspec/changes/archive/2026-09-30-serialize-validate-frp-configuration/"
+    },
+    {
+      "change": "sidebar-short-worktree-list",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-139",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Sidebar groups fold to 7 entries with protected rows, batch rows, no repeated title line, a continuous guide and state-toned names; live verification open."
     },
     {
       "change": "stabilize-process-monitor-refresh",
