@@ -2393,7 +2393,12 @@ pub(crate) fn switch_workspace(
         // miss; the caller queues registry adoption and reports a stale row if
         // the DB writer cannot provide it.
         if let Some(name) = group {
+            let before = session.worktrees.len();
             session.land_on_group(name);
+            // A recreated home group has no panes yet: lay it out.
+            if session.worktrees.len() != before {
+                *need_relayout = true;
+            }
         }
         return SwitchStart::Switched;
     }

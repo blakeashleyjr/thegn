@@ -155,6 +155,14 @@
       "summary": "Tracker-driven worktree and optional agent launch remain unstarted."
     },
     {
+      "change": "add-job-contract-v0",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "The 18 November architecture handoff and roadmap BC 764 own this increment. No Linear issue was supplied for the Jobs contract.",
+      "summary": "Shared input, result, directory, lease and handshake fixtures land first. Durable queue and executor conformance remain open."
+    },
+    {
       "change": "add-launch-admission",
       "lifecycle": "proposed",
       "disposition": "strategic-unstarted",
