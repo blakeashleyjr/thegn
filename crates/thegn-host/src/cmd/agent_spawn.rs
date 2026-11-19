@@ -12,7 +12,7 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use thegn_core::config::Config;
+use thegn_core::config::{Config, EnvProviderKind};
 use thegn_core::db::Db;
 use thegn_core::pipeline_report::display_cell;
 use thegn_core::store::NotificationStore;
@@ -39,6 +39,9 @@ pub(crate) struct RunArgs {
     pub wait: bool,
     /// `--pull`: fetch sandbox commits back after the observed exit.
     pub pull: bool,
+    /// `--keep-running`: Fly/machine0 machines are not stopped after the
+    /// observed exit.
+    pub keep_running: bool,
     pub timeout_secs: u64,
     pub json: bool,
 }
@@ -349,6 +352,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         track,
         wait,
         pull,
+        keep_running,
         timeout_secs,
         json,
     } = args;
@@ -447,6 +451,15 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     } else {
         None
     };
+    // Fly / machine0: a started machine bills until stopped, so once the run
+    // has exited (and after `--pull`) park it, unless `--keep-running` or
+    // another live session still uses the worktree. A failure never changes
+    // the agent's exit code.
+    let stop_outcome = if matches!(status, WaitStatus::Exited(_)) && !keep_running {
+        stop_after_run(cfg, &client, &wt, &info.id, pull).await
+    } else {
+        None
+    };
     if json {
         let mut obj = serde_json::json!({
             "session": info.id,
@@ -459,6 +472,9 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         });
         if let (Some(p), Some(map)) = (&pull_outcome, obj.as_object_mut()) {
             map.insert("pull".to_string(), p.json());
+        }
+        if let (Some(s), Some(map)) = (&stop_outcome, obj.as_object_mut()) {
+            map.insert("stopped".to_string(), s.json());
         }
         crate::cmd::emit_json(&obj)?;
     } else {
@@ -481,6 +497,9 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         }
         if let Some(p) = &pull_outcome {
             outln!("{}", p.line());
+        }
+        if let Some(s) = &stop_outcome {
+            outln!("{}", s.line());
         }
     }
     Ok(process_exit_code(status))
@@ -528,6 +547,212 @@ pub(crate) fn pull_result(res: Result<Option<String>>) -> PullOutcome {
         Err(e) => PullOutcome {
             ok: false,
             reference: None,
+            error: Some(format!("{e:#}")),
+        },
+    }
+}
+
+/// Whether `env down --stop` can park this kind: mirrors
+/// `cmd::env::provider_has_stop` (fly stop, machine0 suspend, vercel
+/// stop-session); every other kind's `Provider::suspend` is a no-op.
+fn kind_has_stop(kind: EnvProviderKind) -> bool {
+    matches!(
+        kind,
+        EnvProviderKind::Fly | EnvProviderKind::Machine0 | EnvProviderKind::Vercel
+    )
+}
+
+/// Pure: whether `agent run --wait` stops the worktree's sandbox after the
+/// observed exit. Only a kind with a stop that does not self-suspend (Fly,
+/// machine0; never Sprites or Vercel), only once the session `exited`, never
+/// with `--keep-running`, and never while `other_live` sessions still use the
+/// worktree.
+pub(crate) fn should_stop_after_run(
+    kind: EnvProviderKind,
+    keep_running: bool,
+    other_live: usize,
+    exited: bool,
+) -> bool {
+    exited && !keep_running && other_live == 0 && kind_has_stop(kind) && !kind.self_suspends()
+}
+
+/// Pure: live (not tombstoned) daemon sessions bound to `wt`, other than the
+/// run's own `own` session.
+pub(crate) fn other_live_sessions(
+    sessions: &[thegn_svc::control::SessionInfo],
+    wt: &str,
+    own: &str,
+) -> usize {
+    let norm = |p: &str| p.trim_end_matches('/').to_string();
+    let wt = norm(wt);
+    sessions
+        .iter()
+        .filter(|s| s.id != own && s.exited_at_ms.is_none())
+        .filter(|s| s.worktree.as_deref().is_some_and(|w| norm(w) == wt))
+        .count()
+}
+
+/// What the post-run stop did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StopOutcome {
+    pub ok: bool,
+    pub name: String,
+    pub error: Option<String>,
+}
+
+impl StopOutcome {
+    /// `{"ok":bool,"name":…,"error":…}`.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "ok": self.ok, "name": self.name, "error": self.error })
+    }
+
+    /// The single line printed in text mode.
+    pub(crate) fn line(&self) -> String {
+        match &self.error {
+            None => format!(
+                "[agent run: stopped {} (it bills while started)]",
+                self.name
+            ),
+            Some(e) => format!("[agent run: could not stop {}: {e}]", self.name),
+        }
+    }
+}
+
+/// The sandbox a post-run stop would park.
+struct StopTarget {
+    kind: EnvProviderKind,
+    provider: thegn_core::config::EnvProviderConfig,
+    name: String,
+}
+
+/// Resolve the worktree's effective provider env and bound sandbox name, as
+/// the explicit park does. `None` when the worktree is not remote, the env is
+/// not a provider env, or the binding is unreadable. Blocking (DB reads): call
+/// it from `spawn_blocking`; the `Db` handle never crosses an await.
+fn stop_target_blocking(cfg: &Config, wt: &str) -> Option<StopTarget> {
+    use std::path::Path;
+    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(wt));
+    if !loc.is_remote() {
+        return None;
+    }
+    let (repo_root, selected) = {
+        let db = Db::open().ok()?;
+        let repo_root = db
+            .repo_root_for(wt)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| thegn_core::repo::main_worktree(Path::new(wt)))
+            .unwrap_or_else(|| PathBuf::from(wt));
+        let selected = match db.effective_env_checked(wt, &repo_root.to_string_lossy()) {
+            Ok(selected) => selected,
+            Err(error) => {
+                tracing::debug!(worktree = %wt, error = %format!("{error:#}"), "agent run stop skipped: environment selection unreadable");
+                return None;
+            }
+        };
+        (repo_root, selected)
+    };
+    let env = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(wt),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected,
+            profile: None,
+        },
+    );
+    let thegn_core::placement::Placement::Provider(p) = &env.placement else {
+        return None;
+    };
+    let provider = cfg.env.get(&env.name)?.provider.clone();
+    let name = match crate::provider_factory::sandbox_id_for(wt, &p.id) {
+        Ok(name) if !name.trim().is_empty() => name,
+        Ok(_) => return None,
+        Err(error) => {
+            tracing::debug!(worktree = %wt, error = %format!("{error:#}"), "agent run stop skipped: sandbox binding unreadable");
+            return None;
+        }
+    };
+    Some(StopTarget {
+        kind: EnvProviderKind::of(provider.provider.trim()),
+        provider,
+        name,
+    })
+}
+
+/// After an observed exit: park a Fly / machine0 sandbox that no other live
+/// session uses. `None` when no stop applies. Provider calls run in
+/// `spawn_blocking`, never on the async loop.
+async fn stop_after_run(
+    cfg: &Config,
+    client: &ControlClient,
+    wt: &str,
+    own: &str,
+    pulled: bool,
+) -> Option<StopOutcome> {
+    let target = {
+        let cfg = cfg.clone();
+        let wt = wt.to_string();
+        tokio::task::spawn_blocking(move || stop_target_blocking(&cfg, &wt))
+            .await
+            .ok()
+            .flatten()?
+    };
+    if !should_stop_after_run(target.kind, false, 0, true) {
+        return None;
+    }
+    let other_live = match client.sessions().await {
+        Ok(sessions) => other_live_sessions(&sessions, wt, own),
+        Err(e) => {
+            return Some(StopOutcome {
+                ok: false,
+                name: target.name,
+                error: Some(format!("session list failed, left running: {e:#}")),
+            });
+        }
+    };
+    if !should_stop_after_run(target.kind, false, other_live, true) {
+        return None;
+    }
+    let name = target.name.clone();
+    let cfg_owned = cfg.clone();
+    let wt_owned = wt.to_string();
+    let res = tokio::task::spawn_blocking(move || {
+        let StopTarget { provider, name, .. } = target;
+        if !pulled {
+            crate::provider_git::pull_back_if_provider(&cfg_owned, &wt_owned).map_err(|e| {
+                anyhow::anyhow!("left running: the pull before the stop failed: {e:#}")
+            })?;
+        }
+        let Some(api) = crate::provider_factory::provider_for_named(&provider, &name) else {
+            anyhow::bail!(
+                "provider {} is not configured (token unset?)",
+                provider.provider
+            );
+        };
+        crate::agent::block_on_provider(|| async { api.suspend(&name).await })?;
+        crate::machine0_bridge::clear(&name);
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("agent run stop task failed: {e}"))
+    .and_then(|r| r);
+    Some(stop_result(name, res))
+}
+
+/// Fold a stop result into a [`StopOutcome`].
+pub(crate) fn stop_result(name: String, res: Result<()>) -> StopOutcome {
+    match res {
+        Ok(()) => StopOutcome {
+            ok: true,
+            name,
+            error: None,
+        },
+        Err(e) => StopOutcome {
+            ok: false,
+            name,
             error: Some(format!("{e:#}")),
         },
     }
@@ -770,10 +995,11 @@ async fn observe_until_exit(
 mod tests {
     use super::{
         DEFAULT_TIMEOUT_SECS, EnvChoice, PIPELINE_ENV, TAIL_BYTES, TAIL_LINES, TailRing,
-        WaitStatus, env_choice, output_tail, pin_env_for_run, process_exit_code, pull_result,
-        strip_ansi, tail_lines,
+        WaitStatus, env_choice, other_live_sessions, output_tail, pin_env_for_run,
+        process_exit_code, pull_result, should_stop_after_run, stop_result, strip_ansi, tail_lines,
     };
     use thegn_core::config::Config;
+    use thegn_core::config::EnvProviderKind;
     use thegn_core::db::Db;
     use thegn_core::store::WorkspaceStore;
     use thegn_core::testenv::IsolatedState;
@@ -1330,5 +1556,78 @@ mod tests {
             serde_json::json!({"ok": false, "ref": null, "error": "boom"})
         );
         assert_eq!(bad.line(), "[agent run: pull failed: boom]");
+    }
+
+    /// b162 D5: which kinds `agent run --wait` stops after the exit.
+    #[test]
+    fn should_stop_after_run_table() {
+        use EnvProviderKind as K;
+        // (kind, keep_running, other_live, exited) -> stop
+        let cases = [
+            (K::Fly, false, 0, true, true),
+            (K::Machine0, false, 0, true, true),
+            // Self-suspending kinds are never touched.
+            (K::Sprites, false, 0, true, false),
+            (K::Vercel, false, 0, true, false),
+            // No stop at all.
+            (K::Hetzner, false, 0, true, false),
+            (K::DigitalOcean, false, 0, true, false),
+            (K::Daytona, false, 0, true, false),
+            (K::Custom, false, 0, true, false),
+            // Another live session on the worktree keeps it started.
+            (K::Fly, false, 1, true, false),
+            (K::Machine0, false, 3, true, false),
+            // --keep-running.
+            (K::Fly, true, 0, true, false),
+            (K::Machine0, true, 0, true, false),
+            // A timeout (not exited) leaves it running.
+            (K::Fly, false, 0, false, false),
+        ];
+        for (kind, keep, other, exited, want) in cases {
+            assert_eq!(
+                should_stop_after_run(kind, keep, other, exited),
+                want,
+                "{kind:?} keep={keep} other={other} exited={exited}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_live_sessions_counts_only_live_peers_on_the_worktree() {
+        let mk = |id: &str, wt: Option<&str>, exited: bool| thegn_svc::control::SessionInfo {
+            id: id.to_string(),
+            worktree: wt.map(str::to_string),
+            exited_at_ms: exited.then_some(1),
+            ..Default::default()
+        };
+        let sessions = vec![
+            mk("own", Some("/wt/a"), false),
+            mk("peer", Some("/wt/a/"), false),
+            mk("dead", Some("/wt/a"), true),
+            mk("elsewhere", Some("/wt/b"), false),
+            mk("unbound", None, false),
+        ];
+        assert_eq!(other_live_sessions(&sessions, "/wt/a", "own"), 1);
+        assert_eq!(other_live_sessions(&sessions[..1], "/wt/a", "own"), 0);
+        assert_eq!(other_live_sessions(&sessions, "/wt/b", "own"), 1);
+    }
+
+    #[test]
+    fn stop_outcome_json_shape_and_line() {
+        let ok = stop_result("fly-wt-1".into(), Ok(()));
+        assert_eq!(
+            ok.json(),
+            serde_json::json!({"ok": true, "name": "fly-wt-1", "error": null})
+        );
+        assert_eq!(
+            ok.line(),
+            "[agent run: stopped fly-wt-1 (it bills while started)]"
+        );
+        let bad = stop_result("m0-wt".into(), Err(anyhow::anyhow!("boom")));
+        assert_eq!(
+            bad.json(),
+            serde_json::json!({"ok": false, "name": "m0-wt", "error": "boom"})
+        );
+        assert_eq!(bad.line(), "[agent run: could not stop m0-wt: boom]");
     }
 }

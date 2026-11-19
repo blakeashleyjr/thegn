@@ -101,6 +101,7 @@ pub static ROUTE_TYPES: &[(&str, &str, &str)] = &[
     // Lead tool surface (THE-2172). The typed DTOs live in thegn-core and are
     // not pinned in the wire snapshot, so every cell is an inline shape.
     ("overview.get", "{workspace, limit}", "{OverviewReply}"),
+    ("producers.status", "{}", "{ProducersStatusReply}"),
     (
         "notifications.list",
         "{kind, unread, since, worktree, limit}",

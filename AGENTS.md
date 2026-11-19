@@ -1,10 +1,7 @@
-# Working in Thegn
+# Thegn
 
-Thegn is a Rust terminal worktree IDE. Start in the worktree assigned to the issue. Git holds the implementation, specs and review evidence. Linear owns priority, assignment, workflow state and acceptance criteria.
-
-- For a Linear issue, run `just agent-context THE-123` (substitute the issue ID). Open the linked change or handoff that answers your question. Use Linear for current scope and status. The [delivery policy](docs/delivery-governance.md) explains when a behavior change needs OpenSpec and how to reconcile the two.
-- For a cross-crate question, use CodeGraph's `codegraph_explore` with this worktree's absolute path and a named symbol. Keep results small. For a missing index or CLI-only session, use `just graph-find TerminalWaker` (substitute your symbol). Use `rg` for literals and verify changes against source and tests. Use Context7 for dependency documentation when available.
-- For a previous decision, look in the issue-specific handoff, design, or [ADRs](docs/adr/index.md). If AgentMemory is available, search for `thegn`, the issue or capability, and a decision keyword. Follow the source pointer before acting. When saving a reusable finding, include the project `thegn`, issue or capability, commit, and evidence path. Keep changing task status in Linear.
-- Enter `nix develop`. Iterate with `just quick <crate>` and `cargo nextest run -p <crate> <filter>`. Follow [the contributor workflow](CONTRIBUTING.md#dev-loop) for pre-push and PR gates. Changes to shared contracts get an early scoped check on the combined branches.
-- Before changing a surface, read its [extension recipe](docs/extending/README.md). For crate boundaries, the event loop, rendering, platform or sandbox changes, read the relevant [architecture section](docs/ARCHITECTURE.md) and [development conventions](DEVELOPMENT.md). Keep the core substrate-free, the event loop free of blocking I/O, and the shell AI-independent.
-- In a pipeline, put the decision, evidence commit, focused test result and remaining question in the existing row handoff. Keep its report short. [Agent workflow and maintenance](docs/agent-workflow.md) covers setup, freshness, memory checks, and measuring accepted changes.
+- Work in the issue’s worktree. Linear owns scope and status. `just agent-context THE-123` finds specs and handoffs. Update OpenSpec when behavior changes.
+- Trace callers with CodeGraph in the current worktree or `just graph-find <symbol>`. Use `rg` for literals.
+- Check the [extension recipe](docs/extending/README.md) before changing a surface. Keep core substrate-free and blocking I/O off the event loop.
+- In `nix develop`, run `just quick <crate>` and `cargo nextest run -p <crate> <filter>`. Follow [merge gates](CONTRIBUTING.md#dev-loop).
+- Cite the commit and source path in AgentMemory (`project=thegn`). Record decisions, test results and open questions in the issue handoff.
