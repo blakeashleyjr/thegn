@@ -4049,6 +4049,22 @@ fn fleet_widget_text_and_tone() {
 }
 
 #[test]
+fn fleet_widget_not_amber_for_down_and_unrecorded_only() {
+    let mut snap = fleet_snap(1, 0.0, 0, 0);
+    snap.view.rows[0].unrecorded = true;
+    snap.view.unrecorded = 1;
+    snap.view
+        .down
+        .push(thegn_core::placement::fleet_cost::RecordedSandbox {
+            worktree: "/wt/down".into(),
+            provider: "fly".into(),
+            env: "e".into(),
+            id: "tg-down".into(),
+        });
+    assert_eq!(fleet_widget(&snap), Some(("$0.00/h".to_string(), false)));
+}
+
+#[test]
 fn fleet_sheds_after_weather_and_before_uptime() {
     let parts: Vec<(String, usize)> = [("cpu", 7), ("uptime", 6), ("fleet", 8), ("weather", 6)]
         .into_iter()
