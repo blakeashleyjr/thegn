@@ -330,9 +330,7 @@ mod tests {
         let path = if fixture.curl {
             // A logging `sleep` so tests can see the heartbeat's nap pids.
             let host = std::env::var("PATH").unwrap_or_default();
-            let Some(real_sleep) = host_sleep(&host) else {
-                return None;
-            };
+            let real_sleep = host_sleep(&host)?;
             let sleep = bin.join("sleep");
             std::fs::write(
                 &sleep,
