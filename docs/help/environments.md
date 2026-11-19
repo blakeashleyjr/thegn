@@ -206,6 +206,15 @@ been verified live against the real Sprites API yet.
 - **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
   also runs `env pull` after the agent exits and reports it in text and `--json`.
 
+### Live script
+
+`THEGN_CHANNEL=dev test/sprites-live.sh --env <name> --i-accept-spend [--keep-going]`
+drives a real sprite and spends money. By default it stops at the first failed
+step. With `--keep-going` a failed step prints `FAIL <id>`, the run continues and
+the exit status is non-zero if anything failed. It proves pull with a real commit
+made inside the sprite (not a stub), and prints the `fleet cost` JSON. A pass shows
+those steps worked on that run; it does not verify the paths it does not touch.
+
 ### Adopt, the daily loop and release
 
 Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
