@@ -136,9 +136,9 @@ fn warm_devshell_at(cwd: &Path, json: bool) -> Result<()> {
         .map(PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(cwd))
         .unwrap_or_else(|| cwd.to_path_buf());
-    if thegn_core::devenv::cache_key(&root).is_none() {
+    let Some(key_before) = thegn_core::devenv::cache_key(&root) else {
         anyhow::bail!("no flake.nix here: {}", root.display());
-    }
+    };
 
     let mut command = Command::new("nix");
     command.args(["print-dev-env", "--json"]).current_dir(&root);
@@ -160,6 +160,11 @@ fn warm_devshell_at(cwd: &Path, json: bool) -> Result<()> {
     }
     let output = std::str::from_utf8(&run.stdout.bytes)?;
     let dev = thegn_core::devenv::parse_print_dev_env(output);
+    if thegn_core::devenv::cache_key(&root).as_deref() != Some(key_before.as_str()) {
+        anyhow::bail!(
+            "flake.nix or flake.lock changed during evaluation; run `thegn sandbox warm-devshell` again"
+        );
+    }
     let path = thegn_core::devenv::store(&root, &dev).map_err(anyhow::Error::msg)?;
     let vars = dev.vars.len();
     let has_path = dev.path.is_some();
