@@ -910,7 +910,9 @@ mod tests {
                     "round {round}: {record:?}"
                 );
                 assert_eq!(record.state, "creating", "round {round}: {record:?}");
-                let error = adopted.unwrap_err();
+                let Err(error) = adopted else {
+                    unreachable!("round {round}: adopt must have lost here")
+                };
                 assert!(
                     format!("{error:#}").contains("another controller/account"),
                     "round {round}: {error:#}"
