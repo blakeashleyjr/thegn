@@ -32,6 +32,7 @@ use termwiz::input::{InputEvent, KeyEvent};
 use termwiz::terminal::{Terminal, new_terminal};
 use thegn_core::config::Config;
 use thegn_core::config_env_tables::wss_native_provider_kind;
+use thegn_core::sprite_hold::{HOLD_ENV, ceiling_secs, hold_name, wrap_argv};
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provider};
 
 /// Exit code when the remote exec stream was lost and could not be reattached
@@ -59,8 +60,21 @@ const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// control reads. `cmd` arrives already shaped by `GitLoc::provider_command`
 /// (`/bin/sh -lc <script>`) or the launch argv; empty falls back to a login
 /// shell.
+///
+/// Keep-awake (THE-2052): `hold` (the `--hold` flag), else [`HOLD_ENV`] in this
+/// process's environment (the daemon sets it for headless sprite launches),
+/// wraps the argv once in the in-sprite heartbeat
+/// ([`thegn_core::sprite_hold::wrap_argv`]). Both modes honour it; a reattach
+/// reuses the same remote process and never re-wraps. The env var is read here
+/// on the host and is never forwarded into the sprite's exec env.
 pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Result<()> {
-    tracing::debug!(target: "thegn::sprites", sprite = id, ?hold, "sprite-exec: keep-awake hold requested");
+    let env_hold = std::env::var_os(HOLD_ENV);
+    let ceiling = hold_ceiling(
+        hold,
+        env_hold
+            .as_deref()
+            .map(|raw| raw.to_str().unwrap_or("\u{fffd}")),
+    )?;
     let argv: Vec<String> = if cmd.is_empty() {
         vec![
             "/bin/sh".into(),
@@ -69,6 +83,14 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
         ]
     } else {
         cmd.to_vec()
+    };
+    let argv = match ceiling {
+        Some(ceiling) => {
+            let task = hold_task()?;
+            tracing::debug!(target: "thegn::sprites", sprite = id, task, ceiling, "sprite-exec: keep-awake hold");
+            wrap_argv(&argv, &task, ceiling)
+        }
+        None => argv,
     };
     // Any WSS-native env's provider config works — the sandbox id is the routing
     // key, and exec takes it as an argument (like `vps-ssh` resolving by name).
@@ -97,6 +119,41 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
 // ---------------------------------------------------------------------------
 // Pure decisions (unit-tested). The streaming below only wires them up.
 // ---------------------------------------------------------------------------
+
+/// The hold ceiling in seconds for this run, or `None` for an unheld run: the
+/// `--hold` flag wins, else the [`HOLD_ENV`] value (`env`, as read from the
+/// host environment; empty counts as unset). Both are capped by
+/// [`ceiling_secs`]. A set value that is not a positive whole number of
+/// seconds is refused rather than silently running unheld.
+pub(crate) fn hold_ceiling(flag: Option<Duration>, env: Option<&str>) -> Result<Option<u64>> {
+    if let Some(flag) = flag {
+        return Ok(Some(ceiling_secs(Some(flag.as_secs().max(1)), 0)));
+    }
+    let Some(raw) = env.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let secs = Some(raw)
+        .filter(|raw| raw.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .ok_or_else(|| {
+            anyhow!("sprite-exec: {HOLD_ENV}={raw:?} is not a positive number of seconds")
+        })?;
+    Ok(Some(ceiling_secs(Some(secs), 0)))
+}
+
+/// A fresh hold task name, `thegn-hold-<16 hex>`, from the OS CSPRNG.
+fn hold_task() -> Result<String> {
+    let mut nonce = [0_u8; 8];
+    getrandom::fill(&mut nonce).map_err(|error| anyhow!("sprite-exec: hold nonce: {error}"))?;
+    hold_task_from(nonce)
+}
+
+/// The task name for `nonce` (split out so the encoding is testable).
+fn hold_task_from(nonce: [u8; 8]) -> Result<String> {
+    let hex: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    hold_name(&hex).ok_or_else(|| anyhow!("sprite-exec: hold nonce {hex:?} is not 16 hex digits"))
+}
 
 /// Backoff before each reattach attempt: 1, 2, 4, 8, 15 s.
 pub(crate) fn reconnect_delays() -> [Duration; REATTACH_ATTEMPTS] {
@@ -455,10 +512,12 @@ fn tty_loop<T: Terminal>(
 mod tests {
     use super::{
         EXIT_REMOTE_LOST, FromTty, REATTACH_BUDGET_RESET, RemoteModes, attempts_after_stream,
-        encode_input, lost_line, pty_size, reconnect_delays, should_reattach,
+        encode_input, hold_ceiling, hold_task_from, lost_line, pty_size, reconnect_delays,
+        should_reattach,
     };
     use std::time::Duration;
     use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+    use thegn_core::sprite_hold::{HOLD_ENV, HOLD_MAX_CEILING_SECS, HOLD_SCRIPT, wrap_argv};
 
     #[test]
     fn reconnect_delays_back_off_1_2_4_8_15() {
@@ -545,5 +604,71 @@ mod tests {
             encode_input(&FromTty::Resize { cols: 1, rows: 1 }, &m),
             None
         );
+    }
+
+    #[test]
+    fn hold_ceiling_prefers_the_flag_then_the_env() {
+        let flag = Some(Duration::from_secs(90));
+        assert_eq!(hold_ceiling(flag, Some("garbage")).unwrap(), Some(90));
+        assert_eq!(
+            hold_ceiling(Some(Duration::from_secs(48 * 3600)), None).unwrap(),
+            Some(HOLD_MAX_CEILING_SECS)
+        );
+        // A sub-second flag still holds for at least a second.
+        assert_eq!(
+            hold_ceiling(Some(Duration::from_millis(10)), None).unwrap(),
+            Some(1)
+        );
+        assert_eq!(hold_ceiling(None, Some("14400")).unwrap(), Some(14400));
+        assert_eq!(hold_ceiling(None, Some(" 600\n")).unwrap(), Some(600));
+        assert_eq!(
+            hold_ceiling(None, Some("999999999")).unwrap(),
+            Some(HOLD_MAX_CEILING_SECS)
+        );
+    }
+
+    #[test]
+    fn hold_ceiling_unset_or_empty_env_runs_unheld() {
+        assert_eq!(hold_ceiling(None, None).unwrap(), None);
+        assert_eq!(hold_ceiling(None, Some("")).unwrap(), None);
+        assert_eq!(hold_ceiling(None, Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn hold_ceiling_refuses_garbage_env() {
+        for raw in [
+            "0",
+            "-5",
+            "+5",
+            "4h",
+            "1.5",
+            "abc",
+            "\u{fffd}",
+            "99999999999999999999999",
+        ] {
+            let error = hold_ceiling(None, Some(raw)).expect_err(raw).to_string();
+            assert!(error.contains(HOLD_ENV), "{raw}: {error}");
+        }
+    }
+
+    #[test]
+    fn hold_task_is_the_lowercase_hex_name() {
+        assert_eq!(
+            hold_task_from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]).unwrap(),
+            "thegn-hold-0123456789abcdef"
+        );
+        assert_eq!(
+            hold_task_from([0; 8]).unwrap(),
+            "thegn-hold-0000000000000000"
+        );
+    }
+
+    #[test]
+    fn a_held_argv_never_carries_the_host_hold_env() {
+        let argv = vec!["claude".to_owned(), "-p".to_owned(), "do it".to_owned()];
+        let wrapped = wrap_argv(&argv, "thegn-hold-0123456789abcdef", 600);
+        assert_eq!(wrapped[2], HOLD_SCRIPT);
+        assert_eq!(&wrapped[6..], argv.as_slice());
+        assert!(wrapped.iter().all(|arg| !arg.contains(HOLD_ENV)));
     }
 }
