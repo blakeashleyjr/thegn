@@ -292,12 +292,172 @@ fn run_once(request: RefreshRequest) {
         waker,
         report,
     } = request;
+    // The UI pass reports through `report` and the waker; the summary is
+    // for the daemon tick.
+    refresh_repo_inner(
+        &cwd,
+        &app_cfg,
+        waker.as_ref(),
+        RefreshSite::Ui,
+        report.as_ref(),
+    );
+}
+
+/// Who runs a tracker refresh. `Ui` is the interactive process (reports,
+/// toasts, the local autopilot driver, and yielding to the daemon's lease);
+/// `Daemon` is the headless producer tick (THE-2209): no reports or toasts,
+/// and autopilot pickup goes through the daemon's queues producer.
+#[allow(
+    dead_code,
+    reason = "the daemon tracker tick drives it once the b161 lane 5 owner arms it"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RefreshSite {
+    Ui,
+    Daemon,
+}
+
+/// What one [`refresh_repo`] pass did.
+#[allow(
+    dead_code,
+    reason = "the daemon tracker tick drives it once the b161 lane 5 owner arms it"
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RefreshSummary {
+    /// Accounts whose list call returned (fully).
+    pub(crate) accounts_ok: usize,
+    /// Accounts that failed or returned a partial list.
+    pub(crate) accounts_failed: usize,
+    /// Notification events written by this pass (diff + overdue emits).
+    pub(crate) events: usize,
+    /// The UI pass yielded to the daemon's live tracker lease: no fetch ran.
+    pub(crate) yielded: bool,
+}
+
+impl RefreshSummary {
+    /// The UI yielded to the daemon: nothing was fetched.
+    pub(crate) const YIELDED: Self = Self {
+        accounts_ok: 0,
+        accounts_failed: 0,
+        events: 0,
+        yielded: true,
+    };
+}
+
+/// Pure: does this pass reach the network? Only a UI pass whose cache the
+/// daemon is keeping warm (it holds the tracker lease AND refreshes this very
+/// cache key) skips the fetch. The daemon never yields to itself.
+pub(crate) fn should_fetch(site: RefreshSite, daemon_covers: bool) -> bool {
+    match site {
+        RefreshSite::Daemon => true,
+        RefreshSite::Ui => !daemon_covers,
+    }
+}
+
+/// One autopilot pickup handed over by a refresh pass.
+pub(crate) struct PickupArgs<'a> {
+    pub(crate) cfg: &'a thegn_core::config::Config,
+    pub(crate) repo_root: &'a std::path::Path,
+    pub(crate) cwd: &'a std::path::Path,
+    pub(crate) account: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) issues: &'a [thegn_core::issue::Issue],
+    pub(crate) from_assignee_me: bool,
+}
+
+fn ui_pickup(args: &PickupArgs<'_>) {
+    crate::autopilot_driver::pickup(
+        args.cfg,
+        args.repo_root,
+        args.cwd,
+        args.account,
+        args.provider,
+        args.issues,
+        args.from_assignee_me,
+    );
+}
+
+fn daemon_pickup(args: &PickupArgs<'_>) {
+    crate::daemon::producers::queues::daemon_pickup(
+        args.cfg,
+        &crate::daemon::producers::queues::PickupRequest {
+            repo_root: args.repo_root,
+            cwd: args.cwd,
+            account: args.account,
+            provider: args.provider,
+            issues: args.issues,
+            from_assignee_me: args.from_assignee_me,
+        },
+    );
+}
+
+/// Route one pickup by site. The UI keeps its own driver (which checks the
+/// repo's autopilot policy itself); the daemon hands over to the queues
+/// producer, and only for a repo whose `[autopilot]` is enabled, so a daemon
+/// tick can never start work for a repo with autopilot off.
+fn route_pickup(
+    site: RefreshSite,
+    args: &PickupArgs<'_>,
+    ui: &dyn Fn(&PickupArgs<'_>),
+    daemon: &dyn Fn(&PickupArgs<'_>),
+    autopilot_enabled: &dyn Fn(&PickupArgs<'_>) -> bool,
+) {
+    match site {
+        RefreshSite::Ui => ui(args),
+        RefreshSite::Daemon => {
+            if autopilot_enabled(args) {
+                daemon(args);
+            }
+        }
+    }
+}
+
+fn repo_autopilot_enabled(args: &PickupArgs<'_>) -> bool {
+    args.cfg.repo_autopilot(args.repo_root).enabled
+}
+
+/// Refresh one worktree's issue cache: fetch every enabled account of the
+/// repo's tracker config (`IssuesConfig::active_accounts`), diff and emit per
+/// `(cache key, provider, account)`, rewrite the cache, and run autopilot
+/// pickup for the site. Blocking (network + DB); callers are off-loop.
+///
+/// A `Ui` pass yields while the daemon holds the tracker lease and refreshes
+/// this cache key (the repo's main checkout): it fetches nothing, wakes the
+/// loop so the hydration pass re-reads the cache (`populate_tracker`), and
+/// returns [`RefreshSummary::YIELDED`].
+#[allow(
+    dead_code,
+    reason = "the daemon tracker tick drives it once the b161 lane 5 owner arms it"
+)]
+pub(crate) fn refresh_repo(
+    cwd: &std::path::Path,
+    app_cfg: &thegn_core::config::Config,
+    waker: Option<&TerminalWaker>,
+    site: RefreshSite,
+) -> RefreshSummary {
+    refresh_repo_inner(cwd, app_cfg, waker, site, None)
+}
+
+fn refresh_repo_inner(
+    cwd: &std::path::Path,
+    app_cfg: &thegn_core::config::Config,
+    waker: Option<&TerminalWaker>,
+    site: RefreshSite,
+    report: Option<&RefreshReportTarget>,
+) -> RefreshSummary {
     use thegn_core::issue::IssueFilter;
     use thegn_svc::issue::IssueRouter;
 
+    // Reports and toasts belong to the interactive process only.
+    let report = match site {
+        RefreshSite::Ui => report,
+        RefreshSite::Daemon => None,
+    };
+    let mut summary = RefreshSummary::default();
+    let cwd = cwd.to_path_buf();
     if !cwd.is_dir() {
-        record_tracker_failure(&cwd, "worktree unavailable", waker.as_ref());
-        if let Some(report) = report.as_ref() {
+        record_tracker_failure(&cwd, "worktree unavailable", waker);
+        if let Some(report) = report {
             send_tracker_toast(
                 &report.tx,
                 &report.waker,
@@ -305,15 +465,38 @@ fn run_once(request: RefreshRequest) {
                 thegn_core::notification::Priority::Alert,
             );
         }
-        return;
+        return summary;
     }
     let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+    // Only the background producer yields; an explicit refresh (report set) runs as before.
+    let yield_to_daemon = site == RefreshSite::Ui
+        && report.is_none()
+        && crate::producer_yield::daemon_owns(thegn_core::producer_lease::ProducerKind::Tracker);
+    let plugin_accounts: std::collections::HashSet<String> =
+        crate::plugin_providers::issue_backends()
+            .into_iter()
+            .map(|(account, _)| account)
+            .collect();
+    if site == RefreshSite::Ui {
+        // The daemon refreshes each repo's main checkout, so it only keeps
+        // THIS cache key warm when the UI is on that checkout; a linked
+        // worktree's own key still needs the UI's pass. Plugin issue
+        // providers live only in the UI process (the daemon cannot reach
+        // them), so a UI with any keeps its own pass too.
+        let daemon_covers = yield_to_daemon && repo_root == cwd && plugin_accounts.is_empty();
+        if !should_fetch(site, daemon_covers) {
+            if let Some(w) = waker {
+                let _ = w.wake(); // best-effort: waker pulse: the hydration pass re-reads the daemon-written cache
+            }
+            return RefreshSummary::YIELDED;
+        }
+    }
     let cfg = app_cfg.repo_issues(Some(&repo_root));
     let mut router = IssueRouter::from_config_at(&cfg, Some(&cwd));
     // Provider-as-plugin: append live plugin issue providers.
     crate::plugin_providers::extend_issue_router(&mut router);
     if !router.is_configured() {
-        if let Some(report) = report.as_ref() {
+        if let Some(report) = report {
             send_tracker_toast(
                 &report.tx,
                 &report.waker,
@@ -321,7 +504,7 @@ fn run_once(request: RefreshRequest) {
                 thegn_core::notification::Priority::Info,
             );
         }
-        return;
+        return summary;
     }
     // Repo scope for GitHub (other providers scope by team/project and
     // ignore `repo`). Mirrors `spawn_my_work_refresh`.
@@ -341,8 +524,8 @@ fn run_once(request: RefreshRequest) {
     let per_provider = match thegn_svc::issue::block_on_tracker(router.list_per_provider(&filter)) {
         Ok(per_provider) => per_provider,
         Err(_) => {
-            record_tracker_failure(&cwd, "could not start tracker runtime", waker.as_ref());
-            if let Some(report) = report.as_ref() {
+            record_tracker_failure(&cwd, "could not start tracker runtime", waker);
+            if let Some(report) = report {
                 send_tracker_toast(
                     &report.tx,
                     &report.waker,
@@ -350,17 +533,17 @@ fn run_once(request: RefreshRequest) {
                     thegn_core::notification::Priority::Alert,
                 );
             }
-            return;
+            return summary;
         }
     };
     let mut failures = Vec::new();
     let mut any_success = false;
     let Ok(db) = thegn_core::db::Db::open() else {
-        record_tracker_failure(&cwd, "could not open issue cache", waker.as_ref());
-        if let Some(report) = report.as_ref() {
+        record_tracker_failure(&cwd, "could not open issue cache", waker);
+        if let Some(report) = report {
             send_refresh_report(report, &[], Some("could not open the issue cache"), false);
         }
-        return;
+        return summary;
     };
     let repo_key = cwd.to_string_lossy();
     let linked: std::collections::HashSet<String> = db
@@ -371,15 +554,22 @@ fn run_once(request: RefreshRequest) {
     let mut changed = false;
     let shared = shared_issue_ids(&per_provider);
     for (account, provider, result) in per_provider {
+        // The daemon produces non-plugin accounts while it holds the lease.
+        let daemon_produces = yield_to_daemon && !plugin_accounts.contains(&account);
+        if daemon_produces && repo_root == cwd {
+            continue; // the daemon writes and diffs this cache row
+        }
         let issues = match result {
             Ok(issues) => {
                 any_success = true;
+                summary.accounts_ok += 1;
                 // Reached the tracker — online evidence for the app-wide holder.
                 thegn_core::connectivity::report_success();
                 issues
             }
             Err(thegn_svc::issue::IssueError::PartialList { issues, reason }) => {
                 tracing::warn!(account = %account, provider, reason, "tracker issue list was partial");
+                summary.accounts_failed += 1;
                 failures.push((format!("{provider}/{account}"), reason.to_owned()));
                 let last_good = db
                     .get_issue_cache(&repo_key, provider, &account)
@@ -417,6 +607,7 @@ fn run_once(request: RefreshRequest) {
                 // trace anywhere (THE-72). One warn; the ring picks it up
                 // for crash reports/bundles even with no sink installed.
                 tracing::warn!(account = %account, provider, error = %e, "tracker refresh failed");
+                summary.accounts_failed += 1;
                 failures.push((format!("{provider}/{account}"), e.to_string()));
                 // Only a dropped link is offline evidence (not a bad token).
                 if e.is_transient() {
@@ -443,44 +634,62 @@ fn run_once(request: RefreshRequest) {
             .collect();
         for (kind, source_ref, msg) in tracker_diff_notifications(&old_issues, &issues, &linked) {
             let msg = account_qualified(msg, &source_ref, &shared, &account);
-            let _ = crate::automation_events::emit(&db, kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if crate::automation_events::emit(&db, kind, &source_ref, &msg, &repo_key).is_ok() {
+                summary.events += 1;
+            }
         }
-        crate::automation_issue::emit_matched(
-            &db,
-            &crate::automation_issue::IssueRefresh {
-                cfg: &app_cfg,
-                repo_key: &repo_key,
-                provider,
-                account: &account,
-                assignee_me: cfg.filter_assignee_me,
-                had_cache,
-            },
-            &old_issues,
-            &issues,
-        );
+        if !daemon_produces {
+            crate::automation_issue::emit_matched(
+                &db,
+                &crate::automation_issue::IssueRefresh {
+                    cfg: app_cfg,
+                    repo_key: &repo_key,
+                    provider,
+                    account: &account,
+                    assignee_me: cfg.filter_assignee_me,
+                    had_cache,
+                },
+                &old_issues,
+                &issues,
+            );
+        }
         // Overdue is re-derived (not diffed) each refresh; the store-side
         // emit-once (`put_notification_once`) keeps it to one row per
         // (issue, due date).
         for (source_ref, msg) in overdue_notifications(&issues, &linked, thegn_core::util::now()) {
             let msg = account_qualified(msg, &source_ref, &shared, &account);
-            let _ =
-                crate::automation_events::emit_once(&db, "overdue", &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if matches!(
+                crate::automation_events::emit_once(&db, "overdue", &source_ref, &msg, &repo_key),
+                Ok(true)
+            ) {
+                summary.events += 1;
+            }
         }
         let _ = db.put_issue_cache(&repo_key, provider, &account, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         changed = true;
-        // The refresh already runs on `sched::spawn_bg`; autopilot claims
-        // here but schedules each slow agent on its own bounded background
-        // worker. It receives filter provenance rather than guessing
-        // consent from issue display fields.
-        crate::autopilot_driver::pickup(
-            &app_cfg,
-            &repo_root,
-            &cwd,
-            &account,
-            provider,
-            &issues,
-            cfg.filter_assignee_me,
-        );
+        // The UI refresh already runs on `sched::spawn_bg` (the daemon tick
+        // on `spawn_blocking`); autopilot claims here but schedules each slow
+        // agent on its own bounded background worker. It receives filter
+        // provenance rather than guessing consent from issue display fields.
+        if !daemon_produces {
+            route_pickup(
+                site,
+                &PickupArgs {
+                    cfg: app_cfg,
+                    repo_root: &repo_root,
+                    cwd: &cwd,
+                    account: &account,
+                    provider,
+                    issues: &issues,
+                    from_assignee_me: cfg.filter_assignee_me,
+                },
+                &ui_pickup,
+                &daemon_pickup,
+                &repo_autopilot_enabled,
+            );
+        }
     }
     let failure_only = !any_success && !failures.is_empty();
     if failure_only {
@@ -500,13 +709,14 @@ fn run_once(request: RefreshRequest) {
             .remove(&cwd.to_string_lossy().into_owned());
     }
     if (changed || failure_only)
-        && let Some(w) = &waker
+        && let Some(w) = waker
     {
         let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
-    if let Some(report) = report.as_ref() {
+    if let Some(report) = report {
         send_refresh_report(report, &failures, None, any_success);
     }
+    summary
 }
 
 const MAX_REPORT_ENTRIES: usize = 3;
@@ -787,6 +997,7 @@ mod tests {
         partial_cache_entry, populate_tracker, prepare_tracker_toast_message,
         record_tracker_failure, safe_report_text, shared_issue_ids, tracker_failures, tracker_load,
     };
+    use super::{PickupArgs, RefreshSite, RefreshSummary, route_pickup, should_fetch};
 
     #[test]
     fn shared_issue_ids_covers_ok_and_partial_accounts() {
@@ -1167,5 +1378,87 @@ mod tests {
 
         // A normal guard drop must not release worker B's admission slot.
         assert_eq!(coalescer.begin("repo", 'C'), None);
+    }
+
+    fn counting_pickup(site: RefreshSite, autopilot_on: bool) -> (usize /*ui*/, usize /*daemon*/) {
+        use std::cell::Cell;
+        let cfg = thegn_core::config::Config::default();
+        let root = std::path::Path::new("/repo");
+        let args = PickupArgs {
+            cfg: &cfg,
+            repo_root: root,
+            cwd: root,
+            account: "default",
+            provider: "linear",
+            issues: &[],
+            from_assignee_me: true,
+        };
+        let ui = Cell::new(0);
+        let daemon = Cell::new(0);
+        route_pickup(
+            site,
+            &args,
+            &|_| ui.set(ui.get() + 1),
+            &|_| daemon.set(daemon.get() + 1),
+            &|_| autopilot_on,
+        );
+        (ui.get(), daemon.get())
+    }
+
+    #[test]
+    fn daemon_site_never_calls_the_ui_autopilot_driver() {
+        assert_eq!(counting_pickup(RefreshSite::Daemon, true), (0, 1));
+        assert_eq!(counting_pickup(RefreshSite::Ui, true), (1, 0));
+    }
+
+    #[test]
+    fn daemon_site_starts_no_pickup_for_a_repo_with_autopilot_off() {
+        assert_eq!(counting_pickup(RefreshSite::Daemon, false), (0, 0));
+        // The UI driver checks the repo policy itself, as before.
+        assert_eq!(counting_pickup(RefreshSite::Ui, false), (1, 0));
+    }
+
+    #[test]
+    fn a_yielding_ui_pass_does_not_fetch_and_the_daemon_always_does() {
+        assert!(!should_fetch(RefreshSite::Ui, true));
+        assert!(should_fetch(RefreshSite::Ui, false));
+        assert!(should_fetch(RefreshSite::Daemon, true));
+        assert!(should_fetch(RefreshSite::Daemon, false));
+        let yielded = RefreshSummary::YIELDED;
+        assert!(yielded.yielded);
+        assert_eq!(RefreshSummary::YIELDED.accounts_ok, 0);
+        assert_eq!(RefreshSummary::YIELDED.events, 0);
+    }
+
+    #[test]
+    fn the_yield_decision_precedes_every_provider_call() {
+        // Source-order guard: in the refresh body the yield return comes
+        // before the router is built, the fetch is issued, or the DB opens.
+        let src = include_str!("hydrate_tracker.rs");
+        let body_start = src.find(concat!("fn refresh_repo_", "inner(")).unwrap();
+        let body = &src[body_start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let yield_at = body.find(concat!("should_", "fetch(site")).unwrap();
+        let ret_at = body
+            .find(concat!("return RefreshSummary::", "YIELDED"))
+            .unwrap();
+        for call in [
+            concat!("IssueRouter::", "from_config_at("),
+            concat!("block_on_", "tracker("),
+            concat!("list_per_", "provider("),
+            concat!("Db::", "open()"),
+            concat!("route_", "pickup("),
+        ] {
+            let at = body.find(call).unwrap_or_else(|| panic!("{call} missing"));
+            assert!(yield_at < at && ret_at < at, "{call} runs before the yield");
+        }
+        let owns_at = body.find(concat!("daemon_", "owns(")).unwrap();
+        let router_at = body
+            .find(concat!("IssueRouter::", "from_config_at("))
+            .unwrap();
+        assert!(
+            owns_at < router_at,
+            "the lease check runs after the router is built"
+        );
     }
 }
