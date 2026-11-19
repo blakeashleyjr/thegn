@@ -1,5 +1,5 @@
-//! Sprite usage for `thegn fleet cost`: CPU seconds and reserved GB-hours from
-//! `GET /v1/usage/{name}?start=<created_at>`. Runs only from the explicit verb.
+//! Sprite and organization usage for `thegn fleet cost`: CPU seconds and
+//! reserved GB-hours from the Sprites usage API. Runs only from the explicit verb.
 
 use anyhow::{Context, Result, anyhow};
 
@@ -132,6 +132,34 @@ pub fn usage_window_start(created_at_secs: i64) -> i64 {
     created_at_secs - created_at_secs.rem_euclid(3600)
 }
 
+/// The first day of the UTC month containing `now_secs`, at 00:00 UTC.
+pub fn month_start_utc(now_secs: i64) -> i64 {
+    use chrono::{Datelike, TimeZone};
+
+    let now = chrono::DateTime::<chrono::Utc>::from_timestamp(now_secs, 0).unwrap_or_else(|| {
+        chrono::Utc
+            .timestamp_opt(0, 0)
+            .single()
+            .expect("epoch is valid")
+    });
+    chrono::Utc
+        .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+        .single()
+        .expect("the first day of a UTC month is valid")
+        .timestamp()
+}
+
+/// Build the organization usage URL (`GET /v1/usage?start=…`).
+pub(crate) fn account_usage_url(base: &str, start_rfc3339: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("sprites: invalid usage URL"))?
+        .pop_if_empty()
+        .push("usage");
+    url.query_pairs_mut().append_pair("start", start_rfc3339);
+    Ok(url)
+}
+
 impl crate::provider::SpritesProvider {
     /// Usage and observation metadata for sprite `name` since `start_rfc3339`.
     pub async fn usage_reading_since(
@@ -166,6 +194,28 @@ impl crate::provider::SpritesProvider {
         );
         let body = response_json(resp, "sprites", "usage").await?;
         parse_usage_reading(&body).map(Some)
+    }
+
+    /// Organization usage totals since `start_rfc3339` (`GET /v1/usage?start=…`, no
+    /// interval: one total). Never wakes a sprite. Runs only from `thegn fleet cost`.
+    pub async fn account_usage_since(&self, start_rfc3339: &str) -> Result<UsageReading> {
+        let http = self.sprites_http()?;
+        let url = account_usage_url(http.base, start_rfc3339)?;
+        let resp = http
+            .client
+            .get(url)
+            .bearer_auth(http.token)
+            .timeout(CONTROL_TIMEOUT)
+            .send()
+            .await
+            .context("sprites: account usage request")?;
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "sprites account usage failed ({})",
+            resp.status()
+        );
+        let body = response_json(resp, "sprites", "account usage").await?;
+        parse_usage_reading(&body)
     }
 
     /// Usage for sprite `name` since `start_rfc3339` (`None` = the sprite is
@@ -300,5 +350,28 @@ mod tests {
         assert_eq!(usage_window_start(3599), 0);
         assert_eq!(usage_window_start(3600), 3600);
         assert_eq!(usage_window_start(7322), 7200);
+    }
+
+    #[test]
+    fn account_usage_url_has_start_and_no_group_by() {
+        let url = account_usage_url("https://api.sprites.dev/v1/", "2026-01-01T00:00:00Z").unwrap();
+
+        assert_eq!(url.path(), "/v1/usage");
+        assert_eq!(url.query(), Some("start=2026-01-01T00%3A00%3A00Z"));
+        assert!(!url.as_str().contains("group_by"));
+    }
+
+    #[test]
+    fn month_start_utc_floors_to_the_first() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-19T17:42:11Z")
+            .unwrap()
+            .timestamp();
+
+        assert_eq!(
+            month_start_utc(now),
+            chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+                .unwrap()
+                .timestamp()
+        );
     }
 }

@@ -48,6 +48,7 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus"
 # case), and the async "persist" chip would flake the statusbar.
 # The runtime dir is isolated for the same reason smoke isolates it: the
 # daemon socket path prefers $XDG_RUNTIME_DIR.
+# Safe override (b175): there is no daemon and the backend is `none` (below), so no sandbox is launched whose masks would follow this dir. If a spec ever enables a sandbox backend, drop this override.
 export THEGN_NO_DAEMON=1 XDG_RUNTIME_DIR="$_tmp/run"
 # Start in the normal UI, not the first-run onboarding wizard / keymap picker —
 # those modals would swallow the specs' driven keystrokes (fresh per-case DB).

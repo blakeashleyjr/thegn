@@ -99,7 +99,22 @@ struct SpritesUsage {
     env: String,
     /// Why the env could not be read at all.
     error: Option<String>,
+    /// Month-to-date usage of the whole Sprites account (`None` when this env
+    /// shares its account with an earlier env, or the API could not be read).
+    account: Option<SpritesAccountUsage>,
+    /// The earlier env whose account row covers this one.
+    account_shared_with: Option<String>,
     rows: Vec<SpritesUsageRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct SpritesAccountUsage {
+    since: String,
+    cpu_hours: f64,
+    gb_hours: f64,
+    partial: bool,
+    reported: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -134,6 +149,20 @@ fn sanitize_text(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// The earlier env whose account row already covers `account`; records `env`
+/// as that account's first env when it is new (and returns `None`).
+fn account_shared_with(
+    first_by_account: &mut std::collections::BTreeMap<String, String>,
+    env: &str,
+    account: &str,
+) -> Option<String> {
+    if let Some(first) = first_by_account.get(account) {
+        return Some(first.clone());
+    }
+    first_by_account.insert(account.to_string(), env.to_string());
+    None
+}
+
 /// The Sprites section's data. `None` when no sprites env is configured, so
 /// the rest of `fleet cost` is byte-identical. Only the explicit verb calls
 /// the API; only ledger-proven sprites are read.
@@ -145,6 +174,10 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
         .copied()
         .filter(|p| p.is_finite() && *p >= 0.0);
     let mut out = Vec::new();
+    let since = unix_to_rfc3339(thegn_svc::sprites::usage::month_start_utc(
+        thegn_core::util::now_ms() / 1000,
+    ));
+    let mut account_first_env = std::collections::BTreeMap::<String, String>::new();
     for (name, envc) in &cfg.env {
         if envc.provider.provider.trim() != "sprites" {
             continue;
@@ -152,6 +185,8 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
         let mut usage = SpritesUsage {
             env: name.clone(),
             error: None,
+            account: None,
+            account_shared_with: None,
             rows: Vec::new(),
         };
         match crate::provider_factory::provider_for_named(&envc.provider, "") {
@@ -160,48 +195,83 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
                     None => {
                         usage.error = Some("no ownership scope (controller id unavailable)".into())
                     }
-                    Some(scope) => match thegn_svc::sprites::ledger::owned(&scope) {
-                        Err(error) => usage.error = Some(sanitize_text(&format!("{error:#}"), 256)),
-                        Ok(view) => {
-                            for rec in view.recorded {
-                                let start = unix_to_rfc3339(
-                                    thegn_svc::sprites::usage::usage_window_start(rec.created_at),
-                                );
-                                let read = crate::agent::block_on_provider(|| async {
-                                    provider.usage_reading_since(&rec.name, &start).await
-                                });
-                                usage.rows.push(match read {
-                                    Ok(Some(reading)) => {
-                                        sprites_row(&rec.name, &rec.state, &reading, price)
-                                    }
-                                    Ok(None) => SpritesUsageRow {
-                                        name: rec.name.clone(),
-                                        status: rec.state.clone(),
-                                        cpu_hours: 0.0,
-                                        gb_hours: 0.0,
-                                        partial: false,
-                                        reported: false,
-                                        last_recorded_at: None,
-                                        error: None,
-                                        usd: None,
-                                        unavailable: true,
-                                    },
-                                    Err(error) => SpritesUsageRow {
-                                        name: rec.name.clone(),
-                                        status: rec.state.clone(),
-                                        cpu_hours: 0.0,
-                                        gb_hours: 0.0,
-                                        partial: false,
-                                        reported: false,
-                                        last_recorded_at: None,
-                                        error: Some(sanitize_text(&format!("{error:#}"), 256)),
-                                        usd: None,
-                                        unavailable: false,
-                                    },
-                                });
+                    Some(scope) => {
+                        if let Some(first) =
+                            account_shared_with(&mut account_first_env, name, &scope.account)
+                        {
+                            usage.account_shared_with = Some(first);
+                        } else {
+                            let mut account = SpritesAccountUsage {
+                                since: since.clone(),
+                                cpu_hours: 0.0,
+                                gb_hours: 0.0,
+                                partial: false,
+                                reported: false,
+                                error: None,
+                            };
+                            match crate::agent::block_on_provider(|| async {
+                                provider.account_usage_since(&since).await
+                            }) {
+                                Ok(reading) => {
+                                    account.cpu_hours = finite_cpu_hours(reading.usage.cpu_seconds);
+                                    account.gb_hours =
+                                        finite_gb_hours(reading.usage.reserved_gb_hours);
+                                    account.partial = reading.usage.partial;
+                                    account.reported = reading.reported;
+                                }
+                                Err(error) => {
+                                    account.error = Some(sanitize_text(&format!("{error:#}"), 256));
+                                }
+                            }
+                            usage.account = Some(account);
+                        }
+                        match thegn_svc::sprites::ledger::owned(&scope) {
+                            Err(error) => {
+                                usage.error = Some(sanitize_text(&format!("{error:#}"), 256))
+                            }
+                            Ok(view) => {
+                                for rec in view.recorded {
+                                    let start = unix_to_rfc3339(
+                                        thegn_svc::sprites::usage::usage_window_start(
+                                            rec.created_at,
+                                        ),
+                                    );
+                                    let read = crate::agent::block_on_provider(|| async {
+                                        provider.usage_reading_since(&rec.name, &start).await
+                                    });
+                                    usage.rows.push(match read {
+                                        Ok(Some(reading)) => {
+                                            sprites_row(&rec.name, &rec.state, &reading, price)
+                                        }
+                                        Ok(None) => SpritesUsageRow {
+                                            name: rec.name.clone(),
+                                            status: rec.state.clone(),
+                                            cpu_hours: 0.0,
+                                            gb_hours: 0.0,
+                                            partial: false,
+                                            reported: false,
+                                            last_recorded_at: None,
+                                            error: None,
+                                            usd: None,
+                                            unavailable: true,
+                                        },
+                                        Err(error) => SpritesUsageRow {
+                                            name: rec.name.clone(),
+                                            status: rec.state.clone(),
+                                            cpu_hours: 0.0,
+                                            gb_hours: 0.0,
+                                            partial: false,
+                                            reported: false,
+                                            last_recorded_at: None,
+                                            error: Some(sanitize_text(&format!("{error:#}"), 256)),
+                                            usd: None,
+                                            unavailable: false,
+                                        },
+                                    });
+                                }
                             }
                         }
-                    },
+                    }
                 }
             }
             _ => {
@@ -214,6 +284,19 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
     (!out.is_empty()).then_some(out)
 }
 
+fn finite_cpu_hours(cpu_seconds: f64) -> f64 {
+    let cpu_hours = cpu_seconds / 3600.0;
+    if cpu_hours.is_finite() {
+        cpu_hours
+    } else {
+        0.0
+    }
+}
+
+fn finite_gb_hours(gb_hours: f64) -> f64 {
+    if gb_hours.is_finite() { gb_hours } else { 0.0 }
+}
+
 fn sprites_row(
     name: &str,
     status: &str,
@@ -221,17 +304,8 @@ fn sprites_row(
     price: Option<f64>,
 ) -> SpritesUsageRow {
     let u = &reading.usage;
-    let cpu_hours = u.cpu_seconds / 3600.0;
-    let cpu_hours = if cpu_hours.is_finite() {
-        cpu_hours
-    } else {
-        0.0
-    };
-    let gb_hours = if u.reserved_gb_hours.is_finite() {
-        u.reserved_gb_hours
-    } else {
-        0.0
-    };
+    let cpu_hours = finite_cpu_hours(u.cpu_seconds);
+    let gb_hours = finite_gb_hours(u.reserved_gb_hours);
     SpritesUsageRow {
         name: name.to_string(),
         status: status.to_string(),
@@ -261,6 +335,26 @@ fn render_sprites(usage: &[SpritesUsage]) -> String {
             "sprites (usage from the Sprites API; unpriced): {}",
             env.env
         ));
+        if let Some(shared_with) = &env.account_shared_with {
+            out.push(format!("  account: same account as {shared_with}"));
+        } else if let Some(account) = &env.account {
+            if let Some(error) = &account.error {
+                out.push(format!(
+                    "  account usage unavailable: {}",
+                    sanitize_text(error, 256)
+                ));
+            } else if !account.reported {
+                out.push("  account: no usage reported yet".into());
+            } else {
+                out.push(format!(
+                    "  account (all sprites, since {}): CPU {:.2} h, {:.2} GB h{}",
+                    account.since,
+                    account.cpu_hours,
+                    account.gb_hours,
+                    if account.partial { " (partial)" } else { "" },
+                ));
+            }
+        }
         if let Some(error) = &env.error {
             out.push(format!("  unavailable: {}", sanitize_text(error, 256)));
             continue;
@@ -1077,6 +1171,8 @@ mod tests {
         vec![SpritesUsage {
             env: "sp".into(),
             error: None,
+            account: None,
+            account_shared_with: None,
             rows: vec![
                 sprites_row(
                     "tg-a",
@@ -1128,10 +1224,89 @@ mod tests {
     }
 
     #[test]
+    fn render_sprites_prints_the_account_row() {
+        let usage = vec![SpritesUsage {
+            env: "sp".into(),
+            error: None,
+            account: Some(SpritesAccountUsage {
+                since: "2026-01-01T00:00:00Z".into(),
+                cpu_hours: 12.5,
+                gb_hours: 6.25,
+                partial: false,
+                reported: true,
+                error: None,
+            }),
+            account_shared_with: None,
+            rows: Vec::new(),
+        }];
+
+        let text = render_sprites(&usage);
+        assert!(
+            text.contains(
+                "account (all sprites, since 2026-01-01T00:00:00Z): CPU 12.50 h, 6.25 GB h"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_sprites_prints_partial_account_row() {
+        let usage = vec![SpritesUsage {
+            env: "sp".into(),
+            error: None,
+            account: Some(SpritesAccountUsage {
+                since: "2026-01-01T00:00:00Z".into(),
+                cpu_hours: 1.0,
+                gb_hours: 2.0,
+                partial: true,
+                reported: true,
+                error: None,
+            }),
+            account_shared_with: None,
+            rows: Vec::new(),
+        }];
+
+        assert!(render_sprites(&usage).contains("GB h (partial)"));
+    }
+
+    #[test]
+    fn render_sprites_prints_unreported_account_row() {
+        let usage = vec![SpritesUsage {
+            env: "sp".into(),
+            error: None,
+            account: Some(SpritesAccountUsage {
+                since: "2026-01-01T00:00:00Z".into(),
+                cpu_hours: 0.0,
+                gb_hours: 0.0,
+                partial: false,
+                reported: false,
+                error: None,
+            }),
+            account_shared_with: None,
+            rows: Vec::new(),
+        }];
+
+        assert!(render_sprites(&usage).contains("account: no usage reported yet"));
+    }
+
+    #[test]
+    fn two_envs_on_one_account_read_it_once() {
+        let mut first = std::collections::BTreeMap::new();
+        assert_eq!(account_shared_with(&mut first, "sp", "acct-a"), None);
+        assert_eq!(
+            account_shared_with(&mut first, "sp-alt", "acct-a"),
+            Some("sp".to_string())
+        );
+        assert_eq!(account_shared_with(&mut first, "other", "acct-b"), None);
+    }
+
+    #[test]
     fn unreported_sprite_shows_dash_and_note() {
         let usage = vec![SpritesUsage {
             env: "sp".into(),
             error: None,
+            account: None,
+            account_shared_with: None,
             rows: vec![SpritesUsageRow {
                 name: "tg-late".into(),
                 status: "ready".into(),
@@ -1167,6 +1342,8 @@ mod tests {
         let usage = vec![SpritesUsage {
             env: "sp".into(),
             error: None,
+            account: None,
+            account_shared_with: None,
             rows: vec![
                 SpritesUsageRow {
                     name: "tg-good".into(),

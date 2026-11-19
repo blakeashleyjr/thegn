@@ -883,8 +883,14 @@ fn provider_enum_dispatch_against_mock() {
 fn ensure_exists_skips_when_present_creates_when_absent() {
     let mock = start_mock();
     let rt = rt();
-    // The list fixture returns ["tgtest1"], so ensure_exists for it is a no-op…
-    let present = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "tgtest1"));
+    // The list fixture returns ["tgtest1"], so seed the matching ledger record
+    // before ensure_exists proves it and treats it as a no-op…
+    let (present, ledger) = scoped(&mock.base_url, "tgtest1");
+    let mut intent =
+        thegn_svc::sprites::ledger::reserve_at(ledger.path(), &scope(), "tgtest1", 0).unwrap();
+    thegn_svc::sprites::ledger::commit_at(ledger.path(), &scope(), "tgtest1").unwrap();
+    intent.preserve();
+    let present = Provider::Sprites(present);
     assert!(
         !rt.block_on(present.ensure_exists("tgtest1")).unwrap(),
         "present ⇒ no create"
@@ -903,6 +909,40 @@ fn ensure_exists_skips_when_present_creates_when_absent() {
         .filter(|r| r.method == "POST" && r.path == "/v1/sprites")
         .count();
     assert_eq!(creates, 1, "create only for the absent sprite: {reqs:?}");
+}
+
+#[test]
+fn ensure_exists_refuses_a_listed_unrecorded_sprite() {
+    let mock = start_mock();
+    let (provider, _ledger) = scoped(&mock.base_url, "tgtest1");
+    let err = rt()
+        .block_on(Provider::Sprites(provider).ensure_exists("tgtest1"))
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("thegn env adopt"), "{err:#}");
+
+    let reqs = mock.recorded.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 1, "only the inventory GET is allowed: {reqs:?}");
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/v1/sprites");
+}
+
+#[test]
+fn ensure_exists_refuses_without_scope() {
+    let mock = start_mock();
+    let provider = SpritesProvider::new(&mock.base_url, "tok", "tgtest1");
+    let err = rt()
+        .block_on(Provider::Sprites(provider).ensure_exists("tgtest1"))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no controller id; refusing to use sprite tgtest1"),
+        "{err:#}"
+    );
+
+    let reqs = mock.recorded.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 1, "only the inventory GET is allowed: {reqs:?}");
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/v1/sprites");
 }
 
 #[test]
