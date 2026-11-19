@@ -509,8 +509,8 @@
       # CARGO_BUILD_JOBS headroom, pinned yazi, OpenSpec seeding). Used by BOTH the
       # full `default` shell and the trimmed `sprite-full` shell so they never drift.
       devShellHook = ''
-        # NOTE: this puts the DEBUG build on PATH, while `just live` runs the
-        # RELEASE build. The two age independently and both print the same
+        # NOTE: this puts the DEBUG build on PATH, while `just live` runs a
+        # release build of the dev instance. The two age independently and both print the same
         # `thegn --version` (the crate version rarely moves), so "I rebuilt it"
         # can be true of one and false of the other — that is how a v57 runtime
         # came to drive a v62 database for hours on 2026-08-29.
@@ -690,6 +690,19 @@
 
       # `nix fmt` formats every tracked file via treefmt.toml.
       formatter = treefmtWrapper;
+
+      # Stable from a published release archive, no local compile:
+      #   programs.thegn.package = inputs.thegn.legacyPackages.${system}.releasePackage inputs.thegn-release;
+      # where `thegn-release` is a `flake = false` input on the gnu archive of the same tag.
+      legacyPackages = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+        releasePackage = archive:
+          pkgs.callPackage ./nix/release-package.nix {
+            inherit archive yaziDeps;
+            yazi = yaziPinned;
+            src = thegnSrc;
+            version = cargoVersion;
+          };
+      };
 
       checks = {
         # `nix flake check` gates on a clean build, formatting, and clippy.
@@ -911,7 +924,7 @@
           # macOS (where the default ld64 is used instead).
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold]
           # Sandbox helpers thegn shells out to at runtime (`just live` runs
-          # the binary with this shell's PATH): `bwrap` for sandboxed panes and
+          # the dev instance's binary with this shell's PATH): `bwrap` for sandboxed panes and
           # `pasta` (passt) for the Lead's isolated network. Linux-only.
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.bubblewrap pkgs.passt]
           # Exact idle child-process counting for the Linux soak harness.

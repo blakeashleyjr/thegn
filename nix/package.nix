@@ -11,6 +11,8 @@
   # feature that pulls in no extra crates, so the artifacts are identical.
   cargoArtifacts,
   makeWrapper,
+  makeDesktopItem,
+  alacrittyConfig ? "${src}/config/alacritty.toml",
   # `installShellCompletion` (a setup hook) — used in postInstall to drop the
   # generated bash/zsh/fish scripts into the XDG dirs every shell already
   # searches. `stdenv` is only read for the cross-compilation guard.
@@ -77,6 +79,17 @@
     if isDev
     then "tg-dev"
     else "tg";
+  desktopItem = makeDesktopItem {
+    name = binName;
+    desktopName = if isDev then "thegn (dev channel)" else "thegn";
+    genericName = "Git Worktree IDE";
+    comment = "Terminal-native git-worktree IDE";
+    exec = "${binName}-standalone";
+    icon = "thegn";
+    terminal = false;
+    categories = ["Development"];
+    startupWMClass = binName;
+  };
 in
   craneLib.buildPackage {
     pname = binName;
@@ -119,6 +132,14 @@ in
 
       # Expose the pinned yazi under a thegn-private name for the file drawer.
       ln -s ${yazi}/bin/yazi $out/bin/thegn-yazi
+
+      ${lib.optionalString stdenv.hostPlatform.isLinux ''
+        install -Dm644 ${alacrittyConfig} $out/share/thegn/alacritty.toml
+        install -Dm644 ${src}/config/thegn.svg $out/share/icons/hicolor/scalable/apps/thegn.svg
+        substitute ${./thegn-standalone.sh} $out/bin/${binName}-standalone --subst-var-by out $out --subst-var-by bin ${binName}
+        chmod 755 $out/bin/${binName}-standalone
+        install -Dm644 ${desktopItem}/share/applications/${binName}.desktop -t $out/share/applications
+      ''}
 
       # Shell completions. The PACKAGER owns delivery: an install gives working
       # `${binName}` and `${aliasName}` completions in bash/zsh/fish with no
@@ -171,6 +192,7 @@ in
       # (git/lazygit/delta/gh/gdu) regardless of the user's PATH.
       wrapProgram $out/bin/${binName} \
         --set THEGN_YAZI_BIN ${yazi}/bin/yazi \
+        ${lib.optionalString stdenv.hostPlatform.isLinux "--set-default THEGN_ALACRITTY_CONFIG $out/share/thegn/alacritty.toml"} \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}${sandboxArgs}${bridgeArgs}
     '';
 
