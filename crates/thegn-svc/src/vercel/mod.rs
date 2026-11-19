@@ -45,6 +45,19 @@ const RESUME_BUDGET: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The captured-output cap of a one-shot command.
 const EXEC_OUT_CAP: usize = 4 << 20;
+
+fn append_vercel_stderr(mut out: String, code: i32, stderr: &str) -> String {
+    if code == 0 || stderr.is_empty() {
+        return out;
+    }
+    out.push_str(&format!(
+        "\n[stderr, last {} bytes]\n{}",
+        stderr.len(),
+        stderr
+    ));
+    out
+}
+
 /// The legal vCPU counts.
 const LEGAL_VCPUS: [u32; 6] = [1, 2, 4, 8, 16, 32];
 
@@ -129,6 +142,17 @@ trait Api: Send + Sync {
         body: &'a serde_json::Value,
         out_cap: usize,
     ) -> BoxFuture<'a, Result<(i32, Vec<u8>)>>;
+    fn run_wait_with_stderr<'a>(
+        &'a self,
+        session: &'a str,
+        body: &'a serde_json::Value,
+        out_cap: usize,
+    ) -> BoxFuture<'a, Result<(i32, Vec<u8>, String)>> {
+        Box::pin(async move {
+            let (code, out) = self.run_wait(session, body, out_cap).await?;
+            Ok((code, out, String::new()))
+        })
+    }
     fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>>;
     fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
     /// The current session's usage (a GET; never resumes).
@@ -182,6 +206,16 @@ impl Api for client::VercelClient {
         out_cap: usize,
     ) -> BoxFuture<'a, Result<(i32, Vec<u8>)>> {
         Box::pin(client::VercelClient::run_wait(self, session, body, out_cap))
+    }
+    fn run_wait_with_stderr<'a>(
+        &'a self,
+        session: &'a str,
+        body: &'a serde_json::Value,
+        out_cap: usize,
+    ) -> BoxFuture<'a, Result<(i32, Vec<u8>, String)>> {
+        Box::pin(client::VercelClient::run_wait_with_stderr(
+            self, session, body, out_cap,
+        ))
     }
     fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(client::VercelClient::snapshots_for(self, name))
@@ -767,8 +801,12 @@ impl VercelProvider {
     ) -> Result<(i32, String)> {
         let body = self.command_body(argv, cwd, env, true)?;
         let session = self.session_for(name, wake).await?;
-        let (code, out) = self.api().run_wait(&session, &body, EXEC_OUT_CAP).await?;
-        Ok((code, String::from_utf8_lossy(&out).into_owned()))
+        let (code, out, stderr) = self
+            .api()
+            .run_wait_with_stderr(&session, &body, EXEC_OUT_CAP)
+            .await?;
+        let out = String::from_utf8_lossy(&out).into_owned();
+        Ok((code, append_vercel_stderr(out, code, &stderr)))
     }
 
     /// Delete the sandbox, then every snapshot of it (404-tolerant). Never
@@ -1158,5 +1196,15 @@ mod tests {
         assert!(!format!("{:?}", provider.spec).contains("vcp_secret_value"));
         let owned = provider.with_owner("wt-1".into());
         assert_eq!(owned.owner(), Some("wt-1"));
+    }
+
+    #[test]
+    fn append_vercel_stderr_only_on_failure() {
+        assert_eq!(append_vercel_stderr("out".into(), 0, "err"), "out");
+        assert_eq!(append_vercel_stderr("out".into(), 1, ""), "out");
+        assert_eq!(
+            append_vercel_stderr("out".into(), 1, "err"),
+            "out\n[stderr, last 3 bytes]\nerr"
+        );
     }
 }

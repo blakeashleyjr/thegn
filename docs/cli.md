@@ -171,8 +171,8 @@ dry run by default and prints names, ages, tags and a cost estimate.
 A partial or unknown listing refuses `--apply`. It never runs automatically.
 See [Vercel sandboxes](help/vercel-sandbox.md).
 
-`thegn env reap --provider sprites [--apply] [--yes] [--json]` is the Sprites
-counterpart. It lists orphans, sprites past `max_lifetime_secs` and sprites
+`thegn env reap --provider sprites [--apply | --unrecorded] [--yes] [--json]` is the Sprites
+counterpart (`--unrecorded` is a read-only listing that refuses `--apply`). It lists orphans, sprites past `max_lifetime_secs` and sprites
 "not recorded by this host", and `--apply` destroys only sprites the local
 ledger recorded (never an unrecorded one). `thegn agent run --wait --pull` runs
 `env pull` for the worktree after the agent exits. See

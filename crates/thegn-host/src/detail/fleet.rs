@@ -256,10 +256,12 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
     secs.push(heading(
         "provider VMs",
         Some(format!(
-            "{} listed · {} orphan · {} missing · read {age_note} ago",
+            "{} listed · {} orphan · {} missing · {} down · {} unrecorded · read {age_note} ago",
             view.rows.len(),
             view.orphans,
-            view.missing.len()
+            view.missing.len(),
+            view.down.len(),
+            view.unrecorded,
         )),
     ));
 
@@ -285,6 +287,7 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
             };
             let worktree = match &row.worktree {
                 Some(wt) => text(clip_start(wt, WORKTREE_COLS), dim()),
+                None if row.unrecorded => text("UNRECORDED", dim()),
                 None => text("ORPHAN", Tok::Hue(Hue::Amber)),
             };
             rows.push(vec![
@@ -412,7 +415,7 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
 #[cfg(test)]
 mod tests {
     use super::{
-        BudgetLevel, Cell, DetailAction, Hue, MAX_ROWS, Section, Tok, UnicodeWidthStr,
+        BudgetLevel, Cell, DetailAction, Hue, MAX_ROWS, S, Section, Tok, UnicodeWidthStr,
         build_sections, clip_start, confirm_menu, confirm_text, fleet_down_argv, fleet_down_tag,
         refresh_open, started_status, stop_for_tag,
     };
@@ -571,12 +574,13 @@ mod tests {
                 env: "do".into(),
                 reason: "unavailable: no token".into(),
             }],
+            ..FleetView::default()
         };
         let secs = build_sections(&snap(view), NOW).sections;
         let lines = texts(&secs);
         assert_eq!(
             lines[0],
-            "provider VMs: 2 listed · 1 orphan · 1 missing · read 1m ago"
+            "provider VMs: 2 listed · 1 orphan · 1 missing · 0 down · 0 unrecorded · read 1m ago"
         );
         assert_eq!(
             lines[1],
@@ -602,6 +606,44 @@ mod tests {
             "orphan: not bound to a worktree; remove it with the provider's console"
         )));
         assert_theme_tokens_only(&secs);
+    }
+
+    #[test]
+    fn down_and_unrecorded_counts_are_neutral() {
+        let mut unrecorded = row("tg-unrecorded", None);
+        unrecorded.unrecorded = true;
+        let view = FleetView {
+            rows: vec![unrecorded],
+            unrecorded: 1,
+            down: vec![RecordedSandbox {
+                worktree: "/wt/down".into(),
+                provider: "fly".into(),
+                env: "fly-dev".into(),
+                id: "tg-down".into(),
+            }],
+            ..FleetView::default()
+        };
+        let detail = build_sections(&snap(view), NOW);
+        let lines = texts(&detail.sections);
+        assert!(lines[0].contains("1 down · 1 unrecorded"), "{lines:?}");
+        let Section::Table(table) = detail
+            .sections
+            .iter()
+            .find(|section| matches!(section, Section::Table(_)))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let cell = table
+            .rows
+            .iter()
+            .flatten()
+            .find_map(|cell| match cell {
+                Cell::Text(label, tone) if label == "UNRECORDED" => Some(tone),
+                _ => None,
+            })
+            .expect("unrecorded worktree marker");
+        assert_eq!(*cell, Tok::Slot(S::Dim));
     }
 
     #[test]

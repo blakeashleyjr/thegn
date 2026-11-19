@@ -34,7 +34,7 @@ use thegn_core::vercel::usage::{SessionUsage, SnapshotUsage};
 
 use super::VercelToken;
 use crate::provider::{
-    CONTROL_BODY_LIMIT, CONTROL_GATE, EXEC_EXIT_STATUS_UNKNOWN, FILE_TRANSFER_TIMEOUT,
+    CONTROL_BODY_LIMIT, CONTROL_GATE, EXEC_EXIT_STATUS_UNKNOWN, FILE_TRANSFER_TIMEOUT, StderrTail,
     authority_key, provider_http_client, redacted_transport_error, response_json, transient_err,
     transient_status, validate_api_base,
 };
@@ -441,15 +441,15 @@ impl VercelClient {
     // --- commands -----------------------------------------------------------
 
     /// Run a command and wait (`wait: true` is forced), streaming the NDJSON
-    /// body. Returns `(exit, last out_cap stdout bytes)`; stderr is not kept. A
-    /// missing final exit gives [`EXEC_EXIT_STATUS_UNKNOWN`]; an `error` line or
-    /// a line over [`LOG_LINE_CAP`] is an error.
-    pub async fn run_wait(
+    /// body. Returns `(exit, last out_cap stdout bytes, sanitized stderr tail)`.
+    /// A missing final exit gives [`EXEC_EXIT_STATUS_UNKNOWN`]; an `error` line
+    /// or a line over [`LOG_LINE_CAP`] is an error.
+    pub async fn run_wait_with_stderr(
         &self,
         session: &str,
         body: &serde_json::Value,
         out_cap: usize,
-    ) -> Result<(i32, Vec<u8>)> {
+    ) -> Result<(i32, Vec<u8>, String)> {
         let p = policy("run command");
         let url = self.session_url(session, &["cmd"])?;
         let mut body = self.json_body(body, p.op)?;
@@ -472,6 +472,7 @@ impl VercelClient {
 
         let mut lines = LineSplitter::new(LOG_LINE_CAP);
         let mut out = TailBuffer::new(out_cap);
+        let mut stderr = StderrTail::default();
         let mut code: Option<i32> = None;
         loop {
             let chunk = resp
@@ -487,7 +488,7 @@ impl VercelClient {
             for line in complete {
                 match parse_log_line(&line) {
                     Ok(LogLine::Stdout(bytes)) => out.push(&bytes),
-                    Ok(LogLine::Stderr(_)) => {}
+                    Ok(LogLine::Stderr(bytes)) => stderr.push(&bytes),
                     Ok(LogLine::Command { exit_code, .. }) => {
                         if exit_code.is_some() {
                             code = exit_code;
@@ -507,7 +508,25 @@ impl VercelClient {
                 break;
             }
         }
-        Ok((code.unwrap_or(EXEC_EXIT_STATUS_UNKNOWN), out.into_vec()))
+        Ok((
+            code.unwrap_or(EXEC_EXIT_STATUS_UNKNOWN),
+            out.into_vec(),
+            stderr.render(),
+        ))
+    }
+
+    /// Run a command and wait (`wait: true` is forced), streaming the NDJSON
+    /// body. Returns `(exit, last out_cap stdout bytes)`; stderr is not kept.
+    /// A missing final exit gives [`EXEC_EXIT_STATUS_UNKNOWN`]; an `error` line
+    /// or a line over [`LOG_LINE_CAP`] is an error.
+    pub async fn run_wait(
+        &self,
+        session: &str,
+        body: &serde_json::Value,
+        out_cap: usize,
+    ) -> Result<(i32, Vec<u8>)> {
+        let (code, out, _) = self.run_wait_with_stderr(session, body, out_cap).await?;
+        Ok((code, out))
     }
 
     /// Start a detached command (`wait: false` is forced). Returns its id.

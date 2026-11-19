@@ -138,6 +138,14 @@ capture: while the compositor owns the alternate screen, stray writes to
 stderr are redirected to `thegn-stderr.log`, with the configured size cap.
 The bundle treats those as separate log sinks.
 
+The stdio bridge verbs keep stdout and stderr byte-for-byte clean. To capture
+their traces, set `THEGN_TRACE_FILE` to an absolute path and request a level
+with `THEGN_LOG` or `THEGN_LOG_LEVEL`; the file is append-only, owner-only,
+and is not rotated. The file's directory must already exist, be owned by you
+and be private (mode 0700), so use something like
+`~/.local/state/thegn/trace/` rather than `/tmp` itself. Invalid, relative, or
+unopenable paths are ignored.
+
 `thegn logs tail` replaces terminal control and formatting characters in each
 log line, while `thegn logs tail --json` escapes them, so hostile log messages
 cannot drive your terminal.
