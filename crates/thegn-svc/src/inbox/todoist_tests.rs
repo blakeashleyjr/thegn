@@ -38,7 +38,9 @@ fn http(status: &str, extra: &str, body: &str) -> String {
 }
 
 fn backend(base: &str) -> TodoistBackend {
-    // SAFETY-free: the env ref is resolved through the svc fallback.
+    // SAFETY: the key is unique to this test file (`_B163`), set to the same
+    // constant value on every call, and read only by this backend's own token
+    // resolution, so no other thread observes a changing value.
     unsafe { std::env::set_var("TODOIST_TEST_TOKEN_B163", TOKEN) };
     TodoistBackend::new(&InboxAccount {
         name: "t".into(),
