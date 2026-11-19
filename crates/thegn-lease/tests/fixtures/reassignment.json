@@ -1,0 +1,23 @@
+{
+  "previousEpoch": 6,
+  "deadlineMs": 100,
+  "ttlMs": 10,
+  "operations": [
+    ["claim", "A", 0, "leased"],
+    ["prepare", "A", 1, "ok"],
+    ["run", "A", 2, "ok"],
+    ["committing", "A", 3, "ok"],
+    ["commit", "A", 10, "expired"],
+    ["renew", "A", 10, "expired"],
+    ["expire", "A", 10, "ok"],
+    ["claim", "B", 11, "leased"],
+    ["renew", "A", 12, "fenced"],
+    ["prepare", "B", 12, "ok"],
+    ["run", "B", 13, "ok"],
+    ["committing", "B", 14, "ok"],
+    ["commit", "B", 15, "publish"],
+    ["commit", "A", 16, "fenced"],
+    ["commit", "B", 101, "replay"],
+    ["conflictingCommit", "B", 102, "conflict"]
+  ]
+}

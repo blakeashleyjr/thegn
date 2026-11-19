@@ -8019,6 +8019,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "thegn-cas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "prost",
+ "schemars",
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "thegn-core"
 version = "0.1.0-alpha.97"
 dependencies = [
@@ -8067,6 +8079,15 @@ dependencies = [
  "url",
  "walkdir",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "thegn-guest-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "protox",
 ]
 
 [[package]]
@@ -8130,6 +8151,27 @@ dependencies = [
  "url",
  "windows-sys 0.59.0",
  "zbus 5.19.0",
+]
+
+[[package]]
+name = "thegn-job-spec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "schemars",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "serde_path_to_error",
+ "thegn-cas",
+]
+
+[[package]]
+name = "thegn-lease"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
