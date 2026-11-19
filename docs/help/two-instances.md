@@ -10,15 +10,15 @@ You can run a **stable** thegn for your daily work and a **dev** thegn built
 from a checkout, side by side, as one user on one machine. The dev instance
 can be rebuilt and restarted freely without touching the stable one.
 
-| Item        | stable                                                         | dev                                                                          |
-| ----------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Binary      | the Nix/home-manager package (a published release)             | `~/.thegn-devel/bin/thegn` (`just live`) or `target/debug/thegn` (`just devel`) |
-| Launch      | `thegn` or the app launcher                                    | `just live` or `just devel`                                                  |
-| Config dir  | `~/.config/thegn`                                              | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`)                                   |
-| State       | the default state dir                                          | `~/.thegn-devel/state` (`XDG_STATE_HOME`)                                    |
-| Runtime     | the login runtime dir (not overridden)                         | the login runtime dir (not overridden)                                       |
-| `THEGN_DIR` | `~/.thegn`                                                     | `~/.thegn-devel/home`                                                        |
-| Channel     | stable                                                         | dev (`THEGN_CHANNEL=dev`)                                                    |
+| Item        | stable                                             | dev                                                                             |
+| ----------- | -------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Binary      | the Nix/home-manager package (a published release) | `~/.thegn-devel/bin/thegn` (`just live`) or `target/debug/thegn` (`just devel`) |
+| Launch      | `thegn` or the app launcher                        | `just live` or `just devel`                                                     |
+| Config dir  | `~/.config/thegn`                                  | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`)                                      |
+| State       | the default state dir                              | `~/.thegn-devel/state` (`XDG_STATE_HOME`)                                       |
+| Runtime     | the login runtime dir (not overridden)             | the login runtime dir (not overridden)                                          |
+| `THEGN_DIR` | `~/.thegn`                                         | `~/.thegn-devel/home`                                                           |
+| Channel     | stable                                             | dev (`THEGN_CHANNEL=dev`)                                                       |
 
 Each instance has its own daemon, database, worktrees and config.
 
