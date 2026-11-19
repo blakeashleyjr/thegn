@@ -12,6 +12,19 @@ All notable changes to **thegn** are documented here. The format follows
 - `just live` no longer touches the real installation: it builds if changed, installs to `~/.thegn-devel/bin/thegn` and starts the dev instance, keeping the dev daemon unless `--restart-daemon` is given. `--relink-launchers`, `--install-dir`, `--yes` and `--no-scope` are refused with a pointer at home-manager. The first dev launch seeds `~/.config/thegn-dev` from stable's `config.toml` with the serve and model-proxy ports shifted by +1.
 - Stable is installed from the published gnu release archive through `legacyPackages.<system>.releasePackage`; the home-manager module gains `manageConfig` (default `true`). The README, `RELEASING.md` and `thegn help two-instances` describe the new flow; `docs/live-upgrades.md` is now a short pointer.
 
+## [0.1.0-alpha.102] — 2026-11-19
+
+### Changed
+
+- The dev instance no longer overrides `XDG_RUNTIME_DIR`: its daemon socket moves beside the stable one under the login runtime dir and both mask it, and rootless podman shares the login runroot. `scripts/devel-launch.sh` scrubs pane identity from its environment and gains `--daemon` to start the dev daemon detached. New `just pipeline-tools` and `pipeline-tools-check` install and show the lint tools for pipeline workers (`.#lint-tools`). `thegn doctor` adds "runtime exposure" and "share teardowns pending" rows.
+- Fresh provider-placed worktrees can claim a warm spare (opt-in pool). `agent run` warns once when the agent CLI is missing in the sandbox, prints a progress line every 60 s under `--wait` on a terminal, adds exit hints for 75 and 127 (`exit_hint` in `--json`), and prints a wake notice when opening a sandbox takes over 3 s.
+- Vercel `env down` keeps the record until `GET` returns 404 (30 s proof); one exec may run up to 31 minutes, and a stream with no exit status is an error. `thegn doctor` remote rows add `placement`, `placement_warning`, `sandbox_agents`, `max_instances` and `max_lifetime_secs`.
+- Live scripts: sprites-live adds 4b, 10w and opt-in `--with-agent`; remote-daily adds 11m, 11k and 11j; vercel-live adds 3s, 7s and 4b. All stay plan-only without spend flags. Vercel live remains UNVERIFIED (THE-2234).
+
+### Fixed
+
+- A newly added project opens and its terminal is focused at once, instead of waiting for the next background refresh.
+
 ## [0.1.0-alpha.101] — 2026-11-19
 
 ### Changed
@@ -3940,7 +3953,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.102...HEAD
+[0.1.0-alpha.102]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...v0.1.0-alpha.102
 [0.1.0-alpha.101]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.100...v0.1.0-alpha.101
 [0.1.0-alpha.100]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.99...v0.1.0-alpha.100
 [0.1.0-alpha.99]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...v0.1.0-alpha.99
