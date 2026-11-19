@@ -9,6 +9,7 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Added
 
+- Sprites environments are now safer to run: thegn records a sprite in its ledger before creating it and deletes only sprites it recorded. `thegn env reap --provider sprites [--apply]` lists orphans, sprites past `max_lifetime_secs` and sprites "not recorded by this host" (older sprites, or ones made outside thegn, are never deleted by thegn; remove them with the Sprites CLI or dashboard). Headless work on a sprite holds it awake up to a ceiling (4 hours by default), `eager` no longer creates sprites in the background, `min_ram_gb` sets the memory limit, `fleet cost` gains a Sprites usage block, and `thegn agent run --wait --pull` pulls results back. Not yet verified against the live Sprites API.
 - `thegn repo forget` removes projects from a stopped instance's registry, for splitting one instance into two (see the `two-instances` help page). Name the projects to forget, or pass `--keep <PATH>` to forget every other one. It is a dry run unless you pass `--apply`, which backs the database up first. It refuses while the instance is running and never touches files, git worktrees or branches.
 
 ### Changed
