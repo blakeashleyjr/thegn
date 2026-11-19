@@ -147,7 +147,7 @@ if [ -d "$login_run" ] && [ -O "$login_run" ]; then
   runtime_dir="$login_run"
 else
   runtime_dir="$T/run"
-  printf 'net-trace: no login runtime dir; masks follow $T/run\n' >&2
+  printf 'net-trace: no login runtime dir; masks follow %s\n' "$T/run" >&2
 fi
 
 env_vars=(

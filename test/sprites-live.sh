@@ -72,7 +72,7 @@ sprites-live plan (nothing is created without both --env <name> and
 --i-accept-spend, plus THEGN_CHANNEL=dev)
 
 Will create : ONE sprite via the named [env.<name>] from your real config
-              (read-only), in a fresh state/runtime/THEGN_DIR and a scratch git
+              (read-only), in a fresh XDG_STATE_HOME and THEGN_DIR (login runtime dir kept) and a scratch git
               repo on branch sx/live-lane. No config is written.
 Max spend   : one sprite for the length of this run (about 15 minutes, incl. a
               420 s hold and 120 s idle); teardown destroys it.
