@@ -227,6 +227,12 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     if worktree_live(worktree) {
         return false;
     }
+    // Serialize warm claims per worktree across processes (TUI materialize vs a
+    // CLI `agent run`): the binding check below and the publish are not atomic.
+    let Ok(_claim_lease) = crate::pool_lease::pool_lease(worktree, "\u{0}worktree-claim") else {
+        tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, "warm claim skipped: another claim for this worktree is in flight");
+        return false;
+    };
     let db = thegn_core::db::Db::open().ok(); // best-effort: cache: the git fallback below decides liveness
     let repo_root = db
         .as_ref()
@@ -1162,6 +1168,17 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn claim_lease_is_exclusive_per_worktree() {
+        let _held =
+            crate::pool_lease::pool_lease("/w", "\u{0}worktree-claim").expect("first claim lease");
+        assert!(matches!(
+            crate::pool_lease::pool_lease("/w", "\u{0}worktree-claim"),
+            Err(crate::pool_lease::LeaseError::Busy)
+        ));
+        assert!(crate::pool_lease::pool_lease("/other", "\u{0}worktree-claim").is_ok());
+    }
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
