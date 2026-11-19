@@ -40,7 +40,7 @@ pub(crate) fn lines(rows: &[thegn_svc::vpn::PendingTeardownRow], errors: &[Strin
         let target = row.worktree.as_deref().unwrap_or(&row.container);
         for port in &row.ports {
             lines.push(thegn_svc::lsp::sanitize_for_terminal(&format!(
-                "  share teardown  {target}: tailscale serve port {port} still pending; retry with thegn share stop {port} --worktree {target}"
+                "  share teardown  {target}: tailscale serve port {port} still pending; retry with `thegn share stop <local port>` (see `thegn share list`)"
             )));
         }
     }
@@ -77,7 +77,7 @@ mod tests {
         assert_eq!(
             lines(&rows, &[]),
             vec![
-                "  share teardown  /work/tree: tailscale serve port 443 still pending; retry with thegn share stop 443 --worktree /work/tree"
+                "  share teardown  /work/tree: tailscale serve port 443 still pending; retry with `thegn share stop <local port>` (see `thegn share list`)"
             ]
         );
     }
