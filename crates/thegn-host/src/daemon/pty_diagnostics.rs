@@ -3,9 +3,18 @@
 
 use std::path::{Path, PathBuf};
 
-fn path_in(root: &Path, daemon: &str, session: &str) -> PathBuf {
+fn dir_in(root: &Path) -> PathBuf {
     root.join("thegn/pty-shutdown")
-        .join(format!("{daemon}-{session}.json"))
+}
+
+fn path_in(root: &Path, daemon: &str, session: &str) -> PathBuf {
+    dir_in(root).join(format!("{daemon}-{session}.json"))
+}
+
+/// The directory holding every pty-shutdown note (`<daemon>-<session>.json`).
+/// `state_gc` prunes it; nothing else lives there.
+pub(crate) fn root_dir() -> PathBuf {
+    dir_in(&state_root())
 }
 
 #[cfg(not(test))]
@@ -51,8 +60,16 @@ pub(crate) fn record(
 
 #[cfg(test)]
 mod tests {
-    use super::{path_in, record, state_root};
+    use super::{path_in, record, root_dir, state_root};
     use std::path::Path;
+
+    #[test]
+    fn root_dir_is_the_parent_of_every_record_path() {
+        assert_eq!(
+            path_in(&state_root(), "d", "s").parent(),
+            Some(root_dir().as_path())
+        );
+    }
 
     fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
         payload
