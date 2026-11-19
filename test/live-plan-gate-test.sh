@@ -55,7 +55,11 @@ if [ "${STUB_MODE:-}" = continue ]; then
     exit 0
     ;;
   "fleet cost"*)
-    echo '{"sprites_usage":[{"env":"sx","error":null,"rows":[{"name":"sp-live","cpu_hours":0.0,"partial":false}]}]}'
+    if [ "${STUB_COST_REPORTED_FALSE:-}" = 1 ]; then
+      echo '{"sprites_usage":[{"env":"sx","error":null,"rows":[{"name":"sp-live","cpu_hours":0.0,"partial":false,"reported":false}]}]}'
+    else
+      echo '{"sprites_usage":[{"env":"sx","error":null,"rows":[{"name":"sp-live","cpu_hours":0.0,"partial":false}]}]}'
+    fi
     exit 0
     ;;
   *"--hold"*) /usr/bin/sleep 2; exit 0 ;;
@@ -129,7 +133,7 @@ if rc_is plan-sprites-keep-going 0 && [ ! -s "$T/plan-sprites-keep-going.log" ] 
 else
   fail "sprites-live: --keep-going plan ($(cat "$T/plan-sprites-keep-going.out"))"
 fi
-for want in "--keep-going" "view.rows" "6c " "8c " "cpu_hours" "zero usage (partial or not)" "FAILED STEPS:"; do
+for want in "--keep-going" "view.rows" "6c " "THE-2450" "8c " "cpu_hours" "zero usage (partial or not)" "FAILED STEPS:"; do
   if has "$T/plan-sprites-live.out" "$want"; then
     pass "sprites-live plan names '$want'"
   else
@@ -231,6 +235,15 @@ if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
   pass "sprites-live: --keep-going records a failure, continues, and avoids repeat force-down"
 else
   fail "sprites-live: --keep-going acting run ($(cat "$T/keep-going-sprites.out"))"
+fi
+
+run reported-false-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_COST_REPORTED_FALSE=1 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if ! rc_is reported-false-sprites 0 &&
+  has "$T/reported-false-sprites.out" "WARN 10: no usage reported yet (the Sprites usage API has no record for this sprite yet)"; then
+  pass "sprites-live: fleet cost warns when usage is not reported"
+else
+  fail "sprites-live: reported false usage ($(cat "$T/reported-false-sprites.out"))"
 fi
 
 # Every acting run must clean up its temp state (nothing was created).
