@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.103] — 2026-11-19
+
 ### Changed
 
 - `just live` no longer touches the real installation: it builds if changed, installs to `~/.thegn-devel/bin/thegn` and starts the dev instance, keeping the dev daemon unless `--restart-daemon` is given. `--relink-launchers`, `--install-dir`, `--yes` and `--no-scope` are refused with a pointer at home-manager. The first dev launch seeds `~/.config/thegn-dev` from stable's `config.toml` with the serve and model-proxy ports shifted by +1.
@@ -3953,7 +3955,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.102...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.103...HEAD
+[0.1.0-alpha.103]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.102...v0.1.0-alpha.103
 [0.1.0-alpha.102]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...v0.1.0-alpha.102
 [0.1.0-alpha.101]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.100...v0.1.0-alpha.101
 [0.1.0-alpha.100]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.99...v0.1.0-alpha.100
