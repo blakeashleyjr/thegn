@@ -18,6 +18,308 @@ use thegn_core::issue::{AgentDispatchStatus, Issue, IssuePatch, NewDispatch};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{AutopilotStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
 
+/// The `autopilot.run` rule action (THE-2196): run autopilot for the issue
+/// an `issue_matched` event names. Returns a one-line summary.
+///
+/// The automation runtime already admitted the budget (`autopilot.run` maps
+/// to a new lane) and wrote the run row, so this path does NOT call
+/// [`admit_pickup`]. The repo's `[autopilot]` policy applies with `enabled`
+/// forced for this call (`max_concurrent`, `max_attempts` and the agent are
+/// kept); the rule's predicate replaces `trigger_label` / `pickup_status`.
+/// The worker keeps the sealed autopilot sandbox.
+pub(crate) fn run_from_rule(
+    cfg: &Config,
+    event: &thegn_core::automation::AutomationEvent,
+) -> anyhow::Result<String> {
+    let (facts, repo) = rule_target(event)?;
+    let cwd = std::path::PathBuf::from(repo);
+    let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+    let issue = rule_issue(cfg, &repo_root, &cwd, facts)?;
+    let scheduled = pickup_inner(
+        cfg,
+        &repo_root,
+        &cwd,
+        &facts.account,
+        &facts.provider,
+        std::slice::from_ref(&issue),
+        facts.assigned_to_me,
+        PickupEntry::Rule,
+    );
+    anyhow::ensure!(
+        scheduled > 0,
+        "autopilot.run did not schedule {} (pickup held or no background slot)",
+        facts.issue_id
+    );
+    Ok(format!(
+        "autopilot scheduled {}:{}:{} in {}",
+        facts.provider,
+        facts.account,
+        facts.issue_id,
+        repo_name(&repo_root)
+    ))
+}
+
+/// The issue facts and repo an `autopilot.run` event must carry.
+fn rule_target(
+    event: &thegn_core::automation::AutomationEvent,
+) -> anyhow::Result<(&thegn_core::automation::IssueFacts, &str)> {
+    let facts = event
+        .issue
+        .as_ref()
+        .context("autopilot.run requires event.issue")?;
+    let repo = event
+        .repo
+        .as_deref()
+        .filter(|repo| !repo.trim().is_empty())
+        .context("autopilot.run requires event.repo")?;
+    anyhow::ensure!(
+        !facts.issue_id.trim().is_empty()
+            && !facts.provider.trim().is_empty()
+            && !facts.account.trim().is_empty(),
+        "autopilot.run requires the issue's provider, account and id"
+    );
+    Ok((facts, repo))
+}
+
+/// The issue an `autopilot.run` names: from the repo's issue cache by id,
+/// else read through the account-scoped tracker router.
+fn rule_issue(
+    cfg: &Config,
+    repo_root: &Path,
+    cwd: &Path,
+    facts: &thegn_core::automation::IssueFacts,
+) -> anyhow::Result<Issue> {
+    use thegn_core::store::CacheStore;
+    let db = Db::open().context("opening the durable database")?;
+    for key in [cwd, repo_root] {
+        let cached = db
+            .get_issue_cache(&key.to_string_lossy(), &facts.provider, &facts.account)
+            .ok()
+            .flatten()
+            .and_then(|(json, _)| thegn_core::issue::IssueCacheEntry::parse(&json));
+        if let Some(issue) = cached
+            .into_iter()
+            .flat_map(|entry| entry.issues)
+            .find(|issue| issue.id == facts.issue_id)
+        {
+            return Ok(issue);
+        }
+    }
+    let tracker_cfg = tracker_config_for_account(cfg, repo_root, &facts.account);
+    let router = autopilot_issue_router(
+        &tracker_cfg,
+        cwd,
+        &facts.account,
+        crate::plugin_providers::issue_backends(),
+    );
+    anyhow::ensure!(
+        router.is_configured(),
+        "no tracker route for autopilot account {}",
+        facts.account
+    );
+    let detail = thegn_svc::issue::block_on_tracker(router.get_issue(&facts.issue_id))
+        .map_err(|error| anyhow::anyhow!("issue runtime build failed: {error}"))?
+        .map_err(|error| anyhow::anyhow!("reading issue {}: {error}", facts.issue_id))?;
+    anyhow::ensure!(
+        detail.issue.id == facts.issue_id,
+        "tracker returned a different issue for {}",
+        facts.issue_id
+    );
+    Ok(detail.issue)
+}
+
+/// The repo's display name: the main checkout's directory name.
+fn repo_name(repo_root: &Path) -> String {
+    repo_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo_root.to_string_lossy().into_owned())
+}
+
+/// The read-only rule id autopilot's pickups are audited under
+/// (`automations.list` synthesizes the matching row).
+pub(crate) fn autopilot_rule_id(repo_root: &Path) -> String {
+    format!("{AUTOPILOT_RULE_PREFIX}{}", repo_name(repo_root))
+}
+
+/// The id prefix of the synthesized autopilot rules; `automations.rm/put/
+/// enable` refuse it.
+pub(crate) const AUTOPILOT_RULE_PREFIX: &str = "autopilot:";
+
+/// Why [`admit_pickup`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickupRefusal {
+    /// Automation is paused (or the flag is unreadable): no row.
+    Paused,
+    /// A durable autopilot row already exists for the issue, so the claim
+    /// could only lose: no row, no budget read (keeps the audit quiet).
+    AlreadyClaimed,
+    /// Over budget: retried on the next refresh.
+    Budget(String),
+    /// The audit row could not be written: refused (fail closed).
+    Unrecorded(String),
+}
+
+impl std::fmt::Display for PickupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paused => f.write_str("automation is paused"),
+            Self::AlreadyClaimed => f.write_str("issue already has an autopilot run"),
+            Self::Budget(reason) => f.write_str(reason),
+            Self::Unrecorded(error) => write!(f, "autopilot run row not written: {error}"),
+        }
+    }
+}
+
+/// Admit one autopilot pickup against the automation policy plane
+/// (THE-2196): refused while automation is paused, refused over the
+/// `[automations]` budgets (a new lane), else an `automation_runs` row is
+/// started and its id returned. The claim result finishes the row
+/// ([`finish_pickup_row`]). A refusal leaves the issue unclaimed, so the next
+/// tracker refresh offers it again (level-triggered).
+pub(crate) fn admit_pickup(
+    cfg: &Config,
+    repo_root: &Path,
+    issue_key: &AutopilotIssueKey,
+) -> Result<i64, String> {
+    let db = Db::open().map_err(|error| format!("opening the durable database: {error}"))?;
+    let budgets = thegn_core::automation_budget::Budgets::from_config(&cfg.effective_automations());
+    admit_pickup_at(
+        &db,
+        &budgets,
+        repo_root,
+        issue_key,
+        thegn_core::util::now_ms(),
+    )
+    .map_err(|refusal| {
+        if let PickupRefusal::Budget(reason) = &refusal {
+            warn_budget_throttled(issue_key, reason, std::time::Instant::now());
+        }
+        refusal.to_string()
+    })
+}
+
+/// [`admit_pickup`] over an open DB with explicit limits and clock.
+fn admit_pickup_at(
+    db: &Db,
+    budgets: &thegn_core::automation_budget::Budgets,
+    repo_root: &Path,
+    issue_key: &AutopilotIssueKey,
+    now_ms: i64,
+) -> Result<i64, PickupRefusal> {
+    use thegn_core::store::AutomationStore;
+    if thegn_core::automation_control::paused_fail_closed(db) {
+        return Err(PickupRefusal::Paused);
+    }
+    // Best effort: a row this listing misses still reaches the claim, which
+    // loses and finishes the run row `skipped`.
+    if db
+        .list_autopilot_runs(&repo_root.to_string_lossy(), 1_000)
+        .is_ok_and(|runs| runs.iter().any(|run| &run.key == issue_key))
+    {
+        return Err(PickupRefusal::AlreadyClaimed);
+    }
+    crate::automation_budget::admit_at(
+        db,
+        budgets,
+        now_ms,
+        thegn_core::automation_budget::SpawnKind::NewLane,
+    )
+    .map_err(|refusal| PickupRefusal::Budget(refusal.to_string()))?;
+    let event_key = pickup_event_key(issue_key);
+    db.start_automation_run(&thegn_core::store::NewAutomationRun {
+        rule_id: autopilot_rule_id(repo_root),
+        event_id: event_key.clone(),
+        event_key,
+        trigger_kind: "issue_matched".into(),
+        event_summary: "autopilot pickup".into(),
+        action_cap: "autopilot.run".into(),
+        action_summary: "claim and start an autopilot worker".into(),
+        started_at: now_ms / 1000,
+        autonomy: Some("review".into()),
+    })
+    .map_err(|error| PickupRefusal::Unrecorded(format!("{error:#}")))
+}
+
+fn pickup_event_key(key: &AutopilotIssueKey) -> String {
+    format!("issue:{}:{}:{}", key.provider, key.account, key.issue_id)
+}
+
+/// Finish an admitted pickup's run row: `succeeded` when the claim won (the
+/// worker is started on it), `skipped` with `reason` otherwise.
+fn finish_pickup_row(db: &Db, row: Option<i64>, claimed: bool, reason: &str) {
+    use thegn_core::store::AutomationStore;
+    let Some(id) = row else { return };
+    let (outcome, skip) = if claimed {
+        ("succeeded", None)
+    } else {
+        ("skipped", Some(reason))
+    };
+    if let Err(error) = db.finish_automation_run(id, outcome, skip, None, thegn_core::util::now()) {
+        tracing::warn!(
+            target: "thegn::autopilot",
+            error = %format!("{error:#}"),
+            "could not finish the autopilot run row"
+        );
+    }
+}
+
+/// [`finish_pickup_row`] opening its own DB (the refresh thread's path).
+fn finish_pickup_row_open(row: Option<i64>, reason: &str) {
+    if row.is_none() {
+        return;
+    }
+    match Db::open() {
+        Ok(db) => finish_pickup_row(&db, row, false, reason),
+        Err(error) => tracing::warn!(
+            target: "thegn::autopilot",
+            error = %error,
+            "could not open the database to finish an autopilot run row"
+        ),
+    }
+}
+
+/// One budget-refusal warn per issue per hour: autopilot is level-triggered,
+/// so a refused issue is re-offered on every refresh.
+fn warn_budget_throttled(key: &AutopilotIssueKey, reason: &str, now: std::time::Instant) {
+    if budget_warn_due(&pickup_event_key(key), now) {
+        tracing::warn!(
+            target: "thegn::autopilot",
+            issue = %key.issue_id,
+            %reason,
+            "autopilot pickup refused by the automation budget; retrying on a later refresh"
+        );
+    }
+}
+
+const BUDGET_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+fn budget_warn_due(key: &str, now: std::time::Instant) -> bool {
+    static LAST: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Bound the map: drop entries whose hour has passed.
+    last.retain(|_, at| now.saturating_duration_since(*at) < BUDGET_WARN_EVERY);
+    if last.contains_key(key) {
+        return false;
+    }
+    last.insert(key.to_owned(), now);
+    true
+}
+
+/// Which entry reached [`pickup_inner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickupEntry {
+    /// A tracker refresh (UI or daemon): policy predicate, then admission.
+    Refresh,
+    /// An `autopilot.run` rule action: already matched and admitted by the
+    /// automation runtime.
+    Rule,
+}
+
 /// Run the pickup/implement/PR path for one successful provider refresh.
 /// `from_assignee_me` is provenance from the authenticated provider filter;
 /// it is deliberately not inferred from display names in an issue payload.
@@ -38,6 +340,7 @@ pub(crate) fn pickup(
         provider,
         issues,
         from_assignee_me,
+        PickupEntry::Refresh,
     );
 }
 
@@ -46,8 +349,7 @@ pub(crate) fn pickup(
 /// does not run for the same refresh; the durable `claim_autopilot_slots`
 /// CAS still makes a racing pickup a no-op. The worker keeps the sealed
 /// autopilot sandbox (`sealed_autopilot_sandbox`), exactly like the UI entry.
-/// Note (THE-2196): autopilot runs are not counted against any budget today,
-/// from either entry; this entry deliberately does not change that.
+/// Every pickup passes the automation pause and budgets ([`admit_pickup`]).
 pub(crate) fn pickup_from_daemon(
     cfg: &Config,
     repo_root: &Path,
@@ -65,11 +367,17 @@ pub(crate) fn pickup_from_daemon(
         provider,
         issues,
         from_assignee_me,
+        PickupEntry::Refresh,
     );
 }
 
-/// The shared pickup body: hold check, then a background permit, then the
-/// durable claim, in that order, for every entry.
+/// The shared pickup body: hold check, then admission (pause + budget + run
+/// row), then a background permit, then the durable claim, in that order,
+/// for every entry. Returns how many workers were scheduled.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared body receives the complete refresh context"
+)]
 fn pickup_inner(
     cfg: &Config,
     repo_root: &Path,
@@ -78,30 +386,50 @@ fn pickup_inner(
     provider: &str,
     issues: &[Issue],
     from_assignee_me: bool,
-) {
-    let policy = cfg.repo_autopilot(repo_root);
+    entry: PickupEntry,
+) -> usize {
+    let mut policy = cfg.repo_autopilot(repo_root);
+    if entry == PickupEntry::Rule {
+        // An explicit `autopilot.run` rule action: the rule's predicate
+        // already matched; the repo policy's limits and agent still apply.
+        policy.enabled = true;
+    }
     if !policy.enabled {
-        return;
+        return 0;
     }
     if let Some(reason) = autopilot_pickup_hold() {
         tracing::warn!(target: "thegn::autopilot", %reason, "autopilot pickup held");
-        return;
+        return 0;
     }
+    let mut scheduled = 0;
     for issue in issues {
-        if !matches_issue(
-            issue,
-            &policy.trigger_label,
-            policy.pickup_status,
-            from_assignee_me,
-        ) {
+        if entry == PickupEntry::Refresh
+            && !matches_issue(
+                issue,
+                &policy.trigger_label,
+                policy.pickup_status,
+                from_assignee_me,
+            )
+        {
             continue;
         }
+        let key = AutopilotIssueKey::new(provider, account, issue.id.clone());
+        // The automation policy plane: paused or over budget skips the issue
+        // unclaimed (a later refresh retries). A rule action was admitted by
+        // the automation runtime, which also wrote its run row.
+        let run_row = match entry {
+            PickupEntry::Refresh => match admit_pickup(cfg, repo_root, &key) {
+                Ok(row) => Some(row),
+                Err(_) => continue,
+            },
+            PickupEntry::Rule => None,
+        };
         // Reserve a background slot before claiming; refusal here leaves the
         // issue unclaimed for a later refresh to retry.
         let Some(permit) = crate::sched::bg_permit() else {
+            finish_pickup_row_open(run_row, "no background slot");
             continue;
         };
-        let key = AutopilotIssueKey::new(provider, account, issue.id.clone());
         let cfg = cfg.clone();
         let policy = policy.clone();
         let repo_root = repo_root.to_path_buf();
@@ -109,7 +437,7 @@ fn pickup_inner(
         let account = account.to_owned();
         let issue = issue.clone();
         let repo_root_s = repo_root.to_string_lossy().into_owned();
-        crate::sched::report_reserved(crate::sched::spawn_bg_reserved(permit, move || {
+        let admission = crate::sched::spawn_bg_reserved(permit, move || {
             let db = match Db::open() {
                 Ok(db) => db,
                 Err(e) => {
@@ -131,20 +459,43 @@ fn pickup_inner(
                 thegn_core::util::now_ms(),
             ) {
                 Ok(thegn_core::store::ClaimOutcome::Claimed(run)) => run,
-                Ok(_) => return,
+                Ok(lost) => {
+                    finish_pickup_row(&db, run_row, false, claim_lost_reason(&lost));
+                    return;
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "thegn::autopilot",
                         error = %e,
                         "autopilot claim failed"
                     );
+                    finish_pickup_row(&db, run_row, false, "claim failed");
                     return;
                 }
             };
+            finish_pickup_row(&db, run_row, true, "");
             drive_claim(
                 &db, &cfg, &policy, &repo_root, &cwd, &account, &issue, claim.id,
             );
-        }));
+        });
+        if admission == crate::sched::Admission::Admitted {
+            scheduled += 1;
+        } else {
+            finish_pickup_row_open(run_row, "background work not submitted");
+        }
+        crate::sched::report_reserved(admission);
+    }
+    scheduled
+}
+
+/// The run row's skip reason for a claim that did not win.
+fn claim_lost_reason(outcome: &thegn_core::store::ClaimOutcome) -> &'static str {
+    use thegn_core::store::ClaimOutcome;
+    match outcome {
+        ClaimOutcome::Claimed(_) => "",
+        ClaimOutcome::AlreadyClaimed => "already_claimed",
+        ClaimOutcome::AtCapacity => "at_capacity",
+        ClaimOutcome::AttemptsExhausted => "attempts_exhausted",
     }
 }
 
@@ -1110,6 +1461,10 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
+        AUTOPILOT_RULE_PREFIX, BUDGET_WARN_EVERY, PickupRefusal, admit_pickup_at,
+        autopilot_rule_id, budget_warn_due, finish_pickup_row, rule_target, run_from_rule,
+    };
+    use super::{
         autopilot_backend_is_isolated, autopilot_issue_router, autopilot_pickup_hold,
         base_has_commits, commits_ahead, issue_prompt, needs_human_overwrites, pr_opened_reason,
         record_pr_open, record_worker_result, sealed_autopilot_sandbox, tracker_config_for_account,
@@ -1117,6 +1472,7 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
+    use thegn_core::autopilot::AutopilotIssueKey;
     use thegn_core::db::Db;
     use thegn_core::issue::{AgentDispatchStatus as Status, IssueFilter, NewDispatch};
     use thegn_core::sandbox::Backend;
@@ -1208,18 +1564,196 @@ mod tests {
                 entry_body.contains(concat!("pickup_", "inner(")),
                 "{entry} must delegate to the shared pickup body"
             );
+            assert!(
+                entry_body.contains(concat!("PickupEntry::", "Refresh")),
+                "{entry} must take the admitted refresh path"
+            );
             assert!(!entry_body.contains(concat!("bg_", "permit()")), "{entry}");
+            assert!(
+                !entry_body.contains(concat!("admit_", "pickup(")),
+                "{entry}"
+            );
             assert!(
                 !entry_body.contains(concat!("claim_autopilot_", "slots(")),
                 "{entry}"
             );
         }
+        // The rule action reaches the same body and never claims on its own.
+        let rule = body(concat!("pub(crate) fn run_", "from_rule("));
+        assert!(rule.contains(concat!("pickup_", "inner(")));
+        assert!(!rule.contains(concat!("bg_", "permit()")));
+        assert!(!rule.contains(concat!("claim_autopilot_", "slots(")));
         let pickup = body(concat!("fn pickup_", "inner("));
         let hold = pickup.find(concat!("autopilot_", "pickup_hold()")).unwrap();
+        let admit = pickup.find(concat!("admit_", "pickup(")).unwrap();
         let permit = pickup.find(concat!("bg_", "permit()")).unwrap();
         let claim = pickup.find(concat!("claim_autopilot_", "slots(")).unwrap();
-        assert!(hold < permit);
-        assert!(permit < claim);
+        assert!(hold < admit, "the hold runs before admission");
+        assert!(admit < permit, "admission runs before the permit");
+        assert!(permit < claim, "the permit is held before the claim");
+        // A refused admission skips the issue: nothing after it runs.
+        let refused = &pickup[admit..permit];
+        assert!(refused.contains("Err(_) => continue"), "{refused}");
+    }
+
+    fn budgets(lanes: u32, spawns: u32) -> thegn_core::automation_budget::Budgets {
+        thegn_core::automation_budget::Budgets {
+            max_concurrent_lanes: lanes,
+            max_spawns_per_day: spawns,
+        }
+    }
+
+    const NOW_MS: i64 = 1_763_337_600_000;
+
+    fn key(issue: &str) -> AutopilotIssueKey {
+        AutopilotIssueKey::new("linear", "work", issue)
+    }
+
+    #[test]
+    fn admit_pickup_while_paused_writes_no_row() {
+        use thegn_core::store::AutomationStore;
+        let db = Db::open_memory().unwrap();
+        thegn_core::automation_control::set_paused(&db, true).unwrap();
+        assert_eq!(
+            admit_pickup_at(
+                &db,
+                &budgets(2, 12),
+                Path::new("/r/app"),
+                &key("T-1"),
+                NOW_MS
+            ),
+            Err(PickupRefusal::Paused)
+        );
+        assert!(db.automation_runs(None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn admit_pickup_over_budget_refuses_then_admits_once_budget_frees() {
+        use thegn_core::store::AutomationStore;
+        let db = Db::open_memory().unwrap();
+        let repo = Path::new("/r/app");
+        // One lane budget: the first pickup holds it while in flight.
+        let first = admit_pickup_at(&db, &budgets(1, 12), repo, &key("T-1"), NOW_MS).unwrap();
+        let refused = admit_pickup_at(&db, &budgets(1, 12), repo, &key("T-2"), NOW_MS);
+        assert!(
+            matches!(&refused, Err(PickupRefusal::Budget(reason)) if reason.contains("max_concurrent_lanes")),
+            "{refused:?}"
+        );
+        assert_eq!(db.automation_runs(None, 10).unwrap().len(), 1, "no row");
+        // The first pickup's claim lost: its row frees the lane, so the next
+        // refresh admits the refused issue.
+        finish_pickup_row(&db, Some(first), false, "already_claimed");
+        let second = admit_pickup_at(&db, &budgets(1, 12), repo, &key("T-2"), NOW_MS).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn admit_pickup_writes_a_run_row_and_the_claim_finishes_it() {
+        use thegn_core::store::AutomationStore;
+        let db = Db::open_memory().unwrap();
+        let id = admit_pickup_at(
+            &db,
+            &budgets(2, 12),
+            Path::new("/r/app"),
+            &key("T-1"),
+            NOW_MS,
+        )
+        .unwrap();
+        let row = db.automation_runs(None, 10).unwrap().remove(0);
+        assert_eq!(row.id, id);
+        assert_eq!(row.rule_id, "autopilot:app");
+        assert_eq!(row.trigger_kind, "issue_matched");
+        assert_eq!(row.action_cap, "autopilot.run");
+        assert_eq!(row.outcome, "started");
+        assert_eq!(row.event_key, "issue:linear:work:T-1");
+        assert_eq!(row.autonomy.as_deref(), Some("review"));
+        assert_eq!(row.finished_at, None);
+        finish_pickup_row(&db, Some(id), true, "");
+        let row = db.automation_runs(None, 10).unwrap().remove(0);
+        assert_eq!(row.outcome, "succeeded");
+        assert!(row.finished_at.is_some());
+
+        let lost = admit_pickup_at(
+            &db,
+            &budgets(2, 12),
+            Path::new("/r/app"),
+            &key("T-2"),
+            NOW_MS,
+        )
+        .unwrap();
+        finish_pickup_row(&db, Some(lost), false, "already_claimed");
+        let row = db
+            .automation_runs(None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == lost)
+            .unwrap();
+        assert_eq!(row.outcome, "skipped");
+        assert_eq!(row.skip_reason.as_deref(), Some("already_claimed"));
+    }
+
+    #[test]
+    fn admit_pickup_skips_an_issue_that_already_has_a_durable_run() {
+        use thegn_core::store::AutomationStore;
+        let db = Db::open_memory().unwrap();
+        let repo = Path::new("/r/app");
+        assert!(matches!(
+            db.claim_autopilot_slots(&key("T-1"), "/r/app", 2, 1, true, NOW_MS)
+                .unwrap(),
+            thegn_core::store::ClaimOutcome::Claimed(_)
+        ));
+        assert_eq!(
+            admit_pickup_at(&db, &budgets(9, 99), repo, &key("T-1"), NOW_MS),
+            Err(PickupRefusal::AlreadyClaimed)
+        );
+        assert!(db.automation_runs(None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn budget_warn_is_throttled_per_issue_per_hour() {
+        let start = std::time::Instant::now();
+        let issue = "issue:throttle-test:acct:T-1";
+        assert!(budget_warn_due(issue, start));
+        assert!(!budget_warn_due(
+            issue,
+            start + std::time::Duration::from_secs(60)
+        ));
+        assert!(budget_warn_due("issue:throttle-test:acct:T-2", start));
+        assert!(budget_warn_due(
+            issue,
+            start + BUDGET_WARN_EVERY + std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn run_from_rule_without_issue_facts_is_an_error() {
+        use thegn_core::automation::{AutomationEvent, AutomationEventKind, IssueFacts};
+        let cfg = thegn_core::config::Config::default();
+        let mut event = AutomationEvent::bare(AutomationEventKind::IssueMatched, "issue:x", 1);
+        event.repo = Some("/r/app".into());
+        let error = run_from_rule(&cfg, &event).unwrap_err().to_string();
+        assert!(error.contains("event.issue"), "{error}");
+        event.repo = None;
+        event.issue = Some(IssueFacts {
+            provider: "linear".into(),
+            account: "work".into(),
+            issue_id: "T-1".into(),
+            ..IssueFacts::default()
+        });
+        let error = run_from_rule(&cfg, &event).unwrap_err().to_string();
+        assert!(error.contains("event.repo"), "{error}");
+        event.repo = Some("/r/app".into());
+        event.issue.as_mut().unwrap().issue_id = String::new();
+        assert!(rule_target(&event).is_err());
+    }
+
+    #[test]
+    fn autopilot_rule_id_names_the_repo() {
+        assert_eq!(
+            autopilot_rule_id(Path::new("/src/thegn")),
+            "autopilot:thegn"
+        );
+        assert!(autopilot_rule_id(Path::new("/src/thegn")).starts_with(AUTOPILOT_RULE_PREFIX));
     }
 
     #[test]

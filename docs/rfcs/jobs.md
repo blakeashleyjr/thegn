@@ -4,6 +4,8 @@ Architecture proposal for review, 18 November 2026. The handoff settles the prod
 
 ## Release sequence
 
+The [agent tier and local-mode amendment](agent-tier-local-mode.md) extends this sequence with stock agent hosts, routed commands and expiring VM leases. Its first gate exercises the local Job through a stock harness. Its workspace protocol makes source changes available as fenced output for review or conditional application by the workspace owner.
+
 Ship a local Job that survives a daemon restart first. Then run the same job on SSH and a volume-backed Fly Machine. Publish the tested contract before the hosted control plane consumes it. The first hosted release has one qualified Kubernetes pool. The next release earns the multi-cloud claim by losing an entire pool during a run and recovering both execution and outputs.
 
 ### Phase 1 decisions for review
