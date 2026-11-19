@@ -253,6 +253,30 @@
       "summary": "Program storage exists; multi-repository navigation and feature-set workflows remain."
     },
     {
+      "change": "add-native-inbox",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2178",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2214",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2215",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2216",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Daemon-only native inbox (IMAP, Todoist, command), sanitized untrusted items, secret-ref credentials, baseline first poll, inbox_item rules and producers.status; live verification open."
+    },
+    {
       "change": "add-observability-dashboards",
       "lifecycle": "active",
       "disposition": "strategic-unstarted",
@@ -915,6 +939,18 @@
         }
       ],
       "summary": "Sandbox reporting must never claim more enforcement than is applied; authored in W0, implemented by WS01 items."
+    },
+    {
+      "change": "fold-autopilot-into-rules",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2196",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "autopilot.run rule action, synthesized autopilot:<repo> rule and budgets counting autopilot and Lead manual spawns; live verification open."
     },
     {
       "change": "harden-live-diagnostics-and-forge",
