@@ -24,8 +24,7 @@ cat >"$T/bin/thegn" <<'STUB'
 printf 'thegn %s\n' "$*" >>"$STUB_LOG"
 printf 'thegn-log %s\n' "${THEGN_LOG:-unset}" >>"$STUB_LOG"
 if [ "${THEGN_LOG:-}" = 'thegn::provider=trace' ]; then
-  mkdir -p "$XDG_STATE_HOME/thegn/logs"
-  printf '%s\n' '2026-11-19T00:00:00Z TRACE sprites exec frame' >>"$XDG_STATE_HOME/thegn/logs/thegn.log"
+  printf '%s\n' '2026-11-19T00:00:00Z TRACE sprites exec frame' >&2
 fi
 if [ "${1:-}" = doctor ] && [ -n "${STUB_DOCTOR:-}" ]; then
   cat "$STUB_DOCTOR"
@@ -42,7 +41,7 @@ if [ "${STUB_MODE:-}" = continue ]; then
     ;;
   "env pull") echo 'fast-forwarded sp-live'; exit 0 ;;
   "env down") rm -f "$XDG_STATE_HOME/thegn/vps/sp-live.json"; touch "$XDG_STATE_HOME/down"; exit 0 ;;
-  "env reap --provider sprites --unrecorded --json") echo '{"apply":false,"results":[]}'; exit 0 ;;
+  "env reap --provider sprites --unrecorded --json") echo '{"apply":false,"results":[],"accounts":[{"entries":[{"name":"sx-foreign","class":"unrecorded"}]}]}'; exit 0 ;;
   "env reap"*) echo '{"orphans":[]}'; exit 0 ;;
   "env deprovision"*) exit 0 ;;
   "fleet list"*)
@@ -220,6 +219,8 @@ if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
   has "$T/keep-going-sprites.out" "== step 13:" &&
   has "$T/keep-going-sprites.out" "trace log path:" &&
   has "$T/keep-going-sprites.out" "last 40 sprites exec frame lines:" &&
+  has "$T/keep-going-sprites.out" "TRACE sprites exec frame" &&
+  has "$T/keep-going-sprites.out" "unrecorded entries: 1" &&
   has "$T/keep-going-sprites.log" "thegn-log thegn::provider=trace" &&
   has "$T/keep-going-sprites.out" "FAILED STEPS:" &&
   ! has "$T/keep-going-sprites.log" "env down --force"; then
