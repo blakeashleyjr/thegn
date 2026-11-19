@@ -692,7 +692,8 @@ mod tests {
 
     #[test]
     fn window_around_uses_full_width_without_hit() {
-        let (l, pre, hit, s, r) = window_around(&"a".repeat(100), (0, 0), 40);
+        let line = "a".repeat(100);
+        let (l, pre, hit, s, r) = window_around(&line, (0, 0), 40);
         assert_eq!((l, pre, hit, r), (false, "", "", true));
         assert_eq!(s.len(), 39);
     }

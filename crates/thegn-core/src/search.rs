@@ -133,6 +133,8 @@ fn on_word_boundaries(line: &str, (s, e): (usize, usize)) -> bool {
 /// The label is whatever the host wants to display (tab name, worktree path, …).
 pub type SearchSource<'a> = (u32, &'a str, &'a HistoryBuffer);
 
+type RankedSearchHit = (usize, u32, Option<(usize, usize)>);
+
 /// Fuzzy search engine over one or more pane histories.
 ///
 /// Call [`SearchEngine::set_query`] (or the incremental `push_char`/`backspace`)
@@ -271,7 +273,7 @@ impl SearchEngine {
             return;
         }
 
-        let mut hits: Vec<(usize, u32, Option<(usize, usize)>)> = Vec::new();
+        let mut hits: Vec<RankedSearchHit> = Vec::new();
         match mode {
             MatchMode::Literal => {
                 for (i, f) in flat.iter().enumerate() {
