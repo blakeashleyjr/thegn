@@ -1324,6 +1324,7 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     // Lead tool surface (THE-2172). `approvals.resolve` is Admin and never an
     // MCP tool.
     "overview.get",
+    "producers.status", // b163: producer and inbox state (read).
     "notifications.list",
     "notifications.ack",
     "automations.put",
@@ -1335,8 +1336,7 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "merge.drain",
     // THE-2197: pausing is the Lead's kill switch; `automations.resume` is
     // Admin and never an MCP tool.
-    "automations.pause", // b163: producer and inbox state (read).
-    "producers.status",
+    "automations.pause",
 ];
 
 /// The injected data fetch: `(capability id, tool arguments) → payload JSON`.
