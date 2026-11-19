@@ -827,12 +827,49 @@ def command_report(args: argparse.Namespace) -> int:
     return 1 if drift else 0
 
 
+def command_context(args: argparse.Namespace) -> int:
+    """Locate one issue's checked-in evidence without contacting its tracker."""
+    issue = args.issue.upper()
+    if not re.fullmatch(r"THE-[1-9][0-9]*", issue):
+        print("Expected a Linear issue identifier such as THE-21.", file=sys.stderr)
+        return 2
+    try:
+        issues = load_json(args.root / args.issues)["issues"]
+        entries = load_json(args.root / args.index)["entries"]
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    row = next((item for item in issues if item["issue"] == issue), None)
+    print(f"{issue} — check Linear for current status and acceptance criteria.")
+    if row:
+        print(f"Project: {row['project']}")
+        if "no_spec_rationale" in row:
+            print(row["no_spec_rationale"])
+    for entry in entries:
+        if any(owner["issue"] == issue for owner in entry["owners"]):
+            directory = entry.get("archive_path") or f"openspec/changes/{entry['change']}"
+            print(f"{entry['lifecycle']}: {directory.rstrip('/')}/ — {entry['summary']}")
+            for spec in sorted((args.root / directory / "specs").glob("*/spec.md")):
+                canonical = Path("openspec/specs") / spec.parent.name / "spec.md"
+                if (args.root / canonical).is_file():
+                    print(f"  contract: {canonical}")
+    handoffs = Path(".thegn/pipeline") / issue
+    if (args.root / handoffs).is_dir():
+        print(f"Handoffs: {handoffs}/")
+    if not row:
+        print("Outside the reviewed active inventory. Look up the issue in Linear.")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--root", type=Path, default=ROOT)
     result.add_argument("--index", type=Path, default=INDEX)
     result.add_argument("--issues", type=Path, default=ISSUES)
     subcommands = result.add_subparsers(dest="command", required=True)
+    context = subcommands.add_parser("context", help="locate an issue's specs and handoffs")
+    context.add_argument("issue")
+    context.set_defaults(func=command_context)
     validate = subcommands.add_parser("validate", help="run the offline repository gate")
     validate.set_defaults(func=command_validate)
     report = subcommands.add_parser("report", help="derive current delivery totals")
