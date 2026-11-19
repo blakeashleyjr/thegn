@@ -454,12 +454,18 @@ impl SessionActor {
                     }
                     Some(SessionMsg::WatchOutput { re, reply }) => self.on_watch(*re, reply),
                     Some(SessionMsg::HistoryTail { reply }) => {
-                        let len = self.history.len();
-                        let start = len.saturating_sub(SNAPSHOT_HISTORY_LINES);
-                        let tail = (start..len)
-                            .filter_map(|i| self.history.get(i))
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let tail = self
+                            .emulator
+                            .scrollback_text(SNAPSHOT_HISTORY_LINES, true)
+                            .map(|lines| lines.join("\n"))
+                            .unwrap_or_else(|| {
+                                let len = self.history.len();
+                                let start = len.saturating_sub(SNAPSHOT_HISTORY_LINES);
+                                (start..len)
+                                    .filter_map(|i| self.history.get(i))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            });
                         // best-effort: the fork request may have timed out.
                         let _ = reply.send(tail);
                     }
@@ -1509,6 +1515,8 @@ pub(crate) fn snapshot_of(
     }
     let history_tail = if alt_screen {
         String::new()
+    } else if let Some(lines) = emu.scrollback_text(history_lines, false) {
+        lines.join("\n")
     } else {
         let total = history.len();
         let start = total.saturating_sub(history_lines);
@@ -2119,6 +2127,23 @@ mod tests {
             "no-history snapshot must omit the tail: {:?}",
             without.history_tail
         );
+    }
+
+    #[test]
+    fn snapshot_uses_grid_scrollback_when_available() {
+        let mut emu = AlacrittyEmulator::new(4, 20, 100);
+        for i in 1..=8 {
+            let ending = if i == 8 { "" } else { "\r\n" };
+            emu.advance(format!("grid-{i}{ending}").as_bytes());
+        }
+        let mut history = HistoryBuffer::new(100);
+        let mut partial = Vec::new();
+        let mut stripper = AnsiStripper::default();
+        feed_bytes_to_history(b"ring-only\n", &mut history, &mut partial, &mut stripper);
+
+        let snapshot = snapshot_of(&emu, &history, 2_000, 1);
+        assert!(snapshot.history_tail.contains("grid-1"));
+        assert!(!snapshot.history_tail.contains("ring-only"));
     }
 
     /// Resize policy: observers never resize the PTY; interactive attaches do.

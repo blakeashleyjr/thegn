@@ -979,7 +979,13 @@ impl PtyPane {
     /// snapshot; trailing blank lines are trimmed so a restored pane doesn't
     /// repaint a wall of emptiness.
     pub fn history_tail(&self, n: usize) -> String {
-        if n == 0 || self.history.is_empty() {
+        if n == 0 {
+            return String::new();
+        }
+        if let Some(lines) = self.emulator.scrollback_text(n, true) {
+            return lines.join("\n");
+        }
+        if self.history.is_empty() {
             return String::new();
         }
         let total = self.history.len();
