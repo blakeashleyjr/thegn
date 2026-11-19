@@ -130,9 +130,13 @@ class LiveTests(unittest.TestCase):
             self.settings()
 
     def test_dev_instance_shell_is_refused_with_a_fix(self):
-        for extra in ({"THEGN_CONFIG_DIR": str(self.root / "dev-config")}, {"THEGN_CHANNEL": "dev"}):
+        for extra in ({"THEGN_CONFIG_DIR": str(self.root / "dev-config")}, {"THEGN_DIR": str(self.home / ".thegn-devel/home")}):
             with self.subTest(extra=extra), self.assertRaisesRegex(live.Refusal, "another thegn instance.*outside that instance"):
                 self.settings(**extra)
+        try:
+            self.settings(THEGN_CHANNEL="dev")
+        except live.Refusal as error:
+            self.assertNotIn("another thegn instance", str(error))
 
     def test_every_refusal_says_what_to_do(self):
         allowed = ("run ", "stop", "remove", "replace", "copy", "rebuild", "relink", "commit", "check out",
@@ -841,8 +845,12 @@ class LiveTests(unittest.TestCase):
 
     def test_installation_ancestor_ignores_other_instances(self):
         other = self._other_binary()
-        dev_proc = self._fake_proc({50: ("thegn", 1, other, [str(other).encode()])}, self.root / "dev-proc")
+        dev_proc = self._fake_proc({50: ("thegn", 1, other, [str(other).encode()], self._env_of(self.root / "dev-state"))},
+                                   self.root / "dev-proc")
         self.assertIsNone(live.installation_ancestor(self.paths, dev_proc, start=50))
+        ours_proc = self._fake_proc({50: ("thegn", 1, other, [str(other).encode()], self._env_of(self.paths["state"].parent))},
+                                    self.root / "ours-proc")
+        self.assertEqual(live.installation_ancestor(self.paths, ours_proc, start=50), 50)
         target_proc = self._fake_proc({50: ("thegn", 1, self.paths["target"], [str(self.paths["target"]).encode()])},
                                       self.root / "target-proc")
         self.assertEqual(live.installation_ancestor(self.paths, target_proc, start=50), 50)

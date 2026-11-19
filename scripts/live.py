@@ -157,10 +157,24 @@ def _nearest_existing(path):
 
 
 def refuse_other_instance_env(env):
+    """Refuse a shell that belongs to another thegn instance (the devel one).
+
+    THEGN_CHANNEL is a feature switch on the SAME instance, never an instance,
+    so it is only reported, not refused on.
+    """
     config_dir = env.get("THEGN_CONFIG_DIR", "").strip()
     channel = env.get("THEGN_CHANNEL", "")
     state_home = env.get("XDG_STATE_HOME", "").strip()
-    if config_dir or channel == "dev":
+    config_home = env.get("XDG_CONFIG_HOME", "").strip()
+    default_config = (absolute(config_home) if config_home.startswith("/")
+                      else absolute(env.get("HOME", "/")) / ".config") / "thegn"
+    other_config = bool(config_dir) and absolute(config_dir) != default_config
+    devel_root = real_home() / ".thegn-devel"
+    devel_dirs = any(
+        value.startswith("/") and (absolute(value) == devel_root or devel_root in absolute(value).parents)
+        for value in (env.get(key, "").strip() for key in ("XDG_STATE_HOME", "XDG_RUNTIME_DIR", "THEGN_DIR"))
+    )
+    if other_config or devel_dirs:
         raise Refusal(
             "This shell targets another thegn instance "
             f"(THEGN_CONFIG_DIR={config_dir or 'unset'}, THEGN_CHANNEL={channel.strip() or 'unset'}, "
@@ -710,8 +724,9 @@ def thegn_ancestor(proc=Path("/proc"), start=None):
 def installation_ancestor(paths, proc=Path("/proc"), start=None):
     """The pid of this installation's `thegn`/`tg` ancestor, or None.
 
-    An unreadable executable is treated as ours: refusing to distinguish the
-    installation is safer than stopping a process that may own the upgrade.
+    An unreadable executable or environment, or a process under this
+    installation's state home, is treated as ours: the stop path signals any
+    `thegn` under that state home, so skipping it would kill the running pane.
     """
     pid = os.getppid() if start is None else start
     installed = {Path(paths[key]).resolve() for key in ("target", "previous")}
@@ -723,11 +738,17 @@ def installation_ancestor(paths, proc=Path("/proc"), start=None):
         except (OSError, Refusal):
             return None
         if comm(status_text) in THEGN_NAMES:
+            # Same rule as the stop path (`attribute`): keep walking only past a
+            # provably other instance, i.e. a foreign binary under another state
+            # home. Anything unreadable, or under this state home, is ours.
             try:
                 executable = os.readlink(proc / str(pid) / "exe").removesuffix(" (deleted)")
-                if Path(executable).resolve() in installed:
-                    return pid
             except OSError:
+                return pid
+            if Path(executable).resolve() in installed:
+                return pid
+            state = _process_state_home(proc / str(pid))
+            if state is None or state == Path(paths["state"]).parent:
                 return pid
         try:
             pid = int(_status_field(status_text, "PPid"))
