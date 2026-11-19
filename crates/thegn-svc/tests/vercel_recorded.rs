@@ -1,7 +1,9 @@
 //! Recorded-shape fixtures for the pure Vercel Sandbox response parsers.
 //!
-//! These fixtures are intentionally modeled response shapes, not live captures;
-//! see `fixtures/vercel/README.md`.
+//! UNVERIFIED: these fixtures are NOT captured from Vercel. They encode the
+//! shapes thegn's own parsers (thegn-core vercel/api.rs) expect, so they pin the
+//! client's assumptions, not the real API. Replace each with a captured body
+//! after THE-2234's first live run; see `fixtures/vercel/README.md`.
 
 use thegn_core::vercel::api::{
     LogLine, SessionStatus, parse_list_page, parse_log_line, parse_sandbox, parse_session_usage,
@@ -57,6 +59,9 @@ fn stopped_sandbox_has_no_session() {
 fn list_pages_carry_the_cursor() {
     let (items, next) = parse_list_page(&fixture("list_page.json")).unwrap();
     assert_eq!(items.len(), 2);
+    assert_eq!(items[0].status, SessionStatus::Running);
+    assert_eq!(items[1].status, SessionStatus::Stopped);
+    assert_eq!(items[1].session_id, None);
     assert_eq!(next.as_deref(), Some("cur_2"));
 
     let (items, next) = parse_list_page(&fixture("list_last.json")).unwrap();
@@ -73,6 +78,8 @@ fn session_usage_reads_cpu_memory_vcpus() {
     assert_eq!(usage.active_cpu_ms, Some(12000));
     assert_eq!(usage.memory_mb, Some(4096));
     assert_eq!(usage.vcpus, Some(2));
+    assert_eq!(usage.started_at_ms, Some(1_763_500_001_000));
+    assert_eq!(usage.stopped_at_ms, None);
 }
 
 #[test]
@@ -81,6 +88,9 @@ fn snapshots_skip_invalid_ids() {
 
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].id, "snap_1");
+    assert_eq!(snapshots[0].size_bytes, 1_048_576);
+    assert_eq!(snapshots[0].expires_at_ms, Some(1_766_000_000_000));
+    assert_eq!(snapshots[0].status, "created");
     assert_eq!(next, None);
 }
 
@@ -117,7 +127,7 @@ fn missing_name_is_refused() {
 
 #[test]
 fn capitalised_status_is_unknown_today() {
-    // THE-2234: status parsing is currently case-sensitive by design.
+    // THE-2234 hazard: status parsing is case-sensitive today; a capitalised status reads as Unknown. The fix is queued; update this test when it lands.
     let view = parse_sandbox(&fixture("sandbox_capitalised_status.json")).unwrap();
     assert_eq!(view.status, SessionStatus::Unknown);
 }
