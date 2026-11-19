@@ -2196,9 +2196,31 @@ fn doctor_json_reports_the_instance_identity() {
         "thegn_dir",
         "channel",
         "daemon_socket",
+        "runtime_dir",
     ] {
         assert!(instance[key].is_string(), "{key}: {}", instance[key]);
     }
+    assert!(instance["controller_id"].is_null() || instance["controller_id"].is_string());
+    assert!(instance["ports"].is_array());
+    for port in instance["ports"].as_array().unwrap() {
+        assert!(port["use"].is_string());
+        assert!(port["addr"].is_string());
+    }
+    assert_eq!(instance["shared"].as_array().unwrap().len(), 2);
+    assert!(
+        instance["shared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(serde_json::Value::is_string)
+    );
+    assert!(
+        instance["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(serde_json::Value::is_string)
+    );
     assert_eq!(instance["config_dir"], config_dir_str.as_str());
     assert_eq!(
         instance["state_dir"],
@@ -2218,6 +2240,58 @@ fn doctor_json_reports_the_instance_identity() {
         crate::channel_state::current().as_str()
     );
     instance_report(&Config::default());
+}
+
+#[cfg(test)]
+#[test]
+fn wayland_note_table() {
+    let missing = wayland_note(Some("wayland-0"), Some("/run/user/1000"), &|_| false);
+    assert!(missing.is_some());
+
+    assert!(
+        wayland_note(
+            Some("/run/user/1000/wayland-0"),
+            Some("/run/user/1000"),
+            &|_| false,
+        )
+        .is_none()
+    );
+    assert!(wayland_note(Some("wayland-0"), Some("/run/user/1000"), &|_| true).is_none());
+    assert!(wayland_note(Some("wayland-0"), None, &|_| false).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn controller_id_is_read_not_minted() {
+    let state = crate::testenv::IsolatedState::new();
+    let path =
+        thegn_svc::state_promote::state_root().join(thegn_svc::vps::controller::CONTROLLER_ID_FILE);
+    assert_eq!(read_controller_id(), None);
+    assert!(!path.exists());
+
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "0123456789abcdef0123456789abcdef\n").unwrap();
+    assert_eq!(read_controller_id().as_deref(), Some("01234567"));
+    drop(state);
+}
+
+#[cfg(test)]
+#[test]
+fn instance_ports_list_model_proxy_only_when_enabled() {
+    let mut cfg = Config::default();
+    assert_eq!(
+        instance_ports(&cfg),
+        vec![("thegn serve".into(), cfg.serve.bind.clone())]
+    );
+
+    cfg.model_proxy.enabled = true;
+    assert_eq!(
+        instance_ports(&cfg),
+        vec![
+            ("thegn serve".into(), cfg.serve.bind.clone()),
+            ("model proxy".into(), cfg.model_proxy.listen.clone()),
+        ]
+    );
 }
 
 /// `--json` twin of [`system_metrics_report`]: one object keyed by family with
@@ -2900,9 +2974,9 @@ fn db_space_suffix(
     }
 }
 
-/// Which thegn instance this is: the paths that tell a stable and a dev
-/// instance apart on one machine (binary, config dir, state dir, `THEGN_DIR`,
-/// channel, daemon socket). Read-only path resolution: never fails.
+/// Which thegn instance this is: the paths and resources that tell a stable
+/// and a dev instance apart on one machine. Read-only path resolution: never
+/// fails.
 struct InstanceInfo {
     binary: String,
     config_dir: String,
@@ -2910,12 +2984,85 @@ struct InstanceInfo {
     thegn_dir: String,
     channel: String,
     daemon_socket: String,
+    runtime_dir: String,
+    controller_id: Option<String>,
+    ports: Vec<(String, String)>,
+    notes: Vec<String>,
+}
+
+const INSTANCE_SHARED: [&str; 2] = ["thegn.slice CPU/memory cap", "keyring service \"thegn\""];
+
+fn read_controller_id() -> Option<String> {
+    let new =
+        thegn_svc::state_promote::state_root().join(thegn_svc::vps::controller::CONTROLLER_ID_FILE);
+    let legacy = thegn_core::util::thegn_dir().join(thegn_svc::vps::controller::CONTROLLER_ID_FILE);
+    for path in [new, legacy] {
+        let Ok(value) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Some(value[..8].to_string());
+        }
+    }
+    None
+}
+
+fn wayland_note(
+    display: Option<&str>,
+    runtime_dir: Option<&str>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    let display = display.filter(|display| !display.is_empty())?;
+    let runtime_dir = runtime_dir.filter(|runtime_dir| !runtime_dir.is_empty())?;
+    if !std::path::Path::new(display).is_relative() {
+        return None;
+    }
+    let socket = std::path::Path::new(runtime_dir).join(display);
+    if exists(&socket) {
+        return None;
+    }
+    let display = display
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(120)
+        .collect::<String>();
+    let runtime_dir = runtime_dir
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(120)
+        .collect::<String>();
+    Some(format!(
+        "WAYLAND_DISPLAY={display} is not under XDG_RUNTIME_DIR={runtime_dir}: wl-copy and wl-paste fail in this instance; start it with 'just devel' (which exports an absolute WAYLAND_DISPLAY) or set an absolute WAYLAND_DISPLAY"
+    ))
+}
+
+fn instance_ports(cfg: &Config) -> Vec<(String, String)> {
+    let mut ports = vec![("thegn serve".to_string(), cfg.serve.bind.clone())];
+    if cfg.model_proxy.enabled {
+        ports.push(("model proxy".to_string(), cfg.model_proxy.listen.clone()));
+    }
+    ports
 }
 
 fn instance_info(cfg: &Config) -> InstanceInfo {
     let binary = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("(unknown: {error})"));
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let notes = wayland_note(
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        runtime.as_deref(),
+        &|path| path.exists(),
+    )
+    .into_iter()
+    .collect();
     InstanceInfo {
         binary,
         config_dir: thegn_core::util::thegn_config_dir().display().to_string(),
@@ -2928,6 +3075,10 @@ fn instance_info(cfg: &Config) -> InstanceInfo {
         daemon_socket: crate::daemon::socket_path(&cfg.daemon)
             .display()
             .to_string(),
+        runtime_dir: runtime.unwrap_or_else(|| "(unset)".to_string()),
+        controller_id: read_controller_id(),
+        ports: instance_ports(cfg),
+        notes,
     }
 }
 
@@ -2941,6 +3092,22 @@ fn instance_report(cfg: &Config) {
     outln!("  THEGN_DIR     {}", info.thegn_dir);
     outln!("  channel       {}", info.channel);
     outln!("  daemon socket {}", info.daemon_socket);
+    outln!("  runtime dir   {}", info.runtime_dir);
+    match info.controller_id {
+        Some(id) => outln!("  controller id  {id}… (sandboxes this instance created carry it)"),
+        None => outln!("  controller id  (none yet)"),
+    }
+    for (label, addr) in &info.ports {
+        outln!("  port {label} {addr}");
+    }
+    outln!(
+        "  shared with other instances on this machine: {}, {}",
+        INSTANCE_SHARED[0],
+        INSTANCE_SHARED[1]
+    );
+    for note in &info.notes {
+        outln!("  note {note}");
+    }
     outln!("");
 }
 
@@ -2954,6 +3121,15 @@ fn instance_json(cfg: &Config) -> serde_json::Value {
         "thegn_dir": info.thegn_dir,
         "channel": info.channel,
         "daemon_socket": info.daemon_socket,
+        "runtime_dir": info.runtime_dir,
+        "controller_id": info.controller_id,
+        "ports": info
+            .ports
+            .into_iter()
+            .map(|(use_, addr)| serde_json::json!({ "use": use_, "addr": addr }))
+            .collect::<Vec<_>>(),
+        "shared": INSTANCE_SHARED,
+        "notes": info.notes,
     })
 }
 
