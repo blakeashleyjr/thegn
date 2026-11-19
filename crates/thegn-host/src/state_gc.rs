@@ -434,8 +434,6 @@ mod tests {
         );
     }
 
-    // Test-only: creating a symlink is platform API; the code under test is not.
-    #[cfg(unix)]
     #[test]
     fn list_files_skips_symlinks_and_never_touches_their_targets() {
         let state = crate::testenv::IsolatedState::new();
@@ -445,7 +443,9 @@ mod tests {
         std::fs::create_dir_all(&outside).expect("outside dir");
         let target = outside.join("real.json");
         touch(&target, NOW - 100 * DAY);
-        std::os::unix::fs::symlink(&target, dir.join("x.json")).expect("symlink");
+        if crate::platform::symlink_file_for_test(&target, &dir.join("x.json")).is_err() {
+            return;
+        }
 
         let (entries, _) = list_files(&dir, is_pty_note);
         assert!(entries.is_empty(), "{entries:?}");
