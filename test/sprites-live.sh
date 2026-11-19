@@ -96,7 +96,7 @@ Steps:
   9   after 120 s idle, fleet list --env shows warm or cold
   9b  /v1/tasks is empty
   10  fleet cost --json: print sprites_usage; error fails, cpu_hours > 0 passes,
-      or partial zero usage warns and passes
+      or zero usage (partial or not) warns and passes
   10b fleet list --env still shows warm or cold (the usage call did not wake it)
   11  env down                         11b fleet list puts this sprite in view.down,
       not view.missing (older binaries FAIL with "binary predates batch 170")
@@ -362,20 +362,27 @@ min_ram_shown() { # doctor reflects min_ram_gb=N as N*1024 MiB
 }
 
 interactive_tty() { # values reach script(1) via the environment, never the command text
-  local log_path frame_log_tail
+  local log_path frame_log_tail frame_count
   # shellcheck disable=SC2016 # fixed text; script(1)'s shell expands the env values
-  INTERACTIVE_OUT="$(LIVE_BIN="$THEGN_BIN" LIVE_SPRITE="$SPRITE_NAME" LIVE_TRACE="$TMP/sprite-exec-trace.log" SHELL=/bin/sh \
-    THEGN_LOG=thegn::provider=trace \
-    script -qec 'exec "$LIVE_BIN" sprite-exec "$LIVE_SPRITE" -- sh -c "tty && echo ok" 2>"$LIVE_TRACE"' /dev/null </dev/null)" || return 1
+  INTERACTIVE_OUT="$(LIVE_BIN="$THEGN_BIN" LIVE_SPRITE="$SPRITE_NAME" SHELL=/bin/sh \
+    THEGN_LOG=thegn::provider=trace THEGN_TRACE_FILE="$TMP/sprite-exec-trace.log" \
+    script -qec 'exec "$LIVE_BIN" sprite-exec "$LIVE_SPRITE" -- sh -c "tty && echo ok"' /dev/null </dev/null)" || return 1
   printf '%s\n' "$INTERACTIVE_OUT"
   log_path="$TMP/sprite-exec-trace.log"
   frame_log_tail=""
+  frame_count=0
   if [ -f "$log_path" ]; then
+    frame_count="$(grep -Fc 'sprites exec frame' "$log_path" || true)"
     frame_log_tail="$(grep -F 'sprites exec frame' "$log_path" | tail -n 40)" || true
   fi
   echo "   trace log path: $log_path"
-  echo "   last 40 sprites exec frame lines:"
-  printf '%s\n' "$frame_log_tail"
+  if [ "$frame_count" -eq 0 ]; then
+    echo "   trace: none (binary predates the bridge trace)"
+  else
+    echo "   trace lines: $frame_count"
+    echo "   last 40 sprites exec frame lines:"
+    printf '%s\n' "$frame_log_tail"
+  fi
   grep -Eq '/dev/pts/[0-9]+' <<<"$INTERACTIVE_OUT" && grep -q 'ok' <<<"$INTERACTIVE_OUT"
 }
 
@@ -479,7 +486,7 @@ except (KeyError, TypeError, ValueError):
 if not isinstance(usage, list) or not usage:
     print("fleet cost JSON sprites_usage is not a non-empty array", file=sys.stderr)
     sys.exit(1)
-partial_zero = False
+zero_usage = False
 for block in usage:
     print("   sprites_usage: " + json.dumps(block, sort_keys=True))
     if block.get("env") != os.environ["COST_ENV"]:
@@ -498,16 +505,16 @@ for block in usage:
     cpu_hours = row.get("cpu_hours")
     if isinstance(cpu_hours, (int, float)) and cpu_hours > 0:
         continue
-    if cpu_hours == 0 and row.get("partial") is True:
-        partial_zero = True
+    if cpu_hours == 0:
+        zero_usage = True
         continue
     print("fleet cost sprites_usage cpu_hours is not positive", file=sys.stderr)
     sys.exit(1)
 if not any(block.get("env") == os.environ["COST_ENV"] for block in usage):
     print("fleet cost sprites_usage has no block for env " + os.environ["COST_ENV"], file=sys.stderr)
     sys.exit(1)
-if partial_zero:
-    print("WARN 10: usage not reported yet (partial)")
+if zero_usage:
+    print("WARN 10: usage not reported yet for a sprite this young")
 '
 }
 
@@ -619,7 +626,7 @@ step 8b "local HEAD equals the commit made inside the sprite" pull_head_matches
 step 8c "refs/thegn/pull is empty after the clean fast-forward" pull_refs_empty
 step 9 "after 120 s idle the sprite is warm or cold" idle_warm_or_cold
 step 9b "/v1/tasks is empty" tasks_empty
-step 10 "fleet cost reports sprites_usage CPU hours or partial zero usage" cost_has_cpu
+step 10 "fleet cost reports sprites_usage CPU hours or zero usage (partial or not)" cost_has_cpu
 step 10b "fleet list still shows warm or cold after fleet cost" warm_or_cold
 step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" env down
 step 11b "ledger record gone; fleet list classifies the sprite as down, not missing" fleet_down_not_missing
