@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.99] — 2026-11-19
+
 ### Changed
 
 - Provider pull-back is journaled: a restart, `wt rm` or another process pulls a `data = "sync"` sandbox back using the journal, a failed pull keeps the sandbox, and `thegn doctor` shows a pending row. `sprite-exec` routes to the account that owns the sprite and refuses when ambiguous; `vercel-exec` capture mode refuses likewise. A failed Sprites one-shot exec appends the last 8 KiB of stderr. Not yet verified live.
@@ -3910,7 +3912,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.99...HEAD
+[0.1.0-alpha.99]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...v0.1.0-alpha.99
 [0.1.0-alpha.98]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.97...v0.1.0-alpha.98
 [0.1.0-alpha.97]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.96...v0.1.0-alpha.97
 [0.1.0-alpha.96]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...v0.1.0-alpha.96
