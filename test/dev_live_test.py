@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("dev_live_test", ROOT / "scripts/dev_live.py")
@@ -23,8 +23,9 @@ class DevLiveTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
 
     def git(self, *args):
-        return subprocess.run(["git", *args], cwd=self.repo, check=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=self.repo,
+                              check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=30)
 
     def make_repo(self):
         self.repo = self.root / "repo"
@@ -103,6 +104,7 @@ class DevLiveTests(unittest.TestCase):
             calls.append(repo)
             return built
 
+        execve_mock = MagicMock()
         common = [
             patch.object(live, "__file__", str(source_file)),
             patch.object(live, "real_home", return_value=home),
@@ -111,23 +113,24 @@ class DevLiveTests(unittest.TestCase):
             patch.object(live, "build", side_effect=fake_build),
             patch.object(live, "validate_config"),
             patch.object(live, "dev_daemons", return_value=[]),
-            patch.object(live.os, "execve"),
+            patch.object(live.os, "execve", new=execve_mock),
             patch.dict(live.os.environ, {"THEGN_SESSION_ID": ""}),
         ]
-        with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8]:
-            live.main(home=home)
         paths = live.dev_paths(home)
+        with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8]:
+            live.main([], home=home)
+        self.assertEqual(execve_mock.call_args.args[2]["THEGN_DEVEL_BIN"], str(paths["bin"]))
         self.assertEqual(len(calls), 1)
         self.assertEqual(paths["bin"].stat().st_mode & 0o777, 0o755)
         self.assertEqual(paths["record"].stat().st_mode & 0o777, 0o600)
         self.assertEqual(live.read_record(paths["record"])["sha256"], live.digest(paths["bin"]))
 
         with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8]:
-            live.main(home=home)
+            live.main([], home=home)
         self.assertEqual(len(calls), 1)
         (self.repo / "crates/a.rs").write_text("fn edited() {}\n")
         with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8]:
-            live.main(home=home)
+            live.main([], home=home)
         self.assertEqual(len(calls), 2)
 
     def test_removed_flags_are_refused(self):
@@ -163,7 +166,8 @@ class DevLiveTests(unittest.TestCase):
         getent.chmod(0o755)
         env = dict(os.environ, HOME=str(home), PATH=f"{stub}:{os.environ['PATH']}")
         output = subprocess.run(["bash", str(ROOT / "scripts/devel-launch.sh"), "--print-env"],
-                                env=env, check=True, stdout=subprocess.PIPE, text=True).stdout
+                                env=env, check=True, stdout=subprocess.PIPE, text=True,
+                                timeout=30).stdout
         launcher = {}
         for line in output.splitlines():
             if line.startswith("export "):
@@ -208,7 +212,7 @@ class DevLiveTests(unittest.TestCase):
                 patch.object(live, "validate_config"), patch.object(live, "install_binary"), patch.object(live, "dev_daemons", return_value=[]), \
                 patch.object(live.shutil, "which", return_value=None):
             with self.assertRaisesRegex(live.Refusal, "--here"):
-                live.main(home=home)
+                live.main([], home=home)
 
 
 if __name__ == "__main__":
