@@ -479,6 +479,140 @@ def retain_live_stages(paths, current=None):
             os.close(target_fd)
 
 
+BACKUP_KEEP = 3
+BACKUP_KEEP_DAYS = 7
+BACKUP_PREFIX = "live-backup-"
+MAX_BACKUP_DESCRIPTOR = 256 * 1024
+
+
+def _backup_completed_at(state_fd, name):
+    """mtime of a well-formed complete.json in one backup dir, else None.
+
+    Opened through descriptors without following links, so a symlinked dir or
+    descriptor never counts as complete (and is therefore never removed)."""
+    dir_fd = None
+    file_fd = None
+    try:
+        dir_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+        file_fd = os.open("complete.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        document = json.loads(read_fd_small(file_fd, MAX_BACKUP_DESCRIPTOR))
+        if not isinstance(document, dict) or not all(
+                isinstance(document.get(key), str) for key in ("binary_sha256", "database_sha256")):
+            return None
+        return info.st_mtime
+    except (OSError, Refusal, ValueError, UnicodeError):
+        return None
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
+def prune_backups(paths, current, now=time.time, keep=BACKUP_KEEP, keep_days=BACKUP_KEEP_DAYS):
+    """Delete old live-backup-* dirs in paths["state"].
+
+    Keep: `current`, the newest `keep` dirs that have a well-formed complete.json,
+    every dir younger than keep_days, and every dir without a readable
+    complete.json (failed or in-progress: it may be the only copy). Never follow
+    symlinks; only real dirs owned by this uid. Removal reuses the existing
+    bounded _remove_stage_tree walker (MAX_STAGE_ENTRIES), so a huge tree
+    aborts instead of blocking. Returns the removed paths.
+
+    A backup's age is the mtime of its complete.json (written once, at the end
+    of the backup), not the dir's, which later doctor/stderr files touch."""
+    state = paths["state"]
+    current_name = Path(current).name if current is not None and Path(current).parent == state else None
+    removed = []
+    state_fd = None
+    try:
+        state_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        state_info = os.fstat(state_fd)
+        if not stat.S_ISDIR(state_info.st_mode) or state_info.st_uid != os.getuid():
+            return removed
+        complete = []
+        with os.scandir(state_fd) as entries:
+            for index, entry in enumerate(entries, 1):
+                if index > MAX_STAGE_ENTRIES:
+                    return removed
+                if not entry.name.startswith(BACKUP_PREFIX) or entry.name == current_name:
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                    continue
+                completed = _backup_completed_at(state_fd, entry.name)
+                if completed is None:
+                    continue  # Failed or in progress: possibly the only copy.
+                complete.append((completed, entry.name, (info.st_dev, info.st_ino)))
+        complete.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
+        cutoff = now() - keep_days * 86400
+        for completed, name, expected in complete[keep:]:
+            if completed > cutoff:
+                continue
+            backup_fd = None
+            try:
+                backup_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+                info = os.fstat(backup_fd)
+                if (info.st_dev, info.st_ino) != expected or info.st_uid != os.getuid():
+                    continue
+                if not _validate_stage_tree(backup_fd, [0]):
+                    continue
+                _remove_stage_tree(backup_fd, [0])
+                again = os.stat(name, dir_fd=state_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(again.st_mode) or (again.st_dev, again.st_ino) != expected:
+                    continue
+                os.rmdir(name, dir_fd=state_fd)
+                removed.append(state / name)
+            except (FileNotFoundError, OSError, Refusal):
+                # A changed, oversized or unverifiable backup stays for an operator.
+                continue
+            finally:
+                if backup_fd is not None:
+                    os.close(backup_fd)
+    except OSError:
+        return removed
+    finally:
+        if state_fd is not None:
+            os.close(state_fd)
+    return removed
+
+
+SCOPE_PROBE_SECONDS = 5
+
+
+def scope_argv(target, env, which=shutil.which, run=subprocess.run):
+    """["systemd-run", "--user", "--scope", "--quiet", "--collect",
+        "-p", "CPUWeight=1000", "-p", "IOWeight=1000", "--", target] when
+    systemd-run exists and `systemd-run --user --scope --quiet true` succeeds
+    within 5 s; otherwise [target].
+
+    Why the weight helps: launched from a terminal, the UI shares that
+    terminal's cgroup with whatever builds run beside it (this very helper's
+    cargo, `just` recipes). Its own scope with CPU and IO weight 1000 (default
+    100) wins contention against them. Pane children that join `thegn.slice`
+    (weight 50) are unaffected; uncapped panes inherit the scope. `--scope`
+    execs in place, so the launched PID is thegn's own."""
+    target = str(target)
+    systemd_run = which("systemd-run", path=env.get("PATH"))
+    if not systemd_run:
+        return [target]
+    try:
+        probe = run([systemd_run, "--user", "--scope", "--quiet", "true"], env=env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=SCOPE_PROBE_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return [target]
+    if probe.returncode != 0:
+        return [target]
+    return [systemd_run, "--user", "--scope", "--quiet", "--collect",
+            "-p", "CPUWeight=1000", "-p", "IOWeight=1000", "--", target]
+
+
 def step(number, text):
     print(f"\n==> [{number}/{STEPS}] {text}", flush=True)
 
@@ -1239,6 +1373,8 @@ def main(argv=None):
     parser.add_argument("--relink-launchers", action="store_true",
                         help="Repoint ~/.local/bin/thegn at the install target and rewrite the old repo paths in "
                              "~/.local/bin/tg and tg-tui (a .bak copy is kept beside each)")
+    parser.add_argument("--no-scope", action="store_true",
+                        help="Launch thegn directly instead of in a systemd user scope with higher CPU/IO weight")
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(raw_argv)
     if not 1 <= args.size_mb <= 1024 or not 1 <= args.files <= 100:
@@ -1304,7 +1440,7 @@ def main(argv=None):
         # Every launcher change is validated before anything is stopped.
         relink = relink_plan(paths, home) if args.relink_launchers else []
         step(2, "Build (the running instance keeps working meanwhile)")
-        _stage, binary, record = build_stage(paths, env)
+        stage, binary, record = build_stage(paths, env)
         step(3, "Validate the configuration with the NEW build")
         validate_config(binary, env)
         step(4, "Stop the running thegn (controllers, then the pane daemon)")
@@ -1325,6 +1461,15 @@ def main(argv=None):
             directories(logs)  # Existing normal 0755 logs are under private state.
         with locked(Path(str(paths["database"]) + ".schema.lock"), schema=True):
             recovery = install(paths, binary, record, env)
+            # Still under the launcher and schema locks, and only after a
+            # successful install: this run's backup is `recovery` and is kept.
+            pruned = prune_backups(paths, recovery)
+            for path in pruned:
+                print(f"  removed old backup {path}")
+            print(f"  removed {len(pruned)} old backup(s) (kept the newest {BACKUP_KEEP}, those under "
+                  f"{BACKUP_KEEP_DAYS} days, incomplete ones and this run's)")
+            # Release stages that only the removed backups pinned.
+            retain_live_stages(paths, current=stage)
         print(f"  recovery (database backup + previous binary): {recovery}")
         if relink:
             try:
@@ -1346,7 +1491,11 @@ def main(argv=None):
             os.close(fd)
             raise Refusal("Reserved launch stderr file changed")
         with os.fdopen(fd, "wb") as stderr:
-            child = subprocess.Popen([str(paths["target"])], cwd=repo, env=child_env, stderr=stderr)
+            # A transient user scope gives the UI CPU/IO weight 1000 over builds
+            # in this terminal's cgroup (see scope_argv); falls back to a direct
+            # launch. systemd-run --scope execs in place: the PID is thegn's.
+            argv = [str(paths["target"])] if args.no_scope else scope_argv(paths["target"], child_env)
+            child = subprocess.Popen(argv, cwd=repo, env=child_env, stderr=stderr)
             while True:
                 try:
                     code = child.wait()
