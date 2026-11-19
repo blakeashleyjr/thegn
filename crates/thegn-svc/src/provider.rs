@@ -998,12 +998,23 @@ impl SpritesProvider {
     /// Drop `name`'s ledger record off the async runtime (best-effort: a
     /// leftover record only makes the reaper look again).
     async fn forget_record(&self, dir: &std::path::Path, name: &str) {
+        let Some(scope) = self.scope.clone() else {
+            tracing::warn!(target: "thegn::sprites", name, "sprites: no ownership scope; ledger record left alone");
+            return;
+        };
         let (dir, name) = (dir.to_path_buf(), name.to_string());
-        if let Err(error) =
-            tokio::task::spawn_blocking(move || crate::sprites::ledger::forget_at(&dir, &name))
-                .await
+        match tokio::task::spawn_blocking(move || {
+            crate::sprites::ledger::forget_at(&dir, &scope, &name)
+        })
+        .await
         {
-            tracing::warn!(target: "thegn::sprites", %error, "sprites: ledger cleanup worker failed");
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(target: "thegn::sprites", error = %format!("{error:#}"), "sprites: ledger record left in place");
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::sprites", %error, "sprites: ledger cleanup worker failed");
+            }
         }
     }
 
@@ -1205,7 +1216,6 @@ impl RemoteProvider for SpritesProvider {
                         Err(_) => false,
                     };
                     if gone {
-                        self.forget_record(&dir, id).await;
                         return Ok(());
                     }
                     return Err(refusal.context(format!("sprites: refusing to delete {id}")));
