@@ -130,8 +130,32 @@ pub(crate) fn shown_message<'a>(
             .get(&n.source_ref)
             .map(String::as_str)
             .unwrap_or("unverified request")
+    } else if let Some(account) = inbox_account(n) {
+        // The account shows as the row's chip; drop the `[account] ` prefix.
+        n.message
+            .strip_prefix(&format!("[{account}] "))
+            .unwrap_or(&n.message)
     } else {
         &n.message
+    }
+}
+
+/// The account of an `inbox_item` row, parsed from its `inbox:<account>:<id>`
+/// source ref (b163, THE-2214).
+fn inbox_account(n: &Notification) -> Option<&str> {
+    if n.kind != thegn_core::notification::NotificationKind::InboxItem {
+        return None;
+    }
+    thegn_core::inbox::parse_source_ref(&n.source_ref).map(|(account, _)| account)
+}
+
+/// The source column of a list row: an inbox row's `[account]` chip, else the
+/// raw source ref. Callers clip it through `display_clip`, which also strips
+/// control characters.
+fn row_source(n: &Notification) -> String {
+    match inbox_account(n) {
+        Some(account) => format!("[{account}]"),
+        None => n.source_ref.clone(),
     }
 }
 
@@ -220,7 +244,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             shown_message(&ctx.model.panel.approval_descriptions, n),
             msg_budget.max(4),
         );
-        let src = display_clip(&n.source_ref, 12);
+        let src = display_clip(&row_source(n), 12);
 
         // Read items dim to `faint` (still legible) so they read as handled
         // without becoming the grey-on-grey that `ghost*` text would.
@@ -331,7 +355,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             rows.push(approvals_header());
         }
         let ago = thegn_core::util::age(n.created_at_ms);
-        let src = display_clip(&n.source_ref, 14);
+        let src = display_clip(&row_source(n), 14);
         let msg_budget = ctx
             .cols
             .saturating_sub(kind_gh(n.kind).0.len() + 1 + src.len() + 3 + ago.len() + 1);
@@ -509,7 +533,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let ago = thegn_core::util::age(n.created_at_ms);
             let sel_mark = if i == cursor { "▶ " } else { "  " };
             let src_w = list_w.saturating_sub(4 + ago.len() + 1).max(4);
-            let src = display_clip(&n.source_ref, src_w);
+            let src = display_clip(&row_source(n), src_w);
             let (glyph_tok, src_tok) = if n.read {
                 (f(), f())
             } else {
@@ -637,6 +661,37 @@ mod tests {
             created_at_ms: 1,
             read: false,
             worktree_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn inbox_row_shows_an_account_chip_and_no_control_characters() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.notifications = vec![Notification {
+            id: 7,
+            kind: NotificationKind::InboxItem,
+            source_ref: "inbox:work:a1".into(),
+            message: "[work] Review\x1b]52;c;QQ==\x07 the PR\u{202e}".into(),
+            created_at_ms: thegn_core::util::now(),
+            read: false,
+            worktree_path: String::new(),
+        }];
+        let ui = crate::panel::PanelUi {
+            open: Section::Notifications,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 60,
+            rows: 20,
+        };
+        let text = rendered_text(&content(&ctx));
+        assert!(text.contains("[work]"), "{text}");
+        assert!(!text.contains("inbox:work"), "{text}");
+        assert_eq!(text.matches("[work]").count(), 1, "{text}");
+        for ch in ['\x1b', '\x07', '\u{202e}'] {
+            assert!(!text.contains(ch), "rendered text contains {ch:?}");
         }
     }
 
