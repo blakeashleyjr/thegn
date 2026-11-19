@@ -179,7 +179,10 @@ seed_config() {
     printf '# DEV instance config, seeded %s by scripts/devel-launch.sh from %s.\n' "$(date -u +%Y-%m-%d)" "$src"
     printf '# Only the dev instance reads it (THEGN_CONFIG_DIR). Ports are shifted by one; secrets/ and nix-signing/ were not copied.\n'
     if [ -r "$src" ]; then dev_ports <"$src"; else dev_ports </dev/null; fi
-  } >"$tmp" || { rm -f "$tmp"; exit 1; }
+  } >"$tmp" || {
+    rm -f "$tmp"
+    exit 1
+  }
   chmod 600 "$tmp" && mv -f "$tmp" "$cfg/config.toml"
   echo "devel-launch: seeded $cfg/config.toml from $src (review it; the keyring service is shared)" >&2
 }
