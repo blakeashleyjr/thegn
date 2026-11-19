@@ -75,6 +75,9 @@ notify = "8"
 futures-util = "0.3.32"
 # Native provider exec transport (Sprites WSS PTY exec — see provider::SpritesProvider).
 tokio-tungstenite.workspace = true
+# The read-only IMAP inbox backend (inbox/imap.rs): implicit TLS, webpki roots.
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
 rusty-s3 = "0.10"
 # iroh call-home reach: the compositor's home Endpoint (accept loop + per-sandbox
 # connection registry) and the exec surface bridged over iroh bi-streams.

@@ -147,6 +147,8 @@ pub fn rule(verb: Verb) -> Rule {
         | Verb::NotificationsList
         | Verb::AutomationsRuns
         | Verb::ApprovalsList
+        // b163: producer arming and scrubbed inbox account state.
+        | Verb::ProducersStatus
         | Verb::Me => Rule::Allow,
 
         // Data-only writes: thegn's own DB rows, tracker writes, owned
@@ -653,6 +655,7 @@ mod tests {
         (Verb::ApprovalsRedeem, Refuse),
         (Verb::AutomationsHalt, Refuse),
         (Verb::McpProxyProfileEnv, AllowIf),
+        (Verb::ProducersStatus, Allow),
     ];
 
     fn kind(r: Rule) -> Kind {

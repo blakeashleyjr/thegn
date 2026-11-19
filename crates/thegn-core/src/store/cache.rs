@@ -22,6 +22,21 @@ pub trait CacheStore {
     fn list_pr_cache(&self) -> Result<Vec<(String, String, i64)>>;
     /// Replace the PR-status cache for a worktree.
     fn put_pr_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()>;
+    /// Compare-and-swap write of a worktree's PR-status cache row.
+    ///
+    /// `expected` is the raw `(json, fetched_at)` the caller read via
+    /// [`CacheStore::get_pr_cache`] before it fetched: `None` inserts when
+    /// no row exists, or replaces a row `get_pr_cache` cannot read; `Some` replaces the row only while it still holds
+    /// exactly that `(json, fetched_at)`. Returns `true` iff this call wrote.
+    /// A `false` means another producer moved the row first, and that
+    /// producer (not this caller) owns the transition's events.
+    fn put_pr_cache_if(
+        &self,
+        worktree: &str,
+        branch: &str,
+        json: &str,
+        expected: Option<(&str, i64)>,
+    ) -> Result<bool>;
 
     /// CI run-history cache for a worktree: `(json, fetched_at)`.
     fn get_ci_cache(&self, worktree: &str) -> Result<Option<(String, i64)>>;

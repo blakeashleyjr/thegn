@@ -5,8 +5,8 @@
 //! whole registry runs in milliseconds and is safe from a subcommand.
 //!
 //! Seams are added here as they adopt `thegn_core::seam`; today the registry
-//! covers ci, forges, issues, calendar, weather, git, editor, files (the drawer
-//! file manager), sandbox, media and debug. A reserved selection reports
+//! covers ci, forges, issues, calendar, inbox, weather, git, editor, files (the
+//! drawer file manager), sandbox, media and debug. A reserved selection reports
 //! [`ProbeReport::reserved`] so doctor explains *why* a seam is unavailable
 //! rather than silently omitting it.
 
@@ -28,6 +28,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(forge_probes(cfg));
     out.extend(issue_probes(cfg));
     out.extend(calendar_probes(cfg));
+    out.extend(crate::inbox::probes(cfg));
     out.extend(weather_probes(cfg));
     out.extend(git_probes(cfg));
     out.extend(editor_probes(cfg));
