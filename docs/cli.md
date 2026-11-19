@@ -186,6 +186,23 @@ destroys a provider worktree's proven sandbox after a successful land (the
 default keeps it). `thegn agent run --wait --keep-running` skips the stop of a
 Fly or machine0 machine after the run. See [Environments](help/environments.md).
 
+## Retrying a failed pull-back (`env sync-retry`)
+
+`thegn env sync-retry [--json]` retries the pull-back for every journal entry in
+state `Failed` whose worktree directory exists. It never destroys a sandbox, and
+exits nonzero while any entry still fails. A failed pull-back on close shows a
+warning that names this verb.
+
+## Forgetting projects (`repo forget`)
+
+`thegn repo forget [--keep <path>] [--copy-from <DB>] [--apply] [--json] [paths...]`
+removes project rows from this instance's database only; files, worktrees and
+branches are untouched. `--copy-from <DB>` first seeds this instance's empty
+state dir from another instance's database (SQLite backup, verified), then
+forgets. It refuses when this instance already has a `thegn.db`, when the
+schema differs, or when source and destination are the same file; the source is
+never written. See [Running two instances](help/two-instances.md).
+
 ## Embedded and configured skills (`skills`)
 
 ```text
