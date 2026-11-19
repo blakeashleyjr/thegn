@@ -29,6 +29,12 @@ fn clean_basename(value: &str) -> String {
     clean(basename)
 }
 
+fn pending_line(total: usize, failed: usize) -> String {
+    format!(
+        "pull-back pending: {total} ({failed} failed); closing or removing the worktree, or thegn env sync-retry, retries it and keeps the sandbox until it succeeds"
+    )
+}
+
 fn remote_envs(cfg: &Config) -> Vec<(&String, EnvProviderKind)> {
     let mut v: Vec<_> = cfg
         .env
@@ -321,11 +327,7 @@ pub(crate) fn report(cfg: &Config) {
                 .iter()
                 .filter(|entry| entry["state"].as_str() == Some("failed"))
                 .count();
-            outln!(
-                "               pull-back pending: {} ({} failed); closing or removing the worktree retries it and keeps the sandbox until it succeeds",
-                pending.len(),
-                failed
-            );
+            outln!("               {}", pending_line(pending.len(), failed));
             for entry in pending
                 .iter()
                 .filter(|entry| entry["state"].as_str() == Some("failed"))
@@ -608,6 +610,11 @@ mod tests {
                 "reason": "network�retry"
             }])
         );
+    }
+
+    #[test]
+    fn doctor_pending_line_names_thegn_env_sync_retry() {
+        assert!(pending_line(2, 1).contains("thegn env sync-retry"));
     }
 
     #[test]
