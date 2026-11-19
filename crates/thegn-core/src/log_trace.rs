@@ -225,9 +225,16 @@ fn level_filter(default: LogLevel) -> EnvFilter {
 /// non-empty filter string) or `THEGN_LOG_LEVEL`. Used both to gate the CLI
 /// stderr layer and to decide whether config's `[log] level` may reconcile in
 /// (the environment always wins).
-fn env_level_is_set() -> bool {
+fn level_requested() -> bool {
     std::env::var_os("THEGN_LOG").is_some_and(|v| !v.to_string_lossy().trim().is_empty())
         || std::env::var_os("THEGN_LOG_LEVEL").is_some()
+}
+
+fn bridge_trace_target(path: Option<&str>, level_requested: bool) -> Option<PathBuf> {
+    level_requested
+        .then(|| path.map(PathBuf::from))
+        .flatten()
+        .filter(|path| path.is_absolute())
 }
 
 // The reload closure is type-erased: `reload::Handle<EnvFilter, S>`'s `S` is the
@@ -241,7 +248,7 @@ static LEVEL_RELOAD: OnceLock<Box<dyn Fn(EnvFilter) + Send + Sync>> = OnceLock::
 pub fn reload_level(level: LogLevel) {
     if let Some(f) = LEVEL_RELOAD.get() {
         // A configuration reconciliation never overrides an explicit request.
-        if !env_level_is_set() {
+        if !level_requested() {
             f(default_level_filter(level));
         }
     }
@@ -277,7 +284,7 @@ pub fn install(role: Role, cfg: &LogConfig) {
     // At most one sink per process (see `Role`): a file for host/daemon/watch,
     // stderr for a CLI verb (and then only when the env asked for logs).
     let want_file = cfg.file && matches!(role, Role::Host | Role::Daemon | Role::Watch { .. });
-    let want_stderr = role.wants_stderr() && env_level_is_set();
+    let want_stderr = role.wants_stderr() && level_requested();
 
     let (reload_filter, reload_handle) =
         tracing_subscriber::reload::Layer::new(level_filter(cfg.level));
@@ -350,6 +357,39 @@ pub fn install(role: Role, cfg: &LogConfig) {
     if installed && has_sink {
         READY.store(true, Ordering::Relaxed);
     }
+}
+
+/// For stdio bridge verbs, install a tracing subscriber that writes only to
+/// `THEGN_TRACE_FILE`. The bridge's stdout and stderr carry remote command
+/// bytes, so an absent, relative, or unopenable path leaves logging disabled.
+pub fn install_bridge_file_trace() -> bool {
+    let path = std::env::var("THEGN_TRACE_FILE").ok();
+    let Some(path) = bridge_trace_target(path.as_deref(), level_requested()) else {
+        return false;
+    };
+    let Ok(sink) = BridgeFileSink::open(&path) else {
+        return false;
+    };
+    let default_level = std::env::var("THEGN_LOG_LEVEL")
+        .ok()
+        .and_then(|level| LogLevel::from_str_any(&level))
+        .unwrap_or_default();
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(sink)
+        .event_format(Brand {
+            ansi: false,
+            timestamp: true,
+            json: false,
+        })
+        .with_filter(level_filter(default_level));
+    let installed = tracing_subscriber::registry()
+        .with(file_layer)
+        .try_init()
+        .is_ok();
+    if installed {
+        READY.store(true, Ordering::Relaxed);
+    }
+    installed
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +754,53 @@ struct Rotating {
     size: u64,
 }
 
+#[derive(Clone)]
+struct BridgeFileSink(Arc<Mutex<File>>);
+
+impl BridgeFileSink {
+    fn open(path: &Path) -> io::Result<Self> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "trace path has no parent")
+        })?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "trace path has no valid file name",
+                )
+            })?;
+        let dir = crate::fsperm::open_private_dir(parent)?;
+        let file = dir.open_or_create_regular_nofollow_append(name)?;
+        Ok(Self(Arc::new(Mutex::new(file))))
+    }
+}
+
+impl Write for BridgeFileSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("bridge log lock"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("bridge log lock"))?
+            .flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BridgeFileSink {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 impl FileSink {
     fn open(cfg: &LogConfig, name: &str) -> io::Result<FileSink> {
         let dir = cfg.dir_path();
@@ -821,6 +908,47 @@ mod tests {
     }
 
     #[test]
+    fn bridge_trace_needs_an_absolute_path_and_a_level() {
+        let absolute = tmp("bridge-target").join("bridge.trace");
+        let absolute = absolute.to_string_lossy().into_owned();
+        assert_eq!(bridge_trace_target(None, true), None);
+        assert_eq!(bridge_trace_target(Some("trace.log"), true), None);
+        assert_eq!(bridge_trace_target(Some(&absolute), false), None);
+        assert!(!Path::new(&absolute).exists());
+        assert_eq!(
+            bridge_trace_target(Some(&absolute), true),
+            Some(PathBuf::from(&absolute))
+        );
+    }
+
+    #[test]
+    fn bridge_file_sink_is_private_append_only_and_no_follow() {
+        let dir = tmp("bridge-sink");
+        crate::fsperm::restrict_dir_to_owner(&dir).unwrap();
+        let path = dir.join("trace.log");
+        {
+            let mut sink = BridgeFileSink::open(&path).unwrap();
+            sink.write_all(b"first\n").unwrap();
+        }
+        {
+            let mut sink = BridgeFileSink::open(&path).unwrap();
+            sink.write_all(b"second\n").unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\n");
+        if let Some(mode) = crate::fsperm::mode_bits(&path).unwrap() {
+            assert_eq!(mode, 0o600);
+        }
+
+        let victim = dir.join("victim.log");
+        std::fs::write(&victim, b"untouched\n").unwrap();
+        let link = dir.join("trace-link.log");
+        if crate::fsperm::create_symlink(&victim, &link, false).is_ok() {
+            assert!(BridgeFileSink::open(&link).is_err());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"untouched\n");
+        }
+    }
+
+    #[test]
     fn file_sink_writes_and_rotates() {
         let dir = tmp("rot");
         let cfg = LogConfig {
@@ -901,7 +1029,7 @@ mod tests {
             assert!(filter.contains("info"), "{filter}");
             assert!(filter.contains("log=error"), "{filter}");
             assert!(filter.contains("tokei=error"), "{filter}");
-            assert!(!env_level_is_set());
+            assert!(!level_requested());
         }
         {
             let _env = crate::testenv::EnvGuard::set(&[("THEGN_LOG", "thegn_core=trace")]);
@@ -910,7 +1038,7 @@ mod tests {
             for directive in NOISY_LOG_DIRECTIVE.split(',') {
                 assert!(filter.contains(directive), "{filter}");
             }
-            assert!(env_level_is_set());
+            assert!(level_requested());
         }
         {
             let _env = crate::testenv::EnvGuard::mutate_pairs(&[
@@ -919,7 +1047,7 @@ mod tests {
             ]);
             let filter = level_filter(LogLevel::Error).to_string();
             assert!(filter.contains("error"), "{filter}");
-            assert!(env_level_is_set());
+            assert!(level_requested());
         }
     }
 
