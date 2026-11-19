@@ -140,7 +140,7 @@ Steps:
  P1  (--with-pool) snapshot the ledger, env pool-fill --worktree <rd-p>
      --size 1 --json, and verify exactly one filled spare
  P2  (--with-pool) exactly one new ledger record is the filled spare
- P3  (--with-pool) agent run on rd-p claims the spare without a new record; needs RD_HOLD_AGENT=1
+ P3  (--with-pool) agent run on rd-p claims the spare without a new record; needs RD_HOLD_AGENT=1 (asserts provision == claimed_spare in the agent JSON)
  P4  (--with-pool) env pool-fill --worktree <rd-p> --size 0 --json
  P5  (--with-pool) wt rm <rd-p> --force, then verify the spare is gone
  A    (--with-adopt <name>) env adopt <name> --env <S> --yes; ledger record
@@ -475,7 +475,23 @@ for field, actual, expected in checks:
 
 agent_hold_run() {
   if in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/3.json"; then
-    agent_json_ok "$TMP/3.json"
+    agent_json_ok "$TMP/3.json" || return 1
+    local provision
+    provision="$(python3 -I -c '
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        provision = json.load(f)["provision"]
+except (KeyError, OSError, TypeError, ValueError):
+    print("agent JSON missing provision", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(provision, str):
+    print("agent JSON provision is not a string", file=sys.stderr)
+    sys.exit(1)
+print(provision)
+' "$TMP/3.json")" || return 1
+    echo "INFO provision=$provision"
   else
     local rc=$?
     agent_json_ok "$TMP/3.json" || true
@@ -511,6 +527,18 @@ print(name)
 pool_claim_run() {
   if in_repo "$THEGN_BIN" agent run --worktree "$POOL_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/p3.json"; then
     agent_json_ok "$TMP/p3.json" || return 1
+    python3 -I -c '
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        if json.load(f)["provision"] != "claimed_spare":
+            print("agent JSON provision is not claimed_spare", file=sys.stderr)
+            sys.exit(1)
+except (KeyError, OSError, TypeError, ValueError):
+    print("agent JSON missing provision", file=sys.stderr)
+    sys.exit(1)
+' "$TMP/p3.json" || return 1
   else
     local rc="$?"
     agent_json_ok "$TMP/p3.json" || true
