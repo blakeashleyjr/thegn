@@ -46,6 +46,12 @@ grid, not the outer-terminal Surface/input) and not a drop-in replacement.
 `portable-pty` is unpatched and its replacement is explicitly deferred, to be
 re-evaluated together with termwiz.
 
+The Jobs contract is a separately versioned group of workspace libraries.
+`thegn-job-spec` uses `thegn-cas` for snapshot and output identities.
+`thegn-lease` defines attempt transitions, and `thegn-guest-proto` owns
+the bounded guest wire format. All four build independently of the daemon
+and UI. The [Jobs RFC](rfcs/jobs.md) describes their daemon and executor integrations.
+
 `thegn-core` may depend on the `thegn-proc` leaf for bounded process
 supervision; it has no core dependency. This is the one sanctioned core-to-leaf
 edge besides `thegn-media`, pinned in `crate_boundaries.rs`.

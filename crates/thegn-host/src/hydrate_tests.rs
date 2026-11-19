@@ -3475,3 +3475,22 @@ fn ls_files_errors_are_single_line_and_capped() {
     );
     assert!(ls_files_spawn_error(&"x".repeat(500)).len() < 150);
 }
+
+#[test]
+fn workspace_list_gives_the_sessions_own_fallback_its_root() {
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.put_workspace("/r/beta", "beta", "repo").unwrap();
+    let session = Session {
+        id: "/r/app".into(),
+        worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/r/app")],
+        active: 0,
+    };
+    let list = workspace_list(&session, Some(&db));
+    let app = list
+        .iter()
+        .find(|w| w.0 == "app")
+        .expect("own fallback listed");
+    assert_eq!(app.3, "/r/app");
+    let beta = list.iter().find(|w| w.0 == "beta").unwrap();
+    assert_eq!(beta.3, "/r/beta");
+}

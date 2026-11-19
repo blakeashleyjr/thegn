@@ -1,0 +1,739 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JobResult",
+  "type": "object",
+  "required": [
+    "artifacts",
+    "cache",
+    "cost",
+    "diagnostics",
+    "failures",
+    "jobId",
+    "logTail",
+    "logs",
+    "placement",
+    "shards",
+    "status",
+    "summary",
+    "timings",
+    "truncated"
+  ],
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Artifact"
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/CacheStats"
+      }
+    },
+    "cost": {
+      "$ref": "#/definitions/Cost"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Diagnostic"
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Failure"
+      }
+    },
+    "jobId": {
+      "type": "string"
+    },
+    "logTail": {
+      "type": "string"
+    },
+    "logs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/LogRef"
+      }
+    },
+    "placement": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PlacementRecord"
+      }
+    },
+    "shards": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ShardResult"
+      }
+    },
+    "status": {
+      "$ref": "#/definitions/JobStatus"
+    },
+    "summary": {
+      "$ref": "#/definitions/TestSummary"
+    },
+    "timings": {
+      "$ref": "#/definitions/Timings"
+    },
+    "truncated": {
+      "$ref": "#/definitions/Truncation"
+    }
+  },
+  "definitions": {
+    "Artifact": {
+      "type": "object",
+      "required": [
+        "digest",
+        "path",
+        "runId",
+        "shard"
+      ],
+      "properties": {
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "digest": {
+          "$ref": "#/definitions/Digest"
+        },
+        "path": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "shard": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        }
+      }
+    },
+    "AttemptTimings": {
+      "type": "object",
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "cacheRestoreMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cacheSaveMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "placementMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StepTiming"
+          }
+        },
+        "syncMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "uploadMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "wakeMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CacheStats": {
+      "type": "object",
+      "required": [
+        "hits",
+        "misses"
+      ],
+      "properties": {
+        "hits": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "misses": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Cost": {
+      "description": "Monetary amounts are integer millionths of the named currency.",
+      "type": "object",
+      "required": [
+        "currency"
+      ],
+      "properties": {
+        "computeMicros": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "currency": {
+          "type": "string"
+        },
+        "egressMicros": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "estimateSource": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storageMicros": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Diagnostic": {
+      "type": "object",
+      "required": [
+        "level",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "Digest": {
+      "type": "object",
+      "required": [
+        "hash",
+        "sizeBytes"
+      ],
+      "properties": {
+        "hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "format": "int64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Exit": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "signal"
+          ],
+          "properties": {
+            "signal": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Failure": {
+      "type": "object",
+      "required": [
+        "excerpt",
+        "message",
+        "testId"
+      ],
+      "properties": {
+        "excerpt": {
+          "type": "string"
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "message": {
+          "type": "string"
+        },
+        "suite": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "testId": {
+          "type": "string"
+        }
+      }
+    },
+    "Isolation": {
+      "type": "string",
+      "enum": [
+        "none",
+        "process",
+        "container",
+        "gvisor",
+        "microvm",
+        "dedicated-host"
+      ]
+    },
+    "JobStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Succeeded"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Failed"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Cancelled"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "TimedOut"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "missingCapabilities",
+            "reason"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Rejected"
+              ]
+            },
+            "missingCapabilities": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Indeterminate"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "LogRef": {
+      "type": "object",
+      "required": [
+        "digest",
+        "runId"
+      ],
+      "properties": {
+        "digest": {
+          "$ref": "#/definitions/Digest"
+        },
+        "runId": {
+          "type": "string"
+        }
+      }
+    },
+    "Outcome": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Preempted",
+            "LeaseExpired",
+            "Fenced",
+            "Cancelled",
+            "TimedOut"
+          ]
+        },
+        {
+          "type": "object",
+          "required": [
+            "Exited"
+          ],
+          "properties": {
+            "Exited": {
+              "$ref": "#/definitions/Exit"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "InfrastructureFailure"
+          ],
+          "properties": {
+            "InfrastructureFailure": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PlacementRecord": {
+      "type": "object",
+      "required": [
+        "isolation",
+        "provider",
+        "runId",
+        "shape",
+        "spot"
+      ],
+      "properties": {
+        "isolation": {
+          "$ref": "#/definitions/Isolation"
+        },
+        "pool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "type": "string"
+        },
+        "shape": {
+          "type": "string"
+        },
+        "spot": {
+          "type": "boolean"
+        }
+      }
+    },
+    "RunAttempt": {
+      "type": "object",
+      "required": [
+        "epoch",
+        "outcome",
+        "runId",
+        "workerId"
+      ],
+      "properties": {
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1.0
+        },
+        "outcome": {
+          "$ref": "#/definitions/Outcome"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "workerId": {
+          "type": "string"
+        }
+      }
+    },
+    "ShardResult": {
+      "type": "object",
+      "required": [
+        "attempts",
+        "index"
+      ],
+      "properties": {
+        "attempts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RunAttempt"
+          }
+        },
+        "exit": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Exit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        }
+      }
+    },
+    "StepTiming": {
+      "type": "object",
+      "required": [
+        "durationMs",
+        "name"
+      ],
+      "properties": {
+        "durationMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "TestSummary": {
+      "type": "object",
+      "required": [
+        "failed",
+        "flaky",
+        "incomplete",
+        "passed",
+        "skipped"
+      ],
+      "properties": {
+        "durationMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "failed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "flaky": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "incomplete": {
+          "type": "boolean"
+        },
+        "passed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "skipped": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Timings": {
+      "type": "object",
+      "required": [
+        "attempts"
+      ],
+      "properties": {
+        "attempts": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/AttemptTimings"
+          }
+        },
+        "queuedMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "wallMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Truncation": {
+      "type": "object",
+      "required": [
+        "diagnostics",
+        "failures",
+        "logTail"
+      ],
+      "properties": {
+        "diagnostics": {
+          "type": "boolean"
+        },
+        "failures": {
+          "type": "boolean"
+        },
+        "logTail": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
