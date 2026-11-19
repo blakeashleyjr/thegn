@@ -141,13 +141,25 @@ struct Opts {
     yes: bool,
 }
 
-pub fn run(cfg: &Config, provider: &str, apply: bool, yes: bool, json: bool) -> Result<()> {
+pub fn run(
+    cfg: &Config,
+    provider: &str,
+    apply: bool,
+    yes: bool,
+    json: bool,
+    unrecorded: bool,
+) -> Result<()> {
     let kind = provider.trim();
     if kind.eq_ignore_ascii_case(sprites::KIND) {
-        return sprites::run(cfg, apply, yes, json);
+        return sprites::run(cfg, apply, yes, json, unrecorded);
     }
     if !kind.eq_ignore_ascii_case(KIND) {
         bail!("env reap supports --provider vercel, sprites (got {kind:?})");
+    }
+    if unrecorded {
+        bail!(
+            "--unrecorded is sprites only (a Vercel listing shows only this controller's sandboxes)"
+        );
     }
     let mut envs: Vec<(String, Option<Box<dyn ReapApi>>)> = Vec::new();
     for (name, envc) in &cfg.env {
@@ -491,6 +503,8 @@ mod sprites {
         fn scope(&self) -> Option<OwnerScope>;
         /// The account's sprites, every page.
         fn listing(&self) -> Listing;
+        /// Usage for a sprite during the last 30 days.
+        fn usage_30d(&self, name: &str) -> Result<Option<thegn_svc::sprites::usage::SpriteUsage>>;
         /// `SpritesProvider::destroy`: its own ownership proof, then DELETE.
         fn destroy(&self, name: &str) -> Result<()>;
     }
@@ -510,9 +524,22 @@ mod sprites {
             }
         }
 
+        fn usage_30d(&self, name: &str) -> Result<Option<thegn_svc::sprites::usage::SpriteUsage>> {
+            let start = unix_to_rfc3339(
+                thegn_core::util::now().saturating_sub(30_i64.saturating_mul(24 * 60 * 60)),
+            );
+            crate::agent::block_on_provider(|| async { self.0.usage_since(name, &start).await })
+        }
+
         fn destroy(&self, name: &str) -> Result<()> {
             crate::agent::block_on_provider(|| async { self.0.destroy(name).await })
         }
+    }
+
+    fn unix_to_rfc3339(secs: i64) -> String {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+            .unwrap_or_default()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
     /// One configured sprites env.
@@ -562,6 +589,12 @@ mod sprites {
         /// `ledger` or `none`.
         pub proof: &'static str,
         pub note: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cpu_hours_30d: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub gb_hours_30d: Option<f64>,
+        #[serde(skip)]
+        usage_error: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -595,6 +628,8 @@ mod sprites {
         pub refused: Option<String>,
         /// Non-fatal caveats (e.g. unreadable ledger records left alone).
         pub notes: Vec<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        pub unrecorded_only: bool,
     }
 
     impl SpritesReport {
@@ -611,7 +646,16 @@ mod sprites {
         }
     }
 
-    pub(super) fn run(cfg: &Config, apply: bool, yes: bool, json: bool) -> Result<()> {
+    pub(super) fn run(
+        cfg: &Config,
+        apply: bool,
+        yes: bool,
+        json: bool,
+        unrecorded: bool,
+    ) -> Result<()> {
+        if unrecorded && apply {
+            bail!("env reap --unrecorded cannot be combined with --apply");
+        }
         let mut envs = Vec::new();
         for (name, envc) in &cfg.env {
             if envc.provider.provider.trim() != KIND {
@@ -634,7 +678,7 @@ mod sprites {
                 "no [env.<name>] with provider = \"sprites\" is configured (see `thegn env list`)"
             );
         }
-        let _lease = if apply {
+        let _lease = if apply && !unrecorded {
             match crate::reaper_policy::try_reaper_lease(KIND) {
                 Ok(Some(lease)) => Some(lease),
                 Ok(None) => bail!("another thegn process is reconciling sprites; retry shortly"),
@@ -644,12 +688,22 @@ mod sprites {
             None
         };
         let mut ask = |prompt: &str| super::tty_prompt(prompt);
-        let report = reap(
+        let mut report = reap(
             &envs,
-            Opts { apply, yes },
+            if unrecorded {
+                Opts {
+                    apply: false,
+                    yes: false,
+                }
+            } else {
+                Opts { apply, yes }
+            },
             &mut ask,
             thegn_core::util::now_ms(),
         )?;
+        if unrecorded {
+            prepare_unrecorded(&mut report, &envs);
+        }
         if json {
             crate::cmd::emit_json(&report)?;
         } else {
@@ -829,6 +883,9 @@ mod sprites {
                                 age: crate::cmd::fleet::age(created, now_ms),
                                 proof: "ledger",
                                 note: None,
+                                cpu_hours_30d: None,
+                                gb_hours_30d: None,
+                                usage_error: false,
                             });
                         }
                     }
@@ -857,6 +914,9 @@ mod sprites {
                             age: crate::cmd::fleet::age(created, now_ms),
                             proof: "ledger",
                             note: Some("the sprite is gone".into()),
+                            cpu_hours_30d: None,
+                            gb_hours_30d: None,
+                            usage_error: false,
                         });
                     }
                     None => {}
@@ -886,6 +946,9 @@ mod sprites {
                     age,
                     proof: "none",
                     note: Some(note.into()),
+                    cpu_hours_30d: None,
+                    gb_hours_30d: None,
+                    usage_error: false,
                 });
             }
             entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -920,6 +983,7 @@ mod sprites {
             results: Vec::new(),
             refused: None,
             notes,
+            unrecorded_only: false,
         };
         if !opts.apply {
             return Ok(report);
@@ -979,6 +1043,58 @@ mod sprites {
         Ok(report)
     }
 
+    /// Turn the ordinary, read-only reap report into the unrecorded-only view.
+    /// Usage is deliberately best effort: one failed usage request marks both
+    /// cells with `?` and leaves the command successful.
+    fn prepare_unrecorded(report: &mut SpritesReport, envs: &[SpritesEnv]) {
+        report.unrecorded_only = true;
+        for account in &mut report.accounts {
+            account
+                .entries
+                .retain(|entry| entry.class == Class::Unrecorded);
+            account.entries.sort_by(|left, right| {
+                match (left.created_ms, right.created_ms) {
+                    (Some(left), Some(right)) => left.cmp(&right),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+                .then_with(|| left.name.cmp(&right.name))
+            });
+        }
+
+        let mut usage_notes = Vec::new();
+        for account in &mut report.accounts {
+            let api = account.envs.iter().find_map(|name| {
+                envs.iter()
+                    .find(|env| env.name == *name)
+                    .and_then(|env| env.api.as_deref())
+            });
+            let Some(api) = api else {
+                continue;
+            };
+            for entry in account.entries.iter_mut().take(50) {
+                match api.usage_30d(&entry.name) {
+                    Ok(Some(usage)) => {
+                        entry.cpu_hours_30d = Some(usage.cpu_seconds / 3600.0);
+                        entry.gb_hours_30d = Some(usage.reserved_gb_hours);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        entry.usage_error = true;
+                        let error = format!("{error:#}");
+                        usage_notes.push(format!(
+                            "30-day usage unavailable for {}: {}",
+                            cell(&entry.name),
+                            cell(&error)
+                        ));
+                    }
+                }
+            }
+        }
+        report.notes.extend(usage_notes);
+    }
+
     /// Remove a record the pass judged stale, after re-reading it: it must
     /// still be a sprites record of this scope in the same state.
     fn remove_record(
@@ -1005,6 +1121,9 @@ mod sprites {
 
     /// The text report (pure).
     pub(super) fn render(report: &SpritesReport) -> String {
+        if report.unrecorded_only {
+            return render_unrecorded(report);
+        }
         let mut out = Vec::new();
         for account in &report.accounts {
             let envs = account.envs.join(", ");
@@ -1096,6 +1215,86 @@ mod sprites {
         out.join("\n")
     }
 
+    fn usage_cell(value: Option<f64>, error: bool) -> String {
+        if error {
+            "?".into()
+        } else {
+            value.map_or_else(String::new, |value| format!("{value:.2}"))
+        }
+    }
+
+    fn safe_adopt_name(name: &str) -> bool {
+        (1..=63).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }
+
+    fn render_unrecorded(report: &SpritesReport) -> String {
+        let mut out = Vec::new();
+        for account in &report.accounts {
+            let envs = account.envs.join(", ");
+            out.push(match &account.reason {
+                Some(reason) => format!(
+                    "sprites ({envs}): listing {}: {}",
+                    account.listing,
+                    cell(reason)
+                ),
+                None => format!("sprites ({envs})"),
+            });
+            let mut rows = vec![
+                ["NAME", "STATUS", "AGE", "CPU-H 30D", "GB-H 30D", "NOTE"]
+                    .map(String::from)
+                    .to_vec(),
+            ];
+            for entry in &account.entries {
+                rows.push(vec![
+                    cell(&entry.name),
+                    cell(&entry.status),
+                    entry.age.clone(),
+                    usage_cell(entry.cpu_hours_30d, entry.usage_error),
+                    usage_cell(entry.gb_hours_30d, entry.usage_error),
+                    entry.note.as_deref().map(cell).unwrap_or_default(),
+                ]);
+            }
+            for line in crate::cmd::fleet::table(&rows).lines() {
+                out.push(format!("  {line}"));
+            }
+            let count = account.entries.len();
+            out.push(format!(
+                "{count} sprite(s) on this account are not recorded by this host; thegn never deletes them."
+            ));
+            out.push("The Sprites API reports no size; 30-day usage is shown instead.".into());
+            out.push("To let thegn manage one (env down / env reap can then remove it):".into());
+            let first_env = account.envs.first().map(String::as_str).unwrap_or("?");
+            for entry in &account.entries {
+                if safe_adopt_name(&entry.name) {
+                    out.push(format!(
+                        "  thegn env adopt {} --env {}",
+                        entry.name,
+                        cell(first_env)
+                    ));
+                } else {
+                    out.push(format!(
+                        "  {}: unusual name, adopt by hand",
+                        cell(&entry.name)
+                    ));
+                }
+            }
+            out.push("To delete one yourself: the Sprites dashboard.".into());
+        }
+        for note in &report.notes {
+            out.push(format!("note: {}", cell(note)));
+        }
+        if !report.complete {
+            out.push(
+                "listing incomplete: the results may be incomplete; this report is read-only"
+                    .into(),
+            );
+        }
+        out.join("\n")
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1107,6 +1306,13 @@ mod sprites {
         struct Fake {
             scope: Option<OwnerScope>,
             listing: Mutex<Option<Listing>>,
+            usage: Mutex<
+                BTreeMap<
+                    String,
+                    std::result::Result<Option<thegn_svc::sprites::usage::SpriteUsage>, String>,
+                >,
+            >,
+            usage_calls: Mutex<Vec<String>>,
             destroys: Mutex<Vec<String>>,
         }
 
@@ -1120,6 +1326,18 @@ mod sprites {
                     .unwrap()
                     .take()
                     .expect("listed once per account")
+            }
+            fn usage_30d(
+                &self,
+                name: &str,
+            ) -> Result<Option<thegn_svc::sprites::usage::SpriteUsage>> {
+                self.usage_calls.lock().unwrap().push(name.to_string());
+                self.usage
+                    .lock()
+                    .unwrap()
+                    .remove(name)
+                    .unwrap_or(Ok(None))
+                    .map_err(|error| anyhow::anyhow!("{error}"))
             }
             fn destroy(&self, name: &str) -> Result<()> {
                 self.destroys.lock().unwrap().push(name.to_string());
@@ -1138,6 +1356,8 @@ mod sprites {
             Arc::new(Fake {
                 scope: Some(scope()),
                 listing: Mutex::new(Some(listing)),
+                usage: Mutex::new(BTreeMap::new()),
+                usage_calls: Mutex::new(Vec::new()),
                 destroys: Mutex::new(Vec::new()),
             })
         }
@@ -1194,6 +1414,18 @@ mod sprites {
                 .iter()
                 .map(|e| (e.name.clone(), e.class))
                 .collect()
+        }
+
+        fn unrecorded_report(fake: &Arc<Fake>, yes: bool) -> SpritesReport {
+            let mut report = reap(
+                &envs(fake, 3600),
+                Opts { apply: false, yes },
+                &mut no_tty,
+                NOW_MS,
+            )
+            .unwrap();
+            prepare_unrecorded(&mut report, &envs(fake, 3600));
+            report
         }
 
         /// Every class in one account: an old recorded sprite, a gone ready
@@ -1334,6 +1566,8 @@ mod sprites {
             let unscoped = Arc::new(Fake {
                 scope: None,
                 listing: Mutex::new(None),
+                usage: Mutex::new(BTreeMap::new()),
+                usage_calls: Mutex::new(Vec::new()),
                 destroys: Mutex::new(Vec::new()),
             });
             let report = reap(&envs(&unscoped, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
@@ -1426,6 +1660,130 @@ mod sprites {
             assert_eq!(json["accounts"][0]["entries"][0]["class"], "unrecorded");
             assert_eq!(json["accounts"][0]["max_lifetime_secs"], 3600);
             assert_eq!(json["results"], serde_json::json!([]));
+        }
+
+        #[test]
+        fn unrecorded_mode_lists_only_unrecorded_oldest_first() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            write("sx-recorded", "ready", NOW_MS / 1000 - 100, "ctl-a");
+            let fake = fake(Listing::Complete(vec![
+                row("sx-young", Some(NOW_MS - HOUR_MS)),
+                row("sx-old", Some(NOW_MS - 3 * HOUR_MS)),
+                row("sx-unknown-age", None),
+                row("sx-recorded", Some(NOW_MS - 5 * HOUR_MS)),
+            ]));
+            let report = unrecorded_report(&fake, true);
+            assert!(report.unrecorded_only);
+            assert_eq!(
+                report.accounts[0]
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["sx-old", "sx-young", "sx-unknown-age"]
+            );
+            assert!(
+                report.accounts[0]
+                    .entries
+                    .iter()
+                    .all(|entry| entry.class == Class::Unrecorded)
+            );
+        }
+
+        #[test]
+        fn unrecorded_mode_never_destroys_or_removes_records() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            write("sx-recorded", "ready", NOW_MS / 1000 - 100, "ctl-a");
+            let fake = fake(Listing::Complete(vec![
+                row("sx-recorded", Some(NOW_MS - HOUR_MS)),
+                row("sx-unrecorded", Some(NOW_MS - 2 * HOUR_MS)),
+            ]));
+            let report = unrecorded_report(&fake, true);
+            assert_eq!(report.results, Vec::<ActionResult>::new());
+            assert!(fake.destroys.lock().unwrap().is_empty());
+            assert!(registry::read_checked("sx-recorded").unwrap().is_some());
+        }
+
+        #[test]
+        fn unrecorded_mode_refuses_vercel() {
+            let error = super::super::run(&Config::default(), "vercel", false, false, false, true)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "--unrecorded is sprites only (a Vercel listing shows only this controller's sandboxes)"
+            );
+        }
+
+        #[test]
+        fn unrecorded_render_prints_adopt_lines_only_for_safe_names() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let fake = fake(Listing::Complete(vec![
+                row("safe-name-1", Some(NOW_MS - HOUR_MS)),
+                row("Unsafe/name", Some(NOW_MS - 2 * HOUR_MS)),
+            ]));
+            fake.usage.lock().unwrap().insert(
+                "safe-name-1".into(),
+                Ok(Some(thegn_svc::sprites::usage::SpriteUsage {
+                    cpu_seconds: 7200.0,
+                    reserved_gb_hours: 3.0,
+                    partial: false,
+                })),
+            );
+            let report = unrecorded_report(&fake, false);
+            let text = render(&report);
+            assert!(
+                text.contains("  thegn env adopt safe-name-1 --env sx"),
+                "{text}"
+            );
+            assert!(text.contains("2.00") && text.contains("3.00"), "{text}");
+            assert!(
+                text.contains("  Unsafe/name: unusual name, adopt by hand"),
+                "{text}"
+            );
+            assert!(!text.contains("thegn env adopt Unsafe/name"), "{text}");
+        }
+
+        #[test]
+        fn usage_error_is_a_note_not_a_failure() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let fake = fake(Listing::Complete(vec![row(
+                "sx-unrecorded",
+                Some(NOW_MS - HOUR_MS),
+            )]));
+            fake.usage
+                .lock()
+                .unwrap()
+                .insert("sx-unrecorded".into(), Err("usage endpoint failed".into()));
+            let report = unrecorded_report(&fake, false);
+            let text = render(&report);
+            assert_eq!(report.failed(), 0);
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("usage endpoint failed"))
+            );
+            assert!(
+                text.contains("CPU-H 30D") && text.contains("GB-H 30D"),
+                "{text}"
+            );
+            assert!(text.contains("  ?"), "{text}");
+        }
+
+        #[test]
+        fn usage_reads_capped_at_50() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let rows = (0..51)
+                .map(|index| {
+                    row(
+                        &format!("sx-{index:02}"),
+                        Some(NOW_MS - (index as i64 + 1) * 60_000),
+                    )
+                })
+                .collect();
+            let fake = fake(Listing::Complete(rows));
+            let _report = unrecorded_report(&fake, false);
+            assert_eq!(fake.usage_calls.lock().unwrap().len(), 50);
         }
     }
 }
