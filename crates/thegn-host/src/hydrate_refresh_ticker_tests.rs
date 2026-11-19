@@ -666,7 +666,8 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
             tick: 0,
         },
         || {},
-    );
+    )
+    .expect("test ticker spawned");
     let ticker = RefreshTicker {
         command: commands,
         stop,
@@ -998,7 +999,8 @@ fn fleet_and_pr_slots_follow_a_live_reconfigure() {
             tick: 0,
         },
         || {},
-    );
+    )
+    .expect("test ticker spawned");
     let mut ticker = RefreshTicker {
         command: commands,
         stop,
