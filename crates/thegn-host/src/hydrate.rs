@@ -4706,13 +4706,14 @@ fn pr_refresh_blocking_fenced(
             return PrRefreshOutcome::Skipped;
         };
 
-        // Snapshot the old PR state BEFORE overwriting the cache.
-        let old_pr: Option<Box<thegn_core::forge::model::PrStatus>> = db
-            .get_pr_cache(&cache_key)
-            .ok()
-            .flatten()
+        // Snapshot the old PR state BEFORE overwriting the cache. The raw
+        // `(json, fetched_at)` row is kept as the CAS expectation for the
+        // definitive write below (THE-2214 lease handover).
+        let old_row: Option<(String, i64)> = db.get_pr_cache(&cache_key).ok().flatten();
+        let old_pr: Option<Box<thegn_core::forge::model::PrStatus>> = old_row
+            .as_ref()
             .and_then(|(json, _)| {
-                serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json).ok()
+                serde_json::from_str::<thegn_core::forge::model::PrPanel>(json).ok()
             })
             .and_then(|p| {
                 if !cached_pr_applies(
@@ -4801,10 +4802,25 @@ fn pr_refresh_blocking_fenced(
         // preserves both the displayed data and the transition diff. See
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
+        //
+        // UI and daemon may both fetch at the lease handover; the CAS makes
+        // exactly one of them the emitter. The write only lands while the row
+        // still holds the `(json, fetched_at)` this pass diffed against; a
+        // loser (another producer moved the row, or the write failed) stops
+        // here, BEFORE the review-cache write and every event below, so a
+        // transition is announced once. Non-definitive states write nothing
+        // and behave as before.
         if pr_state_is_definitive(&panel.state)
             && crate::hydrate_schedule::generation_is_current(generation)
         {
-            let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let expected = old_row.as_ref().map(|(j, at)| (j.as_str(), *at));
+            let cas = db.put_pr_cache_if(&cache_key, &panel.branch, &json, expected);
+            if let Err(error) = &cas {
+                tracing::debug!(target: "thegn::pr", %error, "pr_cache CAS write failed; skipping emit");
+            }
+            if !pr_cas_should_emit(&cas) {
+                return PrRefreshOutcome::Skipped;
+            }
         }
 
         // Deep review data is a separate complete snapshot. Fetching either
@@ -4969,6 +4985,84 @@ fn pr_refresh_blocking_fenced(
         }
 
         PrRefreshOutcome::Fetched
+    }
+}
+
+/// Whether a PR pass whose definitive `pr_cache` CAS write returned `cas`
+/// owns the transition's events. Pure. Only a write that actually landed
+/// (`Ok(true)`) emits: `Ok(false)` means another producer (UI or daemon at
+/// the lease handover) moved the row first and emits instead; an `Err` left
+/// the row untouched, so the next pass re-diffs the same old row and emits.
+pub(crate) fn pr_cas_should_emit(cas: &anyhow::Result<bool>) -> bool {
+    matches!(cas, Ok(true))
+}
+
+#[cfg(test)]
+mod pr_cas_tests {
+    use super::pr_cas_should_emit;
+    use thegn_core::store::CacheStore;
+
+    #[test]
+    fn pr_cas_only_a_landed_write_emits() {
+        assert!(pr_cas_should_emit(&Ok(true)));
+        assert!(!pr_cas_should_emit(&Ok(false)));
+        assert!(!pr_cas_should_emit(&Err(anyhow::anyhow!("busy"))));
+    }
+
+    /// UI and daemon both diff against the same old row at the lease
+    /// handover: exactly one of them is the emitter.
+    #[test]
+    fn pr_cas_two_passes_over_one_old_row_emit_once() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_pr_cache("/wt/a", "br", "{\"old\":1}").unwrap();
+        let old = db.get_pr_cache("/wt/a").unwrap().unwrap();
+        let expected = Some((old.0.as_str(), old.1));
+        let emits = [
+            db.put_pr_cache_if("/wt/a", "br", "{\"new\":1}", expected),
+            db.put_pr_cache_if("/wt/a", "br", "{\"new\":1}", expected),
+        ]
+        .iter()
+        .filter(|cas| pr_cas_should_emit(cas))
+        .count();
+        assert_eq!(emits, 1);
+    }
+
+    /// Source-order pin: in `pr_refresh_blocking_fenced` the CAS write and its
+    /// `Skipped` early return precede the review-cache write and every event
+    /// (`submit_fact`, `emit_with_facts`, `take_merge_origin`, move-on-merge),
+    /// and the unconditional `put_pr_cache` is gone from the body.
+    #[test]
+    fn pr_cas_precedes_every_emit_in_refresh_body() {
+        let src = include_str!("hydrate.rs");
+        let start = src
+            .find("fn pr_refresh_blocking_fenced(")
+            .expect("refresh body");
+        let end = start
+            + src[start..]
+                .find("pub(crate) fn pr_cas_should_emit(")
+                .expect("body end");
+        let body = &src[start..end];
+        let cas = body.find("put_pr_cache_if(").expect("CAS write in body");
+        let gate = body
+            .find("if !pr_cas_should_emit(&cas)")
+            .expect("CAS gate in body");
+        assert!(cas < gate);
+        assert!(
+            !body.contains("db.put_pr_cache(&"),
+            "the definitive write must be the CAS"
+        );
+        for later in [
+            "put_pr_review_cache(",
+            "submit_fact(",
+            "emit_with_facts(",
+            "take_merge_origin(",
+            "move_linked_issues_done(",
+        ] {
+            let first = body
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} in body"));
+            assert!(gate < first, "{later} must follow the CAS gate");
+        }
     }
 }
 
