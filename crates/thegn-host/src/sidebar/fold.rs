@@ -25,6 +25,7 @@ pub(crate) enum LooseItem {
     /// The loose worktree at this index, emitted as a plain row.
     Single(usize),
     /// A batch row for token `key` holding the loose worktrees at `members`.
+    #[allow(dead_code)] // spine stub: lane 2 constructs it; drop this allow then
     Batch { key: String, members: Vec<usize> },
 }
 
