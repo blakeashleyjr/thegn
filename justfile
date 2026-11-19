@@ -923,7 +923,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro
+test: test-dev-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro
     #!/usr/bin/env bash
     set -euo pipefail
     if ! cargo nextest run --workspace; then
@@ -1173,11 +1173,9 @@ start-dev name="dev": build
       "THEGN_CHANNEL=dev" \
       {{bin}}
 
-# Start the DEV instance: an isolated thegn built from this checkout, beside the
-# stable one. Own state, runtime, THEGN_DIR and config dir (~/.config/thegn-dev,
-# which you must seed yourself; secrets are never copied). See `thegn help two-instances`.
+# Start the DEV instance with the DEBUG build (`just live` uses a release build). The first launch seeds ~/.config/thegn-dev from the stable config (ports shifted, secrets not copied). See `thegn help two-instances`.
 devel: build
-    exec "$PWD/scripts/devel-launch.sh"
+    exec env THEGN_DEVEL_BIN="$PWD/target/debug/thegn" "$PWD/scripts/devel-launch.sh"
 
 # Print the dev instance's environment as `export` lines (no side effects):
 # `eval "$(just devel-env)"` targets the dev instance with CLI calls.
@@ -1359,58 +1357,34 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
       "THEGN_PERF=1" \
       "$PWD/target/release/thegn"
 
-# Your REAL instance — real DB, real worktrees, real config — with the
-# profiler + perf rollup + a DISK-CAPPED trace log. `start-term-release` is the
-# same instrumentation against a THROWAWAY state root (~/.thegn-<name>); this is
-# the one to use when the thing you want to diagnose only happens in your actual
-# session (your worktrees, your panes, your queue).
-#
-# THE CAP IS THE POINT. Verbose logging goes to the rotating file sink, which is
-# hard-bounded at `size_mb x (max_files + 1)` — 120 MB by default here. Raise the
-# verbosity and the cap SHRINKS your history, it never grows the footprint:
+# The DEV instance from this checkout: builds a release binary (`--features profiling`, private
+# cache target/live-cache) only when the build inputs changed since the last `just live`,
+# including uncommitted edits, installs it to ~/.thegn-devel/bin/thegn, and starts the dev
+# instance (own state, database, config dir ~/.config/thegn-dev, THEGN_DIR). Only the previous
+# dev UI is restarted. The dev daemon keeps running (pass --restart-daemon to replace it; that
+# ends every dev pane). The stable instance is installed by Nix/home-manager and is never
+# touched. Log level, rotation size (MiB) and file count as before:
 #   just live trace             # firehose, same 120 MB ceiling
-#   just live debug 5 2         # 15 MB ceiling, for a nearly-full disk
-# Startup stderr is retained in each private recovery directory. It is separate
-# from the rotating application-log allowance, as are backups and build artifacts.
-#
-# For the compositor `THEGN_LOG` being set IS the request for logs, so the file
-# sink is forced on regardless of `[log] file` (a `Role::Host` has no stderr
-# layer — honouring `file = false` would mean asking for logs and getting none).
-# What the host did NOT honour until now was the rotation/dir knobs: it passed
-# hardcoded defaults, pinning the ceiling at 5 MB x 5 whatever you configured.
-#
-# Linux/default profile, six unattended steps: preflight, build (the running
-# instance keeps working; all cores, persistent target/live-cache so only what
-# changed recompiles), validate config with the NEW build, stop this
-# installation's controllers then its pane daemon (5 s Ctrl-C window), back up
-# DB + binary and install, launch (the DB migrates on first start; `thegn
-# doctor` is captured to the recovery dir). Run from inside thegn it reopens
-# itself in a fresh ghostty window, since stopping thegn would kill this pane.
-# It installs to ~/.local/lib/thegn (override with --install-dir or
-# $THEGN_LIVE_INSTALL_DIR) and leaves any other installation, such as a dev
-# build, alone; only processes running the installed binary are signalled.
-# Extra flags after the three positionals (e.g. --relink-launchers,
-# --install-dir DIR, --prebuilt /abs/thegn to install a binary built elsewhere
-# with its .build.json sidecar, no local cargo) are passed to scripts/live.py.
-# Never overrides migration
-# authority. See docs/live-upgrades.md.
+#   just live debug 5 2         # 15 MB ceiling
+# Inside a thegn pane it opens a new window (alacritty); --here starts it in the pane.
+# See `thegn help two-instances`.
 [positional-arguments]
 live level="info" size_mb="20" files="5" *flags:
-    a="$1"; b="$2"; c="$3"; shift 3; python3 -B scripts/live.py --level "$a" --size-mb "$b" --files "$c" "$@"
+    a="$1"; b="$2"; c="$3"; shift 3; python3 -B scripts/dev_live.py --level "$a" --size-mb "$b" --files "$c" "$@"
 
-# Read-only upgrade paths, source selection and constraints (no build/launch).
+# What `just live` would do (build needed or not, paths, running dev daemons); changes nothing.
 [positional-arguments]
 live-plan level="info" size_mb="20" files="5" *flags:
-    a="$1"; b="$2"; c="$3"; shift 3; python3 -B scripts/live.py --plan --level "$a" --size-mb "$b" --files "$c" "$@"
+    a="$1"; b="$2"; c="$3"; shift 3; python3 -B scripts/dev_live.py --plan --level "$a" --size-mb "$b" --files "$c" "$@"
 
 # Live Vercel Sandbox run (spends money; plan-only without flags). Not in ci/smoke.
 [positional-arguments]
 vercel-live *args:
     bash test/vercel-live.sh "$@"
 
-# Private launcher regression tests; no Cargo or live-state mutation.
-test-live:
-    python3 -B test/live_test.py
+# `just live` helper tests; no Cargo, no launch, no real home.
+test-dev-live:
+    python3 -B test/dev_live_test.py
 
 # The agent PreToolUse guard that refuses an unquoted heredoc whose body would
 # execute `$(...)`/backticks (.claude/settings.json). Pure; no Cargo.
