@@ -56,13 +56,13 @@ every action. [[keybindings]] is generated from your config, including rebinds.
 
 ## Close and quit
 
-| Keys or action       | Does                                                                  |
-| -------------------- | --------------------------------------------------------------------- |
-| `Alt-x`              | Close the focused pane in a split, otherwise close the tab            |
-| `Alt-X`              | Remove the worktree (see Destructive actions)                         |
-| `Ctrl-q`             | Quit the UI; daemon-backed panes survive and can reattach on relaunch |
-| Palette: `detach`    | Detach while keeping everything running                               |
-| Palette: `quit-kill` | End the sessions instead of detaching                                 |
+| Keys or action       | Does                                                                                                                                                |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Alt-x`              | Close the focused pane in a split, otherwise close the tab                                                                                          |
+| `Alt-X`              | Remove the worktree (see Destructive actions)                                                                                                       |
+| `Ctrl-q`             | Ask to quit (`[ui] confirm_quit`); press `Ctrl-q` again to confirm, any other key cancels. Daemon-backed panes survive and can reattach on relaunch |
+| Palette: `detach`    | Detach while keeping everything running                                                                                                             |
+| Palette: `quit-kill` | End the sessions instead of detaching                                                                                                               |
 
 ## Destructive actions
 
