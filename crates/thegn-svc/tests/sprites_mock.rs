@@ -967,6 +967,9 @@ fn ensure_executable_pushes_once_then_idempotent() {
 /// sprite this host created), so destroy has its proof.
 fn recorded(base: &str, name: &str) -> (SpritesProvider, tempfile::TempDir) {
     let (provider, ledger) = scoped(base, name);
+    thegn_svc::sprites::ledger::reserve_at(ledger.path(), &scope(), name, 0)
+        .unwrap()
+        .preserve();
     thegn_svc::sprites::ledger::commit_at(ledger.path(), &scope(), name).unwrap();
     (provider, ledger)
 }
