@@ -120,8 +120,19 @@ struct SidecarRecord {
     pending_teardown: Vec<u16>,
 }
 
+/// One sidecar record that still holds unverified share teardowns (THE-330).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTeardownRow {
+    pub container: String,
+    pub worktree: Option<String>,
+    pub ports: Vec<u16>,
+}
+
 /// Most share ports one sidecar record retains as pending teardown.
 pub const MAX_PENDING_TEARDOWN: usize = 16;
+
+/// Most sidecar records one listing reads.
+pub const MAX_LISTED_SIDECAR_RECORDS: usize = 256;
 
 /// A sidecar record was written for a different worktree than the caller.
 #[derive(Debug)]
@@ -610,6 +621,57 @@ pub fn pending_teardowns_if_recorded(container: &str) -> Result<Vec<u16>> {
         return Ok(Vec::new());
     }
     pending_teardowns(container)
+}
+
+/// Every recorded sidecar with pending share teardowns, sorted by container,
+/// plus one message per record that could not be read. A missing record
+/// directory is empty. Read-only and lock-free: never writes or removes a
+/// record.
+pub fn pending_teardown_rows() -> Result<(Vec<PendingTeardownRow>, Vec<String>)> {
+    let path = state_root_path()?.join("vpn-runtime");
+    let read_dir = match std::fs::read_dir(&path) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        Err(error) => return Err(error).with_context(|| format!("vpn: read {path:?}")),
+    };
+    let mut entries = read_dir
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.retain(|name| name.ends_with(".json"));
+    entries.sort_unstable();
+
+    let truncated = entries.len() > MAX_LISTED_SIDECAR_RECORDS;
+    entries.truncate(MAX_LISTED_SIDECAR_RECORDS);
+
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let name = entry.strip_suffix(".json").unwrap_or_default();
+        if let Err(error) = validate_container_name(name) {
+            errors.push(format!("{name}: {error:#}"));
+            continue;
+        }
+        match read_validated_sidecar_record(name, None, None) {
+            Ok(record) if !record.pending_teardown.is_empty() => {
+                rows.push(PendingTeardownRow {
+                    container: record.container,
+                    worktree: record.worktree,
+                    ports: record.pending_teardown,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(format!("{name}: {error:#}")),
+        }
+    }
+    if truncated {
+        errors.push(format!(
+            "more than {MAX_LISTED_SIDECAR_RECORDS} sidecar records; listing truncated"
+        ));
+    }
+    rows.sort_unstable_by(|left, right| left.container.cmp(&right.container));
+    Ok((rows, errors))
 }
 
 fn update_pending_teardown(
