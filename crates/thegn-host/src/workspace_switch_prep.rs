@@ -64,6 +64,14 @@ impl PendingSwitch {
             .is_some_and(|request| request.seq == seq)
     }
 
+    /// Whether a cold workspace switch is still loading. Removing the active
+    /// project empties the session and queues the landing switch here; the
+    /// loop must not read that transient empty session as "last worktree
+    /// closed" and quit.
+    pub(crate) fn in_flight(&self) -> bool {
+        self.request.is_some()
+    }
+
     pub(crate) fn request_target(&self) -> Option<&str> {
         self.request.as_ref().map(|request| request.target.as_str())
     }
@@ -669,6 +677,32 @@ mod tests {
             resolve_connect_root(Some(nested)),
             Some(repo.canonicalize().unwrap())
         );
+    }
+
+    /// Removing the active project empties the session while the landing
+    /// switch loads; the loop keeps running only while `in_flight` holds.
+    #[test]
+    fn in_flight_tracks_the_pending_request() {
+        let mut pending = PendingSwitch::default();
+        assert!(!pending.in_flight());
+        let request = pending.begin(SwitchRequestSpec {
+            target: "/next".into(),
+            group: None,
+            after: AfterSwitch::default(),
+        });
+        assert!(pending.in_flight());
+        pending.clear(request.seq);
+        assert!(
+            !pending.in_flight(),
+            "a finished or failed switch clears it"
+        );
+        pending.begin(SwitchRequestSpec {
+            target: "/next".into(),
+            group: None,
+            after: AfterSwitch::default(),
+        });
+        pending.supersede();
+        assert!(!pending.in_flight());
     }
 
     #[test]

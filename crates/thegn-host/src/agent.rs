@@ -3365,6 +3365,7 @@ pub fn provision_provider_env_named(
                     &id,
                     &sprite_home,
                     agents,
+                    &pc.login_homes,
                 );
                 crate::agent_configs::agent_configs_step_result(configs, &account_failures)
             }

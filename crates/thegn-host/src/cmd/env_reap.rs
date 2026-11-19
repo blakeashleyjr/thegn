@@ -457,8 +457,8 @@ fn render(report: &ReapReport) -> String {
 /// - `stale-creating`: a `creating` record older than an hour with no sprite →
 ///   `--apply` removes the record.
 /// - `over-lifetime`: a sprite with a ledger record under this host's scope
-///   older than the env's `max_lifetime_secs` (age from the API `created_at`,
-///   else the record's) → `--apply` destroys it through
+///   older than the env's `max_lifetime_secs` (age from the later of the API
+///   `created_at` and the record's, so lifetime counts from adoption) → `--apply` destroys it through
 ///   `SpritesProvider::destroy`, which proves ownership again itself.
 /// - `unrecorded`: in the account with no record of this host (including one
 ///   a worktree location row names, and every pre-ledger sprite) → reported,
@@ -701,6 +701,17 @@ mod sprites {
         }
     }
 
+    /// When a recorded sprite's lifetime started: the LATER of the API
+    /// `created_at` and the record's (written at create or at adoption), so
+    /// an old sprite adopted recently is aged from its adoption (D1). Either
+    /// alone when the other is unknown.
+    fn lifetime_start_ms(row: &SandboxInfo, record: &VpsRecord) -> Option<i64> {
+        match (row.created_at_ms, record_ms(record)) {
+            (Some(api), Some(rec)) => Some(api.max(rec)),
+            (api, rec) => api.or(rec),
+        }
+    }
+
     /// The reap pass (testable core: no stdout, no tty, no config). The ledger
     /// is the process registry dir (tests isolate it with `IsolatedState`).
     pub(super) fn reap(
@@ -808,7 +819,7 @@ mod sprites {
             for record in &mine {
                 match by_name.get(record.name.as_str()) {
                     Some(row) => {
-                        let created = row.created_at_ms.or_else(|| record_ms(record));
+                        let created = lifetime_start_ms(row, record);
                         if over(created, lifetime, now_ms) {
                             entries.push(Entry {
                                 name: record.name.clone(),
@@ -978,20 +989,9 @@ mod sprites {
         let Some(scope) = scope else {
             return Err("no ownership scope".into());
         };
-        match registry::read_checked(name) {
-            Ok(Some(record))
-                if record.provider == LEDGER_PROVIDER
-                    && record.owner == scope.owner
-                    && record.account == scope.account
-                    && (record.state == "creating") == (class == Class::StaleCreating) =>
-            {
-                ledger::forget(name);
-                Ok(())
-            }
-            Ok(Some(_)) => Err("the record changed; left alone".into()),
-            Ok(None) => Ok(()),
-            Err(error) => Err(format!("ledger unreadable ({error:#}); left alone")),
-        }
+        // Re-read, re-check and remove as one step under the ledger lock.
+        ledger::forget_reaped(scope, name, class == Class::StaleCreating)
+            .map_err(|error| format!("{error:#}"))
     }
 
     /// A terminal-safe table cell: control characters (API text is
@@ -1200,7 +1200,7 @@ mod sprites {
         /// record, a stale and a fresh `creating` record, a foreign sprite.
         fn seed() -> Arc<Fake> {
             let now_s = NOW_MS / 1000;
-            write("sx-old", "ready", now_s - 10, "ctl-a"); // API created_at says old
+            write("sx-old", "ready", now_s - 2 * 3600, "ctl-a"); // both say old
             write("sx-gone", "ready", now_s - 100, "ctl-a");
             write("sx-stale", "creating", now_s - 7200, "ctl-a");
             write("sx-fresh", "creating", now_s - 60, "ctl-a");
@@ -1237,19 +1237,24 @@ mod sprites {
         }
 
         #[test]
-        fn sprites_reap_over_lifetime_uses_the_api_created_at() {
+        fn sprites_reap_over_lifetime_ages_from_the_later_created_at() {
             let _state = thegn_core::testenv::IsolatedState::new();
             let now_s = NOW_MS / 1000;
-            // The record says young; the API says 5 h old → over a 1 h ceiling.
-            write("sx-old", "ready", now_s - 10, "ctl-a");
+            // An old sprite adopted recently: the API says 5 h old, the record
+            // (written at adoption) says 10 s → lifetime counts from adoption,
+            // not over a 1 h ceiling.
+            write("sx-adopted", "ready", now_s - 10, "ctl-a");
             // The record says 5 h old; the API says young → not over.
             write("sx-new", "ready", now_s - 5 * 3600, "ctl-a");
             // No API time: the record's 5 h decides.
             write("sx-notime", "ready", now_s - 5 * 3600, "ctl-a");
+            // Both old: aged from the later (the record's 2 h) → over.
+            write("sx-old", "ready", now_s - 2 * 3600, "ctl-a");
             let fake = fake(Listing::Complete(vec![
-                row("sx-old", Some(NOW_MS - 5 * HOUR_MS)),
+                row("sx-adopted", Some(NOW_MS - 5 * HOUR_MS)),
                 row("sx-new", Some(NOW_MS - 60_000)),
                 row("sx-notime", None),
+                row("sx-old", Some(NOW_MS - 5 * HOUR_MS)),
             ]));
             let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
             assert_eq!(
@@ -1259,12 +1264,15 @@ mod sprites {
                     ("sx-old".to_string(), Class::OverLifetime),
                 ]
             );
-            assert_eq!(report.accounts[0].entries[1].age, "5h0m");
-            // Lifetime 0 = no ceiling.
-            let fake0 = self::fake(Listing::Complete(vec![row(
-                "sx-old",
-                Some(NOW_MS - 5 * HOUR_MS),
-            )]));
+            assert_eq!(report.accounts[0].entries[1].age, "2h0m");
+            // Lifetime 0 = no ceiling. The listing names every recorded sprite
+            // (the ledger still holds all four), so none is an orphan either.
+            let fake0 = self::fake(Listing::Complete(vec![
+                row("sx-adopted", Some(NOW_MS - 5 * HOUR_MS)),
+                row("sx-new", Some(NOW_MS - 60_000)),
+                row("sx-notime", None),
+                row("sx-old", Some(NOW_MS - 5 * HOUR_MS)),
+            ]));
             let report = reap(&envs(&fake0, 0), DRY, &mut no_tty, NOW_MS).unwrap();
             assert!(report.accounts[0].entries.is_empty());
         }

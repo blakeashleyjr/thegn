@@ -510,6 +510,11 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
                 ));
             }
         }
+        errors.extend(
+            login_homes_errors(&env.provider.login_homes)
+                .into_iter()
+                .map(|reason| format!("env.{env_name}.provider.login_homes: {reason}")),
+        );
         let result = match provider.as_str() {
             "fly" => validate_fly_config(
                 &env.provider.api_base,
@@ -542,14 +547,61 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
     errors
 }
 
+/// The `login_homes` keys thegn reads (one dedicated login dir per agent).
+pub const LOGIN_HOMES_KEYS: [&str; 2] = ["claude", "codex"];
+
+/// Refusals for a `login_homes` table: a key outside [`LOGIN_HOMES_KEYS`], or a
+/// dir that is not absolute after `~` expansion. Reasons name the key and the
+/// configured path only (a path, never credential content).
+pub fn login_homes_errors(login_homes: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (key, dir) in login_homes {
+        if !LOGIN_HOMES_KEYS.contains(&key.as_str()) {
+            errors.push(format!(
+                "unknown key `{key}` (login_homes takes claude and codex)"
+            ));
+            continue;
+        }
+        let expanded = crate::util::expand_tilde(dir.trim());
+        if dir.trim().is_empty() || !std::path::Path::new(&expanded).is_absolute() {
+            errors.push(format!(
+                "{key} = \"{dir}\" is not an absolute path (after ~ expansion)"
+            ));
+        }
+    }
+    errors
+}
+
 /// Warnings for provider-table settings that have no effect: sprites sizing
-/// knobs, the sprites memory note, and a provider table whose env still has a
-/// non-`provider` placement (it would run locally).
+/// knobs, the sprites memory note, a provider table whose env still has a
+/// non-`provider` placement (it would run locally), `login_homes` on a
+/// non-provider env, and `lifetime_reap` where it does nothing.
 pub fn provider_table_warnings(cfg: &crate::config::Config) -> Vec<String> {
     let mut warnings = Vec::new();
     for (env_name, env) in &cfg.env {
         let p = &env.provider;
         let provider = p.provider.trim().to_ascii_lowercase();
+        if !p.login_homes.is_empty()
+            && (provider.is_empty() || env.placement != crate::config::PlacementMode::Provider)
+        {
+            warnings.push(format!(
+                "env.{env_name}.provider.login_homes: env.{env_name} is not a provider env (set provider and placement = \"provider\"); login_homes is ignored"
+            ));
+        }
+        if p.lifetime_reap {
+            if !matches!(
+                crate::config::EnvProviderKind::of(&provider),
+                crate::config::EnvProviderKind::Sprites
+            ) {
+                warnings.push(format!(
+                    "env.{env_name}.provider.lifetime_reap: lifetime_reap applies only to provider = \"sprites\"; it is ignored here"
+                ));
+            } else if p.max_lifetime_secs == 0 {
+                warnings.push(format!(
+                    "env.{env_name}.provider.lifetime_reap: lifetime_reap does nothing without max_lifetime_secs"
+                ));
+            }
+        }
         if provider.is_empty() {
             continue;
         }
@@ -590,12 +642,17 @@ pub fn unenforced_lifetime_warnings(cfg: &crate::config::Config) -> Vec<String> 
     let mut warnings = Vec::new();
     for (env_name, env) in &cfg.env {
         let provider = env.provider.provider.trim();
+        let kind = crate::config::EnvProviderKind::of(provider);
+        // Sprites with `lifetime_reap = true` are reaped in the background.
+        let opted_in =
+            matches!(kind, crate::config::EnvProviderKind::Sprites) && env.provider.lifetime_reap;
         if !provider.is_empty()
             && env.provider.max_lifetime_secs > 0
-            && !crate::config::EnvProviderKind::of(provider).lifetime_reaped()
+            && !kind.lifetime_reaped()
+            && !opted_in
         {
             warnings.push(format!(
-                "env.{env_name}.provider.max_lifetime_secs: not enforced for provider `{provider}` (only the Fly, VPS and Vercel reapers destroy instances past a lifetime ceiling); for sprites run `thegn env reap --provider sprites`, otherwise destroy instances yourself or set it to 0"
+                "env.{env_name}.provider.max_lifetime_secs: not enforced for provider `{provider}` (only the Fly, VPS and Vercel reapers destroy instances past a lifetime ceiling); for sprites set lifetime_reap = true or run `thegn env reap --provider sprites`, otherwise destroy instances yourself or set it to 0"
             ));
         }
     }
