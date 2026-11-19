@@ -10,6 +10,8 @@
 //! The error type, its classes and the probes are full; the backends are
 //! stubs that fail closed (filled by b163 lane 4).
 
+pub mod command;
+
 use futures_util::future::BoxFuture;
 use thegn_core::config::{Config, InboxAccount, InboxKind};
 use thegn_core::inbox::InboxPage;
