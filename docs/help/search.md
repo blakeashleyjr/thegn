@@ -36,8 +36,18 @@ history.
 
 Matching is **literal** by default: the query is a substring, case-insensitive
 unless it contains an uppercase letter (smart case). Hits are ranked by match
-quality, then most recent first. `Alt+f` in the overlay toggles fuzzy matching
-and back; the footer shows the mode you would switch to.
+quality, then most recent first. These keys work in the overlay; the footer
+lists them:
+
+| Key      | Effect                                              |
+| -------- | --------------------------------------------------- |
+| `Alt+c`  | toggle exact case (turns smart case off)            |
+| `Alt+w`  | toggle whole-word matching                          |
+| `Alt+r`  | toggle regex matching (as in [[search-replace]])    |
+| `Alt+f`  | toggle fuzzy matching and back                      |
+| `Ctrl+r` | cycle through your recent queries from this session |
+
+Recent queries are kept in memory only, so they are gone after a restart.
 
 `Tab` widens the scope and `Shift-Tab` narrows it, through pane, tab, worktree
 and workspace. The `profile` scope is no longer in the cycle. These scopes are

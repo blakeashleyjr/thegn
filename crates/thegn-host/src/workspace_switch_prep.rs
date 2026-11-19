@@ -234,6 +234,8 @@ fn send_created(
     }
 }
 
+// One route per created project, consumed at once; boxing the result would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum CreatedRoute {
     Drop { seq: u64 },

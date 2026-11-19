@@ -10,6 +10,8 @@ use crate::run::{
     persist_session_layout, refresh_tab_model, switch_workspace,
 };
 
+// A pending switch carries its whole request; activations are made one at a time and consumed at once.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Activation {
     Landed { workspace_switched: bool },
     Pending(crate::workspace_switch_prep::SwitchRequestSpec),
