@@ -86,50 +86,68 @@ pub fn likely_unchanged_since(path: &Path, since: i64) -> bool {
         return false;
     }
     let worktree_changed = CHANGE_SENTINELS.iter().any(|rel| {
-        let p = if rel.is_empty() {
-            path.to_path_buf()
+        if rel.is_empty() {
+            sentinel_moved(path, since)
         } else {
-            path.join(rel)
-        };
-        // A sentinel that does not exist cannot have moved. A metadata error is
-        // treated as "changed": the conservative direction is to walk.
-        match std::fs::symlink_metadata(&p) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(_) => true,
-            Ok(meta) => meta
-                .modified()
-                .ok()
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .is_none_or(|d| d.as_secs() as i64 > since),
+            sentinel_moved(&path.join(rel), since)
         }
     });
     if worktree_changed {
         return false;
     }
 
-    // In a linked worktree `.git` is a file pointing at the per-worktree git
-    // directory, so HEAD and index live there rather than under the checkout.
-    // An absent `.git` means there are no git sentinels to check; an existing
-    // but unresolvable one is uncertain and must force a walk.
+    git_sentinels_unchanged(path, since)
+}
+
+/// `true` when `p`'s mtime is unreadable or newer than `since`; a missing path
+/// cannot have moved. The conservative direction on any error is "moved".
+fn sentinel_moved(p: &Path, since: i64) -> bool {
+    match std::fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(meta) => meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_none_or(|d| d.as_secs() as i64 > since),
+    }
+}
+
+/// HEAD and index are both older than `since`, wherever the git directory
+/// lives.
+///
+/// In a linked worktree `.git` is a file pointing at the per-worktree git
+/// directory, so HEAD and index live there rather than under the checkout.
+/// An absent `.git` means there are no git sentinels to check; an existing
+/// but unresolvable one is uncertain and must force a walk.
+fn git_sentinels_unchanged(path: &Path, since: i64) -> bool {
     match std::fs::symlink_metadata(path.join(".git")) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         _ => {
             let Some(git_dir) = crate::git_memo::git_dir(path) else {
                 return false;
             };
-            !["HEAD", "index"].iter().any(|name| {
-                match std::fs::symlink_metadata(git_dir.join(name)) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(_) => true,
-                    Ok(meta) => meta
-                        .modified()
-                        .ok()
-                        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                        .is_none_or(|d| d.as_secs() as i64 > since),
-                }
-            })
+            !["HEAD", "index"]
+                .iter()
+                .any(|name| sentinel_moved(&git_dir.join(name), since))
         }
     }
+}
+
+/// LOC's change probe: root mtime + HEAD + index (no build sentinels). `false`
+/// when `since <= 0`, the root is gone, or anything is unreadable.
+///
+/// A line count only moves when tracked content moves, and every way that
+/// happens in practice (a commit, a checkout, a `git add`, an editor creating or
+/// renaming a file at the root) bumps one of these three. A build does not
+/// change a line count, so unlike [`likely_unchanged_since`] the `target/`
+/// sentinels are deliberately absent: a background worktree that is only being
+/// built is not re-counted.
+pub fn git_state_unchanged_since(path: &Path, since: i64) -> bool {
+    if since <= 0 || !path.is_dir() {
+        return false;
+    }
+    !sentinel_moved(path, since) && git_sentinels_unchanged(path, since)
 }
 
 /// Measure a worktree's disk usage in ONE parallel walk.
@@ -753,5 +771,63 @@ mod tests {
         let path = d.path().to_path_buf();
         drop(d);
         assert!(!likely_unchanged_since(&path, 2_000));
+    }
+
+    #[test]
+    fn git_state_probe_is_quiet_for_an_untouched_linked_worktree() {
+        let (worktree, _common, _git_dir) = linked_worktree_fixture();
+        assert!(git_state_unchanged_since(worktree.path(), 2_000));
+    }
+
+    #[test]
+    fn git_state_probe_sees_a_moved_head_or_index() {
+        for name in ["HEAD", "index"] {
+            let (worktree, _common, git_dir) = linked_worktree_fixture();
+            touch_at(&git_dir.join(name), 5_000);
+            assert!(
+                !git_state_unchanged_since(worktree.path(), 2_000),
+                "moving {name} must force a recount"
+            );
+        }
+    }
+
+    #[test]
+    fn git_state_probe_sees_a_new_root_entry() {
+        let (worktree, _common, _git_dir) = linked_worktree_fixture();
+        // Creating a file bumps the root's mtime to now, far past `since`.
+        std::fs::write(worktree.path().join("new.rs"), b"fn main() {}").unwrap();
+        assert!(!git_state_unchanged_since(worktree.path(), 2_000));
+    }
+
+    #[test]
+    fn git_state_probe_ignores_build_sentinels() {
+        // A build moves `target/` but not a line count.
+        let (worktree, _common, _git_dir) = linked_worktree_fixture();
+        std::fs::create_dir_all(worktree.path().join("target/debug")).unwrap();
+        let lock = worktree.path().join("target/debug/.cargo-lock");
+        std::fs::write(&lock, b"").unwrap();
+        touch_at(&lock, 5_000);
+        touch_at(&worktree.path().join("target"), 5_000);
+        touch_at(worktree.path(), 1_000);
+        assert!(git_state_unchanged_since(worktree.path(), 2_000));
+        assert!(!likely_unchanged_since(worktree.path(), 2_000));
+    }
+
+    #[test]
+    fn git_state_probe_refuses_missing_roots_and_unstamped_rows() {
+        let (worktree, _common, _git_dir) = linked_worktree_fixture();
+        assert!(!git_state_unchanged_since(worktree.path(), 0));
+        assert!(!git_state_unchanged_since(worktree.path(), -5));
+        let gone = worktree.path().to_path_buf();
+        drop(worktree);
+        assert!(!git_state_unchanged_since(&gone, 2_000));
+    }
+
+    #[test]
+    fn git_state_probe_refuses_an_unresolvable_dot_git() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join(".git"), "gitdir: missing\n").unwrap();
+        touch_at(worktree.path(), 1_000);
+        assert!(!git_state_unchanged_since(worktree.path(), 2_000));
     }
 }

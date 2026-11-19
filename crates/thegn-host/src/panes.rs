@@ -1302,7 +1302,13 @@ impl Panes {
             // client tunneled over the `sprite-proxy` ProxyCommand — ssh owns the
             // PTY (no hand-rolled WSS relay). A normal local PTY pane. Checked
             // before native exec so it takes precedence when configured.
-            if !worktree.is_empty()
+            //
+            // Both provider paths below are config-gated: without an `[env.*]`
+            // whose `placement = "provider"` neither can resolve, so the restore
+            // opens no database for them (this runs on the loop).
+            let provider_envs = crate::agent::provider_envs_configured(cfg);
+            if provider_envs
+                && !worktree.is_empty()
                 && let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, worktree)
             {
                 let exe = thegn_core::util::self_exe_str();
@@ -1332,7 +1338,7 @@ impl Panes {
             // would otherwise need isn't installed on the host). The remembered
             // choice (set by `launch_spec` at create) drives it; absent / "shell" ⇒
             // the login shell.
-            let remembered_agent = if worktree.is_empty() {
+            let remembered_agent = if !provider_envs || worktree.is_empty() {
                 None
             } else {
                 thegn_core::db::Db::open()
@@ -1352,7 +1358,7 @@ impl Panes {
                         }
                     }
                 }
-                None if !worktree.is_empty() => {
+                None if provider_envs && !worktree.is_empty() => {
                     crate::agent::native_shell_exec_for_pane(cfg, worktree)
                 }
                 None => crate::agent::PaneNativeExec::Unavailable,
