@@ -19,6 +19,15 @@ const FIXTURE_ACCOUNT: &str = "THEGN_CAPACITY_RACE_ACCOUNT";
 const FIXTURE_GO: &str = "THEGN_CAPACITY_RACE_GO";
 const FIXTURE_REPORT: &str = "THEGN_CAPACITY_RACE_REPORT";
 
+const SPRITES_FIXTURE_DIR: &str = "THEGN_SPRITES_RACE_DIR";
+const SPRITES_FIXTURE_NAME: &str = "THEGN_SPRITES_RACE_NAME";
+const SPRITES_FIXTURE_CAP: &str = "THEGN_SPRITES_RACE_CAP";
+const SPRITES_FIXTURE_OWNER: &str = "THEGN_SPRITES_RACE_OWNER";
+const SPRITES_FIXTURE_ACCOUNT: &str = "THEGN_SPRITES_RACE_ACCOUNT";
+const SPRITES_FIXTURE_MODE: &str = "THEGN_SPRITES_RACE_MODE";
+const SPRITES_FIXTURE_GO: &str = "THEGN_SPRITES_RACE_GO";
+const SPRITES_FIXTURE_REPORT: &str = "THEGN_SPRITES_RACE_REPORT";
+
 #[test]
 fn capacity_race_child_fixture() {
     let Ok(directory) = std::env::var(FIXTURE_DIR) else {
@@ -77,6 +86,78 @@ fn capacity_race_child_fixture() {
     fs::rename(temporary_report, final_report).expect("publish fixture report");
 }
 
+#[test]
+fn sprites_capacity_race_child_fixture() {
+    let Ok(directory) = std::env::var(SPRITES_FIXTURE_DIR) else {
+        return;
+    };
+    let name = std::env::var(SPRITES_FIXTURE_NAME).expect("sprites fixture child name is set");
+    let cap = std::env::var(SPRITES_FIXTURE_CAP)
+        .expect("sprites fixture cap is set")
+        .parse::<usize>()
+        .expect("sprites fixture cap is a usize");
+    let owner = std::env::var(SPRITES_FIXTURE_OWNER).expect("sprites fixture owner is set");
+    let account = std::env::var(SPRITES_FIXTURE_ACCOUNT).expect("sprites fixture account is set");
+    let mode = std::env::var(SPRITES_FIXTURE_MODE).unwrap_or_default();
+    let start = PathBuf::from(
+        std::env::var(SPRITES_FIXTURE_GO).expect("sprites fixture start path is set"),
+    );
+    let report_dir = PathBuf::from(
+        std::env::var(SPRITES_FIXTURE_REPORT).expect("sprites fixture report dir is set"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let started = loop {
+        if start.exists() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+
+    let result = if started {
+        let scope = thegn_svc::sprites::ledger::OwnerScope { owner, account };
+        if mode == "adopt" {
+            match thegn_svc::sprites::ledger::adopt_at(Path::new(&directory), &scope, &name, cap) {
+                Ok(_) => "ok".to_owned(),
+                Err(error) => sprites_reservation_error(error),
+            }
+        } else {
+            match thegn_svc::sprites::ledger::reserve_at(Path::new(&directory), &scope, &name, cap)
+            {
+                Ok(mut guard) => match thegn_svc::sprites::ledger::commit_at(
+                    Path::new(&directory),
+                    &scope,
+                    &name,
+                ) {
+                    Ok(()) => {
+                        guard.preserve();
+                        "ok".to_owned()
+                    }
+                    Err(error) => format!("err:{error:?}"),
+                },
+                Err(error) => sprites_reservation_error(error),
+            }
+        }
+    } else {
+        "timeout".to_owned()
+    };
+    let temporary_report = report_dir.join(format!("{name}.tmp"));
+    let final_report = report_dir.join(&name);
+    fs::write(&temporary_report, result).expect("write sprites fixture report");
+    fs::rename(temporary_report, final_report).expect("publish sprites fixture report");
+}
+
+fn sprites_reservation_error(error: anyhow::Error) -> String {
+    let debug = format!("{error:?}");
+    if debug.contains("max_instances reached") {
+        "atcap".to_owned()
+    } else {
+        format!("err:{debug}")
+    }
+}
+
 struct ChildProcess {
     name: String,
     child: Child,
@@ -105,34 +186,72 @@ struct RaceFixture<'a> {
     report_dir: &'a Path,
     child_count: usize,
     cap: usize,
-    scope: &'a str,
     account: &'a str,
 }
 
-fn run_children(fixture: RaceFixture<'_>) -> Vec<(String, String)> {
+struct RaceEnv<'a> {
+    directory: &'a str,
+    name: &'a str,
+    cap: &'a str,
+    account: &'a str,
+    start: &'a str,
+    report: &'a str,
+}
+
+const CAPACITY_RACE_ENV: RaceEnv<'static> = RaceEnv {
+    directory: FIXTURE_DIR,
+    name: FIXTURE_NAME,
+    cap: FIXTURE_CAP,
+    account: FIXTURE_ACCOUNT,
+    start: FIXTURE_GO,
+    report: FIXTURE_REPORT,
+};
+
+const SPRITES_RACE_ENV: RaceEnv<'static> = RaceEnv {
+    directory: SPRITES_FIXTURE_DIR,
+    name: SPRITES_FIXTURE_NAME,
+    cap: SPRITES_FIXTURE_CAP,
+    account: SPRITES_FIXTURE_ACCOUNT,
+    start: SPRITES_FIXTURE_GO,
+    report: SPRITES_FIXTURE_REPORT,
+};
+
+fn shared_child_env<'a>(
+    env: &'a [(&'a str, &'a str)],
+    child_count: usize,
+) -> Vec<&'a [(&'a str, &'a str)]> {
+    vec![env; child_count]
+}
+
+fn run_children(
+    fixture: RaceFixture<'_>,
+    child_fixture: &str,
+    env: RaceEnv<'_>,
+    child_env: &[&[(&str, &str)]],
+) -> Vec<(String, String)> {
     let executable = std::env::current_exe().expect("integration test executable is available");
     let mut children = Children(Vec::with_capacity(fixture.child_count));
     for index in 0..fixture.child_count {
         let name = format!("race-{index}");
         let stderr = fs::File::create(fixture.report_dir.join(format!("{name}.stderr")))
             .unwrap_or_else(|error| panic!("failed to create child {name} stderr file: {error}"));
-        let child = Command::new(&executable)
-            .args([
-                "--exact",
-                "capacity_race_child_fixture",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(FIXTURE_DIR, fixture.directory)
-            .env(FIXTURE_NAME, &name)
-            .env(FIXTURE_CAP, fixture.cap.to_string())
-            .env(FIXTURE_SCOPE, fixture.scope)
-            .env(FIXTURE_ACCOUNT, fixture.account)
-            .env(FIXTURE_GO, fixture.start_file)
-            .env(FIXTURE_REPORT, fixture.report_dir)
+        let child_env = child_env.get(index).copied().unwrap_or(&[]);
+        let mut command = Command::new(&executable);
+        command
+            .args(["--exact", child_fixture, "--nocapture", "--test-threads=1"])
+            .env(env.directory, fixture.directory)
+            .env(env.name, &name)
+            .env(env.cap, fixture.cap.to_string())
+            .env(env.account, fixture.account)
+            .env(env.start, fixture.start_file)
+            .env(env.report, fixture.report_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::from(stderr));
+        for (key, value) in child_env {
+            command.env(key, value);
+        }
+        let child = command
             .spawn()
             .unwrap_or_else(|error| panic!("failed to spawn capacity race child {name}: {error}"));
         children.0.push(ChildProcess { name, child });
@@ -252,20 +371,39 @@ fn assert_outcomes(results: &[(String, String)], ok_count: usize, atcap_count: u
     assert_eq!(atcap, atcap_count);
 }
 
+fn sprites_record(name: &str, owner: &str, account: &str) -> VpsRecord {
+    VpsRecord {
+        name: name.to_owned(),
+        provider: thegn_svc::sprites::ledger::LEDGER_PROVIDER.to_owned(),
+        state: "ready".to_owned(),
+        instance_id: name.to_owned(),
+        ip: String::new(),
+        created_at: 1,
+        owner: owner.to_owned(),
+        account: account.to_owned(),
+    }
+}
+
 // Each test releases all independently spawned test-harness processes from one start file.
 // reserve_at holds its cross-process file lock from occupancy count through atomic record write.
 #[test]
 fn capacity_race_six_processes_fill_a_ceiling_of_two() {
     let (_temporary, directory, start_file, report_dir) = temporary_paths();
-    let results = run_children(RaceFixture {
-        directory: &directory,
-        start_file: &start_file,
-        report_dir: &report_dir,
-        child_count: 6,
-        cap: 2,
-        scope: "all",
-        account: "",
-    });
+    let extra_env = [(FIXTURE_SCOPE, "all")];
+    let child_env = shared_child_env(&extra_env, 6);
+    let results = run_children(
+        RaceFixture {
+            directory: &directory,
+            start_file: &start_file,
+            report_dir: &report_dir,
+            child_count: 6,
+            cap: 2,
+            account: "",
+        },
+        "capacity_race_child_fixture",
+        CAPACITY_RACE_ENV,
+        &child_env,
+    );
 
     assert_outcomes(&results, 2, 4);
     let records = registry::list_at(&directory);
@@ -289,15 +427,21 @@ fn capacity_race_provider_scope_ignores_other_providers() {
     let (_temporary, directory, start_file, report_dir) = temporary_paths();
     registry::write_at(&directory, &record("other-0", "fly", "")).expect("seed first Fly record");
     registry::write_at(&directory, &record("other-1", "fly", "")).expect("seed second Fly record");
-    let results = run_children(RaceFixture {
-        directory: &directory,
-        start_file: &start_file,
-        report_dir: &report_dir,
-        child_count: 4,
-        cap: 1,
-        scope: "hetzner",
-        account: "",
-    });
+    let extra_env = [(FIXTURE_SCOPE, "hetzner")];
+    let child_env = shared_child_env(&extra_env, 4);
+    let results = run_children(
+        RaceFixture {
+            directory: &directory,
+            start_file: &start_file,
+            report_dir: &report_dir,
+            child_count: 4,
+            cap: 1,
+            account: "",
+        },
+        "capacity_race_child_fixture",
+        CAPACITY_RACE_ENV,
+        &child_env,
+    );
 
     assert_outcomes(&results, 1, 3);
     assert_eq!(registry::list_at(&directory).len(), 3);
@@ -312,16 +456,139 @@ fn capacity_race_other_account_records_do_not_count() {
         .expect("seed first other-account record");
     registry::write_at(&directory, &record("other-1", "hetzner", "acct-b"))
         .expect("seed second other-account record");
-    let results = run_children(RaceFixture {
-        directory: &directory,
-        start_file: &start_file,
-        report_dir: &report_dir,
-        child_count: 4,
-        cap: 1,
-        scope: "all",
-        account: "acct-a",
-    });
+    let extra_env = [(FIXTURE_SCOPE, "all")];
+    let child_env = shared_child_env(&extra_env, 4);
+    let results = run_children(
+        RaceFixture {
+            directory: &directory,
+            start_file: &start_file,
+            report_dir: &report_dir,
+            child_count: 4,
+            cap: 1,
+            account: "acct-a",
+        },
+        "capacity_race_child_fixture",
+        CAPACITY_RACE_ENV,
+        &child_env,
+    );
 
     assert_outcomes(&results, 1, 3);
     assert_eq!(registry::list_at(&directory).len(), 3);
+}
+
+#[test]
+fn sprites_ledger_race_six_processes_fill_a_cap_of_two() {
+    let (_temporary, directory, start_file, report_dir) = temporary_paths();
+    let extra_env = [
+        (SPRITES_FIXTURE_OWNER, "owner-a"),
+        (SPRITES_FIXTURE_MODE, "reserve"),
+    ];
+    let child_env = shared_child_env(&extra_env, 6);
+    let results = run_children(
+        RaceFixture {
+            directory: &directory,
+            start_file: &start_file,
+            report_dir: &report_dir,
+            child_count: 6,
+            cap: 2,
+            account: "acct-a",
+        },
+        "sprites_capacity_race_child_fixture",
+        SPRITES_RACE_ENV,
+        &child_env,
+    );
+
+    assert_outcomes(&results, 2, 4);
+    let records = registry::list_at(&directory);
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| {
+        record.provider == thegn_svc::sprites::ledger::LEDGER_PROVIDER
+            && record.owner == "owner-a"
+            && record.account == "acct-a"
+            && record.state == "ready"
+    }));
+}
+
+#[test]
+fn sprites_ledger_race_other_account_records_do_not_count() {
+    let (_temporary, directory, start_file, report_dir) = temporary_paths();
+    registry::write_at(&directory, &sprites_record("other-0", "owner-a", "acct-b"))
+        .expect("seed first other-account sprite record");
+    registry::write_at(&directory, &sprites_record("other-1", "owner-a", "acct-b"))
+        .expect("seed second other-account sprite record");
+    // reserve_checked_at excludes records with a different non-empty account
+    // from the occupancy count, so account a still has one slot at cap one.
+    let extra_env = [
+        (SPRITES_FIXTURE_OWNER, "owner-a"),
+        (SPRITES_FIXTURE_MODE, "reserve"),
+    ];
+    let child_env = shared_child_env(&extra_env, 4);
+    let results = run_children(
+        RaceFixture {
+            directory: &directory,
+            start_file: &start_file,
+            report_dir: &report_dir,
+            child_count: 4,
+            cap: 1,
+            account: "acct-a",
+        },
+        "sprites_capacity_race_child_fixture",
+        SPRITES_RACE_ENV,
+        &child_env,
+    );
+
+    assert_outcomes(&results, 1, 3);
+    let records = registry::list_at(&directory);
+    assert_eq!(records.len(), 3);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.account == "acct-a")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.account == "acct-b")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn sprites_ledger_race_adopt_and_reserve_share_one_cap() {
+    let (_temporary, directory, start_file, report_dir) = temporary_paths();
+    let adopt_env = [
+        (SPRITES_FIXTURE_OWNER, "owner-a"),
+        (SPRITES_FIXTURE_MODE, "adopt"),
+    ];
+    let reserve_env = [
+        (SPRITES_FIXTURE_OWNER, "owner-a"),
+        (SPRITES_FIXTURE_MODE, "reserve"),
+    ];
+    let child_env = [
+        &adopt_env[..],
+        &adopt_env[..],
+        &adopt_env[..],
+        &reserve_env[..],
+        &reserve_env[..],
+        &reserve_env[..],
+    ];
+    let results = run_children(
+        RaceFixture {
+            directory: &directory,
+            start_file: &start_file,
+            report_dir: &report_dir,
+            child_count: 6,
+            cap: 1,
+            account: "acct-a",
+        },
+        "sprites_capacity_race_child_fixture",
+        SPRITES_RACE_ENV,
+        &child_env,
+    );
+
+    assert_outcomes(&results, 1, 5);
+    assert_eq!(registry::list_at(&directory).len(), 1);
 }
