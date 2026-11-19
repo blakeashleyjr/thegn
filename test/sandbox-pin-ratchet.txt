@@ -1,6 +1,6 @@
 # Deliberate worktree-less resolver selections, keyed by enclosing function.
 agent_configs.rs:resync_agent_auth  Reads profile-independent credential transfer policy only.
-close_teardown.rs:background_close  Teardown cleanup does not launch a process.
+close_teardown.rs:background_close_with  Teardown cleanup does not launch a process.
 cmd/env.rs:resolve_with_selection  Env display and image-bake use the selected env name only.
 lifecycle.rs:explicit_park  Park and teardown bookkeeping does not launch a process.
 lifecycle.rs:pool_env  Selects the warm-pool env name; it does not launch a worktree.
