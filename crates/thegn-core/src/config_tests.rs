@@ -2887,15 +2887,14 @@ transport = \"ssh\"
 
 #[test]
 fn process_env_reads_real_vars() {
-    // SAFETY: single-threaded test using uniquely-named vars.
-    unsafe { std::env::set_var("THEGN_TEST_PENV_xyz", "v1") };
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("THEGN_TEST_PENV_xyz", Some("v1")),
+        ("THEGN_TEST_PENV_blank", Some("   ")),
+    ]);
     assert_eq!(ProcessEnv.get("THEGN_TEST_PENV_xyz").as_deref(), Some("v1"));
     assert!(ProcessEnv.get("THEGN_TEST_PENV_absent_qqq").is_none());
-    unsafe { std::env::remove_var("THEGN_TEST_PENV_xyz") };
     // blank values are treated as unset.
-    unsafe { std::env::set_var("THEGN_TEST_PENV_blank", "   ") };
     assert!(ProcessEnv.get("THEGN_TEST_PENV_blank").is_none());
-    unsafe { std::env::remove_var("THEGN_TEST_PENV_blank") };
 }
 
 #[test]
@@ -2961,14 +2960,16 @@ fn pin_lookup_by_name_and_index_and_workspace_scope() {
 
 #[test]
 fn expand_env_ref_resolves_env_prefix() {
-    unsafe { std::env::set_var("THEGN_TEST_EXPAND_TOKEN", "secret") };
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("THEGN_TEST_EXPAND_TOKEN", Some("secret")),
+        ("THEGN_TEST_EXPAND_MISSING", None),
+    ]);
     assert_eq!(
         expand_env_ref("env:THEGN_TEST_EXPAND_TOKEN"),
         Some("secret".into())
     );
-    unsafe { std::env::remove_var("THEGN_TEST_EXPAND_TOKEN") };
     // Missing var returns None.
-    assert_eq!(expand_env_ref("env:THEGN_TEST_EXPAND_TOKEN"), None);
+    assert_eq!(expand_env_ref("env:THEGN_TEST_EXPAND_MISSING"), None);
 }
 
 #[test]
