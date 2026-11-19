@@ -1453,6 +1453,18 @@
       "archive_path": "openspec/changes/archive/2026-09-30-serialize-validate-frp-configuration/"
     },
     {
+      "change": "sidebar-short-worktree-list",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-139",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Sidebar groups fold to 7 entries with protected rows, batch rows, no repeated title line, a continuous guide and state-toned names; live verification open."
+    },
+    {
       "change": "stabilize-process-monitor-refresh",
       "archive_path": "openspec/changes/archive/2026-10-19-stabilize-process-monitor-refresh/",
       "lifecycle": "archived",

@@ -228,8 +228,9 @@
     {
       "issue": "THE-139",
       "project": "Workspace Product & Observability",
-      "changes": [],
-      "no_spec_rationale": "Zone UI delivered in b149 (sidebar chip, palette assign); core archived 2026-11-17."
+      "changes": [
+        "sidebar-short-worktree-list"
+      ]
     },
     {
       "issue": "THE-140",
