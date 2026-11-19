@@ -25,8 +25,13 @@ async fn vercel_passes_the_conformance_suite() {
         view("tg-vercel-foreign", SessionStatus::Running, Some("sess_f")),
     );
 
-    let p = Provider::Vercel(provider(&fake, ledger.path(), 1));
+    let mut vp = provider(&fake, ledger.path(), 1);
+    vp.destroy_budget = std::time::Duration::from_millis(200);
+    vp.poll = std::time::Duration::from_millis(20);
+    let p = Provider::Vercel(vp);
     let (seen, counts, resumes) = (fake.clone(), fake.clone(), fake.clone());
+    let hold_fake = fake.clone();
+    let ledger_path = ledger.path().to_path_buf();
     let fx = Fixture {
         created: NAME.into(),
         missing: "tg-vercel-missing".into(),
@@ -47,10 +52,25 @@ async fn vercel_passes_the_conformance_suite() {
         // The untagged foreign sandbox is filtered out of the ledger count.
         cap: Some(1),
         supports_stop: true,
+        hold_after_delete: Some(Box::new(move |name, hold| {
+            let mut gets = hold_fake.gets.lock().unwrap();
+            if hold {
+                gets.push_back(Some(view(name, SessionStatus::Running, Some("sess_h"))));
+            } else {
+                gets.clear();
+            }
+        })),
+        recorded: Some(Box::new(move |name| {
+            ledger_path.join(format!("{name}.json")).exists()
+        })),
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
     assert!(report.skipped.is_empty(), "{report:?}");
+    assert!(
+        report.passed.contains(&"destroy_keeps_record_until_gone"),
+        "{report:?}"
+    );
     assert!(fake.count("stop") >= 1, "{report:?}");
     assert_eq!(fake.count("resume"), 1, "{report:?}");
 }
