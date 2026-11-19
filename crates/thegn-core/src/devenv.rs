@@ -1,7 +1,7 @@
 //! Read an already-existing cached Nix flake `devShell` environment for a
-//! sandboxed worktree pane. This module deliberately does not evaluate flakes,
-//! spawn `nix`, or write cache entries; cold environments remain uncached until
-//! explicit user or target-side setup.
+//! sandboxed worktree pane. This module deliberately does not evaluate flakes
+//! or spawn `nix`. Nothing evaluates a flake on its own; only the explicit
+//! `thegn sandbox warm-devshell` writes a cache entry ([`store`]).
 //!
 //! Flow (Tier A in
 //! `docs/superpowers/specs/2026-06-26-sandbox-devshell-injection-design.md`):
@@ -267,6 +267,65 @@ pub fn cached(repo_root: &Path) -> Option<Devshell> {
     read_cache(&cache_path(&key))
 }
 
+/// Write `dev` as the cache entry `cached(repo_root)` reads: the
+/// `$XDG_STATE_HOME/thegn/devenv/` directory is created private (0700), the
+/// entry is written owner-only and atomically. Refuses an empty `Devshell` and
+/// a repo with no cache key (no flake). Returns the path written.
+pub fn store(repo_root: &Path, dev: &Devshell) -> Result<PathBuf, String> {
+    let dev = sanitize(dev.clone());
+    if dev.is_empty() {
+        return Err(format!(
+            "cannot cache devShell for {}: devShell is empty",
+            repo_root.display()
+        ));
+    }
+    let key = cache_key(repo_root).ok_or_else(|| {
+        format!(
+            "cannot cache devShell for {}: no flake.nix here",
+            repo_root.display()
+        )
+    })?;
+    let path = cache_path(&key);
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "cannot cache devShell: cache path {} has no parent directory",
+            path.display()
+        )
+    })?;
+    crate::fsperm::ensure_private_dir(parent).map_err(|error| {
+        format!(
+            "cannot create private devShell cache directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    cache_parent_admissible(parent).map_err(|reason| {
+        format!(
+            "cannot write devShell cache path {}: {reason}",
+            path.display()
+        )
+    })?;
+    let bytes = serde_json::to_vec(&dev).map_err(|error| {
+        format!(
+            "cannot serialize devShell cache entry {}: {error}",
+            path.display()
+        )
+    })?;
+    const MAX_CACHE_BYTES: usize = 1024 * 1024;
+    if bytes.len() > MAX_CACHE_BYTES {
+        return Err(format!(
+            "devShell cache entry {} exceeds the 1 MiB limit",
+            path.display()
+        ));
+    }
+    crate::fsperm::write_owner_only_atomic(&path, &bytes).map_err(|error| {
+        format!(
+            "cannot write devShell cache entry {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
 fn read_cache(path: &Path) -> Option<Devshell> {
     const MAX_CACHE_BYTES: u64 = 1024 * 1024;
     let file = match crate::fsperm::open_regular_file_nofollow(path) {
@@ -478,6 +537,83 @@ mod tests {
         };
         let json = serde_json::to_string(&dev).unwrap();
         assert_eq!(serde_json::from_str::<Devshell>(&json).unwrap(), dev);
+    }
+
+    #[test]
+    fn store_round_trips_through_cached() {
+        let _state = crate::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("flake.nix"), "{ outputs = _: {}; }").unwrap();
+        let dev = Devshell {
+            path: Some("/tmp:/nix/store/abc/bin".into()),
+            vars: vec![
+                ("SAFE_PROJECT_FLAG".into(), "yes".into()),
+                ("LD_PRELOAD".into(), "/tmp/evil.so".into()),
+            ],
+        };
+        let expected = sanitize(dev.clone());
+        let path = store(repo.path(), &dev).unwrap();
+        assert!(path.is_file());
+        assert_eq!(cached(repo.path()), Some(expected));
+    }
+
+    #[test]
+    fn store_refuses_empty() {
+        let _state = crate::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("flake.nix"), "{ outputs = _: {}; }").unwrap();
+        let error = store(repo.path(), &Devshell::default()).unwrap_err();
+        assert!(error.contains("empty devShell"), "{error}");
+    }
+
+    #[test]
+    fn store_refuses_without_flake() {
+        let _state = crate::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        let error = store(
+            repo.path(),
+            &Devshell {
+                path: Some("/nix/store/abc/bin".into()),
+                vars: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("no flake.nix here"), "{error}");
+    }
+
+    #[test]
+    fn store_refuses_a_symlinked_cache_dir() {
+        let _state = crate::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("flake.nix"), "{ outputs = _: {}; }").unwrap();
+        let state_thegn = crate::util::xdg_state_home().join("thegn");
+        std::fs::create_dir_all(&state_thegn).unwrap();
+        let real = tempfile::tempdir().unwrap();
+        let linked = state_thegn.join("devenv");
+        match crate::fsperm::create_symlink(real.path(), &linked, true) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not create symlink fixture: {error}"),
+        }
+        let error = store(
+            repo.path(),
+            &Devshell {
+                path: Some("/nix/store/abc/bin".into()),
+                vars: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("devenv") || error.contains("symlink"),
+            "{error}"
+        );
     }
 
     #[test]
