@@ -25,8 +25,8 @@ pub trait CacheStore {
     /// Compare-and-swap write of a worktree's PR-status cache row.
     ///
     /// `expected` is the raw `(json, fetched_at)` the caller read via
-    /// [`CacheStore::get_pr_cache`] before it fetched: `None` inserts only
-    /// when no row exists; `Some` replaces the row only while it still holds
+    /// [`CacheStore::get_pr_cache`] before it fetched: `None` inserts when
+    /// no row exists, or replaces a row `get_pr_cache` cannot read; `Some` replaces the row only while it still holds
     /// exactly that `(json, fetched_at)`. Returns `true` iff this call wrote.
     /// A `false` means another producer moved the row first, and that
     /// producer (not this caller) owns the transition's events.
