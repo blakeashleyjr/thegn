@@ -180,7 +180,7 @@ fn read_entry(file: &mut std::fs::File, name: &str) -> Result<SyncJournalEntry> 
         bytes.len() <= MAX_ENTRY_BYTES,
         "provider sync journal entry {name} exceeds {MAX_ENTRY_BYTES} bytes"
     );
-    let entry = serde_json::from_slice(&bytes)
+    let entry: SyncJournalEntry = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse provider sync journal entry {name}"))?;
     anyhow::ensure!(
         entry.version == JOURNAL_VERSION,
