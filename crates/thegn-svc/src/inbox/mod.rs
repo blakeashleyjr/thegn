@@ -10,6 +10,7 @@
 //! The error type, its classes and the probes are full; the backends are
 //! stubs that fail closed (filled by b163 lane 4).
 
+pub mod command;
 mod todoist;
 
 use futures_util::future::BoxFuture;
@@ -126,10 +127,9 @@ pub fn backend_for(account: &InboxAccount) -> Result<Box<dyn InboxBackend>, Inbo
         return Err(InboxError::NotConfigured);
     }
     match account.kind {
+        InboxKind::Command => Ok(Box::new(command::CommandBackend::new(account))),
         InboxKind::Todoist => Ok(Box::new(todoist::TodoistBackend::new(account)?)),
-        InboxKind::Command | InboxKind::Imap => {
-            Err(InboxError::Unsupported("inbox backends (b163 lane 4)"))
-        }
+        InboxKind::Imap => Err(InboxError::Unsupported("inbox backends (b163 lane 4)")),
         InboxKind::Gmail | InboxKind::Jmap | InboxKind::Outlook | InboxKind::Slack => {
             Err(InboxError::NotConfigured)
         }
@@ -148,21 +148,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
                 return ProbeReport::reserved("inbox", &id);
             }
             let report = match account.kind {
-                InboxKind::Command => {
-                    let bin = account.command.first().cloned().unwrap_or_default();
-                    let availability = if bin.trim().is_empty() {
-                        Availability::Unavailable("no command configured".into())
-                    } else if bin.contains('/') {
-                        if std::path::Path::new(&bin).exists() {
-                            Availability::Ready
-                        } else {
-                            Availability::Unavailable(format!("command not found: {bin}"))
-                        }
-                    } else {
-                        crate::seam::registry::binary_availability(&bin)
-                    };
-                    ProbeReport::new("inbox", id, availability)
-                }
+                InboxKind::Command => command::probe(account),
                 InboxKind::Todoist => {
                     let parsed = thegn_core::secretref::SecretRef::parse(
                         &account.token,
@@ -216,12 +202,13 @@ mod tests {
                 "{kind:?}"
             );
         }
-        for kind in [InboxKind::Command, InboxKind::Imap] {
+        for kind in [InboxKind::Imap] {
             assert!(
                 backend_for(&account("x", kind)).is_err(),
                 "stubs fail closed"
             );
         }
+        assert!(backend_for(&account("x", InboxKind::Command)).is_ok());
     }
 
     #[test]
