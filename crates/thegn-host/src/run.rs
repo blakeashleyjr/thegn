@@ -10753,6 +10753,12 @@ async fn event_loop<T: Terminal>(
                                 chrome.center,
                             );
                         }
+                        if let Some(entry) = request.after.sidebar_entry.clone() {
+                            crate::workspace_switch_prep::adopt_sidebar_entry(
+                                &mut model.sidebar_workspaces,
+                                entry,
+                            );
+                        }
                         refresh_tab_model(&mut model, &session, &mut sb);
                         if after.reveal_active {
                             sb.reveal_active_worktree(&mut model, &session);
@@ -12988,7 +12994,17 @@ async fn event_loop<T: Terminal>(
                 )
             {
                 refresh_tab_model(&mut model, &session, &mut sb);
-                kick_model_hydration!();
+                if crate::workspace_switch_prep::applied_switch_hydrates_inline(
+                    last_active_worktree.as_deref(),
+                    &crate::hydrate::active_slice_key(&session),
+                ) {
+                    kick_model_hydration!();
+                }
+                // Same as the cold apply: the switch landed after this turn's detection and
+                // materialize, so pulse once (one wake per intent row, not a timer).
+                if let Err(error) = waker.wake() {
+                    tracing::debug!(target: "thegn::workspace_switch", %error, "post-open wake failed");
+                }
             }
             if fi.repo != session.id
                 && pending_switch.request_target() == Some(fi.repo.as_str())
