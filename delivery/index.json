@@ -1031,7 +1031,7 @@
           "project": "Client API & Remote Access"
         }
       ],
-      "summary": "Sprites ledger-before-create ownership, proof-before-delete reap, headless keep-awake hold, no background creates; live verification open."
+      "summary": "Sprites ledger-before-create ownership, proof-before-delete reap, headless keep-awake hold, no background creates, live script --keep-going with a real in-sprite pull commit and cost JSON; live verification open."
     },
     {
       "change": "harden-remote-teardown-proof",
