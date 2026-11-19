@@ -43,28 +43,43 @@ pub fn ceiling_secs(requested: Option<u64>, max_lifetime_secs: u64) -> u64 {
     }
 }
 
+/// Consecutive failed refreshes after which the heartbeat gives up.
+pub const HOLD_MAX_REFRESH_FAILURES: u64 = 3;
+
 /// `$0` the heartbeat script runs under (`sh -c SCRIPT $0 task ceiling argv…`).
 pub const HOLD_ARG0: &str = "thegn-hold";
 
 /// The POSIX `sh` heartbeat (no bashisms). Positional arguments:
 /// `$1` the task name, `$2` the ceiling in seconds, `$3…` the command.
 ///
-/// - When `curl` is on `PATH` and the sprite API socket exists, it `PUT`s the
-///   task with a 300 s expiry ([`HOLD_EXPIRE_SECS`]) once, then a background
-///   loop re-`PUT`s it every 60 s ([`HOLD_REFRESH_SECS`]) until the ceiling
-///   passes or this shell is gone. Otherwise it prints one line to stderr and
-///   runs the command unheld.
+/// - It `PUT`s the task with a 300 s expiry ([`HOLD_EXPIRE_SECS`]) once. The
+///   hold counts as taken only when that first `PUT` succeeds; a background
+///   loop then re-`PUT`s it every 60 s ([`HOLD_REFRESH_SECS`]) until the
+///   ceiling passes or this shell is gone.
+/// - The keep-awake is unavailable, and the script prints one line to stderr
+///   and runs the command unheld, when any of these holds:
+///   1. `curl` is not on `PATH`;
+///   2. the sprite task socket does not exist;
+///   3. the Tasks API refused (or never answered) the first `PUT`.
+///
+///   An unheld run never sends a `DELETE`: there is no hold to drop.
+/// - A lost hold ends the heartbeat; the sprite may then sleep. After
+///   [`HOLD_MAX_REFRESH_FAILURES`] refreshes fail in a row the loop stops
+///   (silently: it runs on `/dev/null`). The command keeps running, and the
+///   `DELETE` at exit is still sent, best-effort.
 /// - The command runs as a child; its exit code is passed through. On exit
 ///   (and on HUP/INT/TERM, which are forwarded to the child first) the loop is
-///   stopped and the task is `DELETE`d, best-effort.
+///   stopped and, when the hold was taken, the task is `DELETE`d, best-effort.
 /// - The loop and the command are forked before any trap is installed, so a
 ///   signal sent to either before it first runs cannot be lost to an inherited
 ///   handler. A signal reaching the wrapper in that short startup window ends
 ///   it without cleanup: the loop sees its parent gone within 60 s and the
 ///   hold expires 300 s later (the crash bound).
-/// - Stopping the loop is bounded: if it has not exited 5 s after its `TERM`
-///   (a signal can land just before it blocks in `wait`), it is `KILL`ed, so
-///   the command's exit is never held for a whole nap.
+/// - Stopping the loop is prompt: the loop ends its nap with `KILL`, never a
+///   catchable signal. The nap is forked while the loop's `TERM` trap is
+///   installed, so a `TERM` reaching it before it resets that inherited
+///   handler would be swallowed and the nap (and the command's exit) would
+///   last the whole refresh interval.
 /// - The loop never holds the command's stdout/stderr (it runs on
 ///   `/dev/null`), and it kills and reaps its own `sleep` before exiting.
 /// - `THEGN_HOLD_SOCK` overrides the socket path. It exists for thegn's own
@@ -77,7 +92,6 @@ sock=${THEGN_HOLD_SOCK:-/.sprite/api.sock}
 case $ceiling in '' | *[!0-9]*) ceiling=0 ;; esac
 case $task in '' | *[!a-z0-9-]*) valid= ;; *) valid=1 ;; esac
 loop=
-dog=
 held=
 child=
 rc=0
@@ -95,10 +109,14 @@ hold_drop() {
 # being swallowed by an inherited handler. The trap only records the stop and
 # ends the current nap; every step is bounded, so a TERM at any point ends the
 # loop promptly, and the nap is always killed and reaped before it exits.
+# The nap is killed with KILL, never TERM: it is forked while this trap is
+# installed, and until it resets the inherited handler (between its fork and
+# its exec) a TERM would be caught and dropped, leaving a 60 s nap to wait on.
 hold_loop() {
     stop=
     nap=
-    trap 'stop=1; [ -z "$nap" ] || kill "$nap" 2>/dev/null' TERM
+    fails=0
+    trap 'stop=1; [ -z "$nap" ] || kill -s KILL "$nap" 2>/dev/null' TERM
     while [ -z "$stop" ]; do
         nap=
         sleep 60 &
@@ -107,25 +125,27 @@ hold_loop() {
         [ -z "$stop" ] || break
         [ "$(date +%s)" -lt "$end" ] || break
         kill -0 "$parent" 2>/dev/null || break
-        hold_put
+        # A lost hold ends the heartbeat; the sprite may then sleep.
+        if hold_put; then
+            fails=0
+        else
+            fails=$((fails + 1))
+            [ "$fails" -lt 3 ] || break
+        fi
     done
     if [ -n "$stop" ] && [ -n "$nap" ]; then
-        kill "$nap" 2>/dev/null
+        kill -s KILL "$nap" 2>/dev/null
         wait "$nap" 2>/dev/null
     fi
     exit 0
 }
 cleanup() {
     if [ -n "$loop" ]; then
+        # The loop was forked before any trap existed, so this TERM is never
+        # swallowed: it either kills the loop outright (no trap yet, so no nap
+        # yet) or runs its trap, which KILLs the nap. Either way it ends now.
         kill "$loop" 2>/dev/null
-        # Backstop: a TERM that lands just before the loop blocks in its own
-        # `wait` can be missed, which would hold the command's exit for the
-        # whole nap. Bound the reap: KILL the loop if it outlives 5 s.
-        { sleep 5; kill -KILL "$loop" 2>/dev/null; } </dev/null >/dev/null 2>&1 &
-        dog=$!
         wait "$loop" 2>/dev/null
-        kill "$dog" 2>/dev/null
-        wait "$dog" 2>/dev/null
         loop=
     fi
     if [ -n "$held" ]; then
@@ -147,15 +167,16 @@ on_signal() {
     cleanup
     exit "$rc"
 }
-if [ -n "$valid" ] && command -v curl >/dev/null 2>&1 && [ -S "$sock" ]; then
+# The hold is taken only when the first PUT succeeds: an unheld run must not
+# claim a hold, nor DELETE one it never got.
+if [ -n "$valid" ] && command -v curl >/dev/null 2>&1 && [ -S "$sock" ] && hold_put 2>/dev/null; then
     held=1
-    hold_put
     parent=$$
     end=$(( $(date +%s) + ceiling ))
     hold_loop </dev/null >/dev/null 2>&1 &
     loop=$!
 else
-    echo 'thegn: sprite keep-awake unavailable (no curl or task socket); running unheld' >&2
+    echo 'thegn: sprite keep-awake unavailable (no curl, no task socket, or the Tasks API refused the hold); running unheld' >&2
 fi
 exec 3<&0
 "$@" <&3 3<&- &
@@ -248,7 +269,9 @@ mod tests {
         for (at, _) in HOLD_SCRIPT.match_indices("$(") {
             let rest = &HOLD_SCRIPT[at..];
             assert!(
-                rest.starts_with("$(date +%s)") || rest.starts_with("$(( $(date +%s)"),
+                rest.starts_with("$(date +%s)")
+                    || rest.starts_with("$(( $(date +%s)")
+                    || rest.starts_with("$((fails + 1))"),
                 "unexpected command substitution: {}",
                 &rest[..rest.len().min(30)]
             );
@@ -261,6 +284,11 @@ mod tests {
         assert!(HOLD_SCRIPT.contains(&format!("{{\"expire\":\"{HOLD_EXPIRE_SECS}s\"}}")));
         assert!(HOLD_SCRIPT.contains("${THEGN_HOLD_SOCK:-/.sprite/api.sock}"));
         assert!(HOLD_SCRIPT.contains("http://sprite/v1/tasks/$task"));
+        assert!(HOLD_SCRIPT.contains(&format!(
+            "[ \"$fails\" -lt {HOLD_MAX_REFRESH_FAILURES} ] || break"
+        )));
+        // The hold is claimed only by a successful first PUT.
+        assert!(HOLD_SCRIPT.contains("[ -S \"$sock\" ] && hold_put 2>/dev/null; then\n    held=1"));
         // POSIX sh: no bashisms.
         for bashism in ["[[", "function ", "local ", "$'", "<<<", "pipefail"] {
             assert!(!HOLD_SCRIPT.contains(bashism), "bashism {bashism:?}");
@@ -320,10 +348,23 @@ mod tests {
             .find(|candidate| candidate.is_file())
     }
 
+    /// How the fake `curl` answers a `PUT` (a `DELETE` always succeeds).
+    #[derive(Clone, Copy, PartialEq)]
+    enum Put {
+        Ok,
+        Fail,
+        /// The first `PUT` succeeds; every later one fails.
+        FailAfterFirst,
+    }
+
     #[derive(Clone, Copy)]
     struct Fixture {
         curl: bool,
         socket: bool,
+        put: Put,
+        /// The heartbeat's `sleep 60` returns at once, so refreshes run back
+        /// to back (only with `curl`, which installs the fake `sleep`).
+        fast_naps: bool,
     }
 
     /// Run `wrap_argv(argv)` under `/bin/sh`. `None` on a runner with no Unix
@@ -346,8 +387,13 @@ mod tests {
             std::fs::write(
                 &sleep,
                 format!(
-                    "#!/bin/sh\nprintf '%s %s\\n' \"$$\" \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+                    "#!/bin/sh\nprintf '%s %s\\n' \"$$\" \"$*\" >> '{}'\n{}exec '{}' \"$@\"\n",
                     naps.display(),
+                    if fixture.fast_naps {
+                        format!("[ \"$*\" != {HOLD_REFRESH_SECS} ] || exit 0\n")
+                    } else {
+                        String::new()
+                    },
                     real_sleep.display()
                 ),
             )
@@ -356,9 +402,21 @@ mod tests {
                 return None;
             }
             let curl = bin.join("curl");
+            let put = match fixture.put {
+                Put::Ok => "exit 0".to_owned(),
+                Put::Fail => "echo 'curl: (22) refused' >&2; exit 22".to_owned(),
+                Put::FailAfterFirst => format!(
+                    "[ \"$(grep -c -e '-X PUT' '{}')\" -le 1 ] || exit 22",
+                    log.display()
+                ),
+            };
             std::fs::write(
                 &curl,
-                format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                     case \"$*\" in *'-X PUT'*) ;; *) exit 0 ;; esac\n{put}\n",
+                    log = log.display()
+                ),
             )
             .expect("fake curl");
             if crate::fsperm::make_executable_for_test(&curl).is_err() {
@@ -385,6 +443,7 @@ mod tests {
             .env("PATH", path)
             .env("THEGN_HOLD_SOCK", &sock)
             .env("NAPS", &naps)
+            .env("CURL_LOG", &log)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -431,10 +490,12 @@ mod tests {
     const HELD: Fixture = Fixture {
         curl: true,
         socket: true,
+        put: Put::Ok,
+        fast_naps: false,
     };
     const ECHO_ARGS: &str = "printf '<%s>' \"$@\"; exit 7";
-    const WARNING: &str =
-        "thegn: sprite keep-awake unavailable (no curl or task socket); running unheld";
+    const WARNING: &str = "thegn: sprite keep-awake unavailable (no curl, no task socket, or the Tasks API \
+         refused the hold); running unheld";
 
     fn assert_put_then_delete(ran: &Ran) {
         let sock = ran.sock.display().to_string();
@@ -487,6 +548,50 @@ mod tests {
             assert_eq!(ran.code, Some(0), "stderr: {}", ran.stderr);
             assert_put_then_delete(&ran);
             assert_heartbeat_naps_ended(&ran);
+        }
+    }
+
+    /// Every `sleep` the fixture logged is gone once the wrapper has exited.
+    fn assert_no_sleep_survives(ran: &Ran) {
+        for line in &ran.sleep_log {
+            let Some((pid, _)) = line.split_once(' ') else {
+                continue;
+            };
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|stat| !stat.contains(") Z "));
+            assert!(!alive, "sleep {line:?} outlived the wrapper");
+        }
+    }
+
+    #[test]
+    fn immediate_exits_twenty_in_a_row_stop_the_heartbeat_promptly() {
+        // The command ends at once, so the wrapper's TERM reaches the loop
+        // anywhere in its startup: before its trap, while it forks its nap, or
+        // in `wait`. Real 60 s naps make a swallowed TERM a visible stall;
+        // instant naps (the test override) race the stop against refreshes.
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+        for fast_naps in [false, true] {
+            let fixture = Fixture { fast_naps, ..HELD };
+            for round in 0..20 {
+                let started = std::time::Instant::now();
+                let Some(ran) = run_wrapped(fixture, &["true"]) else {
+                    return;
+                };
+                let took = started.elapsed();
+                assert!(
+                    took < BOUND,
+                    "round {round} (fast_naps={fast_naps}) took {took:?}"
+                );
+                assert_eq!(ran.code, Some(0), "stderr: {}", ran.stderr);
+                assert!(
+                    ran.curl_log
+                        .last()
+                        .is_some_and(|call| call.contains("-X DELETE")),
+                    "curl calls: {:?}",
+                    ran.curl_log
+                );
+                assert_no_sleep_survives(&ran);
+            }
         }
     }
 
@@ -546,7 +651,7 @@ mod tests {
     fn no_curl_warns_once_and_still_runs_the_command() {
         let fixture = Fixture {
             curl: false,
-            socket: true,
+            ..HELD
         };
         let Some(ran) = run_wrapped(fixture, &["/bin/sh", "-c", ECHO_ARGS, "cmd", "x y"]) else {
             return;
@@ -561,8 +666,8 @@ mod tests {
     #[test]
     fn no_socket_warns_once_and_never_calls_curl() {
         let fixture = Fixture {
-            curl: true,
             socket: false,
+            ..HELD
         };
         let Some(ran) = run_wrapped(fixture, &["/bin/sh", "-c", "exit 3"]) else {
             return;
@@ -608,6 +713,96 @@ mod tests {
         };
         assert_eq!(ran.code, Some(143), "stderr: {}", ran.stderr);
         assert_put_then_delete(&ran);
+        assert_heartbeat_naps_ended(&ran);
+    }
+
+    #[test]
+    fn refused_first_put_runs_unheld_and_never_deletes() {
+        let fixture = Fixture {
+            put: Put::Fail,
+            ..HELD
+        };
+        let Some(ran) = run_wrapped(fixture, &["/bin/sh", "-c", ECHO_ARGS, "cmd", "a b", "$x"])
+        else {
+            return;
+        };
+        assert_eq!(ran.code, Some(7), "stderr: {}", ran.stderr);
+        assert_eq!(ran.stdout, "<a b><$x>");
+        assert_eq!(ran.stderr.matches(WARNING).count(), 1, "{}", ran.stderr);
+        assert_eq!(ran.stderr.lines().count(), 1, "{}", ran.stderr);
+        assert!(ran.stderr.contains("running unheld"), "{}", ran.stderr);
+        // Exactly the one refused PUT: no DELETE for a hold never taken.
+        assert_eq!(ran.curl_log.len(), 1, "curl calls: {:?}", ran.curl_log);
+        assert!(ran.curl_log[0].contains("-X PUT"), "{:?}", ran.curl_log);
+        assert!(
+            !ran.curl_log.iter().any(|call| call.contains("-X DELETE")),
+            "{:?}",
+            ran.curl_log
+        );
+        // No heartbeat was started.
+        let refresh = HOLD_REFRESH_SECS.to_string();
+        assert!(
+            !ran.sleep_log.iter().any(|line| line
+                .split_once(' ')
+                .is_some_and(|(_, args)| args == refresh)),
+            "heartbeat ran unheld: {:?}",
+            ran.sleep_log
+        );
+    }
+
+    #[test]
+    fn held_run_success_still_puts_then_deletes_without_warning() {
+        let Some(ran) = run_wrapped(HELD, &["/bin/sh", "-c", "exit 5"]) else {
+            return;
+        };
+        assert_eq!(ran.code, Some(5), "stderr: {}", ran.stderr);
+        assert!(!ran.stderr.contains("running unheld"), "{}", ran.stderr);
+        assert_put_then_delete(&ran);
+    }
+
+    #[test]
+    fn three_failed_refreshes_end_the_heartbeat() {
+        // Naps return at once, so refreshes run back to back. The first PUT
+        // takes the hold; every refresh then fails. The command waits for the
+        // initial PUT plus three refreshes, then lingers: a heartbeat still
+        // looping would add many more PUTs in that second.
+        let fixture = Fixture {
+            put: Put::FailAfterFirst,
+            fast_naps: true,
+            ..HELD
+        };
+        let Some(ran) = run_wrapped(
+            fixture,
+            &[
+                "/bin/sh",
+                "-c",
+                "until [ \"$(grep -c -e '-X PUT' \"$CURL_LOG\" 2>/dev/null)\" -ge 4 ]; do \
+                 sleep 1; done; sleep 1; exit 9",
+            ],
+        ) else {
+            return;
+        };
+        assert_eq!(ran.code, Some(9), "stderr: {}", ran.stderr);
+        assert!(!ran.stderr.contains("running unheld"), "{}", ran.stderr);
+        let puts = ran
+            .curl_log
+            .iter()
+            .filter(|call| call.contains("-X PUT"))
+            .count();
+        let max_puts = usize::try_from(1 + HOLD_MAX_REFRESH_FAILURES).unwrap_or(usize::MAX);
+        assert_eq!(puts, max_puts, "curl calls: {:?}", ran.curl_log);
+        // The hold was taken, so the exit still drops it, last.
+        let last = ran.curl_log.last().expect("a curl call");
+        assert!(last.contains("-X DELETE"), "curl calls: {:?}", ran.curl_log);
+        assert_eq!(
+            ran.curl_log
+                .iter()
+                .filter(|call| call.contains("-X DELETE"))
+                .count(),
+            1,
+            "curl calls: {:?}",
+            ran.curl_log
+        );
         assert_heartbeat_naps_ended(&ran);
     }
 }
