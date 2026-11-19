@@ -178,8 +178,8 @@ pub(crate) fn json_with(
             };
             let login_upload = if credential_free {
                 mode.as_str().to_string()
-            } else if kind == EnvProviderKind::Sprites {
-                if grant.login_files { "upload" } else { "none" }.to_string()
+            } else if kind == EnvProviderKind::Sprites && !grant.login_files {
+                "none".to_string()
             } else {
                 let agents = login_agents(cfg, env);
                 if agents.is_empty() { "none".to_string() } else { clean(&agents.join(",")) }
@@ -380,13 +380,14 @@ mod tests {
 
         let mut sprites = cfg_with("sprites");
         sprites.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        sprites.sandbox.home.agents = vec!["claude".into()];
         let out = json_with(&sprites, None, &[], 0);
         assert!(
             out[0]["forwarded_env"]
                 .to_string()
                 .contains("ANTHROPIC_API_KEY")
         );
-        assert_eq!(out[0]["login_upload"], "upload");
+        assert_eq!(out[0]["login_upload"], "claude");
         assert!(
             out[0]["credentials_warning"]
                 .as_str()
@@ -412,6 +413,7 @@ mod tests {
         let _env = EnvGuard::set(&pairs);
         let mut cfg = cfg_with("sprites");
         cfg.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        cfg.sandbox.home.agents = vec!["claude".into()];
         let provider = &mut cfg.env.get_mut("remote").unwrap().provider;
         provider.model_credentials = thegn_core::config::ModelCredentials::Upload;
         provider.mark_model_credentials_explicit();
@@ -421,7 +423,7 @@ mod tests {
                 .to_string()
                 .contains("ANTHROPIC_API_KEY")
         );
-        assert_eq!(out[0]["login_upload"], "upload");
+        assert_eq!(out[0]["login_upload"], "claude");
         assert!(!out.to_string().contains("sentinel-b167"));
     }
 
