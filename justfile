@@ -1400,7 +1400,9 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
 # $THEGN_LIVE_INSTALL_DIR) and leaves any other installation, such as a dev
 # build, alone; only processes running the installed binary are signalled.
 # Extra flags after the three positionals (e.g. --relink-launchers,
-# --install-dir DIR) are passed to scripts/live.py. Never overrides migration
+# --install-dir DIR, --prebuilt /abs/thegn to install a binary built elsewhere
+# with its .build.json sidecar, no local cargo) are passed to scripts/live.py.
+# Never overrides migration
 # authority. See docs/live-upgrades.md.
 [positional-arguments]
 live level="info" size_mb="20" files="5" *flags:
