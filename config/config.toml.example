@@ -2291,6 +2291,9 @@ max_spawns_per_day = 12     # automation spawns per rolling 24 h (0..1000; 0 = n
 # label = "automate"
 # assignee = "me"
 # status = "todo"
+# inbox_account = "work"   # inbox_item events only: [[inbox.accounts]] name, exact
+# inbox_kind = "imap"      # command | todoist | imap, exact
+# inbox_label = "urgent"   # one of the item's labels, case-insensitive
 # [profiles.work.automations.rules.then]
 # cap = "notify.push"
 # title = "Profile rule"
