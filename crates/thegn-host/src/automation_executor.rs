@@ -199,6 +199,11 @@ pub async fn execute(
         }
         "lead.wake" => crate::lead::wake::run(cfg, &event, &action, timeout_secs).await,
         "autopilot.run" => {
+            anyhow::ensure!(
+                !thegn_core::lead_confine::is_lead_rule_id(&action.rule_id),
+                "{}",
+                thegn_core::automation_autonomy::AUTOPILOT_RUN_REFUSAL
+            );
             // Blocking work (tracker reads, git, the claim): off the runtime.
             let run_cfg = Arc::clone(&cfg);
             let run_event = event.clone();
