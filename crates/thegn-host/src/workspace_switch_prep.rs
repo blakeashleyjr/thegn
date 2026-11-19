@@ -482,6 +482,19 @@ pub(crate) fn cold_result_decision(
     }
 }
 
+/// Whether a just-applied cold switch must kick its model hydration itself.
+/// The loop-top switch detection hydrates (and clears the launch splash) on
+/// the next turn whenever the landed slice key differs from the last one it
+/// saw; a hydration kicked here would carry a generation that detection then
+/// bumps past, so its result is dropped on arrival. Only when the key is
+/// unchanged (detection will not fire) does the apply arm hydrate directly.
+pub(crate) fn applied_switch_hydrates_inline(
+    last_active: Option<&std::path::Path>,
+    landed: &std::path::Path,
+) -> bool {
+    last_active == Some(landed)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AfterSwitchEffects {
     pub(crate) region_last_w: Option<Option<String>>,
@@ -741,6 +754,30 @@ mod tests {
             cold_result_decision(2, 2, "/current", "/other", result.is_ok()),
             ColdResultDecision::ReportFailure
         );
+    }
+
+    #[test]
+    fn applied_switch_defers_hydration_to_switch_detection_on_a_new_key() {
+        assert!(!applied_switch_hydrates_inline(
+            Some(std::path::Path::new("/r/a")),
+            std::path::Path::new("/r/b"),
+        ));
+    }
+
+    #[test]
+    fn applied_switch_defers_hydration_when_detection_has_seen_no_key() {
+        assert!(!applied_switch_hydrates_inline(
+            None,
+            std::path::Path::new("/r/b"),
+        ));
+    }
+
+    #[test]
+    fn applied_switch_hydrates_inline_when_the_key_is_unchanged() {
+        assert!(applied_switch_hydrates_inline(
+            Some(std::path::Path::new("/r/a")),
+            std::path::Path::new("/r/a"),
+        ));
     }
 
     #[test]
