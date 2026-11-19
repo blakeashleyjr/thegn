@@ -22,6 +22,11 @@ LOG="$T/calls.log"
 cat >"$T/bin/thegn" <<'STUB'
 #!/usr/bin/env bash
 printf 'thegn %s\n' "$*" >>"$STUB_LOG"
+printf 'thegn-log %s\n' "${THEGN_LOG:-unset}" >>"$STUB_LOG"
+if [ "${THEGN_LOG:-}" = 'thegn::provider=trace' ]; then
+  mkdir -p "$XDG_STATE_HOME/thegn/logs"
+  printf '%s\n' '2026-11-19T00:00:00Z TRACE sprites exec frame' >>"$XDG_STATE_HOME/thegn/logs/thegn.log"
+fi
 if [ "${1:-}" = doctor ] && [ -n "${STUB_DOCTOR:-}" ]; then
   cat "$STUB_DOCTOR"
   exit 0
@@ -37,11 +42,12 @@ if [ "${STUB_MODE:-}" = continue ]; then
     ;;
   "env pull") echo 'fast-forwarded sp-live'; exit 0 ;;
   "env down") rm -f "$XDG_STATE_HOME/thegn/vps/sp-live.json"; touch "$XDG_STATE_HOME/down"; exit 0 ;;
+  "env reap --provider sprites --unrecorded --json") echo '{"apply":false,"results":[]}'; exit 0 ;;
   "env reap"*) echo '{"orphans":[]}'; exit 0 ;;
   "env deprovision"*) exit 0 ;;
   "fleet list"*)
     if [ -e "$XDG_STATE_HOME/down" ]; then
-      echo '{"view":{"rows":[],"missing":[{"id":"sp-live"}],"partial":false}}'
+      echo '{"view":{"rows":[],"down":[{"id":"sp-live"}],"missing":[],"partial":false}}'
     else
       echo '{"view":{"rows":[{"id":"sp-live","state":"warm"}],"partial":false}}'
     fi
@@ -93,7 +99,7 @@ run() {
   done
   [ $# -gt 0 ] && shift
   : >"$LOG"
-  env -u THEGN_BIN -u THEGN_CHANNEL -u STUB_DOCTOR PATH="$T/bin:$PATH" STUB_LOG="$LOG" TMPDIR="$T/tmp" \
+  env -u THEGN_BIN -u THEGN_CHANNEL -u STUB_DOCTOR -u THEGN_LOG PATH="$T/bin:$PATH" STUB_LOG="$LOG" TMPDIR="$T/tmp" \
     "${envs[@]}" bash "$ROOT/test/$script" "$@" >"$T/$name.out" 2>&1 </dev/null || rc=$?
   echo "$rc" >"$T/$name.rc"
   cp "$LOG" "$T/$name.log"
@@ -123,6 +129,13 @@ else
   fail "sprites-live: --keep-going plan ($(cat "$T/plan-sprites-keep-going.out"))"
 fi
 for want in "--keep-going" "view.rows" "6c " "8c " "cpu_hours" "partial zero usage" "FAILED STEPS:"; do
+  if has "$T/plan-sprites-live.out" "$want"; then
+    pass "sprites-live plan names '$want'"
+  else
+    fail "sprites-live plan lacks '$want'"
+  fi
+done
+for want in "11b " "view.down" "view.missing" "binary predates batch 170" "13 " "apply == false" "unrecorded count"; do
   if has "$T/plan-sprites-live.out" "$want"; then
     pass "sprites-live plan names '$want'"
   else
@@ -204,7 +217,10 @@ fi
 run keep-going-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_DOCTOR="$T/tok-true.json" -- \
   "${SX[@]}" --keep-going
 if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
-  has "$T/keep-going-sprites.out" "== step 12:" &&
+  has "$T/keep-going-sprites.out" "== step 13:" &&
+  has "$T/keep-going-sprites.out" "trace log path:" &&
+  has "$T/keep-going-sprites.out" "last 40 sprites exec frame lines:" &&
+  has "$T/keep-going-sprites.log" "thegn-log thegn::provider=trace" &&
   has "$T/keep-going-sprites.out" "FAILED STEPS:" &&
   ! has "$T/keep-going-sprites.log" "env down --force"; then
   pass "sprites-live: --keep-going records a failure, continues, and avoids repeat force-down"

@@ -81,7 +81,8 @@ Steps:
   5   (only with --min-ram-gb N) doctor --json under --set min_ram_gb=N shows N*1024
   5b  (only with --min-ram-gb N) /sys/fs/cgroup/memory.max in the sprite is
       N GiB in bytes (raw value printed; SKIP if the file is absent)
-  6   interactive exec under script(1): /dev/pts/<n> and ok
+  6   interactive exec under script(1): /dev/pts/<n> and ok; print the trace
+      log path and the last 40 "sprites exec frame" lines
   6c  interactive output keeps its line breaks: /dev/pts/<n> and ok are on
       different lines (this is expected to fail until the live output is fixed)
   6b  curl exists in the sprite (keep-awake precondition)
@@ -97,9 +98,12 @@ Steps:
   10  fleet cost --json: print sprites_usage; error fails, cpu_hours > 0 passes,
       or partial zero usage warns and passes
   10b fleet list --env still shows warm or cold (the usage call did not wake it)
-  11  env down                         11b this run's ledger record is gone
+  11  env down                         11b fleet list puts this sprite in view.down,
+      not view.missing (older binaries FAIL with "binary predates batch 170")
   12  env reap --provider sprites --json (dry-run): 0 recorded orphans, others
       listed as unrecorded
+  13  env reap --provider sprites --unrecorded --json (read-only): apply == false,
+      results is empty; print the unrecorded count
 Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
 With --keep-going, failed steps print FAIL <id>, the run continues, and the
 end prints FAILED STEPS: <ids> before exiting non-zero. ALL STEPS PASS prints
@@ -358,10 +362,20 @@ min_ram_shown() { # doctor reflects min_ram_gb=N as N*1024 MiB
 }
 
 interactive_tty() { # values reach script(1) via the environment, never the command text
+  local log_path frame_log_tail
   # shellcheck disable=SC2016 # fixed text; script(1)'s shell expands the env values
   INTERACTIVE_OUT="$(LIVE_BIN="$THEGN_BIN" LIVE_SPRITE="$SPRITE_NAME" SHELL=/bin/sh \
+    THEGN_LOG=thegn::provider=trace \
     script -qec 'exec "$LIVE_BIN" sprite-exec "$LIVE_SPRITE" -- sh -c "tty && echo ok"' /dev/null </dev/null)" || return 1
   printf '%s\n' "$INTERACTIVE_OUT"
+  log_path="$XDG_STATE_HOME/thegn/logs/thegn.log"
+  frame_log_tail=""
+  if [ -f "$log_path" ]; then
+    frame_log_tail="$(grep -F 'sprites exec frame' "$log_path" | tail -n 40)" || true
+  fi
+  echo "   trace log path: $log_path"
+  echo "   last 40 sprites exec frame lines:"
+  printf '%s\n' "$frame_log_tail"
   grep -Eq '/dev/pts/[0-9]+' <<<"$INTERACTIVE_OUT" && grep -q 'ok' <<<"$INTERACTIVE_OUT"
 }
 
@@ -497,8 +511,38 @@ if partial_zero:
 '
 }
 
-record_gone() {
-  [ ! -f "$(ledger_dir)/$SPRITE_NAME.json" ] && listing_lacks_name "$SPRITE_NAME"
+fleet_down_not_missing() {
+  local out
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
+  FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
+import json, os, sys
+
+try:
+    listing = json.loads(os.environ["FLEET_JSON"])
+    view = listing["view"]
+    down = view["down"]
+    missing = view["missing"]
+except KeyError as exc:
+    if exc.args == ("down",):
+        print("fleet list JSON has no down key: binary predates batch 170", file=sys.stderr)
+    else:
+        print("fleet list JSON is missing key " + str(exc.args[0]), file=sys.stderr)
+    sys.exit(1)
+except (TypeError, ValueError):
+    print("fleet list JSON is invalid", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(down, list) or not isinstance(missing, list):
+    print("fleet list JSON view.down and view.missing must be arrays", file=sys.stderr)
+    sys.exit(1)
+sprite = os.environ["FLEET_SPRITE"]
+in_down = any(isinstance(row, dict) and row.get("id") == sprite for row in down)
+in_missing = any(isinstance(row, dict) and row.get("id") == sprite for row in missing)
+if not in_down or in_missing:
+    print("fleet list JSON did not classify the sprite as down (and not missing)", file=sys.stderr)
+    sys.exit(1)
+print("   fleet truth: " + sprite + " is down and not missing")
+'
 }
 
 reap_dry_clean() { # dry-run only: no recorded orphan, everything else unrecorded
@@ -508,6 +552,32 @@ reap_dry_clean() { # dry-run only: no recorded orphan, everything else unrecorde
   grep -Fq "\"$SPRITE_NAME\"" <<<"$out" && return 1
   grep -Eq ': *"recorded"' <<<"$out" && return 1
   return 0
+}
+
+reap_unrecorded_read_only() {
+  local out
+  out="$("$THEGN_BIN" env reap --provider sprites --unrecorded --json)" || return 1
+  UNRECORDED_JSON="$out" python3 -I -c '
+import json, os, sys
+
+try:
+    report = json.loads(os.environ["UNRECORDED_JSON"])
+    apply = report["apply"]
+    results = report["results"]
+except (KeyError, TypeError, ValueError) as exc:
+    print("unrecorded reap JSON is missing apply/results: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+if apply is not False:
+    print("unrecorded reap was not read-only (apply is not false)", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(results, list):
+    print("unrecorded reap JSON results is not an array", file=sys.stderr)
+    sys.exit(1)
+if results:
+    print("unrecorded reap returned " + str(len(results)) + " entries", file=sys.stderr)
+    sys.exit(1)
+print("   unrecorded entries: " + str(len(results)))
+'
 }
 
 preflight_check "$env_name"
@@ -543,8 +613,9 @@ step 9b "/v1/tasks is empty" tasks_empty
 step 10 "fleet cost reports sprites_usage CPU hours or partial zero usage" cost_has_cpu
 step 10b "fleet list still shows warm or cold after fleet cost" warm_or_cold
 step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" env down
-step 11b "this run's ledger record is gone" record_gone
+step 11b "fleet list classifies the sprite as down, not missing" fleet_down_not_missing
 step 12 "reap dry-run: 0 recorded orphans" reap_dry_clean
+step 13 "unrecorded reap is read-only and empty" reap_unrecorded_read_only
 if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
   echo "FAILED STEPS: ${FAILED_STEPS[*]}"
   exit 1
