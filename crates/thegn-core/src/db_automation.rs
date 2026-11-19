@@ -330,12 +330,23 @@ impl AutomationStore for Db {
             [],
             |row| row.get(0),
         )?;
+        // An issue-autopilot run holds a lane until it reaches a terminal
+        // state (THE-2196; `AutopilotState::is_terminal`, pinned by a test).
+        let autopilot: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM autopilot_runs WHERE state NOT IN ({})",
+                sql_list(&AUTOPILOT_TERMINAL_STATES)
+            ),
+            [],
+            |row| row.get(0),
+        )?;
         let since_secs = (now_ms / 1000).saturating_sub(DAY_SECS);
-        // A `pipeline.start` run still in flight (`started`) is about to open
-        // a lane with no dispatch row yet: it holds a lane slot.
+        // A `pipeline.start` or `autopilot.run` still in flight (`started`) is
+        // about to open a lane with no dispatch or autopilot row yet: it holds
+        // a lane slot.
         let lanes_in_flight: i64 = conn.query_row(
             "SELECT COUNT(*) FROM automation_runs \
-             WHERE action_cap = 'pipeline.start' AND outcome = 'started' \
+             WHERE action_cap IN ('pipeline.start','autopilot.run') AND outcome = 'started' \
                AND COALESCE(autonomy,'') <> 'propose' AND started_at >= ?1",
             params![since_secs],
             |row| row.get(0),
@@ -367,7 +378,11 @@ impl AutomationStore for Db {
         )?;
         let clamp = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
         Ok(crate::automation_budget::BudgetUsage {
-            active_lanes: clamp(active.saturating_add(lanes_in_flight)),
+            active_lanes: clamp(
+                active
+                    .saturating_add(lanes_in_flight)
+                    .saturating_add(autopilot),
+            ),
             spawns_24h: clamp(runs.saturating_add(advanced)),
         })
     }
@@ -420,8 +435,19 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRunRow> {
 pub(crate) const ACTIVE_DISPATCH_TOKENS: [&str; 5] =
     ["queued", "spawning", "running", "waiting_human", "pr_open"];
 
-/// The automation actions whose succeeded runs count as spawns (6e).
-const SPAWN_CAPS: [&str; 3] = ["pipeline.start", "sessions.open", "lead.wake"];
+/// The automation actions whose succeeded runs count as spawns (6e). A Lead
+/// manual open is recorded as `sessions.open` (`rule_id = "lead:manual"`);
+/// an autopilot pickup as `autopilot.run` (THE-2196).
+const SPAWN_CAPS: [&str; 4] = [
+    "pipeline.start",
+    "sessions.open",
+    "lead.wake",
+    "autopilot.run",
+];
+
+/// The stored [`crate::autopilot::AutopilotState`] tokens that are terminal
+/// (`is_terminal`). Pinned against `is_terminal` by a test.
+pub(crate) const AUTOPILOT_TERMINAL_STATES: [&str; 3] = ["needs_human", "done", "stopped"];
 
 const DAY_MS: i64 = 86_400_000;
 const DAY_SECS: i64 = 86_400;
@@ -532,6 +558,99 @@ mod tests {
             .automation_runs(None, 20)
             .unwrap();
         (planned, rows)
+    }
+
+    #[test]
+    fn autopilot_terminal_tokens_match_is_terminal() {
+        use crate::autopilot::AutopilotState as S;
+        let terminal: Vec<&str> = [
+            S::Claimed,
+            S::Working,
+            S::PrOpened,
+            S::Shepherding,
+            S::NeedsHuman,
+            S::Done,
+            S::Stopped,
+        ]
+        .into_iter()
+        .filter(|s| s.is_terminal())
+        .map(S::as_str)
+        .collect();
+        assert_eq!(terminal, super::AUTOPILOT_TERMINAL_STATES);
+    }
+
+    #[test]
+    fn budget_usage_active_lanes_counts_an_active_autopilot_run() {
+        use crate::autopilot::{AutopilotIssueKey, AutopilotState};
+        use crate::store::{AutopilotStore, ClaimOutcome};
+        let db = Db::open_memory().unwrap();
+        let now_ms: i64 = 10 * 86_400_000;
+        let claim = |issue: &str| match db
+            .claim_autopilot_slots(
+                &AutopilotIssueKey::new("linear", "work", issue),
+                "/repo",
+                9,
+                1,
+                true,
+                now_ms / 1000,
+            )
+            .unwrap()
+        {
+            ClaimOutcome::Claimed(run) => run.id,
+            other => panic!("{other:?}"),
+        };
+        let live = claim("THE-1");
+        let finished = claim("THE-2");
+        assert_eq!(db.automation_budget_usage(now_ms).unwrap().active_lanes, 2);
+        // A terminal run frees its lane.
+        assert!(
+            db.transition_autopilot(
+                finished,
+                AutopilotState::Claimed,
+                AutopilotState::Stopped,
+                Some("stopped"),
+                None,
+                now_ms / 1000
+            )
+            .unwrap()
+        );
+        let usage = db.automation_budget_usage(now_ms).unwrap();
+        assert_eq!(usage.active_lanes, 1, "only run {live} is active");
+        // Neither claim is a spawn row; the pickup's own audit row is.
+        assert_eq!(usage.spawns_24h, 0);
+    }
+
+    #[test]
+    fn budget_usage_counts_lead_manual_opens_and_autopilot_pickups() {
+        let db = Db::open_memory().unwrap();
+        let now_ms: i64 = 10 * 86_400_000;
+        let now = now_ms / 1000;
+        let mut lead = run("lead:manual", "session:s1", now - 60);
+        lead.trigger_kind = "lead".into();
+        lead.action_cap = "sessions.open".into();
+        lead.autonomy = Some("review".into());
+        let id = db.start_automation_run(&lead).unwrap();
+        db.finish_automation_run(id, "succeeded", None, None, now)
+            .unwrap();
+        assert_eq!(db.automation_budget_usage(now_ms).unwrap().spawns_24h, 1);
+        // An in-flight autopilot pickup holds a spawn and a lane; a pickup
+        // whose claim lost (`skipped`) holds neither.
+        let mut pickup = run("autopilot:repo", "issue:linear:work:THE-1", now - 30);
+        pickup.trigger_kind = "issue_matched".into();
+        pickup.action_cap = "autopilot.run".into();
+        pickup.autonomy = Some("review".into());
+        db.start_automation_run(&pickup).unwrap();
+        let usage = db.automation_budget_usage(now_ms).unwrap();
+        assert_eq!(usage.spawns_24h, 2);
+        assert_eq!(usage.active_lanes, 1);
+        let mut lost = pickup.clone();
+        lost.event_id = "issue:linear:work:THE-2".into();
+        let lost_id = db.start_automation_run(&lost).unwrap();
+        db.finish_automation_run(lost_id, "skipped", Some("claim lost"), None, now)
+            .unwrap();
+        let usage = db.automation_budget_usage(now_ms).unwrap();
+        assert_eq!(usage.spawns_24h, 2);
+        assert_eq!(usage.active_lanes, 1);
     }
 
     #[test]

@@ -8,9 +8,10 @@
 //!   reported, never fixed (the notify degrade).
 //! - [`daemon_pickup`] is the tracker tick's autopilot pickup: refused while
 //!   the automation runtime is paused (fail-closed), otherwise the same
-//!   hold → permit → durable claim path as the UI entry, with the sealed
-//!   autopilot sandbox. Autopilot is not budget-counted from either entry
-//!   (recorded against THE-2196, unchanged here).
+//!   hold → admit → permit → durable claim path as the UI entry, with the
+//!   sealed autopilot sandbox. Admission
+//!   (`autopilot_driver::admit_pickup`, THE-2196) applies the automation
+//!   pause and budgets and writes the `autopilot:<repo>` run row.
 //!
 //! Both run on the producer owner's `spawn_blocking` worker: no new thread.
 #![allow(
