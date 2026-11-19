@@ -895,6 +895,7 @@ impl SpritesProvider {
     }
 
     fn sprite_name_url(&self, name: &str) -> Result<String> {
+        let name = checked_sprite_name(name)?;
         Ok(format!("{}/sprites/{name}", self.base()?))
     }
 
@@ -1094,6 +1095,31 @@ impl SpritesProvider {
         }
     }
 
+    /// A listed sprite is used only when this instance's ledger proves it
+    /// created it: provisioning uploads login files into it. Refuses with the
+    /// `thegn env adopt` hint otherwise. Never sends a mutating request.
+    pub(crate) async fn prove_listed_sprite(&self, name: &str) -> Result<()> {
+        let scope = self.scope.clone().ok_or_else(|| {
+            anyhow!(
+                "sprites: no controller id; refusing to use sprite {name}, which this host cannot prove it created"
+            )
+        })?;
+        let dir = self.ledger_dir();
+        let error_name = name.to_string();
+        let (ledger, name, legacy) = (dir, error_name.clone(), self.legacy_ids.clone());
+        let proof = tokio::task::spawn_blocking(move || {
+            crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
+        })
+        .await
+        .context("sprites: ledger worker failed")?;
+        proof.map(|_| ()).map_err(|refusal| {
+            tracing::debug!(target: "thegn::sprites", sprite = %error_name, "reuse refused: {refusal:#}");
+            anyhow!(
+                "sprites: a sprite named {error_name} exists in this Sprites account but this thegn instance has no record of creating it; refusing to use it (it may belong to another thegn instance or another person). If it is yours: thegn env adopt {error_name} --env <env>"
+            )
+        })
+    }
+
     async fn destroy_confirmed(&self, id: &str, budget: Duration, poll: Duration) -> Result<()> {
         // Ownership before the irreversible delete: thegn never deletes a
         // sprite it cannot prove it created.
@@ -1198,6 +1224,12 @@ impl SpritesProvider {
                 .unwrap_or_else(|| "no response".into())
         ))
     }
+}
+
+/// A sprite name safe to splice into a URL path: one DNS-style name
+/// (`crate::vps::registry::checked_name`), so no `/`, `?`, `#` or `..`.
+fn checked_sprite_name(name: &str) -> Result<&str> {
+    crate::vps::registry::checked_name(name).map_err(|_| anyhow!("sprites: invalid sprite name"))
 }
 
 impl RemoteProvider for SpritesProvider {
@@ -1716,6 +1748,7 @@ pub trait ProviderEgress: Send + Sync {
 
 impl SpritesProvider {
     fn policy_network_url(&self, name: &str) -> Result<String> {
+        let name = checked_sprite_name(name)?;
         Ok(format!("{}/sprites/{name}/policy/network", self.base()?))
     }
 }
@@ -1793,13 +1826,17 @@ pub trait ProviderCheckpoints: Send + Sync {
 impl SpritesProvider {
     /// List endpoint (plural): `…/checkpoints`.
     fn checkpoints_url(&self, name: &str) -> Result<String> {
+        let name = checked_sprite_name(name)?;
         Ok(format!("{}/sprites/{name}/checkpoints", self.base()?))
     }
     /// Create endpoint (SINGULAR): `…/checkpoint` — returns an NDJSON stream.
     fn checkpoint_create_url(&self, name: &str) -> Result<String> {
+        let name = checked_sprite_name(name)?;
         Ok(format!("{}/sprites/{name}/checkpoint", self.base()?))
     }
     fn restore_url(&self, name: &str, cp: &str) -> Result<String> {
+        let name = checked_sprite_name(name)?;
+        let cp = checked_sprite_name(cp)?;
         Ok(format!(
             "{}/sprites/{name}/checkpoints/{cp}/restore",
             self.base()?
@@ -2614,6 +2651,7 @@ impl SpritesProvider {
     /// |delete). The target path is a **query param** (`?path=…&workingDir=/`),
     /// not part of the URL — matching the live v1 API (and the `sprites-py` SDK).
     fn fs_op_url(&self, name: &str, op: &str) -> Result<String> {
+        let name = checked_sprite_name(name)?;
         Ok(format!("{}/sprites/{name}/fs/{op}", self.base()?))
     }
 
@@ -3450,6 +3488,7 @@ fn next_connect_wait(
 
 /// Build the Sprites open-exec WSS URL: `wss://…/sprites/{id}/exec?cmd=…&tty=…`.
 fn exec_ws_url(api_base: &str, id: &str, spec: &ExecSpec) -> Result<String> {
+    checked_sprite_name(id)?;
     let base = ws_scheme(api_base);
     let mut url = reqwest::Url::parse(&format!("{base}/sprites/{id}/exec"))
         .context("sprites: bad exec url")?;
@@ -3471,6 +3510,7 @@ fn exec_ws_url(api_base: &str, id: &str, spec: &ExecSpec) -> Result<String> {
 
 /// Build the Sprites reattach WSS URL: `wss://…/sprites/{id}/exec/{session}?cols=…&rows=…`.
 fn attach_ws_url(api_base: &str, id: &str, session: &str, cols: u16, rows: u16) -> Result<String> {
+    checked_sprite_name(id)?;
     let base = ws_scheme(api_base);
     let mut url = reqwest::Url::parse(&format!("{base}/sprites/{id}/exec/{session}"))
         .context("sprites: bad attach url")?;
@@ -3484,6 +3524,7 @@ fn attach_ws_url(api_base: &str, id: &str, session: &str, cols: u16, rows: u16) 
 
 /// Build the Sprites TCP-proxy WSS URL: `wss://…/sprites/{id}/proxy`.
 fn proxy_ws_url(api_base: &str, id: &str) -> Result<String> {
+    checked_sprite_name(id)?;
     let base = ws_scheme(api_base);
     Ok(reqwest::Url::parse(&format!("{base}/sprites/{id}/proxy"))
         .context("sprites: bad proxy url")?
@@ -4396,6 +4437,9 @@ impl Provider {
             if let Provider::Machine0(provider) = self {
                 provider.adopt_listed_pending(name).await?;
             }
+            if let Provider::Sprites(provider) = self {
+                provider.prove_listed_sprite(name).await?;
+            }
             return Ok(false);
         }
         self.create().await?;
@@ -5109,6 +5153,24 @@ mod tests {
             d.sprites_url().unwrap(),
             "https://api.sprites.dev/v1/sprites"
         );
+    }
+
+    #[test]
+    fn checked_sprite_name_rejects_path_tricks() {
+        let too_long = "a".repeat(64);
+        for rejected in ["a/b", "a?b", "..", ""] {
+            assert!(
+                checked_sprite_name(rejected).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+        assert!(checked_sprite_name(&too_long).is_err());
+        assert_eq!(checked_sprite_name("tg-abc123").unwrap(), "tg-abc123");
+    }
+
+    #[test]
+    fn sprite_name_url_refuses_a_slash() {
+        assert!(sprites().sprite_name_url("a/b").is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+# Dev panes find the dev `thegn` first on PATH (login shells that reset PATH still need $THEGN_BIN; `thegn doctor` names a mismatch).
 
 checkout=$(cd "$(dirname "$0")/.." && pwd -P)
 home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
@@ -10,7 +11,15 @@ state="$root/state"
 run="$root/run"
 cfg="$home/.config/thegn-dev"
 bin="${THEGN_DEVEL_BIN:-$root/bin/thegn}"
+bindir=$(dirname "$bin")
 pane_vars="THEGN_SESSION_ID THEGN_CONTROL_SOCKET THEGN_WORKTREE THEGN_BRANCH THEGN_WORKSPACE THEGN_REPO_ROOT THEGN_SANDBOX THEGN_SANDBOX_NETWORK THEGN_SANDBOX_ENABLED THEGN_FORKED_FROM THEGN_FORK_SCROLLBACK THEGN_ROUTE_TOKEN THEGN_ROUTE_ORIGIN THEGN_PROMPT THEGN_EVENT THEGN_BIN"
+
+dev_path() { # the dev binary's dir first on PATH, once
+  case ":${PATH:-}:" in
+  ":$bindir:"*) printf '%s' "${PATH:-}" ;;
+  *) printf '%s' "$bindir${PATH:+:$PATH}" ;;
+  esac
+}
 
 host_session_env() {
   real_run=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
@@ -39,6 +48,7 @@ print_env() {
   printf "export %s='%s'\n" THEGN_CONFIG_DIR "$cfg"
   printf "export %s='%s'\n" THEGN_NO_MIGRATE 1
   printf "export %s='%s'\n" THEGN_CHANNEL dev
+  printf "export %s='%s'\n" PATH "$(dev_path)"
   # THEGN_BIN is for scripts (the dev binary's absolute path); thegn itself does not read it.
   printf "export %s='%s'\n" THEGN_BIN "$bin"
   if [ -n "$_devel_wayland_rewritten" ]; then
@@ -206,7 +216,8 @@ launch() {
     "THEGN_DIR=$root/home" \
     "THEGN_CONFIG_DIR=$cfg" \
     "THEGN_NO_MIGRATE=1" \
-    "THEGN_CHANNEL=dev"
+    "THEGN_CHANNEL=dev" \
+    "PATH=$(dev_path)"
   if [ "${WAYLAND_DISPLAY+x}" = x ]; then
     set -- "$@" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
   fi
@@ -231,7 +242,8 @@ daemon() {
     "THEGN_DIR=$root/home" \
     "THEGN_CONFIG_DIR=$cfg" \
     "THEGN_NO_MIGRATE=1" \
-    "THEGN_CHANNEL=dev"
+    "THEGN_CHANNEL=dev" \
+    "PATH=$(dev_path)"
   if [ "${WAYLAND_DISPLAY+x}" = x ]; then
     set -- "$@" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
   fi
