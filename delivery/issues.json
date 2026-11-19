@@ -289,10 +289,24 @@
       ]
     },
     {
+      "issue": "THE-155",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
+    },
+    {
       "issue": "THE-325",
       "project": "Client API & Remote Access",
       "changes": [],
       "no_spec_rationale": "The delivered subtask (bounded public-share output and redacted diagnostics) archived as bound-public-share-output. The remaining credential-isolation work — keeping secrets out of public-share client argv — is still In Progress and has no proposal yet."
+    },
+    {
+      "issue": "THE-395",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
     },
     {
       "issue": "THE-588",
@@ -445,6 +459,13 @@
       ]
     },
     {
+      "issue": "THE-2142",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
+    },
+    {
       "issue": "THE-2172",
       "project": "Agent & Workflow Platform",
       "changes": [
@@ -527,27 +548,6 @@
       "changes": [
         "harden-remote-sprites-journey",
         "remote-daily-loop"
-      ]
-    },
-    {
-      "issue": "THE-155",
-      "project": "Client API & Remote Access",
-      "changes": [
-        "harden-remote-exec-and-sync-journal"
-      ]
-    },
-    {
-      "issue": "THE-2142",
-      "project": "Client API & Remote Access",
-      "changes": [
-        "harden-remote-exec-and-sync-journal"
-      ]
-    },
-    {
-      "issue": "THE-395",
-      "project": "Client API & Remote Access",
-      "changes": [
-        "harden-remote-exec-and-sync-journal"
       ]
     }
   ]
