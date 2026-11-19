@@ -413,17 +413,14 @@ impl FrameWriter {
     /// counters, so a large host copy in flight makes later pane sets wait for
     /// capacity and use their existing latest-wins retry.
     pub(crate) fn try_submit_host_clipboard(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
-        self.inner.clipboard_retry.store(true, Ordering::SeqCst);
-        let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(q.status, WriterStatus::Fatal(_)) {
-            return Err(bytes);
-        }
         if bytes.is_empty() {
             return Ok(());
         }
         if bytes.len() > OOB_QUEUE_BYTES {
             return Err(bytes);
         }
+        self.inner.clipboard_retry.store(true, Ordering::SeqCst);
+        let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
         let target = admit_clipboard(&mut q, bytes, OOB_QUEUE_BYTES)?;
         drop(q);
         self.inner.cv.notify_one();
@@ -1154,12 +1151,7 @@ mod tests {
             true,
             move |reason| wake_tx.send(reason).unwrap(),
             |_| Ok(()),
-            |_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "thread quota exhausted",
-                ))
-            },
+            |_| Err(std::io::Error::other("thread quota exhausted")),
         );
 
         assert_eq!(
