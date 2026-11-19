@@ -140,7 +140,7 @@ Steps:
  P1  (--with-pool) snapshot the ledger, env pool-fill --worktree <rd-p>
      --size 1 --json, and verify exactly one filled spare
  P2  (--with-pool) exactly one new ledger record is the filled spare
- P3  (--with-pool) agent run on rd-p claims the spare without a new record
+ P3  (--with-pool) agent run on rd-p claims the spare without a new record; needs RD_HOLD_AGENT=1
  P4  (--with-pool) env pool-fill --worktree <rd-p> --size 0 --json
  P5  (--with-pool) wt rm <rd-p> --force, then verify the spare is gone
  A    (--with-adopt <name>) env adopt <name> --env <S> --yes; ledger record
@@ -174,6 +174,10 @@ fi
 
 if [ "$provider" = fly ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
   echo "fly needs RD_HOLD_AGENT=1 (no exec bridge)" >&2
+  exit 2
+fi
+if [ "$with_pool" = 1 ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
+  echo "--with-pool needs RD_HOLD_AGENT=1 (P3 claims the spare through agent run hold-test)" >&2
   exit 2
 fi
 
@@ -518,6 +522,8 @@ pool_claim_run() {
   [ "$after" = "$RECORDS_BEFORE" ]
 }
 
+pool_new_record() { [ -n "$POOL_SPARE" ] && one_new_record "$POOL_SPARE"; }
+
 pool_remove() {
   no_stdin in_repo "$THEGN_BIN" wt rm "$POOL_PATH" --force || return 1
   record_gone "$POOL_SPARE" || return 1
@@ -730,7 +736,7 @@ if [ "$with_pool" = 1 ]; then
   step P0 "wt new rd-p --env $env_name" in_repo "$THEGN_BIN" wt new rd-p --env "$env_name"
   step P0p "resolve the rd-p worktree path" resolve_pool_path
   step P1 "fill one warm pool spare" pool_fill_one
-  step P2 "exactly one new ledger record is the pool spare" one_new_record "$POOL_SPARE"
+  step P2 "exactly one new ledger record is the pool spare" pool_new_record
   snapshot_records
   step P3 "agent run claims the pool spare without a new ledger record" pool_claim_run
   step P4 "pool-fill target 0 exits 0" in_repo "$THEGN_BIN" env pool-fill --worktree "$POOL_PATH" --size 0 --json
