@@ -232,6 +232,12 @@ fn submit_notification(
     priority: Priority,
     facts: EventFacts,
 ) {
+    // Inbox item text is third-party content: rules see it only through the
+    // producer's `inbox_item` fact (review-capped, baseline-aware), never as a
+    // generic `notification` event.
+    if kind == NotificationKind::InboxItem.as_str() {
+        return;
+    }
     crate::automation_runtime::submit(notification_event(
         row_id, kind, source_ref, message, worktree, priority, facts,
     ));
