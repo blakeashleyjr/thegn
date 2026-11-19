@@ -233,12 +233,42 @@ def settings(repo, env, install_override=None):
     authority = override("THEGN_DATABASE_MIGRATION_AUTHORITY", db.get("migration_authority", "controller"))
     if authority not in ("controller", "any"):
         raise Refusal("Migration authority must be canonical controller or any")
-    pin = override("THEGN_DATABASE_MIGRATION_EXECUTABLE", db.get("migration_executable", ""))
-    if not isinstance(pin, str) or (pin and absolute(pin).resolve(strict=True) != target):
-        raise Refusal(f"Configured migration executable must resolve to the installation target {target}")
+    check_migration_pin(env, db, config, target)
     return {"repo": repo, "state": state, "database": database, "target": target, "config": config,
             "install_dir": install_dir, "previous": previous, "alacritty": alacritty,
             "alacritty_source": alacritty_source}
+
+
+PIN_ENV = "THEGN_DATABASE_MIGRATION_EXECUTABLE"
+
+
+def check_migration_pin(env, db, config, target):
+    """A migration-executable pin must resolve to the install target.
+
+    The refusal names where the pin comes from, its value and the fix. The
+    environment wins over the config file when it is not blank, as in thegn.
+    """
+    raw_env = env.get(PIN_ENV, "")
+    if raw_env.strip():
+        pin, origin = raw_env, f"The environment variable {PIN_ENV}"
+    else:
+        pin, origin = db.get("migration_executable", ""), f"`[database] migration_executable` in {config}"
+    fix = (f"Set it to the install target {target} (after the first install has put a binary there), "
+           "or remove it")
+    if not isinstance(pin, str):
+        raise Refusal(f"{origin} is {pin!r}, which is not a path. {fix}")
+    if not pin:
+        return
+    try:
+        resolved = absolute(pin).resolve(strict=True)
+    except Refusal as error:
+        raise Refusal(f"{origin} is {pin!r}, which is not a usable path ({error}). {fix}") from None
+    except FileNotFoundError:
+        raise Refusal(f"{origin} is {pin!r}, which does not exist. {fix}") from None
+    except (OSError, RuntimeError) as error:
+        raise Refusal(f"{origin} is {pin!r}, which cannot be resolved ({error}). {fix}") from None
+    if resolved != target:
+        raise Refusal(f"{origin} is {pin!r}, which resolves to {resolved}, not the install target. {fix}")
 
 
 @contextlib.contextmanager
@@ -1043,24 +1073,130 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def source_revision(repo, env, require_clean=True):
+REVISION = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# Paths whose content decides the release binary. A prebuilt artifact is
+# admitted only when none of them differs between its revision and HEAD, and
+# only over a checkout with no uncommitted or untracked change under them.
+BUILD_INPUTS = ("crates", "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", ".cargo", "build.rs")
+SIDECAR_SUFFIX = ".build.json"
+MAX_SIDECAR = 64 * 1024
+
+
+def _git(repo, env):
+    """Hardened git: no optional locks, fsmonitor off, cleaned GIT_ env, literal pathspecs."""
     clean_env = {key: value for key, value in env.items() if not key.startswith("GIT_")}
     clean_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_NO_REPLACE_OBJECTS="1")
 
+    def git(*args, check=True, quiet=False):
+        return subprocess.run(["git", "--no-optional-locks", "--literal-pathspecs", "-c", "core.fsmonitor=false", *args],
+                              cwd=repo, env=clean_env, check=check, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL if quiet else None, timeout=30)
+
+    return git
+
+
+def source_revision(repo, env, require_clean=True, inputs_only=False):
+    """HEAD of the canonical checkout root, after the cleanliness rule.
+
+    inputs_only (prebuilt mode only): uncommitted or untracked changes are
+    allowed outside BUILD_INPUTS, since the binary is not built from this
+    working tree. The default stays the whole-tree rule.
+    """
+    run = _git(repo, env)
+
     def git(*args):
-        return subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", *args], cwd=repo,
-                              env=clean_env, check=True, stdout=subprocess.PIPE, timeout=30).stdout
+        return run(*args).stdout
 
     if Path(os.fsdecode(git("rev-parse", "--show-toplevel").rstrip(b"\n"))) != repo:
         raise Refusal("Selected source must be the canonical Git checkout root")
     if require_clean and any(entry and (entry[:1].islower() or entry[:1] == b"S") for entry in git("ls-files", "-v", "-z").split(b"\0")):
         raise Refusal("Assume-unchanged/skip-worktree index flags are unsupported")
-    if require_clean and git("status", "--porcelain=v1", "--untracked-files=normal"):
+    if require_clean and inputs_only:
+        if git("status", "--porcelain=v1", "--untracked-files=normal", "--", *BUILD_INPUTS):
+            raise Refusal(f"The checkout has uncommitted or untracked changes under the build inputs "
+                          f"({', '.join(BUILD_INPUTS)}), so its schema and sources do not match a prebuilt artifact; "
+                          "commit or stash them first (changes elsewhere, such as docs, are allowed)")
+    elif require_clean and git("status", "--porcelain=v1", "--untracked-files=normal"):
         raise Refusal("Selected checkout must be clean, including untracked source; commit reviewed changes first")
     revision = git("rev-parse", "--verify", "HEAD").decode("ascii").strip()
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+    if not REVISION.fullmatch(revision):
         raise Refusal("Unsupported source revision")
     return revision
+
+
+def prebuilt_provenance(repo, env, revision):
+    """The artifact revision is HEAD or an ancestor, with identical build inputs."""
+    git = _git(repo, env)
+    if git("cat-file", "-e", f"{revision}^{{commit}}", check=False, quiet=True).returncode != 0:
+        raise Refusal(f"Prebuilt revision {revision} is not a commit in the local repository {repo}; "
+                      "fetch it (git fetch) and rerun")
+    ancestor = git("merge-base", "--is-ancestor", revision, "HEAD", check=False, quiet=True).returncode
+    if ancestor == 1:
+        raise Refusal(f"Prebuilt revision {revision} is not an ancestor of the checkout's HEAD; check out a "
+                      "commit that contains it, or rebuild on the build box at this HEAD")
+    if ancestor != 0:
+        raise Refusal(f"Could not compare prebuilt revision {revision} with HEAD (git merge-base exit {ancestor})")
+    changed = git("diff", "--quiet", "--no-ext-diff", "--no-textconv", revision, "HEAD", "--", *BUILD_INPUTS,
+                  check=False, quiet=True).returncode
+    if changed == 1:
+        raise Refusal(f"Build inputs ({', '.join(BUILD_INPUTS)}) changed between prebuilt revision {revision} and "
+                      "HEAD; rebuild on the build box at this HEAD")
+    if changed != 0:
+        raise Refusal(f"Could not diff prebuilt revision {revision} against HEAD (git diff exit {changed})")
+
+
+def inspect_prebuilt(value):
+    """Checks 1 and 2: the binary and its sidecar, without any Git access."""
+    try:
+        path = absolute(value)
+    except Refusal as error:
+        raise Refusal(f"--prebuilt {value!r} is not usable ({error}); pass the absolute path of the copied binary") from None
+    try:
+        regular(path, executable=True)
+    except FileNotFoundError:
+        raise Refusal(f"--prebuilt {path} does not exist; copy the binary and its {path.name}{SIDECAR_SUFFIX} "
+                      "from the build box first") from None
+    except Refusal as error:
+        raise Refusal(f"--prebuilt {path} is refused ({error}); copy it as a plain executable file you own, "
+                      "not a symlink, writable only by you") from None
+    sidecar = path.with_name(path.name + SIDECAR_SUFFIX)
+    try:
+        regular(sidecar)
+        raw = read_small(sidecar, MAX_SIDECAR)
+    except FileNotFoundError:
+        raise Refusal(f"Prebuilt sidecar {sidecar} is missing; copy the build box's {path.name}{SIDECAR_SUFFIX} "
+                      "next to the binary") from None
+    except (Refusal, OSError) as error:
+        raise Refusal(f"Prebuilt sidecar {sidecar} is refused ({error}); it must be a small regular file you own, "
+                      "not a symlink") from None
+    try:
+        document = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise Refusal(f"Prebuilt sidecar {sidecar} is not valid JSON; copy it again from the build box") from None
+    if not isinstance(document, dict):
+        raise Refusal(f"Prebuilt sidecar {sidecar} is not a JSON object; copy it again from the build box")
+    revision = document.get("revision")
+    if not isinstance(revision, str) or not REVISION.fullmatch(revision):
+        raise Refusal(f"Prebuilt sidecar {sidecar} has no valid revision (40 or 64 lowercase hex); "
+                      "regenerate it on the build box")
+    if document.get("build") != BUILD:
+        raise Refusal(f"Prebuilt sidecar {sidecar} records the build command {document.get('build')!r}, not the "
+                      f"installer's {BUILD!r}; rebuild on the build box with exactly that command")
+    if document.get("dirty") is not False:
+        raise Refusal(f"Prebuilt sidecar {sidecar} has dirty={document.get('dirty')!r}, not false; rebuild on the "
+                      "build box from a clean checkout")
+    expected, actual = document.get("sha256"), digest(path)
+    if expected != actual:
+        raise Refusal(f"Prebuilt binary {path} has sha256 {actual}, but its sidecar records {expected!r}; the copy "
+                      "is incomplete or the files do not belong together. Copy both again from the build box")
+    return {"path": path, "sidecar": sidecar, "revision": revision, "sha256": actual}
+
+
+def admit_prebuilt(repo, env, value):
+    """Checks 1 to 3. Check 4 is source_revision(..., inputs_only=True)."""
+    artifact = inspect_prebuilt(value)
+    prebuilt_provenance(repo, env, artifact["revision"])
+    return artifact
 
 
 def live_cache(paths):
@@ -1074,13 +1210,52 @@ def live_cache(paths):
     return cache
 
 
-def build_stage(paths, env):
-    revision = source_revision(paths["repo"], env)
-    source = read_small(paths["repo"] / "crates/thegn-core/src/db.rs")
+def source_schema(repo):
+    source = read_small(repo / "crates/thegn-core/src/db.rs")
     versions = re.findall(rb"^pub const SCHEMA_VERSION: i64 = ([0-9]+);$", source, re.MULTILINE)
     if len(versions) != 1:
         raise Refusal("Cannot determine this source's database schema version")
-    schema = int(versions[0])
+    return int(versions[0])
+
+
+def stage_prebuilt(paths, env, value):
+    """Admit a binary built elsewhere into a fresh stage; Cargo never runs.
+
+    The checkout still supplies the schema version: the provenance rule makes
+    its crates/ identical to the artifact's revision.
+    """
+    repo = paths["repo"]
+    revision = source_revision(repo, env, inputs_only=True)
+    artifact = admit_prebuilt(repo, env, value)
+    schema = source_schema(repo)
+    retain_live_stages(paths)
+    (repo / "target").mkdir(mode=0o755, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=LIVE_STAGE_PREFIX, dir=repo / "target"))
+    print(f"Retaining staged prebuilt artifact at {stage}", flush=True)
+    with _stage_build_lock(stage):
+        _mark_stage(stage)
+        binary = stage / "output/release/thegn"
+        binary.parent.mkdir(parents=True, mode=0o700)
+        copy_file(artifact["path"], binary, time.monotonic() + BACKUP_SECONDS, 0o755)
+        regular(binary, executable=True)
+        staged = digest(binary)
+        if staged != artifact["sha256"]:
+            raise Refusal(f"Prebuilt artifact {artifact['path']} changed while it was copied into {binary}; "
+                          "copy it again from the build box and rerun")
+        if source_revision(repo, env, inputs_only=True) != revision:
+            raise Refusal("Source changed while staging the prebuilt artifact; artifact retained but not admitted")
+        record = {"repo": str(repo), "stage": str(stage), "observed_revision": revision,
+                  "artifact_revision": artifact["revision"], "prebuilt": True, "source": str(artifact["path"]),
+                  "schema": schema, "sha256": staged, "build": BUILD}
+        (stage / "build.json").write_text(json.dumps(record))
+    return stage, binary, record
+
+
+def build_stage(paths, env, prebuilt=None):
+    if prebuilt is not None:
+        return stage_prebuilt(paths, env, prebuilt)
+    revision = source_revision(paths["repo"], env)
+    schema = source_schema(paths["repo"])
     retain_live_stages(paths)
     cache = live_cache(paths)
     stage = Path(tempfile.mkdtemp(prefix=".thegn-live-build-", dir=paths["repo"] / "target"))
@@ -1109,6 +1284,7 @@ def build_stage(paths, env):
         regular(binary, executable=True)
         # Observed Git metadata, not exact commit materialization/content proof.
         record = {"repo": str(paths["repo"]), "stage": str(stage), "observed_revision": revision,
+                  "artifact_revision": revision, "prebuilt": False,
                   "schema": schema, "sha256": digest(binary), "build": BUILD}
         (stage / "build.json").write_text(json.dumps(record))
     print("Build retained for inspection; automated artifact reuse is unsupported.", flush=True)
@@ -1375,6 +1551,9 @@ def main(argv=None):
                              "~/.local/bin/tg and tg-tui (a .bak copy is kept beside each)")
     parser.add_argument("--no-scope", action="store_true",
                         help="Launch thegn directly instead of in a systemd user scope with higher CPU/IO weight")
+    parser.add_argument("--prebuilt", metavar="BINARY",
+                        help="Install this absolute-path release binary built elsewhere (with its BINARY.build.json "
+                             "sidecar) instead of building locally; see docs/live-upgrades.md")
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(raw_argv)
     if not 1 <= args.size_mb <= 1024 or not 1 <= args.files <= 100:
@@ -1384,9 +1563,18 @@ def main(argv=None):
     directories(repo)
     paths = settings(repo, env, args.install_dir)
     home = real_home()
-    revision = source_revision(repo, env, require_clean=not args.plan)
+    prebuilt = args.prebuilt is not None
+    # A prebuilt plan runs every admission check, so it answers whether the
+    # real run would be admitted; a local-build plan tolerates dirty source.
+    revision = source_revision(repo, env, require_clean=not args.plan or prebuilt, inputs_only=prebuilt)
+    artifact = admit_prebuilt(repo, env, args.prebuilt) if prebuilt else None
     print(json.dumps({key: str(value) for key, value in paths.items()}, indent=2))
-    print("Build:", " ".join(BUILD), "(isolated output + intermediate directories)")
+    if prebuilt:
+        print(f"Build: none here; prebuilt artifact {artifact['path']} (built elsewhere with:", " ".join(BUILD) + ")")
+        print(f"Prebuilt: would install {artifact['path']}, sidecar revision {artifact['revision']}, "
+              f"sha256 {artifact['sha256'][:16]}... (admitted: build inputs match HEAD)")
+    else:
+        print("Build: local,", " ".join(BUILD), "(isolated output + intermediate directories)")
     print("Selected revision:", revision, "(plan does not admit dirty source for a build)")
     print("Brand moves disabled with THEGN_NO_MIGRATE=1; database migration policy is not overridden.")
     print(f"Install: {paths['target']} and {paths['alacritty']} (outside the checkout)")
@@ -1436,11 +1624,15 @@ def main(argv=None):
             locks.enter_context(locked(paths["previous"].parent / ".thegn-live-install.lock"))
         locks.enter_context(locked(paths["state"] / "live-upgrade.lock"))
         step(1, "Preflight: clean source and supported paths")
-        source_revision(repo, env)
+        source_revision(repo, env, inputs_only=prebuilt)
         # Every launcher change is validated before anything is stopped.
         relink = relink_plan(paths, home) if args.relink_launchers else []
-        step(2, "Build (the running instance keeps working meanwhile)")
-        stage, binary, record = build_stage(paths, env)
+        if prebuilt:
+            step(2, "Stage the prebuilt artifact (no local build)")
+            stage, binary, record = build_stage(paths, env, args.prebuilt)
+        else:
+            step(2, "Build (the running instance keeps working meanwhile)")
+            stage, binary, record = build_stage(paths, env)
         step(3, "Validate the configuration with the NEW build")
         validate_config(binary, env)
         step(4, "Stop the running thegn (controllers, then the pane daemon)")
@@ -1453,8 +1645,10 @@ def main(argv=None):
         # Re-read policy and path constraints after the potentially long build.
         if settings(repo, env, args.install_dir) != paths:
             raise Refusal("Upgrade paths changed while building")
-        if source_revision(repo, env) != record["observed_revision"]:
+        if source_revision(repo, env, inputs_only=prebuilt) != record["observed_revision"]:
             raise Refusal("Source changed after build; installation refused")
+        if prebuilt:
+            prebuilt_provenance(repo, env, record["artifact_revision"])
         step(5, "Back up the database and old binary, then install")
         logs = paths["state"] / "logs"
         if logs.exists() or logs.is_symlink():

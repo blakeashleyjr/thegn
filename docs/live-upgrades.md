@@ -69,6 +69,72 @@ commit snapshot was compiled: this helper builds the checkout in place. Do not
 edit sources during the build. The staged executable's checksum binds the
 artifact that is copied into the installation.
 
+## Installing a binary built elsewhere
+
+`--prebuilt /absolute/path/to/thegn` installs a release binary built on another
+machine, such as the build box, instead of running Cargo here. Every step
+after the build is the same as for a local build. No local Cargo cache is
+created or used.
+
+The build box runs exactly the helper's build command
+(`cargo build --locked --release --features profiling -p thegn-host --bin thegn`)
+in a clean checkout. It writes a sidecar next to the binary, named
+`<binary>.build.json`:
+
+```json
+{
+  "revision": "<40 or 64 hex>",
+  "sha256": "<hex digest of the binary>",
+  "build": [
+    "cargo",
+    "build",
+    "--locked",
+    "--release",
+    "--features",
+    "profiling",
+    "-p",
+    "thegn-host",
+    "--bin",
+    "thegn"
+  ],
+  "dirty": false
+}
+```
+
+Copy both files here, then run:
+
+```sh
+just live info 20 5 --prebuilt /absolute/path/to/thegn
+```
+
+`just live-plan info 20 5 --prebuilt /absolute/path/to/thegn` runs every
+admission check without copying anything and prints the artifact, its revision
+and a sha256 prefix.
+
+The artifact is admitted only when all of these hold:
+
+- The path is absolute. The binary and the sidecar are regular files you own,
+  not symlinks. The binary is executable.
+- The sidecar's `sha256` matches the binary now. Its `build` equals the
+  helper's build command exactly. `dirty` is `false`.
+- **Provenance.** The sidecar's revision is the checkout's `HEAD` or an
+  ancestor of it, and nothing differs between that revision and `HEAD` under
+  the build inputs: `crates`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain`,
+  `rust-toolchain.toml`, `.cargo` and `build.rs`. Commits that touch only docs
+  or scripts can land after the build. Any source change is refused; rebuild at
+  the new `HEAD`. A revision the local repository does not have is refused;
+  fetch it first.
+- The checkout may have uncommitted or untracked changes outside the build
+  inputs, since the binary is not built from this working tree. Any change
+  under the build inputs is still refused. A local build keeps the whole-tree
+  clean rule.
+
+The schema version still comes from the checkout's
+`crates/thegn-core/src/db.rs`, which the provenance rule ties to the artifact.
+The binary is copied into a stage, and the copy's digest is checked against the
+sidecar again. The stage's `build.json` records `"prebuilt": true`, the source
+path and the artifact's revision.
+
 ## Upgrade sequence
 
 `just live` runs six steps without a typed confirmation, printing
@@ -177,6 +243,10 @@ executable are required; this is not a first-install command. Ambiguous ownershi
 unsupported path layouts, unreadable process inspection, named profiles and a migration executable pinned elsewhere
 are reasons to stop, not reasons to broaden process matching or change policy.
 Use the normal application configuration workflow for other profiles or pins.
+A `[database] migration_executable` pin, or `THEGN_DATABASE_MIGRATION_EXECUTABLE`,
+must resolve to the install target. The refusal names where the pin comes from
+and its value. Set it to the install target after the first install, or remove
+it.
 Hard-linked databases are unsupported because another alias can use a different
 schema lock. Hard-linked installed binaries can be replaced without changing
 their other links. Another instance is left running only when its environment

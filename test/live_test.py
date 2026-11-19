@@ -446,6 +446,212 @@ class LiveTests(unittest.TestCase):
         self.assertEqual((failed / live.LIVE_STAGE_MARKER).read_bytes(), b"thegn-live-build-v1\n")
         self.assertEqual(self.target.read_bytes(), b"old executable")
 
+    # --- prebuilt artifacts (built elsewhere, with a provenance sidecar) ------
+
+    def _git(self, *args):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+               "HOME": str(self.root)}
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+                               "-c", "init.defaultBranch=main", *args], cwd=self.repo, env=env, check=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()
+
+    def _commit(self, message, files):
+        for name, text in files.items():
+            (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / name).write_text(text)
+        self._git("add", "--", *files)
+        self._git("commit", "-q", "-m", message)
+        return self._git("rev-parse", "HEAD")
+
+    def _prebuilt_repo(self):
+        """A real Git checkout plus a prebuilt binary whose sidecar names HEAD."""
+        self._git("init", "-q")
+        revision = self._commit("initial", {".gitignore": "target/\n", "Cargo.toml": "[workspace]\n",
+                                            "crates/thegn-core/src/db.rs": "pub const SCHEMA_VERSION: i64 = 3;\n",
+                                            "docs/guide.md": "guide\n", "config/alacritty.toml": "[font]\nsize = 11\n"})
+        artifact = self.root / "artifact/thegn"
+        artifact.parent.mkdir(mode=0o700)
+        artifact.write_bytes(b"prebuilt executable")
+        artifact.chmod(0o755)
+        self._sidecar(artifact, revision=revision)
+        return artifact, revision
+
+    def _sidecar(self, artifact, **overrides):
+        document = {"revision": None, "sha256": live.digest(artifact), "build": list(live.BUILD), "dirty": False}
+        sidecar = artifact.with_name(artifact.name + live.SIDECAR_SUFFIX)
+        if sidecar.exists():
+            document.update(json.loads(sidecar.read_text()))
+        document.update(overrides)
+        sidecar.write_text(json.dumps(document))
+        sidecar.chmod(0o644)
+        return sidecar
+
+    def _git_env(self):
+        return dict(self.env, PATH=os.environ.get("PATH", "/usr/bin:/bin"), HOME=str(self.root))
+
+    @contextlib.contextmanager
+    def _no_cargo(self):
+        """The build fake records cargo calls; git still runs for real."""
+        real_run = subprocess.run
+        calls = []
+
+        def run(argv, *args, **kwargs):
+            if argv and argv[0] == "cargo":
+                calls.append(argv)
+                raise AssertionError("cargo invoked in prebuilt mode")
+            return real_run(argv, *args, **kwargs)
+
+        with patch.object(live.subprocess, "run", side_effect=run):
+            yield calls
+
+    def _stage_prebuilt(self, artifact):
+        with self._no_cargo() as calls, contextlib.redirect_stdout(io.StringIO()):
+            try:
+                return live.build_stage(self.paths, self._git_env(), str(artifact))
+            finally:
+                self.assertEqual(calls, [])
+
+    def test_prebuilt_admitted_at_head_without_cargo(self):
+        artifact, revision = self._prebuilt_repo()
+        stage, binary, record = self._stage_prebuilt(artifact)
+        self.assertEqual(binary, stage / "output/release/thegn")
+        self.assertEqual(binary.read_bytes(), b"prebuilt executable")
+        self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(json.loads((stage / "build.json").read_text()), record)
+        self.assertEqual(record["sha256"], live.digest(artifact))
+        self.assertEqual((record["prebuilt"], record["artifact_revision"], record["observed_revision"]), (True, revision, revision))
+        self.assertEqual((record["schema"], record["build"], record["source"]), (3, live.BUILD, str(artifact)))
+        self.assertEqual(record["repo"], str(self.repo))
+        self.assertEqual(record["stage"], str(stage))
+        self.assertEqual((stage / live.LIVE_STAGE_MARKER).read_bytes(), b"thegn-live-build-v1\n")
+        self.assertFalse((self.repo / "target" / live.LIVE_CACHE).exists())  # no local cargo cache
+        self.assertEqual(self.target.read_bytes(), b"old executable")
+
+    def test_prebuilt_later_commit_docs_only_admitted_crates_refused(self):
+        artifact, revision = self._prebuilt_repo()
+        head = self._commit("docs", {"docs/guide.md": "guide, revised\n"})
+        _stage, _binary, record = self._stage_prebuilt(artifact)
+        self.assertEqual((record["artifact_revision"], record["observed_revision"]), (revision, head))
+        self._commit("source", {"crates/thegn-core/src/lib.rs": "// changed\n"})
+        with self.assertRaisesRegex(live.Refusal, "Build inputs .* changed between prebuilt revision"):
+            self._stage_prebuilt(artifact)
+
+    def test_prebuilt_artifact_and_sidecar_refusals(self):
+        artifact, revision = self._prebuilt_repo()
+        sidecar = artifact.with_name(artifact.name + live.SIDECAR_SUFFIX)
+        good = sidecar.read_text()
+        cases = (
+            ({"sha256": "0" * 64}, "has sha256 .* but its sidecar records"),
+            ({"build": live.BUILD[:-1]}, "records the build command"),
+            ({"build": [*live.BUILD, "--features", "extra"]}, "records the build command"),
+            ({"dirty": True}, "dirty=True, not false"),
+            ({"dirty": "false"}, "not false"),
+            ({"revision": "HEAD"}, "no valid revision"),
+            ({"revision": "f" * 40}, "not a commit in the local repository .* fetch it"),
+        )
+        for overrides, message in cases:
+            sidecar.write_text(good)
+            self._sidecar(artifact, **overrides)
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(live.Refusal, message):
+                self._stage_prebuilt(artifact)
+        sidecar.write_text("[1, 2]")
+        with self.assertRaisesRegex(live.Refusal, "not a JSON object"):
+            self._stage_prebuilt(artifact)
+        sidecar.unlink()
+        with self.assertRaisesRegex(live.Refusal, "sidecar .* is missing"):
+            self._stage_prebuilt(artifact)
+        sidecar.write_text(good)
+        link = self.root / "artifact/linked"
+        link.symlink_to(artifact)
+        self._sidecar(link, revision=revision, sha256=live.digest(artifact))
+        with self.assertRaisesRegex(live.Refusal, "not a symlink"):
+            self._stage_prebuilt(link)
+        with self.assertRaisesRegex(live.Refusal, "absolute path"):
+            self._stage_prebuilt("artifact/thegn")
+        with self.assertRaisesRegex(live.Refusal, "does not exist"):
+            self._stage_prebuilt(self.root / "artifact/absent")
+        # Not an ancestor: built from a side branch the checkout never merged.
+        self._git("checkout", "-q", "-b", "side")
+        side = self._commit("side", {"docs/side.md": "side\n"})
+        self._git("checkout", "-q", "main")
+        self._sidecar(artifact, revision=side)
+        with self.assertRaisesRegex(live.Refusal, "not an ancestor of the checkout's HEAD"):
+            self._stage_prebuilt(artifact)
+        self.assertFalse((self.repo / "target" / live.LIVE_CACHE).exists())
+        self.assertEqual(self.target.read_bytes(), b"old executable")
+
+    def test_prebuilt_relaxes_cleanliness_only_outside_build_inputs(self):
+        artifact, _revision = self._prebuilt_repo()
+        env = self._git_env()
+        (self.repo / "docs/guide.md").write_text("edited, not committed\n")
+        (self.repo / "notes.txt").write_text("untracked\n")
+        self._stage_prebuilt(artifact)  # admitted
+        with self.assertRaisesRegex(live.Refusal, "must be clean"):
+            live.source_revision(self.repo, env)  # the default rule is unchanged
+        (self.repo / "crates/thegn-core/src/db.rs").write_text("pub const SCHEMA_VERSION: i64 = 4;\n")
+        with self.assertRaisesRegex(live.Refusal, "changes under the build inputs"):
+            self._stage_prebuilt(artifact)
+        self._git("checkout", "-q", "--", "crates")
+        (self.repo / "crates/new.rs").write_text("// untracked source\n")
+        with self.assertRaisesRegex(live.Refusal, "changes under the build inputs"):
+            self._stage_prebuilt(artifact)
+        (self.repo / "crates/new.rs").unlink()
+        self._git("update-index", "--assume-unchanged", "docs/guide.md")
+        with self.assertRaisesRegex(live.Refusal, "index flags"):
+            self._stage_prebuilt(artifact)
+
+    def test_prebuilt_plan_checks_admission_and_copies_nothing(self):
+        artifact, revision = self._prebuilt_repo()
+        out = io.StringIO()
+        argv = ["--plan", "--repo", str(self.repo), "--prebuilt", str(artifact)]
+        with self._no_cargo() as calls, contextlib.redirect_stdout(out), patch.object(live, "settings", return_value=self.paths), patch.object(live, "survey", return_value=[]), patch.dict(live.os.environ, self._git_env(), clear=True):
+            before = set(self.root.rglob("*"))
+            self.assertEqual(live.main(argv), 0)
+            self.assertEqual(set(self.root.rglob("*")), before)
+            self.assertIn(f"Prebuilt: would install {artifact}, sidecar revision {revision}, "
+                          f"sha256 {live.digest(artifact)[:16]}", out.getvalue())
+            self.assertIn("Build: none here; prebuilt artifact", out.getvalue())
+            (self.repo / "crates/thegn-core/src/db.rs").write_text("pub const SCHEMA_VERSION: i64 = 4;\n")
+            with self.assertRaisesRegex(live.Refusal, "changes under the build inputs"):
+                live.main(argv)
+            self._git("checkout", "-q", "--", "crates")
+            self._sidecar(artifact, dirty=True)
+            with self.assertRaisesRegex(live.Refusal, "not false"):
+                live.main(argv)
+        self.assertEqual(calls, [])
+
+    def test_local_build_line_names_the_mode(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "survey", return_value=[]):
+            self.assertEqual(live.main(["--plan", "--repo", str(self.repo)]), 0)
+        self.assertIn("Build: local, cargo build", out.getvalue())
+        self.assertNotIn("Prebuilt:", out.getvalue())
+
+    def test_migration_pin_refusal_names_origin_value_and_fix(self):
+        elsewhere = self.root / "elsewhere-thegn"
+        elsewhere.write_bytes(b"other")
+        elsewhere.chmod(0o755)
+        self.config.write_text(f'[database]\nmigration_executable={json.dumps(str(elsewhere))}\n')
+        with self.assertRaises(live.Refusal) as caught:
+            self.settings()
+        message = str(caught.exception)
+        for part in (f"`[database] migration_executable` in {self.config}", repr(str(elsewhere)),
+                     f"Set it to the install target {self.target}", "or remove it"):
+            self.assertIn(part, message)
+        with self.assertRaises(live.Refusal) as caught:
+            self.settings(THEGN_DATABASE_MIGRATION_EXECUTABLE=str(elsewhere))
+        self.assertIn("The environment variable THEGN_DATABASE_MIGRATION_EXECUTABLE", str(caught.exception))
+        # A pin that does not exist is a clear refusal, not a traceback.
+        missing = self.root / "never-installed/thegn"
+        self.config.write_text(f'[database]\nmigration_executable={json.dumps(str(missing))}\n')
+        with self.assertRaisesRegex(live.Refusal, "does not exist. Set it to the install target .* or remove it"):
+            self.settings()
+        with self.assertRaisesRegex(live.Refusal, "THEGN_DATABASE_MIGRATION_EXECUTABLE is .*does not exist"):
+            self.settings(THEGN_DATABASE_MIGRATION_EXECUTABLE=str(missing))
+        self.config.write_text('[database]\nmigration_executable=7\n')
+        with self.assertRaisesRegex(live.Refusal, "is 7, which is not a path"):
+            self.settings()
+
     def _staged_fixture(self, name, age, marker=True):
         stage = self.repo / "target" / name
         stage.mkdir(mode=0o700)
