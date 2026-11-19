@@ -521,6 +521,7 @@ tools.provider
 tools.resume
 tools.route_via_proxy
 ui.confirm_delete_project
+ui.confirm_quit
 ui.dismiss_overlay_on_click_outside
 ui.full_mode_chip
 ui.fullscreen_keep_masthead
