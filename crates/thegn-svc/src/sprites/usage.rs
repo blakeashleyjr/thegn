@@ -92,13 +92,12 @@ pub fn parse_usage_reading(v: &serde_json::Value) -> Result<UsageReading> {
         );
         if let Some(value) = b.get("last_recorded_at").filter(|value| !value.is_null()) {
             reported = true;
-            if let Some(value) = recorded_at(value) {
-                if last_recorded_at
+            if let Some(value) = recorded_at(value)
+                && last_recorded_at
                     .as_ref()
-                    .map_or(true, |old| value.as_str() > old.as_str())
-                {
-                    last_recorded_at = Some(value);
-                }
+                    .is_none_or(|old: &String| value.as_str() > old.as_str())
+            {
+                last_recorded_at = Some(value);
             }
         }
         reported |= has_nonzero(b, &["cpu_time_sec", "cpu_seconds", "cpu_sec"])
