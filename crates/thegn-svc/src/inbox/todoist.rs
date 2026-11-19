@@ -197,8 +197,8 @@ impl Task {
             labels: self.labels,
             due: self.due.and_then(|d| d.date),
             updated_at: None,
-            // API priority 4 is p1 (urgent); 5 - 4 = 1.
-            priority: self.priority.map(|p| 5u8.saturating_sub(p)),
+            // API priority 4 is p1 (urgent); higher is more urgent, as in InboxItem.
+            priority: self.priority,
         }
     }
 }

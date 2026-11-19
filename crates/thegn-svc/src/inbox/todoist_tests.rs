@@ -19,8 +19,12 @@ async fn fake(responses: Vec<String>) -> (String, std::sync::Arc<std::sync::Mute
             log.lock()
                 .unwrap()
                 .push(String::from_utf8_lossy(&buf[..n]).into_owned());
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
+            if sock.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            if sock.shutdown().await.is_err() {
+                return;
+            }
         }
     });
     (base, seen)
@@ -55,11 +59,11 @@ async fn two_pages_are_joined_and_mapped() {
     let page = backend(&base).fetch("", 10).await.unwrap();
     assert_eq!(page.items.len(), 2);
     assert_eq!(page.items[0].id, "a1");
-    assert_eq!(page.items[0].priority, Some(1));
+    assert_eq!(page.items[0].priority, Some(4));
     assert_eq!(page.items[0].due.as_deref(), Some("2026-11-20"));
     assert_eq!(page.items[0].url, "https://app.todoist.com/app/task/a1");
     assert_eq!(page.items[0].from, "");
-    assert_eq!(page.items[1].priority, Some(4));
+    assert_eq!(page.items[1].priority, Some(1));
     assert_eq!(page.mode, PageMode::Snapshot);
     assert!(!page.truncated);
     let reqs = seen.lock().unwrap();
