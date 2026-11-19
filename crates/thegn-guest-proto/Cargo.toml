@@ -1,0 +1,18 @@
+[package]
+name = "thegn-guest-proto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Versioned guest handshake and bounded protobuf framing for Thegn Jobs"
+
+[lints]
+workspace = true
+
+[dependencies]
+prost.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"
+protox.workspace = true
