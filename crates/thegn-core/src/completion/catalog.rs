@@ -823,6 +823,8 @@ pub const CATALOG: &[Slot] = &[
     slot("session close", "session", SourceKind::Session),
     // --- mcp server (`[mcp_servers.<name>]`) -------------------------------
     slot("mcp install", "name", SourceKind::McpServer),
+    // `thegn lead login --mcp <server>`: a `[mcp_servers.<name>]` entry.
+    slot("lead login", "mcp", SourceKind::McpServer),
     // The proxy profile is a free-form `[mcp_proxy] profiles` name.
     slot(
         "mcp proxy",
@@ -1115,6 +1117,14 @@ mod tests {
             );
         }
         assert_eq!(lookup("agent result", "json"), None);
+    }
+
+    #[test]
+    fn lead_login_mcp_slot_completes_mcp_server_names() {
+        assert_eq!(
+            lookup("lead login", "mcp").map(|slot| slot.source),
+            Some(SourceKind::McpServer)
+        );
     }
 
     #[test]
