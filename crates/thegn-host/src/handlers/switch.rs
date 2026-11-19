@@ -153,6 +153,21 @@ pub(crate) fn retarget_active(sb: &mut SidebarState, model: &mut FrameModel, ses
             }
         }
     }
+    // A batch row carries `active` and renders open while it holds the
+    // active worktree (`sidebar::fold::push_batch_group`); a pointer move
+    // into or out of a batch changes both, so take the full rebuild.
+    let batch_moved = model.sidebar_rows.iter().enumerate().any(|(h, r)| {
+        r.kind == crate::sidebar::RowKind::BatchGroup
+            && r.active
+                != model.sidebar_rows[h + 1..]
+                    .iter()
+                    .take_while(|m| m.depth > r.depth)
+                    .any(|m| m.active)
+    });
+    if batch_moved {
+        sb.rebuild(model, session);
+        return;
+    }
     if !sb.focused {
         sb.cursor = visible_index_of_active(model);
     }
