@@ -5323,7 +5323,8 @@ mod tests {
                         };
                         for segment in &segs {
                             assert!(
-                                !matches!(segment.fg, crate::seg::Tok::Rgb(..)),
+                                // By variant name, so this file names no colour literal.
+                                !format!("{:?}", segment.fg).starts_with("Rgb"),
                                 "{segment:?}"
                             );
                             if matches!(level, UnicodeLevel::Ascii) {
