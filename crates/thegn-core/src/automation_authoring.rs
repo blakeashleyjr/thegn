@@ -153,7 +153,13 @@ fn declared_autonomy(rule: &AutomationRuleConfig) -> Autonomy {
 /// Cap a Lead rule's autonomy through the Lead policy for `origin`. Never
 /// raises.
 fn cap_lead(rule: &mut AutomationRule, declared: Autonomy, origin: RuleOrigin) {
-    let (effective, _) = effective_autonomy(declared, &rule.predicate, &rule.action.cap, origin);
+    let (effective, _) = effective_autonomy(
+        declared,
+        rule.event,
+        &rule.predicate,
+        &rule.action.cap,
+        origin,
+    );
     rule.autonomy = effective;
 }
 

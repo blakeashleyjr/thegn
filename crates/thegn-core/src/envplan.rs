@@ -1597,7 +1597,11 @@ pub fn agent_auth_critical_files(agent: &str) -> Vec<String> {
             ".claude/settings.json".into(),
             ".claude/settings.local.json".into(),
         ],
+        // `auth.json` holds codex's login and `config.toml` its config; the two
+        // json paths are older layouts kept for compatibility.
         "codex" => vec![
+            ".codex/auth.json".into(),
+            ".codex/config.toml".into(),
             ".codex/config.json".into(),
             ".config/codex/config.json".into(),
         ],
@@ -3550,6 +3554,21 @@ mod tests {
             "{files:?}"
         );
         assert_eq!(files, agent_auth_critical_files("claude-code"));
+    }
+
+    #[test]
+    fn codex_auth_critical_files_carry_the_login_and_the_legacy_paths() {
+        // b162: codex keeps its login in `auth.json` (+ `config.toml`); the
+        // old json paths stay for older installs.
+        assert_eq!(
+            agent_auth_critical_files("codex"),
+            [
+                ".codex/auth.json",
+                ".codex/config.toml",
+                ".codex/config.json",
+                ".config/codex/config.json",
+            ]
+        );
     }
 
     #[test]

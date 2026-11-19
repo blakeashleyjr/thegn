@@ -121,6 +121,8 @@ const SECURITY_RELEVANT_ROOTS: &[&str] = &[
     "host",
     "host_discovery",
     "identities",
+    // Inbox accounts run commands and carry credential refs (THE-2214).
+    "inbox",
     "issues",
     "lead",
     "lifecycle",
@@ -651,6 +653,10 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     // can ever render stale) and the SecretRef custody rule on
     // `api_key`.
     batch!(crate::config_weather::validate_weather(&cfg.weather));
+    // `[inbox]` (THE-2214): account names, reserved kinds, per-kind
+    // required fields, the SecretRef custody rule on `token`/`password`,
+    // the https rule on `base_url`, and the item/timeout caps.
+    batch!(cfg.inbox.validate());
     // `[[lsp.servers]]` is a registry: a non-built-in key must declare
     // extensions, and an extension may not be claimed by two entries.
     batch!(crate::lsp_registry::validate_servers(&cfg.lsp.servers));
@@ -1871,9 +1877,11 @@ mod tests {
         // (ModelCredentials) — the Vercel credential mode.
         // 108 → 109 (THE-2200): `[merge_queue] gate_sandbox` (GateSandbox) —
         // whether the merge gate runs on the host or in the sealed sandbox.
+        // 109 → 110 (THE-2214): `[[inbox.accounts]] kind` (InboxKind —
+        // command/todoist/imap implemented; gmail/jmap/outlook/slack reserved).
         assert_eq!(
             defs.len(),
-            109,
+            110,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -2193,6 +2201,11 @@ template = "image:registry.example/dev:1"
             ("[search]\nstructural = \"gritql\"\n", true),
             ("[search]\nstructural = \"ast-grep\"\n", false),
             ("[search]\nstructural = \"none\"\n", false),
+            ("[[inbox.accounts]]\nname = \"m\"\nkind = \"gmail\"\n", true),
+            (
+                "[[inbox.accounts]]\nname = \"m\"\nkind = \"command\"\ncommand = [\"feed\"]\n",
+                false,
+            ),
         ] {
             let errs = validate_str(body);
             assert_eq!(!errs.is_empty(), reserved, "{body:?} → {errs:?}");

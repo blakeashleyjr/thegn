@@ -185,7 +185,7 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
-    /// Find Vercel sandboxes this host's controller created but no longer records (dry-run unless --apply).
+    /// Find sandboxes this host's controller created but no longer records, or sprites past their lifetime (dry-run unless --apply).
     Reap {
         #[arg(long)]
         provider: String,
@@ -196,6 +196,8 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Record an existing sprite as thegn's so thegn may delete it later (asks for confirmation)
+    Adopt(super::env_adopt::AdoptArgs),
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -280,6 +282,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             yes,
             json,
         } => super::env_reap::run(cfg, &provider, apply, yes, json),
+        Action::Adopt(args) => super::env_adopt::run(cfg, args),
     }
 }
 
@@ -1328,6 +1331,9 @@ fn provision_headless_blocking(
             "seeding {worktree} onto its ssh host failed; `thegn env up --worktree {worktree}` retries it"
         )
     })?;
+    if crate::provision_gate::claim_spare_for_headless(&cfg, &worktree) {
+        return Ok(());
+    }
     let Some(env_name) = crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? else {
         return Ok(());
     };
@@ -2847,5 +2853,92 @@ mod set_location_tests {
             .expect("reconcile succeeds");
         let stored = db.location_for(&wt).expect("read location");
         assert!(stored.as_deref().unwrap_or("").is_empty(), "{stored:?}");
+    }
+}
+
+/// b162 CLI surface: `env adopt`, `agent run --keep-running` and
+/// `land --release-sandbox` parse (or refuse) as documented.
+#[cfg(test)]
+mod b162_cli_tests {
+    use clap::Parser as _;
+
+    fn parse(args: &[&str]) -> Result<crate::Cli, clap::Error> {
+        crate::Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn env_adopt_parses_name_env_and_yes() {
+        let Ok(cli) = parse(&["thegn", "env", "adopt", "foo", "--env", "s", "--yes"]) else {
+            panic!("env adopt must parse");
+        };
+        match cli.command {
+            Some(crate::Command::Env {
+                action: super::Action::Adopt(args),
+            }) => {
+                assert_eq!(args.name, "foo");
+                assert_eq!(args.env, "s");
+                assert!(args.yes);
+                assert!(!args.json);
+            }
+            _ => panic!("expected env adopt"),
+        }
+    }
+
+    #[test]
+    fn env_adopt_requires_env() {
+        assert!(parse(&["thegn", "env", "adopt", "foo", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn agent_run_keep_running_requires_wait() {
+        let base = [
+            "thegn",
+            "agent",
+            "run",
+            "--agent",
+            "codex",
+            "--worktree",
+            "/w",
+            "--prompt",
+            "x",
+        ];
+        let mut bad = base.to_vec();
+        bad.push("--keep-running");
+        assert!(
+            parse(&bad).is_err(),
+            "--keep-running without --wait must be refused"
+        );
+        let mut ok = base.to_vec();
+        ok.extend(["--wait", "--keep-running"]);
+        let Ok(cli) = parse(&ok) else {
+            panic!("agent run --wait --keep-running must parse");
+        };
+        match cli.command {
+            Some(crate::Command::Agent {
+                action:
+                    crate::cmd::agent::Action::Run {
+                        keep_running, wait, ..
+                    },
+            }) => assert!(keep_running && wait),
+            _ => panic!("expected agent run"),
+        }
+    }
+
+    #[test]
+    fn land_release_sandbox_is_opt_in() {
+        for (args, want) in [
+            (&["thegn", "land", "--release-sandbox"][..], true),
+            (&["thegn", "land"][..], false),
+        ] {
+            let Ok(cli) = parse(args) else {
+                panic!("{args:?} must parse");
+            };
+            match cli.command {
+                Some(crate::Command::Land {
+                    release_sandbox, ..
+                }) => assert_eq!(release_sandbox, want, "{args:?}"),
+                _ => panic!("expected land"),
+            }
+        }
     }
 }

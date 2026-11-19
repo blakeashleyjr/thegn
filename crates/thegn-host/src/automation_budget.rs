@@ -4,6 +4,10 @@
 //!
 //! A usage read error is a refusal ("budget unreadable"): the budget is a
 //! bound on unattended spawns, so a broken read must fail closed.
+//!
+//! Callers (THE-2196): the automation runtime and executor, every issue
+//! autopilot pickup (`autopilot_driver::admit_pickup`, a new lane) and a
+//! Lead's manual `sessions.open` (a session; `daemon::service`).
 
 use thegn_core::automation_budget::{BudgetRefusal, BudgetUsage, Budgets, SpawnKind};
 use thegn_core::config::Config;
@@ -83,8 +87,10 @@ pub(crate) fn admit_at(
     decide(budgets, db.automation_budget_usage(now_ms), kind)
 }
 
-/// The pure decision over a usage read that may have failed.
-fn decide(
+/// The pure decision over a usage read that may have failed (an unreadable
+/// usage is a refusal). Also the Lead manual-open check
+/// (`daemon::service::lead_open_budget`).
+pub(crate) fn decide(
     budgets: &Budgets,
     usage: anyhow::Result<BudgetUsage>,
     kind: SpawnKind,
