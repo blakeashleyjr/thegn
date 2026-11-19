@@ -51,6 +51,29 @@ impl CacheStore for Db {
         Ok(())
     }
 
+    fn put_pr_cache_if(
+        &self,
+        worktree: &str,
+        branch: &str,
+        json: &str,
+        expected: Option<(&str, i64)>,
+    ) -> Result<bool> {
+        let changed = match expected {
+            None => self.conn().execute(
+                r#"INSERT INTO pr_cache(worktree,branch,json,fetched_at)
+                   VALUES(?1,?2,?3,?4)
+                   ON CONFLICT(worktree) DO NOTHING"#,
+                params![worktree, branch, json, util::now()],
+            )?,
+            Some((old_json, old_at)) => self.conn().execute(
+                r#"UPDATE pr_cache SET branch=?1, json=?2, fetched_at=?3
+                   WHERE worktree=?4 AND json=?5 AND fetched_at=?6"#,
+                params![branch, json, util::now(), worktree, old_json, old_at],
+            )?,
+        };
+        Ok(changed == 1)
+    }
+
     fn get_kaneo_token(&self, base_url: &str) -> Result<Option<(String, i64)>> {
         let r = self
             .conn()
@@ -487,6 +510,109 @@ mod tests {
         assert_eq!(rows[0].1, "{\"n\":3}");
         assert!(rows[0].2 > 0);
         assert_eq!(rows[1].0, "/wt/b");
+    }
+
+    /// Pin a row's `fetched_at` so CAS expectations do not depend on the
+    /// wall-clock second the write landed in.
+    fn pin_pr_cache_at(db: &Db, worktree: &str, at: i64) {
+        db.conn()
+            .execute(
+                "UPDATE pr_cache SET fetched_at=?1 WHERE worktree=?2",
+                params![at, worktree],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn put_pr_cache_if_inserts_only_when_absent() {
+        let db = Db::open_memory().unwrap();
+        assert!(
+            db.put_pr_cache_if("/wt/a", "br", "{\"n\":1}", None)
+                .unwrap()
+        );
+        assert_eq!(db.get_pr_cache("/wt/a").unwrap().unwrap().0, "{\"n\":1}");
+        // A second insert-if-absent loses and leaves the winner's row.
+        assert!(
+            !db.put_pr_cache_if("/wt/a", "br", "{\"n\":2}", None)
+                .unwrap()
+        );
+        assert_eq!(db.get_pr_cache("/wt/a").unwrap().unwrap().0, "{\"n\":1}");
+    }
+
+    #[test]
+    fn put_pr_cache_if_updates_when_row_unchanged() {
+        let db = Db::open_memory().unwrap();
+        db.put_pr_cache("/wt/a", "br", "{\"n\":1}").unwrap();
+        pin_pr_cache_at(&db, "/wt/a", 100);
+        assert!(
+            db.put_pr_cache_if("/wt/a", "br2", "{\"n\":2}", Some(("{\"n\":1}", 100)))
+                .unwrap()
+        );
+        let (json, at) = db.get_pr_cache("/wt/a").unwrap().unwrap();
+        assert_eq!(json, "{\"n\":2}");
+        assert!(at > 100, "the winning write restamps fetched_at");
+    }
+
+    #[test]
+    fn put_pr_cache_if_loses_on_changed_json() {
+        let db = Db::open_memory().unwrap();
+        db.put_pr_cache("/wt/a", "br", "{\"n\":1}").unwrap();
+        pin_pr_cache_at(&db, "/wt/a", 100);
+        // Another producer moved the row (same stamp, new payload).
+        db.conn()
+            .execute(
+                "UPDATE pr_cache SET json='{\"n\":9}' WHERE worktree='/wt/a'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.put_pr_cache_if("/wt/a", "br", "{\"n\":2}", Some(("{\"n\":1}", 100)))
+                .unwrap()
+        );
+        assert_eq!(db.get_pr_cache("/wt/a").unwrap().unwrap().0, "{\"n\":9}");
+    }
+
+    #[test]
+    fn put_pr_cache_if_loses_on_changed_fetched_at() {
+        let db = Db::open_memory().unwrap();
+        db.put_pr_cache("/wt/a", "br", "{\"n\":1}").unwrap();
+        pin_pr_cache_at(&db, "/wt/a", 101);
+        assert!(
+            !db.put_pr_cache_if("/wt/a", "br", "{\"n\":2}", Some(("{\"n\":1}", 100)))
+                .unwrap()
+        );
+        let (json, at) = db.get_pr_cache("/wt/a").unwrap().unwrap();
+        assert_eq!((json.as_str(), at), ("{\"n\":1}", 101));
+    }
+
+    #[test]
+    fn put_pr_cache_if_expected_row_missing_loses() {
+        let db = Db::open_memory().unwrap();
+        assert!(
+            !db.put_pr_cache_if("/wt/a", "br", "{\"n\":2}", Some(("{\"n\":1}", 100)))
+                .unwrap()
+        );
+        assert!(db.get_pr_cache("/wt/a").unwrap().is_none());
+    }
+
+    #[test]
+    fn two_passes_over_one_old_row_exactly_one_wins() {
+        let db = Db::open_memory().unwrap();
+        db.put_pr_cache("/wt/a", "br", "{\"state\":\"OPEN\"}")
+            .unwrap();
+        pin_pr_cache_at(&db, "/wt/a", 100);
+        let old = db.get_pr_cache("/wt/a").unwrap().unwrap();
+        let expected = Some((old.0.as_str(), old.1));
+        let ui = db
+            .put_pr_cache_if("/wt/a", "br", "{\"state\":\"MERGED\"}", expected)
+            .unwrap();
+        let daemon = db
+            .put_pr_cache_if("/wt/a", "br", "{\"state\":\"MERGED\"}", expected)
+            .unwrap();
+        assert!(
+            ui ^ daemon,
+            "exactly one pass wins: ui={ui} daemon={daemon}"
+        );
     }
 
     #[test]
