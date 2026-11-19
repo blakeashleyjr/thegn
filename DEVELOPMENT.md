@@ -323,6 +323,16 @@ in effect.
 
 Nix: `nix profile install .#default`; `nix develop` for the dev shell.
 
+### Agent workers and lint tools
+
+Pipeline workers run in a login shell that resets `PATH`, so the lint and format
+tools from the dev shell are not on it. `just pipeline-tools <state_dir>` runs
+`nix build .#lint-tools --profile <state_dir>/nix/profile`, where `<state_dir>`
+is the agents' absolute `XDG_STATE_HOME`; NixOS then puts that profile on the
+login `PATH`. Only an explicit run installs anything. `just pipeline-tools-check
+<state_dir>` shows what a worker's login shell resolves for `treefmt`,
+`shellcheck`, `yamllint`, `taplo`, `rustfmt` and `shfmt` (`MISSING` when absent).
+
 ## Spec-driven development (OpenSpec)
 
 Linear owns work tracking. Changes to versioned behavior use [OpenSpec](https://github.com/Fission-AI/OpenSpec)

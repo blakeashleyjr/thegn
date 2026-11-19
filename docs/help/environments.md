@@ -247,6 +247,47 @@ It also checks the fleet `down` and `unrecorded` states and the read-only
 listing test (`SpritesProvider::with_list_page_size`, `max_results=n` on every
 list page, `#[ignore]`d and read-only) compares paged and unpaged results.
 
+Newer steps (dev channel, unverified live until a paid run passes them):
+
+- `4b` checks that `sprite-exec` returns the command's exit status (3) and its
+  stderr to the caller.
+- `10w` wakes a cold sprite with `sprite-exec -- true` and prints how long the
+  wake took (it must finish within 150 s).
+- `--with-agent <name>` is opt-in. It adds the agent steps (7g-7i), which run
+  `agent run --wait --pull --json` and so spend model usage. Without it those
+  steps are skipped and the plan prints no spend.
+- The state checks are specific to the row they exercise, not to the whole
+  fleet.
+
+`test/remote-daily.sh` checks the `agent run` JSON and adds three steps for
+sprites and vercel: `11m` commits inside the worktree through the exec bridge,
+`11k` lands it without `--release-sandbox` (the sandbox is kept), and `11j`
+confirms the record is still `ready` and still listed. All of these stay
+plan-only without the spend flags.
+
+### Warm claim, agent preflight and progress
+
+- **Warm claim.** A fresh worktree whose stored location is local but whose
+  resolved env is provider-placed may claim a warm spare. The other gates are
+  unchanged: the worktree is not live, the env is poolable, nothing is bound
+  yet, provisioning is pending and the sandbox floor holds. The pool stays
+  opt-in (`[lifecycle.pool] size`). The TUI create path claims the same way.
+- **Agent CLI preflight.** After provisioning and before the open,
+  `thegn agent run` runs `command -v <prog>` in the sandbox (60 s deadline). A
+  missing CLI prints one warning that names the fix; it never blocks the run.
+  Network errors are only debug-logged.
+- **Progress lines and exit hints.** While `--wait` observes a sandbox run on
+  a terminal, stderr gets one progress line every 60 s. Exit 75 and exit 127
+  print a hint line, and `--json` carries an `exit_hint` key when there is one.
+- **Wake notice.** On a terminal, when opening the exec on a Sprite (or the
+  resume, upload and open on Vercel) takes more than 3 s, one line says the
+  sandbox is waking. Capture mode stays silent because callers own its
+  stdout and stderr.
+- **Doctor.** Each remote-live row also shows `placement`, `placement_warning`,
+  `sandbox_agents`, `max_instances` and `max_lifetime_secs`. When providers
+  are channel-clamped and no rows remain, doctor adds a `warning` row. Doctor
+  makes no network calls.
+
 ### Adopt, the daily loop and release
 
 Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
