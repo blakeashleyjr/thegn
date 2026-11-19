@@ -137,6 +137,7 @@ fn on_word_boundaries(line: &str, (s, e): (usize, usize)) -> bool {
 pub type SearchSource<'a> = (u32, &'a str, &'a HistoryBuffer);
 
 type RankedSearchHit = (usize, u32, Option<(usize, usize)>);
+type GroupedSearchHit = (usize, u32, Option<(usize, usize)>, u32);
 
 /// Fuzzy search engine over one or more pane histories.
 ///
@@ -289,8 +290,7 @@ impl SearchEngine {
         }
         hits.sort_by(|a, b| b.1.cmp(&a.1).then(flat[a.0].4.cmp(&flat[b.0].4)));
         let mut groups: HashMap<(u32, &str), usize> = HashMap::with_capacity(hits.len());
-        let mut grouped: Vec<(usize, u32, Option<(usize, usize)>, u32)> =
-            Vec::with_capacity(hits.len());
+        let mut grouped: Vec<GroupedSearchHit> = Vec::with_capacity(hits.len());
         for (i, score, span) in hits {
             let key = (flat[i].0, flat[i].2);
             if let Some(&group_idx) = groups.get(&key) {
