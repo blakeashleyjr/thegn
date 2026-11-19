@@ -15,3 +15,4 @@ cmd/wt.rs:create_and_register  New worktree has no registered worktree pin yet; 
 cmd/doctor_pins.rs:collect  Doctor reports what an unpinned worktree would inherit; the stored pin is shown beside it, never launched.
 agent.rs:launch_spec_full  Reads only the resolved env name to provision the provider repo; a profile pin sets sandbox.profile, never the env name, and the launch itself already went through the merged-pin prepare_sandbox_env_with_selection.
 provision_gate.rs:heal_provider_prefix  Reads only the env's provider transport prefix to repair a stale stored row; never launches.
+cmd/agent_spawn.rs:stop_target_blocking  Identifies the provider env and bound sandbox name to park after a headless run exits; it stops a sandbox and never launches a process.
