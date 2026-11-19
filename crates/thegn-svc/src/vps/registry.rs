@@ -350,40 +350,49 @@ pub fn open_machine0_pending_dir_at(d: &Path) -> Result<Option<thegn_core::fsper
         .context("vps registry: machine0 pending directory is not an owned private directory")
 }
 
-/// Write (atomically: tmp + rename) a record into `d`.
+/// Take the ledger's exclusive lock (the same one [`reserve_at`] holds), so a
+/// read-modify-write of a record cannot interleave with another writer.
+fn lock_ledger(root: &thegn_core::fsperm::PrivateDir) -> Result<std::fs::File> {
+    let lock = root
+        .open_or_create_regular_nofollow(RESERVE_LOCK)
+        .context("vps registry: open the ledger lock")?;
+    lock.lock().context("vps registry: take the ledger lock")?;
+    Ok(lock)
+}
+
+/// Write (atomically: tmp + fsync + rename) a record into `d`, under the ledger lock.
 pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
     checked_name(&rec.name)?;
     let root = open_root(d, true)?.ok_or_else(|| {
         anyhow::anyhow!("vps registry: registry root was not opened after creation")
     })?;
+    let _lock = lock_ledger(&root)?;
+    write_locked(&root, rec)
+}
+
+/// Read-modify-write one record. The caller must hold the ledger lock.
+fn write_locked(root: &thegn_core::fsperm::PrivateDir, rec: &VpsRecord) -> Result<()> {
     let mut record = rec.clone();
-    if record.owner.is_empty() {
-        match read_in(&root, &record.name) {
-            Some(existing) if !existing.owner.is_empty() => record.owner = existing.owner,
-            Some(_) => {}
-            None => {
-                if record_exists_in(&root, &record.name)? {
-                    anyhow::bail!(
-                        "vps registry: cannot preserve owner for unreadable existing record {}",
-                        record.name
-                    );
-                }
+    if record.owner.is_empty() || record.account.is_empty() {
+        // One open: absent is `None`, anything else that cannot be parsed is real
+        // corruption (writers publish by rename under this lock, so never torn).
+        let field = if record.owner.is_empty() {
+            "owner"
+        } else {
+            "account"
+        };
+        let existing = read_checked_in(root, &record.name).map_err(|error| {
+            error.context(format!(
+                "vps registry: cannot preserve {field} for unreadable existing record {}",
+                record.name
+            ))
+        })?;
+        if let Some(existing) = existing {
+            if record.owner.is_empty() && !existing.owner.is_empty() {
+                record.owner = existing.owner;
             }
-        }
-    }
-    if record.account.is_empty() {
-        match read_in(&root, &record.name) {
-            Some(existing) if !existing.account.is_empty() => {
+            if record.account.is_empty() && !existing.account.is_empty() {
                 record.account = existing.account;
-            }
-            Some(_) => {}
-            None => {
-                if record_exists_in(&root, &record.name)? {
-                    anyhow::bail!(
-                        "vps registry: cannot preserve account for unreadable existing record {}",
-                        record.name
-                    );
-                }
             }
         }
     }
@@ -395,11 +404,6 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
 
 pub fn write(rec: &VpsRecord) -> Result<()> {
     write_at(&dir(), rec)
-}
-
-fn record_exists_in(root: &thegn_core::fsperm::PrivateDir, name: &str) -> Result<bool> {
-    root.entry_exists_nofollow(&format!("{name}.json"))
-        .map_err(Into::into)
 }
 
 /// Capacity is per provider account. Unknown-account records (legacy or unreadable)
@@ -453,58 +457,41 @@ pub fn reserve_at(
                 "vps registry: registry root was not opened after creation"
             ))
         })?;
-    let lock = root
-        .open_or_create_regular_nofollow(RESERVE_LOCK)
-        .map_err(anyhow::Error::from)
-        .map_err(ReserveError::Store)?;
-    lock.lock()
-        .map_err(anyhow::Error::from)
-        .map_err(ReserveError::Store)?;
-    if !rec.owner.is_empty() {
-        match read_in(&root, &rec.name) {
-            Some(existing) if !existing.owner.is_empty() && existing.owner != rec.owner => {
+    let _lock = lock_ledger(&root).map_err(ReserveError::Store)?;
+    if !rec.owner.is_empty() || !rec.account.is_empty() {
+        let field = if rec.owner.is_empty() {
+            "account"
+        } else {
+            "owner"
+        };
+        let existing = read_checked_in(&root, &rec.name).map_err(|error| {
+            ReserveError::Store(error.context(format!(
+                "vps registry: cannot verify {field} for existing record {}",
+                rec.name
+            )))
+        })?;
+        if let Some(existing) = existing {
+            if !rec.owner.is_empty() && !existing.owner.is_empty() && existing.owner != rec.owner {
                 return Err(ReserveError::OwnedByOther {
                     name: rec.name.clone(),
                 });
             }
-            Some(_) => {}
-            None => match record_exists_in(&root, &rec.name) {
-                Ok(true) => {
-                    return Err(ReserveError::Store(anyhow::anyhow!(
-                        "vps registry: cannot verify owner for existing record {}",
-                        rec.name
-                    )));
-                }
-                Ok(false) => {}
-                Err(error) => return Err(ReserveError::Store(error)),
-            },
-        }
-    }
-    if !rec.account.is_empty() {
-        match read_in(&root, &rec.name) {
-            Some(existing) if !existing.account.is_empty() && existing.account != rec.account => {
+            if !rec.account.is_empty()
+                && !existing.account.is_empty()
+                && existing.account != rec.account
+            {
                 return Err(ReserveError::OtherAccount {
                     name: rec.name.clone(),
                 });
             }
-            Some(_) => {}
-            None => match record_exists_in(&root, &rec.name) {
-                Ok(true) => {
-                    return Err(ReserveError::Store(anyhow::anyhow!(
-                        "vps registry: cannot verify account for existing record {}",
-                        rec.name
-                    )));
-                }
-                Ok(false) => {}
-                Err(error) => return Err(ReserveError::Store(error)),
-            },
         }
     }
     let occupied = occupied_at(&root, scope, &rec.account).map_err(ReserveError::Store)?;
     if occupied >= cap {
         return Err(ReserveError::AtCap { occupied, cap });
     }
-    write_at(d, rec).map_err(ReserveError::Store)
+    // Same lock still held: re-taking it from a second descriptor would self-deadlock.
+    write_locked(&root, rec).map_err(ReserveError::Store)
 }
 
 /// A stable, versioned digest of the exact worktree path bytes.
@@ -542,7 +529,14 @@ pub fn check_owner_at(d: &Path, name: &str, owner: &str) -> Result<()> {
     let Some(root) = open_root(d, false)? else {
         return Ok(());
     };
-    let record = read_in(&root, name);
+    // One open, not read-then-stat: a lenient read that misses the file and a
+    // later existence check that sees a concurrent writer's rename would report
+    // a healthy record as unverifiable.
+    let record = read_checked_in(&root, name).map_err(|error| {
+        error.context(format!(
+            "vps registry: cannot verify owner for existing record {name}"
+        ))
+    })?;
     if let Some(record) = record.as_ref()
         && !record.owner.is_empty()
         && record.owner != owner
@@ -550,12 +544,6 @@ pub fn check_owner_at(d: &Path, name: &str, owner: &str) -> Result<()> {
         anyhow::bail!(ReserveError::OwnedByOther {
             name: name.to_owned()
         });
-    }
-    if record.is_some() {
-        return Ok(());
-    }
-    if record_exists_in(&root, name)? {
-        anyhow::bail!("vps registry: cannot verify owner for existing record {name}");
     }
     Ok(())
 }
@@ -601,7 +589,12 @@ pub fn read_checked_at(d: &Path, name: &str) -> Result<Option<VpsRecord>> {
     else {
         return Ok(None);
     };
+    read_checked_in(&root, name)
+}
 
+/// Strict single-open read: `Ok(None)` only when the record is absent.
+fn read_checked_in(root: &thegn_core::fsperm::PrivateDir, name: &str) -> Result<Option<VpsRecord>> {
+    checked_name(name)?;
     let mut file = match root.open_regular_nofollow(&format!("{name}.json")) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1073,12 +1066,18 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut record = rec("shared", "ready");
                     record.instance_id = index.to_string();
-                    write_at(&d, &record).unwrap();
+                    write_at(&d, &record)
+                        .map_err(|error| format!("writer {index} failed: {error:#}"))
                 })
             })
             .collect();
-        for worker in workers {
-            worker.join().unwrap();
+        for (index, worker) in workers.into_iter().enumerate() {
+            let outcome = worker
+                .join()
+                .unwrap_or_else(|_| panic!("writer {index} panicked"));
+            if let Err(message) = outcome {
+                panic!("{message}");
+            }
         }
         let record = read_at(&d, "shared").unwrap();
         assert_eq!(record.name, "shared");
