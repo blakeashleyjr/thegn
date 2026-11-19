@@ -1185,24 +1185,26 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         .collect();
     let provider_warnings: Vec<String> = items
         .iter()
-        .filter_map(|item| match crate::provision_gate::provider_target(cfg, &item.worktree) {
-            Ok(Some((env, sandbox))) => Some(provider_row_warning(
-                &item.branch,
-                &item.worktree,
-                &env,
-                &sandbox,
-            )),
-            Ok(None) => None,
-            Err(error) => {
-                tracing::debug!(
-                    target: "thegn::merge",
-                    worktree = %item.worktree,
-                    error = %format!("{error:#}"),
-                    "provider target resolution failed for merge drain"
-                );
-                None
-            }
-        })
+        .filter_map(
+            |item| match crate::provision_gate::provider_target(cfg, &item.worktree) {
+                Ok(Some((env, sandbox))) => Some(provider_row_warning(
+                    &item.branch,
+                    &item.worktree,
+                    &env,
+                    &sandbox,
+                )),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "thegn::merge",
+                        worktree = %item.worktree,
+                        error = %format!("{error:#}"),
+                        "provider target resolution failed for merge drain"
+                    );
+                    None
+                }
+            },
+        )
         .collect();
     if items.is_empty() {
         // The empty path is the one a cron/CI loop hits most often, so it must
