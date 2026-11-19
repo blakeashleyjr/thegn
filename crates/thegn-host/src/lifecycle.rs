@@ -399,10 +399,21 @@ fn resolve_pool_target(
 /// Immediately refill the pool after a claim consumed a spare: re-run the
 /// reconcile for `worktree`'s `(repo, env)` right now instead of waiting for the
 /// next ~8s maintainer tick, so a parked spare is ready again for the next open.
+/// Only in the TUI process: a CLI or daemon process may exit mid-provision (b175 H3).
 /// Runs on its own thread (DB + provider work) and is a no-op for a local
 /// worktree. The UI pool chip refreshes on the next maintainer tick (the refill
 /// itself is a minutes-long provision), so no waker is threaded here.
+fn refill_allowed(tui_active: bool) -> bool {
+    tui_active
+}
+
 pub fn refill_pool_after_claim(cfg: &Config, worktree: &str) {
+    if !refill_allowed(thegn_core::msg::tui_active()) {
+        thegn_core::msg::info(&format!(
+            "warm pool for {worktree} is one spare short; the thegn TUI refills it, or run: thegn env pool-fill --worktree {worktree}"
+        ));
+        return;
+    }
     let cfg = cfg.clone();
     let worktree = worktree.to_string();
     thegn_core::thread_name::spawn_named("thegn-pool-fill", move || {
@@ -1058,6 +1069,12 @@ mod tests {
             stale_provisioning_action(Some(PROVISION_STALE_SECS - 1), free_spare_probe),
             StaleAction::Keep
         ));
+    }
+
+    #[test]
+    fn refill_skips_outside_the_tui() {
+        assert!(!refill_allowed(false));
+        assert!(refill_allowed(true));
     }
 
     #[test]
