@@ -438,10 +438,18 @@ fn pre_land_plan(pre: &crate::provider_git::PreLand) -> Result<Option<bool>> {
 trait SandboxRelease {
     /// `(env, sandbox name)` of the worktree's provider sandbox.
     fn target(&self, worktree: &str) -> std::result::Result<(String, String), String>;
-    /// Destroy it (proof-checked).
-    fn destroy(&self, worktree: &str, env: &str) -> std::result::Result<(), String>;
+    /// Destroy it: `Destroyed` only once a complete inventory no longer lists it.
+    fn destroy(
+        &self,
+        worktree: &str,
+        env: &str,
+    ) -> std::result::Result<crate::agent_teardown::Teardown, String>;
     /// Point the worktree's stored location back at the local checkout.
     fn clear_location(&self, worktree: &str) -> std::result::Result<(), String>;
+    /// Print one user-facing line (a seam so tests can read what was said).
+    fn say(&self, line: &str) {
+        outln!("{line}");
+    }
 }
 
 struct LiveRelease<'a> {
@@ -462,22 +470,14 @@ impl SandboxRelease for LiveRelease<'_> {
     }
 
     // off-loop: `thegn land` is a CLI; the destroy blocks on the provider.
-    fn destroy(&self, worktree: &str, env: &str) -> std::result::Result<(), String> {
-        let pc = &self
-            .cfg
-            .env
-            .get(env)
-            .ok_or_else(|| format!("env {env} is not configured"))?
-            .provider;
-        let name = crate::provider_factory::provider_sandbox_name_checked(self.cfg, worktree, env)
-            .map_err(|error| format!("{error:#}"))?
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| format!("env {env} has no sandbox for {worktree}"))?;
-        if crate::provider_factory::provider_for_named(pc, &name).is_none() {
-            return Err(format!(
-                "provider {} is not configured (token unset?)",
-                pc.provider
-            ));
+    // The helper owns the usable-provider check and the inventory proof.
+    fn destroy(
+        &self,
+        worktree: &str,
+        env: &str,
+    ) -> std::result::Result<crate::agent_teardown::Teardown, String> {
+        if !self.cfg.env.contains_key(env) {
+            return Err(format!("env {env} is not configured"));
         }
         crate::agent_teardown::destroy_provider_sandbox_with(self.cfg, worktree, env)
     }
@@ -495,7 +495,8 @@ impl SandboxRelease for LiveRelease<'_> {
 enum Release {
     /// `--release-sandbox` not given: the sandbox stays.
     Kept,
-    /// The sandbox was destroyed (or already gone) and the location cleared.
+    /// The sandbox was destroyed (proven absent), recycled into the warm pool,
+    /// or already gone, and the location cleared.
     Released,
     /// The sandbox was already gone and no release was asked for.
     Gone,
@@ -513,16 +514,17 @@ fn release_after_land(
     release_sandbox: bool,
     sandbox_gone: bool,
 ) -> Release {
+    use crate::agent_teardown::Teardown;
     if !release_sandbox {
         if sandbox_gone {
             return Release::Gone;
         }
         match ops.target(worktree) {
-            Ok((_, name)) => outln!(
+            Ok((_, name)) => ops.say(&format!(
                 "sandbox {name} kept (thegn land --release-sandbox, or env reap, removes it)"
-            ),
+            )),
             Err(_) => {
-                outln!("sandbox kept (thegn land --release-sandbox, or env reap, removes it)")
+                ops.say("sandbox kept (thegn land --release-sandbox, or env reap, removes it)")
             }
         }
         return Release::Kept;
@@ -531,27 +533,47 @@ fn release_after_land(
         thegn_core::msg::warn(&format!(
             "landed, but sandbox {name} was not released: {error}"
         ));
-        outln!("! sandbox {name} kept: {error}");
+        ops.say(&format!("! sandbox {name} kept: {error}"));
         Release::Failed
     };
     let (env, name) = match ops.target(worktree) {
         Ok(target) => target,
         Err(error) => return kept("of this worktree", error),
     };
-    if !sandbox_gone && let Err(error) = ops.destroy(worktree, &env) {
-        return kept(&name, error);
-    }
+    // The location is cleared only on proof: an inventory that no longer
+    // lists the sandbox (`sandbox_gone` from the pre-land pull, or a confirmed
+    // destroy), or a spare reset into the warm pool.
+    let (name, done) = if sandbox_gone {
+        let done = format!("released sandbox {name}");
+        (name, done)
+    } else {
+        match ops.destroy(worktree, &env) {
+            Ok(Teardown::Destroyed { name }) => {
+                let done = format!("released sandbox {name}");
+                (name, done)
+            }
+            Ok(Teardown::Recycled { name }) => {
+                let done = format!("returned sandbox {name} to the warm pool");
+                (name, done)
+            }
+            Ok(Teardown::NoSandbox) => {
+                ops.say("! no sandbox resolved for this worktree; its location is kept");
+                return Release::Failed;
+            }
+            Err(error) => return kept(&name, error),
+        }
+    };
     if let Err(error) = ops.clear_location(worktree) {
         let detail = if sandbox_gone {
             format!("sandbox {name} is gone, but {error}")
         } else {
-            format!("released sandbox {name}, but {error}")
+            format!("{done}, but {error}")
         };
         thegn_core::msg::warn(&format!("landed; {detail}"));
-        outln!("! {detail}");
+        ops.say(&format!("! {detail}"));
         return Release::Failed;
     }
-    outln!("released sandbox {name}");
+    ops.say(&done);
     Release::Released
 }
 
@@ -958,26 +980,54 @@ mod landed_row_tests {
         assert!(format!("{error:#}").contains("land refused"), "{error:#}");
     }
 
-    #[derive(Default)]
+    type DestroyOutcome = Result<crate::agent_teardown::Teardown, String>;
+
     struct FakeRelease {
-        destroy_error: Option<String>,
+        destroy_outcome: DestroyOutcome,
         clear_error: Option<String>,
         destroys: std::cell::Cell<usize>,
         clears: std::cell::Cell<usize>,
+        said: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Default for FakeRelease {
+        fn default() -> Self {
+            Self::with(Ok(crate::agent_teardown::Teardown::Destroyed {
+                name: "tg-lane-abc".into(),
+            }))
+        }
+    }
+
+    impl FakeRelease {
+        fn with(destroy_outcome: DestroyOutcome) -> Self {
+            Self {
+                destroy_outcome,
+                clear_error: None,
+                destroys: std::cell::Cell::new(0),
+                clears: std::cell::Cell::new(0),
+                said: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn said(&self) -> String {
+            self.said.borrow().join("\n")
+        }
     }
 
     impl super::SandboxRelease for FakeRelease {
         fn target(&self, _worktree: &str) -> Result<(String, String), String> {
             Ok(("sprite".into(), "tg-lane-abc".into()))
         }
-        fn destroy(&self, _worktree: &str, env: &str) -> Result<(), String> {
+        fn destroy(&self, _worktree: &str, env: &str) -> DestroyOutcome {
             assert_eq!(env, "sprite");
             self.destroys.set(self.destroys.get() + 1);
-            self.destroy_error.clone().map_or(Ok(()), Err)
+            self.destroy_outcome.clone()
         }
         fn clear_location(&self, _worktree: &str) -> Result<(), String> {
             self.clears.set(self.clears.get() + 1);
             self.clear_error.clone().map_or(Ok(()), Err)
+        }
+        fn say(&self, line: &str) {
+            self.said.borrow_mut().push(line.to_string());
         }
     }
 
@@ -1007,10 +1057,7 @@ mod landed_row_tests {
         assert_eq!((fake.destroys.get(), fake.clears.get()), (0, 1));
 
         // A destroy error is a warning: the location stays provider.
-        let fake = FakeRelease {
-            destroy_error: Some("api 500".into()),
-            ..FakeRelease::default()
-        };
+        let fake = FakeRelease::with(Err("api 500".into()));
         assert_eq!(release_after_land(&fake, wt, true, false), Release::Failed);
         assert_eq!((fake.destroys.get(), fake.clears.get()), (1, 0));
 
@@ -1020,5 +1067,64 @@ mod landed_row_tests {
             ..FakeRelease::default()
         };
         assert_eq!(release_after_land(&fake, wt, true, false), Release::Failed);
+    }
+
+    #[test]
+    fn release_clears_the_location_only_on_proof() {
+        use super::{Release, release_after_land};
+        use crate::agent_teardown::Teardown;
+        let wt = "/wt/provider-land";
+
+        // Destroyed (a complete inventory no longer lists it): one clear.
+        let fake = FakeRelease::default();
+        assert_eq!(
+            release_after_land(&fake, wt, true, false),
+            Release::Released
+        );
+        assert_eq!((fake.destroys.get(), fake.clears.get()), (1, 1));
+        assert!(
+            fake.said().contains("released sandbox tg-lane-abc"),
+            "{}",
+            fake.said()
+        );
+
+        // An unconfirmed destroy: the location is kept and the line says so.
+        let fake = FakeRelease::with(Err(
+            "destroy of sandbox tg-lane-abc was sent but could not be confirmed".into(),
+        ));
+        assert_eq!(release_after_land(&fake, wt, true, false), Release::Failed);
+        assert_eq!(fake.clears.get(), 0);
+        assert!(
+            fake.said().contains("! sandbox tg-lane-abc kept:"),
+            "{}",
+            fake.said()
+        );
+        assert!(!fake.said().contains("released"), "{}", fake.said());
+
+        // No sandbox resolved: nothing proven, location kept.
+        let fake = FakeRelease::with(Ok(Teardown::NoSandbox));
+        assert_eq!(release_after_land(&fake, wt, true, false), Release::Failed);
+        assert_eq!(fake.clears.get(), 0);
+        assert!(
+            fake.said().contains("its location is kept"),
+            "{}",
+            fake.said()
+        );
+
+        // A recycled pool spare: the worktree no longer owns it, so clear once.
+        let fake = FakeRelease::with(Ok(Teardown::Recycled {
+            name: "tg-spare-1".into(),
+        }));
+        assert_eq!(
+            release_after_land(&fake, wt, true, false),
+            Release::Released
+        );
+        assert_eq!(fake.clears.get(), 1);
+        assert!(
+            fake.said()
+                .contains("returned sandbox tg-spare-1 to the warm pool"),
+            "{}",
+            fake.said()
+        );
     }
 }
