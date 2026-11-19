@@ -385,9 +385,8 @@ listener, as Lead-confined, whatever its scopes. A Lead-confined call:
   `skills.seed`), run tools or presets, or change a worktree's sandbox profile.
 - **May not** enqueue or drain the merge queue (`merge.add`, `merge.drain`):
   the Lead lands only through a rule's land step or an owner approval. In
-  this release a rule's `merge` autonomy behaves like `review` (the land stops
-  for the owner's approval), because the merge gate still runs the lane's code
-  on the host outside any sandbox.
+  this release a rule's `merge` autonomy lands unattended only with a sealed
+  merge gate (see "The merge gate"); otherwise it behaves like `review`.
 - **May** read everything a read token can, kill sessions, record a session,
   file folders, work the tracker, the dispatch roster
   (without binding a session), notifications, approvals requests, its own
@@ -398,6 +397,34 @@ rule when it fires (and the worker it opens counts as Lead-opened). Every
 refusal is logged on `thegn::control::audit` with the outcome `lead_confined`
 and the Lead's label; Lead input is logged allowed or refused with the label
 and the session id, never the text.
+
+The Lead also has a private MCP dir, `$XDG_STATE_HOME/thegn/lead-harness/mcp`,
+writable, for package caches and MCP tokens. Your `~/.mcp-auth` and `~/.npmrc`
+are masked. `thegn lead login --mcp <server>` fills it from a host login that
+the Lead cannot influence.
+
+## The merge gate
+
+By default the merge queue's gate runs on the host. `[merge_queue] gate_sandbox
+= "sealed"` (global or trusted-profile config only, never a repo overlay) runs
+`gate_setup_command`, `gate_command` and `regenerate_command` in the repo's
+sealed sandbox instead. Not yet verified live.
+
+- **Writable:** the gate checkout and its target dir, nothing else. A
+  configured `gate_target_dir` is ignored.
+- **Read-only:** the repo's git common dir and the profile's own mounts.
+- **Hidden:** the daemon socket, state and runtime dirs, the Lead control dir
+  and `$HOME`; no `SSH_AUTH_SOCK`, no forge, tracker or model tokens. The
+  environment is an allowlist.
+- **Network:** none. A land that needs a download goes red with a log headed
+  "sandboxed gate (network: none)" and never lands.
+- **Backend:** local bwrap only. A sandbox with the Nix daemon socket or any
+  socket or device mount is refused, so `nix develop` gates cannot run sealed.
+
+If the sandbox cannot start or is refused, the gate is an infrastructure hold
+that asks for approval; it is never run on the host and never blamed on the
+branch. The fold itself stays thegn's own git. An unattended drain never hands
+a red gate or conflict to the fixer agent.
 
 ## Inspecting
 
