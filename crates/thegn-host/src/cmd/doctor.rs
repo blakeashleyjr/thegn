@@ -3124,6 +3124,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "vercel": vercel_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
+        "remote_live": super::doctor_remote::json(cfg),
         "warm_pool": warm_pool_json(cfg),
         "merge_gate_quarantines": crate::integrate::gate_quarantines().iter().map(|(path, reason)| serde_json::json!({
             "path": path.display().to_string(),
@@ -3828,6 +3829,7 @@ pub fn run(
 
     outln!("");
     provider_cache_report(cfg);
+    super::doctor_remote::report(cfg);
 
     outln!("");
     warm_pool_report(cfg);
