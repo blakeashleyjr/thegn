@@ -7,6 +7,13 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `test/sprites-live.sh` takes `--keep-going` (a failed step prints `FAIL <id>` and the run continues, with a summary at the end), proves pull with a real commit made inside the sprite, and prints the cost JSON. Not yet verified live.
+- Sprites usage is read from the top-level `usage` array (`buckets` stays as a fallback). A non-tty exec exit frame may carry the exit code as one binary byte or as ASCII; both are accepted.
+- `env down` on a sandbox that is already gone says so and clears local state instead of warning that commits are lost.
+- Interactive exec output sometimes lost a line break. The cause is not yet known: this adds a trace to find it and a defensive fix to the one client-side place bytes can vanish. It is not claimed as a fix.
+
 ## [0.1.0-alpha.99] — 2026-11-19
 
 ### Changed
