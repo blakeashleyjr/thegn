@@ -160,8 +160,14 @@ id and worktree as facts.
 
 ## inbox_item
 
-`when = "inbox_item"` is reserved for phase 7 (the native inbox). It is
-accepted in rule syntax but nothing produces it yet.
+`when = "inbox_item"` fires when the daemon's native inbox finds a new item
+(see [[inbox]]). Facts: the account name, its kind, the item id, URL and labels
+and the title, which is untrusted and reaches rules only as `message`.
+Selectors: `inbox_account` (exact), `inbox_kind` (exact) and `inbox_label` (one
+of the labels, case-insensitive). The first poll of an account is a baseline and
+fires nothing. An `inbox_item` rule is capped at `review` autonomy, and a
+`pipeline.start`, `sessions.open` or `lead.wake` action on one may not use
+`{message}` in its template. Pausing automations also stops inbox polling.
 
 ## Actions
 
@@ -170,6 +176,10 @@ accepted in rule syntax but nothing produces it yet.
   claim refuses a duplicate stage dispatch.
 - `lead.wake`: wake the Lead with a bounded, delimited block describing the
   event. The prompt template may not reference `{message}`.
+- `autopilot.run`: run `[autopilot]` for the matched issue (`issue_matched`
+  only). Config rules only (a Lead-authored rule naming it is refused), capped
+  at `review`. Enabling `[autopilot]` for a repo synthesizes an
+  `autopilot:<repo>` rule that does this.
 - `merge.drain`: drain the merge queue for the event's worktree. Config rules
   only; a Lead cannot author it.
 
@@ -227,8 +237,8 @@ max_spawns_per_day = 12   # automation spawns in a rolling 24 h window
 - An active lane is a tracker issue with a dispatch row that an automation
   rule started and that is either active or still has a running session (a
   row marked done while its worker runs still holds its slot), plus each
-  `pipeline.start` run still in flight. Manual dispatches never count.
-- A spawn is a `pipeline.start`, `sessions.open` or `lead.wake` run that
+  `pipeline.start` run still in flight. Manual dispatches never count; autopilot runs and the Lead's manual spawns do.
+- A spawn is a `pipeline.start`, `sessions.open`, `lead.wake` or `autopilot.run` run that
   succeeded, failed, timed out or is still in flight (a failed or timed-out
   run may still have started something; a `propose` start is not a spawn: it
   starts nothing), plus each stage the executor advances an automation lane
@@ -281,4 +291,5 @@ Both exist. `[autopilot]` is a complete UI-process supervisor with durable
 claims, worktree creation, a sealed-sandbox gate, a headless worker, PR open,
 shepherding on merge and tracker write-back. An `issue_matched` rule with
 `pipeline.start` overlaps it, so `pipeline.start` defers to an issue autopilot
-already owns. Folding autopilot into rules is planned after the stage executor.
+already owns. Autopilot now runs as the synthesized `autopilot:<repo>` rule using the
+`autopilot.run` action, so it shares the rule budgets and pause.
