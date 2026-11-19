@@ -3916,8 +3916,20 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # # api_base = "https://api.sprites.dev/v1"   # empty ⇒ this default
 # # Sprites have a fixed 8 vCPU: size, min_vcpu, gpu and nvme are ignored
 # # (`config validate` warns). min_ram_gb > 0 sets the sprite memory limit to
-# # min_ram_gb x 1024 MiB (unit unverified). max_lifetime_secs is not reaped in
-# # the background; run `thegn env reap --provider sprites`.
+# # min_ram_gb x 1024 MiB (unit unverified). max_lifetime_secs is reported by
+# # `thegn env reap --provider sprites`; it is enforced in the background only
+# # with lifetime_reap = true (below).
+# # max_lifetime_secs = 0    # lifetime ceiling in seconds (0 = none)
+# # lifetime_reap = false    # opt-in: destroy sprites thegn created (or adopted
+# #                          #   with `thegn env adopt`) once older than
+# #                          #   max_lifetime_secs, in the background while a
+# #                          #   client is up; never a `running` sprite. Needs
+# #                          #   max_lifetime_secs > 0. Deletes paid resources.
+# # login_homes = { claude = "/srv/agent-logins/claude", codex = "/srv/agent-logins/codex" }
+# #                          # claude/codex only: upload the login found in this
+# #                          #   host dir (a dedicated account) instead of the
+# #                          #   live host login. Your own config only; a repo
+# #                          #   overlay cannot set it. Unset = the host login.
 # # A provider table needs placement = "provider" on its env, or it runs locally.
 # # workdir = "/workspace"   # data = "sync" pushes/pulls the worktree here
 # # auto_provision = false   # create the sprite on first open if missing (8-E
@@ -4224,6 +4236,10 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # # auto_provision = false                # create the sandbox on first open if missing
 # model_credentials = "none"   # none | upload (claude/codex login into tmpfs; see docs) | proxy, inject (refused)
 # interactive_host_suffixes = []   # empty = vercel.run, vercel.sh, vercel.com
+# # login_homes = { claude = "/srv/agent-logins/claude" }   # with model_credentials =
+# #                                       #   "upload": upload the login in this host dir
+# #                                       #   (a dedicated account) instead of the live
+# #                                       #   host login. Your own config only.
 #
 # ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
