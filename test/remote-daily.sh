@@ -230,6 +230,32 @@ run_records() { # names of this run's ledger records for $provider
   return 0
 }
 
+listing_state() { # listing_state <name>: prints absent | present | unknown
+  local out
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>/dev/null)" || {
+    echo unknown
+    return 0
+  }
+  printf '%s' "$out" | LISTED_NAME="$1" python3 -I -c '
+import json, os, sys
+try:
+    view = json.load(sys.stdin)["view"]
+except Exception:
+    print("unknown"); sys.exit(0)
+if view.get("partial"):
+    print("unknown"); sys.exit(0)
+n = os.environ["LISTED_NAME"]
+rows = view.get("rows") or []
+print("present" if any(r.get("id") == n or r.get("name") == n for r in rows) else "absent")
+'
+}
+listing_lacks_name() { # listing_lacks_name [name]: defaults to rd-x's sandbox; a partial or failed listing is not proof
+  local n="${1:-$NAME}" s
+  s="$(listing_state "$n")"
+  echo "   org listing for $n: $s"
+  [ "$s" = absent ]
+}
+
 teardown() {
   local rc=$?
   trap - EXIT INT TERM
@@ -261,18 +287,16 @@ teardown() {
         "$THEGN_BIN" env deprovision "$n" --env "$env_name" --yes </dev/null
       fi
     done
-    local listing
-    listing="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)"
-    echo "-- teardown: daemon stop"
-    "$THEGN_BIN" daemon stop
     for n in $names; do
       [ "$n" = "$adopt_name" ] && continue
-      if [ -f "$(ledger_dir)/$n.json" ] || printf '%s' "$listing" | grep -Fq "\"$n\""; then
+      if [ -f "$(ledger_dir)/$n.json" ] || [ "$(listing_state "$n")" != absent ]; then
         left=1
         rc=1
         echo "TEARDOWN INCOMPLETE: $n may still exist; the ledger is kept in $TMP" >&2
       fi
     done
+    echo "-- teardown: daemon stop"
+    "$THEGN_BIN" daemon stop
   fi
   if [ "$left" = 1 ]; then
     echo "-- keeping $TMP (ledger needed for a later reap)" >&2
@@ -358,11 +382,6 @@ local_log_has_commits() {
   [ "$n" -ge "$want" ]
 }
 
-listing_lacks_name() { # listing_lacks_name [name]: defaults to rd-x's sandbox
-  local out n="${1:-$NAME}"
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
-  ! printf '%s' "$out" | grep -Fq "\"$n\""
-}
 record_gone() { [ ! -f "$(ledger_dir)/${1:-$NAME}.json" ]; }
 rdy_gone() { record_gone "$RDY_NAME" && listing_lacks_name "$RDY_NAME"; }
 
