@@ -3993,6 +3993,7 @@ fn provision_credential_policy(kind: thegn_core::config::EnvProviderKind) -> (bo
     (credential_free, credential_free)
 }
 
+#[cfg(test)]
 fn provision_model_env(
     kind: thegn_core::config::EnvProviderKind,
     mode: thegn_core::config::ModelCredentials,
