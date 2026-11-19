@@ -3,8 +3,131 @@
 //! unambiguous account reference and lifetime policy for automatic cleanup.
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use thegn_core::config::EnvProviderConfig;
+
+pub(crate) const STALL_WARN_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// Admission gate for the in-process lifetime of one provider reaper pass.
+///
+/// The process-shared [`ReaperLease`] below protects provider-kind ownership
+/// across processes; this gate keeps a slow provider call from allowing the
+/// hydration ticker to pile up passes in this process.
+pub(crate) struct ReaperGate {
+    last: Mutex<Option<Instant>>,
+    started: Mutex<Option<Instant>>,
+    in_flight: AtomicBool,
+    stall_warned: AtomicBool,
+}
+
+impl ReaperGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            last: Mutex::new(None),
+            started: Mutex::new(None),
+            in_flight: AtomicBool::new(false),
+            stall_warned: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn try_begin(&'static self, interval: Duration) -> Option<PassToken> {
+        self.try_begin_at(Instant::now(), interval)
+    }
+
+    pub(crate) fn try_begin_at(
+        &'static self,
+        now: Instant,
+        interval: Duration,
+    ) -> Option<PassToken> {
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|previous| now < previous || now.duration_since(previous) < interval) {
+            self.in_flight.store(false, Ordering::Release);
+            return None;
+        }
+        *last = Some(now);
+        drop(last);
+
+        let mut started = self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *started = Some(now);
+        drop(started);
+        self.stall_warned.store(false, Ordering::Release);
+        Some(PassToken { gate: self })
+    }
+
+    pub(crate) fn in_flight(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Return the live pass duration once it exceeds `limit`, at most once per
+    /// pass. This latch lets every hydration tick check cheaply without
+    /// repeating the warning while a provider call remains hung.
+    pub(crate) fn stalled_for(&self, now: Instant, limit: Duration) -> Option<Duration> {
+        if !self.in_flight() {
+            return None;
+        }
+        let started = self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let elapsed = started
+            .and_then(|started| now.checked_duration_since(started))
+            .filter(|elapsed| *elapsed > limit)?;
+        if !self.stall_warned.swap(true, Ordering::AcqRel) {
+            Some(elapsed)
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) struct PassToken {
+    gate: &'static ReaperGate,
+}
+
+impl Drop for PassToken {
+    fn drop(&mut self) {
+        let mut started = self
+            .gate
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *started = None;
+        drop(started);
+        self.gate.in_flight.store(false, Ordering::Release);
+    }
+}
+
+/// Spawn a reaper pass on its named background thread, retaining the gate token
+/// until the pass returns or unwinds.
+pub(crate) fn spawn_pass(
+    token: PassToken,
+    thread_name: &'static str,
+    pass: impl FnOnce() + Send + 'static,
+) -> bool {
+    thegn_core::thread_name::try_spawn_named(thread_name, move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        let _token = token;
+        pass();
+    })
+    .is_ok()
+}
 
 fn lock_dir() -> PathBuf {
     #[cfg(test)]
@@ -358,6 +481,77 @@ mod tests {
             after_release.is_some(),
             "dropping the holder releases its lock"
         );
+    }
+
+    #[test]
+    fn reaper_gate_is_single_flight_and_interval_throttled() {
+        static GATE: ReaperGate = ReaperGate::new();
+        let start = Instant::now();
+        let interval = Duration::from_secs(10);
+        let token = GATE.try_begin_at(start, interval).expect("first pass");
+        assert!(GATE.try_begin_at(start + interval, interval).is_none());
+        drop(token);
+        assert!(
+            GATE.try_begin_at(start + interval - Duration::from_secs(1), interval)
+                .is_none()
+        );
+        assert!(GATE.try_begin_at(start + interval, interval).is_some());
+    }
+
+    #[test]
+    fn reaper_gate_releases_after_a_panic() {
+        static GATE: ReaperGate = ReaperGate::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _token = GATE
+                .try_begin_at(Instant::now(), Duration::from_secs(1))
+                .expect("panic test pass");
+            panic!("provider call panicked");
+        }));
+        assert!(result.is_err());
+        assert!(!GATE.in_flight());
+    }
+
+    #[test]
+    fn reaper_gate_stalled_for_table() {
+        static GATE: ReaperGate = ReaperGate::new();
+        let start = Instant::now();
+        let limit = Duration::from_secs(10);
+        assert_eq!(
+            GATE.stalled_for(start + limit + Duration::from_secs(1), limit),
+            None
+        );
+        let token = GATE
+            .try_begin_at(start, Duration::from_secs(1))
+            .expect("pass");
+        assert_eq!(GATE.stalled_for(start, limit), None);
+        assert_eq!(GATE.stalled_for(start + limit, limit), None);
+        assert_eq!(
+            GATE.stalled_for(start + limit + Duration::from_secs(1), limit),
+            Some(Duration::from_secs(11))
+        );
+        assert_eq!(
+            GATE.stalled_for(start + limit + Duration::from_secs(2), limit),
+            None,
+            "a pass warns about a stall only once"
+        );
+        drop(token);
+        assert_eq!(
+            GATE.stalled_for(start + limit + Duration::from_secs(2), limit),
+            None
+        );
+    }
+
+    #[test]
+    fn reaper_lease_releases_when_a_pass_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = try_reaper_lease_in(dir.path(), "fly")
+                .unwrap()
+                .expect("panic test lease");
+            panic!("provider call panicked");
+        }));
+        assert!(result.is_err());
+        assert!(try_reaper_lease_in(dir.path(), "fly").unwrap().is_some());
     }
 
     #[test]
