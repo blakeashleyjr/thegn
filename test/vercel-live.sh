@@ -12,7 +12,7 @@
 #   test/vercel-live.sh                      # print plan, no network
 #   THEGN_CHANNEL=dev test/vercel-live.sh --token-ref keyring:vercel-token \
 #     --team-id team_x --project-id prj_x --i-accept-spend [--with-model-login] \
-#     [--login-home-claude <dir>] [--with-headless]
+#     [--login-home-claude <dir>] [--with-headless] [--keep-going]
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
@@ -21,7 +21,7 @@ MAX_LIFETIME=3600
 MAX_INSTANCES=1
 VCPUS=2
 
-token_ref="" team_id="" project_id="" accept=0 model_login=0 headless=0 login_home_claude=""
+token_ref="" team_id="" project_id="" accept=0 model_login=0 headless=0 keep_going=0 login_home_claude=""
 while [ $# -gt 0 ]; do
   case "$1" in
   --token-ref)
@@ -46,6 +46,10 @@ while [ $# -gt 0 ]; do
     ;;
   --with-headless)
     headless=1
+    shift
+    ;;
+  --keep-going)
+    keep_going=1
     shift
     ;;
   --login-home-claude)
@@ -80,6 +84,7 @@ print_plan() {
   cat <<PLAN
 vercel-live plan (nothing is created without all of: --token-ref, --team-id,
 --project-id, --i-accept-spend and THEGN_CHANNEL=dev)
+--keep-going alone is plan-only and does not bypass --i-accept-spend.
 
 Will create : ONE Vercel sandbox, ${VCPUS} vCPU, max_lifetime_secs = ${MAX_LIFETIME},
               max_instances = ${MAX_INSTANCES}, in a fresh temp XDG state/config dir
@@ -87,7 +92,9 @@ Will create : ONE Vercel sandbox, ${VCPUS} vCPU, max_lifetime_secs = ${MAX_LIFET
 Max spend   : bounded by ${VCPUS} vCPU x 1 h of active CPU plus memory and snapshot
               storage; roughly under US\$1 at Pro iad1 rates (estimate).
 Teardown    : trap on EXIT/INT/TERM -> env down, env reap --provider vercel
-              --apply --yes (temp state), then fleet list must show 0 rows.
+              --apply --yes (temp state), then each sandbox from this run's
+              ledger (and the named sandbox) must be absent from fleet list.
+              Partial or bad JSON is unknown and counts as present.
 The preflight prints which credentials enter the sandbox.
 Steps:
   1   create env config (temp)
@@ -109,8 +116,12 @@ Steps:
       check (only the first sandbox's ledger record remains); needs a
       second sandbox, so max_instances = 2 with --with-headless
   9   env down (destroy)              9b  no ledger record for this run's sandbox
+  9c  fleet list classifies this sandbox as down, not missing (older binaries
+      pass with a "binary predates batch 170" note)
  10   env reap dry-run, 10a apply
-Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
+Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero unless
+--keep-going is set. With --keep-going, the run finishes and prints FAILED STEPS:
+with the failed step ids before exiting non-zero.
 PLAN
 }
 
@@ -207,6 +218,8 @@ export XDG_RUNTIME_DIR="$TMP/run"
 REPO="$TMP/repo"
 SANDBOX_NAME="(unknown)"
 CREATED=0
+STEP_9_PASSED=0
+FAILED_STEPS=()
 
 print_plan
 echo
@@ -223,6 +236,27 @@ run_records() { # run_records <provider>: names of this run's ledger records
   return 0
 }
 
+listing_lacks_name() { # listing_lacks_name <name>: partial/failed listing is unknown
+  local name="$1" out
+  out="$("$THEGN_BIN" fleet list --env "$ENV_NAME" --json 2>/dev/null)" || return 1
+  printf '%s' "$out" | LISTED_NAME="$name" python3 -I -c '
+import json, os, sys
+
+try:
+    listing = json.load(sys.stdin)
+    view = listing["view"]
+    rows = view["rows"]
+except (AttributeError, KeyError, TypeError, ValueError):
+    sys.exit(1)
+if view.get("partial"):
+    sys.exit(1)
+if not isinstance(rows, list):
+    sys.exit(1)
+name = os.environ["LISTED_NAME"]
+sys.exit(1 if any(isinstance(row, dict) and row.get("id") == name for row in rows) else 0)
+'
+}
+
 teardown() {
   local rc=$?
   trap - EXIT INT TERM
@@ -231,26 +265,30 @@ teardown() {
   if [ "$CREATED" = 1 ]; then
     local names n
     names="$(run_records vercel)"
-    echo "-- teardown: env down"
-    (cd "$REPO" && "$THEGN_BIN" env down --force)
+    if [ "$STEP_9_PASSED" = 0 ]; then
+      echo "-- teardown: env down"
+      (cd "$REPO" && "$THEGN_BIN" env down --force)
+    fi
     echo "-- teardown: env reap"
     "$THEGN_BIN" env reap --provider vercel --apply --yes
-    echo "-- teardown: fleet list (must show 0 rows)"
-    local out
-    out="$("$THEGN_BIN" fleet list --json 2>&1)"
-    echo "$out" | head -40
-    if echo "$out" | grep -Eq '"id": *"'; then
-      left=1
-      echo "TEARDOWN INCOMPLETE: sandbox may still exist; clean up manually: $SANDBOX_NAME (team $team_id, project $project_id)" >&2
-      rc=1
-    fi
-    for n in $names; do
-      if [ -f "$(ledger_dir)/$n.json" ]; then
+    echo "-- teardown: fleet list (run-owned names must be absent)"
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      if [ -f "$(ledger_dir)/$n.json" ] || ! listing_lacks_name "$n"; then
         left=1
         rc=1
         echo "TEARDOWN INCOMPLETE: sandbox $n may still exist; the ledger is kept in $TMP" >&2
       fi
-    done
+    done <<<"$names"
+    if [ -n "$SANDBOX_NAME" ] && {
+      [ "$SANDBOX_NAME" = "(unknown)" ] ||
+        [ -f "$(ledger_dir)/$SANDBOX_NAME.json" ] ||
+        ! listing_lacks_name "$SANDBOX_NAME"
+    }; then
+      left=1
+      rc=1
+      echo "TEARDOWN INCOMPLETE: sandbox $SANDBOX_NAME may still exist; the ledger is kept in $TMP" >&2
+    fi
   fi
   if [ "$left" = 1 ]; then
     echo "-- keeping $TMP (ownership ledger needed for a later reap); ledger records:" >&2
@@ -268,10 +306,17 @@ step() { # step <id> <description> <command...>
   echo "== step $id: $desc"
   if "$@"; then
     echo "PASS $id"
+    if [ "$id" = 9 ]; then
+      STEP_9_PASSED=1
+    fi
   else
     echo "FAIL $id: $desc" >&2
-    exit 1
+    FAILED_STEPS+=("$id")
+    if [ "$keep_going" != 1 ]; then
+      exit 1
+    fi
   fi
+  return 0
 }
 
 ask() { # ask <prompt>: operator confirmation, y (or n/a) passes
@@ -378,6 +423,52 @@ step 8a "resume (env up)" in_repo "$THEGN_BIN" env up
 step 8b "tmpfs login dir is gone after stop/resume" ask "/dev/shm/thegn-login-* absent after resume? "
 step 9 "env down destroys the sandbox" in_repo "$THEGN_BIN" env down
 step 9b "no ledger record for this run's sandbox" sandbox_record_gone
+fleet_down_not_missing() {
+  local out
+  [ ! -f "$(ledger_dir)/$SANDBOX_NAME.json" ] || {
+    echo "   ledger record for $SANDBOX_NAME is still present" >&2
+    return 1
+  }
+  out="$("$THEGN_BIN" fleet list --env "$ENV_NAME" --json)" || return 1
+  printf '%s' "$out" | FLEET_SANDBOX="$SANDBOX_NAME" python3 -I -c '
+import json, os, sys
+
+try:
+    listing = json.load(sys.stdin)
+    view = listing["view"]
+except (AttributeError, KeyError, TypeError, ValueError):
+    print("fleet list JSON is invalid or missing view", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(view, dict):
+    print("fleet list JSON view is not an object", file=sys.stderr)
+    sys.exit(1)
+if "down" not in view:
+    print("fleet list JSON has no down key: binary predates batch 170")
+    sys.exit(0)
+try:
+    down = view["down"]
+    missing = view["missing"]
+except KeyError as exc:
+    print("fleet list JSON is missing key " + str(exc.args[0]), file=sys.stderr)
+    sys.exit(1)
+if not isinstance(down, list) or not isinstance(missing, list):
+    print("fleet list JSON view.down and view.missing must be arrays", file=sys.stderr)
+    sys.exit(1)
+sandbox = os.environ["FLEET_SANDBOX"]
+in_down = any(isinstance(row, dict) and row.get("id") == sandbox for row in down)
+in_missing = any(isinstance(row, dict) and row.get("id") == sandbox for row in missing)
+if not in_down or in_missing:
+    print("fleet list JSON did not classify the sandbox as down (and not missing)", file=sys.stderr)
+    sys.exit(1)
+print("   fleet truth: " + sandbox + " is down and not missing")
+'
+}
+step 9c "fleet list classifies this sandbox as down, not missing" fleet_down_not_missing
 step 10 "reap: dry-run" "$THEGN_BIN" env reap --provider vercel
 step 10a "reap: apply finds nothing left" "$THEGN_BIN" env reap --provider vercel --apply --yes
+if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+  echo "FAILED STEPS: ${FAILED_STEPS[*]}"
+  exit 1
+fi
 echo "ALL STEPS PASS"
