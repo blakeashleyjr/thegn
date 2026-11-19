@@ -19,6 +19,8 @@
 //! └───────────────────────────────────────────────────┘
 //! ```
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
@@ -28,6 +30,32 @@ use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::seg::{self, Line, Tok, seg, sp};
+
+static RECENT: Mutex<VecDeque<String>> = const { Mutex::new(VecDeque::new()) };
+
+fn record_recent(query: &str) {
+    let query = query.trim();
+    if query.is_empty() {
+        return;
+    }
+    let mut recent = RECENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    recent.retain(|item| item != query);
+    recent.push_front(query.to_string());
+    recent.truncate(20);
+}
+
+fn recall_recent(current: &str) -> Option<String> {
+    let recent = RECENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let index = recent
+        .iter()
+        .position(|query| query == current)
+        .map_or(0, |index| (index + 1) % recent.len());
+    recent.get(index).cloned()
+}
 
 /// What `SearchOverlay::handle_key` signals to the caller.
 #[derive(Debug)]
@@ -88,15 +116,18 @@ impl SearchOverlay {
     ) -> SearchOutcome {
         // Dismiss: Esc or Ctrl+g.
         if is_escape(key, mods) {
+            record_recent(self.engine.query());
             return SearchOutcome::Dismiss;
         }
 
         match key {
             KeyCode::Enter => {
                 if let Some(m) = self.engine.selected() {
+                    record_recent(self.engine.query());
                     return SearchOutcome::Jump(m.clone());
                 }
                 // Enter on empty results → dismiss.
+                record_recent(self.engine.query());
                 return SearchOutcome::Dismiss;
             }
 
@@ -120,10 +151,36 @@ impl SearchOverlay {
 
             KeyCode::Char('f') | KeyCode::Char('F') if mods == Modifiers::ALT => {
                 let next = match self.engine.mode() {
-                    MatchMode::Literal => MatchMode::Fuzzy,
+                    MatchMode::Literal | MatchMode::Regex => MatchMode::Fuzzy,
                     MatchMode::Fuzzy => MatchMode::Literal,
                 };
                 self.engine.set_mode(next, sources);
+            }
+
+            KeyCode::Char('c') | KeyCode::Char('C') if mods == Modifiers::ALT => {
+                let mut options = self.engine.options();
+                options.exact_case = !options.exact_case;
+                self.engine.set_options(options, sources);
+            }
+
+            KeyCode::Char('w') | KeyCode::Char('W') if mods == Modifiers::ALT => {
+                let mut options = self.engine.options();
+                options.whole_word = !options.whole_word;
+                self.engine.set_options(options, sources);
+            }
+
+            KeyCode::Char('r') | KeyCode::Char('R') if mods == Modifiers::ALT => {
+                let next = match self.engine.mode() {
+                    MatchMode::Literal | MatchMode::Fuzzy => MatchMode::Regex,
+                    MatchMode::Regex => MatchMode::Literal,
+                };
+                self.engine.set_mode(next, sources);
+            }
+
+            KeyCode::Char('r') | KeyCode::Char('R') if mods == Modifiers::CTRL => {
+                if let Some(query) = recall_recent(self.engine.query()) {
+                    self.engine.set_query(&query, sources);
+                }
             }
 
             KeyCode::Backspace => {
@@ -181,7 +238,19 @@ impl SearchOverlay {
         // rows: prompt(1) + rule(1) + results(shown) + preview + rule(1) + footer(1)
         let content_rows = 4 + shown.max(1) + preview_reserve;
 
-        let scope_pill = format!(" {} ▾", engine.scope().label());
+        let mut scope_pill = format!(" {} ▾", engine.scope().label());
+        let options = engine.options();
+        if options.exact_case {
+            scope_pill.push_str(" Aa");
+        }
+        if options.whole_word {
+            scope_pill.push_str(" ab");
+        }
+        match engine.mode() {
+            MatchMode::Regex => scope_pill.push_str(" .*"),
+            MatchMode::Fuzzy => scope_pill.push_str(" ~"),
+            MatchMode::Literal => {}
+        }
         let spec = LayerSpec {
             title: "Search history".into(),
             badge: Some(scope_pill),
@@ -293,10 +362,16 @@ impl SearchOverlay {
 
         // If no results, show a placeholder.
         if matches.is_empty() && inner.rows > 3 && result_rows > 0 {
-            let placeholder = if engine.query().trim().is_empty() {
-                "no history yet"
+            let placeholder = if let Some(error) = engine.error() {
+                format!("regex error: {error}")
+            } else if engine.query().trim().is_empty() {
+                "no history yet".to_string()
+            } else if matches!(engine.scope(), SearchScope::Pane(_)) {
+                "no matches in this pane: Tab to widen".to_string()
+            } else if engine.mode() == MatchMode::Literal {
+                "no matches: Alt+f for fuzzy".to_string()
             } else {
-                "no matches"
+                "no matches".to_string()
             };
             seg::draw_line(
                 surface,
@@ -330,13 +405,17 @@ impl SearchOverlay {
             seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
             let count_str = if matches.is_empty() {
                 "no results".to_string()
+            } else if engine.truncated() {
+                format!(
+                    "{} of {} (of {})",
+                    selected_idx + 1,
+                    matches.len(),
+                    engine.total()
+                )
             } else {
                 format!("{} of {}", selected_idx + 1, matches.len())
             };
-            let mode_hint = match engine.mode() {
-                MatchMode::Literal => "Alt+f fuzzy",
-                MatchMode::Fuzzy => "Alt+f literal",
-            };
+            let mode_hint = "Alt+c case  Alt+w word  Alt+r regex  Alt+f fuzzy";
             let footer = Line::split(
                 vec![
                     seg(Tok::Slot(S::Ghost2), "↑↓"),
@@ -349,9 +428,9 @@ impl SearchOverlay {
                     seg(Tok::Slot(S::Ghost), " dismiss"),
                 ],
                 vec![
-                    seg(Tok::Slot(S::Ghost2), mode_hint),
-                    sp(2),
                     seg(Tok::Slot(S::Ghost3), count_str),
+                    sp(2),
+                    seg(Tok::Slot(S::Ghost2), mode_hint),
                 ],
             );
             seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
@@ -482,7 +561,7 @@ fn window_around(line: &str, span: (usize, usize), avail: usize) -> (bool, &str,
 mod tests {
     use super::*;
     use thegn_core::history::HistoryBuffer;
-    use thegn_core::search::SearchSource;
+    use thegn_core::search::{MatchOptions, SearchSource};
 
     fn buf_from(lines: &[&str]) -> HistoryBuffer {
         let mut b = HistoryBuffer::new(1_000);
@@ -498,6 +577,13 @@ mod tests {
 
     fn overlay(pane_id: u32) -> SearchOverlay {
         SearchOverlay::new(SearchScope::Pane(pane_id), pane_id, 100)
+    }
+
+    fn clear_recent() {
+        RECENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     #[test]
@@ -830,12 +916,65 @@ mod tests {
         let srcs = sources(1, &buf);
         let mut ov = overlay(1);
         assert_eq!(ov.engine().mode(), MatchMode::Literal);
-        assert!(draw(&ov, 100, 30).contains("Alt+f fuzzy"));
+        assert!(draw(&ov, 100, 30).contains("Alt+c case  Alt+w word  Alt+r regex  Alt+f fuzzy"));
         ov.handle_key(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
         assert_eq!(ov.engine().mode(), MatchMode::Fuzzy);
-        assert!(draw(&ov, 100, 30).contains("Alt+f literal"));
+        assert!(draw(&ov, 100, 30).contains("Alt+c case  Alt+w word  Alt+r regex  Alt+f fuzzy"));
         ov.handle_key(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
         assert_eq!(ov.engine().mode(), MatchMode::Literal);
+    }
+
+    #[test]
+    fn alt_search_keys_toggle_options_and_regex() {
+        let buf = buf_from(&["Error: login", "error: log"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+
+        assert_eq!(ov.engine().options(), MatchOptions::default());
+        ov.handle_key(&KeyCode::Char('c'), Modifiers::ALT, &srcs);
+        assert!(ov.engine().options().exact_case);
+        ov.handle_key(&KeyCode::Char('w'), Modifiers::ALT, &srcs);
+        assert!(ov.engine().options().whole_word);
+        ov.handle_key(&KeyCode::Char('r'), Modifiers::ALT, &srcs);
+        assert_eq!(ov.engine().mode(), MatchMode::Regex);
+        ov.handle_key(&KeyCode::Char('r'), Modifiers::ALT, &srcs);
+        assert_eq!(ov.engine().mode(), MatchMode::Literal);
+    }
+
+    #[test]
+    fn render_footer_shows_total_when_results_are_truncated() {
+        let buf = buf_from(&["hit 1", "hit 2", "hit 3", "hit 4", "hit 5"]);
+        let srcs = sources(1, &buf);
+        let mut ov = SearchOverlay::new(SearchScope::Pane(1), 1, 2);
+        typed(&mut ov, "hit", &srcs);
+        assert!(draw(&ov, 100, 30).contains("1 of 2 (of 5)"));
+    }
+
+    #[test]
+    fn render_shows_regex_error_placeholder() {
+        let buf = buf_from(&["error"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        ov.handle_key(&KeyCode::Char('r'), Modifiers::ALT, &srcs);
+        typed(&mut ov, "[", &srcs);
+        assert!(draw(&ov, 100, 30).contains("regex error:"));
+    }
+
+    #[test]
+    fn ctrl_r_recalls_last_query() {
+        clear_recent();
+        let buf = buf_from(&["cargo build"]);
+        let srcs = sources(1, &buf);
+        let mut first = overlay(1);
+        typed(&mut first, "cargo", &srcs);
+        assert!(matches!(
+            first.handle_key(&KeyCode::Escape, Modifiers::NONE, &srcs),
+            SearchOutcome::Dismiss
+        ));
+
+        let mut recalled = overlay(1);
+        recalled.handle_key(&KeyCode::Char('r'), Modifiers::CTRL, &srcs);
+        assert_eq!(recalled.engine().query(), "cargo");
     }
 
     #[test]

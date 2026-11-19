@@ -344,13 +344,6 @@
       ]
     },
     {
-      "issue": "THE-613",
-      "project": "Distribution & Release Readiness",
-      "changes": [
-        "harden-live-upgrades"
-      ]
-    },
-    {
       "issue": "THE-703",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [],

@@ -2191,6 +2191,7 @@ fn doctor_json_reports_the_instance_identity() {
     let instance = report["instance"].as_object().expect("instance object");
     for key in [
         "binary",
+        "build",
         "config_dir",
         "state_dir",
         "thegn_dir",
@@ -2258,6 +2259,74 @@ fn wayland_note_table() {
     );
     assert!(wayland_note(Some("wayland-0"), Some("/run/user/1000"), &|_| true).is_none());
     assert!(wayland_note(Some("wayland-0"), None, &|_| false).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn pane_instance_note_table() {
+    assert_eq!(pane_instance_note(None, "/run/thegn.sock"), None);
+    assert_eq!(
+        pane_instance_note(Some("/run/thegn.sock"), "/run/thegn.sock"),
+        None
+    );
+    assert_eq!(
+        pane_instance_note(Some("/run/other-thegn.sock"), "/run/thegn.sock").as_deref(),
+        Some(
+            "this shell is a pane of another thegn instance (control socket /run/other-thegn.sock); this binary uses /run/thegn.sock: in a dev pane run $THEGN_BIN or put ~/.thegn-devel/bin first on PATH"
+        )
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn path_thegn_note_uses_first_existing_path_entry() {
+    let path_var = std::env::join_paths([
+        std::path::Path::new("/first"),
+        std::path::Path::new("/second"),
+    ])
+    .unwrap();
+    let path_var = path_var.to_str().expect("test path is UTF-8");
+    let exists = |path: &std::path::Path| path == std::path::Path::new("/first/thegn");
+
+    assert_eq!(
+        path_thegn_note(
+            Some(path_var),
+            "/first/thegn",
+            &exists,
+            &|path: &std::path::Path| path.to_path_buf(),
+        ),
+        None
+    );
+    assert_eq!(
+        path_thegn_note(
+            Some(path_var),
+            "/current/thegn",
+            &exists,
+            &|path: &std::path::Path| path.to_path_buf(),
+        )
+        .as_deref(),
+        Some("`thegn` on PATH is /first/thegn, not this binary (/current/thegn)")
+    );
+    assert_eq!(
+        path_thegn_note(
+            None,
+            "/current/thegn",
+            &exists,
+            &|path: &std::path::Path| path.to_path_buf(),
+        ),
+        None
+    );
+    let resolve = |path: &std::path::Path| {
+        if path == std::path::Path::new("/first/thegn") {
+            std::path::PathBuf::from("/current/thegn")
+        } else {
+            path.to_path_buf()
+        }
+    };
+    assert_eq!(
+        path_thegn_note(Some(path_var), "/current/thegn", &exists, &resolve),
+        None
+    );
 }
 
 #[cfg(test)]
@@ -2979,6 +3048,7 @@ fn db_space_suffix(
 /// fails.
 struct InstanceInfo {
     binary: String,
+    build: String,
     config_dir: String,
     state_dir: String,
     thegn_dir: String,
@@ -2991,6 +3061,49 @@ struct InstanceInfo {
 }
 
 const INSTANCE_SHARED: [&str; 2] = ["thegn.slice CPU/memory cap", "keyring service \"thegn\""];
+
+fn clean_instance_value(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect()
+}
+
+/// A note when this shell is a pane of another instance: its
+/// `THEGN_CONTROL_SOCKET` is set and is not this binary's daemon socket.
+fn pane_instance_note(pane_socket: Option<&str>, own_socket: &str) -> Option<String> {
+    let pane_socket = pane_socket.filter(|socket| !socket.is_empty())?;
+    if pane_socket == own_socket {
+        return None;
+    }
+    Some(format!(
+        "this shell is a pane of another thegn instance (control socket {}); this binary uses {}: in a dev pane run $THEGN_BIN or put ~/.thegn-devel/bin first on PATH",
+        clean_instance_value(pane_socket),
+        clean_instance_value(own_socket),
+    ))
+}
+
+/// The first `thegn` on `path_var` that `exists` accepts, when it is not
+/// `current_exe`.
+fn path_thegn_note(
+    path_var: Option<&str>,
+    current_exe: &str,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+    resolve: &dyn Fn(&std::path::Path) -> std::path::PathBuf,
+) -> Option<String> {
+    let path_var = path_var.filter(|path| !path.is_empty())?;
+    let path = std::env::split_paths(path_var)
+        .map(|directory| directory.join("thegn"))
+        .find(|path| exists(path))?;
+    if resolve(&path) == resolve(std::path::Path::new(current_exe)) {
+        return None;
+    }
+    Some(format!(
+        "`thegn` on PATH is {}, not this binary ({})",
+        clean_instance_value(&path.display().to_string()),
+        clean_instance_value(current_exe),
+    ))
+}
 
 fn read_controller_id() -> Option<String> {
     let new =
@@ -3053,28 +3166,45 @@ fn instance_info(cfg: &Config) -> InstanceInfo {
     let binary = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("(unknown: {error})"));
+    let channel = crate::channel_state::current().as_str().to_string();
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|value| !value.is_empty());
+    let daemon_socket = crate::daemon::socket_path(&cfg.daemon)
+        .display()
+        .to_string();
+    let build = crate::diag::identity(&channel)
+        .build
+        .map(|build| format!("{} ({build})", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let notes = wayland_note(
         std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
         runtime.as_deref(),
         &|path| path.exists(),
     )
     .into_iter()
+    .chain(pane_instance_note(
+        std::env::var("THEGN_CONTROL_SOCKET").ok().as_deref(),
+        &daemon_socket,
+    ))
+    .chain(path_thegn_note(
+        std::env::var("PATH").ok().as_deref(),
+        &binary,
+        &|path| path.exists(),
+        &|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    ))
     .collect();
     InstanceInfo {
         binary,
+        build,
         config_dir: thegn_core::util::thegn_config_dir().display().to_string(),
         state_dir: thegn_core::util::xdg_state_home()
             .join("thegn")
             .display()
             .to_string(),
         thegn_dir: thegn_core::util::thegn_dir().display().to_string(),
-        channel: crate::channel_state::current().as_str().to_string(),
-        daemon_socket: crate::daemon::socket_path(&cfg.daemon)
-            .display()
-            .to_string(),
+        channel,
+        daemon_socket,
         runtime_dir: runtime.unwrap_or_else(|| "(unset)".to_string()),
         controller_id: read_controller_id(),
         ports: instance_ports(cfg),
@@ -3087,6 +3217,7 @@ fn instance_report(cfg: &Config) {
     let info = instance_info(cfg);
     outln!("Instance");
     outln!("  binary        {}", info.binary);
+    outln!("  build         {}", info.build);
     outln!("  config dir    {}", info.config_dir);
     outln!("  state dir     {}", info.state_dir);
     outln!("  THEGN_DIR     {}", info.thegn_dir);
@@ -3116,6 +3247,7 @@ fn instance_json(cfg: &Config) -> serde_json::Value {
     let info = instance_info(cfg);
     serde_json::json!({
         "binary": info.binary,
+        "build": info.build,
         "config_dir": info.config_dir,
         "state_dir": info.state_dir,
         "thegn_dir": info.thegn_dir,
