@@ -523,49 +523,62 @@ pub(crate) fn seed_from_bundle_with(
     workdir: &str,
     branch: &str,
 ) -> anyhow::Result<()> {
-    let wt = Path::new(worktree);
-    check_branch_name(wt, branch)?;
-    let tip = branch_tip(wt, branch)?;
-    let tmp = tempfile::Builder::new().prefix("tg-seed-").tempdir()?;
-    let bundle = tmp.path().join("seed.bundle");
-    bundle_branch(wt, branch, &bundle)?;
-    let size = std::fs::metadata(&bundle)
-        .with_context(|| format!("stat {}", bundle.display()))?
-        .len();
-    if size > MAX_SEED_BUNDLE_BYTES {
-        anyhow::bail!(seed_cap_message(size));
-    }
-    let bytes = std::fs::read(&bundle).with_context(|| format!("read {}", bundle.display()))?;
+    let mut tip = String::new();
+    let result = (|| {
+        let wt = Path::new(worktree);
+        check_branch_name(wt, branch)?;
+        tip = branch_tip(wt, branch)?;
+        let tmp = tempfile::Builder::new().prefix("tg-seed-").tempdir()?;
+        let bundle = tmp.path().join("seed.bundle");
+        bundle_branch(wt, branch, &bundle)?;
+        let size = std::fs::metadata(&bundle)
+            .with_context(|| format!("stat {}", bundle.display()))?
+            .len();
+        if size > MAX_SEED_BUNDLE_BYTES {
+            anyhow::bail!(seed_cap_message(size));
+        }
+        let bytes = std::fs::read(&bundle).with_context(|| format!("read {}", bundle.display()))?;
 
-    let dir = stage_dir_with(t)?;
-    let staged = syncstate::staged_artifact_path(&dir, "seed.bundle");
-    t.write(&staged, &bytes)
-        .with_context(|| format!("upload the repository bundle to {staged}"))?;
-    let script = syncstate::bundle_seed_script(workdir, &staged, branch, &tip);
-    let (code, out) = t
-        .sh(&script)
-        .with_context(|| format!("seed {} repository from the bundle", t.label()))?;
-    if code != 0 {
-        let marker = out
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("TG-SEED-ERROR:"))
-            .unwrap_or("TG-SEED-ERROR:exec");
-        anyhow::bail!(
-            "seeding {workdir} from the bundle failed ({marker}, exit {code}): {}; staged bundle retained in {dir}",
-            crate::provision_recover::stderr_gist(&out)
+        let dir = stage_dir_with(t)?;
+        let staged = syncstate::staged_artifact_path(&dir, "seed.bundle");
+        t.write(&staged, &bytes)
+            .with_context(|| format!("upload the repository bundle to {staged}"))?;
+        let script = syncstate::bundle_seed_script(workdir, &staged, branch, &tip);
+        let (code, out) = t
+            .sh(&script)
+            .with_context(|| format!("seed {} repository from the bundle", t.label()))?;
+        if code != 0 {
+            let marker = out
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("TG-SEED-ERROR:"))
+                .unwrap_or("TG-SEED-ERROR:exec");
+            anyhow::bail!(
+                "seeding {workdir} from the bundle failed ({marker}, exit {code}): {}; staged bundle retained in {dir}",
+                crate::provision_recover::stderr_gist(&out)
+            );
+        }
+        tracing::info!(
+            target: "thegn::git_audit",
+            worktree,
+            branch,
+            to = %tip,
+            bytes = size,
+            outcome = "seeded",
+            "sandbox repository seeded from a git bundle"
         );
-    }
-    tracing::info!(
-        target: "thegn::git_audit",
+        Ok(())
+    })();
+    crate::git_audit::record(&crate::git_audit::GitAuditEvent {
+        ts_ms: thegn_core::util::now_ms(),
+        action: "seed",
         worktree,
         branch,
-        to = %tip,
-        bytes = size,
-        outcome = "seeded",
-        "sandbox repository seeded from a git bundle"
-    );
-    Ok(())
+        from: "",
+        to: &tip,
+        outcome: if result.is_ok() { "ok" } else { "error" },
+    });
+    result
 }
 
 /// Fetch a downloaded sandbox bundle into the worktree's scratch ref and
@@ -791,6 +804,15 @@ pub(crate) fn pull_back(
         outcome = outcome_label,
         "env pull"
     );
+    crate::git_audit::record(&crate::git_audit::GitAuditEvent {
+        ts_ms: thegn_core::util::now_ms(),
+        action: "pull",
+        worktree,
+        branch: &branch,
+        from: &local_tip,
+        to: &to,
+        outcome: outcome_label,
+    });
     let outcome = result?;
     let push = match (
         &outcome,
@@ -805,6 +827,19 @@ pub(crate) fn pull_back(
                 result = %push,
                 "env pull push-lane"
             );
+            crate::git_audit::record(&crate::git_audit::GitAuditEvent {
+                ts_ms: thegn_core::util::now_ms(),
+                action: "push-lane",
+                worktree,
+                branch: &branch,
+                from: "",
+                to: "",
+                outcome: if push.starts_with("pushed ") {
+                    "ok"
+                } else {
+                    "error"
+                },
+            });
             Some(push)
         }
         (PullOutcome::FastForwarded { .. }, Some(Err(refusal))) => {
@@ -1158,13 +1193,14 @@ fn download_and_apply(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SEED_BUNDLE_BYTES, PULL_REF_PREFIX, PullOutcome, PullReport, apply_pulled_bundle,
-        branch_tip, bundle_branch, check_pull_policy, check_pull_target, classify_pull,
-        is_protected_branch, no_exec_channel_message, pull_ref_for, push_decision,
-        seed_cap_message, should_pull_on_exit, try_begin_pull,
+        MAX_SEED_BUNDLE_BYTES, PULL_REF_PREFIX, PullOutcome, PullReport, SeedTransport,
+        apply_pulled_bundle, branch_tip, bundle_branch, check_pull_policy, check_pull_target,
+        classify_pull, is_protected_branch, no_exec_channel_message, pull_ref_for, push_decision,
+        seed_cap_message, seed_from_bundle_with, should_pull_on_exit, try_begin_pull,
     };
     use std::path::Path;
     use thegn_core::config::{SandboxGitConfig, SandboxGitMode};
+    use thegn_core::testenv::IsolatedState;
 
     const A: &str = "1111111111111111111111111111111111111111";
 
@@ -1355,6 +1391,53 @@ mod tests {
             msg,
             "the repository bundle is 513 MiB, over the 512 MiB seed cap; set `[sandbox.git] transport = \"clone\"` (and a credential) for this env"
         );
+    }
+
+    struct FakeSeedTransport;
+
+    impl SeedTransport for FakeSeedTransport {
+        fn sh(&self, _script: &str) -> anyhow::Result<(i32, String)> {
+            Ok((0, String::new()))
+        }
+
+        fn write(&self, _path: &str, _bytes: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn label(&self) -> String {
+            "fake transport".to_string()
+        }
+    }
+
+    #[test]
+    fn seed_with_fake_transport_writes_a_seed_line() {
+        let state = IsolatedState::new();
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        git(&worktree, &["init", "-q", "-b", "lane"]);
+        git(&worktree, &["config", "user.name", "Seed Test"]);
+        git(&worktree, &["config", "user.email", "seed@example.invalid"]);
+        std::fs::write(worktree.join("seed.txt"), "seed\n").unwrap();
+        git(&worktree, &["add", "seed.txt"]);
+        git(&worktree, &["commit", "-q", "-m", "seed"]);
+        let tip = branch_tip(&worktree, "lane").unwrap();
+
+        seed_from_bundle_with(
+            &FakeSeedTransport,
+            worktree.to_str().unwrap(),
+            "/workspace",
+            "lane",
+        )
+        .unwrap();
+
+        let path = state.state_home().join("thegn/provider/git-audit.jsonl");
+        let value: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        assert_eq!(value["action"], "seed");
+        assert_eq!(value["branch"], "lane");
+        assert_eq!(value["to"], tip);
+        assert_eq!(value["outcome"], "ok");
     }
 
     #[test]

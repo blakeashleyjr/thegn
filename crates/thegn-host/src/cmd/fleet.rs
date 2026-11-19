@@ -12,10 +12,14 @@
 //! `--json` emits one document (`FleetReport`) with these stable fields:
 //! - `generated_ms`: epoch ms of the estimate.
 //! - `view.rows[]`: `provider`, `env`, `id`, `name`, `state`, `size`, `region`,
-//!   `created_ms`, `worktree` (`null` = orphan: no worktree records it).
-//! - `view.orphans`: count of rows with no worktree.
+//!   `created_ms`, `worktree` (`null` = orphan: no worktree records it),
+//!   `unrecorded` (`true` = an unowned account-wide sprites row).
+//! - `view.orphans`: count of rows with no worktree that are not unrecorded.
 //! - `view.missing[]`: `worktree`, `provider`, `env`, `id` — recorded by a
 //!   worktree, not listed by its (completely read) provider.
+//! - `view.down[]`: `worktree`, `provider`, `env`, `id` — recorded sandboxes
+//!   not listed and not locally provisioned (or already taken down).
+//! - `view.unrecorded`: count of rows marked `rows[].unrecorded`.
 //! - `view.partial[]`: `env`, `reason` — envs read partially or not at all.
 //! - `cost.per_row[]`: `provider`, `id`, `rate` (`null` = unpriced, else
 //!   `usd_per_hour` and `source`: `"config"` or `{"bundled":{"date":…}}`),
@@ -544,7 +548,13 @@ fn render_list(view: &FleetView, cost: &FleetCost, now_ms: i64) -> String {
             age(row.created_ms, now_ms),
             rate,
             accrued,
-            row.worktree.clone().unwrap_or_else(|| "ORPHAN".into()),
+            row.worktree.clone().unwrap_or_else(|| {
+                if row.unrecorded {
+                    "UNRECORDED".into()
+                } else {
+                    "ORPHAN".into()
+                }
+            }),
         ]);
     }
     let mut out = vec![if view.rows.is_empty() {
@@ -569,14 +579,39 @@ fn render_list(view: &FleetView, cost: &FleetCost, now_ms: i64) -> String {
         }
         out.push(table(&missing));
     }
+    if !view.down.is_empty() {
+        out.push(String::new());
+        out.push("not running (never provisioned, or env down)".into());
+        let mut down = vec![
+            ["WORKTREE", "PROVIDER", "ENV", "ID"]
+                .map(String::from)
+                .to_vec(),
+        ];
+        for rec in &view.down {
+            down.push(vec![
+                rec.worktree.clone(),
+                rec.provider.clone(),
+                rec.env.clone(),
+                rec.id.clone(),
+            ]);
+        }
+        out.push(table(&down));
+    }
     partial_section(view, &mut out);
     out.push(String::new());
     out.push(format!(
-        "{} sandbox(es), {} orphan(s), {} missing",
+        "{} sandbox(es), {} orphan(s), {} missing, {} down, {} unrecorded",
         view.rows.len(),
         view.orphans,
-        view.missing.len()
+        view.missing.len(),
+        view.down.len(),
+        view.unrecorded,
     ));
+    if view.unrecorded > 0 {
+        out.push(
+            "review unrecorded sprites: thegn env reap --provider sprites --unrecorded".into(),
+        );
+    }
     out.push(footer(cost));
     out.join("\n")
 }
@@ -629,6 +664,7 @@ mod tests {
                     region: Some("iad".into()),
                     created_ms: Some(0),
                     worktree: Some("/wt/a".into()),
+                    unrecorded: false,
                 },
                 FleetRow {
                     provider: "sprites".into(),
@@ -648,6 +684,7 @@ mod tests {
                 env: "do".into(),
                 reason: "unavailable: no token".into(),
             }],
+            ..FleetView::default()
         }
     }
 
@@ -682,12 +719,50 @@ mod tests {
         );
         assert!(text.contains("do: unavailable: no token"), "{text}");
         assert!(
-            text.contains("2 sandbox(es), 1 orphan(s), 1 missing"),
+            text.contains("2 sandbox(es), 1 orphan(s), 1 missing, 0 down, 0 unrecorded"),
             "{text}"
         );
         assert!(text.contains("1 unpriced"), "{text}");
         assert!(text.contains(fleet_cost::PRICE_TABLE_DATE), "{text}");
         assert!(text.lines().all(|line| line == line.trim_end()));
+    }
+
+    #[test]
+    fn render_lists_down_and_unrecorded_with_review_hint() {
+        let mut view = view();
+        view.rows.push(FleetRow {
+            provider: "sprites".into(),
+            env: "sp".into(),
+            id: "tg-unrecorded".into(),
+            unrecorded: true,
+            ..FleetRow::default()
+        });
+        view.unrecorded = 1;
+        view.down.push(RecordedSandbox {
+            worktree: "/wt/down".into(),
+            provider: "sprites".into(),
+            env: "sp".into(),
+            id: "tg-down".into(),
+        });
+        let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
+        let text = render_list(&view, &cost, NOW);
+        assert!(text.contains("UNRECORDED"), "{text}");
+        assert!(
+            text.contains("not running (never provisioned, or env down)"),
+            "{text}"
+        );
+        assert!(text.contains("WORKTREE  PROVIDER  ENV  ID"), "{text}");
+        assert!(text.contains("/wt/down  sprites   sp   tg-down"), "{text}");
+        assert!(
+            text.contains("3 sandbox(es), 1 orphan(s), 1 missing, 1 down, 1 unrecorded"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "review unrecorded sprites: thegn env reap --provider sprites --unrecorded"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

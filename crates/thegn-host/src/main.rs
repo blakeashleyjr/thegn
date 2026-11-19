@@ -101,6 +101,7 @@ mod forge_handle;
 mod forward;
 mod frame_write;
 mod frame_writer;
+mod git_audit;
 mod git_handle;
 mod git_watch;
 mod git_worktree;
@@ -1473,6 +1474,23 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     if !verb_manages_own_logging(&command) {
         crate::diag::register_identity(channel.as_str());
         thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
+    } else {
+        match &command {
+            Command::Daemon { .. } | Command::Serve { .. } => {}
+            Command::Bridge
+            | Command::BridgeRevtunnel { .. }
+            | Command::SpriteProxy { .. }
+            | Command::VpsSsh { .. }
+            | Command::Machine0Ssh { .. }
+            | Command::SpriteExec { .. }
+            | Command::VercelExec { .. } => {
+                // Best-effort and file-only: it must never touch stdout or stderr. Whether
+                // it installed is visible only in the trace file itself.
+                let installed = thegn_core::log_trace::install_bridge_file_trace();
+                tracing::trace!(target: "thegn::provider", installed, "bridge file trace");
+            }
+            _ => {} // every other verb took the `if` branch above; a new self-logging verb lands here and installs nothing
+        }
     }
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
     // Keep the outcome for actionable tracker refusals and config inspection;

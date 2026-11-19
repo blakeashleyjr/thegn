@@ -195,6 +195,9 @@ pub enum Action {
         yes: bool,
         #[arg(long)]
         json: bool,
+        /// Sprites only: list sprites this host has no record of (read-only).
+        #[arg(long, conflicts_with = "apply")]
+        unrecorded: bool,
     },
     /// Record an existing sprite as thegn's so thegn may delete it later (asks for confirmation)
     Adopt(super::env_adopt::AdoptArgs),
@@ -281,7 +284,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             apply,
             yes,
             json,
-        } => super::env_reap::run(cfg, &provider, apply, yes, json),
+            unrecorded,
+        } => super::env_reap::run(cfg, &provider, apply, yes, json, unrecorded),
         Action::Adopt(args) => super::env_adopt::run(cfg, args),
     }
 }
@@ -3014,6 +3018,22 @@ mod b162_cli_tests {
     #[test]
     fn env_adopt_requires_env() {
         assert!(parse(&["thegn", "env", "adopt", "foo", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn env_reap_unrecorded_conflicts_with_apply() {
+        assert!(
+            parse(&[
+                "thegn",
+                "env",
+                "reap",
+                "--provider",
+                "sprites",
+                "--unrecorded",
+                "--apply",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

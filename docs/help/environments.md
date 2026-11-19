@@ -171,7 +171,7 @@ been verified live against the real Sprites API yet.
   before this release, or that were made outside thegn, are never deleted by
   thegn; remove those with the Sprites CLI or dashboard.
 - **Unrecorded sprites.** `thegn env reap --provider sprites [--apply] [--yes] [--json]`
-  lists orphans, sprites past `max_lifetime_secs` (age from the API
+  (or `--unrecorded`, below) lists orphans, sprites past `max_lifetime_secs` (age from the API
   `created_at`) and sprites "not recorded by this host". It is a dry run by
   default. `--apply` destroys only recorded sprites past their lifetime, and
   removes ledger records whose sprite is gone. It spares records younger than
@@ -179,6 +179,24 @@ been verified live against the real Sprites API yet.
   no background reaper unless you opt in with `lifetime_reap` (below).
   `thegn env down --all` keeps its prompt, destroys only recorded sprites, and
   says how many it skipped.
+- **Fleet states.** A recorded sandbox the provider does not list is `missing`
+  only when this host still holds its local provisioned marker. Otherwise it is
+  `down` (never provisioned, or `env down` already ran; the worktree keeps its
+  env pin). A sprite in the account listing with no worktree and no ledger
+  record on this host is `unrecorded`, not an orphan. Neither `down` nor
+  `unrecorded` turns the masthead badge amber, because neither is a fault:
+  one is a sandbox you stopped, the other belongs to someone or something else.
+  Budget admission still counts every listed row.
+- **Listing unrecorded sprites.** `thegn env reap --provider sprites --unrecorded [--json]`
+  is read-only: it refuses `--apply`, takes no lease and destroys nothing. It
+  lists unrecorded sprites oldest first with status, age and 30-day CPU and
+  reserved-memory GB-hours (one usage request per sprite, at most 50 per
+  account), and prints one `thegn env adopt <name> --env <env>` line for each
+  sprite whose name is safe to paste. The Sprites list API reports no size, so
+  none is shown. Run `env adopt` to take a sprite under management.
+- **Git audit file.** Seed, pull and push-lane events are appended as JSON lines
+  to `$XDG_STATE_HOME/thegn/provider/git-audit.jsonl`, rotated at 1 MiB with one
+  previous file kept. A failed write only warns.
 - **No background creates.** `eager = "workspace"` or `"all"` never creates a
   sprite for an unfocused worktree. The focused worktree still provisions when
   you focus it.
@@ -214,6 +232,10 @@ step. With `--keep-going` a failed step prints `FAIL <id>`, the run continues an
 the exit status is non-zero if anything failed. It proves pull with a real commit
 made inside the sprite (not a stub), and prints the `fleet cost` JSON. A pass shows
 those steps worked on that run; it does not verify the paths it does not touch.
+It also checks the fleet `down` and `unrecorded` states and the read-only
+`env reap --unrecorded` listing, so it needs a build with those changes. A paged
+listing test (`SpritesProvider::with_list_page_size`, `max_results=n` on every
+list page, `#[ignore]`d and read-only) compares paged and unpaged results.
 
 ### Adopt, the daily loop and release
 
@@ -312,6 +334,9 @@ sandboxes recorded in the run's own temporary ledger.
   the candidates. `vercel-exec` capture mode picks its env the same way as the
   terminal path and refuses when several Vercel envs are configured and none
   resolves.
+- **Vercel failures show stderr.** On a nonzero exit the last 8 KiB of stderr is
+  appended to the error with control characters removed. Raw stdout used for
+  file transfer is unchanged.
 - **Failed one-shot exec shows stderr.** When a Sprites one-shot exec exits
   non-zero, the last 8 KiB of stderr, control characters removed, follows the
   stdout. A zero exit prints exactly what it did before.
