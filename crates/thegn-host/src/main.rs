@@ -1488,6 +1488,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
                     // Bridge logging is best-effort and must never touch stderr.
                 }
             }
+            _ => {} // every other verb took the `if` branch above; a new self-logging verb lands here and installs nothing
         }
     }
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).

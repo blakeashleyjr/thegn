@@ -382,14 +382,10 @@ pub fn install_bridge_file_trace() -> bool {
             json: false,
         })
         .with_filter(level_filter(default_level));
-    let installed = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(file_layer)
         .try_init()
-        .is_ok();
-    if installed {
-        READY.store(true, Ordering::Relaxed);
-    }
-    installed
+        .is_ok()
 }
 
 // ---------------------------------------------------------------------------
