@@ -186,6 +186,18 @@ destroys a provider worktree's proven sandbox after a successful land (the
 default keeps it). `thegn agent run --wait --keep-running` skips the stop of a
 Fly or machine0 machine after the run. See [Environments](help/environments.md).
 
+## Filling the warm pool (`env pool-fill`)
+
+`thegn env pool-fill [--worktree W] [--size N] [--json]` provisions the missing
+warm spares for a worktree's project and provider env, one at a time, in the
+foreground. `--size N` (0 to 8) first saves the per-project pool target, the
+same setting as the TUI's warm-pool keys. The command never destroys anything:
+`--size 0` only turns the pool off, and the TUI drains extra spares. It refuses
+Vercel envs (their pool target is always 0) and envs that are not provider
+envs, and it stops with a retry message while the TUI's own reconcile holds the
+pool lease. A claim made from a CLI or daemon process does not refill the pool;
+it prints a hint to run this verb. See [Environments](help/environments.md).
+
 ## Retrying a failed pull-back (`env sync-retry`)
 
 `thegn env sync-retry [--json]` retries the pull-back for every journal entry in

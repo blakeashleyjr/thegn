@@ -17,3 +17,4 @@
 - [ ] 2.3 Verify the Fly dedicated IPv4 cost live
 - [ ] 2.4 Verify which login files pi needs live
 - [ ] 2.5 Verify `env adopt`, `lifetime_reap` and `land --release-sandbox` against the live Sprites API
+- [ ] 2.6 Run the warm pool step live: `thegn env pool-fill --size 1`, claim the spare, then fill again (pool step of `test/remote-daily.sh --with-pool`, needs `RD_HOLD_AGENT=1`)

@@ -7,6 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn env pool-fill [--worktree W] [--size N] [--json]` fills the warm pool in the foreground and can persist the per-project size (0 to 8). It never destroys, and refuses Vercel and non-provider envs. A claim from a CLI or daemon process no longer refills in the background; it prints a hint, and only the TUI refills.
+- `thegn fleet cost` adds one month-to-date account row per distinct Sprites account, deduplicated by account fingerprint and marked partial when the API says so. `thegn doctor` shows a warm pool line per provider env.
+- Terminal search adds `Alt+c` (exact case), `Alt+w` (whole word), `Alt+r` (regex) and `Ctrl+r` (recent queries); `Alt+f` stays fuzzy.
+
+### Changed
+
+- Sprites reuse is fail-closed: a sprite that already exists is reused only when this instance's ledger proves it created it, otherwise thegn refuses and names `thegn env adopt`. After this change the dev instance refuses sprites the stable instance created for the same worktree path.
+- The Vercel exec keeps its session alive while a command runs (a check at the start and every 5 minutes); a failed check never fails the exec.
+- The live scripts and the net trace stop overriding `XDG_RUNTIME_DIR`. `devel-launch` puts the dev binary's directory first on `PATH`, and `thegn doctor` names a `PATH` mismatch.
+- The `harden-live-upgrades` change is retired as superseded by `just live`.
+
 ## [0.1.0-alpha.103] — 2026-11-19
 
 ### Changed
