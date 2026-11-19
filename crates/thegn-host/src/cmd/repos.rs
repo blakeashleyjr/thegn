@@ -73,6 +73,10 @@ pub enum Action {
         /// Emit one JSON object instead of the table.
         #[arg(long)]
         json: bool,
+        /// Seed this (empty) instance from another instance's state database
+        /// before forgetting (the source is never written).
+        #[arg(long, value_name = "DB", value_hint = clap::ValueHint::FilePath)]
+        copy_from: Option<std::path::PathBuf>,
     },
 }
 
@@ -91,6 +95,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             keep,
             apply,
             json,
+            copy_from,
         } => super::repo_forget::run(
             cfg,
             super::repo_forget::ForgetArgs {
@@ -98,6 +103,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 keep,
                 apply,
                 json,
+                copy_from,
             },
         ),
     }

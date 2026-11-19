@@ -1,8 +1,9 @@
-use super::{ForgetArgs, ForgetEnv, ForgetReport, forget};
+use super::{ForgetArgs, ForgetEnv, ForgetReport, forget, run};
 use crate::handlers::sidebar_persist::SIDEBAR_SCOPE;
 use crate::testenv::IsolatedState;
 use clap::Parser;
 use std::path::{Path, PathBuf};
+use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
 use thegn_core::models::{GroupTabRow, TabGroupRow};
@@ -148,6 +149,16 @@ fn dump(path: &Path) -> Vec<String> {
 
 fn db_file(state: &IsolatedState) -> PathBuf {
     state.state_home().join("thegn").join("thegn.db")
+}
+
+fn source_db(state: &IsolatedState) -> (PathBuf, Seeded, Seeded, Seeded) {
+    let path = state.root().join("source.db");
+    let db = Db::open_at(&path).unwrap();
+    let app = seed(&db, state.root(), "app");
+    let lib = seed(&db, state.root(), "lib");
+    let keep = seed(&db, state.root(), "keep");
+    drop(db);
+    (path, app, lib, keep)
 }
 
 #[test]
@@ -406,6 +417,9 @@ fn both_forms_together_or_neither_refuse() {
         crate::Cli::try_parse_from(["thegn", "repo", "forget", "--keep", "a", "--keep", "b"])
             .is_ok()
     );
+    assert!(
+        crate::Cli::try_parse_from(["thegn", "repo", "forget", "a", "--copy-from", "db"]).is_ok()
+    );
 }
 
 #[test]
@@ -439,4 +453,154 @@ fn a_running_instance_refuses_and_changes_nothing() {
     assert!(text.contains("Nothing was changed"), "{text}");
     assert_eq!(dump(&db_file(&state)), before);
     assert!(!state_dir.join("forget-backup-20261118T000000Z").exists());
+}
+
+#[test]
+fn copy_from_refuses_when_this_instance_has_a_db() {
+    let state = IsolatedState::new();
+    let db = Db::open().unwrap();
+    let destination = db_file(&state);
+    drop(db);
+
+    let error = run(
+        &Config::default(),
+        ForgetArgs {
+            paths: vec!["app".into()],
+            copy_from: Some(state.root().join("source.db")),
+            ..ForgetArgs::default()
+        },
+    )
+    .unwrap_err();
+
+    let text = format!("{error:#}");
+    assert!(text.contains("already has a state database"), "{text}");
+    assert!(text.contains(destination.to_str().unwrap()), "{text}");
+}
+
+#[test]
+fn copy_from_refuses_same_file() {
+    let state = IsolatedState::new();
+    let db = Db::open().unwrap();
+    let destination = db_file(&state);
+    drop(db);
+
+    let error = run(
+        &Config::default(),
+        ForgetArgs {
+            paths: vec!["app".into()],
+            copy_from: Some(destination.clone()),
+            ..ForgetArgs::default()
+        },
+    )
+    .unwrap_err();
+
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("source and destination are the same file"),
+        "{text}"
+    );
+}
+
+#[test]
+fn copy_from_dry_run_writes_nothing() {
+    let state = IsolatedState::new();
+    let (source, app, _, _) = source_db(&state);
+    let before = std::fs::metadata(&source).unwrap().modified().unwrap();
+
+    run(
+        &Config::default(),
+        ForgetArgs {
+            paths: vec![app.repo],
+            copy_from: Some(source.clone()),
+            ..ForgetArgs::default()
+        },
+    )
+    .unwrap();
+
+    assert!(!db_file(&state).exists());
+    assert_eq!(
+        std::fs::metadata(source).unwrap().modified().unwrap(),
+        before
+    );
+}
+
+#[test]
+fn copy_from_apply_seeds_then_forgets() {
+    let state = IsolatedState::new();
+    let (source, app, lib, keep) = source_db(&state);
+
+    run(
+        &Config::default(),
+        ForgetArgs {
+            keep: vec![keep.repo.clone()],
+            apply: true,
+            copy_from: Some(source.clone()),
+            ..ForgetArgs::default()
+        },
+    )
+    .unwrap();
+
+    let destination = Db::open_at(&db_file(&state)).unwrap();
+    assert_eq!(registered(&destination), vec![keep.repo.clone()]);
+    assert!(destination.workspace_tombstoned(&app.repo).unwrap());
+    assert!(destination.workspace_tombstoned(&lib.repo).unwrap());
+
+    let source = Db::open_read_only_current_at(&source).unwrap().unwrap();
+    assert_eq!(registered(&source).len(), 3);
+    assert_eq!(source.workspaces().unwrap().len(), 3);
+}
+
+#[test]
+fn copy_from_schema_mismatch_refuses() {
+    let state = IsolatedState::new();
+    let (source, _, _, _) = source_db(&state);
+    let connection = rusqlite::Connection::open(&source).unwrap();
+    connection
+        .pragma_update(None, "user_version", thegn_core::db::SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(connection);
+
+    let error = run(
+        &Config::default(),
+        ForgetArgs {
+            keep: vec!["keep".into()],
+            copy_from: Some(source),
+            ..ForgetArgs::default()
+        },
+    )
+    .unwrap_err();
+
+    let text = format!("{error:#}");
+    assert!(text.contains("schema v"), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(!db_file(&state).exists());
+}
+
+#[test]
+fn kept_workspace_lists_provider_worktrees() {
+    let state = IsolatedState::new();
+    let db = Db::open().unwrap();
+    let keep = seed(&db, state.root(), "keep");
+    let provider = state.root().join("provider").to_string_lossy().into_owned();
+    let location = r#"{"control_prefix":["sprite","exec"],"path":"/workspace"}"#;
+    db.put_worktree(
+        "keep/provider",
+        &keep.repo,
+        &provider,
+        "provider",
+        Some(location),
+        None,
+    )
+    .unwrap();
+
+    let report = run_forget(
+        &db,
+        &state,
+        &ForgetArgs {
+            keep: vec![keep.repo.clone()],
+            ..ForgetArgs::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.kept[0].provider_worktrees, vec![provider]);
 }

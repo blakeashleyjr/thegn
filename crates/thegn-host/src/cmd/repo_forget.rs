@@ -30,6 +30,7 @@ pub struct ForgetArgs {
     pub keep: Vec<String>,
     pub apply: bool,
     pub json: bool,
+    pub copy_from: Option<PathBuf>,
 }
 
 /// One workspace the command forgets (or would forget).
@@ -47,6 +48,8 @@ pub struct ForgottenWorkspace {
 pub struct KeptWorkspace {
     pub repo_path: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub provider_worktrees: Vec<String>,
 }
 
 /// The `--json` document; the human table renders the same data.
@@ -54,6 +57,8 @@ pub struct KeptWorkspace {
 pub struct ForgetReport {
     pub applied: bool,
     pub backup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<String>,
     pub forgotten: Vec<ForgottenWorkspace>,
     pub kept: Vec<KeptWorkspace>,
 }
@@ -77,12 +82,45 @@ pub fn run(cfg: &Config, args: ForgetArgs) -> Result<()> {
         bail!(refusal(&reason));
     }
     let state_dir = thegn_core::util::xdg_state_home().join("thegn");
+    let dest = state_dir.join("thegn.db");
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let Some(reader) = Db::open_read_only_current()? else {
-        bail!(
-            "no state database at {}; nothing was changed",
-            state_dir.join("thegn.db").display()
-        )
+    let (reader, copied_from) = if let Some(source) = args.copy_from.as_ref() {
+        if dest.exists() {
+            if let (Ok(source), Ok(canonical_dest)) =
+                (std::fs::canonicalize(source), std::fs::canonicalize(&dest))
+                && source == canonical_dest
+            {
+                bail!(
+                    "--copy-from source and destination are the same file at {}; Nothing was changed.",
+                    source.display()
+                );
+            }
+            bail!(
+                "this instance already has a state database at {}; --copy-from only seeds an empty instance (move it aside first). Nothing was changed.",
+                dest.display()
+            );
+        }
+        let source = std::fs::canonicalize(source)
+            .with_context(|| format!("canonicalize source database {}", source.display()))?;
+        let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+        if source == canonical_dest {
+            bail!(
+                "--copy-from source and destination are the same file at {}; Nothing was changed.",
+                source.display()
+            );
+        }
+        let Some(reader) = Db::open_read_only_current_at(&source)? else {
+            bail!("no state database at {}", source.display());
+        };
+        (reader, Some(source))
+    } else {
+        let Some(reader) = Db::open_read_only_current()? else {
+            bail!(
+                "no state database at {}; nothing was changed",
+                dest.display()
+            )
+        };
+        (reader, None)
     };
     let version = reader.user_version()?;
     if version != thegn_core::db::SCHEMA_VERSION {
@@ -91,13 +129,21 @@ pub fn run(cfg: &Config, args: ForgetArgs) -> Result<()> {
             thegn_core::db::SCHEMA_VERSION
         );
     }
-    let report = if args.apply {
-        let backup = state_dir
-            .join(format!("forget-backup-{stamp}"))
-            .join("thegn.db");
-        reader
-            .backup_to(&backup)
-            .context("database backup failed; nothing was forgotten")?;
+    let mut report = if args.apply {
+        let backup = if let Some(source) = copied_from.as_ref() {
+            reader
+                .backup_to(&dest)
+                .context("copy failed; nothing was forgotten")?;
+            source.clone()
+        } else {
+            let backup = state_dir
+                .join(format!("forget-backup-{stamp}"))
+                .join("thegn.db");
+            reader
+                .backup_to(&backup)
+                .context("database backup failed; nothing was forgotten")?;
+            backup
+        };
         drop(reader);
         let db = Db::open()?;
         forget(
@@ -122,6 +168,9 @@ pub fn run(cfg: &Config, args: ForgetArgs) -> Result<()> {
             },
         )?
     };
+    report.copied_from = copied_from
+        .as_ref()
+        .map(|source| source.display().to_string());
     if args.json {
         return super::emit_json(&report);
     }
@@ -196,6 +245,7 @@ pub fn forget(db: &Db, args: &ForgetArgs, env: &ForgetEnv<'_>) -> Result<ForgetR
         _ => {}
     }
     let rows = db.workspaces()?;
+    let worktrees = db.worktrees()?;
     let forget_paths: Vec<String> = if args.keep.is_empty() {
         let mut selected = Vec::new();
         for arg in &args.paths {
@@ -243,6 +293,20 @@ pub fn forget(db: &Db, args: &ForgetArgs, env: &ForgetEnv<'_>) -> Result<ForgetR
             kept.push(KeptWorkspace {
                 repo_path: row.repo_path.clone(),
                 name: row.name.clone(),
+                provider_worktrees: worktrees
+                    .iter()
+                    .filter(|worktree| {
+                        worktree.repo_root == row.repo_path
+                            && matches!(
+                                thegn_core::remote::GitLoc::from_db(
+                                    &worktree.worktree,
+                                    Some(worktree.location.as_str())
+                                ),
+                                thegn_core::remote::GitLoc::Provider { .. }
+                            )
+                    })
+                    .map(|worktree| worktree.worktree.clone())
+                    .collect(),
             });
         }
     }
@@ -250,6 +314,7 @@ pub fn forget(db: &Db, args: &ForgetArgs, env: &ForgetEnv<'_>) -> Result<ForgetR
     let mut report = ForgetReport {
         applied: false,
         backup: None,
+        copied_from: None,
         forgotten,
         kept,
     };
@@ -393,13 +458,30 @@ fn counts_line(counts: &WorkspaceForgetCounts) -> String {
 }
 
 fn print_report(report: &ForgetReport) {
-    if report.applied {
+    if !report.applied {
+        if let Some(source) = &report.copied_from {
+            outln!(
+                "dry run: would copy {source} to {}, then:",
+                thegn_core::util::xdg_state_home()
+                    .join("thegn/thegn.db")
+                    .display()
+            );
+        } else {
+            outln!("dry run: nothing changed (pass --apply to forget)");
+        }
+    } else {
         if let Some(backup) = &report.backup {
             outln!("backup: {backup}");
         }
         outln!("forgot {} workspace(s)", report.forgotten.len());
-    } else {
-        outln!("dry run: nothing changed (pass --apply to forget)");
+        if let Some(source) = &report.copied_from {
+            outln!(
+                "copied from: {source} (untouched; delete {} to undo)",
+                thegn_core::util::xdg_state_home()
+                    .join("thegn/thegn.db")
+                    .display()
+            );
+        }
     }
     if report.forgotten.is_empty() {
         outln!("nothing to forget");
@@ -410,6 +492,11 @@ fn print_report(report: &ForgetReport) {
     }
     for entry in &report.kept {
         outln!("keep    {}  ({})", entry.repo_path, entry.name);
+        for worktree in &entry.provider_worktrees {
+            outln!(
+                "note    {worktree} has a provider sandbox; its ownership record stays in the instance that created it, so take it down there (thegn env down) before using it here"
+            );
+        }
     }
     outln!("files on disk, git worktrees and branches are never touched");
 }
