@@ -64,20 +64,29 @@ contains "$desktop_output" 'StartupWMClass=thegn-dev'
 [[ $desktop_output != *'~'* && $desktop_output != *'$'* ]] || fail 'desktop entry contains shell shorthand'
 contains "$(<"$tmp/desktop.err")" '# save with: just devel-desktop > ~/.local/share/applications/thegn-dev.desktop'
 
-mkdir -p "$tmp/home/.config/thegn-dev" "$tmp/bin"
-cat >"$tmp/stub" <<'EOF'
+mkdir -p "$tmp/home/.config/thegn-dev" "$tmp/bin" "$tmp/stub"
+cat >"$tmp/stub/thegn" <<'EOF'
 #!/bin/sh
 env >"$STUB_OUT"
 EOF
-chmod +x "$tmp/stub"
+chmod +x "$tmp/stub/thegn"
 cat >"$tmp/bin/getent" <<'EOF'
 #!/bin/sh
 exit 1
 EOF
 chmod +x "$tmp/bin/getent"
 
+dev_print_env="$(STUB_OUT="$tmp/print-env.stub.env" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+  THEGN_DEVEL_BIN="$tmp/stub/thegn" "$launcher" --print-env)"
+contains "$dev_print_env" "export PATH='$tmp/stub:$tmp/bin:"
+
+dedup_print_env="$(STUB_OUT="$tmp/dedup.stub.env" HOME="$tmp/home" PATH="$tmp/stub:$tmp/bin:$PATH" \
+  THEGN_DEVEL_BIN="$tmp/stub/thegn" "$launcher" --print-env)"
+contains "$dedup_print_env" "export PATH='$tmp/stub:$tmp/bin:"
+[[ $dedup_print_env != *"export PATH='$tmp/stub:$tmp/stub:"* ]] || fail 'dev binary directory was duplicated on PATH'
+
 STUB_OUT="$tmp/stub.env" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
-  THEGN_DEVEL_BIN="$tmp/stub" THEGN_SESSION_ID=x XDG_RUNTIME_DIR="$tmp/run0" \
+  THEGN_DEVEL_BIN="$tmp/stub/thegn" THEGN_SESSION_ID=x XDG_RUNTIME_DIR="$tmp/run0" \
   "$launcher"
 if grep -q '^THEGN_SESSION_ID=' "$tmp/stub.env"; then
   fail 'launch leaked THEGN_SESSION_ID'
@@ -85,6 +94,7 @@ fi
 stub_env="$(<"$tmp/stub.env")"
 contains "$stub_env" "XDG_RUNTIME_DIR=$tmp/run0"
 contains "$stub_env" 'THEGN_CHANNEL=dev'
+contains "$stub_env" "PATH=$tmp/stub:"
 
 mkdir -p "$tmp/a b/scripts"
 cp "$launcher" "$tmp/a b/scripts/devel-launch.sh"
@@ -123,7 +133,7 @@ mkdir -p "$tmp/h2/.config/thegn"
 printf '%s\n' '[serve]' 'bind = "127.0.0.1:5380"' '[ui]' 'x = 1' >"$tmp/h2/.config/thegn/config.toml"
 cp "$tmp/h2/.config/thegn/config.toml" "$tmp/h2-stable.copy"
 STUB_OUT="$tmp/h2.stub.env" HOME="$tmp/h2" PATH="$tmp/bin:$PATH" \
-  THEGN_DEVEL_BIN="$tmp/stub" XDG_RUNTIME_DIR="$tmp/h2-run" "$launcher"
+  THEGN_DEVEL_BIN="$tmp/stub/thegn" XDG_RUNTIME_DIR="$tmp/h2-run" "$launcher"
 h2_cfg="$tmp/h2/.config/thegn-dev/config.toml"
 [[ -f $h2_cfg ]] || fail 'stable config was not seeded'
 [[ $(stat -c %a "$h2_cfg") == 600 ]] || fail 'seeded config is not mode 600'
@@ -135,7 +145,7 @@ cmp "$tmp/h2/.config/thegn/config.toml" "$tmp/h2-stable.copy"
 
 printf '%s\n' '# mine' >>"$h2_cfg"
 STUB_OUT="$tmp/h2-second.stub.env" HOME="$tmp/h2" PATH="$tmp/bin:$PATH" \
-  THEGN_DEVEL_BIN="$tmp/stub" XDG_RUNTIME_DIR="$tmp/h2-run" "$launcher"
+  THEGN_DEVEL_BIN="$tmp/stub/thegn" XDG_RUNTIME_DIR="$tmp/h2-run" "$launcher"
 contains "$(<"$h2_cfg")" '# mine'
 
 mkdir -p "$tmp/h3/.config/thegn"
@@ -143,14 +153,14 @@ printf '%s\n' '[serve]' 'bind = "127.0.0.1:5380"' >"$tmp/h3/stable.toml"
 chmod 0444 "$tmp/h3/stable.toml"
 ln -s "$tmp/h3/stable.toml" "$tmp/h3/.config/thegn/config.toml"
 STUB_OUT="$tmp/h3.stub.env" HOME="$tmp/h3" PATH="$tmp/bin:$PATH" \
-  THEGN_DEVEL_BIN="$tmp/stub" XDG_RUNTIME_DIR="$tmp/h3-run" "$launcher"
+  THEGN_DEVEL_BIN="$tmp/stub/thegn" XDG_RUNTIME_DIR="$tmp/h3-run" "$launcher"
 h3_cfg="$tmp/h3/.config/thegn-dev/config.toml"
 [[ -f $h3_cfg && ! -L $h3_cfg ]] || fail 'symlink source did not produce a regular seed'
 [[ $(stat -c %a "$h3_cfg") == 600 ]] || fail 'symlink seed is not mode 600'
 
 mkdir -p "$tmp/h4/.config"
 STUB_OUT="$tmp/h4.stub.env" HOME="$tmp/h4" PATH="$tmp/bin:$PATH" \
-  THEGN_DEVEL_BIN="$tmp/stub" XDG_RUNTIME_DIR="$tmp/h4-run" "$launcher"
+  THEGN_DEVEL_BIN="$tmp/stub/thegn" XDG_RUNTIME_DIR="$tmp/h4-run" "$launcher"
 h4_cfg="$tmp/h4/.config/thegn-dev/config.toml"
 contains "$(<"$h4_cfg")" '[serve]'
 contains "$(<"$h4_cfg")" 'bind = "127.0.0.1:5381"'
@@ -160,16 +170,16 @@ contains "$(<"$h4_cfg")" 'listen = "127.0.0.1:8384"'
 mkdir -p "$tmp/h5/.config/thegn"
 printf '%s\n' '[serve]' 'topology = "direct"' >"$tmp/h5/.config/thegn/config.toml"
 STUB_OUT="$tmp/h5.stub.env" HOME="$tmp/h5" PATH="$tmp/bin:$PATH" \
-  THEGN_DEVEL_BIN="$tmp/stub" XDG_RUNTIME_DIR="$tmp/h5-run" "$launcher"
+  THEGN_DEVEL_BIN="$tmp/stub/thegn" XDG_RUNTIME_DIR="$tmp/h5-run" "$launcher"
 h5_cfg="$tmp/h5/.config/thegn-dev/config.toml"
 [[ $(grep -c '^\[serve\]$' "$h5_cfg") -eq 1 ]] || fail 'seed duplicated the serve table'
 [[ $(grep -c '^bind = "127.0.0.1:5381"$' "$h5_cfg") -eq 1 ]] || fail 'seed did not add one serve bind'
 
 readonly_home="$tmp/readonly-home"
 mkdir -p "$readonly_home"
-PATH="$tmp/bin:$PATH" HOME="$readonly_home" THEGN_DEVEL_BIN="$tmp/stub" \
+PATH="$tmp/bin:$PATH" HOME="$readonly_home" THEGN_DEVEL_BIN="$tmp/stub/thegn" \
   "$launcher" --print-env >/dev/null
-PATH="$tmp/bin:$PATH" HOME="$readonly_home" THEGN_DEVEL_BIN="$tmp/stub" \
+PATH="$tmp/bin:$PATH" HOME="$readonly_home" THEGN_DEVEL_BIN="$tmp/stub/thegn" \
   "$launcher" --desktop-entry >/dev/null
 [[ ! -e $readonly_home/.config/thegn-dev ]] || fail 'read-only mode created dev config'
 
