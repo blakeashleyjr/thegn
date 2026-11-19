@@ -117,6 +117,7 @@ struct SecretScrub {
 }
 
 impl SecretScrub {
+    #[cfg(test)]
     fn for_account(argv: &[String], env: &BTreeMap<String, String>) -> Self {
         Self::from_values(env.values().chain(argv.iter().skip(1)))
     }
