@@ -243,6 +243,7 @@ pub struct EnvProviderConfig {
     /// unset/`auto`.
     pub min_vcpu: u32,
     /// Dynamic-size requirement: minimum RAM in GiB. `0` ⇒ unconstrained.
+    /// Sprites: sets the memory policy limit (MiB = GiB × 1024).
     pub min_ram_gb: u32,
     /// Dynamic-size requirement: minimum disk in GiB. `0` ⇒ unconstrained.
     pub min_disk_gb: u32,
@@ -250,13 +251,17 @@ pub struct EnvProviderConfig {
     pub gpu: bool,
     /// Dynamic-size requirement: require an NVMe-backed local disk.
     pub nvme: bool,
-    /// VPS providers only: hard cap on concurrently-managed instances — the
-    /// spend guardrail enforced at create. `0` ⇒ the built-in default (5).
+    /// VPS providers and sprites: hard cap on concurrently-managed instances,
+    /// the spend guardrail enforced at create (0 = no cap for sprites, 5 for
+    /// VPS).
     pub max_instances: u32,
     /// Fly and VPS providers: ceiling on any instance's lifetime in seconds;
     /// their reaper destroys older ones (a VPS bills until destroyed — there is
-    /// no free suspended state). Other provider kinds have no lifetime reaper:
-    /// `config validate` warns when this is set. `0` ⇒ no ceiling.
+    /// no free suspended state). Sprites: enforced in the background only with
+    /// `lifetime_reap = true`; otherwise reported by `thegn env reap
+    /// --provider sprites`. Other provider kinds
+    /// have no lifetime reaper: `config validate` warns when this is set. `0` ⇒
+    /// no ceiling.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub max_lifetime_secs: u64,
     /// Hibernation (snapshot-then-destroy on idle) for this env's claimed
@@ -283,6 +288,15 @@ pub struct EnvProviderConfig {
     /// `vercel.app` (and anything under it) is never accepted.
     #[serde(default)]
     pub interactive_host_suffixes: Vec<String>,
+    /// Sprites only, opt-in: destroy proven sprites older than `max_lifetime_secs`
+    /// in the background (never a `running` one). Off by default.
+    #[serde(default)]
+    pub lifetime_reap: bool,
+    /// `claude` / `codex` only: a host directory whose login is uploaded into a
+    /// sandbox instead of the live host login (a dedicated account). Only the
+    /// user's own config table may set it.
+    #[serde(default)]
+    pub login_homes: std::collections::BTreeMap<String, String>,
 }
 
 impl EnvProviderConfig {
@@ -326,6 +340,8 @@ impl EnvProviderConfig {
             && self.project_id.is_empty()
             && self.model_credentials == ModelCredentials::None
             && self.interactive_host_suffixes.is_empty()
+            && !self.lifetime_reap
+            && self.login_homes.is_empty()
     }
 
     /// Whether this env's provider is scale-to-zero (an idle sandbox self-suspends
@@ -546,10 +562,10 @@ impl EnvProviderKind {
 
     /// Whether `[lifecycle] eager = "workspace"|"all"` may create this kind's
     /// sandbox in the background for a worktree the user has not focused. Off
-    /// for Vercel: a paid sandbox is created only from an explicit open or
-    /// provision.
+    /// for Vercel and Sprites: a paid sandbox is created only from an explicit
+    /// open or provision (the focused worktree still provisions on focus).
     pub fn eager_create_enabled(self) -> bool {
-        !matches!(self, Self::Vercel)
+        !matches!(self, Self::Vercel | Self::Sprites)
     }
 
     /// Lowers `network_allow` / `network_block` to a provider policy API and
@@ -986,6 +1002,47 @@ mod tests {
         assert!(!hosts.is_default());
     }
 
+    #[test]
+    fn lifetime_reap_and_login_homes_round_trip_and_default_off() {
+        let pc: EnvProviderConfig = toml::from_str("").unwrap();
+        assert!(!pc.lifetime_reap);
+        assert!(pc.login_homes.is_empty());
+        assert!(pc.is_default());
+
+        let pc: EnvProviderConfig = toml::from_str(
+            "lifetime_reap = true\nlogin_homes = { claude = \"/srv/a\", codex = \"/srv/b\" }\n",
+        )
+        .unwrap();
+        assert!(pc.lifetime_reap);
+        assert_eq!(
+            pc.login_homes.get("claude").map(String::as_str),
+            Some("/srv/a")
+        );
+        assert_eq!(
+            pc.login_homes.get("codex").map(String::as_str),
+            Some("/srv/b")
+        );
+        let back: EnvProviderConfig = toml::from_str(&toml::to_string(&pc).unwrap()).unwrap();
+        assert!(back.lifetime_reap);
+        assert_eq!(back.login_homes, pc.login_homes);
+    }
+
+    #[test]
+    fn lifetime_reap_and_login_homes_make_the_provider_table_non_default() {
+        let reap = EnvProviderConfig {
+            lifetime_reap: true,
+            ..Default::default()
+        };
+        assert!(!reap.is_default());
+        let homes = EnvProviderConfig {
+            login_homes: [("claude".to_string(), "/srv/a".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!homes.is_default());
+    }
+
     fn provider_env(name: &str) -> EnvProviderConfig {
         EnvProviderConfig {
             provider: name.into(),
@@ -1262,6 +1319,27 @@ mod tests {
         }
     }
 
+    /// Background eager scopes never create a paid sandbox: Vercel and Sprites
+    /// are off, every other kind is on.
+    #[test]
+    fn eager_create_is_off_only_for_paid_sandbox_kinds() {
+        for kind in [
+            EnvProviderKind::Custom,
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Sprites,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+            EnvProviderKind::Vercel,
+        ] {
+            let paid = matches!(kind, EnvProviderKind::Vercel | EnvProviderKind::Sprites);
+            assert_eq!(kind.eager_create_enabled(), !paid, "{kind:?}");
+        }
+        assert!(!EnvProviderKind::of("sprites").eager_create_enabled());
+        assert!(!EnvProviderKind::of("vercel").eager_create_enabled());
+    }
+
     #[test]
     fn vercel_kind_predicates() {
         let k = EnvProviderKind::of("vercel");
@@ -1288,7 +1366,11 @@ mod tests {
         ] {
             assert!(!other.credential_free(), "{other:?}");
             assert!(other.exit_pull_back_enabled(), "{other:?}");
-            assert!(other.eager_create_enabled(), "{other:?}");
+            assert_eq!(
+                other.eager_create_enabled(),
+                other != EnvProviderKind::Sprites,
+                "{other:?}"
+            );
         }
         // Only an explicit `thegn env pull` may resume a stopped Vercel sandbox.
         assert!(!k.exit_pull_back_enabled());
@@ -1361,7 +1443,16 @@ mod tests {
             EnvProviderKind::ALL.len(),
             "every kind is in the table"
         );
-        for kind in EnvProviderKind::ALL.iter().copied() {
+        for kind in [
+            EnvProviderKind::Custom,
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Sprites,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+            EnvProviderKind::Vercel,
+        ] {
             let row = table
                 .iter()
                 .find(|row| row.0 == kind)

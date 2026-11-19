@@ -9,33 +9,39 @@ use crate::provider::ExecSpec;
 
 /// One scripted control plane. Every call is recorded as `"<op> <arg>"`.
 #[derive(Default)]
-struct FakeApi {
-    calls: Mutex<Vec<String>>,
+pub(super) struct FakeApi {
+    pub(super) calls: Mutex<Vec<String>>,
     /// The create outcome (`Err(text)` renders as an anyhow error).
-    create: Mutex<Option<std::result::Result<SandboxView, String>>>,
+    pub(super) create: Mutex<Option<std::result::Result<SandboxView, String>>>,
     /// `get` answers, consumed front to back; the last one repeats.
-    gets: Mutex<VecDeque<Option<SandboxView>>>,
+    pub(super) gets: Mutex<VecDeque<Option<SandboxView>>>,
     /// The resume (`get … resume=true`) answer.
-    resume: Mutex<Option<SandboxView>>,
+    pub(super) resume: Mutex<Option<SandboxView>>,
     /// List pages; when exhausted, `endless` keeps returning a fresh cursor.
-    pages: Mutex<VecDeque<(Vec<SandboxView>, Option<String>)>>,
-    endless: bool,
-    delete_fails: bool,
-    snapshots: Vec<String>,
+    pub(super) pages: Mutex<VecDeque<(Vec<SandboxView>, Option<String>)>>,
+    pub(super) endless: bool,
+    pub(super) delete_fails: bool,
+    pub(super) snapshots: Vec<String>,
     /// Every create and run body sent, in order.
-    bodies: Mutex<Vec<serde_json::Value>>,
+    pub(super) bodies: Mutex<Vec<serde_json::Value>>,
+    /// Name-keyed answers for `get` and (when no page is scripted) `list`.
+    pub(super) by_name: Mutex<BTreeMap<String, SandboxView>>,
+    /// Set by the conformance suite: the ledger file whose existence `create`
+    /// records, and what it saw.
+    pub(super) ledger_probe: Mutex<Option<std::path::PathBuf>>,
+    pub(super) ledger_seen: Mutex<Option<bool>>,
 }
 
 impl FakeApi {
-    fn record(&self, call: String) {
+    pub(super) fn record(&self, call: String) {
         self.calls.lock().unwrap().push(call);
     }
 
-    fn calls(&self) -> Vec<String> {
+    pub(super) fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
 
-    fn count(&self, op: &str) -> usize {
+    pub(super) fn count(&self, op: &str) -> usize {
         self.calls()
             .iter()
             .filter(|call| call.split(' ').next() == Some(op))
@@ -47,9 +53,20 @@ impl Api for FakeApi {
     fn create<'a>(&'a self, body: &'a serde_json::Value) -> BoxFuture<'a, Result<SandboxView>> {
         Box::pin(async move {
             self.record("create".into());
+            if let Some(path) = self.ledger_probe.lock().unwrap().clone() {
+                *self.ledger_seen.lock().unwrap() = Some(path.exists());
+            }
             self.bodies.lock().unwrap().push(body.clone());
             match self.create.lock().unwrap().clone() {
-                Some(Ok(view)) => Ok(view),
+                Some(Ok(view)) => {
+                    if self.ledger_probe.lock().unwrap().is_some() {
+                        self.by_name
+                            .lock()
+                            .unwrap()
+                            .insert(view.name.clone(), view.clone());
+                    }
+                    Ok(view)
+                }
                 Some(Err(text)) => Err(anyhow!(text)),
                 None => Err(anyhow!("fake: no create scripted")),
             }
@@ -67,6 +84,9 @@ impl Api for FakeApi {
                 return Ok(self.resume.lock().unwrap().clone());
             }
             self.record(format!("get {name}"));
+            if let Some(view) = self.by_name.lock().unwrap().get(name).cloned() {
+                return Ok(Some(view));
+            }
             let mut gets = self.gets.lock().unwrap();
             let view = if gets.len() > 1 {
                 gets.pop_front().flatten()
@@ -87,6 +107,10 @@ impl Api for FakeApi {
             if let Some(page) = self.pages.lock().unwrap().pop_front() {
                 return Ok(page);
             }
+            if !self.endless && !self.by_name.lock().unwrap().is_empty() {
+                let rows = self.by_name.lock().unwrap().values().cloned().collect();
+                return Ok((rows, None));
+            }
             if self.endless {
                 let n = self.count("list");
                 return Ok((Vec::new(), Some(format!("c{n}"))));
@@ -101,6 +125,9 @@ impl Api for FakeApi {
             if self.delete_fails {
                 Err(anyhow!("fake: delete failed (503 Service Unavailable)"))
             } else {
+                // A deleted sandbox leaves the name-keyed listing, as on the
+                // real control plane (only the conformance suite fills it).
+                self.by_name.lock().unwrap().remove(name);
                 Ok(())
             }
         })
@@ -175,9 +202,9 @@ impl Api for FakeApi {
     }
 }
 
-const NAME: &str = "tg-vercel-test";
+pub(super) const NAME: &str = "tg-vercel-test";
 
-fn spec(max_instances: u32) -> VercelSpec {
+pub(super) fn spec(max_instances: u32) -> VercelSpec {
     VercelSpec {
         api_base: String::new(),
         token: VercelToken::new("vcp_test_token".into()),
@@ -197,13 +224,13 @@ fn spec(max_instances: u32) -> VercelSpec {
     }
 }
 
-fn provider(fake: &Arc<FakeApi>, ledger: &std::path::Path, cap: u32) -> VercelProvider {
+pub(super) fn provider(fake: &Arc<FakeApi>, ledger: &std::path::Path, cap: u32) -> VercelProvider {
     let api: Arc<dyn Api> = fake.clone();
     VercelProvider::with_client_for_test(spec(cap), api, ledger.to_path_buf())
         .expect("test provider admits its spec")
 }
 
-fn view(name: &str, status: SessionStatus, session: Option<&str>) -> SandboxView {
+pub(super) fn view(name: &str, status: SessionStatus, session: Option<&str>) -> SandboxView {
     SandboxView {
         name: name.into(),
         status,
@@ -217,7 +244,7 @@ fn view(name: &str, status: SessionStatus, session: Option<&str>) -> SandboxView
 }
 
 /// A listed sandbox carrying this controller's ownership tag.
-fn tagged(name: &str, controller: &str) -> SandboxView {
+pub(super) fn tagged(name: &str, controller: &str) -> SandboxView {
     let mut tags = policy::tags_for(controller, "owner", "host");
     if tags.is_empty() {
         tags.insert("thegn-controller".into(), controller.into());
@@ -500,6 +527,38 @@ async fn interactive_open_never_resumes_past_the_lifetime_ceiling() {
     *fake.resume.lock().unwrap() = Some(view(NAME, SessionStatus::Running, Some("sess_2")));
     let p = provider(&fake, ledger.path(), 2);
     assert_eq!(p.interactive_session(NAME).await.unwrap(), "sess_2");
+    assert_eq!(fake.count("resume"), 1);
+}
+
+/// The `vercel-exec` login upload resumes through `resume_interactive`: past
+/// the lifetime ceiling it refuses before any resume (no compute is bought).
+#[tokio::test]
+async fn login_upload_resume_never_resumes_past_the_lifetime_ceiling() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Stopped, None)));
+    *fake.resume.lock().unwrap() = Some(view(NAME, SessionStatus::Running, Some("sess_9")));
+    let p = provider(&fake, ledger.path(), 2);
+    let error = p.resume_interactive(NAME).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("max_lifetime_secs"),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("resume"), 0, "{:?}", fake.calls());
+
+    // Inside the ceiling it resumes as `resume` would.
+    let fake = Arc::new(FakeApi::default());
+    fake.gets.lock().unwrap().push_back(Some(SandboxView {
+        created_at_ms: Some(now_ms() - 60_000),
+        ..view(NAME, SessionStatus::Stopped, None)
+    }));
+    *fake.resume.lock().unwrap() = Some(view(NAME, SessionStatus::Running, Some("sess_9")));
+    let p = provider(&fake, ledger.path(), 2);
+    p.resume_interactive(NAME).await.unwrap();
     assert_eq!(fake.count("resume"), 1);
 }
 

@@ -4704,3 +4704,32 @@ fn removing_the_last_project_does_not_quit() {
     assert!(super::session_closed_last_worktree(&closed, &idle));
     assert!(!super::session_closed_last_worktree(&closed, &loading));
 }
+
+#[test]
+fn quit_key_opens_prompt_when_confirm_quit_is_on_and_runs_at_once_when_off() {
+    use crate::handlers::quit_confirm::{self, QuitKind};
+    // Seam flag: the quit body only runs when `request` says so.
+    let mut body_ran = false;
+    let mut active_menu: Option<MenuOverlay> = None;
+    if quit_confirm::request(true, &mut active_menu, QuitKind::Detach, || (2, 1)) {
+        body_ran = true;
+    }
+    assert!(!body_ran, "the detach body must not run behind a prompt");
+    assert_eq!(
+        active_menu.as_ref().and_then(quit_confirm::is_quit_prompt),
+        Some(QuitKind::Detach)
+    );
+    // A repeat quit while the prompt is open does not re-open it.
+    assert!(quit_confirm::request(
+        true,
+        &mut active_menu,
+        QuitKind::Detach,
+        || (0, 0)
+    ));
+
+    let mut off: Option<MenuOverlay> = None;
+    if quit_confirm::request(false, &mut off, QuitKind::Detach, || (2, 1)) {
+        body_ran = true;
+    }
+    assert!(body_ran && off.is_none());
+}

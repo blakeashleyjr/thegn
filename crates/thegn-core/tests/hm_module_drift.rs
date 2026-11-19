@@ -48,6 +48,10 @@ const OMITTED: &[(&str, &str)] = &[
     ("observe", "Observe configuration is not exposed"),
     ("bars", "status bar configuration is not exposed"),
     ("calendar", "calendar sources are not exposed"),
+    (
+        "inbox",
+        "inbox accounts run commands and carry credential refs; global config only, not exposed",
+    ),
     ("weather.api_key", "credentials are not exposed"),
     ("issues", "issue providers are not exposed"),
     ("ci", "CI providers are not exposed"),
@@ -97,6 +101,10 @@ const OMITTED: &[(&str, &str)] = &[
     (
         "daemon.socket",
         "path-valued control-socket override is not exposed",
+    ),
+    (
+        "daemon.headless_producers",
+        "headless producers run the owner's rules unattended; opt-in per machine, not exposed",
     ),
     ("serve", "remote serving policy is not exposed"),
     ("merge_queue", "merge queue policy is not exposed"),
@@ -1678,6 +1686,7 @@ fn every_numeric_option_matches_its_destination_range() {
         ("port", "sandbox.remote.port"),
         ("themePanePadding", "theme.pane_padding"),
         ("uiSidebarGroupRowLimit", "ui.sidebar_group_row_limit"),
+        ("uiSidebarBatchGroupMin", "ui.sidebar_batch_group_min"),
         ("searchMaxResults", "search.max_results"),
         ("paletteContentMaxResults", "palette.content_max_results"),
         ("paletteFileMaxResults", "palette.file_max_results"),

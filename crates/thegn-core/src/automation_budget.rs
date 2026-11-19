@@ -16,7 +16,9 @@ pub struct Budgets {
 /// What the DB says is in use now.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BudgetUsage {
-    /// Distinct issues with an active dispatch row carrying an automation rule.
+    /// Distinct issues with an active dispatch row carrying an automation
+    /// rule, plus in-flight lane-opening runs and non-terminal issue-autopilot
+    /// runs (THE-2196).
     pub active_lanes: u32,
     /// Automation spawns in the last 24 h.
     pub spawns_24h: u32,
@@ -25,11 +27,12 @@ pub struct BudgetUsage {
 /// What kind of spawn is being admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnKind {
-    /// A new lane (`pipeline.start` at review or merge).
+    /// A new lane (`pipeline.start` at review or merge, an autopilot pickup
+    /// or `autopilot.run`).
     NewLane,
     /// The executor advancing an existing lane to its next stage.
     NextStage,
-    /// A session (`sessions.open`, `lead.wake`).
+    /// A session (`sessions.open`, `lead.wake`, a Lead's manual open).
     Session,
 }
 

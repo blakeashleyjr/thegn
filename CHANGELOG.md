@@ -7,6 +7,47 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.98] — 2026-11-19
+
+### Added
+
+- `thegn env adopt <sprite> --env <S>` records an existing sprite after you confirm it, so thegn can manage it. `[env.<n>.provider] lifetime_reap = true` lets a running client destroy recorded sprites past `max_lifetime_secs`. `thegn land` on a provider worktree now pulls and lands the local branch and keeps the sandbox; `--release-sandbox` destroys it. `agent run --wait` stops a Fly or machine0 machine afterwards unless `--keep-running`. `login_homes` selects a dedicated login for Sprites and Vercel `upload`. Not yet verified live.
+- The daemon has a native inbox: `[inbox]` and `[[inbox.accounts]]` poll Gmail or any IMAP server (app password), Todoist, or any command (himalaya, a Jira JQL script) and record new items as `inbox_item` notifications. Credentials are secret refs resolved only in the daemon, item text is sanitized and untrusted, and the first poll of an account is a baseline that fires nothing. `thegn inbox list|test|status`, `inbox_item` automation rules (capped at `review`, no `{message}` in spawn templates) and the `producers.status` verb are new; the Lead reads items through `notifications.list`. Requires `[daemon] headless_producers`. Schema v116: restart the daemon. Not yet verified live.
+- `[autopilot]` now runs as a synthesized `autopilot:<repo>` rule through the new config-only `autopilot.run` action, and automation budgets count autopilot runs and the Lead's manual spawns. Pausing automations also stops inbox polling. Not yet verified live.
+- The sidebar shows at most 7 entries per group (`[ui] sidebar_group_row_limit`, was 15). The active worktree, the cursor row, pinned rows and rows that need you are never folded. Worktrees sharing a batch token such as `b158` fold into one collapsed batch row (`[ui] sidebar_batch_group_min`, default 2, `0` = off) with a rollup of needs-you, active and done counts. A row drops a second line that repeats its title, worktree names are toned by state, and the tree guide is continuous through two-line rows and closes at the show-more row. Not yet verified live.
+
+### Changed
+
+- `thegn wt rm` now refuses to delete a worktree whose provider sandbox it cannot confirm gone (no token, destroy not confirmed by a complete inventory, or a provider location under a non-provider env), naming the sandbox and the two ways out. `land --release-sandbox` clears the location only after confirmation and otherwise prints `! sandbox <name> kept: <why>`. Closing a provider worktree now says its sandbox is kept. Keep-awake no longer releases a hold it never got. `thegn doctor` gains a "Remote live readiness" block.
+- `[ui] confirm_quit` (default true): `Ctrl-q` asks first; press it again to quit. Daemon panes survive either way.
+- The background LOC and size scanners now go idle. A background worktree's line count is redone only when its git state moved (worktree root, `HEAD` or `index`), not every 15 minutes; the worktree you are in keeps the 900 s TTL, is recounted at most every 60 s while you edit, and is recounted at once when you switch to it with an older count. A file-watch event now counts only the worktree you are in (it used to plan every stale worktree), and a switch or create counts only that worktree plus never-counted ones. Between sweeps neither scanner opens the database. The size of the worktree you are in is `du`d at most every 120 s. Config keys and defaults are unchanged: `max_scan_per_round` still bounds walks, while the number of worktrees a round may examine (a few `stat`s each) adapts to the registry. Steady state with defaults: `loc` at 50 worktrees is 1 round per 15 min (about 300 `stat`s), at 222 two rounds (about 1,300 `stat`s) then idle, at 1,000 two rounds (about 6,000 `stat`s); `disk` at 50 worktrees is 1 round per 45 s (about 9 `stat`s/s), at 222 about 40 `stat`s/s, at 1,000 two rounds per 90 s (about 90 `stat`s/s). A machine with many worktrees went from about 8 tokei walks a minute, continuously, to one walk per worktree whose git state changed plus the one you are in. The tokei pool shrinks from up to 4 threads to 2, and the per-profile "skipped"/"not_due" prune lines drop to DEBUG. The "lane can never go idle — raise `max_scan_per_round`" warning is gone.
+- The state database now maintains itself. The UI (never the daemon) converts a legacy database of up to 256 MiB to incremental auto-vacuum, gives free pages back in small steps, applies bounded retention and sweeps stale state files (`pty-shutdown/` keeps at most 500), at most every 10 minutes behind a lock so two UIs never both maintain. A larger legacy database gets one toast asking for `thegn db vacuum`, which is now an escape hatch that takes the same lock and refuses with `LowDisk` when space is short. `thegn doctor`'s db space line ends `; auto-maintained`.
+
+## [0.1.0-alpha.97] — 2026-11-18
+
+### Added
+
+- Sprites environments are now safer to run: thegn records a sprite in its ledger before creating it and deletes only sprites it recorded. `thegn env reap --provider sprites [--apply]` lists orphans, sprites past `max_lifetime_secs` and sprites "not recorded by this host" (older sprites, or ones made outside thegn, are never deleted by thegn; remove them with the Sprites CLI or dashboard). Headless work on a sprite holds it awake up to a ceiling (4 hours by default), `eager` no longer creates sprites in the background, `min_ram_gb` sets the memory limit, `fleet cost` gains a Sprites usage block, and `thegn agent run --wait --pull` pulls results back. Not yet verified against the live Sprites API.
+- `thegn repo forget` removes projects from a stopped instance's registry, for splitting one instance into two (see the `two-instances` help page). Name the projects to forget, or pass `--keep <PATH>` to forget every other one. It is a dry run unless you pass `--apply`, which backs the database up first. It refuses while the instance is running and never touches files, git worktrees or branches.
+
+- The daemon can run the tracker, PR, mention and PR queue producers with no window open: `[daemon] headless_producers = true` (default off). Each armed kind holds a lease so the UI yields while the daemon polls; the PR poll covers at most 8 worktrees per tick, and `thegn lead pause` stops daemon PR queue work too. `thegn doctor` shows producer status. Not yet verified live.
+- `thegn lead login [--mcp <server>]` logs the Lead's agent, or one of its MCP servers, in from a fresh temporary directory and copies back only the credentials or token files. The Lead cannot influence it, and your `~/.mcp-auth` and `~/.npmrc` are masked inside the Lead.
+- `[merge_queue] gate_sandbox = "sealed"` runs the merge gate in a sealed sandbox (no network, only the gate checkout and its target dir writable), so a `merge` autonomy land can proceed unattended. It is off by default and unattended merge stays off unless you set it. A gate that needs the network or the Nix daemon cannot run sealed and still asks for approval. Not yet verified live.
+
+### Fixed
+
+- The UI's mention check now runs every 5 minutes per repo instead of on every refresh.
+
+### Changed
+
+- The local database migrates forward to schema version 114 (producer leases, THE-2208); restart the daemon after upgrading.
+
+## [0.1.0-alpha.96] — 2026-11-18
+
+### Added
+
+- `just devel` starts a separate dev instance from the checkout (own state and runtime under `~/.thegn-devel`, `THEGN_DIR`, and `~/.config/thegn-dev`), and `just devel-env` prints its environment. The new help page `two-instances` explains the setup and what the two instances still share.
+
 ## [0.1.0-alpha.95] — 2026-11-17
 
 ### Added
@@ -3860,7 +3901,10 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...HEAD
+[0.1.0-alpha.98]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.97...v0.1.0-alpha.98
+[0.1.0-alpha.97]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.96...v0.1.0-alpha.97
+[0.1.0-alpha.96]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...v0.1.0-alpha.96
 [0.1.0-alpha.95]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.94...v0.1.0-alpha.95
 [0.1.0-alpha.94]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.93...v0.1.0-alpha.94
 [0.1.0-alpha.93]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.92...v0.1.0-alpha.93

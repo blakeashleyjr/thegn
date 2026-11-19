@@ -13,6 +13,9 @@ vercel-exec` bridge; there is no SSH.
 ## Setup
 
 ```toml
+[env.cloud]
+placement = "provider"
+
 [env.cloud.provider]
 provider = "vercel"
 team_id = "team_abc123"
@@ -24,6 +27,11 @@ size = "2"
 - `api_key_env` is a secret reference (keyring, file or env). It is resolved at
   call time and sent only to Vercel's API. It never reaches the VM.
 - `team_id` and `project_id` are required and are not secrets.
+- `placement = "provider"` is required. A `provider` with any other
+  `placement` is ignored, and `thegn config validate` warns about it.
+- When a terminal pane opens, thegn writes the admitted interactive host (and the
+  `/health` host, or a refused host) once to stderr and at `info` in the log.
+  Only the host is written, never the URL query or the ticket.
 - `max_instances` defaults to 2; `max_lifetime_secs` defaults to 24 hours.
 
 ## What works
@@ -66,6 +74,9 @@ or at once when its worktree is gone. Pull work back first:
 ```sh
 thegn env pull
 ```
+
+`thegn env down --stop` parks the sandbox without deleting it. A stop and the
+lifetime ceiling both run before any resume.
 
 This fetches the bundle into `refs/thegn/pull/<worktree>`; only the lane's own
 branch fast-forwards. See [[sandboxing]].
@@ -114,6 +125,21 @@ refused (use `[sandbox.home] agents` there).
 - The env is resolved from the sandbox's owner worktree and its bound env; if
   that fails and exactly one vercel env exists, that one is used; otherwise
   upload is skipped with one warning (mode `none` behaviour).
+
+### Recipe: a dedicated login
+
+The shipped default stays `none`. To use a login that is not your daily one,
+change only config (your own config file):
+
+```toml
+[env.cloud.provider]
+model_credentials = "upload"
+login_homes = { claude = "~/.thegn-logins/claude", codex = "~/.thegn-logins/codex" }
+```
+
+`login_homes` makes `upload` read those directories instead of the live host
+login, so a hostile sandbox can only spend the dedicated account. Like
+`model_credentials` it cannot come from a repo overlay.
 
 ### Threat model
 

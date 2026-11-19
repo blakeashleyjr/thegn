@@ -40,8 +40,13 @@ pub(crate) const CONTROL_ADDR_FILE: &str = "control-addr.json";
 /// `lead:<group>/<tab>` caller id.
 pub(crate) const PAIRING_LABEL: &str = "lead";
 
-const NO_LISTENER: &str =
-    "daemon not running or [lead] added after daemon start: restart the daemon";
+const NO_LISTENER: &str = "no Lead listener: the daemon is not running, was started before [lead] \
+                           was added, or runs on the stable channel; run `thegn daemon stop` and \
+                           reopen thegn with THEGN_CHANNEL=dev";
+/// The refusal when the daemon is disabled. Fixed text: the docs and tests
+/// cite it.
+const DAEMON_DISABLED: &str = "[daemon] enabled = false: the Lead's tools need the daemon; enable \
+                               it, then `thegn daemon stop` and reopen thegn";
 const MAX_ADDR_FILE_BYTES: u64 = 4096;
 
 /// What a Lead tab's agent needs for its MCP server: extra agent argv, env,
@@ -85,7 +90,7 @@ pub(crate) fn write_control_addr(state_home: &Path, addr: SocketAddr) -> Result<
 
 /// Parse `control-addr.json`, refusing anything but a loopback address (the
 /// token must never be sent off-host because of a tampered file).
-fn parse_control_addr(bytes: &[u8]) -> Result<SocketAddr> {
+pub(crate) fn parse_control_addr(bytes: &[u8]) -> Result<SocketAddr> {
     #[derive(serde::Deserialize)]
     struct File {
         addr: String,
@@ -422,14 +427,11 @@ fn prepare_in(
         .lead
         .as_ref()
         .context("[lead] is not configured (or is clamped off on this channel)")?;
-    anyhow::ensure!(
-        cfg.daemon.enabled,
-        "[daemon] enabled = false: the Lead's tools need the daemon; enable it and restart"
-    );
+    anyhow::ensure!(cfg.daemon.enabled, DAEMON_DISABLED);
     let harness = crate::daemon::agent_open::harness_for_agent(cfg, &lead.agent).map(|h| h.id());
     if harness != Some("claude") {
         anyhow::bail!(
-            "Lead MCP wiring supports claude in b152 ([lead] agent {:?} runs {})",
+            "the Lead's MCP wiring supports claude only for now ([lead] agent {} runs {})",
             lead.agent,
             harness.unwrap_or("an unknown harness")
         );
@@ -557,6 +559,14 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.to_string(), NO_LISTENER);
+        for needle in [
+            "no Lead listener:",
+            "runs on the stable channel",
+            "`thegn daemon stop`",
+            "THEGN_CHANNEL=dev",
+        ] {
+            assert!(NO_LISTENER.contains(needle), "{needle}");
+        }
         assert!(
             !state
                 .path()
@@ -577,8 +587,9 @@ mod tests {
         let mut cfg = lead_cfg("claude");
         cfg.daemon.enabled = false;
         let err = prepare_in(&cfg, notes.path(), "lead", state.path(), &no_store).unwrap_err();
+        assert_eq!(err.to_string(), DAEMON_DISABLED);
         assert!(
-            err.to_string().contains("[daemon] enabled = false"),
+            err.to_string().contains("then `thegn daemon stop`"),
             "{err}"
         );
 
@@ -591,8 +602,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Lead MCP wiring supports claude in b152"),
+            err.to_string().starts_with(
+                "the Lead's MCP wiring supports claude only for now ([lead] agent lead-agent runs "
+            ),
             "{err}"
         );
     }

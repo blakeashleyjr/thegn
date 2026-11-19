@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import sqlite3
@@ -30,6 +31,12 @@ class LiveTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="thegn-live-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        # The scans skip the scanner's own pid. Fake /proc trees use small
+        # pids (31, 42, ...), which a fresh pid namespace can hand to this
+        # very process: pin the "own pid" to one no fixture uses.
+        own_pid = patch.object(live.os, "getpid", return_value=10**7)
+        own_pid.start()
+        self.addCleanup(own_pid.stop)
         # User-namespace test runners can expose host-owned / and /tmp as
         # unmapped uid 65534. Model only those fixture ancestors as root-owned;
         # every file/directory created by the test retains its actual metadata.
@@ -50,12 +57,22 @@ class LiveTests(unittest.TestCase):
         self.addCleanup(self.ancestor_patch.stop)
         self.unmapped_ancestors = unmapped
         self.repo = self.root / "repo"
-        self.state = self.root / "state/thegn"
+        # The account home comes from passwd; never the real one in tests.
+        self.home = self.root / "home"
+        self.state = self.home / ".local/state/thegn"
         self.config = self.root / "config/thegn/config.toml"
         self.state.mkdir(parents=True, mode=0o700)
         (self.repo / "target/release").mkdir(parents=True)
+        (self.repo / "config").mkdir()
+        (self.repo / "config/alacritty.toml").write_text("[font]\nsize = 11\n")
         self.config.parent.mkdir(parents=True)
-        self.target = self.repo / "target/release/thegn"
+        self.install = self.home / ".local/lib/thegn"
+        self.install.mkdir(parents=True)
+        self.home_patch = patch.object(live, "real_home", return_value=self.home)
+        self.home_patch.start()
+        self.addCleanup(self.home_patch.stop)
+        self.legacy = self.repo / "target/release/thegn"
+        self.target = self.install / "thegn"
         self.target.write_bytes(b"old executable")
         self.target.chmod(0o755)
         self.db = self.state / "thegn.db"
@@ -66,7 +83,9 @@ class LiveTests(unittest.TestCase):
             conn.commit()
         self.db.chmod(0o600)
         self.env = {"XDG_STATE_HOME": str(self.state.parent), "XDG_CONFIG_HOME": str(self.config.parent.parent)}
-        self.paths = {"repo": self.repo, "state": self.state, "database": self.db, "target": self.target, "config": self.config}
+        self.paths = {"repo": self.repo, "state": self.state, "database": self.db, "target": self.target, "config": self.config,
+                      "install_dir": self.install, "previous": self.target, "alacritty": self.install / "alacritty.toml",
+                      "alacritty_source": self.repo / "config/alacritty.toml"}
         self.binary = self.root / "built"
         self.binary.write_bytes(b"new executable")
         self.binary.chmod(0o755)
@@ -561,18 +580,24 @@ class LiveTests(unittest.TestCase):
         relaunch.assert_not_called()
         build.assert_not_called()
 
-    def _fake_proc(self, processes):
-        """processes: {pid: (name, ppid, exe or None, argv)}"""
-        proc = self.root / "fake-proc"
-        proc.mkdir(mode=0o700)
-        for pid, (name, ppid, exe, argv) in processes.items():
+    def _fake_proc(self, processes, proc=None):
+        """processes: {pid: (name, ppid, exe or None, argv[, environ bytes])}"""
+        proc = proc or self.root / "fake-proc"
+        proc.mkdir(mode=0o700, exist_ok=True)
+        for pid, (name, ppid, exe, argv, *environ) in processes.items():
             base = proc / str(pid)
             base.mkdir()
             (base / "status").write_text(f"Name:\t{name}\nState:\tS (sleeping)\nPPid:\t{ppid}\nUid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
             if exe is not None:
                 (base / "exe").symlink_to(exe)
             (base / "cmdline").write_bytes(b"\0".join(argv) + b"\0")
+            if environ:
+                (base / "environ").write_bytes(environ[0])
+            (base / "fd").mkdir()
         return proc
+
+    def _env_of(self, state_home):
+        return b"PATH=/bin\0XDG_STATE_HOME=" + os.fsencode(state_home) + b"\0"
 
     def test_thegn_ancestor_walks_the_parent_chain(self):
         proc = self._fake_proc({40: ("bash", 30, None, [b"bash"]), 30: ("just", 20, None, [b"just"]),
@@ -585,11 +610,12 @@ class LiveTests(unittest.TestCase):
         other = self.root / "other-checkout-thegn"
         other.write_bytes(b"other")
         other.chmod(0o755)
-        proc = self._fake_proc({11: ("thegn", 1, self.target, [str(self.target).encode()]),
-                                12: ("thegn", 1, self.target, [str(self.target).encode(), b"daemon", b"--socket", b"s"]),
-                                13: ("thegn", 1, other, [str(other).encode()]),
-                                14: ("bash", 1, None, [b"bash"])})
-        self.assertEqual(sorted(live.target_processes(self.target, proc)), [(11, False), (12, True)])
+        ours, elsewhere = self._env_of(self.state.parent), self._env_of(self.root / "dev-state")
+        proc = self._fake_proc({11: ("thegn", 1, self.target, [str(self.target).encode()], ours),
+                                12: ("thegn", 1, self.target, [str(self.target).encode(), b"daemon", b"--socket", b"s"], ours),
+                                13: ("thegn", 1, other, [str(other).encode()], elsewhere),
+                                14: ("bash", 1, None, [b"bash"], ours)})
+        self.assertEqual(sorted(live.target_processes(self.paths, proc)), [(11, False), (12, True)])
 
     def test_stop_quits_controllers_first_then_the_daemon(self):
         alive = {11: False, 12: True}  # pid -> is_daemon
@@ -634,6 +660,333 @@ class LiveTests(unittest.TestCase):
                 live.stop_running(self.paths, self.env, sleep=sleep, now=lambda: clock[0], run=run, kill=kill)
         self.assertEqual(signalled, [(12, live.signal.SIGTERM), (12, live.signal.SIGKILL)])
 
+    # --- install location (outside the checkout) ---------------------------
+
+    def test_default_install_dir_is_outside_the_repo_and_overridable(self):
+        paths = self.settings()
+        self.assertEqual(paths["target"], self.home / ".local/lib/thegn/thegn")
+        self.assertNotIn(self.repo, paths["target"].parents)
+        self.assertEqual(paths["alacritty"], paths["target"].parent / "alacritty.toml")
+        other = self.root / "elsewhere"
+        other.mkdir()
+        (other / "thegn").write_bytes(b"other install")
+        (other / "thegn").chmod(0o755)
+        self.assertEqual(self.settings(THEGN_LIVE_INSTALL_DIR=str(other))["target"], other / "thegn")
+        flag = live.settings(self.repo, dict(self.env, THEGN_LIVE_INSTALL_DIR=str(self.install)), str(other))
+        self.assertEqual(flag["target"], other / "thegn")  # --install-dir beats the environment
+        for inside in (self.repo / "target/release", self.repo):
+            with self.subTest(inside=inside), self.assertRaisesRegex(live.Refusal, "inside the checkout"):
+                self.settings(THEGN_LIVE_INSTALL_DIR=str(inside))
+        with self.assertRaises(live.Refusal):
+            self.settings(THEGN_LIVE_INSTALL_DIR="relative/dir")
+
+    def test_home_comes_from_passwd_not_HOME(self):
+        self.home_patch.stop()
+        try:
+            account = type("Pw", (), {"pw_dir": str(self.home)})()
+            with patch.object(live.pwd, "getpwuid", return_value=account) as lookup:
+                paths = self.settings(HOME=str(self.root / "profile-home"))
+            lookup.assert_called_with(os.getuid())
+        finally:
+            self.home_patch.start()
+        self.assertEqual(paths["install_dir"], self.home / ".local/lib/thegn")
+
+    def test_profile_HOME_without_XDG_STATE_HOME_is_refused(self):
+        profile = self.root / "profile-home"
+        (profile / ".local/state/thegn").mkdir(parents=True, mode=0o700)
+        shutil.copy2(self.db, profile / ".local/state/thegn/thegn.db")
+        env = {"HOME": str(profile), "XDG_CONFIG_HOME": self.env["XDG_CONFIG_HOME"]}
+        with self.assertRaisesRegex(live.Refusal, "set XDG_STATE_HOME to the account's state home or pass --install-dir") as caught:
+            live.settings(self.repo, env)
+        self.assertIn(str(profile / ".local/state"), str(caught.exception))
+        self.assertIn(str(self.home / ".local/state"), str(caught.exception))
+        # An explicit install directory (flag or environment) is the opt-out.
+        self.assertEqual(live.settings(self.repo, env, str(self.install))["state"], profile / ".local/state/thegn")
+        self.assertEqual(live.settings(self.repo, dict(env, THEGN_LIVE_INSTALL_DIR=str(self.install)))["target"], self.target)
+
+    def test_noexec_install_dir_is_refused(self):
+        real_statvfs = os.statvfs
+        seen = []
+
+        def noexec(path):
+            seen.append(Path(path))
+            result = real_statvfs(path)
+            return type("V", (), {"f_flag": result.f_flag | os.ST_NOEXEC})()
+
+        with patch.object(live.os, "statvfs", side_effect=noexec), self.assertRaisesRegex(live.Refusal, "noexec"):
+            self.settings()
+        self.assertEqual(seen, [self.install])
+        shutil.rmtree(self.install)  # not yet created: its nearest existing ancestor is checked
+        self.legacy.write_bytes(b"legacy executable")
+        self.legacy.chmod(0o755)
+        seen.clear()
+        with patch.object(live.os, "statvfs", side_effect=noexec), self.assertRaisesRegex(live.Refusal, "noexec"):
+            self.settings()
+        self.assertEqual(seen, [self.home / ".local/lib"])
+
+    def test_install_places_alacritty_config_beside_the_binary(self):
+        with patch.object(live, "settings", return_value=self.paths), patch.object(live, "quiescent"):
+            live.install(self.paths, self.binary, self.record, self.env)
+        self.assertEqual(self.target.read_bytes(), b"new executable")
+        installed = self.install / "alacritty.toml"
+        self.assertEqual(installed.read_text(), "[font]\nsize = 11\n")
+        self.assertEqual(installed.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(sorted(p.name for p in self.install.iterdir()), ["alacritty.toml", "thegn"])
+
+    def test_first_run_migrates_from_the_in_repo_binary(self):
+        shutil.rmtree(self.install)
+        self.legacy.write_bytes(b"legacy executable")
+        self.legacy.chmod(0o755)
+        paths = self.settings()
+        self.assertEqual(paths["previous"], self.legacy)
+        self.assertEqual(paths["target"], self.install / "thegn")
+        self.assertFalse(self.install.exists())  # settings never creates it
+        # Processes of the legacy binary under this state home are this
+        # installation's; the same binary elsewhere is not.
+        proc = self._fake_proc({21: ("thegn", 1, self.legacy, [str(self.legacy).encode()], self._env_of(self.state.parent)),
+                                22: ("thegn", 1, self.legacy, [str(self.legacy).encode()], self._env_of(self.root / "x"))})
+        self.assertEqual(live.target_processes(paths, proc), [(21, False)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch.object(live, "settings", return_value=paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "survey", return_value=[]):
+            self.assertEqual(live.main(["--plan", "--repo", str(self.repo)]), 0)
+        self.assertIn(f"First run at this location: {self.legacy} is treated as the previous installation", out.getvalue())
+        self.assertFalse(self.install.exists())
+        self.install.mkdir(parents=True)
+        with patch.object(live, "settings", return_value=paths), patch.object(live, "quiescent"):
+            recovery = live.install(paths, self.binary, self.record, self.env)
+        self.assertEqual((recovery / "thegn.previous").read_bytes(), b"legacy executable")
+        self.assertEqual(json.loads((recovery / "complete.json").read_text())["previous"], str(self.legacy))
+        self.assertEqual((self.install / "thegn").read_bytes(), b"new executable")
+        self.assertEqual(self.legacy.read_bytes(), b"legacy executable")  # never rewritten
+        self.assertEqual(live.settings(self.repo, self.env)["previous"], self.install / "thegn")
+
+    def test_state_home_of_follows_xdg_then_home(self):
+        self.assertEqual(live.state_home_of(b"HOME=/h\0XDG_STATE_HOME=/s\0"), Path("/s"))
+        self.assertEqual(live.state_home_of(b"HOME=/h\0"), Path("/h/.local/state"))
+        self.assertEqual(live.state_home_of(b"XDG_STATE_HOME=rel\0HOME=/h\0"), Path("/h/.local/state"))
+        self.assertEqual(live.state_home_of(b"XDG_STATE_HOME=/a\0XDG_STATE_HOME=/b\0"), Path("/a"))
+        self.assertIsNone(live.state_home_of(b"PATH=/bin\0"))
+
+    # --- process scope: only this installation ------------------------------
+
+    def _other_binary(self, name="thegn"):
+        other = self.root / "dev-checkout/target/debug" / name
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_bytes(b"dev build")
+        other.chmod(0o755)
+        return other
+
+    def test_another_installation_is_neither_signalled_nor_blocking(self):
+        other = self._other_binary()
+        dev_state = self.root / "dev-state"
+        proc = self._fake_proc({31: ("thegn", 1, other, [str(other).encode()], self._env_of(dev_state)),
+                                32: ("thegn", 1, other, [str(other).encode(), b"daemon"], self._env_of(dev_state))})
+        self.assertEqual(live.target_processes(self.paths, proc), [])
+        live.quiescent(self.paths, proc)  # does not block
+        lines = live.report_processes(live.survey(self.paths, proc))
+        self.assertIn("2 other thegn process(es) belong to another installation and are left alone", lines)
+        self.assertIn(f"  pid 31, {other}, state home {dev_state}", lines)
+        signalled = []
+        with patch.object(live, "quiescent", side_effect=lambda paths: None), contextlib.redirect_stdout(io.StringIO()):
+            live.stop_running(self.paths, self.env, proc=proc, sleep=lambda _s: None,
+                              run=lambda *a, **k: self.fail("daemon stop ran"), kill=lambda *a: signalled.append(a))
+        self.assertEqual(signalled, [])
+
+    def test_same_binary_other_state_home_is_reported_not_signalled(self):
+        isolated = self.root / "isolated-state"
+        proc = self._fake_proc({41: ("thegn", 1, self.target, [str(self.target).encode()], self._env_of(isolated)),
+                                42: ("thegn", 1, self.target, [str(self.target).encode()], self._env_of(self.state.parent))})
+        self.assertEqual(live.target_processes(self.paths, proc), [(42, False)])
+        (proc / "42").rename(self.root / "gone-42")
+        live.quiescent(self.paths, proc)  # the isolated one does not block
+        lines = "\n".join(live.report_processes(live.survey(self.paths, proc)))
+        self.assertIn("run this installation's binary under another state home", lines)
+        self.assertIn("keep running the old binary until restarted", lines)
+        self.assertIn(f"pid 41, {self.target}, state home {isolated}", lines)
+
+    def test_unreadable_environ_is_never_signalled(self):
+        proc = self._fake_proc({51: ("thegn", 1, self.target, [str(self.target).encode()])})  # no environ
+        self.assertEqual(live.target_processes(self.paths, proc), [])
+        with self.assertRaisesRegex(live.Refusal, "cannot be determined is still running"):
+            live.quiescent(self.paths, proc)
+        clock, signalled, ran = [0.0], [], []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        real_quiescent = live.quiescent
+        with patch.object(live, "quiescent", side_effect=lambda paths: real_quiescent(paths, proc)), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(live.Refusal, "cannot be determined"):
+                live.stop_running(self.paths, self.env, proc=proc, sleep=sleep, now=lambda: clock[0],
+                                  run=lambda *a, **k: ran.append(a), kill=lambda *a: signalled.append(a))
+        self.assertEqual((signalled, ran), ([], []))
+        self.assertIn("never signalled", "\n".join(live.report_processes(live.survey(self.paths, proc))))
+
+    def test_state_home_users_that_are_not_thegn_block_but_are_not_signalled(self):
+        stranger = self._other_binary("tg")  # e.g. an unrelated `tg` CLI inheriting HOME
+        proc = self._fake_proc({61: ("tg", 1, stranger, [b"tg"], self._env_of(self.state.parent))})
+        self.assertEqual(live.target_processes(self.paths, proc), [])
+        with self.assertRaisesRegex(live.Refusal, "this installation is still running"):
+            live.quiescent(self.paths, proc)
+        self.assertIn("never signalled and block the upgrade", "\n".join(live.report_processes(live.survey(self.paths, proc))))
+
+    def test_other_installation_holding_our_database_still_blocks(self):
+        other = self._other_binary()
+        proc = self._fake_proc({71: ("thegn", 1, other, [b"thegn"], self._env_of(self.root / "dev-state"))})
+        (proc / "71/fd/3").symlink_to(self.db)
+        with self.assertRaisesRegex(live.Refusal, "files open"):
+            live.quiescent(self.paths, proc)
+
+    # --- launchers -----------------------------------------------------------
+
+    def _launchers(self):
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "thegn").symlink_to(self.legacy)
+        old_config = self.repo / "config/alacritty.toml"
+        (bin_dir / "tg").write_text(f"#!/bin/sh\nexec alacritty --config-file {old_config} -e {bin_dir}/tg-tui\n"
+                                    f"# near miss stays: {self.legacy}-old {old_config}.orig\n")
+        (bin_dir / "tg-tui").write_text(f"#!/bin/sh\nexport THEGN_ALACRITTY_CONFIG={old_config}\nexec {self.legacy} \"$@\"\n")
+        for name in ("tg", "tg-tui"):
+            (bin_dir / name).chmod(0o755)
+        return bin_dir
+
+    def _tree(self, directory):
+        return {p.name: (os.readlink(p) if p.is_symlink() else p.read_bytes(), p.lstat().st_mode)
+                for p in sorted(directory.iterdir())}
+
+    def test_relink_launchers_repoints_symlink_and_rewrites_exact_paths(self):
+        bin_dir = self._launchers()
+        before = {name: (bin_dir / name).read_text() for name in ("tg", "tg-tui")}
+        state = "\n".join(live.launcher_state(self.paths, self.home))
+        self.assertIn("does NOT resolve to the install target", state)
+        self.assertIn(f"{bin_dir / 'tg'} mentions the old repo path(s): {self.repo / 'config/alacritty.toml'}", state)
+        actions = live.relink_plan(self.paths, self.home)
+        with contextlib.redirect_stdout(io.StringIO()):
+            live.apply_relink(self.paths, actions)
+        self.assertEqual(os.readlink(bin_dir / "thegn"), str(self.target))
+        new_config = self.install / "alacritty.toml"
+        tg = (bin_dir / "tg").read_text()
+        self.assertIn(f"--config-file {new_config} -e", tg)
+        self.assertIn(f"{self.legacy}-old {self.repo / 'config/alacritty.toml'}.orig", tg)  # not exact: untouched
+        self.assertEqual((bin_dir / "tg-tui").read_text(),
+                         f"#!/bin/sh\nexport THEGN_ALACRITTY_CONFIG={new_config}\nexec {self.target} \"$@\"\n")
+        for name in ("tg", "tg-tui"):
+            self.assertEqual((bin_dir / (name + ".bak")).read_text(), before[name])
+            self.assertEqual((bin_dir / name).stat().st_mode & 0o777, 0o755)
+        self.assertIn("resolves to the install target", "\n".join(live.launcher_state(self.paths, self.home)))
+        self.assertEqual(live.relink_plan(self.paths, self.home), [])  # idempotent
+
+    def test_relink_refuses_a_wrapper_with_neither_path(self):
+        bin_dir = self._launchers()
+        (bin_dir / "tg").write_text("#!/bin/sh\nexec /opt/thegn/bin/thegn \"$@\"\n")
+        before = self._tree(bin_dir)
+        with self.assertRaisesRegex(live.Refusal, "mentions neither"):
+            live.relink_plan(self.paths, self.home)
+        (bin_dir / "tg").unlink()
+        (bin_dir / "tg").symlink_to("/nix/store/wrapper")
+        with self.assertRaisesRegex(live.Refusal, "not a current-user regular file"):
+            live.relink_plan(self.paths, self.home)
+        (bin_dir / "tg").unlink()
+        (bin_dir / "tg").write_bytes(b"\xff\xfe binary")
+        with self.assertRaisesRegex(live.Refusal, "not a UTF-8 text file"):
+            live.relink_plan(self.paths, self.home)
+        self.assertEqual(os.readlink(bin_dir / "thegn"), str(self.legacy))
+        self.assertFalse(any(name.endswith(".bak") for name in self._tree(bin_dir)))
+        self.assertEqual(before["tg-tui"], self._tree(bin_dir)["tg-tui"])
+
+    def _follow_target(self, bin_dir):
+        (bin_dir / "thegn").unlink()
+        (bin_dir / "thegn").symlink_to(self.target)
+        (bin_dir / "tg").write_text(f"#!/bin/sh\nexec alacritty --config-file {self.install / 'alacritty.toml'} -e {bin_dir}/tg-tui\n")
+        (bin_dir / "tg-tui").write_text(f"#!/bin/sh\nexec {self.target} \"$@\"\n")
+
+    def _main_mocks(self, recovery):
+        class Child:
+            def wait(self):
+                return 0
+
+        return (patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40),
+                patch.object(live, "survey", return_value=[]), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)),
+                patch.object(live, "install", return_value=recovery), patch.object(live.sys.stdin, "isatty", return_value=True),
+                patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None),
+                patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"),
+                patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()),
+                patch.object(live, "scope_argv", side_effect=lambda target, _env: [str(target)]))
+
+    def test_launchers_on_the_checkout_refuse_a_run_without_relink(self):
+        bin_dir = self._launchers()
+        before = self._tree(bin_dir)
+        recovery = self.state / "private-recovery"
+        recovery.mkdir(mode=0o700)
+        stale = f"launchers still run {self.legacy}; rerun with `python3 -B scripts/live.py --relink-launchers`"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.ExitStack() as stack:
+            mocks = [stack.enter_context(item) for item in self._main_mocks(recovery)]
+            build, stop = mocks[3], mocks[9]
+            self.assertEqual(live.main(["--plan", "--repo", str(self.repo)]), 0)
+            self.assertIn(f"WARNING: {stale}", out.getvalue())
+            with self.assertRaisesRegex(live.Refusal, re.escape(stale)):
+                live.main(["--repo", str(self.repo)])
+            # A wrapper alone (symlink already relinked) still refuses.
+            (bin_dir / "thegn").unlink()
+            (bin_dir / "thegn").symlink_to(self.target)
+            with self.assertRaisesRegex(live.Refusal, "launchers still run"):
+                live.main(["--repo", str(self.repo)])
+        build.assert_not_called()
+        stop.assert_not_called()
+        (bin_dir / "thegn").unlink()
+        (bin_dir / "thegn").symlink_to(self.legacy)
+        self.assertEqual(self._tree(bin_dir), before)
+
+    def test_run_without_relink_never_touches_launchers(self):
+        bin_dir = self._launchers()
+        self._follow_target(bin_dir)
+        before = self._tree(bin_dir)
+        recovery = self.state / "private-recovery"
+        recovery.mkdir(mode=0o700)
+        (recovery / "thegn-stderr.log").touch(mode=0o600)
+
+        class Child:
+            def wait(self):
+                return 0
+
+        common = lambda: (patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40),
+                  patch.object(live, "survey", return_value=[]), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)),
+                  patch.object(live, "install", return_value=recovery), patch.object(live.sys.stdin, "isatty", return_value=True),
+                  patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None),
+                  patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"),
+                  patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()),
+                  patch.object(live, "scope_argv", side_effect=lambda target, _env: [str(target)]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.ExitStack() as stack:
+            for item in common():
+                stack.enter_context(item)
+            self.assertEqual(live.main(["--plan", "--relink-launchers", "--repo", str(self.repo)]), 0)
+            # Launchers that already follow the install target pass through.
+            self.assertEqual(live.main(["--repo", str(self.repo)]), 0)
+        self.assertEqual(self._tree(bin_dir), before)
+        self.assertIn("Launchers are not changed without --relink-launchers.", out.getvalue())
+        self.assertIn("--relink-launchers: launchers already follow the install target", out.getvalue())
+        # With the flag, a run relinks stale launchers after the install.
+        shutil.rmtree(bin_dir)
+        bin_dir = self._launchers()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.ExitStack() as stack:
+            for item in common():
+                stack.enter_context(item)
+            self.assertEqual(live.main(["--repo", str(self.repo), "--relink-launchers"]), 0)
+        self.assertEqual(os.readlink(bin_dir / "thegn"), str(self.target))
+        self.assertTrue((bin_dir / "tg.bak").exists())
+
+    def test_relink_refusal_happens_before_anything_is_stopped(self):
+        bin_dir = self._launchers()
+        (bin_dir / "tg-tui").write_text("#!/bin/sh\nexec something-else\n")
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "survey", return_value=[]), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "build_stage") as build, patch.object(live, "stop_running") as stop:
+            with self.assertRaisesRegex(live.Refusal, "mentions neither"):
+                live.main(["--repo", str(self.repo), "--relink-launchers"])
+        build.assert_not_called()
+        stop.assert_not_called()
+
     def test_validate_config_refuses_on_nonzero_exit(self):
         def run(argv, **_kwargs):
             self.assertEqual(argv[1:], ["config", "validate"])
@@ -651,7 +1004,7 @@ class LiveTests(unittest.TestCase):
         (recovery / "thegn-stderr.log").touch(mode=0o600)
 
         def spawn(argv, **kwargs):
-            self.assertEqual(argv, [str(self.target)])
+            self.assertEqual(argv, expected_argv)
             self.assertEqual(kwargs["env"]["THEGN_NO_MIGRATE"], "1")
             self.assertEqual(kwargs["env"].get("THEGN_DATABASE_MIGRATION_EXECUTABLE"), expected_pin)
             self.assertEqual(kwargs["env"]["THEGN_LOG_ROTATION_SIZE_MB"], "20")
@@ -669,6 +1022,10 @@ class LiveTests(unittest.TestCase):
 
             return Child()
 
+        def scoped(target, _env):
+            return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                    "-p", "CPUWeight=1000", "-p", "IOWeight=1000", "--", str(target)]
+
         def install(*_args):
             for path, schema in ((self.state / "live-upgrade.lock", False), (self.target.parent / ".thegn-live-install.lock", False), (Path(str(self.db) + ".schema.lock"), True)):
                 with self.assertRaisesRegex(live.Refusal, "busy"):
@@ -676,20 +1033,133 @@ class LiveTests(unittest.TestCase):
                         self.fail("An install lock was not held")
             return recovery
 
-        with contextlib.redirect_stdout(io.StringIO()), self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"), patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", side_effect=spawn):
-            for expected_pin in (None, str(self.target)):
-                for argv, expected_log in (
-                    (["--repo", str(self.repo)], "info,log=error,tokei=error"),
-                    (["--repo", str(self.repo), "--level", "debug"], "debug,log=error,tokei=error"),
-                ):
-                    # Keep HOME unchanged; test only captured migration override.
-                    env = dict(os.environ, **self.env)
-                    if expected_pin is None:
-                        env.pop("THEGN_DATABASE_MIGRATION_EXECUTABLE", None)
-                    else:
-                        env["THEGN_DATABASE_MIGRATION_EXECUTABLE"] = expected_pin
-                    with patch.dict(live.os.environ, env, clear=True):
-                        self.assertEqual(live.main(argv), 7)
+        with contextlib.redirect_stdout(io.StringIO()), self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"), patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", side_effect=spawn), patch.object(live, "scope_argv", side_effect=scoped) as scope:
+            for scope_flag, expected_argv in (([], scoped(self.target, {})), (["--no-scope"], [str(self.target)])):
+                for expected_pin in (None, str(self.target)):
+                    for argv, expected_log in (
+                        (["--repo", str(self.repo)], "info,log=error,tokei=error"),
+                        (["--repo", str(self.repo), "--level", "debug"], "debug,log=error,tokei=error"),
+                    ):
+                        # Keep HOME unchanged; test only captured migration override.
+                        env = dict(os.environ, **self.env)
+                        if expected_pin is None:
+                            env.pop("THEGN_DATABASE_MIGRATION_EXECUTABLE", None)
+                        else:
+                            env["THEGN_DATABASE_MIGRATION_EXECUTABLE"] = expected_pin
+                        with patch.dict(live.os.environ, env, clear=True):
+                            self.assertEqual(live.main(argv + scope_flag), 7)
+        # --no-scope never even probes for systemd-run.
+        self.assertEqual(scope.call_count, 4)
+
+    def _backup_fixture(self, name, age_days, descriptor=None, stage=None):
+        backup = self.state / name
+        backup.mkdir(mode=0o700)
+        (backup / "thegn.db").write_bytes(b"db")
+        (backup / "thegn.previous").write_bytes(b"old executable")
+        (backup / "thegn-stderr.log").touch(mode=0o600)
+        if descriptor is None:
+            build = {"schema": 3} if stage is None else {"schema": 3, "stage": str(stage)}
+            descriptor = json.dumps({"binary_sha256": "b" * 64, "database_sha256": "d" * 64, "build": build})
+        (backup / "complete.json").write_text(descriptor)
+        stamp = time.time() - age_days * 86400
+        os.utime(backup / "complete.json", (stamp, stamp))
+        os.utime(backup, (stamp, stamp))
+        return backup
+
+    def test_prune_backups_keeps_current_newest_young_and_incomplete(self):
+        backups = {age: self._backup_fixture(f"live-backup-{age}d", age) for age in (1, 2, 9, 10, 11, 12)}
+        current = self._backup_fixture("live-backup-current", 30)  # this run's, whatever its stamp
+        malformed = self._backup_fixture("live-backup-malformed", 40, descriptor="{incomplete")
+        missing = self._backup_fixture("live-backup-missing", 40)
+        (missing / "complete.json").unlink()
+        wrong_shape = self._backup_fixture("live-backup-shape", 40, descriptor=json.dumps(["not", "a", "record"]))
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "complete.json").write_text(json.dumps({"binary_sha256": "b", "database_sha256": "d"}))
+        os.utime(elsewhere / "complete.json", (0, 0))
+        (self.state / "live-backup-x").symlink_to(elsewhere, target_is_directory=True)
+        other = self._backup_fixture("other-backup-old", 40)
+
+        removed = live.prune_backups(self.paths, current)
+
+        # Newest three (1, 2, 9 d) and the under-7-day ones (1, 2 d) stay.
+        self.assertEqual(sorted(removed), sorted([backups[10], backups[11], backups[12]]))
+        for age in (10, 11, 12):
+            self.assertFalse(os.path.lexists(backups[age]))
+        for age in (1, 2, 9):
+            self.assertTrue(backups[age].is_dir())
+        for kept in (current, malformed, missing, wrong_shape, other):
+            self.assertTrue(kept.is_dir())
+        self.assertTrue((self.state / "live-backup-x").is_symlink())
+        self.assertTrue((elsewhere / "complete.json").exists())
+        self.assertTrue(self.db.exists())
+        # A second pass has nothing left to remove.
+        self.assertEqual(live.prune_backups(self.paths, current), [])
+
+    def test_prune_backups_respects_custom_bounds_and_entry_budget(self):
+        old = [self._backup_fixture(f"live-backup-old{index}", 20 + index) for index in range(3)]
+        current = self._backup_fixture("live-backup-current", 0)
+        huge = self._backup_fixture("live-backup-huge", 50)
+        for index in range(10):
+            (huge / f"extra-{index}").write_bytes(b"x")
+        with patch.object(live, "MAX_STAGE_ENTRIES", 8):
+            # The state scan (6 entries) and the 4-entry backups fit the bound;
+            # the 14-entry tree aborts before anything in it is deleted.
+            removed = live.prune_backups(self.paths, current, keep=1, keep_days=21)
+        self.assertEqual(sorted(removed), sorted(old[1:]))
+        self.assertTrue(old[0].is_dir())
+        self.assertTrue(current.is_dir())
+        self.assertEqual(len(list(huge.iterdir())), 14)
+
+    def test_prune_backups_releases_stages_pinned_only_by_removed_backups(self):
+        pinned = self._staged_fixture(live.LIVE_STAGE_PREFIX + "pinned", 100)
+        self._staged_fixture(live.LIVE_STAGE_PREFIX + "middle", 10)
+        newest = self._staged_fixture(live.LIVE_STAGE_PREFIX + "newest", 1)
+        stale = self._backup_fixture("live-backup-stale", 12, stage=pinned / "output" / "thegn")
+        for age in (1, 2, 3):
+            self._backup_fixture(f"live-backup-{age}d", age)
+        current = live.backup(self.paths, dict(self.record, stage=str(newest)))
+
+        self.assertEqual(live.retain_live_stages(self.paths), 0)
+        self.assertTrue(pinned.exists())
+        self.assertEqual(live.prune_backups(self.paths, current), [stale])
+        self.assertEqual(live.retain_live_stages(self.paths), 1)
+        self.assertFalse(pinned.exists())
+        self.assertTrue(newest.exists())
+        self.assertTrue(current.is_dir())
+
+    def test_scope_argv_falls_back_to_a_direct_launch(self):
+        target = self.target
+        self.assertEqual(live.scope_argv(target, {}, which=lambda *_a, **_k: None,
+                                         run=lambda *_a, **_k: self.fail("probe without systemd-run")), [str(target)])
+        failed = lambda argv, **_k: subprocess.CompletedProcess(argv, 1)
+        self.assertEqual(live.scope_argv(target, {}, which=lambda *_a, **_k: "/usr/bin/systemd-run", run=failed), [str(target)])
+
+        def timeout(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        self.assertEqual(live.scope_argv(target, {}, which=lambda *_a, **_k: "/usr/bin/systemd-run", run=timeout), [str(target)])
+
+        def missing(argv, **_k):
+            raise FileNotFoundError(argv[0])
+
+        self.assertEqual(live.scope_argv(target, {}, which=lambda *_a, **_k: "/usr/bin/systemd-run", run=missing), [str(target)])
+
+    def test_scope_argv_wraps_the_target_when_the_probe_succeeds(self):
+        probes = []
+
+        def run(argv, **kwargs):
+            probes.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0)
+
+        env = {"PATH": "/opt/bin"}
+        argv = live.scope_argv(self.target, env, which=lambda name, path=None: f"{path}/{name}", run=run)
+        self.assertEqual(argv, ["/opt/bin/systemd-run", "--user", "--scope", "--quiet", "--collect",
+                                "-p", "CPUWeight=1000", "-p", "IOWeight=1000", "--", str(self.target)])
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0][0], ["/opt/bin/systemd-run", "--user", "--scope", "--quiet", "true"])
+        self.assertEqual(probes[0][1]["timeout"], 5)
+        self.assertIs(probes[0][1]["env"], env)
 
     def test_default_log_level_is_info_and_debug_is_opt_in(self):
         source = Path(live.__file__).read_text()

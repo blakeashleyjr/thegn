@@ -175,6 +175,18 @@
       "summary": "Launch admission contract for the sandbox + remote programme; authored in W0, implemented by WS02-P5 items."
     },
     {
+      "change": "add-lead-headless-producers",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2208",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Daemon-hosted tracker, PR, mention and PR-queue producers under leases so rules fire with no window; live verification open."
+    },
+    {
       "change": "add-lead-tab",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -239,6 +251,30 @@
         }
       ],
       "summary": "Program storage exists; multi-repository navigation and feature-set workflows remain."
+    },
+    {
+      "change": "add-native-inbox",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2178",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2214",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2215",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-2216",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Daemon-only native inbox (IMAP, Todoist, command), sanitized untrusted items, secret-ref credentials, baseline first poll, inbox_item rules and producers.status; live verification open."
     },
     {
       "change": "add-observability-dashboards",
@@ -388,6 +424,18 @@
         }
       ],
       "summary": "A brokered sandbox operation-policy engine remains unstarted."
+    },
+    {
+      "change": "add-sandboxed-merge-gate",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2200",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Opt-in sealed merge gate (gate_sandbox = sealed) so merge autonomy can land unattended; live verification open."
     },
     {
       "change": "add-scm-workflow-customization",
@@ -893,6 +941,18 @@
       "summary": "Sandbox reporting must never claim more enforcement than is applied; authored in W0, implemented by WS01 items."
     },
     {
+      "change": "fold-autopilot-into-rules",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2196",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "autopilot.run rule action, synthesized autopilot:<repo> rule and budgets counting autopilot and Lead manual spawns; live verification open."
+    },
+    {
       "change": "harden-live-diagnostics-and-forge",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -940,6 +1000,30 @@
         }
       ],
       "summary": "Stage and back up confirmed live upgrades; real controller migration verification remains operator-controlled."
+    },
+    {
+      "change": "harden-remote-sprites-journey",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2234",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Sprites ledger-before-create ownership, proof-before-delete reap, headless keep-awake hold, no background creates; live verification open."
+    },
+    {
+      "change": "harden-remote-teardown-proof",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-97",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Inventory-proven sandbox teardown, fail-closed wt rm, doctor remote readiness and quit confirmation."
     },
     {
       "change": "isolate-maintenance-regression-fixtures",
@@ -1137,6 +1221,18 @@
       ],
       "summary": "Existing parked process sampler, relevant monitor invalidation cache, stable Processes columns and render allocation repair; current-source native/UI and measured-cost evidence recorded with explicit tail and inherited-warning qualifications; native queue receipt supplies final gate/landing status.",
       "archive_path": "openspec/changes/archive/2026-09-30-reduce-process-monitor-idle-work/"
+    },
+    {
+      "change": "remote-daily-loop",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2234",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Sprites adopt, opt-in lifetime reaper, land-local-then-release, pull single-flight, credential custody and conformance slice 2; live verification open."
     },
     {
       "change": "repair-kitty-stream-parser",
@@ -1356,6 +1452,18 @@
       "summary": "Discover without mutation, then snapshot only selected confirmed local worktrees; prove native outcome and no-sweep behavior privately."
     },
     {
+      "change": "self-maintaining-state",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-97",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Idle background measurement lanes and a self-maintaining state database."
+    },
+    {
       "change": "serialize-validate-frp-configuration",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1367,6 +1475,18 @@
       ],
       "summary": "Typed FRP serialization, validation before secret resolution, strict reparse and equality verified by 16 focused FRP tests plus strict all-target lint. Credential transport and filesystem custody remain THE-325/THE-328.",
       "archive_path": "openspec/changes/archive/2026-09-30-serialize-validate-frp-configuration/"
+    },
+    {
+      "change": "sidebar-short-worktree-list",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-139",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Sidebar groups fold to 7 entries with protected rows, batch rows, no repeated title line, a continuous guide and state-toned names; live verification open."
     },
     {
       "change": "stabilize-process-monitor-refresh",

@@ -107,6 +107,8 @@ macro_rules! lead_handlers {
 
 lead_handlers!(
     (overview_get, OverviewGet, overview_get),
+    // b163: producer and inbox state (Read; the Lead may call it).
+    (producers_status, ProducersStatus, producers_status),
     (notifications_list, NotificationsList, notifications_list),
     (notifications_ack, NotificationsAck, notifications_ack),
     (automations_put, AutomationsPut, automations_put),

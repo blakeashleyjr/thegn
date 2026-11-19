@@ -156,8 +156,25 @@ per frame: a `du` and a `tokei` walk are both far too slow to sit on the render
 path. A worktree you have never opened gets both within a second or two of being
 created or switched to, and they refresh on the `[loc]` / `[disk]`
 `scan_interval_secs` cadence after that — plus, for `loc`, whenever you actually
-edit the worktree you are in (`[loc] watch_invalidate_secs`). A chip that is
-absent means "not
+edit the worktree you are in (`[loc] watch_invalidate_secs`). Background
+worktrees are only re-counted when their git state moved (a commit, checkout or
+`git add`, or a new file at the root), and the size of the worktree you are in
+is re-measured at most every two minutes. Between sweeps both scanners do no
+work at all. In steady state, with the default settings:
+
+| lane                           | worktrees | rows examined per round | effective refresh | work per window                                                                      |
+| ------------------------------ | --------- | ----------------------- | ----------------- | ------------------------------------------------------------------------------------ |
+| `loc` (900 s, 2 walks a round) | 50        | 64                      | 900 s             | 1 round, about 300 `stat`s; walks only for changed worktrees plus the one you are in |
+| `loc`                          | 222       | 111                     | 900 s             | 2 rounds, about 1,300 `stat`s per 15 min, then idle                                  |
+| `loc`                          | 1,000     | 500                     | 900 s             | 2 rounds, about 6,000 `stat`s per 15 min, then idle                                  |
+| `disk` (45 s, 4 walks a round) | 50        | 128                     | 45 s              | 1 round per 45 s, about 9 `stat`s/s; `du` only for changed worktrees                 |
+| `disk`                         | 222       | 222                     | 45 s              | 1 round per 45 s, about 40 `stat`s/s                                                 |
+| `disk`                         | 1,000     | 512                     | 90 s              | 2 rounds per 90 s, about 90 `stat`s/s                                                |
+
+`max_scan_per_round` still bounds the walks in a round; how many worktrees a
+round may _look at_ adapts to how many you have, so the scanners always reach
+an idle state. Past about 1,000 worktrees the refresh interval is stretched
+rather than examining more per round. A chip that is absent means "not
 measured" — remote and provider worktrees are deliberately never measured on the
 host (their checkout lives in the env, so the host path would be a stub), and
 neither widget ever prints a placeholder zero. Turn either off with

@@ -926,8 +926,10 @@ check "merge rm accepts the canonical --worktree flag" \
   "'$SZ' merge rm --worktree '$MP' >/dev/null 2>&1"
 check "merge add re-queues the branch after rm" \
   "'$SZ' merge add '$MP' | grep -q 'queued'"
+# A landing command keeps working after it prints its result line. `grep -q` exits at the first match and closes
+# the pipe, which can end the command before it records the land: read all of its output instead.
 check "merge drain lands the clean branch" \
-  "'$SZ' merge drain | grep -q 'landed'"
+  "'$SZ' merge drain | grep 'landed' >/dev/null"
 check "drain advanced the target to include the branch's commit" \
   "git -C '$R' log --oneline | grep -q 'smoke merge change'"
 # organize_folders + on_landed = "expire" are on by default: a clean land KEEPS
@@ -1039,7 +1041,7 @@ git -C "$MP_IGNORED" add -f -A && git -C "$MP_IGNORED" commit -q -m "smoke ignor
 check "merge add queues the ignored-only fixture" \
   "'$SZ' merge add '$MP_IGNORED' | grep -q 'queued'"
 check "merge drain lands the ignored-only fixture" \
-  "'$SZ' merge drain | grep -q 'landed'"
+  "'$SZ' merge drain | grep 'landed' >/dev/null"
 # Ignored-only build state is discarded, and the report says so, so an operator
 # can see which worktrees lost a warm target.
 printf '/.smoke-sweep-ignored\n' >>"$(git -C "$MP_IGNORED" rev-parse --git-path info/exclude)"
@@ -1066,7 +1068,7 @@ printf 'manual land\n' >"$LM/manual-land.txt"
 git -C "$LM" -c commit.gpgsign=false add -A
 git -C "$LM" -c commit.gpgsign=false commit -q -m "smoke manual land"
 check "thegn land records the manual landed row" \
-  "'$SZ' land --worktree '$LM' | grep -q 'landed'"
+  "'$SZ' land --worktree '$LM' | grep 'landed' >/dev/null"
 # shellcheck disable=SC2034 # read by the check body below through eval
 manual_land_roster="$("$SZ" dispatch list --json)"
 check "manual land records exactly one dispatch roster row" \
@@ -1078,7 +1080,7 @@ check "manual land keeps the worktree and branch during its grace period" \
   "[[ -d '$LM' ]] && [[ -n \$(git -C '$R' branch --list '$LB') ]]"
 LM_UPDATED_AT="$(sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" "SELECT updated_at FROM merge_queue WHERE branch='$LB'")"
 check "a second manual land leaves the landed row and grace clock untouched" \
-  "'$SZ' land --worktree '$LM' | grep -q 'already in' && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT updated_at FROM merge_queue WHERE branch='$LB'\") == '$LM_UPDATED_AT' ]]"
+  "'$SZ' land --worktree '$LM' | grep 'already in' >/dev/null && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT updated_at FROM merge_queue WHERE branch='$LB'\") == '$LM_UPDATED_AT' ]]"
 # The case above proves UpToDate does not DISTURB an existing row. This proves
 # UpToDate CREATES a missing one, which is the only thing that can repair a
 # worktree landed before this fix existed — on the machine this issue came from,
@@ -1089,7 +1091,7 @@ sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" "DELETE FROM merge_queue WHERE branch='
 check "the pre-fix state really has no landed row" \
   "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$LB'\") -eq 0 ]]"
 check "a second manual land recreates a missing landed row from UpToDate" \
-  "'$SZ' land --worktree '$LM' | grep -q 'already in' && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || target_branch || '|' || result_oid FROM merge_queue WHERE branch='$LB'\") == 'landed|main|$LM_OID' ]]"
+  "'$SZ' land --worktree '$LM' | grep 'already in' >/dev/null && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || target_branch || '|' || result_oid FROM merge_queue WHERE branch='$LB'\") == 'landed|main|$LM_OID' ]]"
 
 # Landing the repo root itself must never record a row: there is no worktree to
 # expire, and a row would make the sweep consider the canonical checkout.
@@ -2552,6 +2554,24 @@ check "stable honours observe toggles" \
   "env THEGN_CHANNEL=stable '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = true'"
 check "dev honours the same toggles" \
   "env THEGN_CHANNEL=dev '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = true'"
+
+# Closed-pipe regressions: a reader that hangs up mid-drain/land must not
+# strand a claimed row or skip the roster/DB bookkeeping after the ref moved.
+MP2="$("$SZ" wt new smoke-pipe-drain --repo "$R")"
+MB2="$(git -C "$MP2" symbolic-ref --short HEAD)"
+echo p >"$MP2/pipe-drain.txt"
+git -C "$MP2" add -f -A && git -C "$MP2" commit -q -m "smoke pipe drain"
+check "merge drain with a closed stdout pipe still records the landed row" \
+  "'$SZ' merge add '$MP2' >/dev/null && ('$SZ' merge drain | true); [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB2' AND status='landed'\") -eq 1 ]]"
+MP3="$("$SZ" wt new smoke-pipe-land --repo "$R")"
+echo p >"$MP3/pipe-land.txt"
+git -C "$MP3" add -f -A && git -C "$MP3" commit -q -m "smoke pipe land"
+MT3="$(git -C "$MP3" rev-parse HEAD)"
+# Ask git directly, NOT `git log | grep -q`: grep -q exits on its first match,
+# git log then dies of SIGPIPE, and `set -o pipefail` fails the check even when
+# the land advanced the target.
+check "land with a closed stdout pipe still advances the target" \
+  "('$SZ' land --worktree '$MP3' | true); git -C '$R' merge-base --is-ancestor '$MT3' main"
 
 echo
 if [[ $fail -eq 0 ]]; then

@@ -2589,6 +2589,130 @@ pub(crate) fn verify_v113_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v114: producer leases (single headless producer per kind, THE-2208).
+/// Additive: at most one row per producer kind (four), written only by the
+/// daemon's producer owner, so no vacuum entry.
+pub(crate) fn migrate_v114(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS producer_leases (
+           producer TEXT PRIMARY KEY
+             CHECK (producer IN ('tracker','pr_poll','mentions','pr_queue')),
+           holder TEXT NOT NULL,
+           holder_pid INTEGER NOT NULL,
+           acquired_at_ms INTEGER NOT NULL,
+           expires_at_ms INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v114_schema(conn: &Connection) -> Result<()> {
+    conn.prepare(
+        "SELECT producer, holder, holder_pid, acquired_at_ms, expires_at_ms \
+         FROM producer_leases LIMIT 0",
+    )
+    .map_err(|e| anyhow::anyhow!("schema v114 incomplete: producer_leases unusable ({e})"))?;
+    Ok(())
+}
+
+/// The stored `CREATE TABLE` text of `table`, or `None` when it is absent.
+fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// v116: producer kinds beyond the four (the CHECK list dropped; ProducerKind::parse gates rows) and inbox account state (THE-2214).
+/// One transaction. The `producer_leases` rebuild runs only while its CHECK
+/// still pins the original four kinds (`'pr_queue'` in the stored SQL), so a
+/// second run is a no-op. No vacuum entry: the producer owner prunes
+/// `inbox_account_state` rows for accounts no longer configured.
+pub(crate) fn migrate_v116(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let pinned = table_sql(&tx, "producer_leases")?.is_some_and(|sql| sql.contains("'pr_queue'"));
+    if pinned {
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS producer_leases_v116;
+             CREATE TABLE producer_leases_v116 (
+               producer TEXT PRIMARY KEY CHECK (length(producer) BETWEEN 1 AND 32),
+               holder TEXT NOT NULL,
+               holder_pid INTEGER NOT NULL,
+               acquired_at_ms INTEGER NOT NULL,
+               expires_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO producer_leases_v116
+               (producer, holder, holder_pid, acquired_at_ms, expires_at_ms)
+             SELECT producer, holder, holder_pid, acquired_at_ms, expires_at_ms
+             FROM producer_leases;
+             DROP TABLE producer_leases;
+             ALTER TABLE producer_leases_v116 RENAME TO producer_leases;",
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS inbox_account_state (
+           account TEXT PRIMARY KEY,
+           kind TEXT NOT NULL,
+           config_digest TEXT NOT NULL DEFAULT '',
+           cursor TEXT NOT NULL DEFAULT '',
+           seen_json TEXT NOT NULL DEFAULT '[]',
+           baselined INTEGER NOT NULL DEFAULT 0,
+           last_poll_ms INTEGER NOT NULL DEFAULT 0,
+           last_ok_ms INTEGER NOT NULL DEFAULT 0,
+           last_error TEXT NOT NULL DEFAULT '',
+           item_count INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The read-only half of [`verify_v116_schema`]: both tables are usable and
+/// the stored `producer_leases` SQL no longer pins the four kinds. The fast
+/// open path runs only this, so a plain open still takes no write lock.
+pub(crate) fn verify_v116_shape(conn: &Connection) -> Result<()> {
+    conn.prepare(
+        "SELECT producer, holder, holder_pid, acquired_at_ms, expires_at_ms \
+         FROM producer_leases LIMIT 0",
+    )
+    .map_err(|e| anyhow::anyhow!("schema v116 incomplete: producer_leases unusable ({e})"))?;
+    conn.prepare(
+        "SELECT account, kind, config_digest, cursor, seen_json, baselined, \
+         last_poll_ms, last_ok_ms, last_error, item_count \
+         FROM inbox_account_state LIMIT 0",
+    )
+    .map_err(|e| anyhow::anyhow!("schema v116 incomplete: inbox_account_state unusable ({e})"))?;
+    if table_sql(conn, "producer_leases")?.is_some_and(|sql| sql.contains("'pr_queue'")) {
+        bail!(
+            "schema v116 incomplete: producer_leases still pins the four producer kinds and refuses an inbox lease"
+        );
+    }
+    Ok(())
+}
+
+/// Verify v116: both tables are usable, and an `inbox` lease row is
+/// insertable (probed inside a SAVEPOINT that is always rolled back). Run on
+/// the migration path, which already holds write intent.
+pub(crate) fn verify_v116_schema(conn: &Connection) -> Result<()> {
+    verify_v116_shape(conn)?;
+    conn.execute_batch("SAVEPOINT verify_v116")?;
+    let probe = conn.execute(
+        "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+         VALUES ('inbox', 'verify_v116', 0, 0, 0) \
+         ON CONFLICT(producer) DO NOTHING",
+        [],
+    );
+    conn.execute_batch("ROLLBACK TO verify_v116; RELEASE verify_v116")?;
+    probe.map_err(|e| {
+        anyhow::anyhow!("schema v116 incomplete: producer_leases refuses an inbox lease ({e})")
+    })?;
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4824,7 +4948,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 113);
+        assert_eq!(version, 116);
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, issue_id TEXT);
@@ -4925,6 +5049,186 @@ mod tests {
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
         super::verify_v113_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v114_adds_producer_leases_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v114_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v114_schema(&conn).is_err());
+        super::migrate_v114(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+             VALUES ('tracker','daemon',1,1,2)",
+            [],
+        )
+        .unwrap();
+        super::migrate_v114(&conn).unwrap();
+        super::verify_v114_schema(&conn).unwrap();
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM producer_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "re-running v114 keeps existing leases");
+        let bad = conn.execute(
+            "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+             VALUES ('bogus','daemon',1,1,2)",
+            [],
+        );
+        assert!(bad.is_err(), "producer is CHECK-constrained");
+    }
+
+    const V114_LEASES: &str = "DROP TABLE producer_leases;
+         CREATE TABLE producer_leases (
+           producer TEXT PRIMARY KEY
+             CHECK (producer IN ('tracker','pr_poll','mentions','pr_queue')),
+           holder TEXT NOT NULL,
+           holder_pid INTEGER NOT NULL,
+           acquired_at_ms INTEGER NOT NULL,
+           expires_at_ms INTEGER NOT NULL
+         );";
+
+    #[test]
+    fn v116_fresh_database_takes_inbox_leases_and_state() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v116_shape(fresh.conn()).unwrap();
+        super::verify_v116_schema(fresh.conn()).unwrap();
+        fresh
+            .conn()
+            .execute(
+                "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+                 VALUES ('inbox','daemon',1,1,2)",
+                [],
+            )
+            .unwrap();
+        let too_long = fresh.conn().execute(
+            "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+             VALUES (?1,'daemon',1,1,2)",
+            params!["x".repeat(33)],
+        );
+        assert!(too_long.is_err(), "producer length stays bounded");
+        let empty = fresh.conn().execute(
+            "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+             VALUES ('','daemon',1,1,2)",
+            [],
+        );
+        assert!(empty.is_err(), "an empty producer name is refused");
+    }
+
+    #[test]
+    fn v116_verify_refuses_a_v114_lease_table_and_leaves_no_probe_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::migrate_v114(&conn).unwrap();
+        assert!(
+            super::verify_v116_schema(&conn).is_err(),
+            "no inbox_account_state yet"
+        );
+        conn.execute_batch(
+            "CREATE TABLE inbox_account_state (account TEXT PRIMARY KEY, kind TEXT NOT NULL,
+               config_digest TEXT NOT NULL DEFAULT '', cursor TEXT NOT NULL DEFAULT '',
+               seen_json TEXT NOT NULL DEFAULT '[]', baselined INTEGER NOT NULL DEFAULT 0,
+               last_poll_ms INTEGER NOT NULL DEFAULT 0, last_ok_ms INTEGER NOT NULL DEFAULT 0,
+               last_error TEXT NOT NULL DEFAULT '', item_count INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+        let err = super::verify_v116_schema(&conn).unwrap_err().to_string();
+        assert!(err.contains("inbox lease"), "{err}");
+        super::migrate_v116(&conn).unwrap();
+        super::verify_v116_schema(&conn).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM producer_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the verify probe is rolled back");
+    }
+
+    #[test]
+    fn v116_upgrades_a_v114_database_keeping_live_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v114.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(&format!(
+                    "{V114_LEASES}
+                     DROP TABLE inbox_account_state;
+                     INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms)
+                       VALUES ('tracker','daemon',42,10,9999999999999);
+                     PRAGMA user_version=114;"
+                ))
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let conn = upgraded.conn();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v116_schema(conn).unwrap();
+        let (holder, pid, expires): (String, i64, i64) = conn
+            .query_row(
+                "SELECT holder, holder_pid, expires_at_ms FROM producer_leases WHERE producer='tracker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (holder.as_str(), pid, expires),
+            ("daemon", 42, 9_999_999_999_999)
+        );
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='producer_leases'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("'pr_queue'"), "the kind list is gone: {sql}");
+        conn.execute(
+            "INSERT INTO producer_leases (producer, holder, holder_pid, acquired_at_ms, expires_at_ms) \
+             VALUES ('inbox','daemon',42,10,20)",
+            [],
+        )
+        .unwrap();
+        // A second run is a no-op: rows and state survive.
+        conn.execute(
+            "INSERT INTO inbox_account_state (account, kind) VALUES ('work','command')",
+            [],
+        )
+        .unwrap();
+        super::migrate_v116(conn).unwrap();
+        super::verify_v116_schema(conn).unwrap();
+        let leases: i64 = conn
+            .query_row("SELECT COUNT(*) FROM producer_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(leases, 2);
+        let states: i64 = conn
+            .query_row("SELECT COUNT(*) FROM inbox_account_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(states, 1);
+    }
+
+    #[test]
+    fn v114_upgrades_a_real_v113_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v113.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE producer_leases;
+                     PRAGMA user_version=113;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v114_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

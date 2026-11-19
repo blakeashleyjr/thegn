@@ -200,6 +200,11 @@ fn template_for(kind: NotificationKind) -> BuiltinTemplate {
             title: "Automation failed",
             prefix: "Automation failed",
         },
+        // The message already carries `[<account>] <title>`.
+        NotificationKind::InboxItem => BuiltinTemplate {
+            title: "Inbox",
+            prefix: "Inbox",
+        },
     }
 }
 

@@ -402,6 +402,8 @@ struct PlumbingAdapter {
     regenerate_paths: Vec<String>,
     /// Empty disables lockfile regeneration (regenerable conflicts just defer).
     regenerate_command: String,
+    /// Where `regenerate_command` runs (`[merge_queue] gate_sandbox`, THE-2200).
+    gate_sandbox: thegn_core::config::GateSandbox,
     /// Sign fold/land commits (`[merge_queue] sign_commits`).
     sign: bool,
     /// Enable git rerere in the driver-merge worktree (`[merge_queue] rerere`).
@@ -582,6 +584,7 @@ impl PlumbingAdapter {
                 &self.regenerate_command,
                 DRIVER_SUBPROCESS_TIMEOUT,
                 &self.refused.overrides(),
+                self.gate_sandbox,
             )
         {
             return MergeOutcome::Clean { tree };
@@ -919,6 +922,10 @@ fn warn_driver_merge_failure(reason: &str, diagnostics: &str) {
 // off-loop: the fold runs from the CLI (`thegn integrate`) or from
 // spawn_fold's spawn_blocking (see the module doc) — never on the loop.
 #[expect(clippy::disallowed_methods)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal fold seam: each argument is a distinct fold input the two callers and tests pass positionally"
+)]
 fn regenerate_merge(
     repo_root: &Path,
     ours: &str,
@@ -927,6 +934,7 @@ fn regenerate_merge(
     regenerate_command: &str,
     timeout: Duration,
     overrides: &[String],
+    gate_sandbox: thegn_core::config::GateSandbox,
 ) -> Option<String> {
     thegn_core::git_operand::revision(ours).ok()?;
     thegn_core::git_operand::revision(theirs).ok()?;
@@ -1020,10 +1028,47 @@ fn regenerate_merge(
         // Rebuild the regenerate artifacts from the merged manifests.
         scratch.verify().ok()?;
         use std::process::Stdio;
-        let mut command = std::process::Command::new("sh");
+        // A sealed gate runs the repo-influenced regeneration in the sandbox
+        // too; a resolve or entry error defers the branch, never a host run.
+        let (mut command, _env_file) =
+            match crate::gate_sandbox::resolve_mode(repo_root, gate_sandbox) {
+                Ok(crate::gate_sandbox::GateExec::Host) => {
+                    let mut command = std::process::Command::new("sh");
+                    command.arg("-c").arg(regenerate_command);
+                    (command, None)
+                }
+                Ok(crate::gate_sandbox::GateExec::Sealed(spec)) => {
+                    let common = git_fence::out(
+                        repo_root,
+                        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    )?;
+                    let env = [("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned())];
+                    match crate::gate_sandbox::sealed_argv(
+                        &spec,
+                        &tmp,
+                        None,
+                        Path::new(common.trim()),
+                        regenerate_command,
+                        &env,
+                    ) {
+                        Ok((argv, env_file)) => {
+                            let mut command = std::process::Command::new(&argv[0]);
+                            command.args(&argv[1..]);
+                            crate::gate_sandbox::scrub_sealed_env(&mut command, &spec.env);
+                            (command, env_file)
+                        }
+                        Err(reason) => {
+                            warn_driver_merge_failure(&reason, "");
+                            return None;
+                        }
+                    }
+                }
+                Err(reason) => {
+                    warn_driver_merge_failure(&reason, "");
+                    return None;
+                }
+            };
         command
-            .arg("-c")
-            .arg(regenerate_command)
             .current_dir(&tmp)
             .stdin(Stdio::null())
             .env("GIT_TERMINAL_PROMPT", "0");
@@ -2368,6 +2413,7 @@ fn run_fold_admitted(
         repo_root: repo_root.to_path_buf(),
         regenerate_paths: cfg.regenerate_paths.clone(),
         regenerate_command: cfg.regenerate_command.clone(),
+        gate_sandbox: cfg.gate_sandbox,
         sign: cfg.sign_commits,
         rerere: cfg.rerere,
         refused,
@@ -3014,6 +3060,7 @@ fn attempt_land_admitted(
         repo_root: repo_root.to_path_buf(),
         regenerate_paths: cfg.regenerate_paths.clone(),
         regenerate_command: cfg.regenerate_command.clone(),
+        gate_sandbox: cfg.gate_sandbox,
         sign: cfg.sign_commits,
         rerere: cfg.rerere,
         refused,
@@ -5677,6 +5724,7 @@ mod tests {
             repo_root: repo.dir.clone(),
             regenerate_paths: Vec::new(),
             regenerate_command: String::new(),
+            gate_sandbox: Default::default(),
             sign: true,
             rerere: false,
             refused: RefusedDrivers::default(),
@@ -5727,6 +5775,7 @@ mod tests {
             repo_root: repo.dir.clone(),
             regenerate_paths: Vec::new(),
             regenerate_command: String::new(),
+            gate_sandbox: Default::default(),
             sign: false,
             rerere: false,
             refused: RefusedDrivers::default(),
@@ -5778,6 +5827,7 @@ mod tests {
             repo_root: repo.dir.clone(),
             regenerate_paths: Vec::new(),
             regenerate_command: String::new(),
+            gate_sandbox: Default::default(),
             sign: false,
             rerere: false,
             refused: RefusedDrivers::default(),
@@ -5831,6 +5881,7 @@ mod tests {
             repo_root: repo.dir.clone(),
             regenerate_paths: Vec::new(),
             regenerate_command: String::new(),
+            gate_sandbox: Default::default(),
             sign: false,
             rerere: false,
             refused: RefusedDrivers::default(),
@@ -6096,6 +6147,7 @@ mod tests {
             "true",
             DRIVER_SUBPROCESS_TIMEOUT,
             &[],
+            Default::default(),
         );
         assert!(
             tree.is_none(),
@@ -6125,6 +6177,7 @@ mod tests {
             "sleep 30",
             Duration::from_secs(1),
             &[],
+            Default::default(),
         );
         assert!(tree.is_none());
         assert!(started.elapsed() < Duration::from_secs(10));

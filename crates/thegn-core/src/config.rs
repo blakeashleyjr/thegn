@@ -2,7 +2,8 @@
 //!
 //! Precedence, lowest to highest:
 //!   1. built-in defaults (`Config::default`)
-//!   2. `$XDG_CONFIG_HOME/thegn/config.toml` (or `--config <path>`)
+//!   2. `$XDG_CONFIG_HOME/thegn/config.toml` (the directory moves with an
+//!      absolute `THEGN_CONFIG_DIR`; the file with `--config <path>`)
 //!   3. `THEGN_<SECTION>_<KEY>` environment overrides (see [`env_overlay`])
 //!   4. CLI flags (a [`ConfigOverlay`] built by `main`)
 //!
@@ -352,6 +353,7 @@ config_enum! {
 pub use crate::config_placement::FailoverMode;
 // The remote/data-placement enums + `MergeRemoteMode` live in `config_remote`
 // (re-exported), keeping `config.rs` under the god-file ratchet.
+pub use crate::config_gate::{GateSandbox, effective_gate_sandbox};
 pub use crate::config_git::SubmoduleMode;
 use crate::config_placement::{de_failover, de_failover_opt};
 pub(crate) use crate::config_remote::data_mode_from_remote;
@@ -873,6 +875,11 @@ pub struct MergeQueueConfig {
     pub gate_timeout_secs: u64,
     /// Whether to run `gate_command` at all.
     pub gate_on: bool,
+    /// Where the gate's commands run: `"off"` (default) on the host, or
+    /// `"sealed"` inside the repo's sealed sandbox (network `none`, no
+    /// credentials). Honoured only from global or trusted config; the
+    /// `[workspace.<slug>.merge_queue]` layer may only raise it (THE-2200).
+    pub gate_sandbox: GateSandbox,
     /// Reuse a stable per-repo gate worktree + `target/` between folds (warm rebuild); `false` ⇒ throwaway `/tmp` (always cold).
     pub gate_reuse_worktree: bool,
     /// `CARGO_TARGET_DIR` for the gate. Empty ⇒ `$XDG_STATE_HOME/thegn/gate/<repo>/target`.
@@ -1078,6 +1085,7 @@ impl Default for MergeQueueConfig {
             gate_setup_timeout_secs: 1800,
             gate_timeout_secs: 3600,
             gate_on: true,
+            gate_sandbox: GateSandbox::Off,
             gate_reuse_worktree: true,
             gate_target_dir: String::new(),
             bisect_on_red: true,
@@ -1196,6 +1204,9 @@ pub struct MergeQueueOverlay {
     pub gate_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_on: Option<bool>,
+    /// May only raise `off` to `sealed` (see [`effective_gate_sandbox`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_sandbox: Option<GateSandbox>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_reuse_worktree: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1303,6 +1314,7 @@ impl MergeQueueOverlay {
             && self.gate_setup_timeout_secs.is_none()
             && self.gate_timeout_secs.is_none()
             && self.gate_on.is_none()
+            && self.gate_sandbox.is_none()
             && self.gate_reuse_worktree.is_none()
             && self.gate_target_dir.is_none()
             && self.bisect_on_red.is_none()
@@ -1350,6 +1362,7 @@ impl MergeQueueOverlay {
             gate_setup_timeout_secs,
             gate_timeout_secs,
             gate_on,
+            gate_sandbox,
             gate_reuse_worktree,
             gate_target_dir,
             bisect_on_red,
@@ -1408,6 +1421,8 @@ impl MergeQueueOverlay {
         if let Some(v) = gate_on {
             base.gate_on = v;
         }
+        // Raise-only: a per-repo layer never lowers a sealed gate.
+        base.gate_sandbox = effective_gate_sandbox(base.gate_sandbox, gate_sandbox);
         if let Some(v) = gate_reuse_worktree {
             base.gate_reuse_worktree = v;
         }
@@ -3634,6 +3649,8 @@ pub use crate::config_calendar::{
 // and the popup's weather block), and lives in its own module for the same
 // reason `[calendar]` does.
 pub use crate::config_weather::{WeatherConfig, WeatherProviderKind, WeatherUnits};
+// `[inbox]` (THE-2214): global-only, in no overlay; its own module.
+pub use crate::config_inbox::{InboxAccount, InboxConfig, InboxKind};
 
 /// `[apps]` — top-level sub-app tab ordering and startup focus.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -5424,6 +5441,9 @@ pub struct Config {
     /// `[weather]` — the reading beside the clock and in the popup. Off by
     /// default; enabling it is the consent step for any network activity.
     pub weather: WeatherConfig,
+    /// `[inbox]` — the native inbox (mail, Todoist, any command). Off by
+    /// default; global config only (in no overlay); polled by the daemon.
+    pub inbox: InboxConfig,
     pub pr: PrConfig,
     pub issues: IssuesConfig,
     /// `[ci]` — cross-provider CI/CD inspection (AV group).
@@ -5678,6 +5698,7 @@ impl Default for Config {
             bars: BarsConfig::default(),
             calendar: CalendarConfig::default(),
             weather: WeatherConfig::default(),
+            inbox: InboxConfig::default(),
             pr: PrConfig::default(),
             issues: IssuesConfig::default(),
             ci: CiConfig::default(),
@@ -6483,7 +6504,7 @@ fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
 impl Config {
     /// The default config path (overridable with `--config`).
     pub fn path() -> PathBuf {
-        util::xdg_config_home().join("thegn/config.toml")
+        util::thegn_config_dir().join("config.toml")
     }
 
     /// Check the trusted files used by the tolerant display projection without
@@ -6616,13 +6637,13 @@ impl Config {
 
     /// The active named profile's config-overlay file
     /// (`<real XDG_CONFIG_HOME>/thegn/profiles/<name>/config.toml`), or `None`
-    /// for the default profile. Uses `xdg_config_home()` directly (the shared
-    /// config home is never rerooted).
+    /// for the default profile. Uses `thegn_config_dir()` (the shared config
+    /// home is never rerooted; `THEGN_CONFIG_DIR` moves the whole directory,
+    /// profiles included, for a second instance).
     pub(crate) fn profile_overlay_path(env: &dyn EnvSource) -> Option<PathBuf> {
         let name = crate::profile::normalize_name(&env.get("THEGN_PROFILE").unwrap_or_default());
         (name != "default").then(|| {
-            util::xdg_config_home()
-                .join("thegn")
+            util::thegn_config_dir()
                 .join("profiles")
                 .join(name)
                 .join("config.toml")

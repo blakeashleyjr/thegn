@@ -533,6 +533,15 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
         "One-call cross-workspace overview: worktrees, agents, queues, attention",
     ),
+    // b163 (THE-2214): producer arming, leases and per-account inbox state.
+    // Read; Lead-confined callers are allowed. gRPC and plugin are not
+    // claimed.
+    cap(
+        "producers.status",
+        Verb::ProducersStatus,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Headless producer arming, leases, and per-account inbox state",
+    ),
     // --- agents --------------------------------------------------------------
     cap(
         "agent.sessions",

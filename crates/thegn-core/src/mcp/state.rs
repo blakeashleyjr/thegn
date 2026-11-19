@@ -1082,6 +1082,12 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
             },
         ],
     },
+    // b163 (THE-2214): no arguments, like a bare `overview.get`.
+    StateToolSpec {
+        cap: "producers.status",
+        description: "The daemon's headless producers: which kinds are armed, who holds each lease, and each inbox account's last poll, error (scrubbed) and item count. Read-scoped; requires a running daemon.",
+        args: &[],
+    },
     StateToolSpec {
         cap: "notifications.list",
         description: "List notifications, newest first, filtered by kind, unread state, age and worktree. Read-scoped; requires a running daemon.",
@@ -1318,6 +1324,7 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     // Lead tool surface (THE-2172). `approvals.resolve` is Admin and never an
     // MCP tool.
     "overview.get",
+    "producers.status", // b163: producer and inbox state (read).
     "notifications.list",
     "notifications.ack",
     "automations.put",
@@ -2678,6 +2685,7 @@ mod tests {
             "notifications.list",
             "automations.runs",
             "approvals.list",
+            "producers.status",
         ];
         let write = [
             "editor.open",
@@ -3007,6 +3015,7 @@ mod tests {
             ("approvals_list", true, false),
             ("approvals_request", false, false),
             ("merge_drain", false, true),
+            ("producers_status", true, false),
         ] {
             let e = entry(name);
             assert_eq!(e["annotations"]["readOnlyHint"], json!(read_only), "{name}");
@@ -3038,6 +3047,11 @@ mod tests {
             json!(["worktree"])
         );
         assert_eq!(entry("overview_get")["inputSchema"]["required"], json!([]));
+        // No declared args: the schema is the bare object form (no `required`).
+        assert_eq!(
+            entry("producers_status")["inputSchema"],
+            json!({ "type": "object", "properties": {} })
+        );
         // A missing required arg never reaches the fetch closure.
         let refused = r.call("merge_drain", &json!({})).unwrap().unwrap_err();
         assert_eq!(refused.0, -32602);

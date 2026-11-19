@@ -391,6 +391,7 @@ self: {
     theme.mascot = cfg.themeMascot;
     theme.mascot_motion = cfg.themeMascotMotion;
     ui.confirm_delete_project = cfg.uiConfirmDeleteProject;
+    ui.confirm_quit = cfg.uiConfirmQuit;
     ui.full_mode_chip = cfg.uiFullModeChip;
     ui.dismiss_overlay_on_click_outside = cfg.uiDismissOverlayOnClickOutside;
     ui.sidebar_freeze_sort = cfg.uiSidebarFreezeSort;
@@ -425,6 +426,7 @@ self: {
     ui.sidebar_other_group_collapsed = cfg.uiSidebarOtherGroupCollapsed;
     ui.sidebar_group_row_limit = cfg.uiSidebarGroupRowLimit;
     ui.sidebar_group_row_limits = cfg.uiSidebarGroupRowLimits;
+    ui.sidebar_batch_group_min = cfg.uiSidebarBatchGroupMin;
     search.max_results = cfg.searchMaxResults;
     search.respect_gitignore = cfg.searchRespectGitignore;
     search.include_hidden = cfg.searchIncludeHidden;
@@ -849,6 +851,12 @@ in {
       description = "Ask before destructive project worktree actions. Unset (null) = the binary's default.";
     };
 
+    uiConfirmQuit = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Ask before Ctrl+Q / quit closes thegn (panes in the daemon keep running). Unset (null) = the binary's default (true).";
+    };
+
     uiFullModeChip = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
@@ -1055,6 +1063,12 @@ in {
       description = "Per-group overrides of the sidebar group row limit, keyed by the folder or group label; 0 means no limit. Unset (null) = the binary's default.";
     };
 
+    uiSidebarBatchGroupMin = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Loose worktrees sharing a batch token fold into one sidebar row once this many share it; 0 = off. Unset (null) = the binary's default.";
+    };
+
     searchMaxResults = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.unsigned);
       default = null;
@@ -1161,13 +1175,13 @@ in {
     locScanIntervalSecs = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 0 2678400);
       default = null;
-      description = "Per-worktree re-count TTL in seconds; 0 counts every pump. Unset (null) = the binary's default.";
+      description = "Re-count TTL in seconds for the active worktree and the scan pump cadence; background worktrees are re-counted only when their git state moved. 0 counts every pump. Unset (null) = the binary's default.";
     };
 
     locMaxScanPerRound = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.u32);
       default = null;
-      description = "Worktrees counted per background round; 0 = unlimited. Unset (null) = the binary's default.";
+      description = "Worktrees walked (tokei) per background round, not rows examined; 0 = unlimited. Unset (null) = the binary's default.";
     };
 
     locWatchInvalidateSecs = lib.mkOption {
@@ -1906,13 +1920,13 @@ in {
     diskScanIntervalSecs = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 0 2678400);
       default = null;
-      description = "Seconds between background disk scans. Unset (null) = the binary's default.";
+      description = "Per-worktree size TTL in seconds and the scan pump cadence; the active worktree is measured at most every 120 s. Unset (null) = the binary's default.";
     };
 
     diskMaxScanPerRound = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.u32);
       default = null;
-      description = "Maximum worktrees measured per scan round. Unset (null) = the binary's default.";
+      description = "Maximum worktrees measured (`du` walks) per scan round, not rows examined. Unset (null) = the binary's default.";
     };
 
     diskAutoCleanOnMerge = lib.mkOption {

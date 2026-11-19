@@ -176,6 +176,7 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("ui.sidebar_*", Live, H::Sidebar),
     ("ui.fullscreen_*", Live, H::Layout),
     ("ui.confirm_delete_project", NextUse, H::None),
+    ("ui.confirm_quit", NextUse, H::None),
     ("ui.dismiss_overlay_on_click_outside", NextUse, H::None),
     // --- sub-tables ---
     ("git.*", NextUse, H::None),
@@ -208,6 +209,8 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("bars.date_format", Live, H::Schedule),
     ("calendar.*", Live, H::Calendar),
     ("weather.*", Live, H::Weather),
+    // The daemon arms the inbox producer at install (THE-2214).
+    ("inbox.*", Restart, H::None),
     ("pr.*", NextUse, H::None),
     ("issues.*", NextUse, H::None),
     ("ci.*", NextUse, H::None),
@@ -573,6 +576,16 @@ mod tests {
         assert_eq!(class_for("base_branch"), Some((NextUse, H::None)));
         assert_eq!(class_for("weather.location"), Some((Live, H::Weather)));
         assert_eq!(class_for("daemon.enabled"), Some((Restart, H::None)));
+        // The daemon arms its producers at start; rule edits re-arm live.
+        assert_eq!(
+            class_for("daemon.headless_producers"),
+            Some((Restart, H::None))
+        );
+        // Same class as `merge_queue.gate_on`: read at the next gate.
+        assert_eq!(
+            class_for("merge_queue.gate_sandbox"),
+            class_for("merge_queue.gate_on")
+        );
         assert_eq!(class_for("nonsense_root_key"), None);
         assert_eq!(class_for(""), None);
     }

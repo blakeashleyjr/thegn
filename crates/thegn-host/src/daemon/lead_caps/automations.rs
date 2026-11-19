@@ -48,9 +48,26 @@ fn runtime_state(svc: &DaemonService) -> (bool, bool) {
     (effective.enabled, armed)
 }
 
+/// The refusal for a synthesized `autopilot:` rule (THE-2196): it is
+/// read-only and only `[autopilot]` in the trusted config changes it.
+pub(crate) const AUTOPILOT_EDIT_REFUSAL: &str = "edit [autopilot] in config";
+
+/// `InvalidArgument` when `name` is a synthesized autopilot rule id.
+fn refuse_autopilot_id(name: &str) -> ControlResult<()> {
+    if name
+        .trim()
+        .starts_with(crate::autopilot_driver::AUTOPILOT_RULE_PREFIX)
+    {
+        return Err(ControlError::InvalidArgument(AUTOPILOT_EDIT_REFUSAL.into()));
+    }
+    Ok(())
+}
+
 /// `Conflict` when `name` is a config rule; otherwise its `lead:` id.
+/// A synthesized `autopilot:` id answers `InvalidArgument`.
 fn lead_target(svc: &DaemonService, name: &str) -> ControlResult<String> {
     let name = name.trim();
+    refuse_autopilot_id(name)?;
     if config_names(svc).iter().any(|config| config == name) {
         return Err(ControlError::Conflict("config rules are read-only".into()));
     }
@@ -60,6 +77,19 @@ fn lead_target(svc: &DaemonService, name: &str) -> ControlResult<String> {
 /// Answer `automations.put`: decode `{rule}`, validate, store.
 pub(crate) async fn put(svc: &DaemonService, req: serde_json::Value) -> JsonResult {
     let LeadRulePut { rule } = decode(req)?;
+    if let Some(name) = rule.get("name").and_then(serde_json::Value::as_str) {
+        refuse_autopilot_id(name)?;
+        let slug = name.trim();
+        if slug
+            .strip_prefix(authoring::LEAD_RULE_PREFIX)
+            .unwrap_or(slug)
+            == "manual"
+        {
+            return Err(ControlError::InvalidArgument(
+                "the rule name manual is reserved for the Lead's manual opens".into(),
+            ));
+        }
+    }
     let rule = authoring::decode_lead_rule(rule)
         .map_err(|errors| ControlError::InvalidArgument(errors.join("\n")))?;
     let compiled = authoring::validate_lead_rule(&rule, &config_names(svc))
@@ -104,6 +134,7 @@ pub(crate) async fn put(svc: &DaemonService, req: serde_json::Value) -> JsonResu
         outcome.map_err(|limit| ControlError::ResourceExhausted(limit.to_string()))?;
     // A stored rule may add or change a schedule (THE-2193).
     crate::automation_schedule::rearm();
+    crate::daemon::producers::rearm();
     let (automations_enabled, armed) = runtime_state(svc);
     let awaiting = arming.is_some() && !already_armed;
     let inert_reason = if awaiting {
@@ -178,6 +209,7 @@ pub(crate) async fn rm(svc: &DaemonService, req: serde_json::Value) -> JsonResul
         return Err(ControlError::NotFound(format!("automation rule {name}")));
     }
     crate::automation_schedule::rearm();
+    crate::daemon::producers::rearm();
     encode(&LeadRuleRmReply { id, removed })
 }
 
@@ -194,6 +226,7 @@ pub(crate) async fn enable(svc: &DaemonService, req: serde_json::Value) -> JsonR
         return Err(ControlError::NotFound(format!("automation rule {name}")));
     }
     crate::automation_schedule::rearm();
+    crate::daemon::producers::rearm();
     encode(&LeadRuleEnableReply { id, enabled })
 }
 
@@ -262,6 +295,53 @@ pub(crate) async fn list_lead_rules(svc: &DaemonService) -> ControlResult<Vec<Au
             .collect())
     })
     .await
+}
+
+/// One read-only row per registered repo with `[autopilot] enabled`
+/// (THE-2196), appended by `automations.list` so the Lead sees autopilot as
+/// a rule: `autopilot:<repo>` on `issue_matched` running `autopilot.run`.
+/// `rm` / `put` / `enable` refuse the id ([`AUTOPILOT_EDIT_REFUSAL`]).
+pub(crate) async fn list_autopilot_rules(
+    svc: &DaemonService,
+) -> ControlResult<Vec<AutomationRuleInfo>> {
+    let cfg = std::sync::Arc::clone(&svc.config);
+    svc.with_db(move |db| {
+        use thegn_core::store::WorkspaceStore;
+        let mut seen = BTreeSet::new();
+        let mut rows = Vec::new();
+        for workspace in db.workspaces()?.into_iter().filter(|w| w.kind == "repo") {
+            let root = std::path::Path::new(&workspace.repo_path);
+            if !cfg.repo_autopilot(root).enabled {
+                continue;
+            }
+            let id = crate::autopilot_driver::autopilot_rule_id(root);
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let recent_outcome = db
+                .automation_runs(Some(&id), 1)
+                .ok()
+                .and_then(|runs| runs.into_iter().next())
+                .map(|run| run.outcome);
+            rows.push(autopilot_rule_info(id, recent_outcome));
+        }
+        Ok(rows)
+    })
+    .await
+}
+
+/// The synthesized row for one autopilot-enabled repo.
+fn autopilot_rule_info(id: String, recent_outcome: Option<String>) -> AutomationRuleInfo {
+    AutomationRuleInfo {
+        name: id,
+        enabled: true,
+        // Not `lead` and not a config layer: the row is read-only.
+        trusted_layer: "autopilot".into(),
+        event: "issue_matched".into(),
+        action: "autopilot.run".into(),
+        inert_reason: None,
+        recent_outcome,
+    }
 }
 
 /// A Lead-authored rule by name (`ping` or `lead:ping`), the `automations.test`
@@ -443,6 +523,62 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn synthesized_autopilot_rules_are_read_only() {
+        let (svc, _profile) = service(true);
+        let info = autopilot_rule_info("autopilot:app".into(), None);
+        assert_eq!(info.name, "autopilot:app");
+        assert_eq!(info.trusted_layer, "autopilot");
+        assert_eq!(info.event, "issue_matched");
+        assert_eq!(info.action, "autopilot.run");
+        assert!(info.enabled);
+        for result in [
+            rm(&svc, json!({"name": "autopilot:app"})).await,
+            enable(&svc, json!({"name": "autopilot:app", "enabled": false})).await,
+            put(
+                &svc,
+                json!({"rule": {
+                    "name": "autopilot:app",
+                    "when": "issue_matched",
+                    "then": {"cap": "notify.push", "params": {"body": "x"}}
+                }}),
+            )
+            .await,
+        ] {
+            match result {
+                Err(ControlError::InvalidArgument(message)) => {
+                    assert_eq!(message, AUTOPILOT_EDIT_REFUSAL)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // A Lead cannot author the rule-only action either.
+        let mut req = ping("autopilot.run");
+        req["rule"]["when"] = json!("issue_matched");
+        assert!(matches!(
+            put(&svc, req).await,
+            Err(ControlError::InvalidArgument(_))
+        ));
+        // `manual` is reserved for the Lead's own manual-open audit id.
+        for name in ["manual", "lead:manual"] {
+            assert!(matches!(
+                put(
+                    &svc,
+                    json!({"rule": {
+                        "name": name,
+                        "when": "agent_finished",
+                        "then": {"cap": "notify.push", "params": {"body": "x"}}
+                    }}),
+                )
+                .await,
+                Err(ControlError::InvalidArgument(_))
+            ));
+        }
+        assert!(list_lead_rules(&svc).await.unwrap().is_empty());
+        // No repo has [autopilot] enabled: nothing is synthesized.
+        assert!(list_autopilot_rules(&svc).await.unwrap().is_empty());
     }
 
     #[tokio::test]
