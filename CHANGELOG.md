@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.104] — 2026-11-19
+
 ### Added
 
 - `thegn env pool-fill [--worktree W] [--size N] [--json]` fills the warm pool in the foreground and can persist the per-project size (0 to 8). It never destroys, and refuses Vercel and non-provider envs. A claim from a CLI or daemon process no longer refills in the background; it prints a hint, and only the TUI refills.
@@ -3968,7 +3970,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.103...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.104...HEAD
+[0.1.0-alpha.104]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.103...v0.1.0-alpha.104
 [0.1.0-alpha.103]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.102...v0.1.0-alpha.103
 [0.1.0-alpha.102]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...v0.1.0-alpha.102
 [0.1.0-alpha.101]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.100...v0.1.0-alpha.101
