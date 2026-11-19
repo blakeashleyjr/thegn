@@ -233,6 +233,13 @@ These keys are accepted only from trusted user/profile config (or the
 `THEGN_DATABASE_MIGRATION_EXECUTABLE` launcher overrides), never from a repo
 overlay, so code in a worktree cannot grant itself authority.
 
+## Quit confirmation: `[ui] confirm_quit`
+
+`[ui] confirm_quit = true` (default) makes `Ctrl-q` ask before the UI closes.
+Press `Ctrl-q` again to confirm; any other key cancels. Daemon-backed panes
+survive a quit either way. Set it to `false` to quit at once. A change applies
+the next time you press `Ctrl-q` (no restart needed).
+
 ## Background measurement: `[loc]` and `[disk]`
 
 Both scanners fill a cache in the state database and go idle between sweeps.

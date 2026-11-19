@@ -210,6 +210,32 @@ The live scripts `test/sprites-live.sh` and `test/vercel-live.sh` spend real
 money. They need `THEGN_CHANNEL=dev` and `--i-accept-spend`, and touch only
 sandboxes recorded in the run's own temporary ledger.
 
+### Removing and releasing provider sandboxes
+
+A destroy counts as done only when a complete provider inventory no longer
+lists the sandbox. A partial listing proves nothing.
+
+- `thegn wt rm` refuses when the sandbox cannot be confirmed gone: the provider
+  token is unset, the destroy is not confirmed, or a provider location is
+  stored under a non-provider env. The message names the sandbox and the two
+  ways out: set the token and retry, or `thegn env set --worktree <wt> <local env>`,
+  which clears the location and warns which sandbox is still running.
+  `thegn env reap --provider <p>` keeps listing that sandbox.
+- `thegn land --release-sandbox` clears the stored location only after the
+  destroy is confirmed. Otherwise it prints `! sandbox <name> kept: <why>`
+  after "landed" and keeps the location; the exit code is unchanged. A pool
+  spare prints `returned sandbox <name> to the warm pool`.
+- Closing a provider worktree keeps its sandbox and says so in one notice that
+  names the sandbox and how to remove it.
+- Keep-awake tells the truth: if the first hold call fails, the script runs
+  unheld with a line on stderr, and on exit it does not release a hold it
+  never got.
+- `thegn doctor` has a "Remote live readiness" block per sprites and vercel
+  env (offline; names only, never values): whether the token resolves and the
+  controller id is readable, ledger counts, ledger sandboxes no worktree or
+  spare is bound to, and which env var names, git token and agent logins go
+  into the sandbox. Sprites credential forwarding itself is unchanged.
+
 ## Remote worktrees
 
 `[sandbox.remote] host` runs worktrees on another machine. Control-plane
