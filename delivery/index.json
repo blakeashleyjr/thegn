@@ -175,6 +175,18 @@
       "summary": "Launch admission contract for the sandbox + remote programme; authored in W0, implemented by WS02-P5 items."
     },
     {
+      "change": "add-lead-headless-producers",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2208",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Daemon-hosted tracker, PR, mention and PR-queue producers under leases so rules fire with no window; live verification open."
+    },
+    {
       "change": "add-lead-tab",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -388,6 +400,18 @@
         }
       ],
       "summary": "A brokered sandbox operation-policy engine remains unstarted."
+    },
+    {
+      "change": "add-sandboxed-merge-gate",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2200",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Opt-in sealed merge gate (gate_sandbox = sealed) so merge autonomy can land unattended; live verification open."
     },
     {
       "change": "add-scm-workflow-customization",

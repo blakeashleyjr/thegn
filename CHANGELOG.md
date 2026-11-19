@@ -12,6 +12,14 @@ All notable changes to **thegn** are documented here. The format follows
 - Sprites environments are now safer to run: thegn records a sprite in its ledger before creating it and deletes only sprites it recorded. `thegn env reap --provider sprites [--apply]` lists orphans, sprites past `max_lifetime_secs` and sprites "not recorded by this host" (older sprites, or ones made outside thegn, are never deleted by thegn; remove them with the Sprites CLI or dashboard). Headless work on a sprite holds it awake up to a ceiling (4 hours by default), `eager` no longer creates sprites in the background, `min_ram_gb` sets the memory limit, `fleet cost` gains a Sprites usage block, and `thegn agent run --wait --pull` pulls results back. Not yet verified against the live Sprites API.
 - `thegn repo forget` removes projects from a stopped instance's registry, for splitting one instance into two (see the `two-instances` help page). Name the projects to forget, or pass `--keep <PATH>` to forget every other one. It is a dry run unless you pass `--apply`, which backs the database up first. It refuses while the instance is running and never touches files, git worktrees or branches.
 
+- The daemon can run the tracker, PR, mention and PR queue producers with no window open: `[daemon] headless_producers = true` (default off). Each armed kind holds a lease so the UI yields while the daemon polls; the PR poll covers at most 8 worktrees per tick, and `thegn lead pause` stops daemon PR queue work too. `thegn doctor` shows producer status. Not yet verified live.
+- `thegn lead login [--mcp <server>]` logs the Lead's agent, or one of its MCP servers, in from a fresh temporary directory and copies back only the credentials or token files. The Lead cannot influence it, and your `~/.mcp-auth` and `~/.npmrc` are masked inside the Lead.
+- `[merge_queue] gate_sandbox = "sealed"` runs the merge gate in a sealed sandbox (no network, only the gate checkout and its target dir writable), so a `merge` autonomy land can proceed unattended. It is off by default and unattended merge stays off unless you set it. A gate that needs the network or the Nix daemon cannot run sealed and still asks for approval. Not yet verified live.
+
+### Fixed
+
+- The UI's mention check now runs every 5 minutes per repo instead of on every refresh.
+
 ### Changed
 
 - The local database migrates forward to schema version 114 (producer leases, THE-2208); restart the daemon after upgrading.
