@@ -203,13 +203,20 @@ impl Saturation {
         matches!(self, Self::Sustainable { .. })
     }
 
-    /// One operator-facing line naming the remedy, or `None` when healthy.
-    /// The remedy is always the budget — never the TTL (see [`Saturation`]).
+    /// One operator-facing line describing the condition, or `None` when
+    /// healthy. It no longer prescribes raising `max_scan_per_round`: since
+    /// [`lane_shape`] adapts the examine cap to the registry, a lane whose walk
+    /// budget is small still reaches an idle state.
     pub fn warning(self) -> Option<String> {
         match self {
             Self::Sustainable { .. } => None,
             Self::Saturated { rows, capacity } => Some(format!(
-                "this lane tracks {rows} rows but can only refresh {capacity} within one                  scan_interval_secs window, so it will never go idle — raise                  max_scan_per_round to at least {} (lengthening scan_interval_secs does                  NOT help: the pump cadence is derived from it)",
+                "this lane tracks {rows} rows but its walk budget alone covers only \
+                 {capacity} within one scan_interval_secs window; the scheduler \
+                 widens how many rows a round examines (cheap probes) and, past \
+                 {EXAMINE_CEILING} rows a round, stretches the effective TTL, so \
+                 the lane still goes idle (about {} walk(s) a round would be \
+                 needed if every row changed)",
                 rows.div_ceil(PUMPS_PER_TTL - 1).max(1)
             )),
         }
@@ -259,6 +266,217 @@ pub fn saturation(rows: usize, budget: usize) -> Saturation {
 /// and clamped to at least one slot.
 pub fn pump_slots(ttl_secs: u64, floor_secs: u64, slot_ms: u64) -> u64 {
     crate::time_policy::cadence_slots(ttl_secs / 4, floor_secs, slot_ms).get()
+}
+
+/// What fired a round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundTrigger {
+    /// The ticker pump: the only trigger that sweeps background rows.
+    Pump,
+    /// The diff watcher saw the ACTIVE worktree change: the active row only.
+    Watch,
+    /// Switch / create / workspace add: the active row plus never-measured rows.
+    Kick,
+}
+
+/// Inputs that shape a lane, from config plus the real pump cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneParams {
+    /// Configured per-row TTL (`scan_interval_secs`).
+    pub ttl_secs: u64,
+    /// Real pump cadence after its floor ([`pump_secs`]).
+    pub pump_secs: u64,
+    /// Configured walks per round (`max_scan_per_round`; 0 = unlimited).
+    pub walk_budget: usize,
+}
+
+/// The lane's derived shape for a registry of `rows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneShape {
+    /// Walks per round (= configured; 0 = unlimited).
+    pub walk_budget: usize,
+    /// Rows a round may examine (cheap probes); 0 = unlimited.
+    pub examine_cap: usize,
+    /// Effective per-row TTL, stretched so a sweep fits in half a window.
+    pub ttl_secs: u64,
+}
+
+/// Rows examined per round never exceed this, whatever the registry size.
+///
+/// Past `EXAMINE_CEILING * sweep_pumps` rows [`lane_shape`] stretches the
+/// effective TTL instead of examining more per round, so a pathological
+/// registry costs a bounded number of `stat`s per pump and still idles.
+pub const EXAMINE_CEILING: usize = 512;
+
+/// Real seconds between pumps: a quarter of the TTL, floored.
+///
+/// The same arithmetic as [`pump_slots`] in seconds rather than ticker slots,
+/// so the planner can reason about the cadence the ticker really runs at (a
+/// 45 s TTL with a 15 s floor pumps every 15 s, three times a window, not
+/// four). Never `0`.
+pub fn pump_secs(ttl_secs: u64, floor_secs: u64) -> u64 {
+    (ttl_secs / 4)
+        .max(floor_secs)
+        .clamp(1, crate::time_policy::MAX_CADENCE_SECS.max(1))
+}
+
+/// Pumps per TTL window from the REAL cadence (not the nominal 4), at least 2.
+pub fn pumps_per_ttl(ttl_secs: u64, pump_secs: u64) -> usize {
+    let per = ttl_secs / pump_secs.max(1);
+    usize::try_from(per).unwrap_or(usize::MAX).max(2)
+}
+
+/// Derive a lane's shape for a registry of `rows`.
+///
+/// `examine_cap = max(walk_budget * EXAMINE_PER_WALK, rows.div_ceil(sweep_pumps))`
+/// capped at [`EXAMINE_CEILING`], where `sweep_pumps = max(1, pumps_per_ttl / 2)`
+/// so a sweep takes at most half a window. The TTL is stretched only when even
+/// the ceiling cannot cover the registry in `sweep_pumps` rounds:
+/// `ttl = ttl_secs * rows.div_ceil(examine_cap * sweep_pumps).max(1)`.
+///
+/// `walk_budget == 0` is unlimited: examine cap `0` (unlimited) and the TTL
+/// unchanged.
+pub fn lane_shape(rows: usize, p: &LaneParams) -> LaneShape {
+    if p.walk_budget == 0 {
+        return LaneShape {
+            walk_budget: 0,
+            examine_cap: 0,
+            ttl_secs: p.ttl_secs,
+        };
+    }
+    let sweep_pumps = (pumps_per_ttl(p.ttl_secs, p.pump_secs) / 2).max(1);
+    let examine_cap = p
+        .walk_budget
+        .saturating_mul(EXAMINE_PER_WALK)
+        .max(rows.div_ceil(sweep_pumps))
+        .min(EXAMINE_CEILING);
+    let stretch = rows
+        .div_ceil(examine_cap.saturating_mul(sweep_pumps).max(1))
+        .max(1);
+    LaneShape {
+        walk_budget: p.walk_budget,
+        examine_cap,
+        ttl_secs: p
+            .ttl_secs
+            .saturating_mul(u64::try_from(stretch).unwrap_or(u64::MAX)),
+    }
+}
+
+/// One round's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundPlan {
+    /// Ordered rows to examine (walk only if changed, cold or active).
+    pub due: Vec<String>,
+    /// When the next pump has work: `Some(now)` = leftovers; `None` = nothing
+    /// measured is tracked (empty registry).
+    pub next_due_at: Option<i64>,
+}
+
+/// Order `(priority, measured_at, path)` rows the way [`plan`] does and keep at
+/// most `cap` (`0` = unlimited). Returns the kept paths and whether any were
+/// dropped.
+fn order_and_cap(mut due: Vec<(ScanPriority, i64, &str)>, cap: usize) -> (Vec<String>, bool) {
+    due.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2)));
+    let truncated = cap > 0 && due.len() > cap;
+    if cap > 0 {
+        due.truncate(cap);
+    }
+    (
+        due.into_iter().map(|(_, _, p)| p.to_string()).collect(),
+        truncated,
+    )
+}
+
+/// Plan a round.
+///
+/// - **Pump:** if any row has age `>= shape.ttl` (or is cold), take every row
+///   with age `>= shape.ttl / 2`. That is alignment slack: a late recount is
+///   tolerated and early ones are pulled forward, so rows re-converge into one
+///   sweep instead of trickling one due row per pump forever. Ordered by
+///   [`ScanPriority`], truncated to the examine cap.
+/// - **Watch:** the active row only, if cold or stale.
+/// - **Kick:** the active row (if cold or stale) plus cold rows, by priority,
+///   truncated.
+///
+/// `ttl == 0`: every row is due on every pump, so such a lane never idles (this
+/// is the documented meaning of `scan_interval_secs = 0`).
+///
+/// `next_due_at` assumes every planned row is stamped `now`; it is `Some(now)`
+/// when the examine cap left due rows behind.
+pub fn plan_round(
+    targets: &[ScanTarget],
+    now: i64,
+    shape: &LaneShape,
+    trigger: RoundTrigger,
+) -> RoundPlan {
+    let ttl = shape.ttl_secs;
+    // Which rows this trigger considers, and the staleness threshold that
+    // decides whether one of them is due.
+    let (threshold, considered): (u64, Vec<&ScanTarget>) = match trigger {
+        RoundTrigger::Pump => {
+            if targets.iter().any(|t| priority(t, now, ttl).is_some()) {
+                (ttl / 2, targets.iter().collect())
+            } else {
+                (ttl, Vec::new())
+            }
+        }
+        RoundTrigger::Watch => (ttl, targets.iter().filter(|t| t.active).collect()),
+        RoundTrigger::Kick => (
+            ttl,
+            targets
+                .iter()
+                .filter(|t| t.active || t.measured_at.is_none())
+                .collect(),
+        ),
+    };
+    let picked: Vec<(ScanPriority, i64, &str)> = considered
+        .into_iter()
+        .filter_map(|t| {
+            priority(t, now, threshold)
+                .map(|p| (p, t.measured_at.unwrap_or(i64::MIN), t.path.as_str()))
+        })
+        .collect();
+    let cap = match trigger {
+        RoundTrigger::Watch => 0,
+        RoundTrigger::Pump | RoundTrigger::Kick => shape.examine_cap,
+    };
+    let (due, truncated) = order_and_cap(picked, cap);
+    let next = if truncated {
+        Some(now)
+    } else {
+        // `next_due_at` over the targets as they will be once this round has
+        // stamped what it planned, without cloning the registry.
+        let planned: std::collections::HashSet<&str> = due.iter().map(String::as_str).collect();
+        let ttl_i = i64::try_from(ttl).unwrap_or(i64::MAX);
+        targets
+            .iter()
+            .map(|t| {
+                if planned.contains(t.path.as_str()) {
+                    now.saturating_add(ttl_i)
+                } else {
+                    t.measured_at.map_or(now, |at| at.saturating_add(ttl_i))
+                }
+            })
+            .min()
+    };
+    RoundPlan {
+        due,
+        next_due_at: next,
+    }
+}
+
+/// Earliest `measured_at + ttl` over targets, `Some(now)` if any is cold, `None`
+/// if empty.
+///
+/// This is the moment a [`RoundTrigger::Pump`] round first has work: before it,
+/// no row has reached its TTL, so [`plan_round`] would plan nothing. A lane can
+/// sleep until then without opening its database.
+pub fn next_due_at(targets: &[ScanTarget], now: i64, ttl_secs: u64) -> Option<i64> {
+    let ttl = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
+    targets
+        .iter()
+        .map(|t| t.measured_at.map_or(now, |at| at.saturating_add(ttl)))
+        .min()
 }
 
 /// Cache rows whose path has left the live set — the shared shape of both orphan
@@ -369,10 +587,13 @@ mod tests {
             pumps_until_idle(REALISTIC_ROWS, 45, SHIPPED_BUDGET, 500).is_none(),
             "a saturated lane must never reach an idle round — if it does, the              capacity model here is wrong"
         );
-        // The warning names the budget, and a number that actually works.
+        // The warning still describes the condition, but it no longer tells
+        // the operator to raise `max_scan_per_round`: `lane_shape` widens the
+        // examine cap instead, so the lane idles at the shipped budget.
         let w = s.warning().expect("a saturated lane must warn");
-        assert!(w.contains("max_scan_per_round"), "{w}");
-        assert!(w.contains("never go idle"), "{w}");
+        assert!(!w.contains("raise"), "{w}");
+        assert!(w.contains("still goes idle"), "{w}");
+        assert!(w.contains(&REALISTIC_ROWS.to_string()), "{w}");
         assert!(
             saturation(REALISTIC_ROWS, REALISTIC_ROWS.div_ceil(PUMPS_PER_TTL - 1)).can_idle(),
             "the budget the warning recommends must actually be sufficient"
@@ -637,5 +858,325 @@ mod tests {
     #[test]
     fn orphans_dedupes_repeated_cache_keys() {
         assert_eq!(orphans(["/x", "/x"], ["/y"]), vec!["/x".to_string()]);
+    }
+
+    // ---- lane_shape / plan_round: the idle-lane regression gate (b165) ----
+
+    /// What [`simulate`] observed.
+    #[derive(Debug)]
+    struct Sim {
+        /// First pump whose plan was empty.
+        idle_at: Option<usize>,
+        /// Walks performed (only changed rows are walked).
+        walks: usize,
+        /// Pumps that planned anything.
+        rounds: usize,
+        /// Rows planned on each pump, for "stays idle" assertions.
+        planned: Vec<usize>,
+    }
+
+    /// Drive [`lane_shape`] + [`plan_round`] with the examine-only model the
+    /// hosts implement: an unchanged row is stamped without a walk; a changed
+    /// row costs a walk, bounded by `walk_budget` per round (a changed row past
+    /// the budget stays unstamped and therefore due). `changed_per_sweep` rows
+    /// change at the start of every effective TTL window. Every row starts
+    /// measured once, exactly one effective TTL ago.
+    fn simulate(rows: usize, p: LaneParams, changed_per_sweep: usize, max_pumps: usize) -> Sim {
+        let shape = lane_shape(rows, &p);
+        let ttl = shape.ttl_secs as i64;
+        let mut targets: Vec<ScanTarget> = (0..rows)
+            .map(|i| ScanTarget::measured(format!("/wt/{i:06}"), NOW - ttl))
+            .collect();
+        let index: std::collections::HashMap<String, usize> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.path.clone(), i))
+            .collect();
+        let window = pumps_per_ttl(shape.ttl_secs, p.pump_secs);
+        let mut changed = vec![false; rows];
+        let mut sim = Sim {
+            idle_at: None,
+            walks: 0,
+            rounds: 0,
+            planned: Vec::new(),
+        };
+        let mut now = NOW;
+        for pump in 0..max_pumps {
+            if rows > 0 && pump % window == 0 {
+                for j in 0..changed_per_sweep.min(rows) {
+                    changed[((pump / window) * changed_per_sweep + j) % rows] = true;
+                }
+            }
+            let plan = plan_round(&targets, now, &shape, RoundTrigger::Pump);
+            sim.planned.push(plan.due.len());
+            if plan.due.is_empty() {
+                sim.idle_at.get_or_insert(pump);
+            } else {
+                sim.rounds += 1;
+            }
+            let mut walked = 0usize;
+            for path in &plan.due {
+                let i = index[path];
+                if changed[i] {
+                    if shape.walk_budget > 0 && walked >= shape.walk_budget {
+                        continue;
+                    }
+                    walked += 1;
+                    changed[i] = false;
+                }
+                targets[i].measured_at = Some(now);
+            }
+            sim.walks += walked;
+            now += p.pump_secs as i64;
+        }
+        sim
+    }
+
+    fn params(ttl_secs: u64, pump: u64, walk_budget: usize) -> LaneParams {
+        LaneParams {
+            ttl_secs,
+            pump_secs: pump,
+            walk_budget,
+        }
+    }
+
+    #[test]
+    fn any_registry_reaches_idle() {
+        for rows in [0usize, 1, 6, 7, 50, 74, 222, 384, 1000, 10_000] {
+            for budget in [1usize, 2, 4] {
+                for (ttl, pump) in [(900u64, 225u64), (45, 15), (300, 75)] {
+                    let p = params(ttl, pump, budget);
+                    let ppt = pumps_per_ttl(ttl, pump);
+                    let bound = 4 * ppt * rows.div_ceil(EXAMINE_CEILING).max(1);
+                    let sim = simulate(rows, p, 0, bound + ppt);
+                    let idle = sim.idle_at.unwrap_or_else(|| {
+                        panic!("rows={rows} budget={budget} ttl={ttl}: never idled ({sim:?})")
+                    });
+                    assert!(
+                        idle <= bound,
+                        "rows={rows} budget={budget} ttl={ttl}: idled at {idle} > {bound}"
+                    );
+                    for k in 0..(ppt / 2) {
+                        assert_eq!(
+                            sim.planned[idle + k],
+                            0,
+                            "rows={rows} budget={budget} ttl={ttl}: pump {} after idling planned work",
+                            idle + k
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn idle_lane_has_no_walks_when_nothing_changed() {
+        for (ttl, pump, budget) in [(900u64, 225u64, 2usize), (45, 15, 4)] {
+            let p = params(ttl, pump, budget);
+            let shape = lane_shape(222, &p);
+            let window = pumps_per_ttl(shape.ttl_secs, pump);
+            let sim = simulate(222, p, 0, 10 * window);
+            assert_eq!(sim.walks, 0, "{sim:?}");
+            // And the rounds it does run are bounded: one sweep per window.
+            let per_sweep = 222usize.div_ceil(shape.examine_cap);
+            assert!(
+                sim.rounds <= 10 * per_sweep + 1,
+                "ttl={ttl}: {} rounds over 10 windows",
+                sim.rounds
+            );
+            assert!(sim.idle_at.is_some());
+        }
+    }
+
+    #[test]
+    fn changed_rows_are_walked_within_budget_then_idle() {
+        // 50 rows, two walks a round, four rows change per window: two rounds
+        // of walks, then idle, every window.
+        let p = params(900, 225, 2);
+        let one = simulate(50, p, 4, 4);
+        assert_eq!(one.walks, 4, "{one:?}");
+        assert_eq!(one.idle_at, Some(2), "{one:?}");
+        let three = simulate(50, p, 4, 12);
+        assert_eq!(three.walks, 12, "{three:?}");
+        // Never more walks per round than the budget.
+        let burst = simulate(50, p, 50, 1);
+        assert_eq!(burst.walks, 2);
+    }
+
+    /// The 15x regression: a watch event used to plan the whole stale registry.
+    #[test]
+    fn watch_plans_only_the_active_row() {
+        let shape = lane_shape(222, &params(900, 225, 2));
+        let mut targets: Vec<ScanTarget> = (0..220)
+            .map(|i| ScanTarget::measured(format!("/wt/{i:03}"), NOW - 5_000))
+            .collect();
+        targets.push(ScanTarget::measured("/wt/fresh", NOW - 1));
+        targets.push(ScanTarget::cold("/wt/active").active());
+        let plan = plan_round(&targets, NOW, &shape, RoundTrigger::Watch);
+        assert_eq!(plan.due, vec!["/wt/active".to_string()]);
+
+        // A fresh active row: nothing.
+        let last = targets.len() - 1;
+        targets[last].measured_at = Some(NOW - 1);
+        let plan = plan_round(&targets, NOW, &shape, RoundTrigger::Watch);
+        assert!(plan.due.is_empty(), "{:?}", plan.due);
+        // …but the stale background rows keep the next pump due.
+        assert_eq!(plan.next_due_at, Some(NOW - 5_000 + 900));
+    }
+
+    #[test]
+    fn kick_plans_active_and_cold_only() {
+        let shape = lane_shape(4, &params(900, 225, 2));
+        let targets = vec![
+            ScanTarget::measured("/stale", NOW - 5_000),
+            ScanTarget::measured("/fresh", NOW - 1),
+            ScanTarget::cold("/new"),
+            ScanTarget::measured("/active", NOW - 5_000).active(),
+        ];
+        let plan = plan_round(&targets, NOW, &shape, RoundTrigger::Kick);
+        assert_eq!(plan.due, vec!["/new".to_string(), "/active".to_string()]);
+        // A fresh active row is not re-planned by a kick.
+        let targets = vec![
+            ScanTarget::measured("/stale", NOW - 5_000),
+            ScanTarget::measured("/active", NOW - 1).active(),
+        ];
+        assert!(
+            plan_round(&targets, NOW, &shape, RoundTrigger::Kick)
+                .due
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn alignment_pulls_half_stale_rows_into_one_sweep() {
+        let shape = lane_shape(3, &params(900, 225, 2));
+        let targets = vec![
+            ScanTarget::measured("/due", NOW - 900),
+            ScanTarget::measured("/half", NOW - 451),
+            ScanTarget::measured("/young", NOW - 449),
+        ];
+        let plan = plan_round(&targets, NOW, &shape, RoundTrigger::Pump);
+        assert_eq!(plan.due, vec!["/due".to_string(), "/half".to_string()]);
+        assert_eq!(plan.next_due_at, Some(NOW - 449 + 900));
+
+        // Half-stale alone does not start a sweep.
+        let targets = vec![
+            ScanTarget::measured("/half", NOW - 451),
+            ScanTarget::measured("/young", NOW - 449),
+        ];
+        let plan = plan_round(&targets, NOW, &shape, RoundTrigger::Pump);
+        assert!(plan.due.is_empty());
+        assert_eq!(plan.next_due_at, Some(NOW - 451 + 900));
+    }
+
+    #[test]
+    fn stretch_only_past_examine_ceiling() {
+        let p = params(900, 225, 2);
+        assert_eq!(lane_shape(50, &p).examine_cap, 64);
+        assert_eq!(lane_shape(222, &p).examine_cap, 111);
+        let thousand = lane_shape(1000, &p);
+        assert_eq!(thousand.examine_cap, 500);
+        assert_eq!(thousand.ttl_secs, 900);
+        let huge = lane_shape(10_000, &p);
+        assert_eq!(huge.examine_cap, EXAMINE_CEILING);
+        assert!(huge.ttl_secs > 900, "{huge:?}");
+        // Disk at (45, 15): one sweep pump per window, so 1,000 rows stretch.
+        let disk = params(45, 15, 4);
+        assert_eq!(lane_shape(50, &disk).examine_cap, 128);
+        assert_eq!(lane_shape(222, &disk).ttl_secs, 45);
+        let d1k = lane_shape(1000, &disk);
+        assert_eq!((d1k.examine_cap, d1k.ttl_secs), (512, 90));
+    }
+
+    #[test]
+    fn an_unlimited_walk_budget_examines_everything_at_the_configured_ttl() {
+        let shape = lane_shape(10_000, &params(900, 225, 0));
+        assert_eq!(
+            shape,
+            LaneShape {
+                walk_budget: 0,
+                examine_cap: 0,
+                ttl_secs: 900
+            }
+        );
+        let sim = simulate(300, params(900, 225, 0), 300, 4);
+        assert_eq!(sim.walks, 300);
+        assert_eq!(sim.idle_at, Some(1));
+    }
+
+    #[test]
+    fn pump_secs_and_pumps_per_ttl_use_the_floor() {
+        assert_eq!(pump_secs(45, 15), 15);
+        assert_eq!(pumps_per_ttl(45, pump_secs(45, 15)), 3);
+        assert_eq!(pump_secs(900, 60), 225);
+        assert_eq!(pumps_per_ttl(900, 225), 4);
+        assert_eq!(pump_secs(0, 15), 15);
+        assert_eq!(pumps_per_ttl(0, 15), 2, "never fewer than two");
+        assert_eq!(pump_secs(0, 0), 1, "never zero");
+        assert_eq!(
+            pumps_per_ttl(10, 0),
+            10,
+            "a zero pump cannot divide by zero"
+        );
+        assert_eq!(pump_secs(u64::MAX, 0), crate::time_policy::MAX_CADENCE_SECS);
+    }
+
+    #[test]
+    fn a_zero_ttl_plans_every_row_every_pump() {
+        let shape = lane_shape(3, &params(0, 15, 4));
+        let targets = vec![
+            ScanTarget::measured("/a", NOW),
+            ScanTarget::measured("/b", NOW),
+            ScanTarget::measured("/c", NOW),
+        ];
+        let plan = plan_round(&targets, NOW, &shape, RoundTrigger::Pump);
+        assert_eq!(plan.due.len(), 3);
+        assert_eq!(plan.next_due_at, Some(NOW));
+    }
+
+    #[test]
+    fn a_truncated_round_leaves_the_next_pump_due_now() {
+        let shape = LaneShape {
+            walk_budget: 1,
+            examine_cap: 2,
+            ttl_secs: 100,
+        };
+        let targets = vec![
+            ScanTarget::cold("/a"),
+            ScanTarget::cold("/b"),
+            ScanTarget::cold("/c"),
+        ];
+        let plan = plan_round(&targets, NOW, &shape, RoundTrigger::Kick);
+        assert_eq!(plan.due.len(), 2);
+        assert_eq!(plan.next_due_at, Some(NOW));
+        let plan = plan_round(&targets, NOW, &shape, RoundTrigger::Pump);
+        assert_eq!(plan.next_due_at, Some(NOW));
+    }
+
+    #[test]
+    fn next_due_at_is_the_earliest_expiry() {
+        assert_eq!(next_due_at(&[], NOW, 100), None);
+        let targets = vec![
+            ScanTarget::measured("/a", NOW - 10),
+            ScanTarget::measured("/b", NOW - 50),
+        ];
+        assert_eq!(next_due_at(&targets, NOW, 100), Some(NOW + 50));
+        let mut with_cold = targets.clone();
+        with_cold.push(ScanTarget::cold("/c"));
+        assert_eq!(next_due_at(&with_cold, NOW, 100), Some(NOW));
+        // An empty registry plans nothing and tracks nothing.
+        let plan = plan_round(
+            &[],
+            NOW,
+            &lane_shape(0, &params(900, 225, 2)),
+            RoundTrigger::Pump,
+        );
+        assert!(plan.due.is_empty());
+        assert_eq!(plan.next_due_at, None);
+        // No overflow on a huge TTL.
+        assert_eq!(
+            next_due_at(&[ScanTarget::measured("/x", i64::MAX - 1)], NOW, u64::MAX),
+            Some(i64::MAX)
+        );
     }
 }
