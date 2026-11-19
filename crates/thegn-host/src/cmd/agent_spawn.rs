@@ -304,9 +304,7 @@ pub(crate) fn cli_missing_warning(program: &str, sandbox: &str, env: &str, wt: &
 }
 
 fn agent_cli_preflight_blocking(cfg: &Config, wt: &str, agent: &str) -> Option<String> {
-    let Some(program) = agent_program(cfg, agent) else {
-        return None;
-    };
+    let program = agent_program(cfg, agent)?;
     let (env, sandbox) = match crate::provision_gate::provider_target(cfg, wt) {
         Ok(Some(target)) => target,
         Ok(None) => return None,
@@ -319,12 +317,8 @@ fn agent_cli_preflight_blocking(cfg: &Config, wt: &str, agent: &str) -> Option<S
             return None;
         }
     };
-    let Some(envc) = cfg.env.get(&env) else {
-        return None;
-    };
-    let Some(provider) = crate::agent::provider_for_named(&envc.provider, &sandbox) else {
-        return None;
-    };
+    let envc = cfg.env.get(&env)?;
+    let provider = crate::agent::provider_for_named(&envc.provider, &sandbox)?;
     let result = crate::agent::block_on_provider(|| async {
         provider
             .run_exec_within(
@@ -1192,7 +1186,7 @@ mod tests {
     fn env_choice_table() {
         let pin = |n: &str| EnvChoice::Pin(n.to_string());
         // (explicit, has_selection, pipeline_defined) -> choice
-        let cases: [(anyhow::Result<(i32, String)>, CliCheck); 4] = [
+        let cases = [
             (Some("host"), false, false, pin("host")),
             (Some("host"), false, true, pin("host")),
             (Some("host"), true, false, pin("host")),
@@ -1432,7 +1426,7 @@ mod tests {
 
     #[test]
     fn cli_check_outcome_table() {
-        let cases = [
+        let cases: [(anyhow::Result<(i32, String)>, CliCheck); 4] = [
             (Ok((0, String::new())), CliCheck::Present),
             (Ok((1, String::new())), CliCheck::Missing),
             (Ok((127, String::new())), CliCheck::Missing),
