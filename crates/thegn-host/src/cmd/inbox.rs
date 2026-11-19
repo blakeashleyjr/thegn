@@ -72,9 +72,9 @@ pub(crate) fn list_rows(
                 return None;
             }
             Some(ListRow {
-                account: acct.to_owned(),
-                item_id: id.to_owned(),
-                message: n.message.clone(),
+                account: sanitize_text(acct, 64),
+                item_id: sanitize_text(id, 128),
+                message: sanitize_text(&n.message, 400),
                 created_at: n.created_at_ms,
                 read: n.read,
             })
@@ -86,7 +86,7 @@ pub(crate) fn list_rows(
 }
 
 /// The message minus its `[account] ` prefix (the title).
-fn title_of<'a>(row: &'a ListRow) -> &'a str {
+fn title_of(row: &ListRow) -> &str {
     let prefix = format!("[{}] ", row.account);
     row.message.strip_prefix(&prefix).unwrap_or(&row.message)
 }
@@ -233,7 +233,11 @@ pub(crate) fn render_status(
         };
     };
     if json {
-        return vec![serde_json::to_string(r).unwrap_or_default()];
+        let mut r = r.clone();
+        for a in &mut r.inbox {
+            a.last_error = scrub(&a.last_error);
+        }
+        return vec![serde_json::to_string(&r).unwrap_or_default()];
     }
     let mut out = vec![format!(
         "headless_producers: {}  installed: {}",
