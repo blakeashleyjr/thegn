@@ -44,6 +44,38 @@ pub(crate) fn mark_session_panes_detached(session: &Session, panes: &Panes) -> u
     kept
 }
 
+/// What a detach-quit would do, without touching any flag: `(kept, closed)`
+/// = daemon-backed panes that keep running vs. panes that close. Walks the
+/// same panes as [`mark_session_panes_detached`] and
+/// [`mark_parked_panes_detached`]. In-memory only (no I/O).
+pub(crate) fn pane_survival_counts(
+    session: &Session,
+    pool: &crate::workspace_pool::WorkspacePool,
+    panes: &Panes,
+) -> (usize, usize) {
+    let (mut kept, mut closed) = (0usize, 0usize);
+    let mut tally = |id: u32| {
+        if let Some(p) = panes.table.get(&id) {
+            if p.is_daemon_backed() {
+                kept += 1;
+            } else {
+                closed += 1;
+            }
+        }
+    };
+    for g in &session.worktrees {
+        for tab in &g.tabs {
+            for id in tab.center.pane_ids() {
+                tally(id);
+            }
+        }
+    }
+    for id in pool.parked_pane_ids() {
+        tally(id);
+    }
+    (kept, closed)
+}
+
 /// Mark PARKED (resident-pool) workspaces' center panes detached-on-drop too.
 /// Their `PtyPane`s stay live in the table but are absent from the active
 /// `Session`, so [`mark_session_panes_detached`] alone would let a parked
@@ -349,6 +381,27 @@ mod tests {
         session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(1);
         assert_eq!(mark_session_panes_detached(&session, &panes), 0);
         assert_eq!(kept_sessions(), 0);
+    }
+
+    #[test]
+    fn survival_counts_empty_and_missing_panes_are_zero() {
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
+            active: 0,
+        };
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel::<thegn_svc::provider::ExecControl>(8);
+        let mut panes = Panes::new(tx);
+        let pool = crate::workspace_pool::WorkspacePool::default();
+        session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(1);
+        assert_eq!(pane_survival_counts(&session, &pool, &panes), (0, 0));
+        // A live non-daemon pane counts as closed and sets no flag.
+        panes
+            .table
+            .insert(1, crate::pane::PtyPane::test_stream(ctrl_tx, 24, 80));
+        let (kept, closed) = pane_survival_counts(&session, &pool, &panes);
+        assert_eq!(kept + closed, 1);
     }
 
     fn daemon_session(sid: &str) -> crate::session::ProviderSession {
