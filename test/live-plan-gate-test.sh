@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline regression test for the three live scripts (b166 live-checks):
+# Offline regression test for the three live scripts (b169 live-checks):
 # test/sprites-live.sh, test/remote-daily.sh and test/vercel-live.sh.
 #
 # - With no flags each prints its plan, exits 0 and runs neither thegn nor curl
@@ -26,6 +26,39 @@ if [ "${1:-}" = doctor ] && [ -n "${STUB_DOCTOR:-}" ]; then
   cat "$STUB_DOCTOR"
   exit 0
 fi
+if [ "${STUB_MODE:-}" = continue ]; then
+  case "$*" in
+  "env test sx") exit 1 ;;
+  "env set sx") exit 0 ;;
+  "env up")
+    mkdir -p "$XDG_STATE_HOME/thegn/vps"
+    printf '%s\n' '{"provider":"sprites","state":"ready"}' >"$XDG_STATE_HOME/thegn/vps/sp-live.json"
+    exit 0
+    ;;
+  "env pull") echo 'fast-forwarded sp-live'; exit 0 ;;
+  "env down") rm -f "$XDG_STATE_HOME/thegn/vps/sp-live.json"; touch "$XDG_STATE_HOME/down"; exit 0 ;;
+  "env reap"*) echo '{"orphans":[]}'; exit 0 ;;
+  "env deprovision"*) exit 0 ;;
+  "fleet list"*)
+    if [ -e "$XDG_STATE_HOME/down" ]; then
+      echo '{"view":{"rows":[],"missing":[{"id":"sp-live"}],"partial":false}}'
+    else
+      echo '{"view":{"rows":[{"id":"sp-live","state":"warm"}],"partial":false}}'
+    fi
+    exit 0
+    ;;
+  "fleet cost"*)
+    echo '{"sprites_usage":[{"env":"sx","error":null,"rows":[{"name":"sp-live","cpu_hours":0.25,"partial":false}]}]}'
+    exit 0
+    ;;
+  *"--hold"*) /usr/bin/sleep 2; exit 0 ;;
+  *"git -c user.name=live"*) echo '1111111111111111111111111111111111111111'; exit 0 ;;
+  *"rev-parse HEAD"*) echo '1111111111111111111111111111111111111111'; exit 0 ;;
+  *"command -v curl"*) echo /usr/bin/curl; exit 0 ;;
+  *"tty && echo ok"*) printf '/dev/pts/1\nok\n'; exit 0 ;;
+  *curl*) echo '[]'; exit 0 ;;
+  esac
+fi
 echo "stub thegn: refusing '$*'" >&2
 exit 97
 STUB
@@ -35,7 +68,11 @@ printf 'curl %s\n' "$*" >>"$STUB_LOG"
 echo "stub curl: refusing" >&2
 exit 97
 STUB
-chmod +x "$T/bin/thegn" "$T/bin/curl"
+cat >"$T/bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T/bin/thegn" "$T/bin/curl" "$T/bin/sleep"
 
 fails=0
 pass() { echo "ok   $1"; }
@@ -76,6 +113,20 @@ for s in sprites-live remote-daily vercel-live; do
     pass "$s: plan names the preflight"
   else
     fail "$s: plan lacks the preflight statement"
+  fi
+done
+run plan-sprites-keep-going sprites-live.sh -- --keep-going
+if rc_is plan-sprites-keep-going 0 && [ ! -s "$T/plan-sprites-keep-going.log" ] &&
+  has "$T/plan-sprites-keep-going.out" "FAILED STEPS:"; then
+  pass "sprites-live: --keep-going is a plan-only flag"
+else
+  fail "sprites-live: --keep-going plan ($(cat "$T/plan-sprites-keep-going.out"))"
+fi
+for want in "--keep-going" "view.rows" "6c " "8c " "cpu_hours" "partial zero usage" "FAILED STEPS:"; do
+  if has "$T/plan-sprites-live.out" "$want"; then
+    pass "sprites-live plan names '$want'"
+  else
+    fail "sprites-live plan lacks '$want'"
   fi
 done
 for want in "5b " "6b " "7e " "10b "; do
@@ -148,6 +199,17 @@ if has "$T/pf-vx.out" "INFO 0: credentials entering the sandbox: forwarded_env=n
   pass "preflight: vercel-live reads the temp env's row"
 else
   fail "preflight: vercel-live ($(cat "$T/pf-vx.out"))"
+fi
+
+run keep-going-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
+  has "$T/keep-going-sprites.out" "== step 12:" &&
+  has "$T/keep-going-sprites.out" "FAILED STEPS:" &&
+  ! has "$T/keep-going-sprites.log" "env down --force"; then
+  pass "sprites-live: --keep-going records a failure, continues, and avoids repeat force-down"
+else
+  fail "sprites-live: --keep-going acting run ($(cat "$T/keep-going-sprites.out"))"
 fi
 
 # Every acting run must clean up its temp state (nothing was created).
