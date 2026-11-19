@@ -674,6 +674,8 @@ pub struct SpritesProvider {
     legacy_ids: Vec<String>,
     /// The memory policy applied after create (`0` = leave the default).
     memory_limit_mb: u32,
+    /// Optional page size for list requests (`None` preserves the API default).
+    list_page_size: Option<u32>,
     /// The ledger reserve cap (`0` = no cap).
     max_instances: usize,
     /// The ledger directory (`None` = `vps::registry::dir()`); tests isolate it.
@@ -734,6 +736,7 @@ impl SpritesProvider {
             scope: None,
             legacy_ids: Vec::new(),
             memory_limit_mb: 0,
+            list_page_size: None,
             max_instances: 0,
             ledger_dir: None,
             client: provider_http_client(),
@@ -774,6 +777,12 @@ impl SpritesProvider {
     /// The memory policy limit applied after create (`0` = none).
     pub fn with_memory_limit_mb(mut self, limit_mb: u32) -> Self {
         self.memory_limit_mb = limit_mb;
+        self
+    }
+
+    /// Set the maximum number of sprites returned by each list request (clamped to the API's 1..=500).
+    pub fn with_list_page_size(mut self, n: u32) -> Self {
+        self.list_page_size = Some(n.clamp(1, 500));
         self
     }
 
@@ -857,13 +866,19 @@ impl SpritesProvider {
 
     fn sprites_list_url(&self, token: Option<&str>) -> Result<String> {
         let url = self.sprites_url()?;
-        let Some(token) = token else {
+        if token.is_none() && self.list_page_size.is_none() {
             return Ok(url);
-        };
+        }
         let mut url = reqwest::Url::parse(&url)
             .map_err(|error| anyhow!("sprites: invalid list URL: {error}"))?;
-        url.query_pairs_mut()
-            .append_pair("continuation_token", token);
+        if let Some(page_size) = self.list_page_size {
+            url.query_pairs_mut()
+                .append_pair("max_results", &page_size.to_string());
+        }
+        if let Some(token) = token {
+            url.query_pairs_mut()
+                .append_pair("continuation_token", token);
+        }
         Ok(url.to_string())
     }
 
@@ -6144,6 +6159,42 @@ mod tests {
             .expect("second page request must carry its continuation token");
         assert!(requests[second].contains("continuation_token=t1"));
         assert!(!requests[0].contains('?'));
+    }
+
+    #[tokio::test]
+    async fn sprites_list_url_carries_max_results_on_every_page() {
+        let (base, server) = paged_list_server(vec![
+            r#"{"sprites":[{"name":"a"}],"has_more":true,"next_continuation_token":"t1"}"#.into(),
+            r#"{"sprites":[{"name":"b"}],"has_more":false}"#.into(),
+        ])
+        .await;
+        let names = SpritesProvider::new(&base, "tok", "x")
+            .with_list_page_size(2)
+            .list()
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["a", "b"]);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("max_results=2"))
+        );
+        assert!(requests[1].contains("continuation_token=t1"));
+    }
+
+    #[test]
+    fn sprites_list_url_without_page_size_is_unchanged() {
+        let p = sprites();
+        assert_eq!(
+            p.sprites_list_url(None).unwrap(),
+            "https://api.sprites.dev/v1/sprites"
+        );
+        assert_eq!(
+            p.sprites_list_url(Some("t1")).unwrap(),
+            "https://api.sprites.dev/v1/sprites?continuation_token=t1"
+        );
     }
 
     #[tokio::test]
