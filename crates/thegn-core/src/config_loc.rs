@@ -21,15 +21,16 @@ pub struct LocConfig {
     /// and the Files-footer count, and runs no tokei walk — the existing cache
     /// is ignored rather than merely frozen.
     pub enabled: bool,
-    /// Per-worktree re-count TTL (seconds). The background scanner skips rows
-    /// younger than this, and pumps at a quarter of it so a budget-bounded round
-    /// still sweeps every worktree inside one window. `0` counts every pump.
+    /// The active worktree's re-count TTL and the background examination
+    /// cadence (seconds); background worktrees are re-counted only when their
+    /// git state changed (root mtime, `HEAD` or `index` moved since the last
+    /// count). The scanner pumps at a quarter of this. `0` makes every row due on
+    /// every pump, so the lane never idles.
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub scan_interval_secs: u64,
-    /// Worktrees counted per background round. tokei walks the whole tree, so a
-    /// bounded round keeps one background-lane permit from being held for
-    /// minutes on a large registry; the next pump resumes where this one
-    /// stopped. `0` = unlimited.
+    /// Tokei walks per round; how many rows a round may *examine* adapts to the
+    /// registry size so the lane always reaches an idle state (examining a row
+    /// is a few `stat`s, not a walk). `0` = unlimited.
     pub max_scan_per_round: u32,
     /// Shortest gap (seconds) between content-driven recounts of the ACTIVE
     /// worktree. Editing files is the one case where the long

@@ -26,7 +26,7 @@ pub(crate) mod pipeline_reaper;
 pub(crate) mod pipeline_retry;
 pub(crate) mod plugins_status;
 pub(crate) mod producers;
-mod pty_diagnostics;
+pub(crate) mod pty_diagnostics;
 pub(crate) mod record;
 pub(crate) mod service;
 pub(crate) mod session;
