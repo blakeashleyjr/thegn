@@ -1126,12 +1126,12 @@ run *args: build
     env THEGN_NO_MIGRATE=1 {{bin}} {{args}}
 
 # Build and run the native host locally in an isolated state root.
+# Do not override XDG_RUNTIME_DIR: masks and the control-socket guard key off the env runtime dir.
 start name="dev": build
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
       . "$PWD/test/lib/instance.sh"; INST_STATE="$state" inst_restart "$pidfile" $$ || exit 1; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
-      "XDG_RUNTIME_DIR=$run" \
       "THEGN_NO_MIGRATE=1" \
       {{bin}}
 
@@ -1143,6 +1143,7 @@ attach: start
 # any other `just start`/install instance. Nothing is reattached (unique name),
 # so you always get a clean db + work area. Ephemeral by design — the dirs are
 # left on disk for post-mortem; sweep them with `just install-clean-sweep`.
+# Do not override XDG_RUNTIME_DIR: masks and the control-socket guard key off the env runtime dir.
 install-clean: build
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1153,7 +1154,6 @@ install-clean: build
     exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
-      "XDG_RUNTIME_DIR=$run" \
       "THEGN_NO_MIGRATE=1" \
       "{{bin}}"
 
@@ -1163,12 +1163,12 @@ install-clean-sweep:
 
 # Like `start`, but in the dev release channel (experimental subsystems enabled)
 # via the runtime override — no separate binary needed. `just start-dev name=x`.
+# Do not override XDG_RUNTIME_DIR: masks and the control-socket guard key off the env runtime dir.
 start-dev name="dev": build
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
       . "$PWD/test/lib/instance.sh"; INST_STATE="$state" inst_restart "$pidfile" $$ || exit 1; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
-      "XDG_RUNTIME_DIR=$run" \
       "THEGN_NO_MIGRATE=1" \
       "THEGN_CHANNEL=dev" \
       {{bin}}
@@ -1190,6 +1190,17 @@ devel-desktop:
 
 test-devel-launch:
     bash test/devel-launch-test.sh
+
+# Install the repo's lint and format tools (.#lint-tools) into <state_dir>/nix/profile. Workers whose
+# XDG_STATE_HOME is <state_dir> then find them after their login shell resets PATH.
+pipeline-tools state_dir:
+    @case "{{state_dir}}" in /*) ;; *) echo "pipeline-tools: give the agents' absolute XDG_STATE_HOME"; exit 2;; esac
+    mkdir -p "{{state_dir}}/nix"
+    nix build ".#lint-tools" --profile "{{state_dir}}/nix/profile"
+
+# Show what a worker's login shell resolves for the lint tools, given its XDG_STATE_HOME.
+pipeline-tools-check state_dir:
+    @env -i HOME="$HOME" USER="$USER" XDG_STATE_HOME="{{state_dir}}" bash -lc 'for t in treefmt shellcheck yamllint taplo rustfmt shfmt; do printf "%s: %s\n" "$t" "$(command -v "$t" || echo MISSING)"; done'
 
 test-sprites-exec-repro:
     python3 -B test/sprites_exec_repro_test.py
