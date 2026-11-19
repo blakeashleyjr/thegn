@@ -126,6 +126,21 @@ refused (use `[sandbox.home] agents` there).
   that fails and exactly one vercel env exists, that one is used; otherwise
   upload is skipped with one warning (mode `none` behaviour).
 
+### Recipe: a dedicated login
+
+The shipped default stays `none`. To use a login that is not your daily one,
+change only config (your own config file):
+
+```toml
+[env.cloud.provider]
+model_credentials = "upload"
+login_homes = { claude = "~/.thegn-logins/claude", codex = "~/.thegn-logins/codex" }
+```
+
+`login_homes` makes `upload` read those directories instead of the live host
+login, so a hostile sandbox can only spend the dedicated account. Like
+`model_credentials` it cannot come from a repo overlay.
+
 ### Threat model
 
 A hostile process inside the sandbox can:
