@@ -65,7 +65,7 @@ If something is off, `just doctor` diagnoses the dev environment.
 
 ## Dev loop
 
-Develop thegn in the dev instance (`just devel`), not in the stable instance you use for other projects. It has its own config, state and `THEGN_DIR`, and you must seed `~/.config/thegn-dev` once yourself. See `thegn help two-instances` (`docs/help/two-instances.md`).
+Develop thegn in the dev instance (`just live` for a release build, `just devel` for a debug build), not in the stable instance you use for other projects. It has its own config, state and `THEGN_DIR`; seeding `~/.config/thegn-dev` is automatic on the first launch. See `thegn help two-instances` (`docs/help/two-instances.md`).
 
 **Enter the dev shell once, right after cloning** (`nix develop`, or `direnv
 allow` to auto-enter per-cd). The pre-commit / pre-push git hooks are generated
