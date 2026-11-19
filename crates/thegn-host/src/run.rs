@@ -2116,6 +2116,8 @@ pub(crate) fn forget_worktree_group(
     cleanup_runtime: bool,
     cfg: Option<&thegn_core::config::Config>,
 ) {
+    let close_snapshot = (cleanup_runtime && !group.path.is_empty())
+        .then(|| crate::close_teardown::capture(db, &group.path));
     if !group.path.is_empty() {
         // `del_worktree` cascades the per-worktree caches + merge-queue row
         // itself now (all three forget paths share it).
@@ -2149,9 +2151,12 @@ pub(crate) fn forget_worktree_group(
     if !group.path.is_empty() {
         let path = group.path.clone();
         let cfg = cfg.cloned();
+        let Some(snap) = close_snapshot else {
+            return;
+        };
         thegn_core::thread_name::spawn_named("thegn-teardown", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            crate::close_teardown::background_close(cfg.as_ref(), &path);
+            crate::close_teardown::background_close_with(cfg.as_ref(), &path, snap);
         });
     }
 }

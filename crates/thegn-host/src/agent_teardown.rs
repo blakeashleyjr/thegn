@@ -25,25 +25,30 @@ fn after_destroy(
 
 /// Suspend-on-close (8-E): for a provider env with `auto_checkpoint`, snapshot the
 /// sandbox when the worktree closes (fast resume next open). Called from the
-/// fire-and-forget close thread, which has only the path — so it loads config +
-/// resolves the env itself. Best-effort + off-loop; checkpoints-capable only.
+/// fire-and-forget close thread, which has the path plus the caller's captured
+/// environment selection. Best-effort + off-loop; checkpoints-capable only.
 pub fn checkpoint_on_close(worktree: &str) {
-    let cfg = crate::config_startup::cleanup_config();
     let db = match Db::open() {
         Ok(db) => db,
         Err(error) => {
-            crate::close_teardown::warn_visible(&format!(
-                "auto-checkpoint on close skipped: the environment selection could not be read: {error:#}"
-            ));
+            checkpoint_on_close_with(worktree, None, Err(format!("{error:#}")));
             return;
         }
     };
-    let repo_root = db
-        .repo_root_for(worktree)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let env_name = match checkpoint_selection(db.effective_env_checked(worktree, &repo_root)) {
+    let repo_root = db.repo_root_for(worktree).ok().flatten();
+    let env = db
+        .effective_env_checked(worktree, repo_root.as_deref().unwrap_or_default())
+        .map_err(|error| format!("{error:#}"));
+    checkpoint_on_close_with(worktree, repo_root.as_deref(), env);
+}
+
+pub fn checkpoint_on_close_with(
+    worktree: &str,
+    _repo_root: Option<&str>,
+    env: Result<Option<String>, String>,
+) {
+    let cfg = crate::config_startup::cleanup_config();
+    let env_name = match checkpoint_selection(env) {
         Ok(Some(name)) => name,
         Ok(None) => return,
         Err(message) => {
@@ -82,10 +87,12 @@ fn checkpoint_failed_message(name: &str, error: &dyn std::fmt::Display) -> Strin
 }
 
 /// The env to checkpoint on close: `Ok(None)` = nothing selected, `Err` = unreadable (skip with a warning).
-fn checkpoint_selection(read: anyhow::Result<Option<String>>) -> Result<Option<String>, String> {
-    read.map_err(|error| format!(
-        "auto-checkpoint on close skipped: the environment selection could not be read: {error:#}"
-    ))
+fn checkpoint_selection(read: Result<Option<String>, String>) -> Result<Option<String>, String> {
+    read.map_err(|error| {
+        format!(
+            "auto-checkpoint on close skipped: the environment selection could not be read: {error}"
+        )
+    })
 }
 
 /// How long a sent destroy may take to disappear from a complete inventory.
@@ -502,7 +509,7 @@ mod tests {
 
     #[test]
     fn checkpoint_selection_skips_an_unreadable_selection() {
-        let Err(message) = checkpoint_selection(Err(anyhow::anyhow!("unavailable"))) else {
+        let Err(message) = checkpoint_selection(Err("unavailable".into())) else {
             panic!("unreadable selection must skip checkpoint");
         };
 
@@ -516,6 +523,15 @@ mod tests {
             Ok(Some("box".into()))
         );
         assert_eq!(checkpoint_selection(Ok(None)), Ok(None));
+    }
+
+    #[test]
+    fn checkpoint_on_close_with_skips_an_env_missing_from_config() {
+        checkpoint_on_close_with(
+            "/wt/unconfigured",
+            None,
+            Ok(Some("__thegn_test_env_missing_from_config__".into())),
+        );
     }
 
     #[test]
