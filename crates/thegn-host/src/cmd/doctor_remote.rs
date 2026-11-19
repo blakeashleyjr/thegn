@@ -142,6 +142,37 @@ fn ledger_names_for(records: &[VpsRecord], provider: &str) -> Vec<(String, Strin
         .collect()
 }
 
+fn pool_counts(states: &[&str]) -> (usize, usize, usize) {
+    let mut ready = 0;
+    let mut provisioning = 0;
+    let mut other = 0;
+    for state in states {
+        match *state {
+            "ready" => ready += 1,
+            "provisioning" => provisioning += 1,
+            _ => other += 1,
+        }
+    }
+    (ready, provisioning, other)
+}
+
+fn warm_pool_report_line(
+    provider: &str,
+    ready: usize,
+    provisioning: usize,
+    other: usize,
+    size: usize,
+) -> Option<String> {
+    if provider == "vercel" {
+        return Some("  warm pool: not used for vercel".to_string());
+    }
+    (ready != 0 || provisioning != 0 || other != 0 || size != 0).then(|| {
+        format!(
+            "  warm pool: {ready} ready, {provisioning} provisioning ([lifecycle.pool] size = {size}; per-project sizes: TUI +/- or thegn env pool-fill --size)"
+        )
+    })
+}
+
 /// Names of sandboxes bound to a worktree row of this env, or spares.
 fn bound_names(cfg: &Config, db: &thegn_core::db::Db, env_name: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -221,6 +252,18 @@ pub(crate) fn json_with(
             let provider = if kind == EnvProviderKind::Vercel { "vercel" } else { "sprites" };
             let ledger = ledger_names_for(records, provider);
             let count = |state: &str| ledger.iter().filter(|(_, s, _)| s == state).count();
+            let pool_spares = match db {
+                Some(db) => ledger
+                    .iter()
+                    .filter_map(|(n, _, _)| db.pool_spare_by_name(n).ok().flatten())
+                    .collect::<Vec<_>>(),
+                None => Vec::new(),
+            };
+            let pool_states = pool_spares
+                .iter()
+                .map(|spare| spare.state.as_str())
+                .collect::<Vec<_>>();
+            let (pool_ready, pool_provisioning, pool_other) = pool_counts(&pool_states);
             let stale = ledger
                 .iter()
                 .filter(|(_, s, at)| s == "creating" && now.saturating_sub(*at) > STALE_CREATING_SECS)
@@ -328,6 +371,10 @@ pub(crate) fn json_with(
                     "creating": count("creating"),
                     "stale_creating": stale,
                 },
+                "pool_ready": pool_ready,
+                "pool_provisioning": pool_provisioning,
+                "pool_other": pool_other,
+                "pool_size_config": cfg.lifecycle.pool.size,
                 "review": if kind == EnvProviderKind::Sprites {
                     SPRITES_REVIEW_COMMAND
                 } else {
@@ -387,6 +434,15 @@ pub(crate) fn report(cfg: &Config) {
             l["creating"],
             l["stale_creating"]
         );
+        if let Some(line) = warm_pool_report_line(
+            s("provider").as_str(),
+            row["pool_ready"].as_u64().unwrap_or(0) as usize,
+            row["pool_provisioning"].as_u64().unwrap_or(0) as usize,
+            row["pool_other"].as_u64().unwrap_or(0) as usize,
+            row["pool_size_config"].as_u64().unwrap_or(0) as usize,
+        ) {
+            outln!("{line}");
+        }
         if !s("review").is_empty() {
             outln!(
                 "               review: {} (sprites on the account this host did not record; read-only)",
@@ -489,6 +545,46 @@ mod tests {
         env.provider.provider = provider.into();
         cfg.env.insert("remote".into(), env);
         cfg
+    }
+
+    #[test]
+    fn pool_counts_table() {
+        let cases: &[(&[&str], (usize, usize, usize))] = &[
+            (&[], (0, 0, 0)),
+            (&["ready"], (1, 0, 0)),
+            (&["provisioning", "provisioning"], (0, 2, 0)),
+            (&["claiming", "claimed", "quarantined"], (0, 0, 3)),
+            (&["ready", "provisioning", "claimed"], (1, 1, 1)),
+        ];
+        for (states, expected) in cases {
+            assert_eq!(pool_counts(states), *expected);
+        }
+    }
+
+    #[test]
+    fn json_reports_ready_pool_spare_from_ledger_name() {
+        let _state = IsolatedState::new();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.insert_pool_spare("spare-1", "/repo", "remote").unwrap();
+        db.set_pool_spare_ready("spare-1", None, "lock").unwrap();
+        let mut cfg = cfg_with("sprites");
+        cfg.lifecycle.pool.size = 2;
+        let records = [rec("spare-1", "sprites", "ready", 0)];
+
+        let out = json_with(&cfg, Some(&db), &records, 0, &[]);
+        let row = &out.as_array().unwrap()[0];
+        assert_eq!(row["pool_ready"], 1);
+        assert_eq!(row["pool_provisioning"], 0);
+        assert_eq!(row["pool_other"], 0);
+        assert_eq!(row["pool_size_config"], 2);
+    }
+
+    #[test]
+    fn warm_pool_report_line_for_vercel() {
+        assert_eq!(
+            warm_pool_report_line("vercel", 0, 0, 0, 0),
+            Some("  warm pool: not used for vercel".into())
+        );
     }
 
     #[test]
@@ -603,6 +699,10 @@ mod tests {
                 "token_resolves",
                 "controller_id",
                 "ledger",
+                "pool_ready",
+                "pool_provisioning",
+                "pool_other",
+                "pool_size_config",
                 "review",
                 "unbound",
                 "forwarded_env",
