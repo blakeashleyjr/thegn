@@ -43,6 +43,8 @@ pub enum SearchOutcome {
 /// The live search overlay. Lives in `run.rs` as `Option<SearchOverlay>`.
 pub struct SearchOverlay {
     engine: SearchEngine,
+    /// Context lines around the selected result, in before/after order.
+    preview: Vec<String>,
     /// The pane id the overlay was opened for (used to wrap scope cycles back
     /// to `Pane(…)` so the correct pane id is preserved).
     anchor_pane: u32,
@@ -54,6 +56,7 @@ impl SearchOverlay {
     pub fn new(scope: SearchScope, pane_id: u32, max_results: usize) -> Self {
         SearchOverlay {
             engine: SearchEngine::new(scope, max_results),
+            preview: Vec::new(),
             anchor_pane: pane_id,
         }
     }
@@ -67,6 +70,7 @@ impl SearchOverlay {
     /// own and does not wait for the first keystroke.
     pub fn prime(&mut self, sources: &[SearchSource<'_>]) {
         self.engine.set_query("", sources);
+        self.refresh_preview(sources);
     }
 
     #[allow(dead_code)] // used in tests
@@ -135,7 +139,33 @@ impl SearchOverlay {
             _ => {}
         }
 
+        self.refresh_preview(sources);
+
         SearchOutcome::Pending
+    }
+
+    fn refresh_preview(&mut self, sources: &[SearchSource<'_>]) {
+        self.preview.clear();
+        let Some(selected) = self.engine.selected() else {
+            return;
+        };
+        let Some((_, _, history)) = sources
+            .iter()
+            .find(|(pane_id, _, _)| *pane_id == selected.pane_id)
+        else {
+            return;
+        };
+
+        if let Some(idx) = selected.line_idx.checked_sub(1)
+            && let Some(line) = history.get(idx)
+        {
+            self.preview.push(preview_line(line));
+        }
+        if let Some(idx) = selected.line_idx.checked_add(1)
+            && let Some(line) = history.get(idx)
+        {
+            self.preview.push(preview_line(line));
+        }
     }
 
     /// Draw the overlay into `surface`. `screen` is the center rect (the area
@@ -147,8 +177,8 @@ impl SearchOverlay {
         let max_rows = (screen.rows * 2 / 3).saturating_sub(4);
         let shown = matches.len().min(max_rows).max(3);
         let width = screen.cols.saturating_sub(4).clamp(40, 120);
-        // rows: prompt(1) + rule(1) + results(shown) + rule(1) + footer(1)
-        let content_rows = 4 + shown.max(1);
+        // rows: prompt(1) + rule(1) + results(shown) + preview + rule(1) + footer(1)
+        let content_rows = 4 + shown.max(1) + self.preview.len();
 
         let scope_pill = format!(" {} ▾", engine.scope().label());
         let spec = LayerSpec {
@@ -200,7 +230,8 @@ impl SearchOverlay {
 
         // ── Result rows ───────────────────────────────────────────────────────
         let selected_idx = engine.selected_idx();
-        let result_rows = inner.rows.saturating_sub(4); // prompt + 2 rules + footer
+        let preview_rows = self.preview.len().min(inner.rows.saturating_sub(4));
+        let result_rows = inner.rows.saturating_sub(4 + preview_rows); // prompt + 2 rules + preview + footer
         let first = selected_idx.saturating_sub(result_rows.saturating_sub(1));
         for (row, (i, m)) in matches
             .iter()
@@ -226,7 +257,12 @@ impl SearchOverlay {
             };
 
             // Content column: the matched line, windowed around the hit.
-            let line_avail = inner.cols.saturating_sub(26); // 24 label + 2 sep
+            let repeat_suffix = repeat_suffix(m.repeat);
+            let suffix_width = repeat_suffix
+                .as_deref()
+                .map(|suffix| unicode_width::UnicodeWidthStr::width(suffix))
+                .unwrap_or(0);
+            let line_avail = inner.cols.saturating_sub(26).saturating_sub(suffix_width); // 24 label + 2 sep + suffix
             let (lcut, pre, hit, post, rcut) =
                 window_around(&m.line, m.span.unwrap_or((0, 0)), line_avail);
             let text_tok = if selected {
@@ -244,6 +280,9 @@ impl SearchOverlay {
             if rcut {
                 segs.push(seg(Tok::Slot(S::Ghost3), ellipsis().to_string()));
             }
+            if let Some(suffix) = repeat_suffix {
+                segs.push(seg(Tok::Slot(S::Ghost3), suffix));
+            }
             seg::draw_line(
                 surface,
                 inner.x,
@@ -255,7 +294,7 @@ impl SearchOverlay {
         }
 
         // If no results, show a placeholder.
-        if matches.is_empty() && inner.rows > 3 {
+        if matches.is_empty() && inner.rows > 3 && result_rows > 0 {
             let placeholder = if engine.query().trim().is_empty() {
                 "no history yet"
             } else {
@@ -267,6 +306,22 @@ impl SearchOverlay {
                 inner.y + 2,
                 inner.cols,
                 &Line::segs(vec![sp(2), seg(Tok::Slot(S::Ghost3), placeholder)]),
+                panel,
+            );
+        }
+
+        // ── Context preview ─────────────────────────────────────────────────
+        // Keep the preview immediately above the footer rule. A clamped layer
+        // on a tiny screen may not have room for all requested rows.
+        let preview_start = inner.y + inner.rows - 2 - preview_rows;
+        for (row, line) in self.preview.iter().take(preview_rows).enumerate() {
+            let line = seg::clip_end(line, inner.cols.saturating_sub(2));
+            seg::draw_line(
+                surface,
+                inner.x,
+                preview_start + row,
+                inner.cols,
+                &Line::segs(vec![sp(2), seg(Tok::Slot(S::Ghost3), line)]),
                 panel,
             );
         }
@@ -317,6 +372,27 @@ fn is_escape(key: &KeyCode, mods: Modifiers) -> bool {
                 key,
                 KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Char('c') | KeyCode::Char('C')
             ))
+}
+
+const PREVIEW_MAX_COLS: usize = 120;
+
+fn preview_line(line: &str) -> String {
+    let filtered: String = line.chars().filter(|c| !c.is_control()).collect();
+    seg::clip_end(&filtered, PREVIEW_MAX_COLS)
+}
+
+fn repeat_suffix(repeat: u32) -> Option<String> {
+    if repeat <= 1 {
+        return None;
+    }
+    // There is no dedicated multiplication token in GlyphSet. If a future
+    // table supplies the exact mark, use it; current tables take the ASCII
+    // fallback rather than borrowing the semantically different cross glyph.
+    let marker = match crate::caps::active_glyphs().cross_heavy {
+        "×" => "×",
+        _ => "x",
+    };
+    Some(format!(" {marker}{repeat}"))
 }
 
 /// Truncate `s` to at most `max_cols` display columns, appending `…` if
@@ -461,6 +537,76 @@ mod tests {
         assert_eq!(ov.engine().query(), "");
         assert_eq!(ov.engine().matches()[0].line, "new");
         assert_eq!(ov.engine().matches()[1].line, "middle");
+    }
+
+    #[test]
+    fn render_shows_repeat_count() {
+        let buf = buf_from(&["repeat", "repeat", "other"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "repeat", &srcs);
+
+        let out = draw(&ov, 100, 30);
+        assert!(out.contains("×2") || out.contains(" x2"), "{out}");
+    }
+
+    #[test]
+    fn preview_tracks_selection() {
+        let buf = buf_from(&[
+            "before first",
+            "first target",
+            "between",
+            "second target",
+            "after second",
+        ]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "target", &srcs);
+        assert_eq!(
+            ov.preview,
+            vec![String::from("between"), String::from("after second")]
+        );
+
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE, &srcs);
+        assert_eq!(
+            ov.preview,
+            vec![String::from("before first"), String::from("between")]
+        );
+    }
+
+    #[test]
+    fn preview_never_crosses_sources() {
+        let first = buf_from(&["first before", "target"]);
+        let second = buf_from(&["other source after"]);
+        let srcs = vec![(1, "first", &first), (2, "second", &second)];
+        let mut ov = overlay(1);
+        typed(&mut ov, "target", &srcs);
+
+        assert_eq!(ov.preview, vec![String::from("first before")]);
+        assert!(!ov.preview.iter().any(|line| line.contains("other source")));
+    }
+
+    #[test]
+    fn preview_absent_for_edge_lines() {
+        let buf = buf_from(&["oldest target", "middle", "newest target"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "oldest", &srcs);
+        assert_eq!(ov.preview, vec![String::from("middle")]);
+
+        ov = overlay(1);
+        typed(&mut ov, "newest", &srcs);
+        assert_eq!(ov.preview, vec![String::from("middle")]);
+    }
+
+    #[test]
+    fn render_with_preview_on_tiny_screen_does_not_panic() {
+        let buf = buf_from(&["before", "target", "after"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "target", &srcs);
+
+        let _ = draw(&ov, 10, 4);
     }
 
     #[test]
