@@ -50,6 +50,11 @@ Use the same path spelling that thegn shows for the repo.
 Workspace keybinds and the workspace editor setting are not applied from a
 bound block.
 
+`[env.<n>.provider] model_credentials` applies to Vercel and Sprites
+(`none` or `upload`; `proxy` and `inject` are refused). On Sprites, leaving it
+unset forwards credentials as before; set `none` to withhold them. See
+[[environments]] and [[vercel-sandbox]].
+
 The canonical root for repositories is `projects_dir`; the former
 `workspaces_dir` spelling remains accepted for three stable releases. The
 same compatibility window applies to `[workspace.<slug>]`,

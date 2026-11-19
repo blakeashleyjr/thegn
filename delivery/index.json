@@ -1026,6 +1026,18 @@
       "summary": "Inventory-proven sandbox teardown, fail-closed wt rm, doctor remote readiness and quit confirmation."
     },
     {
+      "change": "harden-sprites-credentials-and-git-fence",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-801",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Sprites model_credentials grant, destroy proof, exec deadline, close snapshot and literal search default; live checks open."
+    },
+    {
       "change": "isolate-maintenance-regression-fixtures",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",

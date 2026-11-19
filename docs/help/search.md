@@ -23,6 +23,19 @@ Four search surfaces, one habit: type, arrow, `↵`.
 with the pane it came from, so it doubles as "which of these six
 terminals printed that error".
 
+Matching is **literal** by default: the query is a substring, case-insensitive
+unless it contains an uppercase letter (smart case). Hits are ranked by match
+quality, then most recent first. `Alt+f` in the overlay toggles fuzzy matching
+and back; the footer shows the mode you would switch to.
+
+`Tab` widens the scope and `Shift-Tab` narrows it, through pane, tab, worktree
+and workspace. The `profile` scope is no longer in the cycle. These scopes are
+the presets for how far a search reaches.
+
+"History" means the scrollback thegn keeps for each pane (a bounded in-memory
+ring of the lines the pane printed), not your shell history. A pane with no
+output yet shows "no history yet".
+
 `[search] max_results` caps how many hits are collected — raise it for a
 big scrollback, lower it if searching feels heavy. See
 [[configuration]].
