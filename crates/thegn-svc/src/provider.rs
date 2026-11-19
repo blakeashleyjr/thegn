@@ -6163,6 +6163,7 @@ mod tests {
 
     #[tokio::test]
     async fn sprites_destroy_confirms_accepted_delete_before_forgetting_record() {
+        let _state = thegn_core::testenv::IsolatedState::new();
         let ledger = tempfile::tempdir().unwrap();
         let (base, server) = http_sequence_server(
             vec![
@@ -6261,6 +6262,7 @@ mod tests {
 
     #[tokio::test]
     async fn sprites_second_destroy_retries_after_kept_record_and_proves_absence() {
+        let _state = thegn_core::testenv::IsolatedState::new();
         let ledger = tempfile::tempdir().unwrap();
         let (base, server) = http_sequence_server(
             vec![
@@ -6308,6 +6310,7 @@ mod tests {
 
     #[tokio::test]
     async fn sprites_destroy_404_forgets_record_without_confirmation_get() {
+        let _state = thegn_core::testenv::IsolatedState::new();
         let ledger = tempfile::tempdir().unwrap();
         let (base, server) =
             http_sequence_server(vec![("404 Not Found".into(), String::new())], None).await;
