@@ -206,6 +206,8 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Fill the warm pool for a worktree's project and env now, in the foreground (creates sandboxes; never destroys).
+    PoolFill(super::env_pool::PoolFillArgs),
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -293,6 +295,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         } => super::env_reap::run(cfg, &provider, apply, yes, json, unrecorded),
         Action::Adopt(args) => super::env_adopt::run(cfg, args),
         Action::SyncRetry { json } => super::env_sync_retry::run(json),
+        Action::PoolFill(args) => super::env_pool::run(cfg, args),
     }
 }
 

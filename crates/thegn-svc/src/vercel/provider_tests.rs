@@ -26,6 +26,10 @@ pub(super) struct FakeApi {
     pub(super) snapshots: Vec<String>,
     /// Every create and run body sent, in order.
     pub(super) bodies: Mutex<Vec<serde_json::Value>>,
+    /// Delay before a one-shot command answers.
+    pub(super) run_delay: Mutex<Option<std::time::Duration>>,
+    /// Fail keep-alive GETs after the initial session lookup.
+    pub(super) get_fails: bool,
     /// Name-keyed answers for `get` and (when no page is scripted) `list`.
     pub(super) by_name: Mutex<BTreeMap<String, SandboxView>>,
     /// Set by the conformance suite: the ledger file whose existence `create`
@@ -94,6 +98,9 @@ impl Api for FakeApi {
                 return Ok(self.resume.lock().unwrap().clone());
             }
             self.record(format!("get {name}"));
+            if self.get_fails && self.count("get") > 1 {
+                return Err(anyhow!("fake: get failed"));
+            }
             if let Some(view) = self.by_name.lock().unwrap().get(name).cloned() {
                 return Ok(Some(view));
             }
@@ -193,6 +200,23 @@ impl Api for FakeApi {
             self.record(format!("run {session}"));
             self.bodies.lock().unwrap().push(body.clone());
             Ok((0, b"ok".to_vec()))
+        })
+    }
+
+    fn run_wait_with_stderr<'a>(
+        &'a self,
+        session: &'a str,
+        body: &'a serde_json::Value,
+        _out_cap: usize,
+    ) -> BoxFuture<'a, Result<(i32, Vec<u8>, String)>> {
+        Box::pin(async move {
+            self.record(format!("run {session}"));
+            self.bodies.lock().unwrap().push(body.clone());
+            let delay = *self.run_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok((0, b"ok".to_vec(), String::new()))
         })
     }
 
@@ -569,6 +593,81 @@ async fn wake_allow_resumes_a_stopped_sandbox() {
     let p = provider(&fake, ledger.path(), 2);
     assert_eq!(p.session_for(NAME, Wake::Allow).await.unwrap(), "sess_2");
     assert_eq!(fake.count("resume"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_exec_extends_the_session_during_a_long_command() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.by_name.lock().unwrap().insert(
+        NAME.into(),
+        view(NAME, SessionStatus::Running, Some("sess_1")),
+    );
+    *fake.run_delay.lock().unwrap() = Some(std::time::Duration::from_secs(12 * 60));
+
+    // Keep the fixed view() timestamp inside the lifetime ceiling so this
+    // test exercises the extension rather than the ceiling warning path.
+    let mut test_spec = spec(2);
+    test_spec.max_lifetime_secs = 10 * 365 * 24 * 60 * 60;
+    let api: Arc<dyn Api> = fake.clone();
+    let p = VercelProvider::with_client_for_test(test_spec, api, ledger.path().into())
+        .expect("test provider admits its spec");
+    let task = tokio::spawn(async move {
+        p.run_exec(NAME, &["true".to_string()], None, &[], Wake::Never)
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(12 * 60)).await;
+
+    let (code, _) = task.await.unwrap().unwrap();
+    assert_eq!(code, 0);
+    assert!(fake.count("extend") >= 1, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn run_exec_short_command_checks_once() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.by_name.lock().unwrap().insert(
+        NAME.into(),
+        view(NAME, SessionStatus::Running, Some("sess_1")),
+    );
+
+    let result = provider(&fake, ledger.path(), 2)
+        .run_exec(NAME, &["true".to_string()], None, &[], Wake::Never)
+        .await
+        .unwrap();
+    assert_eq!(result.0, 0);
+    assert!(fake.count("get") <= 2, "{:?}", fake.calls());
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_exec_keepalive_error_never_fails_the_exec() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        get_fails: true,
+        ..FakeApi::default()
+    });
+    fake.by_name.lock().unwrap().insert(
+        NAME.into(),
+        view(NAME, SessionStatus::Running, Some("sess_1")),
+    );
+    *fake.run_delay.lock().unwrap() = Some(std::time::Duration::from_secs(1));
+
+    let p = provider(&fake, ledger.path(), 2);
+    let task = tokio::spawn(async move {
+        p.run_exec(NAME, &["true".to_string()], None, &[], Wake::Never)
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+    let (code, _) = task.await.unwrap().unwrap();
+    assert_eq!(code, 0);
+    assert!(fake.count("get") >= 2, "{:?}", fake.calls());
 }
 
 #[tokio::test]
