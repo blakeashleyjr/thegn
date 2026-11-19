@@ -6033,7 +6033,12 @@ mod tests {
         );
         let shown: Vec<(RowKind, &str)> = rows
             .iter()
-            .filter(|r| r.visible && r.depth == 1 && r.kind != RowKind::ShowMore)
+            .filter(|r| {
+                r.visible
+                    && r.depth == 1
+                    && r.workspace_slug == "thegn"
+                    && r.kind != RowKind::ShowMore
+            })
             .map(|r| (r.kind, r.label.as_str()))
             .collect();
         let batches: Vec<&str> = shown
