@@ -2270,9 +2270,10 @@ fn pane_instance_note_table() {
         None
     );
     assert_eq!(
-        pane_instance_note(Some("/run/other-thegn.sock"), "/run/thegn.sock")
-            .as_deref(),
-        Some("this shell is a pane of another thegn instance (control socket /run/other-thegn.sock); this binary uses /run/thegn.sock: in a dev pane run $THEGN_BIN or put ~/.thegn-devel/bin first on PATH")
+        pane_instance_note(Some("/run/other-thegn.sock"), "/run/thegn.sock").as_deref(),
+        Some(
+            "this shell is a pane of another thegn instance (control socket /run/other-thegn.sock); this binary uses /run/thegn.sock: in a dev pane run $THEGN_BIN or put ~/.thegn-devel/bin first on PATH"
+        )
     );
 }
 
@@ -3182,12 +3183,10 @@ fn instance_info(cfg: &Config) -> InstanceInfo {
         &|path| path.exists(),
     )
     .into_iter()
-    .chain(
-        pane_instance_note(
-            std::env::var("THEGN_CONTROL_SOCKET").ok().as_deref(),
-            &daemon_socket,
-        ),
-    )
+    .chain(pane_instance_note(
+        std::env::var("THEGN_CONTROL_SOCKET").ok().as_deref(),
+        &daemon_socket,
+    ))
     .chain(path_thegn_note(
         std::env::var("PATH").ok().as_deref(),
         &binary,
