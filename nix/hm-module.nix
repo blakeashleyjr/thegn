@@ -391,6 +391,7 @@ self: {
     theme.mascot = cfg.themeMascot;
     theme.mascot_motion = cfg.themeMascotMotion;
     ui.confirm_delete_project = cfg.uiConfirmDeleteProject;
+    ui.confirm_quit = cfg.uiConfirmQuit;
     ui.full_mode_chip = cfg.uiFullModeChip;
     ui.dismiss_overlay_on_click_outside = cfg.uiDismissOverlayOnClickOutside;
     ui.sidebar_freeze_sort = cfg.uiSidebarFreezeSort;
@@ -848,6 +849,12 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Ask before destructive project worktree actions. Unset (null) = the binary's default.";
+    };
+
+    uiConfirmQuit = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Ask before Ctrl+Q / quit closes thegn (panes in the daemon keep running). Unset (null) = the binary's default (true).";
     };
 
     uiFullModeChip = lib.mkOption {
