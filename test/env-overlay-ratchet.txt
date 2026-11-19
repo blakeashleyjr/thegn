@@ -141,6 +141,7 @@ clipboard.max_image_bytes
 clipboard.remote_dir
 confirm_delete
 daemon.enabled
+daemon.headless_producers
 daemon.idle_exit_secs
 daemon.lease_grace_secs
 daemon.socket
@@ -268,6 +269,7 @@ merge_queue.failed_folder
 merge_queue.gate_command
 merge_queue.gate_on
 merge_queue.gate_reuse_worktree
+merge_queue.gate_sandbox
 merge_queue.gate_setup_command
 merge_queue.gate_target_dir
 merge_queue.land_message

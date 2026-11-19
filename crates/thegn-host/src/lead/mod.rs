@@ -6,6 +6,7 @@
 
 pub(crate) mod group;
 pub(crate) mod launch;
+pub(crate) mod login;
 pub(crate) mod mcp;
 pub(crate) mod skill;
 pub(crate) mod wake;
