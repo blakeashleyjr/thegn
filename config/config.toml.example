@@ -114,6 +114,8 @@ language = "auto"
 # from disk is the explicit second choice. Set false to skip the prompt
 # (removal then keeps files; it never silently deletes from disk).
 confirm_delete_project = true
+# Ask before Ctrl+Q / quit closes thegn (daemon panes keep running). Signals and the CLI never ask.
+confirm_quit = true
 # Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
 full_mode_chip = true
 # Left-click outside an open detail popup (a stat/badge overlay, e.g. the

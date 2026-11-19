@@ -34,6 +34,7 @@ pub(crate) mod pr_queue;
 pub(crate) mod prefetch_policy;
 pub(crate) mod prewarm;
 pub(crate) mod provision;
+pub(crate) mod quit_confirm;
 pub(crate) mod repo_trust;
 pub(crate) mod ring;
 pub(crate) mod sandbox_panel;
