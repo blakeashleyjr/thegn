@@ -76,9 +76,14 @@ Will create : ONE sandbox/machine via the named [env.<name>] from your real
 Max spend   : one sandbox for about 10 minutes (a 420 s scripted hold); more
               with --with-model (two real model runs). Teardown destroys it.
 Teardown    : trap on EXIT/INT/TERM -> env down --force, env deprovision <name>
-              for each name in THIS run's ledger, daemon stop; fails (keeps the
-              ledger) if any of this run's names remain.
+              for each name in THIS run's ledger (rd-x's and rd-y's), daemon
+              stop; fails (keeps the ledger) if any of this run's names remain
+              in the ledger or the org listing.
+The preflight prints which credentials enter the sandbox.
 Steps:
+  0   preflight: doctor --json remote_live for <S>; FAIL if the token does not
+      resolve; INFO forwarded_env, git_token, login_upload; WARN lists unbound
+      pre-existing sandboxes (never touched); SKIP on an older binary or fly
   1   env test
   2   wt new rd-x --env <S>
   3   agent run --worktree <rd-x path> --agent hold-test --prompt x --wait --pull --json
@@ -96,6 +101,10 @@ Steps:
   8   land --worktree <rd-x path> --release-sandbox
   9   ledger record gone, sandbox absent from the org listing
  10   env reap --provider <p> --json is clean
+ 11   wt new rd-y --env <S>           11b exactly one new ledger record
+      then wt rm <rd-y path> --force exits 0 (the worktree-delete teardown,
+      which confirms the destroy)     11c its record is gone and the org
+      listing lacks it
  A    (--with-adopt <name>) env adopt <name> --env <S> --yes; ledger record
       is checked, then that record file is removed: the adopted sprite was
       not created by this run and is NEVER destroyed by this script
@@ -127,6 +136,66 @@ if [ "$provider" = fly ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
   exit 2
 fi
 
+# ---- step 0: preflight (doctor's "Remote live readiness" block) ----
+# doctor --json lists names only, never values: whether the token resolves,
+# which env var names, git token and agent logins enter the sandbox, and ledger
+# sandboxes nothing is bound to. The token itself is never read or printed.
+PREFLIGHT_PY='
+import json, os, sys
+env = os.environ["PRE_ENV"]
+required = os.environ.get("PRE_REQUIRED", "1") == "1"
+try:
+    doc = json.loads(sys.stdin.read())
+except ValueError:
+    print("FAIL 0: doctor --json did not print JSON", file=sys.stderr)
+    sys.exit(1)
+rows = doc.get("remote_live") if isinstance(doc, dict) else None
+if rows is None:
+    print("SKIP 0: doctor --json has no remote_live key (older binary): no credential statement")
+    sys.exit(0)
+row = next((r for r in rows if isinstance(r, dict) and r.get("env") == env), None)
+if row is None:
+    if required:
+        print("FAIL 0: doctor remote_live has no row for env " + env, file=sys.stderr)
+        sys.exit(1)
+    print("SKIP 0: doctor remote_live has no row for env " + env + " (it covers sprites and vercel envs)")
+    sys.exit(0)
+def show(v):
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, list):
+        return ",".join(show(x) for x in v) or "none"
+    if isinstance(v, dict):
+        return ",".join(k + "=" + show(x) for k, x in sorted(v.items())) or "none"
+    if v is None or v == "":
+        return "none"
+    return str(v)
+if row.get("token_resolves") is not True:
+    print("FAIL 0: the token for env " + env + " does not resolve (remote_live.token_resolves = " + show(row.get("token_resolves")) + ")", file=sys.stderr)
+    sys.exit(1)
+print("INFO 0: credentials entering the sandbox: forwarded_env=" + show(row.get("forwarded_env")) + "; git_token=" + show(row.get("git_token")) + "; login_upload=" + show(row.get("login_upload")))
+unbound = row.get("unbound") or []
+if not isinstance(unbound, list):
+    unbound = [unbound]
+if unbound:
+    print("WARN 0: unbound ledger sandboxes: " + ", ".join(show(n) for n in unbound) + ": pre-existing sandboxes this run will not touch")
+print("PASS 0")
+'
+DOCTOR_JSON=""
+preflight_capture() { # doctor may exit non-zero on unrelated checks; parse what it printed
+  DOCTOR_JSON="$("$THEGN_BIN" doctor --json 2>/dev/null)" || true
+}
+preflight_check() { # preflight_check <env> [required: 1|0]
+  echo "== step 0: preflight (doctor --json remote_live for env '$1')"
+  printf '%s' "$DOCTOR_JSON" | PRE_ENV="$1" PRE_REQUIRED="${2:-1}" python3 -I -c "$PREFLIGHT_PY" || {
+    echo "FAIL 0: preflight" >&2
+    exit 1
+  }
+}
+# Run against the owner's real state, before the fresh dirs below, so
+# pre-existing unbound sandboxes are listed.
+preflight_capture
+
 TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
 unset THEGN_CONFIG_DIR
@@ -138,6 +207,8 @@ NAME="(unknown)"
 CREATED=0
 HOLD_PID=""
 WT_PATH=""
+RDY_NAME=""
+RDY_PATH=""
 case "$provider" in
 sprites) EXEC_BRIDGE="sprite-exec" ;;
 vercel) EXEC_BRIDGE="vercel-exec" ;;
@@ -159,6 +230,32 @@ run_records() { # names of this run's ledger records for $provider
   return 0
 }
 
+listing_state() { # listing_state <name>: prints absent | present | unknown
+  local out
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>/dev/null)" || {
+    echo unknown
+    return 0
+  }
+  printf '%s' "$out" | LISTED_NAME="$1" python3 -I -c '
+import json, os, sys
+try:
+    view = json.load(sys.stdin)["view"]
+except Exception:
+    print("unknown"); sys.exit(0)
+if view.get("partial"):
+    print("unknown"); sys.exit(0)
+n = os.environ["LISTED_NAME"]
+rows = view.get("rows") or []
+print("present" if any(r.get("id") == n or r.get("name") == n for r in rows) else "absent")
+'
+}
+listing_lacks_name() { # listing_lacks_name [name]: defaults to rd-x's sandbox; a partial or failed listing is not proof
+  local n="${1:-$NAME}" s
+  s="$(listing_state "$n")"
+  echo "   org listing for $n: $s"
+  [ "$s" = absent ]
+}
+
 teardown() {
   local rc=$?
   trap - EXIT INT TERM
@@ -174,7 +271,12 @@ teardown() {
     }
   fi
   if [ "$CREATED" = 1 ]; then
+    # rd-y's name came from this run's ledger (11b); keep it even if its
+    # record is gone, so the listing check below still covers it.
     names="$(run_records)"
+    if [ -n "$RDY_NAME" ] && ! printf '%s\n' "$names" | grep -Fxq "$RDY_NAME"; then
+      names="$names $RDY_NAME"
+    fi
     echo "-- teardown: env down --force"
     (cd "$REPO" && "$THEGN_BIN" env down --force)
     for n in $names; do
@@ -185,16 +287,16 @@ teardown() {
         "$THEGN_BIN" env deprovision "$n" --env "$env_name" --yes </dev/null
       fi
     done
-    echo "-- teardown: daemon stop"
-    "$THEGN_BIN" daemon stop
     for n in $names; do
       [ "$n" = "$adopt_name" ] && continue
-      if [ -f "$(ledger_dir)/$n.json" ]; then
+      if [ -f "$(ledger_dir)/$n.json" ] || [ "$(listing_state "$n")" != absent ]; then
         left=1
         rc=1
         echo "TEARDOWN INCOMPLETE: $n may still exist; the ledger is kept in $TMP" >&2
       fi
     done
+    echo "-- teardown: daemon stop"
+    "$THEGN_BIN" daemon stop
   fi
   if [ "$left" = 1 ]; then
     echo "-- keeping $TMP (ledger needed for a later reap)" >&2
@@ -280,12 +382,23 @@ local_log_has_commits() {
   [ "$n" -ge "$want" ]
 }
 
-listing_lacks_name() {
-  local out
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
-  ! printf '%s' "$out" | grep -Fq "\"$NAME\""
+record_gone() { [ ! -f "$(ledger_dir)/${1:-$NAME}.json" ]; }
+rdy_gone() { record_gone "$RDY_NAME" && listing_lacks_name "$RDY_NAME"; }
+
+RECORDS_BEFORE=""
+snapshot_records() { RECORDS_BEFORE="$(run_records)"; }
+one_new_record() { # exactly one ready ledger record that was not there before
+  local n new=""
+  for n in $(run_records); do
+    printf '%s\n' "$RECORDS_BEFORE" | grep -Fxq "$n" || new="$new $n"
+  done
+  new="${new# }"
+  echo "   new ledger records: ${new:-(none)}"
+  [ -n "$new" ] || return 1
+  case "$new" in *' '* | *[!a-z0-9-]*) return 1 ;; esac
+  grep -Eq '"state": *"ready"' "$(ledger_dir)/$new.json" || return 1
+  RDY_NAME="$new"
 }
-record_gone() { [ ! -f "$(ledger_dir)/$NAME.json" ]; }
 
 reap_clean() {
   local out
@@ -302,12 +415,23 @@ adopt_step() {
   rm -f "$(ledger_dir)/$adopt_name.json"
 }
 
+wt_path_for() { # wt_path_for <suffix>: the worktree whose branch ends in <suffix>
+  git -C "$REPO" worktree list --porcelain |
+    awk -v s="$1" '/^worktree /{p=substr($0,10)} /^branch / && substr($0, length($0) - length(s) + 1) == s {print p}'
+}
 resolve_wt_path() { # the worktree whose branch ends in rd-x
-  WT_PATH="$(git -C "$REPO" worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} /^branch .*rd-x$/{print p}')"
+  WT_PATH="$(wt_path_for rd-x)"
   echo "   worktree: ${WT_PATH:-(none)}"
   [ -n "$WT_PATH" ] && [ "$(printf '%s\n' "$WT_PATH" | wc -l)" -eq 1 ]
 }
+resolve_rdy_path() { # the worktree whose branch ends in rd-y
+  RDY_PATH="$(wt_path_for rd-y)"
+  echo "   worktree: ${RDY_PATH:-(none)}"
+  [ -n "$RDY_PATH" ] && [ "$(printf '%s\n' "$RDY_PATH" | wc -l)" -eq 1 ]
+}
 
+# fly envs have no remote_live row (doctor covers sprites and vercel).
+if [ "$provider" = fly ]; then preflight_check "$env_name" 0; else preflight_check "$env_name"; fi
 step 1 "env test" "$THEGN_BIN" env test "$env_name"
 scratch_repo
 in_repo "$THEGN_BIN" env set "$env_name" >/dev/null
@@ -340,6 +464,14 @@ step 8 "land --worktree <rd-x> --release-sandbox" in_repo "$THEGN_BIN" land --wo
 step 9a "ledger record gone" record_gone
 step 9b "sandbox absent from the org listing" listing_lacks_name
 step 10 "env reap --provider $provider is clean" reap_clean
+snapshot_records
+step 11 "wt new rd-y --env $env_name" in_repo "$THEGN_BIN" wt new rd-y --env "$env_name"
+step 11b "exactly one new ledger record for rd-y" one_new_record
+echo "sandbox (rd-y): $RDY_NAME"
+step 11p "resolve the rd-y worktree path" resolve_rdy_path
+# --force only here: rd-y is this run's scratch worktree.
+step 11r "wt rm <rd-y path> --force exits 0" no_stdin in_repo "$THEGN_BIN" wt rm "$RDY_PATH" --force
+step 11c "rd-y's ledger record is gone and the org listing lacks it" rdy_gone
 if [ -n "$adopt_name" ]; then
   step A "env adopt $adopt_name" adopt_step
 fi
