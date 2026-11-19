@@ -128,7 +128,30 @@ labels, assignees or project while the rule exists; an unchanged issue never
 fires when a rule is added, the first refresh of a repo only records a baseline,
 and at most 50 events are produced per refresh. A rule fires at most once per issue
 (`once_per_key` is forced on). It only does work in the existing tracker
-refresh and only when an enabled `issue_matched` rule exists.
+refresh and only when an enabled `issue_matched` rule exists. With
+`[daemon] headless_producers = true` every registered repo is refreshed in the
+daemon; otherwise only the focused repo is refreshed, and only while a UI is open.
+
+## Headless producers
+
+`[daemon] headless_producers = true` (default `false`, needs `[daemon]
+enabled`) lets the daemon run the producers that feed rules, so they fire with
+no window. The kinds are the tracker refresh (also autopilot pickup), the PR
+poll (`pr_checks`, `pr_review_requested`, `merge_landed` and PR notifications;
+at most 8 worktrees per tick, for the forge rate limit), mention polling
+(`[notifications] github_mentions`) and the PR queue drive (`[pr_queue]
+enabled`).
+
+A kind is armed only when something needs it, for example an enabled
+`issue_matched` rule, an `[autopilot]` repo, or an enabled PR rule. With
+nothing armed, the daemon starts no task and does not idle-exit while one is
+armed. Each kind runs under a single-producer lease in the database (schema
+v114: restart the daemon after upgrading), renewed every tick with a TTL of
+three cadences, at least 60 seconds. While the daemon holds it, the UI skips
+its own fetch and only reloads from the cache; if the daemon dies, the UI
+resumes after the TTL. The daemon's PR queue pass hands blockers to an agent only
+with `[pr_queue] agent_sandbox = true`; otherwise it only notifies. Not yet
+verified live; `thegn doctor` shows producer status.
 
 ## session_exited
 
@@ -159,11 +182,12 @@ the API, MCP or the Lead's tool surface except by authoring a rule.
 rule runs at. `propose` starts nothing: it raises an approval request instead.
 `review` and `merge` both start the pipeline today; the difference is the
 recorded ceiling, which the stage executor enforces at land. In this release
-`merge` behaves like `review`: it stops for your approval before landing. The
-merge queue's `gate_command` still runs on the host, outside any sandbox, and
-it runs the lane's own code (its justfile, build scripts and tests), so no land
-skips the owner until the gate itself is sandboxed. The approval's reason says
-"the merge gate is not sandboxed yet".
+`merge` lands unattended only with `[merge_queue] gate_sandbox = "sealed"`
+(default `off`) and a sealed gate that resolves for the repo. Otherwise it
+behaves like `review` and stops for your approval, because the gate runs the
+lane's own code (its justfile, build scripts and tests) and would otherwise run
+on the host. The approval's reason says why. A sealed gate has no network, so a
+gate that downloads dependencies or runs `nix develop` still asks.
 
 The stage executor's validations run inside the lane worktree's sealed
 sandbox, never on the host. A worktree without a sealed sandbox records an
