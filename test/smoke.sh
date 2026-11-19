@@ -2555,6 +2555,20 @@ check "stable honours observe toggles" \
 check "dev honours the same toggles" \
   "env THEGN_CHANNEL=dev '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = true'"
 
+# Closed-pipe regressions: a reader that hangs up mid-drain/land must not
+# strand a claimed row or skip the roster/DB bookkeeping after the ref moved.
+MP2="$("$SZ" wt new smoke-pipe-drain --repo "$R")"
+MB2="$(git -C "$MP2" symbolic-ref --short HEAD)"
+echo p >"$MP2/pipe-drain.txt"
+git -C "$MP2" add -f -A && git -C "$MP2" commit -q -m "smoke pipe drain"
+check "merge drain with a closed stdout pipe still records the landed row" \
+  "'$SZ' merge add '$MP2' >/dev/null && ('$SZ' merge drain | true); [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB2' AND status='landed'\") -eq 1 ]]"
+MP3="$("$SZ" wt new smoke-pipe-land --repo "$R")"
+echo p >"$MP3/pipe-land.txt"
+git -C "$MP3" add -f -A && git -C "$MP3" commit -q -m "smoke pipe land"
+check "land with a closed stdout pipe still advances the target" \
+  "('$SZ' land --worktree '$MP3' | true); git -C '$R' log --oneline | grep -q 'smoke pipe land'"
+
 echo
 if [[ $fail -eq 0 ]]; then
   printf '\033[32mall smoke checks passed\033[0m\n'

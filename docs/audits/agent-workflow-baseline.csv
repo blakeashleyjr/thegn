@@ -1,0 +1,11 @@
+cohort,kind,issue,evidence,uncached_input_tokens,minutes_to_first_green,combined_repair_rounds
+before,pipeline-codex-worktree,THE-4,.thegn/pipeline/THE-4/review/verdict.md,825050,,
+before,pipeline-codex-worktree,THE-7,.thegn/pipeline/THE-7/review/313.md,3361245,,
+before,pipeline-codex-worktree,THE-9,.thegn/pipeline/THE-9/review/verdict.md,1755413,,
+before,pipeline-codex-worktree,THE-10,.thegn/pipeline/THE-10/review/447.md,342363,,
+before,pipeline-codex-worktree,THE-11,.thegn/pipeline/THE-11/review/verdict.md,4342539,,
+before,pipeline-codex-worktree,THE-13,.thegn/pipeline/THE-13/review/359.md,3104331,,
+before,pipeline-codex-worktree,THE-17,.thegn/pipeline/THE-17/review/364.md,3668404,,
+before,pipeline-codex-worktree,THE-20,.thegn/pipeline/THE-20/review/365.md,3819224,,
+before,pipeline-codex-worktree,THE-21,.thegn/pipeline/THE-21/review/379.md,2435233,,
+before,pipeline-codex-worktree,THE-23,.thegn/pipeline/THE-23/review/439.md,2046202,,
