@@ -20659,10 +20659,9 @@ async fn event_loop<T: Terminal>(
                     // prefix), and the matcher is reset either way.
                     let open_quit = crate::handlers::quit_confirm::is_quit_prompt(m);
                     if open_quit.is_some() {
-                        let single = match keymap.dispatch(
-                            mode,
-                            crate::sequence::Key::modified(k.key.clone(), k.modifiers),
-                        ) {
+                        let single = match keymap
+                            .dispatch(mode, crate::sequence::Key::modified(k.key, k.modifiers))
+                        {
                             crate::sequence::MatchResult::Matched(a) => Some(a),
                             _ => None,
                         };

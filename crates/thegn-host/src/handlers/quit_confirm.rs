@@ -77,10 +77,9 @@ pub(crate) fn kind_from_arg(arg: &str) -> Option<QuitKind> {
 
 /// A second quit while the prompt is open confirms. Pure.
 pub(crate) fn second_press(open: Option<QuitKind>, action: Option<&Action>) -> Option<QuitKind> {
-    open?;
-    match action? {
-        Action::Quit => Some(QuitKind::Detach),
-        Action::QuitKill => Some(QuitKind::Kill),
+    match (open?, action?) {
+        (QuitKind::Detach, Action::Quit) => Some(QuitKind::Detach),
+        (QuitKind::Kill, Action::QuitKill) => Some(QuitKind::Kill),
         _ => None,
     }
 }
@@ -149,6 +148,11 @@ mod tests {
         assert_eq!(
             second_press(Some(QuitKind::Kill), Some(&Action::QuitKill)),
             Some(QuitKind::Kill)
+        );
+        assert_eq!(second_press(d, Some(&Action::QuitKill)), None);
+        assert_eq!(
+            second_press(Some(QuitKind::Kill), Some(&Action::Quit)),
+            None
         );
         assert_eq!(second_press(d, Some(&Action::Detach)), None);
         assert_eq!(second_press(d, None), None);
