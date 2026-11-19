@@ -15,7 +15,9 @@ use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STAN
 use zeroize::Zeroizing;
 
 /// The longest response line segment (text between CRLFs, literals excluded).
-pub const MAX_LINE: usize = 64 * 1024;
+/// A `* SEARCH` line naming a large unread set must fit; [`MAX_RESPONSE`]
+/// still bounds memory per command.
+pub const MAX_LINE: usize = 1024 * 1024;
 /// The largest `{n}` literal accepted.
 pub const MAX_LITERAL: usize = 64 * 1024;
 /// The most bytes the whole reply to one command may take (untagged
@@ -23,6 +25,10 @@ pub const MAX_LITERAL: usize = 64 * 1024;
 pub const MAX_RESPONSE: usize = 2 * 1024 * 1024;
 /// The most UIDs one `UID FETCH` names.
 pub const MAX_UIDS: usize = 200;
+/// The most untagged responses one command's reply may carry.
+pub const MAX_UNTAGGED: usize = 4 * MAX_UIDS + 64;
+/// The longest encoded-word scan (charset, and encoded text) before giving up.
+const MAX_ENCODED_WORD: usize = 256;
 /// The deepest parenthesized list nesting accepted.
 pub const MAX_DEPTH: usize = 8;
 /// The most digits in a `{n}` literal length.
@@ -662,7 +668,11 @@ pub fn decode_words(input: &str) -> String {
 /// One encoded word at the start of `s`: the decoded text and the bytes used.
 fn encoded_word(s: &str) -> Option<(String, usize)> {
     let body = s.strip_prefix("=?")?;
-    let q1 = body.find('?')?;
+    let q1 = body
+        .as_bytes()
+        .iter()
+        .take(MAX_ENCODED_WORD)
+        .position(|&b| b == b'?')?;
     let charset = &body[..q1];
     let after = &body[q1 + 1..];
     let enc = *after.as_bytes().first()?;
@@ -670,7 +680,11 @@ fn encoded_word(s: &str) -> Option<(String, usize)> {
         return None;
     }
     let text_all = &after[2..];
-    let end = text_all.find("?=")?;
+    let end = text_all
+        .as_bytes()
+        .windows(2)
+        .take(MAX_ENCODED_WORD)
+        .position(|w| w == b"?=")?;
     let text = &text_all[..end];
     if charset.is_empty()
         || charset.contains(char::is_whitespace)
