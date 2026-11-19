@@ -20,7 +20,7 @@ fn mount_host(spec: &str, home: &Path) -> PathBuf {
 }
 
 fn covers_login_runtime_dir(path: &Path) -> bool {
-    path == Path::new("/run") || path == Path::new("/run/user") || path.starts_with("/run/user/")
+    Path::new("/run/user").starts_with(path) || path.starts_with("/run/user")
 }
 
 fn covers_mounts(input: &ExposureInput<'_>) -> Vec<(&str, &str)> {
@@ -101,13 +101,13 @@ pub(crate) fn json(cfg: &Config) -> serde_json::Value {
         home: &home,
         mounts: &mounts,
     };
-    let runtime_dir = runtime_dir.map(|path| path.display().to_string());
+    let runtime_dir_text = runtime_dir.as_ref().map(|path| path.display().to_string());
     let run_user_mounts = covers_mounts(&input)
         .into_iter()
         .map(|(table, mount)| serde_json::json!({ "table": table, "mount": mount }))
         .collect::<Vec<_>>();
     serde_json::json!({
-        "runtime_dir": runtime_dir,
+        "runtime_dir": runtime_dir_text,
         "run_user_mounts": run_user_mounts,
         "warnings": warnings(&input),
     })
@@ -152,6 +152,14 @@ mod tests {
         let warnings = warnings(&input(Some("/tmp/thegn-runtime"), "/home/me", &mounts));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("mount sandbox:/run/user:/run/user"));
+    }
+
+    #[test]
+    fn exposure_warns_on_a_root_mount() {
+        let mounts = vec![("sandbox".into(), "/:/host".into())];
+        let warnings = warnings(&input(Some("/tmp/rt"), "/home/me", &mounts));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("mount sandbox:/:/host"));
     }
 
     #[test]
