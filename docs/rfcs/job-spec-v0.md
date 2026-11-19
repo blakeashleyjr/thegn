@@ -2,6 +2,10 @@
 
 Draft for public review, 18 November 2026. A Job consumes one immutable snapshot and produces one structured result with artifact references. A shard is a logical partition of that job. A run is one execution attempt of one shard. All providers use those meanings, including when a job has one shard. The wire choices, defaults and failure rules here are proposed for the [Jobs architecture and release plan](jobs.md).
 
+The first implementation provides the [spec and result types](../../crates/thegn-job-spec/src/lib.rs), [canonical directory encoder](../../crates/thegn-cas/src/lib.rs), [attempt lease transitions](../../crates/thegn-lease/src/lib.rs) and [guest handshake](../../crates/thegn-guest-proto/proto/guest.proto). Replay the four crates' contract tests together with `cargo nextest run -p thegn-job-spec -p thegn-cas -p thegn-lease -p thegn-guest-proto`. The [change ledger](../../openspec/changes/add-job-contract-v0/tasks.md) tracks the storage and executor checks.
+
+Non-Rust clients can consume the generated [JobSpec schema](../../crates/thegn-job-spec/schemas/job-v0.json) and [JobResult schema](../../crates/thegn-job-spec/schemas/result-v0.json). A schema describes wire structure. The submission parser also checks cross-field and path constraints. Byte quantities accept unsigned integer bytes or the binary suffixes Ki, Mi, Gi and Ti. Durations accept a positive integer with ms, s, m or h. Result timings use milliseconds, and cost amounts use millionths of the stated currency.
+
 ## A portable job
 
 ```yaml
@@ -61,6 +65,8 @@ The daemon derives the author class from trusted identity and source information
 Expose submit, status, watch/logs, artifacts and cancel through the public API. Submit returns a stable job ID once the request is durable. A retry or a lookup by scoped idempotency key recovers that ID. Status returns current phases or a terminal result. Logs take an attempt ID and cursor for streaming, tail or bounded search. Artifact reads select a job, shard, attempt and manifest path. Cancel can be replayed and reports which terminal state won a race. All reads require authorization for that job. Give agent credentials scoped verbs, concurrency and byte limits. CLI, MCP helpers such as build/test/nix_build, and the optional hosted provider use these same operations.
 
 ## Input, output and storage authority
+
+The [agent-tier proposal](agent-tier-local-mode.md#3-workspace-snapshots-and-source-changes-a4) layers routed command output on this boundary. A worker can publish a candidate patch under its attempt fence. Only the workspace authority can apply it. The proposal also gives live VM leases their own API resource so existing v0 documents retain `kind: Job`.
 
 Build the snapshot from the selected worktree's current bytes, including tracked edits, additions, deletions and non-ignored untracked files, subject to explicit excludes. Exclude Git administrative data. Apply trusted secret/path exclusions before upload. Treat gitlinks, non-portable path names and unsupported file kinds as validation errors until specified. Read symlinks as links, constrain their targets to the tree, preserve the executable bit and sort entries as REAPI requires. Detect changing inputs during capture and retry or return a snapshot error. A submitted job is pinned once its input root is durable.
 
