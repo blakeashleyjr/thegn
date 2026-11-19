@@ -2,7 +2,7 @@
 
 Welcome! This gets you from clone to a running dev build in a few minutes.
 For the product tour see [`README.md`](README.md); for architecture and
-invariants see [`CLAUDE.md`](CLAUDE.md).
+invariants see [the development reference](DEVELOPMENT.md).
 
 ## Start here
 
@@ -11,7 +11,7 @@ invariants see [`CLAUDE.md`](CLAUDE.md).
 - Questions and bug reports go through [SUPPORT.md](SUPPORT.md) and the issue
   templates. Security reports go through [SECURITY.md](SECURITY.md), never a
   public issue.
-- For a first change, read [CLAUDE.md](CLAUDE.md), enter the dev shell with
+- For a first change, read [AGENTS.md](AGENTS.md), enter the dev shell with
   `nix develop`, and iterate with `just quick <crate>` and targeted tests such
   as `cargo nextest run -p <crate> <filter>`. The [Dev loop](#dev-loop)
   explains when to leave the heavy gates until later: `just test` and
@@ -153,6 +153,10 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
 `openspec` CLI is in the dev shell; agent slash-commands regenerate with
 `just openspec-setup`). Every config key is documented in
 [`config/config.toml.example`](config/config.toml.example).
+
+### Early integration of dependent branches
+
+When parallel changes share a schema, generated surface, or caller/callee contract, the integrator checks the first combined checkout that contains both tips. Run `just integration-check <crate> '<nextest expression>' <first-tip> <second-tip>` for the affected behavior. Record the combined SHA and result in the existing issue handoff. Every remaining lane can use that evidence while the normal fold and PR gates run at their usual boundaries.
 
 ## Programme conventions (sandbox + remote, 2026-11)
 
@@ -523,7 +527,7 @@ The architecture (crates, invariants, and the gate behind each) is
 - `crates/thegn-host` — the compositor: event loop (`src/run.rs`), chrome,
   panes, handlers.
 
-Read [`CLAUDE.md`](CLAUDE.md) before touching the event loop or render path —
+Read [the development reference](DEVELOPMENT.md) before touching the event loop or render path —
 the 0%-idle and render-plan invariants are enforced by tests. Prefer sibling
 modules over growing the large legacy files (run.rs, config.rs, …).
 

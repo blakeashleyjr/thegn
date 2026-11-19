@@ -99,6 +99,9 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
         &mut report,
         "destroy_missing_is_ok",
         Some(async {
+            // Whether a DELETE goes out is the provider's business: a sandbox
+            // this host recorded is deleted 404-tolerantly, an unrecorded one
+            // is only probed. The contract is that teardown is idempotent.
             p.destroy(&fx.missing)
                 .await
                 .map_err(|e| format!("destroying a missing sandbox failed: {e:#}"))
@@ -111,12 +114,11 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
         "destroy_unrecorded_refused",
         fx.foreign.as_ref().map(|foreign| async move {
             let count = fx.deletes_for.as_ref().map(|probe| probe());
-            let before = count.as_ref().map_or(0, |c| c(foreign));
             ensure(p.destroy(foreign).await.is_err(), || {
                 format!("destroy of unrecorded {foreign} succeeded")
             })?;
             let after = count.as_ref().map_or(0, |c| c(foreign));
-            ensure(after == before, || {
+            ensure(after == 0, || {
                 format!("a DELETE for unrecorded {foreign} was sent")
             })
         }),
