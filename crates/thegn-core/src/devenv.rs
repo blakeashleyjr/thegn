@@ -286,24 +286,6 @@ pub fn store(repo_root: &Path, dev: &Devshell) -> Result<PathBuf, String> {
         )
     })?;
     let path = cache_path(&key);
-    let parent = path.parent().ok_or_else(|| {
-        format!(
-            "cannot cache devShell: cache path {} has no parent directory",
-            path.display()
-        )
-    })?;
-    crate::fsperm::ensure_private_dir(parent).map_err(|error| {
-        format!(
-            "cannot create private devShell cache directory {}: {error}",
-            parent.display()
-        )
-    })?;
-    cache_parent_admissible(parent).map_err(|reason| {
-        format!(
-            "cannot write devShell cache path {}: {reason}",
-            path.display()
-        )
-    })?;
     let bytes = serde_json::to_vec(&dev).map_err(|error| {
         format!(
             "cannot serialize devShell cache entry {}: {error}",
@@ -317,13 +299,34 @@ pub fn store(repo_root: &Path, dev: &Devshell) -> Result<PathBuf, String> {
             path.display()
         ));
     }
-    crate::fsperm::write_owner_only_atomic(&path, &bytes).map_err(|error| {
+    let anchor = crate::util::xdg_state_home().join("thegn");
+    std::fs::create_dir_all(&anchor).map_err(|error| {
         format!(
-            "cannot write devShell cache entry {}: {error}",
+            "cannot create state directory {}: {error}",
+            anchor.display()
+        )
+    })?;
+    let dir = crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new("devenv")).map_err(
+        |error| {
+            format!(
+                "cannot open private devShell cache directory {}: {error}",
+                anchor.join("devenv").display()
+            )
+        },
+    )?;
+    cache_parent_admissible(dir.path()).map_err(|reason| {
+        format!(
+            "cannot write devShell cache path {}: {reason}",
             path.display()
         )
     })?;
-    Ok(path)
+    dir.write_owner_only_atomic(&format!("{key}.json"), &bytes)
+        .map_err(|error| {
+            format!(
+                "cannot write devShell cache entry {}: {error}",
+                path.display()
+            )
+        })
 }
 
 fn read_cache(path: &Path) -> Option<Devshell> {
@@ -563,7 +566,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("flake.nix"), "{ outputs = _: {}; }").unwrap();
         let error = store(repo.path(), &Devshell::default()).unwrap_err();
-        assert!(error.contains("empty devShell"), "{error}");
+        assert!(error.contains("devShell is empty"), "{error}");
     }
 
     #[test]
