@@ -5985,7 +5985,7 @@ mod tests {
         assert_eq!(on, shape(0), "no batch token: grouping changes nothing");
     }
 
-    // ── b164 lane 2: batch folding through build_rows ──────────────────────
+    // ---- b164 lane 2: batch folding through build_rows ----
 
     /// The owner's 50 real worktrees in the `thegn` workspace: three plain
     /// names (with the synthesized `home`, four singles) and five batches.
