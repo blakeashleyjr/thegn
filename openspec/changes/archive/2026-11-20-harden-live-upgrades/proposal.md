@@ -1,3 +1,5 @@
+Retired (superseded) in batch 175: `just live` now builds the checkout and runs the DEV instance (scripts/dev_live.py, batch 174); the in-place upgrader this change hardened was removed. Its spec delta was not applied.
+
 # Harden live developer upgrades
 
 THE-613, a bounded child of THE-436, replaces the unsafe `just live` broad daemon
