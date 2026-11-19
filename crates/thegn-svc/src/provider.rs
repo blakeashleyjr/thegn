@@ -3134,14 +3134,10 @@ type StderrSink = Arc<Mutex<StderrTail>>;
 
 /// Remove ESC and C0 controls except \n and \t; lossy UTF-8.
 pub(crate) fn sanitize_stderr(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(
-        &bytes
-            .iter()
-            .copied()
-            .filter(|byte| *byte >= 0x20 || matches!(*byte, b'\n' | b'\t'))
-            .collect::<Vec<_>>(),
-    )
-    .into_owned()
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
 }
 
 fn append_stderr_tail(mut output: String, code: i32, stderr: &StderrSink) -> String {
