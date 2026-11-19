@@ -128,7 +128,7 @@ impl AnsiStripper {
                     self.state = AnsiState::EscIntermediate;
                     None
                 }
-                byte if byte < 0x20 || byte >= 0x80 => {
+                byte if !(0x20..0x80).contains(&byte) => {
                     self.state = AnsiState::Normal;
                     self.consume_byte(byte)
                 }
