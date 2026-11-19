@@ -25,7 +25,7 @@ async fn vercel_passes_the_conformance_suite() {
         view("tg-vercel-foreign", SessionStatus::Running, Some("sess_f")),
     );
 
-    let p = Provider::Vercel(provider(&fake, ledger.path(), 5));
+    let p = Provider::Vercel(provider(&fake, ledger.path(), 1));
     let (seen, counts, resumes) = (fake.clone(), fake.clone(), fake.clone());
     let fx = Fixture {
         created: NAME.into(),
