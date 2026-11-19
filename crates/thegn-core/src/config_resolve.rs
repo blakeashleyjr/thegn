@@ -3612,8 +3612,9 @@ mod tests {
         assert!(!resolved.events.iter().any(|event| event.key == "env"));
     }
 
-    /// b156: `model_credentials` (and `interactive_host_suffixes`) are set
-    /// only by the user's own config table. A repo `.thegn.*` overlay can name
+    /// b156: `model_credentials` (and `interactive_host_suffixes`, and b162's
+    /// `login_homes` / `lifetime_reap`) are set only by the user's own config
+    /// table. A repo `.thegn.*` overlay can name
     /// an env but has no route to its provider table: the overlay shape has no
     /// such key, an overlay that tries is dropped whole, and the effective
     /// value stays `none`.
@@ -3625,6 +3626,8 @@ mod tests {
                 .unwrap();
         assert!(!schema.contains("model_credentials"), "{schema}");
         assert!(!schema.contains("interactive_host_suffixes"), "{schema}");
+        assert!(!schema.contains("login_homes"), "{schema}");
+        assert!(!schema.contains("lifetime_reap"), "{schema}");
 
         let cfg: Config = toml::from_str(
             r#"
@@ -3642,6 +3645,9 @@ mod tests {
             "env = \"v\"\n[env.v.provider]\nmodel_credentials = \"upload\"\n",
             "env = \"v\"\nmodel_credentials = \"upload\"\n",
             "env = \"v\"\n[sandbox]\nmodel_credentials = \"upload\"\n",
+            "[env.v.provider]\nlogin_homes = { claude = \"/tmp/evil\" }\nlifetime_reap = true\n",
+            "env = \"v\"\n[env.v.provider]\nlogin_homes = { codex = \"/tmp/evil\" }\n",
+            "env = \"v\"\nlogin_homes = { claude = \"/tmp/evil\" }\n",
         ] {
             let repo = tempfile::tempdir().unwrap();
             std::fs::write(repo.path().join(".thegn.toml"), overlay).unwrap();
@@ -3658,6 +3664,8 @@ mod tests {
                 "{overlay}"
             );
             assert!(effective.interactive_host_suffixes.is_empty(), "{overlay}");
+            assert!(effective.login_homes.is_empty(), "{overlay}");
+            assert!(!effective.lifetime_reap, "{overlay}");
         }
     }
 

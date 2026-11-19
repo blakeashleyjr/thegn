@@ -1,12 +1,15 @@
 //! `model_credentials = "upload"`: read the host's claude/codex login files
 //! (and only those) for the `vercel-exec` TTY bridge to upload.
 //!
-//! Only [`creds::login_files`] are read, from the agent's relocated home
+//! Only [`creds::login_files`] are read, from the env's `login_homes.<agent>`
+//! dir when set (a dedicated account; a missing dir skips that agent, never
+//! falling back to the live login), else the agent's relocated home
 //! (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`) when set, else `~/.claude` /
 //! `~/.codex`. A symlink, a non-regular file or a file over [`MAX_LOGIN_FILE`]
 //! is refused. Never settings, hooks, MCP config, `[[accounts]]` trees or
 //! anything else in the home.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -26,17 +29,44 @@ fn agent_home_source(agent: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// The agent's host home: the relocation var (tilde-expanded) if set and
-/// non-empty, else `<home>/<default dir>`.
-fn agent_home(agent: &str, env: &dyn Fn(&str) -> Option<String>, home: &Path) -> Option<PathBuf> {
+/// The `login_homes` key an upload agent reads.
+fn login_home_key(agent: &str) -> Option<&'static str> {
+    match agent {
+        "claude" | "claude-code" => Some("claude"),
+        "codex" => Some("codex"),
+        _ => None,
+    }
+}
+
+/// The agent's host home: its `login_homes` entry (tilde-expanded) if set and
+/// non-empty, else the relocation var (tilde-expanded) if set and non-empty,
+/// else `<home>/<default dir>`. `Err` names a `login_homes` dir that is not a
+/// directory: the agent is skipped rather than read from the live login.
+fn agent_home(
+    agent: &str,
+    login_homes: &BTreeMap<String, String>,
+    env: &dyn Fn(&str) -> Option<String>,
+    home: &Path,
+) -> Option<Result<PathBuf, String>> {
     let (var, default_dir) = agent_home_source(agent)?;
-    Some(
-        env(var)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .map(|v| PathBuf::from(thegn_core::util::expand_tilde_in(&v, home)))
-            .unwrap_or_else(|| home.join(default_dir)),
-    )
+    let nonempty = |v: &str| Some(v.trim().to_string()).filter(|v| !v.is_empty());
+    if let Some(key) = login_home_key(agent)
+        && let Some(dir) = login_homes.get(key).and_then(|v| nonempty(v))
+    {
+        let dir = PathBuf::from(thegn_core::util::expand_tilde_in(&dir, home));
+        return Some(if dir.is_dir() {
+            Ok(dir)
+        } else {
+            Err(format!(
+                "login_homes.{key} = {} is not a directory (the live host login is not used in its place)",
+                dir.display()
+            ))
+        });
+    }
+    Some(Ok(env(var)
+        .and_then(|v| nonempty(&v))
+        .map(|v| PathBuf::from(thegn_core::util::expand_tilde_in(&v, home)))
+        .unwrap_or_else(|| home.join(default_dir))))
 }
 
 /// Read one login file: no-follow, regular, at most [`MAX_LOGIN_FILE`] bytes.
@@ -84,6 +114,7 @@ fn wipe(mut bytes: Vec<u8>) {
 /// without touching process env).
 pub(crate) fn read_host_logins_in(
     agents: &[String],
+    login_homes: &BTreeMap<String, String>,
     env: &dyn Fn(&str) -> Option<String>,
     home: &Path,
 ) -> (Vec<LoginPayload>, Vec<String>) {
@@ -91,12 +122,21 @@ pub(crate) fn read_host_logins_in(
     let mut skipped = Vec::new();
     for agent in agents {
         let agent = agent.trim();
-        let (Some(files), Some(dir)) = (creds::login_files(agent), agent_home(agent, env, home))
-        else {
+        let (Some(files), Some(dir)) = (
+            creds::login_files(agent),
+            agent_home(agent, login_homes, env, home),
+        ) else {
             skipped.push(format!(
                 "{agent}: model_credentials = upload supports claude and codex"
             ));
             continue;
+        };
+        let dir = match dir {
+            Ok(dir) => dir,
+            Err(why) => {
+                skipped.push(format!("{agent}: {why}"));
+                continue;
+            }
         };
         let mut read = Vec::new();
         let mut failed = None;
@@ -129,10 +169,14 @@ pub(crate) fn read_host_logins_in(
     (payloads, skipped)
 }
 
-/// The login payloads for `agents`, plus one reason line per skipped agent.
-pub(crate) fn read_host_logins(agents: &[String]) -> (Vec<LoginPayload>, Vec<String>) {
+/// The login payloads for `agents` (read from `login_homes` where set), plus
+/// one reason line per skipped agent.
+pub(crate) fn read_host_logins(
+    agents: &[String],
+    login_homes: &BTreeMap<String, String>,
+) -> (Vec<LoginPayload>, Vec<String>) {
     let home = thegn_core::util::home();
-    read_host_logins_in(agents, &|key| std::env::var(key).ok(), &home)
+    read_host_logins_in(agents, login_homes, &|key| std::env::var(key).ok(), &home)
 }
 
 #[cfg(test)]
@@ -160,7 +204,8 @@ mod tests {
         write(&profile.join("settings.json"), b"SETTINGS-MARKER");
         let env = |key: &str| (key == "CLAUDE_CONFIG_DIR").then(|| profile.display().to_string());
 
-        let (payloads, skipped) = read_host_logins_in(&agents(&["claude"]), &env, &home);
+        let (payloads, skipped) =
+            read_host_logins_in(&agents(&["claude"]), &BTreeMap::new(), &env, &home);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert_eq!(payloads.len(), 1);
         let names = payloads[0].file_names();
@@ -174,11 +219,53 @@ mod tests {
     }
 
     #[test]
+    fn login_homes_win_over_the_relocated_and_default_homes() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let home = state.root().to_path_buf();
+        write(&home.join(".codex/auth.json"), b"LIVE");
+        let relocated = home.join("relocated");
+        write(&relocated.join("auth.json"), b"RELOCATED");
+        let dedicated = home.join("accounts/codex");
+        write(&dedicated.join("auth.json"), b"DEDICATED-ACCOUNT");
+        let env = |key: &str| (key == "CODEX_HOME").then(|| relocated.display().to_string());
+        let homes: BTreeMap<String, String> =
+            [("codex".to_string(), "~/accounts/codex".to_string())]
+                .into_iter()
+                .collect();
+        let (payloads, skipped) = read_host_logins_in(&agents(&["codex"]), &homes, &env, &home);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            payloads[0].file_len("auth.json"),
+            Some(b"DEDICATED-ACCOUNT".len())
+        );
+    }
+
+    #[test]
+    fn a_missing_login_home_skips_the_agent_instead_of_the_live_login() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let home = state.root().to_path_buf();
+        write(&home.join(".claude/.credentials.json"), b"LIVE-SECRET");
+        let homes: BTreeMap<String, String> = [(
+            "claude".to_string(),
+            home.join("no-such-account").display().to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let (payloads, skipped) =
+            read_host_logins_in(&agents(&["claude"]), &homes, &|_| None, &home);
+        assert!(payloads.is_empty());
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].contains("login_homes.claude"), "{skipped:?}");
+        assert!(!skipped[0].contains("LIVE-SECRET"), "{skipped:?}");
+    }
+
+    #[test]
     fn falls_back_to_the_default_home() {
         let state = thegn_core::testenv::IsolatedState::new();
         let home = state.root().to_path_buf();
         write(&home.join(".codex/auth.json"), b"{\"k\":1}");
-        let (payloads, skipped) = read_host_logins_in(&agents(&["codex"]), &|_| None, &home);
+        let (payloads, skipped) =
+            read_host_logins_in(&agents(&["codex"]), &BTreeMap::new(), &|_| None, &home);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert_eq!(payloads[0].file_names(), ["auth.json"]);
     }
@@ -198,7 +285,8 @@ mod tests {
         {
             return; // symlinks unavailable on this platform
         }
-        let (payloads, skipped) = read_host_logins_in(&agents(&["codex"]), &|_| None, &home);
+        let (payloads, skipped) =
+            read_host_logins_in(&agents(&["codex"]), &BTreeMap::new(), &|_| None, &home);
         assert!(payloads.is_empty());
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].contains("symlinks are refused"), "{skipped:?}");
@@ -212,7 +300,8 @@ mod tests {
             &home.join(".codex/auth.json"),
             &vec![b'x'; MAX_LOGIN_FILE as usize + 1],
         );
-        let (payloads, skipped) = read_host_logins_in(&agents(&["codex"]), &|_| None, &home);
+        let (payloads, skipped) =
+            read_host_logins_in(&agents(&["codex"]), &BTreeMap::new(), &|_| None, &home);
         assert!(payloads.is_empty());
         assert!(skipped[0].contains("larger than"), "{skipped:?}");
     }
@@ -221,7 +310,12 @@ mod tests {
     fn unsupported_and_missing_agents_are_skipped() {
         let state = thegn_core::testenv::IsolatedState::new();
         let home = state.root().to_path_buf();
-        let (payloads, skipped) = read_host_logins_in(&agents(&["pi", "codex"]), &|_| None, &home);
+        let (payloads, skipped) = read_host_logins_in(
+            &agents(&["pi", "codex"]),
+            &BTreeMap::new(),
+            &|_| None,
+            &home,
+        );
         assert!(payloads.is_empty());
         assert_eq!(skipped.len(), 2, "{skipped:?}");
         assert!(skipped[0].starts_with("pi: "), "{skipped:?}");
