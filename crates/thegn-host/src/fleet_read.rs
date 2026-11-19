@@ -17,6 +17,7 @@
 //! a fleet it cannot read is a new sandbox it refuses.
 
 use anyhow::Result;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 use thegn_core::config::Config;
@@ -175,7 +176,48 @@ fn gather_where(
         .zip(reads)
         .map(|(slot, read)| env_inventory(&slot.env, &slot.provider_name, read))
         .collect();
-    Ok(fleet_cost::join(inventories, recorded_sandboxes(cfg)))
+    let mut view = fleet_cost::join(inventories, recorded_sandboxes(cfg));
+    fleet_cost::split_down(&mut view, |record| {
+        crate::provider_workdir::is_provisioned_locally(&record.id)
+    });
+
+    let mut sprites_names = BTreeMap::<String, Option<BTreeSet<String>>>::new();
+    for slot in &slots {
+        let Ok(Provider::Sprites(provider)) = &slot.provider else {
+            continue;
+        };
+        let names = provider.scope().map(|scope| {
+            thegn_svc::sprites::ledger::owned(scope)
+                .map(|owned| {
+                    owned
+                        .recorded
+                        .into_iter()
+                        .map(|record| record.name)
+                        .collect()
+                })
+                .map_err(|error| {
+                    tracing::debug!(
+                        target: "thegn::fleet",
+                        env = %slot.env,
+                        error = %format!("{error:#}"),
+                        "sprites ownership ledger read failed"
+                    );
+                })
+                .ok()
+        });
+        sprites_names.insert(slot.env.clone(), names.flatten());
+    }
+    fleet_cost::mark_unrecorded(&mut view, |row| {
+        sprites_ours(
+            sprites_names.get(&row.env).and_then(|names| names.as_ref()),
+            row,
+        )
+    });
+    Ok(view)
+}
+
+fn sprites_ours(names: Option<&BTreeSet<String>>, row: &fleet_cost::FleetRow) -> Option<bool> {
+    (row.provider == "sprites").then(|| names.is_some_and(|names| names.contains(&row.id)))
 }
 
 /// Shape one env's read. `Err` carries the reason (build or read failure).
@@ -265,6 +307,7 @@ fn recorded_for(cfg: &Config, worktree: &str) -> Option<RecordedSandbox> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn env_inventory_shapes_each_read() {
@@ -308,6 +351,30 @@ mod tests {
         assert_eq!(
             unbuilt.completeness,
             Completeness::Unavailable("unavailable: API token FLY_X could not be resolved".into())
+        );
+    }
+
+    #[test]
+    fn sprites_ours_table() {
+        let names = BTreeSet::from(["owned".to_string()]);
+        let sprite = |id: &str| fleet_cost::FleetRow {
+            provider: "sprites".into(),
+            id: id.into(),
+            ..fleet_cost::FleetRow::default()
+        };
+        assert_eq!(sprites_ours(None, &sprite("owned")), None);
+        assert_eq!(sprites_ours(Some(&names), &sprite("owned")), Some(true));
+        assert_eq!(sprites_ours(Some(&names), &sprite("foreign")), Some(false));
+        assert_eq!(
+            sprites_ours(
+                Some(&names),
+                &fleet_cost::FleetRow {
+                    provider: "vercel".into(),
+                    id: "owned".into(),
+                    ..fleet_cost::FleetRow::default()
+                }
+            ),
+            None
         );
     }
 
@@ -391,6 +458,16 @@ mod tests {
             Ok(()),
             "a stopped sandbox does not burn"
         );
+    }
+
+    #[test]
+    fn admit_counts_unrecorded_rows_toward_the_budget() {
+        let cfg = budget_cfg(2.0);
+        let mut view = running(&["a", "unrecorded"]);
+        view.rows[1].unrecorded = true;
+        view.unrecorded = 1;
+        let error = admit_with(&cfg, "e", "new", |_| Ok(view)).unwrap_err();
+        assert!(error.contains("max_hourly $2.00/h"), "{error}");
     }
 
     #[test]

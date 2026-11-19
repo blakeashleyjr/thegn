@@ -277,11 +277,15 @@ pub struct FleetRow {
     pub region: Option<String>,
     pub created_ms: Option<i64>,
     pub worktree: Option<String>,
+    /// Listed by an account-wide provider (sprites) with no worktree and no
+    /// record of this host: not thegn's to judge, never an orphan.
+    #[serde(default)]
+    pub unrecorded: bool,
 }
 
 impl FleetRow {
     pub fn is_orphan(&self) -> bool {
-        self.worktree.is_none()
+        self.worktree.is_none() && !self.unrecorded
     }
 }
 
@@ -297,13 +301,49 @@ pub struct PartialEnv {
 pub struct FleetView {
     /// Every listed sandbox, deduplicated by `(provider, id)`.
     pub rows: Vec<FleetRow>,
-    /// How many rows have no worktree.
+    /// How many rows have no worktree and are not marked `unrecorded`.
     pub orphans: usize,
     /// Recorded sandboxes the provider did not list (only judged for envs
     /// whose inventory was complete).
     pub missing: Vec<RecordedSandbox>,
+    /// Recorded worktree sandboxes the provider does not list and this host
+    /// never provisioned or already tore down (`env down`): not a warning.
+    #[serde(default)]
+    pub down: Vec<RecordedSandbox>,
+    /// Rows marked `unrecorded`.
+    #[serde(default)]
+    pub unrecorded: usize,
     /// Envs whose inventory was partial or unavailable.
     pub partial: Vec<PartialEnv>,
+}
+
+/// Move every `missing` record for which `provisioned` is false into `down`
+/// (order kept).
+pub fn split_down(view: &mut FleetView, provisioned: impl Fn(&RecordedSandbox) -> bool) {
+    let mut missing = Vec::with_capacity(view.missing.len());
+    for record in view.missing.drain(..) {
+        if provisioned(&record) {
+            missing.push(record);
+        } else {
+            view.down.push(record);
+        }
+    }
+    view.missing = missing;
+}
+
+/// For each row with no worktree, `ours(row) == Some(false)` marks it
+/// `unrecorded`. `None` (unknown) leaves it an orphan. Recomputes `orphans`
+/// and `unrecorded`.
+pub fn mark_unrecorded(view: &mut FleetView, ours: impl Fn(&FleetRow) -> Option<bool>) {
+    for row in &mut view.rows {
+        row.unrecorded = if row.worktree.is_none() {
+            ours(row) == Some(false)
+        } else {
+            false
+        };
+    }
+    view.orphans = view.rows.iter().filter(|row| row.is_orphan()).count();
+    view.unrecorded = view.rows.iter().filter(|row| row.unrecorded).count();
 }
 
 /// Reconcile inventories with recorded bindings. Two envs sharing one account
@@ -340,6 +380,7 @@ pub fn join(inventory: Vec<EnvInventory>, recorded: Vec<RecordedSandbox>) -> Fle
                 region: row.region,
                 created_ms: row.created_ms,
                 worktree: None,
+                unrecorded: false,
             });
         }
     }
@@ -857,6 +898,87 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn split_down_moves_only_unprovisioned_missing() {
+        let mut view = FleetView {
+            missing: vec![
+                recorded("/wt/kept", "a", "kept"),
+                recorded("/wt/down", "a", "down"),
+                recorded("/wt/kept-2", "a", "kept-2"),
+            ],
+            ..FleetView::default()
+        };
+        split_down(&mut view, |record| record.id != "down");
+        assert_eq!(
+            view.missing,
+            vec![
+                recorded("/wt/kept", "a", "kept"),
+                recorded("/wt/kept-2", "a", "kept-2"),
+            ]
+        );
+        assert_eq!(view.down, vec![recorded("/wt/down", "a", "down")]);
+    }
+
+    #[test]
+    fn mark_unrecorded_excludes_rows_from_orphans_and_unknown_stays_orphan() {
+        let mut view = FleetView {
+            rows: vec![
+                FleetRow {
+                    id: "known".into(),
+                    ..FleetRow::default()
+                },
+                FleetRow {
+                    id: "unknown".into(),
+                    ..FleetRow::default()
+                },
+            ],
+            ..FleetView::default()
+        };
+        mark_unrecorded(&mut view, |row| match row.id.as_str() {
+            "known" => Some(false),
+            "unknown" => None,
+            _ => Some(true),
+        });
+        assert!(view.rows[0].unrecorded);
+        assert!(!view.rows[0].is_orphan());
+        assert!(!view.rows[1].unrecorded);
+        assert!(view.rows[1].is_orphan());
+        assert_eq!(view.orphans, 1);
+        assert_eq!(view.unrecorded, 1);
+    }
+
+    #[test]
+    fn bound_rows_are_never_unrecorded() {
+        let mut view = FleetView {
+            rows: vec![FleetRow {
+                id: "bound".into(),
+                worktree: Some("/wt/bound".into()),
+                ..FleetRow::default()
+            }],
+            ..FleetView::default()
+        };
+        mark_unrecorded(&mut view, |_| Some(false));
+        assert!(!view.rows[0].unrecorded);
+        assert_eq!(view.orphans, 0);
+        assert_eq!(view.unrecorded, 0);
+    }
+
+    #[test]
+    fn fleet_view_without_new_fields_deserializes() {
+        let old = r#"{
+            "rows": [{"provider":"fly","env":"e","id":"a",
+                "name":null,"state":null,"size":null,"region":null,
+                "created_ms":null,"worktree":null}],
+            "orphans": 1,
+            "missing": [],
+            "partial": []
+        }"#;
+        let view: FleetView = serde_json::from_str(old).unwrap();
+        assert_eq!(view.unrecorded, 0);
+        assert!(view.down.is_empty());
+        assert!(!view.rows[0].unrecorded);
     }
 
     #[test]
