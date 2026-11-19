@@ -4679,3 +4679,28 @@ fn cold_request_changes_nothing_until_apply() {
     assert!(!need_relayout);
     assert!(!clear_on_next_frame);
 }
+
+/// Removing the last project must leave thegn on the splash, not quit; only
+/// closing the last worktree of a still-present project quits.
+#[test]
+fn removing_the_last_project_does_not_quit() {
+    use crate::workspace_switch_prep::{AfterSwitch, PendingSwitch, SwitchRequestSpec};
+    let idle = PendingSwitch::default();
+    let mut loading = PendingSwitch::default();
+    loading.begin(SwitchRequestSpec {
+        target: "/r/next".into(),
+        group: None,
+        after: AfterSwitch::default(),
+    });
+    // Project removed (id cleared): splash, with or without a landing switch.
+    let removed = crate::session::Session::default();
+    assert!(!super::session_closed_last_worktree(&removed, &idle));
+    assert!(!super::session_closed_last_worktree(&removed, &loading));
+    // Last worktree closed inside a live project: quit.
+    let closed = crate::session::Session {
+        id: "/r/app".into(),
+        ..Default::default()
+    };
+    assert!(super::session_closed_last_worktree(&closed, &idle));
+    assert!(!super::session_closed_last_worktree(&closed, &loading));
+}

@@ -307,6 +307,30 @@ impl SidebarState {
         })
     }
 
+    /// The project the sidebar cursor is in — its own project row, or the
+    /// project row a worktree/folder/lane under the cursor belongs to — as a
+    /// `RemoveWorkspace` outcome. Used by the palette's "Remove project" so it
+    /// acts on the project the user selected, not the active one. `None` when
+    /// the cursor is not inside a removable project (terminals, headings).
+    pub(crate) fn selected_project_removal(&self, model: &FrameModel) -> Option<SidebarOutcome> {
+        use crate::sidebar::RowKind;
+        let visible: Vec<&crate::sidebar::SidebarRow> =
+            model.sidebar_rows.iter().filter(|r| r.visible).collect();
+        let row = *visible.get(self.cursor)?;
+        if row.workspace_slug.is_empty() {
+            return None;
+        }
+        let project = visible[..=self.cursor]
+            .iter()
+            .rev()
+            .find(|r| r.kind == RowKind::Workspace && r.workspace_slug == row.workspace_slug)?;
+        Some(SidebarOutcome::RemoveWorkspace {
+            repo_path: project.worktree_path.clone()?,
+            slug: project.workspace_slug.clone(),
+            display: project.label.clone(),
+        })
+    }
+
     /// Whether the cursor row is the workspace's home worktree (undeletable,
     /// unrenamable).
     fn cursor_is_home(&self, model: &FrameModel, session: &crate::session::Session) -> bool {
@@ -2083,5 +2107,70 @@ mod tests {
         assert_eq!(sb.cursor, more_idx(&model));
         assert!(sb.marked.is_empty(), "Space toggles, it does not mark");
         assert!(sb.menu_for_cursor(&model, &session).is_none());
+    }
+}
+
+#[cfg(test)]
+mod selected_project_removal_tests {
+    use super::*;
+
+    /// The palette's "Remove project" must act on the project the sidebar
+    /// cursor is in, never the first (top) project or the active one.
+    #[test]
+    fn resolves_the_project_owning_the_cursor_row() {
+        let _state = crate::testenv::IsolatedState::new();
+        let session = crate::session::Session::default();
+        let mut model = crate::hydrate::build_initial_model(&session, None);
+        model.sidebar_workspaces = vec![
+            (
+                "alpha".into(),
+                "alpha".into(),
+                "repo".into(),
+                "/r/alpha".into(),
+            ),
+            (
+                "beta".into(),
+                "beta".into(),
+                "repo".into(),
+                "/r/beta".into(),
+            ),
+            (
+                "gamma".into(),
+                "gamma".into(),
+                "repo".into(),
+                "/r/gamma".into(),
+            ),
+        ];
+        let mut sb = SidebarState {
+            focused: true,
+            ..Default::default()
+        };
+        sb.rebuild(&mut model, &session);
+        let visible: Vec<_> = model.sidebar_rows.iter().filter(|r| r.visible).collect();
+        let at = |kind, slug: &str| {
+            visible
+                .iter()
+                .position(|r| r.kind == kind && r.workspace_slug == slug)
+                .unwrap()
+        };
+        let target = |sb: &SidebarState| match sb.selected_project_removal(&model) {
+            Some(SidebarOutcome::RemoveWorkspace {
+                repo_path, slug, ..
+            }) => Some((repo_path, slug)),
+            _ => None,
+        };
+        use crate::sidebar::RowKind;
+        // On the project row itself.
+        sb.cursor = at(RowKind::Workspace, "beta");
+        assert_eq!(target(&sb), Some(("/r/beta".into(), "beta".into())));
+        // On a worktree under the project.
+        sb.cursor = at(RowKind::Worktree, "gamma");
+        assert_eq!(target(&sb), Some(("/r/gamma".into(), "gamma".into())));
+        // Outside any project (terminals section): fall back to the caller.
+        sb.cursor = visible
+            .iter()
+            .position(|r| r.kind == RowKind::SectionHeading)
+            .unwrap();
+        assert_eq!(target(&sb), None);
     }
 }
