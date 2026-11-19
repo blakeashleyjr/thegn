@@ -4600,19 +4600,109 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
     let branch_generation = generation.clone();
     let disk_cfg = cfg.disk.clone();
     crate::sched::spawn_bg_replaceable(move || {
-        if !cwd.is_dir() {
-            return;
+        let outcome = pr_refresh_blocking_fenced(&cwd, &cfg, PrSite::Ui, generation.as_ref());
+        // A fetched PR cache, or (yielded) the daemon's cache, surfaces via a
+        // model rehydrate; pulse the waker so an idle loop repaints promptly.
+        if matches!(
+            outcome,
+            PrRefreshOutcome::Fetched | PrRefreshOutcome::Yielded
+        ) && let Some(w) = &waker
+        {
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
-        let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
+    });
+    spawn_pr_branch_feed(branch_cwd, branch_waker, branch_generation, disk_cfg);
+}
+
+/// Where a PR refresh runs (THE-2210). Lane-local on purpose: the tracker's
+/// `RefreshSite` is a separate type, so neither lane depends on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrSite {
+    /// The interactive UI's `sched::spawn_bg` refresh.
+    Ui,
+    /// The daemon's headless PR poll (`daemon/producers/pr.rs`).
+    Daemon,
+}
+
+/// What one [`pr_refresh_blocking`] pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrRefreshOutcome {
+    /// Nothing ran to completion: no dir, no DB, the checkout moved under the
+    /// fetch, or the pass was superseded.
+    Skipped,
+    /// The UI yielded to the daemon's live lease: no forge call was made, and
+    /// the panel reloads from the PR cache the daemon writes.
+    Yielded,
+    /// The forge was asked and the pass completed (cache, review snapshot and
+    /// events as applicable).
+    Fetched,
+}
+
+/// Whether a PR (or mentions) pass at `site` makes its forge calls. Pure.
+///
+/// - The daemon always fetches: it holds the lease and is the only poller.
+/// - The UI yields only when the daemon holds the live lease (`daemon_owns`)
+///   AND the daemon actually polls this target (`daemon_covers`: a local
+///   worktree whose cached PR is OPEN). A worktree with no cached PR, or a
+///   closed/merged one, is not polled by the daemon, so the UI keeps
+///   fetching it; that is how a PR opened outside thegn first appears.
+/// - The UI never yields while its own connectivity holder is offline: the
+///   PR refresh doubles as the offline recovery probe, and yielding would
+///   leave the UI's offline chip latched while the daemon is online.
+pub(crate) fn should_fetch(
+    site: PrSite,
+    daemon_owns: bool,
+    daemon_covers: bool,
+    ui_offline: bool,
+) -> bool {
+    match site {
+        PrSite::Daemon => true,
+        PrSite::Ui => ui_offline || !(daemon_owns && daemon_covers),
+    }
+}
+
+/// True when the daemon's PR poll selects a worktree with this cached PR
+/// state at this location: an OPEN PR on a local checkout. The UI yield and
+/// the daemon's selection (`daemon/producers/pr.rs`) share this predicate so
+/// a worktree is never left with no poller.
+pub(crate) fn daemon_polls_pr(cached_state: Option<&str>, local: bool) -> bool {
+    local && cached_state.is_some_and(|s| s.eq_ignore_ascii_case("OPEN"))
+}
+
+/// One blocking PR-panel refresh of `cwd`: snapshot the cached PR, fetch the
+/// full feed, write the cache and review snapshot, and emit the PR events
+/// (`pr_state_changed`, `pr_checks`, `pr_review_requested`, `merge_landed`,
+/// `move_on_merge`). Shared by the UI refresh and the daemon's PR poll
+/// (THE-2210). At [`PrSite::Ui`] it yields to the daemon's live `PrPoll`
+/// lease (see [`should_fetch`]). Off-loop only: it blocks on git and the forge.
+pub(crate) fn pr_refresh_blocking(
+    cwd: &Path,
+    cfg: &thegn_core::config::Config,
+    site: PrSite,
+) -> PrRefreshOutcome {
+    pr_refresh_blocking_fenced(cwd, cfg, site, None)
+}
+
+fn pr_refresh_blocking_fenced(
+    cwd: &Path,
+    cfg: &thegn_core::config::Config,
+    site: PrSite,
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
+) -> PrRefreshOutcome {
+    {
+        if !cwd.is_dir() {
+            return PrRefreshOutcome::Skipped;
+        }
+        let loc = thegn_core::remote::GitLoc::for_worktree(cwd);
         let Ok(db) = thegn_core::db::Db::open() else {
-            return;
+            return PrRefreshOutcome::Skipped;
         };
 
         // Per-worktree cache key: the HOST path, never `loc.path()` (which
         // collides across sandboxed worktrees — see `worktree_cache_key`).
-        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&cwd);
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(cwd);
         let Ok(scope_before) = thegn_core::forge::checkout::checkout_scope(&loc) else {
-            return;
+            return PrRefreshOutcome::Skipped;
         };
 
         // Snapshot the old PR state BEFORE overwriting the cache.
@@ -4640,6 +4730,31 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
             });
         let old_pr_state = old_pr.as_ref().map(|pr| pr.state.clone());
 
+        // UI yield (THE-2210): while the daemon holds the live PrPoll lease
+        // and polls this worktree, make no forge call; the panel reloads from
+        // the cache the daemon writes. Lease read only when it could matter.
+        if site == PrSite::Ui {
+            let covers = daemon_polls_pr(
+                old_pr_state.as_deref(),
+                matches!(loc, thegn_core::remote::GitLoc::Local(_)),
+            );
+            let ui_offline = thegn_core::connectivity::current()
+                == thegn_core::connectivity::Connectivity::Offline;
+            if covers
+                && !ui_offline
+                && !should_fetch(
+                    site,
+                    crate::producer_yield::daemon_owns(
+                        thegn_core::producer_lease::ProducerKind::PrPoll,
+                    ),
+                    covers,
+                    ui_offline,
+                )
+            {
+                return PrRefreshOutcome::Yielded;
+            }
+        }
+
         // The full feed: PR + checks + review threads + issues (extras are
         // best-effort and never fail the panel).
         let forges = crate::forge_handle::get();
@@ -4650,7 +4765,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
         );
         let scope_after = thegn_core::forge::checkout::checkout_scope(&loc).ok();
         if scope_after.as_ref() != Some(&scope_before) {
-            return;
+            return PrRefreshOutcome::Skipped;
         }
         panel.source_scope = scope_after;
         if !cached_pr_applies(
@@ -4660,21 +4775,21 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
             &scope_before.branch,
             Some(&scope_before),
         ) {
-            return;
+            return PrRefreshOutcome::Skipped;
         }
-        if generation.as_ref().is_some_and(|(current, expected)| {
+        if generation.is_some_and(|(current, expected)| {
             current.load(std::sync::atomic::Ordering::Acquire) != *expected
         }) {
-            return;
+            return PrRefreshOutcome::Skipped;
         }
         // Feed the app-wide connectivity holder (this CLI path is the 20s PR
         // backstop + the offline recovery probe).
-        if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-            return;
+        if !crate::hydrate_schedule::generation_is_current(generation) {
+            return PrRefreshOutcome::Skipped;
         }
         crate::connectivity_gate::report_pr_panel(&panel.state);
         let Ok(json) = serde_json::to_string(&panel) else {
-            return;
+            return PrRefreshOutcome::Skipped;
         };
         // Only overwrite the cache for DEFINITIVE states. A transient
         // Error/Offline/RateLimited (a network blip) must NOT clobber a good
@@ -4686,7 +4801,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
         if pr_state_is_definitive(&panel.state)
-            && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+            && crate::hydrate_schedule::generation_is_current(generation)
         {
             let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
@@ -4694,10 +4809,10 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
         // Deep review data is a separate complete snapshot. Fetching either
         // half failing leaves the previous snapshot untouched, so an outage
         // cannot turn a useful cached conversation into a partial one.
-        if generation.as_ref().is_some_and(|(current, expected)| {
+        if generation.is_some_and(|(current, expected)| {
             current.load(std::sync::atomic::Ordering::Acquire) != *expected
         }) {
-            return;
+            return PrRefreshOutcome::Skipped;
         }
         if let thegn_core::forge::model::PanelState::Pr(pr) = &panel.state
             && let Some((owner, repo)) = thegn_core::forge::model::owner_repo_from_url(&pr.url)
@@ -4716,7 +4831,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                     .as_ref()
                     != Some(&scope_before)
                 {
-                    return;
+                    return PrRefreshOutcome::Skipped;
                 }
                 let snapshot = thegn_core::review::PrReviewSnapshot {
                     worktree_key: cache_key.clone(),
@@ -4732,14 +4847,14 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 };
                 // Complete payload only; DB failures are cache misses on the
                 // next hydrate and do not affect the primary PR refresh.
-                if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                if crate::hydrate_schedule::generation_is_current(generation) {
                     let _ = db.put_pr_review_cache(&snapshot);
                 }
             }
         }
 
-        if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-            return;
+        if !crate::hydrate_schedule::generation_is_current(generation) {
+            return PrRefreshOutcome::Skipped;
         }
 
         // Typed automation edges come from authoritative old/new forge cache
@@ -4827,9 +4942,8 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 && let Ok(linked) = db.linked_issue_refs(&wt)
                 && !linked.is_empty()
             {
-                let local_cwd =
-                    matches!(loc, thegn_core::remote::GitLoc::Local(_)).then_some(cwd.as_path());
-                let issues_cfg = crate::repo_issues::for_merge_refresh(&cfg, local_cwd);
+                let local_cwd = matches!(loc, thegn_core::remote::GitLoc::Local(_)).then_some(cwd);
+                let issues_cfg = crate::repo_issues::for_merge_refresh(cfg, local_cwd);
                 let mut router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
                 // Provider-as-plugin: append live plugin issue providers.
                 crate::plugin_providers::extend_issue_router(&mut router);
@@ -4853,17 +4967,23 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
             }
         }
 
-        // PR cache landing should surface via a model rehydrate; pulse the waker
-        // so an idle loop repaints promptly.
-        if let Some(w) = &waker {
-            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        }
-    });
-    // Sibling feed: the repo's open-PR headers (`pr_branch_cache`) join onto
-    // branch rows as PR badges and back the branches view's open-in-browser.
-    // The forge ladder (native HTTP → gh CLI) is a blocking seam, so it
-    // runs on its own blocking thread — neither the subprocess fallback nor
-    // the HTTP wait can ever touch the event loop.
+        PrRefreshOutcome::Fetched
+    }
+}
+
+/// Sibling feed: the repo's open-PR headers (`pr_branch_cache`) join onto
+/// branch rows as PR badges and back the branches view's open-in-browser; it
+/// also runs the on-merge auto-clean, the `pr_linked` producer and (via
+/// [`mentions_poll`]) the mentions producer. The forge ladder (native HTTP →
+/// gh CLI) is a blocking seam, so it runs on its own blocking thread — neither
+/// the subprocess fallback nor the HTTP wait can ever touch the event loop.
+/// UI-only: the daemon does not poll the open-PR list (THE-2210).
+fn spawn_pr_branch_feed(
+    branch_cwd: std::path::PathBuf,
+    branch_waker: Option<TerminalWaker>,
+    branch_generation: Option<crate::hydrate_schedule::ScheduleFence>,
+    disk_cfg: thegn_core::config::DiskConfig,
+) {
     crate::sched::spawn_bg_replaceable(move || {
         if branch_generation
             .as_ref()
@@ -4986,48 +5106,119 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 }
             }
 
-            // Mentioned producer: poll GitHub's notifications API for
-            // @mentions in this repo (`reason == "mention"`). Throttled to
-            // one REST call per repo per 5 minutes via a ui_state stamp
-            // (checked before the config load, so the steady-state cost is
-            // one SELECT); the `ghn:<thread>:<updated_at>` ref + store-side
-            // emit-once keeps it to one row per mention event. Chosen over
-            // scanning review-thread bodies for `@login`: the API covers
-            // issues AND PRs repo-wide with GitHub's own mention detection,
-            // while thread snippets are truncated and per-PR only.
-            const MENTION_POLL_MS: i64 = 5 * 60 * 1000;
-            let now = thegn_core::util::now();
-            let poll_due = db
-                .get_ui_state("gh_mentions", &repo_root)
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<i64>().ok())
-                .is_none_or(|last| now.saturating_sub(last) >= MENTION_POLL_MS);
-            if poll_due
-                && load_hydration_config().notifications.github_mentions
-                && let Some(repo) = forge.repo_ref(&loc)
-            {
-                // Stamp before the fetch so a failing fetch can't retry hot.
-                let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                if let Ok(mentions) = forge.mentions(&loc, &repo) {
-                    for (source_ref, msg) in mentions {
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ = crate::automation_events::emit_once(
-                            &db,
-                            "mentioned",
-                            &source_ref,
-                            &msg,
-                            &repo_root,
-                        );
-                    }
-                }
-            }
+            // Mentioned producer (see [`mentions_poll`]); the UI yields it to
+            // the daemon's live Mentions lease (THE-2210).
+            mentions_poll(&db, &repo_root, &loc, forge, PrSite::Ui, || {
+                load_hydration_config().notifications.github_mentions
+            });
 
             if let Some(w) = &branch_waker {
                 let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         }
     });
+}
+
+/// One mentions poll of `repo_root` from the daemon (THE-2210): the same
+/// throttled, emit-once body the UI's branch feed runs. Returns the number of
+/// mentions the forge returned (0 when throttled, disabled or failed).
+/// Blocking: it calls the forge.
+pub(crate) fn mentions_blocking(repo_root: &Path, cfg: &thegn_core::config::Config) -> usize {
+    if !repo_root.is_dir() {
+        return 0;
+    }
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return 0;
+    };
+    let root = repo_root.to_string_lossy().into_owned();
+    let loc = thegn_core::remote::GitLoc::Local(repo_root.to_path_buf());
+    let forges = crate::forge_handle::get();
+    let forge = forges.for_loc(&loc);
+    let enabled = cfg.notifications.github_mentions;
+    mentions_poll(&db, &root, &loc, forge, PrSite::Daemon, || enabled)
+}
+
+/// Most repo roots the daemon's mentions poll covers per tick.
+pub(crate) const DAEMON_MENTION_ROOTS: usize = 32;
+
+/// The repo roots the daemon's mentions poll lists: the most recently opened
+/// registered repos, at most [`DAEMON_MENTION_ROOTS`]. Shared with the UI
+/// yield so a repo outside the cap is never left with no poller.
+pub(crate) fn daemon_mention_roots(db: &thegn_core::db::Db) -> Vec<String> {
+    let limit = i64::try_from(DAEMON_MENTION_ROOTS).unwrap_or(i64::MAX);
+    let mut roots = db.recent_repos(limit).unwrap_or_default();
+    roots.truncate(DAEMON_MENTION_ROOTS);
+    roots
+}
+
+/// The mentions throttle: one forge call per repo per this many seconds.
+/// Seconds, like the `gh_mentions` stamp (`util::now()`); the pre-THE-2210
+/// block compared the seconds stamp against a millisecond constant, which
+/// throttled to ~3.5 days instead of the documented 5 minutes.
+pub(crate) const MENTION_POLL_SECS: i64 = 5 * 60;
+
+/// True when the `gh_mentions` stamp (`last`, unix seconds as written by
+/// [`mentions_poll`]) allows another poll at `now` (unix seconds). Pure.
+pub(crate) fn mention_poll_due(last: Option<i64>, now: i64) -> bool {
+    last.is_none_or(|last| now.saturating_sub(last) >= MENTION_POLL_SECS)
+}
+
+/// Mentioned producer: poll GitHub's notifications API for @mentions in this
+/// repo (`reason == "mention"`). Throttled to one REST call per repo per 5
+/// minutes via a `gh_mentions` ui_state stamp shared by the UI and the daemon
+/// (checked before the config load, so the steady-state cost is one SELECT);
+/// the `ghn:<thread>:<updated_at>` ref + store-side emit-once keeps it to one
+/// row per mention event even across the UI→daemon handover. Chosen over
+/// scanning review-thread bodies for `@login`: the API covers issues AND PRs
+/// repo-wide with GitHub's own mention detection, while thread snippets are
+/// truncated and per-PR only. At [`PrSite::Ui`] it yields to the daemon's
+/// live Mentions lease (no stamp, no forge call).
+fn mentions_poll(
+    db: &thegn_core::db::Db,
+    repo_root: &str,
+    loc: &thegn_core::remote::GitLoc,
+    forge: &dyn thegn_core::forge::Forge,
+    site: PrSite,
+    enabled: impl FnOnce() -> bool,
+) -> usize {
+    let now = thegn_core::util::now();
+    let last = db
+        .get_ui_state("gh_mentions", repo_root)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok());
+    if !mention_poll_due(last, now) {
+        return 0;
+    }
+    if site == PrSite::Ui {
+        let ui_offline =
+            thegn_core::connectivity::current() == thegn_core::connectivity::Connectivity::Offline;
+        let owns =
+            crate::producer_yield::daemon_owns(thegn_core::producer_lease::ProducerKind::Mentions);
+        // The daemon polls only the roots it lists; any other repo stays the
+        // UI's to poll.
+        let covers = owns && daemon_mention_roots(db).iter().any(|r| r == repo_root);
+        if !should_fetch(site, owns, covers, ui_offline) {
+            return 0;
+        }
+    }
+    if !enabled() {
+        return 0;
+    }
+    let Some(repo) = forge.repo_ref(loc) else {
+        return 0;
+    };
+    // Stamp before the fetch so a failing fetch can't retry hot.
+    let _ = db.set_ui_state("gh_mentions", repo_root, &now.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    let Ok(mentions) = forge.mentions(loc, &repo) else {
+        return 0;
+    };
+    let n = mentions.len();
+    for (source_ref, msg) in mentions {
+        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        let _ = crate::automation_events::emit_once(db, "mentioned", &source_ref, &msg, repo_root);
+    }
+    n
 }
 
 fn pr_checks_passed(pr: &thegn_core::forge::model::PrStatus) -> bool {
