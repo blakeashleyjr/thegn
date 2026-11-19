@@ -2566,8 +2566,12 @@ check "merge drain with a closed stdout pipe still records the landed row" \
 MP3="$("$SZ" wt new smoke-pipe-land --repo "$R")"
 echo p >"$MP3/pipe-land.txt"
 git -C "$MP3" add -f -A && git -C "$MP3" commit -q -m "smoke pipe land"
+MT3="$(git -C "$MP3" rev-parse HEAD)"
+# Ask git directly, NOT `git log | grep -q`: grep -q exits on its first match,
+# git log then dies of SIGPIPE, and `set -o pipefail` fails the check even when
+# the land advanced the target.
 check "land with a closed stdout pipe still advances the target" \
-  "('$SZ' land --worktree '$MP3' | true); git -C '$R' log --oneline | grep -q 'smoke pipe land'"
+  "('$SZ' land --worktree '$MP3' | true); git -C '$R' merge-base --is-ancestor '$MT3' main"
 
 echo
 if [[ $fail -eq 0 ]]; then
