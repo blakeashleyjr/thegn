@@ -745,7 +745,13 @@ impl PaneEmulator for AlacrittyEmulator {
             consider(logical, current_top);
         }
 
-        best.map(|(offset, _)| offset.saturating_sub(JUMP_CONTEXT_ROWS))
+        best.map(|(offset, _)| {
+            if offset == 0 {
+                0
+            } else {
+                offset.saturating_add(JUMP_CONTEXT_ROWS)
+            }
+        })
     }
 
     fn row_text(&self, row: u16) -> Option<String> {
