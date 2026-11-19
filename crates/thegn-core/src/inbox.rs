@@ -1,6 +1,6 @@
 //! The native inbox's pure core (THE-2214): item types, the sanitizer every
 //! backend's output passes through, the notification `source_ref`/message
-//! shape, and (b163 lane 5) the seen-set diff and rule facts.
+//! shape, and the seen-set diff and rule facts.
 //!
 //! Everything an inbox backend returns is third-party content. Titles,
 //! senders, labels, URLs and ids pass [`sanitize_item`] before they are
@@ -207,26 +207,106 @@ pub struct InboxDiff {
     pub baseline: bool,
 }
 
-/// Diff a page against the persisted seen-set. Stub: surfaces nothing and
-/// keeps the seen-set (filled by b163 lane 5).
-#[allow(dead_code, reason = "filled by b163 lane 5")]
+/// The page's items, de-duplicated by id (first occurrence wins), newest
+/// first: `updated_at` descending (unknown last), then page order.
+fn newest_first(items: &[InboxItem]) -> Vec<&InboxItem> {
+    let mut ids = std::collections::HashSet::new();
+    let mut out: Vec<&InboxItem> = items.iter().filter(|i| ids.insert(i.id.as_str())).collect();
+    // Stable: equal keys keep page order.
+    out.sort_by(|a, b| {
+        b.updated_at
+            .unwrap_or(i64::MIN)
+            .cmp(&a.updated_at.unwrap_or(i64::MIN))
+    });
+    out
+}
+
+/// Keep the newest [`MAX_SEEN`] ids (the tail).
+fn cap_seen(mut seen: Vec<String>) -> Vec<String> {
+    let skip = seen.len().saturating_sub(MAX_SEEN);
+    seen.drain(..skip);
+    seen
+}
+
+/// Diff a page against the persisted seen-set (oldest id first).
+///
+/// - A baseline (`!baselined`, or the account's `config_digest` changed):
+///   `new` is the [`FIRST_POLL_SURFACE`] newest items and `baseline` is set,
+///   so the caller writes rows but submits no rule events. The previous
+///   seen-set is discarded (a digest change means a different source).
+/// - Otherwise `new` is every item whose id is not in `prev_seen` (and, for a
+///   `Delta` page, not in `removed`). An item that left the set and came back
+///   is new again.
+/// - `seen`: a `Snapshot` page's ids; for a `Delta` page, the previous set
+///   minus `removed` plus the page's ids. Oldest first, capped at
+///   [`MAX_SEEN`] with the newest kept.
 pub fn diff(
     prev_seen: &[String],
-    _baselined: bool,
-    _digest_changed: bool,
-    _page: &InboxPage,
+    baselined: bool,
+    digest_changed: bool,
+    page: &InboxPage,
 ) -> InboxDiff {
+    use std::collections::HashSet;
+    let baseline = !baselined || digest_changed;
+    let ordered = newest_first(&page.items);
+    let removed: HashSet<&str> = page.removed.iter().map(String::as_str).collect();
+    let prev: HashSet<&str> = if baseline {
+        HashSet::new()
+    } else {
+        prev_seen.iter().map(String::as_str).collect()
+    };
+    let new: Vec<InboxItem> = if baseline {
+        ordered
+            .iter()
+            .take(FIRST_POLL_SURFACE)
+            .map(|i| (*i).clone())
+            .collect()
+    } else {
+        ordered
+            .iter()
+            .filter(|i| !prev.contains(i.id.as_str()))
+            .filter(|i| page.mode == PageMode::Snapshot || !removed.contains(i.id.as_str()))
+            .map(|i| (*i).clone())
+            .collect()
+    };
+    // The page's ids, oldest first, so the cap keeps the newest.
+    let page_ids = ordered.iter().rev().map(|i| i.id.clone());
+    let seen = match page.mode {
+        PageMode::Snapshot => page_ids.collect(),
+        PageMode::Delta => {
+            let base = if baseline { &[][..] } else { prev_seen };
+            let mut seen: Vec<String> = base
+                .iter()
+                .filter(|id| !removed.contains(id.as_str()))
+                .cloned()
+                .collect();
+            let mut have: HashSet<String> = seen.iter().cloned().collect();
+            for id in page_ids {
+                if !removed.contains(id.as_str()) && have.insert(id.clone()) {
+                    seen.push(id);
+                }
+            }
+            seen
+        }
+    };
     InboxDiff {
-        new: vec![],
-        seen: prev_seen.to_vec(),
-        baseline: false,
+        new,
+        seen: cap_seen(seen),
+        baseline,
     }
 }
 
-/// The rule facts for an item. Stub: empty facts (filled by b163 lane 5).
-#[allow(dead_code, reason = "filled by b163 lane 5")]
-pub fn facts(_kind: &str, _account: &str, _item: &InboxItem) -> crate::automation::InboxFacts {
-    crate::automation::InboxFacts::default()
+/// The rule facts for an already-sanitized item. `title` is sanitized and
+/// capped again here; it reaches rules only as `message`.
+pub fn facts(kind: &str, account: &str, item: &InboxItem) -> crate::automation::InboxFacts {
+    crate::automation::InboxFacts {
+        kind: kind.to_owned(),
+        account: account.to_owned(),
+        item_id: item.id.clone(),
+        url: item.url.clone(),
+        labels: item.labels.clone(),
+        title: sanitize_text(&item.title, MAX_TITLE_CHARS),
+    }
 }
 
 #[cfg(test)]
@@ -401,16 +481,133 @@ mod tests {
         assert_eq!(parsed.id, "1");
     }
 
+    fn at(id: &str, updated_at: i64) -> InboxItem {
+        InboxItem {
+            updated_at: Some(updated_at),
+            ..item(id)
+        }
+    }
+
+    fn snapshot(items: Vec<InboxItem>) -> InboxPage {
+        InboxPage {
+            items,
+            ..Default::default()
+        }
+    }
+
+    fn ids(items: &[InboxItem]) -> Vec<&str> {
+        items.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     #[test]
-    fn stubs_fail_closed() {
-        let seen = vec!["a".to_owned()];
+    fn diff_baseline_surfaces_at_most_twenty_newest() {
+        let items: Vec<_> = (0..30).map(|i| at(&format!("i{i}"), i)).collect();
+        let d = diff(&[], false, false, &snapshot(items));
+        assert!(d.baseline);
+        assert_eq!(d.new.len(), FIRST_POLL_SURFACE);
+        assert_eq!(d.new[0].id, "i29", "newest first");
+        assert_eq!(d.new[19].id, "i10");
+        assert_eq!(d.seen.len(), 30, "the whole page is seen");
+        assert_eq!(d.seen.last().map(String::as_str), Some("i29"));
+        // Unknown updated_at sorts last, page order breaks ties.
+        let d = diff(
+            &[],
+            false,
+            false,
+            &snapshot(vec![item("x"), at("y", 5), item("z")]),
+        );
+        assert_eq!(ids(&d.new), ["y", "x", "z"]);
+    }
+
+    #[test]
+    fn diff_snapshot_new_and_removed_items() {
+        let prev = strs(&["a", "b"]);
+        let d = diff(&prev, true, false, &snapshot(vec![item("a"), item("c")]));
+        assert!(!d.baseline);
+        assert_eq!(ids(&d.new), ["c"]);
+        let mut seen = d.seen.clone();
+        seen.sort();
+        assert_eq!(seen, strs(&["a", "c"]), "b left the set");
+        // b comes back: new again.
+        let d = diff(
+            &d.seen,
+            true,
+            false,
+            &snapshot(vec![item("a"), item("b"), item("c")]),
+        );
+        assert_eq!(ids(&d.new), ["b"]);
+        // Duplicate ids in a page count once.
+        let d = diff(&[], true, false, &snapshot(vec![item("d"), item("d")]));
+        assert_eq!(ids(&d.new), ["d"]);
+        assert_eq!(d.seen, strs(&["d"]));
+    }
+
+    #[test]
+    fn diff_delta_keeps_the_previous_set() {
+        let prev = strs(&["a", "b"]);
         let page = InboxPage {
-            items: vec![item("b")],
+            items: vec![item("b"), item("c"), item("x")],
+            removed: vec!["a".into(), "x".into()],
+            mode: PageMode::Delta,
             ..Default::default()
         };
-        let d = diff(&seen, true, false, &page);
-        assert!(d.new.is_empty() && !d.baseline);
-        assert_eq!(d.seen, seen);
-        assert_eq!(facts("command", "work", &item("b")), Default::default());
+        let d = diff(&prev, true, false, &page);
+        assert!(!d.baseline);
+        assert_eq!(ids(&d.new), ["c"], "b seen, x removed");
+        assert_eq!(d.seen, strs(&["b", "c"]));
+    }
+
+    #[test]
+    fn diff_a_digest_change_rebaselines() {
+        let prev = strs(&["a"]);
+        let d = diff(&prev, true, true, &snapshot(vec![item("a"), item("b")]));
+        assert!(d.baseline);
+        assert_eq!(ids(&d.new), ["a", "b"], "the old set is discarded");
+        let delta = InboxPage {
+            items: vec![item("b")],
+            mode: PageMode::Delta,
+            ..Default::default()
+        };
+        let d = diff(&prev, true, true, &delta);
+        assert_eq!(d.seen, strs(&["b"]), "a different source: prev dropped");
+    }
+
+    #[test]
+    fn diff_seen_is_capped_newest_kept() {
+        let prev: Vec<String> = (0..MAX_SEEN).map(|i| format!("p{i}")).collect();
+        let page = InboxPage {
+            items: vec![item("n1"), item("n2")],
+            mode: PageMode::Delta,
+            ..Default::default()
+        };
+        let d = diff(&prev, true, false, &page);
+        assert_eq!(d.new.len(), 2);
+        assert_eq!(d.seen.len(), MAX_SEEN);
+        assert_eq!(d.seen.first().map(String::as_str), Some("p2"));
+        assert!(d.seen.iter().any(|s| s == "n1") && d.seen.iter().any(|s| s == "n2"));
+    }
+
+    #[test]
+    fn facts_copy_the_item_and_cap_the_title() {
+        let it = InboxItem {
+            id: "7".into(),
+            title: format!("t\u{202E}{}", "x".repeat(400)),
+            url: "https://e.com".into(),
+            labels: vec!["l".into()],
+            ..Default::default()
+        };
+        let f = facts("command", "work", &it);
+        assert_eq!(
+            (f.kind.as_str(), f.account.as_str(), f.item_id.as_str()),
+            ("command", "work", "7")
+        );
+        assert_eq!(f.url, "https://e.com");
+        assert_eq!(f.labels, ["l"]);
+        assert_eq!(f.title.chars().count(), MAX_TITLE_CHARS);
+        assert!(!f.title.contains('\u{202E}'));
     }
 }
