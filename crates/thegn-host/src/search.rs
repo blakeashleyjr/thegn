@@ -177,8 +177,9 @@ impl SearchOverlay {
         let max_rows = (screen.rows * 2 / 3).saturating_sub(4);
         let shown = matches.len().min(max_rows).max(3);
         let width = screen.cols.saturating_sub(4).clamp(40, 120);
+        let preview_reserve = if self.preview.is_empty() { 0 } else { 2 };
         // rows: prompt(1) + rule(1) + results(shown) + preview + rule(1) + footer(1)
-        let content_rows = 4 + shown.max(1) + self.preview.len();
+        let content_rows = 4 + shown.max(1) + preview_reserve;
 
         let scope_pill = format!(" {} ▾", engine.scope().label());
         let spec = LayerSpec {
@@ -230,7 +231,7 @@ impl SearchOverlay {
 
         // ── Result rows ───────────────────────────────────────────────────────
         let selected_idx = engine.selected_idx();
-        let preview_rows = self.preview.len().min(inner.rows.saturating_sub(4));
+        let preview_rows = preview_reserve.min(inner.rows.saturating_sub(4));
         let result_rows = inner.rows.saturating_sub(4 + preview_rows); // prompt + 2 rules + preview + footer
         let first = selected_idx.saturating_sub(result_rows.saturating_sub(1));
         for (row, (i, m)) in matches
@@ -258,10 +259,7 @@ impl SearchOverlay {
 
             // Content column: the matched line, windowed around the hit.
             let repeat_suffix = repeat_suffix(m.repeat);
-            let suffix_width = repeat_suffix
-                .as_deref()
-                .map(|suffix| unicode_width::UnicodeWidthStr::width(suffix))
-                .unwrap_or(0);
+            let suffix_width = repeat_suffix.as_ref().map_or(0, String::len);
             let line_avail = inner.cols.saturating_sub(26).saturating_sub(suffix_width); // 24 label + 2 sep + suffix
             let (lcut, pre, hit, post, rcut) =
                 window_around(&m.line, m.span.unwrap_or((0, 0)), line_avail);
@@ -385,14 +383,7 @@ fn repeat_suffix(repeat: u32) -> Option<String> {
     if repeat <= 1 {
         return None;
     }
-    // There is no dedicated multiplication token in GlyphSet. If a future
-    // table supplies the exact mark, use it; current tables take the ASCII
-    // fallback rather than borrowing the semantically different cross glyph.
-    let marker = match crate::caps::active_glyphs().cross_heavy {
-        "×" => "×",
-        _ => "x",
-    };
-    Some(format!(" {marker}{repeat}"))
+    Some(format!(" x{repeat}"))
 }
 
 /// Truncate `s` to at most `max_cols` display columns, appending `…` if
@@ -547,7 +538,7 @@ mod tests {
         typed(&mut ov, "repeat", &srcs);
 
         let out = draw(&ov, 100, 30);
-        assert!(out.contains("×2") || out.contains(" x2"), "{out}");
+        assert!(out.contains("repeat x2"), "{out}");
     }
 
     #[test]
@@ -576,14 +567,14 @@ mod tests {
 
     #[test]
     fn preview_never_crosses_sources() {
-        let first = buf_from(&["first before", "target"]);
-        let second = buf_from(&["other source after"]);
+        let first = buf_from(&["first a", "first b", "first c"]);
+        let second = buf_from(&["second before", "target"]);
         let srcs = vec![(1, "first", &first), (2, "second", &second)];
-        let mut ov = overlay(1);
+        let mut ov = overlay(2);
         typed(&mut ov, "target", &srcs);
 
-        assert_eq!(ov.preview, vec![String::from("first before")]);
-        assert!(!ov.preview.iter().any(|line| line.contains("other source")));
+        assert_eq!(ov.preview, vec![String::from("second before")]);
+        assert!(!ov.preview.iter().any(|line| line.starts_with("first")));
     }
 
     #[test]
