@@ -132,6 +132,15 @@ pub(crate) fn worktree_live(worktree: &str) -> bool {
     LIVE.count(worktree) > 0
 }
 
+/// Whether a worktree may try a warm claim given its stored location and resolved placement.
+pub(crate) fn claim_location_gate(
+    stored_is_remote: bool,
+    provider_placed: bool,
+    live: bool,
+) -> bool {
+    !live && (stored_is_remote || provider_placed)
+}
+
 /// A generic name for a new warm-pool spare with a collision-resistant random suffix.
 pub(crate) fn mint_spare_name(repo: &str) -> anyhow::Result<String> {
     let slug = std::path::Path::new(repo)
@@ -215,7 +224,7 @@ pub(crate) fn flake_lock_hash(repo_root: &std::path::Path) -> String {
 /// (DB + git subprocess + provider network).
 pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) -> bool {
     let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
-    if !loc.is_remote() || worktree_live(worktree) {
+    if worktree_live(worktree) {
         return false;
     }
     let db = thegn_core::db::Db::open().ok(); // best-effort: cache: the git fallback below decides liveness
@@ -245,6 +254,13 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     };
     selection.name = selected;
     let environment = cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection);
+    let provider_placed = matches!(
+        environment.placement,
+        thegn_core::placement::Placement::Provider(_)
+    );
+    if !claim_location_gate(loc.is_remote(), provider_placed, false) {
+        return false;
+    }
     if matches!(
         environment.placement,
         thegn_core::placement::Placement::Provider(_)
@@ -400,6 +416,21 @@ pub(crate) fn unprovisioned_provider_env(
     cfg: &thegn_core::config::Config,
     worktree: &str,
 ) -> anyhow::Result<Option<String>> {
+    let Some((env_name, id)) = provider_target(cfg, worktree)? else {
+        return Ok(None);
+    };
+    if crate::provider_workdir::is_provisioned_locally(&id) {
+        return Ok(None);
+    }
+    Ok(Some(env_name))
+}
+
+/// `(env name, sandbox id)` when `worktree` resolves to a provider env with a
+/// sandbox name; `None` otherwise. No network.
+pub(crate) fn provider_target(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+) -> anyhow::Result<Option<(String, String)>> {
     let loc = thegn_core::remote::GitLoc::for_worktree_op(
         std::path::Path::new(worktree),
         "provider attach",
@@ -423,10 +454,7 @@ pub(crate) fn unprovisioned_provider_env(
     let Some(id) = crate::agent::provider_sandbox_name(cfg, worktree, &env_name) else {
         return Ok(None);
     };
-    if crate::provider_workdir::is_provisioned_locally(&id) {
-        return Ok(None);
-    }
-    Ok(Some(env_name))
+    Ok(Some((env_name, id)))
 }
 
 /// The refusal for an attach onto an unprovisioned provider sandbox. Names the
@@ -1788,6 +1816,32 @@ mod tests {
         let wt = dir.path().to_string_lossy().into_owned();
         let result = unprovisioned_provider_env(&thegn_core::config::Config::default(), &wt);
         assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[test]
+    fn provider_target_is_none_for_a_local_worktree() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().to_string_lossy().into_owned();
+        let result = provider_target(&thegn_core::config::Config::default(), &wt);
+        assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[test]
+    fn claim_location_gate_table() {
+        let cases = [
+            (true, false, true, false),
+            (false, true, false, true),
+            (false, false, false, false),
+            (true, false, false, true),
+        ];
+        for (stored_is_remote, provider_placed, live, expected) in cases {
+            assert_eq!(
+                claim_location_gate(stored_is_remote, provider_placed, live),
+                expected,
+                "{stored_is_remote}, {provider_placed}, {live}"
+            );
+        }
     }
 
     struct ScriptedClaimEgress {
