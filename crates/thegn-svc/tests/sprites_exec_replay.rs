@@ -141,8 +141,9 @@ fn handle_connection(mut stream: TcpStream, script: Script, requests: Arc<Mutex<
         Hs::Status(code) => {
             let response =
                 format!("HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
+            if stream.write_all(response.as_bytes()).is_err() || stream.flush().is_err() {
+                return;
+            }
             return;
         }
         Hs::Accept => {}
@@ -286,7 +287,9 @@ async fn non_tty_nonzero_exit_appends_the_stderr_tail() {
 #[tokio::test]
 async fn non_tty_text_exit_ends_the_run() {
     let mock = start_mock(vec![script(vec![
+        session_info(),
         Out::Bin([vec![1], b"x".to_vec()].concat()),
+        Out::Bin([vec![2], b"e".to_vec()].concat()),
         Out::Text(r#"{"type":"exit","exit_code":3}"#),
     ])]);
 
@@ -295,7 +298,11 @@ async fn non_tty_text_exit_ends_the_run() {
         .await
         .unwrap();
     assert_eq!(code, 3);
-    assert_eq!(output, "x");
+    assert!(
+        output.starts_with("x\n[stderr, last 1 bytes]\n"),
+        "{output:?}"
+    );
+    assert!(output.ends_with('e'), "{output:?}");
 }
 
 #[tokio::test]
@@ -356,7 +363,7 @@ async fn auth_rejection_is_not_retried() {
         .unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(requests(&mock).len(), 1);
-    assert!(error.to_string().contains("401"));
+    assert!(format!("{error:#}").contains("401"));
 }
 
 #[tokio::test]
@@ -370,7 +377,7 @@ async fn reattach_does_not_retry_a_cold_endpoint() {
         .await
         .unwrap_err();
 
-    assert!(error.to_string().contains("503"));
+    assert!(format!("{error:#}").contains("503"));
     let recorded = requests(&mock);
     assert_eq!(recorded.len(), 1);
     assert!(
