@@ -28,8 +28,11 @@ static LOC_POOL: LazyLock<Option<ThreadPool>> = LazyLock::new(|| {
     }
 });
 
+/// Tokei threads: an eighth of the CPUs, at most two. Counting is a background
+/// prefetch (only the active worktree's count is ever shown), so it must never
+/// compete with the foreground for more than two cores.
 pub(crate) fn loc_pool_threads(cpus: usize) -> usize {
-    (cpus / 4).clamp(1, 4)
+    (cpus / 8).clamp(1, 2)
 }
 
 fn run_in_loc_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
@@ -132,7 +135,7 @@ mod tests {
 
     #[test]
     fn loc_pool_is_small_and_never_zero() {
-        for (cpus, want) in [(1, 1), (4, 1), (8, 2), (16, 4), (24, 4), (128, 4)] {
+        for (cpus, want) in [(1, 1), (4, 1), (8, 1), (16, 2), (24, 2), (64, 2), (128, 2)] {
             assert_eq!(loc_pool_threads(cpus), want, "cpus={cpus}");
         }
     }
