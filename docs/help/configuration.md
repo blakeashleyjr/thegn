@@ -233,6 +233,58 @@ These keys are accepted only from trusted user/profile config (or the
 `THEGN_DATABASE_MIGRATION_EXECUTABLE` launcher overrides), never from a repo
 overlay, so code in a worktree cannot grant itself authority.
 
+## Quit confirmation: `[ui] confirm_quit`
+
+`[ui] confirm_quit = true` (default) makes `Ctrl-q` ask before the UI closes.
+Press `Ctrl-q` again to confirm; any other key cancels. Daemon-backed panes
+survive a quit either way. Set it to `false` to quit at once. A change applies
+the next time you press `Ctrl-q` (no restart needed).
+
+## Background measurement: `[loc]` and `[disk]`
+
+Both scanners fill a cache in the state database and go idle between sweeps.
+`scan_interval_secs` is the per-row TTL and still sets the pump cadence;
+`max_scan_per_round` still means walks per round (defaults 2 and 4). Neither
+default changed.
+
+| key                                | applies to  | meaning                                                                                                                             |
+| ---------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `[loc] scan_interval_secs` (900)   | active only | The worktree you are in is recounted when its count is older than this, and at once when you switch to it.                          |
+| `[loc] max_scan_per_round` (2)     | background  | tokei walks per round. A background worktree is recounted only when its git state moved (root mtime, `HEAD`, `index`).              |
+| `[loc] watch_invalidate_secs` (60) | active only | Shortest gap between edit-triggered recounts.                                                                                       |
+| `[disk] scan_interval_secs` (45)   | all         | Per-worktree size TTL. The active worktree's `du` runs at most once per 120 s; inside that window the row is re-stamped from cache. |
+| `[disk] max_scan_per_round` (4)    | all         | `du` walks per round.                                                                                                               |
+
+How many rows a round may _examine_ (a few `stat`s each, no walk) adapts to the
+registry size, so the lanes always reach an idle state, and a round that finds
+nothing due returns before it opens the database. A file-watch event counts
+only the active worktree; a switch or create counts that worktree plus
+never-counted ones. The tokei pool is at most 2 threads. See the cost table on
+[the bars page](bars.md).
+
+### State database maintenance
+
+The database maintains itself; there is nothing to configure. Only a UI
+process runs maintenance (never the daemon), on the disk worker thread, behind
+the `locks/db-maintain.lock` file in the state directory, so two UIs never
+maintain at once. A pass runs at most every 10 minutes, the first one at least
+120 seconds after the first frame. Each pass does bounded retention, a sweep of
+stale state files (such as old `pty-shutdown/` entries), then one of:
+
+- A legacy (non-incremental) database up to 256 MiB live is converted with a
+  full `VACUUM`, at most 3 attempts per process. It needs `2 * live + 64 MiB`
+  free on the database filesystem and `live` free in the temp directory; short
+  of space, you get one toast and no attempt.
+- A larger legacy database gets one toast asking you to run `thegn db vacuum`.
+- An incremental database with at least `max(8 MiB, 10% of the file)` free gives
+  pages back, 2,048 at a time, at most 16 steps a pass, stopping when a step
+  takes over 250 ms.
+
+After a pass that freed pages the write-ahead log is truncated. You see a toast
+before and after a conversion, and one toast when a pass shrinks the file by 64
+MiB or more. Otherwise nothing. `thegn doctor` ends its db space line with
+`; auto-maintained`.
+
 ## Worktree lifecycle hooks
 
 `[hooks]` contains host-side commands for the six lifecycle events:

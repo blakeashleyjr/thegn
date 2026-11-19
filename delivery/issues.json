@@ -41,7 +41,9 @@
       "issue": "THE-97",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
-        "verify-stage-worker-containment"
+        "verify-stage-worker-containment",
+        "self-maintaining-state",
+        "harden-remote-teardown-proof"
       ]
     },
     {

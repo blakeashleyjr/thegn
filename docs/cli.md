@@ -149,7 +149,9 @@ Inspect it with `thegn sandbox profile show`; change it with
 `thegn sandbox profile set <standard|sealed>` or remove the override with
 `thegn sandbox profile clear` to inherit again. Each profile command accepts
 `--worktree <path>`.
-`wt rm` runs provider/sandbox teardown synchronously, then
+`wt rm` runs provider/sandbox teardown synchronously and refuses to delete
+when it cannot confirm the sandbox is gone (it names the sandbox and the two
+ways out; see the environments help page), then
 `git worktree remove`, then cleans every DB row (including tab groups, so a
 removed worktree is never resurrected at the next launch).
 
