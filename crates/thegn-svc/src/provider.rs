@@ -780,9 +780,9 @@ impl SpritesProvider {
         self
     }
 
-    /// Set the maximum number of sprites returned by each list request.
+    /// Set the maximum number of sprites returned by each list request (clamped to the API's 1..=500).
     pub fn with_list_page_size(mut self, n: u32) -> Self {
-        self.list_page_size = Some(n.clamp(1, 1000));
+        self.list_page_size = Some(n.clamp(1, 500));
         self
     }
 
