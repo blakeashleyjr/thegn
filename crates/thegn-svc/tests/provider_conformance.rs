@@ -5,7 +5,8 @@
 //! something to observe. Hermetic: no token, no network, no cost.
 //!
 //! WS08-P1-08 slice 2 (fly, vps): minimal fakes copied from `fly_mock.rs` and
-//! `vps_mock.rs` run the same suite below.
+//! `vps_mock.rs` run the same suite below. Slice 3: record kept until proven
+//! gone.
 //!
 //! Run: `cargo test -p thegn-svc --test provider_conformance`.
 
@@ -246,6 +247,9 @@ async fn sprites_passes_the_conformance_suite() {
         resumes: None,
         cap: None,
         supports_stop: false,
+        // Sprites' 30 s confirmation budget is not injectable from an integration test; the same contract is unit-tested in provider.rs `sprites_destroy_keeps_record_and_custody_when_confirmation_times_out`.
+        hold_after_delete: None,
+        recorded: None,
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
@@ -254,7 +258,8 @@ async fn sprites_passes_the_conformance_suite() {
         vec![
             "reads_never_resume",
             "create_respects_cap",
-            "stop_resume_round_trip"
+            "stop_resume_round_trip",
+            "destroy_keeps_record_until_gone"
         ],
         "{report:?}"
     );
@@ -403,9 +408,16 @@ async fn fly_passes_the_conformance_suite() {
         cap: None,
         // The minimal fake serves no machine list/stop routes.
         supports_stop: false,
+        // UNVERIFIED: whether Fly/VPS keep the record until absent is queued.
+        hold_after_delete: None,
+        recorded: None,
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
+    assert!(
+        report.skipped.contains(&"destroy_keeps_record_until_gone"),
+        "{report:?}"
+    );
 }
 
 #[tokio::test]
@@ -481,7 +493,14 @@ async fn vps_passes_the_conformance_suite() {
         cap: None,
         // A powered-off VPS still bills: no stop by construction.
         supports_stop: false,
+        // UNVERIFIED: whether Fly/VPS keep the record until absent is queued.
+        hold_after_delete: None,
+        recorded: None,
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
+    assert!(
+        report.skipped.contains(&"destroy_keeps_record_until_gone"),
+        "{report:?}"
+    );
 }
