@@ -1014,6 +1014,18 @@
       "summary": "Sprites ledger-before-create ownership, proof-before-delete reap, headless keep-awake hold, no background creates; live verification open."
     },
     {
+      "change": "harden-remote-teardown-proof",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-97",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Inventory-proven sandbox teardown, fail-closed wt rm, doctor remote readiness and quit confirmation."
+    },
+    {
       "change": "isolate-maintenance-regression-fixtures",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1440,6 +1452,18 @@
       "summary": "Discover without mutation, then snapshot only selected confirmed local worktrees; prove native outcome and no-sweep behavior privately."
     },
     {
+      "change": "self-maintaining-state",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-97",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Idle background measurement lanes and a self-maintaining state database."
+    },
+    {
       "change": "serialize-validate-frp-configuration",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1595,30 +1619,6 @@
         }
       ],
       "summary": "Continuously prove staged workers can commit without escaping configured containment."
-    },
-    {
-      "change": "self-maintaining-state",
-      "lifecycle": "active",
-      "disposition": "alpha-delivery",
-      "owners": [
-        {
-          "issue": "THE-97",
-          "project": "Alpha Reliability & State Compatibility"
-        }
-      ],
-      "summary": "Idle background measurement lanes and a self-maintaining state database."
-    },
-    {
-      "change": "harden-remote-teardown-proof",
-      "lifecycle": "active",
-      "disposition": "alpha-delivery",
-      "owners": [
-        {
-          "issue": "THE-97",
-          "project": "Alpha Reliability & State Compatibility"
-        }
-      ],
-      "summary": "Inventory-proven sandbox teardown, fail-closed wt rm, doctor remote readiness and quit confirmation."
     }
   ]
 }
