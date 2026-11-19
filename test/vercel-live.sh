@@ -103,12 +103,16 @@ Steps:
       git_token, login_upload; WARN lists unbound sandboxes (never touched);
       SKIP on an older binary
   2   env test (token works)
-  3   provision sandbox (env up)      4   run a command in the sandbox
+  3   provision sandbox (env up)
+  3b  exactly one vercel ledger record for this run
+  3s  response shapes parsed (fleet list --json)
+  4   run a command in the sandbox (vercel-exec)
+  4b  exit status and stderr reach the caller
   5   interactive terminal open       5b  record the interactive host
   6   commit in sandbox               6b  in-sandbox curl must fail (egress)
   6b-m..6e upload mode (only --with-model-login)
-  3b  exactly one vercel ledger record for this run
   7   env pull (fast-forward)         8   stop (env down --stop), 8a resume
+  7s  Vercel usage response shapes parsed (fleet cost --json)
   8b  tmpfs login dir is gone after stop/resume
   7h  (--with-headless) agent run --wait --pull with model_credentials =
       "upload" (+ optional --login-home-claude <dir> -> login_homes), then
@@ -343,6 +347,101 @@ egress_denied() {
   case "$out" in *curl_rc=0* | *curl_rc=127*) return 1 ;; *curl_rc=*) return 0 ;; *) return 1 ;; esac
 }
 
+response_shapes_parsed() {
+  local out
+  out="$("$THEGN_BIN" fleet list --env "$ENV_NAME" --json)" || return 1
+  printf '%s' "$out" | FLEET_JSON="$out" FLEET_SANDBOX="$SANDBOX_NAME" python3 -I -c '
+import json, os, sys
+
+try:
+    listing = json.loads(os.environ["FLEET_JSON"])
+    view = listing["view"]
+    rows = view["rows"]
+except (KeyError, TypeError, ValueError):
+    print("status not parsed: the Vercel response shape differs from thegn'"'"'s parser", file=sys.stderr)
+    print("createdAt not parsed: the lifetime ceiling cannot work", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(rows, list):
+    print("status not parsed: the Vercel response shape differs from thegn'"'"'s parser", file=sys.stderr)
+    print("createdAt not parsed: the lifetime ceiling cannot work", file=sys.stderr)
+    sys.exit(1)
+
+name = os.environ["FLEET_SANDBOX"]
+row = next((r for r in rows if isinstance(r, dict) and r.get("id") == name), None)
+failed = False
+if row is None or row.get("state") not in {"running", "pending"}:
+    print("status not parsed: the Vercel response shape differs from thegn'"'"'s parser", file=sys.stderr)
+    failed = True
+
+created_ms = row.get("created_ms") if row is not None else None
+if isinstance(created_ms, bool) or not isinstance(created_ms, (int, float)) or created_ms <= 0:
+    print("createdAt not parsed: the lifetime ceiling cannot work", file=sys.stderr)
+    failed = True
+
+if row is not None and row.get("size") is None:
+    print("WARN 3s: size not parsed")
+if failed:
+    sys.exit(1)
+print("   Vercel response shape: " + json.dumps(row, sort_keys=True))
+'
+}
+
+exit_status_and_stderr_reach_caller() {
+  local out rc
+  if out="$("$THEGN_BIN" vercel-exec "$SANDBOX_NAME" -- sh -c 'echo boom >&2; exit 3' 2>&1)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  printf '%s\n' "$out"
+  echo "   vercel-exec exit status: $rc"
+  [ "$rc" -eq 3 ] && [[ "$out" == *boom* ]]
+}
+
+usage_shapes_parsed() {
+  local out
+  out="$("$THEGN_BIN" fleet cost --json)" || return 1
+  COST_JSON="$out" COST_SANDBOX="$SANDBOX_NAME" python3 -I -c '
+import json, os, sys
+
+try:
+    report = json.loads(os.environ["COST_JSON"])
+except ValueError:
+    print("Vercel usage not parsed: fleet cost JSON is invalid", file=sys.stderr)
+    sys.exit(1)
+
+usage = report.get("vercel_usage") if isinstance(report, dict) else None
+if not isinstance(usage, list):
+    print("Vercel usage not parsed: fleet cost JSON has no vercel_usage", file=sys.stderr)
+    sys.exit(1)
+
+name = os.environ["COST_SANDBOX"]
+row = None
+for block in usage:
+    if not isinstance(block, dict) or not isinstance(block.get("rows"), list):
+        continue
+    row = next((r for r in block["rows"] if isinstance(r, dict) and r.get("name") == name), None)
+    if row is not None:
+        break
+if row is None:
+    print("Vercel usage not parsed: no row for the sandbox", file=sys.stderr)
+    sys.exit(1)
+
+status = row.get("status")
+if status is None or status == "unknown":
+    print("status not parsed: the Vercel response shape differs from thegn'"'"'s parser", file=sys.stderr)
+    sys.exit(1)
+if row.get("session_usd") is None:
+    print("WARN 7s: usage fields not parsed")
+print("   Vercel usage row: " + json.dumps({
+    key: row.get(key) for key in (
+        "name", "status", "session_usd", "snapshots_usd_month", "snapshot_bytes"
+    )
+}, sort_keys=True))
+'
+}
+
 VX_PATH=""
 resolve_vx_path() { # the worktree whose branch ends in vx-h
   VX_PATH="$(git -C "$REPO" worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} /^branch .*vx-h$/{print p}')"
@@ -394,7 +493,9 @@ CREATED=1
 step 3 "provision sandbox (env up)" in_repo "$THEGN_BIN" env up
 step 3b "exactly one vercel ledger record for this run" name_from_ledger
 echo "sandbox: $SANDBOX_NAME"
+step 3s "response shapes parsed" response_shapes_parsed
 step 4 "command runs in the sandbox (vercel-exec)" no_stdin "$THEGN_BIN" vercel-exec "$SANDBOX_NAME" -- true
+step 4b "exit status and stderr reach the caller" exit_status_and_stderr_reach_caller
 echo "   run in ANOTHER terminal: XDG_STATE_HOME='$XDG_STATE_HOME' XDG_CONFIG_HOME='$XDG_CONFIG_HOME' XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR' THEGN_CHANNEL=dev $THEGN_BIN  (open $REPO)"
 echo "== step 5: open an interactive terminal pane for this worktree now (manual)"
 echo "   (a pane open runs the vercel-exec TTY bridge; then close it)"
@@ -411,6 +512,7 @@ else
   echo "SKIP 6b-6e (upload mode needs --with-model-login and a host claude login)"
 fi
 step 7 "env pull fast-forwards the lane branch" in_repo "$THEGN_BIN" env pull
+step 7s "Vercel usage response shapes parsed" usage_shapes_parsed
 if [ "$headless" = 1 ]; then
   step 7w "wt new vx-h" in_repo "$THEGN_BIN" wt new vx-h --env "$ENV_NAME"
   step 7p "resolve the vx-h worktree path" resolve_vx_path
