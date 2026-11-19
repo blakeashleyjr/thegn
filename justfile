@@ -1763,3 +1763,9 @@ fly-image-publish registry tag="v1":
     echo "pushed $ref — point the Fly env at it:"
     echo "  [env.fly.provider]"
     echo "  template = \"image:$ref\"   # boots from the baked image (fast path)"
+
+# Live Sprites run (real spend; plan-only without `--env <name> --i-accept-spend`
+# and THEGN_CHANNEL=dev). Not part of ci/ci-local/smoke.
+[positional-arguments]
+sprites-live *args:
+    bash test/sprites-live.sh "$@"
