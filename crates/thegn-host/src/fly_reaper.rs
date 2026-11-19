@@ -61,38 +61,20 @@ pub fn tick(cfg: &Config) {
     if !has_fly_work(&view) {
         return;
     }
-    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    static GATE: crate::reaper_policy::ReaperGate = crate::reaper_policy::ReaperGate::new();
+    let Some(token) = GATE.try_begin(TICK_INTERVAL) else {
+        if let Some(elapsed) =
+            GATE.stalled_for(Instant::now(), crate::reaper_policy::STALL_WARN_AFTER)
+        {
+            let minutes = elapsed.as_secs() / 60;
+            tracing::warn!(target: "thegn::lifecycle", "fly reaper pass has run for {minutes} min; a provider call may be hung; no new pass starts until it ends");
+        }
         return;
-    }
-    {
-        let mut last = LAST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.is_some_and(|t| t.elapsed() < TICK_INTERVAL) {
-            IN_FLIGHT.store(false, Ordering::Release);
-            return;
-        }
-        *last = Some(Instant::now());
-    }
-    let spawned = thegn_core::thread_name::try_spawn_named("thegn-fly-reap", move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        struct FlightGuard;
-        impl Drop for FlightGuard {
-            fn drop(&mut self) {
-                IN_FLIGHT.store(false, Ordering::Release);
-            }
-        }
-        let _guard = FlightGuard;
+    };
+    if !crate::reaper_policy::spawn_pass(token, "thegn-fly-reap", move || {
         reap(&envs);
-    });
-    if let Err(error) = spawned {
-        IN_FLIGHT.store(false, Ordering::Release);
-        tracing::warn!(target: "thegn::lifecycle", %error, "fly reaper thread could not start");
+    }) {
+        tracing::warn!(target: "thegn::lifecycle", "fly reaper thread could not start");
     }
 }
 

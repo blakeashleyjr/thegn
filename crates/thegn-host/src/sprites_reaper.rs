@@ -24,7 +24,7 @@
 //! `env reap` sprites lease is shared, so this never races an `--apply`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -61,47 +61,29 @@ pub fn tick(cfg: &Config) {
     if !reaper_enabled(cfg) {
         return;
     }
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    {
-        let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
-        if last.is_some_and(|t| t.elapsed() < TICK_INTERVAL) {
-            IN_FLIGHT.store(false, Ordering::Release);
-            return;
+    static GATE: crate::reaper_policy::ReaperGate = crate::reaper_policy::ReaperGate::new();
+    let Some(token) = GATE.try_begin(TICK_INTERVAL) else {
+        if let Some(elapsed) =
+            GATE.stalled_for(Instant::now(), crate::reaper_policy::STALL_WARN_AFTER)
+        {
+            let minutes = elapsed.as_secs() / 60;
+            tracing::warn!(target: "thegn::provider", "sprites reaper pass has run for {minutes} min; a provider call may be hung; no new pass starts until it ends");
         }
-        *last = Some(Instant::now());
-    }
+        return;
+    };
     let envs: Vec<(String, EnvConfig)> = cfg
         .env
         .iter()
         .filter(|(_, env)| is_sprites_provider_env(env))
         .map(|(name, env)| (name.clone(), env.clone()))
         .collect();
-    let spawned = thegn_core::thread_name::try_spawn_named("thegn-sprt-reap", move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        struct FlightGuard;
-        impl Drop for FlightGuard {
-            fn drop(&mut self) {
-                IN_FLIGHT.store(false, Ordering::Release);
-            }
-        }
-        let _guard = FlightGuard;
+    let spawned = crate::reaper_policy::spawn_pass(token, "thegn-sprt-reap", move || {
         run_pass(&envs);
     });
-    match spawned {
-        Ok(_) => {
-            PASSES_STARTED.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(error) => {
-            IN_FLIGHT.store(false, Ordering::Release);
-            tracing::warn!(target: "thegn::provider", %error, "sprites reaper thread could not start");
-        }
+    if spawned {
+        PASSES_STARTED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        tracing::warn!(target: "thegn::provider", "sprites reaper thread could not start");
     }
 }
 
