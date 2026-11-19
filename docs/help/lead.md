@@ -73,6 +73,13 @@ with the normal new-tab key and it starts its own Lead process.
 The Lead only has the tools listed in [[ai-usage]] under "Lead tool
 surface", each gated by its scope. All repositories are read-only to it.
 
+## Mail and tasks
+
+The Lead reads your mail and tasks through `notifications.list kind=inbox_item`,
+fed by the daemon's native inbox (see [[inbox]]). `producers.status` shows which
+producers and inbox accounts are armed and their last error. It does not need
+its own MCP servers for Todoist or mail, and never sees the credentials.
+
 ## Approvals
 
 The Lead never grants an approval. It asks (`approvals_request`) and you
