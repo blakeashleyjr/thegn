@@ -1128,6 +1128,15 @@ impl SidebarState {
                 self.rebuild(model, session);
                 return SidebarOutcome::Redraw;
             }
+            // A batch row's open state is `batch_open:<key>` (absent =
+            // collapsed), keyed on its stable `pin_key`.
+            if row.kind == crate::sidebar::RowKind::BatchGroup {
+                let key = row.pin_key.clone();
+                let open = row.collapsed;
+                self.set_batch_open(&key, open);
+                self.rebuild(model, session);
+                return SidebarOutcome::Redraw;
+            }
             // Per-kind collapse key: folders key on their `pin_key`
             // (`{slug}/folder:{id}`), everything else on `workspace_slug`.
             let slug = row.collapse_key().to_string();
@@ -2111,6 +2120,103 @@ mod tests {
         assert_eq!(sb.cursor, more_idx(&model));
         assert!(sb.marked.is_empty(), "Space toggles, it does not mark");
         assert!(sb.menu_for_cursor(&model, &session).is_none());
+    }
+
+    /// Home plus three `b158` lanes: a collapsed-by-default batch row.
+    fn batch_fixture() -> (crate::session::Session, FrameModel, SidebarState) {
+        use crate::session::{GroupKind, Session, WorktreeGroup};
+        let mut worktrees = vec![WorktreeGroup::new(
+            "app/main".to_string(),
+            GroupKind::Home,
+            "/tmp/app-main".to_string(),
+        )];
+        for n in ["a", "b", "c"] {
+            worktrees.push(WorktreeGroup::new(
+                format!("app/b158-{n}"),
+                GroupKind::Branch,
+                format!("/tmp/app-b158-{n}"),
+            ));
+        }
+        let session = Session {
+            id: "s1".into(),
+            worktrees,
+            active: 0,
+        };
+        let mut model = crate::hydrate::build_initial_model(&session, None);
+        model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+        let mut sb = SidebarState {
+            focused: true,
+            ..Default::default()
+        };
+        sb.view.display.batch_group_min = 2;
+        sb.rebuild(&mut model, &session);
+        (session, model, sb)
+    }
+
+    fn batch_idx(model: &FrameModel) -> usize {
+        model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible)
+            .position(|r| r.kind == crate::sidebar::RowKind::BatchGroup)
+            .expect("a visible batch row")
+    }
+
+    #[test]
+    fn enter_on_a_batch_row_opens_then_closes_it() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (session, mut model, mut sb) = batch_fixture();
+        let idx = batch_idx(&model);
+        sb.cursor = idx;
+        assert!(sb.selected_row(&model).unwrap().collapsed);
+        let key = sb.selected_row(&model).unwrap().pin_key.clone();
+
+        sb.handle_key(&KeyCode::Enter, Modifiers::NONE, &mut model, &session);
+        assert!(sb.view.batch_open.contains(&key));
+        assert_eq!(
+            sb.cursor,
+            batch_idx(&model),
+            "cursor stays on the batch row"
+        );
+        assert!(!sb.selected_row(&model).unwrap().collapsed);
+
+        sb.handle_key(&KeyCode::Enter, Modifiers::NONE, &mut model, &session);
+        assert!(!sb.view.batch_open.contains(&key));
+        assert!(sb.selected_row(&model).unwrap().collapsed);
+    }
+
+    #[test]
+    fn left_on_a_member_collapses_its_batch_and_lands_on_it() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (session, mut model, mut sb) = batch_fixture();
+        sb.cursor = batch_idx(&model);
+        sb.handle_key(&KeyCode::Enter, Modifiers::NONE, &mut model, &session);
+        let idx = batch_idx(&model);
+        sb.cursor = idx + 1;
+        assert_eq!(
+            sb.selected_row(&model).unwrap().kind,
+            crate::sidebar::RowKind::Worktree
+        );
+
+        sb.handle_key(&KeyCode::LeftArrow, Modifiers::NONE, &mut model, &session);
+        assert!(sb.view.batch_open.is_empty());
+        assert_eq!(sb.cursor, batch_idx(&model));
+        assert!(sb.selected_row(&model).unwrap().collapsed);
+    }
+
+    #[test]
+    fn the_menu_offers_only_collapse_expand_on_a_batch_row() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (session, model, mut sb) = batch_fixture();
+        sb.cursor = batch_idx(&model);
+        let menu = sb.menu_for_cursor(&model, &session).expect("batch menu");
+        let ids: Vec<&str> = menu
+            .entries
+            .iter()
+            .filter(|e| !e.is_separator())
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["toggle"]);
     }
 }
 
