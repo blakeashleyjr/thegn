@@ -741,15 +741,19 @@ impl VercelProvider {
             return Ok(None);
         };
         self.remember_session(name, session, false);
+        let now = now_ms();
+        // A GET just saw this session Running, so it has not expired: an estimate in
+        // the past is stale bookkeeping, not expiry. The lifetime ceiling still bounds it.
         let est = self
             .expiry
             .lock()
             .unwrap()
             .get(name)
             .map(|(_, est)| *est)
-            .unwrap_or_else(now_ms);
+            .unwrap_or(now)
+            .max(now);
         let Some(ms) = policy::next_extension(
-            now_ms(),
+            now,
             est,
             created_at_ms,
             policy::max_lifetime_secs(self.spec.max_lifetime_secs),
@@ -820,8 +824,10 @@ impl VercelProvider {
                 _ = check.tick() => {
                     // A long provisioning step must not outlive its session; the
                     // lifetime ceiling inside `extend_if_due` still bounds the spend.
-                    if let Err(error) = self.extend_if_due(name).await {
-                        tracing::debug!(target: "thegn::vercel", sandbox = %name, error = %format!("{error:#}"), "vercel: session keep-alive check failed");
+                    match tokio::time::timeout(std::time::Duration::from_secs(30), self.extend_if_due(name)).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => tracing::debug!(target: "thegn::vercel", sandbox = %name, error = %format!("{error:#}"), "vercel: session keep-alive check failed"),
+                        Err(_) => tracing::debug!(target: "thegn::vercel", sandbox = %name, "vercel: session keep-alive check timed out"),
                     }
                 }
             }
