@@ -146,6 +146,28 @@ class SpritesExecReproTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertNotIn("SYNTHETIC", completed.stdout + completed.stderr)
 
+    def test_rejects_non_ascii_token_without_leaking_it(self) -> None:
+        environment = os.environ.copy()
+        environment["SPRITES_TOKEN"] = "SYNéTIC"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(SCRIPT),
+                "demo-sprite",
+                "--run",
+                "--api-base",
+                "ws://127.0.0.1:9",
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("SYN", completed.stdout + completed.stderr)
+        self.assertNotIn("é", completed.stdout + completed.stderr)
+
     def test_plan_opens_no_socket(self) -> None:
         repro = load_repro()
         with mock.patch.object(repro.socket, "create_connection", side_effect=AssertionError("network")):

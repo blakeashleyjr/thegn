@@ -290,6 +290,12 @@ def main(argv: list[str] | None = None) -> int:
     if not token:
         print(f"error: environment variable {args.token_env} is empty", file=sys.stderr)
         return 2
+    if not token.isascii() or not token.isprintable() or any(c.isspace() for c in token):
+        print(
+            f"error: environment variable {args.token_env} holds characters a bearer token cannot contain",
+            file=sys.stderr,
+        )
+        return 2
     try:
         run_once(args.api_base, args.sprite, token, True)
         run_once(args.api_base, args.sprite, token, False)
