@@ -3271,6 +3271,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
     let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
     serde_json::json!({
         "instance": instance_json(cfg),
+        "runtime_exposure": super::doctor_exposure::json(cfg),
         "identification": identification_json(cfg),
         "channel": channel_json(),
         "completions": completions_json(),
@@ -3320,6 +3321,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "devcontainer": devcontainer_json(cfg),
         "preview_renderers": preview_renderers_json(),
         "vercel": vercel_json(cfg),
+        "share_teardowns": super::doctor_share::json(),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
         "remote_live": super::doctor_remote::json(cfg),
@@ -3817,6 +3819,7 @@ pub fn run(
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     instance_report(cfg);
+    super::doctor_exposure::report(cfg);
     identification_report(cfg);
     let voice = super::voice::status(&cfg.voice);
     outln!("Voice");
@@ -4018,6 +4021,7 @@ pub fn run(
     preview_renderers_report();
 
     vercel_report(cfg);
+    super::doctor_share::report();
 
     outln!("");
     hosts_report(cfg);
