@@ -5006,6 +5006,9 @@ fn deprovision_sync_in(dir: &Path, cfg: &Config, path: &str) -> Result<(), Strin
             let mut registry = provider_sync_registry()
                 .lock()
                 .map_err(|_| "provider sync registry unavailable".to_string())?;
+            if registry.get(path).is_some_and(|record| record.in_flight) {
+                return Err("provider sync is already in progress".into());
+            }
             registry.insert(
                 path.to_owned(),
                 ProviderSyncRecord {
@@ -5031,6 +5034,18 @@ fn deprovision_sync_in(dir: &Path, cfg: &Config, path: &str) -> Result<(), Strin
 
     let result = match provider_sync_target(cfg, &env_name) {
         Some((provider, id, workdir)) => {
+            if let Ok(Some(entry)) = thegn_svc::sync_journal::load_at(dir, path)
+                && journal_pull_is_fresh(&entry, thegn_core::util::now_ms())
+            {
+                if let Ok(mut registry) = provider_sync_registry().lock()
+                    && let Some(record) = registry.get_mut(path)
+                {
+                    record.in_flight = false;
+                }
+                return Err(
+                    "provider sync pull is already running in another thegn process".into(),
+                );
+            }
             if let Err(error) = thegn_svc::sync_journal::set_state_at(
                 dir,
                 path,
