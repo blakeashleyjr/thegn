@@ -54,7 +54,7 @@ while [ $# -gt 0 ]; do
     shift 2
     ;;
   -h | --help)
-    sed -n 2,15p "$0"
+    sed -n 2,16p "$0"
     exit 0
     ;;
   *)
@@ -372,7 +372,7 @@ exec_exit_and_stderr() {
   rc=$?
   set -e
   printf '%s\n' "$out"
-  [ "$rc" -eq 3 ] && [[ "$out" == *boom* ]]
+  [ "$rc" -eq 3 ] && [[ $out == *boom* ]]
 }
 
 memory_max_matches() { # memory.max in bytes equals N GiB; absent file skips
@@ -518,7 +518,7 @@ pull_refs_empty() { [ -z "$(git -C "$REPO" for-each-ref refs/thegn/pull)" ]; }
 
 warm_or_cold() {
   local out
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
   FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
 import json, os, sys
 try:
@@ -557,7 +557,7 @@ wake_from_cold() {
 
 wake_state() {
   local out
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
   FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
 import json, os, sys
 try:
@@ -601,6 +601,9 @@ agent_run() {
   set +e
   AGENT_JSON="$(in_repo "$THEGN_BIN" agent run --worktree "$REPO" --agent "$agent_name" --prompt "create sx-agent.txt containing ok and commit it" --wait --pull --json)"
   rc=$?
+  kill "$AGENT_POLL_PID" 2>/dev/null
+  wait "$AGENT_POLL_PID" 2>/dev/null
+  AGENT_POLL_PID=""
   set -e
   ended="$(date +%s)" || return 1
   AGENT_RUN_SECONDS=$((ended - started))
