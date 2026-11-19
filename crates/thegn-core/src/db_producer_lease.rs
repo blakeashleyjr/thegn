@@ -62,6 +62,44 @@ impl Db {
         Ok(changed == 1)
     }
 
+    /// Replace `kind`'s lease with `(holder, pid)` until `now_ms + ttl_ms`,
+    /// but only if the row still names `(dead_holder, dead_pid)`: a CAS for
+    /// taking over from a holder the caller has judged dead or implausible
+    /// (a crashed daemon whose expiry a backward clock step pushed far into
+    /// the future). `Ok(false)` when the row changed meanwhile or is gone.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a compare-and-swap names both the old and the new holder"
+    )]
+    pub fn take_over_producer_lease(
+        &self,
+        kind: ProducerKind,
+        dead_holder: &str,
+        dead_pid: i64,
+        holder: &str,
+        pid: i64,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE producer_leases
+                SET holder = :holder, holder_pid = :pid,
+                    acquired_at_ms = :now, expires_at_ms = :expires
+              WHERE producer = :producer
+                AND holder = :dead_holder AND holder_pid = :dead_pid",
+            named_params! {
+                ":producer": kind.as_str(),
+                ":holder": holder,
+                ":pid": pid,
+                ":now": now_ms,
+                ":expires": now_ms.saturating_add(ttl_ms.max(0)),
+                ":dead_holder": dead_holder,
+                ":dead_pid": dead_pid,
+            },
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Drop `kind`'s lease if `(holder, pid)` holds it. `Ok(false)` when
     /// there is no lease or someone else holds it.
     pub fn release_producer_lease(
@@ -241,6 +279,77 @@ mod tests {
                 ProducerKind::PrQueue,
                 ProducerKind::Tracker,
             ]
+        );
+    }
+
+    #[test]
+    fn take_over_replaces_only_the_named_dead_holder() {
+        let db = Db::open_memory().unwrap();
+        let far = 10 * 3600 * 1000;
+        assert!(
+            db.try_acquire_producer_lease(ProducerKind::Inbox, DAEMON_HOLDER, 7, 0, far)
+                .unwrap()
+        );
+        assert!(
+            !db.try_acquire_producer_lease(ProducerKind::Inbox, DAEMON_HOLDER, 8, 1_000, TTL)
+                .unwrap(),
+            "the plain acquire is refused"
+        );
+        assert!(
+            !db.take_over_producer_lease(
+                ProducerKind::Inbox,
+                DAEMON_HOLDER,
+                6,
+                DAEMON_HOLDER,
+                8,
+                1_000,
+                TTL
+            )
+            .unwrap(),
+            "the row names another pid: the CAS refuses"
+        );
+        assert!(
+            db.take_over_producer_lease(
+                ProducerKind::Inbox,
+                DAEMON_HOLDER,
+                7,
+                DAEMON_HOLDER,
+                8,
+                1_000,
+                TTL
+            )
+            .unwrap()
+        );
+        let row = db.producer_lease(ProducerKind::Inbox).unwrap().unwrap();
+        assert_eq!(
+            (row.holder_pid, row.acquired_at_ms, row.expires_at_ms),
+            (8, 1_000, 61_000)
+        );
+        assert!(
+            !db.take_over_producer_lease(
+                ProducerKind::Inbox,
+                DAEMON_HOLDER,
+                7,
+                DAEMON_HOLDER,
+                9,
+                2_000,
+                TTL
+            )
+            .unwrap(),
+            "a second taker loses the race"
+        );
+        assert!(
+            !db.take_over_producer_lease(
+                ProducerKind::Tracker,
+                DAEMON_HOLDER,
+                7,
+                DAEMON_HOLDER,
+                9,
+                2_000,
+                TTL
+            )
+            .unwrap(),
+            "no row: nothing to take over"
         );
     }
 
