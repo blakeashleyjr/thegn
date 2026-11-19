@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.100] — 2026-11-19
+
 ### Changed
 
 - Fleet reads a recorded sandbox the provider does not list as `down` unless this host still holds its provisioned marker (then `missing`), and a sprite with no worktree and no ledger record as `unrecorded`. Neither turns the masthead badge amber. Budget admission still counts every listed row. Not yet verified live.
@@ -3923,7 +3925,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.99...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.100...HEAD
+[0.1.0-alpha.100]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.99...v0.1.0-alpha.100
 [0.1.0-alpha.99]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...v0.1.0-alpha.99
 [0.1.0-alpha.98]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.97...v0.1.0-alpha.98
 [0.1.0-alpha.97]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.96...v0.1.0-alpha.97
