@@ -401,7 +401,11 @@ pub(crate) fn plan_spec_before_ensure(
     recursive_submodules: bool,
     warnings: &mut Vec<String>,
 ) -> Option<RemoteSyncPlan> {
-    if let Some(w) = degrade_oci_runtime(spec) {
+    if probes_apply(
+        spec.placement.is_local(),
+        thegn_core::sandbox_backend::host_os(),
+    ) && let Some(w) = degrade_oci_runtime(spec)
+    {
         thegn_core::msg::warn(&format!("{w} for {worktree}"));
         warnings.push(w);
     }
@@ -466,6 +470,28 @@ pub(crate) fn apply_remote_sync_with(
 /// it degraded, else `None`. The keep-or-degrade rule is the unit-tested pure
 /// [`thegn_core::sandbox_runtime::decide`]; here we only probe the host.
 pub(crate) fn degrade_oci_runtime(spec: &mut thegn_core::sandbox::SandboxSpec) -> Option<String> {
+    degrade_oci_runtime_with(
+        spec,
+        &|binary| thegn_core::util::which_path(binary).is_some(),
+        &thegn_core::host_probe::kvm_accessible,
+    )
+}
+
+/// Runtime probes describe this machine: only a local placement on a Linux
+/// host may use them.
+pub(crate) fn probes_apply(
+    placement_is_local: bool,
+    os: thegn_core::sandbox_backend::HostOs,
+) -> bool {
+    placement_is_local && os == thegn_core::sandbox_backend::HostOs::Linux
+}
+
+/// Testable host-probe half of [`degrade_oci_runtime`].
+pub(crate) fn degrade_oci_runtime_with(
+    spec: &mut thegn_core::sandbox::SandboxSpec,
+    binary_present: &dyn Fn(&str) -> bool,
+    kvm: &dyn Fn() -> bool,
+) -> Option<String> {
     use thegn_core::sandbox_runtime::{RuntimeDecision, decide, runtime_req};
     if !spec.backend.is_oci() {
         return None;
@@ -473,8 +499,8 @@ pub(crate) fn degrade_oci_runtime(spec: &mut thegn_core::sandbox::SandboxSpec) -
     let requested = spec.oci_runtime.clone();
     let requested = requested.as_deref()?;
     let req = runtime_req(requested.trim())?;
-    let binary_present = thegn_core::util::which_path(req.binary).is_some();
-    let kvm_present = std::path::Path::new("/dev/kvm").exists();
+    let binary_present = binary_present(req.binary);
+    let kvm_present = !req.needs_kvm || kvm();
     match decide(Some(requested), binary_present, kvm_present) {
         RuntimeDecision::Keep => None,
         RuntimeDecision::Degrade(reason) => {
@@ -687,10 +713,10 @@ fn sync_worktree_uncached(
 mod tests {
     use super::{
         MAX_SYNC_BYTES, MAX_SYNC_FILES, SyncCache, UNTRACKED_STREAM_LIMIT, UntrackedSize,
-        apply_diff_command, apply_remote_sync_with, claim_command, pipe_step_error,
-        plan_spec_before_ensure, promote_command, record_command, refresh_command, restore_command,
-        should_apply_tracked_diff, ssh_none_guard, sync_key, sync_once, untracked_budget,
-        untracked_size,
+        apply_diff_command, apply_remote_sync_with, claim_command, degrade_oci_runtime_with,
+        pipe_step_error, plan_spec_before_ensure, probes_apply, promote_command, record_command,
+        refresh_command, restore_command, should_apply_tracked_diff, ssh_none_guard, sync_key,
+        sync_once, untracked_budget, untracked_size,
     };
     use std::process::Command;
     use std::sync::{
@@ -1501,6 +1527,58 @@ mod tests {
 
         let mut non_oci = sandbox_spec(thegn_core::sandbox::Backend::None, true);
         assert!(plan_spec_before_ensure(&mut non_oci, "/wt/x", false, &mut Vec::new()).is_none());
+    }
+
+    #[test]
+    fn remote_ssh_spec_keeps_runtime_unprobed() {
+        let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, true);
+        spec.oci_runtime = Some("krun".into());
+
+        let _ = plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new());
+
+        assert_eq!(spec.oci_runtime.as_deref(), Some("krun"));
+    }
+
+    #[test]
+    fn macos_local_spec_not_degraded_by_local_path() {
+        let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, false);
+        spec.oci_runtime = Some("runsc".into());
+
+        if probes_apply(
+            spec.placement.is_local(),
+            thegn_core::sandbox_backend::HostOs::MacOs,
+        ) {
+            degrade_oci_runtime_with(&mut spec, &|_| false, &|| false);
+        }
+
+        assert_eq!(spec.oci_runtime.as_deref(), Some("runsc"));
+    }
+
+    #[test]
+    fn linux_local_krun_without_kvm_access_degrades() {
+        let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, false);
+        spec.oci_runtime = Some("krun".into());
+
+        let warning = degrade_oci_runtime_with(&mut spec, &|_| true, &|| false);
+
+        assert!(warning.is_some_and(|warning| warning.contains("/dev/kvm")));
+        assert_eq!(spec.oci_runtime, None);
+    }
+
+    #[test]
+    fn probes_apply_table() {
+        use thegn_core::sandbox_backend::HostOs;
+
+        for (placement_is_local, os, expected) in [
+            (true, HostOs::Linux, true),
+            (true, HostOs::MacOs, false),
+            (true, HostOs::Windows, false),
+            (true, HostOs::Other, false),
+            (false, HostOs::Linux, false),
+            (false, HostOs::MacOs, false),
+        ] {
+            assert_eq!(probes_apply(placement_is_local, os), expected);
+        }
     }
 
     #[test]
