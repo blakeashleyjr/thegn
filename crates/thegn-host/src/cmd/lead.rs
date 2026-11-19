@@ -1,4 +1,4 @@
-//! `thegn lead pause|resume|status` (b155 6f): the Lead kill switch.
+//! `thegn lead pause|resume|status|login` (b155 6f): the Lead kill switch.
 //!
 //! `pause` posts `automations.halt` (Admin), which sets the pause flag and,
 //! unless `--keep-sessions`, kills every automation-started and Lead-opened
@@ -34,6 +34,13 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Log the Lead's agent (or one of its MCP servers) in once, on the host.
+    Login {
+        /// Log in this `[mcp_servers.<server>]` (a member of the Lead's
+        /// `mcp_profile`) instead of the agent.
+        #[arg(long, value_name = "SERVER")]
+        mcp: Option<String>,
+    },
 }
 
 pub fn run(cfg: &Config, a: Action) -> Result<()> {
@@ -41,6 +48,7 @@ pub fn run(cfg: &Config, a: Action) -> Result<()> {
         Action::Pause { keep_sessions } => pause(keep_sessions),
         Action::Resume => resume(),
         Action::Status { json } => status(cfg, json),
+        Action::Login { mcp } => crate::lead::login::run(cfg, mcp.as_deref()),
     }
 }
 
@@ -370,6 +378,16 @@ mod tests {
             parse(&["status", "--json"]).unwrap(),
             Action::Status { json: true }
         ));
+        assert!(matches!(
+            parse(&["login"]).unwrap(),
+            Action::Login { mcp: None }
+        ));
+        assert!(matches!(
+            parse(&["login", "--mcp", "x"]).unwrap(),
+            Action::Login { mcp: Some(ref s) } if s == "x"
+        ));
+        assert!(parse(&["login", "--mcp"]).is_err());
+        assert!(parse(&["login", "--json"]).is_err());
         assert!(parse(&["resume", "--keep-sessions"]).is_err());
         assert!(parse(&["pause", "--json"]).is_err());
         assert!(parse(&[]).is_err());

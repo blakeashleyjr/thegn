@@ -3149,6 +3149,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
             crate::agent_run::headless_unsupported().as_deref()
         ),
         "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
+        "lead_readiness": super::doctor_lead::json(&super::doctor_lead::inspect(cfg)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
         "local_control": local_control_security_json_with_legacy_state(cfg, legacy_state_override),
@@ -3774,6 +3775,7 @@ pub fn run(
     macos_report(&env);
     outln!("");
     super::batteries_doctor::print(&super::batteries_doctor::inspect_env());
+    super::doctor_lead::print(&super::doctor_lead::inspect(cfg));
     outln!("");
     let (pin_rows, pin_unread) = pins::collect(cfg);
     pins::print(&pin_rows, pin_unread.as_deref());

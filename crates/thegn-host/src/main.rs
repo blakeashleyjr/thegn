@@ -59,6 +59,7 @@ mod completions_health;
 mod compositor;
 mod fold_cancel;
 mod gate_capture;
+mod gate_sandbox;
 mod heavy_slot;
 #[cfg(test)]
 mod tmp_root_ratchet_tests;
@@ -242,6 +243,7 @@ mod proc_worker;
 mod proc_workload;
 #[cfg(test)]
 mod proc_workload_alloc;
+mod producer_yield;
 mod profile;
 mod provider_factory;
 mod provider_git;
