@@ -26,7 +26,7 @@
 //! Lead control dir; the sealed floor hides `$HOME`. The sealed command
 //! inherits only an allowlisted env ([`scrub_sealed_env`]).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thegn_core::config::{Config, GateSandbox, MergeQueueConfig, Network};
 use thegn_core::sandbox::{Mount, SandboxSpec, SecretEnvFile};
@@ -339,6 +339,24 @@ fn under(path: &Path, root: &Path) -> bool {
     !root.as_os_str().is_empty() && path.starts_with(root)
 }
 
+/// Every spelling of `p` the filter compares: the raw path plus its
+/// canonical form (symlinks resolved, e.g. `/home` vs `/var/home`), deduped.
+/// A path that cannot be canonicalized (missing, unreadable) is raw only.
+fn spellings(p: &Path) -> Vec<PathBuf> {
+    let mut out = vec![p.to_path_buf()];
+    if let Ok(canonical) = std::fs::canonicalize(p)
+        && canonical != p
+    {
+        out.push(canonical);
+    }
+    out
+}
+
+/// Whether any spelling in `a` is any spelling in `b` or lies beneath it.
+fn under_any(a: &[PathBuf], b: &[PathBuf]) -> bool {
+    a.iter().any(|a| b.iter().any(|b| under(a, b)))
+}
+
 /// The sealed spec for one gate command: `spec` re-rooted at `checkout`.
 /// The repo's own mounts (its main checkout, anything above it, its `.git`
 /// carve-outs) are dropped, every remaining profile mount becomes read-only,
@@ -351,16 +369,20 @@ pub(crate) fn gate_spec(
     common_git: &Path,
     extra_env: &[(String, String)],
 ) -> SandboxSpec {
-    let original = spec.worktree.clone();
+    // Compare raw AND canonical spellings, so a mount naming the main
+    // checkout through another path (`/home` vs `/var/home`, a symlink) is
+    // dropped as well.
+    let original = spellings(&spec.worktree);
+    let common_spellings = spellings(common_git);
     let mut spec = spec.clone();
     spec.mounts.retain(|m| {
-        let (h, d) = (Path::new(&m.host), Path::new(&m.dest));
-        !(under(h, &original)
-            || under(d, &original)
-            || under(&original, h)
-            || under(&original, d)
-            || under(h, common_git)
-            || under(d, common_git))
+        let (h, d) = (spellings(Path::new(&m.host)), spellings(Path::new(&m.dest)));
+        !(under_any(&h, &original)
+            || under_any(&d, &original)
+            || under_any(&original, &h)
+            || under_any(&original, &d)
+            || under_any(&h, &common_spellings)
+            || under_any(&d, &common_spellings))
     });
     for m in &mut spec.mounts {
         m.ro = true;
@@ -613,6 +635,91 @@ mod tests {
             gated.mounts
         );
         assert_eq!(gated.mounts.len(), 2);
+    }
+
+    #[test]
+    fn a_mount_reaching_the_checkout_through_a_symlink_is_dropped() {
+        // `link` -> `real`: the main checkout is `real`, and a profile mount
+        // names it (and a path under it) through the symlink spelling.
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return; // no unprivileged directory symlink on this platform
+        }
+        let real = temp.real_path();
+        let link = temp.path();
+        std::fs::create_dir(real.join("sub")).unwrap();
+        let link_str = link.to_string_lossy().into_owned();
+        let sub_str = link.join("sub").to_string_lossy().into_owned();
+        let mut spec = SandboxSpec {
+            worktree: real.to_path_buf(),
+            ..base()
+        };
+        spec.mounts = vec![
+            mount(&link_str, false, false),
+            mount(&sub_str, true, false),
+            mount("/home/u/.cargo/registry", false, true),
+        ];
+        let gated = gate_spec(
+            &spec,
+            Path::new("/state/gate/wt"),
+            None,
+            &real.join(".git"),
+            &gate_env(),
+        );
+        assert!(
+            gated
+                .mounts
+                .iter()
+                .all(|m| m.host != link_str && m.host != sub_str),
+            "{:?}",
+            gated.mounts
+        );
+        assert!(
+            gated
+                .mounts
+                .iter()
+                .any(|m| m.host == "/home/u/.cargo/registry" && m.ro)
+        );
+
+        // The reverse spelling: the spec names the checkout through the
+        // symlink and the mount names the real path.
+        let mut aliased = SandboxSpec {
+            worktree: link.to_path_buf(),
+            ..base()
+        };
+        let real_str = real.to_string_lossy().into_owned();
+        aliased.mounts = vec![mount(&real_str, false, false)];
+        let gated = gate_spec(
+            &aliased,
+            Path::new("/state/gate/wt"),
+            None,
+            &link.join(".git"),
+            &gate_env(),
+        );
+        assert!(
+            gated.mounts.iter().all(|m| m.host != real_str),
+            "{:?}",
+            gated.mounts
+        );
+    }
+
+    #[test]
+    fn spellings_are_raw_plus_canonical_deduped() {
+        let missing = Path::new("/definitely/not/a/real/path/for/thegn");
+        assert_eq!(spellings(missing), vec![missing.to_path_buf()]);
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        let real = spellings(temp.real_path());
+        assert_eq!(real, vec![temp.real_path().to_path_buf()]);
+        if temp.path() != temp.real_path() {
+            assert_eq!(
+                spellings(temp.path()),
+                vec![temp.path().to_path_buf(), temp.real_path().to_path_buf()]
+            );
+        }
+        assert!(under_any(
+            &spellings(temp.path()),
+            &[temp.real_path().to_path_buf()]
+        ));
     }
 
     #[test]

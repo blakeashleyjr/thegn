@@ -117,7 +117,7 @@ check-cross:
     # carry most of the per-OS code (sysinfo metrics; MPRIS/SMTC/AppleScript
     # media). thegn-core/-svc/-host + gtui-query are NOT here — ring, bundled
     # sqlite and libgit2 make them need a real cross cc.
-    leaves="thegn-metrics thegn-media thegn-proc tg-kit gtui-core gtui-render gtui-app"
+    leaves="thegn-metrics thegn-media thegn-proc thegn-cas thegn-job-spec thegn-lease thegn-guest-proto tg-kit gtui-core gtui-render gtui-app"
     if [ -d "$rustlib/aarch64-apple-darwin" ]; then
       for crate in $leaves; do
         cargo check -p "$crate" --target aarch64-apple-darwin
@@ -220,7 +220,7 @@ completions: build
     # This shell often runs INSIDE a live thegn, and `completions` reaches the
     # generator via run_subcommand — which loads the layered config and opens the
     # SQLite state DB. Point the whole XDG surface at a scratch dir so a
-    # generation run cannot touch the real state (CLAUDE.md).
+    # generation run cannot touch the real state (DEVELOPMENT.md).
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
     export HOME="$scratch" XDG_STATE_HOME="$scratch/state" XDG_CONFIG_HOME="$scratch/config"
@@ -475,7 +475,7 @@ flake-check:
     nix flake check
 
 # --- spec-driven development (OpenSpec) -----------------------------------
-# thegn manages its OWN development with OpenSpec (see openspec/, CLAUDE.md).
+# thegn manages its OWN development with OpenSpec (see docs/delivery-governance.md).
 # The `openspec` binary is the hermetic, pinned build from nix/openspec.nix,
 # provided on PATH by `nix develop`. tasks.md stays the roadmap index.
 
@@ -514,26 +514,11 @@ agent-context issue:
 
 # Each worktree owns its symbol index. The MCP server watches while connected.
 graph-sync:
-    @if [ ! -f .codegraph/codegraph.db ]; then codegraph init .; fi
-    @codegraph sync .
+    @python3 scripts/check_codegraph.py --sync
 
 # Read-only freshness check for this checkout after a fold or tool upgrade.
 graph-check:
-    #!/usr/bin/env python3
-    import json
-    from pathlib import Path
-    import subprocess
-    import sys
-    report = json.loads(subprocess.check_output(["codegraph", "status", "--json", "."]))
-    index = report.get("index", {})
-    if not report.get("initialized") or Path(report["projectPath"]).resolve() != Path.cwd().resolve():
-        sys.exit("No CodeGraph index for this worktree. Run just graph-sync.")
-    if index.get("reindexRecommended"):
-        sys.exit("The extractor changed. Run codegraph index . and recheck.")
-    if (index.get("state") != "complete" or report.get("worktreeMismatch")
-            or any(report["pendingChanges"].values())):
-        sys.exit("CodeGraph has pending changes or an incomplete index. Run just graph-sync.")
-    print(f"Current CodeGraph index: {report['fileCount']} files, {report['nodeCount']} symbols and nodes.")
+    @python3 scripts/check_codegraph.py
 
 [positional-arguments]
 graph-find +query: graph-sync
@@ -546,16 +531,10 @@ memory-check *args:
 # Run on the integrator's checkout as soon as the two dependent lane tips meet.
 [positional-arguments]
 integration-check crate filter first_tip second_tip:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for tip in "$3" "$4"; do
-      sha=$(git rev-parse --verify --end-of-options "${tip}^{commit}")
-      git merge-base --is-ancestor "$sha" HEAD || { echo "HEAD does not contain $sha" >&2; exit 1; }
-    done
-    git log -1 --format='Combined checkout HEAD: %H'
-    if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
-      echo "Local edits are included in this check. Repeat on the clean combined commit for handoff evidence."
-    fi
+    @git merge-base --is-ancestor -- "$3" HEAD || { echo "Cannot verify first tip $3 in HEAD" >&2; exit 1; }
+    @git merge-base --is-ancestor -- "$4" HEAD || { echo "Cannot verify second tip $4 in HEAD" >&2; exit 1; }
+    @git log -1 --format='Combined checkout HEAD: %H'
+    @if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then echo "Local edits included. Repeat on the clean combined commit for handoff evidence."; fi
     cargo clippy -p "$1" -- -D warnings
     cargo nextest run -p "$1" --no-tests=fail -E "$2"
 
@@ -1790,3 +1769,9 @@ fly-image-publish registry tag="v1":
 [positional-arguments]
 sprites-live *args:
     bash test/sprites-live.sh "$@"
+
+# Daily live remote run: headless agent, pull, land, reap (real spend; plan-only
+# without `--env <name> --i-accept-spend` and THEGN_CHANNEL=dev). Not in ci/smoke.
+[positional-arguments]
+remote-daily *args:
+    bash test/remote-daily.sh "$@"

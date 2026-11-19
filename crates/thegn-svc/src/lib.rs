@@ -20,6 +20,7 @@ pub mod git;
 pub mod host;
 pub mod host_discovery;
 pub(crate) mod http;
+pub mod inbox;
 pub mod ipc;
 #[cfg(feature = "iroh")]
 pub mod iroh_reach;
