@@ -39,20 +39,22 @@ every action. [[keybindings]] is generated from your config, including rebinds.
 
 ## Tools and panels
 
-| Keys                    | Does                                           |
-| ----------------------- | ---------------------------------------------- |
-| `Alt-g`                 | Open lazygit                                   |
-| `Alt-e`                 | Open your `$EDITOR`                            |
-| `Alt-/`                 | Open the git diff                              |
-| `Alt-y` or `Ctrl-Alt-f` | Open the files drawer                          |
-| `Ctrl-Alt-s`            | Cycle the sidebar: full, rail, hidden          |
-| `Ctrl-Alt-p`            | Show or hide the diff and PR panel             |
-| `Ctrl-Alt-z`            | Zoom the focused pane                          |
-| `Ctrl-Alt-/`            | Search pane history                            |
-| `Ctrl-/`                | Search across panes                            |
-| `Ctrl-g`                | Lock keybinds and pass every chord to the pane |
-| `F1`                    | Open help                                      |
-| `Ctrl-q`                | Quit the UI; daemon-backed panes keep running  |
+| Keys                            | Does                                                  |
+| ------------------------------- | ----------------------------------------------------- |
+| `Alt-g`                         | Open lazygit                                          |
+| `Alt-e`                         | Open your `$EDITOR`                                   |
+| `Alt-/`                         | Open the git diff                                     |
+| `Alt-y` or `Ctrl-Alt-f`         | Open the files drawer                                 |
+| `Ctrl-Alt-s`                    | Cycle the sidebar: full, rail, hidden                 |
+| `Ctrl-Alt-p`                    | Show or hide the diff and PR panel                    |
+| `Ctrl-Alt-z`                    | Zoom the focused pane                                 |
+| `Ctrl-Alt-/`                    | Search pane history                                   |
+| `Ctrl-/`                        | Search across panes                                   |
+| `Alt+f` (in search)             | Toggle literal / fuzzy matching                       |
+| `Tab` / `Shift-Tab` (in search) | Widen / narrow scope (pane, tab, worktree, workspace) |
+| `Ctrl-g`                        | Lock keybinds and pass every chord to the pane        |
+| `F1`                            | Open help                                             |
+| `Ctrl-q`                        | Quit the UI; daemon-backed panes keep running         |
 
 ## Close and quit
 

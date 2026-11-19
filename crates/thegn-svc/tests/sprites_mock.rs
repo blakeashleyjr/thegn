@@ -280,8 +280,7 @@ fn handle_exec_websocket(
             return;
         }
     }
-    let mut exit = vec![3];
-    exit.extend_from_slice(code.to_string().as_bytes());
+    let exit = vec![0x03, code as u8];
     // best-effort: test mock: the client may already have hung up.
     let _ = socket.send(tokio_tungstenite::tungstenite::Message::Binary(exit.into()));
 }
@@ -362,8 +361,8 @@ fn start_delete_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
     start_delete_mock_get(fail_first, "404 Not Found")
 }
 
-/// Like `start_delete_mock`, but answers every non-DELETE request (the
-/// read-only existence probe) with `get_status`.
+/// Like `start_delete_mock`, but answers the read-only existence probe with
+/// `get_status` until an accepted DELETE, then answers 404 like the real API.
 fn start_delete_mock_get(
     fail_first: usize,
     get_status: &'static str,
@@ -371,10 +370,13 @@ fn start_delete_mock_get(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let deletes = Arc::new(Mutex::new(0usize));
+    let accepted = Arc::new(Mutex::new(false));
     let d = deletes.clone();
+    let a = accepted.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let d = d.clone();
+            let a = a.clone();
             thread::spawn(move || {
                 let mut writer = stream.try_clone().unwrap();
                 let mut reader = stream;
@@ -399,8 +401,11 @@ fn start_delete_mock_get(
                     if *n <= fail_first {
                         ("500 Internal Server Error", b"boom")
                     } else {
+                        *a.lock().unwrap() = true;
                         ("204 No Content", b"")
                     }
+                } else if *a.lock().unwrap() {
+                    ("404 Not Found", b"no route")
                 } else if get_status.starts_with("200") {
                     (get_status, b"{}")
                 } else {

@@ -85,36 +85,70 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String]) -> Result<()> {
         if let Some(line) = warning {
             note(&line);
         }
-        let resolved = resolved.and_then(|name| cfg.env.get(&name).map(|e| (name, e)));
-        // Upload only through the resolved env's OWN provider: a fallback
-        // provider is another account (team, project, token).
-        let own = resolved
-            .as_ref()
-            .and_then(|(_, envc)| crate::provider_factory::vercel_provider_for(&envc.provider, id));
-        let upload = if own.is_some() {
-            resolved.and_then(|(_, envc)| upload_plan(cfg, envc))
-        } else {
-            None
+        let (provider, upload) = match resolved {
+            Some(name) => {
+                let envc = cfg.env.get(&name).ok_or_else(|| refusal(id, cfg))?;
+                let provider = crate::provider_factory::vercel_provider_for(&envc.provider, id)
+                    .ok_or_else(|| unavailable_env(&name))?;
+                (provider, upload_plan(cfg, envc))
+            }
+            None => {
+                let provider = first_vercel_provider(cfg, id)?;
+                let envc = only_vercel_env(cfg).ok_or_else(|| refusal(id, cfg))?;
+                (provider, upload_plan(cfg, envc))
+            }
         };
-        let provider = own.map_or_else(|| first_vercel_provider(cfg, id), Ok)?;
         let code = run_tty(Arc::new(provider), id, argv, env, upload)?;
         std::process::exit(host_exit_code(code));
     }
-    let provider = first_vercel_provider(cfg, id)?;
+    // Capture follows the same ledger-aware resolution as TTY mode. The
+    // fallback is safe only when there is exactly one configured Vercel env.
+    let (resolved, _) = resolve_env(cfg, id);
+    let provider = match resolved {
+        Some(name) => {
+            let envc = cfg.env.get(&name).ok_or_else(|| refusal(id, cfg))?;
+            crate::provider_factory::vercel_provider_for(&envc.provider, id)
+                .ok_or_else(|| unavailable_env(&name))?
+        }
+        None => first_vercel_provider(cfg, id)?,
+    };
     let code = run_capture(&provider, id, &argv, &env)?;
     std::process::exit(host_exit_code(code));
 }
 
-/// The first `provider = "vercel"` env with a resolvable token (capture mode's
-/// pick, and the TTY fallback when the env cannot be resolved).
+/// The only `provider = "vercel"` env with a resolvable token. This fallback
+/// is deliberately refused when the config has zero or multiple Vercel envs.
 fn first_vercel_provider(cfg: &Config, id: &str) -> Result<VercelProvider> {
+    let envc = only_vercel_env(cfg).ok_or_else(|| refusal(id, cfg))?;
+    crate::provider_factory::vercel_provider_for(&envc.provider, id)
+        .ok_or_else(|| unavailable_env("the only configured Vercel env"))
+}
+
+fn vercel_env_names(cfg: &Config) -> Vec<String> {
     cfg.env
-        .values()
-        .filter(|envc| is_vercel(envc))
-        .find_map(|envc| crate::provider_factory::vercel_provider_for(&envc.provider, id))
-        .ok_or_else(|| {
-            anyhow!("vercel-exec: no `provider = \"vercel\"` env with a resolvable token")
-        })
+        .iter()
+        .filter(|(_, envc)| is_vercel(envc))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn only_vercel_env(cfg: &Config) -> Option<&EnvConfig> {
+    let mut envs = cfg.env.iter().filter(|(_, envc)| is_vercel(envc));
+    let only = envs.next()?.1;
+    envs.next().is_none().then_some(only)
+}
+
+fn refusal(id: &str, cfg: &Config) -> anyhow::Error {
+    let names = vercel_env_names(cfg);
+    anyhow!(
+        "vercel-exec: cannot tell which vercel env owns {id}; {} Vercel envs are configured ({})",
+        names.len(),
+        names.join(", ")
+    )
+}
+
+fn unavailable_env(name: &str) -> anyhow::Error {
+    anyhow!("vercel-exec: selected env '{name}' has no resolvable Vercel provider")
 }
 
 fn is_vercel(envc: &EnvConfig) -> bool {
@@ -1076,6 +1110,37 @@ mod tests {
         // Ambiguous: skip (no first-env pick).
         assert_eq!(pick_env(None, &two), None);
         assert_eq!(pick_env(None, &[]), None);
+    }
+
+    #[test]
+    fn capture_mode_with_two_envs_and_no_owner_refuses() {
+        let mut cfg = Config::default();
+        for name in ["vx-a", "vx-b"] {
+            let mut env = EnvConfig::default();
+            env.provider.provider = "vercel".into();
+            cfg.env.insert(name.into(), env);
+        }
+        assert!(first_vercel_provider(&cfg, "sb-1").is_err());
+        assert!(only_vercel_env(&cfg).is_none());
+        let error = refusal("sb-1", &cfg).to_string();
+        assert!(error.contains("sb-1"), "{error}");
+        assert!(error.contains("vx-a") && error.contains("vx-b"), "{error}");
+        assert!(
+            !error.contains("token") && !error.contains("secret"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn capture_mode_with_one_env_uses_it() {
+        let mut cfg = Config::default();
+        let mut env = EnvConfig::default();
+        env.provider.provider = "vercel".into();
+        cfg.env.insert("vx-only".into(), env);
+        let (resolved, warning) = resolve_env(&cfg, "sb-1");
+        assert_eq!(resolved.as_deref(), Some("vx-only"));
+        assert!(warning.is_none());
+        assert!(only_vercel_env(&cfg).is_some());
     }
 
     #[test]

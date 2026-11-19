@@ -19,6 +19,7 @@ use futures_util::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use thegn_core::remote::SshTarget;
 
 /// Build the shared reqwest client for a provider. The default `Client::new()`
@@ -150,6 +151,13 @@ mod sessions;
 /// with their separate policy. Capping control calls turns an infinite stall
 /// into a fast, retryable error.
 pub(crate) const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const DESTROY_CONFIRM_BUDGET: Duration = Duration::from_secs(30);
+const DESTROY_CONFIRM_POLL: Duration = Duration::from_secs(2);
+
+/// Overall ceiling for one-shot exec (THE-533); above the 30 min per-step
+/// provisioning ceiling.
+pub const RUN_EXEC_DEADLINE: Duration = Duration::from_secs(31 * 60);
 
 /// Bounds simultaneous provider control calls across provider instances.
 ///
@@ -1029,6 +1037,152 @@ impl SpritesProvider {
             "--".into(),
         ])
     }
+
+    /// After an accepted DELETE, poll until the control plane gives definite
+    /// proof that the sprite is gone. The caller holds the priority permit for
+    /// the DELETE and this confirmation, so the GET must not acquire another.
+    async fn confirm_sprite_gone(
+        &self,
+        id: &str,
+        budget: Duration,
+        poll: Duration,
+    ) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let response = match tokio::time::timeout_at(
+                deadline,
+                Box::pin(
+                    self.client
+                        .get(self.sprite_name_url(id)?)
+                        .bearer_auth(&self.token)
+                        .timeout(CONTROL_TIMEOUT)
+                        .send(),
+                ),
+            )
+            .await
+            {
+                Ok(response) => response.context("sprites: GET /sprites/{name} after DELETE")?,
+                Err(_) => return Ok(false),
+            };
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(true);
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(poll.min(deadline - now)).await;
+        }
+    }
+
+    async fn destroy_confirmed(&self, id: &str, budget: Duration, poll: Duration) -> Result<()> {
+        // Ownership before the irreversible delete: thegn never deletes a
+        // sprite it cannot prove it created.
+        let scope = self.scope.clone().ok_or_else(|| {
+            anyhow!("sprites: no controller id; refusing to delete {id}, which this host cannot prove it created")
+        })?;
+        let dir = self.ledger_dir();
+        {
+            let (ledger, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
+            let proof = tokio::task::spawn_blocking(move || {
+                crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
+            })
+            .await
+            .context("sprites: ledger worker failed")?;
+            if let Err(refusal) = proof {
+                // No proof. Teardown stays idempotent: a record dropped by an
+                // earlier destroy or by `env reap --apply` must not turn a
+                // second teardown into an error. One non-mutating GET decides;
+                // only a definite 404 (nothing to delete) is OK. The DELETE is
+                // never sent on this path.
+                let gone = match self
+                    .client
+                    .get(self.sprite_name_url(id)?)
+                    .bearer_auth(&self.token)
+                    .timeout(CONTROL_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp.status() == reqwest::StatusCode::NOT_FOUND,
+                    Err(_) => false,
+                };
+                if gone {
+                    return Ok(());
+                }
+                return Err(refusal.context(format!("sprites: refusing to delete {id}")));
+            }
+        }
+        let _permit = CONTROL_GATE.acquire_priority(&self.authority()?).await?;
+        // Validate custody before the irreversible remote delete. A corrupt
+        // row may be the only evidence of an authorized key and must never
+        // be collapsed into "missing" by lifecycle cleanup.
+        let custody_account = self.custody_account(id)?;
+        // A deleted worktree must not keep billing, so a transient 5xx/429/408 on
+        // teardown (the observed "sprites destroy failed (500)") is retried a few
+        // times with a short backoff rather than immediately leaking a paid
+        // sandbox. 404 (already gone) and 2xx are terminal-OK; other 4xx are the
+        // caller's fault and won't change on retry, so we stop early.
+        const ATTEMPTS: u32 = 3;
+        let mut last_status = None;
+        for attempt in 0..ATTEMPTS {
+            let resp = self
+                .client
+                .delete(self.sprite_name_url(id)?)
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+                .context("sprites: DELETE /sprites/{name}")?;
+            let status = resp.status();
+            // 404 = already gone — idempotent teardown.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if let Some(account) = custody_account.as_deref() {
+                    thegn_core::managed_ssh::record_revoked("sprites", account, id)
+                        .context("sprites: retire managed SSH custody")?;
+                }
+                self.forget_record(&dir, id).await;
+                return Ok(());
+            }
+            if status.is_success() {
+                let confirmed = match self.confirm_sprite_gone(id, budget, poll).await {
+                    Ok(confirmed) => confirmed,
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::sprites", %error, "sprites: delete confirmation GET failed");
+                        false
+                    }
+                };
+                if confirmed {
+                    if let Some(account) = custody_account.as_deref() {
+                        thegn_core::managed_ssh::record_revoked("sprites", account, id)
+                            .context("sprites: retire managed SSH custody")?;
+                    }
+                    self.forget_record(&dir, id).await;
+                    return Ok(());
+                }
+                return Err(anyhow!(
+                    "sprites: DELETE for {id} was accepted but the sprite still exists after {}s; its ledger record is kept so `thegn wt rm` or `thegn env reap --provider sprites` can finish it",
+                    budget.as_secs()
+                ));
+            }
+            last_status = Some(status);
+            if !transient_status(status) {
+                break;
+            }
+            if attempt + 1 < ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        Err(anyhow!(
+            "sprites destroy failed ({})",
+            last_status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "no response".into())
+        ))
+    }
 }
 
 impl RemoteProvider for SpritesProvider {
@@ -1184,89 +1338,7 @@ impl RemoteProvider for SpritesProvider {
     }
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            // Ownership before the irreversible delete: thegn never deletes a
-            // sprite it cannot prove it created.
-            let scope = self.scope.clone().ok_or_else(|| {
-                anyhow!("sprites: no controller id; refusing to delete {id}, which this host cannot prove it created")
-            })?;
-            let dir = self.ledger_dir();
-            {
-                let (ledger, name, legacy) = (dir.clone(), id.to_string(), self.legacy_ids.clone());
-                let proof = tokio::task::spawn_blocking(move || {
-                    crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
-                })
-                .await
-                .context("sprites: ledger worker failed")?;
-                if let Err(refusal) = proof {
-                    // No proof. Teardown stays idempotent: a record dropped by an
-                    // earlier destroy or by `env reap --apply` must not turn a
-                    // second teardown into an error. One non-mutating GET decides;
-                    // only a definite 404 (nothing to delete) is OK. The DELETE is
-                    // never sent on this path.
-                    let gone = match self
-                        .client
-                        .get(self.sprite_name_url(id)?)
-                        .bearer_auth(&self.token)
-                        .timeout(CONTROL_TIMEOUT)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => resp.status() == reqwest::StatusCode::NOT_FOUND,
-                        Err(_) => false,
-                    };
-                    if gone {
-                        return Ok(());
-                    }
-                    return Err(refusal.context(format!("sprites: refusing to delete {id}")));
-                }
-            }
-            let _permit = CONTROL_GATE.acquire_priority(&self.authority()?).await?;
-            // Validate custody before the irreversible remote delete. A corrupt
-            // row may be the only evidence of an authorized key and must never
-            // be collapsed into "missing" by lifecycle cleanup.
-            let custody_account = self.custody_account(id)?;
-            // A deleted worktree must not keep billing, so a transient 5xx/429/408 on
-            // teardown (the observed "sprites destroy failed (500)") is retried a few
-            // times with a short backoff rather than immediately leaking a paid
-            // sandbox. 404 (already gone) and 2xx are terminal-OK; other 4xx are the
-            // caller's fault and won't change on retry, so we stop early.
-            const ATTEMPTS: u32 = 3;
-            let mut last_status = None;
-            for attempt in 0..ATTEMPTS {
-                let resp = self
-                    .client
-                    .delete(self.sprite_name_url(id)?)
-                    .bearer_auth(&self.token)
-                    .timeout(CONTROL_TIMEOUT)
-                    .send()
-                    .await
-                    .context("sprites: DELETE /sprites/{name}")?;
-                let status = resp.status();
-                // 404 = already gone — idempotent teardown.
-                if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                    if let Some(account) = custody_account.as_deref() {
-                        thegn_core::managed_ssh::record_revoked("sprites", account, id)
-                            .context("sprites: retire managed SSH custody")?;
-                    }
-                    self.forget_record(&dir, id).await;
-                    return Ok(());
-                }
-                last_status = Some(status);
-                if !transient_status(status) {
-                    break;
-                }
-                if attempt + 1 < ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-            Err(anyhow!(
-                "sprites destroy failed ({})",
-                last_status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "no response".into())
-            ))
-        })
+        Box::pin(self.destroy_confirmed(id, DESTROY_CONFIRM_BUDGET, DESTROY_CONFIRM_POLL))
     }
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
@@ -3029,6 +3101,94 @@ pub(crate) struct ExecCollected {
     pub(crate) dropped: u64,
 }
 
+/// Bounded tail of a non-TTY exec's stderr (stream id 2).
+#[derive(Default)]
+pub(crate) struct StderrTail {
+    bytes: std::collections::VecDeque<u8>,
+    total: u64,
+}
+
+pub(crate) const STDERR_TAIL_CAP: usize = 8 * 1024;
+
+impl StderrTail {
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len() as u64);
+        if chunk.len() >= STDERR_TAIL_CAP {
+            self.bytes.clear();
+            self.bytes.extend(&chunk[chunk.len() - STDERR_TAIL_CAP..]);
+            return;
+        }
+        let excess = self
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(STDERR_TAIL_CAP);
+        self.bytes.drain(..excess);
+        self.bytes.extend(chunk);
+    }
+
+    pub(crate) fn render(&self) -> String {
+        sanitize_stderr(&self.bytes.iter().copied().collect::<Vec<_>>())
+    }
+}
+
+type StderrSink = Arc<Mutex<StderrTail>>;
+
+/// Remove ESC and C0 controls except \n and \t; lossy UTF-8.
+pub(crate) fn sanitize_stderr(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
+fn append_stderr_tail(mut output: String, code: i32, stderr: &StderrSink) -> String {
+    if code == 0 {
+        return output;
+    }
+    let tail = stderr
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tail.bytes.is_empty() {
+        return output;
+    }
+    let n = tail.total.min(STDERR_TAIL_CAP as u64);
+    output.push_str(&format!("\n[stderr, last {n} bytes]\n{}", tail.render()));
+    output
+}
+
+fn collect_exec_frame(
+    frame: ExecFrame,
+    cap: usize,
+    output: &mut std::collections::VecDeque<u8>,
+    code: &mut Option<i32>,
+    dropped: &mut u64,
+) -> bool {
+    match frame {
+        ExecFrame::Stdout(bytes) if cap == 0 => {
+            *dropped = dropped.saturating_add(bytes.len() as u64);
+        }
+        ExecFrame::Stdout(bytes) if bytes.len() >= cap => {
+            *dropped = dropped
+                .saturating_add(output.len() as u64)
+                .saturating_add((bytes.len() - cap) as u64);
+            output.clear();
+            output.extend(&bytes[bytes.len() - cap..]);
+        }
+        ExecFrame::Stdout(bytes) => {
+            let excess = output.len().saturating_add(bytes.len()).saturating_sub(cap);
+            output.drain(..excess);
+            *dropped = dropped.saturating_add(excess as u64);
+            output.extend(bytes);
+        }
+        ExecFrame::Exit(exit_code) => {
+            *code = Some(exit_code);
+            return true;
+        }
+    }
+    false
+}
+
 /// Drain one-shot exec frames while retaining only the last `cap` stdout bytes.
 pub(crate) async fn collect_exec_output(
     frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
@@ -3038,27 +3198,8 @@ pub(crate) async fn collect_exec_output(
     let mut code = None;
     let mut dropped = 0_u64;
     while let Some(frame) = frames.recv().await {
-        match frame {
-            ExecFrame::Stdout(bytes) if cap == 0 => {
-                dropped = dropped.saturating_add(bytes.len() as u64);
-            }
-            ExecFrame::Stdout(bytes) if bytes.len() >= cap => {
-                dropped = dropped
-                    .saturating_add(output.len() as u64)
-                    .saturating_add((bytes.len() - cap) as u64);
-                output.clear();
-                output.extend(&bytes[bytes.len() - cap..]);
-            }
-            ExecFrame::Stdout(bytes) => {
-                let excess = output.len().saturating_add(bytes.len()).saturating_sub(cap);
-                output.drain(..excess);
-                dropped = dropped.saturating_add(excess as u64);
-                output.extend(bytes);
-            }
-            ExecFrame::Exit(exit_code) => {
-                code = Some(exit_code);
-                break;
-            }
+        if collect_exec_frame(frame, cap, &mut output, &mut code, &mut dropped) {
+            break;
         }
     }
     ExecCollected {
@@ -3066,6 +3207,33 @@ pub(crate) async fn collect_exec_output(
         output: output.into_iter().collect(),
         dropped,
     }
+}
+
+/// Pure seam: collect one-shot exec output until an absolute deadline. `None`
+/// means the deadline fired before the stream ended or reported an exit.
+pub(crate) async fn collect_exec_output_until(
+    frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
+    cap: usize,
+    until: tokio::time::Instant,
+) -> Option<ExecCollected> {
+    let mut output = std::collections::VecDeque::new();
+    let mut code = None;
+    let mut dropped = 0_u64;
+    loop {
+        let frame = match tokio::time::timeout_at(until, frames.recv()).await {
+            Ok(frame) => frame,
+            Err(_) => return None,
+        };
+        let Some(frame) = frame else { break };
+        if collect_exec_frame(frame, cap, &mut output, &mut code, &mut dropped) {
+            break;
+        }
+    }
+    Some(ExecCollected {
+        code,
+        output: output.into_iter().collect(),
+        dropped,
+    })
 }
 
 /// One client→server control message for a native exec session.
@@ -3359,12 +3527,19 @@ fn decode_stream_frame(b: &[u8]) -> StreamMsg {
     match id {
         1 => StreamMsg::Stdout(rest.to_vec()),
         2 => StreamMsg::Stderr(rest.to_vec()),
-        3 => StreamMsg::Exit(
-            String::from_utf8_lossy(rest)
-                .trim()
-                .parse()
-                .unwrap_or(EXEC_EXIT_STATUS_UNKNOWN),
-        ),
+        3 => {
+            let code = if rest.len() == 1 {
+                // A one-byte payload is the documented binary exit code. It is
+                // ambiguous with one ASCII digit, so the binary form wins.
+                i32::from(rest[0])
+            } else {
+                String::from_utf8_lossy(rest)
+                    .trim()
+                    .parse()
+                    .unwrap_or(EXEC_EXIT_STATUS_UNKNOWN)
+            };
+            StreamMsg::Exit(code)
+        }
         _ => StreamMsg::Ignore,
     }
 }
@@ -3376,15 +3551,18 @@ enum SpriteCtrl {
     Session(String),
     /// The command exited with this code.
     Exit(i32),
+    /// A non-JSON-object text frame that may be output in TTY mode.
+    Forward,
     /// A frame we don't act on (port notifications, unknown shapes).
     Ignore,
 }
 
 /// Classify a Sprites exec text frame: `{"type":"exit","exit_code":N}` ⇒ exit,
-/// a frame carrying `session_id` ⇒ the session announcement, else ignore.
+/// a frame carrying `session_id` ⇒ the session announcement, JSON objects ⇒
+/// ignore, and other text ⇒ possible TTY output.
 fn parse_sprite_ctrl(text: &str) -> SpriteCtrl {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return SpriteCtrl::Ignore;
+        return SpriteCtrl::Forward;
     };
     if v.get("type").and_then(|t| t.as_str()) == Some("exit") {
         let code = v
@@ -3397,7 +3575,11 @@ fn parse_sprite_ctrl(text: &str) -> SpriteCtrl {
     if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
         return SpriteCtrl::Session(sid.to_string());
     }
-    SpriteCtrl::Ignore
+    if v.is_object() {
+        SpriteCtrl::Ignore
+    } else {
+        SpriteCtrl::Forward
+    }
 }
 
 impl SpritesProvider {
@@ -3406,7 +3588,19 @@ impl SpritesProvider {
     /// runtime until the socket closes or `ExecControl::Close` is sent.
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         let url = exec_ws_url(self.base()?, id, spec)?;
-        self.start_session(url, spec.tty).await
+        Box::pin(self.start_session(url, spec.tty, None)).await
+    }
+
+    async fn open_exec_capturing(
+        &self,
+        id: &str,
+        spec: &ExecSpec,
+    ) -> Result<(ExecSession, StderrSink)> {
+        let url = exec_ws_url(self.base()?, id, spec)?;
+        let stderr = Arc::new(Mutex::new(StderrTail::default()));
+        let session =
+            Box::pin(self.start_session(url, spec.tty, Some(Arc::clone(&stderr)))).await?;
+        Ok((session, stderr))
     }
 
     /// Reattach to a persisted exec session (the server replays its scrollback).
@@ -3419,20 +3613,32 @@ impl SpritesProvider {
         rows: u16,
     ) -> Result<ExecSession> {
         let url = attach_ws_url(self.base()?, id, session, cols, rows)?;
-        self.connect_exec(url, true, false).await
+        Box::pin(self.connect_exec(url, true, false, None)).await
     }
 
     /// Run a one-shot command in the sprite over the WSS exec API (NON-tty) and
     /// collect its combined output + exit code. This is the CLI-free / bridge-free
     /// channel the env provisioner uses to set the sandbox up (the non-tty framing
-    /// surfaces stdout + the exit; redirect stderr with `2>&1` in the script to
-    /// capture it). Returns `(exit_code, output)`.
+    /// surfaces stdout, stderr, and the exit without mixing stderr into stdout).
+    /// Returns `(exit_code, output)`.
     pub async fn run_exec(
         &self,
         id: &str,
         argv: &[String],
         cwd: Option<&str>,
         env: &[(String, String)],
+    ) -> Result<(i32, String)> {
+        Box::pin(self.run_exec_within(id, argv, cwd, env, RUN_EXEC_DEADLINE)).await
+    }
+
+    /// Run one-shot exec with an overall deadline covering open and output.
+    pub async fn run_exec_within(
+        &self,
+        id: &str,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        deadline: Duration,
     ) -> Result<(i32, String)> {
         let spec = ExecSpec {
             argv: argv.to_vec(),
@@ -3442,30 +3648,68 @@ impl SpritesProvider {
             env: env.to_vec(),
             cwd: cwd.map(str::to_string),
         };
-        let mut sess = self.open_exec(id, &spec).await?;
-        let collected =
-            collect_exec_output(&mut sess.frames, crate::vps::ssh_shim::EXEC_OUTPUT_CAP).await;
+        let until = tokio::time::Instant::now() + deadline;
+        let (mut sess, stderr) =
+            match tokio::time::timeout_at(until, Box::pin(self.open_exec_capturing(id, &spec)))
+                .await
+            {
+                Ok(session) => session?,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "sprites: exec exceeded its {}s deadline; the session was closed",
+                        deadline.as_secs()
+                    ));
+                }
+            };
+        let collected = match Box::pin(collect_exec_output_until(
+            &mut sess.frames,
+            crate::vps::ssh_shim::EXEC_OUTPUT_CAP,
+            until,
+        ))
+        .await
+        {
+            Some(collected) => collected,
+            None => {
+                if let Err(error) = sess.control.send(ExecControl::Close).await {
+                    tracing::debug!(target: "thegn::provider", %error, "best-effort exec close after deadline failed");
+                }
+                return Err(anyhow!(
+                    "sprites: exec exceeded its {}s deadline; the session was closed",
+                    deadline.as_secs()
+                ));
+            }
+        };
         if let Err(error) = sess.control.send(ExecControl::Close).await {
             tracing::debug!(target: "thegn::provider", %error, "best-effort exec close failed");
         }
         let Some(code) = collected.code else {
             return Err(anyhow!("exec stream ended without an exit status"));
         };
-        Ok((
-            code,
-            crate::vps::ssh_shim::render_capped_output(&collected.output, collected.dropped),
-        ))
+        let output =
+            crate::vps::ssh_shim::render_capped_output(&collected.output, collected.dropped);
+        Ok((code, append_stderr_tail(output, code, &stderr)))
     }
 
     /// Run the WSS handshake (bearer auth) and spawn the bridge task. `tty`
     /// selects the wire framing: raw (PTY) vs 1-byte stream-id prefixes (non-PTY).
-    async fn start_session(&self, url: String, tty: bool) -> Result<ExecSession> {
-        self.connect_exec(url, tty, true).await
+    async fn start_session(
+        &self,
+        url: String,
+        tty: bool,
+        stderr: Option<StderrSink>,
+    ) -> Result<ExecSession> {
+        Box::pin(self.connect_exec(url, tty, true, stderr)).await
     }
 
     // Fresh exec can wait for cold boot. Reattach is already retried by the
     // session relay and must not multiply its budget by an inner 90s loop.
-    async fn connect_exec(&self, url: String, tty: bool, cold_open: bool) -> Result<ExecSession> {
+    async fn connect_exec(
+        &self,
+        url: String,
+        tty: bool,
+        cold_open: bool,
+        stderr: Option<StderrSink>,
+    ) -> Result<ExecSession> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let auth: tokio_tungstenite::tungstenite::http::HeaderValue =
             format!("Bearer {}", self.token)
@@ -3497,7 +3741,11 @@ impl SpritesProvider {
             };
             match tokio::time::timeout(
                 attempt_timeout,
-                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false),
+                Box::pin(tokio_tungstenite::connect_async_with_config(
+                    req,
+                    Some(exec_ws_config()),
+                    false,
+                )),
             )
             .await
             {
@@ -3539,7 +3787,9 @@ impl SpritesProvider {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<ExecControl>(256);
         let (sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
 
-        tokio::spawn(drive_exec(ws, tty, frames_tx, control_rx, sid_tx));
+        tokio::spawn(Box::pin(drive_exec(
+            ws, tty, frames_tx, control_rx, sid_tx, stderr,
+        )));
 
         Ok(ExecSession {
             frames: frames_rx,
@@ -3567,7 +3817,7 @@ impl SpritesProvider {
         let (from_srv_tx, from_srv_rx) =
             tokio::sync::mpsc::channel::<Vec<u8>>(EXEC_CHANNEL_CAPACITY);
         let (end_tx, end_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(drive_proxy(ws, to_srv_rx, from_srv_tx, end_tx));
+        tokio::spawn(Box::pin(drive_proxy(ws, to_srv_rx, from_srv_tx, end_tx)));
         Ok(ProxyStream {
             rx: from_srv_rx,
             tx: to_srv_tx,
@@ -3586,17 +3836,20 @@ async fn connect_proxy_ws(
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
 
-    let result = tokio::time::timeout(deadline, async move {
-        let (mut ws, _resp) =
-            tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false)
+    let result = tokio::time::timeout(
+        deadline,
+        Box::pin(async move {
+            let (mut ws, _resp) =
+                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false)
+                    .await
+                    .context("sprites: proxy ws connect")?;
+            // The init frame selects the target; after it, the socket is a raw relay.
+            ws.send(Message::Text(init.into()))
                 .await
-                .context("sprites: proxy ws connect")?;
-        // The init frame selects the target; after it, the socket is a raw relay.
-        ws.send(Message::Text(init.into()))
-            .await
-            .context("sprites: proxy init")?;
-        Ok::<_, anyhow::Error>(ws)
-    })
+                .context("sprites: proxy init")?;
+            Ok::<_, anyhow::Error>(ws)
+        }),
+    )
     .await;
     match result {
         Ok(result) => result,
@@ -3671,14 +3924,15 @@ async fn drive_proxy<S>(
 /// The exec bridge task: pump WebSocket frames ⇄ the [`ExecSession`] channels.
 /// Generic over the socket so the concrete (TLS) stream type need not be named.
 /// `tty` selects the wire framing: raw bytes (PTY) vs 1-byte stream-id prefixes
-/// (non-PTY — stdin gets a `0` prefix; only stdout/exit are surfaced, stderr is
-/// dropped so a non-PTY consumer like the bridge sees a clean byte stream).
+/// (non-PTY — stdin gets a `0` prefix; only stdout/exit are surfaced, while an
+/// optional stderr sink captures stream id 2).
 async fn drive_exec<S>(
     ws: S,
     tty: bool,
     frames_tx: tokio::sync::mpsc::Sender<ExecFrame>,
     mut control_rx: tokio::sync::mpsc::Receiver<ExecControl>,
     sid_tx: tokio::sync::watch::Sender<Option<String>>,
+    stderr: Option<StderrSink>,
 ) where
     S: futures_util::Sink<tokio_tungstenite::tungstenite::Message>
         + futures_util::Stream<
@@ -3720,6 +3974,16 @@ async fn drive_exec<S>(
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
+                    if tracing::enabled!(target: "thegn::provider", tracing::Level::TRACE) {
+                        let preview = &b[..b.len().min(64)];
+                        tracing::trace!(
+                            target: "thegn::provider",
+                            kind = "binary",
+                            len = b.len(),
+                            bytes = %preview.escape_ascii(),
+                            "sprites exec frame"
+                        );
+                    }
                     if tty {
                         if !send_chunked(&frames_tx, b.into(), ExecFrame::Stdout).await {
                             break;
@@ -3735,22 +3999,52 @@ async fn drive_exec<S>(
                                 let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
                                 break;
                             }
-                            // stderr (agent logs) and unknown ids: not part of the
-                            // consumer's byte stream.
-                            StreamMsg::Stderr(_) | StreamMsg::Ignore => {}
+                            // Stderr is never part of the consumer's byte stream.
+                            StreamMsg::Stderr(d) => {
+                                if let Some(stderr) = &stderr {
+                                    stderr
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(&d);
+                                }
+                            }
+                            StreamMsg::Ignore => {}
                         }
                     }
                 }
-                Some(Ok(Message::Text(t))) => match parse_sprite_ctrl(t.as_str()) {
-                    SpriteCtrl::Session(s) => {
-                        let _ = sid_tx.send(Some(s)); // best-effort: waiter may have timed out
+                Some(Ok(Message::Text(t))) => {
+                    if tracing::enabled!(target: "thegn::provider", tracing::Level::TRACE) {
+                        let bytes = t.as_bytes();
+                        let preview = &bytes[..bytes.len().min(64)];
+                        tracing::trace!(
+                            target: "thegn::provider",
+                            kind = "text",
+                            len = bytes.len(),
+                            bytes = %preview.escape_ascii(),
+                            "sprites exec frame"
+                        );
                     }
-                    SpriteCtrl::Exit(code) => {
-                        let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
-                        break;
+                    match parse_sprite_ctrl(t.as_str()) {
+                        SpriteCtrl::Session(s) => {
+                            let _ = sid_tx.send(Some(s)); // best-effort: waiter may have timed out
+                        }
+                        SpriteCtrl::Exit(code) => {
+                            let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
+                            break;
+                        }
+                        SpriteCtrl::Forward if tty => {
+                            // Defensive fix for the observed missing line break:
+                            // this is where client-side bytes can vanish, but it
+                            // is not a confirmed cause of that incident.
+                            if !send_chunked(&frames_tx, t.as_bytes().to_vec(), ExecFrame::Stdout)
+                                .await
+                            {
+                                break;
+                            }
+                        }
+                        SpriteCtrl::Forward | SpriteCtrl::Ignore => {}
                     }
-                    SpriteCtrl::Ignore => {}
-                },
+                }
                 Some(Ok(Message::Ping(p))) => {
                     let _ = write.send(Message::Pong(p)).await; // best-effort: peer may be gone
                 }
@@ -3961,10 +4255,13 @@ impl Provider {
     }
 
     pub async fn destroy(&self, id: &str) -> Result<()> {
-        self.remote()
-            .ok_or_else(|| iroh_exec_only("destroy"))?
-            .destroy(id)
-            .await
+        Box::pin(async move {
+            self.remote()
+                .ok_or_else(|| iroh_exec_only("destroy"))?
+                .destroy(id)
+                .await
+        })
+        .await
     }
 
     pub async fn list(&self) -> Result<Vec<String>> {
@@ -4199,10 +4496,13 @@ impl Provider {
 
     /// Write a file into the sandbox fs.
     pub async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.files_ops()
-            .ok_or_else(|| self.no_files())?
-            .write(id, path, data)
-            .await
+        Box::pin(async move {
+            self.files_ops()
+                .ok_or_else(|| self.no_files())?
+                .write(id, path, data)
+                .await
+        })
+        .await
     }
 
     /// Write an executable into the sandbox fs (mode 0755 where supported).
@@ -4216,10 +4516,13 @@ impl Provider {
     /// Write an owner-only file into the sandbox fs (mode 0600 where supported;
     /// see [`ProviderFiles::write_private`]).
     pub async fn write_private(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.files_ops()
-            .ok_or_else(|| self.no_files())?
-            .write_private(id, path, data)
-            .await
+        Box::pin(async move {
+            self.files_ops()
+                .ok_or_else(|| self.no_files())?
+                .write_private(id, path, data)
+                .await
+        })
+        .await
     }
 
     /// Idempotently install the executable `data` at `path` in the sandbox.
@@ -4247,28 +4550,27 @@ impl Provider {
         let lease_id = id.to_string();
         let lease_path_for_acquire = lease_path.clone();
         let owner_for_acquire = owner.clone();
-        let acquired = install_executable_verified(
+        let acquired = Box::pin(install_executable_verified(
             files,
             id,
             path,
             data,
             move || async move {
-                let (code, output) = self
-                    .run_exec(
-                        &lease_id,
-                        &install_shell_argv(
-                            "thegn-install-lease",
-                            INSTALL_LEASE_ACQUIRE_SCRIPT,
-                            &[
-                                &lease_path_for_acquire,
-                                &owner_for_acquire,
-                                INSTALL_LEASE_TTL_MINUTES,
-                            ],
-                        ),
-                        None,
-                        &[],
-                    )
-                    .await?;
+                let (code, output) = Box::pin(self.run_exec(
+                    &lease_id,
+                    &install_shell_argv(
+                        "thegn-install-lease",
+                        INSTALL_LEASE_ACQUIRE_SCRIPT,
+                        &[
+                            &lease_path_for_acquire,
+                            &owner_for_acquire,
+                            INSTALL_LEASE_TTL_MINUTES,
+                        ],
+                    ),
+                    None,
+                    &[],
+                ))
+                .await?;
                 match code {
                     0 => Ok(true),
                     75 => Ok(false),
@@ -4280,18 +4582,17 @@ impl Provider {
                 let lease_path = lease_path.clone();
                 let owner = owner.clone();
                 move || async move {
-                    let (code, output) = self
-                        .run_exec(
-                            &lease_id,
-                            &install_shell_argv(
-                                "thegn-install-release",
-                                INSTALL_LEASE_RELEASE_SCRIPT,
-                                &[&lease_path, &owner],
-                            ),
-                            None,
-                            &[],
-                        )
-                        .await?;
+                    let (code, output) = Box::pin(self.run_exec(
+                        &lease_id,
+                        &install_shell_argv(
+                            "thegn-install-release",
+                            INSTALL_LEASE_RELEASE_SCRIPT,
+                            &[&lease_path, &owner],
+                        ),
+                        None,
+                        &[],
+                    ))
+                    .await?;
                     if code == 0 {
                         Ok(())
                     } else {
@@ -4304,18 +4605,17 @@ impl Provider {
                 let previous_path = previous_path.clone();
                 let target_path = path.to_string();
                 move || async move {
-                    let (code, output) = self
-                        .run_exec(
-                            &previous_id,
-                            &install_shell_argv(
-                                "thegn-install-preserve",
-                                INSTALL_PRESERVE_SCRIPT,
-                                &[&target_path, &previous_path],
-                            ),
-                            None,
-                            &[],
-                        )
-                        .await?;
+                    let (code, output) = Box::pin(self.run_exec(
+                        &previous_id,
+                        &install_shell_argv(
+                            "thegn-install-preserve",
+                            INSTALL_PRESERVE_SCRIPT,
+                            &[&target_path, &previous_path],
+                        ),
+                        None,
+                        &[],
+                    ))
+                    .await?;
                     if code == 0 {
                         Ok(())
                     } else {
@@ -4326,21 +4626,20 @@ impl Provider {
                 }
             },
             |stage, dest| async move {
-                let (code, output) = self
-                    .run_exec(
-                        id,
-                        &[
-                            "/bin/sh".into(),
-                            "-c".into(),
-                            "mv -f -- \"$1\" \"$2\"".into(),
-                            "thegn-install-publish".into(),
-                            stage,
-                            dest,
-                        ],
-                        None,
-                        &[],
-                    )
-                    .await?;
+                let (code, output) = Box::pin(self.run_exec(
+                    id,
+                    &[
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "mv -f -- \"$1\" \"$2\"".into(),
+                        "thegn-install-publish".into(),
+                        stage,
+                        dest,
+                    ],
+                    None,
+                    &[],
+                ))
+                .await?;
                 if code != 0 {
                     let mut tail_start = output.len().saturating_sub(200);
                     while !output.is_char_boundary(tail_start) {
@@ -4355,18 +4654,17 @@ impl Provider {
                 let previous_path = previous_path.clone();
                 let target_path = path.to_string();
                 move || async move {
-                    let (code, output) = self
-                        .run_exec(
-                            &rollback_id,
-                            &install_shell_argv(
-                                "thegn-install-restore",
-                                INSTALL_RESTORE_SCRIPT,
-                                &[&target_path, &previous_path],
-                            ),
-                            None,
-                            &[],
-                        )
-                        .await?;
+                    let (code, output) = Box::pin(self.run_exec(
+                        &rollback_id,
+                        &install_shell_argv(
+                            "thegn-install-restore",
+                            INSTALL_RESTORE_SCRIPT,
+                            &[&target_path, &previous_path],
+                        ),
+                        None,
+                        &[],
+                    ))
+                    .await?;
                     if code == 0 {
                         Ok(())
                     } else {
@@ -4379,18 +4677,17 @@ impl Provider {
             {
                 let cleanup_id = id.to_string();
                 move || async move {
-                    let (code, output) = self
-                        .run_exec(
-                            &cleanup_id,
-                            &install_shell_argv(
-                                "thegn-install-cleanup",
-                                INSTALL_REMOVE_PREVIOUS_SCRIPT,
-                                &[&previous_path],
-                            ),
-                            None,
-                            &[],
-                        )
-                        .await?;
+                    let (code, output) = Box::pin(self.run_exec(
+                        &cleanup_id,
+                        &install_shell_argv(
+                            "thegn-install-cleanup",
+                            INSTALL_REMOVE_PREVIOUS_SCRIPT,
+                            &[&previous_path],
+                        ),
+                        None,
+                        &[],
+                    ))
+                    .await?;
                     if code == 0 {
                         Ok(())
                     } else {
@@ -4400,7 +4697,7 @@ impl Provider {
                     }
                 }
             },
-        )
+        ))
         .await?;
         Ok(acquired)
     }
@@ -4408,9 +4705,8 @@ impl Provider {
     /// Create and validate private directories before installing an executable.
     /// Symlinks, non-directories and directories owned by another user refuse.
     pub async fn ensure_private_exec_dir(&self, id: &str, root: &str, dir: &str) -> Result<()> {
-        let (code, output) = self
-            .run_exec(id, &private_exec_dir_argv(root, dir), None, &[])
-            .await?;
+        let (code, output) =
+            Box::pin(self.run_exec(id, &private_exec_dir_argv(root, dir), None, &[])).await?;
         if code != 0 {
             let mut tail_start = output.len().saturating_sub(200);
             while !output.is_char_boundary(tail_start) {
@@ -4507,41 +4803,81 @@ impl Provider {
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<(i32, String)> {
+        Box::pin(self.run_exec_within(id, argv, cwd, env, RUN_EXEC_DEADLINE)).await
+    }
+
+    /// Run one-shot exec with a provider-specific overall deadline.
+    pub async fn run_exec_within(
+        &self,
+        id: &str,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        deadline: Duration,
+    ) -> Result<(i32, String)> {
+        let timeout_error = || {
+            anyhow!(
+                "provider '{}' exec exceeded its {}s deadline",
+                self.name(),
+                deadline.as_secs()
+            )
+        };
         match self {
-            Provider::Sprites(p) => p.run_exec(id, argv, cwd, env).await,
-            Provider::Vps(p) => p.run_exec(id, argv, cwd, env).await,
-            Provider::Fly(p) => p.run_exec(id, argv, cwd, env).await,
-            Provider::Machine0(p) => p.run_exec(id, argv, cwd, env).await,
-            Provider::Vercel(p) => {
-                p.run_exec(id, argv, cwd, env, crate::vercel::Wake::Allow)
+            Provider::Sprites(p) => Box::pin(p.run_exec_within(id, argv, cwd, env, deadline)).await,
+            Provider::Vps(p) => {
+                tokio::time::timeout(deadline, Box::pin(p.run_exec(id, argv, cwd, env)))
                     .await
+                    .map_err(|_| timeout_error())?
             }
+            Provider::Fly(p) => {
+                tokio::time::timeout(deadline, Box::pin(p.run_exec(id, argv, cwd, env)))
+                    .await
+                    .map_err(|_| timeout_error())?
+            }
+            Provider::Machine0(p) => {
+                tokio::time::timeout(deadline, Box::pin(p.run_exec(id, argv, cwd, env)))
+                    .await
+                    .map_err(|_| timeout_error())?
+            }
+            Provider::Vercel(p) => tokio::time::timeout(
+                deadline,
+                Box::pin(p.run_exec(id, argv, cwd, env, crate::vercel::Wake::Allow)),
+            )
+            .await
+            .map_err(|_| timeout_error())?,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
             // One-shot capture over iroh: open a non-tty exec and drain it.
-            Provider::Iroh { home, .. } => {
-                let spec = ExecSpec {
-                    argv: argv.to_vec(),
-                    tty: false,
-                    cols: 80,
-                    rows: 24,
-                    env: env.to_vec(),
-                    cwd: cwd.map(str::to_string),
-                };
-                let mut session = home.open_exec(id, spec).await?;
-                let collected =
-                    collect_exec_output(&mut session.frames, crate::vps::ssh_shim::EXEC_OUTPUT_CAP)
-                        .await;
-                let Some(code) = collected.code else {
-                    return Err(anyhow!("exec stream ended without an exit status"));
-                };
-                Ok((
-                    code,
-                    crate::vps::ssh_shim::render_capped_output(
-                        &collected.output,
-                        collected.dropped,
-                    ),
-                ))
-            }
+            Provider::Iroh { home, .. } => tokio::time::timeout(
+                deadline,
+                Box::pin(async {
+                    let spec = ExecSpec {
+                        argv: argv.to_vec(),
+                        tty: false,
+                        cols: 80,
+                        rows: 24,
+                        env: env.to_vec(),
+                        cwd: cwd.map(str::to_string),
+                    };
+                    let mut session = Box::pin(home.open_exec(id, spec)).await?;
+                    let collected = Box::pin(collect_exec_output(
+                        &mut session.frames,
+                        crate::vps::ssh_shim::EXEC_OUTPUT_CAP,
+                    ))
+                    .await;
+                    let Some(code) = collected.code else {
+                        return Err(anyhow!("exec stream ended without an exit status"));
+                    };
+                    Ok((
+                        code,
+                        crate::vps::ssh_shim::render_capped_output(
+                            &collected.output,
+                            collected.dropped,
+                        ),
+                    ))
+                }),
+            )
+            .await
+            .map_err(|_| timeout_error())?,
         }
     }
 
@@ -4606,6 +4942,23 @@ mod tests {
         SpritesProvider::new("https://api.sprites.dev/v1/", "tok", "my-sprite")
     }
 
+    #[test]
+    fn sprites_ensure_executable_future_stays_small() {
+        let provider = Provider::Sprites(sprites());
+        let future = provider.ensure_executable("sprite", "/workspace/.tg/thegn", b"binary");
+        assert!(std::mem::size_of_val(&future) < 16 * 1024);
+        drop(future);
+    }
+
+    #[test]
+    fn provider_run_exec_future_stays_small() {
+        let provider = Provider::Sprites(sprites());
+        let argv = vec!["/bin/true".to_string()];
+        let future = provider.run_exec("sprite", &argv, None, &[]);
+        assert!(std::mem::size_of_val(&future) < 16 * 1024);
+        drop(future);
+    }
+
     async fn list_response(status: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4660,6 +5013,68 @@ mod tests {
             request_lines
         });
         (format!("http://{address}"), server)
+    }
+
+    type HttpResponse = (String, String);
+    type HttpSequence = tokio::task::JoinHandle<Vec<String>>;
+
+    async fn http_sequence_server(
+        responses: Vec<HttpResponse>,
+        repeat: Option<HttpResponse>,
+    ) -> (String, HttpSequence) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request_lines = Vec::new();
+            let mut responses = responses.into_iter();
+            loop {
+                let response = match responses.next() {
+                    Some(response) => response,
+                    None => match repeat.clone() {
+                        Some(response) => response,
+                        None => return request_lines,
+                    },
+                };
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "request ended before headers completed");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                request_lines.push(
+                    String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .expect("HTTP request must contain a request line")
+                        .to_string(),
+                );
+                let (status, body) = response;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn ledgered_sprites(base: &str, ledger_dir: &Path, name: &str) -> SpritesProvider {
+        let scope = crate::sprites::ledger::OwnerScope {
+            owner: "test-owner".into(),
+            account: "test-account".into(),
+        };
+        let mut intent = crate::sprites::ledger::reserve_at(ledger_dir, &scope, name, 0).unwrap();
+        intent.preserve();
+        drop(intent);
+        crate::sprites::ledger::commit_at(ledger_dir, &scope, name).unwrap();
+        SpritesProvider::new(base, "tok", name)
+            .with_scope(scope)
+            .with_ledger_dir(ledger_dir.to_path_buf())
     }
 
     #[test]
@@ -5921,6 +6336,170 @@ mod tests {
         assert!(!transient_status(StatusCode::NOT_FOUND));
     }
 
+    #[tokio::test]
+    async fn sprites_destroy_confirms_accepted_delete_before_forgetting_record() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) = http_sequence_server(
+            vec![
+                ("202 Accepted".into(), String::new()),
+                ("200 OK".into(), r#"{"name":"sprite"}"#.into()),
+                ("404 Not Found".into(), String::new()),
+            ],
+            None,
+        )
+        .await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite");
+
+        provider
+            .destroy_confirmed("sprite", Duration::from_secs(1), Duration::ZERO)
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                "DELETE /sprites/sprite HTTP/1.1",
+                "GET /sprites/sprite HTTP/1.1",
+                "GET /sprites/sprite HTTP/1.1",
+            ]
+        );
+        assert!(
+            crate::sprites::ledger::prove_owned_at(
+                ledger.path(),
+                &crate::sprites::ledger::OwnerScope {
+                    owner: "test-owner".into(),
+                    account: "test-account".into(),
+                },
+                "sprite",
+                &[],
+            )
+            .is_err(),
+            "confirmed deletion must forget the ledger record"
+        );
+    }
+
+    #[tokio::test]
+    async fn sprites_destroy_keeps_record_and_custody_when_confirmation_times_out() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) = http_sequence_server(
+            vec![
+                ("202 Accepted".into(), String::new()),
+                ("200 OK".into(), r#"{"name":"sprite"}"#.into()),
+            ],
+            Some(("200 OK".into(), r#"{"name":"sprite"}"#.into())),
+        )
+        .await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite")
+            .with_custody_accounts(["test-custody".into()]);
+        thegn_core::managed_ssh::record_authorized(
+            "sprites",
+            "test-custody",
+            "sprite",
+            Path::new("/tmp/thegn-test-key"),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn",
+        )
+        .unwrap();
+
+        let error = provider
+            .destroy_confirmed(
+                "sprite",
+                Duration::from_millis(30),
+                Duration::from_millis(15),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sprite still exists"));
+        assert!(
+            crate::sprites::ledger::prove_owned_at(
+                ledger.path(),
+                &crate::sprites::ledger::OwnerScope {
+                    owner: "test-owner".into(),
+                    account: "test-account".into(),
+                },
+                "sprite",
+                &[],
+            )
+            .is_ok(),
+            "an unproven deletion must keep the ledger record"
+        );
+        assert!(
+            thegn_core::managed_ssh::read("sprites", "test-custody", "sprite")
+                .unwrap()
+                .is_some(),
+            "an unproven deletion must keep managed SSH custody"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn sprites_second_destroy_retries_after_kept_record_and_proves_absence() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) = http_sequence_server(
+            vec![
+                ("202 Accepted".into(), String::new()),
+                ("200 OK".into(), r#"{"name":"sprite"}"#.into()),
+                ("202 Accepted".into(), String::new()),
+                ("404 Not Found".into(), String::new()),
+            ],
+            None,
+        )
+        .await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite");
+        let first = provider
+            .destroy_confirmed("sprite", Duration::from_nanos(1), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(first.to_string().contains("still exists"));
+        provider
+            .destroy_confirmed("sprite", Duration::from_secs(1), Duration::ZERO)
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("DELETE "))
+                .count(),
+            2,
+            "a kept record must permit a second DELETE"
+        );
+        assert!(
+            crate::sprites::ledger::prove_owned_at(
+                ledger.path(),
+                &crate::sprites::ledger::OwnerScope {
+                    owner: "test-owner".into(),
+                    account: "test-account".into(),
+                },
+                "sprite",
+                &[],
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn sprites_destroy_404_forgets_record_without_confirmation_get() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) =
+            http_sequence_server(vec![("404 Not Found".into(), String::new())], None).await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite");
+        provider
+            .destroy_confirmed("sprite", Duration::ZERO, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            vec!["DELETE /sprites/sprite HTTP/1.1"]
+        );
+    }
+
     #[test]
     fn ws_scheme_rewrites_http_family_only() {
         assert_eq!(
@@ -6160,8 +6739,13 @@ mod tests {
             decode_stream_frame(&[3, b'1', b'3', b'7']),
             StreamMsg::Exit(137)
         );
+        assert_eq!(decode_stream_frame(&[3, 0]), StreamMsg::Exit(0));
+        assert_eq!(decode_stream_frame(&[3, 1]), StreamMsg::Exit(1));
+        assert_eq!(decode_stream_frame(&[3, 137]), StreamMsg::Exit(137));
+        // A one-byte ASCII digit is the documented binary form, not text.
+        assert_eq!(decode_stream_frame(&[3, b'1']), StreamMsg::Exit(49));
         assert_eq!(
-            decode_stream_frame(&[3, b'x']),
+            decode_stream_frame(&[3, b'x', b'!']),
             StreamMsg::Exit(EXEC_EXIT_STATUS_UNKNOWN)
         );
         assert_eq!(decode_stream_frame(&[]), StreamMsg::Ignore);
@@ -6195,7 +6779,11 @@ mod tests {
             parse_sprite_ctrl(r#"{"type":"port_opened","port":8080}"#),
             SpriteCtrl::Ignore
         );
-        assert_eq!(parse_sprite_ctrl("not json"), SpriteCtrl::Ignore);
+        assert_eq!(
+            parse_sprite_ctrl(r#"{"message":"not a control frame"}"#),
+            SpriteCtrl::Ignore
+        );
+        assert_eq!(parse_sprite_ctrl("not json"), SpriteCtrl::Forward);
     }
 
     #[tokio::test]
@@ -6231,6 +6819,91 @@ mod tests {
         assert!(!send_chunked(&tx, vec![1u8; 4], std::convert::identity).await);
     }
 
+    async fn fake_non_tty_output(stderr: &[u8], stdout: &[u8], code: i32) -> String {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
+        let driver = tokio::spawn(drive_exec(
+            client,
+            false,
+            frames_tx,
+            control_rx,
+            sid_tx,
+            Some(Arc::clone(&stderr_tail)),
+        ));
+
+        let mut stderr_frame = Vec::with_capacity(stderr.len() + 1);
+        stderr_frame.push(2);
+        stderr_frame.extend_from_slice(stderr);
+        server
+            .send(Message::Binary(stderr_frame.into()))
+            .await
+            .unwrap();
+        let mut stdout_frame = Vec::with_capacity(stdout.len() + 1);
+        stdout_frame.push(1);
+        stdout_frame.extend_from_slice(stdout);
+        server
+            .send(Message::Binary(stdout_frame.into()))
+            .await
+            .unwrap();
+        let exit_frame = vec![0x03, code as u8];
+        server
+            .send(Message::Binary(exit_frame.into()))
+            .await
+            .unwrap();
+
+        let collected =
+            collect_exec_output(&mut frames_rx, crate::vps::ssh_shim::EXEC_OUTPUT_CAP).await;
+        driver.await.unwrap();
+        let code = collected.code.expect("fake exec sent an exit");
+        let output =
+            crate::vps::ssh_shim::render_capped_output(&collected.output, collected.dropped);
+        append_stderr_tail(output, code, &stderr_tail)
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_appends_sanitized_stderr_tail() {
+        let output = fake_non_tty_output(b"err\x1b[31m\r\n", b"stdout", 7).await;
+        assert_eq!(output, "stdout\n[stderr, last 10 bytes]\nerr[31m\n");
+    }
+
+    #[tokio::test]
+    async fn zero_exit_output_is_unchanged_with_stderr() {
+        let output = fake_non_tty_output(b"warning\n", b"stdout", 0).await;
+        assert_eq!(output, "stdout");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_the_last_8_kib() {
+        let mut tail = StderrTail::default();
+        tail.push(&vec![b'a'; STDERR_TAIL_CAP]);
+        tail.push(b"tail");
+
+        assert_eq!(tail.bytes.len(), STDERR_TAIL_CAP);
+        assert_eq!(tail.total, (STDERR_TAIL_CAP + 4) as u64);
+        assert!(tail.render().ends_with("tail"));
+        assert_eq!(tail.render().len(), STDERR_TAIL_CAP);
+    }
+
+    #[test]
+    fn sanitize_stderr_drops_escapes_and_controls() {
+        assert_eq!(
+            sanitize_stderr(b"ok\x00\x01\x08\x0b\x0c\r\x1b[31m\n\t\xff"),
+            "ok[31m\n\t�"
+        );
+    }
+
     #[tokio::test]
     async fn drive_exec_sends_stdin_eof_exactly_once_on_control_close() {
         use futures_util::StreamExt;
@@ -6246,7 +6919,9 @@ mod tests {
         let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, false, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None,
+        ));
         drop(control_tx);
 
         assert_eq!(
@@ -6275,7 +6950,9 @@ mod tests {
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
 
         server
             .send(Message::Binary(vec![b'o', b'k'].into()))
@@ -6288,6 +6965,118 @@ mod tests {
             Some(ExecFrame::Stdout(b"ok".to_vec()))
         );
         assert_eq!(frames_rx.recv().await, None);
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_tty_forwards_non_json_text_frames() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
+
+        server
+            .send(Message::Binary(b"/dev/pts/0".to_vec().into()))
+            .await
+            .unwrap();
+        server.send(Message::Text("\r\n".into())).await.unwrap();
+        server
+            .send(Message::Binary(b"ok\r\n".to_vec().into()))
+            .await
+            .unwrap();
+        server
+            .send(Message::Text(r#"{"type":"exit","exit_code":0}"#.into()))
+            .await
+            .unwrap();
+
+        let collected = collect_exec_output(&mut frames_rx, usize::MAX).await;
+        assert_eq!(collected.code, Some(0));
+        assert_eq!(collected.output, b"/dev/pts/0\r\nok\r\n");
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_non_tty_ignores_non_json_text_frames() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None,
+        ));
+
+        let mut first = vec![1];
+        first.extend_from_slice(b"/dev/pts/0");
+        server.send(Message::Binary(first.into())).await.unwrap();
+        server.send(Message::Text("\r\n".into())).await.unwrap();
+        let mut second = vec![1];
+        second.extend_from_slice(b"ok\r\n");
+        server.send(Message::Binary(second.into())).await.unwrap();
+        server
+            .send(Message::Text(r#"{"type":"exit","exit_code":0}"#.into()))
+            .await
+            .unwrap();
+
+        let collected = collect_exec_output(&mut frames_rx, usize::MAX).await;
+        assert_eq!(collected.code, Some(0));
+        assert_eq!(collected.output, b"/dev/pts/0ok\r\n");
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_tty_does_not_forward_json_text_frames() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
+
+        server
+            .send(Message::Text(
+                r#"{"type":"session_info","session_id":"sess-1"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        server
+            .send(Message::Text(r#"{"type":"exit","exit_code":0}"#.into()))
+            .await
+            .unwrap();
+
+        let collected = collect_exec_output(&mut frames_rx, usize::MAX).await;
+        assert_eq!(collected.code, Some(0));
+        assert!(collected.output.is_empty());
         driver.await.unwrap();
     }
 
@@ -6463,7 +7252,9 @@ mod tests {
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
 
         drop(server);
 
@@ -6486,7 +7277,9 @@ mod tests {
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
 
         server
             .send(Message::Text(r#"{"type":"exit","exit_code":3}"#.into()))
@@ -6513,10 +7306,12 @@ mod tests {
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, false, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None,
+        ));
 
         server
-            .send(Message::Binary(vec![3, b'x'].into()))
+            .send(Message::Binary(vec![3, b'x', b'!'].into()))
             .await
             .unwrap();
 
@@ -7770,6 +8565,34 @@ mod tests {
         assert_eq!(collected.code, Some(0));
         assert_eq!(collected.output, b"");
         assert_eq!(rx.try_recv().unwrap(), ExecFrame::Stdout(b"late".to_vec()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_exec_output_until_returns_none_at_deadline_without_exit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(ExecFrame::Stdout(b"kept".to_vec())).await.unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert!(collect_exec_output_until(&mut rx, 8, until).await.is_none());
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_exec_output_until_returns_exit_before_deadline() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(ExecFrame::Exit(0)).await.unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        let collected = collect_exec_output_until(&mut rx, 8, until)
+            .await
+            .expect("exit arrived before deadline");
+        assert_eq!(collected.code, Some(0));
+        drop(tx);
+    }
+
+    #[test]
+    fn run_exec_deadline_exceeds_host_provision_step_timeout() {
+        // The host's provision_step_timeout ceiling is 1800 s; one-shot exec
+        // has a larger overall deadline so the host's shorter timeout wins.
+        const _: () = assert!(RUN_EXEC_DEADLINE.as_secs() > 1800);
     }
 
     struct SwappingProvider {

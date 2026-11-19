@@ -206,6 +206,15 @@ been verified live against the real Sprites API yet.
 - **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
   also runs `env pull` after the agent exits and reports it in text and `--json`.
 
+### Live script
+
+`THEGN_CHANNEL=dev test/sprites-live.sh --env <name> --i-accept-spend [--keep-going]`
+drives a real sprite and spends money. By default it stops at the first failed
+step. With `--keep-going` a failed step prints `FAIL <id>`, the run continues and
+the exit status is non-zero if anything failed. It proves pull with a real commit
+made inside the sprite (not a stub), and prints the `fleet cost` JSON. A pass shows
+those steps worked on that run; it does not verify the paths it does not touch.
+
 ### Adopt, the daily loop and release
 
 Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
@@ -260,6 +269,52 @@ money. They need `THEGN_CHANNEL=dev` and `--i-accept-spend`, and touch only
 sandboxes recorded in the run's own temporary ledger.
 
 ### Removing and releasing provider sandboxes
+
+- **Sprites `model_credentials`.** `[env.<n>.provider] model_credentials` is
+  valid for `provider = "sprites"` with `none` or `upload`; `proxy` and
+  `inject` are refused. `upload` forwards model credentials and agent login
+  files into the sandbox. `none` withholds the fixed list of model credential
+  variables from provisioning, the pane environment and repo exec, and skips the
+  agent login upload and resync; provisioning prints one line naming what was
+  withheld and how to grant it. An env that does not set `model_credentials`
+  behaves as before (credentials are forwarded), and `thegn doctor` and config
+  validation say so. Set `model_credentials = "none"` to withhold explicitly.
+  Names you add to `env_passthrough` yourself are not affected. Not yet
+  verified live.
+- **Sprites destroy needs proof.** After the provider accepts the DELETE,
+  thegn polls the sprite every 2 seconds for up to 30 seconds until it gets a
+  definite 404. Only then does it revoke custody and forget the record.
+  Otherwise the record is kept and destroy fails, so a second `wt rm` or
+  `env reap` can finish the job. A 404 on the DELETE itself counts as done.
+- **Closing keeps the environment.** Closing a worktree tab or pane never
+  destroys its sandbox. The close resolves the worktree's location, repo root
+  and env first and then forgets the worktree, so the background close and
+  auto-checkpoint act on that snapshot. Only `wt rm`, `env down`, `env reap`
+  and `land --release-sandbox` destroy.
+- **Exec deadline.** A single provider exec has an overall 31 minute deadline,
+  above the 30 minute provisioning step ceiling, so shorter caller timeouts fire
+  first. On expiry the Sprites session is closed.
+
+- **Pull-back survives restarts.** Every successful `data = "sync"` upload
+  writes a journal entry, so closing a worktree or `thegn wt rm` in any process
+  (a restarted UI, or the CLI) pulls the sandbox's changes back first, using the
+  in-memory record when there is one and the journal otherwise. The pull marks
+  the entry `pulling`; success removes it. A failed pull marks it
+  `failed {reason}` and **keeps the sandbox**. A `pulling` entry younger than 15
+  minutes means another process is pulling, and the command refuses and keeps the
+  sandbox. A journal whose target (provider kind, sandbox id, workdir) no longer
+  matches the current env, or an entry that cannot be read, also refuses, keeps
+  the entry and names the file (remove it by hand once you have checked it).
+- **`thegn doctor`** lists a pending pull-back as its own row per sandbox.
+- **`sprite-exec` routes to the owning account.** It reads the sprite's ledger
+  record and uses the Sprites env whose provider account matches. With no record
+  and exactly one Sprites env it uses that env; otherwise it refuses and names
+  the candidates. `vercel-exec` capture mode picks its env the same way as the
+  terminal path and refuses when several Vercel envs are configured and none
+  resolves.
+- **Failed one-shot exec shows stderr.** When a Sprites one-shot exec exits
+  non-zero, the last 8 KiB of stderr, control characters removed, follows the
+  stdout. A zero exit prints exactly what it did before.
 
 A destroy counts as done only when a complete provider inventory no longer
 lists the sandbox. A partial listing proves nothing.

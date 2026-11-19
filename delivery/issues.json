@@ -289,10 +289,24 @@
       ]
     },
     {
+      "issue": "THE-155",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
+    },
+    {
       "issue": "THE-325",
       "project": "Client API & Remote Access",
       "changes": [],
       "no_spec_rationale": "The delivered subtask (bounded public-share output and redacted diagnostics) archived as bound-public-share-output. The remaining credential-isolation work — keeping secrets out of public-share client argv — is still In Progress and has no proposal yet."
+    },
+    {
+      "issue": "THE-395",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
     },
     {
       "issue": "THE-588",
@@ -341,6 +355,13 @@
       "project": "Alpha Reliability & State Compatibility",
       "changes": [],
       "no_spec_rationale": "Phase 1 (classify, approve, plan) archived as add-pipeline-supervisor-policy. Phases 2-4 of the supervisor policy layer are still open and have no proposal yet."
+    },
+    {
+      "issue": "THE-801",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-sprites-credentials-and-git-fence"
+      ]
     },
     {
       "issue": "THE-1510",
@@ -435,6 +456,13 @@
       "project": "Sandbox & Remote 00: Shared contracts",
       "changes": [
         "add-programme-features"
+      ]
+    },
+    {
+      "issue": "THE-2142",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
       ]
     },
     {

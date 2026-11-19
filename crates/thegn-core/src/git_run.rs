@@ -1,8 +1,8 @@
 //! Typed, bounded Git execution for THE-368 slice a.
 //!
-//! This introduces the executor without migrating any existing callers. Git reads
-//! are complete when the leader exits; a helper that keeps a pipe open is quiesced
-//! immediately. Calls block, so `git_run` must run off the UI loop.
+//! Git reads and host mutations use the typed executor. Git reads are complete
+//! when the leader exits; a helper that keeps a pipe open is quiesced immediately.
+//! Calls block, so `git_run` must run off the UI loop.
 
 use std::{
     fmt,
@@ -13,6 +13,17 @@ use std::{
 };
 
 use thegn_proc::{End, Leader, Limits, Stream, Which};
+
+/// THE-225: host-automatic mutating Git never runs repository hooks or fsmonitor.
+pub const HOST_MUTATION_FENCE: [&str; 4] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+];
+
+/// THE-225: thegn's own Git never runs a repository-configured fsmonitor program.
+pub const READ_FENCE: [&str; 2] = ["-c", "core.fsmonitor=false"];
 
 /// Per-call execution and capture budgets. The defaults in [`GitPolicy::read`]
 /// are starting points for callers to override; they are not a global limit.
@@ -191,6 +202,30 @@ pub fn git_run(dir: &Path, args: &[&str], policy: &GitPolicy, cancel: &AtomicBoo
     crate::util::note_core_git_spawn();
     crate::git_spawn_stats::record(args);
     let mut cmd = crate::util::git_cmd(dir);
+    cmd.args(READ_FENCE);
+    cmd.args(args);
+    run_command(&mut cmd, policy, cancel)
+}
+
+/// Build a Git command for host-automatic mutations, disabling repository hooks
+/// and fsmonitor for this invocation.
+pub fn fenced_git_cmd(dir: &Path) -> std::process::Command {
+    let mut cmd = crate::util::git_cmd(dir);
+    cmd.args(HOST_MUTATION_FENCE);
+    cmd
+}
+
+/// Run host-automatic mutating Git with repository hooks and fsmonitor fenced.
+/// This is blocking; call it off the UI loop.
+pub fn git_run_fenced(
+    dir: &Path,
+    args: &[&str],
+    policy: &GitPolicy,
+    cancel: &AtomicBool,
+) -> GitOutcome {
+    crate::util::note_core_git_spawn();
+    crate::git_spawn_stats::record(args);
+    let mut cmd = fenced_git_cmd(dir);
     cmd.args(args);
     run_command(&mut cmd, policy, cancel)
 }
@@ -203,7 +238,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{GitOutcome, GitPolicy, GitTextError, git_run, outcome_from_run, run_command};
+    use super::{
+        GitOutcome, GitPolicy, GitTextError, HOST_MUTATION_FENCE, fenced_git_cmd, git_run,
+        outcome_from_run, run_command,
+    };
     use crate::util;
     use thegn_proc::{Capture, Containment, End, GroupState, Leader, Run, Which};
 
@@ -418,6 +456,21 @@ mod tests {
     }
 
     #[test]
+    fn fenced_git_cmd_starts_with_host_mutation_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = fenced_git_cmd(dir.path())
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        let expected = ["-C", dir.path().to_str().unwrap()]
+            .into_iter()
+            .chain(HOST_MUTATION_FENCE)
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(args, expected);
+    }
+
+    #[test]
     fn outcomes_report_success_and_preserve_failures_as_text_errors() {
         let success = GitOutcome::Ok(b"data".to_vec());
         assert!(success.is_success());
@@ -502,3 +555,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "git_run_fence_tests.rs"]
+mod fence_tests;

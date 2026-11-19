@@ -234,6 +234,11 @@ command `<command>` (timeout Ns) -> tree <oid>”.
 
 ## After it lands
 
+Every landing records where it came from. **Integrate** records both the gated
+source tip and the target base; a **ready land** records the admitted source
+(`candidate_oid`); a **manual land** records neither, because the commits were
+not admitted by thegn. The event row carries the same values.
+
 `on_landed` decides what happens to a worktree whose branch just landed.
 The default is **`expire`**: the worktree is filed into the _Merged_
 folder and kept there for `merged_ttl_secs` (7 days out of the box),

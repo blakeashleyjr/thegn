@@ -197,6 +197,23 @@ pub trait PaneEmulator: Send {
     fn scrollback(&self) -> usize {
         0
     }
+    /// The last `max_lines` LOGICAL lines of the primary-screen grid, oldest first:
+    /// scrollback above the screen, plus the live screen rows when `include_screen`.
+    /// Soft-wrapped rows (alacritty WRAPLINE on the last cell) are joined, wide-char
+    /// spacers skipped, trailing spaces trimmed, trailing blank lines dropped.
+    /// None when the emulator has no scrollback or the alt screen is active. One lock.
+    fn scrollback_text(&self, _max_lines: usize, _include_screen: bool) -> Option<Vec<String>> {
+        None
+    }
+    /// Display offset (rows scrolled up from the live bottom) that brings the
+    /// newest-nearest logical line equal to `text` (trailing spaces trimmed,
+    /// soft wraps joined) into view, picking the occurrence whose logical
+    /// distance from the bottom is closest to `hint_from_bottom`.
+    /// None when the alt screen is active or the line is not in the grid. One
+    /// lock.
+    fn locate_line(&self, _text: &str, _hint_from_bottom: usize) -> Option<usize> {
+        None
+    }
     /// Borrow a visible row as a single plain string when it carries no
     /// styling, else `None`. The compositor composes cell-by-cell (so this is
     /// no longer on its hot path), but it stays as a cheap accessor that tests
@@ -307,6 +324,7 @@ pub struct AlacrittyEmulator {
 /// `snap_cursor` sentinel: no snapshot has been taken yet, so
 /// [`PaneEmulator::snapshot_cursor`] falls back to the live cursor.
 const NO_SNAP_CURSOR: u32 = u32::MAX;
+const JUMP_CONTEXT_ROWS: usize = 3;
 
 fn pack_cursor(row: u16, col: u16) -> u32 {
     ((row as u32) << 16) | col as u32
@@ -381,6 +399,21 @@ fn conv_color(c: alacritty_terminal::vte::ansi::Color) -> CellColor {
         }
         Color::Named(n) => CellColor::Indexed(n as u8),
     }
+}
+
+fn collect_scrollback_line(
+    newest: &mut Vec<String>,
+    skipping_trailing_blanks: &mut bool,
+    line: String,
+    max_lines: usize,
+) -> bool {
+    let line = line.trim_end_matches(' ').to_string();
+    if *skipping_trailing_blanks && line.trim().is_empty() {
+        return false;
+    }
+    *skipping_trailing_blanks = false;
+    newest.push(line);
+    newest.len() >= max_lines
 }
 
 /// The off-thread feed handle for [`AlacrittyEmulator`]: a clone of the
@@ -563,6 +596,162 @@ impl PaneEmulator for AlacrittyEmulator {
 
     fn scrollback(&self) -> usize {
         self.term.lock().grid().display_offset()
+    }
+
+    fn scrollback_text(&self, max_lines: usize, include_screen: bool) -> Option<Vec<String>> {
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+
+        let grid = term.grid();
+        let history = grid.history_size();
+        if history == 0 {
+            return None;
+        }
+        if max_lines == 0 {
+            return Some(Vec::new());
+        }
+
+        let cols = grid.columns();
+        if cols == 0 {
+            return Some(Vec::new());
+        }
+        let screen = grid.screen_lines() as i32;
+        let first = -(history as i32);
+        let last = if include_screen { screen } else { 0 };
+        let mut newest = Vec::new();
+        let mut current: Option<String> = None;
+        let mut skipping_trailing_blanks = true;
+
+        for line_no in (first..last).rev() {
+            let line = Line(line_no);
+            let mut segment = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &grid[Point::new(line, Column(col))];
+                if !cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    segment.push(cell.c);
+                }
+            }
+            let wraps = grid[line][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+
+            match current.take() {
+                Some(logical) if wraps => {
+                    segment.push_str(&logical);
+                    current = Some(segment);
+                }
+                Some(logical) => {
+                    if collect_scrollback_line(
+                        &mut newest,
+                        &mut skipping_trailing_blanks,
+                        logical,
+                        max_lines,
+                    ) {
+                        break;
+                    }
+                    current = Some(segment);
+                }
+                None => current = Some(segment),
+            }
+        }
+
+        if newest.len() < max_lines
+            && let Some(logical) = current
+        {
+            collect_scrollback_line(
+                &mut newest,
+                &mut skipping_trailing_blanks,
+                logical,
+                max_lines,
+            );
+        }
+
+        newest.reverse();
+        Some(newest)
+    }
+
+    fn locate_line(&self, text: &str, hint_from_bottom: usize) -> Option<usize> {
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+
+        let grid = term.grid();
+        let (cols, screen, history) = (grid.columns(), grid.screen_lines(), grid.history_size());
+        if cols == 0 || screen == 0 {
+            return None;
+        }
+
+        let target = text.trim_end_matches(' ');
+        let first = -(history as i32);
+        let last = screen as i32;
+        let mut current: Option<String> = None;
+        let mut current_top = 0i32;
+        let mut best: Option<(usize, usize)> = None;
+
+        let mut consider = |logical: String, top: i32| {
+            if logical.trim_end_matches(' ') != target {
+                return;
+            }
+            let offset = if top < 0 { (-top) as usize } else { 0 };
+            let distance = offset.abs_diff(hint_from_bottom);
+            if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+                best = Some((offset, distance));
+            }
+        };
+
+        for line_no in (first..last).rev() {
+            let line = Line(line_no);
+            let mut segment = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &grid[Point::new(line, Column(col))];
+                if !cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    segment.push(cell.c);
+                }
+            }
+            let wraps = grid[line][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+
+            match current.take() {
+                Some(logical) if wraps => {
+                    segment.push_str(&logical);
+                    current = Some(segment);
+                    current_top = line_no;
+                }
+                Some(logical) => {
+                    consider(logical, current_top);
+                    current = Some(segment);
+                    current_top = line_no;
+                }
+                None => {
+                    current = Some(segment);
+                    current_top = line_no;
+                }
+            }
+        }
+
+        if let Some(logical) = current {
+            consider(logical, current_top);
+        }
+
+        best.map(|(offset, _)| {
+            if offset == 0 {
+                0
+            } else {
+                offset.saturating_add(JUMP_CONTEXT_ROWS)
+            }
+        })
     }
 
     fn row_text(&self, row: u16) -> Option<String> {
@@ -805,6 +994,164 @@ mod tests {
 
         e.scroll_reset();
         assert_eq!(e.scrollback(), 0);
+    }
+
+    #[test]
+    fn scrollback_text_returns_history_and_live_screen() {
+        let mut e = AlacrittyEmulator::new(10, 80, 100);
+        for i in 1..=30 {
+            let ending = if i == 30 { "" } else { "\r\n" };
+            e.advance(format!("line{i}{ending}").as_bytes());
+        }
+
+        let history = e.scrollback_text(100, false).expect("grid history");
+        assert_eq!(
+            history,
+            (1..=20).map(|i| format!("line{i}")).collect::<Vec<_>>()
+        );
+
+        let all = e.scrollback_text(100, true).expect("grid history");
+        assert_eq!(
+            all,
+            (1..=30).map(|i| format!("line{i}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scrollback_text_does_not_duplicate_redraws() {
+        let mut e = AlacrittyEmulator::new(10, 80, 100);
+        for i in 1..=11 {
+            e.advance(format!("history{i}\r\n").as_bytes());
+        }
+        e.advance(b"spinner\r\nstatus");
+        for _ in 0..50 {
+            e.advance(b"\r\x1b[1A\x1b[Jspinner\r\nstatus");
+        }
+
+        let lines = e.scrollback_text(100, true).expect("grid history");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "spinner")
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "status")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scrollback_text_joins_soft_wrapped_rows() {
+        let mut e = AlacrittyEmulator::new(3, 80, 100);
+        let text = "x".repeat(300);
+        e.advance(text.as_bytes());
+
+        let lines = e.scrollback_text(100, true).expect("grid history");
+        assert_eq!(lines, vec![text]);
+    }
+
+    #[test]
+    fn locate_line_finds_a_line_in_history() {
+        let mut e = AlacrittyEmulator::new(5, 40, 100);
+        for i in 0..30 {
+            e.advance(format!("line {i}\r\n").as_bytes());
+        }
+
+        let offset = e.locate_line("line 10", 100).expect("history line");
+        e.scroll_down(usize::MAX / 2);
+        e.scroll_up(offset);
+        assert!(
+            (0..5).any(|row| e
+                .row_text(row)
+                .is_some_and(|line| line.trim_end().contains("line 10"))),
+            "line 10 should be visible after the exact jump"
+        );
+    }
+
+    #[test]
+    fn locate_line_joins_a_300_col_wrapped_line() {
+        let mut e = AlacrittyEmulator::new(5, 80, 100);
+        let text = "x".repeat(300);
+        e.advance(text.as_bytes());
+
+        assert!(e.locate_line(&text, 0).is_some());
+    }
+
+    #[test]
+    fn locate_line_prefers_the_occurrence_nearest_the_hint() {
+        let mut e = AlacrittyEmulator::new(5, 40, 100);
+        for i in 0..30 {
+            if i == 3 || i == 25 {
+                e.advance(b"needle\r\n");
+            } else {
+                e.advance(format!("line {i}\r\n").as_bytes());
+            }
+        }
+
+        let newest = e.locate_line("needle", 0).expect("newest occurrence");
+        let oldest = e
+            .locate_line("needle", usize::MAX)
+            .expect("oldest occurrence");
+        assert!(newest < oldest, "hint should select the nearer occurrence");
+    }
+
+    #[test]
+    fn locate_line_is_none_on_the_alt_screen() {
+        let mut e = AlacrittyEmulator::new(5, 40, 100);
+        e.advance(b"history\r\n\x1b[?1049hvisible");
+
+        assert_eq!(e.locate_line("history", 0), None);
+    }
+
+    #[test]
+    fn locate_line_is_none_for_absent_text() {
+        let mut e = AlacrittyEmulator::new(5, 40, 100);
+        e.advance(b"present");
+
+        assert_eq!(e.locate_line("absent", 0), None);
+    }
+
+    #[test]
+    fn locate_line_large_wrapped_fixture_puts_line_on_screen() {
+        let mut e = AlacrittyEmulator::new(10, 80, 1_000);
+        for i in 0..200 {
+            let line = if i == 50 {
+                "w".repeat(300)
+            } else {
+                format!("line {i}")
+            };
+            e.advance(format!("{line}\r\n").as_bytes());
+        }
+
+        let offset = e.locate_line("line 120", 0).expect("fixture line");
+        e.scroll_down(usize::MAX / 2);
+        e.scroll_up(offset);
+        assert!(
+            (0..10).any(|row| e
+                .row_text(row)
+                .is_some_and(|line| line.trim_end().contains("line 120"))),
+            "line 120 should land on screen despite the wrapped line 50"
+        );
+    }
+
+    #[test]
+    fn scrollback_text_is_unavailable_on_the_alt_screen() {
+        let mut e = AlacrittyEmulator::new(10, 80, 100);
+        for i in 0..20 {
+            e.advance(format!("history{i}\r\n").as_bytes());
+        }
+        assert!(
+            e.scrollback_text(100, true).is_some(),
+            "primary screen has grid history"
+        );
+        e.advance(b"\x1b[?1049h");
+
+        assert_eq!(e.scrollback_text(100, true), None);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! answer to "is this key a secret?" and one placeholder string. New leak
 //! surfaces MUST import from here rather than grow a local copy. Structural
 //! calendar-account secrets are recognized by path: URLs, usernames, env
-//! values, and command arguments after argv[0].
+//! values, and command arguments after `argv[0]`.
 
 use serde_json::{Value, json};
 
@@ -59,7 +59,7 @@ const NOT_SECRET: &[&str] = &["project_key", "binary_cache_key"];
 
 /// Whether a config key names a secret scalar. Case-insensitive substring match
 /// against [`SENSITIVE`], plus the `*_key` suffix rule, minus `*_env` keys and
-/// the explicit [`NOT_SECRET`] list.
+/// the explicit `NOT_SECRET` list.
 pub fn is_sensitive(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
     if k.ends_with("_env") || NOT_SECRET.contains(&k.as_str()) {

@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use thegn_core::config::{Config, EnvProviderKind};
 use thegn_core::outln;
 use thegn_core::store::{PoolStore, WorkspaceStore};
+use thegn_svc::sync_journal::{self, SyncJournalEntry, SyncState};
 use thegn_svc::vps::registry::VpsRecord;
 
 /// A `creating` ledger entry older than this is stale.
@@ -15,6 +16,16 @@ const STALE_CREATING_SECS: i64 = 3600;
 
 fn clean(value: &str) -> String {
     crate::merge_sweep::safe_display(value)
+}
+
+fn clean_basename(value: &str) -> String {
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    let basename = std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .or_else(|| trimmed.rsplit(['/', '\\']).next())
+        .unwrap_or("");
+    clean(basename)
 }
 
 fn remote_envs(cfg: &Config) -> Vec<(&String, EnvProviderKind)> {
@@ -104,12 +115,31 @@ fn bound_names(cfg: &Config, db: &thegn_core::db::Db, env_name: &str) -> BTreeSe
 
 pub(crate) fn json(cfg: &Config) -> serde_json::Value {
     let db = thegn_core::db::Db::open_read_only_current().ok().flatten();
-    json_with(
+    let (journal, journal_error) = match sync_journal::list_at(&sync_journal::dir()) {
+        Ok(journal) => (journal, None),
+        Err(error) => (Vec::new(), Some(clean(&error.to_string()))),
+    };
+    let mut rows = json_with(
         cfg,
         db.as_ref(),
         &thegn_svc::vps::registry::list(),
         thegn_core::util::now(),
-    )
+        &journal,
+    );
+    if let Some(error) = journal_error
+        && let Some(rows) = rows.as_array_mut()
+    {
+        for row in rows.iter_mut() {
+            if row.get("env").is_some() {
+                row["sync_journal_error"] = serde_json::Value::String(error.clone());
+            }
+        }
+        rows.push(serde_json::json!({
+            "warning": "sync journal unavailable",
+            "sync_journal_error": error,
+        }));
+    }
+    rows
 }
 
 pub(crate) fn json_with(
@@ -117,6 +147,7 @@ pub(crate) fn json_with(
     db: Option<&thegn_core::db::Db>,
     records: &[VpsRecord],
     now: i64,
+    journal: &[SyncJournalEntry],
 ) -> serde_json::Value {
     let controller = controller_id_readable();
     let rows = remote_envs(cfg)
@@ -146,11 +177,30 @@ pub(crate) fn json_with(
             };
             let sandbox = env_sandbox(cfg, env);
             let credential_free = kind.credential_free();
+            let mode = if kind == EnvProviderKind::Sprites
+                && !pc.model_credentials_is_explicit()
+            {
+                thegn_core::config::ModelCredentials::Upload
+            } else {
+                pc.model_credentials
+            };
+            let grant = thegn_core::provider_credentials::model_grant(
+                kind,
+                mode,
+            );
             let forwarded: Vec<String> = if credential_free {
                 Vec::new()
             } else {
-                sandbox
+                let forwarded = sandbox
                     .passthrough_env_remote()
+                    .into_iter();
+                let forwarded = if grant.env_keys {
+                    forwarded.collect::<Vec<_>>()
+                } else {
+                    thegn_core::provider_credentials::strip_model_env(forwarded.collect())
+                        .0
+                };
+                forwarded
                     .into_iter()
                     .map(|(k, _)| clean(&k))
                     .collect::<BTreeSet<_>>()
@@ -158,11 +208,38 @@ pub(crate) fn json_with(
                     .collect()
             };
             let login_upload = if credential_free {
-                pc.model_credentials.as_str().to_string()
+                mode.as_str().to_string()
+            } else if kind == EnvProviderKind::Sprites && !grant.login_files {
+                "none".to_string()
             } else {
                 let agents = login_agents(cfg, env);
                 if agents.is_empty() { "none".to_string() } else { clean(&agents.join(",")) }
             };
+            let credentials_warning = if kind == EnvProviderKind::Sprites
+                && !pc.model_credentials_is_explicit()
+            {
+                format!(
+                    "credentials are forwarded by default on this env; set model_credentials = \"none\" in [env.{name}.provider] to turn them off"
+                )
+            } else {
+                String::new()
+            };
+            let sync_pending = journal
+                .iter()
+                .filter(|entry| entry.env_name == name.as_str())
+                .map(|entry| {
+                    let (state, reason) = match &entry.state {
+                        SyncState::Uploaded => ("uploaded", String::new()),
+                        SyncState::Pulling => ("pulling", String::new()),
+                        SyncState::Failed { reason } => ("failed", clean(reason)),
+                    };
+                    serde_json::json!({
+                        "worktree": clean_basename(&entry.worktree),
+                        "state": state,
+                        "reason": reason,
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "env": clean(name),
                 "provider": provider,
@@ -177,6 +254,9 @@ pub(crate) fn json_with(
                 "forwarded_env": forwarded,
                 "git_token": !credential_free && sandbox.git.admits_git_token(),
                 "login_upload": login_upload,
+                "credentials_warning": credentials_warning,
+                "sync_pending": sync_pending,
+                "sync_journal_error": "",
             })
         })
         .collect::<Vec<_>>();
@@ -200,6 +280,15 @@ pub(crate) fn report(cfg: &Config) {
         }
     };
     for row in rows {
+        if let Some(warning) = row["warning"].as_str() {
+            let error = row["sync_journal_error"].as_str().unwrap_or("");
+            if error.is_empty() {
+                outln!("  warning: {warning}");
+            } else {
+                outln!("  warning: {warning}: {error}");
+            }
+            continue;
+        }
         let s = |k: &str| row[k].as_str().unwrap_or("").to_string();
         outln!("  {:<12} {}", s("env"), s("provider"));
         outln!(
@@ -214,6 +303,28 @@ pub(crate) fn report(cfg: &Config) {
             l["creating"],
             l["stale_creating"]
         );
+        let pending = row["sync_pending"].as_array().cloned().unwrap_or_default();
+        if !pending.is_empty() {
+            let failed = pending
+                .iter()
+                .filter(|entry| entry["state"].as_str() == Some("failed"))
+                .count();
+            outln!(
+                "               pull-back pending: {} ({} failed); closing or removing the worktree retries it and keeps the sandbox until it succeeds",
+                pending.len(),
+                failed
+            );
+            for entry in pending
+                .iter()
+                .filter(|entry| entry["state"].as_str() == Some("failed"))
+            {
+                outln!(
+                    "               pull-back failed: {}: {}",
+                    entry["worktree"].as_str().unwrap_or(""),
+                    entry["reason"].as_str().unwrap_or("")
+                );
+            }
+        }
         let names = |k: &str| -> Vec<String> {
             row[k]
                 .as_array()
@@ -245,6 +356,9 @@ pub(crate) fn report(cfg: &Config) {
             yn(&row["git_token"]),
             s("login_upload")
         );
+        if !s("credentials_warning").is_empty() {
+            outln!("               warning: {}", s("credentials_warning"));
+        }
     }
 }
 
@@ -277,6 +391,21 @@ mod tests {
         cfg
     }
 
+    fn journal_entry(worktree: &str, env_name: &str, state: SyncState) -> SyncJournalEntry {
+        SyncJournalEntry {
+            version: sync_journal::JOURNAL_VERSION,
+            worktree: worktree.into(),
+            env_name: env_name.into(),
+            provider: "sprites".into(),
+            sandbox: "sandbox".into(),
+            workdir: "/workspace".into(),
+            baseline: std::collections::BTreeMap::new(),
+            state,
+            uploaded_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
     #[test]
     fn unbound_is_ledger_minus_spares_and_shape_is_stable() {
         let _state = IsolatedState::new();
@@ -288,7 +417,7 @@ mod tests {
             rec("stale-1", "sprites", "creating", 0),
             rec("other", "vercel", "ready", 0),
         ];
-        let out = json_with(&cfg_with("sprites"), Some(&db), &records, 10_000);
+        let out = json_with(&cfg_with("sprites"), Some(&db), &records, 10_000, &[]);
         let row = &out.as_array().unwrap()[0];
         let keys: BTreeSet<&str> = row
             .as_object()
@@ -307,7 +436,10 @@ mod tests {
                 "unbound",
                 "forwarded_env",
                 "git_token",
-                "login_upload"
+                "login_upload",
+                "credentials_warning",
+                "sync_pending",
+                "sync_journal_error"
             ])
         );
         let unbound: BTreeSet<&str> = row["unbound"]
@@ -338,19 +470,153 @@ mod tests {
         let _env = EnvGuard::set(&pairs);
         let mut cfg = cfg_with("vercel");
         cfg.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
-        let out = json_with(&cfg, None, &[], 0);
+        let out = json_with(&cfg, None, &[], 0, &[]);
         assert_eq!(out[0]["forwarded_env"], serde_json::json!([]));
         assert_eq!(out[0]["git_token"], false);
         assert!(!out.to_string().contains("sentinel"));
 
         let mut sprites = cfg_with("sprites");
         sprites.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
-        let out = json_with(&sprites, None, &[], 0);
+        sprites.sandbox.home.agents = vec!["claude".into()];
+        let out = json_with(&sprites, None, &[], 0, &[]);
         assert!(
             out[0]["forwarded_env"]
                 .to_string()
                 .contains("ANTHROPIC_API_KEY")
         );
+        assert_eq!(out[0]["login_upload"], "claude");
+        assert!(
+            out[0]["credentials_warning"]
+                .as_str()
+                .unwrap()
+                .contains("model_credentials = \"none\"")
+        );
         assert!(!out.to_string().contains("sentinel"));
+    }
+
+    #[test]
+    fn sprites_upload_forwards_model_env_and_reports_upload() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut vars: Vec<(String, String)> = thegn_core::testenv::state_env_all(temp.path())
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.display().to_string()))
+            .collect();
+        vars.push((
+            "THEGN_DIR".into(),
+            temp.path().join(".thegn").display().to_string(),
+        ));
+        vars.push(("ANTHROPIC_API_KEY".into(), "sentinel-b167".into()));
+        let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let _env = EnvGuard::set(&pairs);
+        let mut cfg = cfg_with("sprites");
+        cfg.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        cfg.sandbox.home.agents = vec!["claude".into()];
+        let provider = &mut cfg.env.get_mut("remote").unwrap().provider;
+        provider.model_credentials = thegn_core::config::ModelCredentials::Upload;
+        provider.mark_model_credentials_explicit();
+        let out = json_with(&cfg, None, &[], 0, &[]);
+        assert!(
+            out[0]["forwarded_env"]
+                .to_string()
+                .contains("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(out[0]["login_upload"], "claude");
+        assert!(!out.to_string().contains("sentinel-b167"));
+    }
+
+    #[test]
+    fn sprites_none_withholds_model_env_and_has_no_default_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut vars: Vec<(String, String)> = thegn_core::testenv::state_env_all(temp.path())
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.display().to_string()))
+            .collect();
+        vars.push((
+            "THEGN_DIR".into(),
+            temp.path().join(".thegn").display().to_string(),
+        ));
+        vars.push(("ANTHROPIC_API_KEY".into(), "sentinel-b167".into()));
+        let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let _env = EnvGuard::set(&pairs);
+        let mut cfg = cfg_with("sprites");
+        cfg.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        let provider = &mut cfg.env.get_mut("remote").unwrap().provider;
+        provider.model_credentials = thegn_core::config::ModelCredentials::None;
+        provider.mark_model_credentials_explicit();
+        let out = json_with(&cfg, None, &[], 0, &[]);
+        assert_eq!(out[0]["forwarded_env"], serde_json::json!([]));
+        assert_eq!(out[0]["login_upload"], "none");
+        assert_eq!(out[0]["credentials_warning"], "");
+        assert!(!out.to_string().contains("sentinel-b167"));
+    }
+
+    #[test]
+    fn doctor_lists_failed_sync_entries_for_their_env() {
+        let _state = IsolatedState::new();
+        let cfg = cfg_with("sprites");
+        let journal = [journal_entry(
+            "/private/worktrees/remote-one",
+            "remote",
+            SyncState::Failed {
+                reason: "network\nretry".into(),
+            },
+        )];
+
+        let out = json_with(&cfg, None, &[], 0, &journal);
+
+        assert_eq!(
+            out[0]["sync_pending"],
+            serde_json::json!([{
+                "worktree": "remote-one",
+                "state": "failed",
+                "reason": "network�retry"
+            }])
+        );
+    }
+
+    #[test]
+    fn doctor_ignores_entries_for_other_envs() {
+        let _state = IsolatedState::new();
+        let mut cfg = cfg_with("sprites");
+        let mut other = thegn_core::config::EnvConfig {
+            placement: thegn_core::config::PlacementMode::Provider,
+            ..Default::default()
+        };
+        other.provider.provider = "vercel".into();
+        cfg.env.insert("other".into(), other);
+        let journal = [journal_entry(
+            "/private/worktrees/other",
+            "other",
+            SyncState::Uploaded,
+        )];
+
+        let out = json_with(&cfg, None, &[], 0, &journal);
+
+        let rows = out.as_array().unwrap();
+        let remote = rows.iter().find(|row| row["env"] == "remote").unwrap();
+        assert_eq!(remote["sync_pending"], serde_json::json!([]));
+        let other = rows.iter().find(|row| row["env"] == "other").unwrap();
+        assert_eq!(other["sync_pending"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn doctor_rows_never_contain_paths_beyond_the_basename() {
+        let _state = IsolatedState::new();
+        let cfg = cfg_with("sprites");
+        let journal = [journal_entry(
+            "/private/attacker/worktrees/remote-one",
+            "remote",
+            SyncState::Pulling,
+        )];
+
+        let out = json_with(&cfg, None, &[], 0, &journal);
+
+        assert_eq!(out[0]["sync_pending"][0]["worktree"], "remote-one");
+        assert!(
+            !out[0]["sync_pending"][0]["worktree"]
+                .as_str()
+                .unwrap()
+                .contains('/')
+        );
     }
 }

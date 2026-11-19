@@ -121,6 +121,7 @@ struct FinalRow {
     result_oid: Option<String>,
     conflict_paths: Option<String>,
     error_detail: Option<String>,
+    provenance: Option<(String, Option<String>)>,
 }
 
 /// Validate the complete projection before the first write. Category order is
@@ -128,7 +129,13 @@ struct FinalRow {
 fn project(candidates: &Candidates, report: &FoldReport) -> Result<Vec<FinalRow>> {
     let mut rows = Vec::new();
     let mut seen = HashSet::new();
-    let mut add = |branch: &str, status, result_oid, conflict_paths, error_detail| -> Result<()> {
+    let mut add = |branch: &str,
+                   status,
+                   result_oid,
+                   conflict_paths,
+                   error_detail,
+                   provenance|
+     -> Result<()> {
         let worktree = candidates
             .worktrees
             .get(branch)
@@ -144,6 +151,7 @@ fn project(candidates: &Candidates, report: &FoldReport) -> Result<Vec<FinalRow>
             result_oid,
             conflict_paths,
             error_detail,
+            provenance,
         });
         Ok(())
     };
@@ -161,12 +169,22 @@ fn project(candidates: &Candidates, report: &FoldReport) -> Result<Vec<FinalRow>
     for landed in &report.landed {
         if report.advanced {
             anyhow::ensure!(!landed.commit.is_empty(), "landed outcome has no commit");
+            let source = report
+                .gated_sources
+                .iter()
+                .find(|(branch, _)| branch == &landed.branch)
+                .map(|(_, source)| source.clone())
+                .context("landed outcome has no gated source")?;
             add(
                 &landed.branch,
                 MergeFinalStatus::Landed,
                 Some(landed.commit.clone()),
                 None,
                 None,
+                Some((
+                    source,
+                    (!report.original.is_empty()).then(|| report.original.clone()),
+                )),
             )?;
         } else {
             add(
@@ -175,6 +193,7 @@ fn project(candidates: &Candidates, report: &FoldReport) -> Result<Vec<FinalRow>
                 None,
                 None,
                 Some(hold()),
+                None,
             )?;
         }
     }
@@ -185,6 +204,7 @@ fn project(candidates: &Candidates, report: &FoldReport) -> Result<Vec<FinalRow>
             None,
             None,
             Some(hold()),
+            None,
         )?;
     }
     for branch in &report.unprepared {
@@ -197,6 +217,7 @@ fn project(candidates: &Candidates, report: &FoldReport) -> Result<Vec<FinalRow>
                 "fold preparation unavailable; not landed\n{}",
                 report.diagnostics
             )),
+            None,
         )?;
     }
     for deferred in &report.deferred {
@@ -216,6 +237,7 @@ fn project(candidates: &Candidates, report: &FoldReport) -> Result<Vec<FinalRow>
                 .gate_failed
                 .then(|| report.diagnostics.clone())
                 .or_else(|| deferred.driver_refusal.clone()),
+            None,
         )?;
     }
     Ok(rows)
@@ -251,6 +273,12 @@ pub(super) fn persist(
             result_oid: row.result_oid.as_deref(),
             conflict_paths: row.conflict_paths.as_deref(),
             error_detail: row.error_detail.as_deref(),
+            provenance: row.provenance.as_ref().map(|(source, base)| {
+                thegn_core::store::LandedProvenance {
+                    source_oid: source,
+                    target_base_oid: base.as_deref(),
+                }
+            }),
         };
         match db.persist_merge_outcome(observed, &final_row)? {
             MergeOutcomeWrite::Written => {}
@@ -382,10 +410,11 @@ mod tests {
         }
 
         fn report(&self, status: MergeFinalStatus) -> FoldReport {
+            let original = "b".repeat(40);
             let mut report = build_report(
                 "main",
-                "original",
-                &empty_plan("original"),
+                &original,
+                &empty_plan(&original),
                 &[],
                 GateOutcome::Skipped,
                 0,
@@ -394,6 +423,7 @@ mod tests {
             match status {
                 MergeFinalStatus::Landed => {
                     report.advanced = true;
+                    report.gated_sources = vec![("b1".into(), "a".repeat(40))];
                     report.landed.push(LandedReport {
                         branch: "b1".into(),
                         commit: "actual-cas-commit".into(),
@@ -424,6 +454,36 @@ mod tests {
                 b"retained"
             );
         }
+    }
+
+    #[test]
+    fn project_assigns_each_landed_branch_its_gated_tip() {
+        let fixture = Fixture::new();
+        let rows = project(
+            &fixture.candidates,
+            &fixture.report(MergeFinalStatus::Landed),
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].provenance,
+            Some(("a".repeat(40), Some("b".repeat(40))))
+        );
+    }
+
+    #[test]
+    fn project_refuses_a_landed_row_without_a_gated_source() {
+        let fixture = Fixture::new();
+        let mut report = fixture.report(MergeFinalStatus::Landed);
+        report.gated_sources.clear();
+
+        let error = project(&fixture.candidates, &report).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("landed outcome has no gated source")
+        );
     }
 
     #[test]

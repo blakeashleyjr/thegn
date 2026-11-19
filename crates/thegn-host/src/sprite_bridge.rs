@@ -18,8 +18,8 @@
 //!   [`EXIT_REMOTE_LOST`], which `session list` renders as
 //!   `cause:remote-exec-lost`.
 //!
-//! Resolves the sprites provider from the first WSS-native env whose API token
-//! resolves, built named with THIS id (exec takes the id as an argument).
+//! Resolves the sprites provider from the WSS-native env whose account owns the
+//! sprite, built named with THIS id (exec takes the id as an argument).
 
 use std::io::{IsTerminal as _, Write as _};
 use std::sync::Arc;
@@ -92,16 +92,31 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
         }
         None => argv,
     };
-    // Any WSS-native env's provider config works — the sandbox id is the routing
-    // key, and exec takes it as an argument (like `vps-ssh` resolving by name).
-    let provider = cfg
+    let record_account = thegn_svc::vps::registry::read(id)
+        .filter(|record| record.provider == "sprites")
+        .map(|record| record.account);
+    let mut candidates = Vec::new();
+    let mut providers = Vec::new();
+    for (name, envc) in cfg
         .env
-        .values()
-        .filter(|envc| wss_native_provider_kind(&envc.provider.provider))
-        .find_map(|envc| crate::provider_factory::provider_for_named(&envc.provider, id))
-        .ok_or_else(|| {
-            anyhow!("sprite-exec: no WSS-native env with a resolvable API token for id {id:?}")
-        })?;
+        .iter()
+        .filter(|(_, envc)| wss_native_provider_kind(&envc.provider.provider))
+    {
+        let provider = crate::provider_factory::provider_for_named(&envc.provider, id);
+        let account = provider.as_ref().and_then(|provider| match provider {
+            Provider::Sprites(provider) => provider.scope().map(|scope| scope.account.clone()),
+            _ => None,
+        });
+        candidates.push((name.clone(), account));
+        providers.push(provider);
+    }
+    let selected = pick_sprites_env_named(id, &candidates, record_account.as_deref())
+        .map_err(|error| anyhow!(error))?;
+    let provider = providers
+        .into_iter()
+        .nth(selected)
+        .flatten()
+        .ok_or_else(|| anyhow!("sprite-exec: selected Sprites env has no resolvable API token"))?;
     if std::io::stdin().is_terminal() {
         let code = run_tty(&provider, id, argv)?;
         std::process::exit(code);
@@ -119,6 +134,51 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
 // ---------------------------------------------------------------------------
 // Pure decisions (unit-tested). The streaming below only wires them up.
 // ---------------------------------------------------------------------------
+
+/// Which candidate env serves a sprite. `candidates` contains the env name and
+/// the provider account fingerprint, when that provider could be built.
+/// `record_account` is the account from the sprite ledger record. Errors name
+/// envs only; they never include a token or credential reference.
+#[cfg(test)]
+pub(crate) fn pick_sprites_env(
+    candidates: &[(String, Option<String>)],
+    record_account: Option<&str>,
+) -> Result<usize, String> {
+    pick_sprites_env_named("the requested sprite", candidates, record_account)
+}
+
+fn pick_sprites_env_named(
+    id: &str,
+    candidates: &[(String, Option<String>)],
+    record_account: Option<&str>,
+) -> Result<usize, String> {
+    let names = candidates
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(record_account) = record_account {
+        let matches = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, account))| account.as_deref() == Some(record_account))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        return match matches.as_slice() {
+            [index] => Ok(*index),
+            _ => Err(format!(
+                "sprite-exec: cannot match the Sprites ledger account to exactly one env ({names})"
+            )),
+        };
+    }
+    match candidates {
+        [_] => Ok(0),
+        _ => Err(format!(
+            "sprite-exec: cannot tell which Sprites account owns {id}; it has no ledger record and {} Sprites envs are configured ({names})",
+            candidates.len()
+        )),
+    }
+}
 
 /// The hold ceiling in seconds for this run, or `None` for an unheld run: the
 /// `--hold` flag wins, else the [`HOLD_ENV`] value (`env`, as read from the
@@ -512,8 +572,8 @@ fn tty_loop<T: Terminal>(
 mod tests {
     use super::{
         EXIT_REMOTE_LOST, FromTty, REATTACH_BUDGET_RESET, RemoteModes, attempts_after_stream,
-        encode_input, hold_ceiling, hold_task_from, lost_line, pty_size, reconnect_delays,
-        should_reattach,
+        encode_input, hold_ceiling, hold_task_from, lost_line, pick_sprites_env, pty_size,
+        reconnect_delays, should_reattach,
     };
     use std::time::Duration;
     use termwiz::input::{KeyCode, KeyEvent, Modifiers};
@@ -554,6 +614,46 @@ mod tests {
         );
         assert!(!lost_line("a", "b").contains('\n'));
         assert_eq!(EXIT_REMOTE_LOST, 75);
+    }
+
+    #[test]
+    fn pick_sprites_env_table() {
+        let candidates = vec![
+            ("sprites-a".to_string(), Some("acct-a".to_string())),
+            ("sprites-b".to_string(), Some("acct-b".to_string())),
+        ];
+        assert_eq!(pick_sprites_env(&candidates, Some("acct-b")), Ok(1));
+        assert!(pick_sprites_env(&candidates, Some("acct-missing")).is_err());
+
+        let duplicate = vec![
+            ("sprites-a".to_string(), Some("acct-a".to_string())),
+            ("sprites-b".to_string(), Some("acct-a".to_string())),
+        ];
+        assert!(pick_sprites_env(&duplicate, Some("acct-a")).is_err());
+
+        let one = vec![("sprites-a".to_string(), None)];
+        assert_eq!(pick_sprites_env(&one, None), Ok(0));
+        let error = pick_sprites_env(&candidates, None).expect_err("ambiguous envs");
+        assert!(
+            error.contains("sprites-a") && error.contains("sprites-b"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pick_sprites_env_errors_never_include_a_token() {
+        let _env = thegn_core::testenv::EnvGuard::set(&[("SPRITES_TOKEN", "token-sentinel")]);
+        let candidates = vec![
+            ("sprites-a".to_string(), Some("acct-a".to_string())),
+            ("sprites-b".to_string(), Some("acct-b".to_string())),
+        ];
+        for result in [
+            pick_sprites_env(&candidates, Some("acct-missing")),
+            pick_sprites_env(&candidates, None),
+        ] {
+            let error = result.expect_err("ambiguous account");
+            assert!(!error.contains("token-sentinel"), "{error}");
+        }
     }
 
     #[test]

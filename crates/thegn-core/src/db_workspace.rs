@@ -1854,7 +1854,7 @@ impl Db {
         Ok(())
     }
 
-    /// Worktree analogue of [`Db::normalize_workspace_positions`]. Uses the same
+    /// Worktree analogue of `Db::normalize_workspace_positions`. Uses the same
     /// `ORDER BY` as [`WorkspaceStore::worktrees`] so filed/loose worktree order
     /// is preserved while positions become contiguous + distinct.
     pub(crate) fn normalize_worktree_positions(&self) -> Result<()> {
@@ -1901,7 +1901,7 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Terminal analogue of [`Db::normalize_worktree_positions`]. Uses the same
+    /// Terminal analogue of `Db::normalize_worktree_positions`. Uses the same
     /// `ORDER BY` as [`WorkspaceStore::terminals`] (`position, last_active DESC`)
     /// so the visible order is preserved while positions become contiguous +
     /// distinct; `name` is the final deterministic tie-break. Idempotent.
