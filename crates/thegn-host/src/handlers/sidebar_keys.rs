@@ -2198,7 +2198,7 @@ mod tests {
             crate::sidebar::RowKind::Worktree
         );
 
-        sb.handle_key(&KeyCode::Left, Modifiers::NONE, &mut model, &session);
+        sb.handle_key(&KeyCode::LeftArrow, Modifiers::NONE, &mut model, &session);
         assert!(sb.view.batch_open.is_empty());
         assert_eq!(sb.cursor, batch_idx(&model));
         assert!(sb.selected_row(&model).unwrap().collapsed);

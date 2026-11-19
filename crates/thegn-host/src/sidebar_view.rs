@@ -1827,7 +1827,6 @@ fn guide_indent(depth: u8, guides: u8) -> Vec<crate::seg::Seg> {
         if k <= 8 && guides & (1 << (k - 1)) != 0 {
             if blank > 0 {
                 out.push(sp(blank));
-                blank = 0;
             }
             out.push(seg(Tok::Slot(S::Ghost2), gl.tree_pipe));
             blank = 1;
