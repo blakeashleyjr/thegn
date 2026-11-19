@@ -2038,6 +2038,42 @@ fn request_preview_scan(
     );
 }
 
+/// The quit bodies shared by the Quit/QuitKill keys, the palette `quit`
+/// branch, the second-press confirm and the confirm-menu arm. The caller
+/// returns from the loop right after.
+fn run_quit_body(
+    kind: crate::handlers::quit_confirm::QuitKind,
+    share_supervisor: &mut crate::share::ShareSupervisor,
+    session: &mut crate::session::Session,
+    panes: &Panes,
+    workspace_pool: &crate::workspace_pool::WorkspacePool,
+    daemon_cfg: &thegn_core::config::DaemonConfig,
+) {
+    use crate::handlers::quit_confirm::QuitKind;
+    shutdown_shares(share_supervisor);
+    persist_session_layout(session, panes);
+    match kind {
+        QuitKind::Detach => {
+            // Quit is a detach: daemon-backed center panes keep running; the
+            // next launch reattaches. Cover BOTH the active session and the
+            // parked (resident-pool) workspaces — the latter's panes stay
+            // live in the table but aren't in `session`, so they'd otherwise
+            // be killed on drop.
+            crate::handlers::daemon_lifecycle::mark_session_panes_detached(session, panes);
+            crate::handlers::daemon_lifecycle::mark_parked_panes_detached(workspace_pool, panes);
+        }
+        QuitKind::Kill => {
+            // One-time bounded wait on the quit path so the kills land before
+            // shutdown_background() aborts in-flight tasks.
+            crate::handlers::daemon_lifecycle::kill_daemon_sessions_blocking(
+                panes,
+                daemon_cfg,
+                std::time::Duration::from_secs(3),
+            );
+        }
+    }
+}
+
 fn shutdown_shares(share_supervisor: &mut crate::share::ShareSupervisor) {
     for (worktree, port, generation) in share_supervisor.shutdown_all() {
         let op = crate::share::SharePersist::DeleteIfOwned {
@@ -20617,6 +20653,34 @@ async fn event_loop<T: Terminal>(
                 }
                 // Modal: an open git option/confirm menu captures all keys.
                 if let Some(m) = active_menu.as_mut() {
+                    // A second quit key confirms an open quit prompt. The menu
+                    // swallows Ctrl keys, so resolve it here; only a key that is
+                    // by itself a complete quit binding counts (never a chord
+                    // prefix), and the matcher is reset either way.
+                    let open_quit = crate::handlers::quit_confirm::is_quit_prompt(m);
+                    if open_quit.is_some() {
+                        let single = match keymap.dispatch(
+                            mode,
+                            crate::sequence::Key::modified(k.key.clone(), k.modifiers),
+                        ) {
+                            crate::sequence::MatchResult::Matched(a) => Some(a),
+                            _ => None,
+                        };
+                        keymap.reset();
+                        if let Some(kind) =
+                            crate::handlers::quit_confirm::second_press(open_quit, single.as_ref())
+                        {
+                            run_quit_body(
+                                kind,
+                                &mut share_supervisor,
+                                &mut session,
+                                &panes,
+                                &workspace_pool,
+                                &current_config.daemon,
+                            );
+                            return Ok(());
+                        }
+                    }
                     match m.handle_key(&k.key, k.modifiers) {
                         menu::MenuOutcome::Pending => {}
                         menu::MenuOutcome::Cancel => {
@@ -20654,6 +20718,27 @@ async fn event_loop<T: Terminal>(
                             // dismissal below must be gated on this being one.
                             let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
+                            if let menu::MenuChoice::Confirm {
+                                tag: crate::handlers::quit_confirm::TAG,
+                                arg,
+                            } = &choice
+                            {
+                                if let Some(kind) =
+                                    crate::handlers::quit_confirm::kind_from_arg(arg)
+                                {
+                                    run_quit_body(
+                                        kind,
+                                        &mut share_supervisor,
+                                        &mut session,
+                                        &panes,
+                                        &workspace_pool,
+                                        &current_config.daemon,
+                                    );
+                                    return Ok(());
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             if let menu::MenuChoice::Confirm {
                                 tag: "sandbox-profile",
                                 arg,
@@ -22142,14 +22227,29 @@ async fn event_loop<T: Terminal>(
                                     // Action::Quit keybind (audit run.rs:13511):
                                     // otherwise pane/split/focus changes made since
                                     // the last periodic persist are lost on relaunch.
-                                    shutdown_shares(&mut share_supervisor);
-                                    persist_session_layout(&mut session, &panes);
-                                    crate::handlers::daemon_lifecycle::mark_session_panes_detached(
-                                        &session, &panes,
-                                    );
-                                    crate::handlers::daemon_lifecycle::mark_parked_panes_detached(
-                                        &workspace_pool,
+                                    if !crate::handlers::quit_confirm::request(
+                                        current_config.ui.confirm_quit,
+                                        &mut active_menu,
+                                        crate::handlers::quit_confirm::QuitKind::Detach,
+                                        || {
+                                            crate::handlers::daemon_lifecycle::pane_survival_counts(
+                                                &session,
+                                                &workspace_pool,
+                                                &panes,
+                                            )
+                                        },
+                                    ) {
+                                        palette = None;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    run_quit_body(
+                                        crate::handlers::quit_confirm::QuitKind::Detach,
+                                        &mut share_supervisor,
+                                        &mut session,
                                         &panes,
+                                        &workspace_pool,
+                                        &current_config.daemon,
                                     );
                                     return Ok(());
                                 } else if let Some(payload) = key.strip_prefix("wt:") {
@@ -25981,34 +26081,38 @@ async fn event_loop<T: Terminal>(
                                     model.status = "No worktree to file into a folder".into();
                                 }
                             }
-                            Action::Quit | Action::Detach => {
-                                shutdown_shares(&mut share_supervisor);
-                                persist_session_layout(&mut session, &panes);
-                                // Quit is a detach: daemon-backed center panes
-                                // keep running; the next launch reattaches. Cover
-                                // BOTH the active session and the parked
-                                // (resident-pool) workspaces — the latter's panes
-                                // stay live in the table but aren't in `session`,
-                                // so they'd otherwise be killed on drop.
-                                crate::handlers::daemon_lifecycle::mark_session_panes_detached(
-                                    &session, &panes,
-                                );
-                                crate::handlers::daemon_lifecycle::mark_parked_panes_detached(
+                            Action::Quit | Action::Detach | Action::QuitKill => {
+                                use crate::handlers::quit_confirm::{self, QuitKind};
+                                let kind = if matches!(action, Action::QuitKill) {
+                                    QuitKind::Kill
+                                } else {
+                                    QuitKind::Detach
+                                };
+                                // `Action::Detach` is an explicit verb: never prompted.
+                                let ask = !matches!(action, Action::Detach)
+                                    && !quit_confirm::request(
+                                        current_config.ui.confirm_quit,
+                                        &mut active_menu,
+                                        kind,
+                                        || {
+                                            crate::handlers::daemon_lifecycle::pane_survival_counts(
+                                                &session,
+                                                &workspace_pool,
+                                                &panes,
+                                            )
+                                        },
+                                    );
+                                if ask {
+                                    dirty = true;
+                                    continue;
+                                }
+                                run_quit_body(
+                                    kind,
+                                    &mut share_supervisor,
+                                    &mut session,
+                                    &panes,
                                     &workspace_pool,
-                                    &panes,
-                                );
-                                return Ok(());
-                            }
-                            Action::QuitKill => {
-                                shutdown_shares(&mut share_supervisor);
-                                persist_session_layout(&mut session, &panes);
-                                // One-time bounded wait on the quit path so the
-                                // kills land before shutdown_background() aborts
-                                // in-flight tasks. Panes stay kill-on-drop.
-                                crate::handlers::daemon_lifecycle::kill_daemon_sessions_blocking(
-                                    &panes,
                                     &current_config.daemon,
-                                    std::time::Duration::from_secs(3),
                                 );
                                 return Ok(());
                             }
