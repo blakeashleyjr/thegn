@@ -3527,12 +3527,19 @@ fn decode_stream_frame(b: &[u8]) -> StreamMsg {
     match id {
         1 => StreamMsg::Stdout(rest.to_vec()),
         2 => StreamMsg::Stderr(rest.to_vec()),
-        3 => StreamMsg::Exit(
-            String::from_utf8_lossy(rest)
-                .trim()
-                .parse()
-                .unwrap_or(EXEC_EXIT_STATUS_UNKNOWN),
-        ),
+        3 => {
+            let code = if rest.len() == 1 {
+                // A one-byte payload is the documented binary exit code. It is
+                // ambiguous with one ASCII digit, so the binary form wins.
+                i32::from(rest[0])
+            } else {
+                String::from_utf8_lossy(rest)
+                    .trim()
+                    .parse()
+                    .unwrap_or(EXEC_EXIT_STATUS_UNKNOWN)
+            };
+            StreamMsg::Exit(code)
+        }
         _ => StreamMsg::Ignore,
     }
 }
@@ -3544,15 +3551,18 @@ enum SpriteCtrl {
     Session(String),
     /// The command exited with this code.
     Exit(i32),
+    /// A non-JSON-object text frame that may be output in TTY mode.
+    Forward,
     /// A frame we don't act on (port notifications, unknown shapes).
     Ignore,
 }
 
 /// Classify a Sprites exec text frame: `{"type":"exit","exit_code":N}` ⇒ exit,
-/// a frame carrying `session_id` ⇒ the session announcement, else ignore.
+/// a frame carrying `session_id` ⇒ the session announcement, JSON objects ⇒
+/// ignore, and other text ⇒ possible TTY output.
 fn parse_sprite_ctrl(text: &str) -> SpriteCtrl {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return SpriteCtrl::Ignore;
+        return SpriteCtrl::Forward;
     };
     if v.get("type").and_then(|t| t.as_str()) == Some("exit") {
         let code = v
@@ -3565,7 +3575,11 @@ fn parse_sprite_ctrl(text: &str) -> SpriteCtrl {
     if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
         return SpriteCtrl::Session(sid.to_string());
     }
-    SpriteCtrl::Ignore
+    if v.is_object() {
+        SpriteCtrl::Ignore
+    } else {
+        SpriteCtrl::Forward
+    }
 }
 
 impl SpritesProvider {
@@ -3960,6 +3974,16 @@ async fn drive_exec<S>(
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
+                    if tracing::enabled!(target: "thegn::provider", tracing::Level::TRACE) {
+                        let preview = &b[..b.len().min(64)];
+                        tracing::trace!(
+                            target: "thegn::provider",
+                            kind = "binary",
+                            len = b.len(),
+                            bytes = %preview.escape_ascii(),
+                            "sprites exec frame"
+                        );
+                    }
                     if tty {
                         if !send_chunked(&frames_tx, b.into(), ExecFrame::Stdout).await {
                             break;
@@ -3988,16 +4012,39 @@ async fn drive_exec<S>(
                         }
                     }
                 }
-                Some(Ok(Message::Text(t))) => match parse_sprite_ctrl(t.as_str()) {
-                    SpriteCtrl::Session(s) => {
-                        let _ = sid_tx.send(Some(s)); // best-effort: waiter may have timed out
+                Some(Ok(Message::Text(t))) => {
+                    if tracing::enabled!(target: "thegn::provider", tracing::Level::TRACE) {
+                        let bytes = t.as_bytes();
+                        let preview = &bytes[..bytes.len().min(64)];
+                        tracing::trace!(
+                            target: "thegn::provider",
+                            kind = "text",
+                            len = bytes.len(),
+                            bytes = %preview.escape_ascii(),
+                            "sprites exec frame"
+                        );
                     }
-                    SpriteCtrl::Exit(code) => {
-                        let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
-                        break;
+                    match parse_sprite_ctrl(t.as_str()) {
+                        SpriteCtrl::Session(s) => {
+                            let _ = sid_tx.send(Some(s)); // best-effort: waiter may have timed out
+                        }
+                        SpriteCtrl::Exit(code) => {
+                            let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
+                            break;
+                        }
+                        SpriteCtrl::Forward if tty => {
+                            // Defensive fix for the observed missing line break:
+                            // this is where client-side bytes can vanish, but it
+                            // is not a confirmed cause of that incident.
+                            if !send_chunked(&frames_tx, t.as_bytes().to_vec(), ExecFrame::Stdout)
+                                .await
+                            {
+                                break;
+                            }
+                        }
+                        SpriteCtrl::Forward | SpriteCtrl::Ignore => {}
                     }
-                    SpriteCtrl::Ignore => {}
-                },
+                }
                 Some(Ok(Message::Ping(p))) => {
                     let _ = write.send(Message::Pong(p)).await; // best-effort: peer may be gone
                 }
@@ -6692,8 +6739,13 @@ mod tests {
             decode_stream_frame(&[3, b'1', b'3', b'7']),
             StreamMsg::Exit(137)
         );
+        assert_eq!(decode_stream_frame(&[3, 0]), StreamMsg::Exit(0));
+        assert_eq!(decode_stream_frame(&[3, 1]), StreamMsg::Exit(1));
+        assert_eq!(decode_stream_frame(&[3, 137]), StreamMsg::Exit(137));
+        // A one-byte ASCII digit is the documented binary form, not text.
+        assert_eq!(decode_stream_frame(&[3, b'1']), StreamMsg::Exit(49));
         assert_eq!(
-            decode_stream_frame(&[3, b'x']),
+            decode_stream_frame(&[3, b'x', b'!']),
             StreamMsg::Exit(EXEC_EXIT_STATUS_UNKNOWN)
         );
         assert_eq!(decode_stream_frame(&[]), StreamMsg::Ignore);
@@ -6727,7 +6779,11 @@ mod tests {
             parse_sprite_ctrl(r#"{"type":"port_opened","port":8080}"#),
             SpriteCtrl::Ignore
         );
-        assert_eq!(parse_sprite_ctrl("not json"), SpriteCtrl::Ignore);
+        assert_eq!(
+            parse_sprite_ctrl(r#"{"message":"not a control frame"}"#),
+            SpriteCtrl::Ignore
+        );
+        assert_eq!(parse_sprite_ctrl("not json"), SpriteCtrl::Forward);
     }
 
     #[tokio::test]
@@ -6910,6 +6966,118 @@ mod tests {
             Some(ExecFrame::Stdout(b"ok".to_vec()))
         );
         assert_eq!(frames_rx.recv().await, None);
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_tty_forwards_non_json_text_frames() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
+
+        server
+            .send(Message::Binary(b"/dev/pts/0".to_vec().into()))
+            .await
+            .unwrap();
+        server.send(Message::Text("\r\n".into())).await.unwrap();
+        server
+            .send(Message::Binary(b"ok\r\n".to_vec().into()))
+            .await
+            .unwrap();
+        server
+            .send(Message::Text(r#"{"type":"exit","exit_code":0}"#.into()))
+            .await
+            .unwrap();
+
+        let collected = collect_exec_output(&mut frames_rx, usize::MAX).await;
+        assert_eq!(collected.code, Some(0));
+        assert_eq!(collected.output, b"/dev/pts/0\r\nok\r\n");
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_non_tty_ignores_non_json_text_frames() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None,
+        ));
+
+        let mut first = vec![1];
+        first.extend_from_slice(b"/dev/pts/0");
+        server.send(Message::Binary(first.into())).await.unwrap();
+        server.send(Message::Text("\r\n".into())).await.unwrap();
+        let mut second = vec![1];
+        second.extend_from_slice(b"ok\r\n");
+        server.send(Message::Binary(second.into())).await.unwrap();
+        server
+            .send(Message::Text(r#"{"type":"exit","exit_code":0}"#.into()))
+            .await
+            .unwrap();
+
+        let collected = collect_exec_output(&mut frames_rx, usize::MAX).await;
+        assert_eq!(collected.code, Some(0));
+        assert_eq!(collected.output, b"/dev/pts/0ok\r\n");
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_tty_does_not_forward_json_text_frames() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
+
+        server
+            .send(Message::Text(
+                r#"{"type":"session_info","session_id":"sess-1"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        server
+            .send(Message::Text(r#"{"type":"exit","exit_code":0}"#.into()))
+            .await
+            .unwrap();
+
+        let collected = collect_exec_output(&mut frames_rx, usize::MAX).await;
+        assert_eq!(collected.code, Some(0));
+        assert!(collected.output.is_empty());
         driver.await.unwrap();
     }
 
@@ -7144,7 +7312,7 @@ mod tests {
         ));
 
         server
-            .send(Message::Binary(vec![3, b'x'].into()))
+            .send(Message::Binary(vec![3, b'x', b'!'].into()))
             .await
             .unwrap();
 
