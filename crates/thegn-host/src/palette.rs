@@ -1136,9 +1136,7 @@ pub(crate) fn known_profile_names(cfg: &thegn_core::config::Config) -> Vec<Strin
         names.insert(k.clone());
     }
     // Profiles defined only by a `profiles/<name>/config.toml` file on disk.
-    let pdir = thegn_core::util::xdg_config_home()
-        .join("thegn")
-        .join("profiles");
+    let pdir = thegn_core::util::thegn_config_dir().join("profiles");
     if let Ok(entries) = std::fs::read_dir(&pdir) {
         for e in entries.flatten() {
             if e.path().join("config.toml").is_file()

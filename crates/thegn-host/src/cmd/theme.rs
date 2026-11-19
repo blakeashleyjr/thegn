@@ -95,7 +95,7 @@ fn import(path: &Path, name: Option<&str>) -> Result<()> {
         theme.meta.name = name.to_owned();
     }
     theme.validate()?;
-    let dir = util::xdg_config_home().join("thegn/themes");
+    let dir = util::thegn_config_dir().join("themes");
     crate::theme_store::write_theme(&dir, &theme).map_err(anyhow::Error::msg)?;
     report_contrast_warnings(&theme);
     msg::info(&format!("theme imported as `{}`", theme.meta.name));
@@ -103,7 +103,7 @@ fn import(path: &Path, name: Option<&str>) -> Result<()> {
 }
 
 fn rename(active: &str, old: &str, new: &str) -> Result<()> {
-    let dir = util::xdg_config_home().join("thegn/themes");
+    let dir = util::thegn_config_dir().join("themes");
     let outcome = crate::theme_rename::rename_theme(&dir, old, new, Some(active))
         .map_err(anyhow::Error::msg)?;
     msg::info(&format!(
@@ -132,7 +132,7 @@ fn report_contrast_warnings(theme: &UserTheme) {
 }
 
 fn read_user_themes(active: Option<&str>) -> Vec<UserTheme> {
-    let dir = util::xdg_config_home().join("thegn/themes");
+    let dir = util::thegn_config_dir().join("themes");
     let (themes, warnings) = crate::theme_store::scan_dir(&dir, active);
     for warning in warnings {
         msg::warn(&warning);
