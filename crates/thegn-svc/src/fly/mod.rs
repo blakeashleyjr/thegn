@@ -775,7 +775,7 @@ impl FlyProvider {
                 return Ok(());
             }
             if status.is_success() {
-                self.confirm_app_gone(&url).await?;
+                self.confirm_app_gone(id, &url).await?;
                 self.ips.lock().unwrap().remove(id);
                 return Ok(());
             }
@@ -798,7 +798,7 @@ impl FlyProvider {
     /// Poll `GET /v1/apps/{app}` until 404 (gone), within the budget. A
     /// non-404 answer or a transport error keeps polling; the budget ends it
     /// with an error so local ownership remains available for retry.
-    async fn confirm_app_gone(&self, url: &str) -> Result<()> {
+    async fn confirm_app_gone(&self, id: &str, url: &str) -> Result<()> {
         let authority = crate::provider::authority_key(url)?;
         let deadline = tokio::time::Instant::now() + self.destroy_budget;
         loop {
@@ -826,7 +826,7 @@ impl FlyProvider {
             if now >= deadline {
                 return Err(anyhow!(
                     "fly: DELETE for {} was accepted but the app still exists after {}s; its record is kept so thegn wt rm or the reaper can finish it",
-                    self.spec.name,
+                    id,
                     self.destroy_budget.as_secs()
                 ));
             }
@@ -1309,7 +1309,8 @@ mod tests {
             graphql_url: format!("{base}/"),
             name: "tg-fly-confirm".into(),
             ..spec()
-        });
+        })
+        .with_destroy_confirm(Duration::from_secs(5), Duration::from_millis(20));
         let account = thegn_core::managed_ssh::account_label(&provider.spec.key_path);
         thegn_core::managed_ssh::record_authorized(
             "fly",
