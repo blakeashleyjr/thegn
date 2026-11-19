@@ -547,7 +547,9 @@ mod tests {
     fn worker_thread_is_named() {
         let (name_tx, name_rx) = std::sync::mpsc::channel();
         let tx = spawn_worker(move |_| {
-            let _ = name_tx.send(std::thread::current().name().map(str::to_owned));
+            name_tx
+                .send(std::thread::current().name().map(str::to_owned))
+                .expect("test receiver is alive");
         })
         .expect("spawn");
         tx.send(TrimCause::Idle).unwrap();
