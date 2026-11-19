@@ -2812,9 +2812,11 @@ fn build_parity_lines() {
     match Db::open_read_only_current() {
         Ok(Some(db)) => match db.space() {
             Ok(space) => {
-                let step = thegn_core::plan_maintenance(&space, 1);
-                let recommend = space.auto_vacuum != thegn_core::AutoVacuum::Incremental
-                    || matches!(step, thegn_core::MaintenanceStep::TooLargeForAuto { .. });
+                let room = db
+                    .file_path()
+                    .map(|path| crate::db_maintain::host_room(&path))
+                    .unwrap_or_default();
+                let step = thegn_core::plan_maintenance(&space, room, 1);
                 outln!(
                     "  db space      {} MB ({} MB reclaimable, auto_vacuum {}){}",
                     space.file_bytes().div_ceil(1024 * 1024),
@@ -2824,11 +2826,7 @@ fn build_parity_lines() {
                         thegn_core::AutoVacuum::Full => "full",
                         thegn_core::AutoVacuum::Incremental => "incremental",
                     },
-                    if recommend {
-                        "; run 'thegn db vacuum'"
-                    } else {
-                        ""
-                    },
+                    db_space_suffix(step, space.auto_vacuum),
                 );
             }
             Err(error) => outln!("  db space      unavailable ({error})"),
@@ -2875,6 +2873,30 @@ fn build_parity_lines() {
             exe.map(|p| p.display().to_string())
                 .unwrap_or_else(|| format!("(pid {} — unreadable)", d.pid))
         );
+    }
+}
+
+/// The `db space` doctor line's suffix for the planner's step: what thegn
+/// does next on its own, or the one case that needs the user.
+fn db_space_suffix(
+    step: thegn_core::MaintenanceStep,
+    auto_vacuum: thegn_core::AutoVacuum,
+) -> std::borrow::Cow<'static, str> {
+    use thegn_core::MaintenanceStep;
+    match step {
+        MaintenanceStep::Convert => "; converts automatically at the next idle pass".into(),
+        MaintenanceStep::TooLargeForAuto { .. } => "; run 'thegn db vacuum'".into(),
+        MaintenanceStep::LowDisk { need_bytes, .. } => format!(
+            "; needs {} MB free to compact",
+            need_bytes.div_ceil(1024 * 1024)
+        )
+        .into(),
+        MaintenanceStep::Incremental { .. } | MaintenanceStep::Nothing
+            if auto_vacuum == thegn_core::AutoVacuum::Incremental =>
+        {
+            "; auto-maintained".into()
+        }
+        MaintenanceStep::Incremental { .. } | MaintenanceStep::Nothing => "".into(),
     }
 }
 
@@ -6528,6 +6550,51 @@ mod pins;
 mod tests {
     use super::*;
     use thegn_core::notification::{Notification, NotificationKind};
+
+    #[test]
+    fn db_space_suffix_names_the_next_step() {
+        use thegn_core::{AutoVacuum, MaintenanceStep};
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            db_space_suffix(MaintenanceStep::Nothing, AutoVacuum::Incremental),
+            "; auto-maintained"
+        );
+        assert_eq!(
+            db_space_suffix(
+                MaintenanceStep::Incremental { pages: 2048 },
+                AutoVacuum::Incremental
+            ),
+            "; auto-maintained"
+        );
+        assert_eq!(
+            db_space_suffix(MaintenanceStep::Convert, AutoVacuum::None),
+            "; converts automatically at the next idle pass"
+        );
+        assert_eq!(
+            db_space_suffix(
+                MaintenanceStep::TooLargeForAuto {
+                    live_bytes: 300 * MIB,
+                    free_bytes: MIB,
+                },
+                AutoVacuum::None
+            ),
+            "; run 'thegn db vacuum'"
+        );
+        assert_eq!(
+            db_space_suffix(
+                MaintenanceStep::LowDisk {
+                    need_bytes: 464 * MIB,
+                    free_bytes: 10 * MIB,
+                },
+                AutoVacuum::None
+            ),
+            "; needs 464 MB free to compact"
+        );
+        assert_eq!(
+            db_space_suffix(MaintenanceStep::Nothing, AutoVacuum::None),
+            ""
+        );
+    }
 
     #[test]
     fn sprites_report_lines_cover_bridge_ledger_memory_and_hold() {
