@@ -169,6 +169,15 @@ The existing tuning variables are `THEGN_PERF_INTERVAL_MS` and
 `THEGN_INPUT_BUDGET_US` adjust the related guards. A `THEGN_LOG` filter that
 selects `thegn::perf` also enables the accounting.
 
+To watch background measurement and database maintenance, launch with
+`THEGN_LOG=info,thegn::measure=debug,thegn::db=debug`. A `planned round` line
+from `thegn::measure` names the scan (`scan="loc"` or `scan="disk"`), how many
+rows it examined and how many it will walk; with defaults expect at most 2
+non-empty `loc` rounds per 15 minutes, and none while nothing changed. Between
+sweeps the `thegn-loc-*` threads should show 0 CPU in `top -H`. A `state
+retention pass` line from `thegn::db` reports what each bounded retention rule
+removed and how long the pass took; a pass that removes nothing is normal.
+
 `input_no_effect_events` counts input keys whose cohort stayed pending while
 the loop went idle and was closed by a frame 250 ms or more after the key,
 including effects that arrive late from background work. Those keys are

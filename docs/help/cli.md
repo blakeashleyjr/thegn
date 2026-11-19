@@ -33,6 +33,11 @@ worktree):
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 (repeatable), and `--profile <name>`.
 
+`thegn db vacuum` is now an escape hatch: the database maintains itself (see
+[[configuration]]). It takes the same maintenance lock as the UI, waiting at
+most 30 seconds, and refuses with `LowDisk` when the disk lacks room for the
+rewrite.
+
 Before reclaiming pages, `thegn db vacuum` removes semantic-index rows for
 deleted files and cache keys left by removed worktrees, and reports both
 counts. `--json` emits one report (including `pruned_semantic_rows` and
