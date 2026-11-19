@@ -197,6 +197,14 @@ pub trait PaneEmulator: Send {
     fn scrollback(&self) -> usize {
         0
     }
+    /// The last `max_lines` LOGICAL lines of the primary-screen grid, oldest first:
+    /// scrollback above the screen, plus the live screen rows when `include_screen`.
+    /// Soft-wrapped rows (alacritty WRAPLINE on the last cell) are joined, wide-char
+    /// spacers skipped, trailing spaces trimmed, trailing blank lines dropped.
+    /// None when the emulator has no scrollback or the alt screen is active. One lock.
+    fn scrollback_text(&self, _max_lines: usize, _include_screen: bool) -> Option<Vec<String>> {
+        None
+    }
     /// Borrow a visible row as a single plain string when it carries no
     /// styling, else `None`. The compositor composes cell-by-cell (so this is
     /// no longer on its hot path), but it stays as a cheap accessor that tests
@@ -383,6 +391,21 @@ fn conv_color(c: alacritty_terminal::vte::ansi::Color) -> CellColor {
     }
 }
 
+fn collect_scrollback_line(
+    newest: &mut Vec<String>,
+    skipping_trailing_blanks: &mut bool,
+    line: String,
+    max_lines: usize,
+) -> bool {
+    let line = line.trim_end_matches(' ').to_string();
+    if *skipping_trailing_blanks && line.trim().is_empty() {
+        return false;
+    }
+    *skipping_trailing_blanks = false;
+    newest.push(line);
+    newest.len() >= max_lines
+}
+
 /// The off-thread feed handle for [`AlacrittyEmulator`]: a clone of the
 /// `FairMutex<Term>` plus its own `Processor`. This is alacritty's shipped
 /// architecture — its reader thread parses into the shared Term while the
@@ -563,6 +586,84 @@ impl PaneEmulator for AlacrittyEmulator {
 
     fn scrollback(&self) -> usize {
         self.term.lock().grid().display_offset()
+    }
+
+    fn scrollback_text(&self, max_lines: usize, include_screen: bool) -> Option<Vec<String>> {
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+
+        let grid = term.grid();
+        let history = grid.history_size();
+        if history == 0 {
+            return None;
+        }
+        if max_lines == 0 {
+            return Some(Vec::new());
+        }
+
+        let cols = grid.columns();
+        if cols == 0 {
+            return Some(Vec::new());
+        }
+        let screen = grid.screen_lines() as i32;
+        let first = -(history as i32);
+        let last = if include_screen { screen } else { 0 };
+        let mut newest = Vec::new();
+        let mut current = None;
+        let mut skipping_trailing_blanks = true;
+
+        for line_no in (first..last).rev() {
+            let line = Line(line_no);
+            let mut segment = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &grid[Point::new(line, Column(col))];
+                if !cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    segment.push(cell.c);
+                }
+            }
+            let wraps = grid[line][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+
+            match current.take() {
+                Some(logical) if wraps => {
+                    segment.push_str(&logical);
+                    current = Some(segment);
+                }
+                Some(logical) => {
+                    if collect_scrollback_line(
+                        &mut newest,
+                        &mut skipping_trailing_blanks,
+                        logical,
+                        max_lines,
+                    ) {
+                        break;
+                    }
+                    current = Some(segment);
+                }
+                None => current = Some(segment),
+            }
+        }
+
+        if newest.len() < max_lines {
+            if let Some(logical) = current {
+                collect_scrollback_line(
+                    &mut newest,
+                    &mut skipping_trailing_blanks,
+                    logical,
+                    max_lines,
+                );
+            }
+        }
+
+        newest.reverse();
+        Some(newest)
     }
 
     fn row_text(&self, row: u16) -> Option<String> {
@@ -805,6 +906,67 @@ mod tests {
 
         e.scroll_reset();
         assert_eq!(e.scrollback(), 0);
+    }
+
+    #[test]
+    fn scrollback_text_returns_history_and_live_screen() {
+        let mut e = AlacrittyEmulator::new(10, 80, 100);
+        for i in 1..=30 {
+            let ending = if i == 30 { "" } else { "\r\n" };
+            e.advance(format!("line{i}{ending}").as_bytes());
+        }
+
+        let history = e.scrollback_text(100, false).expect("grid history");
+        assert_eq!(
+            history,
+            (1..=20).map(|i| format!("line{i}")).collect::<Vec<_>>()
+        );
+
+        let all = e.scrollback_text(100, true).expect("grid history");
+        assert_eq!(
+            all,
+            (1..=30).map(|i| format!("line{i}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scrollback_text_does_not_duplicate_redraws() {
+        let mut e = AlacrittyEmulator::new(10, 80, 100);
+        for i in 1..=11 {
+            e.advance(format!("history{i}\r\n").as_bytes());
+        }
+        e.advance(b"\x1b[Hspinner\r\nstatus");
+        for _ in 0..50 {
+            e.advance(b"\x1b[2A\x1b[Jspinner\r\nstatus");
+        }
+
+        let lines = e.scrollback_text(100, true).expect("grid history");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "spinner")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scrollback_text_joins_soft_wrapped_rows() {
+        let mut e = AlacrittyEmulator::new(3, 80, 100);
+        let text = "x".repeat(300);
+        e.advance(text.as_bytes());
+
+        let lines = e.scrollback_text(100, true).expect("grid history");
+        assert_eq!(lines, vec![text]);
+    }
+
+    #[test]
+    fn scrollback_text_is_unavailable_on_the_alt_screen() {
+        let mut e = AlacrittyEmulator::new(10, 80, 100);
+        e.advance(b"history\r\n");
+        e.advance(b"\x1b[?1049h");
+
+        assert_eq!(e.scrollback_text(100, true), None);
     }
 
     #[test]
