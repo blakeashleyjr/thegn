@@ -26,8 +26,15 @@ pub fn canonical_common_dir(root: &Path) -> Result<ExactPath, IdentityError> {
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         MAX_GIT_IDENTITY_OUTPUT,
     )
-    .map_err(|_| IdentityError::GitProbeFailed {
-        operation: "rev-parse --git-common-dir",
+    .map_err(|error| {
+        tracing::debug!(
+            target: "thegn::repo",
+            %error,
+            "git identity probe failed"
+        );
+        IdentityError::GitProbeFailed {
+            operation: "rev-parse --git-common-dir",
+        }
     })?;
     let raw = trim_git_line(&output).ok_or(IdentityError::GitProbeFailed {
         operation: "empty git common directory",
