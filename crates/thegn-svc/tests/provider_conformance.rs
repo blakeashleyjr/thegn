@@ -135,6 +135,18 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>, ledger_file: &std::path::
                 format!(r#"{{"sprites":[{}],"has_more":false}}"#, rows.join(",")).into_bytes(),
             )
         }
+        ("GET", p) if p.starts_with("/v1/sprites/") => {
+            let name = p.trim_start_matches("/v1/sprites/");
+            let st = state.lock().unwrap();
+            if st.sprites.contains(name) {
+                (
+                    "200 OK",
+                    format!(r#"{{"id":"id-{name}","name":"{name}","status":"warm"}}"#).into_bytes(),
+                )
+            } else {
+                ("404 Not Found", b"missing".to_vec())
+            }
+        }
         ("DELETE", p) if p.starts_with("/v1/sprites/") => {
             let name = p.trim_start_matches("/v1/sprites/").to_string();
             let mut st = state.lock().unwrap();

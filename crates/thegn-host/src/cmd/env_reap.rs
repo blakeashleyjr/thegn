@@ -1260,11 +1260,13 @@ mod sprites {
                 ]
             );
             assert_eq!(report.accounts[0].entries[1].age, "5h0m");
-            // Lifetime 0 = no ceiling.
-            let fake0 = self::fake(Listing::Complete(vec![row(
-                "sx-old",
-                Some(NOW_MS - 5 * HOUR_MS),
-            )]));
+            // Lifetime 0 = no ceiling. The listing names every recorded sprite
+            // (the ledger still holds all three), so none is an orphan either.
+            let fake0 = self::fake(Listing::Complete(vec![
+                row("sx-old", Some(NOW_MS - 5 * HOUR_MS)),
+                row("sx-new", Some(NOW_MS - 60_000)),
+                row("sx-notime", None),
+            ]));
             let report = reap(&envs(&fake0, 0), DRY, &mut no_tty, NOW_MS).unwrap();
             assert!(report.accounts[0].entries.is_empty());
         }
