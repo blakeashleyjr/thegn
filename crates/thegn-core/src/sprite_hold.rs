@@ -330,9 +330,7 @@ mod tests {
         let path = if fixture.curl {
             // A logging `sleep` so tests can see the heartbeat's nap pids.
             let host = std::env::var("PATH").unwrap_or_default();
-            let Some(real_sleep) = host_sleep(&host) else {
-                return None;
-            };
+            let real_sleep = host_sleep(&host)?;
             let sleep = bin.join("sleep");
             std::fs::write(
                 &sleep,
@@ -386,14 +384,16 @@ mod tests {
         // output open, fails here with a message instead of hanging the run.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
+            tx.send(child.wait_with_output()).unwrap_or_default(); // best-effort: the receiver may have timed out
         });
         let out = match rx.recv_timeout(RUN_LIMIT) {
             Ok(out) => out.expect("wait for the wrapper"),
             Err(_) => {
-                let _ = Command::new("/bin/sh")
+                // best-effort: the wrapper may already be gone; the panic below reports the hang
+                Command::new("/bin/sh")
                     .args(["-c", "kill -KILL \"$1\" 2>/dev/null", "sh", &pid])
-                    .status();
+                    .status()
+                    .unwrap_or_default();
                 panic!(
                     "hold wrapper for {argv:?} did not exit (or kept its output open) \
                      within {RUN_LIMIT:?}: the heartbeat wrapper hung"
