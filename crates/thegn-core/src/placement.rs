@@ -381,7 +381,7 @@ pub struct ProviderPlacement {
 impl ProviderPlacement {
     /// Whether this placement can actually reach its sandbox: BOTH the
     /// interactive and control prefixes are non-empty. An empty prefix would
-    /// make [`Self::wrap`] produce a bare `/bin/sh -lc …` — a HOST shell.
+    /// make `Self::wrap` produce a bare `/bin/sh -lc …` — a HOST shell.
     pub fn has_transport(&self) -> bool {
         !self.interactive_prefix.is_empty() && !self.control_prefix.is_empty()
     }

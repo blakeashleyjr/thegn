@@ -6,7 +6,7 @@
 //! (`systemd-run --user`, `podman run`). bwrap and local podman/docker mask
 //! these entries after every bind; the systemd backend makes them
 //! inaccessible. The planner is pure (the filesystem probe is injected);
-//! [`host_runtime_escape_masks`] is the one wrapper that reads the host, and
+//! `host_runtime_escape_masks` is the one wrapper that reads the host, and
 //! `config validate` passes the runtime dir and home from its call site.
 
 use std::path::{Path, PathBuf};

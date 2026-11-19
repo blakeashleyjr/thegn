@@ -288,7 +288,7 @@ fn segments_with_gap(
 
 impl TimeseriesRenderer {
     /// `width` is the panel width in columns; it bounds how many samples are
-    /// walked (see [`plot_points`]).
+    /// walked (see `plot_points`).
     pub fn render<'a>(
         frame: &'a Frame,
         title: &str,

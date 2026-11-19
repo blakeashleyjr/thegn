@@ -245,7 +245,7 @@ fn push_spaces(out: &mut String, n: usize) {
     out.extend(std::iter::repeat_n(' ', n));
 }
 
-/// Allocation-free twin of [`fit`].
+/// Allocation-free twin of `fit` (test-only).
 fn push_fit(out: &mut String, candidate: &str, width: usize) {
     let used = cells(candidate);
     if used > width {
@@ -256,7 +256,7 @@ fn push_fit(out: &mut String, candidate: &str, width: usize) {
     out.push_str(candidate);
 }
 
-/// Allocation-free twin of [`fit_mark`].
+/// Allocation-free twin of `fit_mark` (test-only).
 fn push_fit_mark(out: &mut String, mark: &str, width: usize) {
     let mut end = 0;
     for (index, c) in mark.char_indices() {
