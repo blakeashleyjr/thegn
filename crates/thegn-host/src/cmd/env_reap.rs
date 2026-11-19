@@ -989,20 +989,9 @@ mod sprites {
         let Some(scope) = scope else {
             return Err("no ownership scope".into());
         };
-        match registry::read_checked(name) {
-            Ok(Some(record))
-                if record.provider == LEDGER_PROVIDER
-                    && record.owner == scope.owner
-                    && record.account == scope.account
-                    && (record.state == "creating") == (class == Class::StaleCreating) =>
-            {
-                ledger::forget(name);
-                Ok(())
-            }
-            Ok(Some(_)) => Err("the record changed; left alone".into()),
-            Ok(None) => Ok(()),
-            Err(error) => Err(format!("ledger unreadable ({error:#}); left alone")),
-        }
+        // Re-read, re-check and remove as one step under the ledger lock.
+        ledger::forget_reaped(scope, name, class == Class::StaleCreating)
+            .map_err(|error| format!("{error:#}"))
     }
 
     /// A terminal-safe table cell: control characters (API text is
