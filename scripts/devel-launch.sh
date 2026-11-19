@@ -102,7 +102,7 @@ dev_ports() {
   function shifted_port(line,    port) {
     if (match(line, /:[0-9]+"/)) {
       port = substr(line, RSTART + 1, RLENGTH - 2)
-      return substr(line, 1, RSTART) ":" (port + 1) "\"" substr(line, RSTART + RLENGTH)
+      return substr(line, 1, RSTART) (port + 1) "\"" substr(line, RSTART + RLENGTH)
     }
     return line
   }
