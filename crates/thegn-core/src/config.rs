@@ -2,7 +2,8 @@
 //!
 //! Precedence, lowest to highest:
 //!   1. built-in defaults (`Config::default`)
-//!   2. `$XDG_CONFIG_HOME/thegn/config.toml` (or `--config <path>`)
+//!   2. `$XDG_CONFIG_HOME/thegn/config.toml` (the directory moves with an
+//!      absolute `THEGN_CONFIG_DIR`; the file with `--config <path>`)
 //!   3. `THEGN_<SECTION>_<KEY>` environment overrides (see [`env_overlay`])
 //!   4. CLI flags (a [`ConfigOverlay`] built by `main`)
 //!
@@ -6483,7 +6484,7 @@ fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
 impl Config {
     /// The default config path (overridable with `--config`).
     pub fn path() -> PathBuf {
-        util::xdg_config_home().join("thegn/config.toml")
+        util::thegn_config_dir().join("config.toml")
     }
 
     /// Check the trusted files used by the tolerant display projection without
@@ -6616,13 +6617,13 @@ impl Config {
 
     /// The active named profile's config-overlay file
     /// (`<real XDG_CONFIG_HOME>/thegn/profiles/<name>/config.toml`), or `None`
-    /// for the default profile. Uses `xdg_config_home()` directly (the shared
-    /// config home is never rerooted).
+    /// for the default profile. Uses `thegn_config_dir()` (the shared config
+    /// home is never rerooted; `THEGN_CONFIG_DIR` moves the whole directory,
+    /// profiles included, for a second instance).
     pub(crate) fn profile_overlay_path(env: &dyn EnvSource) -> Option<PathBuf> {
         let name = crate::profile::normalize_name(&env.get("THEGN_PROFILE").unwrap_or_default());
         (name != "default").then(|| {
-            util::xdg_config_home()
-                .join("thegn")
+            util::thegn_config_dir()
                 .join("profiles")
                 .join(name)
                 .join("config.toml")

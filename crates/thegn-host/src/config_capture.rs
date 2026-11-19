@@ -563,6 +563,9 @@ impl ConfigCaptureSeed {
                 .unwrap_or_else(|| home.join(".thegn")),
         )?;
 
+        // Read before the error check below so a bounds failure surfaces.
+        let config_dir_override = env.raw(thegn_core::util::THEGN_CONFIG_DIR_ENV);
+
         // Populate the exact mapper-requested set once.  The admission call
         // later receives FrozenEnv and can therefore never consult ambient
         // process state a second time.
@@ -612,11 +615,18 @@ impl ConfigCaptureSeed {
             return Err(CaptureInputError::ProfileBindingMismatch);
         }
         let profile_name = resolved_profile.name.clone();
+        // thegn's own config dir: an absolute `THEGN_CONFIG_DIR` wins, a
+        // relative or empty one is ignored (the rule of
+        // `thegn_core::util::thegn_config_dir`).
+        let thegn_config_dir = config_dir_override
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .unwrap_or_else(|| config_home.join("thegn"));
         let base_path = settle(
             &cwd,
             &cli.config
                 .map(Path::to_owned)
-                .unwrap_or_else(|| config_home.join("thegn/config.toml")),
+                .unwrap_or_else(|| thegn_config_dir.join("config.toml")),
         )?;
         let base = CapturedSource {
             identity: opaque_identity("base", &base_path, cli.config.is_some(), &profile_name),
@@ -624,8 +634,8 @@ impl ConfigCaptureSeed {
             explicit: cli.config.is_some(),
         };
         let profile = if profile_name != "default" {
-            let path = config_home
-                .join("thegn/profiles")
+            let path = thegn_config_dir
+                .join("profiles")
                 .join(&profile_name)
                 .join("config.toml");
             checked_path(&path)?;

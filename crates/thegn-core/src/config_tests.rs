@@ -3013,6 +3013,24 @@ fn profile_overlay_path_none_for_default_some_for_named() {
 }
 
 #[test]
+fn config_and_profile_overlay_paths_honour_thegn_config_dir() {
+    struct FakeEnv;
+    impl EnvSource for FakeEnv {
+        fn get(&self, k: &str) -> Option<String> {
+            (k == "THEGN_PROFILE").then(|| "work".to_string())
+        }
+    }
+    let dir = std::env::temp_dir().join("thegn-config-dir-test");
+    let dir_str = dir.to_str().expect("temp dir is UTF-8").to_string();
+    let _env = crate::testenv::EnvGuard::set(&[(util::THEGN_CONFIG_DIR_ENV, dir_str.as_str())]);
+    assert_eq!(Config::path(), dir.join("config.toml"));
+    assert_eq!(
+        Config::profile_overlay_path(&FakeEnv),
+        Some(dir.join("profiles").join("work").join("config.toml"))
+    );
+}
+
+#[test]
 fn surface_self_log_errors_defaults_off_and_overlay_applies() {
     // Default: thegn's own log errors are not surfaced as user notifications.
     let mut base = NotificationsConfig::default();

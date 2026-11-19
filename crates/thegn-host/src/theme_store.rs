@@ -79,7 +79,7 @@ pub(crate) struct ThemeStore {
 
 impl ThemeStore {
     pub(crate) fn spawn(waker: TerminalWaker, config_path: PathBuf, active_preset: &str) -> Self {
-        let themes_dir = thegn_core::util::xdg_config_home().join("thegn/themes");
+        let themes_dir = thegn_core::util::thegn_config_dir().join("themes");
         Self::start(
             Some(waker),
             themes_dir,
