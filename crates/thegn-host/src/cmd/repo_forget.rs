@@ -102,6 +102,16 @@ pub fn run(cfg: &Config, args: ForgetArgs) -> Result<()> {
         }
         let source = std::fs::canonicalize(source)
             .with_context(|| format!("canonicalize source database {}", source.display()))?;
+        let mut shm = source.clone().into_os_string();
+        shm.push("-shm");
+        let mut wal = source.clone().into_os_string();
+        wal.push("-wal");
+        if std::path::Path::new(&shm).exists() || std::path::Path::new(&wal).exists() {
+            bail!(
+                "the instance that owns {} looks running (its -wal/-shm files exist); stop that instance (thegn daemon stop and quit its UI, with that instance's environment) and retry. Nothing was changed.",
+                source.display()
+            );
+        }
         let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
         if source == canonical_dest {
             bail!(
@@ -174,7 +184,7 @@ pub fn run(cfg: &Config, args: ForgetArgs) -> Result<()> {
     if args.json {
         return super::emit_json(&report);
     }
-    print_report(&report);
+    print_report(&report, args.apply && copied_from.is_some());
     Ok(())
 }
 
@@ -457,9 +467,21 @@ fn counts_line(counts: &WorkspaceForgetCounts) -> String {
     }
 }
 
-fn print_report(report: &ForgetReport) {
+fn print_report(report: &ForgetReport, copied: bool) {
+    let print_copied = || {
+        if copied && let Some(source) = &report.copied_from {
+            outln!(
+                "copied from: {source} (untouched; delete {} to undo)",
+                thegn_core::util::xdg_state_home()
+                    .join("thegn/thegn.db")
+                    .display()
+            );
+        }
+    };
     if !report.applied {
-        if let Some(source) = &report.copied_from {
+        if copied {
+            print_copied();
+        } else if let Some(source) = &report.copied_from {
             outln!(
                 "dry run: would copy {source} to {}, then:",
                 thegn_core::util::xdg_state_home()
@@ -474,14 +496,7 @@ fn print_report(report: &ForgetReport) {
             outln!("backup: {backup}");
         }
         outln!("forgot {} workspace(s)", report.forgotten.len());
-        if let Some(source) = &report.copied_from {
-            outln!(
-                "copied from: {source} (untouched; delete {} to undo)",
-                thegn_core::util::xdg_state_home()
-                    .join("thegn/thegn.db")
-                    .display()
-            );
-        }
+        print_copied();
     }
     if report.forgotten.is_empty() {
         outln!("nothing to forget");
