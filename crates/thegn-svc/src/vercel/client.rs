@@ -1254,9 +1254,12 @@ mod tests {
                 return;
             };
             let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request).await;
-            let _ = stream.write_all(&response).await;
-            let _ = stream.flush().await;
+            if stream.read(&mut request).await.is_err() {
+                return;
+            }
+            if stream.write_all(&response).await.is_err() || stream.flush().await.is_err() {
+                return;
+            }
             tokio::time::sleep(hold).await;
         });
         format!("http://{addr}")
