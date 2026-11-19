@@ -644,9 +644,11 @@ mod tests {
         let mut ov = overlay(1);
         typed(&mut ov, "NEEDLE", &srcs);
         let out = draw(&ov, 120, 30);
+        // The query row also reads NEEDLE: the hit row is the one after it.
         let row = out
             .lines()
-            .find(|l| l.contains("NEEDLE"))
+            .filter(|l| l.contains("NEEDLE"))
+            .nth(1)
             .expect("hit row drawn");
         let at = row.find("NEEDLE").expect("hit");
         assert!(
