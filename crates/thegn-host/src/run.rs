@@ -1867,7 +1867,7 @@ pub(crate) fn visible_index_of_active(model: &FrameModel) -> usize {
         .sidebar_rows
         .iter()
         .filter(|r| r.visible)
-        .position(|r| r.active)
+        .position(|r| r.active && r.kind != crate::sidebar::RowKind::BatchGroup)
         .unwrap_or(0)
 }
 
