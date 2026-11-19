@@ -6,7 +6,9 @@
 # justfile, workflows or nix checks globs `test/*live*.sh`; it runs only through
 # `just sprites-live`. It reads the owner's REAL config read-only
 # (XDG_CONFIG_HOME as given; the sprites token is never read or printed) with a
-# fresh XDG_STATE_HOME, XDG_RUNTIME_DIR and THEGN_DIR and a scratch repo.
+# fresh XDG_STATE_HOME and THEGN_DIR and a scratch repo. The login runtime dir
+# is kept so sandbox masks and the control guard cover every instance's control
+# directory.
 #
 # The daily headless/land/reap run lives in test/remote-daily.sh (just remote-daily).
 #
@@ -70,7 +72,7 @@ sprites-live plan (nothing is created without both --env <name> and
 --i-accept-spend, plus THEGN_CHANNEL=dev)
 
 Will create : ONE sprite via the named [env.<name>] from your real config
-              (read-only), in a fresh state/runtime/THEGN_DIR and a scratch git
+              (read-only), in a fresh XDG_STATE_HOME and THEGN_DIR (login runtime dir kept) and a scratch git
               repo on branch sx/live-lane. No config is written.
 Max spend   : one sprite for the length of this run (about 15 minutes, incl. a
               420 s hold and 120 s idle); teardown destroys it.
@@ -213,8 +215,6 @@ TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
 unset THEGN_CONFIG_DIR
 mkdir -p "$XDG_STATE_HOME" "$THEGN_DIR" "$TMP/repo"
-mkdir -m 700 "$TMP/run"
-export XDG_RUNTIME_DIR="$TMP/run"
 REPO="$TMP/repo"
 SPRITE_NAME="(unknown)"
 CREATED=0
