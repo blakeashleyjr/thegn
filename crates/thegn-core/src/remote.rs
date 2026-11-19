@@ -421,22 +421,38 @@ impl GitLoc {
                 ));
             }
         }
+        match crate::db::Db::open() {
+            Ok(db) => Self::for_worktree_op_in(&db, path, op),
+            Err(error) => Err(Self::op_refusal(
+                path,
+                op,
+                &format!("open worktree location DB: {error}"),
+            )),
+        }
+    }
+
+    /// [`GitLoc::for_worktree_op`] over a caller's open handle (no extra open).
+    ///
+    /// The read and its refusals are identical (both go through
+    /// `from_checked_lookup`); only the state-DB existence check and the open
+    /// are the caller's, since it already holds the handle.
+    pub fn for_worktree_op_in(db: &crate::db::Db, path: &Path, op: &str) -> Result<GitLoc, String> {
         let path_text = path.to_string_lossy();
-        let db =
-            crate::db::Db::open().map_err(|error| format!("open worktree location DB: {error}"));
-        let location = db.and_then(|db| {
-            db.location_for(path_text.as_ref())
-                .map_err(|error| format!("read worktree location: {error}"))
-        });
+        let location = db
+            .location_for(path_text.as_ref())
+            .map_err(|error| format!("read worktree location: {error}"));
         if path.to_str().is_none() && matches!(&location, Ok(None)) {
             return Ok(GitLoc::Local(path.to_path_buf()));
         }
-        Self::from_checked_lookup(path_text.as_ref(), location).map_err(|error| {
-            format!(
-                "{op} refused: cannot read where {} lives ({error}); nothing was run against the local checkout",
-                path.display()
-            )
-        })
+        Self::from_checked_lookup(path_text.as_ref(), location)
+            .map_err(|error| Self::op_refusal(path, op, &error))
+    }
+
+    fn op_refusal(path: &Path, op: &str, error: &str) -> String {
+        format!(
+            "{op} refused: cannot read where {} lives ({error}); nothing was run against the local checkout",
+            path.display()
+        )
     }
 }
 
@@ -2249,6 +2265,60 @@ mod tests {
         db.put_worktree("tab", "/repo", "/wt/x", "feat", Some(&location), None)
             .unwrap();
         drop(db);
+        assert!(matches!(
+            GitLoc::for_worktree_op(Path::new("/wt/x"), "commit"),
+            Ok(GitLoc::Provider { path, .. }) if path == "/workspace"
+        ));
+    }
+
+    #[test]
+    fn for_worktree_op_in_refuses_a_read_failure_on_the_callers_handle() {
+        // The handle-level mirror of the "cannot be opened" case: the caller's
+        // open handle whose read fails refuses exactly like `for_worktree_op`.
+        let _state = crate::testenv::IsolatedState::new();
+        let db = crate::db::Db::open().unwrap();
+        db.conn().execute_batch("DROP TABLE worktrees").unwrap();
+        let result = GitLoc::for_worktree_op_in(&db, Path::new("/wt/x"), "commit");
+        assert!(matches!(result, Err(message)
+            if message.contains("commit refused")
+                && message.contains("/wt/x")
+                && message.contains("read worktree location")));
+    }
+
+    #[test]
+    fn for_worktree_op_in_refuses_an_unrecognised_recorded_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = crate::db::Db::open().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/x", "feat", Some("garbage"), None)
+            .unwrap();
+        let result = GitLoc::for_worktree_op_in(&db, Path::new("/wt/x"), "commit");
+        assert!(matches!(result, Err(message)
+            if message.contains("commit refused")
+                && message.contains("unrecognised worktree location")));
+    }
+
+    #[test]
+    fn for_worktree_op_in_treats_an_unrecorded_worktree_as_local() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = crate::db::Db::open().unwrap();
+        assert!(matches!(
+            GitLoc::for_worktree_op_in(&db, Path::new("/wt/x"), "commit"),
+            Ok(GitLoc::Local(path)) if path == Path::new("/wt/x")
+        ));
+    }
+
+    #[test]
+    fn for_worktree_op_in_resolves_a_recorded_provider_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = crate::db::Db::open().unwrap();
+        let location = GitLoc::provider_db_string(&["sprite".into(), "exec".into()], "/workspace");
+        db.put_worktree("tab", "/repo", "/wt/x", "feat", Some(&location), None)
+            .unwrap();
+        assert!(matches!(
+            GitLoc::for_worktree_op_in(&db, Path::new("/wt/x"), "commit"),
+            Ok(GitLoc::Provider { path, .. }) if path == "/workspace"
+        ));
+        // Same answer as the opening variant.
         assert!(matches!(
             GitLoc::for_worktree_op(Path::new("/wt/x"), "commit"),
             Ok(GitLoc::Provider { path, .. }) if path == "/workspace"
