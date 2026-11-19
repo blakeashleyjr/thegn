@@ -36,7 +36,7 @@ pub struct ProfilePaths {
 
 /// The bounded, normalized process-profile selector used before profile
 /// resolution or reroot side effects.  This is deliberately separate from
-/// [`Config::profile`](crate::config::Config::profile), which selects a
+/// `Config::profile`, which selects a
 /// keybinding profile rather than the process storage root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSelector {

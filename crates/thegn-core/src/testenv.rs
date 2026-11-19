@@ -71,7 +71,7 @@ pub fn is_real_state_path(
         || ambient.iter().any(|root| path.starts_with(root))
 }
 
-/// RAII guard that serializes on [`ENV_LOCK`], mutates one or more process env
+/// RAII guard that serializes on `ENV_LOCK`, mutates one or more process env
 /// vars, and restores their previous values (or unsets them) when dropped.
 ///
 /// ```ignore
@@ -98,7 +98,7 @@ impl EnvGuard {
     }
 
     /// Mixed set/unset in one guard (`Some` sets, `None` unsets). Use this
-    /// instead of stacking two guards — [`ENV_LOCK`] is not reentrant.
+    /// instead of stacking two guards — `ENV_LOCK` is not reentrant.
     pub fn mutate_pairs(vars: &[(&str, Option<&str>)]) -> Self {
         Self::mutate(vars.iter().map(|(k, v)| ((*k).to_string(), *v)))
     }
