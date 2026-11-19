@@ -12,12 +12,12 @@
 #
 # Usage:
 #   test/sprites-live.sh                       # print plan, no network
-#   THEGN_CHANNEL=dev test/sprites-live.sh --env <name> --i-accept-spend
+#   THEGN_CHANNEL=dev test/sprites-live.sh --env <name> --i-accept-spend [--keep-going]
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
 
-env_name="" accept=0 min_ram=""
+env_name="" accept=0 keep_going=0 min_ram=""
 while [ $# -gt 0 ]; do
   case "$1" in
   --env)
@@ -36,6 +36,10 @@ while [ $# -gt 0 ]; do
     ;;
   --i-accept-spend)
     accept=1
+    shift
+    ;;
+  --keep-going)
+    keep_going=1
     shift
     ;;
   -h | --help)
@@ -60,9 +64,11 @@ Will create : ONE sprite via the named [env.<name>] from your real config
 Max spend   : one sprite for the length of this run (about 15 minutes, incl. a
               420 s hold and 120 s idle); teardown destroys it.
 Teardown    : trap on EXIT/INT/TERM -> kill a still-running hold, env down
-              --force, env deprovision <name> for each record in THIS run's
-              ledger, env reap --provider sprites --apply --yes; fails (and keeps
-              the ledger) if any of this run's records or sprites remain.
+              --force only when step 11 did not pass, env deprovision <name> for
+              each record in THIS run's ledger, env reap --provider sprites
+              --apply --yes; fails (and keeps the ledger) if any of this run's
+              records or sprites remain. A sprite is absent only when no
+              view.rows entry has its id; partial or unparsable JSON is unknown.
 The preflight prints which credentials enter the sandbox.
 Steps:
   0   preflight: doctor --json remote_live for <name>; FAIL if the token does
@@ -75,21 +81,29 @@ Steps:
   5   (only with --min-ram-gb N) doctor --json under --set min_ram_gb=N shows N*1024
   5b  (only with --min-ram-gb N) /sys/fs/cgroup/memory.max in the sprite is
       N GiB in bytes (raw value printed; SKIP if the file is absent)
-  6   interactive exec under script(1): tty && echo ok
+  6   interactive exec under script(1): /dev/pts/<n> and ok
+  6c  interactive output keeps its line breaks: /dev/pts/<n> and ok are on
+      different lines (this is expected to fail until the live output is fixed)
   6b  curl exists in the sprite (keep-awake precondition)
   7a  headless hold: sprite-exec --hold 10m -- sleep 420 in the background (no
       per-run overlay can add a hold-test agent, so no agent run --wait);
       /v1/tasks shows thegn-hold- during, none after
   7e  the hold's stderr has no "keep-awake unavailable"
-  8   env pull                         8b  refs/thegn/pull is non-empty
+  8   env pull after an empty commit inside the sprite; output is fast-forwarded
+  8b  local HEAD equals the commit made inside the sprite
+  8c  refs/thegn/pull is empty after the clean fast-forward
   9   after 120 s idle, fleet list --env shows warm or cold
   9b  /v1/tasks is empty
-  10  fleet cost --json: sprites_usage with CPU seconds > 0
+  10  fleet cost --json: print sprites_usage; error fails, cpu_hours > 0 passes,
+      or partial zero usage warns and passes
   10b fleet list --env still shows warm or cold (the usage call did not wake it)
   11  env down                         11b this run's ledger record is gone
   12  env reap --provider sprites --json (dry-run): 0 recorded orphans, others
       listed as unrecorded
 Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
+With --keep-going, failed steps print FAIL <id>, the run continues, and the
+end prints FAILED STEPS: <ids> before exiting non-zero. ALL STEPS PASS prints
+only when no step failed.
 PLAN
 }
 
@@ -183,6 +197,10 @@ SPRITE_NAME="(unknown)"
 CREATED=0
 HOLD_PID=""
 HOLD_ERR="$TMP/hold.err"
+STEP_11_PASSED=0
+FAILED_STEPS=()
+INTERACTIVE_OUT=""
+PULL_SHA=""
 
 print_plan
 echo
@@ -197,6 +215,26 @@ run_records() { # run_records <provider>: names of this run's ledger records
     if grep -Eq "\"provider\": *\"$1\"" "$f"; then basename "$f" .json; fi
   done
   return 0
+}
+
+listing_lacks_name() { # listing_lacks_name <name>: partial/failed listing is unknown
+  local name="$1" out
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>/dev/null)" || return 1
+  printf '%s' "$out" | LISTED_NAME="$name" python3 -I -c '
+import json, os, sys
+try:
+    listing = json.load(sys.stdin)
+    view = listing["view"]
+    rows = view["rows"]
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)
+if view.get("partial"):
+    sys.exit(1)
+if not isinstance(rows, list):
+    sys.exit(1)
+name = os.environ["LISTED_NAME"]
+sys.exit(1 if any(isinstance(row, dict) and row.get("id") == name for row in rows) else 0)
+'
 }
 
 teardown() {
@@ -214,10 +252,12 @@ teardown() {
     fi
   fi
   if [ "$CREATED" = 1 ]; then
-    local names n out
+    local names n
     names="$(run_records sprites)"
-    echo "-- teardown: env down"
-    (cd "$REPO" && "$THEGN_BIN" env down --force)
+    if [ "$STEP_11_PASSED" = 0 ]; then
+      echo "-- teardown: env down"
+      (cd "$REPO" && "$THEGN_BIN" env down --force)
+    fi
     for n in $names; do
       case "$n" in *[!a-z0-9-]*) continue ;; esac
       echo "-- teardown: env deprovision $n"
@@ -225,9 +265,8 @@ teardown() {
     done
     echo "-- teardown: env reap"
     "$THEGN_BIN" env reap --provider sprites --apply --yes
-    out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)"
     for n in $names; do
-      if [ -f "$(ledger_dir)/$n.json" ] || printf '%s' "$out" | grep -Fq "\"$n\""; then
+      if [ -f "$(ledger_dir)/$n.json" ] || ! listing_lacks_name "$n"; then
         left=1
         rc=1
         echo "TEARDOWN INCOMPLETE: sprite $n may still exist; the ledger is kept in $TMP" >&2
@@ -250,10 +289,17 @@ step() { # step <id> <description> <command...>
   echo "== step $id: $desc"
   if "$@"; then
     echo "PASS $id"
+    if [ "$id" = 11 ]; then
+      STEP_11_PASSED=1
+    fi
   else
     echo "FAIL $id: $desc" >&2
-    exit 1
+    FAILED_STEPS+=("$id")
+    if [ "$keep_going" != 1 ]; then
+      exit 1
+    fi
   fi
+  return 0
 }
 
 in_repo() { (cd "$REPO" && "$@"); }
@@ -312,12 +358,21 @@ min_ram_shown() { # doctor reflects min_ram_gb=N as N*1024 MiB
 }
 
 interactive_tty() { # values reach script(1) via the environment, never the command text
-  local out
   # shellcheck disable=SC2016 # fixed text; script(1)'s shell expands the env values
-  out="$(LIVE_BIN="$THEGN_BIN" LIVE_SPRITE="$SPRITE_NAME" SHELL=/bin/sh \
+  INTERACTIVE_OUT="$(LIVE_BIN="$THEGN_BIN" LIVE_SPRITE="$SPRITE_NAME" SHELL=/bin/sh \
     script -qec 'exec "$LIVE_BIN" sprite-exec "$LIVE_SPRITE" -- sh -c "tty && echo ok"' /dev/null </dev/null)" || return 1
-  printf '%s\n' "$out"
-  printf '%s' "$out" | grep -Eq '(^|[[:space:]])ok([[:space:]]|$)'
+  printf '%s\n' "$INTERACTIVE_OUT"
+  grep -Eq '/dev/pts/[0-9]+' <<<"$INTERACTIVE_OUT" && grep -q 'ok' <<<"$INTERACTIVE_OUT"
+}
+
+interactive_line_breaks() {
+  INTERACTIVE_OUT="$INTERACTIVE_OUT" python3 -I -c '
+import os, re, sys
+lines = os.environ["INTERACTIVE_OUT"].replace("\r", "").splitlines()
+tty = next((i for i, line in enumerate(lines) if re.search(r"/dev/pts/[0-9]+", line)), None)
+ok = next((i for i, line in enumerate(lines) if re.search(r"(^|\s)ok(\s|$)", line)), None)
+sys.exit(0 if tty is not None and ok is not None and tty != ok else 1)
+'
 }
 
 list_tasks() { # the sprite's in-VM Tasks API
@@ -362,7 +417,28 @@ hold_was_awake() { # sprite_hold prints this line when it runs unheld
   fi
 }
 
-pull_refs_present() { [ -n "$(git -C "$REPO" for-each-ref refs/thegn/pull)" ]; }
+pull_fast_forwarded() {
+  # shellcheck disable=SC2016 # $HOME must expand inside the sprite
+  PULL_SHA="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'cd "$HOME/workspace" && git -c user.name=live -c user.email=live@example.invalid commit --allow-empty -qm live-pull && git rev-parse HEAD')" || return 1
+  PULL_SHA="$(printf '%s' "$PULL_SHA" | tr -d '\r\n ')"
+  [ -n "$PULL_SHA" ] || return 1
+  local out
+  out="$(in_repo "$THEGN_BIN" env pull 2>&1)" || {
+    printf '%s\n' "$out"
+    return 1
+  }
+  printf '%s\n' "$out"
+  grep -Fq 'fast-forwarded' <<<"$out"
+}
+
+pull_head_matches() {
+  local local_head
+  local_head="$(git -C "$REPO" rev-parse HEAD)" || return 1
+  echo "   pulled commit $PULL_SHA, local HEAD $local_head"
+  [ -n "$PULL_SHA" ] && [ "$local_head" = "$PULL_SHA" ]
+}
+
+pull_refs_empty() { [ -z "$(git -C "$REPO" for-each-ref refs/thegn/pull)" ]; }
 
 warm_or_cold() {
   local out
@@ -377,20 +453,55 @@ idle_warm_or_cold() {
 
 cost_has_cpu() {
   local out
-  out="$("$THEGN_BIN" fleet cost --json 2>&1)" || return 1
-  printf '%s' "$out" | grep -q '"sprites_usage"' || return 1
-  printf '%s' "$out" | grep -Eo '"cpu_seconds": *[0-9.eE+-]+' | sed 's/.*: *//' |
-    awk 'BEGIN { ok = 1 } $1 + 0 > 0 { ok = 0 } END { exit ok }'
+  out="$("$THEGN_BIN" fleet cost --json)" || return 1
+  COST_JSON="$out" COST_SPRITE="$SPRITE_NAME" python3 -I -c '
+import json, os, sys
+try:
+    report = json.loads(os.environ["COST_JSON"])
+    usage = report["sprites_usage"]
+except (KeyError, TypeError, ValueError):
+    print("fleet cost JSON has no sprites_usage", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(usage, list) or not usage:
+    print("fleet cost JSON sprites_usage is not a non-empty array", file=sys.stderr)
+    sys.exit(1)
+partial_zero = False
+for block in usage:
+    print("   sprites_usage: " + json.dumps(block, sort_keys=True))
+    if block.get("error") is not None:
+        print("fleet cost sprites_usage error: " + str(block["error"]), file=sys.stderr)
+        sys.exit(1)
+    rows = block.get("rows")
+    if not isinstance(rows, list):
+        print("fleet cost sprites_usage has no rows", file=sys.stderr)
+        sys.exit(1)
+    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == os.environ["COST_SPRITE"]), None)
+    if row is None:
+        print("fleet cost sprites_usage has no row for the sprite", file=sys.stderr)
+        sys.exit(1)
+    cpu_hours = row.get("cpu_hours")
+    if isinstance(cpu_hours, (int, float)) and cpu_hours > 0:
+        continue
+    if cpu_hours == 0 and row.get("partial") is True:
+        partial_zero = True
+        continue
+    print("fleet cost sprites_usage cpu_hours is not positive", file=sys.stderr)
+    sys.exit(1)
+if partial_zero:
+    print("WARN 10: usage not reported yet (partial)")
+'
 }
 
-record_gone() { [ ! -f "$(ledger_dir)/$SPRITE_NAME.json" ]; }
+record_gone() {
+  [ ! -f "$(ledger_dir)/$SPRITE_NAME.json" ] && listing_lacks_name "$SPRITE_NAME"
+}
 
 reap_dry_clean() { # dry-run only: no recorded orphan, everything else unrecorded
   local out
   out="$("$THEGN_BIN" env reap --provider sprites --json 2>&1)" || return 1
   printf '%s\n' "$out" | head -40
-  printf '%s' "$out" | grep -Fq "\"$SPRITE_NAME\"" && return 1
-  printf '%s' "$out" | grep -Eq ': *"recorded"' && return 1
+  grep -Fq "\"$SPRITE_NAME\"" <<<"$out" && return 1
+  grep -Eq ': *"recorded"' <<<"$out" && return 1
   return 0
 }
 
@@ -411,20 +522,26 @@ if [ -n "$min_ram" ]; then
 else
   echo "SKIP 5, 5b (needs --min-ram-gb N)"
 fi
-step 6 "interactive exec has a tty" interactive_tty
+step 6 "interactive exec has /dev/pts/<n> and ok" interactive_tty
+step 6c "interactive output keeps its line breaks" interactive_line_breaks
 step 6b "curl exists in the sprite (keep-awake precondition)" curl_present
 step 7a "background hold runs (sprite-exec --hold 10m -- sleep 420)" hold_start
 step 7b "/v1/tasks shows thegn-hold- during the hold" hold_task_present
 step 7c "the hold exits clean" hold_finish
 step 7d "/v1/tasks shows no thegn-hold- after the hold" hold_task_absent
 step 7e "the hold had keep-awake (no 'keep-awake unavailable' on stderr)" hold_was_awake
-step 8 "env pull" in_repo "$THEGN_BIN" env pull
-step 8b "refs/thegn/pull is non-empty" pull_refs_present
+step 8 "env pull fast-forwards the commit made inside the sprite" pull_fast_forwarded
+step 8b "local HEAD equals the commit made inside the sprite" pull_head_matches
+step 8c "refs/thegn/pull is empty after the clean fast-forward" pull_refs_empty
 step 9 "after 120 s idle the sprite is warm or cold" idle_warm_or_cold
 step 9b "/v1/tasks is empty" tasks_empty
-step 10 "fleet cost reports sprites_usage CPU seconds > 0" cost_has_cpu
+step 10 "fleet cost reports sprites_usage CPU hours or partial zero usage" cost_has_cpu
 step 10b "fleet list still shows warm or cold after fleet cost" warm_or_cold
 step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" env down
 step 11b "this run's ledger record is gone" record_gone
 step 12 "reap dry-run: 0 recorded orphans" reap_dry_clean
+if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+  echo "FAILED STEPS: ${FAILED_STEPS[*]}"
+  exit 1
+fi
 echo "ALL STEPS PASS"
