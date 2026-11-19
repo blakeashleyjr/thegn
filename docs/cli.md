@@ -176,6 +176,14 @@ ledger recorded (never an unrecorded one). `thegn agent run --wait --pull` runs
 `env pull` for the worktree after the agent exits. See
 [Environments](help/environments.md).
 
+`thegn env adopt <sprite> --env <S> [--yes] [--json]` records an existing
+sprite in the ledger after showing its name, status, `created_at`, this host's
+controller id and the account fingerprint; type the sprite name back on a tty,
+or pass `--yes`. It never changes the sprite. `thegn land --release-sandbox`
+destroys a provider worktree's proven sandbox after a successful land (the
+default keeps it). `thegn agent run --wait --keep-running` skips the stop of a
+Fly or machine0 machine after the run. See [Environments](help/environments.md).
+
 ## Embedded and configured skills (`skills`)
 
 ```text
