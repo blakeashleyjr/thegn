@@ -67,21 +67,25 @@ class Refusal(Exception):
 
 def absolute(value):
     if not value or len(value) > 4096 or any(ord(c) < 32 for c in value):
-        raise Refusal("Unsupported empty, oversized or control-containing path")
+        raise Refusal(f"Unsupported empty, oversized or control-containing path ({value!r:.80}); "
+                      "pass an absolute path without . or .. components")
     path = Path(value)
     if not path.is_absolute() or ".." in value.split("/") or "." in value.split("/"):
-        raise Refusal("Paths must be absolute, without dot components")
+        raise Refusal(f"Paths must be absolute, without dot components ({value!r:.80}); "
+                      "pass an absolute path without . or .. components")
     return path
 
 
 def regular(path, private=False, executable=False):
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-        raise Refusal("Expected a current-user regular file (no symlinks)")
+        raise Refusal(f"Expected a current-user regular file (no symlinks): {path}; "
+                      "replace it with a regular file you own (not a symlink)")
     if info.st_mode & (0o077 if private else 0o022):
-        raise Refusal("File permissions are too broad")
+        raise Refusal(f"File permissions are too broad: {path}; run chmod go-w {path} "
+                      "(chmod 600 for private files)")
     if executable and not info.st_mode & stat.S_IXUSR:
-        raise Refusal("Selected artifact is not executable")
+        raise Refusal(f"Selected artifact is not executable: {path}; run chmod u+x {path}")
     return info
 
 
@@ -93,13 +97,16 @@ def directories(path, private=False):
     for parent in reversed((path, *path.parents)):
         info = parent.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid()):
-            raise Refusal("Unsupported directory owner/type or symlink ancestor")
+            raise Refusal(f"Unsupported directory owner/type or symlink ancestor: {parent}; "
+                          "fix ownership, or run chmod go-w on it")
         sticky_root = info.st_uid == 0 and info.st_mode & stat.S_ISVTX
         if info.st_mode & 0o022 and not sticky_root:
-            raise Refusal("Directory is writable by another user/group")
+            raise Refusal(f"Directory is writable by another user/group: {parent}; "
+                          "fix ownership, or run chmod go-w on it")
     info = path.stat()
     if info.st_uid != os.getuid() or info.st_mode & (0o077 if private else 0o022):
-        raise Refusal("Final directory must be current-user owned with private permissions")
+        raise Refusal(f"Final directory must be current-user owned with private permissions: {path}; "
+                      f"run chmod 700 {path}")
 
 
 def read_small(path, maximum=MAX_CONFIG):
@@ -107,24 +114,24 @@ def read_small(path, maximum=MAX_CONFIG):
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
-            raise Refusal("Expected bounded regular input")
+            raise Refusal(f"Expected bounded regular input: {path}; replace it with a small regular file")
         data = stream.read(maximum + 1)
         if len(data) > maximum:
-            raise Refusal("Input exceeds size limit")
+            raise Refusal(f"Input exceeds size limit: {path}; replace it with a small regular file")
         return data
 
 
 def read_fd_small(fd, maximum):
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
-        raise Refusal("Expected bounded regular input")
+        raise Refusal("Expected bounded regular input; retry; the file changed while it was read")
     data = bytearray()
     while len(data) <= maximum:
         chunk = os.read(fd, maximum + 1 - len(data))
         if not chunk:
             return bytes(data)
         data.extend(chunk)
-    raise Refusal("Input exceeds size limit")
+    raise Refusal("Input exceeds size limit; retry; the file changed while it was read")
 
 
 def real_home():
@@ -149,9 +156,25 @@ def _nearest_existing(path):
     return Path("/")
 
 
+def refuse_other_instance_env(env):
+    config_dir = env.get("THEGN_CONFIG_DIR", "").strip()
+    channel = env.get("THEGN_CHANNEL", "")
+    state_home = env.get("XDG_STATE_HOME", "").strip()
+    if config_dir or channel == "dev":
+        raise Refusal(
+            "This shell targets another thegn instance "
+            f"(THEGN_CONFIG_DIR={config_dir or 'unset'}, THEGN_CHANNEL={channel.strip() or 'unset'}, "
+            f"XDG_STATE_HOME={state_home or 'unset'}); 'just live' upgrades the stable instance. "
+            "Run it from a terminal outside that instance (a plain login shell), "
+            "not after eval \"$(just devel-env)\"."
+        )
+
+
 def settings(repo, env, install_override=None):
+    refuse_other_instance_env(env)
     if sys.platform != "linux" or os.getuid() == 0 or os.geteuid() != os.getuid():
-        raise Refusal("This helper supports ordinary-user Linux upgrades only")
+        raise Refusal("This helper supports ordinary-user Linux upgrades only; "
+                      "run it as your own user on Linux, not root or setuid")
     user_home_path = absolute(env.get("HOME", "/"))
     roots = {key: absolute(env[key]) for key in ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "THEGN_DIR", "XDG_RUNTIME_DIR") if key in env}
     state = roots.get("XDG_STATE_HOME", user_home_path / ".local/state") / "thegn"
@@ -159,7 +182,7 @@ def settings(repo, env, install_override=None):
     if env.get("THEGN_PROFILE", "") not in ("", "default"):
         raise Refusal("Named profiles are unsupported; use the ordinary launcher")
     if env.get("THEGN_ALLOW_SCHEMA_DOWNGRADE", ""):
-        raise Refusal("Schema downgrade opt-in is unsupported")
+        raise Refusal("Schema downgrade opt-in is unsupported; unset THEGN_ALLOW_SCHEMA_DOWNGRADE")
     directories(state, private=True)
     install_dir = install_dir_for(env, install_override)
     account_state = real_home() / ".local/state"
@@ -194,14 +217,17 @@ def settings(repo, env, install_override=None):
         regular(legacy, executable=True)
         previous = legacy
     else:
-        raise Refusal(f"No installed executable at {target} (or the legacy {legacy}); this is not a first-install command")
+        raise Refusal(f"No installed executable at {target} (or the legacy {legacy}); "
+                      "run an install command to put a regular executable there before running just live")
     if os.path.lexists(alacritty):
         info = alacritty.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-            raise Refusal(f"Installed {alacritty} is not a current-user regular file")
+            raise Refusal(f"Installed {alacritty} is not a current-user regular file; "
+                          f"replace it with a regular file you own (not a symlink): {alacritty}")
     regular(alacritty_source)
     if regular(database, private=True).st_nlink != 1:
-        raise Refusal("Hardlinked database paths use distinct schema locks and are unsupported")
+        raise Refusal(f"Hardlinked database paths use distinct schema locks and are unsupported: {database}; "
+                      f"remove the extra hard link to {database}")
     raw = b""
     try:
         directories(config.parent)
@@ -211,20 +237,21 @@ def settings(repo, env, install_override=None):
         # Only genuinely absent configuration is optional. A dangling symlink
         # fails O_NOFOLLOW; other inspection/read errors remain refusals.
         if config.is_symlink():
-            raise Refusal("Config symlink is unsupported") from None
+            raise Refusal(f"Config symlink is unsupported: {config}; replace {config} with a regular file") from None
     try:
         document = tomllib.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeError):
-        raise Refusal("Configuration is not valid bounded UTF-8 TOML") from None
+        raise Refusal(f"Configuration is not valid bounded UTF-8 TOML: {config}; fix the TOML syntax in {config}") from None
     if document.get("profile", "") not in ("", "default"):
-        raise Refusal("Config-selected profiles are unsupported")
+        raise Refusal(f"Config-selected profiles are unsupported: {config}; remove the profile key from {config}")
     db = document.get("database", {})
     keys = {"migration_authority", "migration_executable"}
     if not isinstance(db, dict) or set(db) - keys:
-        raise Refusal("Unsupported database configuration fields")
+        raise Refusal(f"Unsupported database configuration fields: {config}; remove [database] keys other than "
+                      "migration_authority and migration_executable")
     allowed_env = {"THEGN_DATABASE_MIGRATION_AUTHORITY", "THEGN_DATABASE_MIGRATION_EXECUTABLE"}
     if any(key.startswith("THEGN_DATABASE_") and key not in allowed_env for key in env):
-        raise Refusal("Unsupported database environment override")
+        raise Refusal("Unsupported database environment override; unset the THEGN_DATABASE_* variable")
     # ProcessEnv ignores blank strings; XDG var_os above deliberately does not.
     def override(key, default):
         value = env.get(key, "")
@@ -232,7 +259,8 @@ def settings(repo, env, install_override=None):
 
     authority = override("THEGN_DATABASE_MIGRATION_AUTHORITY", db.get("migration_authority", "controller"))
     if authority not in ("controller", "any"):
-        raise Refusal("Migration authority must be canonical controller or any")
+        raise Refusal(f"Migration authority must be canonical controller or any; "
+                      "set migration_authority to controller or any")
     check_migration_pin(env, db, config, target)
     return {"repo": repo, "state": state, "database": database, "target": target, "config": config,
             "install_dir": install_dir, "previous": previous, "alacritty": alacritty,
@@ -256,19 +284,19 @@ def check_migration_pin(env, db, config, target):
     fix = (f"Set it to the install target {target} (after the first install has put a binary there), "
            "or remove it")
     if not isinstance(pin, str):
-        raise Refusal(f"{origin} is {pin!r}, which is not a path. {fix}")
+        raise Refusal(f"{origin} is {pin!r}, which is not a path; fix: {fix}")
     if not pin:
         return
     try:
         resolved = absolute(pin).resolve(strict=True)
     except Refusal as error:
-        raise Refusal(f"{origin} is {pin!r}, which is not a usable path ({error}). {fix}") from None
+        raise Refusal(f"{origin} is {pin!r}, which is not a usable path ({error}); fix: {fix}") from None
     except FileNotFoundError:
-        raise Refusal(f"{origin} is {pin!r}, which does not exist. {fix}") from None
+        raise Refusal(f"{origin} is {pin!r}, which does not exist. Set it to the install target {target}; {fix}") from None
     except (OSError, RuntimeError) as error:
-        raise Refusal(f"{origin} is {pin!r}, which cannot be resolved ({error}). {fix}") from None
+        raise Refusal(f"{origin} is {pin!r}, which cannot be resolved ({error}); fix: {fix}") from None
     if resolved != target:
-        raise Refusal(f"{origin} is {pin!r}, which resolves to {resolved}, not the install target. {fix}")
+        raise Refusal(f"{origin} is {pin!r}, which resolves to {resolved}, not the install target; fix: {fix}")
 
 
 @contextlib.contextmanager
@@ -277,7 +305,7 @@ def locked(path, schema=False):
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & (0o022 if schema else 0o077):
-            raise Refusal("Unsafe lock file")
+            raise Refusal(f"Unsafe lock file: {path}; remove the lock file and retry")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -319,24 +347,25 @@ def _validate_stage_tree(fd, count):
     return True
 
 
-def _remove_stage_tree(fd, count=None):
+def _remove_stage_tree(fd, count=None, stage=None):
     for name in os.listdir(fd):
         if count is not None:
             count[0] += 1
             if count[0] > MAX_STAGE_ENTRIES:
-                raise Refusal("stage cleanup bound exceeded")
+                raise Refusal(f"stage cleanup bound exceeded; remove the stage directory {stage} and retry")
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if stat.S_ISDIR(info.st_mode):
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             try:
-                _remove_stage_tree(child, count)
+                _remove_stage_tree(child, count, stage)
             finally:
                 os.close(child)
             os.rmdir(name, dir_fd=fd)
         elif stat.S_ISREG(info.st_mode):
             os.unlink(name, dir_fd=fd)
         else:
-            raise Refusal("stage changed to an unsupported entry during cleanup")
+            raise Refusal(f"stage changed to an unsupported entry during cleanup; "
+                          f"remove the stage directory {stage} and retry")
 
 
 def _recovery_linked_stages(paths):
@@ -490,7 +519,7 @@ def retain_live_stages(paths, current=None):
                     continue
                 if not _stage_name_identity(target_fd, name, opened_identity):
                     continue
-                _remove_stage_tree(stage_fd, [0])
+                _remove_stage_tree(stage_fd, [0], stage)
                 if not _stage_name_identity(target_fd, name, opened_identity):
                     continue
                 os.rmdir(name, dir_fd=target_fd)
@@ -593,7 +622,7 @@ def prune_backups(paths, current, now=time.time, keep=BACKUP_KEEP, keep_days=BAC
                     continue
                 if not _validate_stage_tree(backup_fd, [0]):
                     continue
-                _remove_stage_tree(backup_fd, [0])
+                _remove_stage_tree(backup_fd, [0], state / name)
                 again = os.stat(name, dir_fd=state_fd, follow_symlinks=False)
                 if not stat.S_ISDIR(again.st_mode) or (again.st_dev, again.st_ino) != expected:
                     continue
@@ -671,6 +700,35 @@ def thegn_ancestor(proc=Path("/proc"), start=None):
             return None
         if comm(status_text) in ("thegn", "tg"):
             return pid
+        try:
+            pid = int(_status_field(status_text, "PPid"))
+        except ValueError:
+            return None
+    return None
+
+
+def installation_ancestor(paths, proc=Path("/proc"), start=None):
+    """The pid of this installation's `thegn`/`tg` ancestor, or None.
+
+    An unreadable executable is treated as ours: refusing to distinguish the
+    installation is safer than stopping a process that may own the upgrade.
+    """
+    pid = os.getppid() if start is None else start
+    installed = {Path(paths[key]).resolve() for key in ("target", "previous")}
+    for _ in range(64):
+        if pid <= 1:
+            return None
+        try:
+            status_text = read_small(proc / str(pid) / "status", 65536).decode("ascii", "replace")
+        except (OSError, Refusal):
+            return None
+        if comm(status_text) in THEGN_NAMES:
+            try:
+                executable = os.readlink(proc / str(pid) / "exe").removesuffix(" (deleted)")
+                if Path(executable).resolve() in installed:
+                    return pid
+            except OSError:
+                return pid
         try:
             pid = int(_status_field(status_text, "PPid"))
         except ValueError:
@@ -942,7 +1000,7 @@ def _stage_build_lock(stage):
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
-            raise Refusal("Unsafe staged-build lock")
+            raise Refusal(f"Unsafe staged-build lock: {stage / LIVE_STAGE_LOCK}; remove the lock file and retry")
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -955,7 +1013,8 @@ def _mark_stage(stage):
     try:
         marker = b"thegn-live-build-v1\n"
         if os.write(fd, marker) != len(marker):
-            raise Refusal("Could not write complete staged-build marker")
+            raise Refusal(f"Could not write complete staged-build marker: {stage / LIVE_STAGE_MARKER}; "
+                          "check free disk space and retry")
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -972,7 +1031,8 @@ def comm(status_text):
         if line.startswith("Name:"):
             fields = line.split(maxsplit=1)
             return fields[1].strip() if len(fields) == 2 else ""
-    raise Refusal("Process status has no name")
+    raise Refusal("Process status has no name; retry; if it repeats, stop thegn yourself "
+                  "(thegn daemon stop) and retry")
 
 
 def _refuse_unless_foreign(record):
@@ -1003,13 +1063,15 @@ def quiescent(paths, proc=Path("/proc")):
                 continue
             count += 1
             if count > 32768:
-                raise Refusal("Process inspection bound exceeded")
+                raise Refusal("Process inspection bound exceeded; retry; if it repeats, stop thegn yourself "
+                              "(thegn daemon stop) and retry")
             base = Path(entry.path)
             try:
                 status_text = read_small(base / "status", 65536).decode("ascii")
                 uids = next(line.split()[1:] for line in status_text.splitlines() if line.startswith("Uid:"))
                 if len(uids) != 4:
-                    raise Refusal("Ambiguous process UID")
+                    raise Refusal("Ambiguous process UID; retry; if it repeats, stop thegn yourself "
+                                  "(thegn daemon stop) and retry")
                 if os.getuid() not in map(int, uids):
                     continue
                 # A zombie (or dying) process has already released its address
@@ -1035,7 +1097,8 @@ def quiescent(paths, proc=Path("/proc")):
                     with os.scandir(base / "fd") as handles:
                         for index, handle in enumerate(handles):
                             if index >= 4096:
-                                raise Refusal("Process descriptor inspection bound exceeded")
+                                raise Refusal("Process descriptor inspection bound exceeded; retry; if it repeats, "
+                                              "stop thegn yourself (thegn daemon stop) and retry")
                             try:
                                 if identity(Path(handle.path)) in watched:
                                     raise Refusal("A process still has database/install files open; stop it manually")
@@ -1063,7 +1126,8 @@ def quiescent(paths, proc=Path("/proc")):
                     continue
             except FileNotFoundError:
                 if base.exists():
-                    raise Refusal("Cannot inspect a remaining process (including zombies)") from None
+                    raise Refusal("Cannot inspect a remaining process (including zombies); retry; if it repeats, "
+                                  "stop thegn yourself (thegn daemon stop) and retry") from None
             except (PermissionError, UnicodeError, StopIteration, ValueError):
                 raise Refusal("Cannot inspect process ownership/files; stop manually and retry") from None
 
@@ -1108,9 +1172,11 @@ def source_revision(repo, env, require_clean=True, inputs_only=False):
         return run(*args).stdout
 
     if Path(os.fsdecode(git("rev-parse", "--show-toplevel").rstrip(b"\n"))) != repo:
-        raise Refusal("Selected source must be the canonical Git checkout root")
+        raise Refusal(f"Selected source must be the canonical Git checkout root: {repo}; "
+                      "run just live from the checkout root")
     if require_clean and any(entry and (entry[:1].islower() or entry[:1] == b"S") for entry in git("ls-files", "-v", "-z").split(b"\0")):
-        raise Refusal("Assume-unchanged/skip-worktree index flags are unsupported")
+        raise Refusal(f"Assume-unchanged/skip-worktree index flags are unsupported: {repo}; "
+                      "run git update-index --no-assume-unchanged / --no-skip-worktree on those paths")
     if require_clean and inputs_only:
         if git("status", "--porcelain=v1", "--untracked-files=normal", "--", *BUILD_INPUTS):
             raise Refusal(f"The checkout has uncommitted or untracked changes under the build inputs "
@@ -1120,7 +1186,7 @@ def source_revision(repo, env, require_clean=True, inputs_only=False):
         raise Refusal("Selected checkout must be clean, including untracked source; commit reviewed changes first")
     revision = git("rev-parse", "--verify", "HEAD").decode("ascii").strip()
     if not REVISION.fullmatch(revision):
-        raise Refusal("Unsupported source revision")
+        raise Refusal(f"Unsupported source revision: {repo}; check out a normal commit")
     return revision
 
 
@@ -1129,20 +1195,22 @@ def prebuilt_provenance(repo, env, revision):
     git = _git(repo, env)
     if git("cat-file", "-e", f"{revision}^{{commit}}", check=False, quiet=True).returncode != 0:
         raise Refusal(f"Prebuilt revision {revision} is not a commit in the local repository {repo}; "
-                      "fetch it (git fetch) and rerun")
+                      "run git fetch, fetch it and rerun")
     ancestor = git("merge-base", "--is-ancestor", revision, "HEAD", check=False, quiet=True).returncode
     if ancestor == 1:
         raise Refusal(f"Prebuilt revision {revision} is not an ancestor of the checkout's HEAD; check out a "
                       "commit that contains it, or rebuild on the build box at this HEAD")
     if ancestor != 0:
-        raise Refusal(f"Could not compare prebuilt revision {revision} with HEAD (git merge-base exit {ancestor})")
+        raise Refusal(f"Could not compare prebuilt revision {revision} with HEAD (git merge-base exit {ancestor}); "
+                      f"check the repository {repo} and retry")
     changed = git("diff", "--quiet", "--no-ext-diff", "--no-textconv", revision, "HEAD", "--", *BUILD_INPUTS,
                   check=False, quiet=True).returncode
     if changed == 1:
         raise Refusal(f"Build inputs ({', '.join(BUILD_INPUTS)}) changed between prebuilt revision {revision} and "
                       "HEAD; rebuild on the build box at this HEAD")
     if changed != 0:
-        raise Refusal(f"Could not diff prebuilt revision {revision} against HEAD (git diff exit {changed})")
+        raise Refusal(f"Could not diff prebuilt revision {revision} against HEAD (git diff exit {changed}); "
+                      f"check the repository {repo} and retry")
 
 
 def inspect_prebuilt(value):
@@ -1167,7 +1235,7 @@ def inspect_prebuilt(value):
         raise Refusal(f"Prebuilt sidecar {sidecar} is missing; copy the build box's {path.name}{SIDECAR_SUFFIX} "
                       "next to the binary") from None
     except (Refusal, OSError) as error:
-        raise Refusal(f"Prebuilt sidecar {sidecar} is refused ({error}); it must be a small regular file you own, "
+        raise Refusal(f"Prebuilt sidecar {sidecar} is refused ({error}); copy it as a small regular file you own, "
                       "not a symlink") from None
     try:
         document = json.loads(raw)
@@ -1178,7 +1246,7 @@ def inspect_prebuilt(value):
     revision = document.get("revision")
     if not isinstance(revision, str) or not REVISION.fullmatch(revision):
         raise Refusal(f"Prebuilt sidecar {sidecar} has no valid revision (40 or 64 lowercase hex); "
-                      "regenerate it on the build box")
+                      "regenerate or rebuild it on the build box")
     if document.get("build") != BUILD:
         raise Refusal(f"Prebuilt sidecar {sidecar} records the build command {document.get('build')!r}, not the "
                       f"installer's {BUILD!r}; rebuild on the build box with exactly that command")
@@ -1214,7 +1282,8 @@ def source_schema(repo):
     source = read_small(repo / "crates/thegn-core/src/db.rs")
     versions = re.findall(rb"^pub const SCHEMA_VERSION: i64 = ([0-9]+);$", source, re.MULTILINE)
     if len(versions) != 1:
-        raise Refusal("Cannot determine this source's database schema version")
+        raise Refusal(f"Cannot determine this source's database schema version: {repo}; "
+                      "rebuild from a clean checkout")
     return int(versions[0])
 
 
@@ -1243,7 +1312,8 @@ def stage_prebuilt(paths, env, value):
             raise Refusal(f"Prebuilt artifact {artifact['path']} changed while it was copied into {binary}; "
                           "copy it again from the build box and rerun")
         if source_revision(repo, env, inputs_only=True) != revision:
-            raise Refusal("Source changed while staging the prebuilt artifact; artifact retained but not admitted")
+            raise Refusal(f"Source changed while staging the prebuilt artifact: {repo}; "
+                          "commit or stash changes and run just live again; artifact retained but not admitted")
         record = {"repo": str(repo), "stage": str(stage), "observed_revision": revision,
                   "artifact_revision": artifact["revision"], "prebuilt": True, "source": str(artifact["path"]),
                   "schema": schema, "sha256": staged, "build": BUILD}
@@ -1273,7 +1343,8 @@ def build_stage(paths, env, prebuilt=None):
         subprocess.run(BUILD, cwd=paths["repo"], env=build_env, check=True)
         print(f"  built in {time.monotonic() - started:.0f}s", flush=True)
         if source_revision(paths["repo"], env) != revision:
-            raise Refusal("Source changed during build; artifact retained but not admitted")
+            raise Refusal(f"Source changed during build: {paths['repo']}; "
+                          "commit or stash changes and run just live again; artifact retained but not admitted")
         built = cache / "release/thegn"
         regular(built, executable=True)
         # The stage holds the admitted artifact; the cache's copy is overwritten
@@ -1297,7 +1368,8 @@ def copy_file(source, destination, deadline, mode=0o600):
         os.fchmod(out.fileno(), mode)  # Exact owned-file mode, independent of umask.
         while chunk := inp.read(1024 * 1024):
             if time.monotonic() >= deadline:
-                raise Refusal("Backup/copy deadline exceeded; installation not attempted")
+                raise Refusal(f"Backup/copy deadline exceeded for {destination}; "
+                              "stop processes holding the database and retry")
             out.write(chunk)
         out.flush()
         os.fsync(out.fileno())
@@ -1314,7 +1386,8 @@ def backup(paths, record):
 
     def progress(_status, _remaining, _total):
         if time.monotonic() >= deadline:
-            raise Refusal("SQLite backup deadline exceeded; installation not attempted")
+            raise Refusal(f"SQLite backup deadline exceeded for {paths['database']}; "
+                          "stop processes holding the database and retry")
 
     # mode=ro does not mean no WAL/SHM side effects. This is a normal SQLite
     # connection, not immutable=1: committed WAL contents must be backed up.
@@ -1323,7 +1396,8 @@ def backup(paths, record):
             source.backup(destination, pages=128, progress=progress, sleep=0.05)
             version = destination.execute("PRAGMA user_version").fetchone()[0]
             if version > record["schema"]:
-                raise Refusal("Database is newer than selected source; downgrade refused")
+                raise Refusal(f"Database is newer than selected source: {paths['database']}; downgrade refused; "
+                              "upgrade with a build at least as new as the database")
     with output.open("rb") as stream:
         os.fsync(stream.fileno())
     # The staged path is transient build provenance. Persisting it in a
@@ -1375,21 +1449,25 @@ def install(paths, binary, record, env):
     recovery = backup(paths, record)
     quiescent(paths)
     if _snapshot(paths) != before:
-        raise Refusal("Install/database identity changed; retained backup, refusing install")
+        raise Refusal(f"Install/database identity changed: {paths['database']} or {paths['target']}; "
+                      "retained backup, refusing install; something changed the installation during the upgrade; retry")
     temporary = paths["install_dir"] / (".thegn-install-" + recovery.name)
     deadline = time.monotonic() + BACKUP_SECONDS
     copy_file(binary, temporary, deadline, 0o755)
     if digest(temporary) != record["sha256"]:
-        raise Refusal("Staged artifact changed; installation refused")
+        raise Refusal(f"Staged artifact changed: {binary}; installation refused; "
+                      "something changed the installation during the upgrade; retry")
     config_temporary = paths["install_dir"] / (".thegn-alacritty-" + recovery.name)
     copy_file(paths["alacritty_source"], config_temporary, deadline, 0o644)
     # Copies may take time: repeat observations at the last replacement point.
     # This still does not exclude a legacy process starting after this scan.
     if settings(paths["repo"], env, paths["install_dir"]) != paths:
-        raise Refusal("Policy/path selection changed before replacement")
+        raise Refusal(f"Policy/path selection changed before replacement: {paths['install_dir']}; "
+                      "something changed the installation during the upgrade; retry")
     quiescent(paths)
     if _snapshot(paths) != before:
-        raise Refusal("Install/database identity changed before replacement")
+        raise Refusal(f"Install/database identity changed before replacement: {paths['database']} or {paths['target']}; "
+                      "something changed the installation during the upgrade; retry")
     # The alacritty config first: a failure there leaves the binary untouched.
     os.replace(config_temporary, paths["alacritty"])
     os.replace(temporary, paths["target"])
@@ -1501,7 +1579,7 @@ def relink_plan(paths, home):
             actions.append(("wrapper", wrapper, (updated, mode)))
         elif not any(_exact(new).search(text) for _old, new in replacements):
             raise Refusal(f"{wrapper} mentions neither {replacements[0][0]} nor {replacements[1][0]}; "
-                          "refusing to edit it (nothing changed)")
+                          "fix it or remove the launcher (nothing changed)")
     return actions
 
 
@@ -1510,7 +1588,7 @@ def _backup_name(path):
         candidate = path.with_name(path.name + (".bak" if index == 0 else f".bak.{index}"))
         if not os.path.lexists(candidate):
             return candidate
-    raise Refusal(f"Too many backups beside {path}")
+    raise Refusal(f"Too many backups beside {path}; delete old *.bak files beside {path}")
 
 
 def apply_relink(paths, actions):
@@ -1557,7 +1635,7 @@ def main(argv=None):
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(raw_argv)
     if not 1 <= args.size_mb <= 1024 or not 1 <= args.files <= 100:
-        raise Refusal("Log limits must be 1..1024 MiB and 1..100 rotations")
+        raise Refusal("Log limits must be 1..1024 MiB and 1..100 rotations; pass limits within the stated ranges")
     env = dict(os.environ)
     repo = absolute(args.repo) if args.repo else Path(__file__).resolve().parent.parent
     directories(repo)
@@ -1610,8 +1688,9 @@ def main(argv=None):
     # agent (no tty) must never be able to start an upgrade, including by
     # having it reopen itself in a fresh window that nobody is watching.
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise Refusal("A real terminal is required: the new controller launches in the foreground")
-    if thegn_ancestor() is not None:
+        raise Refusal("A real terminal is required: the new controller launches in the foreground; "
+                      "run it from a real terminal")
+    if installation_ancestor(paths) is not None:
         relaunch_outside(raw_argv, env, repo)
         return 0
     if not paths["install_dir"].exists():
@@ -1644,9 +1723,11 @@ def main(argv=None):
         stop_running(paths, env)
         # Re-read policy and path constraints after the potentially long build.
         if settings(repo, env, args.install_dir) != paths:
-            raise Refusal("Upgrade paths changed while building")
+            raise Refusal(f"Upgrade paths changed while building: {paths['install_dir']}; "
+                          "retry; do not move the install while it runs")
         if source_revision(repo, env, inputs_only=prebuilt) != record["observed_revision"]:
-            raise Refusal("Source changed after build; installation refused")
+            raise Refusal(f"Source changed after build: {repo}; "
+                          "commit or stash changes and run just live again; installation refused")
         if prebuilt:
             prebuilt_provenance(repo, env, record["artifact_revision"])
         step(5, "Back up the database and old binary, then install")
@@ -1683,7 +1764,8 @@ def main(argv=None):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
             os.close(fd)
-            raise Refusal("Reserved launch stderr file changed")
+            raise Refusal(f"Reserved launch stderr file changed: {recovery / 'thegn-stderr.log'}; "
+                          "retry; the launch log was replaced")
         with os.fdopen(fd, "wb") as stderr:
             # A transient user scope gives the UI CPU/IO weight 1000 over builds
             # in this terminal's cgroup (see scope_argv); falls back to a direct
