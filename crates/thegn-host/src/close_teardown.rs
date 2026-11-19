@@ -79,6 +79,17 @@ pub(crate) fn warn_visible(text: &str) {
     });
 }
 
+pub(crate) fn sync_failure_warning(path: &str, error: &str) -> String {
+    let clean: String = error
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(300)
+        .collect();
+    format!(
+        "Pull-back of {path} from its sandbox failed: {clean}. The sandbox is kept; run 'thegn env sync-retry' to try again (thegn doctor lists it)."
+    )
+}
+
 fn placed_teardown_warning(path: &str, name: &str, error: &dyn std::fmt::Display) -> String {
     format!(
         "Sandbox teardown incomplete while closing {path}: container {name} may still be running on its SSH host ({error})"
@@ -135,6 +146,7 @@ pub(crate) fn background_close_with(
     crate::agent::deproject(path);
     if let Err(error) = crate::agent::deprovision_sync(path) {
         tracing::warn!(target: "thegn::lifecycle", worktree = path, %error, "provider sync failed during background close");
+        warn_visible(&sync_failure_warning(path, &error));
     }
     crate::agent_teardown::checkpoint_on_close_with(
         path,
@@ -193,7 +205,7 @@ pub(crate) fn background_close_with(
 mod tests {
     use super::{
         CloseSnapshot, Route, capture, close_location, close_selection, placed_teardown_warning,
-        route, snapshot_location, warn_visible_with,
+        route, snapshot_location, sync_failure_warning, warn_visible_with,
     };
     use thegn_core::db::Db;
     use thegn_core::placement::{Placement, ProviderPlacement, SshPlacement, TransportKind};
@@ -313,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn warn_visible_toasts_only_while_the_tui_runs() {
+    fn warn_visible_with_delivers_text_to_tui_when_active() {
         let mut shown: Option<String> = None;
         warn_visible_with("x", true, |text| shown = Some(text.to_string()));
         assert_eq!(shown.as_deref(), Some("x"));
@@ -321,6 +333,17 @@ mod tests {
         let mut shown: Option<String> = None;
         warn_visible_with("x", false, |text| shown = Some(text.to_string()));
         assert_eq!(shown, None);
+    }
+
+    #[test]
+    fn sync_failure_warning_names_the_retry_and_strips_controls() {
+        let error = format!("network\n\t{}\u{0000}", "x".repeat(400));
+        let clean = format!("network{}", "x".repeat(293));
+        let expected = format!(
+            "Pull-back of /wt from its sandbox failed: {clean}. The sandbox is kept; run 'thegn env sync-retry' to try again (thegn doctor lists it)."
+        );
+
+        assert_eq!(sync_failure_warning("/wt", &error), expected);
     }
 
     #[test]
