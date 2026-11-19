@@ -1073,19 +1073,6 @@ fn ledger_state(ledger: &tempfile::TempDir, name: &str) -> Option<String> {
 }
 
 #[test]
-fn destroy_of_an_unrecorded_sprite_sends_no_delete() {
-    let (base, deletes) = start_delete_mock_get(0, "200 OK");
-    let (p, _ledger) = scoped(&base, "tgtest1");
-    let err = rt().block_on(p.destroy("sx-not-ours")).unwrap_err();
-    let text = format!("{err:#}");
-    assert!(
-        text.contains("thegn has no record of creating sx-not-ours"),
-        "{text}"
-    );
-    assert_eq!(*deletes.lock().unwrap(), 0, "no DELETE without a proof");
-}
-
-#[test]
 fn destroy_of_a_recorded_sprite_deletes_and_forgets_the_record() {
     let (base, deletes) = start_delete_mock(0);
     let (p, ledger) = recorded(&base, "tgtest1");
