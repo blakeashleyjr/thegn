@@ -58,10 +58,9 @@ just devel-desktop > ~/.local/share/applications/thegn-dev.desktop
 The entry and `just devel` both go through `scripts/devel-launch.sh`, the single
 source of the dev environment. The entry runs `~/.thegn-devel/bin/thegn`.
 
-The dev instance does **not** override `XDG_RUNTIME_DIR`: sandbox masks follow
-the runtime directory in the environment, so a private one would leave the dev
-daemon's socket unmasked or hide the stable one. The dev daemon's socket lives
-under the login runtime dir,
+The dev instance does **not** override `XDG_RUNTIME_DIR`: sandbox masks follow the runtime directory in the
+environment, so a private one would leave the dev daemon's socket unmasked or
+hide the stable one. The dev daemon's socket lives under the login runtime dir,
 `/run/user/<uid>/thegn/<hash of the dev state dir>/daemon.sock`, beside the
 stable one, and both instances mask it. `~/.thegn-devel/run` remains only the
 launcher's pidfile dir. Because the runtime dir is the login one, rootless
