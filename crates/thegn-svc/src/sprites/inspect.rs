@@ -20,6 +20,7 @@ pub struct SpriteInfo {
     pub name: String,
     pub status: String,
     pub created_at: Option<String>,
+    pub url_auth: Option<String>,
 }
 
 /// A string field: absent → `None`; present but not a string, or longer than
@@ -55,10 +56,21 @@ pub fn parse_info(v: &serde_json::Value) -> Result<SpriteInfo> {
         .filter(|status| !status.is_empty())
         .ok_or_else(|| anyhow!("sprites: inspect response for {name} has no status"))?;
     let created_at = checked_str(obj, "created_at")?.filter(|at| !at.is_empty());
+    let url_auth = match obj.get("url_settings").and_then(|u| u.get("auth")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => {
+            if s.len() > MAX_FIELD_LEN {
+                bail!("sprites: inspect field url_settings.auth is too long");
+            }
+            Some(s.clone())
+        }
+        Some(_) => bail!("sprites: inspect field url_settings.auth is not a string"),
+    };
     Ok(SpriteInfo {
         name,
         status,
         created_at,
+        url_auth,
     })
 }
 
@@ -131,6 +143,7 @@ mod tests {
                 name: "sx-adopt".into(),
                 status: "warm".into(),
                 created_at: Some("2026-11-18T10:00:00Z".into()),
+                url_auth: None,
             }
         );
         let wrapped = serde_json::json!({"sprite": {"name": "sx-b", "status": "cold"}});
@@ -152,6 +165,38 @@ mod tests {
         ] {
             assert!(parse_info(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn parse_info_reads_url_auth() {
+        let info = parse_info(&serde_json::json!({
+            "name": "sx",
+            "status": "warm",
+            "url_settings": {"auth": "sprite"}
+        }))
+        .unwrap();
+        assert_eq!(info.url_auth.as_deref(), Some("sprite"));
+        assert_eq!(
+            parse_info(&serde_json::json!({
+                "name": "sx",
+                "status": "warm",
+                "url_settings": {"auth": null}
+            }))
+            .unwrap()
+            .url_auth,
+            None
+        );
+    }
+
+    #[test]
+    fn parse_info_refuses_a_non_string_url_auth() {
+        let error = parse_info(&serde_json::json!({
+            "name": "sx",
+            "status": "warm",
+            "url_settings": {"auth": false}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("url_settings.auth"));
     }
 
     /// A one-shot HTTP fake: records each request line and answers every
