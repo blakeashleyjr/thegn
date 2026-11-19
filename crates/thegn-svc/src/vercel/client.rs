@@ -442,13 +442,27 @@ impl VercelClient {
 
     /// Run a command and wait (`wait: true` is forced), streaming the NDJSON
     /// body. Returns `(exit, last out_cap stdout bytes, sanitized stderr tail)`.
-    /// A missing final exit gives [`EXEC_EXIT_STATUS_UNKNOWN`]; an `error` line
-    /// or a line over [`LOG_LINE_CAP`] is an error.
+    /// A missing final exit is an error; an `error` line or a line over
+    /// [`LOG_LINE_CAP`] is an error.
     pub async fn run_wait_with_stderr(
         &self,
         session: &str,
         body: &serde_json::Value,
         out_cap: usize,
+    ) -> Result<(i32, Vec<u8>, String)> {
+        self.run_wait_with_stderr_within(session, body, out_cap, crate::provider::RUN_EXEC_DEADLINE)
+            .await
+    }
+
+    /// Run a command and wait, bounded by `deadline`. The request timeout is
+    /// slightly longer than the caller's deadline so the outer timeout owns
+    /// the user-facing error and can distinguish an incomplete command stream.
+    pub async fn run_wait_with_stderr_within(
+        &self,
+        session: &str,
+        body: &serde_json::Value,
+        out_cap: usize,
+        deadline: Duration,
     ) -> Result<(i32, Vec<u8>, String)> {
         let p = policy("run command");
         let url = self.session_url(session, &["cmd"])?;
@@ -459,66 +473,72 @@ impl VercelClient {
             }
             None => bail!("{PROVIDER}: {}: body must be a JSON object", p.op),
         }
-        let resp = self
-            .send(p, || {
-                Ok(self
-                    .http
-                    .post(url.clone())
-                    .timeout(FILE_TRANSFER_TIMEOUT)
-                    .json(&body))
-            })
-            .await?;
-        let mut resp = self.ok(resp, p.op, false).await?;
+        tokio::time::timeout(deadline, async {
+            let resp = self
+                .send(p, || {
+                    Ok(self
+                        .http
+                        .post(url.clone())
+                        .timeout(deadline + Duration::from_secs(5))
+                        .json(&body))
+                })
+                .await?;
+            let mut resp = self.ok(resp, p.op, false).await?;
 
-        let mut lines = LineSplitter::new(LOG_LINE_CAP);
-        let mut out = TailBuffer::new(out_cap);
-        let mut stderr = StderrTail::default();
-        let mut code: Option<i32> = None;
-        loop {
-            let chunk = resp
-                .chunk()
-                .await
-                .map_err(|e| redacted_transport_error(PROVIDER, p.op, &e))?;
-            let done = chunk.is_none();
-            let complete = match chunk {
-                Some(chunk) => lines.push(&chunk),
-                None => lines.finish(),
-            }
-            .map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
-            for line in complete {
-                match parse_log_line(&line) {
-                    Ok(LogLine::Stdout(bytes)) => out.push(&bytes),
-                    Ok(LogLine::Stderr(bytes)) => stderr.push(&bytes),
-                    Ok(LogLine::Command { exit_code, .. }) => {
-                        if exit_code.is_some() {
-                            code = exit_code;
+            let mut lines = LineSplitter::new(LOG_LINE_CAP);
+            let mut out = TailBuffer::new(out_cap);
+            let mut stderr = StderrTail::default();
+            let mut code: Option<i32> = None;
+            loop {
+                let chunk = resp
+                    .chunk()
+                    .await
+                    .map_err(|e| redacted_transport_error(PROVIDER, p.op, &e))?;
+                let done = chunk.is_none();
+                let complete = match chunk {
+                    Some(chunk) => lines.push(&chunk),
+                    None => lines.finish(),
+                }
+                .map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+                for line in complete {
+                    match parse_log_line(&line) {
+                        Ok(LogLine::Stdout(bytes)) => out.push(&bytes),
+                        Ok(LogLine::Stderr(bytes)) => stderr.push(&bytes),
+                        Ok(LogLine::Command { exit_code, .. }) => {
+                            if exit_code.is_some() {
+                                code = exit_code;
+                            }
                         }
+                        Ok(LogLine::Error { code, message }) => bail!(
+                            "{PROVIDER}: {}: the command stream reported an error: {}",
+                            p.op,
+                            self.snippet(&format!("{code}: {message}"))
+                        ),
+                        // An unrecognised line (a future stream kind) is skipped,
+                        // never echoed.
+                        Err(_) => {}
                     }
-                    Ok(LogLine::Error { code, message }) => bail!(
-                        "{PROVIDER}: {}: the command stream reported an error: {}",
-                        p.op,
-                        self.snippet(&format!("{code}: {message}"))
-                    ),
-                    // An unrecognised line (a future stream kind) is skipped,
-                    // never echoed.
-                    Err(_) => {}
+                }
+                if done {
+                    break;
                 }
             }
-            if done {
-                break;
-            }
-        }
-        Ok((
-            code.unwrap_or(EXEC_EXIT_STATUS_UNKNOWN),
-            out.into_vec(),
-            stderr.render(),
-        ))
+            let code = code.ok_or_else(|| anyhow!("{PROVIDER}: run command ended without an exit status"))?;
+            Ok((code, out.into_vec(), stderr.render()))
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "{PROVIDER}: run command exceeded its {}s deadline; the command may still be running in the sandbox",
+                deadline.as_secs()
+            )
+        })?
     }
 
     /// Run a command and wait (`wait: true` is forced), streaming the NDJSON
     /// body. Returns `(exit, last out_cap stdout bytes)`; stderr is not kept.
-    /// A missing final exit gives [`EXEC_EXIT_STATUS_UNKNOWN`]; an `error` line
-    /// or a line over [`LOG_LINE_CAP`] is an error.
+    /// A missing final exit is an error; an `error` line or a line over
+    /// [`LOG_LINE_CAP`] is an error.
     pub async fn run_wait(
         &self,
         session: &str,
@@ -1222,6 +1242,123 @@ impl TailBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn loopback_response(response: Vec<u8>, hold: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback server");
+        let addr = listener.local_addr().expect("loopback address");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream.write_all(&response).await;
+            let _ = stream.flush().await;
+            tokio::time::sleep(hold).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn content_length_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn stalled_chunked_response(line: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:X}\r\n{line}\r\n",
+            line.len()
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn run_wait_with_stderr_within_times_out_stalled_stream() {
+        let line = "{\"stream\":\"stdout\",\"data\":\"x\"}\n";
+        let base = loopback_response(stalled_chunked_response(line), Duration::from_secs(2)).await;
+        let client = VercelClient::new(
+            &base,
+            VercelToken::new("t".into()),
+            Scope {
+                team_id: "team_t".into(),
+                project_id: "prj_t".into(),
+            },
+        )
+        .expect("loopback client");
+
+        let err = client
+            .run_wait_with_stderr_within(
+                "sess_1",
+                &serde_json::json!({}),
+                64,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("exceeded its"));
+    }
+
+    #[tokio::test]
+    async fn missing_exit_is_an_error() {
+        let body = "{\"stream\":\"stdout\",\"data\":\"x\"}\n";
+        let base = loopback_response(content_length_response(body), Duration::ZERO).await;
+        let client = VercelClient::new(
+            &base,
+            VercelToken::new("t".into()),
+            Scope {
+                team_id: "team_t".into(),
+                project_id: "prj_t".into(),
+            },
+        )
+        .expect("loopback client");
+
+        let err = client
+            .run_wait_with_stderr_within(
+                "sess_1",
+                &serde_json::json!({}),
+                64,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("without an exit status"));
+    }
+
+    #[tokio::test]
+    async fn exit_line_is_returned() {
+        let body = concat!(
+            "{\"stream\":\"stdout\",\"data\":\"out\"}\n",
+            "{\"stream\":\"stderr\",\"data\":\"err\"}\n",
+            "{\"command\":{\"id\":\"cmd_1\",\"exitCode\":3}}\n",
+        );
+        let base = loopback_response(content_length_response(body), Duration::ZERO).await;
+        let client = VercelClient::new(
+            &base,
+            VercelToken::new("t".into()),
+            Scope {
+                team_id: "team_t".into(),
+                project_id: "prj_t".into(),
+            },
+        )
+        .expect("loopback client");
+
+        let result = client
+            .run_wait_with_stderr_within(
+                "sess_1",
+                &serde_json::json!({}),
+                64,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("command result");
+        assert_eq!(result, (3, b"out".to_vec(), "err".to_string()));
+    }
 
     #[test]
     fn ticket_url_admission() {
