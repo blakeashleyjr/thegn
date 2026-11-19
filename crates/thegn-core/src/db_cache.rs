@@ -62,7 +62,10 @@ impl CacheStore for Db {
             None => self.conn().execute(
                 r#"INSERT INTO pr_cache(worktree,branch,json,fetched_at)
                    VALUES(?1,?2,?3,?4)
-                   ON CONFLICT(worktree) DO NOTHING"#,
+                   ON CONFLICT(worktree) DO UPDATE SET branch=excluded.branch,
+                       json=excluded.json, fetched_at=excluded.fetched_at
+                   WHERE typeof(pr_cache.json) <> 'text'
+                      OR typeof(pr_cache.fetched_at) <> 'integer'"#,
                 params![worktree, branch, json, util::now()],
             )?,
             Some((old_json, old_at)) => self.conn().execute(
@@ -532,6 +535,29 @@ mod tests {
         );
         assert_eq!(db.get_pr_cache("/wt/a").unwrap().unwrap().0, "{\"n\":1}");
         // A second insert-if-absent loses and leaves the winner's row.
+        assert!(
+            !db.put_pr_cache_if("/wt/a", "br", "{\"n\":2}", None)
+                .unwrap()
+        );
+        assert_eq!(db.get_pr_cache("/wt/a").unwrap().unwrap().0, "{\"n\":1}");
+    }
+
+    #[test]
+    fn put_pr_cache_if_none_repairs_an_unreadable_row() {
+        let db = Db::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO pr_cache(worktree,branch,json,fetched_at) VALUES('/wt/a','br',NULL,NULL)",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_pr_cache("/wt/a").unwrap().is_none());
+        assert!(
+            db.put_pr_cache_if("/wt/a", "br", "{\"n\":1}", None)
+                .unwrap()
+        );
+        assert_eq!(db.get_pr_cache("/wt/a").unwrap().unwrap().0, "{\"n\":1}");
+        // The row is readable now, so a second insert-if-absent loses.
         assert!(
             !db.put_pr_cache_if("/wt/a", "br", "{\"n\":2}", None)
                 .unwrap()
