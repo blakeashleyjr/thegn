@@ -8,7 +8,7 @@ const OID_A40: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OID_B40: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OID_B64: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OID_C40: &str = "cccccccccccccccccccccccccccccccccccccccc";
-const OID_D40: &str = "dddddddddddddddddddddddddddddddddddddd";
+const OID_D40: &str = "dddddddddddddddddddddddddddddddddddddddd";
 
 fn outcome(status: MergeFinalStatus) -> MergeFinalOutcome<'static> {
     MergeFinalOutcome {
