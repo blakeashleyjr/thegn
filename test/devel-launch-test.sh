@@ -27,7 +27,7 @@ if [[ $root_before -eq 1 ]]; then
   before_entries="$(find "$root" -mindepth 1 -maxdepth 1 -printf '%P\n' | sort)"
 fi
 
-env_output="$(XDG_RUNTIME_DIR="$tmp/run0" WAYLAND_DISPLAY=wayland-9 DBUS_SESSION_BUS_ADDRESS= \
+env_output="$(XDG_RUNTIME_DIR="$tmp/run0" WAYLAND_DISPLAY=wayland-9 DBUS_SESSION_BUS_ADDRESS='' \
   "$launcher" --print-env)"
 contains "$env_output" "export WAYLAND_DISPLAY='$tmp/run0/wayland-9'"
 contains "$env_output" "export XDG_RUNTIME_DIR='$root/run'"
@@ -39,12 +39,12 @@ else
   [[ ! -e $root ]] || fail "--print-env created $root"
 fi
 
-absolute_output="$(XDG_RUNTIME_DIR="$tmp/run0" WAYLAND_DISPLAY=/x/w DBUS_SESSION_BUS_ADDRESS= \
+absolute_output="$(XDG_RUNTIME_DIR="$tmp/run0" WAYLAND_DISPLAY=/x/w DBUS_SESSION_BUS_ADDRESS='' \
   "$launcher" --print-env)"
 [[ $absolute_output != *"$tmp/run0/x/w"* ]] || fail "absolute WAYLAND_DISPLAY was rewritten"
 [[ $absolute_output != *"export WAYLAND_DISPLAY="* ]] || fail "absolute WAYLAND_DISPLAY was unexpectedly emitted"
 
-dbus_output="$(XDG_RUNTIME_DIR="$tmp/run0" WAYLAND_DISPLAY= DBUS_SESSION_BUS_ADDRESS=unix:path=/already-set \
+dbus_output="$(XDG_RUNTIME_DIR="$tmp/run0" WAYLAND_DISPLAY='' DBUS_SESSION_BUS_ADDRESS=unix:path=/already-set \
   "$launcher" --print-env)"
 [[ $dbus_output != *"export DBUS_SESSION_BUS_ADDRESS="* ]] || fail "existing DBUS address was emitted"
 
