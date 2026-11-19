@@ -954,6 +954,23 @@ impl PrivateDir {
         }
     }
 
+    /// Rename one child over another relative to the held directory handle.
+    /// The destination is replaced atomically and no path component is
+    /// resolved outside this directory.
+    pub fn rename_child(&self, from: &str, to: &str) -> std::io::Result<()> {
+        let from_path = single_component(from)?;
+        let to_path = single_component(to)?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::renameat;
+            renameat(&self.fd, from_path, &self.fd, to_path).map_err(nix_io_error)
+        }
+        #[cfg(not(unix))]
+        {
+            rename_replace(&self.path.join(from_path), &self.path.join(to_path))
+        }
+    }
+
     /// Open an existing child directory relative to this held handle without
     /// following a symlink and without ever creating it. A missing child, a
     /// symlink or a non-directory is `None`. The child must be owned by the
@@ -1087,15 +1104,36 @@ impl PrivateDir {
     /// Create or open a lock file beneath this held private directory without
     /// following a leaf symlink. The file is never truncated.
     pub fn open_or_create_regular_nofollow(&self, name: &str) -> std::io::Result<std::fs::File> {
+        self.open_or_create_regular_nofollow_mode(name, false)
+    }
+
+    /// Create or open an owner-only append file beneath this held private
+    /// directory without following a leaf symlink.
+    pub fn open_or_create_regular_nofollow_append(
+        &self,
+        name: &str,
+    ) -> std::io::Result<std::fs::File> {
+        self.open_or_create_regular_nofollow_mode(name, true)
+    }
+
+    fn open_or_create_regular_nofollow_mode(
+        &self,
+        name: &str,
+        append: bool,
+    ) -> std::io::Result<std::fs::File> {
         let name_path = single_component(name)?;
         #[cfg(unix)]
         {
             use nix::fcntl::{OFlag, openat};
             use nix::sys::stat::{SFlag, fstat};
+            let mut flags = OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+            if append {
+                flags |= OFlag::O_APPEND;
+            }
             let fd = openat(
                 &self.fd,
                 name_path,
-                OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                flags,
                 nix::sys::stat::Mode::from_bits_truncate(0o600),
             )
             .map_err(|error| {
@@ -1141,6 +1179,7 @@ impl PrivateDir {
                 .write(true)
                 .create(true)
                 .truncate(false)
+                .append(append)
                 .open(self.path.join(name_path))
         }
     }
@@ -3311,6 +3350,18 @@ mod tests {
         )
         .unwrap();
         assert!(pinned.open_regular_nofollow("link").is_err());
+    }
+
+    #[test]
+    fn private_dir_rename_child_replaces_destination() {
+        let (_root, private, pinned) = pinned_private_fixture();
+        std::fs::write(private.join("current"), b"new").unwrap();
+        std::fs::write(private.join("previous"), b"old").unwrap();
+
+        pinned.rename_child("current", "previous").unwrap();
+
+        assert_eq!(std::fs::read(private.join("previous")).unwrap(), b"new");
+        assert!(!private.join("current").exists());
     }
 
     fn pinned_private_fixture() -> (tempfile::TempDir, PathBuf, PrivateDir) {
