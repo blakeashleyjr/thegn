@@ -1175,6 +1175,18 @@
       "archive_path": "openspec/changes/archive/2026-09-30-reduce-process-monitor-idle-work/"
     },
     {
+      "change": "remote-daily-loop",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2234",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Sprites adopt, opt-in lifetime reaper, land-local-then-release, pull single-flight, credential custody and conformance slice 2; live verification open."
+    },
+    {
       "change": "repair-kitty-stream-parser",
       "archive_path": "openspec/changes/archive/2026-10-21-repair-kitty-stream-parser/",
       "lifecycle": "archived",

@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn env adopt <sprite> --env <S>` records an existing sprite after you confirm it, so thegn can manage it. `[env.<n>.provider] lifetime_reap = true` lets a running client destroy recorded sprites past `max_lifetime_secs`. `thegn land` on a provider worktree now pulls and lands the local branch and keeps the sandbox; `--release-sandbox` destroys it. `agent run --wait` stops a Fly or machine0 machine afterwards unless `--keep-running`. `login_homes` selects a dedicated login for Sprites and Vercel `upload`. Not yet verified live.
+
 ## [0.1.0-alpha.97] — 2026-11-18
 
 ### Added

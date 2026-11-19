@@ -480,7 +480,8 @@
       "issue": "THE-2234",
       "project": "Client API & Remote Access",
       "changes": [
-        "harden-remote-sprites-journey"
+        "harden-remote-sprites-journey",
+        "remote-daily-loop"
       ]
     }
   ]
