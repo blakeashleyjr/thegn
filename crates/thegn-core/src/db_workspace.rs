@@ -115,6 +115,10 @@ impl Db {
     /// terminal slice of `prune_missing_semantic_files`, which the `db.rs`
     /// worker loop reaches after its semantic scan is complete.
     pub(crate) fn prune_orphan_worktree_caches(&self, max_keys: usize) -> Result<usize> {
+        /// Scope and key prefix of the merge view's per-worktree denominator
+        /// (`hydrate::merge_total`).
+        const MERGE_TOTAL_UI_SCOPE: &str = "panel";
+        const MERGE_TOTAL_UI_PREFIX: &str = "merge_total:";
         let conn = self.conn();
         let mut cache_queries = vec![
             "SELECT worktree FROM worktree_disk",
@@ -158,7 +162,7 @@ impl Db {
         // on-disk protections. Share the sweep's key budget so this pass
         // cannot make one terminal slice unbounded. The return value remains
         // the number of worktree-cache keys removed, preserving its contract.
-        let remaining_budget = max_keys.saturating_sub(orphan_keys.len());
+        let mut remaining_budget = max_keys.saturating_sub(orphan_keys.len());
         if remaining_budget > 0 {
             let repo_cache_tables = [
                 ("issue_cache", "repo_root"),
@@ -184,6 +188,7 @@ impl Db {
                 .filter(|key| is_removed_root(&registered, key))
                 .take(remaining_budget)
                 .collect();
+            remaining_budget = remaining_budget.saturating_sub(orphan_repo_roots.len());
             for repo_root in orphan_repo_roots {
                 for (table, column) in repo_cache_tables {
                     conn.execute(
@@ -191,6 +196,42 @@ impl Db {
                         params![repo_root],
                     )?;
                 }
+            }
+        }
+
+        // The merge view's `merge_total:<worktree>` ui_state rows are keyed by
+        // a worktree path too; retire them for removed roots inside the same
+        // key budget. The LIKE pattern is escaped as `del_ui_state_prefix`
+        // does so `_` in the prefix matches literally.
+        if remaining_budget > 0 {
+            let prefix = MERGE_TOTAL_UI_PREFIX
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let keys = {
+                let mut stmt = conn.prepare(
+                    "SELECT key FROM ui_state WHERE scope=?1 AND key LIKE ?2 ESCAPE '\\' \
+                     ORDER BY key",
+                )?;
+                let rows = stmt
+                    .query_map(params![MERGE_TOTAL_UI_SCOPE, format!("{prefix}%")], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let orphan_merge_totals: Vec<String> = keys
+                .into_iter()
+                .filter(|key| {
+                    key.strip_prefix(MERGE_TOTAL_UI_PREFIX)
+                        .is_some_and(|root| !root.is_empty() && is_removed_root(&registered, root))
+                })
+                .take(remaining_budget)
+                .collect();
+            for key in orphan_merge_totals {
+                conn.execute(
+                    "DELETE FROM ui_state WHERE scope=?1 AND key=?2",
+                    params![MERGE_TOTAL_UI_SCOPE, key],
+                )?;
             }
         }
         Ok(orphan_keys.len())
@@ -2787,6 +2828,60 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM pr_cache", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn orphan_cache_sweep_prunes_merge_total_ui_state_of_removed_roots() {
+        let db = Db::open_memory().unwrap();
+        let live = tempfile::Builder::new().tempdir().unwrap();
+        let live_key = format!("merge_total:{}", live.path().display());
+        db.set_ui_state("panel", &live_key, "3").unwrap();
+        for key in ["/gone/wt-a", "/gone/wt-b", "/gone/wt-c"] {
+            db.set_ui_state("panel", &format!("merge_total:{key}"), "2")
+                .unwrap();
+        }
+        // A key that only matches the prefix without ESCAPE must survive.
+        db.set_ui_state("panel", "mergeXtotal:/gone/wt-a", "1")
+            .unwrap();
+        // Another scope is not swept.
+        db.set_ui_state("other", "merge_total:/gone/wt-a", "1")
+            .unwrap();
+
+        // Bounded: two of three removed roots per call.
+        assert_eq!(db.prune_orphan_worktree_caches(2).unwrap(), 0);
+        let left: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM ui_state WHERE scope='panel' AND key LIKE 'merge\\_total:/gone/%' ESCAPE '\\'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1);
+        db.prune_orphan_worktree_caches(2).unwrap();
+        for key in ["/gone/wt-a", "/gone/wt-b", "/gone/wt-c"] {
+            assert_eq!(
+                db.get_ui_state("panel", &format!("merge_total:{key}"))
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            db.get_ui_state("panel", &live_key).unwrap().as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            db.get_ui_state("panel", "mergeXtotal:/gone/wt-a")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            db.get_ui_state("other", "merge_total:/gone/wt-a")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
