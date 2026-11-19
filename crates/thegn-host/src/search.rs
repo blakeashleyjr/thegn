@@ -62,6 +62,13 @@ impl SearchOverlay {
         self.engine.scope()
     }
 
+    /// Populate the result list before the user types. An empty query ranks
+    /// the newest history lines first, so opening the overlay is useful on its
+    /// own and does not wait for the first keystroke.
+    pub fn prime(&mut self, sources: &[SearchSource<'_>]) {
+        self.engine.set_query("", sources);
+    }
+
     #[allow(dead_code)] // used in tests
     pub fn engine(&self) -> &SearchEngine {
         &self.engine
@@ -441,6 +448,19 @@ mod tests {
         let r = ov.handle_key(&KeyCode::Char('a'), Modifiers::NONE, &srcs);
         assert!(matches!(r, SearchOutcome::Pending));
         assert_eq!(ov.engine().query(), "ca");
+    }
+
+    #[test]
+    fn prime_lists_newest_lines_before_typing() {
+        let buf = buf_from(&["old", "middle", "new"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+
+        ov.prime(&srcs);
+
+        assert_eq!(ov.engine().query(), "");
+        assert_eq!(ov.engine().matches()[0].line, "new");
+        assert_eq!(ov.engine().matches()[1].line, "middle");
     }
 
     #[test]
