@@ -30,7 +30,6 @@ use thegn_core::config::InboxAccount;
 use thegn_core::db::Db;
 use thegn_core::db_inbox::InboxAccountState;
 use thegn_core::inbox::{InboxPage, diff, facts, message, sanitize_item, source_ref};
-use thegn_core::seam::Kind as _;
 use thegn_core::store::NotificationStore;
 use thegn_svc::inbox::{InboxBackend, InboxError};
 
