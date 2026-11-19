@@ -85,13 +85,36 @@ pub(crate) fn list_rows(
     rows
 }
 
+/// One verb's output: a single `--json` document, or text lines.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Output {
+    Json(serde_json::Value),
+    Lines(Vec<String>),
+}
+
+impl Output {
+    /// Print it: JSON through `emit_json` (one compact document on stdout),
+    /// text a line at a time.
+    fn print(&self) -> Result<()> {
+        match self {
+            Output::Json(value) => super::emit_json(value),
+            Output::Lines(lines) => {
+                for line in lines {
+                    outln!("{line}");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// The message minus its `[account] ` prefix (the title).
 fn title_of(row: &ListRow) -> &str {
     let prefix = format!("[{}] ", row.account);
     row.message.strip_prefix(&prefix).unwrap_or(&row.message)
 }
 
-pub(crate) fn render_list(rows: &[ListRow], json: bool, now: i64) -> Vec<String> {
+pub(crate) fn render_list(rows: &[ListRow], json: bool, now: i64) -> Output {
     if json {
         let arr: Vec<serde_json::Value> = rows
             .iter()
@@ -105,18 +128,20 @@ pub(crate) fn render_list(rows: &[ListRow], json: bool, now: i64) -> Vec<String>
                 })
             })
             .collect();
-        return vec![serde_json::Value::Array(arr).to_string()];
+        return Output::Json(serde_json::Value::Array(arr));
     }
-    rows.iter()
-        .map(|r| {
-            format!(
-                "{}  [{}] {}",
-                thegn_core::util::age_since(now, r.created_at),
-                r.account,
-                title_of(r)
-            )
-        })
-        .collect()
+    Output::Lines(
+        rows.iter()
+            .map(|r| {
+                format!(
+                    "{}  [{}] {}",
+                    thegn_core::util::age_since(now, r.created_at),
+                    r.account,
+                    title_of(r)
+                )
+            })
+            .collect(),
+    )
 }
 
 /// The `test` guard inputs (the caller environment).
@@ -160,12 +185,12 @@ fn scrub(msg: &str) -> String {
     sanitize_text(&thegn_core::log_redact::redact_text_line(msg), 200)
 }
 
-/// Render a fetch outcome: `(lines, ok)`.
+/// Render a fetch outcome: `(output, ok)`.
 pub(crate) fn render_test(
     kind: &str,
     result: &Result<thegn_core::inbox::InboxPage, thegn_svc::inbox::InboxError>,
     json: bool,
-) -> (Vec<String>, bool) {
+) -> (Output, bool) {
     match result {
         Ok(page) => {
             let items: Vec<_> = page
@@ -179,7 +204,7 @@ pub(crate) fn render_test(
                 let v = serde_json::json!({
                     "kind": kind, "count": items.len(), "items": shown,
                 });
-                return (vec![v.to_string()], true);
+                return (Output::Json(v), true);
             }
             let mut out = vec![format!("kind: {kind}"), format!("items: {}", items.len())];
             for item in items.iter().take(TEST_SHOW) {
@@ -190,17 +215,20 @@ pub(crate) fn render_test(
                 };
                 out.push(format!("  {}  {}{url}", item.id, item.title));
             }
-            (out, true)
+            (Output::Lines(out), true)
         }
         Err(e) => {
             let class = format!("{:?}", e.class()).to_lowercase();
             let msg = scrub(&e.to_string());
             if json {
                 let v = serde_json::json!({"kind": kind, "error_class": class, "error": msg});
-                (vec![v.to_string()], false)
+                (Output::Json(v), false)
             } else {
                 (
-                    vec![format!("kind: {kind}"), format!("error ({class}): {msg}")],
+                    Output::Lines(vec![
+                        format!("kind: {kind}"),
+                        format!("error ({class}): {msg}"),
+                    ]),
                     false,
                 )
             }
@@ -224,20 +252,20 @@ pub(crate) fn render_status(
     reply: Option<&ProducersStatusReply>,
     json: bool,
     now_ms: i64,
-) -> Vec<String> {
+) -> Result<Output> {
     let Some(r) = reply else {
-        return if json {
-            vec![serde_json::json!({"daemon": false}).to_string()]
+        return Ok(if json {
+            Output::Json(serde_json::json!({"daemon": false}))
         } else {
-            vec![NO_DAEMON.to_owned()]
-        };
+            Output::Lines(vec![NO_DAEMON.to_owned()])
+        });
     };
     if json {
         let mut r = r.clone();
         for a in &mut r.inbox {
             a.last_error = scrub(&a.last_error);
         }
-        return vec![serde_json::to_string(&r).unwrap_or_default()];
+        return Ok(Output::Json(serde_json::to_value(&r)?));
     }
     let mut out = vec![format!(
         "headless_producers: {}  installed: {}",
@@ -269,7 +297,7 @@ pub(crate) fn render_status(
             a.item_count
         ));
     }
-    out
+    Ok(Output::Lines(out))
 }
 
 /// Ask a running daemon for `producers.status` (None when none answers).
@@ -321,10 +349,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 None => Vec::new(),
             };
             let rows = list_rows(&all, account.as_deref(), unread);
-            for line in render_list(&rows, json, thegn_core::util::now()) {
-                outln!("{line}");
-            }
-            Ok(())
+            render_list(&rows, json, thegn_core::util::now()).print()
         }
         Action::Test { account, json } => {
             let acct = test_target(cfg, TestEnv::current(), &account)?;
@@ -338,10 +363,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 }
                 Err(e) => Err(e),
             };
-            let (lines, ok) = render_test(kind, &result, json);
-            for line in lines {
-                outln!("{line}");
-            }
+            let (output, ok) = render_test(kind, &result, json);
+            output.print()?;
             if ok {
                 Ok(())
             } else {
@@ -350,10 +373,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         }
         Action::Status { json } => {
             let reply = daemon_producers_status(cfg);
-            for line in render_status(reply.as_ref(), json, now_ms()) {
-                outln!("{line}");
-            }
-            Ok(())
+            render_status(reply.as_ref(), json, now_ms())?.print()
         }
     }
 }
@@ -452,9 +472,10 @@ mod tests {
         assert_eq!(rows[0].item_id, "a1");
         assert_eq!(list_rows(&all, None, false).len(), 2);
         let text = render_list(&rows, false, rows[0].created_at + 120);
-        assert_eq!(text, vec!["2m  [work] Review PR".to_owned()]);
-        let json = render_list(&rows, true, 0);
-        let v: serde_json::Value = serde_json::from_str(&json[0]).unwrap();
+        assert_eq!(text, Output::Lines(vec!["2m  [work] Review PR".to_owned()]));
+        let Output::Json(v) = render_list(&rows, true, 0) else {
+            panic!("--json renders one JSON document");
+        };
         let o = &v[0];
         assert_eq!(o["account"], "work");
         assert_eq!(o["item_id"], "a1");
@@ -466,7 +487,14 @@ mod tests {
     #[test]
     fn status_text_from_a_canned_reply() {
         use thegn_core::producer_status::InboxAccountStatus;
-        assert_eq!(render_status(None, false, 0), vec![NO_DAEMON.to_owned()]);
+        assert_eq!(
+            render_status(None, false, 0).unwrap(),
+            Output::Lines(vec![NO_DAEMON.to_owned()])
+        );
+        assert_eq!(
+            render_status(None, true, 0).unwrap(),
+            Output::Json(serde_json::json!({"daemon": false}))
+        );
         let reply = ProducersStatusReply {
             installed: true,
             headless: true,
@@ -481,7 +509,9 @@ mod tests {
                 baselined: false,
             }],
         };
-        let lines = render_status(Some(&reply), false, 1_000_000);
+        let Output::Lines(lines) = render_status(Some(&reply), false, 1_000_000).unwrap() else {
+            panic!("text mode renders lines");
+        };
         assert!(
             lines.iter().any(|l| l.contains("[work]")
                 && l.contains("polled 2m ago")
