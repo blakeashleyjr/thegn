@@ -60,7 +60,7 @@ fn list_pages_carry_the_cursor() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].status, SessionStatus::Running);
     assert_eq!(items[1].status, SessionStatus::Stopped);
-    assert_eq!(items[1].session_id, None);
+    assert_eq!(items[1].session_id.as_deref(), Some("sess_old1"));
     assert_eq!(next.as_deref(), Some("cur_2"));
 
     let (items, next) = parse_list_page(&fixture("list_last.json")).unwrap();

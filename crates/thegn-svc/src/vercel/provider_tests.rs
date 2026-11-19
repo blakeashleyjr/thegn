@@ -30,6 +30,8 @@ pub(super) struct FakeApi {
     pub(super) run_delay: Mutex<Option<std::time::Duration>>,
     /// Fail keep-alive GETs after the initial session lookup.
     pub(super) get_fails: bool,
+    /// Make every extend answer "session gone".
+    pub(super) extend_gone: bool,
     /// Name-keyed answers for `get` and (when no page is scripted) `list`.
     pub(super) by_name: Mutex<BTreeMap<String, SandboxView>>,
     /// Set by the conformance suite: the ledger file whose existence `create`
@@ -175,6 +177,9 @@ impl Api for FakeApi {
     ) -> BoxFuture<'a, Result<client::ExtendOutcome>> {
         Box::pin(async move {
             self.record(format!("extend {session} {ms}"));
+            if self.extend_gone {
+                return Err(client::SessionGone { status: 404 }.into());
+            }
             Ok(client::ExtendOutcome::Extended)
         })
     }
@@ -626,6 +631,40 @@ async fn run_exec_extends_the_session_during_a_long_command() {
     assert!(fake.count("extend") >= 1, "{:?}", fake.calls());
 }
 
+#[tokio::test(start_paused = true)]
+async fn run_exec_surfaces_a_gone_session() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        extend_gone: true,
+        ..FakeApi::default()
+    });
+    fake.by_name.lock().unwrap().insert(
+        NAME.into(),
+        view(NAME, SessionStatus::Running, Some("sess_1")),
+    );
+    *fake.run_delay.lock().unwrap() = Some(std::time::Duration::from_secs(12 * 60));
+
+    let mut test_spec = spec(2);
+    test_spec.max_lifetime_secs = 10 * 365 * 24 * 60 * 60;
+    let api: Arc<dyn Api> = fake.clone();
+    let p = VercelProvider::with_client_for_test(test_spec, api, ledger.path().into())
+        .expect("test provider admits its spec");
+    let task = tokio::spawn(async move {
+        p.run_exec(NAME, &["true".to_string()], None, &[], Wake::Never)
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(12 * 60)).await;
+
+    let error = task.await.unwrap().unwrap_err();
+    assert!(
+        error.downcast_ref::<client::SessionGone>().is_some(),
+        "{error:#}"
+    );
+    assert!(fake.count("extend") >= 1, "{:?}", fake.calls());
+}
+
 #[tokio::test]
 async fn run_exec_short_command_checks_once() {
     let _state = thegn_core::testenv::IsolatedState::new();
@@ -645,7 +684,7 @@ async fn run_exec_short_command_checks_once() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn run_exec_keepalive_error_fails_the_exec() {
+async fn run_exec_keepalive_error_never_fails_the_exec() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let ledger = tempfile::tempdir().unwrap();
     let fake = Arc::new(FakeApi {
@@ -666,8 +705,8 @@ async fn run_exec_keepalive_error_fails_the_exec() {
     tokio::task::yield_now().await;
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
 
-    let error = task.await.unwrap().unwrap_err();
-    assert!(error.to_string().contains("fake: get failed"), "{error:#}");
+    let (code, _) = task.await.unwrap().unwrap();
+    assert_eq!(code, 0);
     assert!(fake.count("get") >= 2, "{:?}", fake.calls());
 }
 
@@ -905,10 +944,15 @@ fn credential_env() -> Vec<(String, String)> {
 }
 
 fn env_keys(body: &serde_json::Value) -> Vec<String> {
-    body.get("env")
-        .and_then(|e| e.as_object())
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default()
+    match body.get("env") {
+        Some(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .filter_map(|item| item.split_once('=').map(|(key, _)| key.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[tokio::test]

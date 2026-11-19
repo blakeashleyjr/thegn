@@ -95,9 +95,27 @@ const WAIT_MAX_POLLS: u32 = 120;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtendOutcome {
     Extended,
-    /// A 4xx on extend: the plan ceiling; stop extending and warn once.
+    /// A 400 or 422 on extend: the plan ceiling; stop extending and warn once.
     AtCeiling,
 }
+
+/// `extend` found the session gone (OpenAPI: extend-timeout 404 or 410).
+#[derive(Debug)]
+pub struct SessionGone {
+    pub status: u16,
+}
+
+impl fmt::Display for SessionGone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{PROVIDER}: extend session: session no longer exists (HTTP {})",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for SessionGone {}
 
 /// The `/interactive` WebSocket ticket. `token` is a secret; `Debug` redacts it.
 /// The API token is never sent to `url`: callers present `token` alone.
@@ -429,10 +447,10 @@ impl VercelClient {
             }
             reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE => {
                 drain_quietly(resp).await;
-                bail!(
-                    "{PROVIDER}: extend session: session no longer exists (HTTP {})",
-                    status.as_u16()
-                );
+                return Err(SessionGone {
+                    status: status.as_u16(),
+                }
+                .into());
             }
             _ => {}
         }
@@ -453,8 +471,11 @@ impl VercelClient {
         let Some(view) = self.get(name, false).await? else {
             return Ok(());
         };
-        if view.status == thegn_core::vercel::api::SessionStatus::Running
-            && let Some(session) = view.session_id.as_deref()
+        if matches!(
+            view.status,
+            thegn_core::vercel::api::SessionStatus::Running
+                | thegn_core::vercel::api::SessionStatus::Pending
+        ) && let Some(session) = view.session_id.as_deref()
         {
             let policy = body.get("networkPolicy").ok_or_else(|| {
                 anyhow!("{PROVIDER}: {}: request body has no networkPolicy", p.op)

@@ -18,7 +18,7 @@
     {
       "name": "tg-fixture-1",
       "status": "stopped",
-      "currentSessionId": null,
+      "currentSessionId": "sess_old1",
       "vcpus": 2,
       "memory": 4096,
       "region": "iad1",
