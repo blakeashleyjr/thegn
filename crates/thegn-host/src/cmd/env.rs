@@ -1035,7 +1035,7 @@ fn down_provider(
         crate::agent::block_on_provider(|| async { provider.destroy(id).await })
             .map_err(|e| anyhow::anyhow!("env down failed: destroy {id} failed: {e}"))
     };
-    let mut list = || crate::agent::block_on_provider(|| async { provider.list().await });
+    let mut list = || crate::agent::block_on_provider(|| async { provider.inventory().await });
     let mut sleep = std::thread::sleep;
     let mut forget = || forget_destroyed_sandbox(id, wt);
     destroy_provider_sandbox(
@@ -1055,10 +1055,11 @@ fn down_provider(
     )
 }
 
-/// Clear the local provisioned marker and the worktree's provider location
-/// after a verified destroy. Failures warn: the sandbox is already gone.
+/// Clear local state after a verified destroy. Failures warn: the sandbox is
+/// already gone.
 fn forget_destroyed_sandbox(id: &str, wt: &str) {
     crate::provider_workdir::clear_provisioned(id);
+    crate::lifecycle::forget_destroyed_spare(id);
     match Db::open() {
         Ok(db) => {
             if let Err(e) = db.set_worktree_location(wt, "") {
@@ -1082,8 +1083,8 @@ const DOWN_VERIFY_POLL: Duration = Duration::from_secs(2);
 type PullStep<'a> = &'a mut dyn FnMut() -> Result<crate::provider_git::PullReport>;
 /// A fallible provider/side-effect step.
 type DownStep<'a> = &'a mut dyn FnMut() -> Result<()>;
-/// The provider `list()` the destroy verification polls.
-type ListStep<'a> = &'a mut dyn FnMut() -> Result<Vec<String>>;
+/// The provider inventory the destroy verification polls.
+type ListStep<'a> = &'a mut dyn FnMut() -> Result<thegn_svc::provider::InventoryReport>;
 
 /// The side effects of a provider `env down`, injected so tests drive the
 /// ordering with fakes.
@@ -1102,6 +1103,32 @@ struct DownSteps<'a> {
     sleep: &'a mut dyn FnMut(Duration),
     /// Clear the provisioned marker and provider location (after verify).
     forget: &'a mut dyn FnMut(),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownInventoryDecision {
+    AlreadyGone,
+    Proceed,
+}
+
+/// A complete inventory that lacks the sandbox proves it is already gone.
+/// Partial inventories and listing errors prove nothing and keep the normal
+/// pull/destroy path intact.
+fn down_inventory_decision(
+    inventory: Result<thegn_svc::provider::InventoryReport>,
+    id: &str,
+) -> DownInventoryDecision {
+    match inventory {
+        Ok(report)
+            if matches!(
+                crate::provider_git::sandbox_in_inventory(&report, id),
+                Some(false)
+            ) =>
+        {
+            DownInventoryDecision::AlreadyGone
+        }
+        Ok(_) | Err(_) => DownInventoryDecision::Proceed,
+    }
 }
 
 /// The kept ref of a pull-back that could not fast-forward.
@@ -1136,6 +1163,11 @@ fn destroy_provider_sandbox(
     opts: DownOpts,
     steps: DownSteps<'_>,
 ) -> Result<()> {
+    if down_inventory_decision((steps.list)(), id) == DownInventoryDecision::AlreadyGone {
+        (steps.forget)();
+        outln!("env {env_name}: sandbox {id} is already gone; nothing to pull back or destroy");
+        return Ok(());
+    }
     match (steps.pull)() {
         Ok(report) => {
             outln!("pull-back: {}", report.summary());
@@ -1171,15 +1203,15 @@ fn destroy_provider_sandbox(
 /// (capped at the time left) between asks. A `list` error before `deadline` is
 /// retried; at the deadline a still-listed id, or a failing list, is an error.
 fn wait_until_gone(
-    list: &mut dyn FnMut() -> anyhow::Result<Vec<String>>,
+    list: &mut dyn FnMut() -> anyhow::Result<thegn_svc::provider::InventoryReport>,
     id: &str,
     deadline: Instant,
     sleep: &mut dyn FnMut(Duration),
 ) -> anyhow::Result<()> {
     loop {
         let listed = list();
-        if let Ok(ids) = &listed
-            && !ids.iter().any(|listed_id| listed_id == id)
+        if let Ok(report) = &listed
+            && crate::provider_git::sandbox_in_inventory(report, id) == Some(false)
         {
             return Ok(());
         }
@@ -2391,15 +2423,21 @@ mod up_tests {
 #[cfg(test)]
 mod down_tests {
     use super::{
-        DownMode, DownOpts, DownSteps, LocationAction, destroy_provider_sandbox,
-        is_provider_location, kept_ref, location_action, no_stop_message, provider_has_stop,
-        pull_failed_refusal, resume_on_up, wait_until_gone,
+        DownInventoryDecision, DownMode, DownOpts, DownSteps, LocationAction,
+        destroy_provider_sandbox, down_inventory_decision, is_provider_location, kept_ref,
+        location_action, no_stop_message, provider_has_stop, pull_failed_refusal, resume_on_up,
+        wait_until_gone,
     };
     use crate::provider_git::{PullOutcome, PullReport};
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
+    use thegn_svc::provider::{InventoryReport, SandboxInfo};
 
-    type ListAnswer = anyhow::Result<Vec<String>>;
+    type ListAnswer = anyhow::Result<InventoryReport>;
+
+    fn inventory(ids: &[&str]) -> InventoryReport {
+        InventoryReport::Complete(ids.iter().map(|id| SandboxInfo::id_only(*id)).collect())
+    }
 
     fn report(outcome: PullOutcome) -> PullReport {
         PullReport {
@@ -2444,9 +2482,15 @@ mod down_tests {
             calls.borrow_mut().push("destroy");
             Ok(())
         };
-        let mut list = || -> anyhow::Result<Vec<String>> {
+        let mut list_calls = 0;
+        let mut list = || -> anyhow::Result<InventoryReport> {
             calls.borrow_mut().push("list");
-            Ok(Vec::new())
+            list_calls += 1;
+            if list_calls == 1 {
+                Ok(inventory(&["sbx-1"]))
+            } else {
+                Ok(inventory(&[]))
+            }
         };
         let mut sleep = |_: Duration| calls.borrow_mut().push("sleep");
         let mut forget = || calls.borrow_mut().push("forget");
@@ -2469,7 +2513,9 @@ mod down_tests {
         (result, calls)
     }
 
-    const DESTROYED: [&str; 6] = ["pull", "teardown", "revoke", "destroy", "list", "forget"];
+    const DESTROYED: [&str; 7] = [
+        "list", "pull", "teardown", "revoke", "destroy", "list", "forget",
+    ];
 
     #[test]
     fn an_up_to_date_pull_destroys_and_forgets_the_sandbox() {
@@ -2518,7 +2564,7 @@ mod down_tests {
     fn a_failed_pull_refuses_without_force_and_destroys_nothing() {
         let (result, calls) = run_down(Err(anyhow::anyhow!("sandbox unreachable")), destroy());
         let error = format!("{:#}", result.expect_err("a failed pull refuses"));
-        assert_eq!(calls, ["pull"]);
+        assert_eq!(calls, ["list", "pull"]);
         assert!(
             error.contains("could not pull back from sandbox sbx-1: sandbox unreachable"),
             "{error}"
@@ -2546,7 +2592,7 @@ mod down_tests {
         };
         let (result, calls) = run_down(Ok(report(PullOutcome::UpToDate)), opts);
         result.expect("stop succeeds");
-        assert_eq!(calls, ["pull", "suspend"]);
+        assert_eq!(calls, ["list", "pull", "suspend"]);
     }
 
     #[test]
@@ -2557,7 +2603,7 @@ mod down_tests {
         };
         let (result, calls) = run_down(Err(anyhow::anyhow!("no exec channel")), opts);
         result.expect("parking loses nothing");
-        assert_eq!(calls, ["pull", "suspend"]);
+        assert_eq!(calls, ["list", "pull", "suspend"]);
     }
 
     #[test]
@@ -2697,7 +2743,7 @@ mod down_tests {
 
     #[test]
     fn gone_on_the_first_list_never_sleeps() {
-        let answers = scripted(vec![Ok(vec!["other".into()])]);
+        let answers = scripted(vec![Ok(inventory(&["other"]))]);
         let mut list = || answers.borrow_mut().pop().expect("one list call");
         let mut sleeps: Vec<Duration> = Vec::new();
         let mut sleep = |d: Duration| sleeps.push(d);
@@ -2709,9 +2755,9 @@ mod down_tests {
     #[test]
     fn gone_after_two_polls_sleeps_twice() {
         let answers = scripted(vec![
-            Ok(vec!["sbx-1".into()]),
+            Ok(inventory(&["sbx-1"])),
             Err(anyhow::anyhow!("transient 503")),
-            Ok(Vec::new()),
+            Ok(inventory(&[])),
         ]);
         let mut list = || answers.borrow_mut().pop().expect("three list calls");
         let mut sleeps: Vec<Duration> = Vec::new();
@@ -2723,7 +2769,7 @@ mod down_tests {
 
     #[test]
     fn still_listed_at_the_deadline_is_an_error() {
-        let answers = scripted(vec![Ok(vec!["sbx-1".into(), "other".into()])]);
+        let answers = scripted(vec![Ok(inventory(&["sbx-1", "other"]))]);
         let mut list = || answers.borrow_mut().pop().expect("one list call");
         let mut sleeps: Vec<Duration> = Vec::new();
         let mut sleep = |d: Duration| sleeps.push(d);
@@ -2753,6 +2799,77 @@ mod down_tests {
         );
         assert!(error.contains("401 unauthorized"), "{error}");
         assert!(sleeps.is_empty(), "{sleeps:?}");
+    }
+
+    #[test]
+    fn down_inventory_decision_requires_complete_absence() {
+        let partial = InventoryReport::Partial {
+            rows: vec![],
+            reason: "page 2 failed".into(),
+        };
+        let cases = vec![
+            (
+                Ok(inventory(&["other"])),
+                DownInventoryDecision::AlreadyGone,
+            ),
+            (Ok(inventory(&["sbx-1"])), DownInventoryDecision::Proceed),
+            (Ok(partial), DownInventoryDecision::Proceed),
+            (
+                Err(anyhow::anyhow!("provider unavailable")),
+                DownInventoryDecision::Proceed,
+            ),
+        ];
+        for (listing, expected) in cases {
+            assert_eq!(down_inventory_decision(listing, "sbx-1"), expected);
+        }
+    }
+
+    #[test]
+    fn already_gone_skips_pull_and_destroy_and_forgets_state() {
+        let calls = RefCell::new(Vec::new());
+        let mut pull = || {
+            calls.borrow_mut().push("pull");
+            Ok(report(PullOutcome::UpToDate))
+        };
+        let mut teardown = || {
+            calls.borrow_mut().push("teardown");
+            Ok(())
+        };
+        let mut suspend = || {
+            calls.borrow_mut().push("suspend");
+            Ok(())
+        };
+        let mut revoke = || {
+            calls.borrow_mut().push("revoke");
+            Ok(())
+        };
+        let mut destroy_call = || {
+            calls.borrow_mut().push("destroy");
+            Ok(())
+        };
+        let mut list = || {
+            calls.borrow_mut().push("list");
+            Ok(inventory(&[]))
+        };
+        let mut sleep = |_: Duration| calls.borrow_mut().push("sleep");
+        let mut forget = || calls.borrow_mut().push("forget");
+        destroy_provider_sandbox(
+            "fly-dev",
+            "sbx-1",
+            destroy(),
+            DownSteps {
+                pull: &mut pull,
+                teardown: &mut teardown,
+                suspend: &mut suspend,
+                revoke: &mut revoke,
+                destroy: &mut destroy_call,
+                list: &mut list,
+                sleep: &mut sleep,
+                forget: &mut forget,
+            },
+        )
+        .expect("already-gone down succeeds");
+        assert_eq!(*calls.borrow(), ["list", "forget"]);
     }
 
     #[test]
