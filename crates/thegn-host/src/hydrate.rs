@@ -1228,8 +1228,18 @@ pub(crate) fn workspace_list(
             && !live.iter().any(|(s, _, _, _)| *s == repo)
         {
             // Live worktrees always belong to a git repo workspace. The empty
-            // repo_path marks this as a live fallback (no DB row yet).
-            live.push((repo.clone(), repo, "repo".to_string(), String::new()));
+            // repo_path marks this as a live fallback (no DB row yet) — except
+            // the session's OWN workspace, whose root is the session id. A
+            // removed (tombstoned) project reopened at startup has no DB or
+            // registry row to heal from; without its root the sidebar row can't
+            // be clicked, opened, or removed.
+            let path = own_slug
+                .as_ref()
+                .filter(|slug| thegn_core::util::slugify(&repo) == **slug)
+                .and(session.repo_root())
+                .map(|root| root.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            live.push((repo.clone(), repo, "repo".to_string(), path));
         }
     }
     merge_workspace_lists(db_backed, live)
