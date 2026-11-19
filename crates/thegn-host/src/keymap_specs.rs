@@ -275,7 +275,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "delete-project",
         label: "Delete project",
         message_key: "action-delete-project",
-        hint: "remove the active project",
+        hint: "remove the selected project",
         // No default chord — `Alt X` / `Space X` belong to close-worktree, so
         // this action is palette-driven + user-bindable (also reachable from the
         // sidebar row menu's "Remove project").
