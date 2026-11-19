@@ -527,11 +527,13 @@ mod tests {
 
     #[test]
     fn checkpoint_on_close_with_skips_an_env_missing_from_config() {
+        let _state = crate::testenv::IsolatedState::new();
         checkpoint_on_close_with(
             "/wt/unconfigured",
             None,
             Ok(Some("__thegn_test_env_missing_from_config__".into())),
         );
+        // Reaching here without a provider call or a panic is the property: an env absent from config returns early.
     }
 
     #[test]

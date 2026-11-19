@@ -126,18 +126,6 @@ fn snapshot_location(
     }
 }
 
-pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &str) {
-    let snapshot = match thegn_core::db::Db::open() {
-        Ok(db) => capture(&db, path),
-        Err(error) => CloseSnapshot {
-            location: Err(format!("{error:#}")),
-            repo_root: None,
-            env: Err(format!("{error:#}")),
-        },
-    };
-    background_close_with(cfg, path, snapshot);
-}
-
 pub(crate) fn background_close_with(
     cfg: Option<&thegn_core::config::Config>,
     path: &str,
@@ -292,9 +280,12 @@ mod tests {
             } else if provider {
                 assert!(matches!(result, Ok(GitLoc::Provider { .. })));
             } else if let Err(error) = location {
-                assert_eq!(result, Err(error));
+                assert!(matches!(&result, Err(e) if *e == error), "{result:?}");
             } else {
-                assert_eq!(result, Err("unrecognised worktree location".into()));
+                assert!(
+                    matches!(&result, Err(e) if e == "unrecognised worktree location"),
+                    "{result:?}"
+                );
             }
         }
     }
