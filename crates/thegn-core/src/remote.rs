@@ -335,7 +335,7 @@ struct RemoteLoc {
 /// Serialized form stored in `worktrees.location` for a managed-provider
 /// (e.g. Sprites) worktree: the control-plane exec prefix that runs a command
 /// *inside* the environment, plus the worktree's path inside it. Distinguished
-/// from [`RemoteLoc`] by the required `control_prefix` field (no `host`).
+/// from `RemoteLoc` by the required `control_prefix` field (no `host`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderLoc {
     control_prefix: Vec<String>,
@@ -810,7 +810,7 @@ impl GitLoc {
     /// Wrap a shell script to run *inside* a managed-provider env via its
     /// control-plane exec prefix, e.g. `sprite exec -s <name> -- /bin/sh -lc
     /// "<script>"`. The provider/transport-agnostic sibling of
-    /// [`ssh_command`](Self::ssh_command).
+    /// `ssh_command`.
     fn provider_command(&self, control_prefix: &[String], script: String) -> Command {
         let mut argv = control_prefix.to_vec();
         argv.push("/bin/sh".into());
