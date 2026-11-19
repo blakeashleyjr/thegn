@@ -723,8 +723,14 @@ fn claude_json_near(root: &Path) -> Option<std::path::PathBuf> {
         .filter(|beside| beside.is_file())
 }
 
+/// A host file's bytes plus its executable bit.
+type HostFile = (Vec<u8>, bool);
+
+/// An auth-critical file: relative path, bytes, executable bit.
+type AuthFile = (String, Vec<u8>, bool);
+
 /// Read a host file and whether it is executable. `None` ⇒ absent/unreadable.
-fn read_host_file(path: &Path) -> Option<(Vec<u8>, bool)> {
+fn read_host_file(path: &Path) -> Option<HostFile> {
     let data = std::fs::read(path).ok()?;
     let exec = std::fs::metadata(path)
         .map(|md| is_executable(&md))
@@ -737,8 +743,8 @@ fn read_host_file(path: &Path) -> Option<(Vec<u8>, bool)> {
 fn collect_auth_critical(
     sources: &[(String, LoginSource)],
     host_home: &str,
-    read: &mut dyn FnMut(&Path) -> Option<(Vec<u8>, bool)>,
-) -> Vec<(String, Vec<u8>, bool)> {
+    read: &mut dyn FnMut(&Path) -> Option<HostFile>,
+) -> Vec<AuthFile> {
     let mut out = Vec::new();
     for (agent, source) in sources {
         for f in thegn_core::envplan::agent_auth_critical_files(agent) {
