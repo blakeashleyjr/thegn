@@ -10769,7 +10769,12 @@ async fn event_loop<T: Terminal>(
                             keymap.config(),
                             chrome.center,
                         );
-                        kick_model_hydration!();
+                        if crate::workspace_switch_prep::applied_switch_hydrates_inline(
+                            last_active_worktree.as_deref(),
+                            &crate::hydrate::active_slice_key(&session),
+                        ) {
+                            kick_model_hydration!();
+                        }
                         need_relayout = true;
                         if after.open_merge_queue {
                             panel_auto_revealed = None;
@@ -10799,6 +10804,13 @@ async fn event_loop<T: Terminal>(
                         switch_at =
                             Some((request.requested_at, crate::perf::SwitchKind::Workspace));
                         applied_switch_seq = Some(request.seq);
+                        // The switch landed after this turn's loop-top switch detection and lazy
+                        // materialize ran, so without a pulse the new worktree's shell, cache paint
+                        // and hydration wait for the next incidental wake. One pulse per applied
+                        // switch (not a timer): the idle loop still never polls.
+                        if let Err(error) = waker.wake() {
+                            tracing::debug!(target: "thegn::workspace_switch", %error, "post-switch wake failed");
+                        }
                     }
                 }
                 pending_switch.clear(request.seq);

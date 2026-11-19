@@ -409,7 +409,7 @@ pub fn write(rec: &VpsRecord) -> Result<()> {
 /// Read-decide-write one record as a single step under the ledger lock: take
 /// the lock once, read `name` strictly once, hand it to `decide`, and write
 /// the record `decide` returns (`None` = write nothing) through
-/// [`write_locked`] before the lock is released. `decide`'s error aborts
+/// `write_locked` before the lock is released. `decide`'s error aborts
 /// without writing. `decide` must not call back into this module's locking
 /// functions (the lock is not re-entrant across descriptors).
 pub fn update_locked_at(

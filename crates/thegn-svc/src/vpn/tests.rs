@@ -1299,6 +1299,52 @@ fn pending_fixture_worktree() -> tempfile::TempDir {
 }
 
 #[test]
+fn pending_teardown_rows_is_empty_without_a_record_dir() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+
+    assert_eq!(pending_teardown_rows().unwrap(), (Vec::new(), Vec::new()));
+}
+
+#[test]
+fn pending_teardown_rows_lists_only_records_with_ports() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = pending_fixture_worktree();
+    write_sidecar_record_for_test("c-pending", worktree.path(), &"a".repeat(64), 1, vec![443])
+        .unwrap();
+    write_sidecar_record_for_test("c-clear", worktree.path(), &"b".repeat(64), 1, Vec::new())
+        .unwrap();
+
+    let (rows, errors) = pending_teardown_rows().unwrap();
+    assert!(errors.is_empty());
+    assert_eq!(
+        rows,
+        vec![PendingTeardownRow {
+            container: "c-pending".into(),
+            worktree: Some(
+                std::fs::canonicalize(worktree.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ports: vec![443],
+        }]
+    );
+}
+
+#[test]
+fn pending_teardown_rows_reports_an_unreadable_record() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let dir = sidecar_record_dir().unwrap();
+    dir.write_owner_only_atomic(&sidecar_record_name("bad"), b"{")
+        .unwrap();
+
+    let (rows, errors) = pending_teardown_rows().unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].starts_with("bad: "), "{}", errors[0]);
+}
+
+#[test]
 fn sidecar_record_without_pending_teardown_parses_empty() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let dir = sidecar_record_dir().unwrap();

@@ -621,18 +621,18 @@ fn run_wait_keeps_only_the_last_out_cap_bytes() {
 }
 
 #[test]
-fn run_wait_without_a_final_exit_is_unknown() {
+fn run_wait_without_a_final_exit_is_an_error() {
     let mock = Mock::start(|_| {
         let mut reply = Reply::ndjson(&[started(), out("partial")]);
         reply.no_length = true;
         reply
     });
-    let (code, output) = rt()
+    let err = rt()
         .block_on(mock.client().run_wait("sess_1", &serde_json::json!({}), 64))
-        .expect("run_wait");
-    assert_eq!(code, EXEC_EXIT_STATUS_UNKNOWN);
-    assert_eq!(output, b"partial");
-    mock.assert_custody(&[]);
+        .unwrap_err();
+    let shown = format!("{err:#}");
+    assert!(shown.contains("without an exit status"), "{shown}");
+    mock.assert_custody(&[&err]);
 }
 
 #[test]

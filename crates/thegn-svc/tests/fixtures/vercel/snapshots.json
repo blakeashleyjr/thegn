@@ -1,0 +1,17 @@
+{
+  "snapshots": [
+    {
+      "id": "snap_1",
+      "sizeBytes": 1048576,
+      "expiresAt": 1766000000000,
+      "status": "created"
+    },
+    {
+      "id": "bad id!",
+      "sizeBytes": 1
+    }
+  ],
+  "pagination": {
+    "next": null
+  }
+}
