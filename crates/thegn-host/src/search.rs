@@ -24,9 +24,7 @@ use std::sync::Mutex;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
-use thegn_core::search::{
-    MatchMode, SearchEngine, SearchMatch, SearchScope, SearchSource,
-};
+use thegn_core::search::{MatchMode, SearchEngine, SearchMatch, SearchScope, SearchSource};
 
 use crate::chrome::S;
 use crate::compositor::Rect;
