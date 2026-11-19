@@ -658,7 +658,7 @@ fn spawn_worker_inner(
             }
             io.tick_complete(ticks);
         }
-        }) {
+    }) {
         Ok(worker) => Some(worker),
         Err(error) => {
             tracing::error!(
