@@ -12,6 +12,7 @@
 
 pub mod imap;
 pub mod imap_proto;
+mod todoist;
 
 use futures_util::future::BoxFuture;
 use thegn_core::config::{Config, InboxAccount, InboxKind};
@@ -32,6 +33,10 @@ pub enum InboxError {
     /// The provider's output could not be parsed.
     Parse(String),
     Timeout,
+    /// HTTP 429, with the provider's Retry-After seconds when given.
+    RateLimited(Option<u64>),
+    /// A response body over the size cap.
+    BodyLimit,
     /// An optional op this backend does not support.
     Unsupported(&'static str),
     Io(String),
@@ -55,13 +60,15 @@ impl InboxError {
     pub fn class(&self) -> InboxErrorClass {
         match self {
             InboxError::NotConfigured | InboxError::Unsupported(_) => InboxErrorClass::Config,
-            InboxError::Network(_) | InboxError::Timeout | InboxError::Io(_) => {
-                InboxErrorClass::Transient
-            }
+            InboxError::Network(_)
+            | InboxError::Timeout
+            | InboxError::RateLimited(_)
+            | InboxError::Io(_) => InboxErrorClass::Transient,
             InboxError::Auth(_) => InboxErrorClass::Auth,
-            InboxError::Api(_) | InboxError::Subprocess(_) | InboxError::Parse(_) => {
-                InboxErrorClass::Permanent
-            }
+            InboxError::Api(_)
+            | InboxError::Subprocess(_)
+            | InboxError::Parse(_)
+            | InboxError::BodyLimit => InboxErrorClass::Permanent,
         }
     }
 }
@@ -76,6 +83,9 @@ impl std::fmt::Display for InboxError {
             InboxError::Subprocess(e) => write!(f, "{e}"),
             InboxError::Parse(e) => write!(f, "could not parse inbox items: {e}"),
             InboxError::Timeout => write!(f, "inbox fetch timed out"),
+            InboxError::RateLimited(Some(s)) => write!(f, "rate limited; retry after {s}s"),
+            InboxError::RateLimited(None) => write!(f, "rate limited"),
+            InboxError::BodyLimit => write!(f, "provider response exceeded the size limit"),
             InboxError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
             InboxError::Io(e) => write!(f, "{e}"),
         }
@@ -118,10 +128,9 @@ pub fn backend_for(account: &InboxAccount) -> Result<Box<dyn InboxBackend>, Inbo
         return Err(InboxError::NotConfigured);
     }
     match account.kind {
+        InboxKind::Todoist => Ok(Box::new(todoist::TodoistBackend::new(account)?)),
         InboxKind::Imap => Ok(Box::new(imap::ImapBackend::from_account(account)?)),
-        InboxKind::Command | InboxKind::Todoist => {
-            Err(InboxError::Unsupported("inbox backends (b163 lane 4)"))
-        }
+        InboxKind::Command => Err(InboxError::Unsupported("inbox backends (b163 lane 4)")),
         InboxKind::Gmail | InboxKind::Jmap | InboxKind::Outlook | InboxKind::Slack => {
             Err(InboxError::NotConfigured)
         }
@@ -154,6 +163,19 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
                         crate::seam::registry::binary_availability(&bin)
                     };
                     ProbeReport::new("inbox", id, availability)
+                }
+                InboxKind::Todoist => {
+                    let parsed = thegn_core::secretref::SecretRef::parse(
+                        &account.token,
+                        thegn_core::secretref::BareAs::EnvName,
+                    );
+                    let availability = if parsed.is_configured() {
+                        Availability::Ready
+                    } else {
+                        Availability::Unavailable("no token reference configured".into())
+                    };
+                    ProbeReport::new("inbox", id, availability)
+                        .note(format!("filter: {}", account.filter))
                 }
                 InboxKind::Imap => imap::probe(account, id),
                 _ => ProbeReport::new("inbox", id, Availability::Ready)
@@ -196,7 +218,7 @@ mod tests {
                 "{kind:?}"
             );
         }
-        for kind in [InboxKind::Command, InboxKind::Todoist, InboxKind::Imap] {
+        for kind in [InboxKind::Command, InboxKind::Imap] {
             assert!(
                 backend_for(&account("x", kind)).is_err(),
                 "stubs fail closed"
@@ -215,6 +237,7 @@ mod tests {
             account("chat", InboxKind::Slack),
         ];
         cfg.inbox.accounts[0].command = vec!["/definitely/not/here".into()];
+        cfg.inbox.accounts[1].token = "env:TODOIST_TEST_TOKEN".into();
         let reports = probes(&cfg);
         assert_eq!(reports.len(), 4);
         assert!(reports.iter().all(|r| r.seam == "inbox"));
@@ -247,6 +270,8 @@ mod tests {
             (InboxError::Unsupported("mark_read"), Config),
             (InboxError::Network("x".into()), Transient),
             (InboxError::Timeout, Transient),
+            (InboxError::RateLimited(Some(3)), Transient),
+            (InboxError::BodyLimit, Permanent),
             (InboxError::Io("x".into()), Transient),
             (InboxError::Auth("x".into()), Auth),
             (InboxError::Api("x".into()), Permanent),
