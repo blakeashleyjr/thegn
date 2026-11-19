@@ -49,10 +49,10 @@ print_env() {
 
 desktop_entry() {
   case "$checkout" in
-    *[!A-Za-z0-9/._-]*)
-      echo "devel-launch: checkout path contains characters that cannot be represented in a desktop Exec line: $checkout" >&2
-      exit 2
-      ;;
+  *[!A-Za-z0-9/._-]*)
+    echo "devel-launch: checkout path contains characters that cannot be represented in a desktop Exec line: $checkout" >&2
+    exit 2
+    ;;
   esac
   printf '%s\n' \
     '[Desktop Entry]' \
@@ -95,6 +95,7 @@ launch() {
   host_session_env
   pidfile="$run/thegn.pid"
   mkdir -p "$state" "$run" "$root/home"
+  # shellcheck source=test/lib/instance.sh disable=SC1091 # resolved at run time from the checkout
   . "$checkout/test/lib/instance.sh"
   INST_STATE="$state" inst_restart "$pidfile" $$ || exit 1
   set -- \
@@ -115,23 +116,32 @@ launch() {
 }
 
 case "${1-}" in
-  --print-env)
-    [ "$#" -eq 1 ] || { echo "devel-launch: --print-env takes no arguments" >&2; exit 2; }
-    print_env
-    ;;
-  --desktop-entry)
-    [ "$#" -eq 1 ] || { echo "devel-launch: --desktop-entry takes no arguments" >&2; exit 2; }
-    desktop_entry
-    ;;
-  --standalone)
-    [ "$#" -eq 1 ] || { echo "devel-launch: --standalone takes no arguments" >&2; exit 2; }
-    standalone
-    ;;
-  '')
-    launch
-    ;;
-  *)
-    echo "devel-launch: unknown argument: $1" >&2
+--print-env)
+  [ "$#" -eq 1 ] || {
+    echo "devel-launch: --print-env takes no arguments" >&2
     exit 2
-    ;;
+  }
+  print_env
+  ;;
+--desktop-entry)
+  [ "$#" -eq 1 ] || {
+    echo "devel-launch: --desktop-entry takes no arguments" >&2
+    exit 2
+  }
+  desktop_entry
+  ;;
+--standalone)
+  [ "$#" -eq 1 ] || {
+    echo "devel-launch: --standalone takes no arguments" >&2
+    exit 2
+  }
+  standalone
+  ;;
+'')
+  launch
+  ;;
+*)
+  echo "devel-launch: unknown argument: $1" >&2
+  exit 2
+  ;;
 esac
