@@ -1006,6 +1006,10 @@ fn drive_queue_with(
         let claim = std::cell::RefCell::new(claim);
         let write_error = std::cell::RefCell::new(None::<String>);
         let post_release = std::cell::RefCell::new(None::<PostRelease>);
+        // Landed/UpToDate progress is buffered and emitted only after the claim
+        // is released and the post-land lifecycle has run: the callback prints
+        // to stdout, and a closed pipe there must not strand a claimed row.
+        let landed_step = std::cell::RefCell::new(None::<(MergeStatusFields, String)>);
         let lifecycle_notes = std::cell::RefCell::new(Vec::<String>::new());
         let stop_drain = std::cell::Cell::new(false);
         let record_write_error = |error: anyhow::Error| {
@@ -1234,13 +1238,8 @@ fn drive_queue_with(
                             lifecycle_notes.borrow_mut().push(note.text().to_owned());
                         }
                     }
-                    progress(&DriveStep {
-                        fields: &fields,
-                        worktree: &item.worktree,
-                        branch: &item.branch,
-                        status: MqStatus::Landed.as_str(),
-                        detail: &commit[..commit.len().min(12)],
-                    });
+                    *landed_step.borrow_mut() =
+                        Some((fields, commit[..commit.len().min(12)].to_owned()));
                     out.landed.push(item.branch.clone());
                     break;
                 }
@@ -1248,13 +1247,7 @@ fn drive_queue_with(
                     let fields = set(db, MqStatus::Landed, Some(&commit), Some("already merged"));
                     stop_on_write_error!('attempt);
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Landed);
-                    progress(&DriveStep {
-                        fields: &fields,
-                        worktree: &item.worktree,
-                        branch: &item.branch,
-                        status: MqStatus::Landed.as_str(),
-                        detail: "already merged",
-                    });
+                    *landed_step.borrow_mut() = Some((fields, "already merged".to_owned()));
                     out.landed.push(item.branch.clone());
                     break;
                 }
@@ -1709,6 +1702,15 @@ fn drive_queue_with(
             }
         }
         out.warnings.extend(lifecycle_notes.into_inner());
+        if let Some((fields, detail)) = landed_step.into_inner() {
+            progress(&DriveStep {
+                fields: &fields,
+                worktree: &item.worktree,
+                branch: &item.branch,
+                status: MqStatus::Landed.as_str(),
+                detail: &detail,
+            });
+        }
         if stop_drain.get() {
             break 'items;
         }
@@ -2619,6 +2621,46 @@ mod tests {
                 organize_folders: false,
                 ..MergeQueueConfig::default()
             }
+        }
+
+        #[test]
+        fn landed_step_is_emitted_after_the_claim_is_released() {
+            let (_fixture, root, feat_wt) = clean_repo("landed-after-release");
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = item(&db, &feat_wt);
+            let wt = queued.worktree.clone();
+            // Ordering recorder: the claim phase observed at each step.
+            let mut seen: Vec<(String, Option<String>)> = Vec::new();
+            let outcome = drive_queue(
+                &cfg("", 0),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |step: &DriveStep| {
+                    let phase = db.observe_merge_claim(&wt).unwrap().map(|v| v.phase);
+                    seen.push((step.status.to_owned(), phase));
+                },
+            );
+            assert_eq!(outcome.landed, ["feat"]);
+            let landed = seen
+                .iter()
+                .find(|(status, _)| status == "landed")
+                .expect("a landed step is emitted");
+            assert_eq!(
+                landed.1.as_deref(),
+                Some("unclaimed"),
+                "Landed must be reported only after claim.finish: {seen:?}"
+            );
         }
 
         #[test]
