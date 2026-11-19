@@ -991,15 +991,19 @@
     },
     {
       "change": "harden-live-upgrades",
-      "lifecycle": "active",
-      "disposition": "verification-gated",
+      "lifecycle": "archived",
+      "disposition": "superseded-retire",
       "owners": [
         {
           "issue": "THE-613",
           "project": "Distribution & Release Readiness"
         }
       ],
-      "summary": "Stage and back up confirmed live upgrades; real controller migration verification remains operator-controlled."
+      "summary": "Retired harden-live-upgrades as superseded by the batch 174 dev-instance `just live` (scripts/dev_live.py).",
+      "successors": [
+        "scripts/dev_live.py"
+      ],
+      "archive_path": "openspec/changes/archive/2026-11-20-harden-live-upgrades/"
     },
     {
       "change": "harden-remote-exec-and-sync-journal",
