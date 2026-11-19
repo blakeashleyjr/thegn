@@ -37,6 +37,16 @@ pub struct ArmInputs<'a> {
     pub github_mentions: bool,
     /// A push topic is configured.
     pub push_configured: bool,
+    /// `[inbox] enabled` with at least one enabled account of an implemented
+    /// kind ([`inbox_armable`]). The inbox needs no rule: its items are for
+    /// the owner to see.
+    pub inbox_any: bool,
+}
+
+/// True when `[inbox]` has something to poll: the section is enabled and at
+/// least one enabled account is of an implemented kind.
+pub fn inbox_armable(cfg: &crate::config::Config) -> bool {
+    cfg.inbox.enabled && cfg.inbox.implemented_enabled().next().is_some()
 }
 
 /// True when the daemon should run `kind`'s producer: the master switches
@@ -56,6 +66,7 @@ pub fn armed(kind: ProducerKind, i: &ArmInputs<'_>) -> bool {
             i.github_mentions && (i.push_configured || enabled.any(needs_mentions))
         }
         ProducerKind::PrQueue => i.pr_queue_enabled,
+        ProducerKind::Inbox => i.inbox_any,
     }
 }
 
@@ -100,7 +111,23 @@ pub fn cadence_secs(kind: ProducerKind, cfg: &crate::config::Config) -> u64 {
             cfg.watch.pr_interval_secs.max(PR_POLL_FLOOR_SECS)
         }
         ProducerKind::PrQueue => cfg.pr_queue.poll_interval_secs.max(PR_QUEUE_FLOOR_SECS),
+        ProducerKind::Inbox => inbox_cadence_secs(&cfg.inbox),
     }
+}
+
+/// The inbox producer ticks at its most frequent account's cadence (each
+/// account's own cadence is floored at [`crate::config_inbox::MIN_POLL_SECS`]);
+/// with no pollable account it falls back to the floored global interval.
+fn inbox_cadence_secs(inbox: &crate::config::InboxConfig) -> u64 {
+    inbox
+        .implemented_enabled()
+        .map(|account| account.effective_poll_secs(inbox.poll_interval_secs))
+        .min()
+        .unwrap_or_else(|| {
+            inbox
+                .poll_interval_secs
+                .max(crate::config_inbox::MIN_POLL_SECS)
+        })
 }
 
 #[cfg(test)]
@@ -143,6 +170,7 @@ mod tests {
             pr_queue_enabled: false,
             github_mentions: false,
             push_configured: false,
+            inbox_any: false,
         }
     }
 
@@ -168,6 +196,7 @@ mod tests {
             pr_queue_enabled: false,
             github_mentions: false,
             push_configured: false,
+            inbox_any: false,
         };
         assert!(armed_kinds(&inputs).is_empty());
     }
@@ -189,6 +218,7 @@ mod tests {
             pr_queue_enabled: true,
             github_mentions: true,
             push_configured: true,
+            inbox_any: true,
             ..on(&rules)
         };
         assert_eq!(kinds(&everything), ProducerKind::ALL.to_vec());
@@ -293,6 +323,99 @@ mod tests {
             ..on(&[])
         };
         assert_eq!(kinds(&queue), [ProducerKind::PrQueue]);
+    }
+
+    #[test]
+    fn inbox_arms_on_its_input_only_and_needs_an_implemented_account() {
+        let inbox = ArmInputs {
+            inbox_any: true,
+            ..on(&[])
+        };
+        assert_eq!(kinds(&inbox), [ProducerKind::Inbox]);
+        let mut cfg = crate::config::Config::default();
+        assert!(!inbox_armable(&cfg), "off by default");
+        cfg.inbox.enabled = true;
+        assert!(!inbox_armable(&cfg), "no accounts");
+        cfg.inbox.accounts.push(crate::config::InboxAccount {
+            name: "chat".into(),
+            kind: crate::config::InboxKind::Slack,
+            ..Default::default()
+        });
+        assert!(!inbox_armable(&cfg), "a reserved kind arms nothing");
+        cfg.inbox.accounts.push(crate::config::InboxAccount {
+            name: "work".into(),
+            enabled: false,
+            ..Default::default()
+        });
+        assert!(!inbox_armable(&cfg), "a disabled account arms nothing");
+        cfg.inbox.accounts[1].enabled = true;
+        assert!(inbox_armable(&cfg));
+        cfg.inbox.enabled = false;
+        assert!(!inbox_armable(&cfg), "the section switch wins");
+    }
+
+    #[test]
+    fn armed_inbox_table() {
+        use crate::config::{InboxAccount, InboxKind};
+        let account = |kind| InboxAccount {
+            name: "a".into(),
+            kind,
+            ..Default::default()
+        };
+        // (master switches on, [inbox] enabled, accounts, armed)
+        let rows: [(bool, bool, Vec<InboxAccount>, bool); 6] = [
+            (false, true, vec![account(InboxKind::Command)], false),
+            (true, false, vec![account(InboxKind::Command)], false),
+            (true, true, vec![], false),
+            (true, true, vec![account(InboxKind::Slack)], false),
+            (
+                true,
+                true,
+                vec![account(InboxKind::Gmail), account(InboxKind::Jmap)],
+                false,
+            ),
+            (
+                true,
+                true,
+                vec![account(InboxKind::Slack), account(InboxKind::Imap)],
+                true,
+            ),
+        ];
+        for (i, (master, enabled, accounts, want)) in rows.into_iter().enumerate() {
+            let mut cfg = crate::config::Config::default();
+            cfg.inbox.enabled = enabled;
+            cfg.inbox.accounts = accounts;
+            let inputs = ArmInputs {
+                daemon_enabled: master,
+                headless: master,
+                inbox_any: inbox_armable(&cfg),
+                ..on(&[])
+            };
+            assert_eq!(armed(ProducerKind::Inbox, &inputs), want, "row {i}");
+        }
+    }
+
+    #[test]
+    fn inbox_cadence_is_the_fastest_account_and_floored() {
+        let mut cfg = crate::config::Config::default();
+        assert_eq!(cadence_secs(ProducerKind::Inbox, &cfg), 300);
+        cfg.inbox.poll_interval_secs = 0;
+        assert_eq!(cadence_secs(ProducerKind::Inbox, &cfg), 60);
+        cfg.inbox.poll_interval_secs = 600;
+        cfg.inbox.accounts = vec![
+            crate::config::InboxAccount {
+                name: "a".into(),
+                poll_interval_secs: 120,
+                ..Default::default()
+            },
+            crate::config::InboxAccount {
+                name: "b".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(cadence_secs(ProducerKind::Inbox, &cfg), 120);
+        cfg.inbox.accounts[0].poll_interval_secs = 5;
+        assert_eq!(cadence_secs(ProducerKind::Inbox, &cfg), 60, "floored");
     }
 
     #[test]

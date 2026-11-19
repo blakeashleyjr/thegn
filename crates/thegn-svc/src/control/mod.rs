@@ -1441,6 +1441,16 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async { Err(ControlError::Unimplemented("overview.get")) })
     }
 
+    /// Headless producer arming, leases and per-account inbox state
+    /// (`producers.status`, b163). The reply is a
+    /// `thegn_core::producer_status::ProducersStatusReply`.
+    fn producers_status(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("producers.status")) })
+    }
+
     /// Filtered notification listing (`notifications.list`).
     fn notifications_list(
         &self,

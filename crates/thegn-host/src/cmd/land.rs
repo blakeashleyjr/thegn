@@ -68,7 +68,7 @@ pub(crate) fn land_branch(
     cfg: &Config,
     worktree: &Path,
 ) -> Result<(String, String, AttemptOutcome)> {
-    land_branch_pinned_with_options(cfg, worktree, None, None, false)
+    land_branch_pinned_with_options(cfg, worktree, None, None, false, None)
 }
 
 /// Fold `worktree`'s current branch onto the repo target via the fold-actor's
@@ -81,7 +81,23 @@ pub(crate) fn land_branch_pinned(
     worktree: &Path,
     expected_tip: Option<&str>,
 ) -> Result<(String, String, AttemptOutcome)> {
-    land_branch_pinned_with_options(cfg, worktree, expected_tip, None, false)
+    land_branch_pinned_with_options(cfg, worktree, expected_tip, None, false, None)
+}
+
+/// The loc `attempt_land` folds from. `thegn land` lands the branch checked
+/// out in `worktree`; its stored loc tells attempt_land whether that worktree is
+/// on this host (no ingest) or remote. An override (a provider worktree whose
+/// sandbox commits [`crate::provider_git::pull_before_land`] already brought
+/// home) skips the lookup.
+fn branch_loc_for(
+    worktree: &Path,
+    branch_loc_override: Option<thegn_core::remote::GitLoc>,
+) -> Result<thegn_core::remote::GitLoc> {
+    match branch_loc_override {
+        Some(loc) => Ok(loc),
+        None => thegn_core::remote::GitLoc::for_worktree_op(worktree, "land")
+            .map_err(anyhow::Error::msg),
+    }
 }
 
 fn land_branch_pinned_with_options(
@@ -90,6 +106,7 @@ fn land_branch_pinned_with_options(
     expected_tip: Option<&str>,
     db: Option<&Db>,
     trust_gate: bool,
+    branch_loc_override: Option<thegn_core::remote::GitLoc>,
 ) -> Result<(String, String, AttemptOutcome)> {
     let root = integrate::main_checkout(worktree).context("not inside a git repository")?;
     let branch = match crate::merge_ops::branch_of(worktree) {
@@ -151,10 +168,7 @@ fn land_branch_pinned_with_options(
     } else {
         None
     };
-    // `thegn land` lands the branch checked out in `worktree`; its loc tells
-    // attempt_land whether that worktree is on this host (no ingest) or remote.
-    let branch_loc = thegn_core::remote::GitLoc::for_worktree_op(worktree, "land")
-        .map_err(anyhow::Error::msg)?;
+    let branch_loc = branch_loc_for(worktree, branch_loc_override)?;
     let outcome = if let Some((attestation_id, folded_commit, target_tip)) = trusted {
         let outcome = integrate::attempt_land_trusted(
             &mq,
@@ -177,7 +191,19 @@ fn land_branch_pinned_with_options(
     Ok((branch, target, outcome))
 }
 
-pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<()> {
+/// `release_sandbox` (`--release-sandbox`): destroy a provider worktree's
+/// proven sandbox after a successful land. Off by default: a sandbox holds
+/// gitignored state that exists nowhere else, so landing alone never deletes it.
+///
+/// A provider worktree first pulls its sandbox commits home
+/// ([`crate::provider_git::pull_before_land`]) and then lands the **local**
+/// branch; a sandbox head kept in a scratch ref refuses the land.
+pub fn run(
+    cfg: &Config,
+    worktree: Option<String>,
+    trust_gate: bool,
+    release_sandbox: bool,
+) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
     let root = integrate::main_checkout(&wt).context("not inside a git repository")?;
     let mq = cfg.repo_merge_queue(&root);
@@ -201,6 +227,29 @@ pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<(
     if let Some(msg) = crate::merge_ops::remote_target_guard(db.db(), &root)? {
         anyhow::bail!("{msg}");
     }
+    // A provider worktree lands its local branch once the sandbox's commits
+    // are home. The pull is explicit here: it may wake or resume the sandbox.
+    let pre_land = if non_root {
+        crate::provider_git::pull_before_land(cfg, &wt.to_string_lossy())?
+    } else {
+        crate::provider_git::PreLand::NotProvider
+    };
+    let provider_land = pre_land_plan(&pre_land)?;
+    let release_sandbox = if release_sandbox
+        && matches!(
+            pre_land,
+            crate::provider_git::PreLand::Ready { report: None }
+        ) {
+        outln!(
+            "! --release-sandbox ignored: no pull ran for this worktree (read-only git policy, or not a provider env); the sandbox is kept"
+        );
+        false
+    } else {
+        release_sandbox
+    };
+    let branch_loc_override = provider_land
+        .is_some()
+        .then(|| thegn_core::remote::GitLoc::Local(wt.clone()));
     // Capture the registry/queue identity before any fold, gate, or CAS work.
     // A later reassignment must degrade bookkeeping rather than overwrite the
     // new owner. Root lands intentionally do not observe or write a row.
@@ -215,8 +264,14 @@ pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<(
     };
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
-    let (branch, target, outcome) =
-        land_branch_pinned_with_options(cfg, &wt, None, Some(db.db()), trust_gate)?;
+    let (branch, target, outcome) = land_branch_pinned_with_options(
+        cfg,
+        &wt,
+        None,
+        Some(db.db()),
+        trust_gate,
+        branch_loc_override,
+    )?;
     let tracking_outcome = integration_tracking_outcome(non_root, &outcome);
     if let Some(tracking_outcome) = tracking_outcome
         && let Some(label) = Path::new(&wt).file_name().and_then(|name| name.to_str())
@@ -290,6 +345,10 @@ pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<(
                 outln!("! {detail}");
             }
             crate::integrate::report_resyncs(&target, &resyncs);
+            if let Some(sandbox_gone) = provider_land {
+                let ops = LiveRelease { cfg, db: db.db() };
+                release_after_land(&ops, &wt.to_string_lossy(), release_sandbox, sandbox_gone);
+            }
         }
         AttemptOutcome::UpToDate { commit } => {
             // UpToDate has the same verified commit identity and must repair
@@ -299,6 +358,10 @@ pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<(
             if let Some(detail) = degraded {
                 thegn_core::msg::warn(&format!("{branch} is up to date, but {detail}"));
                 outln!("! {detail}");
+            }
+            if let Some(sandbox_gone) = provider_land {
+                let ops = LiveRelease { cfg, db: db.db() };
+                release_after_land(&ops, &wt.to_string_lossy(), release_sandbox, sandbox_gone);
             }
         }
         // A failed land must exit non-zero: `thegn land` is scripted (CI, the
@@ -348,6 +411,148 @@ pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Print the pre-land pull and decide how to land. `None` = not a provider
+/// worktree (land from its stored loc); `Some(sandbox_gone)` = land the local
+/// branch. A kept sandbox head is an error.
+fn pre_land_plan(pre: &crate::provider_git::PreLand) -> Result<Option<bool>> {
+    use crate::provider_git::PreLand;
+    match pre {
+        PreLand::NotProvider => Ok(None),
+        PreLand::Ready { report } => {
+            if let Some(report) = report {
+                outln!("pulled {}: {}", report.branch, report.summary());
+            }
+            Ok(Some(false))
+        }
+        PreLand::SandboxGone => {
+            outln!("sandbox gone; landing the local branch");
+            Ok(Some(true))
+        }
+        PreLand::Refused(message) => bail!("{message}"),
+    }
+}
+
+/// The I/O the post-land sandbox release needs, as a seam for tests.
+trait SandboxRelease {
+    /// `(env, sandbox name)` of the worktree's provider sandbox.
+    fn target(&self, worktree: &str) -> std::result::Result<(String, String), String>;
+    /// Destroy it (proof-checked).
+    fn destroy(&self, worktree: &str, env: &str) -> std::result::Result<(), String>;
+    /// Point the worktree's stored location back at the local checkout.
+    fn clear_location(&self, worktree: &str) -> std::result::Result<(), String>;
+}
+
+struct LiveRelease<'a> {
+    cfg: &'a Config,
+    db: &'a Db,
+}
+
+impl SandboxRelease for LiveRelease<'_> {
+    fn target(&self, worktree: &str) -> std::result::Result<(String, String), String> {
+        let env = crate::cmd::env::resolve_for(self.cfg, Some(worktree.to_string()))
+            .map_err(|error| format!("resolve the worktree's env: {error:#}"))?;
+        let name =
+            crate::provider_factory::provider_sandbox_name_checked(self.cfg, worktree, &env.name)
+                .map_err(|error| format!("resolve the worktree's provider sandbox: {error:#}"))?
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("env {} has no sandbox for {worktree}", env.name))?;
+        Ok((env.name, name))
+    }
+
+    // off-loop: `thegn land` is a CLI; the destroy blocks on the provider.
+    fn destroy(&self, worktree: &str, env: &str) -> std::result::Result<(), String> {
+        let pc = &self
+            .cfg
+            .env
+            .get(env)
+            .ok_or_else(|| format!("env {env} is not configured"))?
+            .provider;
+        let name = crate::provider_factory::provider_sandbox_name_checked(self.cfg, worktree, env)
+            .map_err(|error| format!("{error:#}"))?
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("env {env} has no sandbox for {worktree}"))?;
+        if crate::provider_factory::provider_for_named(pc, &name).is_none() {
+            return Err(format!(
+                "provider {} is not configured (token unset?)",
+                pc.provider
+            ));
+        }
+        crate::agent_teardown::destroy_provider_sandbox_with(self.cfg, worktree, env)
+    }
+
+    fn clear_location(&self, worktree: &str) -> std::result::Result<(), String> {
+        use thegn_core::store::WorkspaceStore;
+        self.db
+            .restore_worktree_location(worktree, None)
+            .map_err(|error| format!("clear the stored provider location: {error:#}"))
+    }
+}
+
+/// What the post-land release did.
+#[derive(Debug, PartialEq, Eq)]
+enum Release {
+    /// `--release-sandbox` not given: the sandbox stays.
+    Kept,
+    /// The sandbox was destroyed (or already gone) and the location cleared.
+    Released,
+    /// The sandbox was already gone and no release was asked for.
+    Gone,
+    /// The release failed after the land; reported as a warning only.
+    Failed,
+}
+
+/// After a successful provider land: keep the sandbox (the default: it holds
+/// gitignored state that exists nowhere else) or, with `--release-sandbox`,
+/// destroy it and clear the worktree's provider location. Runs after the
+/// landed line and its bookkeeping; never an error (the land already happened).
+fn release_after_land(
+    ops: &dyn SandboxRelease,
+    worktree: &str,
+    release_sandbox: bool,
+    sandbox_gone: bool,
+) -> Release {
+    if !release_sandbox {
+        if sandbox_gone {
+            return Release::Gone;
+        }
+        match ops.target(worktree) {
+            Ok((_, name)) => outln!(
+                "sandbox {name} kept (thegn land --release-sandbox, or env reap, removes it)"
+            ),
+            Err(_) => {
+                outln!("sandbox kept (thegn land --release-sandbox, or env reap, removes it)")
+            }
+        }
+        return Release::Kept;
+    }
+    let kept = |name: &str, error: String| {
+        thegn_core::msg::warn(&format!(
+            "landed, but sandbox {name} was not released: {error}"
+        ));
+        outln!("! sandbox {name} kept: {error}");
+        Release::Failed
+    };
+    let (env, name) = match ops.target(worktree) {
+        Ok(target) => target,
+        Err(error) => return kept("of this worktree", error),
+    };
+    if !sandbox_gone && let Err(error) = ops.destroy(worktree, &env) {
+        return kept(&name, error);
+    }
+    if let Err(error) = ops.clear_location(worktree) {
+        let detail = if sandbox_gone {
+            format!("sandbox {name} is gone, but {error}")
+        } else {
+            format!("released sandbox {name}, but {error}")
+        };
+        thegn_core::msg::warn(&format!("landed; {detail}"));
+        outln!("! {detail}");
+        return Release::Failed;
+    }
+    outln!("released sandbox {name}");
+    Release::Released
 }
 
 /// Persist the final landed projection for a non-root manual land. The caller
@@ -694,5 +899,126 @@ mod landed_row_tests {
         let result = super::land_branch_pinned(&thegn_core::config::Config::default(), &wt, None);
         assert!(matches!(result, Err(error) if format!("{error:#}").contains("land refused")));
         assert_eq!(git(&repo, &["rev-parse", "main"]), root_head);
+        // A provider worktree whose sandbox commits are home lands the local
+        // branch through the override: the stored location is never read.
+        let overridden = super::land_branch_pinned_with_options(
+            &thegn_core::config::Config::default(),
+            &wt,
+            None,
+            None,
+            false,
+            Some(thegn_core::remote::GitLoc::Local(wt.clone())),
+        );
+        if let Err(error) = overridden {
+            assert!(
+                !format!("{error:#}").contains("cannot read where"),
+                "the override must skip the location lookup: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_loc_override_skips_the_location_lookup() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let wt = std::path::PathBuf::from("/wt/provider-land");
+        let local = thegn_core::remote::GitLoc::Local(wt.clone());
+        assert!(matches!(
+            super::branch_loc_for(&wt, Some(local)).unwrap(),
+            thegn_core::remote::GitLoc::Local(path) if path == wt
+        ));
+        let error = super::branch_loc_for(&wt, None).unwrap_err();
+        assert!(format!("{error:#}").contains("land refused"), "{error:#}");
+    }
+
+    #[test]
+    fn pre_land_plan_lands_local_or_refuses() {
+        use crate::provider_git::{PreLand, PullOutcome, PullReport};
+        assert_eq!(super::pre_land_plan(&PreLand::NotProvider).unwrap(), None);
+        let ready = PreLand::Ready {
+            report: Some(PullReport {
+                branch: "tg/lane".into(),
+                outcome: PullOutcome::UpToDate,
+                push: None,
+            }),
+        };
+        assert_eq!(super::pre_land_plan(&ready).unwrap(), Some(false));
+        assert_eq!(
+            super::pre_land_plan(&PreLand::Ready { report: None }).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            super::pre_land_plan(&PreLand::SandboxGone).unwrap(),
+            Some(true)
+        );
+        let error = super::pre_land_plan(&PreLand::Refused(
+            "kept refs/thegn/pull/x ; land refused: merge the kept ref first".into(),
+        ))
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("land refused"), "{error:#}");
+    }
+
+    #[derive(Default)]
+    struct FakeRelease {
+        destroy_error: Option<String>,
+        clear_error: Option<String>,
+        destroys: std::cell::Cell<usize>,
+        clears: std::cell::Cell<usize>,
+    }
+
+    impl super::SandboxRelease for FakeRelease {
+        fn target(&self, _worktree: &str) -> Result<(String, String), String> {
+            Ok(("sprite".into(), "tg-lane-abc".into()))
+        }
+        fn destroy(&self, _worktree: &str, env: &str) -> Result<(), String> {
+            assert_eq!(env, "sprite");
+            self.destroys.set(self.destroys.get() + 1);
+            self.destroy_error.clone().map_or(Ok(()), Err)
+        }
+        fn clear_location(&self, _worktree: &str) -> Result<(), String> {
+            self.clears.set(self.clears.get() + 1);
+            self.clear_error.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    #[test]
+    fn release_is_opt_in_and_never_fails_the_land() {
+        use super::{Release, release_after_land};
+        let wt = "/wt/provider-land";
+
+        // Default (no --release-sandbox): zero destroy calls, location kept.
+        let fake = FakeRelease::default();
+        assert_eq!(release_after_land(&fake, wt, false, false), Release::Kept);
+        assert_eq!((fake.destroys.get(), fake.clears.get()), (0, 0));
+        assert_eq!(release_after_land(&fake, wt, false, true), Release::Gone);
+        assert_eq!((fake.destroys.get(), fake.clears.get()), (0, 0));
+
+        // Opt-in: destroy, then point the worktree back at local.
+        let fake = FakeRelease::default();
+        assert_eq!(
+            release_after_land(&fake, wt, true, false),
+            Release::Released
+        );
+        assert_eq!((fake.destroys.get(), fake.clears.get()), (1, 1));
+
+        // A gone sandbox is not destroyed again; its location is cleared.
+        let fake = FakeRelease::default();
+        assert_eq!(release_after_land(&fake, wt, true, true), Release::Released);
+        assert_eq!((fake.destroys.get(), fake.clears.get()), (0, 1));
+
+        // A destroy error is a warning: the location stays provider.
+        let fake = FakeRelease {
+            destroy_error: Some("api 500".into()),
+            ..FakeRelease::default()
+        };
+        assert_eq!(release_after_land(&fake, wt, true, false), Release::Failed);
+        assert_eq!((fake.destroys.get(), fake.clears.get()), (1, 0));
+
+        // A location error after the destroy is also only a warning.
+        let fake = FakeRelease {
+            clear_error: Some("db locked".into()),
+            ..FakeRelease::default()
+        };
+        assert_eq!(release_after_land(&fake, wt, true, false), Release::Failed);
     }
 }

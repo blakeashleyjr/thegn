@@ -1,0 +1,31 @@
+apiVersion: thegn.dev/jobs/v0
+kind: Job
+metadata:
+  name: web-e2e
+source:
+  snapshot: auto
+  exclude: [node_modules/, test-results/]
+environment:
+  image: ghcr.io/acme/ci:2026-11
+resources: {cpu: 8, memory: 16Gi, shm: 2Gi, disk: 40Gi, arch: x86_64}
+isolation: microvm
+placement: {providers: [any], regions: ["us-*"], spot: allowed, affinity: [cache]}
+services:
+  - name: db
+    image: postgres:17
+    env: {POSTGRES_PASSWORD: test}
+caches:
+  - key: "playwright-${hash(package-lock.json)}"
+    paths: ["~/.cache/ms-playwright"]
+    restoreKeys: ["playwright-"]
+env: {CI: "true", PLAYWRIGHT_JUNIT_OUTPUT_FILE: test-results/junit.xml}
+steps:
+  - name: install
+    run: npm ci
+  - name: test
+    run: npx playwright test --reporter=junit --shard=${THEGN_SHARD}/${THEGN_SHARDS}
+shards: 8
+results: {junit: "test-results/*.xml"}
+artifacts: [test-results/]
+retry: {onPreempt: {max: 2}, onFailure: {max: 0}, escalate: on-demand}
+timeout: 30m

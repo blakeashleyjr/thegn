@@ -11,6 +11,8 @@
 # regenerate with `just ratchet-update` (THEGN_RATCHET_UPDATE=1).
 
 # lead.* — Lead is configured per machine; no CI job flips it.
+# inbox.* — global-only config (THE-2214): the switch that lets the daemon poll
+# third-party accounts is a reviewed file setting, never an ambient launcher knob.
 # autopilot.* — issue pickup is a trusted file/workspace policy, not a
 # launcher/environment switch; enabling it can run commands and make forge
 # writes, so every key stays file-only.
@@ -200,6 +202,8 @@ hooks.pre_destroy
 hooks.session_end
 hooks.session_start
 host_discovery.kind
+inbox.enabled
+inbox.poll_interval_secs
 issues.filter_assignee_me
 issues.max_issues
 issues.move_on_merge

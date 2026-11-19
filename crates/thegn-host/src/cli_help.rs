@@ -60,6 +60,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "notify",
             "automations",
             "lead",
+            "inbox",
             "logs",
             "share",
             "forward",

@@ -48,6 +48,10 @@ const OMITTED: &[(&str, &str)] = &[
     ("observe", "Observe configuration is not exposed"),
     ("bars", "status bar configuration is not exposed"),
     ("calendar", "calendar sources are not exposed"),
+    (
+        "inbox",
+        "inbox accounts run commands and carry credential refs; global config only, not exposed",
+    ),
     ("weather.api_key", "credentials are not exposed"),
     ("issues", "issue providers are not exposed"),
     ("ci", "CI providers are not exposed"),

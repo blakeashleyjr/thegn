@@ -461,6 +461,23 @@ pub(crate) struct ProducerFacts {
     pub headless: bool,
     /// `(kind, armed, lease holder)` per kind.
     pub kinds: Vec<(String, bool, Option<String>)>,
+    /// Recomputed from config because no daemon answered.
+    pub from_config: bool,
+}
+
+impl ProducerFacts {
+    /// The daemon's own `producers.status` answer.
+    pub(crate) fn from_reply(r: &thegn_core::producer_status::ProducersStatusReply) -> Self {
+        ProducerFacts {
+            headless: r.headless,
+            kinds: r
+                .kinds
+                .iter()
+                .map(|k| (k.kind.clone(), k.armed, k.holder.clone()))
+                .collect(),
+            from_config: false,
+        }
+    }
 }
 
 pub(crate) fn check_producers(f: &ProducerFacts) -> Check {
@@ -479,7 +496,64 @@ pub(crate) fn check_producers(f: &ProducerFacts) -> Check {
             armed.join(", ")
         }
     );
+    let text = if f.from_config {
+        format!("{text} (computed from config; daemon not reachable)")
+    } else {
+        text
+    };
     check("producers", Level::Info, text, None)
+}
+
+pub(crate) struct InboxFacts {
+    /// `[inbox] enabled`.
+    pub enabled: bool,
+    /// `[daemon] headless_producers`.
+    pub headless: bool,
+    /// Enabled accounts of a reserved kind.
+    pub reserved: Vec<String>,
+    /// Enabled implemented accounts, and (daemon answering) their state:
+    /// `Some(None)` = not polled yet, `Some(Some(err))` = last error
+    /// (empty = ok), `None` = daemon not answering.
+    pub accounts: Vec<(String, Option<Option<String>>)>,
+}
+
+/// The `inbox` row; `None` when `[inbox]` is not enabled.
+pub(crate) fn check_inbox(f: &InboxFacts) -> Option<Check> {
+    if !f.enabled {
+        return None;
+    }
+    let mut problems: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    if !f.headless {
+        problems.push("headless_producers is off; the inbox is never polled".to_owned());
+    }
+    for name in &f.reserved {
+        problems.push(format!("account {name}: reserved kind, not implemented"));
+    }
+    for (name, state) in &f.accounts {
+        match state {
+            Some(Some(err)) if !err.is_empty() => problems.push(format!("account {name}: {err}")),
+            Some(Some(_)) => notes.push(format!("{name}: ok")),
+            Some(None) | None => notes.push(format!("{name}: not polled yet")),
+        }
+    }
+    if problems.is_empty() {
+        let text = if notes.is_empty() {
+            "inbox: enabled, no accounts".to_owned()
+        } else {
+            format!("inbox: {}", notes.join("; "))
+        };
+        Some(check("inbox", Level::Info, text, None))
+    } else {
+        let fix = (!f.headless).then_some("set [daemon] headless_producers = true");
+        let all: Vec<String> = problems.into_iter().chain(notes).collect();
+        Some(check(
+            "inbox",
+            Level::Warn,
+            format!("inbox: {}", all.join("; ")),
+            fix,
+        ))
+    }
 }
 
 // ---- gathering ---------------------------------------------------------
@@ -720,7 +794,16 @@ pub(crate) fn inspect(cfg: &Config) -> LeadReadiness {
         inbox_secret_set: !push.inbox.inbox_secret.trim().is_empty(),
         redeem_allowed: push.inbox.allow.iter().any(|a| a == "approvals.redeem"),
     }));
-    checks.push(check_producers(&producer_facts(cfg, db.as_ref())));
+    let reply = if cfg.daemon.enabled {
+        super::inbox::daemon_producers_status(cfg)
+    } else {
+        None
+    };
+    checks.push(check_producers(&match &reply {
+        Some(r) => ProducerFacts::from_reply(r),
+        None => producer_facts(cfg, db.as_ref()),
+    }));
+    checks.extend(check_inbox(&inbox_facts(cfg, reply.as_ref())));
     LeadReadiness {
         checks,
         unconfigured: false,
@@ -752,6 +835,35 @@ fn worker_facts(cfg: &Config, root: &str) -> WorkerFacts {
     }
 }
 
+fn inbox_facts(
+    cfg: &Config,
+    reply: Option<&thegn_core::producer_status::ProducersStatusReply>,
+) -> InboxFacts {
+    use thegn_core::seam::Kind;
+    let enabled_accounts = cfg.inbox.accounts.iter().filter(|a| a.enabled);
+    InboxFacts {
+        enabled: cfg.inbox.enabled,
+        headless: cfg.daemon.headless_producers,
+        reserved: enabled_accounts
+            .clone()
+            .filter(|a| a.kind.is_reserved())
+            .map(|a| a.name.clone())
+            .collect(),
+        accounts: enabled_accounts
+            .filter(|a| !a.kind.is_reserved())
+            .map(|a| {
+                let state = reply.map(|r| {
+                    r.inbox
+                        .iter()
+                        .find(|s| s.account == a.name)
+                        .map(|s| s.last_error.clone())
+                });
+                (a.name.clone(), state)
+            })
+            .collect(),
+    }
+}
+
 fn producer_facts(cfg: &Config, db: Option<&thegn_core::db::Db>) -> ProducerFacts {
     let mut rules = cfg
         .effective_automations()
@@ -769,6 +881,7 @@ fn producer_facts(cfg: &Config, db: Option<&thegn_core::db::Db>) -> ProducerFact
         pr_queue_enabled: cfg.pr_queue.enabled,
         github_mentions: cfg.notifications.github_mentions,
         push_configured: !push.topic.trim().is_empty(),
+        inbox_any: thegn_core::producer_arm::inbox_armable(cfg),
     };
     let armed = thegn_core::producer_arm::armed_kinds(&inputs);
     let leases = db
@@ -787,6 +900,7 @@ fn producer_facts(cfg: &Config, db: Option<&thegn_core::db::Db>) -> ProducerFact
     ProducerFacts {
         headless: cfg.daemon.headless_producers,
         kinds,
+        from_config: true,
     }
 }
 
@@ -1068,10 +1182,75 @@ mod tests {
                 ("tracker".into(), true, Some("daemon".into())),
                 ("pr_poll".into(), false, None),
             ],
+            from_config: false,
         });
         assert_eq!(c.level, Level::Info);
         assert!(c.text.contains("tracker (lease: daemon)"));
         assert!(!c.text.contains("pr_poll"));
+    }
+
+    #[test]
+    fn producers_reads_the_daemon_reply_or_notes_the_fallback() {
+        use thegn_core::producer_status::{ProducerKindStatus, ProducersStatusReply};
+        let reply = ProducersStatusReply {
+            installed: true,
+            headless: true,
+            kinds: vec![ProducerKindStatus {
+                kind: "inbox".into(),
+                armed: true,
+                holder: Some("daemon".into()),
+                ..Default::default()
+            }],
+            inbox: vec![],
+        };
+        let c = check_producers(&ProducerFacts::from_reply(&reply));
+        assert!(c.text.contains("inbox (lease: daemon)"));
+        assert!(!c.text.contains("computed from config"));
+        let mut f = ProducerFacts::from_reply(&reply);
+        f.from_config = true;
+        assert!(
+            check_producers(&f)
+                .text
+                .contains("(computed from config; daemon not reachable)")
+        );
+    }
+
+    fn inbox_facts_for_test(headless: bool) -> InboxFacts {
+        InboxFacts {
+            enabled: true,
+            headless,
+            reserved: vec![],
+            accounts: vec![("work".into(), Some(None))],
+        }
+    }
+
+    #[test]
+    fn inbox_row_cases() {
+        let off = InboxFacts {
+            enabled: false,
+            ..inbox_facts_for_test(true)
+        };
+        assert!(check_inbox(&off).is_none());
+        let c = check_inbox(&inbox_facts_for_test(false)).unwrap();
+        assert_eq!(lv(&c), Level::Warn);
+        assert_eq!(
+            c.fix.as_deref(),
+            Some("set [daemon] headless_producers = true")
+        );
+        let c = check_inbox(&inbox_facts_for_test(true)).unwrap();
+        assert_eq!(lv(&c), Level::Info);
+        assert!(c.text.contains("work: not polled yet"));
+        let mut f = inbox_facts_for_test(true);
+        f.accounts = vec![("work".into(), Some(Some("auth failed".into())))];
+        let c = check_inbox(&f).unwrap();
+        assert_eq!(lv(&c), Level::Warn);
+        assert!(c.text.contains("account work: auth failed"));
+        let mut f = inbox_facts_for_test(true);
+        f.accounts = vec![("work".into(), Some(Some(String::new())))];
+        assert!(check_inbox(&f).unwrap().text.contains("work: ok"));
+        let mut f = inbox_facts_for_test(true);
+        f.reserved = vec!["chat".into()];
+        assert!(check_inbox(&f).unwrap().text.contains("reserved kind"));
     }
 
     #[test]

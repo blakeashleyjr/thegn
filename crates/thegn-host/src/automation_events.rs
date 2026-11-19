@@ -32,6 +32,8 @@ pub struct EventFacts {
     pub pr_review_requested: Option<bool>,
     pub pr_merged: Option<bool>,
     pub origin: Option<AutomationOrigin>,
+    /// Inbox facts (b163); set only for `inbox_item` facts.
+    pub inbox: Option<thegn_core::automation::InboxFacts>,
 }
 
 pub fn emit(
@@ -203,6 +205,7 @@ pub fn submit_fact(
         origin: facts.origin,
         issue: None,
         exit_code: None,
+        inbox: facts.inbox,
     });
 }
 
@@ -229,6 +232,12 @@ fn submit_notification(
     priority: Priority,
     facts: EventFacts,
 ) {
+    // Inbox item text is third-party content: rules see it only through the
+    // producer's `inbox_item` fact (review-capped, baseline-aware), never as a
+    // generic `notification` event.
+    if kind == NotificationKind::InboxItem.as_str() {
+        return;
+    }
     crate::automation_runtime::submit(notification_event(
         row_id, kind, source_ref, message, worktree, priority, facts,
     ));
@@ -270,6 +279,7 @@ fn notification_event(
         origin: facts.origin,
         issue: None,
         exit_code: None,
+        inbox: None,
     }
 }
 

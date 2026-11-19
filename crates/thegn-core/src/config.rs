@@ -3649,6 +3649,8 @@ pub use crate::config_calendar::{
 // and the popup's weather block), and lives in its own module for the same
 // reason `[calendar]` does.
 pub use crate::config_weather::{WeatherConfig, WeatherProviderKind, WeatherUnits};
+// `[inbox]` (THE-2214): global-only, in no overlay; its own module.
+pub use crate::config_inbox::{InboxAccount, InboxConfig, InboxKind};
 
 /// `[apps]` — top-level sub-app tab ordering and startup focus.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -5439,6 +5441,9 @@ pub struct Config {
     /// `[weather]` — the reading beside the clock and in the popup. Off by
     /// default; enabling it is the consent step for any network activity.
     pub weather: WeatherConfig,
+    /// `[inbox]` — the native inbox (mail, Todoist, any command). Off by
+    /// default; global config only (in no overlay); polled by the daemon.
+    pub inbox: InboxConfig,
     pub pr: PrConfig,
     pub issues: IssuesConfig,
     /// `[ci]` — cross-provider CI/CD inspection (AV group).
@@ -5693,6 +5698,7 @@ impl Default for Config {
             bars: BarsConfig::default(),
             calendar: CalendarConfig::default(),
             weather: WeatherConfig::default(),
+            inbox: InboxConfig::default(),
             pr: PrConfig::default(),
             issues: IssuesConfig::default(),
             ci: CiConfig::default(),

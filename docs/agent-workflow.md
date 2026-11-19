@@ -1,6 +1,6 @@
 # Agent development workflow
 
-Codex reads the root `AGENTS.md`. Claude Code imports the same file from `CLAUDE.md`. Keep the starting instructions short enough to use on every task. Put specialized rules beside the relevant architecture or extension guide. [Codex instruction discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md) · [Claude Code project memory](https://code.claude.com/docs/en/memory)
+Use the root [AGENTS.md](../AGENTS.md) for project instructions. In Claude Code, check the loaded memory files with `/context all`. [Claude Code project instructions](https://code.claude.com/docs/en/memory)
 
 ## Find the evidence
 
@@ -38,4 +38,4 @@ Run `just agent-metrics <csv-path>` after ten comparable issues. Compare medians
 
 ## Maintenance
 
-The author updates the linked guide in the same change that alters a command, tool, or delivery convention. The offline delivery gate checks the shared instruction import, local guide links and issue routing. At wave close, the integrator reconciles Linear and the ledger, checks graph freshness on the integration checkout, and reviews any recurring rediscovery or merge repair in the dispatch reports. After a client or memory-service upgrade, repeat the live checks above on a developer host. When parallel lanes change a contract, use the [early integration check](../CONTRIBUTING.md#early-integration-of-dependent-branches) on the combined checkout.
+The author updates the linked guide in the same change that alters a command, tool, or delivery convention. The offline delivery gate checks local guide links and issue routing. At wave close, the integrator reconciles Linear and the ledger, checks graph freshness on the integration checkout, and reviews any recurring rediscovery or merge repair in the dispatch reports. After a client or memory-service upgrade, repeat the live checks above on a developer host. When parallel lanes change a contract, use the [early integration check](../CONTRIBUTING.md#early-integration-of-dependent-branches) on the combined checkout.
