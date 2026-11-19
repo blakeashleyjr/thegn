@@ -23,3 +23,13 @@ writable. thegn MUST NOT run any of them on the host in that mode.
 ### Requirement: Unattended drain and the fixer
 
 An unattended drain SHALL NOT hand a red gate or a conflict to the fixer agent.
+
+#### Scenario: Red gate in an unattended drain
+
+- **WHEN** an unattended drain meets a red gate
+- **THEN** the entry is left red for a human and the fixer agent is not started
+
+#### Scenario: Conflict in an unattended drain
+
+- **WHEN** an unattended drain meets a merge conflict
+- **THEN** the entry is left conflicted for a human and the fixer agent is not started
