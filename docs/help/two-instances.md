@@ -86,7 +86,7 @@ rows only: files on disk, git worktrees and branches are never touched.
 
 3. (Already done by step 2.)
 
-3. In a plain shell (the stable instance), forget those same projects:
+4. In a plain shell (the stable instance), forget those same projects:
 
    ```
    thegn repo forget ~/code/thegn
