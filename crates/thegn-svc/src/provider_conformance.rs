@@ -1,6 +1,6 @@
 //! Provider conformance suite (first slice of WS08-P1-08): one `suite` entry
 //! point run over today's `RemoteProvider` and its optional traits, against the
-//! sprites fake server and the Vercel `FakeApi`. WS08-P1-08 extends this file
+//! sprites fake server, the Vercel `FakeApi`, and (WS08-P1-08 slice 2) Fly and VPS fakes. WS08-P1-08 extends this file
 //! rather than replacing it: add cases to `suite`, keep the names stable.
 //!
 //! A case is *skipped* (never failed) only when the [`Fixture`] says the op is
@@ -35,6 +35,12 @@ pub struct Fixture {
     pub deletes_for: Option<Probe<DeleteCounter>>,
     /// How many resume requests the fake has seen (none for sprites).
     pub resumes: Option<Probe<usize>>,
+    /// The provider's instance cap (`max_instances`) when the fixture is
+    /// configured with one the suite can fill; `None` skips `create_respects_cap`.
+    pub cap: Option<usize>,
+    /// Whether the fake backs `suspend` + `resume` (Fly, Vercel); `false`
+    /// skips `stop_resume_round_trip`.
+    pub supports_stop: bool,
 }
 
 /// The outcome of one suite run, case by case.
@@ -99,6 +105,9 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
         &mut report,
         "destroy_missing_is_ok",
         Some(async {
+            // Whether a DELETE goes out is the provider's business: a sandbox
+            // this host recorded is deleted 404-tolerantly, an unrecorded one
+            // is only probed. The contract is that teardown is idempotent.
             p.destroy(&fx.missing)
                 .await
                 .map_err(|e| format!("destroying a missing sandbox failed: {e:#}"))
@@ -111,12 +120,11 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
         "destroy_unrecorded_refused",
         fx.foreign.as_ref().map(|foreign| async move {
             let count = fx.deletes_for.as_ref().map(|probe| probe());
-            let before = count.as_ref().map_or(0, |c| c(foreign));
             ensure(p.destroy(foreign).await.is_err(), || {
                 format!("destroy of unrecorded {foreign} succeeded")
             })?;
             let after = count.as_ref().map_or(0, |c| c(foreign));
-            ensure(after == before, || {
+            ensure(after == 0, || {
                 format!("a DELETE for unrecorded {foreign} was sent")
             })
         }),
@@ -172,6 +180,87 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
             let after = probe();
             ensure(after == before, || {
                 format!("reads resumed a sandbox ({before} -> {after})")
+            })
+        }),
+    )
+    .await;
+
+    case(
+        &mut report,
+        "inventory_partial_keeps_created",
+        Some(async {
+            // A Partial listing must still carry every row it did read: the
+            // created sandbox may never vanish from a degraded report.
+            match p.inventory().await {
+                Ok(InventoryReport::Complete(_)) => Ok(()),
+                Ok(InventoryReport::Partial { rows, .. }) => {
+                    ensure(rows.iter().any(|row| row.id == fx.created), || {
+                        format!("partial inventory dropped {}: {rows:?}", fx.created)
+                    })
+                }
+                Err(e) => Err(format!("inventory failed: {e:#}")),
+            }
+        }),
+    )
+    .await;
+
+    case(
+        &mut report,
+        "create_respects_cap",
+        fx.cap.map(|cap| async move {
+            // Fill the cap, then the cap+1 create must be refused. Creates the
+            // fake already satisfied count toward the cap (idempotent by name).
+            let mut refused = false;
+            for _ in 0..=cap {
+                if p.create().await.is_err() {
+                    refused = true;
+                    break;
+                }
+            }
+            ensure(refused, || {
+                format!("create {} succeeded past the cap of {cap}", cap + 1)
+            })
+        }),
+    )
+    .await;
+
+    case(
+        &mut report,
+        "stop_resume_round_trip",
+        fx.supports_stop.then_some(async {
+            p.suspend(&fx.created)
+                .await
+                .map_err(|e| format!("suspend failed: {e:#}"))?;
+            p.suspend(&fx.created)
+                .await
+                .map_err(|e| format!("second suspend not idempotent: {e:#}"))?;
+            p.resume(&fx.created)
+                .await
+                .map_err(|e| format!("resume failed: {e:#}"))
+        }),
+    )
+    .await;
+
+    // Last: it removes the sandbox the cases above work against.
+    case(
+        &mut report,
+        "destroy_is_idempotent",
+        Some(async {
+            // Idempotence is the contract, not the request count: a provider
+            // may re-send a 404-tolerant DELETE for a sandbox it recorded.
+            p.destroy(&fx.created)
+                .await
+                .map_err(|e| format!("first destroy failed: {e:#}"))?;
+            p.destroy(&fx.created)
+                .await
+                .map_err(|e| format!("second destroy failed: {e:#}"))?;
+            let ids = match p.inventory().await {
+                Ok(InventoryReport::Complete(rows)) => rows,
+                Ok(InventoryReport::Partial { rows, .. }) => rows,
+                Err(e) => return Err(format!("inventory failed: {e:#}")),
+            };
+            ensure(!ids.iter().any(|row| row.id == fx.created), || {
+                format!("destroyed {} still in inventory: {ids:?}", fx.created)
             })
         }),
     )

@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.97] — 2026-11-18
+
 ### Added
 
 - Sprites environments are now safer to run: thegn records a sprite in its ledger before creating it and deletes only sprites it recorded. `thegn env reap --provider sprites [--apply]` lists orphans, sprites past `max_lifetime_secs` and sprites "not recorded by this host" (older sprites, or ones made outside thegn, are never deleted by thegn; remove them with the Sprites CLI or dashboard). Headless work on a sprite holds it awake up to a ceiling (4 hours by default), `eager` no longer creates sprites in the background, `min_ram_gb` sets the memory limit, `fleet cost` gains a Sprites usage block, and `thegn agent run --wait --pull` pulls results back. Not yet verified against the live Sprites API.
@@ -3883,7 +3885,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.96...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.97...HEAD
+[0.1.0-alpha.97]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.96...v0.1.0-alpha.97
 [0.1.0-alpha.96]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...v0.1.0-alpha.96
 [0.1.0-alpha.95]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.94...v0.1.0-alpha.95
 [0.1.0-alpha.94]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.93...v0.1.0-alpha.94

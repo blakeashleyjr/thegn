@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--mcp", "--path", "."]
+    },
+    "agentmemory": {
+      "command": "agentmemory",
+      "args": ["mcp"],
+      "env": { "AGENTMEMORY_TOOLS": "core" }
+    },
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp"
+    }
+  }
+}
