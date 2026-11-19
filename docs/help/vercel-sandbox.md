@@ -91,6 +91,11 @@ branch fast-forwards. See [[sandboxing]].
 - **Exec ceiling.** One exec request may run for up to 31 minutes; the
   facade's outer deadline governs. A stream that ends with no command exit is
   an error: "vercel: run command ended without an exit status".
+- **Exec keep-alive.** While a command runs, the exec checks the session once
+  at the start and then every 5 minutes (`EXTEND_CHECK_SECS`) and extends it
+  when it is due, so a long command is not cut off by the 30 minute session
+  timeout. The lifetime ceiling still bounds it. A failed check is logged at
+  debug level and never fails the exec.
 - **Live sentinels.** `test/vercel-live.sh` step `3s` checks that the
   `fleet list --json` response shapes parse, and `7s` does the same for
   `fleet cost --json`. Step `4b` checks the exec exit code. Both sentinels
@@ -256,3 +261,9 @@ Not yet checked on a live account; each is shown as unverified:
   current-session only).
 
 The kind is experimental (`thegn doctor` says so).
+
+## Unverified
+
+- The live casing of Vercel session statuses.
+- The cause of the live exit 127 for the agent CLI in a sandbox.
+- Whether Fly and VPS keep their records until the machine is absent.
