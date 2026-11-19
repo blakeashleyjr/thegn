@@ -923,7 +923,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch
+test: test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro
     #!/usr/bin/env bash
     set -euo pipefail
     if ! cargo nextest run --workspace; then
@@ -1190,6 +1190,9 @@ devel-desktop:
 
 test-devel-launch:
     bash test/devel-launch-test.sh
+
+test-sprites-exec-repro:
+    python3 -B test/sprites_exec_repro_test.py
 
 # Headless terminal-capability matrix: run `thegn doctor` under a set of
 # degraded environments (each a clean `env -i`, so the outer terminal's
