@@ -944,11 +944,10 @@ pub mod order {
     use crate::util;
     use std::path::PathBuf;
 
-    /// `~/.config/thegn/profiles-order.json` (the real, un-rerooted config home).
+    /// `~/.config/thegn/profiles-order.json` (thegn's config dir: the real,
+    /// un-rerooted config home unless `THEGN_CONFIG_DIR` moves it).
     fn order_path() -> PathBuf {
-        util::xdg_config_home()
-            .join("thegn")
-            .join("profiles-order.json")
+        util::thegn_config_dir().join("profiles-order.json")
     }
 
     #[derive(serde::Serialize, serde::Deserialize, Default)]

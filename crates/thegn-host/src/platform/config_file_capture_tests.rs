@@ -72,6 +72,32 @@ fn opened_identity_change_is_rejected_without_path_reread() {
     );
 }
 
+fn coarse_now() -> (i64, i64) {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts) },
+        0
+    );
+    (ts.tv_sec, ts.tv_nsec)
+}
+
+/// Spin until the coarse realtime clock (the pre-6.13 file timestamp source)
+/// moves. Bounded: a tick is at most 10 ms, the bound is two seconds.
+fn wait_for_coarse_clock_tick() {
+    let start = coarse_now();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while coarse_now() == start {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "coarse clock did not advance"
+        );
+        std::hint::spin_loop();
+    }
+}
+
 #[test]
 fn equal_length_mutation_changes_observed_descriptor_time_identity() {
     let dir = fixture();
@@ -84,6 +110,11 @@ fn equal_length_mutation_changes_observed_descriptor_time_identity() {
             // Keep the same inode and length. Linux mtime/ctime nanoseconds
             // are the observable mutation evidence; the old identity tuple
             // (dev, inode, length) incorrectly accepted this.
+            // Kernels before 6.13 stamp files from the coarse clock, so a
+            // rewrite inside one timer tick carries the same timestamp. Wait
+            // for the tick to advance: the property under test is that a
+            // timestamp change is observed, not the kernel's granularity.
+            wait_for_coarse_clock_tick();
             std::fs::write(&original, b"two").unwrap();
             Ok(readable)
         }),
