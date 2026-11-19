@@ -43,6 +43,9 @@ pub(crate) struct MastheadLayout {
 /// The brand logo segs for the current width's rung: `þ thegn v0.0.0` (full),
 /// `þ thegn` (compact), or nothing (hidden). A leading pad is the caller's.
 /// The sigil is the Old English thorn (`þegn`), `*` under ASCII caps.
+///
+/// When the config directory is relocated, the instance tag follows the brand
+/// on both visible rungs. It is intentionally absent from the hidden rung.
 fn brand_segs(model: &FrameModel, brand_cols: usize) -> Vec<Seg> {
     if brand_cols == 0 {
         return Vec::new();
@@ -50,11 +53,51 @@ fn brand_segs(model: &FrameModel, brand_cols: usize) -> Vec<Seg> {
     let accent = Tok::Attr(chrome::theme_color(model.accent_or_default()));
     let sigil = format!("{} ", crate::caps::active_glyphs().brand_sigil);
     let mut v = vec![seg(accent, sigil), seg(Tok::Slot(S::Text), "thegn")];
+    if let Some(tag) = current_instance_tag() {
+        v.push(seg(Tok::Slot(S::Accent), format!(" [{tag}]")));
+    }
     if brand_cols >= chrome::BRAND_FULL_COLS {
         v.push(seg(Tok::Slot(S::Text), " "));
         v.push(seg(Tok::Slot(S::Ghost), crate::e2e_freeze::version_label()));
     }
     v
+}
+
+/// The instance tag shown after the brand: the basename of `config_dir` when
+/// it is not `default_dir`, control characters dropped, at most 16 characters;
+/// `None` for the default. An empty basename becomes `"alt"`.
+fn instance_tag(config_dir: &std::path::Path, default_dir: &std::path::Path) -> Option<String> {
+    if config_dir == default_dir {
+        return None;
+    }
+
+    let tag: String = config_dir
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(16)
+        .collect();
+    Some(if tag.is_empty() {
+        "alt".to_owned()
+    } else {
+        tag
+    })
+}
+
+fn current_instance_tag() -> Option<&'static str> {
+    if cfg!(test) || crate::e2e_freeze::active() {
+        return None;
+    }
+    static TAG: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        instance_tag(
+            &thegn_core::util::thegn_config_dir(),
+            &thegn_core::util::xdg_config_home().join("thegn"),
+        )
+    })
+    .as_deref()
 }
 
 /// The faint button pill behind an inactive app chip (and the hidden-sidebar
@@ -375,4 +418,45 @@ pub(crate) fn chip_at(
         .iter()
         .find(|(_, r)| r.contains(x, y))
         .map(|(idx, _)| *idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instance_tag;
+    use std::path::Path;
+
+    #[test]
+    fn instance_tag_table() {
+        let cases = [
+            (
+                Path::new("/home/u/.config/thegn"),
+                Path::new("/home/u/.config/thegn"),
+                None,
+            ),
+            (
+                Path::new("/home/u/.config/thegn-dev"),
+                Path::new("/home/u/.config/thegn"),
+                Some("thegn-dev"),
+            ),
+            (
+                Path::new("/home/u/1234567890123456789012345678901234567890"),
+                Path::new("/home/u/.config/thegn"),
+                Some("1234567890123456"),
+            ),
+            (
+                Path::new("/home/u/thegn-\u{1b}dev"),
+                Path::new("/home/u/.config/thegn"),
+                Some("thegn-dev"),
+            ),
+            (
+                Path::new(""),
+                Path::new("/home/u/.config/thegn"),
+                Some("alt"),
+            ),
+        ];
+
+        for (config_dir, default_dir, expected) in cases {
+            assert_eq!(instance_tag(config_dir, default_dir).as_deref(), expected);
+        }
+    }
 }
