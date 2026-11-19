@@ -89,6 +89,51 @@ fn login_agents(cfg: &Config, env: &thegn_core::config::EnvConfig) -> Vec<String
     }
 }
 
+fn sandbox_agents(cfg: &Config, env: &thegn_core::config::EnvConfig) -> Vec<String> {
+    env.sandbox
+        .home
+        .as_ref()
+        .and_then(|h| h.agents.clone())
+        .unwrap_or_else(|| cfg.sandbox.home.agents.clone())
+        .into_iter()
+        .map(|agent| clean(&agent))
+        .collect()
+}
+
+fn channel_warning(clamped: bool, rows_empty: bool) -> Option<String> {
+    (clamped && rows_empty).then(|| {
+        "provider envs are configured but this instance runs on the stable channel, which ignores them; use the dev instance (THEGN_CHANNEL=dev)".to_string()
+    })
+}
+
+fn report_preamble(rows: &[serde_json::Value]) -> Vec<String> {
+    let warnings = rows
+        .iter()
+        .filter_map(|row| {
+            let warning = row["warning"].as_str()?;
+            let error = row["sync_journal_error"].as_str().unwrap_or("");
+            if error.is_empty() {
+                Some(format!("  warning: {warning}"))
+            } else {
+                Some(format!("  warning: {warning}: {error}"))
+            }
+        })
+        .collect::<Vec<_>>();
+    if warnings.is_empty() && rows.is_empty() {
+        vec!["  (no sprites or vercel envs configured)".to_string()]
+    } else {
+        warnings
+    }
+}
+
+fn cap_display(value: u64) -> String {
+    if value == 0 {
+        "provider default".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn ledger_names_for(records: &[VpsRecord], provider: &str) -> Vec<(String, String, i64)> {
     records
         .iter()
@@ -133,6 +178,7 @@ pub(crate) fn json(cfg: &Config) -> serde_json::Value {
         thegn_core::util::now(),
         &journal,
     );
+    let rows_empty = matches!(rows.as_array(), Some(rows) if rows.is_empty());
     if let Some(error) = journal_error
         && let Some(rows) = rows.as_array_mut()
     {
@@ -144,6 +190,16 @@ pub(crate) fn json(cfg: &Config) -> serde_json::Value {
         rows.push(serde_json::json!({
             "warning": "sync journal unavailable",
             "sync_journal_error": error,
+        }));
+    }
+    if let Some(warning) = channel_warning(
+        crate::channel_state::clamped(thegn_core::channel::Feature::Providers),
+        rows_empty,
+    ) && let Some(rows) = rows.as_array_mut()
+    {
+        rows.push(serde_json::json!({
+            "warning": warning,
+            "sync_journal_error": "",
         }));
     }
     rows
@@ -183,6 +239,16 @@ pub(crate) fn json_with(
                 None => Vec::new(),
             };
             let sandbox = env_sandbox(cfg, env);
+            let placement = env.placement.as_str();
+            let placement_warning = if env.placement
+                != thegn_core::config::PlacementMode::Provider
+            {
+                format!(
+                    "[env.{name}] has a provider table but placement = \"{placement}\": worktrees on it run on this machine, not in a sandbox; set placement = \"provider\""
+                )
+            } else {
+                String::new()
+            };
             let credential_free = kind.credential_free();
             let mode = if kind == EnvProviderKind::Sprites
                 && !pc.model_credentials_is_explicit()
@@ -250,6 +316,11 @@ pub(crate) fn json_with(
             serde_json::json!({
                 "env": clean(name),
                 "provider": provider,
+                "placement": placement,
+                "placement_warning": placement_warning,
+                "sandbox_agents": sandbox_agents(cfg, env),
+                "max_instances": pc.max_instances,
+                "max_lifetime_secs": pc.max_lifetime_secs,
                 "token_resolves": crate::secret::resolve_present_cached(&crate::env_ui::effective_token_env(pc)),
                 "controller_id": controller,
                 "ledger": {
@@ -280,8 +351,11 @@ pub(crate) fn report(cfg: &Config) {
     outln!("Remote live readiness");
     let rows = json(cfg);
     let rows = rows.as_array().cloned().unwrap_or_default();
+    let preamble = report_preamble(&rows);
+    for line in &preamble {
+        outln!("{line}");
+    }
     if rows.is_empty() {
-        outln!("  (no sprites or vercel envs configured)");
         return;
     }
     let yn = |v: &serde_json::Value| {
@@ -292,17 +366,15 @@ pub(crate) fn report(cfg: &Config) {
         }
     };
     for row in rows {
-        if let Some(warning) = row["warning"].as_str() {
-            let error = row["sync_journal_error"].as_str().unwrap_or("");
-            if error.is_empty() {
-                outln!("  warning: {warning}");
-            } else {
-                outln!("  warning: {warning}: {error}");
-            }
+        if row["warning"].is_string() {
             continue;
         }
         let s = |k: &str| row[k].as_str().unwrap_or("").to_string();
         outln!("  {:<12} {}", s("env"), s("provider"));
+        outln!("               placement: {}", s("placement"));
+        if !s("placement_warning").is_empty() {
+            outln!("               warning: {}", s("placement_warning"));
+        }
         outln!(
             "               token resolves: {} · controller id readable: {}",
             yn(&row["token_resolves"]),
@@ -370,6 +442,20 @@ pub(crate) fn report(cfg: &Config) {
             yn(&row["git_token"]),
             s("login_upload")
         );
+        let agents = names("sandbox_agents");
+        outln!(
+            "               sandbox agents: {} (provisioning installs them; a missing CLI makes agent run exit 127)",
+            if agents.is_empty() {
+                "none".to_string()
+            } else {
+                agents.join(", ")
+            }
+        );
+        outln!(
+            "               caps: max_instances {} · max_lifetime_secs {}",
+            cap_display(row["max_instances"].as_u64().unwrap_or(0)),
+            cap_display(row["max_lifetime_secs"].as_u64().unwrap_or(0))
+        );
         if !s("credentials_warning").is_empty() {
             outln!("               warning: {}", s("credentials_warning"));
         }
@@ -403,6 +489,68 @@ mod tests {
         env.provider.provider = provider.into();
         cfg.env.insert("remote".into(), env);
         cfg
+    }
+
+    #[test]
+    fn rows_carry_placement_agents_and_caps() {
+        let mut cfg = cfg_with("sprites");
+        let env = cfg.env.get_mut("remote").unwrap();
+        env.placement = thegn_core::config::PlacementMode::Local;
+        env.sandbox.home = Some(thegn_core::config::HomeOverlay {
+            agents: Some(vec!["codex".into(), "claude".into()]),
+            ..Default::default()
+        });
+        env.provider.max_instances = 3;
+        env.provider.max_lifetime_secs = 900;
+
+        let row = &json_with(&cfg, None, &[], 0, &[]).as_array().unwrap()[0];
+
+        assert_eq!(row["placement"].as_str(), Some("local"));
+        assert!(row["placement_warning"].is_string());
+        assert_eq!(
+            row["sandbox_agents"],
+            serde_json::json!(["codex", "claude"])
+        );
+        assert_eq!(row["max_instances"].as_u64(), Some(3));
+        assert_eq!(row["max_lifetime_secs"].as_u64(), Some(900));
+    }
+
+    #[test]
+    fn placement_warning_only_off_provider() {
+        let mut cfg = cfg_with("sprites");
+        let provider = &json_with(&cfg, None, &[], 0, &[]).as_array().unwrap()[0];
+        assert_eq!(provider["placement_warning"], "");
+
+        cfg.env.get_mut("remote").unwrap().placement = thegn_core::config::PlacementMode::Ssh;
+        let remote = &json_with(&cfg, None, &[], 0, &[]).as_array().unwrap()[0];
+        assert_eq!(
+            remote["placement_warning"],
+            "[env.remote] has a provider table but placement = \"ssh\": worktrees on it run on this machine, not in a sandbox; set placement = \"provider\""
+        );
+    }
+
+    #[test]
+    fn channel_warning_table() {
+        assert_eq!(channel_warning(false, false), None);
+        assert_eq!(channel_warning(false, true), None);
+        assert_eq!(channel_warning(true, false), None);
+        assert_eq!(
+            channel_warning(true, true),
+            Some("provider envs are configured but this instance runs on the stable channel, which ignores them; use the dev instance (THEGN_CHANNEL=dev)".into())
+        );
+    }
+
+    #[test]
+    fn report_skips_the_empty_line_when_clamped() {
+        let warning = channel_warning(true, true).unwrap();
+        let rows = vec![serde_json::json!({
+            "warning": warning,
+            "sync_journal_error": "",
+        })];
+        let rendered = report_preamble(&rows).join("\n");
+
+        assert!(rendered.contains("provider envs are configured"));
+        assert!(!rendered.contains("no sprites or vercel envs configured"));
     }
 
     fn journal_entry(worktree: &str, env_name: &str, state: SyncState) -> SyncJournalEntry {
@@ -444,6 +592,11 @@ mod tests {
             BTreeSet::from([
                 "env",
                 "provider",
+                "placement",
+                "placement_warning",
+                "sandbox_agents",
+                "max_instances",
+                "max_lifetime_secs",
                 "token_resolves",
                 "controller_id",
                 "ledger",
