@@ -425,6 +425,7 @@ self: {
     ui.sidebar_other_group_collapsed = cfg.uiSidebarOtherGroupCollapsed;
     ui.sidebar_group_row_limit = cfg.uiSidebarGroupRowLimit;
     ui.sidebar_group_row_limits = cfg.uiSidebarGroupRowLimits;
+    ui.sidebar_batch_group_min = cfg.uiSidebarBatchGroupMin;
     search.max_results = cfg.searchMaxResults;
     search.respect_gitignore = cfg.searchRespectGitignore;
     search.include_hidden = cfg.searchIncludeHidden;
@@ -1053,6 +1054,12 @@ in {
       default = null;
       example = lib.literalExpression "{ Other = 5; }";
       description = "Per-group overrides of the sidebar group row limit, keyed by the folder or group label; 0 means no limit. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarBatchGroupMin = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Loose worktrees sharing a batch token fold into one sidebar row once this many share it; 0 = off. Unset (null) = the binary's default.";
     };
 
     searchMaxResults = lib.mkOption {

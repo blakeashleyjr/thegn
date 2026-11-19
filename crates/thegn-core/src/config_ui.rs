@@ -371,13 +371,16 @@ pub struct UiConfig {
     /// Whether the "Other" group starts collapsed. Expanding or collapsing it
     /// is remembered per project.
     pub sidebar_other_group_collapsed: bool,
-    /// Rows a sidebar group shows before a "show more" affordance; `0` = no
-    /// limit.
+    /// Rows a sidebar group shows before a "show more" affordance (default
+    /// 7); `0` = no limit.
     pub sidebar_group_row_limit: usize,
     /// Per-group overrides of `sidebar_group_row_limit`, keyed by the folder
     /// or group label (`{ Other = 5 }`); `0` = no limit for that group.
     /// Overrides match by group label across workspaces.
     pub sidebar_group_row_limits: std::collections::BTreeMap<String, usize>,
+    /// Loose worktrees sharing a batch token (`tg/b158-…` → `b158`) fold into one
+    /// collapsible row per batch once at least this many share it; `0` = off.
+    pub sidebar_batch_group_min: usize,
 }
 
 impl Default for UiConfig {
@@ -421,8 +424,9 @@ impl Default for UiConfig {
             sidebar_external_worktrees: ExternalWorktrees::default(),
             sidebar_other_group_label: "Other".to_string(),
             sidebar_other_group_collapsed: true,
-            sidebar_group_row_limit: 15,
+            sidebar_group_row_limit: 7,
             sidebar_group_row_limits: std::collections::BTreeMap::new(),
+            sidebar_batch_group_min: 2,
         }
     }
 }
@@ -790,12 +794,12 @@ mod tests {
         assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Group);
         assert_eq!(cfg.sidebar_other_group_label, "Other");
         assert!(cfg.sidebar_other_group_collapsed);
-        assert_eq!(cfg.sidebar_group_row_limit, 15);
+        assert_eq!(cfg.sidebar_group_row_limit, 7);
         assert!(cfg.sidebar_group_row_limits.is_empty());
         // Defaults survive an empty table.
         let cfg: UiConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Group);
-        assert_eq!(cfg.sidebar_group_row_limit, 15);
+        assert_eq!(cfg.sidebar_group_row_limit, 7);
         for (raw, want) in [
             ("show", ExternalWorktrees::Show),
             ("group", ExternalWorktrees::Group),
@@ -804,6 +808,12 @@ mod tests {
             assert_eq!(ExternalWorktrees::from_str_validated(raw).unwrap(), want);
         }
         assert!(ExternalWorktrees::from_str_validated("bogus").is_err());
+        assert_eq!(cfg.sidebar_batch_group_min, 2);
+        assert_eq!(UiConfig::default().sidebar_batch_group_min, 2);
+        let cfg: UiConfig = toml::from_str("sidebar_batch_group_min = 0").unwrap();
+        assert_eq!(cfg.sidebar_batch_group_min, 0);
+        let cfg: UiConfig = toml::from_str("sidebar_batch_group_min = 4").unwrap();
+        assert_eq!(cfg.sidebar_batch_group_min, 4);
         let pretty = r#"
 sidebar_external_worktrees = "hide"
 sidebar_other_group_label = "Elsewhere"

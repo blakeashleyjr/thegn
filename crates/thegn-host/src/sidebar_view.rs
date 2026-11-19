@@ -60,6 +60,9 @@ pub struct SidebarDisplay {
     /// Per-group overrides keyed by group label (`[ui]
     /// sidebar_group_row_limits`); `0` = no limit for that group.
     pub group_row_limits: std::collections::BTreeMap<String, usize>,
+    /// Loose worktrees sharing a batch token fold into one row once at least
+    /// this many share it (`[ui] sidebar_batch_group_min`); `0` = off.
+    pub batch_group_min: usize,
 }
 
 impl Default for SidebarDisplay {
@@ -92,9 +95,12 @@ impl Default for SidebarDisplay {
             other_group_label: "Other".into(),
             other_group_collapsed: true,
             // Exception: unit-built models carry no row limit (config default
-            // 15), so fixtures with long groups keep every row.
+            // 7), so fixtures with long groups keep every row.
             group_row_limit: 0,
             group_row_limits: std::collections::BTreeMap::new(),
+            // Exception: unit-built models do not group batches (config
+            // default 2), so fixtures with batch-named branches stay loose.
+            batch_group_min: 0,
         }
     }
 }
@@ -132,6 +138,7 @@ impl SidebarDisplay {
             other_group_collapsed: ui.sidebar_other_group_collapsed,
             group_row_limit: ui.sidebar_group_row_limit,
             group_row_limits: ui.sidebar_group_row_limits.clone(),
+            batch_group_min: ui.sidebar_batch_group_min,
         }
     }
 
@@ -803,6 +810,11 @@ fn block_parity(visible: &[&crate::sidebar::SidebarRow]) -> Vec<bool> {
     out
 }
 
+/// The worktree title line's text before any batch-prefix strip.
+pub(crate) fn row_title(window_title: Option<&str>, row: &crate::sidebar::SidebarRow) -> String {
+    crate::sidebar::compose_row_label(window_title, crate::sidebar::row_display_branch(row))
+}
+
 /// [`sidebar_geom`] with the visible-row slice already filtered — so
 /// `build_sidebar` doesn't collect it twice.
 fn sidebar_geom_from(
@@ -869,7 +881,18 @@ fn sidebar_geom_from(
                 && model
                     .sidebar_display
                     .show_detail(detail_focused, i == detail_cursor)
-                && crate::sidebar_detail::detail_has_content(row, &model.sidebar_display)
+                && crate::sidebar_detail::detail_has_content(row, &model.sidebar_display, {
+                    let wt = row
+                        .worktree_path
+                        .as_deref()
+                        .and_then(|p| model.sidebar_window_titles.get(p))
+                        .map(String::as_str);
+                    crate::sidebar_detail::title_echo(
+                        row,
+                        &model.sidebar_display,
+                        &row_title(wt, row),
+                    )
+                })
             {
                 h = 2;
             }
@@ -1556,6 +1579,10 @@ pub(crate) fn hit_rows(model: &FrameModel, rect: Rect) -> Vec<RowHit> {
                 RowKind::Folder | RowKind::PipelineGroup | RowKind::OtherGroup => Some(rect.x + 3),
                 // A lane sits one level in from its group's caret.
                 RowKind::PipelineLane => Some(rect.x + 5),
+                // Gutter (4) + the tree lead at the batch row's depth.
+                RowKind::BatchGroup => {
+                    Some(rect.x + 6 + 2 * (row.depth.saturating_sub(1) as usize))
+                }
                 _ => None,
             };
             Some(RowHit {
@@ -2072,6 +2099,17 @@ fn compose_row_lines(
             seg(Tok::Slot(S::Dim), display_cell(&row.label)),
             seg(Tok::Slot(S::Ghost), format!(" ({})", row.child_count)),
         ])],
+        // A derived batch row (loose worktrees sharing a batch token): caret,
+        // label and member count, at its members' guide column.
+        RowKind::BatchGroup => {
+            let mut l = vec![sp(1), sp(3)];
+            l.extend(tree_lead(row.depth, is_last));
+            l.push(seg(Tok::Slot(S::Faint), caret(row.collapsed)));
+            l.push(sp(1));
+            l.push(seg(Tok::Slot(S::Text), display_cell(&row.label)));
+            l.push(seg(Tok::Slot(S::Faint), format!(" ({})", row.child_count)));
+            vec![Line::Segs(l)]
+        }
         RowKind::Folder => {
             // Label = bare folder name (rename/delete seed from it); the
             // filed-count decoration is render-only and rides one tier down,
@@ -2148,10 +2186,7 @@ fn compose_row_lines(
             }
             // Main line is the dynamic name (OSC window title) or the branch; PR
             // moves to a compact right-cluster chip + the focused detail line.
-            let label = crate::sidebar::compose_row_label(
-                window_title,
-                crate::sidebar::row_display_branch(row),
-            );
+            let label = row_title(window_title, row);
             left.push(seg(name_fg, display_cell(&label)));
             if let Some(meta) = row.branch_meta.as_ref() {
                 if disp.show_commits
@@ -2336,6 +2371,7 @@ fn compose_row_lines(
                         row,
                         disp,
                         crate::sidebar_detail::unix_now(),
+                        crate::sidebar_detail::title_echo(row, disp, &label),
                         lead,
                         lead_cols,
                         content_cols,

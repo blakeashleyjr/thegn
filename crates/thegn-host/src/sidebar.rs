@@ -14,6 +14,8 @@ use crate::session::Session;
 use thegn_core::config_ui::ExternalWorktrees;
 use thegn_svc::git::{BranchMeta, DiffCount};
 
+pub(crate) mod fold;
+
 /// Which level of the tree a row sits at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -65,6 +67,16 @@ pub enum RowKind {
     /// `folder_id` and no `tab_target`, and is not markable, pinnable,
     /// fileable or draggable: there is no `folders` row behind it.
     OtherGroup,
+    /// A **derived** batch row under a workspace (grouped layout only)
+    /// folding its loose worktrees that share a batch token (`tg/b158-…` ->
+    /// `b158`; see [`fold::batch_key`]) once at least `[ui]
+    /// sidebar_batch_group_min` share it. Keyed `batch:{slug}/{token}`;
+    /// collapsible (collapsed by default, opened state remembered as
+    /// `batch_open:{key}`). Like [`RowKind::OtherGroup`] it carries no
+    /// `folder_id` and no `tab_target`, and is not markable, pinnable,
+    /// fileable or draggable: there is no `folders` row behind it.
+    #[allow(dead_code)] // spine stub: lane 2 emits it; drop this allow then
+    BatchGroup,
     /// A **derived** "… show N more" / "show fewer" toggle closing a group
     /// whose entries exceed `[ui] sidebar_group_row_limit` (or its
     /// `sidebar_group_row_limits` override; see `apply_row_limits`). Sits at
@@ -90,6 +102,7 @@ impl RowKind {
                 | RowKind::PipelineGroup
                 | RowKind::PipelineLane
                 | RowKind::OtherGroup
+                | RowKind::BatchGroup
         )
     }
 }
@@ -354,6 +367,12 @@ pub struct SidebarRow {
     /// Resident plugin values resolved for this worktree. Empty when no
     /// installed plugin has published a value for the row.
     pub plugin_fields: Vec<PluginFieldValue>,
+    /// Batch members: the leading part of the label hidden on screen (`tg/b161-b161-`).
+    #[allow(dead_code)] // spine stub: read once lanes 2-5 land; drop this allow then
+    pub batch_prefix: Option<String>,
+    /// BatchGroup rows: the members' rollup (filled by `fold::rollup_batch_stats`).
+    #[allow(dead_code)] // spine stub: read once lanes 2-5 land; drop this allow then
+    pub group_stats: Option<fold::GroupStats>,
 }
 
 impl SidebarRow {
@@ -406,6 +425,8 @@ impl SidebarRow {
             repo_prefix: None,
             mq_rollup: None,
             plugin_fields: Vec::new(),
+            batch_prefix: None,
+            group_stats: None,
         }
     }
 
@@ -430,6 +451,7 @@ impl SidebarRow {
                     | RowKind::PipelineLane
                     | RowKind::PipelineWorktree
                     | RowKind::OtherGroup
+                    | RowKind::BatchGroup
                     | RowKind::ShowMore
             )
     }
@@ -446,7 +468,8 @@ impl SidebarRow {
             RowKind::Folder
             | RowKind::PipelineGroup
             | RowKind::PipelineLane
-            | RowKind::OtherGroup => &self.pin_key,
+            | RowKind::OtherGroup
+            | RowKind::BatchGroup => &self.pin_key,
             _ => &self.workspace_slug,
         }
     }
@@ -634,6 +657,13 @@ pub struct ViewState {
     /// Loop-owned and transient: never persisted to `ui_state`, and never part
     /// of hydration equality.
     pub freeze: Option<std::sync::Arc<crate::sidebar_freeze::SortFreeze>>,
+    /// Batch groups the user opened (`batch_open:{key}` = "1"); absent = collapsed.
+    #[allow(dead_code)] // spine stub: read once lanes 2-5 land; drop this allow then
+    pub batch_open: HashSet<String>,
+    /// The focused cursor row's pin_key at rebuild time; the row limit never folds it.
+    /// Loop-owned and transient, never persisted.
+    #[allow(dead_code)] // spine stub: read once lanes 2-5 land; drop this allow then
+    pub cursor_key: Option<String>,
 }
 
 /// What activating a sidebar row does.
@@ -1213,13 +1243,43 @@ pub fn build_rows(
         // are emitted later under their folder header at depth 2. A worktree
         // whose `folder_id` has no matching header falls back to loose so it is
         // never invisible.
-        for gr in groups.iter().filter(|g| {
-            g.folder_id
-                .is_none_or(|fid| !rendered_folder_ids.contains(&fid))
-                && inline(g)
-        }) {
-            let pin_key = format!("{repo_slug}/{}", gr.label);
-            rows.push(mk_row(gr, 1, pin_key));
+        //
+        // Loose worktrees sharing a batch token fold into one derived
+        // `BatchGroup` row per batch (`fold::plan_loose`); pinned worktrees
+        // never join one. Single rows keep the sorted order; batch rows follow.
+        let loose: Vec<&Group> = groups
+            .iter()
+            .filter(|g| {
+                g.folder_id
+                    .is_none_or(|fid| !rendered_folder_ids.contains(&fid))
+                    && inline(g)
+            })
+            .collect();
+        let branches: Vec<&str> = loose.iter().map(|gr| gr.label.as_str()).collect();
+        let keep: Vec<bool> = loose
+            .iter()
+            .map(|gr| view.pins.contains(&format!("{repo_slug}/{}", gr.label)))
+            .collect();
+        let plan = fold::plan_loose(&branches, &keep, view.display.batch_group_min);
+        for item in plan {
+            match item {
+                fold::LooseItem::Single(i) => {
+                    let gr = loose[i];
+                    let pin_key = format!("{repo_slug}/{}", gr.label);
+                    rows.push(mk_row(gr, 1, pin_key));
+                }
+                fold::LooseItem::Batch { key, members } => {
+                    let members: Vec<SidebarRow> = members
+                        .into_iter()
+                        .map(|i| {
+                            let gr = loose[i];
+                            let pin_key = format!("{repo_slug}/{}", gr.label);
+                            mk_row(gr, 1, pin_key)
+                        })
+                        .collect();
+                    fold::push_batch_group(&mut rows, repo_slug, &key, members, collapsed, view);
+                }
+            }
         }
 
         // Build a quick lookup from folder_id → worktree rows for this workspace.
@@ -1491,6 +1551,8 @@ pub fn build_rows(
         rows[index].mq_rollup = mq_rollup;
     }
 
+    fold::rollup_batch_stats(&mut rows);
+
     apply_pins(&mut rows, &view.pins);
     apply_row_limits(&mut rows, view);
     apply_filter(&mut rows, &view.filter);
@@ -1513,157 +1575,9 @@ pub fn show_more_group(row: &SidebarRow) -> Option<&str> {
     }
 }
 
-/// Whether rows of this kind head a group the row limit applies to: a
-/// workspace (its loose rows), a user folder, the derived "Other" group, and
-/// the derived pipeline group and lane folders.
-fn is_limited_group(kind: RowKind) -> bool {
-    matches!(
-        kind,
-        RowKind::Workspace
-            | RowKind::Folder
-            | RowKind::OtherGroup
-            | RowKind::PipelineGroup
-            | RowKind::PipelineLane
-    )
-}
-
-/// Whether a direct child of a limited group is an *entry* that counts toward
-/// (and can be hidden by) the limit. Nested group heads (folders, "Other",
-/// `Pipelines`) are structure, not entries: they always show and carry their
-/// own limit.
-fn counts_toward_limit(kind: RowKind) -> bool {
-    !matches!(
-        kind,
-        RowKind::Folder
-            | RowKind::OtherGroup
-            | RowKind::PipelineGroup
-            | RowKind::SectionHeading
-            | RowKind::EmptyHint
-            | RowKind::ShowMore
-    )
-}
-
-/// The row-limit pass (`[ui] sidebar_group_row_limit` /
-/// `sidebar_group_row_limits`), run on the final order (after sorts and
-/// pins). For every group with more entries than its limit, entries past the
-/// limit are hidden (`visible = false`, their subtrees with them) and one
-/// [`RowKind::ShowMore`] row is inserted after the group's last entry. While
-/// the group is expanded (`ViewState::more_open`) every entry shows and the
-/// same row reads "show fewer".
-///
-/// - The limit is the group label's entry in `group_row_limits`, else
-///   `group_row_limit`; `0` disables it.
-/// - Pinned entries and the entry holding the active row are never hidden.
-///   They count toward the limit: a protected entry past it takes the slot of
-///   the last unprotected one, so the group still shows `limit` entries.
-/// - A non-empty filter disables the pass: every match shows.
-///
-/// Pure string/flag work over rows already built; no I/O.
+/// The row-limit pass; see [`fold::apply_row_limits`].
 fn apply_row_limits(rows: &mut Vec<SidebarRow>, view: &ViewState) {
-    let disp = &view.display;
-    if !view.filter.trim().is_empty() {
-        return;
-    }
-    if disp.group_row_limit == 0 && disp.group_row_limits.values().all(|l| *l == 0) {
-        return;
-    }
-    let heads: Vec<usize> = (0..rows.len())
-        .filter(|&i| is_limited_group(rows[i].kind))
-        .collect();
-    // Back to front: an insertion only shifts rows after it, which are
-    // already processed, and a nested group's toggle row then sits inside its
-    // parent's entry block (so hiding the entry hides it too).
-    for &h in heads.iter().rev() {
-        let limit = disp
-            .group_row_limits
-            .get(rows[h].label.as_str())
-            .copied()
-            .unwrap_or(disp.group_row_limit);
-        if limit == 0 {
-            continue;
-        }
-        let depth = rows[h].depth;
-        // Direct-child entry blocks as half-open `(start, end)` ranges.
-        let mut blocks: Vec<(usize, usize)> = Vec::new();
-        let mut j = h + 1;
-        while j < rows.len() && rows[j].depth > depth {
-            let start = j;
-            j += 1;
-            while j < rows.len() && rows[j].depth > rows[start].depth {
-                j += 1;
-            }
-            if counts_toward_limit(rows[start].kind) {
-                blocks.push((start, j));
-            }
-        }
-        if blocks.len() <= limit {
-            continue;
-        }
-        let protected: Vec<bool> = blocks
-            .iter()
-            .map(|&(s, e)| {
-                (!rows[s].pin_key.is_empty() && view.pins.contains(&rows[s].pin_key))
-                    || rows[s..e].iter().any(|r| r.active)
-            })
-            .collect();
-        let mut budget = limit.saturating_sub(protected.iter().filter(|p| **p).count());
-        let mut hide: Vec<bool> = Vec::with_capacity(blocks.len());
-        for &p in &protected {
-            let shown = if p {
-                true
-            } else if budget > 0 {
-                budget -= 1;
-                true
-            } else {
-                false
-            };
-            hide.push(!shown);
-        }
-        let hidden = hide.iter().filter(|h| **h).count();
-        if hidden == 0 {
-            continue;
-        }
-        // The toggle shows exactly when the group's shown entries do (a
-        // collapsed ancestor hides both).
-        let visible = blocks
-            .iter()
-            .zip(&hide)
-            .find(|(_, h)| !**h)
-            .is_some_and(|(&(s, _), _)| rows[s].visible);
-        let key = rows[h].collapse_key().to_string();
-        let open = view.more_open.contains(&key);
-        if !open {
-            for (&(s, e), _) in blocks.iter().zip(&hide).filter(|(_, h)| **h) {
-                for r in &mut rows[s..e] {
-                    r.visible = false;
-                }
-            }
-        }
-        // Right after the last entry the group still shows (so the toggle
-        // never drifts past following folders/sub-groups); when expanded,
-        // after the last entry.
-        let at = if open {
-            blocks.last().map_or(h + 1, |b| b.1)
-        } else {
-            blocks
-                .iter()
-                .zip(&hide)
-                .rev()
-                .find(|(_, h)| !**h)
-                .map_or(h + 1, |(b, _)| b.1)
-        };
-        let slug = rows[h].workspace_slug.clone();
-        rows.insert(
-            at,
-            SidebarRow {
-                pin_key: show_more_key(&key),
-                collapsed: !open,
-                child_count: hidden,
-                visible,
-                ..SidebarRow::base(RowKind::ShowMore, depth + 1, String::new(), slug)
-            },
-        );
-    }
+    fold::apply_row_limits(rows, view)
 }
 
 /// Emit a workspace's derived "Other (N)" group and its external worktree
@@ -2323,7 +2237,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
             }
             // The derived "Other" group nests its rows at depth 2 exactly like
             // a folder, so the filter surfaces and reveals it the same way.
-            RowKind::Folder | RowKind::OtherGroup => {
+            RowKind::Folder | RowKind::OtherGroup | RowKind::BatchGroup => {
                 last_folder = Some(i);
                 // A folder that matches on its own label surfaces its parent
                 // workspace header, so it never floats orphaned at depth 1.
@@ -2417,7 +2331,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 reveal_folder = false; // folders don't span workspaces
                 reveal_group = false;
             }
-            RowKind::Folder | RowKind::OtherGroup => {
+            RowKind::Folder | RowKind::OtherGroup | RowKind::BatchGroup => {
                 // A folder that matched on its own label reveals its children,
                 // and (like any surfaced folder) is itself surfaced above.
                 reveal_folder = self_match[i] || reveal_ws;
@@ -6027,5 +5941,47 @@ mod tests {
         let rows = build_rows(&s, &ws, &filtered, &no_activity(), &dbw, &[], &[]);
         assert!(show_more_rows(&rows).is_empty());
         assert!(shown_worktrees(&rows).len() >= 20);
+    }
+
+    /// The plan-driven loose emission (`fold::plan_loose`) emits every loose
+    /// worktree exactly once, in the workspace's sort order: the 20-row
+    /// fixture (home + 20, no batch token) renders 21 entries whether batch
+    /// grouping is on or off, and grouping on changes no row.
+    #[test]
+    fn build_rows_spine_emits_every_loose_row_once() {
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let dbw: Vec<DbWorktree> = (0..20)
+            .map(|i| db_row("app", &format!("b{i:02}")))
+            .collect();
+        let s = session(vec![], 0);
+        let shape = |min: usize| -> Vec<(RowKind, String, String)> {
+            let view = ViewState {
+                display: crate::sidebar_view::SidebarDisplay {
+                    batch_group_min: min,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[])
+                .into_iter()
+                .map(|r| (r.kind, r.label, r.pin_key))
+                .collect()
+        };
+        let on = shape(2);
+        let worktrees: Vec<&(RowKind, String, String)> =
+            on.iter().filter(|r| r.0 == RowKind::Worktree).collect();
+        assert_eq!(worktrees.len(), 21, "home + 20 = 21 entries");
+        let keys: HashSet<&str> = worktrees.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(keys.len(), 21, "every loose row is emitted once");
+        for i in 0..20 {
+            assert!(keys.contains(format!("app/b{i:02}").as_str()));
+        }
+        assert!(!on.iter().any(|r| r.0 == RowKind::BatchGroup));
+        assert_eq!(on, shape(0), "no batch token: grouping changes nothing");
     }
 }

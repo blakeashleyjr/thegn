@@ -737,8 +737,9 @@ pub(crate) fn spot_for_hover(
                     .filter(|(_, r)| r.workspace_slug == *slug)
                     .fold(None, |acc, (_, r)| match r.kind {
                         RowKind::Folder => r.folder_id,
-                        // The "Other" group's rows belong to no folder.
-                        RowKind::OtherGroup => None,
+                        // The "Other" group's and a batch row's rows belong
+                        // to no folder.
+                        RowKind::OtherGroup | RowKind::BatchGroup => None,
                         RowKind::Worktree if r.depth < 2 => None,
                         _ => acc,
                     })

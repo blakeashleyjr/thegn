@@ -1616,6 +1616,7 @@ impl SidebarState {
             .flatten()
             .filter(|(k, _)| !k.is_empty());
         let rows_span = crate::perf::measure(crate::perf::Subsys::Rows);
+        self.view.cursor_key = cursor_anchor.as_ref().map(|(key, _)| key.clone());
         model.sidebar_rows = crate::sidebar::build_rows(
             session,
             &model.sidebar_workspaces,
