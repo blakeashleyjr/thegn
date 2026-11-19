@@ -567,6 +567,11 @@ fn extend_reports_extended_or_the_plan_ceiling_and_missing_sessions() {
             format!("{err:#}").contains("session no longer exists"),
             "{err:#}"
         );
+        assert!(
+            err.downcast_ref::<thegn_svc::vercel::client::SessionGone>()
+                .is_some(),
+            "{err:#}"
+        );
     }
     let reqs = mock.requests();
     assert_eq!(
@@ -1008,7 +1013,8 @@ fn interactive_refuses_a_ticket_carrying_the_api_token() {
 #[test]
 fn snapshots_for_lists_ids_scoped_by_name() {
     let mock = Mock::start(|r| {
-        let page = r.query().get("cursor").map(String::as_str);
+        let query = r.query();
+        let page = query.get("cursor").map(String::as_str);
         match page {
             None => Reply::json(
                 "200 OK",
@@ -1112,6 +1118,38 @@ fn set_network_policy_patches_without_a_session_post_when_stopped() {
     assert_eq!(reqs.len(), 2);
     assert_eq!(reqs[0].method, "PATCH");
     assert_eq!(reqs[1].method, "GET");
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn set_network_policy_patches_and_posts_for_a_pending_session() {
+    let mock = Mock::start(|r| match (r.method.as_str(), r.path()) {
+        ("PATCH", "/v2/sandboxes/tg-a") => Reply::json("200 OK", serde_json::json!({})),
+        ("GET", "/v2/sandboxes/tg-a") => Reply::json(
+            "200 OK",
+            serde_json::json!({
+                "sandbox": {
+                    "name": "tg-a",
+                    "status": "pending",
+                    "currentSessionId": "sess_1"
+                },
+                "session": {"id": "sess_1", "status": "pending"}
+            }),
+        ),
+        ("POST", "/v2/sandboxes/sessions/sess_1/network-policy") => {
+            Reply::json("200 OK", serde_json::json!({}))
+        }
+        _ => Reply::json("500 Internal Server Error", serde_json::json!({})),
+    });
+    let policy = serde_json::json!({"mode": "allow-all"});
+    rt().block_on(mock.client().set_network_policy("tg-a", &policy))
+        .expect("set network policy");
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(reqs[0].method, "PATCH");
+    assert_eq!(reqs[1].method, "GET");
+    assert_eq!(reqs[2].method, "POST");
+    assert_eq!(reqs[2].json(), policy);
     mock.assert_custody(&[]);
 }
 
