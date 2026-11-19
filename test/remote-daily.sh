@@ -17,7 +17,7 @@ set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
 
-env_name="" accept=0 provider="sprites" with_model=0 adopt_name="" with_reaper=0
+env_name="" accept=0 provider="sprites" with_model=0 adopt_name="" with_reaper=0 keep_going=0
 while [ $# -gt 0 ]; do
   case "$1" in
   --env)
@@ -55,6 +55,7 @@ while [ $# -gt 0 ]; do
     shift
     ;;
   --keep-going)
+    keep_going=1
     shift
     ;;
   -h | --help)
@@ -78,8 +79,9 @@ Will create : ONE sandbox/machine via the named [env.<name>] from your real
               daemon and a scratch git repo on branch rd/daily-lane.
 Max spend   : one sandbox for about 10 minutes (a 420 s scripted hold); more
               with --with-model (two real model runs). Teardown destroys it.
-Options     : --keep-going is accepted for plan-only runs; it does not bypass
-              --i-accept-spend.
+Options     : --keep-going alone is plan-only and does not bypass
+              --i-accept-spend; with it, the run continues and prints
+              FAILED STEPS: <ids> before exiting non-zero.
 Teardown    : trap on EXIT/INT/TERM -> env down --force, env deprovision <name>
               for each name in THIS run's ledger (rd-x's and rd-y's), daemon
               stop; fails (keeps the ledger) if any of this run's names remain
@@ -122,6 +124,9 @@ Steps:
       not created by this run and is NEVER destroyed by this script
  R    (--with-reaper) lifetime_reap on a throwaway env, hydrate cadence
 Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
+With --keep-going, failed steps print FAIL <id>, the run continues, and the
+end prints FAILED STEPS: <ids> before exiting non-zero. ALL STEPS PASS prints
+only when no step failed.
 PLAN
 }
 
@@ -219,6 +224,7 @@ export XDG_RUNTIME_DIR="$TMP/run"
 REPO="$TMP/repo"
 NAME="(unknown)"
 CREATED=0
+FAILED_STEPS=()
 HOLD_PID=""
 WT_PATH=""
 RDY_NAME=""
@@ -330,8 +336,12 @@ step() { # step <id> <description> <command...>
     echo "PASS $id"
   else
     echo "FAIL $id: $desc" >&2
-    exit 1
+    FAILED_STEPS+=("$id")
+    if [ "$keep_going" != 1 ]; then
+      exit 1
+    fi
   fi
+  return 0
 }
 
 in_repo() { (cd "$REPO" && "$@"); }
@@ -400,6 +410,7 @@ no_model_login() {
   local out
   # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
   out="$(no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$NAME" -- sh -c 'test ! -e "$HOME/.claude/.credentials.json" && echo absent')" || return 1
+  out="$(printf '%s' "$out" | tr -d '\r\n ')"
   echo "   credentials: $out"
   [ "$out" = absent ]
 }
@@ -488,11 +499,14 @@ fi
 if [ "$provider" = fly ]; then
   step 5 "fleet list shows the machine stopped" fly_stopped
 fi
-if [ "$LOGIN_UPLOAD" = claude ]; then
+case ",$LOGIN_UPLOAD," in
+*,claude,*)
   step 6 "credentials file mode is 600" cred_mode
-else
+  ;;
+*)
   step 6 "no model login entered the sandbox (model_credentials default)" no_model_login
-fi
+  ;;
+esac
 if [ "$with_model" = 1 ]; then want=3; else want=1; fi
 step 7 "local git log has the commits" local_log_has_commits "$want"
 step 8 "land --worktree <rd-x> --release-sandbox" in_repo "$THEGN_BIN" land --worktree "$WT_PATH" --release-sandbox
@@ -514,5 +528,9 @@ fi
 if [ "$with_reaper" = 1 ]; then
   echo "NOTE R: lifetime_reap needs a client up and a throwaway env with max_lifetime_secs > 0;" >&2
   echo "        verify manually with: thegn fleet list after the 300 s hydrate cadence" >&2
+fi
+if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+  echo "FAILED STEPS: ${FAILED_STEPS[*]}"
+  exit 1
 fi
 echo "ALL STEPS PASS"
