@@ -1272,12 +1272,12 @@ demo-script-check:
 # config edit needed). Folds eligible worktree branches into the target branch
 # with a compile gate; Super+K → "Integrate" / "Merge queue", or it auto-drains
 # ~5s after an agent finishes. Override the gate with `gate='just test'` etc.
+# Do not override XDG_RUNTIME_DIR: masks and the control-socket guard key off the env runtime dir.
 start-mq name="dev" gate="cargo build --workspace": build
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
       . "$PWD/test/lib/instance.sh"; INST_STATE="$state" inst_restart "$pidfile" $$ || exit 1; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
-      "XDG_RUNTIME_DIR=$run" \
       "THEGN_NO_MIGRATE=1" \
       {{bin}} --set merge_queue.enabled=true \
               --set 'merge_queue.gate_command={{gate}}' \
