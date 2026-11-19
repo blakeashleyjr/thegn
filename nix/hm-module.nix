@@ -1175,13 +1175,13 @@ in {
     locScanIntervalSecs = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 0 2678400);
       default = null;
-      description = "Per-worktree re-count TTL in seconds; 0 counts every pump. Unset (null) = the binary's default.";
+      description = "Re-count TTL in seconds for the active worktree and the scan pump cadence; background worktrees are re-counted only when their git state moved. 0 counts every pump. Unset (null) = the binary's default.";
     };
 
     locMaxScanPerRound = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.u32);
       default = null;
-      description = "Worktrees counted per background round; 0 = unlimited. Unset (null) = the binary's default.";
+      description = "Worktrees walked (tokei) per background round, not rows examined; 0 = unlimited. Unset (null) = the binary's default.";
     };
 
     locWatchInvalidateSecs = lib.mkOption {
@@ -1920,13 +1920,13 @@ in {
     diskScanIntervalSecs = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 0 2678400);
       default = null;
-      description = "Seconds between background disk scans. Unset (null) = the binary's default.";
+      description = "Per-worktree size TTL in seconds and the scan pump cadence; the active worktree is measured at most every 120 s. Unset (null) = the binary's default.";
     };
 
     diskMaxScanPerRound = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.u32);
       default = null;
-      description = "Maximum worktrees measured per scan round. Unset (null) = the binary's default.";
+      description = "Maximum worktrees measured (`du` walks) per scan round, not rows examined. Unset (null) = the binary's default.";
     };
 
     diskAutoCleanOnMerge = lib.mkOption {
