@@ -1484,9 +1484,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             | Command::Machine0Ssh { .. }
             | Command::SpriteExec { .. }
             | Command::VercelExec { .. } => {
-                if !thegn_core::log_trace::install_bridge_file_trace() {
-                    // Bridge logging is best-effort and must never touch stderr.
-                }
+                // Best-effort and file-only: it must never touch stdout or stderr. Whether
+                // it installed is visible only in the trace file itself.
+                let installed = thegn_core::log_trace::install_bridge_file_trace();
+                tracing::trace!(target: "thegn::provider", installed, "bridge file trace");
             }
             _ => {} // every other verb took the `if` branch above; a new self-logging verb lands here and installs nothing
         }
