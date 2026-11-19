@@ -57,6 +57,13 @@ pub const HOLD_ARG0: &str = "thegn-hold";
 /// - The command runs as a child; its exit code is passed through. On exit
 ///   (and on HUP/INT/TERM, which are forwarded to the child first) the loop is
 ///   stopped and the task is `DELETE`d, best-effort.
+/// - The loop and the command are forked before any trap is installed, so a
+///   signal sent to either before it first runs cannot be lost to an inherited
+///   handler. A signal reaching the wrapper in that short startup window ends
+///   it without cleanup: the loop sees its parent gone within 60 s and the
+///   hold expires 300 s later (the crash bound).
+/// - The loop never holds the command's stdout/stderr (it runs on
+///   `/dev/null`), and it kills and reaps its own `sleep` before exiting.
 /// - `THEGN_HOLD_SOCK` overrides the socket path. It exists for thegn's own
 ///   tests (a fake socket); nothing in production sets it.
 pub const HOLD_SCRIPT: &str = r#"task=$1
@@ -79,17 +86,30 @@ hold_drop() {
     curl -fsS --max-time 10 --unix-socket "$sock" -X DELETE \
         "http://sprite/v1/tasks/$task" >/dev/null 2>&1
 }
+# The heartbeat. It is forked before this shell installs any trap, so a TERM
+# reaching it before its own trap exists kills it (default action) instead of
+# being swallowed by an inherited handler. The trap only records the stop and
+# ends the current nap; every step is bounded, so a TERM at any point ends the
+# loop promptly, and the nap is always killed and reaped before it exits.
 hold_loop() {
+    stop=
     nap=
-    trap 'kill "$nap" 2>/dev/null; exit 0' TERM
-    while :; do
+    trap 'stop=1; [ -z "$nap" ] || kill "$nap" 2>/dev/null' TERM
+    while [ -z "$stop" ]; do
+        nap=
         sleep 60 &
         nap=$!
-        wait "$nap"
-        [ "$(date +%s)" -lt "$end" ] || exit 0
-        kill -0 "$parent" 2>/dev/null || exit 0
+        [ -n "$stop" ] || wait "$nap"
+        [ -z "$stop" ] || break
+        [ "$(date +%s)" -lt "$end" ] || break
+        kill -0 "$parent" 2>/dev/null || break
         hold_put
     done
+    if [ -n "$stop" ] && [ -n "$nap" ]; then
+        kill "$nap" 2>/dev/null
+        wait "$nap" 2>/dev/null
+    fi
+    exit 0
 }
 cleanup() {
     if [ -n "$loop" ]; then
@@ -116,9 +136,6 @@ on_signal() {
     cleanup
     exit "$rc"
 }
-trap 'on_signal HUP 129' HUP
-trap 'on_signal INT 130' INT
-trap 'on_signal TERM 143' TERM
 if [ -n "$valid" ] && command -v curl >/dev/null 2>&1 && [ -S "$sock" ]; then
     held=1
     hold_put
@@ -132,6 +149,11 @@ fi
 exec 3<&0
 "$@" <&3 3<&- &
 child=$!
+# Traps go in only now, with both pids recorded: a process forked while a trap
+# was installed could lose a signal sent to it before it first ran.
+trap 'on_signal HUP 129' HUP
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
 wait "$child"
 rc=$?
 child=
@@ -271,7 +293,20 @@ mod tests {
         stdout: String,
         stderr: String,
         curl_log: Vec<String>,
+        /// `<pid> <args>` per `sleep` run under the held fixture.
+        sleep_log: Vec<String>,
         sock: PathBuf,
+    }
+
+    /// A wrapper run that takes longer than this is a hang, not slowness: the
+    /// runs here finish in well under a second.
+    const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The host's real `sleep`, so the fixture can log every nap and exec it.
+    fn host_sleep(host_path: &str) -> Option<PathBuf> {
+        std::env::split_paths(host_path)
+            .map(|dir| dir.join("sleep"))
+            .find(|candidate| candidate.is_file())
     }
 
     #[derive(Clone, Copy)]
@@ -290,8 +325,27 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).expect("bin dir");
         let log = dir.path().join("curl.log");
+        let naps = dir.path().join("sleep.log");
         let sock = dir.path().join("api.sock");
         let path = if fixture.curl {
+            // A logging `sleep` so tests can see the heartbeat's nap pids.
+            let host = std::env::var("PATH").unwrap_or_default();
+            let Some(real_sleep) = host_sleep(&host) else {
+                return None;
+            };
+            let sleep = bin.join("sleep");
+            std::fs::write(
+                &sleep,
+                format!(
+                    "#!/bin/sh\nprintf '%s %s\\n' \"$$\" \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+                    naps.display(),
+                    real_sleep.display()
+                ),
+            )
+            .expect("fake sleep");
+            if crate::fsperm::make_executable_for_test(&sleep).is_err() {
+                return None;
+            }
             let curl = bin.join("curl");
             std::fs::write(
                 &curl,
@@ -301,8 +355,7 @@ mod tests {
             if crate::fsperm::make_executable_for_test(&curl).is_err() {
                 return None;
             }
-            // The fake shadows any real curl; `date`/`sleep` come from the host.
-            let host = std::env::var("PATH").unwrap_or_default();
+            // The fakes shadow any real curl/sleep; `date` comes from the host.
             format!("{}:{host}", bin.display())
         } else {
             // Nothing on PATH at all: `command -v curl` must fail.
@@ -322,22 +375,44 @@ mod tests {
             .args(&wrapped[1..])
             .env("PATH", path)
             .env("THEGN_HOLD_SOCK", &sock)
+            .env("NAPS", &naps)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn /bin/sh");
-        let out = child.wait_with_output().expect("wait for the wrapper");
-        let curl_log = std::fs::read_to_string(&log)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect();
+        let pid = child.id().to_string();
+        // Bounded: a wrapper that never exits, or leaves something holding its
+        // output open, fails here with a message instead of hanging the run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let out = match rx.recv_timeout(RUN_LIMIT) {
+            Ok(out) => out.expect("wait for the wrapper"),
+            Err(_) => {
+                let _ = Command::new("/bin/sh")
+                    .args(["-c", "kill -KILL \"$1\" 2>/dev/null", "sh", &pid])
+                    .status();
+                panic!(
+                    "hold wrapper for {argv:?} did not exit (or kept its output open) \
+                     within {RUN_LIMIT:?}: the heartbeat wrapper hung"
+                );
+            }
+        };
+        let read_lines = |file: &Path| -> Vec<String> {
+            std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
         Some(Ran {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            curl_log,
+            curl_log: read_lines(&log),
+            sleep_log: read_lines(&naps),
             sock,
         })
     }
@@ -372,6 +447,64 @@ mod tests {
         );
     }
 
+    /// Every heartbeat nap (`sleep 60`) is gone once the wrapper has exited:
+    /// the loop kills and reaps its own sleep. (Checked through `/proc`; where
+    /// there is none the check is vacuous.)
+    fn assert_heartbeat_naps_ended(ran: &Ran) {
+        let refresh = HOLD_REFRESH_SECS.to_string();
+        for line in &ran.sleep_log {
+            let Some((pid, args)) = line.split_once(' ') else {
+                continue;
+            };
+            if args != refresh {
+                continue;
+            }
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|stat| !stat.contains(") Z "));
+            assert!(!alive, "heartbeat nap {pid} outlived the wrapper");
+        }
+    }
+
+    #[test]
+    fn held_run_survives_a_command_that_exits_immediately() {
+        // The command ends before the heartbeat has necessarily even run; the
+        // wrapper must still stop it and exit. Repeated to cover interleavings.
+        for _ in 0..10 {
+            let Some(ran) = run_wrapped(HELD, &["true"]) else {
+                return;
+            };
+            assert_eq!(ran.code, Some(0), "stderr: {}", ran.stderr);
+            assert_put_then_delete(&ran);
+            assert_heartbeat_naps_ended(&ran);
+        }
+    }
+
+    #[test]
+    fn held_run_ends_while_the_heartbeat_is_mid_sleep() {
+        // The command waits until the heartbeat's nap has started, then exits:
+        // the wrapper must end the nap rather than wait out the refresh.
+        let Some(ran) = run_wrapped(
+            HELD,
+            &[
+                "/bin/sh",
+                "-c",
+                "until grep -q ' 60$' \"$NAPS\" 2>/dev/null; do sleep 1; done",
+            ],
+        ) else {
+            return;
+        };
+        assert_eq!(ran.code, Some(0), "stderr: {}", ran.stderr);
+        assert_put_then_delete(&ran);
+        assert!(
+            ran.sleep_log
+                .iter()
+                .any(|line| line.ends_with(&format!(" {HOLD_REFRESH_SECS}"))),
+            "no heartbeat nap seen: {:?}",
+            ran.sleep_log
+        );
+        assert_heartbeat_naps_ended(&ran);
+    }
+
     #[test]
     fn held_run_puts_then_deletes_and_passes_the_exit_code() {
         let Some(ran) = run_wrapped(
@@ -395,6 +528,7 @@ mod tests {
         };
         assert_eq!(ran.code, Some(0), "stderr: {}", ran.stderr);
         assert_put_then_delete(&ran);
+        assert_heartbeat_naps_ended(&ran);
     }
 
     #[test]
@@ -430,27 +564,39 @@ mod tests {
     #[test]
     fn term_is_forwarded_to_the_child_and_the_hold_dropped() {
         // The child signals its parent (the wrapper), then becomes a sleep the
-        // wrapper must TERM for the run to end promptly.
+        // wrapper must TERM for the run to end promptly. The leading pause
+        // lets the wrapper install its traps (it does so just after the fork).
         let Some(ran) = run_wrapped(
             HELD,
-            &["/bin/sh", "-c", "kill -TERM \"$PPID\"; exec sleep 30"],
+            &[
+                "/bin/sh",
+                "-c",
+                "sleep 1; kill -TERM \"$PPID\"; exec sleep 30",
+            ],
         ) else {
             return;
         };
         assert_eq!(ran.code, Some(128 + 15), "stderr: {}", ran.stderr);
         assert_put_then_delete(&ran);
+        assert_heartbeat_naps_ended(&ran);
     }
 
     #[test]
     fn int_ends_the_child_and_drops_the_hold() {
-        // An async child ignores INT, so the wrapper escalates to TERM.
+        // An async child ignores INT, so the wrapper escalates to TERM. The
+        // leading pause lets the wrapper install its traps first.
         let Some(ran) = run_wrapped(
             HELD,
-            &["/bin/sh", "-c", "kill -INT \"$PPID\"; exec sleep 30"],
+            &[
+                "/bin/sh",
+                "-c",
+                "sleep 1; kill -INT \"$PPID\"; exec sleep 30",
+            ],
         ) else {
             return;
         };
         assert_eq!(ran.code, Some(143), "stderr: {}", ran.stderr);
         assert_put_then_delete(&ran);
+        assert_heartbeat_naps_ended(&ran);
     }
 }
