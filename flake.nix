@@ -647,7 +647,7 @@
           # The OpenSpec CLI for spec-driven development (`nix run .#openspec`).
           openspec = openspec;
           # Lint and format tools for agent workers. A NixOS login shell (`bash -lc`, as codex runs
-          # every command) resets PATH but keeps `/home/user/.superzej/pipeline-state/nix/profile/bin`; `just
+          # every command) resets PATH but keeps `${XDG_STATE_HOME}/nix/profile/bin`; `just
           # pipeline-tools <state dir>` puts this env there.
           lint-tools = pkgs.buildEnv {
             name = "thegn-lint-tools";

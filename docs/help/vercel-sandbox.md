@@ -81,6 +81,26 @@ lifetime ceiling both run before any resume.
 This fetches the bundle into `refs/thegn/pull/<worktree>`; only the lane's own
 branch fast-forwards. See [[sandboxing]].
 
+## Destroy proof, exec ceiling and live shape checks
+
+- **Destroy keeps the record until proven gone.** After the DELETE returns
+  2xx, thegn polls `GET` (never resuming the sandbox) every poll interval for
+  up to 30 s. A 404 removes the ledger record and deletes the snapshots. A
+  sandbox that is still present keeps the record and returns an error, which
+  matches the 60 s listing proof `env down` already requires.
+- **Exec ceiling.** One exec request may run for up to 31 minutes; the
+  facade's outer deadline governs. A stream that ends with no command exit is
+  an error: "vercel: run command ended without an exit status".
+- **Live sentinels.** `test/vercel-live.sh` step `3s` checks that the
+  `fleet list --json` response shapes parse, and `7s` does the same for
+  `fleet cost --json`. Step `4b` checks the exec exit code. Both sentinels
+  WARN rather than fail when a field is missing.
+- **Fixtures.** `crates/thegn-svc/tests/fixtures/vercel/README.md` records
+  that those JSON files are the shapes thegn parses, not captured bodies.
+  After the first live run (THE-2234), replace each file with a captured body
+  (secrets removed) so a parse change fails CI instead of the next paid run.
+  Until then the destroy proof is UNVERIFIED live.
+
 ## Model credentials
 
 One key, per environment, default `none`:
