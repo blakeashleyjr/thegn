@@ -3099,6 +3099,62 @@ pub(crate) struct ExecCollected {
     pub(crate) dropped: u64,
 }
 
+/// Bounded tail of a non-TTY exec's stderr (stream id 2).
+#[derive(Default)]
+pub(crate) struct StderrTail {
+    bytes: std::collections::VecDeque<u8>,
+    total: u64,
+}
+
+pub(crate) const STDERR_TAIL_CAP: usize = 8 * 1024;
+
+impl StderrTail {
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len() as u64);
+        if chunk.len() >= STDERR_TAIL_CAP {
+            self.bytes.clear();
+            self.bytes.extend(&chunk[chunk.len() - STDERR_TAIL_CAP..]);
+            return;
+        }
+        let excess = self
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(STDERR_TAIL_CAP);
+        self.bytes.drain(..excess);
+        self.bytes.extend(chunk);
+    }
+
+    pub(crate) fn render(&self) -> String {
+        sanitize_stderr(&self.bytes.iter().copied().collect::<Vec<_>>())
+    }
+}
+
+type StderrSink = Arc<Mutex<StderrTail>>;
+
+/// Remove ESC and C0 controls except \n and \t; lossy UTF-8.
+pub(crate) fn sanitize_stderr(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
+fn append_stderr_tail(mut output: String, code: i32, stderr: &StderrSink) -> String {
+    if code == 0 {
+        return output;
+    }
+    let tail = stderr
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tail.bytes.is_empty() {
+        return output;
+    }
+    let n = tail.total.min(STDERR_TAIL_CAP as u64);
+    output.push_str(&format!("\n[stderr, last {n} bytes]\n{}", tail.render()));
+    output
+}
+
 fn collect_exec_frame(
     frame: ExecFrame,
     cap: usize,
@@ -3516,7 +3572,20 @@ impl SpritesProvider {
     /// runtime until the socket closes or `ExecControl::Close` is sent.
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         let url = exec_ws_url(self.base()?, id, spec)?;
-        self.start_session(url, spec.tty).await
+        self.start_session(url, spec.tty, None).await
+    }
+
+    async fn open_exec_capturing(
+        &self,
+        id: &str,
+        spec: &ExecSpec,
+    ) -> Result<(ExecSession, StderrSink)> {
+        let url = exec_ws_url(self.base()?, id, spec)?;
+        let stderr = Arc::new(Mutex::new(StderrTail::default()));
+        let session = self
+            .start_session(url, spec.tty, Some(Arc::clone(&stderr)))
+            .await?;
+        Ok((session, stderr))
     }
 
     /// Reattach to a persisted exec session (the server replays its scrollback).
@@ -3529,14 +3598,14 @@ impl SpritesProvider {
         rows: u16,
     ) -> Result<ExecSession> {
         let url = attach_ws_url(self.base()?, id, session, cols, rows)?;
-        self.connect_exec(url, true, false).await
+        self.connect_exec(url, true, false, None).await
     }
 
     /// Run a one-shot command in the sprite over the WSS exec API (NON-tty) and
     /// collect its combined output + exit code. This is the CLI-free / bridge-free
     /// channel the env provisioner uses to set the sandbox up (the non-tty framing
-    /// surfaces stdout + the exit; redirect stderr with `2>&1` in the script to
-    /// capture it). Returns `(exit_code, output)`.
+    /// surfaces stdout, stderr, and the exit without mixing stderr into stdout).
+    /// Returns `(exit_code, output)`.
     pub async fn run_exec(
         &self,
         id: &str,
@@ -3566,15 +3635,16 @@ impl SpritesProvider {
             cwd: cwd.map(str::to_string),
         };
         let until = tokio::time::Instant::now() + deadline;
-        let mut sess = match tokio::time::timeout_at(until, self.open_exec(id, &spec)).await {
-            Ok(session) => session?,
-            Err(_) => {
-                return Err(anyhow!(
-                    "sprites: exec exceeded its {}s deadline; the session was closed",
-                    deadline.as_secs()
-                ));
-            }
-        };
+        let (mut sess, stderr) =
+            match tokio::time::timeout_at(until, self.open_exec_capturing(id, &spec)).await {
+                Ok(session) => session?,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "sprites: exec exceeded its {}s deadline; the session was closed",
+                        deadline.as_secs()
+                    ));
+                }
+            };
         let collected = match collect_exec_output_until(
             &mut sess.frames,
             crate::vps::ssh_shim::EXEC_OUTPUT_CAP,
@@ -3599,21 +3669,31 @@ impl SpritesProvider {
         let Some(code) = collected.code else {
             return Err(anyhow!("exec stream ended without an exit status"));
         };
-        Ok((
-            code,
-            crate::vps::ssh_shim::render_capped_output(&collected.output, collected.dropped),
-        ))
+        let output =
+            crate::vps::ssh_shim::render_capped_output(&collected.output, collected.dropped);
+        Ok((code, append_stderr_tail(output, code, &stderr)))
     }
 
     /// Run the WSS handshake (bearer auth) and spawn the bridge task. `tty`
     /// selects the wire framing: raw (PTY) vs 1-byte stream-id prefixes (non-PTY).
-    async fn start_session(&self, url: String, tty: bool) -> Result<ExecSession> {
-        self.connect_exec(url, tty, true).await
+    async fn start_session(
+        &self,
+        url: String,
+        tty: bool,
+        stderr: Option<StderrSink>,
+    ) -> Result<ExecSession> {
+        self.connect_exec(url, tty, true, stderr).await
     }
 
     // Fresh exec can wait for cold boot. Reattach is already retried by the
     // session relay and must not multiply its budget by an inner 90s loop.
-    async fn connect_exec(&self, url: String, tty: bool, cold_open: bool) -> Result<ExecSession> {
+    async fn connect_exec(
+        &self,
+        url: String,
+        tty: bool,
+        cold_open: bool,
+        stderr: Option<StderrSink>,
+    ) -> Result<ExecSession> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let auth: tokio_tungstenite::tungstenite::http::HeaderValue =
             format!("Bearer {}", self.token)
@@ -3687,7 +3767,7 @@ impl SpritesProvider {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<ExecControl>(256);
         let (sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
 
-        tokio::spawn(drive_exec(ws, tty, frames_tx, control_rx, sid_tx));
+        tokio::spawn(drive_exec(ws, tty, frames_tx, control_rx, sid_tx, stderr));
 
         Ok(ExecSession {
             frames: frames_rx,
@@ -3819,14 +3899,15 @@ async fn drive_proxy<S>(
 /// The exec bridge task: pump WebSocket frames ⇄ the [`ExecSession`] channels.
 /// Generic over the socket so the concrete (TLS) stream type need not be named.
 /// `tty` selects the wire framing: raw bytes (PTY) vs 1-byte stream-id prefixes
-/// (non-PTY — stdin gets a `0` prefix; only stdout/exit are surfaced, stderr is
-/// dropped so a non-PTY consumer like the bridge sees a clean byte stream).
+/// (non-PTY — stdin gets a `0` prefix; only stdout/exit are surfaced, while an
+/// optional stderr sink captures stream id 2).
 async fn drive_exec<S>(
     ws: S,
     tty: bool,
     frames_tx: tokio::sync::mpsc::Sender<ExecFrame>,
     mut control_rx: tokio::sync::mpsc::Receiver<ExecControl>,
     sid_tx: tokio::sync::watch::Sender<Option<String>>,
+    stderr: Option<StderrSink>,
 ) where
     S: futures_util::Sink<tokio_tungstenite::tungstenite::Message>
         + futures_util::Stream<
@@ -3883,9 +3964,16 @@ async fn drive_exec<S>(
                                 let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
                                 break;
                             }
-                            // stderr (agent logs) and unknown ids: not part of the
-                            // consumer's byte stream.
-                            StreamMsg::Stderr(_) | StreamMsg::Ignore => {}
+                            // Stderr is never part of the consumer's byte stream.
+                            StreamMsg::Stderr(d) => {
+                                if let Some(stderr) = &stderr {
+                                    stderr
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(&d);
+                                }
+                            }
+                            StreamMsg::Ignore => {}
                         }
                     }
                 }
@@ -6635,6 +6723,92 @@ mod tests {
         assert!(!send_chunked(&tx, vec![1u8; 4], std::convert::identity).await);
     }
 
+    async fn fake_non_tty_output(stderr: &[u8], stdout: &[u8], code: i32) -> String {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
+        let driver = tokio::spawn(drive_exec(
+            client,
+            false,
+            frames_tx,
+            control_rx,
+            sid_tx,
+            Some(Arc::clone(&stderr_tail)),
+        ));
+
+        let mut stderr_frame = Vec::with_capacity(stderr.len() + 1);
+        stderr_frame.push(2);
+        stderr_frame.extend_from_slice(stderr);
+        server
+            .send(Message::Binary(stderr_frame.into()))
+            .await
+            .unwrap();
+        let mut stdout_frame = Vec::with_capacity(stdout.len() + 1);
+        stdout_frame.push(1);
+        stdout_frame.extend_from_slice(stdout);
+        server
+            .send(Message::Binary(stdout_frame.into()))
+            .await
+            .unwrap();
+        let mut exit_frame = vec![3];
+        exit_frame.extend_from_slice(code.to_string().as_bytes());
+        server
+            .send(Message::Binary(exit_frame.into()))
+            .await
+            .unwrap();
+
+        let collected =
+            collect_exec_output(&mut frames_rx, crate::vps::ssh_shim::EXEC_OUTPUT_CAP).await;
+        driver.await.unwrap();
+        let code = collected.code.expect("fake exec sent an exit");
+        let output =
+            crate::vps::ssh_shim::render_capped_output(&collected.output, collected.dropped);
+        append_stderr_tail(output, code, &stderr_tail)
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_appends_sanitized_stderr_tail() {
+        let output = fake_non_tty_output(b"err\x1b[31m\r\n", b"stdout", 7).await;
+        assert_eq!(output, "stdout\n[stderr, last 10 bytes]\nerr[31m\n");
+    }
+
+    #[tokio::test]
+    async fn zero_exit_output_is_unchanged_with_stderr() {
+        let output = fake_non_tty_output(b"warning\n", b"stdout", 0).await;
+        assert_eq!(output, "stdout");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_the_last_8_kib() {
+        let mut tail = StderrTail::default();
+        tail.push(&vec![b'a'; STDERR_TAIL_CAP]);
+        tail.push(b"tail");
+
+        assert_eq!(tail.bytes.len(), STDERR_TAIL_CAP);
+        assert_eq!(tail.total, (STDERR_TAIL_CAP + 4) as u64);
+        assert!(tail.render().ends_with("tail"));
+        assert_eq!(tail.render().len(), STDERR_TAIL_CAP);
+    }
+
+    #[test]
+    fn sanitize_stderr_drops_escapes_and_controls() {
+        assert_eq!(
+            sanitize_stderr(b"ok\x00\x01\x08\x0b\x0c\r\x1b[31m\n\t\xff"),
+            "ok[31m\n\t�"
+        );
+    }
+
     #[tokio::test]
     async fn drive_exec_sends_stdin_eof_exactly_once_on_control_close() {
         use futures_util::StreamExt;
@@ -6650,7 +6824,9 @@ mod tests {
         let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, false, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None,
+        ));
         drop(control_tx);
 
         assert_eq!(
@@ -6679,7 +6855,9 @@ mod tests {
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
 
         server
             .send(Message::Binary(vec![b'o', b'k'].into()))
@@ -6867,7 +7045,9 @@ mod tests {
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
 
         drop(server);
 
@@ -6890,7 +7070,9 @@ mod tests {
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None,
+        ));
 
         server
             .send(Message::Text(r#"{"type":"exit","exit_code":3}"#.into()))
@@ -6917,7 +7099,9 @@ mod tests {
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
-        let driver = tokio::spawn(drive_exec(client, false, frames_tx, control_rx, sid_tx));
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None,
+        ));
 
         server
             .send(Message::Binary(vec![3, b'x'].into()))
