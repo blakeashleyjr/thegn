@@ -441,7 +441,7 @@ fn group_confirmed_after_reap(_pid: libc::pid_t) -> bool {
 /// This is the fallback for a group whose leader the caller cannot reap (it is not the caller's
 /// child, e.g. a detached survivor group): its leader may be a zombie that keeps `killpg(pgid, 0)`
 /// succeeding, so emptiness needs the global `/proc` walk. A run's own group uses the cheaper
-/// reap-then-probe in [`own_group_live`].
+/// reap-then-probe in `own_group_live`.
 pub fn group_has_live_members(pgid: u32) -> bool {
     let mut scan = LivenessScan::default();
     group_live_with_scan(Path::new("/proc"), pgid as libc::pid_t, &mut scan)
