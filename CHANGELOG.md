@@ -7,6 +7,16 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.101] — 2026-11-19
+
+### Changed
+
+- `just devel`, `just devel-env` and the new `just devel-desktop` share `scripts/devel-launch.sh`, which keeps a relative `WAYLAND_DISPLAY` and the session D-Bus address working under the dev runtime dir. `devel-desktop` prints a desktop entry and writes nothing.
+- `thegn repo forget --copy-from <DB>` seeds an empty instance from another instance's database through a verified backup, then forgets. `just live` refuses from a shell that carries another instance's config, state or `THEGN_DIR`, and names the path and the fix. `thegn doctor` reports the runtime dir, controller id, bind addresses and a relative-`WAYLAND_DISPLAY` note.
+- `thegn env sync-retry [--json]` retries failed provider pull-backs without destroying a sandbox; a failed pull-back on close now warns and names it.
+- `fleet cost` starts the Sprites usage window at the ledger `created_at` floored to its UTC hour and shows "no usage reported yet" instead of 0.00 when nothing was reported. Live step 6c is a WARN that names THE-2450 (upstream line-ending quirk); `test/sprites_exec_repro.py` reproduces it.
+- Search output is unchanged but faster: results are grouped before sorting, only the top `max_results` are fully sorted, and growing literal queries re-scan only the previous hits.
+
 ## [0.1.0-alpha.100] — 2026-11-19
 
 ### Changed
@@ -3925,7 +3935,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.100...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...HEAD
+[0.1.0-alpha.101]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.100...v0.1.0-alpha.101
 [0.1.0-alpha.100]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.99...v0.1.0-alpha.100
 [0.1.0-alpha.99]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...v0.1.0-alpha.99
 [0.1.0-alpha.98]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.97...v0.1.0-alpha.98

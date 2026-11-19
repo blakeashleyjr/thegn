@@ -201,6 +201,11 @@ pub enum Action {
     },
     /// Record an existing sprite as thegn's so thegn may delete it later (asks for confirmation)
     Adopt(super::env_adopt::AdoptArgs),
+    /// Retry failed pull-backs of `data = "sync"` sandboxes (never destroys a sandbox).
+    SyncRetry {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -287,6 +292,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             unrecorded,
         } => super::env_reap::run(cfg, &provider, apply, yes, json, unrecorded),
         Action::Adopt(args) => super::env_adopt::run(cfg, args),
+        Action::SyncRetry { json } => super::env_sync_retry::run(json),
     }
 }
 
