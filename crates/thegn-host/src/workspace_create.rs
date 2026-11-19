@@ -1740,20 +1740,33 @@ pub(crate) fn seed_workspace_create(
     let root_s = root.to_string_lossy().into_owned();
     db.put_workspace(&root_s, name, "repo")?;
     db.touch_repo(&root_s, name)?;
-    let display = if name.trim().is_empty() {
+    let prepared = crate::session::Session::prepare_workspace_switch(&root_s, db, cfg)?;
+    // Read the name back after preparing: preparing can rewrite the stored row,
+    // and the entry must be exactly what hydration will show a moment later.
+    let stored = match db.workspaces() {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|row| row.repo_path == root_s)
+            .map(|row| (row.name, row.kind)),
+        Err(error) => {
+            tracing::debug!(target: "thegn::workspace_switch", %error, "workspace row read failed after create");
+            None
+        }
+    };
+    let (stored_name, kind) = stored.unwrap_or_else(|| (name.to_owned(), "repo".to_owned()));
+    let display = if stored_name.trim().is_empty() {
         std::path::Path::new(&root_s)
             .file_name()
             .map(|part| part.to_string_lossy().into_owned())
             .unwrap_or_else(|| root_s.clone())
     } else {
-        name.to_owned()
+        stored_name
     };
     let base = thegn_core::util::slugify(&display);
     let slug = db
         .slug_for_repo_nowait(&root_s, &base)
         .unwrap_or_else(|_| base.clone());
-    let sidebar_entry = Some((slug, display, "repo".into(), root_s.clone()));
-    let prepared = crate::session::Session::prepare_workspace_switch(&root_s, db, cfg)?;
+    let sidebar_entry = Some((slug, display, kind, root_s.clone()));
     let seed_ms = seed_started.elapsed().as_millis() as u64;
     tracing::debug!(
         target: "thegn::workspace_switch",
