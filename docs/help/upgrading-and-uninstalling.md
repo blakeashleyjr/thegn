@@ -79,8 +79,8 @@ the previous binary when one exists.
 ### Nix
 
 For a binary installed in a Nix profile, run `nix profile upgrade` for the
-thegn entry. To upgrade a Home Manager install, update the thegn flake input
-and rebuild your Home Manager configuration. `nix profile rollback` returns a
+thegn entry. To upgrade a Home Manager install, bump the release tag in both thegn inputs
+(see the README's Install section) and rebuild your Home Manager configuration. `nix profile rollback` returns a
 profile to its previous generation; this is Nix's profile history, not a
 thegn rollback command.
 
