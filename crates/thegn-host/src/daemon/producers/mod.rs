@@ -295,7 +295,14 @@ pub(crate) fn status_reply() -> thegn_core::producer_status::ProducersStatusRepl
     };
     let installed = INSTALLED.get();
     let armed = current_kinds();
-    let db = thegn_core::db::Db::open().ok();
+    // A status read: an unopenable database reports no leases rather than failing.
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => Some(db),
+        Err(error) => {
+            tracing::debug!(target: "thegn::producers", %error, "producer status: database unavailable");
+            None
+        }
+    };
     let leases = db
         .as_ref()
         .and_then(|db| db.producer_leases().ok())
