@@ -21,8 +21,8 @@ config_enum! {
 }
 
 config_enum! {
-    /// Vercel only. What model credential reaches the sandbox; `none` sends
-    /// nothing. See docs/help/vercel-sandbox.md.
+    /// Vercel and Sprites; default none. What model credential reaches the
+    /// sandbox. See docs/help/vercel-sandbox.md.
     pub enum ModelCredentials: "model credentials" {
         None = "none", Upload = "upload", Proxy = "proxy", Inject = "inject",
     } default = None;
@@ -277,12 +277,16 @@ pub struct EnvProviderConfig {
     pub team_id: String,
     /// Vercel only: the project id (`prj_…`). Not secrets.
     pub project_id: String,
-    /// Vercel only: which model credential reaches the sandbox (`none`, the
-    /// default, sends nothing; `upload` copies the claude/codex login into the
-    /// sandbox's tmpfs; `proxy`/`inject` are refused). Only the user's own
-    /// config table may set it.
+    /// Vercel and Sprites: which model credential reaches the sandbox; default
+    /// none. `upload` copies the claude/codex login into the sandbox's tmpfs;
+    /// `proxy`/`inject` are refused. Only the user's own config table may set it.
     #[serde(default)]
     pub model_credentials: ModelCredentials,
+    /// Whether the user supplied `model_credentials`; omitted Sprites settings
+    /// retain the historical forwarding behavior without adding a config key.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub model_credentials_explicit: bool,
     /// Vercel only: host suffixes the interactive WebSocket ticket URL may
     /// point at. Empty ⇒ the built-in `vercel.run`, `vercel.sh`, `vercel.com`.
     /// `vercel.app` (and anything under it) is never accepted.
@@ -300,6 +304,14 @@ pub struct EnvProviderConfig {
 }
 
 impl EnvProviderConfig {
+    pub fn model_credentials_is_explicit(&self) -> bool {
+        self.model_credentials_explicit
+    }
+
+    pub fn mark_model_credentials_explicit(&mut self) {
+        self.model_credentials_explicit = true;
+    }
+
     pub(crate) fn is_default(&self) -> bool {
         self.provider.is_empty()
             && self.id.is_empty()
@@ -339,6 +351,7 @@ impl EnvProviderConfig {
             && self.team_id.is_empty()
             && self.project_id.is_empty()
             && self.model_credentials == ModelCredentials::None
+            && !self.model_credentials_explicit
             && self.interactive_host_suffixes.is_empty()
             && !self.lifetime_reap
             && self.login_homes.is_empty()
@@ -458,6 +471,25 @@ impl EnvProviderConfig {
             return vec![exe, "sprite-exec".into(), "{id}".into(), "--".into()];
         }
         Vec::new()
+    }
+}
+
+/// Preserve whether a trusted config layer explicitly supplied the
+/// `model_credentials` key. The marker is runtime-only and never enters the
+/// serialized schema.
+pub fn mark_model_credentials_explicit(cfg: &mut crate::config::Config, raw: &serde_json::Value) {
+    let Some(envs) = raw.get("env").and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    for (name, value) in envs {
+        let Some(provider) = value.get("provider").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        if provider.contains_key("model_credentials")
+            && let Some(env) = cfg.env.get_mut(name)
+        {
+            env.provider.mark_model_credentials_explicit();
+        }
     }
 }
 
@@ -986,6 +1018,39 @@ mod tests {
         assert_eq!(pc.model_credentials, ModelCredentials::None);
         assert!(pc.interactive_host_suffixes.is_empty());
         assert!(pc.is_default());
+    }
+
+    #[test]
+    fn model_credentials_presence_marker_keeps_omitted_distinct_from_none() {
+        let mut cfg = crate::config::Config::default();
+        cfg.env.insert(
+            "unset".into(),
+            crate::config::EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(!cfg.env["unset"].provider.model_credentials_is_explicit());
+        crate::config::apply_json_overlay(
+            &mut cfg,
+            serde_json::json!({
+                "env": {
+                    "set": {
+                        "provider": {
+                            "provider": "sprites",
+                            "model_credentials": "none"
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert!(!cfg.env["unset"].provider.model_credentials_is_explicit());
+        assert!(cfg.env["set"].provider.model_credentials_is_explicit());
+        assert!(!cfg.env["set"].provider.is_default());
     }
 
     #[test]

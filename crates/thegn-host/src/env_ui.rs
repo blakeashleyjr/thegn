@@ -167,6 +167,21 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                     "credentials",
                     format!("{} · sends: {}", disclosure.mode, disclosure.leaves_machine),
                 );
+            } else if is_provider && e.provider.provider.trim() == "sprites" {
+                let mode = if !e.provider.model_credentials_is_explicit() {
+                    thegn_core::config::ModelCredentials::Upload
+                } else {
+                    e.provider.model_credentials
+                };
+                push_detail(
+                    &mut detail,
+                    "credentials",
+                    format!(
+                        "{} · sends: {}",
+                        mode,
+                        thegn_core::provider_credentials::sprites_disclosure(mode)
+                    ),
+                );
             }
             if bound == Some(name.as_str()) {
                 push_detail(&mut detail, "bound", "this worktree".to_string());
@@ -961,5 +976,20 @@ mod tests {
             .expect("credentials row");
         assert!(creds.1.starts_with("none"), "{creds:?}");
         assert!(creds.1.contains("sends:"));
+    }
+
+    #[test]
+    fn sprites_snapshot_detail_discloses_model_credentials() {
+        let mut cfg = Config::default();
+        cfg.env
+            .insert("sp".into(), provider_env("sprites", "SPRITES_TOKEN", ""));
+        let snaps = env_snapshots(&cfg, None);
+        let creds = snaps[0]
+            .detail
+            .iter()
+            .find(|(label, _)| label == "credentials")
+            .expect("credentials row");
+        assert!(creds.1.starts_with("upload"), "{creds:?}");
+        assert!(creds.1.contains("agent login files"), "{creds:?}");
     }
 }
