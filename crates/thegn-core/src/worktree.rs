@@ -711,6 +711,9 @@ pub fn resolve_base_checked(root: &Path, cfg: &Config) -> Result<String, String>
 /// digest suffix, never the label, is what keeps their directories apart.
 const MAX_CHECKOUT_LABEL_BYTES: usize = 48;
 
+/// Hex characters of the checkout digest kept in the directory name (64 bits).
+const CHECKOUT_DIGEST_HEX: usize = 16;
+
 fn checkout_label(branch: &str) -> String {
     let slug = util::slugify(branch);
     // `slugify` emits ASCII only, so a byte cut is a char boundary.
@@ -759,13 +762,15 @@ pub fn is_managed_checkout(root: &Path, repo_dir_name: &str, path: &Path, cfg: &
 /// (`repo::repo_name`) spawns `git rev-parse --show-toplevel`, which
 /// [`allocate_worktree_path`] does off the loop.
 ///
-/// Shape: `<parent>/<label>--<digest>` where `<digest>` is the full 64-hex
-/// SHA-256 of the domain-separated `(repository id, exact branch bytes, path
-/// mode)`. The parent keeps the historical `<worktrees_dir>/<repo name>` (or
-/// `<root>/.worktrees`) layout, so tooling that walks one level per repo is
-/// unaffected; same-basename repositories may share that parent but never a
-/// checkout, because their repository IDs differ. Existing checkouts are never
-/// moved to this shape — they stay where Git has them registered.
+/// Shape: `<parent>/<label>--<digest>` where `<digest>` is the first 16 hex
+/// characters (64 bits) of the domain-separated SHA-256 of `(repository id,
+/// exact branch bytes, path mode)`. A digest collision can only make a later
+/// create refuse because the destination already exists under the mutation
+/// lock; it can never alias another checkout. The parent keeps the historical
+/// `<worktrees_dir>/<repo name>` (or `<root>/.worktrees`) layout, so tooling that
+/// walks one level per repo is unaffected; same-basename repositories may share
+/// that parent but never a checkout, because their repository IDs differ.
+/// Existing checkouts keep their paths and are never moved to this shape.
 pub fn worktree_path_for(
     repository: &RepositoryId,
     root: &Path,
@@ -782,10 +787,11 @@ pub fn worktree_path_for(
             BytePart::new(path_mode_tag(cfg)),
         ],
     )?;
+    let hex = crate::identity::hex_bytes(&digest);
     let leaf = format!(
         "{}--{}",
         checkout_label(branch),
-        crate::identity::hex_bytes(&digest)
+        &hex[..CHECKOUT_DIGEST_HEX]
     );
     Ok(checkout_parent(root, repo_dir_name, cfg).join(leaf))
 }
@@ -820,10 +826,11 @@ pub fn provisional_worktree_path(root: &Path, branch: &str, cfg: &Config) -> Pat
         ],
     )
     .unwrap_or([0; 32]);
+    let hex = crate::identity::hex_bytes(&digest);
     let leaf = format!(
         "{}--{}",
         checkout_label(branch),
-        crate::identity::hex_bytes(&digest)
+        &hex[..CHECKOUT_DIGEST_HEX]
     );
     checkout_parent(root, &repo::repo_name_from_path(root), cfg).join(leaf)
 }
@@ -2688,6 +2695,40 @@ mod tests {
         let cfg = Config::default();
         assert!(worktree_path_for(&repository, root, "app", "", &cfg).is_err());
         assert!(worktree_path_for(&repository, root, "app", "a\0b", &cfg).is_err());
+    }
+
+    #[test]
+    fn checkout_leaf_carries_a_16_hex_digest() {
+        let repository = crate::identity::RepositoryId::from_bytes([3; 32]);
+        let root = Path::new("/r/app");
+        let cfg = Config {
+            worktrees_dir: "/wt".into(),
+            ..Default::default()
+        };
+
+        for leaf in [
+            worktree_path_for(&repository, root, "app", "feat/a", &cfg)
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            provisional_worktree_path(root, "feat/a", &cfg)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ] {
+            let digest = leaf.rsplit_once("--").unwrap().1;
+            assert_eq!(digest.len(), CHECKOUT_DIGEST_HEX);
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            );
+        }
     }
 
     #[test]
