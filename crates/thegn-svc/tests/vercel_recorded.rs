@@ -126,8 +126,8 @@ fn missing_name_is_refused() {
 }
 
 #[test]
-fn capitalised_status_is_unknown_today() {
-    // THE-2234 hazard: status parsing is case-sensitive today; a capitalised status reads as Unknown. The fix is queued; update this test when it lands.
+fn capitalised_status_reads_as_running() {
+    // THE-2234: status parsing folds case, so a capitalised status is not read as Unknown.
     let view = parse_sandbox(&fixture("sandbox_capitalised_status.json")).unwrap();
-    assert_eq!(view.status, SessionStatus::Unknown);
+    assert_eq!(view.status, SessionStatus::Running);
 }

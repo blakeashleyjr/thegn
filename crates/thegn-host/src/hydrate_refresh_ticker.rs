@@ -114,7 +114,7 @@ pub(crate) fn spawn_refresh_ticker(
     RefreshTicker {
         command,
         stop,
-        worker: Some(worker),
+        worker,
     }
 }
 
@@ -210,7 +210,7 @@ fn spawn_worker(
     io: impl TickerIo,
     notify: impl Fn() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
-    spawn_worker_inner(cadences, 0, None, None, tx, io, notify)
+    spawn_worker_inner(cadences, 0, None, None, tx, io, notify).expect("test ticker spawned")
 }
 
 fn spawn_worker_with_commands(
@@ -221,7 +221,7 @@ fn spawn_worker_with_commands(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     io: impl TickerIo,
     notify: impl Fn() + Send + 'static,
-) -> std::thread::JoinHandle<()> {
+) -> Option<std::thread::JoinHandle<()>> {
     spawn_worker_inner(cadences, 1, Some(commands), Some(stop), tx, io, notify)
 }
 
@@ -235,8 +235,8 @@ fn spawn_worker_inner(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut io: impl TickerIo,
     notify: impl Fn() + Send + 'static,
-) -> std::thread::JoinHandle<()> {
-    thegn_core::thread_name::try_spawn_named(TICKER_THREAD_NAME, move || {
+) -> Option<std::thread::JoinHandle<()>> {
+    match thegn_core::thread_name::try_spawn_named(TICKER_THREAD_NAME, move || {
         let _failure = crate::worker_failure::PanicNotify::new(|| {
             tracing::error!(target: "thegn::hydrate", "shared refresh ticker terminated by panic; periodic refresh is unavailable");
             notify();
@@ -658,8 +658,17 @@ fn spawn_worker_inner(
             }
             io.tick_complete(ticks);
         }
-        })
-        .expect("spawn the refresh ticker")
+    }) {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            tracing::error!(
+                target: "thegn::hydrate",
+                %error,
+                "could not start the refresh ticker; periodic refresh is off"
+            );
+            None
+        }
+    }
 }
 
 /// The live adapter owns exactly the sampler/channels formerly local to the
