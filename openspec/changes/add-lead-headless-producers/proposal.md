@@ -31,3 +31,7 @@ the PR queue, so rules fire with no window.
 ## Unverified
 
 Nothing here has run live. See the unticked task in `tasks.md`.
+
+- Lease acquire and take-over use a compare-and-swap, a lease whose holder died is
+  taken over after its TTL, and the tracker producer keeps a memo of its last
+  refresh (batch 163 amendment).
