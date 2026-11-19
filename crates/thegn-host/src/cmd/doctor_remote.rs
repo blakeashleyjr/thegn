@@ -503,7 +503,8 @@ mod tests {
         env.provider.max_instances = 3;
         env.provider.max_lifetime_secs = 900;
 
-        let row = &json_with(&cfg, None, &[], 0, &[]).as_array().unwrap()[0];
+        let rows = json_with(&cfg, None, &[], 0, &[]);
+        let row = &rows.as_array().unwrap()[0];
 
         assert_eq!(row["placement"].as_str(), Some("local"));
         assert!(row["placement_warning"].is_string());
@@ -518,11 +519,13 @@ mod tests {
     #[test]
     fn placement_warning_only_off_provider() {
         let mut cfg = cfg_with("sprites");
-        let provider = &json_with(&cfg, None, &[], 0, &[]).as_array().unwrap()[0];
+        let rows = json_with(&cfg, None, &[], 0, &[]);
+        let provider = &rows.as_array().unwrap()[0];
         assert_eq!(provider["placement_warning"], "");
 
         cfg.env.get_mut("remote").unwrap().placement = thegn_core::config::PlacementMode::Ssh;
-        let remote = &json_with(&cfg, None, &[], 0, &[]).as_array().unwrap()[0];
+        let rows = json_with(&cfg, None, &[], 0, &[]);
+        let remote = &rows.as_array().unwrap()[0];
         assert_eq!(
             remote["placement_warning"],
             "[env.remote] has a provider table but placement = \"ssh\": worktrees on it run on this machine, not in a sandbox; set placement = \"provider\""
