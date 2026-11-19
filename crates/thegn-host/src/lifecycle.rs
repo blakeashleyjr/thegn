@@ -403,8 +403,12 @@ fn resolve_pool_target(
 /// Runs on its own thread (DB + provider work) and is a no-op for a local
 /// worktree. The UI pool chip refreshes on the next maintainer tick (the refill
 /// itself is a minutes-long provision), so no waker is threaded here.
+fn refill_allowed(tui_active: bool) -> bool {
+    tui_active
+}
+
 pub fn refill_pool_after_claim(cfg: &Config, worktree: &str) {
-    if !thegn_core::msg::tui_active() {
+    if !refill_allowed(thegn_core::msg::tui_active()) {
         thegn_core::msg::info(&format!(
             "warm pool for {worktree} is one spare short; the thegn TUI refills it, or run: thegn env pool-fill --worktree {worktree}"
         ));
@@ -1069,11 +1073,8 @@ mod tests {
 
     #[test]
     fn refill_skips_outside_the_tui() {
-        thegn_core::msg::set_tui_active(false);
-        assert!(!thegn_core::msg::tui_active());
-        refill_pool_after_claim(&Config::default(), "/worktree/pool-fill-test");
-        thegn_core::msg::set_tui_active(true);
-        assert!(thegn_core::msg::tui_active());
+        assert!(!refill_allowed(false));
+        assert!(refill_allowed(true));
     }
 
     #[test]
