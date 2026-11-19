@@ -1087,15 +1087,36 @@ impl PrivateDir {
     /// Create or open a lock file beneath this held private directory without
     /// following a leaf symlink. The file is never truncated.
     pub fn open_or_create_regular_nofollow(&self, name: &str) -> std::io::Result<std::fs::File> {
+        self.open_or_create_regular_nofollow_mode(name, false)
+    }
+
+    /// Create or open an owner-only append file beneath this held private
+    /// directory without following a leaf symlink.
+    pub fn open_or_create_regular_nofollow_append(
+        &self,
+        name: &str,
+    ) -> std::io::Result<std::fs::File> {
+        self.open_or_create_regular_nofollow_mode(name, true)
+    }
+
+    fn open_or_create_regular_nofollow_mode(
+        &self,
+        name: &str,
+        append: bool,
+    ) -> std::io::Result<std::fs::File> {
         let name_path = single_component(name)?;
         #[cfg(unix)]
         {
             use nix::fcntl::{OFlag, openat};
             use nix::sys::stat::{SFlag, fstat};
+            let mut flags = OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+            if append {
+                flags |= OFlag::O_APPEND;
+            }
             let fd = openat(
                 &self.fd,
                 name_path,
-                OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                flags,
                 nix::sys::stat::Mode::from_bits_truncate(0o600),
             )
             .map_err(|error| {
@@ -1141,6 +1162,7 @@ impl PrivateDir {
                 .write(true)
                 .create(true)
                 .truncate(false)
+                .append(append)
                 .open(self.path.join(name_path))
         }
     }

@@ -1,4 +1,4 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::Path;
 
 pub(crate) const FILE: &str = "git-audit.jsonl";
@@ -53,18 +53,17 @@ pub(crate) fn record_in(
         to: &to,
         outcome: &outcome,
     };
-    let line = serde_json::to_vec(&clean).map_err(std::io::Error::other)?;
+    let mut line = serde_json::to_vec(&clean).map_err(std::io::Error::other)?;
+    line.push(b'\n');
 
-    let mut file = dir.open_or_create_regular_nofollow(FILE)?;
+    let mut file = dir.open_or_create_regular_nofollow_append(FILE)?;
     if file.metadata()?.len() >= max_bytes {
         drop(file);
         dir.remove_file(PREV)?;
         dir.rename_child_noreplace(FILE, PREV)?;
-        file = dir.open_or_create_regular_nofollow(FILE)?;
+        file = dir.open_or_create_regular_nofollow_append(FILE)?;
     }
-    file.seek(SeekFrom::End(0))?;
-    file.write_all(&line)?;
-    file.write_all(b"\n")
+    file.write_all(&line)
 }
 
 fn clean_field(value: &str) -> String {
@@ -79,6 +78,7 @@ fn clean_field(value: &str) -> String {
 mod tests {
     use super::{FILE, GitAuditEvent, PREV, record, record_in};
     use std::path::Path;
+    use std::sync::Arc;
     use thegn_core::fsperm::ensure_private_dir_beneath;
     use thegn_core::testenv::IsolatedState;
 
@@ -142,6 +142,41 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(current.trim())["action"],
             "pull"
+        );
+    }
+
+    #[test]
+    fn interleaved_record_in_calls_leave_intact_json_lines() {
+        let state = IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let dir_a = ensure_private_dir_beneath(&anchor, Path::new("provider")).unwrap();
+        let dir_b = ensure_private_dir_beneath(&anchor, Path::new("provider")).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            record_in(&dir_a, &event("seed"), u64::MAX).unwrap();
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            record_in(&dir_b, &event("pull"), u64::MAX).unwrap();
+        });
+
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let contents = std::fs::read_to_string(audit_path(&state, FILE)).unwrap();
+        let mut actions: Vec<_> = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["action"].clone())
+            .collect();
+        actions.sort_by_key(|action| action.as_str().unwrap().to_owned());
+        assert_eq!(
+            actions,
+            vec![serde_json::json!("pull"), serde_json::json!("seed")]
         );
     }
 
