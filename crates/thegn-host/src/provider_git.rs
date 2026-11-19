@@ -1008,7 +1008,10 @@ impl PreLandOps for LivePreLand<'_> {
 
 /// Whether `id` is in a provider inventory: a complete listing proves
 /// absence; a partial one only presence. Pure.
-fn sandbox_in_inventory(report: &thegn_svc::provider::InventoryReport, id: &str) -> Option<bool> {
+pub(crate) fn sandbox_in_inventory(
+    report: &thegn_svc::provider::InventoryReport,
+    id: &str,
+) -> Option<bool> {
     use thegn_svc::provider::InventoryReport;
     let matches =
         |info: &thegn_svc::provider::SandboxInfo| info.id == id || info.name.as_deref() == Some(id);
