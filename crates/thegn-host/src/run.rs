@@ -184,6 +184,16 @@ fn lookup_workspace_slug_read_only(root: &Path) -> Option<String> {
     }
 }
 
+/// The loop's "last worktree closed → quit" test. An empty session with no
+/// project (`id` cleared by removing the active project) stays up on the
+/// splash, as does one whose landing switch is still loading.
+fn session_closed_last_worktree(
+    session: &crate::session::Session,
+    pending_switch: &crate::workspace_switch_prep::PendingSwitch,
+) -> bool {
+    session.worktrees.is_empty() && !session.id.is_empty() && !pending_switch.in_flight()
+}
+
 fn delete_workspace_slug(
     session: &crate::session::Session,
     repo_path: &str,
@@ -9498,7 +9508,12 @@ async fn event_loop<T: Terminal>(
                 crate::perf_log::emit(log_stats);
             }
         }
-        if session.worktrees.is_empty() {
+        // Quit only when the user closed the last worktree of a project that
+        // still exists. Removing the active project clears `session.id` too:
+        // that empty session is the splash (loading / no projects) while a
+        // landing switch loads — or indefinitely when no project remains —
+        // never a quit.
+        if session_closed_last_worktree(&session, &pending_switch) {
             shutdown_shares(&mut share_supervisor);
             return Ok(()); // last worktree closed
         }
@@ -10321,7 +10336,7 @@ async fn event_loop<T: Terminal>(
         // launch splash is up (dormant) nothing is forked — the first
         // keypress/center click clears `center_dormant` and the next loop turn
         // materializes the shell.
-        if !center_dormant && first_frame_logged {
+        if !center_dormant && first_frame_logged && !session.worktrees.is_empty() {
             let (name, path, ti, is_terminal) = {
                 let g = &mut session.worktrees[session.active];
                 let ti = g.active_tab.min(g.tabs.len().saturating_sub(1));
@@ -10600,7 +10615,7 @@ async fn event_loop<T: Terminal>(
             crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
         }
-        if session.worktrees.is_empty() {
+        if session_closed_last_worktree(&session, &pending_switch) {
             return Ok(());
         }
 
@@ -28041,8 +28056,21 @@ async fn event_loop<T: Terminal>(
                                 .replace("workspace", "project");
                             }
                             Action::DeleteWorkspace => {
-                                // Remove the *active* workspace. Same modal + path
-                                // as the sidebar "Remove workspace" action.
+                                // With the sidebar focused, remove the project the
+                                // cursor is in (the one the user selected) through
+                                // the sidebar's own remove path; the palette keeps
+                                // sidebar focus, so this is what "Remove project"
+                                // from Ctrl+Space means there.
+                                if sb.focused
+                                    && let Some(out) = sb.selected_project_removal(&model)
+                                {
+                                    let mut synth: Option<crate::keymap::Action> = None;
+                                    dispatch_sidebar_outcome!(out, &mut synth);
+                                    dirty = true;
+                                    continue;
+                                }
+                                // Otherwise remove the *active* workspace. Same
+                                // modal + path as the sidebar "Remove workspace".
                                 if session.id.is_empty() {
                                     model.status = "No project to delete".into();
                                     dirty = true;
