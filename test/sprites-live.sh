@@ -13,11 +13,12 @@
 # Usage:
 #   test/sprites-live.sh                       # print plan, no network
 #   THEGN_CHANNEL=dev test/sprites-live.sh --env <name> --i-accept-spend [--keep-going]
+#     [--with-agent <name>]
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
 
-env_name="" accept=0 keep_going=0 min_ram=""
+env_name="" accept=0 keep_going=0 min_ram="" agent_name=""
 while [ $# -gt 0 ]; do
   case "$1" in
   --env)
@@ -41,6 +42,16 @@ while [ $# -gt 0 ]; do
   --keep-going)
     keep_going=1
     shift
+    ;;
+  --with-agent)
+    agent_name="${2:?--with-agent needs a value}"
+    case "$agent_name" in
+    '' | *[!a-z0-9_-]*)
+      echo "--with-agent needs a value matching [a-z0-9_-]+" >&2
+      exit 2
+      ;;
+    esac
+    shift 2
     ;;
   -h | --help)
     sed -n 2,15p "$0"
@@ -78,6 +89,7 @@ Steps:
   2   no sprites ledger record before create
   3   provision (env up)               3b  exactly one ready sprites ledger record
   4   sprite workspace HEAD == local HEAD (sprite-exec, \$HOME/workspace)
+  4b  sprite-exec exit status and stderr reach the caller (exit 3, boom)
   5   (only with --min-ram-gb N) doctor --json under --set min_ram_gb=N shows N*1024
   5b  (only with --min-ram-gb N) /sys/fs/cgroup/memory.max in the sprite is
       N GiB in bytes (raw value printed; SKIP if the file is absent)
@@ -94,11 +106,17 @@ Steps:
   8   env pull after an empty commit inside the sprite; output is fast-forwarded
   8b  local HEAD equals the commit made inside the sprite
   8c  refs/thegn/pull is empty after the clean fast-forward
+  7g  (only with --with-agent <name>) agent run --wait --pull --json spends model usage;
+      poll /v1/tasks every 15 s while it runs
+  7h  (only with --with-agent <name>) agent JSON is exited 0 and pull.ok is true
+  7i  (only with --with-agent <name>) /v1/tasks includes thegn-hold- during the run
   9   after 120 s idle, fleet list --env shows warm or cold
   9b  /v1/tasks is empty
   10  fleet cost --json: print sprites_usage; error fails, cpu_hours > 0 passes,
       or zero usage (partial or not) warns and passes; reported false warns
   10b fleet list --env still shows warm or cold (the usage call did not wake it)
+  10w wake from cold: sprite-exec -- true completes within 150 s; print wake time
+  10x wake row is running or warm (a lagging cold state warns and passes)
   11  env down                         11b fleet list puts this sprite in view.down,
       not view.missing (older binaries FAIL with "binary predates batch 170")
   12  env reap --provider sprites --json (dry-run): 0 recorded orphans, others
@@ -201,11 +219,14 @@ REPO="$TMP/repo"
 SPRITE_NAME="(unknown)"
 CREATED=0
 HOLD_PID=""
+AGENT_POLL_PID=""
 HOLD_ERR="$TMP/hold.err"
 STEP_11_PASSED=0
 FAILED_STEPS=()
 INTERACTIVE_OUT=""
 PULL_SHA=""
+AGENT_JSON=""
+AGENT_RUN_SECONDS=0
 
 print_plan
 echo
@@ -255,6 +276,12 @@ teardown() {
       echo "TEARDOWN INCOMPLETE: hold process $HOLD_PID survived" >&2
       rc=1
     fi
+  fi
+  if [ -n "$AGENT_POLL_PID" ] && kill -0 "$AGENT_POLL_PID" 2>/dev/null; then
+    echo "-- teardown: stopping the agent task poller (pid $AGENT_POLL_PID)"
+    kill "$AGENT_POLL_PID" 2>/dev/null
+    wait "$AGENT_POLL_PID" 2>/dev/null
+    AGENT_POLL_PID=""
   fi
   if [ "$CREATED" = 1 ]; then
     local names n
@@ -336,6 +363,16 @@ head_matches() { # the sprite workspace HEAD equals the local lane HEAD
   local_head="$(git -C "$REPO" rev-parse HEAD)" || return 1
   echo "   sprite HEAD $remote, local HEAD $local_head"
   [ -n "$remote" ] && [ "$remote" = "$local_head" ]
+}
+
+exec_exit_and_stderr() {
+  local out rc
+  set +e
+  out="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'echo boom >&2; exit 3')"
+  rc=$?
+  set -e
+  printf '%s\n' "$out"
+  [ "$rc" -eq 3 ] && [[ "$out" == *boom* ]]
 }
 
 memory_max_matches() { # memory.max in bytes equals N GiB; absent file skips
@@ -482,12 +519,125 @@ pull_refs_empty() { [ -z "$(git -C "$REPO" for-each-ref refs/thegn/pull)" ]; }
 warm_or_cold() {
   local out
   out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
-  printf '%s' "$out" | grep -Eq '"(warm|cold)"'
+  FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
+import json, os, sys
+try:
+    listing = json.loads(os.environ["FLEET_JSON"])
+    rows = listing["view"]["rows"]
+except (KeyError, TypeError, ValueError) as exc:
+    print("fleet list JSON is invalid: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+if not isinstance(rows, list):
+    print("fleet list JSON view.rows is not an array", file=sys.stderr)
+    sys.exit(1)
+row = next((r for r in rows if isinstance(r, dict) and r.get("id") == os.environ["FLEET_SPRITE"]), None)
+if row is None:
+    print("sprite row absent from the listing", file=sys.stderr)
+    sys.exit(1)
+if row.get("state") not in {"warm", "cold"}:
+    print("sprite row state is not warm or cold: " + str(row.get("state")), file=sys.stderr)
+    sys.exit(1)
+print("   sprite state: " + row["state"])
+'
 }
 idle_warm_or_cold() {
   echo "   idling 120 s"
   sleep 120
   warm_or_cold
+}
+
+wake_from_cold() {
+  local started ended elapsed
+  started="$(date +%s)" || return 1
+  timeout 150 "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- true </dev/null || return 1
+  ended="$(date +%s)" || return 1
+  elapsed=$((ended - started))
+  echo "   woke in ${elapsed} s"
+}
+
+wake_state() {
+  local out
+  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
+  FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
+import json, os, sys
+try:
+    listing = json.loads(os.environ["FLEET_JSON"])
+    rows = listing["view"]["rows"]
+except (KeyError, TypeError, ValueError) as exc:
+    print("fleet list JSON is invalid: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+if not isinstance(rows, list):
+    print("fleet list JSON view.rows is not an array", file=sys.stderr)
+    sys.exit(1)
+row = next((r for r in rows if isinstance(r, dict) and r.get("id") == os.environ["FLEET_SPRITE"]), None)
+if row is None:
+    print("sprite row absent from the listing", file=sys.stderr)
+    sys.exit(1)
+state = row.get("state")
+if state in {"running", "warm"}:
+    print("   wake state: " + state)
+    sys.exit(0)
+if state == "cold":
+    print("WARN 10x: sprite state is still cold; state lags the wake", file=sys.stderr)
+    sys.exit(0)
+print("sprite row state is not running, warm, or cold: " + str(state), file=sys.stderr)
+sys.exit(1)
+'
+}
+
+agent_tasks_poll() {
+  : >"$TMP/agent-tasks.log"
+  while :; do
+    list_tasks >>"$TMP/agent-tasks.log" 2>&1 || true
+    sleep 15
+  done
+}
+
+agent_run() {
+  local started ended rc
+  started="$(date +%s)" || return 1
+  agent_tasks_poll &
+  AGENT_POLL_PID=$!
+  set +e
+  AGENT_JSON="$(in_repo "$THEGN_BIN" agent run --worktree "$REPO" --agent "$agent_name" --prompt "create sx-agent.txt containing ok and commit it" --wait --pull --json)"
+  rc=$?
+  set -e
+  ended="$(date +%s)" || return 1
+  AGENT_RUN_SECONDS=$((ended - started))
+  [ "$rc" -eq 0 ] || return "$rc"
+  [ -n "$AGENT_JSON" ]
+}
+
+agent_result_ok() {
+  AGENT_RESULT_JSON="$AGENT_JSON" python3 -I -c '
+import json, os, sys
+try:
+    result = json.loads(os.environ["AGENT_RESULT_JSON"])
+except (TypeError, ValueError) as exc:
+    print("agent run JSON is invalid: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+if result.get("status") != "exited":
+    print("agent run status is not exited", file=sys.stderr)
+    sys.exit(1)
+if result.get("exit_code") != 0:
+    print("agent run exit_code is not 0", file=sys.stderr)
+    sys.exit(1)
+pull = result.get("pull")
+if not isinstance(pull, dict) or pull.get("ok") is not True:
+    print("agent run pull.ok is not true", file=sys.stderr)
+    sys.exit(1)
+'
+}
+
+agent_task_log_ok() {
+  if grep -Fq 'thegn-hold-' "$TMP/agent-tasks.log" 2>/dev/null; then
+    return 0
+  fi
+  if [ "$AGENT_RUN_SECONDS" -lt 30 ]; then
+    echo "WARN 7i: agent run lasted ${AGENT_RUN_SECONDS} s; task poll may have missed thegn-hold-" >&2
+    return 0
+  fi
+  return 1
 }
 
 cost_has_cpu() {
@@ -640,6 +790,7 @@ step 3 "provision sprite (env up)" in_repo "$THEGN_BIN" env up
 step 3b "exactly one ready sprites ledger record (plan step 3)" name_from_ledger
 echo "sprite: $SPRITE_NAME"
 step 4 "sprite workspace HEAD matches the local lane HEAD" head_matches
+step 4b "sprite-exec exit status and stderr reach the caller" exec_exit_and_stderr
 if [ -n "$min_ram" ]; then
   step 5 "doctor shows min_ram_gb=$min_ram as $((min_ram * 1024)) MiB" min_ram_shown
   step 5b "sprite memory.max is $min_ram GiB" memory_max_matches
@@ -657,10 +808,19 @@ step 7e "the hold had keep-awake (no 'keep-awake unavailable' on stderr)" hold_w
 step 8 "env pull fast-forwards the commit made inside the sprite" pull_fast_forwarded
 step 8b "local HEAD equals the commit made inside the sprite" pull_head_matches
 step 8c "refs/thegn/pull is empty after the clean fast-forward" pull_refs_empty
+if [ -n "$agent_name" ]; then
+  step 7g "agent run --wait --pull --json (spends model usage)" agent_run
+  step 7h "agent JSON is exited 0 with pull.ok true" agent_result_ok
+  step 7i "agent task polling sees thegn-hold-" agent_task_log_ok
+else
+  echo "SKIP 7g-7i (needs --with-agent <name>)"
+fi
 step 9 "after 120 s idle the sprite is warm or cold" idle_warm_or_cold
 step 9b "/v1/tasks is empty" tasks_empty
 step 10 "fleet cost reports sprites_usage CPU hours or zero usage (partial or not)" cost_has_cpu
 step 10b "fleet list still shows warm or cold after fleet cost" warm_or_cold
+step 10w "wake from cold (sprite-exec -- true within 150 s)" wake_from_cold
+step 10x "wake row is running or warm" wake_state
 step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" env down
 step 11b "ledger record gone; fleet list classifies the sprite as down, not missing" fleet_down_not_missing
 step 12 "reap dry-run: 0 recorded orphans" reap_dry_clean
