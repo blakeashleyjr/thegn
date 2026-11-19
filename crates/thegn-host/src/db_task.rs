@@ -109,10 +109,15 @@ fn spawn_writer(open: impl Fn() -> anyhow::Result<Db> + Send + 'static) -> Write
     let (tx, rx) = channel::<Msg>();
     let state = Arc::new(QueueState::default());
     let worker_state = Arc::clone(&state);
-    thegn_core::thread_name::try_spawn_named("thegn-db-writer", move || {
+    if let Err(error) = thegn_core::thread_name::try_spawn_named("thegn-db-writer", move || {
         run(rx, open, worker_state)
-    })
-    .expect("spawn db-writer thread");
+    }) {
+        tracing::error!(
+            target: "thegn::db",
+            %error,
+            "could not start the database writer thread; writes will be reported lost"
+        );
+    }
     Writer { tx, state }
 }
 
@@ -658,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn send_to_stopped_writer_counts_as_a_drop() {
+    fn writer_with_a_dead_receiver_reports_drops() {
         let (tx, rx) = channel();
         drop(rx);
         let writer = Writer {
@@ -667,7 +672,9 @@ mod tests {
         };
 
         assert!(!enqueue(&writer, |_db| {}));
+        assert!(!persist_critical_for(&writer, |_db| {}));
         assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(writer.state.critical_lost.load(Ordering::Relaxed), 1);
         assert_eq!(writer.state.depth.load(Ordering::Relaxed), 0);
     }
 

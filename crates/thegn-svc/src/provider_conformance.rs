@@ -1,7 +1,13 @@
-//! Provider conformance suite (first slice of WS08-P1-08): one `suite` entry
-//! point run over today's `RemoteProvider` and its optional traits, against the
-//! sprites fake server, the Vercel `FakeApi`, and (WS08-P1-08 slice 2) Fly and VPS fakes. WS08-P1-08 extends this file
-//! rather than replacing it: add cases to `suite`, keep the names stable.
+//! Provider conformance suite (WS08-P1-08): one `suite` entry point run over
+//! today's `RemoteProvider` and its optional traits, against the sprites fake
+//! server, the Vercel `FakeApi`, and Fly and VPS fakes. The cases are
+//! `create_records_before_request`, `destroy_missing_is_ok`,
+//! `destroy_unrecorded_refused`, `inventory_contains_created`,
+//! `run_captures_exit_and_output`, `reads_never_resume`,
+//! `inventory_partial_keeps_created`, `create_respects_cap`,
+//! `stop_resume_round_trip`, `destroy_keeps_record_until_gone`,
+//! `destroy_is_idempotent`, and `probe_report_shape`. WS08-P1-08 extends this
+//! file rather than replacing it: add cases to `suite`, keep the names stable.
 //!
 //! A case is *skipped* (never failed) only when the [`Fixture`] says the op is
 //! unbacked (no probe, no `foreign`, `supports_run == false`).
@@ -15,6 +21,13 @@ pub type Probe<T> = Box<dyn Fn() -> T + Send + Sync>;
 
 /// Counts the DELETE requests a fake has seen for one name.
 pub type DeleteCounter = Box<dyn Fn(&str) -> usize + Send + Sync>;
+
+/// Arms (`true`) or disarms (`false`) the fake so a DELETE of the name is accepted (2xx)
+/// while the sandbox stays present on every later read.
+pub type HoldSwitch = Box<dyn Fn(&str, bool) + Send + Sync>;
+
+/// Whether this host's ownership record for a name is on disk.
+pub type RecordProbe = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What one provider run of the suite works against.
 pub struct Fixture {
@@ -41,6 +54,10 @@ pub struct Fixture {
     /// Whether the fake backs `suspend` + `resume` (Fly, Vercel); `false`
     /// skips `stop_resume_round_trip`.
     pub supports_stop: bool,
+    /// `None` (with `recorded`) skips `destroy_keeps_record_until_gone`.
+    pub hold_after_delete: Option<HoldSwitch>,
+    /// `None` skips `destroy_keeps_record_until_gone`.
+    pub recorded: Option<RecordProbe>,
 }
 
 /// The outcome of one suite run, case by case.
@@ -238,6 +255,28 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
                 .await
                 .map_err(|e| format!("resume failed: {e:#}"))
         }),
+    )
+    .await;
+
+    case(
+        &mut report,
+        "destroy_keeps_record_until_gone",
+        fx.hold_after_delete.as_ref().zip(fx.recorded.as_ref()).map(
+            |(hold, recorded)| async move {
+                ensure(recorded(&fx.created), || {
+                    "the ownership record was not present before destroy".into()
+                })?;
+                hold(&fx.created, true);
+                let result = p.destroy(&fx.created).await;
+                hold(&fx.created, false);
+                ensure(result.is_err(), || {
+                    "destroy reported success while the sandbox was still present".into()
+                })?;
+                ensure(recorded(&fx.created), || {
+                    "the ownership record was dropped before the sandbox was proven gone".into()
+                })
+            },
+        ),
     )
     .await;
 

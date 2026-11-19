@@ -1736,13 +1736,34 @@ pub(crate) fn seed_workspace_create(
     name: &str,
     cfg: &thegn_core::config::Config,
 ) -> Result<crate::workspace_switch_prep::CreateOutcome> {
+    let seed_started = Instant::now();
     let root_s = root.to_string_lossy().into_owned();
     db.put_workspace(&root_s, name, "repo")?;
     db.touch_repo(&root_s, name)?;
+    let display = if name.trim().is_empty() {
+        std::path::Path::new(&root_s)
+            .file_name()
+            .map(|part| part.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root_s.clone())
+    } else {
+        name.to_owned()
+    };
+    let base = thegn_core::util::slugify(&display);
+    let slug = db
+        .slug_for_repo_nowait(&root_s, &base)
+        .unwrap_or_else(|_| base.clone());
+    let sidebar_entry = Some((slug, display, "repo".into(), root_s.clone()));
     let prepared = crate::session::Session::prepare_workspace_switch(&root_s, db, cfg)?;
+    let seed_ms = seed_started.elapsed().as_millis() as u64;
+    tracing::debug!(
+        target: "thegn::workspace_switch",
+        seed_ms,
+        "workspace create seed complete"
+    );
     Ok(crate::workspace_switch_prep::CreateOutcome::Repo {
         root: root_s,
         prepared,
+        sidebar_entry,
     })
 }
 
@@ -2133,9 +2154,10 @@ Receiving objects: 100% (10/10)\rdone.\n";
     }
 
     #[test]
-    fn seed_workspace_create_registers_the_repo_and_prepares_its_home_group() {
+    fn seed_workspace_create_returns_the_db_shaped_entry() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        let db = thegn_core::db::Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
         let repo = scratch.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         let initialized = fixture_git(&repo, &["init"]);
@@ -2144,12 +2166,27 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let outcome =
             seed_workspace_create(&db, &repo, "label", &thegn_core::config::Config::default())
                 .unwrap();
-        let crate::workspace_switch_prep::CreateOutcome::Repo { root, prepared } = outcome else {
+        let crate::workspace_switch_prep::CreateOutcome::Repo {
+            root,
+            prepared,
+            sidebar_entry,
+        } = outcome
+        else {
             panic!("initialized git repository should be prepared as a repo")
         };
         assert_eq!(root, repo.to_string_lossy().into_owned());
         assert_eq!(prepared.worktrees[0].kind, crate::session::GroupKind::Home);
-        let slug = db.repo_slug_lookup(&root).unwrap().unwrap();
+        let session = crate::session::Session {
+            id: root.clone(),
+            worktrees: prepared.worktrees.clone(),
+            active: prepared.active,
+        };
+        let expected = crate::hydrate::workspace_list(&session, Some(&db))
+            .into_iter()
+            .find(|(_, _, _, repo_path)| repo_path == &root)
+            .expect("seeded workspace should be in the hydrated list");
+        assert_eq!(sidebar_entry, Some(expected.clone()));
+        let slug = expected.0;
         assert_eq!(
             prepared.worktrees[0].name,
             thegn_core::repo::home_tab(&slug)
