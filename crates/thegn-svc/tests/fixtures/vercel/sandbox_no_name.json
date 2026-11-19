@@ -1,0 +1,9 @@
+{
+  "sandbox": {
+    "status": "running",
+    "currentSessionId": "sess_abc123",
+    "resources": {
+      "vcpus": 2
+    }
+  }
+}
