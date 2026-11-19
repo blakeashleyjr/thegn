@@ -614,7 +614,7 @@ impl PaneEmulator for AlacrittyEmulator {
         let first = -(history as i32);
         let last = if include_screen { screen } else { 0 };
         let mut newest = Vec::new();
-        let mut current = None;
+        let mut current: Option<String> = None;
         let mut skipping_trailing_blanks = true;
 
         for line_no in (first..last).rev() {
