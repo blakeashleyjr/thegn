@@ -923,7 +923,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace
+test: test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro
     #!/usr/bin/env bash
     set -euo pipefail
     if ! cargo nextest run --workspace; then
@@ -1177,43 +1177,22 @@ start-dev name="dev": build
 # stable one. Own state, runtime, THEGN_DIR and config dir (~/.config/thegn-dev,
 # which you must seed yourself; secrets are never copied). See `thegn help two-instances`.
 devel: build
-    #!/usr/bin/env sh
-    set -eu
-    home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
-    [ -n "$home" ] || home="$HOME"
-    root="$home/.thegn-devel"; state="$root/state"; run="$root/run"; cfg="$home/.config/thegn-dev"
-    if [ ! -d "$cfg" ]; then
-      echo "just devel: $cfg does not exist; seed it first: cp -r '$home/.config/thegn' '$cfg' (review it for secrets)" >&2
-      exit 1
-    fi
-    pidfile="$run/thegn.pid"; mkdir -p "$state" "$run" "$root/home"
-    . "$PWD/test/lib/instance.sh"; INST_STATE="$state" inst_restart "$pidfile" $$ || exit 1
-    exec env \
-      "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
-      "XDG_STATE_HOME=$state" \
-      "XDG_RUNTIME_DIR=$run" \
-      "THEGN_DIR=$root/home" \
-      "THEGN_CONFIG_DIR=$cfg" \
-      "THEGN_NO_MIGRATE=1" \
-      "THEGN_CHANNEL=dev" \
-      "$PWD/{{bin}}"
+    exec "$PWD/scripts/devel-launch.sh"
 
 # Print the dev instance's environment as `export` lines (no side effects):
 # `eval "$(just devel-env)"` targets the dev instance with CLI calls.
 devel-env:
-    #!/usr/bin/env sh
-    set -eu
-    home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
-    [ -n "$home" ] || home="$HOME"
-    root="$home/.thegn-devel"
-    printf "export XDG_STATE_HOME='%s'\n" "$root/state"
-    printf "export XDG_RUNTIME_DIR='%s'\n" "$root/run"
-    printf "export THEGN_DIR='%s'\n" "$root/home"
-    printf "export THEGN_CONFIG_DIR='%s'\n" "$home/.config/thegn-dev"
-    printf "export THEGN_NO_MIGRATE='%s'\n" 1
-    printf "export THEGN_CHANNEL='%s'\n" dev
-    # THEGN_BIN is for scripts (the dev binary's absolute path); thegn itself does not read it.
-    printf "export THEGN_BIN='%s'\n" "$PWD/{{bin}}"
+    @"$PWD/scripts/devel-launch.sh" --print-env
+
+# Print a desktop entry for the dev instance (writes nothing)
+devel-desktop:
+    @"$PWD/scripts/devel-launch.sh" --desktop-entry
+
+test-devel-launch:
+    bash test/devel-launch-test.sh
+
+test-sprites-exec-repro:
+    python3 -B test/sprites_exec_repro_test.py
 
 # Headless terminal-capability matrix: run `thegn doctor` under a set of
 # degraded environments (each a clean `env -i`, so the outer terminal's
