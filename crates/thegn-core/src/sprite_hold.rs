@@ -75,6 +75,9 @@ pub const HOLD_ARG0: &str = "thegn-hold";
 ///   handler. A signal reaching the wrapper in that short startup window ends
 ///   it without cleanup: the loop sees its parent gone within 60 s and the
 ///   hold expires 300 s later (the crash bound).
+/// - Stopping the loop is bounded: if it has not exited 5 s after its `TERM`
+///   (a signal can land just before it blocks in `wait`), it is `KILL`ed, so
+///   the command's exit is never held for a whole nap.
 /// - The loop never holds the command's stdout/stderr (it runs on
 ///   `/dev/null`), and it kills and reaps its own `sleep` before exiting.
 /// - `THEGN_HOLD_SOCK` overrides the socket path. It exists for thegn's own
@@ -87,6 +90,7 @@ sock=${THEGN_HOLD_SOCK:-/.sprite/api.sock}
 case $ceiling in '' | *[!0-9]*) ceiling=0 ;; esac
 case $task in '' | *[!a-z0-9-]*) valid= ;; *) valid=1 ;; esac
 loop=
+dog=
 held=
 child=
 rc=0
@@ -134,7 +138,14 @@ hold_loop() {
 cleanup() {
     if [ -n "$loop" ]; then
         kill "$loop" 2>/dev/null
+        # Backstop: a TERM that lands just before the loop blocks in its own
+        # `wait` can be missed, which would hold the command's exit for the
+        # whole nap. Bound the reap: KILL the loop if it outlives 5 s.
+        { sleep 5; kill -KILL "$loop" 2>/dev/null; } </dev/null >/dev/null 2>&1 &
+        dog=$!
         wait "$loop" 2>/dev/null
+        kill "$dog" 2>/dev/null
+        wait "$dog" 2>/dev/null
         loop=
     fi
     if [ -n "$held" ]; then

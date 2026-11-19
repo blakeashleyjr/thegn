@@ -45,5 +45,12 @@ async fn vercel_passes_the_conformance_suite() {
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
-    assert!(report.skipped.is_empty(), "{report:?}");
+    // FakeApi returns one canned create result (it cannot fill a cap) and has
+    // no stop/resume round trip, so exactly these two cases are skipped; any
+    // other skip is a regression in what the fixture declares.
+    assert_eq!(
+        report.skipped,
+        vec!["create_respects_cap", "stop_resume_round_trip"],
+        "{report:?}"
+    );
 }
