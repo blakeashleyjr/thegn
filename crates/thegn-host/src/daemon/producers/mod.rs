@@ -652,7 +652,7 @@ mod tests {
             drop(first);
             assert!(TickSlot::try_take(ProducerKind::PrQueue).is_some());
             drop(other);
-            let _ = done.send(());
+            done.send(()).unwrap_or_default(); // best-effort: the receiver times out on its own
         });
         finished
             .recv_timeout(Duration::from_secs(5))
