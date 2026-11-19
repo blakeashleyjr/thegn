@@ -606,8 +606,7 @@ mod tests {
     use super::{
         EXIT_REMOTE_LOST, FromTty, REATTACH_BUDGET_RESET, RemoteModes, WAKE_NOTICE_AFTER,
         attempts_after_stream, encode_input, hold_ceiling, hold_task_from, lost_line,
-        pick_sprites_env, pty_size, reconnect_delays, should_reattach, sprite_wake_line,
-        with_slow_notice,
+        pick_sprites_env, pty_size, reconnect_delays, should_reattach, with_slow_notice,
     };
     use std::cell::Cell;
     use std::time::Duration;
