@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/thegn-cas",
+  "crates/thegn-guest-proto",
+  "crates/thegn-job-spec",
+  "crates/thegn-lease",
   "crates/thegn-core",
   "crates/thegn-svc",
   "crates/thegn-metrics",

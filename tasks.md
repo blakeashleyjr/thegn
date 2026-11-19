@@ -25,7 +25,7 @@ deadbranch import 659–671 under Y; brows releases 672–683 under AT; the drop
 harness 505/506 resurfaces scoped as AR 581).
 
 **Status legend:** `[x]` done · `[~]` partial · `[ ]` not started. Statuses are
-verified against the codebase. See `CLAUDE.md` for architecture.
+verified against the codebase. See `docs/ARCHITECTURE.md` for architecture.
 
 **September 13 live-build remediation:** THE-614 tracks the bounded fixes and
 review gates in [the remediation record](docs/audits/remediation-2026-09-13.md).
@@ -911,6 +911,8 @@ as the agent-specific side of the broader attention queue._
 
 ### U. LLM proxy
 
+The [model gateway architecture and delivery RFC](docs/rfcs/model-gateway.md) reconciles this inventory with the restored proxy and defines the qualification gates. The [Linear initiative](https://linear.app/blakeashley/initiative/thegn-model-gateway-9da776fbc1bf) tracks implementation and acceptance.
+
 _The **lower control plane**. Foreign ACP agents are pointed here via ACP's
 Configurable LLM Providers (`providers/set` with `baseUrl` = `tgproxy`) — **R 689**
 is the bridge; 283 (local upstreams) is reachable the same way. Per-agent virtual
@@ -1656,7 +1658,7 @@ _The multi-wave programme that makes sandbox and egress reporting truthful, adds
 
 ### BC. Jobs and hosted execution
 
-- [ ] 764. Add bounded Jobs alongside Sessions. Ship local execution, then SSH and Fly against the public contract. The separately released hosted service consumes that contract after the OSS portability gate. See the [architecture and delivery gates](docs/rfcs/jobs.md) and [draft v0 spec](docs/rfcs/job-spec-v0.md). Coordinate launch admission, providers and remote workers with BB 763.
+- [~] 764. Add bounded Jobs alongside Sessions. The [v0 contract change](openspec/changes/add-job-contract-v0/tasks.md) tracks the shared crates and consumer verification. Ship local execution, then SSH and Fly against the public contract. The separately released hosted service consumes that contract after the OSS portability gate. See the [architecture and delivery gates](docs/rfcs/jobs.md) and [draft v0 spec](docs/rfcs/job-spec-v0.md). Coordinate launch admission, providers and remote workers with BB 763.
 
 ### AI-free mode (audience-widener)
 
