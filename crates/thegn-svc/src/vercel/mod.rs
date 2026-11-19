@@ -826,7 +826,7 @@ impl VercelProvider {
                     // lifetime ceiling inside `extend_if_due` still bounds the spend.
                     match tokio::time::timeout(std::time::Duration::from_secs(30), self.extend_if_due(name)).await {
                         Ok(Ok(_)) => {}
-                        Ok(Err(error)) => tracing::debug!(target: "thegn::vercel", sandbox = %name, error = %format!("{error:#}"), "vercel: session keep-alive check failed"),
+                        Ok(Err(error)) => return Err(error),
                         Err(_) => tracing::debug!(target: "thegn::vercel", sandbox = %name, "vercel: session keep-alive check timed out"),
                     }
                 }

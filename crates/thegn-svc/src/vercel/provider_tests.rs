@@ -488,7 +488,7 @@ async fn destroy_deletes_the_snapshots() {
     let ledger = tempfile::tempdir().unwrap();
     registry::write_at(ledger.path(), &ledger_record(NAME, "ready")).unwrap();
     let fake = Arc::new(FakeApi {
-        snapshots: vec!["snap_1".into(), "snap_2".into()],
+        snapshots: vec!["snap_1".into(), "snap_2".into(), "snap_3".into()],
         ..FakeApi::default()
     });
     fake.gets
@@ -509,6 +509,7 @@ async fn destroy_deletes_the_snapshots() {
             format!("snapshots {NAME}"),
             "delete_snapshot snap_1".to_string(),
             "delete_snapshot snap_2".to_string(),
+            "delete_snapshot snap_3".to_string(),
         ]
     );
     assert!(registry::read_at(ledger.path(), NAME).is_none());
@@ -644,7 +645,7 @@ async fn run_exec_short_command_checks_once() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn run_exec_keepalive_error_never_fails_the_exec() {
+async fn run_exec_keepalive_error_fails_the_exec() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let ledger = tempfile::tempdir().unwrap();
     let fake = Arc::new(FakeApi {
@@ -665,8 +666,8 @@ async fn run_exec_keepalive_error_never_fails_the_exec() {
     tokio::task::yield_now().await;
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
 
-    let (code, _) = task.await.unwrap().unwrap();
-    assert_eq!(code, 0);
+    let error = task.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("fake: get failed"), "{error:#}");
     assert!(fake.count("get") >= 2, "{:?}", fake.calls());
 }
 
@@ -946,6 +947,8 @@ async fn every_sandbox_env_path_drops_credentials_and_the_token_ref() {
         .command_body(&spec.argv, None, &spec.env, false)
         .expect("detached body");
     assert_eq!(env_keys(&detached), want, "detached command");
+    let detached = thegn_core::vercel::api::with_attach_stdin(detached);
+    assert_eq!(detached["attachStdin"], serde_json::json!(true));
 
     // The one-shot command (capture reads and provisioning steps).
     p.run_exec(NAME, &["true".to_string()], None, &env, Wake::Allow)

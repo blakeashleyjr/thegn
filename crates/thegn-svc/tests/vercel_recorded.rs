@@ -1,9 +1,8 @@
 //! Recorded-shape fixtures for the pure Vercel Sandbox response parsers.
 //!
-//! UNVERIFIED: these fixtures are NOT captured from Vercel. They encode the
-//! shapes thegn's own parsers (thegn-core vercel/api.rs) expect, so they pin the
-//! client's assumptions, not the real API. Replace each with a captured body
-//! after THE-2234's first live run; see `fixtures/vercel/README.md`.
+//! These fixtures match the published OpenAPI document (2026-11-19); not yet
+//! seen live. Error body JSON, 410 meaning, the interactive endpoint and its
+//! ticket hosts remain unverified.
 
 use thegn_core::vercel::api::{
     LogLine, SessionStatus, parse_list_page, parse_log_line, parse_sandbox, parse_session_usage,
@@ -48,11 +47,11 @@ fn running_sandbox_parses_every_field_thegn_relies_on() {
 }
 
 #[test]
-fn stopped_sandbox_has_no_session() {
+fn stopped_sandbox_keeps_the_stopped_session_details() {
     let view = parse_sandbox(&fixture("sandbox_stopped.json")).unwrap();
 
     assert_eq!(view.status, SessionStatus::Stopped);
-    assert_eq!(view.session_id, None);
+    assert_eq!(view.session_id.as_deref(), Some("sess_abc123"));
 }
 
 #[test]
@@ -71,15 +70,15 @@ fn list_pages_carry_the_cursor() {
 
 #[test]
 fn session_usage_reads_cpu_memory_vcpus() {
-    let usage = parse_session_usage(&fixture("sandbox_running.json"))
+    let usage = parse_session_usage(&fixture("sandbox_stopped.json"))
         .unwrap()
-        .expect("running fixture has a session");
+        .expect("stopped fixture has a session");
 
     assert_eq!(usage.active_cpu_ms, Some(12000));
     assert_eq!(usage.memory_mb, Some(4096));
     assert_eq!(usage.vcpus, Some(2));
     assert_eq!(usage.started_at_ms, Some(1_763_500_001_000));
-    assert_eq!(usage.stopped_at_ms, None);
+    assert_eq!(usage.stopped_at_ms, Some(1_763_500_361_000));
 }
 
 #[test]
@@ -100,6 +99,13 @@ fn ndjson_run_log_parses_each_stream() {
         .lines()
         .map(|line| parse_log_line(line.as_bytes()).unwrap());
 
+    assert_eq!(
+        lines.next(),
+        Some(LogLine::Command {
+            id: "cmd_1".into(),
+            exit_code: None,
+        })
+    );
     assert_eq!(lines.next(), Some(LogLine::Stdout(b"hello\n".to_vec())));
     assert_eq!(lines.next(), Some(LogLine::Stderr(b"warn\n".to_vec())));
     assert_eq!(
@@ -114,10 +120,28 @@ fn ndjson_run_log_parses_each_stream() {
     assert_eq!(
         parse_log_line(include_str!("fixtures/vercel/run_error.ndjson").as_bytes()).unwrap(),
         LogLine::Error {
-            code: "sandbox_stopped".into(),
-            message: "stopped".into(),
+            code: "sandbox_stream_closed".into(),
+            message: "stream closed".into(),
         }
     );
+}
+
+#[test]
+fn one_shot_fixture_ignores_opening_command_and_collects_output() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit = None;
+    for line in include_str!("fixtures/vercel/run_log.ndjson").lines() {
+        match parse_log_line(line.as_bytes()).unwrap() {
+            LogLine::Command { exit_code, .. } => exit = exit_code.or(exit),
+            LogLine::Stdout(bytes) => stdout.extend(bytes),
+            LogLine::Stderr(bytes) => stderr.extend(bytes),
+            LogLine::Error { .. } => panic!("fixture has an error line"),
+        }
+    }
+    assert_eq!(stdout, b"hello\n");
+    assert_eq!(stderr, b"warn\n");
+    assert_eq!(exit, Some(3));
 }
 
 #[test]
