@@ -2155,7 +2155,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
 
     #[test]
     fn seed_workspace_create_returns_the_db_shaped_entry() {
-        let _state = thegn_core::testenv::IsolatedState::new();
+        let _state = crate::testenv::IsolatedState::new();
         let db = thegn_core::db::Db::open().unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
