@@ -63,20 +63,29 @@ Teardown    : trap on EXIT/INT/TERM -> kill a still-running hold, env down
               --force, env deprovision <name> for each record in THIS run's
               ledger, env reap --provider sprites --apply --yes; fails (and keeps
               the ledger) if any of this run's records or sprites remain.
+The preflight prints which credentials enter the sandbox.
 Steps:
+  0   preflight: doctor --json remote_live for <name>; FAIL if the token does
+      not resolve; INFO forwarded_env, git_token, login_upload; WARN lists
+      unbound pre-existing sandboxes (never touched); SKIP on an older binary
   1   scratch repo + env test          1b  env test
   2   no sprites ledger record before create
   3   provision (env up)               3b  exactly one ready sprites ledger record
   4   sprite workspace HEAD == local HEAD (sprite-exec, \$HOME/workspace)
   5   (only with --min-ram-gb N) doctor --json under --set min_ram_gb=N shows N*1024
+  5b  (only with --min-ram-gb N) /sys/fs/cgroup/memory.max in the sprite is
+      N GiB in bytes (raw value printed; SKIP if the file is absent)
   6   interactive exec under script(1): tty && echo ok
+  6b  curl exists in the sprite (keep-awake precondition)
   7a  headless hold: sprite-exec --hold 10m -- sleep 420 in the background (no
       per-run overlay can add a hold-test agent, so no agent run --wait);
       /v1/tasks shows thegn-hold- during, none after
+  7e  the hold's stderr has no "keep-awake unavailable"
   8   env pull                         8b  refs/thegn/pull is non-empty
   9   after 120 s idle, fleet list --env shows warm or cold
   9b  /v1/tasks is empty
   10  fleet cost --json: sprites_usage with CPU seconds > 0
+  10b fleet list --env still shows warm or cold (the usage call did not wake it)
   11  env down                         11b this run's ledger record is gone
   12  env reap --provider sprites --json (dry-run): 0 recorded orphans, others
       listed as unrecorded
@@ -102,6 +111,66 @@ if [ "${THEGN_CHANNEL:-}" != "dev" ]; then
   exit 2
 fi
 
+# ---- step 0: preflight (doctor's "Remote live readiness" block) ----
+# doctor --json lists names only, never values: whether the token resolves,
+# which env var names, git token and agent logins enter the sandbox, and ledger
+# sandboxes nothing is bound to. The token itself is never read or printed.
+PREFLIGHT_PY='
+import json, os, sys
+env = os.environ["PRE_ENV"]
+required = os.environ.get("PRE_REQUIRED", "1") == "1"
+try:
+    doc = json.loads(sys.stdin.read())
+except ValueError:
+    print("FAIL 0: doctor --json did not print JSON", file=sys.stderr)
+    sys.exit(1)
+rows = doc.get("remote_live") if isinstance(doc, dict) else None
+if rows is None:
+    print("SKIP 0: doctor --json has no remote_live key (older binary): no credential statement")
+    sys.exit(0)
+row = next((r for r in rows if isinstance(r, dict) and r.get("env") == env), None)
+if row is None:
+    if required:
+        print("FAIL 0: doctor remote_live has no row for env " + env, file=sys.stderr)
+        sys.exit(1)
+    print("SKIP 0: doctor remote_live has no row for env " + env + " (it covers sprites and vercel envs)")
+    sys.exit(0)
+def show(v):
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, list):
+        return ",".join(show(x) for x in v) or "none"
+    if isinstance(v, dict):
+        return ",".join(k + "=" + show(x) for k, x in sorted(v.items())) or "none"
+    if v is None or v == "":
+        return "none"
+    return str(v)
+if row.get("token_resolves") is not True:
+    print("FAIL 0: the token for env " + env + " does not resolve (remote_live.token_resolves = " + show(row.get("token_resolves")) + ")", file=sys.stderr)
+    sys.exit(1)
+print("INFO 0: credentials entering the sandbox: forwarded_env=" + show(row.get("forwarded_env")) + "; git_token=" + show(row.get("git_token")) + "; login_upload=" + show(row.get("login_upload")))
+unbound = row.get("unbound") or []
+if not isinstance(unbound, list):
+    unbound = [unbound]
+if unbound:
+    print("WARN 0: unbound ledger sandboxes: " + ", ".join(show(n) for n in unbound) + ": pre-existing sandboxes this run will not touch")
+print("PASS 0")
+'
+DOCTOR_JSON=""
+preflight_capture() { # doctor may exit non-zero on unrelated checks; parse what it printed
+  DOCTOR_JSON="$("$THEGN_BIN" doctor --json 2>/dev/null)" || true
+}
+preflight_check() { # preflight_check <env> [required: 1|0]
+  echo "== step 0: preflight (doctor --json remote_live for env '$1')"
+  printf '%s' "$DOCTOR_JSON" | PRE_ENV="$1" PRE_REQUIRED="${2:-1}" python3 -I -c "$PREFLIGHT_PY" || {
+    echo "FAIL 0: preflight" >&2
+    exit 1
+  }
+}
+# Run against the owner's real state, before the fresh dirs below, so
+# pre-existing unbound sandboxes are listed.
+preflight_capture
+
 # Real config stays as given (read-only); everything mutable is fresh.
 TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
@@ -113,6 +182,7 @@ REPO="$TMP/repo"
 SPRITE_NAME="(unknown)"
 CREATED=0
 HOLD_PID=""
+HOLD_ERR="$TMP/hold.err"
 
 print_plan
 echo
@@ -217,6 +287,24 @@ head_matches() { # the sprite workspace HEAD equals the local lane HEAD
   [ -n "$remote" ] && [ "$remote" = "$local_head" ]
 }
 
+memory_max_matches() { # memory.max in bytes equals N GiB; absent file skips
+  local out want
+  want=$((min_ram * 1024 * 1024 * 1024))
+  out="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- \
+    sh -c 'if [ -r /sys/fs/cgroup/memory.max ]; then cat /sys/fs/cgroup/memory.max; else echo thegn-absent; fi')" || return 1
+  out="$(printf '%s' "$out" | tr -d '\r\n ')"
+  echo "   memory.max raw value: $out (want $want)"
+  if [ "$out" = thegn-absent ]; then
+    echo "SKIP 5b: /sys/fs/cgroup/memory.max is absent in the sprite"
+    return 0
+  fi
+  [ "$out" = "$want" ]
+}
+
+curl_present() { # the keep-awake hold needs curl inside the sprite
+  no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'command -v curl'
+}
+
 min_ram_shown() { # doctor reflects min_ram_gb=N as N*1024 MiB
   local out
   out="$("$THEGN_BIN" --set "env.$env_name.provider.min_ram_gb=$min_ram" doctor --json 2>&1)" || return 1
@@ -255,7 +343,7 @@ tasks_empty() {
 }
 
 hold_start() {
-  no_stdin "$THEGN_BIN" sprite-exec --hold 10m "$SPRITE_NAME" -- sleep 420 &
+  no_stdin "$THEGN_BIN" sprite-exec --hold 10m "$SPRITE_NAME" -- sleep 420 2>"$HOLD_ERR" &
   HOLD_PID=$!
   sleep 30
   kill -0 "$HOLD_PID" 2>/dev/null
@@ -266,14 +354,25 @@ hold_finish() {
   HOLD_PID=""
 }
 
+hold_was_awake() { # sprite_hold prints this line when it runs unheld
+  if grep -Fq "keep-awake unavailable" "$HOLD_ERR"; then
+    echo "   hold stderr:"
+    sed 's/^/     /' "$HOLD_ERR"
+    return 1
+  fi
+}
+
 pull_refs_present() { [ -n "$(git -C "$REPO" for-each-ref refs/thegn/pull)" ]; }
 
-idle_warm_or_cold() {
+warm_or_cold() {
   local out
-  echo "   idling 120 s"
-  sleep 120
   out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>&1)" || return 1
   printf '%s' "$out" | grep -Eq '"(warm|cold)"'
+}
+idle_warm_or_cold() {
+  echo "   idling 120 s"
+  sleep 120
+  warm_or_cold
 }
 
 cost_has_cpu() {
@@ -295,6 +394,7 @@ reap_dry_clean() { # dry-run only: no recorded orphan, everything else unrecorde
   return 0
 }
 
+preflight_check "$env_name"
 step 1 "scratch repo + env test (token resolves)" bash -c "true"
 scratch_repo
 step 1b "env test" "$THEGN_BIN" env test "$env_name"
@@ -307,19 +407,23 @@ echo "sprite: $SPRITE_NAME"
 step 4 "sprite workspace HEAD matches the local lane HEAD" head_matches
 if [ -n "$min_ram" ]; then
   step 5 "doctor shows min_ram_gb=$min_ram as $((min_ram * 1024)) MiB" min_ram_shown
+  step 5b "sprite memory.max is $min_ram GiB" memory_max_matches
 else
-  echo "SKIP 5 (needs --min-ram-gb N)"
+  echo "SKIP 5, 5b (needs --min-ram-gb N)"
 fi
 step 6 "interactive exec has a tty" interactive_tty
+step 6b "curl exists in the sprite (keep-awake precondition)" curl_present
 step 7a "background hold runs (sprite-exec --hold 10m -- sleep 420)" hold_start
 step 7b "/v1/tasks shows thegn-hold- during the hold" hold_task_present
 step 7c "the hold exits clean" hold_finish
 step 7d "/v1/tasks shows no thegn-hold- after the hold" hold_task_absent
+step 7e "the hold had keep-awake (no 'keep-awake unavailable' on stderr)" hold_was_awake
 step 8 "env pull" in_repo "$THEGN_BIN" env pull
 step 8b "refs/thegn/pull is non-empty" pull_refs_present
 step 9 "after 120 s idle the sprite is warm or cold" idle_warm_or_cold
 step 9b "/v1/tasks is empty" tasks_empty
 step 10 "fleet cost reports sprites_usage CPU seconds > 0" cost_has_cpu
+step 10b "fleet list still shows warm or cold after fleet cost" warm_or_cold
 step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" env down
 step 11b "this run's ledger record is gone" record_gone
 step 12 "reap dry-run: 0 recorded orphans" reap_dry_clean
