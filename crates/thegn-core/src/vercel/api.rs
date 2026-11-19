@@ -121,8 +121,10 @@ pub fn create_body(scope: &Scope, req: &CreatePlan) -> serde_json::Value {
     serde_json::to_value(body).unwrap_or(serde_json::Value::Null)
 }
 
+/// Case- and whitespace-insensitive: the live casing is UNVERIFIED (THE-2234),
+/// and an unknown status disables extension and confuses the reaper.
 fn status_of(s: &str) -> SessionStatus {
-    match s {
+    match s.trim().to_ascii_lowercase().as_str() {
         "pending" => SessionStatus::Pending,
         "running" => SessionStatus::Running,
         "stopping" => SessionStatus::Stopping,
@@ -797,16 +799,25 @@ mod tests {
         for (t, st) in [
             ("pending", SessionStatus::Pending),
             ("running", SessionStatus::Running),
+            ("Running", SessionStatus::Running),
             ("stopping", SessionStatus::Stopping),
             ("stopped", SessionStatus::Stopped),
+            (" STOPPED ", SessionStatus::Stopped),
             ("failed", SessionStatus::Failed),
             ("aborted", SessionStatus::Aborted),
             ("snapshotting", SessionStatus::Snapshotting),
+            ("Snapshotting", SessionStatus::Snapshotting),
             ("???", SessionStatus::Unknown),
         ] {
             let sb = parse_sandbox(&json!({"name": "n", "status": t})).unwrap();
             assert_eq!(sb.status, st, "{t}");
         }
+    }
+
+    #[test]
+    fn status_unknown_stays_unknown() {
+        let sb = parse_sandbox(&json!({"name": "n", "status": "runningish"})).unwrap();
+        assert_eq!(sb.status, SessionStatus::Unknown);
     }
 
     #[test]
