@@ -108,10 +108,6 @@ pub struct MatchOptions {
     pub whole_word: bool,
 }
 
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 /// Smart-case literal search: case-sensitive iff `needle` has an uppercase
 /// char, ASCII case-insensitive otherwise. Byte-window scan, no allocation.
 /// Returns the byte range of the first hit.
@@ -142,8 +138,22 @@ pub fn find_literal(line: &str, needle: &str) -> Option<(usize, usize)> {
 }
 
 fn on_word_boundaries(line: &str, (s, e): (usize, usize)) -> bool {
-    let b = line.as_bytes();
-    (s == 0 || !is_word_byte(b[s - 1])) && (e >= b.len() || !is_word_byte(b[e]))
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    !line[..s].chars().next_back().is_some_and(word) && !line[e..].chars().next().is_some_and(word)
+}
+
+/// First occurrence of `needle` that sits on word boundaries.
+fn find_literal_word(line: &str, needle: &str, sensitive: bool) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while from < line.len() {
+        let (s, e) = find_literal_with(&line[from..], needle, sensitive)?;
+        let span = (from + s, from + e);
+        if on_word_boundaries(line, span) {
+            return Some(span);
+        }
+        from = span.0 + line[span.0..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -345,6 +355,7 @@ impl SearchEngine {
                 MatchMode::Literal => {
                     let refine_hits = self.refine.as_ref().and_then(|cache| {
                         (cache.fingerprint == fingerprint
+                            && !options.whole_word
                             && !cache.query.is_empty()
                             && trimmed.contains(cache.query.as_str()))
                         .then(|| cache.hits.clone())
@@ -357,13 +368,14 @@ impl SearchEngine {
                                     {
                                         self.scanned += 1;
                                     }
-                                    if let Some(span) = find_literal_with(
-                                        f.2,
-                                        &trimmed,
-                                        options.exact_case
-                                            || trimmed.chars().any(char::is_uppercase),
-                                    ) && (!options.whole_word || on_word_boundaries(f.2, span))
-                                    {
+                                    let sensitive = options.exact_case
+                                        || trimmed.chars().any(char::is_uppercase);
+                                    let found = if options.whole_word {
+                                        find_literal_word(f.2, &trimmed, sensitive)
+                                    } else {
+                                        find_literal_with(f.2, &trimmed, sensitive)
+                                    };
+                                    if let Some(span) = found {
                                         hits.push((
                                             i,
                                             if on_word_boundaries(f.2, span) { 2 } else { 1 },
@@ -379,12 +391,14 @@ impl SearchEngine {
                                 {
                                     self.scanned += 1;
                                 }
-                                if let Some(span) = find_literal_with(
-                                    f.2,
-                                    &trimmed,
-                                    options.exact_case || trimmed.chars().any(char::is_uppercase),
-                                ) && (!options.whole_word || on_word_boundaries(f.2, span))
-                                {
+                                let sensitive =
+                                    options.exact_case || trimmed.chars().any(char::is_uppercase);
+                                let found = if options.whole_word {
+                                    find_literal_word(f.2, &trimmed, sensitive)
+                                } else {
+                                    find_literal_with(f.2, &trimmed, sensitive)
+                                };
+                                if let Some(span) = found {
                                     hits.push((
                                         i,
                                         if on_word_boundaries(f.2, span) { 2 } else { 1 },
@@ -421,7 +435,10 @@ impl SearchEngine {
                                 error
                                     .to_string()
                                     .lines()
-                                    .next()
+                                    .map(str::trim)
+                                    .filter(|line| !line.is_empty())
+                                    .last()
+                                    .map(|line| line.strip_prefix("error: ").unwrap_or(line))
                                     .map_or_else(String::new, |line| {
                                         line.chars().take(120).collect()
                                     }),
@@ -906,6 +923,57 @@ mod tests {
     }
 
     #[test]
+    fn whole_word_extension_finds_the_longer_word() {
+        let buf = buf_from(&["login"]);
+        let srcs: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_options(
+            MatchOptions {
+                whole_word: true,
+                ..MatchOptions::default()
+            },
+            &srcs,
+        );
+        eng.set_query("log", &srcs);
+        eng.push_char('i', &srcs);
+        eng.push_char('n', &srcs);
+        assert_eq!(lines_of(&eng), ["login"]);
+    }
+
+    #[test]
+    fn whole_word_finds_a_later_occurrence() {
+        let buf = buf_from(&["catalog cat"]);
+        let srcs: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_options(
+            MatchOptions {
+                whole_word: true,
+                ..MatchOptions::default()
+            },
+            &srcs,
+        );
+        eng.set_query("cat", &srcs);
+        assert_eq!(eng.matches().len(), 1);
+        assert_eq!(eng.matches()[0].span, Some((8, 11)));
+    }
+
+    #[test]
+    fn whole_word_respects_unicode_boundaries() {
+        let buf = buf_from(&["café"]);
+        let srcs: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_options(
+            MatchOptions {
+                whole_word: true,
+                ..MatchOptions::default()
+            },
+            &srcs,
+        );
+        eng.set_query("caf", &srcs);
+        assert!(eng.matches().is_empty());
+    }
+
+    #[test]
     fn exact_case_refuses_other_case() {
         let buf = buf_from(&["Error", "error"]);
         let srcs: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
@@ -930,6 +998,7 @@ mod tests {
         eng.set_query("[", &srcs);
         assert!(eng.matches().is_empty());
         assert!(eng.error().is_some());
+        assert!(eng.error().unwrap().contains("unclosed"));
     }
 
     #[test]
