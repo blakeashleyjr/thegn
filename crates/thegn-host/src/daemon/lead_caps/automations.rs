@@ -104,6 +104,7 @@ pub(crate) async fn put(svc: &DaemonService, req: serde_json::Value) -> JsonResu
         outcome.map_err(|limit| ControlError::ResourceExhausted(limit.to_string()))?;
     // A stored rule may add or change a schedule (THE-2193).
     crate::automation_schedule::rearm();
+    crate::daemon::producers::rearm();
     let (automations_enabled, armed) = runtime_state(svc);
     let awaiting = arming.is_some() && !already_armed;
     let inert_reason = if awaiting {
@@ -178,6 +179,7 @@ pub(crate) async fn rm(svc: &DaemonService, req: serde_json::Value) -> JsonResul
         return Err(ControlError::NotFound(format!("automation rule {name}")));
     }
     crate::automation_schedule::rearm();
+    crate::daemon::producers::rearm();
     encode(&LeadRuleRmReply { id, removed })
 }
 
@@ -194,6 +196,7 @@ pub(crate) async fn enable(svc: &DaemonService, req: serde_json::Value) -> JsonR
         return Err(ControlError::NotFound(format!("automation rule {name}")));
     }
     crate::automation_schedule::rearm();
+    crate::daemon::producers::rearm();
     encode(&LeadRuleEnableReply { id, enabled })
 }
 

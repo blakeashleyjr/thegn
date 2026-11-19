@@ -133,6 +133,11 @@ pub struct DaemonConfig {
     /// `0` = never end it (the reconnect backoff still applies).
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub stream_gap_window_secs: u64,
+    /// Let the daemon run the headless producers (tracker, PR poll,
+    /// mentions, PR queue) so rules and autopilot fire with no UI open
+    /// (THE-2208). Off by default; even when on, a producer is armed only
+    /// when a rule, autopilot or the PR queue needs it. Read at daemon start.
+    pub headless_producers: bool,
 }
 
 impl Default for DaemonConfig {
@@ -143,6 +148,7 @@ impl Default for DaemonConfig {
             idle_exit_secs: 1800,
             lease_grace_secs: 0,
             stream_gap_window_secs: 600,
+            headless_producers: false,
         }
     }
 }
@@ -462,6 +468,16 @@ mod tests {
             "0 = never reap: a detached session lives until killed"
         );
         assert_eq!(d.stream_gap_window_secs, 600);
+        assert!(!d.headless_producers, "headless producers are opt-in");
+    }
+
+    #[test]
+    fn headless_producers_parses() {
+        let config =
+            toml::from_str::<crate::config::Config>("[daemon]\nheadless_producers = true\n")
+                .unwrap();
+        assert!(config.daemon.headless_producers);
+        assert!(!crate::config::Config::default().daemon.headless_producers);
     }
 
     #[test]
