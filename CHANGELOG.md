@@ -9,6 +9,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Changed
 
+- Fleet reads a recorded sandbox the provider does not list as `down` unless this host still holds its provisioned marker (then `missing`), and a sprite with no worktree and no ledger record as `unrecorded`. Neither turns the masthead badge amber. Budget admission still counts every listed row. Not yet verified live.
+- `thegn env reap --provider sprites --unrecorded` is a read-only listing (oldest first, status, age, 30-day usage) with one `env adopt` line per paste-safe name; it refuses `--apply`. The Sprites list API reports no size.
+- Seed, pull and push-lane events append to `$XDG_STATE_HOME/thegn/provider/git-audit.jsonl` (rotated at 1 MiB); a failed Vercel exec appends the last 8 KiB of stderr; `SpritesProvider::with_list_page_size` adds `max_results` to list pages for a read-only live paging test. The live script gains steps for these.
+- With `THEGN_LOG` set, `THEGN_TRACE_FILE=<absolute path>` sends stdio bridge verb traces to that file only, never stdout or stderr.
 - `test/sprites-live.sh` takes `--keep-going` (a failed step prints `FAIL <id>` and the run continues, with a summary at the end), proves pull with a real commit made inside the sprite, and prints the cost JSON. Not yet verified live.
 - Sprites usage is read from the top-level `usage` array (`buckets` stays as a fallback). A non-tty exec exit frame may carry the exit code as one binary byte or as ASCII; both are accepted.
 - `env down` on a sandbox that is already gone says so and clears local state instead of warning that commits are lost.
