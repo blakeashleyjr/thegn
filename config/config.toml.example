@@ -222,8 +222,10 @@ sidebar_other_group_label = "Other"
 sidebar_other_group_collapsed = true
 # Rows a sidebar group shows before "show more"; 0 = no limit. Per-group
 # overrides are keyed by the folder or group label.
-sidebar_group_row_limit = 15
+sidebar_group_row_limit = 7
 # sidebar_group_row_limits = { Other = 5 }
+# Loose worktrees sharing a batch token fold into one row once this many share it; 0 = off.
+sidebar_batch_group_min = 2
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused

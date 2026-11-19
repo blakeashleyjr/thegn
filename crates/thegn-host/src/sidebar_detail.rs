@@ -130,7 +130,27 @@ pub(crate) fn format_badge(template: &str, count: u32, fallback: &str) -> String
     display_cell(&template.replace("{n}", &count_text(count)))
 }
 
-fn detail_fields(row: &SidebarRow, disp: &SidebarDisplay, now_unix: i64) -> Vec<Field> {
+/// What the worktree's title line already shows; the detail line never repeats it.
+#[allow(dead_code)] // spine stub: lane 3 reads the fields; drop this allow then
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TitleEcho {
+    pub branch: bool,
+    pub commits: bool,
+    pub pr: bool,
+    pub upstream: bool,
+}
+
+/// Stub (lane 3 fills): no elision.
+pub(crate) fn title_echo(_row: &SidebarRow, _disp: &SidebarDisplay, _title: &str) -> TitleEcho {
+    TitleEcho::default()
+}
+
+fn detail_fields(
+    row: &SidebarRow,
+    disp: &SidebarDisplay,
+    now_unix: i64,
+    _echo: TitleEcho,
+) -> Vec<Field> {
     if row.kind != RowKind::Worktree {
         return Vec::new();
     }
@@ -681,7 +701,15 @@ pub(crate) fn compose_detail_line_at(
     cols: usize,
 ) -> Option<Line> {
     let indent = indent.min(cols / 2);
-    compose_detail_line_guided(row, disp, now_unix, vec![sp(indent)], indent, cols)
+    compose_detail_line_guided(
+        row,
+        disp,
+        now_unix,
+        TitleEcho::default(),
+        vec![sp(indent)],
+        indent,
+        cols,
+    )
 }
 
 /// Like `compose_detail_line_at`, but the line starts with `lead` (display
@@ -692,6 +720,7 @@ pub(crate) fn compose_detail_line_guided(
     row: &SidebarRow,
     disp: &SidebarDisplay,
     now_unix: i64,
+    echo: TitleEcho,
     lead: Vec<Seg>,
     lead_cols: usize,
     cols: usize,
@@ -703,7 +732,7 @@ pub(crate) fn compose_detail_line_guided(
         (lead, lead_cols)
     };
     let fields = fit_fields(
-        detail_fields(row, disp, now_unix),
+        detail_fields(row, disp, now_unix, echo),
         cols.saturating_sub(lead_cols),
     );
     if fields.is_empty() {
@@ -720,8 +749,8 @@ pub(crate) fn compose_detail_line_guided(
 }
 
 /// The width-independent content predicate used by the heights pass.
-pub(crate) fn detail_has_content(row: &SidebarRow, disp: &SidebarDisplay) -> bool {
-    !detail_fields(row, disp, 0).is_empty()
+pub(crate) fn detail_has_content(row: &SidebarRow, disp: &SidebarDisplay, echo: TitleEcho) -> bool {
+    !detail_fields(row, disp, 0, echo).is_empty()
 }
 
 /// Stable wrapper retained for sidebar callers and unit tests.
@@ -877,7 +906,7 @@ mod tests {
             ],
             ..SidebarDisplay::default()
         };
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -908,7 +937,7 @@ mod tests {
         row.unread_count = 0;
         row.disk_bytes = None;
         row.git = Some(crate::sidebar::GitGlyphs::default());
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -1055,7 +1084,7 @@ mod tests {
                 .contains(&builtin(DetailField::Stash))
         );
         assert!(
-            detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000, TitleEcho::default())
                 .iter()
                 .any(|field| field.id == FieldId::Stash)
         );
@@ -1066,7 +1095,7 @@ mod tests {
             detail_fields: ui.detail_entries_resolved(),
             ..SidebarDisplay::default()
         };
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -1141,7 +1170,7 @@ mod tests {
         let defaults = SidebarDisplay::default();
         assert!(defaults.detail_fields.contains(&builtin(DetailField::Ci)));
         assert!(
-            detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000, TitleEcho::default())
                 .iter()
                 .any(|field| field.id == FieldId::Ci)
         );
@@ -1152,7 +1181,7 @@ mod tests {
             detail_fields: ui.detail_entries_resolved(),
             ..SidebarDisplay::default()
         };
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -1260,7 +1289,7 @@ mod tests {
                 .contains(&builtin(DetailField::Issue))
         );
         assert!(
-            detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000, TitleEcho::default())
                 .iter()
                 .any(|field| field.id == FieldId::Issue)
         );
@@ -1271,7 +1300,7 @@ mod tests {
             detail_fields: ui.detail_entries_resolved(),
             ..SidebarDisplay::default()
         };
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -1310,7 +1339,7 @@ mod tests {
         let row = row();
         let display = SidebarDisplay::default();
         assert_eq!(
-            detail_has_content(&row, &display),
+            detail_has_content(&row, &display, TitleEcho::default()),
             compose_detail_line_at(&row, &display, 2_000, 8, 24).is_some()
         );
     }
@@ -1391,9 +1420,15 @@ mod tests {
             ..SidebarDisplay::default()
         };
         let lead = vec![sp(4), seg(Tok::Slot(S::Ghost2), "| "), sp(2)];
-        let Some(Line::Segs(segs)) =
-            compose_detail_line_guided(&row, &display, 2_000, lead.clone(), 8, 24)
-        else {
+        let Some(Line::Segs(segs)) = compose_detail_line_guided(
+            &row,
+            &display,
+            2_000,
+            TitleEcho::default(),
+            lead.clone(),
+            8,
+            24,
+        ) else {
             panic!("guided detail line is a segment line")
         };
         assert_eq!(&segs[..3], &lead[..]);
@@ -1410,7 +1445,8 @@ mod tests {
             ..SidebarDisplay::default()
         };
         let lead = vec![sp(4), seg(Tok::Slot(S::Ghost2), "| "), sp(2)];
-        let guided = compose_detail_line_guided(&row, &display, 2_000, lead, 8, 8);
+        let guided =
+            compose_detail_line_guided(&row, &display, 2_000, TitleEcho::default(), lead, 8, 8);
         let plain = compose_detail_line_at(&row, &display, 2_000, 8, 8);
         let (Some(Line::Segs(g)), Some(Line::Segs(p))) = (guided, plain) else {
             panic!("both variants render a segment line")
@@ -1471,7 +1507,10 @@ mod tests {
             ],
             ..SidebarDisplay::default()
         };
-        let fitted = fit_fields(detail_fields(&row, &display, 2_000), 20);
+        let fitted = fit_fields(
+            detail_fields(&row, &display, 2_000, TitleEcho::default()),
+            20,
+        );
         assert!(!fitted.iter().any(|field| field.id == FieldId::Plugin));
         assert!(fitted.iter().any(|field| field.id == FieldId::Branch));
     }

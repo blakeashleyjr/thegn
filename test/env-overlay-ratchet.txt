@@ -522,6 +522,7 @@ ui.full_mode_chip
 ui.fullscreen_keep_masthead
 ui.fullscreen_keep_statusbar
 ui.language
+ui.sidebar_batch_group_min
 ui.sidebar_behind_badge
 ui.sidebar_commit_badge
 ui.sidebar_detail_branch

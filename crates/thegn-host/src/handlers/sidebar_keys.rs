@@ -593,8 +593,12 @@ impl SidebarState {
             // roster, so renaming, filing, pinning or deleting one has nothing
             // to write to.
             // The derived "Other" group of external worktrees is the same: a
-            // view-side grouping with no folder row to rename or delete.
-            RowKind::PipelineGroup | RowKind::PipelineLane | RowKind::OtherGroup => {
+            // view-side grouping with no folder row to rename or delete, and
+            // so is a derived batch row.
+            RowKind::PipelineGroup
+            | RowKind::PipelineLane
+            | RowKind::OtherGroup
+            | RowKind::BatchGroup => {
                 entries.push(e(
                     "toggle",
                     "Collapse / expand",

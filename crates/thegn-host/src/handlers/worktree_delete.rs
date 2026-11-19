@@ -449,6 +449,7 @@ pub(crate) fn hide_pending_deletes(
                 crate::sidebar::RowKind::Folder
                     | crate::sidebar::RowKind::PipelineLane
                     | crate::sidebar::RowKind::OtherGroup
+                    | crate::sidebar::RowKind::BatchGroup
             )
         {
             parent.child_count = parent.child_count.saturating_sub(1);
