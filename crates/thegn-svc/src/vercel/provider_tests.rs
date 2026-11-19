@@ -519,11 +519,12 @@ async fn destroy_confirms_absence_before_forgetting() {
     let ledger = tempfile::tempdir().unwrap();
     registry::write_at(ledger.path(), &ledger_record(NAME, "ready")).unwrap();
     let fake = Arc::new(FakeApi::default());
-    let mut gets = fake.gets.lock().unwrap();
-    gets.push_back(Some(tagged(NAME, &controller)));
-    gets.push_back(Some(tagged(NAME, &controller)));
-    gets.push_back(None);
-    drop(gets);
+    {
+        let mut gets = fake.gets.lock().unwrap();
+        gets.push_back(Some(tagged(NAME, &controller)));
+        gets.push_back(Some(tagged(NAME, &controller)));
+        gets.push_back(None);
+    }
 
     provider(&fake, ledger.path(), 2)
         .destroy(NAME)
