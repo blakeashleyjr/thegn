@@ -19,6 +19,7 @@ pub const CONVERT_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 pub const INCREMENTAL_STEPS_PER_PASS: u32 = 16;
 pub(crate) const DISPATCH_TERMINAL_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_RECLAIM_BYTES: u64 = 8 * 1024 * 1024;
+const CHECKPOINT_BUSY: Duration = Duration::from_millis(100);
 const TERMINAL_DISPATCH_STATUSES: [AgentDispatchStatus; 4] = [
     AgentDispatchStatus::Merged,
     AgentDispatchStatus::Abandoned,
@@ -400,32 +401,39 @@ impl Db {
     /// succeeded (the WAL file is then empty).
     pub fn checkpoint_truncate(&self) -> Result<bool> {
         let conn = self.conn();
-        let truncated = match checkpoint_wal(conn) {
-            Ok(()) => true,
-            Err(error) => {
-                let busy = match error.downcast_ref::<SqlError>() {
-                    // `checkpoint_wal`'s own "could not acquire the lock" result.
-                    None => true,
-                    Some(SqlError::SqliteFailure(code, _)) => matches!(
-                        code.code,
-                        ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
-                    ),
-                    Some(_) => false,
-                };
-                if !busy {
-                    return Err(error);
-                }
-                tracing::debug!(%error, "WAL TRUNCATE checkpoint busy; falling back to PASSIVE");
-                false
-            }
-        };
-        if !truncated {
-            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(map_busy)?;
+        if let Err(error) = conn.busy_timeout(CHECKPOINT_BUSY) {
+            tracing::debug!(%error, "could not shorten the checkpoint busy timeout");
         }
-        Ok(truncated)
+        let outcome: Result<bool> = (|| {
+            let truncated = match checkpoint_wal(conn) {
+                Ok(()) => true,
+                Err(error) => {
+                    let busy = match error.downcast_ref::<SqlError>() {
+                        // `checkpoint_wal`'s own "could not acquire the lock" result.
+                        None => true,
+                        Some(SqlError::SqliteFailure(code, _)) => matches!(
+                            code.code,
+                            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                        ),
+                        Some(_) => false,
+                    };
+                    if !busy {
+                        return Err(error);
+                    }
+                    tracing::debug!(%error, "WAL TRUNCATE checkpoint busy; falling back to PASSIVE");
+                    false
+                }
+            };
+            if !truncated {
+                conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(map_busy)?;
+            }
+            Ok(truncated)
+        })();
+        restore_busy_timeout(conn);
+        outcome
     }
 }
 

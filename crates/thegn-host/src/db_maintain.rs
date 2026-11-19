@@ -692,6 +692,7 @@ mod tests {
     #[test]
     fn gate_waits_for_the_first_delay_after_arm_then_the_interval() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _state = crate::testenv::IsolatedState::new();
         let (_dir, db) = temp_db();
         let state = PassState::new();
         // Not before arm, however late.
@@ -712,6 +713,7 @@ mod tests {
     #[test]
     fn held_maintenance_lock_defers_the_pass_one_interval() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _state = crate::testenv::IsolatedState::new();
         let (dir, db) = temp_db();
         gone_entity(&db, "locked-entity");
         let path = dir.path().join("locks/db-maintain.lock");
@@ -750,15 +752,11 @@ mod tests {
         );
         drop(holder);
         assert!(maintenance_lock_at_within(&path, Duration::from_millis(50)).is_ok());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        if let Some(mode) = thegn_core::fsperm::mode_bits(&path).unwrap() {
             assert_eq!(mode & 0o077, 0, "lock file must be owner-only");
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn maintenance_lock_refuses_a_symlink() {
         let _guard = TEST_LOCK.lock().unwrap();
@@ -766,13 +764,16 @@ mod tests {
         let target = dir.path().join("elsewhere");
         std::fs::write(&target, b"").unwrap();
         let path = dir.path().join("db-maintain.lock");
-        std::os::unix::fs::symlink(&target, &path).unwrap();
+        if crate::platform::symlink_file_for_test(&target, &path).is_err() {
+            return;
+        }
         assert!(try_lock_at(&path).is_err());
     }
 
     #[test]
     fn armed_round_prunes_orphan_semantic_rows() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _state = crate::testenv::IsolatedState::new();
         let (_dir, db) = temp_db();
         gone_entity(&db, "armed-entity");
         assert!(round(&db, &armed_state(), DUE));
@@ -782,6 +783,7 @@ mod tests {
     #[test]
     fn semantic_prune_rests_after_a_wrap() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _state = crate::testenv::IsolatedState::new();
         let (_dir, db) = temp_db();
         let state = armed_state();
         // An empty table wraps on the first slice.
@@ -1015,6 +1017,7 @@ mod tests {
     #[test]
     fn armed_round_prunes_removed_worktree_read_notifications() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _state = crate::testenv::IsolatedState::new();
         let (dir, db) = temp_db();
         let gone = dir.path().join("gone").to_string_lossy().into_owned();
         let read_id = db
