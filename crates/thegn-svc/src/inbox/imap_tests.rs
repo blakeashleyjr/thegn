@@ -4,7 +4,7 @@
 
 use super::*;
 use thegn_core::config::InboxKind;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 
 const PASSWORD: &str = "hunter2-b163-sentinel";
