@@ -1654,6 +1654,10 @@ _The multi-wave programme that makes sandbox and egress reporting truthful, adds
 - [~] 768. Sandboxed merge gate (THE-2200) _(`[merge_queue] gate_sandbox = "sealed"` runs the gate, setup and regenerate commands in the sealed sandbox, network none; any failure to seal holds the land; unattended merge stays off unless set; overlaps 763 and WS02-P5-08; not yet verified live; openspec `add-sandboxed-merge-gate`)_
 - [~] 769. Lead headless producers (THE-2208) _(`[daemon] headless_producers`: tracker, PR, mention and PR-queue producers in the daemon under leases, schema v114, `thegn lead login`; not yet verified live; openspec `add-lead-headless-producers`)_
 
+### BC. Jobs and hosted execution
+
+- [ ] 764. Add bounded Jobs alongside Sessions. Ship local execution, then SSH and Fly against the public contract. The separately released hosted service consumes that contract after the OSS portability gate. See the [architecture and delivery gates](docs/rfcs/jobs.md) and [draft v0 spec](docs/rfcs/job-spec-v0.md). Coordinate launch admission, providers and remote workers with BB 763.
+
 ### AI-free mode (audience-widener)
 
 - [~] 511. AI-free mode — run as a pure terminal workspace/worktree manager, no agents/proxy/LLM
