@@ -19,11 +19,11 @@ fn clean(value: &str) -> String {
 }
 
 fn clean_basename(value: &str) -> String {
-    let trimmed = value.trim_end_matches(|c| c == '/' || c == '\\');
+    let trimmed = value.trim_end_matches(['/', '\\']);
     let basename = std::path::Path::new(trimmed)
         .file_name()
         .and_then(|name| name.to_str())
-        .or_else(|| trimmed.rsplit(|c| c == '/' || c == '\\').next())
+        .or_else(|| trimmed.rsplit(['/', '\\']).next())
         .unwrap_or("");
     clean(basename)
 }
@@ -126,18 +126,18 @@ pub(crate) fn json(cfg: &Config) -> serde_json::Value {
         thegn_core::util::now(),
         &journal,
     );
-    if let Some(error) = journal_error {
-        if let Some(rows) = rows.as_array_mut() {
-            for row in rows.iter_mut() {
-                if row.get("env").is_some() {
-                    row["sync_journal_error"] = serde_json::Value::String(error.clone());
-                }
+    if let Some(error) = journal_error
+        && let Some(rows) = rows.as_array_mut()
+    {
+        for row in rows.iter_mut() {
+            if row.get("env").is_some() {
+                row["sync_journal_error"] = serde_json::Value::String(error.clone());
             }
-            rows.push(serde_json::json!({
-                "warning": "sync journal unavailable",
-                "sync_journal_error": error,
-            }));
         }
+        rows.push(serde_json::json!({
+            "warning": "sync journal unavailable",
+            "sync_journal_error": error,
+        }));
     }
     rows
 }
@@ -552,6 +552,7 @@ mod tests {
 
     #[test]
     fn doctor_lists_failed_sync_entries_for_their_env() {
+        let _state = IsolatedState::new();
         let cfg = cfg_with("sprites");
         let journal = [journal_entry(
             "/private/worktrees/remote-one",
@@ -575,6 +576,7 @@ mod tests {
 
     #[test]
     fn doctor_ignores_entries_for_other_envs() {
+        let _state = IsolatedState::new();
         let mut cfg = cfg_with("sprites");
         let mut other = thegn_core::config::EnvConfig {
             placement: thegn_core::config::PlacementMode::Provider,
@@ -590,13 +592,16 @@ mod tests {
 
         let out = json_with(&cfg, None, &[], 0, &journal);
 
-        for row in out.as_array().unwrap() {
-            assert_eq!(row["sync_pending"], serde_json::json!([]));
-        }
+        let rows = out.as_array().unwrap();
+        let remote = rows.iter().find(|row| row["env"] == "remote").unwrap();
+        assert_eq!(remote["sync_pending"], serde_json::json!([]));
+        let other = rows.iter().find(|row| row["env"] == "other").unwrap();
+        assert_eq!(other["sync_pending"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn doctor_rows_never_contain_paths_beyond_the_basename() {
+        let _state = IsolatedState::new();
         let cfg = cfg_with("sprites");
         let journal = [journal_entry(
             "/private/attacker/worktrees/remote-one",
