@@ -1956,9 +1956,9 @@ fn batch_right_cluster(
     for part in parts {
         let sep = seg(Tok::Slot(S::Ghost), format!(" {} ", gl.middot));
         let extra = if out.is_empty() {
-            part.width()
+            crate::seg::cells(&part.text)
         } else {
-            sep.width() + part.width()
+            crate::seg::cells(&sep.text) + crate::seg::cells(&part.text)
         };
         if seg_width(&out) + extra > avail {
             break;
@@ -2284,12 +2284,15 @@ fn compose_row_lines(
         // rollup marker, label and member count at its members' guide column;
         // the right cluster counts who needs you, who is working, who is done.
         // `row.active` is set by the fold pass when any member is the active
-        // worktree (`visible_index_of_active` keys on `RowKind::Worktree`, so
-        // the header carrying it is safe).
+        // worktree (`visible_index_of_active` skips `BatchGroup`).
         RowKind::BatchGroup => {
             let stats = row.group_stats.unwrap_or_default();
             let mut l = vec![sp(1), sp(3)];
-            l.extend(tree_lead(row.depth, is_last, guides));
+            // Open, the next row is its own member: close the connector when no
+            // later sibling at this depth follows (the guide bit for this level).
+            let closes =
+                is_last || (1..=8).contains(&row.depth) && guides & (1u8 << (row.depth - 1)) == 0;
+            l.extend(tree_lead(row.depth, closes, guides));
             l.push(seg(Tok::Slot(S::Faint), caret(row.collapsed)));
             l.push(sp(1));
             if matches!(stats.marker, ActivityState::None) {
@@ -4469,6 +4472,7 @@ mod tests {
                 ahead_base: Some(3),
                 ..BranchMeta::default()
             });
+            rows[index].disk_bytes = Some(1024);
         }
         let model = FrameModel {
             sidebar_rows: rows,
@@ -4645,17 +4649,20 @@ mod tests {
         use crate::sidebar::SidebarRow;
         let mut rows = vec![SidebarRow::base(RowKind::Workspace, 0, "ws", "ws")];
         for (i, d) in depths.iter().enumerate() {
-            rows.push(SidebarRow::base(
-                RowKind::Worktree,
-                *d,
-                format!("feat-{i}"),
-                "ws",
-            ));
+            let mut row = SidebarRow::base(RowKind::Worktree, *d, format!("feat-{i}"), "ws");
+            row.worktree_path = Some(format!("/w/feat-{i}"));
+            row.disk_bytes = Some(1024);
+            rows.push(row);
         }
         let mut model = FrameModel {
             sidebar_rows: rows,
             ..FrameModel::default()
         };
+        for i in 0..depths.len() {
+            model
+                .sidebar_window_titles
+                .insert(format!("/w/feat-{i}"), format!("title {i}"));
+        }
         model.sidebar_display = SidebarDisplay {
             focus_detail: thegn_core::config::FocusDetail::All,
             detail_when: thegn_core::config::DetailWhen::Always,
@@ -4744,8 +4751,14 @@ mod tests {
         let model = FrameModel {
             sidebar_rows: vec![
                 SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
-                SidebarRow::base(RowKind::Worktree, 1, "feat-0", "ws"),
-                SidebarRow::base(RowKind::Worktree, 1, "feat-1", "ws"),
+                SidebarRow {
+                    disk_bytes: Some(1024),
+                    ..SidebarRow::base(RowKind::Worktree, 1, "feat-0", "ws")
+                },
+                SidebarRow {
+                    disk_bytes: Some(1024),
+                    ..SidebarRow::base(RowKind::Worktree, 1, "feat-1", "ws")
+                },
             ],
             sidebar_selected: 1,
             sidebar_display: SidebarDisplay {
@@ -5007,6 +5020,50 @@ mod tests {
             assert!(!c.trim().is_empty(), "line {i} breaks the guide: {col4:?}");
         }
         assert_eq!(show_more, crate::caps::active_glyphs().tree_corner);
+    }
+
+    #[test]
+    fn the_last_open_batch_closes_with_a_corner() {
+        use crate::sidebar::{SidebarRow, fold::GroupStats};
+        let batch = SidebarRow {
+            collapsed: false,
+            child_count: 2,
+            group_stats: Some(GroupStats {
+                lanes: 2,
+                ..GroupStats::default()
+            }),
+            ..SidebarRow::base(RowKind::BatchGroup, 1, "b161", "ws")
+        };
+        let member = |name: &str| SidebarRow {
+            batch_prefix: Some("tg/b161-".into()),
+            ..SidebarRow::base(RowKind::Worktree, 2, format!("tg/b161-{name}"), "ws")
+        };
+        let model = FrameModel {
+            sidebar_rows: vec![
+                SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
+                SidebarRow::base(RowKind::Worktree, 1, "feat-a", "ws"),
+                batch,
+                member("spine"),
+                member("view"),
+            ],
+            ..FrameModel::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let mut s = Surface::new(40, 30);
+        draw_sidebar(&mut s, rect, &model);
+        let frame = build_sidebar(&model, rect, 0);
+        let p = frame
+            .rows
+            .iter()
+            .find(|p| p.visible_index == 2)
+            .expect("batch row painted");
+        let cell = s.screen_cells()[p.y + p.lead_gap][4].str().to_string();
+        assert_eq!(cell, crate::caps::active_glyphs().tree_corner);
     }
 
     #[test]
