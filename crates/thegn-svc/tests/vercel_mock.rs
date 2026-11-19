@@ -580,6 +580,36 @@ fn run_wait_relays_stdout_drops_stderr_and_reports_the_exit() {
 }
 
 #[test]
+fn run_wait_with_stderr_keeps_the_sanitized_tail() {
+    let mock = Mock::start(|_| Reply::ndjson(&[err_line("\u{1b}[31mred\n"), exit(3)]));
+    let (code, output, stderr) = rt()
+        .block_on(
+            mock.client()
+                .run_wait_with_stderr("sess_1", &serde_json::json!({}), 1024),
+        )
+        .expect("run_wait_with_stderr");
+    assert_eq!(code, 3);
+    assert!(output.is_empty());
+    assert_eq!(stderr, "[31mred\n");
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn run_wait_with_stderr_caps_at_8_kib() {
+    let first = "a".repeat(8 * 1024);
+    let mock = Mock::start(move |_| Reply::ndjson(&[err_line(&first), err_line("bc"), exit(1)]));
+    let (_, _, stderr) = rt()
+        .block_on(
+            mock.client()
+                .run_wait_with_stderr("sess_1", &serde_json::json!({}), 1024),
+        )
+        .expect("run_wait_with_stderr");
+    assert_eq!(stderr.len(), 8 * 1024);
+    assert_eq!(stderr, format!("{}bc", "a".repeat(8 * 1024 - 2)));
+    mock.assert_custody(&[]);
+}
+
+#[test]
 fn run_wait_keeps_only_the_last_out_cap_bytes() {
     let mock = Mock::start(|_| Reply::ndjson(&[out("abcdef"), out("ghij"), exit(0)]));
     let (code, output) = rt()
