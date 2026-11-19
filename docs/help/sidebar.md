@@ -198,36 +198,112 @@ project: `[project.<slug>] worktree_roots = ["~/agent-worktrees"]`.
 ## Long groups: show more
 
 A group with many entries is cut to its first rows and closed by one
-highlighted toggle row at the group's indent:
+highlighted toggle row at the group's indent, which also closes the group's
+guide line:
 
 ```
-  ▾ ▪ wip (20)
-      ├ feature-01
-      …
-      └ feature-15
-        … show 5 more
+  v wip (20)
+      |- feature-01
+      |- feature-02
+      ...
+      |- feature-07
+      +- ... show 13 more
 ```
 
-`↵`, `Space` or a click on that row expands the group, and the row then reads
-`show fewer`; the cursor stays on it either way. The choice is remembered per
-group across restarts. Groups are a project's own worktree rows, each folder,
-the Other group, the `Pipelines` folder and each pipeline lane.
+`Enter`, `Space` or a click on that row expands the group, and the row then
+reads `show fewer`; the cursor stays on it either way. The choice is
+remembered per group across restarts. Groups are a project's own worktree
+rows, each folder, the Other group, the `Pipelines` folder and each pipeline
+lane.
 
-- Pinned rows and the worktree you are in are never hidden. They count toward
-  the limit, so a pinned or active row past it takes the place of the last
-  unpinned one.
+- Protected rows are never hidden: the worktree you are in, the row under
+  the sidebar cursor, pinned rows, rows that need you (blocked attention or a
+  failed run) and any batch row that holds one of these. They count toward the
+  limit, so a protected row past it takes the place of the last unprotected
+  one. A row that finished unread is not protected.
+- Everything else folds from the tail, in display order.
+- An open batch row is not limited: it shows every lane it holds.
 - While a `/` filter is active nothing is truncated: every match shows.
 - The toggle row cannot be pinned, marked, dragged or filed, and has no menu.
 
 Two `[ui]` settings in [[config-reference]] set the limit:
 
-- `sidebar_group_row_limit` — entries a group shows before the toggle
-  (default `15`); `0` turns truncation off.
-- `sidebar_group_row_limits` — per-group overrides keyed by the group's label
+- `sidebar_group_row_limit` - entries a group shows before the toggle
+  (default `7`); `0` turns truncation off.
+- `sidebar_group_row_limits` - per-group overrides keyed by the group's label
   (a folder name, the Other label, a project name):
   `sidebar_group_row_limits = { Other = 5, "agents wip" = 0 }`. `0` turns it
   off for that group alone. Overrides match by group label across all
   workspaces, so same-named folders in different workspaces share one.
+
+## Batch rows
+
+Agent lanes fold harder than ordinary worktrees. A loose worktree belongs to
+a batch when its label carries a batch token: take the part after the last
+`/`, up to the first `-`; it must be one to three letters followed by one to
+six digits, and a `-` must follow. So `tg/b158-config-dir-env` belongs to
+batch `b158`, while `tg/hardy-onyx`, `main` and `the-2060-x` belong to none.
+Pinned worktrees never join a batch.
+
+When at least `sidebar_batch_group_min` worktrees share a token (default `2`;
+`0` turns batch rows off) they fold into one row:
+
+```
+  v app
+      |- home
+      |- b163 (3)   1 needs you
+      |  |- spine
+      |  |- view
+      |  +- docs
+      +- b158 (2)
+```
+
+- The row is collapsed by default. `Enter`, `Left`/`Right` or a click opens
+  it, and the choice is remembered per batch. It also renders open while it
+  holds the worktree you are in.
+- Batch rows come after the single loose rows, newest first (the number
+  descending, then the token). Members keep the workspace sort order and show
+  their name without the batch prefix, so `tg/b161-b161-spine` reads `spine`.
+- A batch row counts as one entry toward its parent's row limit. It cannot be
+  pinned, marked, dragged, filed or renamed. A `/` filter reveals its matches
+  like a folder.
+- The label is bold when any member needs you and in the focus colour when it
+  holds the active worktree. The count `(N)` is faint. The right side reads
+  `N needs you` (`N need you` when more than one), `N active` and `N done`,
+  clipped from the right in that priority order.
+
+## One line when the second adds nothing
+
+A worktree row's second line (branch, commits, PR, upstream) drops anything
+the title line already says:
+
+- the branch, when it equals the title;
+- the commit count, when the title shows commit or behind-base badges;
+- the PR, when the title shows the PR chip;
+- the upstream, when the title shows ahead/behind.
+
+If nothing is left the row is one line. A title counter is never repeated on
+the second line either.
+
+## Names, markers and the guide
+
+The worktree name is toned by state, from strongest to quietest:
+
+| State                                     | Name              |
+| ----------------------------------------- | ----------------- |
+| the worktree you are in                   | focus colour      |
+| needs you (blocked or failed)             | normal text, bold |
+| working, loading, finished unread, cursor | normal text       |
+| seen or idle                              | dim               |
+
+The marker glyph in front of the name carries the same state, so it reads
+without colour: the glyph set differs per state, and needs-you is also the
+only bold name. In the ASCII tier the markers are ASCII characters.
+
+The tree guide is one continuous line. Ancestor pipes are drawn through
+two-line rows, batch rows and the toggle row, and the toggle row closes the
+group with a corner (`+` in ASCII). Folder, Other and `Pipelines` headers keep
+their own layout and interrupt the line, since they open a new section.
 
 ## Pipeline lanes
 
