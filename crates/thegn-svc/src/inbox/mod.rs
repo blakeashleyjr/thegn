@@ -7,9 +7,11 @@
 //! path, queued). Everything a backend returns is untrusted; the daemon's
 //! producer passes it through `thegn_core::inbox::sanitize_item`.
 //!
-//! The error type, its classes and the probes are full; the backends are
-//! stubs that fail closed (filled by b163 lane 4).
+//! Three kinds are implemented, each in its own module: `command`,
+//! `todoist` and `imap`. Their secret refs are resolved at fetch time, never
+//! at construction. The reserved kinds fail closed as `NotConfigured`.
 
+pub mod command;
 pub mod imap;
 pub mod imap_proto;
 mod todoist;
@@ -121,16 +123,16 @@ pub trait InboxBackend: Send + Sync {
     }
 }
 
-/// The backend for `account`. A reserved kind is `NotConfigured`. Stub: the
-/// implemented kinds are not built yet (filled by b163 lane 4).
+/// The backend for `account`. A reserved kind is `NotConfigured`; an
+/// implemented kind whose account is unusable as written is an error too.
 pub fn backend_for(account: &InboxAccount) -> Result<Box<dyn InboxBackend>, InboxError> {
     if account.kind.is_reserved() {
         return Err(InboxError::NotConfigured);
     }
     match account.kind {
+        InboxKind::Command => Ok(Box::new(command::CommandBackend::new(account))),
         InboxKind::Todoist => Ok(Box::new(todoist::TodoistBackend::new(account)?)),
         InboxKind::Imap => Ok(Box::new(imap::ImapBackend::from_account(account)?)),
-        InboxKind::Command => Err(InboxError::Unsupported("inbox backends (b163 lane 4)")),
         InboxKind::Gmail | InboxKind::Jmap | InboxKind::Outlook | InboxKind::Slack => {
             Err(InboxError::NotConfigured)
         }
@@ -138,7 +140,8 @@ pub fn backend_for(account: &InboxAccount) -> Result<Box<dyn InboxBackend>, Inbo
 }
 
 /// One probe per `[[inbox.accounts]]` entry (none when the section has no
-/// accounts). Cheap: a `which` for a command, nothing for the network kinds.
+/// accounts). Cheap and offline: a `which` for a command, a config and
+/// secret-ref shape check for the network kinds.
 pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     cfg.inbox
         .accounts
@@ -149,21 +152,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
                 return ProbeReport::reserved("inbox", &id);
             }
             let report = match account.kind {
-                InboxKind::Command => {
-                    let bin = account.command.first().cloned().unwrap_or_default();
-                    let availability = if bin.trim().is_empty() {
-                        Availability::Unavailable("no command configured".into())
-                    } else if bin.contains('/') {
-                        if std::path::Path::new(&bin).exists() {
-                            Availability::Ready
-                        } else {
-                            Availability::Unavailable(format!("command not found: {bin}"))
-                        }
-                    } else {
-                        crate::seam::registry::binary_availability(&bin)
-                    };
-                    ProbeReport::new("inbox", id, availability)
-                }
+                InboxKind::Command => command::probe(account),
                 InboxKind::Todoist => {
                     let parsed = thegn_core::secretref::SecretRef::parse(
                         &account.token,
@@ -178,8 +167,9 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
                         .note(format!("filter: {}", account.filter))
                 }
                 InboxKind::Imap => imap::probe(account, id),
-                _ => ProbeReport::new("inbox", id, Availability::Ready)
-                    .note("network provider; not probed offline"),
+                InboxKind::Gmail | InboxKind::Jmap | InboxKind::Outlook | InboxKind::Slack => {
+                    ProbeReport::reserved("inbox", &id)
+                }
             };
             let report = report.with_caps(&InboxCaps::default());
             match (cfg.inbox.enabled, account.enabled) {
@@ -218,12 +208,12 @@ mod tests {
                 "{kind:?}"
             );
         }
-        for kind in [InboxKind::Command, InboxKind::Imap] {
-            assert!(
-                backend_for(&account("x", kind)).is_err(),
-                "stubs fail closed"
-            );
-        }
+        assert!(
+            backend_for(&account("x", InboxKind::Imap)).is_err(),
+            "an imap account with no host fails closed"
+        );
+        assert!(backend_for(&account("x", InboxKind::Command)).is_ok());
+        assert!(backend_for(&account("x", InboxKind::Todoist)).is_ok());
     }
 
     #[test]
