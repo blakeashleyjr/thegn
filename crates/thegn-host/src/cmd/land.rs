@@ -606,6 +606,8 @@ fn persist_landed_row(
         result_oid: Some(result_oid),
         conflict_paths: None,
         error_detail: None,
+        // A raw land has no gated plan.
+        provenance: None,
     };
     match db.persist_merge_outcome(observed, &outcome)? {
         MergeOutcomeWrite::Written => Ok(()),

@@ -196,6 +196,14 @@ impl MergeOutcomeOperation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandedProvenance<'a> {
+    /// The exact source tip that was gated and folded (40 or 64 lowercase hex).
+    pub source_oid: &'a str,
+    /// The target OID the landing replaced, when known.
+    pub target_base_oid: Option<&'a str>,
+}
+
 /// Complete replacement of the outcome columns. `None` means SQL NULL, unlike
 /// `update_merge_status`. Finalization preserves an existing row's nomination
 /// time and attempt budget; it is not an enqueue/retry gesture. The operation
@@ -215,6 +223,7 @@ pub struct MergeFinalOutcome<'a> {
     pub result_oid: Option<&'a str>,
     pub conflict_paths: Option<&'a str>,
     pub error_detail: Option<&'a str>,
+    pub provenance: Option<LandedProvenance<'a>>,
 }
 
 /// Result of removing one PR-queue row.
