@@ -2022,12 +2022,12 @@ command = "git diff"
 #                              #   because an absolute total is permanently red on a machine
 #                              #   with many worktrees — and a permanently-red threshold says
 #                              #   nothing.
-# scan_interval_secs = 45      # per-worktree size TTL; also drives the scan cadence (the
-#                              #   scanner pumps at a quarter of this so a bounded round still
-#                              #   sweeps everything). Runs off the event loop, cached in the DB.
-# max_scan_per_round = 4       # worktrees `du`d per pump. The active worktree and any
-#                              #   never-measured one go first, so a freshly created worktree
-#                              #   never queues behind stale multi-GB re-measurements. 0 = all.
+# scan_interval_secs = 45      # per-worktree size TTL; also drives the pump cadence. The active
+#                              #   worktree's `du` runs at most once per 120 s. Runs off the event
+#                              #   loop, cached in the DB; the lane idles between sweeps.
+# max_scan_per_round = 4       # worktrees `du`d per pump (walks, not rows examined: the examine
+#                              #   budget adapts to the registry). The active worktree and any
+#                              #   never-measured one go first. 0 = all.
 # auto_clean_on_merge = true   # `cargo clean` a worktree's target/ when its PR merges
 #                              #   (checkout kept; active worktree + running builds skipped)
 # clean_on_pr_closed = false   # also clean when a PR is closed without merging
@@ -2070,11 +2070,12 @@ command = "git diff"
 [loc]
 # enabled = true               # count lines of code. false hides the LOC chip, its detail
 #                              #   table and the Files-footer count, and runs no tokei walk.
-# scan_interval_secs = 900     # per-worktree re-count TTL; the scanner pumps at a quarter of
-#                              #   this so a bounded round still sweeps every worktree.
-# max_scan_per_round = 2       # worktrees counted per pump. tokei walks the whole tree, so a
-#                              #   bounded round keeps one background permit from being held
-#                              #   for minutes on a large registry. 0 = all.
+# scan_interval_secs = 900     # re-count TTL for the ACTIVE worktree (also the pump cadence).
+#                              #   Background worktrees are re-counted only when their git state
+#                              #   moved (root mtime, HEAD, index), never on the TTL alone.
+# max_scan_per_round = 2       # tokei walks per pump (not rows examined: that budget adapts to
+#                              #   the registry size). tokei walks the whole tree, so a bounded
+#                              #   round keeps one permit from being held for minutes. 0 = all.
 # watch_invalidate_secs = 60   # editing the ACTIVE worktree lets the diff filesystem watcher
 #                              #   jump the TTL above and recount it — but no more often than
 #                              #   this, so a save storm can't re-walk the tree continuously.
