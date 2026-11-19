@@ -117,7 +117,8 @@ pub fn backend_for(account: &InboxAccount) -> Result<Box<dyn InboxBackend>, Inbo
         return Err(InboxError::NotConfigured);
     }
     match account.kind {
-        InboxKind::Command | InboxKind::Todoist | InboxKind::Imap => {
+        InboxKind::Command => Ok(Box::new(command::CommandBackend::new(account))),
+        InboxKind::Todoist | InboxKind::Imap => {
             Err(InboxError::Unsupported("inbox backends (b163 lane 4)"))
         }
         InboxKind::Gmail | InboxKind::Jmap | InboxKind::Outlook | InboxKind::Slack => {
@@ -138,21 +139,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
                 return ProbeReport::reserved("inbox", &id);
             }
             let report = match account.kind {
-                InboxKind::Command => {
-                    let bin = account.command.first().cloned().unwrap_or_default();
-                    let availability = if bin.trim().is_empty() {
-                        Availability::Unavailable("no command configured".into())
-                    } else if bin.contains('/') {
-                        if std::path::Path::new(&bin).exists() {
-                            Availability::Ready
-                        } else {
-                            Availability::Unavailable(format!("command not found: {bin}"))
-                        }
-                    } else {
-                        crate::seam::registry::binary_availability(&bin)
-                    };
-                    ProbeReport::new("inbox", id, availability)
-                }
+                InboxKind::Command => command::probe(account),
                 _ => ProbeReport::new("inbox", id, Availability::Ready)
                     .note("network provider; not probed offline"),
             };
@@ -193,12 +180,13 @@ mod tests {
                 "{kind:?}"
             );
         }
-        for kind in [InboxKind::Command, InboxKind::Todoist, InboxKind::Imap] {
+        for kind in [InboxKind::Todoist, InboxKind::Imap] {
             assert!(
                 backend_for(&account("x", kind)).is_err(),
                 "stubs fail closed"
             );
         }
+        assert!(backend_for(&account("x", InboxKind::Command)).is_ok());
     }
 
     #[test]

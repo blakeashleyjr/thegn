@@ -273,6 +273,7 @@ struct ItemSink {
     /// Uncapped count of non-JSON lines (`junk` keeps only a few, scrubbed).
     junk_lines: usize,
     error: Option<InboxError>,
+    retained: usize,
 }
 
 impl ItemSink {
@@ -289,6 +290,7 @@ impl ItemSink {
             junk: Vec::new(),
             junk_lines: 0,
             error: None,
+            retained: 0,
         }
     }
 
@@ -342,6 +344,13 @@ impl ItemSink {
                 "command sent more than {MAX_SEEN} removed ids"
             )));
         }
+        self.retained = self.retained.saturating_add(text.len());
+        if self.retained > proc::MAX_RUN_BYTES {
+            return Err(InboxError::Parse(format!(
+                "command output exceeded {} bytes",
+                proc::MAX_RUN_BYTES
+            )));
+        }
         self.items
             .extend(params.items.into_iter().map(InboxItem::from));
         self.removed.extend(params.removed);
@@ -360,8 +369,8 @@ impl ItemSink {
                     .unwrap_or_default();
                 tracing::debug!(
                     target: TARGET,
-                    level = self.scrub.scrub(p.level.as_deref().unwrap_or("info")),
-                    message = self.scrub.scrub(p.message.as_deref().unwrap_or_default()),
+                    level = ?self.scrub.scrub(p.level.as_deref().unwrap_or("info")),
+                    text = ?self.scrub.scrub(p.message.as_deref().unwrap_or_default()),
                     "inbox command log"
                 );
                 Ok(())
@@ -562,7 +571,7 @@ fn finish(run: StreamRun<ItemSink>, resumed: bool) -> Result<InboxPage, InboxErr
     for j in &sink.junk {
         tracing::warn!(
             target: TARGET,
-            line = %j,
+            line = ?j,
             "inbox command wrote a non-JSON line to stdout — diagnostics belong on stderr or in a `log` message"
         );
     }
