@@ -23,7 +23,7 @@ fn covers_login_runtime_dir(path: &Path) -> bool {
     Path::new("/run/user").starts_with(path) || path.starts_with("/run/user")
 }
 
-fn covers_mounts(input: &ExposureInput<'_>) -> Vec<(&str, &str)> {
+fn covers_mounts<'a>(input: &ExposureInput<'a>) -> Vec<(&'a str, &'a str)> {
     input
         .mounts
         .iter()
