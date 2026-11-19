@@ -368,6 +368,7 @@ fn outcome_retry_and_claim_preserve_the_pair() {
                 result_oid: None,
                 conflict_paths: None,
                 error_detail: Some("retry me"),
+                provenance: None,
             },
         )
         .unwrap(),
