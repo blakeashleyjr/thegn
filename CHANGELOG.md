@@ -7,6 +7,12 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.96] — 2026-11-18
+
+### Added
+
+- `just devel` starts a separate dev instance from the checkout (own state and runtime under `~/.thegn-devel`, `THEGN_DIR`, and `~/.config/thegn-dev`), and `just devel-env` prints its environment. The new help page `two-instances` explains the setup and what the two instances still share.
+
 ## [0.1.0-alpha.95] — 2026-11-17
 
 ### Added
@@ -3860,7 +3866,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.96...HEAD
+[0.1.0-alpha.96]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...v0.1.0-alpha.96
 [0.1.0-alpha.95]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.94...v0.1.0-alpha.95
 [0.1.0-alpha.94]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.93...v0.1.0-alpha.94
 [0.1.0-alpha.93]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.92...v0.1.0-alpha.93

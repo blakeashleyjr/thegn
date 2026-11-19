@@ -1173,6 +1173,48 @@ start-dev name="dev": build
       "THEGN_CHANNEL=dev" \
       {{bin}}
 
+# Start the DEV instance: an isolated thegn built from this checkout, beside the
+# stable one. Own state, runtime, THEGN_DIR and config dir (~/.config/thegn-dev,
+# which you must seed yourself; secrets are never copied). See `thegn help two-instances`.
+devel: build
+    #!/usr/bin/env sh
+    set -eu
+    home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
+    [ -n "$home" ] || home="$HOME"
+    root="$home/.thegn-devel"; state="$root/state"; run="$root/run"; cfg="$home/.config/thegn-dev"
+    if [ ! -d "$cfg" ]; then
+      echo "just devel: $cfg does not exist; seed it first: cp -r '$home/.config/thegn' '$cfg' (review it for secrets)" >&2
+      exit 1
+    fi
+    pidfile="$run/thegn.pid"; mkdir -p "$state" "$run" "$root/home"
+    . "$PWD/test/lib/instance.sh"; INST_STATE="$state" inst_restart "$pidfile" $$ || exit 1
+    exec env \
+      "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
+      "XDG_STATE_HOME=$state" \
+      "XDG_RUNTIME_DIR=$run" \
+      "THEGN_DIR=$root/home" \
+      "THEGN_CONFIG_DIR=$cfg" \
+      "THEGN_NO_MIGRATE=1" \
+      "THEGN_CHANNEL=dev" \
+      "$PWD/{{bin}}"
+
+# Print the dev instance's environment as `export` lines (no side effects):
+# `eval "$(just devel-env)"` targets the dev instance with CLI calls.
+devel-env:
+    #!/usr/bin/env sh
+    set -eu
+    home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
+    [ -n "$home" ] || home="$HOME"
+    root="$home/.thegn-devel"
+    printf "export XDG_STATE_HOME='%s'\n" "$root/state"
+    printf "export XDG_RUNTIME_DIR='%s'\n" "$root/run"
+    printf "export THEGN_DIR='%s'\n" "$root/home"
+    printf "export THEGN_CONFIG_DIR='%s'\n" "$home/.config/thegn-dev"
+    printf "export THEGN_NO_MIGRATE='%s'\n" 1
+    printf "export THEGN_CHANNEL='%s'\n" dev
+    # THEGN_BIN is for scripts (the dev binary's absolute path); thegn itself does not read it.
+    printf "export THEGN_BIN='%s'\n" "$PWD/{{bin}}"
+
 # Headless terminal-capability matrix: run `thegn doctor` under a set of
 # degraded environments (each a clean `env -i`, so the outer terminal's
 # COLORTERM / TERM_PROGRAM can't leak in and mask a degradation) and assert the
@@ -1354,17 +1396,20 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
 # DB + binary and install, launch (the DB migrates on first start; `thegn
 # doctor` is captured to the recovery dir). Run from inside thegn it reopens
 # itself in a fresh ghostty window, since stopping thegn would kill this pane.
-# Only processes running this exact binary are signalled; anything else named
-# thegn blocks with its pid. Never overrides migration authority. See
-# docs/live-upgrades.md.
+# It installs to ~/.local/lib/thegn (override with --install-dir or
+# $THEGN_LIVE_INSTALL_DIR) and leaves any other installation, such as a dev
+# build, alone; only processes running the installed binary are signalled.
+# Extra flags after the three positionals (e.g. --relink-launchers,
+# --install-dir DIR) are passed to scripts/live.py. Never overrides migration
+# authority. See docs/live-upgrades.md.
 [positional-arguments]
-live level="info" size_mb="20" files="5":
-    python3 -B scripts/live.py --level "$1" --size-mb "$2" --files "$3"
+live level="info" size_mb="20" files="5" *flags:
+    a="$1"; b="$2"; c="$3"; shift 3; python3 -B scripts/live.py --level "$a" --size-mb "$b" --files "$c" "$@"
 
 # Read-only upgrade paths, source selection and constraints (no build/launch).
 [positional-arguments]
-live-plan level="info" size_mb="20" files="5":
-    python3 -B scripts/live.py --plan --level "$1" --size-mb "$2" --files "$3"
+live-plan level="info" size_mb="20" files="5" *flags:
+    a="$1"; b="$2"; c="$3"; shift 3; python3 -B scripts/live.py --plan --level "$a" --size-mb "$b" --files "$c" "$@"
 
 # Live Vercel Sandbox run (spends money; plan-only without flags). Not in ci/smoke.
 [positional-arguments]
