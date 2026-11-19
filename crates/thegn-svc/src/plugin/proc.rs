@@ -741,7 +741,8 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
                 Ok(true) => {
                     // A successful one-shot run also kills helpers left in its process group,
                     // matching gh_run; backgrounded helpers do not outlive the plugin run.
-                    let stragglers = thegn_proc::group_has_live_members(pid);
+                    let stragglers =
+                        super::platform::tracked_live_in_group(&tracked, pid as libc::pid_t);
                     #[cfg(unix)]
                     reader_deadline_ms.store(
                         started

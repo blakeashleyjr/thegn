@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_ARENA_MAX: i32 = 2;
 const IDLE_TRIM_DELAY: Duration = Duration::from_secs(10);
 const TRIM_MIN_INTERVAL: u64 = 30_000;
+const TRIM_MAX_INTERVAL: u64 = 3_600_000;
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 static LAST_TRIM_MS: AtomicU64 = AtomicU64::new(0);
@@ -63,7 +64,7 @@ struct TrimCounters {
     total_us: AtomicU64,
     max_us: AtomicU64,
     skipped_swap: AtomicU64,
-    last_scan_duration_us: AtomicU64,
+    last_duration_us: AtomicU64,
 }
 
 impl TrimCounters {
@@ -77,7 +78,7 @@ impl TrimCounters {
             total_us: AtomicU64::new(0),
             max_us: AtomicU64::new(0),
             skipped_swap: AtomicU64::new(0),
-            last_scan_duration_us: AtomicU64::new(0),
+            last_duration_us: AtomicU64::new(0),
         }
     }
 }
@@ -85,7 +86,7 @@ impl TrimCounters {
 #[derive(Clone, Copy)]
 struct TrimLimiter<'a> {
     last: &'a AtomicU64,
-    last_scan_duration_us: Option<&'a AtomicU64>,
+    last_duration_us: Option<&'a AtomicU64>,
     now_ms: u64,
     min_ms: u64,
 }
@@ -122,11 +123,16 @@ fn epoch_ms() -> u64 {
     epoch().elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
+/// Next trim not before last + clamp(last_duration_us * 1000 µs, 30 s, 1 h),
+/// for both causes. `duration_us * 1000` µs is `duration_us` ms.
+fn backoff_ms(last_duration_us: u64) -> u64 {
+    last_duration_us.clamp(TRIM_MIN_INTERVAL, TRIM_MAX_INTERVAL)
+}
+
 fn claim(limiter: TrimLimiter<'_>) -> bool {
     let adaptive_ms = limiter
-        .last_scan_duration_us
-        .map(|duration_us| duration_us.load(Ordering::Acquire).saturating_mul(200))
-        .map(|duration_us| duration_us.saturating_add(999) / 1_000)
+        .last_duration_us
+        .map(|duration_us| backoff_ms(duration_us.load(Ordering::Acquire)))
         .unwrap_or(0);
     let min_ms = limiter.min_ms.max(adaptive_ms);
     let mut previous = limiter.last.load(Ordering::Acquire);
@@ -171,8 +177,7 @@ fn try_trim_with_status(
     if !claim(limiter) {
         return false;
     }
-    if matches!(cause, TrimCause::ScanDrain)
-        && let Some(status) = read_memory_status()
+    if let Some(status) = read_memory_status()
         && should_skip_scan_trim(status.swap_kb, status.rss_kb)
     {
         counters.skipped_swap.fetch_add(1, Ordering::Relaxed);
@@ -180,7 +185,7 @@ fn try_trim_with_status(
             target: "thegn::mem",
             vm_swap_kb = status.swap_kb,
             vm_rss_kb = status.rss_kb,
-            "skipping scan trim while swap is elevated"
+            "skipping trim while swap is elevated"
         );
         return false;
     }
@@ -199,11 +204,7 @@ fn try_trim_with_status(
     counters.bytes.fetch_add(outcome.bytes, Ordering::Relaxed);
     counters.total_us.fetch_add(elapsed, Ordering::Relaxed);
     counters.max_us.fetch_max(elapsed, Ordering::Relaxed);
-    if matches!(cause, TrimCause::ScanDrain) {
-        counters
-            .last_scan_duration_us
-            .store(elapsed, Ordering::Release);
-    }
+    counters.last_duration_us.store(elapsed, Ordering::Release);
     true
 }
 
@@ -211,45 +212,61 @@ fn should_skip_scan_trim(swap_kb: u64, rss_kb: u64) -> bool {
     swap_kb > rss_kb / 4
 }
 
-/// Return freed pages when the loop has been idle, sharing a limiter with
-/// scan-drain trims. Called on idle wakes and adds no timer or wake source.
-pub fn trim_if_idle(last_activity: Instant) {
-    let _trimmed = trim_if_idle_with(
-        last_activity,
-        TrimLimiter {
-            last: &LAST_TRIM_MS,
-            last_scan_duration_us: None,
-            now_ms: epoch_ms(),
-            min_ms: TRIM_MIN_INTERVAL,
-        },
-        &TRIMS,
-        trim_now,
-    );
+/// Background trim worker: one named thread parked in `recv`; requests are
+/// dropped when one is already queued. No timer.
+fn trim_worker() -> Option<&'static std::sync::mpsc::SyncSender<TrimCause>> {
+    static WORKER: OnceLock<Option<std::sync::mpsc::SyncSender<TrimCause>>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            spawn_worker(|cause| {
+                let _trimmed = try_trim_with(
+                    cause,
+                    TrimLimiter {
+                        last: &LAST_TRIM_MS,
+                        last_duration_us: Some(&TRIMS.last_duration_us),
+                        now_ms: epoch_ms(),
+                        min_ms: TRIM_MIN_INTERVAL,
+                    },
+                    &TRIMS,
+                    trim_now,
+                );
+            })
+        })
+        .as_ref()
 }
 
-fn trim_if_idle_with(
-    last_activity: Instant,
-    limiter: TrimLimiter<'_>,
-    counters: &TrimCounters,
-    trim: impl FnOnce() -> Option<TrimOutcome>,
-) -> bool {
-    last_activity.elapsed() >= IDLE_TRIM_DELAY
-        && try_trim_with(TrimCause::Idle, limiter, counters, trim)
+fn spawn_worker(
+    handler: impl Fn(TrimCause) + Send + 'static,
+) -> Option<std::sync::mpsc::SyncSender<TrimCause>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TrimCause>(1);
+    thegn_core::thread_name::try_spawn_named("thegn-mem-trim", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        while let Ok(cause) = rx.recv() {
+            handler(cause);
+        }
+    })
+    .ok()
+    .map(|_| tx)
+}
+
+/// Return freed pages when the loop has been idle. The caller only checks
+/// the idle delay and queues a request; the limiter, swap check and trim run
+/// on the worker. Adds no timer or wake source.
+pub fn trim_if_idle(last_activity: Instant) {
+    if let Some(tx) = trim_worker() {
+        let _queued = trim_if_idle_with(last_activity, tx);
+    }
+}
+
+fn trim_if_idle_with(last_activity: Instant, tx: &std::sync::mpsc::SyncSender<TrimCause>) -> bool {
+    last_activity.elapsed() >= IDLE_TRIM_DELAY && tx.try_send(TrimCause::Idle).is_ok()
 }
 
 pub(crate) fn trim_after_scan_burst() {
     TRIMS.scan_drains.fetch_add(1, Ordering::Relaxed);
-    try_trim_with(
-        TrimCause::ScanDrain,
-        TrimLimiter {
-            last: &LAST_TRIM_MS,
-            last_scan_duration_us: Some(&TRIMS.last_scan_duration_us),
-            now_ms: epoch_ms(),
-            min_ms: TRIM_MIN_INTERVAL,
-        },
-        &TRIMS,
-        trim_now,
-    );
+    if let Some(tx) = trim_worker() {
+        let _queued = tx.try_send(TrimCause::ScanDrain);
+    }
 }
 
 pub(crate) fn alloc_stats() -> AllocStats {
@@ -308,7 +325,7 @@ pub(crate) fn record_test_idle_trim() {
         TrimCause::Idle,
         TrimLimiter {
             last: &limiter,
-            last_scan_duration_us: None,
+            last_duration_us: None,
             now_ms: 30_000,
             min_ms: TRIM_MIN_INTERVAL,
         },
@@ -346,26 +363,26 @@ mod tests {
         let last = AtomicU64::new(0);
         assert!(!claim(TrimLimiter {
             last: &last,
-            last_scan_duration_us: None,
+            last_duration_us: None,
             now_ms: 29_999,
             min_ms: 30_000
         }));
         assert!(claim(TrimLimiter {
             last: &last,
-            last_scan_duration_us: None,
+            last_duration_us: None,
             now_ms: 30_000,
             min_ms: 30_000
         }));
         assert_eq!(last.load(Ordering::Relaxed), 30_000);
         assert!(!claim(TrimLimiter {
             last: &last,
-            last_scan_duration_us: None,
+            last_duration_us: None,
             now_ms: 59_999,
             min_ms: 30_000
         }));
         assert!(claim(TrimLimiter {
             last: &last,
-            last_scan_duration_us: None,
+            last_duration_us: None,
             now_ms: 60_000,
             min_ms: 30_000
         }));
@@ -377,32 +394,32 @@ mod tests {
         let duration = AtomicU64::new(25_000);
         assert!(!claim(TrimLimiter {
             last: &last,
-            last_scan_duration_us: Some(&duration),
+            last_duration_us: Some(&duration),
             now_ms: 59_999,
             min_ms: TRIM_MIN_INTERVAL,
         }));
         assert!(claim(TrimLimiter {
             last: &last,
-            last_scan_duration_us: Some(&duration),
+            last_duration_us: Some(&duration),
             now_ms: 60_000,
             min_ms: TRIM_MIN_INTERVAL,
         }));
     }
 
     #[test]
-    fn slow_scan_trim_pushes_next_admission_to_two_hundred_sixty_seconds() {
+    fn slow_trim_pushes_next_admission_by_its_duration_in_ms() {
         let last = AtomicU64::new(30_000);
         let duration = AtomicU64::new(1_300_000);
         assert!(!claim(TrimLimiter {
             last: &last,
-            last_scan_duration_us: Some(&duration),
-            now_ms: 289_999,
+            last_duration_us: Some(&duration),
+            now_ms: 1_329_999,
             min_ms: TRIM_MIN_INTERVAL,
         }));
         assert!(claim(TrimLimiter {
             last: &last,
-            last_scan_duration_us: Some(&duration),
-            now_ms: 290_000,
+            last_duration_us: Some(&duration),
+            now_ms: 1_330_000,
             min_ms: TRIM_MIN_INTERVAL,
         }));
     }
@@ -417,7 +434,7 @@ mod tests {
                 std::thread::spawn(move || {
                     if claim(TrimLimiter {
                         last: &last,
-                        last_scan_duration_us: None,
+                        last_duration_us: None,
                         now_ms: 30_000,
                         min_ms: 30_000,
                     }) {
@@ -438,7 +455,7 @@ mod tests {
         let last = AtomicU64::new(0);
         let limiter = TrimLimiter {
             last: &last,
-            last_scan_duration_us: None,
+            last_duration_us: None,
             now_ms: 30_000,
             min_ms: 30_000,
         };
@@ -501,60 +518,68 @@ mod tests {
         assert!(
             counters.max_us.load(Ordering::Relaxed) <= counters.total_us.load(Ordering::Relaxed)
         );
-        assert!(counters.last_scan_duration_us.load(Ordering::Acquire) > 0);
+        assert!(counters.last_duration_us.load(Ordering::Acquire) > 0);
     }
 
     #[test]
-    fn trims_only_when_idle_and_not_too_often() {
+    fn backoff_ms_table() {
+        assert_eq!(backoff_ms(1_000), 30_000);
+        assert_eq!(backoff_ms(0), 30_000);
+        assert_eq!(backoff_ms(2_370_000), 2_370_000);
+        assert_eq!(backoff_ms(10_000_000), 3_600_000);
+    }
+
+    #[test]
+    fn idle_check_only_queues_and_never_trims_on_the_caller() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TrimCause>(1);
+        let before = TRIMS.idle.load(Ordering::Relaxed);
+        assert!(!trim_if_idle_with(Instant::now(), &tx), "recent activity");
+        assert!(rx.try_recv().is_err());
+        let idle = Instant::now() - Duration::from_secs(20);
+        assert!(trim_if_idle_with(idle, &tx));
+        assert!(!trim_if_idle_with(idle, &tx), "second request is dropped");
+        assert!(matches!(rx.try_recv(), Ok(TrimCause::Idle)));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(TRIMS.idle.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn worker_thread_is_named() {
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let tx = spawn_worker(move |_| {
+            let _ = name_tx.send(std::thread::current().name().map(str::to_owned));
+        })
+        .expect("spawn");
+        tx.send(TrimCause::Idle).unwrap();
+        let name = name_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(name.as_deref(), Some("thegn-mem-trim"));
+    }
+
+    #[test]
+    fn idle_trim_skips_elevated_swap() {
         let counters = TrimCounters::new();
         let last = AtomicU64::new(0);
-        let recent = Instant::now();
         let called = AtomicUsize::new(0);
-        let limiter = TrimLimiter {
-            last: &last,
-            last_scan_duration_us: None,
-            now_ms: 30_000,
-            min_ms: 30_000,
-        };
-        assert!(!trim_if_idle_with(recent, limiter, &counters, || {
-            called.fetch_add(1, Ordering::Relaxed);
-            Some(TrimOutcome {
-                released: false,
-                bytes: 0,
-            })
-        }));
-        assert_eq!(
-            called.load(Ordering::Relaxed),
-            0,
-            "recent activity must not trim"
-        );
-        let idle = Instant::now() - Duration::from_secs(20);
-        assert!(trim_if_idle_with(idle, limiter, &counters, || {
-            called.fetch_add(1, Ordering::Relaxed);
-            Some(TrimOutcome {
-                released: false,
-                bytes: 0,
-            })
-        }));
-        assert_eq!(called.load(Ordering::Relaxed), 1);
-        assert!(!trim_if_idle_with(
-            idle,
+        assert!(!try_trim_with_status(
+            TrimCause::Idle,
             TrimLimiter {
                 last: &last,
-                last_scan_duration_us: None,
-                now_ms: 59_999,
-                min_ms: 30_000,
+                last_duration_us: None,
+                now_ms: 30_000,
+                min_ms: TRIM_MIN_INTERVAL,
             },
             &counters,
+            || Some(crate::platform::proc::ProcessMemoryStatus {
+                swap_kb: 26,
+                rss_kb: 100,
+            }),
             || {
                 called.fetch_add(1, Ordering::Relaxed);
-                Some(TrimOutcome {
-                    released: false,
-                    bytes: 0,
-                })
+                None
             }
         ));
-        assert_eq!(called.load(Ordering::Relaxed), 1);
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.skipped_swap.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -575,7 +600,7 @@ mod tests {
             TrimCause::ScanDrain,
             TrimLimiter {
                 last: &last,
-                last_scan_duration_us: Some(&counters.last_scan_duration_us),
+                last_duration_us: Some(&counters.last_duration_us),
                 now_ms: 60_000,
                 min_ms: TRIM_MIN_INTERVAL,
             },
