@@ -1533,11 +1533,12 @@ fn passthrough_env_remote_drops_host_local_socket_vars() {
         env_passthrough: vec!["TG_TEST_TOK_42".into(), "SSH_AUTH_SOCK".into()],
         ..Default::default()
     };
-    // SAFETY: test-local env mutation with a unique key; restored below.
-    unsafe {
-        std::env::set_var("TG_TEST_TOK_42", "secret");
-        std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
-    }
+    // Guarded: restores the prior values (SSH_AUTH_SOCK is a real ambient var)
+    // and serialises against other env tests via ENV_LOCK.
+    let _env = crate::testenv::EnvGuard::set(&[
+        ("TG_TEST_TOK_42", "secret"),
+        ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+    ]);
     let remote = sb.passthrough_env_remote();
     assert!(
         remote.iter().any(|(k, _)| k == "TG_TEST_TOK_42"),
@@ -1553,10 +1554,6 @@ fn passthrough_env_remote_drops_host_local_socket_vars() {
             .iter()
             .any(|(k, _)| k == "SSH_AUTH_SOCK")
     );
-    unsafe {
-        std::env::remove_var("TG_TEST_TOK_42");
-        std::env::remove_var("SSH_AUTH_SOCK");
-    }
 }
 
 #[test]
@@ -1602,10 +1599,7 @@ fn passthrough_env_remote_normalizes_term() {
         env_passthrough: vec!["TERM".into()],
         ..Default::default()
     };
-    // SAFETY: test-local env mutation; restored below.
-    unsafe {
-        std::env::set_var("TERM", "xterm-ghostty");
-    }
+    let _env = crate::testenv::EnvGuard::set(&[("TERM", "xterm-ghostty")]);
     let remote = sb.passthrough_env_remote();
     assert!(
         remote
@@ -1613,9 +1607,6 @@ fn passthrough_env_remote_normalizes_term() {
             .any(|(k, v)| k == "TERM" && v == "xterm-256color"),
         "exotic host TERM normalized for the remote: {remote:?}"
     );
-    unsafe {
-        std::env::remove_var("TERM");
-    }
 }
 
 #[test]
