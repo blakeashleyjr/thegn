@@ -473,7 +473,8 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::wt::Action,
     },
-    /// Repo discovery + history (`repo list|recent`).
+    /// Repo discovery, history, trust and offline registry pruning
+    /// (`repo list|recent|trust|provenance|forget`).
     Repo {
         #[command(subcommand)]
         action: cmd::repos::Action,
