@@ -16,6 +16,7 @@
 //! | `sidebar_flat`       | `"1"` (absent=grouped) | toggle_flat (`g`)               |
 //! | `sidebar_focus_detail` | `FocusDetail::as_str()` (absent=`[ui]` config) | cycle_focus_detail (`i`) |
 //! | `other_open:<slug>`  | `"1"` open / `"0"` collapsed (absent=`[ui] sidebar_other_group_collapsed`) | toggle_collapse on the "Other" group |
+//! | `batch_open:<key>`   | `"1"` (absent=collapsed) | toggle_collapse on a batch row (`batch:{slug}/{token}`) |
 //! | `more_open:<key>`    | `"1"` (absent=truncated to the row limit) | toggle_show_more ("show more"/"show fewer") |
 //!
 //! `<key>` is the row's stable identity: a workspace slug, `{slug}/{branch}`
@@ -180,6 +181,13 @@ impl SidebarState {
                     // best-effort: lazy sweep of a legacy tombstone row
                     let _ = db.del_ui_state(scope, &key);
                 }
+            } else if let Some(batch) = key.strip_prefix("batch_open:") {
+                if value == "1" {
+                    self.view.batch_open.insert(batch.to_string());
+                } else {
+                    // best-effort: lazy sweep of a legacy tombstone row
+                    let _ = db.del_ui_state(scope, &key);
+                }
             } else if let Some(slug) = key.strip_prefix("other_open:") {
                 // Both values are real overrides of the config default, so
                 // neither is a tombstone; anything else is junk and is swept.
@@ -206,6 +214,19 @@ impl SidebarState {
     pub(crate) fn set_other_open(&mut self, slug: &str, open: bool) {
         self.view.other_open.insert(slug.to_string(), open);
         self.persist(&format!("other_open:{slug}"), if open { "1" } else { "0" });
+    }
+
+    /// Record (and persist) whether a batch row is open. Collapsed is the
+    /// default, so closing deletes the key rather than tombstoning it.
+    pub(crate) fn set_batch_open(&mut self, key: &str, open: bool) {
+        let ui_key = format!("batch_open:{key}");
+        if open {
+            self.view.batch_open.insert(key.to_string());
+            self.persist(&ui_key, "1");
+        } else {
+            self.view.batch_open.remove(key);
+            self.unpersist(&ui_key);
+        }
     }
 
     /// Record (and persist) whether a row-limited group is expanded past its
@@ -455,5 +476,48 @@ mod tests {
         sb.load(&db, SIDEBAR_SCOPE);
         assert_eq!(sb.focus_detail_override, None);
         assert_eq!(sb.focus_detail(), FocusDetail::Off, "config wins");
+    }
+
+    /// A batch row's open state round-trips through `ui_state`; closing
+    /// deletes the key and a stray `"0"` is swept on load.
+    #[test]
+    fn batch_open_round_trips_through_ui_state() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        drop(db);
+
+        let mut sidebar = SidebarState::default();
+        sidebar.set_batch_open("batch:app/b158", true);
+        sidebar.set_batch_open("batch:app/b159", true);
+        sidebar.set_batch_open("batch:app/b159", false);
+        assert!(sidebar.view.batch_open.contains("batch:app/b158"));
+        assert!(!sidebar.view.batch_open.contains("batch:app/b159"));
+        let rows = read_sidebar_state_from_writer().unwrap();
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "batch_open:batch:app/b158" && value == "1")
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(key, _)| key == "batch_open:batch:app/b159")
+        );
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        for (key, value) in rows {
+            db.set_ui_state(SIDEBAR_SCOPE, &key, &value).unwrap();
+        }
+        db.set_ui_state(SIDEBAR_SCOPE, "batch_open:batch:app/stale", "0")
+            .unwrap();
+        let mut loaded = SidebarState::default();
+        loaded.load(&db, SIDEBAR_SCOPE);
+        assert!(loaded.view.batch_open.contains("batch:app/b158"));
+        assert!(!loaded.view.batch_open.contains("batch:app/stale"));
+        assert!(
+            !db.ui_state_in_scope(SIDEBAR_SCOPE)
+                .unwrap()
+                .iter()
+                .any(|(key, _)| key == "batch_open:batch:app/stale")
+        );
     }
 }
