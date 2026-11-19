@@ -8291,6 +8291,7 @@ dependencies = [
  "thegn-core",
  "thegn-proc",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "toml 0.8.23",
  "tonic",
@@ -8299,6 +8300,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "url",
+ "webpki-roots 1.0.11",
  "windows-sys 0.59.0",
  "zeroize",
 ]
