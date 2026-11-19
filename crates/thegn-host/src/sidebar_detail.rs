@@ -131,7 +131,6 @@ pub(crate) fn format_badge(template: &str, count: u32, fallback: &str) -> String
 }
 
 /// What the worktree's title line already shows; the detail line never repeats it.
-#[allow(dead_code)] // spine stub: lane 3 reads the fields; drop this allow then
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TitleEcho {
     pub branch: bool,
@@ -140,26 +139,40 @@ pub(crate) struct TitleEcho {
     pub upstream: bool,
 }
 
-/// Stub (lane 3 fills): no elision.
-pub(crate) fn title_echo(_row: &SidebarRow, _disp: &SidebarDisplay, _title: &str) -> TitleEcho {
-    TitleEcho::default()
+/// The branch `detail_fields` shows: the row's branch, else its label.
+fn detail_branch(row: &SidebarRow) -> &str {
+    row.branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or(&row.label)
+}
+
+/// Which detail fields the title line already carries. Width-independent, so
+/// the heights pass and the compose pass agree.
+pub(crate) fn title_echo(row: &SidebarRow, disp: &SidebarDisplay, title: &str) -> TitleEcho {
+    TitleEcho {
+        branch: row.kind == RowKind::Worktree
+            && display_cell(title) == display_cell(detail_branch(row)),
+        commits: disp.show_commits || disp.show_behind_base,
+        pr: disp.show_pr_chip && row.pr_number.is_some(),
+        upstream: disp.show_ahead_behind && row.git.is_some(),
+    }
 }
 
 fn detail_fields(
     row: &SidebarRow,
     disp: &SidebarDisplay,
     now_unix: i64,
-    _echo: TitleEcho,
+    echo: TitleEcho,
 ) -> Vec<Field> {
     if row.kind != RowKind::Worktree {
         return Vec::new();
     }
-    let branch = row
-        .branch
-        .as_deref()
-        .filter(|branch| !branch.is_empty())
-        .unwrap_or(&row.label);
+    let branch = detail_branch(row);
     if disp.detail_fields.is_empty() {
+        if echo.branch {
+            return Vec::new();
+        }
         return branch_field(row, branch, FieldId::Branch)
             .into_iter()
             .collect();
@@ -170,6 +183,13 @@ fn detail_fields(
         .flat_map(|requested| match requested {
             DetailEntry::Builtin(field) => requested_fields(row, disp, *field, branch, now_unix),
             DetailEntry::Plugin { plugin, field } => plugin_fields(row, plugin, field),
+        })
+        .filter(|field| match field.id {
+            FieldId::Branch => !echo.branch,
+            FieldId::Commits => !echo.commits,
+            FieldId::Pr => !echo.pr,
+            FieldId::Upstream => !echo.upstream,
+            _ => true,
         })
         .collect()
 }
@@ -787,6 +807,110 @@ mod tests {
 
     fn builtin(field: DetailField) -> thegn_core::config::DetailEntry {
         thegn_core::config::DetailEntry::Builtin(field)
+    }
+
+    fn echo_all(branch: bool) -> TitleEcho {
+        TitleEcho {
+            branch,
+            commits: true,
+            pr: true,
+            upstream: true,
+        }
+    }
+
+    fn ids_of(row: &SidebarRow, disp: &SidebarDisplay, echo: TitleEcho) -> Vec<FieldId> {
+        detail_fields(row, disp, 2_000, echo)
+            .into_iter()
+            .map(|f| f.id)
+            .collect()
+    }
+
+    #[test]
+    fn echo_truth_table() {
+        let mut r = row();
+        let d = SidebarDisplay::default();
+        assert!(title_echo(&r, &d, "feature/retry-loop").branch);
+        assert!(!title_echo(&r, &d, "feature").branch);
+        let off = SidebarDisplay {
+            show_commits: false,
+            show_behind_base: false,
+            show_pr_chip: false,
+            show_ahead_behind: false,
+            ..SidebarDisplay::default()
+        };
+        let e = title_echo(&r, &off, "x");
+        assert!(!e.commits && !e.pr && !e.upstream);
+        r.pr_number = Some(3);
+        let on = SidebarDisplay {
+            show_commits: true,
+            show_pr_chip: true,
+            ..off.clone()
+        };
+        let e = title_echo(&r, &on, "x");
+        assert!(e.commits && e.pr && !e.upstream);
+        // Empty branch falls back to label.
+        r.branch = None;
+        assert!(title_echo(&r, &d, "feature").branch);
+        r.kind = RowKind::Folder;
+        assert!(!title_echo(&r, &d, "feature").branch);
+    }
+
+    #[test]
+    fn screenshot_row_has_no_detail_line() {
+        let mut r = SidebarRow::base(RowKind::Worktree, 1, "tg/b158-config-dir-env", "repo");
+        r.branch = Some("tg/b158-config-dir-env".into());
+        r.branch_meta = Some(BranchMeta {
+            ahead_base: Some(1),
+            ..BranchMeta::default()
+        });
+        let d = SidebarDisplay::default();
+        let echo = title_echo(&r, &d, "tg/b158-config-dir-env");
+        assert!(!detail_has_content(&r, &d, echo));
+    }
+
+    #[test]
+    fn home_keeps_its_branch_line() {
+        let mut r = SidebarRow::base(RowKind::Worktree, 1, "home", "repo");
+        r.branch = Some("main".into());
+        let d = SidebarDisplay::default();
+        let echo = title_echo(&r, &d, "home");
+        assert!(!echo.branch);
+        assert!(detail_has_content(&r, &d, echo));
+    }
+
+    #[test]
+    fn a_window_title_keeps_the_branch() {
+        let r = row();
+        let d = SidebarDisplay::default();
+        let echo = title_echo(&r, &d, "retry window");
+        assert!(ids_of(&r, &d, echo).contains(&FieldId::Branch));
+    }
+
+    #[test]
+    fn pr_number_moves_to_the_title_but_a_bare_count_stays() {
+        let mut r = row();
+        let d = SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Pr)],
+            ..SidebarDisplay::default()
+        };
+        r.pr_number = Some(42);
+        let echo = title_echo(&r, &d, "x");
+        assert!(ids_of(&r, &d, echo).is_empty());
+        r.pr_number = None;
+        r.pr_count = Some(2);
+        let echo = title_echo(&r, &d, "x");
+        assert_eq!(ids_of(&r, &d, echo), vec![FieldId::Pr]);
+    }
+
+    #[test]
+    fn dirty_count_and_branch_stat_still_show() {
+        let r = row();
+        let d = SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Dirty), builtin(DetailField::Commits)],
+            ..SidebarDisplay::default()
+        };
+        let ids = ids_of(&r, &d, echo_all(true));
+        assert_eq!(ids, vec![FieldId::Dirty]);
     }
 
     #[test]
