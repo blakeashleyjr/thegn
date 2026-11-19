@@ -813,16 +813,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(unix), ignore = "needs a live pid that is not ours")]
     fn a_second_holder_skips_the_tick() {
         let _state = crate::testenv::IsolatedState::new();
         let cfg = Arc::new(Config::default());
         // A live process that is not us (our parent: the test runner), so the
         // lease is credible and is not taken over.
-        #[cfg(unix)]
-        let other_daemon = i64::from(std::os::unix::process::parent_id());
-        #[cfg(not(unix))]
-        let other_daemon = i64::from(std::process::id()) + 1;
+        let Some(parent) = crate::platform::parent_pid() else {
+            return; // no live, non-self pid to name on this platform
+        };
+        let other_daemon = i64::from(parent);
         let db = thegn_core::db::Db::open().expect("isolated db");
         assert!(
             db.try_acquire_producer_lease(
