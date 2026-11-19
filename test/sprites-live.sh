@@ -364,11 +364,11 @@ min_ram_shown() { # doctor reflects min_ram_gb=N as N*1024 MiB
 interactive_tty() { # values reach script(1) via the environment, never the command text
   local log_path frame_log_tail
   # shellcheck disable=SC2016 # fixed text; script(1)'s shell expands the env values
-  INTERACTIVE_OUT="$(LIVE_BIN="$THEGN_BIN" LIVE_SPRITE="$SPRITE_NAME" SHELL=/bin/sh \
+  INTERACTIVE_OUT="$(LIVE_BIN="$THEGN_BIN" LIVE_SPRITE="$SPRITE_NAME" LIVE_TRACE="$TMP/sprite-exec-trace.log" SHELL=/bin/sh \
     THEGN_LOG=thegn::provider=trace \
-    script -qec 'exec "$LIVE_BIN" sprite-exec "$LIVE_SPRITE" -- sh -c "tty && echo ok"' /dev/null </dev/null)" || return 1
+    script -qec 'exec "$LIVE_BIN" sprite-exec "$LIVE_SPRITE" -- sh -c "tty && echo ok" 2>"$LIVE_TRACE"' /dev/null </dev/null)" || return 1
   printf '%s\n' "$INTERACTIVE_OUT"
-  log_path="$XDG_STATE_HOME/thegn/logs/thegn.log"
+  log_path="$TMP/sprite-exec-trace.log"
   frame_log_tail=""
   if [ -f "$log_path" ]; then
     frame_log_tail="$(grep -F 'sprites exec frame' "$log_path" | tail -n 40)" || true
@@ -513,6 +513,10 @@ if partial_zero:
 
 fleet_down_not_missing() {
   local out
+  [ ! -f "$(ledger_dir)/$SPRITE_NAME.json" ] || {
+    echo "   ledger record for $SPRITE_NAME is still present" >&2
+    return 1
+  }
   out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
   FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
 import json, os, sys
@@ -576,7 +580,12 @@ if not isinstance(results, list):
 if results:
     print("unrecorded reap returned " + str(len(results)) + " entries", file=sys.stderr)
     sys.exit(1)
-print("   unrecorded entries: " + str(len(results)))
+accounts = report.get("accounts")
+if not isinstance(accounts, list):
+    print("unrecorded reap JSON accounts is not an array", file=sys.stderr)
+    sys.exit(1)
+count = sum(len(a.get("entries") or []) for a in accounts if isinstance(a, dict))
+print("   unrecorded entries: " + str(count))
 '
 }
 
@@ -613,7 +622,7 @@ step 9b "/v1/tasks is empty" tasks_empty
 step 10 "fleet cost reports sprites_usage CPU hours or partial zero usage" cost_has_cpu
 step 10b "fleet list still shows warm or cold after fleet cost" warm_or_cold
 step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" env down
-step 11b "fleet list classifies the sprite as down, not missing" fleet_down_not_missing
+step 11b "ledger record gone; fleet list classifies the sprite as down, not missing" fleet_down_not_missing
 step 12 "reap dry-run: 0 recorded orphans" reap_dry_clean
 step 13 "unrecorded reap is read-only and empty" reap_unrecorded_read_only
 if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
