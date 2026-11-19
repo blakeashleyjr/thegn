@@ -268,8 +268,10 @@ mod tests {
 
     fn cfg_with(provider: &str) -> Config {
         let mut cfg = Config::default();
-        let mut env = thegn_core::config::EnvConfig::default();
-        env.placement = thegn_core::config::PlacementMode::Provider;
+        let mut env = thegn_core::config::EnvConfig {
+            placement: thegn_core::config::PlacementMode::Provider,
+            ..Default::default()
+        };
         env.provider.provider = provider.into();
         cfg.env.insert("remote".into(), env);
         cfg
@@ -322,7 +324,18 @@ mod tests {
 
     #[test]
     fn vercel_forwards_nothing_and_no_value_reaches_the_json() {
-        let _env = EnvGuard::set(&[("ANTHROPIC_API_KEY", "sentinel")]);
+        let temp = tempfile::tempdir().unwrap();
+        let mut vars: Vec<(String, String)> = thegn_core::testenv::state_env_all(temp.path())
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.display().to_string()))
+            .collect();
+        vars.push((
+            "THEGN_DIR".into(),
+            temp.path().join(".thegn").display().to_string(),
+        ));
+        vars.push(("ANTHROPIC_API_KEY".into(), "sentinel".into()));
+        let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let _env = EnvGuard::set(&pairs);
         let mut cfg = cfg_with("vercel");
         cfg.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
         let out = json_with(&cfg, None, &[], 0);

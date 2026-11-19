@@ -243,10 +243,11 @@ pub(crate) struct CloseOutcome {
 /// The provider sandbox a worktree row is bound to, when its stored location
 /// is a provider one. Local rows return `None` without any env resolution.
 /// A resolution error is a debug log only.
-fn kept_sandbox_for(
+fn kept_sandbox_for_with(
     db: &thegn_core::db::Db,
     cfg: &thegn_core::config::Config,
     path: &str,
+    name_of: &mut dyn FnMut(&str, &str) -> anyhow::Result<Option<String>>,
 ) -> Option<(String, String)> {
     use thegn_core::store::WorkspaceStore;
     let location = db.location_for(path).ok().flatten();
@@ -265,7 +266,7 @@ fn kept_sandbox_for(
             return None;
         }
     };
-    let name = match crate::provider_factory::provider_sandbox_name_checked(cfg, path, &env) {
+    let name = match name_of(path, &env) {
         Ok(Some(name)) => name,
         Ok(None) => return None,
         Err(error) => {
@@ -275,6 +276,16 @@ fn kept_sandbox_for(
     };
     let provider = cfg.env.get(&env)?.provider.provider.trim().to_string();
     Some((provider, name))
+}
+
+fn kept_sandbox_for(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+    path: &str,
+) -> Option<(String, String)> {
+    kept_sandbox_for_with(db, cfg, path, &mut |path, env| {
+        crate::provider_factory::provider_sandbox_name_checked(cfg, path, env)
+    })
 }
 
 /// The one-line notice for sandboxes a close left running.
@@ -788,8 +799,9 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 mod tests {
     use super::{
         TargetState, close_failure_notice, close_groups_durably, group_names_for,
-        hide_pending_deletes, kept_sandbox_notice, landing_for_slug, next_or_prev,
-        pending_delete_refusal, pending_target_refusal, resolve_group_indices, target_state,
+        hide_pending_deletes, kept_sandbox_for_with, kept_sandbox_notice, landing_for_slug,
+        next_or_prev, pending_delete_refusal, pending_target_refusal, resolve_group_indices,
+        target_state,
     };
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
@@ -1237,6 +1249,13 @@ mod tests {
             .unwrap();
         let group = WorktreeGroup::new("repo/local".to_string(), GroupKind::Branch, path);
         let cfg = thegn_core::config::Config::default();
+        let mut calls = 0;
+        let kept = kept_sandbox_for_with(&db, &cfg, &group.path, &mut |_, _| {
+            calls += 1;
+            Ok(Some("tg-box-1".into()))
+        });
+        assert_eq!(kept, None);
+        assert_eq!(calls, 0);
         let outcome = close_groups_durably(&db, "session", &[group], Some(&cfg));
         assert!(outcome.failures.is_empty());
         assert!(outcome.kept.is_empty());
@@ -1264,18 +1283,19 @@ mod tests {
         );
         db.set_worktree_location(&path, &location).unwrap();
         let mut cfg = thegn_core::config::Config::default();
-        let mut env = thegn_core::config::EnvConfig::default();
-        env.placement = thegn_core::config::PlacementMode::Provider;
+        let mut env = thegn_core::config::EnvConfig {
+            placement: thegn_core::config::PlacementMode::Provider,
+            ..Default::default()
+        };
         env.provider.provider = "sprites".into();
         cfg.env.insert("sp".into(), env);
-        let group = WorktreeGroup::new("repo/prov".to_string(), GroupKind::Branch, path);
-        let outcome = close_groups_durably(&db, "session", &[group], Some(&cfg));
-        assert!(outcome.failures.is_empty());
-        assert!(outcome.kept.len() <= 1);
-        if let Some((provider, name)) = outcome.kept.first() {
-            assert_eq!(provider, "sprites");
-            assert!(!name.is_empty());
-        }
+        let mut calls = 0;
+        let kept = super::kept_sandbox_for_with(&db, &cfg, &path, &mut |_, _| {
+            calls += 1;
+            Ok(Some("tg-box-1".into()))
+        });
+        assert_eq!(kept, Some(("sprites".into(), "tg-box-1".into())));
+        assert_eq!(calls, 1);
     }
 
     #[test]
