@@ -52,3 +52,40 @@ point `suite`) that runs against the sprites mock and the Vercel fake.
 
 - **WHEN** the svc tests run
 - **THEN** the suite passes for both providers
+
+### Requirement: Fleet down and unrecorded states
+
+A recorded sandbox the provider does not list SHALL count as `missing` only when
+this host holds its local provisioned marker, otherwise as `down`. A listed
+sprite with no worktree and no local ledger record SHALL count as `unrecorded`.
+Neither state SHALL turn the masthead badge amber. Budget admission MUST still
+count every listed row.
+
+#### Scenario: Stopped sandbox
+
+- **WHEN** `env down` has run and the provider no longer lists the sandbox
+- **THEN** the fleet shows it as `down` and the badge stays calm
+
+### Requirement: Read-only unrecorded listing
+
+`env reap --provider sprites --unrecorded` SHALL list unrecorded sprites oldest
+first with status, age and 30-day usage, print one `env adopt` line per sprite
+with a paste-safe name, and MUST refuse `--apply`, take no lease and destroy
+nothing.
+
+#### Scenario: Apply refused
+
+- **WHEN** `--unrecorded --apply` is given
+- **THEN** the command refuses and changes nothing
+
+### Requirement: Git audit and Vercel stderr
+
+Seed, pull and push-lane events SHALL be appended as JSON lines to
+`$XDG_STATE_HOME/thegn/provider/git-audit.jsonl` (rotated at 1 MiB, one previous
+file); a failed write MUST only warn. A nonzero Vercel exec SHALL append the last
+8 KiB of stderr with control characters removed, leaving raw stdout unchanged.
+
+#### Scenario: Audit write fails
+
+- **WHEN** the audit file cannot be written
+- **THEN** a warning is logged and the operation continues

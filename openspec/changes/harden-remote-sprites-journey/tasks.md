@@ -25,3 +25,4 @@
 - [ ] 4.4 Verify the usage API field units live
 - [ ] 4.5 Verify `created_at` is present on every sprite live
 - [ ] 4.6 Verify a Vercel stopped sandbox resumes on pane open live
+- [ ] 4.7 Live-check fleet `down`/`unrecorded`, `env reap --unrecorded`, paged listing, git audit file and Vercel stderr with `test/sprites-live.sh`
