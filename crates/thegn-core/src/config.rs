@@ -6465,13 +6465,26 @@ pub(crate) fn apply_json_overlay(
     cfg: &mut Config,
     overlay: serde_json::Value,
 ) -> Result<(), String> {
+    let explicit_model_credentials: Vec<String> = cfg
+        .env
+        .iter()
+        .filter(|(_, env)| env.provider.model_credentials_is_explicit())
+        .map(|(name, _)| name.clone())
+        .collect();
     let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
     crate::config_duration::introduced(
         &[],
         crate::config_duration::errors_for_value::<Config>(&overlay),
     )?;
+    let explicit = overlay.clone();
     deep_merge_json(&mut base, overlay);
     *cfg = serde_json::from_value(base).map_err(|e| e.to_string())?;
+    for name in explicit_model_credentials {
+        if let Some(env) = cfg.env.get_mut(&name) {
+            env.provider.mark_model_credentials_explicit();
+        }
+    }
+    crate::config_env_tables::mark_model_credentials_explicit(cfg, &explicit);
     Ok(())
 }
 
@@ -6548,6 +6561,9 @@ impl Config {
             config_warn(diagnostic);
         }
         let mut cfg: Config = toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
+        if let Ok(raw) = toml::from_str::<serde_json::Value>(&normalized.body) {
+            crate::config_env_tables::mark_model_credentials_explicit(&mut cfg, &raw);
+        }
         for diagnostic in crate::config_duration::errors_for_base(&cfg, &normalized.body) {
             config_warn(&format!(
                 "{diagnostic}; retaining configuration; affected runtime policy will cap or quarantine this value"
@@ -6705,6 +6721,12 @@ impl Config {
             return Ok(());
         }
 
+        let explicit_model_credentials: Vec<String> = cfg
+            .env
+            .iter()
+            .filter(|(_, env)| env.provider.model_credentials_is_explicit())
+            .map(|(name, _)| name.clone())
+            .collect();
         let mut tree = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
 
         let parts: Vec<&str> = key.split('.').collect();
@@ -6747,6 +6769,19 @@ impl Config {
             }
         }
         *cfg = new_cfg;
+        for name in explicit_model_credentials {
+            if let Some(env) = cfg.env.get_mut(&name) {
+                env.provider.mark_model_credentials_explicit();
+            }
+        }
+        if parts.len() == 4
+            && parts[0] == "env"
+            && parts[2] == "provider"
+            && parts[3] == "model_credentials"
+            && let Some(env) = cfg.env.get_mut(parts[1])
+        {
+            env.provider.mark_model_credentials_explicit();
+        }
         Ok(())
     }
 

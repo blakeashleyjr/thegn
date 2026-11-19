@@ -2128,6 +2128,15 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
         return PaneNativeExec::Unavailable;
     };
     let pc = &env_cfg.provider;
+    let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
+    let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
+        && !pc.model_credentials_is_explicit()
+    {
+        thegn_core::config::ModelCredentials::Upload
+    } else {
+        pc.model_credentials
+    };
+    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
     if let Some(request) =
         thegn_core::sandbox_floor::provider_explicit_request(&environment.sandbox)
     {
@@ -2178,6 +2187,9 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
     // code, hermes) work like local. Remote-safe filter drops host-local socket
     // vars (SSH_AUTH_SOCK/GPG_*) that would dangle in the VM. THEGN_* win.
     let mut env = environment.sandbox.passthrough_env_remote();
+    if !grant.env_keys {
+        env = thegn_core::provider_credentials::strip_model_env(env).0;
+    }
     // Let an in-sandbox `nix develop` / direnv `use flake` fetch PRIVATE flake
     // inputs: nix's fetcher ignores git's credential helper, so without a
     // `github.com` access-token a private `github:org/repo` flake input 404s even
@@ -2898,11 +2910,19 @@ pub fn provision_provider_env_named(
         return Ok((false, None));
     };
     let pc = &env.provider;
+    let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
+    let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
+        && !pc.model_credentials_is_explicit()
+    {
+        thegn_core::config::ModelCredentials::Upload
+    } else {
+        pc.model_credentials
+    };
+    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
     // Credential-free kinds (Vercel): the repo goes in only as a host bundle and
     // no host credential is uploaded. Refuse BEFORE anything billable exists
     // when the bundle seed is impossible — never fall back to an origin clone.
-    let (force_bundle, credential_free) =
-        provision_credential_policy(thegn_core::config::EnvProviderKind::of(&pc.provider));
+    let (force_bundle, credential_free) = provision_credential_policy(kind);
     if force_bundle {
         // off-loop: provisioning entry (see the branch lookup below).
         #[expect(clippy::disallowed_methods)]
@@ -3074,7 +3094,7 @@ pub fn provision_provider_env_named(
         crate::provider_workdir::mark_provisioned(&id);
         // A credential-free kind never receives agent auth, and never holds a
         // route-to-host bearer (`false` revokes + removes any installed one).
-        if !credential_free {
+        if !credential_free && grant.login_files {
             crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, &loc, env_name);
         }
         crate::remote_enqueue_auth::reconcile_provider_credential(
@@ -3103,6 +3123,20 @@ pub fn provision_provider_env_named(
     let mut exec_env = repo_sandbox.passthrough_env_remote();
     if credential_free {
         exec_env = credential_free_exec_env(exec_env);
+    }
+    let mut withheld = Vec::new();
+    if !grant.env_keys {
+        let (kept, names) = thegn_core::provider_credentials::strip_model_env(exec_env);
+        exec_env = kept;
+        withheld.extend(names);
+    }
+    if !grant.login_files {
+        withheld.push("agent logins".to_string());
+    }
+    if kind == thegn_core::config::EnvProviderKind::Sprites
+        && let Some(message) = sprites_withheld_notice(env_name, &withheld)
+    {
+        thegn_core::msg::info(&message);
     }
     crate::agent_configs::push_host_git_identity(&repo_root, &mut exec_env);
     // The generic, declarative personal layer ([sandbox.home]) — applied to every
@@ -3430,16 +3464,24 @@ pub fn provision_provider_env_named(
             }
             StepKind::Dotfiles(files) => upload_dotfiles(&provider, &id, &sprite_home, files),
             StepKind::AgentConfigs(agents) => {
-                let account_failures =
-                    crate::agent_configs::upload_agent_accounts(&provider, &id, &sprite_home, cfg);
-                let configs = crate::agent_configs::upload_agent_configs(
-                    &provider,
-                    &id,
-                    &sprite_home,
-                    agents,
-                    &pc.login_homes,
-                );
-                crate::agent_configs::agent_configs_step_result(configs, &account_failures)
+                if !grant.login_files {
+                    Ok(())
+                } else {
+                    let account_failures = crate::agent_configs::upload_agent_accounts(
+                        &provider,
+                        &id,
+                        &sprite_home,
+                        cfg,
+                    );
+                    let configs = crate::agent_configs::upload_agent_configs(
+                        &provider,
+                        &id,
+                        &sprite_home,
+                        agents,
+                        &pc.login_homes,
+                    );
+                    crate::agent_configs::agent_configs_step_result(configs, &account_failures)
+                }
             }
             StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home, &exec_env),
             StepKind::LocalParity {
@@ -3951,6 +3993,28 @@ fn provision_credential_policy(kind: thegn_core::config::EnvProviderKind) -> (bo
     (credential_free, credential_free)
 }
 
+fn provision_model_env(
+    kind: thegn_core::config::EnvProviderKind,
+    mode: thegn_core::config::ModelCredentials,
+    env: Vec<(String, String)>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
+    if grant.env_keys {
+        (env, Vec::new())
+    } else {
+        thegn_core::provider_credentials::strip_model_env(env)
+    }
+}
+
+fn sprites_withheld_notice(env_name: &str, names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        format!(
+            "sprites env {env_name}: model credentials not sent ({}); set model_credentials = \"upload\" in [env.{env_name}.provider] to send them",
+            names.join(", ")
+        )
+    })
+}
+
 /// Refuse a credential-free provision that cannot bundle-seed: a SPARE
 /// (`name_override`), a worktree without a local git dir, or one not on a
 /// branch (detached HEAD). There is no origin clone fallback.
@@ -4075,6 +4139,32 @@ mod credential_policy_tests {
         ]);
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["TERM", "THEGN_DEVSHELL"]);
+    }
+
+    #[test]
+    fn sprites_model_credential_modes_filter_only_none() {
+        let env = vec![
+            ("TERM".into(), "xterm-256color".into()),
+            ("ANTHROPIC_API_KEY".into(), "sentinel-b167".into()),
+        ];
+        let (none, names) = provision_model_env(
+            EnvProviderKind::Sprites,
+            thegn_core::config::ModelCredentials::None,
+            env.clone(),
+        );
+        assert_eq!(none, vec![("TERM".into(), "xterm-256color".into())]);
+        assert_eq!(names, vec!["ANTHROPIC_API_KEY"]);
+        assert!(!names.iter().any(|name| name.contains("sentinel-b167")));
+        let (upload, names) = provision_model_env(
+            EnvProviderKind::Sprites,
+            thegn_core::config::ModelCredentials::Upload,
+            env,
+        );
+        assert_eq!(upload.len(), 2);
+        assert!(names.is_empty());
+        let notice = sprites_withheld_notice("remote", &["ANTHROPIC_API_KEY".into()]).unwrap();
+        assert!(notice.contains("ANTHROPIC_API_KEY"));
+        assert!(!notice.contains("sentinel-b167"));
     }
 }
 
@@ -4431,7 +4521,26 @@ fn provision_provider_repo(
     let wd = thegn_core::util::sh_quote(&loc.path());
     let argv =
         crate::provision_recover::exec_login_argv(&format!("mkdir -p {wd} && cd {wd} && {script}"));
+    let pc = &cfg
+        .env
+        .get(env_name)
+        .expect("provider env checked above")
+        .provider;
+    let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
+    let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
+        && !pc.model_credentials_is_explicit()
+    {
+        thegn_core::config::ModelCredentials::Upload
+    } else {
+        pc.model_credentials
+    };
+    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
     let exec_env = cfg.repo_sandbox(repo_root).passthrough_env_remote();
+    let exec_env = if grant.env_keys {
+        exec_env
+    } else {
+        thegn_core::provider_credentials::strip_model_env(exec_env).0
+    };
     match block_on_provider(|| async { provider.run_exec(&id, &argv, None, &exec_env).await }) {
         Ok((0, _)) => initialize_provider_submodules(cfg, repo_root, loc),
         Ok((code, out)) => thegn_core::msg::warn(&format!(
