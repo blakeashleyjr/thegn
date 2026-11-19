@@ -41,8 +41,9 @@
 //! - `sprites_usage[]` (`fleet cost` only; absent when no `provider = "sprites"`
 //!   env is configured): `envs`, `error`, `rows[]` with `name`, `status`,
 //!   `cpu_hours`, `gb_hours`, `partial`, `usd` (`null` = unpriced; priced only
-//!   when `[placement.price]` has a `sprites` entry). Only sprites this host
-//!   proves it owns (the ledger); usage comes from the Sprites API.
+//!   when `[placement.price]` has a `sprites` entry), `reported`,
+//!   `last_recorded_at`, and per-row `error`. Only sprites this host proves it
+//!   owns (the ledger); usage comes from the Sprites API.
 //!
 //! All amounts are USD estimates from the bundled price table and
 //! `[placement.price]`.
@@ -80,6 +81,16 @@ struct FleetReport {
     vercel_usage: Option<Vec<VercelUsage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sprites_usage: Option<Vec<SpritesUsage>>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    agents: std::collections::BTreeMap<String, FleetAgent>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct FleetAgent {
+    agent: String,
+    status: String,
+    issue: String,
+    stage: Option<String>,
 }
 
 /// One sprites env's per-sprite usage (`fleet cost` only).
@@ -98,6 +109,11 @@ struct SpritesUsageRow {
     cpu_hours: f64,
     gb_hours: f64,
     partial: bool,
+    reported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_recorded_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
     /// `None` = unpriced.
     usd: Option<f64>,
     /// The API had no usage for this sprite (404).
@@ -108,6 +124,14 @@ fn unix_to_rfc3339(secs: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
         .unwrap_or_default()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn sanitize_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect()
 }
 
 /// The Sprites section's data. `None` when no sprites env is configured, so
@@ -137,28 +161,43 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
                         usage.error = Some("no ownership scope (controller id unavailable)".into())
                     }
                     Some(scope) => match thegn_svc::sprites::ledger::owned(&scope) {
-                        Err(error) => usage.error = Some(format!("{error:#}")),
+                        Err(error) => usage.error = Some(sanitize_text(&format!("{error:#}"), 256)),
                         Ok(view) => {
                             for rec in view.recorded {
-                                let start = unix_to_rfc3339(rec.created_at);
+                                let start = unix_to_rfc3339(
+                                    thegn_svc::sprites::usage::usage_window_start(rec.created_at),
+                                );
                                 let read = crate::agent::block_on_provider(|| async {
-                                    provider.usage_since(&rec.name, &start).await
+                                    provider.usage_reading_since(&rec.name, &start).await
                                 });
                                 usage.rows.push(match read {
-                                    Ok(Some(u)) => sprites_row(&rec.name, &rec.state, &u, price),
+                                    Ok(Some(reading)) => {
+                                        sprites_row(&rec.name, &rec.state, &reading, price)
+                                    }
                                     Ok(None) => SpritesUsageRow {
                                         name: rec.name.clone(),
                                         status: rec.state.clone(),
                                         cpu_hours: 0.0,
                                         gb_hours: 0.0,
                                         partial: false,
+                                        reported: false,
+                                        last_recorded_at: None,
+                                        error: None,
                                         usd: None,
                                         unavailable: true,
                                     },
-                                    Err(error) => {
-                                        usage.error = Some(format!("{error:#}"));
-                                        break;
-                                    }
+                                    Err(error) => SpritesUsageRow {
+                                        name: rec.name.clone(),
+                                        status: rec.state.clone(),
+                                        cpu_hours: 0.0,
+                                        gb_hours: 0.0,
+                                        partial: false,
+                                        reported: false,
+                                        last_recorded_at: None,
+                                        error: Some(sanitize_text(&format!("{error:#}"), 256)),
+                                        usd: None,
+                                        unavailable: false,
+                                    },
                                 });
                             }
                         }
@@ -178,9 +217,10 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
 fn sprites_row(
     name: &str,
     status: &str,
-    u: &thegn_svc::sprites::usage::SpriteUsage,
+    reading: &thegn_svc::sprites::usage::UsageReading,
     price: Option<f64>,
 ) -> SpritesUsageRow {
+    let u = &reading.usage;
     let cpu_hours = u.cpu_seconds / 3600.0;
     let cpu_hours = if cpu_hours.is_finite() {
         cpu_hours
@@ -198,7 +238,17 @@ fn sprites_row(
         cpu_hours,
         gb_hours,
         partial: u.partial,
-        usd: price.map(|p| cpu_hours * p).filter(|v| v.is_finite()),
+        reported: reading.reported,
+        last_recorded_at: reading
+            .last_recorded_at
+            .as_deref()
+            .map(|value| sanitize_text(value, 40)),
+        error: None,
+        usd: if reading.reported {
+            price.map(|p| cpu_hours * p).filter(|v| v.is_finite())
+        } else {
+            None
+        },
         unavailable: false,
     }
 }
@@ -212,7 +262,7 @@ fn render_sprites(usage: &[SpritesUsage]) -> String {
             env.env
         ));
         if let Some(error) = &env.error {
-            out.push(format!("  unavailable: {error}"));
+            out.push(format!("  unavailable: {}", sanitize_text(error, 256)));
             continue;
         }
         if env.rows.is_empty() {
@@ -225,8 +275,10 @@ fn render_sprites(usage: &[SpritesUsage]) -> String {
                 .to_vec(),
         ];
         for row in &env.rows {
-            let (cpu, gb) = if row.unavailable {
+            let (cpu, gb) = if row.unavailable || row.error.is_some() {
                 ("?".to_string(), "?".to_string())
+            } else if !row.reported {
+                ("-".to_string(), "-".to_string())
             } else {
                 (
                     format!("{:.2}", row.cpu_hours),
@@ -244,6 +296,36 @@ fn render_sprites(usage: &[SpritesUsage]) -> String {
         }
         for line in table(&rows).lines() {
             out.push(format!("  {line}"));
+        }
+        let unreported: Vec<&str> = env
+            .rows
+            .iter()
+            .filter(|row| !row.reported)
+            .map(|row| row.name.as_str())
+            .collect();
+        if !unreported.is_empty() {
+            out.push(format!(
+                "  no usage reported yet: {} (Sprites records usage with a delay; run thegn fleet cost again later)",
+                unreported.join(", ")
+            ));
+        }
+        for row in &env.rows {
+            if let Some(error) = &row.error {
+                out.push(format!(
+                    "  usage error: {}: {}",
+                    row.name,
+                    sanitize_text(error, 256)
+                ));
+            }
+        }
+        if let Some(latest) = env
+            .rows
+            .iter()
+            .filter_map(|row| row.last_recorded_at.as_deref())
+            .map(|value| sanitize_text(value, 40))
+            .max()
+        {
+            out.push(format!("  latest usage record: {latest}"));
         }
     }
     out.join("\n")
@@ -381,6 +463,52 @@ fn render_vercel(usage: &[VercelUsage]) -> String {
     out.join("\n")
 }
 
+fn remote_agents_with(
+    view: &FleetView,
+    lookup: &dyn Fn(&str) -> Option<thegn_core::issue::AgentDispatch>,
+) -> std::collections::BTreeMap<String, FleetAgent> {
+    let mut agents = std::collections::BTreeMap::new();
+    for row in &view.rows {
+        let Some(worktree) = row.worktree.as_deref() else {
+            continue;
+        };
+        let Some(dispatch) = lookup(worktree) else {
+            continue;
+        };
+        agents.insert(
+            sanitize_text(worktree, 32),
+            FleetAgent {
+                agent: sanitize_text(&dispatch.agent_name, 32),
+                status: sanitize_text(dispatch.status.as_str(), 32),
+                issue: sanitize_text(&dispatch.issue_id, 32),
+                stage: dispatch
+                    .stage
+                    .as_deref()
+                    .map(|stage| sanitize_text(stage, 32)),
+            },
+        );
+    }
+    agents
+}
+
+fn remote_agents(view: &FleetView) -> std::collections::BTreeMap<String, FleetAgent> {
+    match thegn_core::db::Db::open_read_only_current() {
+        Ok(Some(db)) => remote_agents_with(view, &|worktree| {
+            db.latest_active_dispatch_for_worktree(worktree)
+                .ok()
+                .flatten()
+        }),
+        Ok(None) => {
+            tracing::debug!("fleet list: state database is unavailable for remote agents");
+            std::collections::BTreeMap::new()
+        }
+        Err(error) => {
+            tracing::debug!(%error, "fleet list: could not open state database for remote agents");
+            std::collections::BTreeMap::new()
+        }
+    }
+}
+
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     let (only_env, json, list) = match action {
         Action::List { env, json } => (env, json, true),
@@ -408,6 +536,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     };
     let vercel = if list { None } else { vercel_usage(cfg) };
     let sprites = if list { None } else { sprites_usage(cfg) };
+    let agents = if list {
+        remote_agents(&view)
+    } else {
+        std::collections::BTreeMap::new()
+    };
     if json {
         return super::emit_json(&FleetReport {
             generated_ms: now_ms,
@@ -415,10 +548,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             cost,
             vercel_usage: vercel,
             sprites_usage: sprites,
+            agents,
         });
     }
     let text = if list {
-        render_list(&view, &cost, now_ms)
+        render_list(&view, &cost, now_ms, &agents)
     } else {
         let text = render_cost(&view, &cost);
         let text = match vercel.as_deref() {
@@ -513,7 +647,12 @@ fn partial_section(view: &FleetView, out: &mut Vec<String>) {
 }
 
 /// The `fleet list` table (pure; `cost.per_row` is in `view.rows` order).
-fn render_list(view: &FleetView, cost: &FleetCost, now_ms: i64) -> String {
+fn render_list(
+    view: &FleetView,
+    cost: &FleetCost,
+    now_ms: i64,
+    agents: &std::collections::BTreeMap<String, FleetAgent>,
+) -> String {
     let mut rows = vec![
         [
             "PROVIDER/ENV",
@@ -612,6 +751,24 @@ fn render_list(view: &FleetView, cost: &FleetCost, now_ms: i64) -> String {
             "review unrecorded sprites: thegn env reap --provider sprites --unrecorded".into(),
         );
     }
+    if !agents.is_empty() {
+        out.push(String::new());
+        out.push("remote agents:".into());
+        let mut agent_rows = vec![
+            ["WORKTREE", "AGENT", "STATUS", "ISSUE"]
+                .map(String::from)
+                .to_vec(),
+        ];
+        for (worktree, agent) in agents {
+            agent_rows.push(vec![
+                worktree.clone(),
+                agent.agent.clone(),
+                agent.status.clone(),
+                agent.issue.clone(),
+            ]);
+        }
+        out.push(table(&agent_rows));
+    }
     out.push(footer(cost));
     out.join("\n")
 }
@@ -694,7 +851,7 @@ mod tests {
     fn list_table_aligns_marks_orphans_and_unpriced() {
         let view = view();
         let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
-        let text = render_list(&view, &cost, NOW);
+        let text = render_list(&view, &cost, NOW, &Default::default());
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("PROVIDER/ENV  ID"), "{text}");
         let id_col = lines[0].find("  ID").unwrap() + 2;
@@ -745,7 +902,7 @@ mod tests {
             id: "tg-down".into(),
         });
         let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
-        let text = render_list(&view, &cost, NOW);
+        let text = render_list(&view, &cost, NOW, &Default::default());
         assert!(text.contains("UNRECORDED"), "{text}");
         assert!(
             text.contains("not running (never provisioned, or env down)"),
@@ -769,7 +926,10 @@ mod tests {
     fn empty_list_and_cost_summary() {
         let empty = FleetView::default();
         let cost = fleet_cost::fleet_cost(&empty, TABLE, &Default::default(), NOW);
-        assert!(render_list(&empty, &cost, NOW).starts_with("No provider sandboxes listed."));
+        assert!(
+            render_list(&empty, &cost, NOW, &Default::default())
+                .starts_with("No provider sandboxes listed.")
+        );
         let view = view();
         let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
         let text = render_cost(&view, &cost);
@@ -892,6 +1052,7 @@ mod tests {
             cost: cost.clone(),
             vercel_usage: None,
             sprites_usage: None,
+            agents: Default::default(),
         })
         .unwrap();
         assert!(json.get("vercel_usage").is_none(), "{json}");
@@ -901,6 +1062,7 @@ mod tests {
             cost,
             vercel_usage: Some(vercel_fixture()),
             sprites_usage: None,
+            agents: Default::default(),
         })
         .unwrap();
         assert_eq!(with["vercel_usage"][0]["rows"][0]["name"], "tg-run");
@@ -919,20 +1081,28 @@ mod tests {
                 sprites_row(
                     "tg-a",
                     "ready",
-                    &thegn_svc::sprites::usage::SpriteUsage {
-                        cpu_seconds: 5400.0,
-                        reserved_gb_hours: 3.0,
-                        partial: true,
+                    &thegn_svc::sprites::usage::UsageReading {
+                        usage: thegn_svc::sprites::usage::SpriteUsage {
+                            cpu_seconds: 5400.0,
+                            reserved_gb_hours: 3.0,
+                            partial: true,
+                        },
+                        last_recorded_at: Some("2026-01-01T02:00:00Z".into()),
+                        reported: true,
                     },
                     None,
                 ),
                 sprites_row(
                     "tg-b",
                     "ready",
-                    &thegn_svc::sprites::usage::SpriteUsage {
-                        cpu_seconds: 3600.0,
-                        reserved_gb_hours: 1.0,
-                        partial: false,
+                    &thegn_svc::sprites::usage::UsageReading {
+                        usage: thegn_svc::sprites::usage::SpriteUsage {
+                            cpu_seconds: 3600.0,
+                            reserved_gb_hours: 1.0,
+                            partial: false,
+                        },
+                        last_recorded_at: Some("2026-01-01T02:00:00Z".into()),
+                        reported: true,
                     },
                     Some(0.5),
                 ),
@@ -958,6 +1128,146 @@ mod tests {
     }
 
     #[test]
+    fn unreported_sprite_shows_dash_and_note() {
+        let usage = vec![SpritesUsage {
+            env: "sp".into(),
+            error: None,
+            rows: vec![SpritesUsageRow {
+                name: "tg-late".into(),
+                status: "ready".into(),
+                cpu_hours: 0.0,
+                gb_hours: 0.0,
+                partial: false,
+                reported: false,
+                last_recorded_at: None,
+                error: None,
+                usd: None,
+                unavailable: false,
+            }],
+        }];
+
+        let text = render_sprites(&usage);
+        assert!(text.contains("tg-late"), "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("tg-late") && line.matches('-').count() >= 2),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "no usage reported yet: tg-late (Sprites records usage with a delay; run thegn fleet cost again later)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("0.00"), "{text}");
+    }
+
+    #[test]
+    fn one_failed_usage_read_keeps_other_rows() {
+        let usage = vec![SpritesUsage {
+            env: "sp".into(),
+            error: None,
+            rows: vec![
+                SpritesUsageRow {
+                    name: "tg-good".into(),
+                    status: "ready".into(),
+                    cpu_hours: 1.5,
+                    gb_hours: 2.0,
+                    partial: false,
+                    reported: true,
+                    last_recorded_at: Some("2026-01-01T02:00:00Z".into()),
+                    error: None,
+                    usd: None,
+                    unavailable: false,
+                },
+                SpritesUsageRow {
+                    name: "tg-bad".into(),
+                    status: "ready".into(),
+                    cpu_hours: 0.0,
+                    gb_hours: 0.0,
+                    partial: false,
+                    reported: false,
+                    last_recorded_at: None,
+                    error: Some("request failed".into()),
+                    usd: None,
+                    unavailable: false,
+                },
+            ],
+        }];
+
+        let text = render_sprites(&usage);
+        assert!(text.contains("tg-good"), "{text}");
+        assert!(text.contains("tg-bad"), "{text}");
+        assert!(
+            text.contains("usage error: tg-bad: request failed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn json_rows_carry_reported() {
+        let row = &sprites_fixture()[0].rows[0];
+        let json = serde_json::to_value(row).unwrap();
+
+        assert_eq!(json["reported"], true);
+        assert_eq!(json["last_recorded_at"], "2026-01-01T02:00:00Z");
+    }
+
+    #[test]
+    fn remote_agents_join_by_worktree() {
+        let view = view();
+        let agents = remote_agents_with(&view, &|worktree| {
+            (worktree == "/wt/a").then_some(thegn_core::issue::AgentDispatch {
+                id: 1,
+                issue_id: "THE-2020".into(),
+                worktree_path: worktree.into(),
+                agent_name: "coder\n".into(),
+                dispatched_at_ms: 0,
+                status: thegn_core::issue::AgentDispatchStatus::Running,
+                stage: Some("code".into()),
+                parent_id: None,
+                session_id: None,
+            })
+        });
+
+        assert_eq!(
+            agents.get("/wt/a"),
+            Some(&FleetAgent {
+                agent: "coder".into(),
+                status: "running".into(),
+                issue: "THE-2020".into(),
+                stage: Some("code".into()),
+            })
+        );
+        assert!(!agents.contains_key("/wt/gone"));
+    }
+
+    #[test]
+    fn render_list_appends_agents_section_only_when_present() {
+        let view = view();
+        let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert(
+            "/wt/a".into(),
+            FleetAgent {
+                agent: "coder".into(),
+                status: "running".into(),
+                issue: "THE-2020".into(),
+                stage: Some("code".into()),
+            },
+        );
+
+        let text = render_list(&view, &cost, NOW, &agents);
+        assert!(text.contains("remote agents:"), "{text}");
+        assert!(text.contains("WORKTREE  AGENT  STATUS   ISSUE"), "{text}");
+        assert!(
+            text.contains("/wt/a     coder  running  THE-2020"),
+            "{text}"
+        );
+        assert!(!render_list(&view, &cost, NOW, &Default::default()).contains("remote agents:"));
+    }
+
+    #[test]
     fn sprites_json_shape_and_absent_without_env() {
         let cfg = Config::default();
         assert!(sprites_usage(&cfg).is_none());
@@ -969,6 +1279,7 @@ mod tests {
             cost: cost.clone(),
             vercel_usage: None,
             sprites_usage: None,
+            agents: Default::default(),
         })
         .unwrap();
         assert!(without.get("sprites_usage").is_none());
@@ -978,6 +1289,7 @@ mod tests {
             cost,
             vercel_usage: None,
             sprites_usage: Some(sprites_fixture()),
+            agents: Default::default(),
         })
         .unwrap();
         assert_eq!(with["sprites_usage"][0]["rows"][0]["name"], "tg-a");
