@@ -176,6 +176,7 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("ui.sidebar_*", Live, H::Sidebar),
     ("ui.fullscreen_*", Live, H::Layout),
     ("ui.confirm_delete_project", NextUse, H::None),
+    ("ui.confirm_quit", NextUse, H::None),
     ("ui.dismiss_overlay_on_click_outside", NextUse, H::None),
     // --- sub-tables ---
     ("git.*", NextUse, H::None),
