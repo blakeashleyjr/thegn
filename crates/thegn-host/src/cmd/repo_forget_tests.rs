@@ -551,6 +551,29 @@ fn copy_from_apply_seeds_then_forgets() {
 }
 
 #[test]
+fn copy_from_refuses_a_running_source() {
+    let state = IsolatedState::new();
+    let (source, _, _, keep) = source_db(&state);
+    let mut shm = source.clone().into_os_string();
+    shm.push("-shm");
+    std::fs::write(&shm, b"").unwrap();
+
+    let error = run(
+        &Config::default(),
+        ForgetArgs {
+            keep: vec![keep.repo.clone()],
+            apply: true,
+            copy_from: Some(source.clone()),
+            ..ForgetArgs::default()
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("looks running"), "{error:#}");
+    assert!(!db_file(&state).exists());
+}
+
+#[test]
 fn copy_from_schema_mismatch_refuses() {
     let state = IsolatedState::new();
     let (source, _, _, _) = source_db(&state);
