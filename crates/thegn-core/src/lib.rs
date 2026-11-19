@@ -150,8 +150,9 @@ mod db_vacuum;
 pub mod docx_text;
 pub mod git_spawn_stats;
 pub use db_vacuum::{
-    AUTO_CONVERT_MAX_LIVE_BYTES, AutoVacuum, ConvertOutcome, DbSpace, INCREMENTAL_PAGES_PER_ROUND,
-    MaintenanceReport, MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, VacuumError,
+    AUTO_CONVERT_MAX_LIVE_BYTES, AutoVacuum, CONVERT_HEADROOM_BYTES, ConvertOutcome, DbSpace,
+    HostRoom, INCREMENTAL_PAGES_PER_ROUND, INCREMENTAL_STEPS_PER_PASS, MaintenanceReport,
+    MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, VacuumError, conversion_needs_bytes,
     plan_maintenance,
 };
 mod db_workspace;
