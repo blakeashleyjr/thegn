@@ -293,6 +293,76 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     claim_spare(cfg, worktree, &repo_root, &env_name, branch.as_deref()).is_some()
 }
 
+/// Headless warm start: before `provision_headless_blocking` provisions a
+/// worktree, claim a `ready` pool spare for the same (repo, env) and lockfile
+/// through [`try_claim_spare`]. `true` means a spare now serves `worktree` and
+/// provisioning is skipped. Never creates: the pool stays opt-in
+/// (`[lifecycle.pool] size`). Off-loop only.
+///
+/// `false` unless the worktree's effective env is a provider env whose pool
+/// target is above zero ([`headless_pool_gate`], reads only). A claim failure
+/// is a debug log plus `false`: the caller provisions cold.
+pub(crate) fn claim_spare_for_headless(cfg: &thegn_core::config::Config, worktree: &str) -> bool {
+    let gate = match thegn_core::db::Db::open() {
+        Ok(db) => headless_pool_gate(cfg, &db, worktree),
+        Err(error) => {
+            tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "headless warm claim skipped: the state database could not be opened");
+            false
+        }
+    };
+    if !gate {
+        return false;
+    }
+    let claimed = try_claim_spare(cfg, worktree);
+    if !claimed {
+        tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, "headless warm claim found no usable spare; provisioning cold");
+    }
+    claimed
+}
+
+/// Whether a headless open may try the warm pool: the worktree's effective env
+/// is a configured provider env and its pool target (runtime override, else
+/// `[lifecycle.pool] size`) is above zero. Reads only: never writes the DB, so
+/// the default (pool off) costs a selection read and nothing else.
+fn headless_pool_gate(
+    cfg: &thegn_core::config::Config,
+    db: &thegn_core::db::Db,
+    worktree: &str,
+) -> bool {
+    let repo_root = db
+        .repo_root_for(worktree)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(std::path::Path::new(worktree)))
+        .unwrap_or_else(|| std::path::PathBuf::from(worktree));
+    let repo = repo_root.to_string_lossy().into_owned();
+    let selection = match db.effective_env_selection(worktree, &repo) {
+        Ok(selection) => selection,
+        Err(error) => {
+            tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "headless warm claim skipped: environment selection unreadable");
+            return false;
+        }
+    };
+    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
+    let environment = cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection);
+    if !matches!(
+        environment.placement,
+        thegn_core::placement::Placement::Provider(_)
+    ) || !poolable_env(cfg, &environment.name)
+    {
+        return false;
+    }
+    match crate::lifecycle::effective_pool_target(db, cfg, &repo, &environment.name) {
+        Ok(target) => target > 0,
+        Err(error) => {
+            tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "headless warm claim skipped: pool target unreadable");
+            false
+        }
+    }
+}
+
 /// The provisioning-gate halt for an attach: `Some` when `worktree` resolves to a
 /// provider env whose sandbox has NOT finished provisioning (no LOCAL marker — set
 /// at provision completion in `provision_provider_env_named`). Refusing the raw
@@ -1383,6 +1453,40 @@ mod tests {
         // Independent per worktree.
         let _g = worktree_live_guard("/wt/x");
         assert!(!worktree_live("/wt/y"));
+    }
+
+    /// b162 D9: the headless warm claim is off unless a pool target is set,
+    /// and deciding that writes nothing to the DB.
+    #[test]
+    fn headless_claim_gate_is_false_without_a_pool_and_writes_nothing() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        use thegn_core::config::{Config, EnvConfig, EnvProviderConfig, PlacementMode};
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let wt = "/nonexistent/b162/headless-wt";
+        // No env tables at all.
+        let mut cfg = Config::default();
+        assert!(!headless_pool_gate(&cfg, &db, wt));
+        // A provider env pinned to the worktree, but `[lifecycle.pool] size`
+        // left at its default (0) and no runtime override.
+        cfg.env.insert(
+            "sprites".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        db.set_worktree_env(wt, "sprites").unwrap();
+        assert_eq!(cfg.lifecycle.pool.size, 0);
+        assert!(!headless_pool_gate(&cfg, &db, wt));
+        // Zero writes from the gate: no pool target recorded, no spare rows.
+        for repo in [wt, "/nonexistent/b162"] {
+            assert_eq!(db.pool_target(repo, "sprites").unwrap(), None);
+            assert!(db.pool_spares_for(repo, "sprites").unwrap().is_empty());
+        }
     }
 
     #[test]
