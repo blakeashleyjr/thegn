@@ -2564,6 +2564,7 @@ git -C "$MP2" add -f -A && git -C "$MP2" commit -q -m "smoke pipe drain"
 check "merge drain with a closed stdout pipe still records the landed row" \
   "'$SZ' merge add '$MP2' >/dev/null && ('$SZ' merge drain | true); [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB2' AND status='landed'\") -eq 1 ]]"
 MP3="$("$SZ" wt new smoke-pipe-land --repo "$R")"
+MB3="$(git -C "$MP3" symbolic-ref --short HEAD)"
 echo p >"$MP3/pipe-land.txt"
 git -C "$MP3" add -f -A && git -C "$MP3" commit -q -m "smoke pipe land"
 MT3="$(git -C "$MP3" rev-parse HEAD)"
@@ -2572,6 +2573,23 @@ MT3="$(git -C "$MP3" rev-parse HEAD)"
 # the land advanced the target.
 check "land with a closed stdout pipe still advances the target" \
   "('$SZ' land --worktree '$MP3' | true); git -C '$R' merge-base --is-ancestor '$MT3' main"
+# shellcheck disable=SC2034 # read by the check body below through eval
+pipe_land_roster="$("$SZ" dispatch list --json)"
+MT3_FOLD="$(git -C "$R" rev-parse main)"
+check "land with a closed stdout pipe records the landed row" \
+  "[[ \$(sqlite3 \"\$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || result_oid FROM merge_queue WHERE branch='$MB3'\") == 'landed|$MT3_FOLD' ]]"
+check "land with a closed stdout pipe records one roster row" \
+  "printf '%s' \"\$pipe_land_roster\" | python3 -c 'import json,sys; rows=json.load(sys.stdin); hits=[row for row in rows if row[\"issue_id\"].startswith(\"local:tg-smoke-pipe-land\")]; assert len(hits) == 1, rows'"
+
+MP4="$("$SZ" wt new smoke-pipe-land-closed --repo "$R")"
+MB4="$(git -C "$MP4" symbolic-ref --short HEAD)"
+echo p >"$MP4/pipe-land-closed.txt"
+git -C "$MP4" add -f -A && git -C "$MP4" commit -q -m "smoke pipe land closed"
+MT4="$(git -C "$MP4" rev-parse HEAD)"
+check "land with stdout closed records the landed row" \
+  "'$SZ' land --worktree '$MP4' 1>&-; [[ \$(sqlite3 \"\$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || result_oid FROM merge_queue WHERE branch='$MB4'\") == \"landed|\$(git -C '$R' rev-parse main)\" ]]"
+check "land with stdout closed still advances the target" \
+  "git -C '$R' merge-base --is-ancestor '$MT4' main"
 
 echo
 if [[ $fail -eq 0 ]]; then
