@@ -90,11 +90,11 @@ if has "$T/plan-vercel-live.out" "9b  no ledger record"; then pass "vercel-live 
 doctor() { # doctor <file> <json>
   printf '%s\n' "$2" >"$T/$1.json"
 }
-doctor tok-false '{"remote_live":[{"env":"sx","token_resolves":false,"forwarded_env":[],"git_token":"none","login_upload":[],"unbound":[]}]}'
-doctor tok-true '{"checks":[],"remote_live":[{"env":"other","token_resolves":false},{"env":"sx","token_resolves":true,"forwarded_env":["GH_NAME_ONLY","NPM_NAME_ONLY"],"git_token":"github","login_upload":["claude"],"unbound":["sx-old-1","sx-old-2"]}]}'
+doctor tok-false '{"remote_live":[{"env":"sx","token_resolves":false,"forwarded_env":[],"git_token":false,"login_upload":"none","unbound":[]}]}'
+doctor tok-true '{"checks":[],"remote_live":[{"env":"other","token_resolves":false},{"env":"sx","token_resolves":true,"forwarded_env":["GH_NAME_ONLY","NPM_NAME_ONLY"],"git_token":true,"login_upload":"claude","unbound":["sx-old-1","sx-old-2"]}]}'
 doctor no-key '{"checks":[]}'
 doctor no-row '{"remote_live":[{"env":"other","token_resolves":true}]}'
-doctor vx '{"remote_live":[{"env":"vxlive","token_resolves":true,"forwarded_env":[],"git_token":"none","login_upload":[],"unbound":[]}]}'
+doctor vx '{"remote_live":[{"env":"vxlive","token_resolves":true,"forwarded_env":[],"git_token":false,"login_upload":"none","unbound":[]}]}'
 
 SX=(--env sx --i-accept-spend)
 
@@ -107,7 +107,7 @@ else
 fi
 
 run pf-true sprites-live.sh THEGN_CHANNEL=dev STUB_DOCTOR="$T/tok-true.json" -- "${SX[@]}"
-if has "$T/pf-true.out" "INFO 0: credentials entering the sandbox: forwarded_env=GH_NAME_ONLY,NPM_NAME_ONLY; git_token=github; login_upload=claude" &&
+if has "$T/pf-true.out" "INFO 0: credentials entering the sandbox: forwarded_env=GH_NAME_ONLY,NPM_NAME_ONLY; git_token=yes; login_upload=claude" &&
   has "$T/pf-true.out" "WARN 0: unbound ledger sandboxes: sx-old-1, sx-old-2: pre-existing sandboxes this run will not touch" &&
   has "$T/pf-true.out" "PASS 0" && has "$T/pf-true.log" "env test sx" && ! rc_is pf-true 0; then
   pass "preflight: INFO credential line, WARN unbound, continues to env test"
@@ -143,7 +143,7 @@ fi
 
 run pf-vx vercel-live.sh THEGN_CHANNEL=dev STUB_DOCTOR="$T/vx.json" -- \
   --token-ref env:VX_NAME_ONLY --team-id team_x --project-id prj_x --i-accept-spend
-if has "$T/pf-vx.out" "INFO 0: credentials entering the sandbox: forwarded_env=none; git_token=none; login_upload=none" &&
+if has "$T/pf-vx.out" "INFO 0: credentials entering the sandbox: forwarded_env=none; git_token=no; login_upload=none" &&
   has "$T/pf-vx.out" "PASS 0" && has "$T/pf-vx.log" "env test vxlive" && ! has "$T/pf-vx.out" "WARN 0"; then
   pass "preflight: vercel-live reads the temp env's row"
 else
