@@ -1616,26 +1616,48 @@ pub fn agent_auth_critical_files(agent: &str) -> Vec<String> {
 
 /// Install known coding-agent CLIs (best-effort, idempotent). Known agents get a
 /// real installer; unknown ones are left to the user's `setup`/`tools` (their
-/// config is still uploaded). Per-agent failures are non-fatal.
+/// config is still uploaded). Per-agent failures are non-fatal and logged to
+/// `~/.cache/thegn-agent-install.log` in the sandbox. `thegn agent run`'s
+/// preflight names the missing CLI, and the log says why. The real cause of a
+/// live exit 127 is UNVERIFIED.
 fn agents_install_script(agents: &[String]) -> String {
     let mut lines = vec![
         "have() { command -v \"$1\" >/dev/null 2>&1; }".to_string(),
-        "npm_g() { have npm && npm install -g \"$1\" 2>/dev/null; }".to_string(),
+        "log=\"$HOME/.cache/thegn-agent-install.log\"".to_string(),
+        "mkdir -p \"$HOME/.cache\" 2>/dev/null".to_string(),
+        ": >\"$log\" 2>/dev/null || log=/dev/null".to_string(),
+        "npm_g() { if ! have npm; then echo \"npm not found: cannot install $1\" >>\"$log\"; return 1; fi; npm install -g \"$1\" >>\"$log\" 2>&1; }".to_string(),
+        "missing=\"\"".to_string(),
     ];
+    let mut known_programs = Vec::new();
     for a in agents {
         let line = match a.trim() {
             "claude" | "claude-code" => {
+                known_programs.push("claude");
                 "have claude || npm_g @anthropic-ai/claude-code || true".to_string()
             }
-            "codex" => "have codex || npm_g @openai/codex || true".to_string(),
+            "codex" => {
+                known_programs.push("codex");
+                "have codex || npm_g @openai/codex || true".to_string()
+            }
             // thegn's own agent; pi >=0.80 bundles its extension deps.
-            "pi" => "have pi || npm_g @earendil-works/pi-coding-agent || true".to_string(),
+            "pi" => {
+                known_programs.push("pi");
+                "have pi || npm_g @earendil-works/pi-coding-agent || true".to_string()
+            }
             // Nous Research hermes-agent (Python/uv) — its own curl installer.
-            "hermes" => "have hermes || (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash) || true".to_string(),
+            "hermes" => {
+                known_programs.push("hermes");
+                "have hermes || (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash) >>\"$log\" 2>&1 || true".to_string()
+            }
             other => format!("# {other}: install via [sandbox.home] setup/tools"),
         };
         lines.push(line);
     }
+    for program in known_programs {
+        lines.push(format!("have {program} || missing=\"$missing {program}\""));
+    }
+    lines.push("if [ -n \"$missing\" ]; then echo \"thegn: agent CLI not installed:$missing (log: $log)\" >>\"$log\"; echo \"thegn: agent CLI not installed:$missing (log: $log)\" >&2; fi".into());
     lines.push("true".into());
     lines.join("; ")
 }
@@ -2923,6 +2945,21 @@ mod tests {
         // a genuinely unknown agent doesn't fabricate an installer.
         let unknown = agents_install_script(&["frobnicator".into()]);
         assert!(unknown.contains("frobnicator: install via"));
+    }
+
+    #[test]
+    fn agents_installer_logs_failures_and_lists_missing() {
+        let s = agents_install_script(&["codex".into()]);
+        assert!(s.contains("thegn-agent-install.log"));
+        assert!(s.contains("npm not found"));
+        assert!(s.contains("agent CLI not installed"));
+        assert!(s.ends_with("true"));
+    }
+
+    #[test]
+    fn agents_installer_never_fails_the_step() {
+        let s = agents_install_script(&["claude".into(), "hermes".into()]);
+        assert_eq!(s.split("; ").last(), Some("true"));
     }
 
     #[test]
