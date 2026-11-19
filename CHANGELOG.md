@@ -7,6 +7,12 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Search is literal smart-case by default, ranked by match quality then recency; `Alt+f` toggles fuzzy. The `profile` scope leaves the `Tab` cycle.
+- `[env.<n>.provider] model_credentials` is now valid for Sprites (`none` or `upload`). `none` withholds model credentials and agent logins; unset behaves as before. Not yet verified live.
+- Sprites destroy now counts only after a definite 404 from polling the sprite; otherwise the record is kept and destroy fails so a retry can finish. Provider exec has an overall 31 minute deadline. Closing a worktree resolves its location and env before forgetting it.
+
 ## [0.1.0-alpha.98] — 2026-11-19
 
 ### Added

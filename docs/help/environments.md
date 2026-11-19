@@ -261,6 +261,31 @@ sandboxes recorded in the run's own temporary ledger.
 
 ### Removing and releasing provider sandboxes
 
+- **Sprites `model_credentials`.** `[env.<n>.provider] model_credentials` is
+  valid for `provider = "sprites"` with `none` or `upload`; `proxy` and
+  `inject` are refused. `upload` forwards model credentials and agent login
+  files into the sandbox. `none` withholds the fixed list of model credential
+  variables from provisioning, the pane environment and repo exec, and skips the
+  agent login upload and resync; provisioning prints one line naming what was
+  withheld and how to grant it. An env that does not set `model_credentials`
+  behaves as before (credentials are forwarded), and `thegn doctor` and config
+  validation say so. Set `model_credentials = "none"` to withhold explicitly.
+  Names you add to `env_passthrough` yourself are not affected. Not yet
+  verified live.
+- **Sprites destroy needs proof.** After the provider accepts the DELETE,
+  thegn polls the sprite every 2 seconds for up to 30 seconds until it gets a
+  definite 404. Only then does it revoke custody and forget the record.
+  Otherwise the record is kept and destroy fails, so a second `wt rm` or
+  `env reap` can finish the job. A 404 on the DELETE itself counts as done.
+- **Closing keeps the environment.** Closing a worktree tab or pane never
+  destroys its sandbox. The close resolves the worktree's location, repo root
+  and env first and then forgets the worktree, so the background close and
+  auto-checkpoint act on that snapshot. Only `wt rm`, `env down`, `env reap`
+  and `land --release-sandbox` destroy.
+- **Exec deadline.** A single provider exec has an overall 31 minute deadline,
+  above the 30 minute provisioning step ceiling, so shorter caller timeouts fire
+  first. On expiry the Sprites session is closed.
+
 A destroy counts as done only when a complete provider inventory no longer
 lists the sandbox. A partial listing proves nothing.
 

@@ -4242,7 +4242,7 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #                                       #   unbounded): the reaper STOPS the sandbox,
 # #                                       #   and deletes it 7 days later
 # # auto_provision = false                # create the sandbox on first open if missing
-# model_credentials = "none"   # none | upload (claude/codex login into tmpfs; see docs) | proxy, inject (refused)
+# model_credentials = "none"   # none | upload (vercel: tmpfs login; sprites: forward creds; unset sprites = forward) | proxy, inject (refused)
 # interactive_host_suffixes = []   # empty = vercel.run, vercel.sh, vercel.com
 # # login_homes = { claude = "/srv/agent-logins/claude" }   # with model_credentials =
 # #                                       #   "upload": upload the login in this host dir
