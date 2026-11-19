@@ -139,6 +139,7 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
 /// the provider account fingerprint, when that provider could be built.
 /// `record_account` is the account from the sprite ledger record. Errors name
 /// envs only; they never include a token or credential reference.
+#[cfg(test)]
 pub(crate) fn pick_sprites_env(
     candidates: &[(String, Option<String>)],
     record_account: Option<&str>,
