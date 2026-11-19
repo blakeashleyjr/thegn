@@ -20,6 +20,8 @@ pub(super) struct FakeApi {
     /// List pages; when exhausted, `endless` keeps returning a fresh cursor.
     pub(super) pages: Mutex<VecDeque<(Vec<SandboxView>, Option<String>)>>,
     pub(super) endless: bool,
+    /// When set, make stop/resume update the name-keyed control-plane view.
+    pub(super) stateful: bool,
     pub(super) delete_fails: bool,
     pub(super) snapshots: Vec<String>,
     /// Every create and run body sent, in order.
@@ -81,6 +83,14 @@ impl Api for FakeApi {
         Box::pin(async move {
             if resume {
                 self.record(format!("resume {name}"));
+                if self.stateful {
+                    let n = self.count("resume");
+                    if let Some(view) = self.by_name.lock().unwrap().get_mut(name) {
+                        view.status = SessionStatus::Running;
+                        view.session_id = Some(format!("sess_resumed_{n}"));
+                        return Ok(Some(view.clone()));
+                    }
+                }
                 return Ok(self.resume.lock().unwrap().clone());
             }
             self.record(format!("get {name}"));
@@ -136,6 +146,17 @@ impl Api for FakeApi {
     fn stop<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.record(format!("stop {session}"));
+            if self.stateful
+                && let Some(view) = self
+                    .by_name
+                    .lock()
+                    .unwrap()
+                    .values_mut()
+                    .find(|view| view.session_id.as_deref() == Some(session))
+            {
+                view.status = SessionStatus::Stopped;
+                view.session_id = None;
+            }
             Ok(())
         })
     }
@@ -576,6 +597,27 @@ async fn stop_session_never_resumes() {
         .await
         .unwrap();
     assert_eq!(fake.calls(), [format!("get {NAME}"), "stop sess_3".into()]);
+}
+
+#[tokio::test]
+async fn stateful_fake_stop_then_resume_flips_status() {
+    let fake = FakeApi {
+        stateful: true,
+        ..FakeApi::default()
+    };
+    fake.by_name.lock().unwrap().insert(
+        NAME.into(),
+        view(NAME, SessionStatus::Running, Some("sess_1")),
+    );
+
+    fake.stop("sess_1").await.unwrap();
+    let stopped = fake.get(NAME, false).await.unwrap().unwrap();
+    assert_eq!(stopped.status, SessionStatus::Stopped);
+    assert_eq!(stopped.session_id, None);
+
+    let resumed = fake.get(NAME, true).await.unwrap().unwrap();
+    assert_eq!(resumed.status, SessionStatus::Running);
+    assert_eq!(resumed.session_id.as_deref(), Some("sess_resumed_1"));
 }
 
 #[test]

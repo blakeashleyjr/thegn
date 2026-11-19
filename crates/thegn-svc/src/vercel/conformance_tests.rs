@@ -13,7 +13,10 @@ async fn vercel_passes_the_conformance_suite() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let controller = crate::vps::controller::controller_id().unwrap();
     let ledger = tempfile::tempdir().unwrap();
-    let fake = Arc::new(FakeApi::default());
+    let fake = Arc::new(FakeApi {
+        stateful: true,
+        ..FakeApi::default()
+    });
     *fake.create.lock().unwrap() = Some(Ok(tagged(NAME, &controller)));
     *fake.ledger_probe.lock().unwrap() = Some(ledger.path().join(format!("{NAME}.json")));
     // A sandbox this controller did not create: no thegn tag at all.
@@ -39,18 +42,15 @@ async fn vercel_passes_the_conformance_suite() {
             })
         })),
         resumes: Some(Box::new(move || resumes.count("resume"))),
-        cap: None,
-        // FakeApi (kept untouched) has no stop/resume round trip to observe.
-        supports_stop: false,
+        // The first suite case records the created sandbox in the ledger, so
+        // max_instances = 1 makes the later cap+1 create refuse before HTTP.
+        // The untagged foreign sandbox is filtered out of the ledger count.
+        cap: Some(1),
+        supports_stop: true,
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
-    // FakeApi returns one canned create result (it cannot fill a cap) and has
-    // no stop/resume round trip, so exactly these two cases are skipped; any
-    // other skip is a regression in what the fixture declares.
-    assert_eq!(
-        report.skipped,
-        vec!["create_respects_cap", "stop_resume_round_trip"],
-        "{report:?}"
-    );
+    assert!(report.skipped.is_empty(), "{report:?}");
+    assert!(fake.count("stop") >= 1, "{report:?}");
+    assert_eq!(fake.count("resume"), 1, "{report:?}");
 }
