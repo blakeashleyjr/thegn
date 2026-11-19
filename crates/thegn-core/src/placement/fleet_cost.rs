@@ -368,7 +368,15 @@ pub fn is_stopped_state(state: Option<&str>) -> bool {
     state.is_some_and(|s| {
         matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "stopped" | "stopping" | "suspended" | "destroyed" | "destroying" | "off" | "archived"
+            "stopped"
+                | "stopping"
+                | "suspended"
+                | "destroyed"
+                | "destroying"
+                | "off"
+                | "archived"
+                | "warm"
+                | "cold"
         )
     })
 }
@@ -855,6 +863,8 @@ mod tests {
     fn stopped_states() {
         assert!(is_stopped_state(Some(" Stopped ")));
         assert!(is_stopped_state(Some("suspended")));
+        assert!(is_stopped_state(Some("warm")));
+        assert!(is_stopped_state(Some("COLD")));
         assert!(!is_stopped_state(Some("started")));
         assert!(!is_stopped_state(None));
     }
