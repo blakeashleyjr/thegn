@@ -26,6 +26,8 @@ pub(crate) const TAIL_BYTES: usize = 256 * 1024;
 pub(crate) const TAIL_LINES: usize = 200;
 /// `--timeout` default, seconds.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 3600;
+/// Cadence for the optional `--wait` progress notice.
+pub(crate) const PROGRESS_EVERY: Duration = Duration::from_secs(60);
 
 /// Parsed `agent run` flags (the clap variant's fields, moved in).
 pub(crate) struct RunArgs {
@@ -231,6 +233,147 @@ pub(crate) fn output_tail(raw: &[u8]) -> String {
     tail_lines(&strip_ansi(raw), TAIL_LINES)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CliCheck {
+    Present,
+    Missing,
+    Unknown(String),
+}
+
+fn safe_bare_word(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if value.len() > 64 || !(first.is_ascii_alphanumeric() || matches!(first, '.' | '_' | '+')) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// The configured agent's executable when it is safe to use in `command -v`.
+pub(crate) fn agent_program(cfg: &Config, agent: &str) -> Option<String> {
+    if agent.is_empty() || agent == "__shell__" {
+        return None;
+    }
+    let command = cfg.agent_command(agent)?;
+    if command.trim().is_empty() {
+        return None;
+    }
+    let program = crate::pane::agent_program_name(command, agent);
+    safe_bare_word(&program).then_some(program)
+}
+
+pub(crate) fn cli_check_argv(program: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        format!(
+            "command -v {} >/dev/null 2>&1",
+            thegn_core::util::sh_quote(program)
+        ),
+    ]
+}
+
+fn sanitize(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect()
+}
+
+pub(crate) fn cli_check_outcome(res: anyhow::Result<(i32, String)>) -> CliCheck {
+    match res {
+        Ok((0, _)) => CliCheck::Present,
+        Ok((1 | 127, _)) => CliCheck::Missing,
+        Ok((code, _)) => CliCheck::Unknown(format!("exit {code}")),
+        Err(error) => CliCheck::Unknown(sanitize(&format!("{error:#}"))),
+    }
+}
+
+pub(crate) fn cli_missing_warning(program: &str, sandbox: &str, env: &str, wt: &str) -> String {
+    format!(
+        "agent run: `{}` is not on PATH in sandbox {} (env {}); the run will likely exit 127. Add it to [sandbox.home] agents (or tools) for env {}, then run `thegn env up --worktree {}`",
+        sanitize(program),
+        sanitize(sandbox),
+        sanitize(env),
+        sanitize(env),
+        sanitize(wt),
+    )
+}
+
+fn agent_cli_preflight_blocking(cfg: &Config, wt: &str, agent: &str) -> Option<String> {
+    let program = agent_program(cfg, agent)?;
+    let (env, sandbox) = match crate::provision_gate::provider_target(cfg, wt) {
+        Ok(Some(target)) => target,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(
+                worktree = %wt,
+                error = %format!("{error:#}"),
+                "agent run CLI preflight target resolution failed"
+            );
+            return None;
+        }
+    };
+    let envc = cfg.env.get(&env)?;
+    let provider = crate::agent::provider_for_named(&envc.provider, &sandbox)?;
+    let result = crate::agent::block_on_provider(|| async {
+        provider
+            .run_exec_within(
+                &sandbox,
+                &cli_check_argv(&program),
+                None,
+                &[],
+                Duration::from_secs(60),
+            )
+            .await
+    });
+    match cli_check_outcome(result) {
+        CliCheck::Missing => Some(cli_missing_warning(&program, &sandbox, &env, wt)),
+        CliCheck::Unknown(reason) => {
+            tracing::debug!(
+                worktree = %wt,
+                sandbox = %sandbox,
+                error = %reason,
+                "agent run CLI preflight was inconclusive"
+            );
+            None
+        }
+        CliCheck::Present => None,
+    }
+}
+
+pub(crate) fn exit_hint(code: Option<i32>) -> Option<&'static str> {
+    match code {
+        Some(crate::sprite_bridge::EXIT_REMOTE_LOST) => Some(
+            "the remote exec stream was lost and could not be reattached (the sandbox may have suspended); thegn session list shows cause:remote-exec-lost",
+        ),
+        Some(127) => Some(
+            "command not found; on a provider env the agent CLI is missing in the sandbox (thegn doctor, Remote live readiness)",
+        ),
+        _ => None,
+    }
+}
+
+pub(crate) fn progress_line(session: &str, elapsed: Duration, tail: &[u8]) -> String {
+    let last = output_tail(tail)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take(80).collect::<String>())
+        .unwrap_or_else(|| "(none yet)".to_string());
+    format!(
+        "agent run: session {} still running ({}m{:02}s); last output: {} (thegn session attach {} to watch)",
+        display_cell(session),
+        elapsed.as_secs() / 60,
+        elapsed.as_secs() % 60,
+        last,
+        display_cell(session),
+    )
+}
+
 /// The env every `agent run` onto an unbound worktree is pinned to.
 pub(crate) const PIPELINE_ENV: &str = "pipeline";
 
@@ -399,6 +542,15 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             .map_err(|e| anyhow::anyhow!("agent run env pin task failed: {e}"))??
     };
     crate::cmd::env::provision_for_headless_open(cfg, wt.clone()).await?;
+    let warn = {
+        let (cfg, wt, agent) = (cfg.clone(), wt.clone(), agent.clone());
+        tokio::task::spawn_blocking(move || agent_cli_preflight_blocking(&cfg, &wt, &agent))
+            .await
+            .unwrap_or(None)
+    };
+    if let Some(w) = warn {
+        thegn_core::msg::warn(&w);
+    }
     let started = Instant::now();
     let (info, row) = crate::cmd::session::open_plain(
         cfg,
@@ -432,10 +584,16 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         }
         return Ok(crate::cmd::EXIT_OK);
     }
-    let (status, raw) =
-        observe_until_exit(&client, &info.id, Duration::from_secs(timeout_secs)).await?;
+    let (status, raw) = observe_until_exit(
+        &client,
+        &info.id,
+        Duration::from_secs(timeout_secs),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    )
+    .await?;
     let duration_ms = thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
     let tail = output_tail(&raw);
+    let hint = exit_hint(status.exit_code());
     // `--pull`: only once the agent actually exited (a timed-out session is
     // still running); a failure never changes the agent's exit code.
     let pull_outcome = if pull && matches!(status, WaitStatus::Exited(_)) {
@@ -470,6 +628,9 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             "output_tail": tail,
             "duration_ms": duration_ms,
         });
+        if let (Some(hint), Some(map)) = (hint, obj.as_object_mut()) {
+            map.insert("exit_hint".to_string(), serde_json::json!(hint));
+        }
         if let (Some(p), Some(map)) = (&pull_outcome, obj.as_object_mut()) {
             map.insert("pull".to_string(), p.json());
         }
@@ -491,6 +652,9 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
                 "[agent run: timed out after {timeout_secs}s; session {id} is still running — \
                  `thegn session wait {id}` or `thegn session close {id}`]"
             ),
+        }
+        if let Some(hint) = hint {
+            outln!("[agent run: hint: {hint}]");
         }
         if let Some(row) = row {
             outln!("dispatch {row} tracked");
@@ -953,15 +1117,26 @@ async fn observe_until_exit(
     client: &ControlClient,
     session: &str,
     timeout: Duration,
+    progress: bool,
 ) -> Result<(WaitStatus, Vec<u8>)> {
     use thegn_core::control_wire::EventFrame;
+    let observed = tokio::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut next_note = observed + PROGRESS_EVERY;
     let mut ring = TailRing::new(TAIL_BYTES);
     let client_id = format!("agent-run-{}", std::process::id());
     let mut stream = client.attach(session, &client_id, 0, 0, true).await?;
     loop {
-        match tokio::time::timeout_at(deadline, stream.frames.recv()).await {
+        let wait_until = deadline.min(next_note);
+        match tokio::time::timeout_at(wait_until, stream.frames.recv()).await {
             Err(_) => {
+                if next_note <= deadline {
+                    if progress {
+                        msg::info(&progress_line(session, observed.elapsed(), &ring.bytes()));
+                    }
+                    next_note += PROGRESS_EVERY;
+                    continue;
+                }
                 detach(&stream.control).await;
                 return Ok((WaitStatus::Timeout, ring.bytes()));
             }
@@ -994,10 +1169,13 @@ async fn observe_until_exit(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT_SECS, EnvChoice, PIPELINE_ENV, TAIL_BYTES, TAIL_LINES, TailRing,
-        WaitStatus, env_choice, other_live_sessions, output_tail, pin_env_for_run,
-        process_exit_code, pull_result, should_stop_after_run, stop_result, strip_ansi, tail_lines,
+        CliCheck, DEFAULT_TIMEOUT_SECS, EnvChoice, PIPELINE_ENV, PROGRESS_EVERY, TAIL_BYTES,
+        TAIL_LINES, TailRing, WaitStatus, agent_program, cli_check_argv, cli_check_outcome,
+        cli_missing_warning, env_choice, exit_hint, other_live_sessions, output_tail,
+        pin_env_for_run, process_exit_code, progress_line, pull_result, should_stop_after_run,
+        stop_result, strip_ansi, tail_lines,
     };
+    use std::time::Duration;
     use thegn_core::config::Config;
     use thegn_core::config::EnvProviderKind;
     use thegn_core::db::Db;
@@ -1209,6 +1387,90 @@ mod tests {
     fn output_tail_strips_then_caps() {
         let raw = b"\x1b[1mstart\x1b[0m\r\n\r\n\x1b]0;t\x07end\r\n";
         assert_eq!(output_tail(raw), "start\nend");
+    }
+
+    #[test]
+    fn agent_program_accepts_bare_words_only() {
+        let cfg: Config = toml::from_str(
+            r#"
+                [[agents]]
+                name = "claude"
+                command = "claude --model sonnet"
+
+                [[agents]]
+                name = "path"
+                command = "$HOME/x"
+            "#,
+        )
+        .expect("config parses");
+        assert_eq!(agent_program(&cfg, "claude"), Some("claude".into()));
+        assert_eq!(agent_program(&cfg, "path"), Some("path".into()));
+        assert_eq!(agent_program(&cfg, "__shell__"), None);
+
+        let mut unsafe_cfg = cfg.clone();
+        unsafe_cfg.agents[0].command = "-x".into();
+        assert_eq!(agent_program(&unsafe_cfg, "claude"), None);
+    }
+
+    #[test]
+    fn cli_check_argv_quotes_the_program() {
+        assert_eq!(
+            cli_check_argv("a'b"),
+            [
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "command -v 'a'\\''b' >/dev/null 2>&1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_check_outcome_table() {
+        let cases: [(anyhow::Result<(i32, String)>, CliCheck); 4] = [
+            (Ok((0, String::new())), CliCheck::Present),
+            (Ok((1, String::new())), CliCheck::Missing),
+            (Ok((127, String::new())), CliCheck::Missing),
+            (Ok((2, String::new())), CliCheck::Unknown("exit 2".into())),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(cli_check_outcome(result), expected);
+        }
+        assert_eq!(
+            cli_check_outcome(Err(anyhow::anyhow!("bad\nnetwork"))),
+            CliCheck::Unknown("badnetwork".into())
+        );
+    }
+
+    #[test]
+    fn cli_missing_warning_names_the_fix_and_strips_controls() {
+        let warning = cli_missing_warning("claude", "sandbox\n1", "env\tname", "/tmp/wt\r");
+        assert!(!warning.chars().any(char::is_control), "{warning:?}");
+        assert!(warning.contains("claude"));
+        assert!(warning.contains("[sandbox.home] agents (or tools)"));
+        assert!(warning.contains("thegn env up --worktree /tmp/wt"));
+    }
+
+    #[test]
+    fn exit_hint_table() {
+        assert!(exit_hint(Some(75)).is_some());
+        assert!(exit_hint(Some(127)).is_some());
+        assert_eq!(exit_hint(Some(0)), None);
+        assert_eq!(exit_hint(None), None);
+    }
+
+    #[test]
+    fn progress_line_shows_elapsed_and_last_line() {
+        let long = "x".repeat(100);
+        let line = progress_line(
+            "sess-1",
+            Duration::from_secs(65),
+            format!("\x1b[31m{long}\x1b[0m\n").as_bytes(),
+        );
+        assert!(line.contains("1m05s"), "{line}");
+        assert!(!line.contains('\x1b'), "{line}");
+        assert!(line.contains(&"x".repeat(80)), "{line}");
+        assert!(!line.contains(&"x".repeat(81)), "{line}");
+        assert!(progress_line("sess-1", PROGRESS_EVERY, b"\n  \t\n").contains("(none yet)"));
     }
 
     #[test]
