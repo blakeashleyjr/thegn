@@ -180,8 +180,10 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     // earlier in-memory indices stay valid without opening SQLite on the loop.
     let cfg = cx.cfg.clone();
     crate::db_task::persist_critical(move |db| {
-        let failures = close_groups_durably(db, &session_id, &removed_groups, Some(&cfg));
-        if let Some(notice) = close_failure_notice(&failures) {
+        let outcome = close_groups_durably(db, &session_id, &removed_groups, Some(&cfg));
+        if let Some(notice) = close_failure_notice(&outcome.failures) {
+            crate::db_task::status(&notice);
+        } else if let Some(notice) = kept_sandbox_notice(&outcome.kept) {
             crate::db_task::status(&notice);
         }
     });
@@ -229,18 +231,89 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     }
 }
 
+/// What closing a set of groups did: the closes that were not recorded, and
+/// the provider sandboxes the close left running.
+#[derive(Debug, Default)]
+pub(crate) struct CloseOutcome {
+    pub(crate) failures: Vec<String>,
+    /// `(provider, sandbox name)` for each closed provider worktree.
+    pub(crate) kept: Vec<(String, String)>,
+}
+
+/// The provider sandbox a worktree row is bound to, when its stored location
+/// is a provider one. Local rows return `None` without any env resolution.
+/// A resolution error is a debug log only.
+fn kept_sandbox_for(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+    path: &str,
+) -> Option<(String, String)> {
+    use thegn_core::store::WorkspaceStore;
+    let location = db.location_for(path).ok().flatten();
+    if !matches!(
+        thegn_core::remote::GitLoc::from_db(path, location.as_deref()),
+        thegn_core::remote::GitLoc::Provider { .. }
+    ) {
+        return None;
+    }
+    let repo = db.repo_root_for(path).ok().flatten().unwrap_or_default();
+    let env = match db.effective_env_checked(path, &repo) {
+        Ok(Some(env)) => env,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(target: "thegn::worktree", %error, "kept-sandbox notice: env lookup failed");
+            return None;
+        }
+    };
+    let name = match crate::provider_factory::provider_sandbox_name_checked(cfg, path, &env) {
+        Ok(Some(name)) => name,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(target: "thegn::worktree", %error, "kept-sandbox notice: sandbox name lookup failed");
+            return None;
+        }
+    };
+    let provider = cfg.env.get(&env)?.provider.provider.trim().to_string();
+    Some((provider, name))
+}
+
+/// The one-line notice for sandboxes a close left running.
+pub(crate) fn kept_sandbox_notice(kept: &[(String, String)]) -> Option<String> {
+    match kept {
+        [] => None,
+        [(provider, name)] => {
+            let name = crate::merge_sweep::safe_display(name);
+            let provider = crate::merge_sweep::safe_display(provider);
+            Some(format!(
+                "Closed. Sandbox {name} ({provider}) was kept and may still bill when awake; reopen the worktree to use it, or run `thegn env reap --provider {provider}` to remove it."
+            ))
+        }
+        many => {
+            let names = many
+                .iter()
+                .map(|(_, name)| crate::merge_sweep::safe_display(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("{} sandboxes kept: {names}", many.len()))
+        }
+    }
+}
+
 pub(crate) fn close_groups_durably(
     db: &thegn_core::db::Db,
     session_id: &str,
     groups: &[crate::session::WorktreeGroup],
     cfg: Option<&thegn_core::config::Config>,
-) -> Vec<String> {
+) -> CloseOutcome {
     let mut failures = Vec::new();
+    let mut kept = Vec::new();
     for group in groups {
         if group.path.is_empty() {
             crate::run::forget_worktree_group(db, session_id, group, true, cfg);
             continue;
         }
+        // Before the row is forgotten: the binding is gone afterwards.
+        let kept_here = cfg.and_then(|cfg| kept_sandbox_for(db, cfg, &group.path));
         let result = thegn_core::worktree_suppress::keys_for(std::path::Path::new(&group.path))
             .and_then(|keys| {
                 thegn_core::worktree_suppress::close_with_suppression(
@@ -260,9 +333,10 @@ pub(crate) fn close_groups_durably(
             failures.push(format!("{}: {error}", group.path));
         } else {
             crate::run::forget_worktree_group(db, session_id, group, true, cfg);
+            kept.extend(kept_here);
         }
     }
-    failures
+    CloseOutcome { failures, kept }
 }
 
 pub(crate) fn close_failure_notice(failures: &[String]) -> Option<String> {
@@ -714,8 +788,8 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 mod tests {
     use super::{
         TargetState, close_failure_notice, close_groups_durably, group_names_for,
-        hide_pending_deletes, landing_for_slug, next_or_prev, pending_delete_refusal,
-        pending_target_refusal, resolve_group_indices, target_state,
+        hide_pending_deletes, kept_sandbox_notice, landing_for_slug, next_or_prev,
+        pending_delete_refusal, pending_target_refusal, resolve_group_indices, target_state,
     };
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
@@ -1084,7 +1158,11 @@ mod tests {
             .unwrap();
         let group = WorktreeGroup::new("repo/feature".to_string(), GroupKind::Branch, path.clone());
 
-        assert!(close_groups_durably(&db, "session", &[group], None).is_empty());
+        assert!(
+            close_groups_durably(&db, "session", &[group], None)
+                .failures
+                .is_empty()
+        );
 
         assert!(db.worktree_record(&path).unwrap().is_none());
         let keys = thegn_core::worktree_suppress::keys_for(std::path::Path::new(&path)).unwrap();
@@ -1100,7 +1178,7 @@ mod tests {
             .unwrap();
         let group = WorktreeGroup::new("repo/feature".to_string(), GroupKind::Branch, path);
 
-        let failures = close_groups_durably(&db, "session", &[group], None);
+        let failures = close_groups_durably(&db, "session", &[group], None).failures;
 
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains(path));
@@ -1136,6 +1214,71 @@ mod tests {
     }
 
     #[test]
+    fn kept_sandbox_notice_none_one_many() {
+        assert!(kept_sandbox_notice(&[]).is_none());
+        let one = kept_sandbox_notice(&[("sprites".into(), "wt-a".into())]).unwrap();
+        assert!(one.contains("Sandbox wt-a (sprites) was kept"));
+        assert!(one.contains("thegn env reap --provider sprites"));
+        let many = kept_sandbox_notice(&[
+            ("sprites".into(), "a".into()),
+            ("vercel".into(), "b".into()),
+        ])
+        .unwrap();
+        assert_eq!(many, "2 sandboxes kept: a, b");
+    }
+
+    #[test]
+    fn close_groups_reports_no_kept_sandbox_for_a_local_row() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        use thegn_core::store::WorkspaceStore;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("local").to_string_lossy().into_owned();
+        db.put_worktree("repo/local", "/repo", &path, "local", None, None)
+            .unwrap();
+        let group = WorktreeGroup::new("repo/local".to_string(), GroupKind::Branch, path);
+        let cfg = thegn_core::config::Config::default();
+        let outcome = close_groups_durably(&db, "session", &[group], Some(&cfg));
+        assert!(outcome.failures.is_empty());
+        assert!(outcome.kept.is_empty());
+    }
+
+    #[test]
+    fn close_groups_reports_the_kept_sandbox_for_a_provider_row() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        use thegn_core::store::WorkspaceStore;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prov").to_string_lossy().into_owned();
+        db.put_worktree("repo/prov", "/repo", &path, "prov", None, None)
+            .unwrap();
+        db.set_worktree_env(&path, "sp").unwrap();
+        let location = thegn_core::remote::GitLoc::provider_db_string(
+            &[
+                "sprite".into(),
+                "exec".into(),
+                "-s".into(),
+                "box-1".into(),
+                "--".into(),
+            ],
+            "/workspace",
+        );
+        db.set_worktree_location(&path, &location).unwrap();
+        let mut cfg = thegn_core::config::Config::default();
+        let mut env = thegn_core::config::EnvConfig::default();
+        env.placement = thegn_core::config::PlacementMode::Provider;
+        env.provider.provider = "sprites".into();
+        cfg.env.insert("sp".into(), env);
+        let group = WorktreeGroup::new("repo/prov".to_string(), GroupKind::Branch, path);
+        let outcome = close_groups_durably(&db, "session", &[group], Some(&cfg));
+        assert!(outcome.failures.is_empty());
+        assert!(outcome.kept.len() <= 1);
+        if let Some((provider, name)) = outcome.kept.first() {
+            assert_eq!(provider, "sprites");
+            assert!(!name.is_empty());
+        }
+    }
+
+    #[test]
     fn close_failure_notice_reports_the_relative_path_refusal() {
         let db = thegn_core::db::Db::open_memory().unwrap();
         use thegn_core::store::WorkspaceStore;
@@ -1143,7 +1286,7 @@ mod tests {
         db.put_worktree("repo/feature", "/repo", path, "feature", None, None)
             .unwrap();
         let group = WorktreeGroup::new("repo/feature".to_string(), GroupKind::Branch, path);
-        let failures = close_groups_durably(&db, "session", &[group], None);
+        let failures = close_groups_durably(&db, "session", &[group], None).failures;
 
         let notice = close_failure_notice(&failures).unwrap();
         assert!(notice.contains("rel/wt"));
