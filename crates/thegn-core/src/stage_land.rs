@@ -34,9 +34,14 @@ pub struct UnattendedFacts {
     pub gate_timeout_secs: u64,
     pub paused: bool,
     pub budget_ok: bool,
-    /// The merge gate runs inside a sandbox. While it does not, the gate runs
-    /// worker-written code on the host, so no land may skip the owner.
+    /// The merge gate runs inside a sandbox (`[merge_queue] gate_sandbox =
+    /// "sealed"` and the sealed spec resolves for the repo now). While it
+    /// does not, the gate runs worker-written code on the host, so no land
+    /// may skip the owner.
     pub gate_isolated: bool,
+    /// Why the gate is not isolated, when known (e.g. the sealed gate cannot
+    /// start); `None` reads as [`GATE_NOT_ISOLATED`].
+    pub gate_isolation_refusal: Option<String>,
 }
 
 /// A lane's autonomy: the minimum over every row in its chain, with a NULL
@@ -80,7 +85,15 @@ pub const GATE_UNBOUNDED: &str = "[merge_queue] gate_timeout_secs is 0, so the g
 pub const PAUSED: &str = "automations are paused";
 pub const BUDGET_SPENT: &str = "the automation budget does not allow another land";
 /// Check 7's refusal.
-pub const GATE_NOT_ISOLATED: &str = "the merge gate is not sandboxed yet";
+pub const GATE_NOT_ISOLATED: &str =
+    "the merge gate is not sandboxed (set [merge_queue] gate_sandbox = \"sealed\")";
+/// Check 7's refusal when the gate is configured sealed but cannot start.
+pub const GATE_CANNOT_START: &str = "the sealed merge gate cannot start";
+
+/// [`GATE_CANNOT_START`] with its cause.
+pub fn gate_cannot_start(why: &str) -> String {
+    format!("{GATE_CANNOT_START}: {why}")
+}
 
 /// `Ok` only when every unattended-land check passes; the error names the
 /// first failed check (it becomes the land approval's reason). Checks run in
@@ -108,7 +121,10 @@ pub fn unattended_land(f: &UnattendedFacts) -> Result<(), String> {
         return Err(BUDGET_SPENT.into());
     }
     if !f.gate_isolated {
-        return Err(GATE_NOT_ISOLATED.into());
+        return Err(f
+            .gate_isolation_refusal
+            .clone()
+            .unwrap_or_else(|| GATE_NOT_ISOLATED.into()));
     }
     Ok(())
 }
@@ -202,6 +218,7 @@ mod tests {
             paused: false,
             budget_ok: true,
             gate_isolated: true,
+            gate_isolation_refusal: None,
         }
     }
 
@@ -318,6 +335,22 @@ mod tests {
             flip(&mut f);
             assert_eq!(unattended_land(&f), Err((*want).to_string()), "{name}");
         }
+    }
+
+    #[test]
+    fn a_sealed_gate_that_cannot_start_names_its_cause() {
+        let mut f = passing();
+        f.gate_isolated = false;
+        f.gate_isolation_refusal = Some(gate_cannot_start("no sandbox runtime"));
+        assert_eq!(
+            unattended_land(&f),
+            Err("the sealed merge gate cannot start: no sandbox runtime".to_string())
+        );
+        assert!(GATE_NOT_ISOLATED.contains("gate_sandbox = \"sealed\""));
+        // A refusal text never lets an isolated gate through, nor the reverse.
+        let mut ok = passing();
+        ok.gate_isolation_refusal = Some("stale".into());
+        assert_eq!(unattended_land(&ok), Ok(()));
     }
 
     #[test]
