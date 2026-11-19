@@ -1228,6 +1228,12 @@ mod tests {
                 stage: Some("code".into()),
                 parent_id: None,
                 session_id: None,
+                artifact_path: None,
+                note: None,
+                chunk_path: None,
+                report: None,
+                exit_code: None,
+                exited_at_ms: None,
             })
         });
 
