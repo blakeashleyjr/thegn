@@ -7,6 +7,15 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Provider pull-back is journaled: a restart, `wt rm` or another process pulls a `data = "sync"` sandbox back using the journal, a failed pull keeps the sandbox, and `thegn doctor` shows a pending row. `sprite-exec` routes to the account that owns the sprite and refuses when ambiguous; `vercel-exec` capture mode refuses likewise. A failed Sprites one-shot exec appends the last 8 KiB of stderr. Not yet verified live.
+- Search rows are labelled worktree · tab · program, the overlay lists recent lines on open, identical lines from one pane are grouped, and Enter scrolls to the exact line or points to replay when it has left the grid.
+- Merge integrate and land record provenance (source tip and target base for integrate, the admitted candidate for a ready land, none for a manual land). Remote and macOS placements keep the requested `oci_runtime`; krun needs read-write `/dev/kvm` on a local Linux host.
+- Search is literal smart-case by default, ranked by match quality then recency; `Alt+f` toggles fuzzy. The `profile` scope leaves the `Tab` cycle.
+- `[env.<n>.provider] model_credentials` is now valid for Sprites (`none` or `upload`). `none` withholds model credentials and agent logins; unset behaves as before. Not yet verified live.
+- Sprites destroy now counts only after a definite 404 from polling the sprite; otherwise the record is kept and destroy fails so a retry can finish. Provider exec has an overall 31 minute deadline. Closing a worktree resolves its location and env before forgetting it.
+
 ## [0.1.0-alpha.98] — 2026-11-19
 
 ### Added

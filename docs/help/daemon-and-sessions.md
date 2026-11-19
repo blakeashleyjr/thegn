@@ -441,6 +441,7 @@ nonempty base64 data up to 64 KiB decoded. BEL and ST terminators are supported
 across PTY reads. Queries, empty/default or multiple selectors, empty/clear
 forms and malformed data are refused; this deliberately narrows the broader
 [xterm OSC 52 grammar](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html).
+A sequence outside these limits is dropped, not truncated (THE-152).
 
 A refused set remains pending for that pane, and a newer validated set replaces
 it. Reattach, fallback and exit discard unadmitted partial/pending clipboard
