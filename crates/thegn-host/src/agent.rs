@@ -1914,19 +1914,10 @@ pub fn provider_proxy_target(
     String,
     String,
 )> {
-    let loc = provider_pane_loc(worktree, "provider proxy target")?;
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    let read =
-        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
-    let selected_env = env_selection_or_refuse(worktree, "provider proxy target", read)?;
-    let selection = selection_with_profile(worktree, &repo_root, selected_env.clone())?;
-    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
+    if !provider_envs_configured(cfg) {
+        return None;
+    }
+    let environment = resolve_provider_env(cfg, worktree, "provider proxy target")?;
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
         return None;
     };
@@ -2121,26 +2112,15 @@ pub(crate) fn native_agent_exec_for_pane(
 /// that agent command (run via the same `cd workdir; <cmd>` wrapper).
 fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> PaneNativeExec {
     use thegn_core::config::ProviderExecMode;
-    let Some(loc) = provider_pane_loc(worktree, "native exec") else {
+    // Config-only fast path: `resolve_env` only yields `Placement::Provider`
+    // from an `[env.*]` with `placement = "provider"`, so without one this
+    // resolves to `Unavailable` and no database is opened (the pane spawn path).
+    if !provider_envs_configured(cfg) {
+        return PaneNativeExec::Unavailable;
+    }
+    let Some(environment) = resolve_provider_env(cfg, worktree, "native exec") else {
         return PaneNativeExec::Unavailable;
     };
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    let read =
-        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
-    let selected_env = match env_selection_or_refuse(worktree, "native exec", read) {
-        Some(selected_env) => selected_env,
-        None => return PaneNativeExec::Unavailable,
-    };
-    let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
-        return PaneNativeExec::Unavailable;
-    };
-    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
         return PaneNativeExec::Unavailable;
     };
@@ -2571,6 +2551,16 @@ fn selection_with_profile(
             return None;
         }
     };
+    selection_with_profile_in(&db, worktree, repo_root, selected_name)
+}
+
+/// As [`selection_with_profile`], over a caller's open handle.
+fn selection_with_profile_in(
+    db: &Db,
+    worktree: &str,
+    repo_root: &Path,
+    selected_name: Option<String>,
+) -> Option<thegn_core::sandbox_pin::EnvSelection> {
     let mut selection = match db.effective_env_selection(worktree, &repo_root.to_string_lossy()) {
         Ok(selection) => selection,
         Err(error) => {
@@ -2620,6 +2610,10 @@ pub(crate) fn remote_placement_configured(cfg: &Config) -> bool {
 
 /// The worktree's location for a provider pane or connect path. `None` (logged) when it cannot be read: the caller
 /// treats the worktree as having no provider target, and the pane launch then refuses visibly in `launch_spec_full`.
+///
+/// Production paths share one handle through [`provider_pane_loc_in`]; this
+/// opening form stays as the reference the equivalence tests compare against.
+#[cfg(test)]
 pub(crate) fn provider_pane_loc(worktree: &str, what: &str) -> Option<GitLoc> {
     match GitLoc::for_worktree_op(Path::new(worktree), what) {
         Ok(loc) => Some(loc),
@@ -2628,6 +2622,84 @@ pub(crate) fn provider_pane_loc(worktree: &str, what: &str) -> Option<GitLoc> {
             None
         }
     }
+}
+
+/// True when any `[env.*]` has `placement = "provider"`. Config-only, no I/O.
+///
+/// `Config::resolve_env` builds a `Placement::Provider` only in
+/// `envbuild::build_env_placement`, reached only for a selected name that is an
+/// `[env.<name>]` table whose `placement` is `Provider`; the unresolved/default
+/// arm uses `placement_from_loc`, which yields only `Local` or `Ssh` (a
+/// recorded provider *location* alone never makes a provider placement). So a
+/// config with no such table can never resolve a provider env, and the provider
+/// pane/proxy/connect paths may skip every database read.
+pub(crate) fn provider_envs_configured(cfg: &Config) -> bool {
+    cfg.env
+        .values()
+        .any(|env| env.placement == thegn_core::config::PlacementMode::Provider)
+}
+
+/// The worktree's location for a provider pane or connect path, over an open
+/// handle. `None` (logged) when it cannot be read: the caller treats the
+/// worktree as having no provider target.
+pub(crate) fn provider_pane_loc_in(db: &Db, worktree: &str, what: &str) -> Option<GitLoc> {
+    match GitLoc::for_worktree_op_in(db, Path::new(worktree), what) {
+        Ok(loc) => Some(loc),
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, %error, "{what}: location unreadable");
+            None
+        }
+    }
+}
+
+/// The one state-DB handle a provider pane/proxy/connect resolution shares.
+/// `None` (logged like an unreadable location) when it cannot be opened: the
+/// caller refuses, exactly as the separate opens it replaces did.
+#[track_caller]
+pub(crate) fn provider_resolution_db(worktree: &str, what: &str) -> Option<Db> {
+    match Db::open() {
+        Ok(db) => Some(db),
+        Err(error) => {
+            let error = format!(
+                "{what} refused: cannot read where {worktree} lives (open worktree location DB: {error:#}); nothing was run against the local checkout"
+            );
+            tracing::warn!(target: "thegn::provider", worktree, %error, "{what}: location unreadable");
+            None
+        }
+    }
+}
+
+/// The worktree's repo root read through `db`, falling back to git's main
+/// worktree and then the worktree itself (a read error falls back too).
+pub(crate) fn repo_root_in(db: &Db, worktree: &str) -> PathBuf {
+    db.repo_root_for(worktree)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree))
+}
+
+/// Resolve the execution environment a provider pane/proxy path acts on, over
+/// ONE database handle (location, repo root, env selection, profile). `None`
+/// (logged) when any read fails: the caller refuses instead of resolving the
+/// default env. The handle is dropped before `resolve_env` runs.
+fn resolve_provider_env(
+    cfg: &Config,
+    worktree: &str,
+    what: &str,
+) -> Option<thegn_core::env::Environment> {
+    let (loc, repo_root, selection) = {
+        let db = provider_resolution_db(worktree, what)?;
+        let loc = provider_pane_loc_in(&db, worktree, what)?;
+        let repo_root = repo_root_in(&db, worktree);
+        let read = db.effective_env_checked(worktree, &repo_root.to_string_lossy());
+        let selected_env = env_selection_or_refuse(worktree, what, read)?;
+        let selection = selection_with_profile_in(&db, worktree, &repo_root, selected_env)?;
+        (loc, repo_root, selection)
+    };
+    Some(cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection))
 }
 
 /// Retry cannot identify the selected provider while the DB read is failing.
