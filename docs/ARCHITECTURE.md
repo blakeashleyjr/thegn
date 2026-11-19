@@ -1,7 +1,7 @@
 # thegn architecture
 
 The single source for how thegn is put together and which invariants are
-enforced. `CLAUDE.md` and `openspec/config.yaml` point here; the behavioural
+enforced. `AGENTS.md` and `openspec/config.yaml` point here; the behavioural
 contracts live in `openspec/specs/<capability>/spec.md`. Each section ends
 with the **gate** that fails when the invariant is broken — an invariant with
 no gate is a wish, not an architecture.
