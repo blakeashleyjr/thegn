@@ -88,6 +88,7 @@ printf '[user]\nname = demo\nemail = demo@example.invalid\n' >"$T/gitconfig" || 
 export HOME="$T/home"
 export XDG_CONFIG_HOME="$T/cfg"
 export XDG_STATE_HOME="$T/state"
+# Safe override (b175): there is no daemon and the backend is `none` (below), so no sandbox is launched whose masks would follow this dir. If a spec ever enables a sandbox backend, drop this override.
 export XDG_RUNTIME_DIR="$T/run"
 export GIT_CONFIG_GLOBAL="$T/gitconfig"
 export GIT_CONFIG_SYSTEM=/dev/null

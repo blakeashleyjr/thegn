@@ -2,9 +2,12 @@
 set -euo pipefail
 
 # Opt-in Linux trace of a release binary's first frame. This is not part of
-# `just ci`. It runs in a disposable HOME, XDG config/state/runtime/cache/data
-# roots, a temporary git repository, and a DBus address that cannot reach a
-# session bus. The default window ends immediately after the first frame;
+# `just ci`. It runs in a disposable HOME, XDG config/state/cache/data roots
+# and a temporary git repository, but keeps the usable login runtime dir so the
+# sandbox masks and the control guard cover every instance's control directory.
+# Daemon sockets are hashed per state dir, so the throwaway `--daemon` cannot
+# collide. The DBus address still cannot reach a session bus. The default
+# window ends immediately after the first frame;
 # --hold-ms N instead runs the full loop for N milliseconds and includes later
 # background work. strace's -e trace=network records connect and related
 # network syscalls; the report counts connect() calls with an address and
@@ -139,11 +142,19 @@ GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_CONFIG_SYSTEM=/dev/null \
   GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' \
   git -C "$T/repo" -c commit.gpgsign=false commit -q -m 'fixture'
 
+login_run="/run/user/$(id -u)"
+if [ -d "$login_run" ] && [ -O "$login_run" ]; then
+  runtime_dir="$login_run"
+else
+  runtime_dir="$T/run"
+  printf 'net-trace: no login runtime dir; masks follow $T/run\n' >&2
+fi
+
 env_vars=(
   "HOME=$T/home"
   "XDG_CONFIG_HOME=$T/cfg"
   "XDG_STATE_HOME=$T/state"
-  "XDG_RUNTIME_DIR=$T/run"
+  "XDG_RUNTIME_DIR=$runtime_dir"
   "XDG_CACHE_HOME=$T/cache"
   "XDG_DATA_HOME=$T/data"
   "GIT_CONFIG_GLOBAL=$T/gitconfig"
