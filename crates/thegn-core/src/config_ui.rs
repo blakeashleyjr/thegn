@@ -265,6 +265,8 @@ pub struct UiConfig {
     /// Ask before destructive project worktree actions (deleting a worktree from disk via the sidebar).
     #[serde(rename = "confirm_delete_project", alias = "confirm_delete_workspace")]
     pub confirm_delete_workspace: bool,
+    /// Ask before Ctrl+Q / quit closes thegn (panes in the daemon keep running). Signals, the CLI and live upgrades never ask.
+    pub confirm_quit: bool,
     /// Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
     pub full_mode_chip: bool,
     /// Dismiss a detail popup when the user left-clicks outside it, like Escape.
@@ -388,6 +390,7 @@ impl Default for UiConfig {
         Self {
             language: "auto".to_string(),
             confirm_delete_workspace: true,
+            confirm_quit: true,
             full_mode_chip: true,
             dismiss_overlay_on_click_outside: true,
             sidebar_workspace_sort: WorkspaceSort::default(),
@@ -568,6 +571,7 @@ mod tests {
         // Defaults survive an empty table.
         let cfg: UiConfig = toml::from_str("").unwrap();
         assert!(cfg.confirm_delete_workspace);
+        assert!(cfg.confirm_quit);
         assert_eq!(cfg.language, "auto");
     }
 
