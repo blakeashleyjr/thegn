@@ -2583,6 +2583,11 @@
       "path": "/v1/overview"
     },
     {
+      "cap": "producers.status",
+      "method": "POST",
+      "path": "/v1/producers/status"
+    },
+    {
       "cap": "notifications.list",
       "method": "POST",
       "path": "/v1/notifications/list"
