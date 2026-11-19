@@ -4927,7 +4927,7 @@ pub(crate) fn deprovision_sync(path: &str) -> Result<(), String> {
 /// Test seam for close-time provider sync. The caller is always an off-loop
 /// lifecycle path; the provider call remains on its blocking runtime thread.
 fn deprovision_sync_in(dir: &Path, cfg: &Config, path: &str) -> Result<(), String> {
-    let (env_name, baseline) = {
+    let sync_record = {
         let mut registry = provider_sync_registry()
             .lock()
             .map_err(|_| "provider sync registry unavailable".to_string())?;
@@ -4956,7 +4956,7 @@ fn deprovision_sync_in(dir: &Path, cfg: &Config, path: &str) -> Result<(), Strin
         .map_err(|error| format!("{error:#}"))
     };
 
-    let Some((env_name, baseline)) = env_name else {
+    let Some((env_name, baseline)) = sync_record else {
         let entry = match thegn_svc::sync_journal::load_at(dir, path) {
             Ok(Some(entry)) => entry,
             Ok(None) => return Ok(()),
