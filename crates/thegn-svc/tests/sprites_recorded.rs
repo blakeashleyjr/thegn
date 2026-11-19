@@ -81,9 +81,13 @@ fn handle(mut stream: TcpStream, usage_body: &'static str, omit_has_more: bool) 
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let _ = stream.write_all(headers.as_bytes());
-    let _ = stream.write_all(&body);
-    let _ = stream.flush();
+    respond(&mut stream, &headers, &body).unwrap_or_default(); // best-effort: client may have disconnected
+}
+
+fn respond(stream: &mut TcpStream, head: &str, body: &[u8]) -> std::io::Result<()> {
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
 }
 
 #[test]
@@ -177,5 +181,9 @@ async fn usage_with_observation_is_reported() {
 async fn list_with_token_but_no_has_more_is_refused() {
     let mock = start_mock(USAGE_UNREPORTED, true);
     let provider = SpritesProvider::new(&mock.base_url, "test-token", "my-dev-sprite");
-    assert!(provider.sandbox_inventory().await.is_err());
+    let error = provider.sandbox_inventory().await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("continuation token without has_more"),
+        "{error:#}"
+    );
 }
