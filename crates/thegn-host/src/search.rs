@@ -430,9 +430,9 @@ impl SearchOverlay {
                     seg(Tok::Slot(S::Ghost), " dismiss"),
                 ],
                 vec![
-                    seg(Tok::Slot(S::Ghost2), mode_hint),
-                    sp(2),
                     seg(Tok::Slot(S::Ghost3), count_str),
+                    sp(2),
+                    seg(Tok::Slot(S::Ghost2), mode_hint),
                 ],
             );
             seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
