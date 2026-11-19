@@ -524,6 +524,8 @@ pub const CATALOG: &[Slot] = &[
     // `repo forget`: the workspaces to forget, or (`--keep`) the ones to keep.
     slot("repo forget", "paths", SourceKind::Repo),
     slot("repo forget", "keep", SourceKind::Repo),
+    // The source database is a filesystem path.
+    slot("repo forget", "copy_from", SourceKind::Structural),
     // The hidden legacy top-level alias of `repo trust`.
     slot("repo-trust", "path", SourceKind::Repo),
     slot("wt new", "repo", SourceKind::Repo),
