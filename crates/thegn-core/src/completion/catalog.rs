@@ -351,6 +351,13 @@ pub const CATALOG: &[Slot] = &[
         "name",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    // A sprite name as the Sprites API lists it: listing would be a network
+    // call on <TAB>, so it stays free text.
+    slot(
+        "fleet inspect",
+        "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),
@@ -607,6 +614,7 @@ pub const CATALOG: &[Slot] = &[
     slot("env set", "name", SourceKind::Env),
     slot("env test", "name", SourceKind::Env),
     slot("fleet list", "env", SourceKind::Env),
+    slot("fleet inspect", "env", SourceKind::Env),
     slot("wt new", "env", SourceKind::Env),
     // --- profile (`[profiles.<name>]`) -------------------------------------
     // A `global = true` arg: classified once at the root, and clap propagates
