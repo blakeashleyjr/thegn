@@ -896,8 +896,37 @@ impl Session {
                 self.switch_to(idx);
                 true
             }
-            None => false,
+            None => self.restore_home_group(name),
         }
+    }
+
+    /// Recreate this workspace's home group when `name` is its home tab and the
+    /// session lost it, then focus it. The sidebar always draws a home row for
+    /// a workspace, but nothing recreated the group once a layout was persisted
+    /// without it: the row sat there and could never be entered. Appended, not
+    /// inserted first, because `self.active` and every live row target are
+    /// indices; the next resurrect sorts it back to the top.
+    fn restore_home_group(&mut self, name: &str) -> bool {
+        let is_home_tab = crate::sidebar::split_tab(name)
+            .is_some_and(|(slug, _)| name == thegn_core::repo::home_tab(&slug));
+        if !is_home_tab || !std::path::Path::new(&self.id).is_absolute() {
+            return false;
+        }
+        let idx = match self
+            .worktrees
+            .iter()
+            .position(|g| g.kind == GroupKind::Home)
+        {
+            Some(idx) => idx,
+            None => {
+                tracing::warn!(target: "thegn::session", session = %self.id, group = name, "home group was missing from the session; recreated it");
+                self.worktrees
+                    .push(WorktreeGroup::new(name, GroupKind::Home, self.id.clone()));
+                self.worktrees.len() - 1
+            }
+        };
+        self.switch_to(idx);
+        true
     }
 
     /// Adopt registry rows of this live session's workspace that its in-memory
@@ -1189,6 +1218,28 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(p.parent().unwrap()); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         Db::open_at(&p).unwrap()
+    }
+
+    #[test]
+    fn landing_on_a_lost_home_group_recreates_it() {
+        let mut s = Session {
+            id: "/r/app".into(),
+            worktrees: vec![WorktreeGroup::new("app/feat", GroupKind::Branch, "/w/feat")],
+            active: 0,
+        };
+        // A branch row the session never adopted still reports the miss.
+        assert!(!s.land_on_group("app/other"));
+        assert_eq!(s.worktrees.len(), 1);
+        // The home row lands: the group comes back, appended, and is focused.
+        assert!(s.land_on_group("app/home"));
+        assert_eq!(s.worktrees.len(), 2);
+        assert_eq!(s.active, 1);
+        assert_eq!(s.worktrees[1].kind, GroupKind::Home);
+        assert_eq!(s.worktrees[1].path, "/r/app");
+        // Landing again reuses it.
+        s.switch_to(0);
+        assert!(s.land_on_group("app/home"));
+        assert_eq!((s.worktrees.len(), s.active), (2, 1));
     }
 
     #[test]
