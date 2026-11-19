@@ -109,14 +109,12 @@ fn list_files(dir: &Path, accept: impl Fn(&str) -> bool) -> (Vec<Entry>, bool) {
             return (out, false);
         }
     };
-    let mut seen = 0usize;
     let mut truncated = false;
-    for dirent in read {
+    for (seen, dirent) in read.enumerate() {
         if seen >= MAX_ENTRIES_READ {
             truncated = true;
             break;
         }
-        seen += 1;
         let Ok(dirent) = dirent else { continue };
         let Some(name) = dirent.file_name().to_str().map(str::to_owned) else {
             continue;
