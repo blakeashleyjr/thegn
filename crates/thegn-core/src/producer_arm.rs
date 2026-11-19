@@ -355,6 +355,47 @@ mod tests {
     }
 
     #[test]
+    fn armed_inbox_table() {
+        use crate::config::{InboxAccount, InboxKind};
+        let account = |kind| InboxAccount {
+            name: "a".into(),
+            kind,
+            ..Default::default()
+        };
+        // (master switches on, [inbox] enabled, accounts, armed)
+        let rows: [(bool, bool, Vec<InboxAccount>, bool); 6] = [
+            (false, true, vec![account(InboxKind::Command)], false),
+            (true, false, vec![account(InboxKind::Command)], false),
+            (true, true, vec![], false),
+            (true, true, vec![account(InboxKind::Slack)], false),
+            (
+                true,
+                true,
+                vec![account(InboxKind::Gmail), account(InboxKind::Jmap)],
+                false,
+            ),
+            (
+                true,
+                true,
+                vec![account(InboxKind::Slack), account(InboxKind::Imap)],
+                true,
+            ),
+        ];
+        for (i, (master, enabled, accounts, want)) in rows.into_iter().enumerate() {
+            let mut cfg = crate::config::Config::default();
+            cfg.inbox.enabled = enabled;
+            cfg.inbox.accounts = accounts;
+            let inputs = ArmInputs {
+                daemon_enabled: master,
+                headless: master,
+                inbox_any: inbox_armable(&cfg),
+                ..on(&[])
+            };
+            assert_eq!(armed(ProducerKind::Inbox, &inputs), want, "row {i}");
+        }
+    }
+
+    #[test]
     fn inbox_cadence_is_the_fastest_account_and_floored() {
         let mut cfg = crate::config::Config::default();
         assert_eq!(cadence_secs(ProducerKind::Inbox, &cfg), 300);
