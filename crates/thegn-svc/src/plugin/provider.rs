@@ -13,6 +13,7 @@
 //! replace pending waiters; exhaustion or collision refuses the call.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -302,6 +303,81 @@ fn require_mutation_success(op: &'static str, value: serde_json::Value) -> Resul
     }
 }
 
+/// Most rows one plugin listing or search may return (THE-531).
+pub const MAX_PLUGIN_ISSUE_ROWS: usize = 1000;
+
+/// Check that `issue` (the plugin's reply) reflects every field `patch` asked
+/// for. Status and priority must be equal; title is compared trimmed.
+/// `assignee_me` is not verifiable here (the adapter does not know the
+/// plugin's "me") and is skipped.
+fn verify_patch_applied(patch: &IssuePatch, issue: &Issue) -> Result<(), IssueError> {
+    let mut applied = Vec::new();
+    let mut unverified = Vec::new();
+
+    if let Some(want) = patch.status {
+        if issue.status == want {
+            applied.push("status");
+        } else {
+            unverified.push("status");
+        }
+    }
+    if let Some(want) = patch.title.as_deref() {
+        if issue.title.trim() == want.trim() {
+            applied.push("title");
+        } else {
+            unverified.push("title");
+        }
+    }
+    if let Some(want) = patch.priority {
+        if issue.priority == want {
+            applied.push("priority");
+        } else {
+            unverified.push("priority");
+        }
+    }
+
+    if !unverified.is_empty() {
+        return Err(IssueError::PartialUpdate {
+            applied,
+            unapplied: Vec::new(),
+            unverified,
+            source: Box::new(IssueError::Api(
+                "plugin did not apply the requested fields".into(),
+            )),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a reply that names one issue id twice, then bound the rows.
+/// `limit == 0` reports an over-cap reply as partial; a positive limit
+/// truncates to the requested limit and the plugin row cap.
+fn bound_rows(rows: Vec<Issue>, limit: usize) -> Result<Vec<Issue>, IssueError> {
+    let mut ids = HashSet::with_capacity(rows.len());
+    for issue in &rows {
+        if !ids.insert(issue.id.as_str()) {
+            return Err(IssueError::Parse(
+                "plugin reply names the same issue id twice".into(),
+            ));
+        }
+    }
+
+    if limit == 0 {
+        if rows.len() > MAX_PLUGIN_ISSUE_ROWS {
+            return Err(IssueError::PartialList {
+                issues: rows.into_iter().take(MAX_PLUGIN_ISSUE_ROWS).collect(),
+                reason: "plugin listing exceeded the row cap",
+            });
+        }
+        return Ok(rows);
+    }
+
+    Ok(rows
+        .into_iter()
+        .take(limit.min(MAX_PLUGIN_ISSUE_ROWS))
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Issue seam adapter
 // ---------------------------------------------------------------------------
@@ -396,7 +472,11 @@ impl IssueBackend for PluginIssueBackend {
         Box::pin(async move {
             let args = serde_json::to_value(filter).unwrap_or_default();
             let rows: Vec<Issue> = self.op("list_issues", args).await?;
-            rows.into_iter().map(|i| self.validate_issue(i)).collect()
+            let rows = rows
+                .into_iter()
+                .map(|i| self.validate_issue(i))
+                .collect::<Result<Vec<_>, _>>()?;
+            bound_rows(rows, filter.limit)
         })
     }
 
@@ -431,7 +511,9 @@ impl IssueBackend for PluginIssueBackend {
                 "patch": serde_json::to_value(patch).unwrap_or_default(),
             });
             self.checked_input(id)?;
-            self.validate_issue(self.op("update_issue", args).await?)
+            let issue = self.validate_issue(self.op("update_issue", args).await?)?;
+            verify_patch_applied(patch, &issue)?;
+            Ok(issue)
         })
     }
 
@@ -447,7 +529,11 @@ impl IssueBackend for PluginIssueBackend {
                     serde_json::json!({ "query": query, "limit": limit }),
                 )
                 .await?;
-            rows.into_iter().map(|i| self.validate_issue(i)).collect()
+            let rows = rows
+                .into_iter()
+                .map(|i| self.validate_issue(i))
+                .collect::<Result<Vec<_>, _>>()?;
+            bound_rows(rows, limit)
         })
     }
 
@@ -599,6 +685,134 @@ done
             Err(IssueError::Api(message)) if message == "plugin add_comment reply has no success result"
         ));
         assert!(require_mutation_success("add_comment", serde_json::json!(true)).is_ok());
+    }
+
+    #[test]
+    fn verify_patch_accepts_matching_status_title_priority() {
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::InProgress),
+            title: Some("new title".into()),
+            priority: Some(thegn_core::issue::IssuePriority::High),
+            ..Default::default()
+        };
+        let issue = Issue {
+            title: "new title".into(),
+            status: thegn_core::issue::IssueStatus::InProgress,
+            priority: thegn_core::issue::IssuePriority::High,
+            ..Default::default()
+        };
+
+        assert!(verify_patch_applied(&patch, &issue).is_ok());
+    }
+
+    #[test]
+    fn verify_patch_reports_each_mismatched_field() {
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::Done),
+            title: Some("new title".into()),
+            priority: Some(thegn_core::issue::IssuePriority::Low),
+            ..Default::default()
+        };
+        let issue = Issue {
+            title: "old title".into(),
+            status: thegn_core::issue::IssueStatus::Todo,
+            priority: thegn_core::issue::IssuePriority::Low,
+            ..Default::default()
+        };
+
+        let Err(IssueError::PartialUpdate { unverified, .. }) =
+            verify_patch_applied(&patch, &issue)
+        else {
+            panic!("expected a partial update");
+        };
+        assert_eq!(unverified, vec!["status", "title"]);
+    }
+
+    #[test]
+    fn verify_patch_compares_title_trimmed() {
+        let patch = IssuePatch {
+            title: Some("  new title  ".into()),
+            ..Default::default()
+        };
+        let issue = Issue {
+            title: "new title".into(),
+            ..Default::default()
+        };
+
+        assert!(verify_patch_applied(&patch, &issue).is_ok());
+    }
+
+    #[test]
+    fn verify_patch_skips_assignee_me() {
+        let patch = IssuePatch {
+            assignee_me: Some(true),
+            ..Default::default()
+        };
+
+        assert!(verify_patch_applied(&patch, &Issue::default()).is_ok());
+    }
+
+    #[test]
+    fn bound_rows_refuses_duplicate_ids() {
+        let rows = vec![
+            Issue {
+                id: "plugin:demo:1".into(),
+                ..Default::default()
+            },
+            Issue {
+                id: "plugin:demo:1".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert!(matches!(
+            bound_rows(rows, 0),
+            Err(IssueError::Parse(message))
+                if message == "plugin reply names the same issue id twice"
+        ));
+    }
+
+    #[test]
+    fn bound_rows_truncates_to_a_positive_limit() {
+        let rows = (0..5)
+            .map(|index| Issue {
+                id: format!("plugin:demo:{index}"),
+                ..Default::default()
+            })
+            .collect();
+
+        let rows = bound_rows(rows, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].id, "plugin:demo:1");
+    }
+
+    #[test]
+    fn bound_rows_caps_an_unbounded_listing_as_partial() {
+        let rows = (0..=MAX_PLUGIN_ISSUE_ROWS)
+            .map(|index| Issue {
+                id: format!("plugin:demo:{index}"),
+                ..Default::default()
+            })
+            .collect();
+
+        let Err(IssueError::PartialList { issues, reason }) = bound_rows(rows, 0) else {
+            panic!("expected a partial list");
+        };
+        assert_eq!(issues.len(), MAX_PLUGIN_ISSUE_ROWS);
+        assert_eq!(reason, "plugin listing exceeded the row cap");
+    }
+
+    #[test]
+    fn bound_rows_keeps_rows_under_the_cap() {
+        let rows = (0..MAX_PLUGIN_ISSUE_ROWS)
+            .map(|index| Issue {
+                id: format!("plugin:demo:{index}"),
+                ..Default::default()
+            })
+            .collect();
+
+        let rows = bound_rows(rows, 0).unwrap();
+        assert_eq!(rows.len(), MAX_PLUGIN_ISSUE_ROWS);
     }
 
     fn live_bridge() -> (FixtureSupervisor, ResidentSession, Arc<ProviderBridge>) {
@@ -848,6 +1062,33 @@ done
             .unwrap();
         assert_eq!(updated.title, "updated by plugin");
         assert_eq!(bridge.writer.next_request_peek(), before + 1);
+    }
+
+    #[test]
+    fn plugin_update_that_ignores_the_title_is_a_partial_update() {
+        let (_fixture, _session, bridge) = live_bridge();
+        let caps = IssueCaps::from_json(&serde_json::Value::Null).unwrap();
+        let backend = PluginIssueBackend::new(bridge, "demo", caps).unwrap();
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router
+            .push_backend("demo".into(), Box::new(backend))
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = rt.block_on(router.update_issue(
+            "plugin:demo:1",
+            &IssuePatch {
+                title: Some("new".into()),
+                ..Default::default()
+            },
+        ));
+        let Err(IssueError::PartialUpdate { unverified, .. }) = result else {
+            panic!("expected a partial update");
+        };
+        assert_eq!(unverified, vec!["title"]);
     }
 
     #[test]
