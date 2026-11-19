@@ -2863,23 +2863,31 @@ mod tests {
             cols: 40,
             rows: 20,
         };
+        let dirty = thegn_svc::git::BranchMeta {
+            dirty_files: Some(2),
+            ..Default::default()
+        };
         let mut model = FrameModel {
             sidebar_rows: vec![
-                // The branch differs from the title: a branch that equals the
-                // title is echoed by it and gets no detail line (b164).
+                // With no window title the title line is the branch, so the
+                // detail's branch field is echoed away (b164). The rows carry
+                // the git-scan metadata a real worktree row has, which is what
+                // the detail line shows.
                 SidebarRow {
                     branch: Some("feature/a".into()),
+                    branch_meta: Some(dirty.clone()),
                     ..SidebarRow::base(RowKind::Worktree, 1, "feat-a", "ws")
                 },
                 SidebarRow {
                     branch: Some("feature/b".into()),
+                    branch_meta: Some(dirty),
                     ..SidebarRow::base(RowKind::Worktree, 1, "feat-b", "ws")
                 },
             ],
             ..FrameModel::default()
         };
-        // Detail-on-focus for all rows, leading with the branch name — so a
-        // focused row grows a second line regardless of git/PR/env data.
+        // Detail-on-focus for all rows, so a focused row grows a second line
+        // carrying its dirty count.
         model.sidebar_display = SidebarDisplay {
             focus_detail: FocusDetail::All,
             detail_when: thegn_core::config::DetailWhen::Focused,
