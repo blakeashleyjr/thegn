@@ -1,7 +1,9 @@
 //! The sprite memory policy: `[env.<n>.provider] min_ram_gb > 0` sets
-//! `limit_mb = min_ram_gb × 1024` (autoscale unset) after create and again,
-//! with a GET readback, at each provision. Sprites have a fixed 8 vCPU, so
-//! there is no CPU knob.
+//! `limit_mb = min_ram_gb × 1024` (autoscale unset) once, right after create, with a
+//! GET read-back. It is NOT re-applied on reuse, resume or a warm-spare claim: the
+//! Sprites API stores it per sprite. `thegn fleet inspect <sprite> --env <S> --policy`
+//! reads it back (UNVERIFIED: whether that GET wakes a cold sprite). It is not a
+//! cgroup limit inside the guest.
 
 use anyhow::{Context, Result, bail};
 
@@ -11,12 +13,14 @@ use crate::provider::CONTROL_TIMEOUT;
 /// Largest policy response body read.
 const MAX_POLICY_BYTES: usize = 64 * 1024;
 
-fn policy_url(http: &SpritesHttp<'_>) -> String {
-    format!(
+fn policy_url(http: &SpritesHttp<'_>) -> Result<String> {
+    crate::vps::registry::checked_name(http.name)
+        .map_err(|_| anyhow::anyhow!("sprites: invalid sprite name"))?;
+    Ok(format!(
         "{}/sprites/{}/policy/resources",
         http.base.trim_end_matches('/'),
         http.name
-    )
+    ))
 }
 
 /// Apply the memory policy, then read it back; a mismatch is an error.
@@ -24,7 +28,7 @@ pub(crate) async fn apply(http: &SpritesHttp<'_>, limit_mb: u32) -> Result<()> {
     let name = http.name;
     let response = http
         .client
-        .post(policy_url(http))
+        .post(policy_url(http)?)
         .bearer_auth(http.token)
         .timeout(CONTROL_TIMEOUT)
         .json(&policy_body(limit_mb))
@@ -47,7 +51,7 @@ pub(crate) async fn read(http: &SpritesHttp<'_>) -> Result<Option<u32>> {
     let name = http.name;
     let response = http
         .client
-        .get(policy_url(http))
+        .get(policy_url(http)?)
         .bearer_auth(http.token)
         .timeout(CONTROL_TIMEOUT)
         .send()
@@ -79,6 +83,16 @@ pub fn policy_body(limit_mb: u32) -> serde_json::Value {
     serde_json::json!({ "memory": { "limit_mb": limit_mb } })
 }
 
+impl crate::provider::SpritesProvider {
+    /// The memory limit (MiB) of sprite `name` from `GET …/policy/resources`;
+    /// `None` = no limit set. Read only; UNVERIFIED whether it wakes a cold sprite.
+    pub async fn memory_policy_mb(&self, name: &str) -> Result<Option<u32>> {
+        let base = self.sprites_http()?;
+        let http = super::SpritesHttp { name, ..base };
+        read(&http).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +104,18 @@ mod tests {
             Some(16384)
         );
         assert_eq!(parse_limit(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn policy_url_refuses_a_slash() {
+        let client = reqwest::Client::new();
+        let http = SpritesHttp {
+            client: &client,
+            base: "https://api.sprites.dev/v1",
+            token: "tok-secret",
+            name: "a/b",
+        };
+        assert!(policy_url(&http).is_err());
     }
 
     async fn serve(responses: Vec<String>) -> String {
@@ -131,6 +157,17 @@ mod tests {
             name: "sp1",
         };
         apply(&http, 2048).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_policy_mb_reads_another_name() {
+        let client = reqwest::Client::new();
+        let base = serve(vec![r#"{"memory":{"limit_mb":2048}}"#.into()]).await;
+        let provider = crate::provider::SpritesProvider::new(&base, "tok-secret", "owned");
+        assert_eq!(
+            provider.memory_policy_mb("another").await.unwrap(),
+            Some(2048)
+        );
     }
 
     #[test]
