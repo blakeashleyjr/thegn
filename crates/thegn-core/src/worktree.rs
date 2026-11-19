@@ -739,7 +739,7 @@ fn checkout_parent(root: &Path, repo_dir_name: &str, cfg: &Config) -> PathBuf {
 }
 
 /// Whether `path` sits where thegn itself places checkouts of this repo:
-/// under [`checkout_parent`] (`<worktrees_dir>/<repo dir name>/` or
+/// under `checkout_parent` (`<worktrees_dir>/<repo dir name>/` or
 /// `<root>/.worktrees`) or anywhere under the repo `root` itself.
 ///
 /// Pure and loop-safe: a lexical, component-wise prefix test on the stored
