@@ -256,6 +256,9 @@ impl IsolatedState {
             }
         }
         vars.push(("THEGN_DIR", temp.path().join(".thegn")));
+        // An empty value is ignored, so the config dir follows the isolated
+        // config home even when the ambient shell sets one.
+        vars.push((crate::util::THEGN_CONFIG_DIR_ENV, PathBuf::new()));
         let strings: Vec<_> = vars
             .iter()
             .map(|(key, value)| (*key, value.to_str().expect("state path is UTF-8")))
