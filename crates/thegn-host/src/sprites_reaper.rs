@@ -83,7 +83,7 @@ pub fn tick(cfg: &Config) {
         .filter(|(_, env)| is_sprites_provider_env(env))
         .map(|(name, env)| (name.clone(), env.clone()))
         .collect();
-    let spawned = thegn_core::thread_name::try_spawn_named("thegn-sprite-reap", move || {
+    let spawned = thegn_core::thread_name::try_spawn_named("thegn-sprt-reap", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         struct FlightGuard;
         impl Drop for FlightGuard {
