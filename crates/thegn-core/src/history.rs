@@ -21,6 +21,8 @@ enum AnsiState {
     Normal,
     /// Saw ESC.
     Esc,
+    /// Saw an ESC intermediate introducer; swallow one more byte.
+    EscIntermediate,
     /// Inside a CSI sequence (`ESC [`); accumulating parameter/intermediate bytes.
     Csi,
     /// Inside a non-CSI escape sequence (e.g. OSC, DCS); drop until ST or BEL.
@@ -32,6 +34,47 @@ enum AnsiState {
 #[derive(Default, Clone)]
 pub struct AnsiStripper {
     state: AnsiState,
+    param: u32,
+    private: bool,
+    cr_pending: bool,
+    rewind: usize,
+    alt: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AnsiEvent {
+    Byte(u8),
+    Spaces(usize),
+    CursorUp(usize),
+    EraseLine,
+    CarriageReturn,
+    Newline,
+    Alt(bool),
+}
+
+/// Length of `bytes` minus an incomplete trailing UTF-8 sequence (at most 3 bytes).
+fn utf8_flush_cut(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    for back in 1..=len.min(3) {
+        let b = bytes[len - back];
+        if b & 0xC0 == 0x80 {
+            continue;
+        }
+        // 0xF8..=0xFF can never start a sequence: nothing to wait for.
+        let need = if b >= 0xF8 {
+            1
+        } else if b >= 0xF0 {
+            4
+        } else if b >= 0xE0 {
+            3
+        } else if b >= 0xC0 {
+            2
+        } else {
+            1
+        };
+        return if need > back { len - back } else { len };
+    }
+    len
 }
 
 impl AnsiStripper {
@@ -39,47 +82,192 @@ impl AnsiStripper {
     /// `out`. Call repeatedly with successive chunks; state carries over.
     pub fn strip_into(&mut self, input: &[u8], out: &mut Vec<u8>) {
         for &b in input {
-            match self.state {
-                AnsiState::Normal => {
-                    if b == 0x1b {
-                        self.state = AnsiState::Esc;
-                    } else if b >= 0x20 || matches!(b, b'\n' | b'\r' | b'\t') {
-                        // Printable or significant whitespace.
-                        out.push(b);
+            if let Some(event) = self.consume_byte(b) {
+                match event {
+                    AnsiEvent::Byte(byte) => out.push(byte),
+                    AnsiEvent::Spaces(count) => {
+                        out.extend(std::iter::repeat_n(b' ', count));
                     }
-                    // Drop other C0 controls (e.g. BEL 0x07, BS 0x08, …).
-                }
-                AnsiState::Esc => {
-                    match b {
-                        b'[' => self.state = AnsiState::Csi,
-                        // ESC followed by anything else: private two-byte seq or
-                        // OSC/DCS/PM/APC all start here — drop until we understand
-                        // the sequence terminator.
-                        b'P' | b']' | b'^' | b'_' | b'X' => self.state = AnsiState::Other,
-                        _ => {
-                            // Two-byte sequence (ESC + final) fully consumed.
-                            self.state = AnsiState::Normal;
-                        }
-                    }
-                }
-                AnsiState::Csi => {
-                    // CSI parameter/intermediate: 0x20–0x3F; final: 0x40–0x7E.
-                    if (0x40..=0x7e).contains(&b) {
-                        self.state = AnsiState::Normal;
-                    }
-                    // Drop the byte either way.
-                }
-                AnsiState::Other => {
-                    // OSC/DCS: terminated by ST (ESC \) or BEL (0x07).
-                    if b == 0x07 {
-                        self.state = AnsiState::Normal;
-                    } else if b == 0x1b {
-                        // Could be the ESC of ST (ESC \) — transition to Esc.
-                        self.state = AnsiState::Esc;
-                    }
-                    // Drop content bytes.
+                    AnsiEvent::Newline => out.push(b'\n'),
+                    AnsiEvent::CarriageReturn => out.push(b'\r'),
+                    _ => {}
                 }
             }
+        }
+    }
+
+    fn consume_byte(&mut self, b: u8) -> Option<AnsiEvent> {
+        match self.state {
+            AnsiState::Normal => {
+                if b == 0x1b {
+                    self.state = AnsiState::Esc;
+                    None
+                } else if b == b'\n' {
+                    Some(AnsiEvent::Newline)
+                } else if b == b'\r' {
+                    Some(AnsiEvent::CarriageReturn)
+                } else if b >= 0x20 || b == b'\t' {
+                    Some(AnsiEvent::Byte(b))
+                } else {
+                    // Drop other C0 controls (e.g. BEL 0x07, BS 0x08, …).
+                    None
+                }
+            }
+            AnsiState::Esc => match b {
+                b'[' => {
+                    self.param = 0;
+                    self.private = false;
+                    self.state = AnsiState::Csi;
+                    None
+                }
+                b'P' | b']' | b'^' | b'_' | b'X' => {
+                    self.state = AnsiState::Other;
+                    None
+                }
+                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' => {
+                    self.state = AnsiState::EscIntermediate;
+                    None
+                }
+                byte if !(0x20..0x80).contains(&byte) => {
+                    self.state = AnsiState::Normal;
+                    self.consume_byte(byte)
+                }
+                _ => {
+                    // Two-byte sequence (ESC + final) fully consumed.
+                    self.state = AnsiState::Normal;
+                    None
+                }
+            },
+            AnsiState::EscIntermediate => {
+                self.state = AnsiState::Normal;
+                None
+            }
+            AnsiState::Csi => {
+                if b.is_ascii_digit() {
+                    self.param = self
+                        .param
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(b - b'0'))
+                        .min(9999);
+                } else if b == b'?' {
+                    self.private = true;
+                } else if (0x40..=0x7e).contains(&b) {
+                    let param = self.param;
+                    let private = self.private;
+                    self.state = AnsiState::Normal;
+                    self.param = 0;
+                    self.private = false;
+                    return match b {
+                        b'C' => Some(AnsiEvent::Spaces(param.clamp(1, 256) as usize)),
+                        b'A' => Some(AnsiEvent::CursorUp(param.max(1) as usize)),
+                        b'K' if param == 2 => Some(AnsiEvent::EraseLine),
+                        b'h' if private && matches!(param, 47 | 1047 | 1049) => {
+                            Some(AnsiEvent::Alt(true))
+                        }
+                        b'l' if private && matches!(param, 47 | 1047 | 1049) => {
+                            Some(AnsiEvent::Alt(false))
+                        }
+                        _ => None,
+                    };
+                }
+                None
+            }
+            AnsiState::Other => {
+                // OSC/DCS: terminated by ST (ESC \) or BEL (0x07).
+                if b == 0x07 {
+                    self.state = AnsiState::Normal;
+                } else if b == 0x1b {
+                    // Could be the ESC of ST (ESC \) — transition to Esc.
+                    self.state = AnsiState::Esc;
+                }
+                None
+            }
+        }
+    }
+
+    /// Strip input while applying terminal line-editing events to history.
+    fn feed_lines(&mut self, input: &[u8], partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
+        for &b in input {
+            let Some(event) = self.consume_byte(b) else {
+                continue;
+            };
+
+            match event {
+                AnsiEvent::Alt(alt) => {
+                    self.alt = alt;
+                    partial.clear();
+                    self.cr_pending = false;
+                }
+                _ if self.alt => {}
+                AnsiEvent::Byte(byte) => self.append_byte(byte, partial, buf),
+                AnsiEvent::Spaces(count) => {
+                    for _ in 0..count {
+                        self.append_byte(b' ', partial, buf);
+                    }
+                }
+                AnsiEvent::CarriageReturn => {
+                    self.cr_pending = true;
+                }
+                AnsiEvent::Newline => {
+                    self.cr_pending = false;
+                    self.finish_line(partial, buf);
+                }
+                AnsiEvent::CursorUp(count) => {
+                    self.rewind = self.rewind.saturating_add(count).min(buf.len()).min(64);
+                    partial.clear();
+                    self.cr_pending = false;
+                }
+                AnsiEvent::EraseLine => {
+                    partial.clear();
+                    self.cr_pending = false;
+                }
+            }
+        }
+    }
+
+    fn append_byte(&mut self, byte: u8, partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
+        const MAX_PARTIAL: usize = 4096;
+
+        if self.cr_pending {
+            partial.clear();
+            self.cr_pending = false;
+        }
+        partial.push(byte);
+        if partial.len() >= MAX_PARTIAL {
+            self.flush_partial(partial, buf);
+        }
+    }
+
+    fn finish_line(&mut self, partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
+        let mut line = String::from_utf8_lossy(partial).into_owned();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        self.store_line(line, buf);
+        partial.clear();
+    }
+
+    fn flush_partial(&mut self, partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
+        let cut = utf8_flush_cut(partial);
+        if cut == 0 {
+            return;
+        }
+
+        let mut line = String::from_utf8_lossy(&partial[..cut]).into_owned();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        self.store_line(line, buf);
+        partial.drain(..cut);
+    }
+
+    fn store_line(&mut self, line: String, buf: &mut HistoryBuffer) {
+        if self.rewind > 0 && self.rewind <= buf.len() {
+            buf.replace_from_end(self.rewind, line);
+            self.rewind -= 1;
+        } else {
+            self.rewind = 0;
+            buf.push_line(line);
         }
     }
 
@@ -129,6 +317,19 @@ impl HistoryBuffer {
         self.total += 1;
     }
 
+    /// Replace the `k`-th stored line from the end (`k = 1` is newest).
+    /// Returns `false` when `k` is out of range. A replacement counts as one
+    /// line write in `total_pushed`, so new-line consumers rescan it.
+    pub fn replace_from_end(&mut self, k: usize, line: String) -> bool {
+        if k == 0 || k > self.lines.len() {
+            return false;
+        }
+        let index = self.lines.len() - k;
+        self.lines[index] = line;
+        self.total += 1;
+        true
+    }
+
     /// Iterate lines oldest-first.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         self.lines.iter().map(String::as_str)
@@ -143,7 +344,8 @@ impl HistoryBuffer {
         self.lines.is_empty()
     }
 
-    /// Monotonic count of all lines ever pushed (survives ring eviction).
+    /// Monotonic count of completed line writes (pushes and replacements);
+    /// survives ring eviction.
     pub fn total_pushed(&self) -> u64 {
         self.total
     }
@@ -173,30 +375,7 @@ pub fn feed_bytes_to_history(
     partial: &mut Vec<u8>,
     stripper: &mut AnsiStripper,
 ) {
-    // Force-flush a partial that has grown unreasonably large (binary / no-LF output).
-    const MAX_PARTIAL: usize = 4096;
-
-    // We strip ANSI in-place into `stripped`, then split on '\n'.
-    let mut stripped: Vec<u8> = Vec::with_capacity(bytes.len());
-    stripper.strip_into(bytes, &mut stripped);
-
-    for &b in &stripped {
-        if b == b'\n' {
-            // Complete the current line.
-            let line = String::from_utf8_lossy(partial).into_owned();
-            // Trim trailing '\r' (CR LF).
-            let line = line.trim_end_matches('\r').to_string();
-            buf.push_line(line);
-            partial.clear();
-        } else {
-            partial.push(b);
-            if partial.len() >= MAX_PARTIAL {
-                let line = String::from_utf8_lossy(partial).into_owned();
-                buf.push_line(line);
-                partial.clear();
-            }
-        }
-    }
+    stripper.feed_lines(bytes, partial, buf);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -269,6 +448,22 @@ mod tests {
         assert_eq!(String::from_utf8(out).unwrap(), "text");
     }
 
+    #[test]
+    fn ansi_stripper_cursor_forward_emits_clamped_spaces() {
+        assert_eq!(strip("hello\x1b[1Cworld"), "hello world");
+        assert_eq!(strip("a\x1b[9999Cb"), format!("a{}b", " ".repeat(256)));
+    }
+
+    #[test]
+    fn ansi_stripper_intermediate_escape_consumes_one_byte() {
+        assert_eq!(strip("\x1b(Bplain\n"), "plain\n");
+    }
+
+    #[test]
+    fn ansi_stripper_reprocesses_non_ascii_after_escape() {
+        assert_eq!(strip("\x1bé\n"), "é\n");
+    }
+
     // ── HistoryBuffer ─────────────────────────────────────────────────────────
 
     fn make_buf(cap: usize) -> HistoryBuffer {
@@ -332,6 +527,20 @@ mod tests {
         assert_eq!(buf.get(1), None);
     }
 
+    #[test]
+    fn replace_from_end_replaces_and_counts_as_a_line_write() {
+        let mut buf = make_buf(10);
+        buf.push_line("first".into());
+        buf.push_line("second".into());
+        let total = buf.total_pushed();
+        assert!(buf.replace_from_end(1, "new second".into()));
+        assert_eq!(buf.get(1), Some("new second"));
+        assert_eq!(buf.total_pushed(), total + 1);
+        assert!(!buf.replace_from_end(0, "nope".into()));
+        assert!(!buf.replace_from_end(3, "nope".into()));
+        assert_eq!(buf.total_pushed(), total + 1);
+    }
+
     // ── feed_bytes_to_history ─────────────────────────────────────────────────
 
     fn feed_str(s: &str, buf: &mut HistoryBuffer, partial: &mut Vec<u8>, st: &mut AnsiStripper) {
@@ -360,6 +569,26 @@ mod tests {
         feed_str(&big, &mut buf, &mut partial, &mut st);
         assert_eq!(buf.len(), 1, "force-flushed at 4096");
         assert!(partial.is_empty(), "partial cleared after force-flush");
+    }
+
+    #[test]
+    fn non_utf8_output_still_flushes_in_4096_byte_lines() {
+        let mut buf = make_buf(10);
+        let mut partial = Vec::new();
+        let mut st = AnsiStripper::default();
+        feed_bytes_to_history(&[0xffu8; 5000], &mut buf, &mut partial, &mut st);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(partial.len(), 5000 - 4096);
+    }
+
+    #[test]
+    fn partial_line_force_flush_preserves_utf8_boundaries() {
+        let mut buf = make_buf(10);
+        let mut partial = Vec::new();
+        let mut st = AnsiStripper::default();
+        feed_str(&"é".repeat(5000), &mut buf, &mut partial, &mut st);
+        assert!(buf.iter().all(|line| !line.contains('\u{fffd}')));
+        assert!(String::from_utf8(partial).is_ok());
     }
 
     #[test]
@@ -401,5 +630,57 @@ mod tests {
         feed_bytes_to_history(b"vis\x1b[31m", &mut buf, &mut partial, &mut st);
         feed_bytes_to_history(b"ible\x1b[0m\n", &mut buf, &mut partial, &mut st);
         assert_eq!(buf.get(0), Some("visible"));
+    }
+
+    #[test]
+    fn carriage_return_overwrites_previous_partial_line() {
+        let mut buf = make_buf(10);
+        let mut partial = Vec::new();
+        let mut st = AnsiStripper::default();
+        feed_str(
+            "\rthinking 1\rthinking 50\n",
+            &mut buf,
+            &mut partial,
+            &mut st,
+        );
+        assert_eq!(buf.iter().collect::<Vec<_>>(), ["thinking 50"]);
+    }
+
+    #[test]
+    fn ink_style_redraw_replaces_lines_from_the_end() {
+        let mut buf = make_buf(10);
+        let mut partial = Vec::new();
+        let mut st = AnsiStripper::default();
+        feed_str(
+            "a\nb\n\x1b[2A\x1b[Ja2\nb2\n",
+            &mut buf,
+            &mut partial,
+            &mut st,
+        );
+        assert_eq!(buf.iter().collect::<Vec<_>>(), ["a2", "b2"]);
+    }
+
+    #[test]
+    fn erase_line_clears_partial_output() {
+        let mut buf = make_buf(10);
+        let mut partial = Vec::new();
+        let mut st = AnsiStripper::default();
+        feed_str("stale\x1b[2Kfresh\n", &mut buf, &mut partial, &mut st);
+        assert_eq!(buf.get(0), Some("fresh"));
+    }
+
+    #[test]
+    fn alternate_screen_output_is_not_recorded() {
+        let mut buf = make_buf(10);
+        let mut partial = Vec::new();
+        let mut st = AnsiStripper::default();
+        feed_str(
+            "\x1b[?1049halt-screen line\nsecond line\x1b[?1049l",
+            &mut buf,
+            &mut partial,
+            &mut st,
+        );
+        assert!(buf.is_empty());
+        assert!(partial.is_empty());
     }
 }

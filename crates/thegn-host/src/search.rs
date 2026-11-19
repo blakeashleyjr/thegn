@@ -22,7 +22,7 @@
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
-use thegn_core::search::{SearchEngine, SearchMatch, SearchScope, SearchSource};
+use thegn_core::search::{MatchMode, SearchEngine, SearchMatch, SearchScope, SearchSource};
 
 use crate::chrome::S;
 use crate::compositor::Rect;
@@ -60,6 +60,13 @@ impl SearchOverlay {
 
     pub fn scope(&self) -> SearchScope {
         self.engine.scope()
+    }
+
+    /// Populate the result list before the user types. An empty query ranks
+    /// the newest history lines first, so opening the overlay is useful on its
+    /// own and does not wait for the first keystroke.
+    pub fn prime(&mut self, sources: &[SearchSource<'_>]) {
+        self.engine.set_query("", sources);
     }
 
     #[allow(dead_code)] // used in tests
@@ -107,6 +114,14 @@ impl SearchOverlay {
                 self.engine.set_scope(new_scope, sources);
             }
 
+            KeyCode::Char('f') | KeyCode::Char('F') if mods == Modifiers::ALT => {
+                let next = match self.engine.mode() {
+                    MatchMode::Literal => MatchMode::Fuzzy,
+                    MatchMode::Fuzzy => MatchMode::Literal,
+                };
+                self.engine.set_mode(next, sources);
+            }
+
             KeyCode::Backspace => {
                 self.engine.backspace(sources);
             }
@@ -129,8 +144,9 @@ impl SearchOverlay {
         let engine = &self.engine;
         let matches = engine.matches();
 
-        const MAX_RESULT_ROWS: usize = 12;
-        let shown = matches.len().min(MAX_RESULT_ROWS);
+        let max_rows = (screen.rows * 2 / 3).saturating_sub(4);
+        let shown = matches.len().min(max_rows).max(3);
+        let width = screen.cols.saturating_sub(4).clamp(40, 120);
         // rows: prompt(1) + rule(1) + results(shown) + rule(1) + footer(1)
         let content_rows = 4 + shown.max(1);
 
@@ -138,7 +154,7 @@ impl SearchOverlay {
         let spec = LayerSpec {
             title: "Search history".into(),
             badge: Some(scope_pill),
-            cols: 72,
+            cols: width,
             rows: content_rows,
             anchor: Anchor::TopThird,
             dim: true,
@@ -185,8 +201,15 @@ impl SearchOverlay {
         // ── Result rows ───────────────────────────────────────────────────────
         let selected_idx = engine.selected_idx();
         let result_rows = inner.rows.saturating_sub(4); // prompt + 2 rules + footer
-        for (row, m) in matches.iter().take(result_rows).enumerate() {
-            let selected = row == selected_idx;
+        let first = selected_idx.saturating_sub(result_rows.saturating_sub(1));
+        for (row, (i, m)) in matches
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(result_rows)
+            .enumerate()
+        {
+            let selected = i == selected_idx;
             let bg = if selected { Tok::SelAccent } else { panel };
 
             // Label column: "● label" or "  label"
@@ -202,22 +225,31 @@ impl SearchOverlay {
                 )
             };
 
-            // Content column: the matched line, truncated.
+            // Content column: the matched line, windowed around the hit.
             let line_avail = inner.cols.saturating_sub(26); // 24 label + 2 sep
-            let line_text = truncate_label(m.line.trim(), line_avail);
-            let line_seg = if selected {
-                seg(Tok::Slot(S::Text), line_text).bold()
+            let (lcut, pre, hit, post, rcut) =
+                window_around(&m.line, m.span.unwrap_or((0, 0)), line_avail);
+            let text_tok = if selected {
+                Tok::Slot(S::Text)
             } else {
-                seg(Tok::Slot(S::Dim), line_text)
+                Tok::Slot(S::Dim)
             };
-
-            let row_line = Line::segs(vec![bullet, label_tok, sp(2), line_seg]);
+            let mut segs = vec![bullet, label_tok, sp(2)];
+            if lcut {
+                segs.push(seg(Tok::Slot(S::Ghost3), ellipsis().to_string()));
+            }
+            segs.push(seg(text_tok, pre.to_string()));
+            segs.push(seg(Tok::Slot(S::Accent), hit.to_string()).bold());
+            segs.push(seg(text_tok, post.to_string()));
+            if rcut {
+                segs.push(seg(Tok::Slot(S::Ghost3), ellipsis().to_string()));
+            }
             seg::draw_line(
                 surface,
                 inner.x,
                 inner.y + 2 + row,
                 inner.cols,
-                &row_line,
+                &Line::segs(segs),
                 bg,
             );
         }
@@ -243,11 +275,15 @@ impl SearchOverlay {
         if inner.rows >= 4 {
             let fy = inner.y + inner.rows - 2;
             seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
-            let count_str = format!(
-                "{} result{}",
-                matches.len(),
-                if matches.len() == 1 { "" } else { "s" }
-            );
+            let count_str = if matches.is_empty() {
+                "no results".to_string()
+            } else {
+                format!("{} of {}", selected_idx + 1, matches.len())
+            };
+            let mode_hint = match engine.mode() {
+                MatchMode::Literal => "Alt+f fuzzy",
+                MatchMode::Fuzzy => "Alt+f literal",
+            };
             let footer = Line::split(
                 vec![
                     seg(Tok::Slot(S::Ghost2), "↑↓"),
@@ -259,7 +295,11 @@ impl SearchOverlay {
                     seg(Tok::Slot(S::Ghost2), "esc"),
                     seg(Tok::Slot(S::Ghost), " dismiss"),
                 ],
-                vec![seg(Tok::Slot(S::Ghost3), count_str)],
+                vec![
+                    seg(Tok::Slot(S::Ghost2), mode_hint),
+                    sp(2),
+                    seg(Tok::Slot(S::Ghost3), count_str),
+                ],
             );
             seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
         }
@@ -284,6 +324,89 @@ fn is_escape(key: &KeyCode, mods: Modifiers) -> bool {
 /// scrollback, taking down the whole compositor).
 fn truncate_label(s: &str, max_cols: usize) -> String {
     crate::seg::clip_end(s, max_cols)
+}
+
+/// The ellipsis glyph `seg::clip_end` draws (derived, not re-declared).
+fn ellipsis() -> char {
+    seg::clip_end("abc", 2).chars().last().unwrap_or(' ')
+}
+
+/// Longest prefix of `s` fitting `cols` display cells.
+fn take_prefix(s: &str, cols: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > cols {
+            return &s[..i];
+        }
+        used += w;
+    }
+    s
+}
+
+/// Longest suffix of `s` fitting `cols` display cells.
+fn take_suffix(s: &str, cols: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > cols {
+            return &s[i + c.len_utf8()..];
+        }
+        used += w;
+    }
+    s
+}
+
+/// Window `line` into `avail` cells around the byte `span` of the hit.
+/// Returns `(left_cut, before, hit, after, right_cut)`; each cut costs one
+/// cell for the ellipsis. Width-aware and char-boundary safe.
+fn window_around(line: &str, span: (usize, usize), avail: usize) -> (bool, &str, &str, &str, bool) {
+    use unicode_width::UnicodeWidthStr;
+    let (s, e) = (
+        span.0.min(line.len()),
+        span.1.min(line.len()).max(span.0.min(line.len())),
+    );
+    let (s, e) = if line.is_char_boundary(s) && line.is_char_boundary(e) {
+        (s, e)
+    } else {
+        (0, 0)
+    };
+    let (pre, hit, post) = (&line[..s], &line[s..e], &line[e..]);
+    if UnicodeWidthStr::width(line) <= avail {
+        return (false, pre, hit, post, false);
+    }
+    let hit_w = UnicodeWidthStr::width(hit);
+    if hit_w >= avail {
+        // The hit alone fills the row: show its head, cut on the right.
+        return (
+            false,
+            "",
+            take_prefix(hit, avail.saturating_sub(1)),
+            "",
+            avail > 0,
+        );
+    }
+    let budget = avail - hit_w;
+    let post_w = UnicodeWidthStr::width(post);
+    let pre_w = UnicodeWidthStr::width(pre);
+    let right_budget = budget - pre_w.min(budget / 2);
+    let (post_out, rcut) = if post_w <= right_budget {
+        (post, false)
+    } else if right_budget == 0 {
+        ("", false)
+    } else {
+        (take_prefix(post, right_budget - 1), true)
+    };
+    let used_right = UnicodeWidthStr::width(post_out) + usize::from(rcut);
+    let left_budget = budget - used_right;
+    let (pre_out, lcut) = if pre_w <= left_budget {
+        (pre, false)
+    } else if left_budget == 0 {
+        ("", false)
+    } else {
+        (take_suffix(pre, left_budget - 1), true)
+    };
+    (lcut, pre_out, hit, post_out, rcut)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -325,6 +448,19 @@ mod tests {
         let r = ov.handle_key(&KeyCode::Char('a'), Modifiers::NONE, &srcs);
         assert!(matches!(r, SearchOutcome::Pending));
         assert_eq!(ov.engine().query(), "ca");
+    }
+
+    #[test]
+    fn prime_lists_newest_lines_before_typing() {
+        let buf = buf_from(&["old", "middle", "new"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+
+        ov.prime(&srcs);
+
+        assert_eq!(ov.engine().query(), "");
+        assert_eq!(ov.engine().matches()[0].line, "new");
+        assert_eq!(ov.engine().matches()[1].line, "middle");
     }
 
     #[test]
@@ -408,9 +544,7 @@ mod tests {
         assert_eq!(ov.scope(), SearchScope::Worktree);
         ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs);
         assert_eq!(ov.scope(), SearchScope::Workspace);
-        ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs);
-        assert_eq!(ov.scope(), SearchScope::Profile);
-        // Wrap back to Pane.
+        // Profile is skipped: wrap back to Pane.
         ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs);
         assert_eq!(ov.scope(), SearchScope::Pane(5));
     }
@@ -480,5 +614,109 @@ mod tests {
         assert!(is_escape(&KeyCode::Char('c'), Modifiers::CTRL));
         assert!(!is_escape(&KeyCode::Char('g'), Modifiers::NONE));
         assert!(!is_escape(&KeyCode::Enter, Modifiers::NONE));
+    }
+
+    fn draw(ov: &SearchOverlay, cols: usize, rows: usize) -> String {
+        let mut surface = Surface::new(cols, rows);
+        ov.render(
+            &mut surface,
+            Rect {
+                x: 0,
+                y: 0,
+                cols,
+                rows,
+            },
+        );
+        surface.screen_chars_to_string()
+    }
+
+    fn typed(ov: &mut SearchOverlay, q: &str, srcs: &[SearchSource<'_>]) {
+        for c in q.chars() {
+            ov.handle_key(&KeyCode::Char(c), Modifiers::NONE, srcs);
+        }
+    }
+
+    #[test]
+    fn long_line_window_shows_hit_with_left_cut() {
+        let line = format!("{}NEEDLE{}", "x".repeat(250), "y".repeat(44));
+        let buf = buf_from(&[&line]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "NEEDLE", &srcs);
+        let out = draw(&ov, 120, 30);
+        // The query row also reads NEEDLE: the hit row is the one after it.
+        let row = out
+            .lines()
+            .filter(|l| l.contains("NEEDLE"))
+            .nth(1)
+            .expect("hit row drawn");
+        let at = row.find("NEEDLE").expect("hit");
+        assert!(
+            row[..at].contains('…'),
+            "left cut ellipsis before the hit: {row}"
+        );
+    }
+
+    #[test]
+    fn narrow_screen_still_shows_hit() {
+        let line = format!("{}NEEDLE{}", "x".repeat(250), "y".repeat(44));
+        let buf = buf_from(&[&line]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "NEEDLE", &srcs);
+        assert!(draw(&ov, 80, 24).contains("NEEDLE"));
+    }
+
+    #[test]
+    fn selection_stays_drawn_when_scrolling_and_footer_counts() {
+        let owned: Vec<String> = (0..415).map(|i| format!("hit {i}")).collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let buf = buf_from(&refs);
+        let srcs = sources(1, &buf);
+        let mut ov = SearchOverlay::new(SearchScope::Pane(1), 1, 1000);
+        typed(&mut ov, "hit", &srcs);
+        for _ in 0..11 {
+            ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE, &srcs);
+        }
+        assert!(draw(&ov, 100, 30).contains("12 of 415"));
+        for _ in 0..9 {
+            ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE, &srcs);
+        }
+        let out = draw(&ov, 100, 30);
+        assert!(out.contains("21 of 415"));
+        assert!(out.contains("hit 394")); // selected row (newest-first idx 20)
+    }
+
+    #[test]
+    fn alt_f_toggles_mode() {
+        let buf = buf_from(&["cargo build"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        assert_eq!(ov.engine().mode(), MatchMode::Literal);
+        assert!(draw(&ov, 100, 30).contains("Alt+f fuzzy"));
+        ov.handle_key(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
+        assert_eq!(ov.engine().mode(), MatchMode::Fuzzy);
+        assert!(draw(&ov, 100, 30).contains("Alt+f literal"));
+        ov.handle_key(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
+        assert_eq!(ov.engine().mode(), MatchMode::Literal);
+    }
+
+    #[test]
+    fn window_around_is_boundary_safe() {
+        let line = "日本語日本語日本語hit日本語";
+        let s = line.find("hit").unwrap();
+        let (l, a, h, b, r) = window_around(line, (s, s + 3), 12);
+        assert_eq!(h, "hit");
+        assert!(l && r);
+        assert!(a.len() + b.len() > 0);
+        let _ = window_around(line, (0, 0), 0);
+    }
+
+    #[test]
+    fn window_around_uses_full_width_without_hit() {
+        let line = "a".repeat(100);
+        let (l, pre, hit, s, r) = window_around(&line, (0, 0), 40);
+        assert_eq!((l, pre, hit, r), (false, "", "", true));
+        assert_eq!(s.len(), 39);
     }
 }

@@ -2116,6 +2116,8 @@ pub(crate) fn forget_worktree_group(
     cleanup_runtime: bool,
     cfg: Option<&thegn_core::config::Config>,
 ) {
+    let close_snapshot = (cleanup_runtime && !group.path.is_empty())
+        .then(|| crate::close_teardown::capture(db, &group.path));
     if !group.path.is_empty() {
         // `del_worktree` cascades the per-worktree caches + merge-queue row
         // itself now (all three forget paths share it).
@@ -2149,9 +2151,12 @@ pub(crate) fn forget_worktree_group(
     if !group.path.is_empty() {
         let path = group.path.clone();
         let cfg = cfg.cloned();
+        let Some(snap) = close_snapshot else {
+            return;
+        };
         thegn_core::thread_name::spawn_named("thegn-teardown", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            crate::close_teardown::background_close(cfg.as_ref(), &path);
+            crate::close_teardown::background_close_with(cfg.as_ref(), &path, snap);
         });
     }
 }
@@ -6615,153 +6620,9 @@ fn compose_corner(
 
 // ── Search helpers ────────────────────────────────────────────────────────────
 
-/// Build the list of `(pane_id, label, &HistoryBuffer)` sources for the search
-/// engine. The `scope` determines which panes from `session` are included;
-/// only live panes present in `panes` contribute (closed panes are skipped).
-///
-/// For `Pane(id)` scope we return at most one entry. For broader scopes we
-/// walk the session tree in display order.
-fn build_search_sources<'a>(
-    scope: thegn_core::search::SearchScope,
-    session: &crate::session::Session,
-    panes: &'a Panes,
-    focused: u32,
-) -> Vec<(u32, String, &'a thegn_core::history::HistoryBuffer)> {
-    use thegn_core::search::SearchScope;
-    let mut out = Vec::new();
-
-    match scope {
-        SearchScope::Pane(id) => {
-            if let Some(p) = panes.table.get(&id) {
-                out.push((id, "pane".to_string(), &p.history));
-            }
-        }
-        SearchScope::Tab => {
-            // Collect panes in the active tab only.
-            if let Some(tab) = session.active_tab() {
-                for pid in tab.center.pane_ids() {
-                    if let Some(p) = panes.table.get(&pid) {
-                        let label = if pid == focused {
-                            "focused pane".to_string()
-                        } else {
-                            format!("pane {pid}")
-                        };
-                        out.push((pid, label, &p.history));
-                    }
-                }
-            }
-        }
-        SearchScope::Worktree => {
-            // All tabs in the active worktree.
-            if let Some(g) = session.active_group() {
-                for (ti, tab) in g.tabs.iter().enumerate() {
-                    let tab_label = format!("tab {}", ti + 1);
-                    for pid in tab.center.pane_ids() {
-                        if let Some(p) = panes.table.get(&pid) {
-                            out.push((pid, tab_label.clone(), &p.history));
-                        }
-                    }
-                }
-            }
-        }
-        SearchScope::Workspace => {
-            // All worktrees in the active session.
-            for g in &session.worktrees {
-                let wt_name = thegn_core::util::basename(&g.path).to_string();
-                for (ti, tab) in g.tabs.iter().enumerate() {
-                    let label = format!("tab {} · {}", ti + 1, wt_name);
-                    for pid in tab.center.pane_ids() {
-                        if let Some(p) = panes.table.get(&pid) {
-                            out.push((pid, label.clone(), &p.history));
-                        }
-                    }
-                }
-            }
-        }
-        SearchScope::Profile => {
-            // Same as Workspace for now (profile == session in the current model;
-            // when profiles land this will walk across sessions).
-            for g in &session.worktrees {
-                let wt_name = thegn_core::util::basename(&g.path).to_string();
-                for (ti, tab) in g.tabs.iter().enumerate() {
-                    let label = format!("tab {} · {}", ti + 1, wt_name);
-                    for pid in tab.center.pane_ids() {
-                        if let Some(p) = panes.table.get(&pid) {
-                            out.push((pid, label.clone(), &p.history));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Compute the overlay rect: centered horizontally, upper third of the center.
 fn search_overlay_rect(center: Rect) -> Rect {
     center // run.rs passes center directly; open_layer handles sizing
-}
-
-/// Jump to the matched line: switch tab if needed, scroll the pane so the
-/// matched line is visible, focus the center terminal.
-fn apply_search_jump(
-    m: thegn_core::search::SearchMatch,
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    focus: &mut crate::focus::FocusState,
-    model: &mut crate::chrome::FrameModel,
-    sb: &mut SidebarState,
-    need_relayout: &mut bool,
-) {
-    use crate::focus::Zone;
-
-    // Find which tab owns this pane and switch to it if not already active.
-    let mut switched = false;
-    'outer: for (gi, g) in session.worktrees.iter().enumerate() {
-        for (ti, tab) in g.tabs.iter().enumerate() {
-            if tab.center.pane_ids().contains(&m.pane_id) {
-                if gi != session.active {
-                    session.switch_to(gi);
-                    switched = true;
-                }
-                if gi == session.active {
-                    let g = &mut session.worktrees[gi];
-                    if g.active_tab != ti {
-                        g.active_tab = ti;
-                        switched = true;
-                    }
-                }
-                break 'outer;
-            }
-        }
-    }
-    if switched {
-        refresh_tab_model(model, session, sb);
-        *need_relayout = true;
-    }
-
-    // Focus the center terminal.
-    focus.zone = Zone::Center;
-    if let Some(tab) = session.active_tab_mut() {
-        tab.focused_pane = m.pane_id;
-    }
-
-    // Scroll the pane to bring the matched line into view.
-    // `line_idx` is the 0-based index in the history ring (oldest surviving = 0).
-    // The history ring may have evicted older lines; the distance from the tail
-    // is `history.len() - 1 - line_idx` lines up from the live tail.
-    if let Some(p) = panes.table.get_mut(&m.pane_id) {
-        let buf_len = p.history.len();
-        if buf_len > 0 && m.line_idx < buf_len {
-            let lines_from_tail = buf_len - 1 - m.line_idx;
-            // Reset first so we're always measuring from the tail.
-            // Scroll to tail first (huge down scroll clamps to 0).
-            p.scroll_down(usize::MAX / 2);
-            if lines_from_tail > 0 {
-                p.scroll_up(lines_from_tail);
-            }
-        }
-    }
 }
 
 fn palette_cancel_key(
@@ -21712,7 +21573,12 @@ async fn event_loop<T: Terminal>(
                 }
                 // Modal: when the search overlay is open it captures all keys.
                 if let Some(ref mut ov) = search {
-                    let srcs = build_search_sources(ov.scope(), &session, &panes, focused);
+                    let srcs = crate::search_sources::build_search_sources(
+                        ov.scope(),
+                        &session,
+                        &panes,
+                        focused,
+                    );
                     // Convert to the borrow shape the engine expects.
                     let srcs_ref: Vec<(u32, &str, &thegn_core::history::HistoryBuffer)> = srcs
                         .iter()
@@ -21730,7 +21596,7 @@ async fn event_loop<T: Terminal>(
                         }
                         crate::search::SearchOutcome::Jump(m) => {
                             search = None;
-                            apply_search_jump(
+                            crate::search_sources::apply_search_jump(
                                 m,
                                 &mut session,
                                 &mut panes,
@@ -28571,21 +28437,53 @@ async fn event_loop<T: Terminal>(
                                 // Open an incremental search overlay scoped to
                                 // the focused pane's history.
                                 let max = keymap.config().search.max_results;
-                                search = Some(crate::search::SearchOverlay::new(
+                                let mut overlay = crate::search::SearchOverlay::new(
                                     thegn_core::search::SearchScope::Pane(focused),
                                     focused,
                                     max,
-                                ));
+                                );
+                                let srcs = crate::search_sources::build_search_sources(
+                                    overlay.scope(),
+                                    &session,
+                                    &panes,
+                                    focused,
+                                );
+                                let srcs_ref: Vec<(
+                                    u32,
+                                    &str,
+                                    &thegn_core::history::HistoryBuffer,
+                                )> = srcs
+                                    .iter()
+                                    .map(|(id, label, buf)| (*id, label.as_str(), *buf))
+                                    .collect();
+                                overlay.prime(&srcs_ref);
+                                search = Some(overlay);
                             }
                             Action::SearchGlobal => {
                                 // Open the search overlay scoped to the whole
                                 // active worktree; user can Tab to widen scope.
                                 let max = keymap.config().search.max_results;
-                                search = Some(crate::search::SearchOverlay::new(
+                                let mut overlay = crate::search::SearchOverlay::new(
                                     thegn_core::search::SearchScope::Worktree,
                                     focused,
                                     max,
-                                ));
+                                );
+                                let srcs = crate::search_sources::build_search_sources(
+                                    overlay.scope(),
+                                    &session,
+                                    &panes,
+                                    focused,
+                                );
+                                let srcs_ref: Vec<(
+                                    u32,
+                                    &str,
+                                    &thegn_core::history::HistoryBuffer,
+                                )> = srcs
+                                    .iter()
+                                    .map(|(id, label, buf)| (*id, label.as_str(), *buf))
+                                    .collect();
+                                overlay.prime(&srcs_ref);
+                                search = Some(overlay);
                             }
                             Action::SearchReplace => {
                                 // Open the workspace-wide Search & Replace surface

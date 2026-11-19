@@ -284,6 +284,7 @@ mod search;
 mod search_apply;
 mod search_everywhere;
 mod search_overlay;
+mod search_sources;
 mod search_worker;
 mod secret;
 mod sections;

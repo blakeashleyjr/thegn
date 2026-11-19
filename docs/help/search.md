@@ -23,6 +23,30 @@ Four search surfaces, one habit: type, arrow, `↵`.
 with the pane it came from, so it doubles as "which of these six
 terminals printed that error".
 
+Each hit is labelled **worktree · tab · program**, so two panes running the
+same program in different tabs are told apart. Opening the overlay with an
+empty query lists the pane's most recent lines instead of an empty box.
+Identical lines from one pane are grouped into a single row, and `↵` goes to
+the newest of them.
+
+`↵` scrolls the pane to the exact grid line when the terminal emulator still
+holds it. When the line has already scrolled out of the emulator's grid, the
+status line says so and points you to replay (`Alt r`), which has the full
+history.
+
+Matching is **literal** by default: the query is a substring, case-insensitive
+unless it contains an uppercase letter (smart case). Hits are ranked by match
+quality, then most recent first. `Alt+f` in the overlay toggles fuzzy matching
+and back; the footer shows the mode you would switch to.
+
+`Tab` widens the scope and `Shift-Tab` narrows it, through pane, tab, worktree
+and workspace. The `profile` scope is no longer in the cycle. These scopes are
+the presets for how far a search reaches.
+
+"History" means the scrollback thegn keeps for each pane (a bounded in-memory
+ring of the lines the pane printed), not your shell history. A pane with no
+output yet shows "no history yet".
+
 `[search] max_results` caps how many hits are collected — raise it for a
 big scrollback, lower it if searching feels heavy. See
 [[configuration]].

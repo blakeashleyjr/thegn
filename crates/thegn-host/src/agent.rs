@@ -2128,6 +2128,15 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
         return PaneNativeExec::Unavailable;
     };
     let pc = &env_cfg.provider;
+    let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
+    let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
+        && !pc.model_credentials_is_explicit()
+    {
+        thegn_core::config::ModelCredentials::Upload
+    } else {
+        pc.model_credentials
+    };
+    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
     if let Some(request) =
         thegn_core::sandbox_floor::provider_explicit_request(&environment.sandbox)
     {
@@ -2178,6 +2187,9 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
     // code, hermes) work like local. Remote-safe filter drops host-local socket
     // vars (SSH_AUTH_SOCK/GPG_*) that would dangle in the VM. THEGN_* win.
     let mut env = environment.sandbox.passthrough_env_remote();
+    if !grant.env_keys {
+        env = thegn_core::provider_credentials::strip_model_env(env).0;
+    }
     // Let an in-sandbox `nix develop` / direnv `use flake` fetch PRIVATE flake
     // inputs: nix's fetcher ignores git's credential helper, so without a
     // `github.com` access-token a private `github:org/repo` flake input 404s even
@@ -2898,11 +2910,19 @@ pub fn provision_provider_env_named(
         return Ok((false, None));
     };
     let pc = &env.provider;
+    let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
+    let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
+        && !pc.model_credentials_is_explicit()
+    {
+        thegn_core::config::ModelCredentials::Upload
+    } else {
+        pc.model_credentials
+    };
+    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
     // Credential-free kinds (Vercel): the repo goes in only as a host bundle and
     // no host credential is uploaded. Refuse BEFORE anything billable exists
     // when the bundle seed is impossible — never fall back to an origin clone.
-    let (force_bundle, credential_free) =
-        provision_credential_policy(thegn_core::config::EnvProviderKind::of(&pc.provider));
+    let (force_bundle, credential_free) = provision_credential_policy(kind);
     if force_bundle {
         // off-loop: provisioning entry (see the branch lookup below).
         #[expect(clippy::disallowed_methods)]
@@ -3074,7 +3094,7 @@ pub fn provision_provider_env_named(
         crate::provider_workdir::mark_provisioned(&id);
         // A credential-free kind never receives agent auth, and never holds a
         // route-to-host bearer (`false` revokes + removes any installed one).
-        if !credential_free {
+        if !credential_free && grant.login_files {
             crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, &loc, env_name);
         }
         crate::remote_enqueue_auth::reconcile_provider_credential(
@@ -3103,6 +3123,20 @@ pub fn provision_provider_env_named(
     let mut exec_env = repo_sandbox.passthrough_env_remote();
     if credential_free {
         exec_env = credential_free_exec_env(exec_env);
+    }
+    let mut withheld = Vec::new();
+    if !grant.env_keys {
+        let (kept, names) = thegn_core::provider_credentials::strip_model_env(exec_env);
+        exec_env = kept;
+        withheld.extend(names);
+    }
+    if !grant.login_files {
+        withheld.push("agent logins".to_string());
+    }
+    if kind == thegn_core::config::EnvProviderKind::Sprites
+        && let Some(message) = sprites_withheld_notice(env_name, &withheld)
+    {
+        thegn_core::msg::info(&message);
     }
     crate::agent_configs::push_host_git_identity(&repo_root, &mut exec_env);
     // The generic, declarative personal layer ([sandbox.home]) — applied to every
@@ -3430,16 +3464,24 @@ pub fn provision_provider_env_named(
             }
             StepKind::Dotfiles(files) => upload_dotfiles(&provider, &id, &sprite_home, files),
             StepKind::AgentConfigs(agents) => {
-                let account_failures =
-                    crate::agent_configs::upload_agent_accounts(&provider, &id, &sprite_home, cfg);
-                let configs = crate::agent_configs::upload_agent_configs(
-                    &provider,
-                    &id,
-                    &sprite_home,
-                    agents,
-                    &pc.login_homes,
-                );
-                crate::agent_configs::agent_configs_step_result(configs, &account_failures)
+                if !grant.login_files {
+                    Ok(())
+                } else {
+                    let account_failures = crate::agent_configs::upload_agent_accounts(
+                        &provider,
+                        &id,
+                        &sprite_home,
+                        cfg,
+                    );
+                    let configs = crate::agent_configs::upload_agent_configs(
+                        &provider,
+                        &id,
+                        &sprite_home,
+                        agents,
+                        &pc.login_homes,
+                    );
+                    crate::agent_configs::agent_configs_step_result(configs, &account_failures)
+                }
             }
             StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home, &exec_env),
             StepKind::LocalParity {
@@ -3951,6 +3993,29 @@ fn provision_credential_policy(kind: thegn_core::config::EnvProviderKind) -> (bo
     (credential_free, credential_free)
 }
 
+#[cfg(test)]
+fn provision_model_env(
+    kind: thegn_core::config::EnvProviderKind,
+    mode: thegn_core::config::ModelCredentials,
+    env: Vec<(String, String)>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
+    if grant.env_keys {
+        (env, Vec::new())
+    } else {
+        thegn_core::provider_credentials::strip_model_env(env)
+    }
+}
+
+fn sprites_withheld_notice(env_name: &str, names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        format!(
+            "sprites env {env_name}: model credentials not sent ({}); set model_credentials = \"upload\" in [env.{env_name}.provider] to send them",
+            names.join(", ")
+        )
+    })
+}
+
 /// Refuse a credential-free provision that cannot bundle-seed: a SPARE
 /// (`name_override`), a worktree without a local git dir, or one not on a
 /// branch (detached HEAD). There is no origin clone fallback.
@@ -4075,6 +4140,32 @@ mod credential_policy_tests {
         ]);
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["TERM", "THEGN_DEVSHELL"]);
+    }
+
+    #[test]
+    fn sprites_model_credential_modes_filter_only_none() {
+        let env = vec![
+            ("TERM".into(), "xterm-256color".into()),
+            ("ANTHROPIC_API_KEY".into(), "sentinel-b167".into()),
+        ];
+        let (none, names) = provision_model_env(
+            EnvProviderKind::Sprites,
+            thegn_core::config::ModelCredentials::None,
+            env.clone(),
+        );
+        assert_eq!(none, vec![("TERM".into(), "xterm-256color".into())]);
+        assert_eq!(names, vec!["ANTHROPIC_API_KEY"]);
+        assert!(!names.iter().any(|name| name.contains("sentinel-b167")));
+        let (upload, names) = provision_model_env(
+            EnvProviderKind::Sprites,
+            thegn_core::config::ModelCredentials::Upload,
+            env,
+        );
+        assert_eq!(upload.len(), 2);
+        assert!(names.is_empty());
+        let notice = sprites_withheld_notice("remote", &["ANTHROPIC_API_KEY".into()]).unwrap();
+        assert!(notice.contains("ANTHROPIC_API_KEY"));
+        assert!(!notice.contains("sentinel-b167"));
     }
 }
 
@@ -4431,7 +4522,26 @@ fn provision_provider_repo(
     let wd = thegn_core::util::sh_quote(&loc.path());
     let argv =
         crate::provision_recover::exec_login_argv(&format!("mkdir -p {wd} && cd {wd} && {script}"));
+    let pc = &cfg
+        .env
+        .get(env_name)
+        .expect("provider env checked above")
+        .provider;
+    let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
+    let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
+        && !pc.model_credentials_is_explicit()
+    {
+        thegn_core::config::ModelCredentials::Upload
+    } else {
+        pc.model_credentials
+    };
+    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
     let exec_env = cfg.repo_sandbox(repo_root).passthrough_env_remote();
+    let exec_env = if grant.env_keys {
+        exec_env
+    } else {
+        thegn_core::provider_credentials::strip_model_env(exec_env).0
+    };
     match block_on_provider(|| async { provider.run_exec(&id, &argv, None, &exec_env).await }) {
         Ok((0, _)) => initialize_provider_submodules(cfg, repo_root, loc),
         Ok((code, out)) => thegn_core::msg::warn(&format!(
@@ -4571,6 +4681,127 @@ fn provider_sync_registry()
     REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// How long a `pulling` entry written by another process blocks a second pull.
+const SYNC_PULL_FRESH_MS: i64 = 15 * 60 * 1000;
+
+fn provider_kind_name(pc: &thegn_core::config::EnvProviderConfig) -> String {
+    pc.provider.trim().to_ascii_lowercase()
+}
+
+fn journal_entry(
+    worktree: &str,
+    env_name: &str,
+    provider: &str,
+    sandbox: &str,
+    workdir: &str,
+    baseline: &thegn_svc::provider::SyncBaseline,
+    now_ms: i64,
+) -> thegn_svc::sync_journal::SyncJournalEntry {
+    thegn_svc::sync_journal::SyncJournalEntry {
+        version: thegn_svc::sync_journal::JOURNAL_VERSION,
+        worktree: worktree.to_owned(),
+        env_name: env_name.to_owned(),
+        provider: provider.to_owned(),
+        sandbox: sandbox.to_owned(),
+        workdir: workdir.to_owned(),
+        baseline: thegn_svc::sync_journal::baseline_to_hex(baseline),
+        state: thegn_svc::sync_journal::SyncState::Uploaded,
+        uploaded_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    }
+}
+
+/// Ok when the entry still names the env's current target; Err otherwise.
+fn journal_target_matches(
+    entry: &thegn_svc::sync_journal::SyncJournalEntry,
+    provider: &str,
+    sandbox: &str,
+    workdir: &str,
+) -> Result<(), String> {
+    if entry.provider != provider {
+        return Err("provider changed".to_owned());
+    }
+    if entry.sandbox != sandbox {
+        return Err("sandbox changed".to_owned());
+    }
+    if entry.workdir != workdir {
+        return Err("workdir changed".to_owned());
+    }
+    Ok(())
+}
+
+/// True when an entry is still in the short handoff window owned by another
+/// process.
+fn journal_pull_is_fresh(entry: &thegn_svc::sync_journal::SyncJournalEntry, now_ms: i64) -> bool {
+    matches!(&entry.state, thegn_svc::sync_journal::SyncState::Pulling)
+        && now_ms.saturating_sub(entry.updated_at_ms) < SYNC_PULL_FRESH_MS
+}
+
+fn journal_failure_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
+}
+
+fn set_journal_failed(dir: &Path, path: &str, reason: &str) {
+    let state = thegn_svc::sync_journal::SyncState::Failed {
+        reason: journal_failure_reason(reason),
+    };
+    if let Err(error) =
+        thegn_svc::sync_journal::set_state_at(dir, path, state, thegn_core::util::now_ms())
+    {
+        tracing::warn!(
+            target: "thegn::lifecycle",
+            worktree = %path,
+            %error,
+            "provider sync journal failure state could not be written"
+        );
+    }
+}
+
+fn finish_provider_sync(
+    dir: &Path,
+    path: &str,
+    env_name: &str,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    let mut registry = provider_sync_registry()
+        .lock()
+        .map_err(|_| "provider sync registry unavailable after pull".to_string())?;
+    match result {
+        Ok(()) => {
+            registry.remove(path);
+            drop(registry);
+            if let Err(error) = thegn_svc::sync_journal::remove_at(dir, path) {
+                tracing::warn!(
+                    target: "thegn::lifecycle",
+                    worktree = %path,
+                    %error,
+                    "provider sync journal entry could not be removed after pull"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(record) = registry.get_mut(path) {
+                record.in_flight = false;
+            }
+            drop(registry);
+            set_journal_failed(dir, path, &error);
+            tracing::warn!(
+                target: "thegn::lifecycle",
+                worktree = %path,
+                environment = %env_name,
+                %error,
+                "provider sync failed during close; sync record retained"
+            );
+            Err(error)
+        }
+    }
+}
+
 /// Upload the local worktree into a provider sandbox for `data = "sync"`. Called
 /// only AFTER the launch is admitted, and at most once per resolution (`done`),
 /// so a refused or failed candidate never transmits the worktree.
@@ -4604,7 +4835,37 @@ fn upload_provider_sync_once(
             .await
     }) {
         Ok(baseline) => {
-            register_provider_sync(worktree, env_name, Some(std::sync::Arc::new(baseline)))
+            register_provider_sync(
+                worktree,
+                env_name,
+                Some(std::sync::Arc::new(baseline.clone())),
+            );
+            if let Some(env) = cfg.env.get(env_name) {
+                let entry = journal_entry(
+                    worktree,
+                    env_name,
+                    &provider_kind_name(&env.provider),
+                    &id,
+                    &workdir,
+                    &baseline,
+                    thegn_core::util::now_ms(),
+                );
+                if let Err(error) =
+                    thegn_svc::sync_journal::record_at(&thegn_svc::sync_journal::dir(), &entry)
+                {
+                    let warning = format!(
+                        "provider sync journal not written: {error}; a restart before close will not pull back"
+                    );
+                    warnings.push(warning.clone());
+                    tracing::warn!(
+                        target: "thegn::lifecycle",
+                        worktree = %worktree,
+                        %error,
+                        "provider sync journal not written"
+                    );
+                    thegn_core::msg::warn(&warning);
+                }
+            }
         }
         Err(e) => {
             warnings.push(format!("provider sync upload failed: {e}"));
@@ -4640,59 +4901,372 @@ pub(crate) fn forget_provider_sync(worktree: &str) {
     if let Ok(mut registry) = provider_sync_registry().lock() {
         registry.remove(worktree);
     }
+    if let Err(error) =
+        thegn_svc::sync_journal::remove_at(&thegn_svc::sync_journal::dir(), worktree)
+    {
+        tracing::warn!(
+            target: "thegn::lifecycle",
+            worktree = %worktree,
+            %error,
+            "provider sync journal entry could not be removed"
+        );
+    }
 }
 
 /// On worktree close, pull the sandbox fs back into the local worktree for a
 /// provider `data = "sync"` env. A failed pull is surfaced and retained in the
 /// in-process registry so a later close can retry it.
 pub(crate) fn deprovision_sync(path: &str) -> Result<(), String> {
-    let (env_name, baseline) = {
+    deprovision_sync_in(
+        &thegn_svc::sync_journal::dir(),
+        &crate::config_startup::cleanup_config(),
+        path,
+    )
+}
+
+/// Test seam for close-time provider sync. The caller is always an off-loop
+/// lifecycle path; the provider call remains on its blocking runtime thread.
+fn deprovision_sync_in(dir: &Path, cfg: &Config, path: &str) -> Result<(), String> {
+    let sync_record = {
         let mut registry = provider_sync_registry()
             .lock()
             .map_err(|_| "provider sync registry unavailable".to_string())?;
-        let Some(record) = registry.get_mut(path) else {
-            return Ok(());
-        };
-        if record.in_flight {
-            return Err("provider sync is already in progress".into());
+        match registry.get_mut(path) {
+            Some(record) => {
+                if record.in_flight {
+                    return Err("provider sync is already in progress".into());
+                }
+                record.in_flight = true;
+                Some((record.env_name.clone(), record.baseline.clone()))
+            }
+            None => None,
         }
-        record.in_flight = true;
-        (record.env_name.clone(), record.baseline.clone())
     };
-    let cfg = crate::config_startup::cleanup_config();
-    let result = if let Some((provider, id, workdir)) = provider_sync_target(&cfg, &env_name) {
+
+    let download = |provider: &thegn_svc::provider::Provider,
+                    id: &str,
+                    workdir: &str,
+                    baseline: Option<&thegn_svc::provider::SyncBaseline>| {
         let p = path.to_string();
         block_on_provider(|| async {
             provider
-                .download_dir_reconciled(
-                    &id,
-                    &workdir,
-                    std::path::Path::new(&p),
-                    baseline.as_deref(),
-                )
+                .download_dir_reconciled(id, workdir, std::path::Path::new(&p), baseline)
                 .await
         })
         .map_err(|error| format!("{error:#}"))
-    } else {
-        Err(format!(
-            "provider sync target unavailable for environment {env_name}"
-        ))
     };
-    let mut registry = provider_sync_registry()
-        .lock()
-        .map_err(|_| "provider sync registry unavailable after pull".to_string())?;
-    match result {
-        Ok(()) => {
-            registry.remove(path);
-            Ok(())
-        }
-        Err(error) => {
-            if let Some(record) = registry.get_mut(path) {
-                record.in_flight = false;
+
+    let Some((env_name, baseline)) = sync_record else {
+        let entry = match thegn_svc::sync_journal::load_at(dir, path) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                let file = thegn_svc::sync_journal::entry_path(dir, path);
+                return Err(format!(
+                    "provider sync journal entry for {path} is unreadable ({error:#}); remove {} to continue without a pull-back",
+                    file.display()
+                ));
             }
-            tracing::warn!(target: "thegn::lifecycle", worktree = %path, environment = %env_name, %error, "provider sync failed during close; sync record retained");
-            Err(error)
+        };
+        if journal_pull_is_fresh(&entry, thegn_core::util::now_ms()) {
+            return Err("provider sync pull is already running in another thegn process".into());
         }
+
+        let Some(env) = cfg.env.get(&entry.env_name) else {
+            return Err(format!(
+                "provider sync journal entry for {path} names removed environment {}; keeping the entry",
+                entry.env_name
+            ));
+        };
+        let Some((provider, id, workdir)) = provider_sync_target(cfg, &entry.env_name) else {
+            return Err(format!(
+                "provider sync journal entry for {path} names environment {} whose provider sync target is unavailable; keeping the entry",
+                entry.env_name
+            ));
+        };
+        if let Err(reason) =
+            journal_target_matches(&entry, &provider_kind_name(&env.provider), &id, &workdir)
+        {
+            let file = thegn_svc::sync_journal::entry_path(dir, path);
+            return Err(format!(
+                "provider sync journal entry for {path} target no longer matches environment {} ({reason}); keep {}",
+                entry.env_name,
+                file.display()
+            ));
+        }
+        let baseline = match thegn_svc::sync_journal::baseline_from_hex(&entry.baseline) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                let reason = format!("provider sync journal baseline is unreadable: {error:#}");
+                set_journal_failed(dir, path, &reason);
+                return Err(reason);
+            }
+        };
+        {
+            let mut registry = provider_sync_registry()
+                .lock()
+                .map_err(|_| "provider sync registry unavailable".to_string())?;
+            if registry.get(path).is_some_and(|record| record.in_flight) {
+                return Err("provider sync is already in progress".into());
+            }
+            registry.insert(
+                path.to_owned(),
+                ProviderSyncRecord {
+                    env_name: entry.env_name.clone(),
+                    in_flight: true,
+                    baseline: Some(std::sync::Arc::new(baseline.clone())),
+                },
+            );
+        }
+        if let Err(error) = thegn_svc::sync_journal::set_state_at(
+            dir,
+            path,
+            thegn_svc::sync_journal::SyncState::Pulling,
+            thegn_core::util::now_ms(),
+        ) {
+            let reason =
+                format!("provider sync journal could not mark pull in progress: {error:#}");
+            return finish_provider_sync(dir, path, &entry.env_name, Err(reason));
+        }
+        let result = download(&provider, &id, &workdir, Some(&baseline));
+        return finish_provider_sync(dir, path, &entry.env_name, result);
+    };
+
+    let result = match provider_sync_target(cfg, &env_name) {
+        Some((provider, id, workdir)) => {
+            if let Ok(Some(entry)) = thegn_svc::sync_journal::load_at(dir, path)
+                && journal_pull_is_fresh(&entry, thegn_core::util::now_ms())
+            {
+                if let Ok(mut registry) = provider_sync_registry().lock()
+                    && let Some(record) = registry.get_mut(path)
+                {
+                    record.in_flight = false;
+                }
+                return Err(
+                    "provider sync pull is already running in another thegn process".into(),
+                );
+            }
+            if let Err(error) = thegn_svc::sync_journal::set_state_at(
+                dir,
+                path,
+                thegn_svc::sync_journal::SyncState::Pulling,
+                thegn_core::util::now_ms(),
+            ) {
+                tracing::warn!(
+                    target: "thegn::lifecycle",
+                    worktree = %path,
+                    %error,
+                    "provider sync journal could not mark pull in progress"
+                );
+            }
+            download(&provider, &id, &workdir, baseline.as_deref())
+        }
+        _ => Err(format!(
+            "provider sync target unavailable for environment {env_name}"
+        )),
+    };
+    finish_provider_sync(dir, path, &env_name, result)
+}
+
+#[cfg(test)]
+mod sync_journal_wire_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use thegn_core::config::{Config, EnvConfig};
+    use thegn_core::testenv::IsolatedState;
+    use thegn_svc::provider::SyncBaseline;
+    use thegn_svc::sync_journal::{self, SyncJournalEntry, SyncState};
+
+    fn config_with_env(name: &str) -> Config {
+        Config {
+            env: BTreeMap::from([(name.to_owned(), EnvConfig::default())]),
+            ..Config::default()
+        }
+    }
+
+    fn entry(path: &str, env_name: &str, state: SyncState, updated_at_ms: i64) -> SyncJournalEntry {
+        let baseline: SyncBaseline = BTreeMap::from([("src/lib.rs".to_owned(), [0xabu8; 32])]);
+        let mut entry = journal_entry(
+            path,
+            env_name,
+            "sprites",
+            "sandbox-a",
+            "/workspace",
+            &baseline,
+            100,
+        );
+        entry.state = state;
+        entry.updated_at_ms = updated_at_ms;
+        entry
+    }
+
+    #[test]
+    fn journal_entry_round_trips_the_baseline() {
+        let _state = IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let baseline: SyncBaseline = BTreeMap::from([
+            ("a.txt".to_owned(), [0xabu8; 32]),
+            ("b.txt".to_owned(), [0x01u8; 32]),
+        ]);
+        let original = journal_entry(
+            "/worktrees/a",
+            "env-a",
+            "sprites",
+            "sandbox-a",
+            "/workspace",
+            &baseline,
+            42,
+        );
+
+        sync_journal::record_at(dir.path(), &original).unwrap();
+        let loaded = sync_journal::load_at(dir.path(), &original.worktree)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded, original);
+        assert_eq!(
+            sync_journal::baseline_from_hex(&loaded.baseline).unwrap(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn journal_target_mismatch_names_the_changed_field() {
+        let _state = IsolatedState::new();
+        let original = entry("/worktrees/a", "env-a", SyncState::Uploaded, 100);
+
+        let mut changed = original.clone();
+        changed.provider = "daytona".to_owned();
+        assert!(
+            journal_target_matches(&changed, "sprites", "sandbox-a", "/workspace")
+                .unwrap_err()
+                .contains("provider")
+        );
+
+        let mut changed = original.clone();
+        changed.sandbox = "sandbox-b".to_owned();
+        assert!(
+            journal_target_matches(&changed, "sprites", "sandbox-a", "/workspace")
+                .unwrap_err()
+                .contains("sandbox")
+        );
+
+        let mut changed = original;
+        changed.workdir = "/other".to_owned();
+        assert!(
+            journal_target_matches(&changed, "sprites", "sandbox-a", "/workspace")
+                .unwrap_err()
+                .contains("workdir")
+        );
+    }
+
+    #[test]
+    fn fresh_pulling_entry_from_another_process_refuses() {
+        let _state = IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worktree").to_string_lossy().into_owned();
+        let original = entry(
+            &path,
+            "missing-env",
+            SyncState::Pulling,
+            thegn_core::util::now_ms(),
+        );
+        sync_journal::record_at(dir.path(), &original).unwrap();
+
+        let error = deprovision_sync_in(dir.path(), &Config::default(), &path).unwrap_err();
+        assert_eq!(
+            error,
+            "provider sync pull is already running in another thegn process"
+        );
+        assert_eq!(
+            sync_journal::load_at(dir.path(), &path).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn stale_pulling_entry_is_retried() {
+        let _state = IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worktree").to_string_lossy().into_owned();
+        let original = entry(
+            &path,
+            "env-a",
+            SyncState::Pulling,
+            thegn_core::util::now_ms() - SYNC_PULL_FRESH_MS - 1,
+        );
+        sync_journal::record_at(dir.path(), &original).unwrap();
+
+        let error = deprovision_sync_in(dir.path(), &config_with_env("env-a"), &path).unwrap_err();
+        assert!(error.contains("target is unavailable"), "{error}");
+        assert!(!error.contains("already running"), "{error}");
+        assert_eq!(
+            sync_journal::load_at(dir.path(), &path).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn deprovision_without_registry_or_journal_is_ok() {
+        let _state = IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worktree").to_string_lossy().into_owned();
+
+        assert_eq!(
+            deprovision_sync_in(dir.path(), &Config::default(), &path),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn deprovision_with_unreadable_journal_is_an_error_naming_the_file() {
+        let _state = IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worktree").to_string_lossy().into_owned();
+        sync_journal::record_at(dir.path(), &entry(&path, "env-a", SyncState::Uploaded, 100))
+            .unwrap();
+        let file = sync_journal::entry_path(dir.path(), &path);
+        let root = thegn_core::fsperm::open_private_dir(dir.path()).unwrap();
+        let file_name = file.file_name().unwrap().to_str().unwrap();
+        root.write_owner_only_atomic(file_name, b"garbage").unwrap();
+
+        let error = deprovision_sync_in(dir.path(), &Config::default(), &path).unwrap_err();
+        assert!(error.contains(&file.display().to_string()), "{error}");
+        assert!(error.contains("remove"), "{error}");
+    }
+
+    #[test]
+    fn deprovision_with_journal_for_a_removed_env_keeps_the_entry() {
+        let _state = IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worktree").to_string_lossy().into_owned();
+        let original = entry(&path, "removed-env", SyncState::Uploaded, 100);
+        sync_journal::record_at(dir.path(), &original).unwrap();
+
+        let error = deprovision_sync_in(dir.path(), &Config::default(), &path).unwrap_err();
+        assert!(error.contains("removed-env"), "{error}");
+        assert_eq!(
+            sync_journal::load_at(dir.path(), &path).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn forget_removes_the_journal_entry() {
+        let _state = IsolatedState::new();
+        let path = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .to_string_lossy()
+            .into_owned();
+        let original = entry(&path, "env-a", SyncState::Uploaded, 100);
+        let dir = sync_journal::dir();
+        sync_journal::record_at(&dir, &original).unwrap();
+        register_provider_sync(&path, "env-a", None);
+
+        forget_provider_sync(&path);
+
+        assert_eq!(sync_journal::load_at(&dir, &path).unwrap(), None);
     }
 }
 

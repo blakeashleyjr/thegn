@@ -436,6 +436,7 @@ fn bounded_stdout_with(
     let limits = thegn_proc::Limits {
         stdout: thegn_proc::Stream::HeadOrFail { cap: max_bytes },
         stderr: thegn_proc::Stream::Null,
+        reader_grace: Duration::from_millis(100),
         ..thegn_proc::Limits::silent(IDENTITY_PROBE_DEADLINE)
     };
     let cancel = AtomicBool::new(false);
@@ -600,7 +601,7 @@ impl std::hash::Hasher for IdentityStampHasher {
 
 /// Convert Git's bounded path output to a native path without using lossy
 /// UTF-8 conversion. Git emits UTF-8 on Windows; the native representation is
-/// captured by [`native_path_bytes`] after that conversion.
+/// captured by [`native_path_bytes_bounded`] after that conversion.
 pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -2542,11 +2543,15 @@ mod tests {
     fn bounded_stdout_handles_idle_and_oversized_injected_children() {
         let mut idle = Command::new("/bin/sh");
         idle.args(["-c", "exit 0"]);
-        assert!(bounded_stdout(idle, 32).unwrap().is_empty());
+        assert!(
+            bounded_stdout_with(idle, 32, test_lane(4))
+                .unwrap()
+                .is_empty()
+        );
 
         let mut oversized = Command::new("/bin/sh");
         oversized.args(["-c", "head -c 128 /dev/zero"]);
-        let error = bounded_stdout(oversized, 32).unwrap_err();
+        let error = bounded_stdout_with(oversized, 32, test_lane(4)).unwrap_err();
         assert!(error.contains("exceeded its bound"));
     }
 
@@ -2555,7 +2560,7 @@ mod tests {
     fn bounded_stdout_cleans_a_child_that_holds_stdout_after_exit() {
         let mut holding = Command::new("/bin/sh");
         holding.args(["-c", "(sleep 10) & exit 0"]);
-        let error = bounded_stdout(holding, 32).unwrap_err();
+        let error = bounded_stdout_with(holding, 32, test_lane(4)).unwrap_err();
         assert!(error.contains("reader") || error.contains("time bound"));
     }
 

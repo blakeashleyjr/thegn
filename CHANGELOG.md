@@ -7,6 +7,24 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `test/sprites-live.sh` takes `--keep-going` (a failed step prints `FAIL <id>` and the run continues, with a summary at the end), proves pull with a real commit made inside the sprite, and prints the cost JSON. Not yet verified live.
+- Sprites usage is read from the top-level `usage` array (`buckets` stays as a fallback). A non-tty exec exit frame may carry the exit code as one binary byte or as ASCII; both are accepted.
+- `env down` on a sandbox that is already gone says so and clears local state instead of warning that commits are lost.
+- Interactive exec output sometimes lost a line break. The cause is not yet known: this adds a trace to find it and a defensive fix to the one client-side place bytes can vanish. It is not claimed as a fix.
+
+## [0.1.0-alpha.99] — 2026-11-19
+
+### Changed
+
+- Provider pull-back is journaled: a restart, `wt rm` or another process pulls a `data = "sync"` sandbox back using the journal, a failed pull keeps the sandbox, and `thegn doctor` shows a pending row. `sprite-exec` routes to the account that owns the sprite and refuses when ambiguous; `vercel-exec` capture mode refuses likewise. A failed Sprites one-shot exec appends the last 8 KiB of stderr. Not yet verified live.
+- Search rows are labelled worktree · tab · program, the overlay lists recent lines on open, identical lines from one pane are grouped, and Enter scrolls to the exact line or points to replay when it has left the grid.
+- Merge integrate and land record provenance (source tip and target base for integrate, the admitted candidate for a ready land, none for a manual land). Remote and macOS placements keep the requested `oci_runtime`; krun needs read-write `/dev/kvm` on a local Linux host.
+- Search is literal smart-case by default, ranked by match quality then recency; `Alt+f` toggles fuzzy. The `profile` scope leaves the `Tab` cycle.
+- `[env.<n>.provider] model_credentials` is now valid for Sprites (`none` or `upload`). `none` withholds model credentials and agent logins; unset behaves as before. Not yet verified live.
+- Sprites destroy now counts only after a definite 404 from polling the sprite; otherwise the record is kept and destroy fails so a retry can finish. Provider exec has an overall 31 minute deadline. Closing a worktree resolves its location and env before forgetting it.
+
 ## [0.1.0-alpha.98] — 2026-11-19
 
 ### Added
@@ -3901,7 +3919,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.99...HEAD
+[0.1.0-alpha.99]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...v0.1.0-alpha.99
 [0.1.0-alpha.98]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.97...v0.1.0-alpha.98
 [0.1.0-alpha.97]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.96...v0.1.0-alpha.97
 [0.1.0-alpha.96]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.95...v0.1.0-alpha.96

@@ -2,6 +2,28 @@ use thegn_core::placement::Placement;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorkspaceStore;
 
+/// What a close needs about a worktree, read from the caller's handle BEFORE
+/// its row is deleted. DB reads only: no fs, no git, no open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloseSnapshot {
+    pub(crate) location: Result<Option<String>, String>,
+    pub(crate) repo_root: Option<String>,
+    pub(crate) env: Result<Option<String>, String>,
+}
+
+pub(crate) fn capture(db: &thegn_core::db::Db, path: &str) -> CloseSnapshot {
+    let location = db.location_for(path).map_err(|error| format!("{error:#}"));
+    let repo_root = db.repo_root_for(path).ok().flatten();
+    let env = db
+        .effective_env_checked(path, repo_root.as_deref().unwrap_or_default())
+        .map_err(|error| format!("{error:#}"));
+    CloseSnapshot {
+        location,
+        repo_root,
+        env,
+    }
+}
+
 pub(crate) enum Route {
     Placed,
     LocalByPath,
@@ -86,13 +108,39 @@ pub(crate) fn sandbox_teardown(
     }
 }
 
-pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &str) {
+/// Mirror of `GitLoc::from_checked_lookup` over a close snapshot.
+fn snapshot_location(
+    path: &str,
+    location: &Result<Option<String>, String>,
+) -> Result<GitLoc, String> {
+    match location {
+        Ok(Some(location)) if !location.trim().is_empty() && location.trim() != "local" => {
+            let parsed = GitLoc::from_db(path, Some(location.as_str()));
+            if matches!(&parsed, GitLoc::Local(_)) {
+                return Err("unrecognised worktree location".into());
+            }
+            Ok(parsed)
+        }
+        Ok(location) => Ok(GitLoc::from_db(path, location.as_deref())),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+pub(crate) fn background_close_with(
+    cfg: Option<&thegn_core::config::Config>,
+    path: &str,
+    snap: CloseSnapshot,
+) {
     crate::agent::deregister_vpn(path);
     crate::agent::deproject(path);
     if let Err(error) = crate::agent::deprovision_sync(path) {
         tracing::warn!(target: "thegn::lifecycle", worktree = path, %error, "provider sync failed during background close");
     }
-    crate::agent::checkpoint_on_close(path);
+    crate::agent_teardown::checkpoint_on_close_with(
+        path,
+        snap.repo_root.as_deref(),
+        snap.env.clone(),
+    );
     crate::bridge_sup::disconnect_path(path);
 
     let Some(cfg) = cfg else {
@@ -100,7 +148,7 @@ pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &
         return;
     };
     let worktree = std::path::Path::new(path);
-    let loc = match close_location(path, GitLoc::for_worktree_op(worktree, "close teardown")) {
+    let loc = match close_location(path, snapshot_location(path, &snap.location)) {
         Ok(loc) => loc,
         Err(warning) => {
             tracing::warn!(target: "thegn::lifecycle", worktree = path, %warning,
@@ -110,12 +158,14 @@ pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &
             return;
         }
     };
-    let repo_root =
-        thegn_core::repo::main_worktree(worktree).unwrap_or_else(|| worktree.to_path_buf());
-    let read = thegn_core::db::Db::open().and_then(|db| {
-        db.effective_env_checked(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
-    });
-    let selected = match close_selection(path, read) {
+    let repo_root = snap
+        .repo_root
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            thegn_core::repo::main_worktree(worktree).unwrap_or_else(|| worktree.to_path_buf())
+        });
+    let selected = match close_selection(path, snap.env.map_err(anyhow::Error::msg)) {
         Ok(selected) => selected,
         Err(warning) => {
             tracing::warn!(target: "thegn::lifecycle", worktree = path, %warning,
@@ -142,9 +192,13 @@ pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &
 #[cfg(test)]
 mod tests {
     use super::{
-        Route, close_location, close_selection, placed_teardown_warning, route, warn_visible_with,
+        CloseSnapshot, Route, capture, close_location, close_selection, placed_teardown_warning,
+        route, snapshot_location, warn_visible_with,
     };
+    use thegn_core::db::Db;
     use thegn_core::placement::{Placement, ProviderPlacement, SshPlacement, TransportKind};
+    use thegn_core::remote::GitLoc;
+    use thegn_core::store::WorkspaceStore;
 
     #[test]
     fn ssh_placement_routes_to_the_placed_teardown() {
@@ -203,12 +257,59 @@ mod tests {
 
     #[test]
     fn close_location_passes_a_location_through() {
-        use thegn_core::remote::GitLoc;
-
         assert!(matches!(
             close_location("/wt", Ok(GitLoc::Local("/wt".into()))),
             Ok(GitLoc::Local(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_location_mirrors_checked_lookup() {
+        let provider = r#"{"control_prefix":["sprite","exec"],"path":"/workspace"}"#;
+        let cases: [(Result<Option<String>, String>, bool, bool); 5] = [
+            (Ok(None), true, false),
+            (Ok(Some("local".into())), true, false),
+            (Ok(Some(provider.into())), false, true),
+            (Ok(Some("garbage".into())), false, false),
+            (Err("unavailable".into()), false, false),
+        ];
+        for (location, local, provider) in cases {
+            let result = snapshot_location("/wt", &location);
+            if local {
+                assert!(matches!(result, Ok(GitLoc::Local(_))));
+            } else if provider {
+                assert!(matches!(result, Ok(GitLoc::Provider { .. })));
+            } else if let Err(error) = location {
+                assert!(matches!(&result, Err(e) if *e == error), "{result:?}");
+            } else {
+                assert!(
+                    matches!(&result, Err(e) if e == "unrecognised worktree location"),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capture_preserves_location_and_env_after_worktree_deletion() {
+        let db = Db::open_memory().unwrap();
+        let path = "/wt/provider";
+        let location = r#"{"control_prefix":["sprite","exec"],"path":"/workspace"}"#;
+        db.put_worktree("tab", "/repo", path, "feat", Some(location), None)
+            .unwrap();
+        db.set_worktree_env(path, "machine0").unwrap();
+
+        let snapshot = capture(&db, path);
+        db.del_worktree(path).unwrap();
+
+        assert_eq!(
+            snapshot,
+            CloseSnapshot {
+                location: Ok(Some(location.into())),
+                repo_root: Some("/repo".into()),
+                env: Ok(Some("machine0".into())),
+            }
+        );
     }
 
     #[test]

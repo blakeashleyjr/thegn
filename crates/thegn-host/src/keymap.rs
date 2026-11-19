@@ -1779,17 +1779,17 @@ pub fn default_keymap_with_config(cfg: &thegn_core::config::Config) -> KeyMap {
 pub fn apply_keymap_preset(map: &mut KeyMap, preset: &str) {
     let binds: &[(&str, Action)] = match preset.trim().to_ascii_lowercase().as_str() {
         "vscode" | "vs-code" | "code" => &[
-            ("Ctrl p", Action::SearchGlobal),       // quick open / go to file
-            ("Ctrl Shift p", Action::OpenPalette),  // command palette
-            ("Ctrl b", Action::ToggleSidebar),      // toggle side bar
+            ("Ctrl p", Action::OpenPalette), // quick open; palette's All mode includes files
+            ("Ctrl Shift p", Action::OpenPalette), // command palette
+            ("Ctrl b", Action::ToggleSidebar), // toggle side bar
             ("Ctrl Shift e", Action::FocusSidebar), // explorer focus
-            ("Ctrl Shift g", Action::FocusPanel),   // source-control panel
+            ("Ctrl Shift g", Action::FocusPanel), // source-control panel
         ],
         "jetbrains" | "intellij" | "idea" => &[
-            ("Ctrl Shift a", Action::OpenPalette),  // Find Action
-            ("Ctrl e", Action::SearchGlobal),       // Recent Files
-            ("Ctrl Shift f", Action::SearchGlobal), // Find in Path
-            ("Alt 1", Action::ToggleSidebar),       // Project tool window
+            ("Ctrl Shift a", Action::OpenPalette),   // Find Action
+            ("Ctrl e", Action::OpenPalette),         // Recent Files via the palette
+            ("Ctrl Shift f", Action::SearchReplace), // Find in Path; workspace Search & Replace
+            ("Alt 1", Action::ToggleSidebar),        // Project tool window
         ],
         _ => return,
     };
@@ -2748,7 +2748,7 @@ mod tests {
     }
 
     #[test]
-    fn keymap_preset_vscode_binds_ide_chords() {
+    fn vscode_preset_ctrl_p_opens_the_palette() {
         let cfg = thegn_core::config::Config {
             keymap_preset: "vscode".into(),
             ..Default::default()
@@ -2756,11 +2756,25 @@ mod tests {
         let mut map = default_keymap_for(&cfg, None, None);
         assert_eq!(
             map.dispatch(Mode::Normal, Key::ctrl('p')),
-            MatchResult::Matched(Action::SearchGlobal)
+            MatchResult::Matched(Action::OpenPalette)
         );
         assert_eq!(
             map.dispatch(Mode::Normal, Key::ctrl('b')),
             MatchResult::Matched(Action::ToggleSidebar)
+        );
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('e'), Modifiers::CTRL | Modifiers::SHIFT)
+            ),
+            MatchResult::Matched(Action::FocusSidebar)
+        );
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('g'), Modifiers::CTRL | Modifiers::SHIFT)
+            ),
+            MatchResult::Matched(Action::FocusPanel)
         );
         // Core nav defaults the preset deliberately avoids still work.
         assert_eq!(
@@ -2770,7 +2784,7 @@ mod tests {
     }
 
     #[test]
-    fn keymap_preset_jetbrains_binds_ide_chords() {
+    fn jetbrains_preset_ctrl_e_opens_the_palette() {
         let cfg = thegn_core::config::Config {
             keymap_preset: "jetbrains".into(),
             ..Default::default()
@@ -2778,7 +2792,37 @@ mod tests {
         let mut map = default_keymap_for(&cfg, None, None);
         assert_eq!(
             map.dispatch(Mode::Normal, Key::ctrl('e')),
-            MatchResult::Matched(Action::SearchGlobal)
+            MatchResult::Matched(Action::OpenPalette)
+        );
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('a'), Modifiers::CTRL | Modifiers::SHIFT)
+            ),
+            MatchResult::Matched(Action::OpenPalette)
+        );
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('1'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::ToggleSidebar)
+        );
+    }
+
+    #[test]
+    fn jetbrains_preset_find_in_path_opens_search_replace() {
+        let cfg = thegn_core::config::Config {
+            keymap_preset: "jetbrains".into(),
+            ..Default::default()
+        };
+        let mut map = default_keymap_for(&cfg, None, None);
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('f'), Modifiers::CTRL | Modifiers::SHIFT)
+            ),
+            MatchResult::Matched(Action::SearchReplace)
         );
     }
 

@@ -553,6 +553,7 @@ fn claim_aware_persist_refuses_a_claimed_row() {
         result_oid: Some("verified-commit"),
         conflict_paths: None,
         error_detail: None,
+        provenance: None,
     };
 
     assert_eq!(

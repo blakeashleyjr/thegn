@@ -1575,13 +1575,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tg-unmanaged-cfg-{}", crate::util::now()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir_s = dir.to_string_lossy().into_owned();
-        // SAFETY: single-threaded test setup; CLAUDE_CONFIG_DIR is only read by
-        // `account::effective_config_dir`, reached solely on this unmanaged path.
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir_s) };
-
-        let r = compose(&cfg, &db, "/wt", None, Some("claude"));
-
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let r = {
+            let _env = crate::testenv::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", dir_s.as_str())]);
+            compose(&cfg, &db, "/wt", None, Some("claude"))
+        };
         std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
 
         assert_eq!(get(&r.overrides, "CLAUDE_CONFIG_DIR"), Some(dir_s.as_str()));

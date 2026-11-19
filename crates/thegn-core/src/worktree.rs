@@ -120,8 +120,15 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
         &["worktree", "list", "--porcelain", "-z"],
         MAX_GIT_IDENTITY_OUTPUT,
     )
-    .map_err(|_| IdentityError::GitProbeFailed {
-        operation: "git worktree list --porcelain -z",
+    .map_err(|error| {
+        tracing::debug!(
+            target: "thegn::worktree",
+            %error,
+            "git identity probe failed"
+        );
+        IdentityError::GitProbeFailed {
+            operation: "git worktree list --porcelain -z",
+        }
     })?;
     let entry = registered_entry(&parse_worktree_identity_records(&porcelain)?, &requested)?;
     let common_dir = repo::canonical_common_dir(entry.path.as_path())?;
@@ -732,7 +739,7 @@ fn checkout_parent(root: &Path, repo_dir_name: &str, cfg: &Config) -> PathBuf {
 }
 
 /// Whether `path` sits where thegn itself places checkouts of this repo:
-/// under [`checkout_parent`] (`<worktrees_dir>/<repo dir name>/` or
+/// under `checkout_parent` (`<worktrees_dir>/<repo dir name>/` or
 /// `<root>/.worktrees`) or anywhere under the repo `root` itself.
 ///
 /// Pure and loop-safe: a lexical, component-wise prefix test on the stored
@@ -967,7 +974,7 @@ pub fn add_checked_with_state(
             });
         }
     };
-    let out = util::git_cmd(root)
+    let out = crate::git_run::fenced_git_cmd(root)
         // Worktree creation runs on a worker, but Git must still fail fast if
         // a remote credential helper would otherwise prompt for input.
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1076,7 +1083,7 @@ fn git_destructive(root: &Path, args: &[&str]) -> Result<(), DestructiveError> {
         #[cfg(test)]
         WORKTREE_DESTRUCTIVE_ATTEMPTS.set(attempt);
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let outcome = crate::git_run::git_run(root, args, &destructive_policy(), &cancel);
+        let outcome = crate::git_run::git_run_fenced(root, args, &destructive_policy(), &cancel);
         match outcome {
             outcome if outcome.is_success() => return Ok(()),
             crate::git_run::GitOutcome::Exit { stderr_tail, .. } => {
@@ -1589,6 +1596,10 @@ pub fn rename(
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+
+#[cfg(test)]
+#[path = "worktree_hook_fence_tests.rs"]
+mod hook_fence_tests;
 
 #[cfg(test)]
 mod tests {
