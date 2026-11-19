@@ -302,7 +302,7 @@ fn every_value_option_defaults_to_null() {
         let is_list_item_field = item_ranges
             .iter()
             .any(|(start, end)| *start <= declaration_offset && declaration_offset < *end);
-        let is_submodule_container = matches!(name, "package" | "log" | "sandbox")
+        let is_submodule_container = matches!(name, "package" | "log" | "sandbox" | "manageConfig")
             || (name == "remote"
                 && src[..declaration_offset].rfind("sandboxSubmodule =")
                     > src[..declaration_offset].rfind("remoteSubmodule ="));
