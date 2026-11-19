@@ -767,13 +767,14 @@ struct RowState {
     generation: i64,
     phase: String,
     result_oid: Option<String>,
+    error_detail: Option<String>,
 }
 
 fn row_state(fixture: &Fixture) -> RowState {
     let connection = Connection::open(fixture.db_path()).unwrap();
     connection
         .query_row(
-            "SELECT status,agent_attempts,claim_generation,claim_phase,result_oid FROM merge_queue",
+            "SELECT status,agent_attempts,claim_generation,claim_phase,result_oid,error_detail FROM merge_queue",
             [],
             |row| {
                 Ok(RowState {
@@ -782,6 +783,7 @@ fn row_state(fixture: &Fixture) -> RowState {
                     generation: row.get(2)?,
                     phase: row.get(3)?,
                     result_oid: row.get(4)?,
+                    error_detail: row.get(5)?,
                 })
             },
         )
@@ -1285,6 +1287,150 @@ fn race_two_cli_drains_have_one_owner() {
     assert_eq!(row_state(&f).phase, "unclaimed");
     assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
     assert_eq!(f.git(&repo, &["rev-parse", "refs/heads/main"]), before_ref);
+    gate_release.disarm();
+    f.close();
+}
+
+// `wt rm` removes the checkout while the drain owns the row, but the
+// claim-aware DB cleanup keeps that row until the owner can settle it. The
+// target ref must not move while the gate is held. Once released, a successful
+// land is valid only if it advanced the target; otherwise the missing checkout
+// must produce a held row with a diagnostic rather than a false landed result.
+#[test]
+fn race_worktree_delete_keeps_the_claimed_row() {
+    let mut f = one_row_fixture(FixtureOpts {
+        gate: String::new(),
+        auto_land: true,
+        agent: AgentMode::HeldAtFloor,
+    });
+    let repo = f.repo.clone();
+    let worktree = f.held.clone();
+    let worktree_s = worktree.to_string_lossy().into_owned();
+    let root = f.root.path().to_path_buf();
+    let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    make_gate_fifo(&root, "gate-hold");
+    let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    wait_gate_count(&root, "gate-runs", "start ", 1);
+    let held = row_state(&f);
+    assert_eq!(held.status, "folding");
+    assert_ne!(held.phase, "unclaimed");
+
+    let removed = f.cli(&["wt", "rm", &worktree_s, "--force"]);
+    assert!(removed.status.success(), "{}", removed.stderr);
+    assert!(!worktree.exists());
+    let after_remove = row_state(&f);
+    assert_eq!(after_remove.status, held.status);
+    assert_eq!(after_remove.generation, held.generation);
+    assert_eq!(after_remove.phase, held.phase);
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_before
+    );
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+
+    release_gate(&root, "gate-hold", "gate-open");
+    let finished = f.finish_cli(owner);
+    assert!(finished.status.success(), "{}", finished.stderr);
+    wait_gate_count(&root, "gate-runs", "end ", 1);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    let finished_json: Value = serde_json::from_str(&finished.stdout).unwrap();
+    let final_row = row_state(&f);
+    assert_eq!(final_row.phase, "unclaimed");
+    assert_eq!(final_row.generation, held.generation);
+    let target_after = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    if final_row.status == "landed" {
+        assert_ne!(target_after, target_before);
+        assert_eq!(final_row.result_oid.as_deref(), Some(target_after.as_str()));
+        assert_eq!(finished_json["landed"], json!(["feature"]));
+    } else {
+        assert!(
+            matches!(
+                final_row.status.as_str(),
+                "deferred" | "gate_failed" | "gate_error" | "agent_blocked" | "needs_human"
+            ),
+            "missing checkout must not settle as an unheld row: {final_row:?}"
+        );
+        assert!(
+            final_row
+                .error_detail
+                .as_deref()
+                .is_some_and(|detail| !detail.trim().is_empty())
+        );
+        assert_eq!(target_after, target_before);
+        assert!(
+            finished_json["landed"]
+                .as_array()
+                .is_none_or(|landed| landed.iter().all(|branch| branch != "feature"))
+        );
+    }
+    gate_release.disarm();
+    f.close();
+}
+
+// The sweep only considers landed rows. While the real drain is blocked in
+// its gate, move the claimed row into the post-land observation window to
+// exercise the cleanup fence: sweep must report merge_claimed and leave both
+// the checkout and queue row untouched. The owner then completes and releases
+// the claim normally.
+#[test]
+fn race_merge_sweep_skips_a_claimed_row() {
+    let mut f = one_row_fixture(FixtureOpts {
+        gate: String::new(),
+        auto_land: true,
+        agent: AgentMode::HeldAtFloor,
+    });
+    let config = fs::read_to_string(&f.config).unwrap().replace(
+        "on_landed = \"off\"",
+        "on_landed = \"expire\"\nmerged_ttl_secs = 1",
+    );
+    fs::write(&f.config, config).unwrap();
+    let repo = f.repo.clone();
+    let worktree = f.held.clone();
+    let worktree_s = worktree.to_string_lossy().into_owned();
+    let root = f.root.path().to_path_buf();
+    let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    let landed_oid = f.git(&repo, &["rev-parse", "feature"]);
+    make_gate_fifo(&root, "gate-hold");
+    let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    wait_gate_count(&root, "gate-runs", "start ", 1);
+    let held = row_state(&f);
+    assert_eq!(held.status, "folding");
+    assert_ne!(held.phase, "unclaimed");
+
+    let db = Connection::open(f.db_path()).unwrap();
+    db.execute(
+        "UPDATE merge_queue SET status='landed',result_oid=?1,updated_at=1 WHERE worktree=?2",
+        rusqlite::params![landed_oid, worktree_s],
+    )
+    .unwrap();
+    drop(db);
+    let claimed_landed = row_state(&f);
+    assert_eq!(claimed_landed.status, "landed");
+    assert_eq!(claimed_landed.generation, held.generation);
+    assert_eq!(claimed_landed.phase, held.phase);
+
+    let sweep = f.cli_failing(&["merge", "sweep", "--json"]);
+    let sweep_json: Value = serde_json::from_str(&sweep.stdout).unwrap();
+    assert_eq!(sweep_json["collected"], json!([]));
+    assert_eq!(sweep_json["cleared_rows"], json!([]));
+    assert_eq!(sweep_json["kept"].as_array().unwrap().len(), 1);
+    assert_eq!(sweep_json["kept"][0]["branch"], "feature");
+    assert_eq!(sweep_json["kept"][0]["class"], "merge_claimed");
+    assert_eq!(row_state(&f), claimed_landed);
+    assert!(worktree.exists());
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_before
+    );
+
+    release_gate(&root, "gate-hold", "gate-open");
+    let finished = f.finish_cli(owner);
+    assert!(finished.status.success(), "{}", finished.stderr);
+    wait_gate_count(&root, "gate-runs", "end ", 1);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(row_state(&f).phase, "unclaimed");
     gate_release.disarm();
     f.close();
 }
