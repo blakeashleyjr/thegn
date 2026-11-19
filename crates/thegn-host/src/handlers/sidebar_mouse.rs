@@ -1980,11 +1980,16 @@ mod tests {
     fn sidebar_row_heights_follow_the_focus_detail_policy_exactly() {
         use thegn_core::config::FocusDetail as F;
         let (mut model, rect) = slots_fixture();
-        // A branch equal to the title is echoed by it and has no detail line
-        // (b164), so give `a` and `b` branches that differ from their titles.
+        // With no OSC window title the title line IS the branch, so the detail
+        // line's branch field is always echoed away (b164) and a row with no
+        // git metadata has nothing left to expand into. Give `a` and `b` the
+        // git-scan metadata a real worktree row carries (uncommitted files).
         for row in model.sidebar_rows.iter_mut() {
             if row.pin_key == "app/a" || row.pin_key == "app/b" {
-                row.branch = Some(format!("feature/{}", row.label));
+                row.branch_meta = Some(thegn_svc::git::BranchMeta {
+                    dirty_files: Some(2),
+                    ..Default::default()
+                });
             }
         }
         let height = |model: &crate::chrome::FrameModel, pin: &str| -> usize {
@@ -1996,8 +2001,8 @@ mod tests {
                 .map(|h| h.height)
                 .unwrap()
         };
-        // `a` carries a branch, so it has a detail line to expand into; headers
-        // never do.
+        // `a` carries git metadata, so it has a detail line to expand into;
+        // headers never do.
         for detail in [F::Off, F::Cursor, F::All] {
             model.sidebar_display.focus_detail = detail;
             model.sidebar_focused = false;
