@@ -271,27 +271,32 @@ impl SearchEngine {
             return;
         }
 
+        let mut hits: Vec<(usize, u32, Option<(usize, usize)>)> = Vec::new();
         match mode {
             MatchMode::Literal => {
-                for f in &flat {
+                for (i, f) in flat.iter().enumerate() {
                     if let Some(span) = find_literal(f.2, &trimmed) {
-                        let score = if on_word_boundaries(f.2, span) { 2 } else { 1 };
-                        out.push(mk(f, score, Some(span)));
+                        hits.push((
+                            i,
+                            if on_word_boundaries(f.2, span) { 2 } else { 1 },
+                            Some(span),
+                        ));
                     }
                 }
             }
             MatchMode::Fuzzy => {
                 let hay: Vec<&str> = flat.iter().map(|f| f.2).collect();
                 for m in match_list(&trimmed, &hay, &Config::default()) {
-                    let f = &flat[m.index as usize];
-                    out.push(mk(f, m.score as u32, None));
+                    hits.push((m.index as usize, m.score as u32, None));
                 }
             }
         }
-        // Stable: score desc, then newest first.
-        out.sort_by(|a, b| b.score.cmp(&a.score).then(a.from_tail.cmp(&b.from_tail)));
-        out.truncate(self.max_results);
-        self.matches = out;
+        hits.sort_by(|a, b| b.1.cmp(&a.1).then(flat[a.0].4.cmp(&flat[b.0].4)));
+        hits.truncate(self.max_results);
+        self.matches = hits
+            .into_iter()
+            .map(|(i, s, sp)| mk(&flat[i], s, sp))
+            .collect();
     }
 }
 
