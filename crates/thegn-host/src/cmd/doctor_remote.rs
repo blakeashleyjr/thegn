@@ -13,6 +13,7 @@ use thegn_svc::vps::registry::VpsRecord;
 
 /// A `creating` ledger entry older than this is stale.
 const STALE_CREATING_SECS: i64 = 3600;
+const SPRITES_REVIEW_COMMAND: &str = "thegn env reap --provider sprites --unrecorded";
 
 fn clean(value: &str) -> String {
     crate::merge_sweep::safe_display(value)
@@ -250,6 +251,11 @@ pub(crate) fn json_with(
                     "creating": count("creating"),
                     "stale_creating": stale,
                 },
+                "review": if kind == EnvProviderKind::Sprites {
+                    SPRITES_REVIEW_COMMAND
+                } else {
+                    ""
+                },
                 "unbound": unbound,
                 "forwarded_env": forwarded,
                 "git_token": !credential_free && sandbox.git.admits_git_token(),
@@ -303,6 +309,12 @@ pub(crate) fn report(cfg: &Config) {
             l["creating"],
             l["stale_creating"]
         );
+        if !s("review").is_empty() {
+            outln!(
+                "               review: {} (sprites on the account this host did not record; read-only)",
+                s("review")
+            );
+        }
         let pending = row["sync_pending"].as_array().cloned().unwrap_or_default();
         if !pending.is_empty() {
             let failed = pending
@@ -433,6 +445,7 @@ mod tests {
                 "token_resolves",
                 "controller_id",
                 "ledger",
+                "review",
                 "unbound",
                 "forwarded_env",
                 "git_token",
@@ -452,6 +465,29 @@ mod tests {
         assert_eq!(row["ledger"]["ready"], 2);
         assert_eq!(row["ledger"]["creating"], 1);
         assert_eq!(row["ledger"]["stale_creating"], 1);
+    }
+
+    #[test]
+    fn review_hint_is_sprites_only() {
+        let _state = IsolatedState::new();
+        let mut cfg = cfg_with("sprites");
+        let mut vercel = thegn_core::config::EnvConfig {
+            placement: thegn_core::config::PlacementMode::Provider,
+            ..Default::default()
+        };
+        vercel.provider.provider = "vercel".into();
+        cfg.env.insert("vercel".into(), vercel);
+
+        let out = json_with(&cfg, None, &[], 0, &[]);
+        let rows = out.as_array().unwrap();
+        let sprites = rows
+            .iter()
+            .find(|row| row["provider"] == "sprites")
+            .unwrap();
+        let vercel = rows.iter().find(|row| row["provider"] == "vercel").unwrap();
+
+        assert_eq!(sprites["review"], SPRITES_REVIEW_COMMAND);
+        assert_eq!(vercel["review"], "");
     }
 
     #[test]
