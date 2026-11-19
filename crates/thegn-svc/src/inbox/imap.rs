@@ -555,6 +555,9 @@ impl Session {
                             "server closed the session during {name}"
                         )));
                     }
+                    if untagged.len() >= proto::MAX_UNTAGGED {
+                        return Err(proto_error(ProtoError::BodyLimit("responses")));
+                    }
                     untagged.push(response);
                 }
             }

@@ -281,3 +281,9 @@ fn percent_encoding_keeps_message_ids_link_safe() {
     assert_eq!(percent_encode("abc.1@host"), "abc.1@host");
     assert_eq!(percent_encode("a b#c/\"<>"), "a%20b%23c%2F%22%3C%3E");
 }
+
+#[test]
+fn hostile_encoded_word_run_stays_raw_and_bounded() {
+    let hostile = "=?a?Q? ".repeat(10_000);
+    assert_eq!(decode_words(&hostile), hostile);
+}
