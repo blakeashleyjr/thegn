@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.102] — 2026-11-19
+
 ### Changed
 
 - The dev instance no longer overrides `XDG_RUNTIME_DIR`: its daemon socket moves beside the stable one under the login runtime dir and both mask it, and rootless podman shares the login runroot. `scripts/devel-launch.sh` scrubs pane identity from its environment and gains `--daemon` to start the dev daemon detached. New `just pipeline-tools` and `pipeline-tools-check` install and show the lint tools for pipeline workers (`.#lint-tools`). `thegn doctor` adds "runtime exposure" and "share teardowns pending" rows.
@@ -3946,7 +3948,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.102...HEAD
+[0.1.0-alpha.102]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...v0.1.0-alpha.102
 [0.1.0-alpha.101]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.100...v0.1.0-alpha.101
 [0.1.0-alpha.100]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.99...v0.1.0-alpha.100
 [0.1.0-alpha.99]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.98...v0.1.0-alpha.99
