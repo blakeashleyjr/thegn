@@ -189,8 +189,7 @@ fn exec_websocket(mut stream: TcpStream, headers: &HashMap<String, String>) {
     if socket.send(Message::Binary(out.into())).is_err() {
         return;
     }
-    let mut exit = vec![3];
-    exit.extend_from_slice(b"7");
+    let exit = vec![0x03, 7];
     // best-effort: the client may already have hung up.
     socket
         .send(Message::Binary(exit.into()))
