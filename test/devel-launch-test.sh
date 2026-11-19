@@ -30,7 +30,15 @@ fi
 env_output="$(XDG_RUNTIME_DIR="$tmp/run0" WAYLAND_DISPLAY=wayland-9 DBUS_SESSION_BUS_ADDRESS='' \
   "$launcher" --print-env)"
 contains "$env_output" "export WAYLAND_DISPLAY='$tmp/run0/wayland-9'"
-contains "$env_output" "export XDG_RUNTIME_DIR='$root/run'"
+contains "$env_output" "export XDG_RUNTIME_DIR='$tmp/run0'"
+
+scrub_output="$(THEGN_SESSION_ID=x THEGN_ROUTE_TOKEN=y "$launcher" --print-env)"
+scrub_first_line="${scrub_output%%$'\n'*}"
+contains "$scrub_first_line" 'unset THEGN_SESSION_ID'
+contains "$scrub_first_line" 'THEGN_ROUTE_TOKEN'
+[[ $(grep -c '^unset ' <<<"$scrub_output") -eq 1 ]] || fail 'expected one unset line'
+[[ $scrub_output != *'THEGN_SESSION_ID=x'* ]] || fail 'session id leaked from --print-env'
+[[ $scrub_output != *'THEGN_ROUTE_TOKEN=y'* ]] || fail 'route token leaked from --print-env'
 
 if [[ $root_before -eq 1 ]]; then
   after_entries="$(find "$root" -mindepth 1 -maxdepth 1 -printf '%P\n' | sort)"
@@ -55,6 +63,28 @@ contains "$desktop_output" 'StartupWMClass=thegn-dev'
 [[ $desktop_output != *'~'* && $desktop_output != *'$'* ]] || fail 'desktop entry contains shell shorthand'
 contains "$(<"$tmp/desktop.err")" '# save with: just devel-desktop > ~/.local/share/applications/thegn-dev.desktop'
 
+mkdir -p "$tmp/home/.config/thegn-dev" "$tmp/bin"
+cat >"$tmp/stub" <<'EOF'
+#!/bin/sh
+env >"$STUB_OUT"
+EOF
+chmod +x "$tmp/stub"
+cat >"$tmp/bin/getent" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$tmp/bin/getent"
+
+STUB_OUT="$tmp/stub.env" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+  THEGN_DEVEL_BIN="$tmp/stub" THEGN_SESSION_ID=x XDG_RUNTIME_DIR="$tmp/run0" \
+  "$launcher"
+if grep -q '^THEGN_SESSION_ID=' "$tmp/stub.env"; then
+  fail 'launch leaked THEGN_SESSION_ID'
+fi
+stub_env="$(<"$tmp/stub.env")"
+contains "$stub_env" "XDG_RUNTIME_DIR=$tmp/run0"
+contains "$stub_env" 'THEGN_CHANNEL=dev'
+
 mkdir -p "$tmp/a b/scripts"
 cp "$launcher" "$tmp/a b/scripts/devel-launch.sh"
 chmod +x "$tmp/a b/scripts/devel-launch.sh"
@@ -76,5 +106,13 @@ else
   [[ $missing_rc -eq 1 ]] || fail "missing binary returned $missing_rc, want 1"
 fi
 contains "$(<"$tmp/missing.err")" "just devel"
+
+if THEGN_DEVEL_BIN="$tmp/missing" "$launcher" --daemon >"$tmp/daemon.out" 2>"$tmp/daemon.err"; then
+  fail 'daemon launch without a binary succeeded'
+else
+  daemon_rc=$?
+  [[ $daemon_rc -eq 1 ]] || fail "missing daemon binary returned $daemon_rc, want 1"
+fi
+contains "$(<"$tmp/daemon.err")" 'is missing'
 
 echo 'devel launch checks passed'
