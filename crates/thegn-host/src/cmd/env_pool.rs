@@ -111,10 +111,9 @@ pub fn run(cfg: &Config, args: PoolFillArgs) -> Result<()> {
                 for step in steps {
                     if step.state == crate::agent::ProvisionState::Active
                         && seen.insert(step.label.clone())
+                        && !args.json
                     {
-                        if !args.json {
-                            outln!("  {}", step.label);
-                        }
+                        outln!("  {}", step.label);
                     }
                 }
             },
@@ -181,7 +180,7 @@ mod tests {
     use super::*;
     use clap::Parser as _;
     use thegn_core::config::{EnvConfig, PlacementMode};
-    use thegn_core::store::{PoolStore as _, WorkspaceStore as _};
+    use thegn_core::store::WorkspaceStore as _;
 
     #[test]
     fn pool_deficit_table() {
