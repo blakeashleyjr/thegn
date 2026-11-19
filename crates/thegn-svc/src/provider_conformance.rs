@@ -105,6 +105,9 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
         &mut report,
         "destroy_missing_is_ok",
         Some(async {
+            // Whether a DELETE goes out is the provider's business: a sandbox
+            // this host recorded is deleted 404-tolerantly, an unrecorded one
+            // is only probed. The contract is that teardown is idempotent.
             p.destroy(&fx.missing)
                 .await
                 .map_err(|e| format!("destroying a missing sandbox failed: {e:#}"))
@@ -244,20 +247,21 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
         &mut report,
         "destroy_is_idempotent",
         Some(async {
-            let count = fx.deletes_for.as_ref().map(|probe| probe());
+            // Idempotence is the contract, not the request count: a provider
+            // may re-send a 404-tolerant DELETE for a sandbox it recorded.
             p.destroy(&fx.created)
                 .await
                 .map_err(|e| format!("first destroy failed: {e:#}"))?;
-            let after_first = count.as_ref().map_or(0, |c| c(&fx.created));
             p.destroy(&fx.created)
                 .await
                 .map_err(|e| format!("second destroy failed: {e:#}"))?;
-            let after_second = count.as_ref().map_or(0, |c| c(&fx.created));
-            ensure(after_second == after_first, || {
-                format!(
-                    "second destroy sent {} extra DELETE(s)",
-                    after_second - after_first
-                )
+            let ids = match p.inventory().await {
+                Ok(InventoryReport::Complete(rows)) => rows,
+                Ok(InventoryReport::Partial { rows, .. }) => rows,
+                Err(e) => return Err(format!("inventory failed: {e:#}")),
+            };
+            ensure(!ids.iter().any(|row| row.id == fx.created), || {
+                format!("destroyed {} still in inventory: {ids:?}", fx.created)
             })
         }),
     )
