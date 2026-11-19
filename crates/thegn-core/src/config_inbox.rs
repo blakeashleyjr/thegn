@@ -293,7 +293,7 @@ impl InboxConfig {
                     ));
                 }
             }
-            if (account.kind == InboxKind::Todoist || !account.base_url.trim().is_empty())
+            if !account.base_url.trim().is_empty()
                 && let Some(problem) = base_url_problem(&account.base_url)
             {
                 errs.push(format!("{at}.base_url: {problem}"));
