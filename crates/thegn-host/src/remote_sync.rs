@@ -1534,7 +1534,7 @@ mod tests {
         let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, true);
         spec.oci_runtime = Some("krun".into());
 
-        let _ = plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new());
+        assert!(plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new()).is_some());
 
         assert_eq!(spec.oci_runtime.as_deref(), Some("krun"));
     }
