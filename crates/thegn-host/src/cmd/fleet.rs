@@ -149,18 +149,18 @@ fn sanitize_text(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
-fn account_key_plan(envs: &[(&str, &str)]) -> Vec<Option<String>> {
-    let mut first_by_account = std::collections::BTreeMap::new();
-    envs.iter()
-        .map(|(env, account)| {
-            if let Some(first) = first_by_account.get(*account) {
-                Some(first.clone())
-            } else {
-                first_by_account.insert((*account).to_string(), (*env).to_string());
-                None
-            }
-        })
-        .collect()
+/// The earlier env whose account row already covers `account`; records `env`
+/// as that account's first env when it is new (and returns `None`).
+fn account_shared_with(
+    first_by_account: &mut std::collections::BTreeMap<String, String>,
+    env: &str,
+    account: &str,
+) -> Option<String> {
+    if let Some(first) = first_by_account.get(account) {
+        return Some(first.clone());
+    }
+    first_by_account.insert(account.to_string(), env.to_string());
+    None
 }
 
 /// The Sprites section's data. `None` when no sprites env is configured, so
@@ -196,10 +196,11 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
                         usage.error = Some("no ownership scope (controller id unavailable)".into())
                     }
                     Some(scope) => {
-                        if let Some(first) = account_first_env.get(&scope.account) {
-                            usage.account_shared_with = Some(first.clone());
+                        if let Some(first) =
+                            account_shared_with(&mut account_first_env, name, &scope.account)
+                        {
+                            usage.account_shared_with = Some(first);
                         } else {
-                            account_first_env.insert(scope.account.clone(), name.clone());
                             let mut account = SpritesAccountUsage {
                                 since: since.clone(),
                                 cpu_hours: 0.0,
@@ -1290,10 +1291,13 @@ mod tests {
 
     #[test]
     fn two_envs_on_one_account_read_it_once() {
+        let mut first = std::collections::BTreeMap::new();
+        assert_eq!(account_shared_with(&mut first, "sp", "acct-a"), None);
         assert_eq!(
-            account_key_plan(&[("sp", "acct-a"), ("sp-alt", "acct-a"), ("other", "acct-b")]),
-            vec![None, Some("sp".into()), None]
+            account_shared_with(&mut first, "sp-alt", "acct-a"),
+            Some("sp".to_string())
         );
+        assert_eq!(account_shared_with(&mut first, "other", "acct-b"), None);
     }
 
     #[test]
