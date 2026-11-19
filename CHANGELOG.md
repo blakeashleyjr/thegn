@@ -10,6 +10,8 @@ All notable changes to **thegn** are documented here. The format follows
 ### Added
 
 - `thegn env adopt <sprite> --env <S>` records an existing sprite after you confirm it, so thegn can manage it. `[env.<n>.provider] lifetime_reap = true` lets a running client destroy recorded sprites past `max_lifetime_secs`. `thegn land` on a provider worktree now pulls and lands the local branch and keeps the sandbox; `--release-sandbox` destroys it. `agent run --wait` stops a Fly or machine0 machine afterwards unless `--keep-running`. `login_homes` selects a dedicated login for Sprites and Vercel `upload`. Not yet verified live.
+- The daemon has a native inbox: `[inbox]` and `[[inbox.accounts]]` poll Gmail or any IMAP server (app password), Todoist, or any command (himalaya, a Jira JQL script) and record new items as `inbox_item` notifications. Credentials are secret refs resolved only in the daemon, item text is sanitized and untrusted, and the first poll of an account is a baseline that fires nothing. `thegn inbox list|test|status`, `inbox_item` automation rules (capped at `review`, no `{message}` in spawn templates) and the `producers.status` verb are new; the Lead reads items through `notifications.list`. Requires `[daemon] headless_producers`. Schema v116: restart the daemon. Not yet verified live.
+- `[autopilot]` now runs as a synthesized `autopilot:<repo>` rule through the new config-only `autopilot.run` action, and automation budgets count autopilot runs and the Lead's manual spawns. Pausing automations also stops inbox polling. Not yet verified live.
 
 ## [0.1.0-alpha.97] — 2026-11-18
 
