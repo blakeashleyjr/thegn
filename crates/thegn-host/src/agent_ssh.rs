@@ -7,8 +7,6 @@
 use std::path::{Path, PathBuf};
 
 use thegn_core::config::{Config, ManagedKeyScope};
-use thegn_core::db::Db;
-use thegn_core::repo;
 use thegn_core::store::WorkspaceStore;
 
 use crate::agent::shell_inner;
@@ -153,20 +151,23 @@ pub fn sprite_sshd_start_script() -> String {
 /// proxy: `(private key path, ssh user, in-sandbox workdir)`. `None` otherwise.
 pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, String, String)> {
     use thegn_core::config::ProviderConnect;
-    let loc = crate::agent::provider_pane_loc(worktree, "sprite ssh connect")?;
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = ssh_connect_selection(
-        worktree,
-        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
-    )?;
-    let mut selection = crate::sandbox_profile_ui::selection_for(worktree, &repo_root).ok()?;
-    selection.name = selected_env;
+    // Config-only fast path: without a provider env no placement can be a
+    // provider one, so no database is opened (see `provider_envs_configured`).
+    if !crate::agent::provider_envs_configured(cfg) {
+        return None;
+    }
+    // ONE handle for the location, repo root, env selection and profile.
+    let (loc, repo_root, selection) = {
+        let db = crate::agent::provider_resolution_db(worktree, "sprite ssh connect")?;
+        let loc = crate::agent::provider_pane_loc_in(&db, worktree, "sprite ssh connect")?;
+        let repo_root = crate::agent::repo_root_in(&db, worktree);
+        let repo_text = repo_root.to_string_lossy().into_owned();
+        let selected_env =
+            ssh_connect_selection(worktree, db.effective_env_checked(worktree, &repo_text))?;
+        let mut selection = db.effective_env_selection(worktree, &repo_text).ok()?;
+        selection.name = selected_env;
+        (loc, repo_root, selection)
+    };
     let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let thegn_core::placement::Placement::Provider(_) = &environment.placement else {
         return None;
