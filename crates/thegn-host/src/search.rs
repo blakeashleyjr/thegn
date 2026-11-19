@@ -25,7 +25,7 @@ use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
 use thegn_core::search::{
-    MatchMode, MatchOptions, SearchEngine, SearchMatch, SearchScope, SearchSource,
+    MatchMode, SearchEngine, SearchMatch, SearchScope, SearchSource,
 };
 
 use crate::chrome::S;
@@ -563,7 +563,7 @@ fn window_around(line: &str, span: (usize, usize), avail: usize) -> (bool, &str,
 mod tests {
     use super::*;
     use thegn_core::history::HistoryBuffer;
-    use thegn_core::search::SearchSource;
+    use thegn_core::search::{MatchOptions, SearchSource};
 
     fn buf_from(lines: &[&str]) -> HistoryBuffer {
         let mut b = HistoryBuffer::new(1_000);
