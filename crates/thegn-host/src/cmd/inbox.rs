@@ -80,7 +80,7 @@ pub(crate) fn list_rows(
             })
         })
         .collect();
-    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
     rows.truncate(LIST_CAP);
     rows
 }
