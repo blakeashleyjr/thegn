@@ -2201,7 +2201,13 @@ template = "image:registry.example/dev:1"
             ("[search]\nstructural = \"gritql\"\n", true),
             ("[search]\nstructural = \"ast-grep\"\n", false),
             ("[search]\nstructural = \"none\"\n", false),
-            ("[[inbox.accounts]]\nname = \"m\"\nkind = \"gmail\"\n", true),
+            // A reserved kind lenient-loads as the default `command` kind, so
+            // the fixture carries an argv: the reserved error must be the
+            // only (and first) one.
+            (
+                "[[inbox.accounts]]\nname = \"m\"\nkind = \"gmail\"\ncommand = [\"feed\"]\n",
+                true,
+            ),
             (
                 "[[inbox.accounts]]\nname = \"m\"\nkind = \"command\"\ncommand = [\"feed\"]\n",
                 false,
