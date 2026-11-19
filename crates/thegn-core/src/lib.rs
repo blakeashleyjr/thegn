@@ -151,6 +151,7 @@ pub use db_vacuum::{
     plan_maintenance,
 };
 mod db_workspace;
+pub mod db_workspace_forget;
 mod db_worktree_identity;
 mod db_zones;
 pub mod debug;
