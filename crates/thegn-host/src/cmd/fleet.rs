@@ -752,7 +752,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("WORKTREE  PROVIDER  ENV  ID"), "{text}");
-        assert!(text.contains("/wt/down  sprites  sp  tg-down"), "{text}");
+        assert!(text.contains("/wt/down  sprites   sp   tg-down"), "{text}");
         assert!(
             text.contains("3 sandbox(es), 1 orphan(s), 1 missing, 1 down, 1 unrecorded"),
             "{text}"
