@@ -600,7 +600,7 @@ impl std::hash::Hasher for IdentityStampHasher {
 
 /// Convert Git's bounded path output to a native path without using lossy
 /// UTF-8 conversion. Git emits UTF-8 on Windows; the native representation is
-/// captured by [`native_path_bytes`] after that conversion.
+/// captured by [`native_path_bytes_bounded`] after that conversion.
 pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
     {

@@ -136,7 +136,7 @@ pub enum RecurError {
     /// A numeric part would not parse.
     BadValue(String),
     /// A numeric part parsed but lies outside its RFC 5545 domain (or a list
-    /// exceeds [`MAX_BY_LIST`] entries).
+    /// exceeds `MAX_BY_LIST` entries).
     OutOfRange(String),
 }
 
