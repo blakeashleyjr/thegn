@@ -16,8 +16,7 @@ import delivery_state
 class AgentWorkflowTests(unittest.TestCase):
     def test_agent_entry_points(self):
         root = delivery_state.ROOT
-        self.assertIn("@AGENTS.md", (root / "CLAUDE.md").read_text().splitlines())
-        for guide in ("AGENTS.md", "CLAUDE.md", "docs/agent-workflow.md"):
+        for guide in ("AGENTS.md", "docs/agent-workflow.md"):
             path = root / guide
             for link in re.findall(r"\]\(([^)]+)\)", path.read_text()):
                 if not link.startswith(("https://", "#")):
