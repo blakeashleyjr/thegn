@@ -1000,9 +1000,6 @@
         }
       ],
       "summary": "Retired harden-live-upgrades as superseded by the batch 174 dev-instance `just live` (scripts/dev_live.py).",
-      "successors": [
-        "scripts/dev_live.py"
-      ],
       "archive_path": "openspec/changes/archive/2026-11-20-harden-live-upgrades/"
     },
     {
