@@ -43,6 +43,8 @@ const MAX_LIST_PAGES: usize = 50;
 const RESUME_BUDGET: Duration = Duration::from_secs(120);
 /// The status poll interval while waiting for `running`.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long an accepted delete may take to become visible as gone.
+const DESTROY_CONFIRM_BUDGET: Duration = Duration::from_secs(30);
 /// The captured-output cap of a one-shot command.
 const EXEC_OUT_CAP: usize = 4 << 20;
 
@@ -432,6 +434,7 @@ pub struct VercelProvider {
     /// The ledger directory (`None` ⇒ `registry::dir()`).
     ledger_dir: Option<PathBuf>,
     poll: Duration,
+    destroy_budget: Duration,
     #[cfg(test)]
     fake: Option<std::sync::Arc<dyn Api>>,
 }
@@ -456,6 +459,7 @@ impl VercelProvider {
             policies: Mutex::new(HashMap::new()),
             ledger_dir: None,
             poll: POLL_INTERVAL,
+            destroy_budget: DESTROY_CONFIRM_BUDGET,
             #[cfg(test)]
             fake: None,
         })
@@ -473,6 +477,7 @@ impl VercelProvider {
         provider.fake = Some(fake);
         provider.ledger_dir = Some(ledger_dir);
         provider.poll = Duration::from_millis(1);
+        provider.destroy_budget = Duration::from_millis(50);
         Ok(provider)
     }
 
@@ -822,6 +827,7 @@ impl VercelProvider {
                     );
                 }
                 self.api().delete(name).await?;
+                self.confirm_gone(name).await?;
             }
             None => {
                 // Already gone: only clear snapshots of a name our ledger holds.
@@ -854,6 +860,25 @@ impl VercelProvider {
             );
         }
         Ok(())
+    }
+
+    async fn confirm_gone(&self, name: &str) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + self.destroy_budget;
+        let budget_secs = self.destroy_budget.as_secs();
+        loop {
+            let Some(view) = self.api().get(name, false).await? else {
+                return Ok(());
+            };
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "vercel: delete of {name} was accepted but the sandbox is still present after {}s (status {}); its ledger record is kept; retry thegn env down or thegn env reap --provider vercel",
+                    budget_secs,
+                    status_text(view.status)
+                );
+            }
+            let now = tokio::time::Instant::now();
+            tokio::time::sleep(self.poll.min(deadline - now)).await;
+        }
     }
 
     /// The reaper's read of one sandbox (never resumes).
