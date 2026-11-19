@@ -32,9 +32,22 @@ const PULL_IN_PROGRESS: &str = "a pull may be running in another thegn process";
 const PULL_ON_CLOSE: &str = "pull-back runs when the worktree closes";
 
 pub fn run(json: bool) -> Result<()> {
-    let entries = thegn_svc::sync_journal::list_at(&thegn_svc::sync_journal::dir())?;
+    let dir = thegn_svc::sync_journal::dir();
+    let entries = thegn_svc::sync_journal::list_at(&dir)?;
     let rows = retry_with(entries, &|path| Path::new(path).is_dir(), &mut |path| {
-        crate::agent::deprovision_sync(path)
+        match thegn_svc::sync_journal::load_at(&dir, path) {
+            Ok(Some(entry)) if matches!(entry.state, SyncState::Failed { .. }) => {
+                crate::agent::deprovision_sync(path)
+            }
+            Ok(Some(_)) => Err(
+                "the journal entry changed since it was listed (no longer failed); not pulled"
+                    .to_owned(),
+            ),
+            Ok(None) => {
+                Err("the journal entry was removed since it was listed; not pulled".to_owned())
+            }
+            Err(error) => Err(format!("journal entry unreadable: {error:#}")),
+        }
     });
 
     if json {
