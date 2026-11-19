@@ -76,7 +76,7 @@ fn instance_tag(config_dir: &std::path::Path, default_dir: &std::path::Path) -> 
         .map(|name| name.to_string_lossy())
         .unwrap_or_default()
         .chars()
-        .filter(|ch| !ch.is_control())
+        .filter(|ch| !ch.is_control() && !thegn_core::pipeline_report::is_format_control(*ch))
         .take(16)
         .collect();
     Some(if tag.is_empty() {
@@ -445,6 +445,11 @@ mod tests {
             ),
             (
                 Path::new("/home/u/thegn-\u{1b}dev"),
+                Path::new("/home/u/.config/thegn"),
+                Some("thegn-dev"),
+            ),
+            (
+                Path::new("/home/u/thegn-\u{202e}dev"),
                 Path::new("/home/u/.config/thegn"),
                 Some("thegn-dev"),
             ),
