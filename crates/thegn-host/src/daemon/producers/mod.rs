@@ -26,13 +26,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use thegn_core::config::Config;
 use thegn_core::producer_arm::{ArmInputs, armed_kinds, cadence_secs};
-use thegn_core::producer_lease::{DAEMON_HOLDER, ProducerKind, ttl_ms};
+use thegn_core::producer_lease::{DAEMON_HOLDER, LeaseRow, ProducerKind, plausible, ttl_ms};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -197,8 +197,8 @@ fn wanted_kinds(cfg: &Config) -> BTreeSet<ProducerKind> {
         pr_queue_enabled: cfg.pr_queue.enabled,
         github_mentions: cfg.notifications.github_mentions,
         push_configured: cfg.notifications.push.is_configured(),
-        // b163 lane 5 arms the inbox (`producer_arm::inbox_armable`).
-        inbox_any: false,
+        // `[inbox] enabled` with an enabled account of an implemented kind.
+        inbox_any: thegn_core::producer_arm::inbox_armable(cfg),
     };
     armed_kinds(&inputs).into_iter().collect()
 }
@@ -241,10 +241,10 @@ pub(crate) fn armed_any() -> bool {
     ARMED_ANY.load(Ordering::SeqCst)
 }
 
-/// Each producer kind and whether it is armed, for `thegn doctor`.
-#[allow(
-    dead_code,
-    reason = "read by thegn doctor once the queued producers.status verb lands"
+/// Each producer kind and whether it is armed.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "status_reply reads TASKS directly")
 )]
 pub(crate) fn status() -> Vec<(ProducerKind, bool /*armed*/)> {
     let tasks = lock(&TASKS);
@@ -254,16 +254,130 @@ pub(crate) fn status() -> Vec<(ProducerKind, bool /*armed*/)> {
         .collect()
 }
 
-/// Re-evaluate arming, coalescing bursts (b163). Stub: a no-op (filled by
-/// b163 lane 5).
-#[allow(dead_code, reason = "filled by b163 lane 5")]
-pub(crate) fn rearm_debounced() {}
+/// The shortest gap between two debounced re-arms.
+const REARM_DEBOUNCE_MS: i64 = 30_000;
 
-/// The `producers.status` reply. Blocking. Stub: the default (empty) reply
-/// (filled by b163 lane 5).
-#[allow(dead_code, reason = "filled by b163 lane 5")]
+/// When the last debounced re-arm ran (ms since the epoch; 0 = never).
+static LAST_DEBOUNCED_REARM_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Re-evaluate arming, at most once per [`REARM_DEBOUNCE_MS`]. Called on
+/// every session open, so a repo registered after the daemon started (whose
+/// `[autopilot]` now needs the tracker) is armed without a restart. A no-op
+/// unless the owner is installed; a call inside the window is dropped (the
+/// next open after it re-arms).
+pub(crate) fn rearm_debounced() {
+    if INSTALLED.get().is_none() {
+        return;
+    }
+    if debounce_ok(&LAST_DEBOUNCED_REARM_MS, now_ms()) {
+        rearm();
+    }
+}
+
+/// Claim the debounce window at `now`: true (and `last` advanced) when the
+/// previous claim is at least [`REARM_DEBOUNCE_MS`] old, or lies in the
+/// future (the clock stepped back). One winner per window across threads.
+fn debounce_ok(last: &AtomicI64, now: i64) -> bool {
+    let prev = last.load(Ordering::SeqCst);
+    let open = prev == 0 || now.saturating_sub(prev) >= REARM_DEBOUNCE_MS || prev > now;
+    open && last
+        .compare_exchange(prev, now, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+/// The `producers.status` reply. Blocking (reads the state DB). A lease row
+/// reads `live` only when it is unexpired, plausible (expiry within the
+/// longest TTL) and its holder pid is alive, the rule the owner uses to take
+/// over from a crashed holder.
 pub(crate) fn status_reply() -> thegn_core::producer_status::ProducersStatusReply {
-    Default::default()
+    use thegn_core::producer_status::{
+        InboxAccountStatus, ProducerKindStatus, ProducersStatusReply,
+    };
+    let installed = INSTALLED.get();
+    let armed = current_kinds();
+    // A status read: an unopenable database reports no leases rather than failing.
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => Some(db),
+        Err(error) => {
+            tracing::debug!(target: "thegn::producers", %error, "producer status: database unavailable");
+            None
+        }
+    };
+    let leases = db
+        .as_ref()
+        .and_then(|db| db.producer_leases().ok())
+        .unwrap_or_default();
+    let now = now_ms();
+    let kinds = ProducerKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let lease = leases.iter().find(|row| row.kind == kind);
+            let mut row = ProducerKindStatus::from_lease(kind, armed.contains(&kind), lease, now);
+            row.live = row.live
+                && lease.is_some_and(|l| holder_credible(l, now, &crate::platform::pid_alive));
+            row
+        })
+        .collect();
+    let inbox = db
+        .as_ref()
+        .and_then(|db| db.inbox_states().ok())
+        .unwrap_or_default()
+        .iter()
+        .map(InboxAccountStatus::from)
+        .collect();
+    ProducersStatusReply {
+        installed: installed.is_some(),
+        headless: installed.is_some_and(|inst| inst.cfg.daemon.headless_producers),
+        kinds,
+        inbox,
+    }
+}
+
+/// A lease holder still to be believed: its expiry is plausible and its pid
+/// is alive. Anything else is a crashed holder (possibly one whose expiry a
+/// backward clock step pushed far ahead) that must not block a successor.
+fn holder_credible(row: &LeaseRow, now: i64, alive: &dyn Fn(i64) -> bool) -> bool {
+    plausible(row, now) && alive(row.holder_pid)
+}
+
+/// After a refused acquire: take `kind`'s lease over from a holder that is
+/// not credible ([`holder_credible`]). A compare-and-swap on the holder the
+/// row named when read, so two successors cannot both win. Returns whether
+/// this pid now holds the lease.
+fn take_over_if_dead(
+    db: &thegn_core::db::Db,
+    kind: ProducerKind,
+    pid: i64,
+    now: i64,
+    ttl: i64,
+    alive: &dyn Fn(i64) -> bool,
+) -> anyhow::Result<bool> {
+    let Some(row) = db.producer_lease(kind)? else {
+        return Ok(false);
+    };
+    if row.holder_pid == pid || holder_credible(&row, now, alive) {
+        return Ok(false);
+    }
+    let taken = db.take_over_producer_lease(
+        kind,
+        &row.holder,
+        row.holder_pid,
+        DAEMON_HOLDER,
+        pid,
+        now,
+        ttl,
+    )?;
+    if taken {
+        tracing::warn!(
+            target: "thegn::producers",
+            kind = kind.as_str(),
+            dead_holder = %row.holder,
+            dead_pid = row.holder_pid,
+            expires_at_ms = row.expires_at_ms,
+            "took over a producer lease from a dead or implausible holder"
+        );
+    }
+    Ok(taken)
 }
 
 /// Release every lease this daemon holds (graceful shutdown). Blocking; a
@@ -349,9 +463,16 @@ fn pass(
         if !current() {
             return Pass::Superseded;
         }
-        match db.try_acquire_producer_lease(kind, DAEMON_HOLDER, pid, now, ttl_ms(cadence_secs)) {
+        let ttl = ttl_ms(cadence_secs);
+        match db.try_acquire_producer_lease(kind, DAEMON_HOLDER, pid, now, ttl) {
             Ok(true) => {}
-            Ok(false) => return Pass::NotHeld,
+            Ok(false) => {
+                match take_over_if_dead(&db, kind, pid, now, ttl, &crate::platform::pid_alive) {
+                    Ok(true) => {}
+                    Ok(false) => return Pass::NotHeld,
+                    Err(error) => return Pass::Error(format!("{error:#}")),
+                }
+            }
             Err(error) => return Pass::Error(format!("{error:#}")),
         }
     }
@@ -539,23 +660,136 @@ mod tests {
     }
 
     #[test]
-    fn producers_status_route_answers_the_default_reply_shape() {
+    fn status_reply_lists_every_kind_the_leases_and_inbox_accounts() {
+        let _state = crate::testenv::IsolatedState::new();
         rearm_debounced();
-        let value = serde_json::to_value(status_reply()).unwrap();
         assert_eq!(
-            value,
-            serde_json::json!({"installed": false, "headless": false, "kinds": [], "inbox": []})
+            LAST_DEBOUNCED_REARM_MS.load(Ordering::SeqCst),
+            0,
+            "uninstalled: a no-op"
         );
-        assert_eq!(
-            dispatch(
+        let db = thegn_core::db::Db::open().unwrap();
+        let pid = i64::from(std::process::id());
+        assert!(
+            db.try_acquire_producer_lease(
                 ProducerKind::Inbox,
-                &TickCtx {
-                    cfg: Arc::new(Config::default()),
-                    now_ms: 0,
-                }
-            ),
-            TickOutcome::Skipped("not implemented")
+                DAEMON_HOLDER,
+                pid,
+                now_ms(),
+                60_000
+            )
+            .unwrap()
         );
+        assert!(
+            db.try_acquire_producer_lease(
+                ProducerKind::Tracker,
+                DAEMON_HOLDER,
+                i64::from(i32::MAX),
+                now_ms(),
+                60_000
+            )
+            .unwrap()
+        );
+        db.put_inbox_state(&thegn_core::db_inbox::InboxAccountState {
+            account: "work".into(),
+            kind: "command".into(),
+            last_error: "boom".into(),
+            baselined: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let reply = status_reply();
+        assert!(!reply.installed && !reply.headless);
+        let kinds: Vec<_> = reply.kinds.iter().map(|k| k.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["tracker", "pr_poll", "mentions", "pr_queue", "inbox"]
+        );
+        let inbox = &reply.kinds[4];
+        assert!(inbox.live && !inbox.armed);
+        assert_eq!(inbox.holder_pid, Some(pid));
+        assert!(!reply.kinds[0].live, "a dead holder pid is not live");
+        assert_eq!(reply.kinds[1].holder, None);
+        assert_eq!(reply.inbox.len(), 1);
+        assert_eq!(
+            (
+                reply.inbox[0].account.as_str(),
+                reply.inbox[0].last_error.as_str()
+            ),
+            ("work", "boom")
+        );
+        let value = serde_json::to_value(&reply).unwrap();
+        for key in ["installed", "headless", "kinds", "inbox"] {
+            assert!(value.get(key).is_some(), "{key}");
+        }
+    }
+
+    #[test]
+    fn debounce_collapses_bursts() {
+        let last = AtomicI64::new(0);
+        assert!(debounce_ok(&last, 1_000_000));
+        assert!(!debounce_ok(&last, 1_000_001));
+        assert!(!debounce_ok(&last, 1_000_000 + REARM_DEBOUNCE_MS - 1));
+        assert!(debounce_ok(&last, 1_000_000 + REARM_DEBOUNCE_MS));
+        assert!(!debounce_ok(&last, 1_000_000 + REARM_DEBOUNCE_MS + 1));
+        assert!(
+            debounce_ok(&last, 5),
+            "a clock step back reopens the window"
+        );
+        let calls = (0..100)
+            .filter(|i| debounce_ok(&last, 2_000_000 + i))
+            .count();
+        assert_eq!(calls, 1, "a burst re-arms once");
+    }
+
+    #[test]
+    fn take_over_needs_a_dead_or_implausible_holder() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        let now = now_ms();
+        let me = 100;
+        let other = 200;
+        let alive = |_: i64| true;
+        let dead = |_: i64| false;
+        assert!(
+            !take_over_if_dead(&db, ProducerKind::Inbox, me, now, 60_000, &dead).unwrap(),
+            "no row"
+        );
+        assert!(
+            db.try_acquire_producer_lease(ProducerKind::Inbox, DAEMON_HOLDER, other, now, 60_000)
+                .unwrap()
+        );
+        assert!(
+            !take_over_if_dead(&db, ProducerKind::Inbox, me, now, 60_000, &alive).unwrap(),
+            "a live, plausible holder keeps it"
+        );
+        assert!(take_over_if_dead(&db, ProducerKind::Inbox, me, now, 60_000, &dead).unwrap());
+        let row = db.producer_lease(ProducerKind::Inbox).unwrap().unwrap();
+        assert_eq!(row.holder_pid, me);
+        // A crashed holder whose expiry a backward clock step put far ahead.
+        let far = thegn_core::producer_lease::MAX_TTL_MS * 4;
+        assert!(
+            db.try_acquire_producer_lease(ProducerKind::Tracker, DAEMON_HOLDER, other, now, far)
+                .unwrap()
+        );
+        assert!(take_over_if_dead(&db, ProducerKind::Tracker, me, now, 60_000, &alive).unwrap());
+    }
+
+    #[test]
+    fn the_inbox_arms_only_with_an_enabled_implemented_account() {
+        let _state = crate::testenv::IsolatedState::new();
+        let mut cfg = Config::default();
+        cfg.daemon.enabled = true;
+        cfg.daemon.headless_producers = true;
+        cfg.inbox.accounts.push(thegn_core::config::InboxAccount {
+            name: "work".into(),
+            ..Default::default()
+        });
+        assert!(wanted_kinds(&cfg).is_empty(), "[inbox] enabled = false");
+        cfg.inbox.enabled = true;
+        assert_eq!(wanted_kinds(&cfg), set(&[ProducerKind::Inbox]));
+        cfg.inbox.accounts[0].kind = thegn_core::config::InboxKind::Slack;
+        assert!(wanted_kinds(&cfg).is_empty(), "reserved kinds only");
     }
 
     #[test]
@@ -593,7 +827,12 @@ mod tests {
     fn a_second_holder_skips_the_tick() {
         let _state = crate::testenv::IsolatedState::new();
         let cfg = Arc::new(Config::default());
-        let other_daemon = i64::from(std::process::id()) + 1;
+        // A live process that is not us (our parent: the test runner), so the
+        // lease is credible and is not taken over.
+        let Some(parent) = crate::platform::parent_pid() else {
+            return; // no live, non-self pid to name on this platform
+        };
+        let other_daemon = i64::from(parent);
         let db = thegn_core::db::Db::open().expect("isolated db");
         assert!(
             db.try_acquire_producer_lease(
