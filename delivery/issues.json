@@ -343,6 +343,13 @@
       "no_spec_rationale": "Phase 1 (classify, approve, plan) archived as add-pipeline-supervisor-policy. Phases 2-4 of the supervisor policy layer are still open and have no proposal yet."
     },
     {
+      "issue": "THE-801",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-sprites-credentials-and-git-fence"
+      ]
+    },
+    {
       "issue": "THE-1510",
       "project": "Workspace Product & Observability",
       "changes": [
@@ -520,6 +527,27 @@
       "changes": [
         "harden-remote-sprites-journey",
         "remote-daily-loop"
+      ]
+    },
+    {
+      "issue": "THE-155",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
+    },
+    {
+      "issue": "THE-2142",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
+    },
+    {
+      "issue": "THE-395",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
       ]
     }
   ]

@@ -1002,6 +1002,26 @@
       "summary": "Stage and back up confirmed live upgrades; real controller migration verification remains operator-controlled."
     },
     {
+      "change": "harden-remote-exec-and-sync-journal",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-155",
+          "project": "Client API & Remote Access"
+        },
+        {
+          "issue": "THE-2142",
+          "project": "Client API & Remote Access"
+        },
+        {
+          "issue": "THE-395",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Journaled sync pull-back, exec account routing, stderr on failed exec, merge provenance and remote runtimes; live checks open."
+    },
+    {
       "change": "harden-remote-sprites-journey",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -1024,6 +1044,18 @@
         }
       ],
       "summary": "Inventory-proven sandbox teardown, fail-closed wt rm, doctor remote readiness and quit confirmation."
+    },
+    {
+      "change": "harden-sprites-credentials-and-git-fence",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-801",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Sprites model_credentials grant, destroy proof, exec deadline, close snapshot and literal search default; live checks open."
     },
     {
       "change": "isolate-maintenance-regression-fixtures",
