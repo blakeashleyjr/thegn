@@ -803,7 +803,7 @@ fn vercel_lifetime_ceiling_is_reaped_so_not_warned() {
 
 fn vercel_cred_cfg(provider: &str, mode: crate::config::ModelCredentials) -> crate::config::Config {
     let mut cfg = crate::config::Config::default();
-    let env = crate::config::EnvConfig {
+    let mut env = crate::config::EnvConfig {
         provider: crate::config::EnvProviderConfig {
             provider: provider.into(),
             team_id: "team_abc1".into(),
@@ -813,6 +813,7 @@ fn vercel_cred_cfg(provider: &str, mode: crate::config::ModelCredentials) -> cra
         },
         ..Default::default()
     };
+    env.provider.mark_model_credentials_explicit();
     cfg.env.insert("e".into(), env);
     cfg
 }
@@ -847,8 +848,33 @@ fn model_credentials_admission_per_provider_and_mode() {
             "{mode}"
         );
     }
-    // Any other kind: every mode but none is refused with the shared message.
-    for provider in ["fly", "sprites", "hetzner", "daytona", ""] {
+    // Sprites: none and upload pass; proxy and inject are refused locally.
+    for mode in [ModelCredentials::None, ModelCredentials::Upload] {
+        let errors = validate_config(&vercel_cred_cfg("sprites", mode));
+        assert!(
+            labelled(&errors, LABEL).is_empty(),
+            "sprites {mode}: {errors:?}"
+        );
+    }
+    for (mode, text) in [
+        (
+            ModelCredentials::Proxy,
+            "model_credentials = \"proxy\" is not offered for sprites",
+        ),
+        (
+            ModelCredentials::Inject,
+            "model_credentials = \"inject\" is not offered for sprites",
+        ),
+    ] {
+        let errors = validate_config(&vercel_cred_cfg("sprites", mode));
+        assert_eq!(
+            labelled(&errors, LABEL),
+            vec![&format!("{LABEL} {text}")],
+            "sprites {mode}"
+        );
+    }
+    // Other kinds refuse upload with the shared message.
+    for provider in ["fly", "hetzner", "daytona", ""] {
         let errors = validate_config(&vercel_cred_cfg(provider, ModelCredentials::None));
         assert!(
             labelled(&errors, LABEL).is_empty(),
@@ -914,7 +940,7 @@ fn sprites_fixed_size_warning_names_its_field() {
     ] {
         let w = provider_table_warnings(&sprites_cfg(Provider, set));
         assert_eq!(labelled(&w, "env.s.provider.size:").len(), 1, "{w:?}");
-        assert!(w[0].contains("fixed 8 vCPU"));
+        assert!(labelled(&w, "env.s.provider.size:")[0].contains("fixed 8 vCPU"));
     }
 }
 
@@ -922,18 +948,29 @@ fn sprites_fixed_size_warning_names_its_field() {
 fn sprites_min_ram_note_and_clean_env() {
     use crate::config::PlacementMode::Provider;
     let w = provider_table_warnings(&sprites_cfg(Provider, |p| p.min_ram_gb = 16));
-    assert_eq!(w.len(), 1, "{w:?}");
-    assert!(w[0].starts_with("env.s.provider.min_ram_gb:") && w[0].contains("16384 MiB"));
+    assert_eq!(labelled(&w, "env.s.provider.min_ram_gb:").len(), 1, "{w:?}");
+    assert!(labelled(&w, "env.s.provider.min_ram_gb:")[0].contains("16384 MiB"));
     let w = provider_table_warnings(&sprites_cfg(Provider, |p| p.size = "auto".into()));
-    assert!(w.is_empty(), "{w:?}");
+    assert_eq!(
+        labelled(&w, "env.s.provider.model_credentials:").len(),
+        1,
+        "{w:?}"
+    );
+    assert!(
+        labelled(&w, "env.s.provider.model_credentials:")[0]
+            .contains("credentials are forwarded by default")
+    );
 }
 
 #[test]
 fn provider_table_with_local_placement_warns() {
     use crate::config::PlacementMode::Local;
     let w = provider_table_warnings(&sprites_cfg(Local, |_| {}));
-    assert_eq!(w.len(), 1, "{w:?}");
-    assert!(w[0].contains("runs locally") && w[0].contains("\"local\""));
+    assert_eq!(labelled(&w, "env.s.provider.provider:").len(), 1, "{w:?}");
+    assert!(
+        labelled(&w, "env.s.provider.provider:")[0].contains("runs locally")
+            && labelled(&w, "env.s.provider.provider:")[0].contains("\"local\"")
+    );
     let w = provider_table_warnings(&vercel_cred_cfg(
         "vercel",
         crate::config::ModelCredentials::None,
