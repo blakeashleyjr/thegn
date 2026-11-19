@@ -280,8 +280,7 @@ fn handle_exec_websocket(
             return;
         }
     }
-    let mut exit = vec![3];
-    exit.extend_from_slice(code.to_string().as_bytes());
+    let exit = vec![0x03, code as u8];
     // best-effort: test mock: the client may already have hung up.
     let _ = socket.send(tokio_tungstenite::tungstenite::Message::Binary(exit.into()));
 }

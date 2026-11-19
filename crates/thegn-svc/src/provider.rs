@@ -6857,8 +6857,7 @@ mod tests {
             .send(Message::Binary(stdout_frame.into()))
             .await
             .unwrap();
-        let mut exit_frame = vec![3];
-        exit_frame.extend_from_slice(code.to_string().as_bytes());
+        let exit_frame = vec![0x03, code as u8];
         server
             .send(Message::Binary(exit_frame.into()))
             .await
