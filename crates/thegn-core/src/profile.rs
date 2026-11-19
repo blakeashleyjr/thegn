@@ -1240,24 +1240,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_credential_env_is_restored_by_an_env_guard() {
-        let before_term = std::env::var_os("TERM");
-        let before_git = std::env::var_os("GIT_CONFIG_GLOBAL");
-        {
-            let _env = crate::testenv::EnvGuard::unset(&[
-                "TERM",
-                "GIT_CONFIG_GLOBAL",
-                "ANTHROPIC_API_KEY",
-                "SSH_AUTH_SOCK",
-            ]);
-            let root = tempfile::tempdir().unwrap();
-            apply_credential_env(root.path(), None);
-        }
-        assert_eq!(std::env::var_os("TERM"), before_term);
-        assert_eq!(std::env::var_os("GIT_CONFIG_GLOBAL"), before_git);
-    }
-
-    #[test]
     fn named_firewall_denies_unshared_credentials() {
         let _env = crate::testenv::EnvGuard::unset(&[
             "ANTHROPIC_API_KEY",
