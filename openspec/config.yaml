@@ -2,7 +2,7 @@
 # `schema` selects the workflow (proposal -> specs -> design -> tasks).
 # `context` is injected into every artifact instruction the AI generates, so it
 # is the single place that teaches agents what thegn is and its hard rules.
-# See CLAUDE.md for the full developer guide and tasks.md for the roadmap.
+# See DEVELOPMENT.md for the full developer guide and tasks.md for the roadmap.
 schema: spec-driven
 context: |
   thegn (binary `thegn`, alias `tg`) is a terminal-native git-worktree IDE

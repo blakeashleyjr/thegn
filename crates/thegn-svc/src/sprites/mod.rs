@@ -7,8 +7,10 @@
 //! - [`resources`]: the memory policy (`min_ram_gb` × 1024 MiB).
 //! - [`usage`]: CPU and reserved GB-hours from the Sprites usage API.
 //! - [`hold_api`]: the keep-awake Tasks-API hold constants.
+//! - [`inspect`]: a single sprite's status over the org API (never wakes it).
 
 pub mod hold_api;
+pub mod inspect;
 pub mod ledger;
 pub mod resources;
 pub mod usage;
