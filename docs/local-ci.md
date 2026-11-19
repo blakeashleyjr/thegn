@@ -24,7 +24,7 @@ The scoped commands are the day-to-day loop. Individual heavy stages are useful
 for deliberate diagnosis or the pre-push/PR boundary, but are not per-edit
 commands. A green `just ci` locally covers the non-e2e CI gate (modulo
 runner-only infrastructure — see below); `just ci-local` adds the local e2e
-gate. Follow the dev-loop policy in `CLAUDE.md` and run the full gates once at
+gate. Follow the dev-loop policy in `DEVELOPMENT.md` and run the full gates once at
 the appropriate boundary.
 
 ## Checkout hooks and linked worktrees
