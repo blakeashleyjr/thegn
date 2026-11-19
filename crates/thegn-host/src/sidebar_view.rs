@@ -2865,8 +2865,16 @@ mod tests {
         };
         let mut model = FrameModel {
             sidebar_rows: vec![
-                SidebarRow::base(RowKind::Worktree, 1, "feat-a", "ws"),
-                SidebarRow::base(RowKind::Worktree, 1, "feat-b", "ws"),
+                // The branch differs from the title: a branch that equals the
+                // title is echoed by it and gets no detail line (b164).
+                SidebarRow {
+                    branch: Some("feature/a".into()),
+                    ..SidebarRow::base(RowKind::Worktree, 1, "feat-a", "ws")
+                },
+                SidebarRow {
+                    branch: Some("feature/b".into()),
+                    ..SidebarRow::base(RowKind::Worktree, 1, "feat-b", "ws")
+                },
             ],
             ..FrameModel::default()
         };
