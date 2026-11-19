@@ -49,7 +49,15 @@ fn live_sandbox_lifecycle() {
         return;
     };
     let name = format!("tglc-{}", std::process::id());
-    let prov = thegn_svc::provider::Provider::Sprites(SpritesProvider::new("", &token, &name));
+    let ledger = tempfile::tempdir().unwrap();
+    let prov = thegn_svc::provider::Provider::Sprites(
+        SpritesProvider::new("", &token, &name)
+            .with_scope(thegn_svc::sprites::ledger::OwnerScope {
+                owner: "tglc-live".into(),
+                account: "acct1-tglc-live".into(),
+            })
+            .with_ledger_dir(ledger.path().to_path_buf()),
+    );
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // Clean slate (ignore: may not exist yet).
