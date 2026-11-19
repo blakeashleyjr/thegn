@@ -351,11 +351,10 @@ mod tests {
 
     #[test]
     fn resolve_env_expands_indirection_and_drops_missing() {
-        // SAFETY: single-threaded test env mutation.
-        unsafe {
-            std::env::set_var("TG_PRESET_TEST_TOK", "s3cret");
-            std::env::remove_var("TG_PRESET_TEST_MISSING");
-        }
+        let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+            ("TG_PRESET_TEST_TOK", Some("s3cret")),
+            ("TG_PRESET_TEST_MISSING", None),
+        ]);
         let mut env = BTreeMap::new();
         env.insert("PLAIN".to_string(), "value".to_string());
         env.insert("TOK".to_string(), "env:TG_PRESET_TEST_TOK".to_string());
@@ -369,9 +368,6 @@ mod tests {
                 ("TOK".to_string(), "s3cret".to_string()),
             ]
         );
-        unsafe {
-            std::env::remove_var("TG_PRESET_TEST_TOK");
-        }
     }
 
     #[test]
