@@ -21,7 +21,7 @@
 //! Other tools with similar sandboxing behaviour (Cursor, Windsurf, …) mask
 //! the same paths, so the check is written generically.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The canonical list of home-directory paths that sandbox tools may replace
 /// with empty directories. Checked in order; each entry is relative to `$HOME`.
@@ -31,17 +31,19 @@ const MASKED_PATHS: &[&str] = &[".gitconfig", ".bash_profile", ".bashrc"];
 /// the first git subprocess or config read. Non-fatal: a failed repair logs a
 /// warning and continues; it never aborts the session.
 pub fn run_checks() {
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => PathBuf::from(h),
-        _ => return,
-    };
-    run_checks_in(&home);
+    run_checks_from(std::env::var_os("HOME"));
 }
 
-/// The masked-path checks against an explicit `home`. Split out so tests can
-/// exercise the real behaviour without mutating the process-global `HOME` (a
-/// parallel-test data race against everything that reads `HOME`).
-fn run_checks_in(home: &Path) {
+/// `HOME` as read from the environment; empty, unset or non-UTF-8 returns
+/// early (as today).
+fn run_checks_from(home: Option<std::ffi::OsString>) {
+    let Some(home) = home.and_then(|home| home.into_string().ok()) else {
+        return;
+    };
+    if home.is_empty() {
+        return;
+    }
+    let home = Path::new(&home);
     for rel in MASKED_PATHS {
         let path = home.join(rel);
         if is_sandbox_mask(&path) {
@@ -148,8 +150,11 @@ fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // A process-wide `HOME` pointing at a masked `.gitconfig` makes every
+    // concurrent git in the test process fail (THE-2390).
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     /// Create a unique temp directory for each test — avoids cross-test
     /// interference without requiring the `tempfile` crate.
@@ -275,7 +280,7 @@ mod tests {
 
         // Drive the real check against an explicit home — no global `HOME`
         // mutation, so this can't race the many tests that read `HOME`.
-        run_checks_in(&home);
+        run_checks_from(Some(home.clone().into_os_string()));
 
         let meta = fs::symlink_metadata(&gitconfig).unwrap();
         assert!(meta.file_type().is_symlink());
@@ -327,16 +332,8 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    // These tests mutate the process-global `HOME`. They go through
-    // `testenv::EnvGuard`, NOT a local mutex: a second mutex over the same
-    // variable serializes these two tests against each other while doing nothing
-    // to exclude any `EnvGuard`-holding test elsewhere in the crate — two
-    // mutexes over one resource, which is exactly what `testenv`'s module doc
-    // warns against. `EnvGuard` also restores on panic, which the hand-rolled
-    // save/restore below did not.
-
     #[test]
-    fn run_checks_uses_home_env_and_repairs() {
+    fn run_checks_from_repairs_the_mask() {
         let home = tmp_home("run-checks-env");
 
         // Plant XDG config + the gitconfig mask.
@@ -346,11 +343,7 @@ mod tests {
         let gitconfig = home.join(".gitconfig");
         fs::create_dir(&gitconfig).unwrap();
 
-        // Drive the public entry point via the real HOME read.
-        {
-            let _env = crate::testenv::EnvGuard::set(&[("HOME", &home.to_string_lossy())]);
-            run_checks();
-        }
+        run_checks_from(Some(home.clone().into_os_string()));
 
         let meta = fs::symlink_metadata(&gitconfig).unwrap();
         assert!(meta.file_type().is_symlink());
@@ -362,14 +355,8 @@ mod tests {
     fn run_checks_returns_when_home_empty() {
         // An empty HOME (and an unset HOME) must take the early `return` arm
         // and do nothing — no panic, no filesystem touch.
-        {
-            let _env = crate::testenv::EnvGuard::set(&[("HOME", "")]);
-            run_checks();
-        }
-        {
-            let _env = crate::testenv::EnvGuard::unset(&["HOME"]);
-            run_checks();
-        }
+        run_checks_from(Some("".into()));
+        run_checks_from(None);
     }
 
     #[test]
@@ -430,13 +417,13 @@ mod tests {
 
     #[test]
     fn run_checks_skips_when_no_mask_present() {
-        // A home where ~/.gitconfig is a real file (not a mask): run_checks_in
+        // A home where ~/.gitconfig is a real file (not a mask): run_checks_from
         // must leave it untouched. No global HOME mutation (see above).
         let home = tmp_home("no-mask");
         let gitconfig = home.join(".gitconfig");
         fs::write(&gitconfig, b"[user]\n\tname = Real\n").unwrap();
 
-        run_checks_in(&home);
+        run_checks_from(Some(home.clone().into_os_string()));
         // Still a regular file with its original contents.
         let content = fs::read_to_string(&gitconfig).unwrap();
         assert!(content.contains("Real"));
