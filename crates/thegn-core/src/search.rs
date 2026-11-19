@@ -6,6 +6,7 @@
 //! the overlay UI and feeds the engine sources on each keystroke.
 
 use neo_frizbee::{Config, match_list};
+use std::collections::HashMap;
 
 use crate::history::HistoryBuffer;
 
@@ -83,6 +84,8 @@ pub struct SearchMatch {
     pub span: Option<(usize, usize)>,
     /// Lines between this line and its source's newest line (0 = newest).
     pub from_tail: usize,
+    /// Number of identical lines grouped into this result (1 = single line).
+    pub repeat: u32,
 }
 
 /// How the query is matched against lines.
@@ -249,8 +252,7 @@ impl SearchEngine {
             })
             .collect();
 
-        let mut out: Vec<SearchMatch> = Vec::new();
-        let mk = |f: &(u32, usize, &str, &str, usize), score: u32, span| SearchMatch {
+        let mk = |f: &(u32, usize, &str, &str, usize), score: u32, span, repeat| SearchMatch {
             pane_id: f.0,
             line_idx: f.1,
             line: f.2.to_string(),
@@ -258,46 +260,56 @@ impl SearchEngine {
             pane_label: f.3.to_string(),
             span,
             from_tail: f.4,
+            repeat,
         };
 
-        if empty {
-            let mut order: Vec<&_> = flat.iter().collect();
-            order.sort_by_key(|f| f.4); // stable: newest first, source order on ties
-            out.extend(
-                order
-                    .into_iter()
-                    .take(self.max_results)
-                    .map(|f| mk(f, 0, None)),
-            );
-            self.matches = out;
-            return;
-        }
-
         let mut hits: Vec<RankedSearchHit> = Vec::new();
-        match mode {
-            MatchMode::Literal => {
-                for (i, f) in flat.iter().enumerate() {
-                    if let Some(span) = find_literal(f.2, &trimmed) {
-                        hits.push((
-                            i,
-                            if on_word_boundaries(f.2, span) { 2 } else { 1 },
-                            Some(span),
-                        ));
+        if empty {
+            hits.extend(flat.iter().enumerate().map(|(i, _)| (i, 0, None)));
+        } else {
+            match mode {
+                MatchMode::Literal => {
+                    for (i, f) in flat.iter().enumerate() {
+                        if let Some(span) = find_literal(f.2, &trimmed) {
+                            hits.push((
+                                i,
+                                if on_word_boundaries(f.2, span) { 2 } else { 1 },
+                                Some(span),
+                            ));
+                        }
                     }
                 }
-            }
-            MatchMode::Fuzzy => {
-                let hay: Vec<&str> = flat.iter().map(|f| f.2).collect();
-                for m in match_list(&trimmed, &hay, &Config::default()) {
-                    hits.push((m.index as usize, m.score as u32, None));
+                MatchMode::Fuzzy => {
+                    let hay: Vec<&str> = flat.iter().map(|f| f.2).collect();
+                    for m in match_list(&trimmed, &hay, &Config::default()) {
+                        hits.push((m.index as usize, m.score as u32, None));
+                    }
                 }
             }
         }
         hits.sort_by(|a, b| b.1.cmp(&a.1).then(flat[a.0].4.cmp(&flat[b.0].4)));
-        hits.truncate(self.max_results);
-        self.matches = hits
+        let mut groups: HashMap<(u32, &str), usize> = HashMap::with_capacity(hits.len());
+        let mut grouped: Vec<(usize, u32, Option<(usize, usize)>, u32)> =
+            Vec::with_capacity(hits.len());
+        for (i, score, span) in hits {
+            let key = (flat[i].0, flat[i].2);
+            if let Some(&group_idx) = groups.get(&key) {
+                grouped[group_idx].3 += 1;
+                if flat[i].4 < flat[grouped[group_idx].0].4 {
+                    grouped[group_idx].0 = i;
+                    grouped[group_idx].1 = score;
+                    grouped[group_idx].2 = span;
+                }
+            } else {
+                groups.insert(key, grouped.len());
+                grouped.push((i, score, span, 1));
+            }
+        }
+        grouped.sort_by(|a, b| b.1.cmp(&a.1).then(flat[a.0].4.cmp(&flat[b.0].4)));
+        grouped.truncate(self.max_results);
+        self.matches = grouped
             .into_iter()
-            .map(|(i, s, sp)| mk(&flat[i], s, sp))
+            .map(|(i, score, span, repeat)| mk(&flat[i], score, span, repeat))
             .collect();
     }
 }
@@ -378,6 +390,48 @@ mod tests {
         assert_eq!(eng.matches()[0].score, 0);
     }
 
+    #[test]
+    fn identical_lines_from_one_pane_group_with_a_count() {
+        let buf = buf_from(&["same", "other", "same"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_query("same", &sources);
+        assert_eq!(eng.matches().len(), 1);
+        assert_eq!(eng.matches()[0].repeat, 2);
+    }
+
+    #[test]
+    fn identical_lines_from_two_panes_do_not_group() {
+        let a = buf_from(&["same"]);
+        let b = buf_from(&["same"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "a", &a), (2, "b", &b)];
+        let mut eng = engine(SearchScope::Worktree);
+        eng.set_query("same", &sources);
+        assert_eq!(eng.matches().len(), 2);
+        assert!(eng.matches().iter().all(|m| m.repeat == 1));
+    }
+
+    #[test]
+    fn group_keeps_the_newest_occurrence() {
+        let buf = buf_from(&["same", "other", "same"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_query("same", &sources);
+        assert_eq!(eng.matches()[0].line_idx, 2);
+        assert_eq!(eng.matches()[0].from_tail, 0);
+    }
+
+    #[test]
+    fn empty_query_groups_spinner_repeats() {
+        let buf = buf_from(&["⠋", "⠙", "⠋", "⠋"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_query("", &sources);
+        let spinner = eng.matches().iter().find(|m| m.line == "⠋").unwrap();
+        assert_eq!(spinner.repeat, 3);
+        assert_eq!(spinner.from_tail, 0);
+    }
+
     // ── fuzzy matching ────────────────────────────────────────────────────────
 
     #[test]
@@ -433,8 +487,9 @@ mod tests {
 
     #[test]
     fn results_capped_at_max_results() {
-        let lines: Vec<&str> = (0..200).map(|_| "match line").collect();
-        let buf = buf_from(&lines);
+        let lines: Vec<String> = (0..200).map(|i| format!("match line {i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let buf = buf_from(&refs);
         let sources: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
         let mut eng = SearchEngine::new(SearchScope::Pane(1), 50);
         eng.set_query("match", &sources);
