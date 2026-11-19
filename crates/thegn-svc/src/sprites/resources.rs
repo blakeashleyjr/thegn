@@ -34,7 +34,12 @@ pub(crate) async fn apply(http: &SpritesHttp<'_>, limit_mb: u32) -> Result<()> {
         .json(&policy_body(limit_mb))
         .send()
         .await
-        .with_context(|| format!("sprites: setting the memory policy of `{name}` failed"))?;
+        .map_err(|error| {
+            crate::provider::redacted_transport_error("sprites", "set memory policy", &error)
+                .context(format!(
+                    "sprites: setting the memory policy of `{name}` failed"
+                ))
+        })?;
     let status = response.status();
     if !status.is_success() {
         bail!("sprites: setting the memory policy of `{name}` returned HTTP {status}");
@@ -56,7 +61,11 @@ pub(crate) async fn read(http: &SpritesHttp<'_>) -> Result<Option<u32>> {
         .timeout(CONTROL_TIMEOUT)
         .send()
         .await
-        .with_context(|| format!("sprites: reading the memory policy of `{name}` failed"))?;
+        .map_err(|error| {
+            crate::provider::redacted_transport_error("sprites", "memory policy", &error).context(
+                format!("sprites: reading the memory policy of `{name}` failed"),
+            )
+        })?;
     let status = response.status();
     if !status.is_success() {
         bail!("sprites: reading the memory policy of `{name}` returned HTTP {status}");
@@ -161,13 +170,33 @@ mod tests {
 
     #[tokio::test]
     async fn memory_policy_mb_reads_another_name() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let count = sock.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..count]);
+            assert!(
+                request.starts_with("GET /sprites/another/policy/resources"),
+                "{request}"
+            );
+            let body = r#"{"memory":{"limit_mb":2048}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+        let base = format!("http://{addr}");
         let client = reqwest::Client::new();
-        let base = serve(vec![r#"{"memory":{"limit_mb":2048}}"#.into()]).await;
         let provider = crate::provider::SpritesProvider::new(&base, "tok-secret", "owned");
         assert_eq!(
             provider.memory_policy_mb("another").await.unwrap(),
             Some(2048)
         );
+        server.await.unwrap();
     }
 
     #[test]
