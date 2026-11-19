@@ -549,7 +549,8 @@ mod tests {
 
     #[test]
     fn pool_counts_table() {
-        let cases: &[(&[&str], (usize, usize, usize))] = &[
+        type Case = (&'static [&'static str], (usize, usize, usize));
+        let cases: &[Case] = &[
             (&[], (0, 0, 0)),
             (&["ready"], (1, 0, 0)),
             (&["provisioning", "provisioning"], (0, 2, 0)),

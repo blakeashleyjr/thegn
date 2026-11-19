@@ -437,7 +437,7 @@ impl SearchEngine {
                                     .lines()
                                     .map(str::trim)
                                     .filter(|line| !line.is_empty())
-                                    .last()
+                                    .next_back()
                                     .map(|line| line.strip_prefix("error: ").unwrap_or(line))
                                     .map_or_else(String::new, |line| {
                                         line.chars().take(120).collect()
