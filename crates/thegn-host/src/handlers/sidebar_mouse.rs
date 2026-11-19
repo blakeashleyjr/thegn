@@ -1980,6 +1980,13 @@ mod tests {
     fn sidebar_row_heights_follow_the_focus_detail_policy_exactly() {
         use thegn_core::config::FocusDetail as F;
         let (mut model, rect) = slots_fixture();
+        // A branch equal to the title is echoed by it and has no detail line
+        // (b164), so give `a` and `b` branches that differ from their titles.
+        for row in model.sidebar_rows.iter_mut() {
+            if row.pin_key == "app/a" || row.pin_key == "app/b" {
+                row.branch = Some(format!("feature/{}", row.label));
+            }
+        }
         let height = |model: &crate::chrome::FrameModel, pin: &str| -> usize {
             let hits = hit_rows(model, rect);
             let visible: Vec<&SidebarRow> =
