@@ -1651,6 +1651,8 @@ _The multi-wave programme that makes sandbox and egress reporting truthful, adds
 
 - [~] 763. Sandbox + remote programme (W0 contracts and W1 truth-in-reporting shipped: nine release-channel features, help-page split, honest egress and capability reporting, kubernetes clamp on stable, reserved smol/appcontainer backends and vpn dns mode, DNS filter removed, wave-0 spike scripts; later waves pending) — see the programme record above; overlaps AC 365/372 and AJ 434 (egress truth, WS01), AB/AE (sandbox and provider seams)
 - [~] 767. Harden the remote Sprites journey (THE-2234) _(ledger before create, proof before delete, `env reap --provider sprites`, headless keep-awake hold, no background creates, first conformance slice WS08-P1-08; not yet verified live; openspec `harden-remote-sprites-journey`)_
+- [~] 768. Sandboxed merge gate (THE-2200) _(`[merge_queue] gate_sandbox = "sealed"` runs the gate, setup and regenerate commands in the sealed sandbox, network none; any failure to seal holds the land; unattended merge stays off unless set; overlaps 763 and WS02-P5-08; not yet verified live; openspec `add-sandboxed-merge-gate`)_
+- [~] 769. Lead headless producers (THE-2208) _(`[daemon] headless_producers`: tracker, PR, mention and PR-queue producers in the daemon under leases, schema v114, `thegn lead login`; not yet verified live; openspec `add-lead-headless-producers`)_
 
 ### BC. Jobs and hosted execution
 
