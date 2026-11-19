@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::db::Db;
 use thegn_core::scan_sched;
+use thegn_core::scan_sched::RoundTrigger;
 use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 
 use super::LOG;
@@ -135,6 +136,72 @@ fn remember_walk(path: &std::path::Path, walked_at: i64) {
         .insert(path.to_path_buf(), walked_at);
 }
 
+/// The active worktree is `du`d at most this often; inside the floor its row is
+/// re-stamped from cache like a lazy skip.
+const ACTIVE_WALK_FLOOR_SECS: i64 = 120;
+
+/// Hook-log pruning runs at most this often from the disk round (it also
+/// throttles itself hourly; this keeps an idle round from even resolving the
+/// state path).
+const HOOK_LOG_PRUNE_EVERY_SECS: i64 = 600;
+static HOOK_LOG_PRUNED_AT: Mutex<Option<i64>> = Mutex::new(None);
+
+/// The active-path generation-prune fallback runs at most this often per path.
+const ACTIVE_GENERATION_EVERY_SECS: i64 = 300;
+static ACTIVE_GENERATION_AT: OnceLock<Mutex<std::collections::HashMap<String, i64>>> =
+    OnceLock::new();
+
+/// `true` once `period` seconds have passed since `prev` (or there is none).
+fn elapsed_at_least(prev: Option<i64>, now: i64, period: i64) -> bool {
+    prev.is_none_or(|at| now.saturating_sub(at) >= period)
+}
+
+/// Whether the active worktree's floor allows a real walk now.
+fn active_walk_due(last_walk: i64, now: i64) -> bool {
+    elapsed_at_least(Some(last_walk), now, ACTIVE_WALK_FLOOR_SECS)
+}
+
+/// Claim a once-per-`period` slot recorded in `memo`.
+fn take_slot(memo: &Mutex<Option<i64>>, now: i64, period: i64) -> bool {
+    let mut last = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !elapsed_at_least(*last, now, period) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// Claim the active path's generation-prune fallback slot (once per 5 min).
+fn take_active_generation_slot(path: &str, now: i64) -> bool {
+    let mut memo = ACTIVE_GENERATION_AT
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !elapsed_at_least(memo.get(path).copied(), now, ACTIVE_GENERATION_EVERY_SECS) {
+        return false;
+    }
+    memo.insert(path.to_owned(), now);
+    true
+}
+
+fn disk_fingerprint(
+    cfg: &thegn_core::config::DiskConfig,
+    policy: &thegn_core::disk_reclaim::Policy,
+) -> u64 {
+    super::shape_fingerprint(&[
+        cfg.scan_interval_secs,
+        u64::from(cfg.max_scan_per_round),
+        u64::from(cfg.show_sizes),
+        u64::from(cfg.generation_min_age_days),
+        u64::from(policy.idle_days),
+        u64::from(policy.on_low_disk),
+        u64::from(policy.free_warn_pct),
+        u64::from(policy.free_critical_pct),
+    ])
+}
+
 /// Background per-worktree disk scan.
 ///
 /// Ordered by [`scan_sched::plan`], so the ACTIVE worktree and any
@@ -150,12 +217,31 @@ pub(crate) fn spawn_scan(
     active: Option<std::path::PathBuf>,
     waker: Option<TerminalWaker>,
 ) {
+    let fp = disk_fingerprint(&cfg, &policy);
+    // The disk lane has no Watch trigger: a kick or the pump.
+    let trigger = if super::DISK_GATE.take_kick() {
+        RoundTrigger::Kick
+    } else {
+        RoundTrigger::Pump
+    };
+    if !super::DISK_GATE.admit(thegn_core::util::now(), fp, trigger) {
+        return;
+    }
     crate::sched::report_replaceable(super::DISK_LANE.submit(Box::new(move || {
         let Some(_round) = super::begin(&INFLIGHT, "disk") else {
             return;
         };
         let Ok(db) = Db::open() else {
             return;
+        };
+        let now = thegn_core::util::now();
+        // When a kick round ends the gate stays as the kick left it (open);
+        // otherwise it sleeps until the earliest row falls due.
+        let arm = |next: Option<i64>, ttl: u64| {
+            if trigger != RoundTrigger::Kick {
+                let fallback = now.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
+                super::DISK_GATE.arm(next.or(Some(fallback)), fp);
+            }
         };
 
         // The orphan sweep runs BEFORE the `show_sizes` gate. A row for a
@@ -164,7 +250,9 @@ pub(crate) fn spawn_scan(
         // is not a reason to stop reclaiming them.
         let reaped = sweep_orphans(&db);
         crate::db_maintain::run_round(&db);
-        crate::hook_run::prune_logs(&crate::hook_run::log_root(), thegn_core::util::now());
+        if take_slot(&HOOK_LOG_PRUNED_AT, now, HOOK_LOG_PRUNE_EVERY_SECS) {
+            crate::hook_run::prune_logs(&crate::hook_run::log_root(), now);
+        }
 
         // `show_sizes` hides the badges; it is not a reason to stop reclaiming
         // disk. The round still runs when a reclaim rule is on, because the
@@ -173,6 +261,7 @@ pub(crate) fn spawn_scan(
         // to do beyond the orphan sweep above.
         let reclaim_on = policy.idle_days > 0 || policy.on_low_disk;
         if !cfg.show_sizes && !reclaim_on {
+            arm(None, cfg.scan_interval_secs);
             if reaped > 0
                 && let Some(w) = &waker
             {
@@ -187,33 +276,35 @@ pub(crate) fn spawn_scan(
         // TWO budgets, because this lane has two costs. `max_scan_per_round`
         // bounds the `du` below — the expensive thing. The examine cap bounds
         // how many rows the round may *look at*, which after the lazy gate is
-        // mostly six `stat`s apiece. Spending a whole unit of walk budget on a
-        // skip is what kept this lane pinned: 83 worktrees against a capacity of
-        // 12 meant 82 of 83 rows re-stamped every five minutes while doing
-        // almost no real work. See `scan_sched::EXAMINE_PER_WALK`.
+        // mostly six `stat`s apiece, and `lane_shape` sizes it to the registry
+        // so the lane always reaches an idle round (stretching the effective
+        // TTL only past `scan_sched::EXAMINE_CEILING`).
         let walk_budget = cfg.max_scan_per_round as usize;
-        let examine_cap = scan_sched::examine_cap(walk_budget);
-        // Saturation is judged on the EXAMINE cap: a row the round never looks
-        // at stays due forever. Walk-budget pressure is a different condition
-        // and self-limiting — it means several worktrees are genuinely dirty at
-        // once, and bounding that is precisely what the walk budget is for.
-        super::warn_if_saturated("disk", targets.len(), examine_cap);
-        let due = scan_sched::plan(
-            &targets,
-            thegn_core::util::now(),
-            cfg.scan_interval_secs,
-            examine_cap,
-        );
+        let params = scan_sched::LaneParams {
+            ttl_secs: cfg.scan_interval_secs,
+            pump_secs: scan_sched::pump_secs(
+                cfg.scan_interval_secs,
+                crate::hydrate::DISK_PUMP_FLOOR_SECS,
+            ),
+            walk_budget,
+        };
+        let shape = scan_sched::lane_shape(targets.len(), &params);
+        if shape.ttl_secs > params.ttl_secs {
+            super::log_stretched_once("disk", targets.len(), shape.ttl_secs);
+        }
+        let plan = scan_sched::plan_round(&targets, now, &shape, trigger);
+        let due = plan.due;
         tracing::debug!(
             target: LOG,
             scan = "disk",
+            ?trigger,
             known = targets.len(),
             due = due.len(),
+            examine_cap = shape.examine_cap,
             reaped,
             "planned round"
         );
 
-        let now = thegn_core::util::now();
         // One bulk read for the lazy gate below, so a skipped row costs a map
         // lookup rather than a query.
         let cached_all = db.all_worktree_disk().unwrap_or_default();
@@ -226,11 +317,17 @@ pub(crate) fn spawn_scan(
         let mut walked = 0usize;
         // Freshly measured this round, for the reclaim pass below.
         let mut fresh: Vec<(String, thegn_core::disk::DiskUsage)> = Vec::new();
+        // Rows this round stamped (walked, re-stamped or cleared), for arming
+        // the gate; `left_due` = the walk budget ran out with rows still due.
+        let mut processed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut left_due = false;
         for path_s in &due {
             // `0` means unlimited, matching `plan`'s budget convention.
             if walk_budget > 0 && walked >= walk_budget {
+                left_due = true;
                 break;
             }
+            processed.insert(path_s.as_str());
             let path = std::path::Path::new(path_s);
             if !path.is_dir() {
                 // Vanished since the registry row was written — drop any stale
@@ -258,6 +355,18 @@ pub(crate) fn spawn_scan(
             {
                 // Re-stamp so the scheduler treats the row as fresh; without
                 // this it stays due forever and the round never idles.
+                let _ = db.put_worktree_disk(path_s, total, target); // best-effort: cache write: the DB is a cache
+                skipped += 1;
+                continue;
+            }
+            // ACTIVE WALK FLOOR. The on-screen worktree is the one being
+            // built in, so its sentinels move constantly; without a floor it
+            // would be `du`d on every 45 s TTL. Inside the floor, re-stamp it
+            // from cache exactly like a lazy skip.
+            if active.as_deref() == Some(path_s.as_str())
+                && !active_walk_due(last_walk, now)
+                && let Some(&(total, target)) = cached_all.get(path_s.as_str())
+            {
                 let _ = db.put_worktree_disk(path_s, total, target); // best-effort: cache write: the DB is a cache
                 skipped += 1;
                 continue;
@@ -292,7 +401,10 @@ pub(crate) fn spawn_scan(
         // path only to the generation set as a direct fallback. Keep `fresh`
         // untouched for whole-target reclaim: a fabricated zero measurement
         // would make that path do unnecessary DB, UI-state, and statvfs work.
-        let generation_rows = generation_prune_rows(&fresh, active.as_deref());
+        let active_fallback = active
+            .as_deref()
+            .filter(|path| take_active_generation_slot(path, now));
+        let generation_rows = generation_prune_rows(&fresh, active_fallback);
         let generation_reclaimed = reap_generation_footprints(
             &generation_rows,
             cfg.generation_min_age_days,
@@ -316,8 +428,28 @@ pub(crate) fn spawn_scan(
             walked,
             walk_budget,
             reclaimed,
+            left_due,
             "round complete"
         );
+
+        let next = if left_due {
+            Some(now)
+        } else {
+            let after: Vec<scan_sched::ScanTarget> = targets
+                .iter()
+                .map(|t| scan_sched::ScanTarget {
+                    path: t.path.clone(),
+                    measured_at: if processed.contains(t.path.as_str()) {
+                        Some(now)
+                    } else {
+                        t.measured_at
+                    },
+                    active: t.active,
+                })
+                .collect();
+            scan_sched::next_due_at(&after, now, shape.ttl_secs)
+        };
+        arm(next, shape.ttl_secs);
 
         if (measured > 0 || reaped > 0 || reclaimed > 0 || generation_reclaimed > 0)
             && let Some(w) = &waker
@@ -498,6 +630,18 @@ struct ProfileRound {
 /// `outcome` is `pruned` or `skipped`; `reason` is one of `lock_held`,
 /// `not_due`, `exempt`, `unsafe_tree` (empty for `pruned`).
 fn log_profile_round(profile: &std::path::Path, outcome: &str, reason: &str, round: ProfileRound) {
+    // "skipped" / "not_due" fire on every round for every quiet profile, so they
+    // are DEBUG; only a prune that did something is worth an INFO line.
+    if outcome != "pruned" {
+        tracing::debug!(
+            target: DISK_LOG,
+            profile = %profile.display(),
+            outcome,
+            reason,
+            "cargo profile prune"
+        );
+        return;
+    }
     tracing::info!(
         target: DISK_LOG,
         profile = %profile.display(),
@@ -1524,6 +1668,55 @@ mod generation_tests {
             .unwrap()
             .as_secs();
         assert!(newest >= accessed_secs);
+    }
+
+    #[test]
+    fn the_active_walk_floor_holds_for_two_minutes() {
+        let now = 1_000_000;
+        assert!(!active_walk_due(now - 10, now));
+        assert!(!active_walk_due(now - 119, now));
+        assert!(active_walk_due(now - 120, now));
+        assert!(active_walk_due(0, now), "never walked this process");
+        assert!(!active_walk_due(now + 50, now), "a future stamp holds");
+    }
+
+    #[test]
+    fn once_per_period_slots_are_claimed_once() {
+        let memo = Mutex::new(None);
+        assert!(take_slot(&memo, 1_000, 600));
+        assert!(!take_slot(&memo, 1_599, 600));
+        assert!(take_slot(&memo, 1_600, 600));
+        assert!(elapsed_at_least(None, 0, 600));
+
+        let path = "/test/active-generation-slot";
+        assert!(take_active_generation_slot(path, 10_000));
+        assert!(!take_active_generation_slot(path, 10_299));
+        assert!(take_active_generation_slot(path, 10_300));
+    }
+
+    #[test]
+    fn disk_fingerprint_tracks_config_and_policy() {
+        let cfg = thegn_core::config::DiskConfig::default();
+        let policy = thegn_core::disk_reclaim::Policy {
+            idle_days: 0,
+            on_low_disk: false,
+            free_warn_pct: 10,
+            free_critical_pct: 5,
+        };
+        let mut other = cfg.clone();
+        other.max_scan_per_round += 1;
+        assert_ne!(
+            disk_fingerprint(&cfg, &policy),
+            disk_fingerprint(&other, &policy)
+        );
+        let busier = thegn_core::disk_reclaim::Policy {
+            idle_days: 3,
+            ..policy
+        };
+        assert_ne!(
+            disk_fingerprint(&cfg, &policy),
+            disk_fingerprint(&cfg, &busier)
+        );
     }
 
     #[test]
