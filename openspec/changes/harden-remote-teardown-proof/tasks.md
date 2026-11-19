@@ -12,4 +12,4 @@
 - [ ] 1.8 live: sprites 7e
 - [ ] 1.9 live: sprites 10b
 - [ ] 1.10 live: remote-daily 11
-- [ ] 1.11 live: vercel 9b
+- [ ] 1.11 live: vercel 9b (record kept until GET 404 (b172); live UNVERIFIED (THE-2234))
