@@ -125,6 +125,9 @@ impl Api for FakeApi {
             if self.delete_fails {
                 Err(anyhow!("fake: delete failed (503 Service Unavailable)"))
             } else {
+                // A deleted sandbox leaves the name-keyed listing, as on the
+                // real control plane (only the conformance suite fills it).
+                self.by_name.lock().unwrap().remove(name);
                 Ok(())
             }
         })
