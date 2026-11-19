@@ -310,9 +310,15 @@ impl Db {
         }
         let before = self.space()?.freelist_count;
         if max_pages > 0 {
-            self.conn()
-                .execute_batch(&format!("PRAGMA incremental_vacuum({max_pages});"))
+            // The pragma yields one result row per page it frees, so it must be
+            // stepped to completion: `execute_batch` steps each statement once
+            // and would free a single page whatever `max_pages` says.
+            let mut stmt = self
+                .conn()
+                .prepare(&format!("PRAGMA incremental_vacuum({max_pages})"))
                 .map_err(map_busy)?;
+            let mut rows = stmt.query([]).map_err(map_busy)?;
+            while rows.next().map_err(map_busy)?.is_some() {}
         }
         let after = self.space()?.freelist_count;
         Ok(before.saturating_sub(after))
@@ -601,7 +607,8 @@ mod tests {
             .unwrap();
         db.conn().execute("DELETE FROM fixture", []).unwrap();
         assert_eq!(db.incremental_vacuum(0).unwrap(), 0);
-        assert!(db.incremental_vacuum(2048).unwrap() > 0);
+        // More than one page: a single-stepped pragma frees exactly one.
+        assert!(db.incremental_vacuum(2048).unwrap() > 1);
         let (_dir, legacy) = full_db();
         assert!(matches!(
             legacy
