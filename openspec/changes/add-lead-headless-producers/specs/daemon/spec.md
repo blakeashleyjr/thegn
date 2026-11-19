@@ -17,3 +17,13 @@ seconds). A UI MUST skip its own fetch while the daemon holds the lease.
 
 The daemon MUST NOT idle-exit while any producer is armed. A producer that
 disarms SHALL release its lease.
+
+#### Scenario: Producer armed
+
+- **WHEN** at least one producer is armed and the daemon would otherwise be idle
+- **THEN** the daemon stays running
+
+#### Scenario: Producer disarms
+
+- **WHEN** a producer disarms
+- **THEN** it releases its lease and, with no other producer armed, the daemon may idle-exit
