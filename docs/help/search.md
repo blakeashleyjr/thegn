@@ -23,6 +23,17 @@ Four search surfaces, one habit: type, arrow, `↵`.
 with the pane it came from, so it doubles as "which of these six
 terminals printed that error".
 
+Each hit is labelled **worktree · tab · program**, so two panes running the
+same program in different tabs are told apart. Opening the overlay with an
+empty query lists the pane's most recent lines instead of an empty box.
+Identical lines from one pane are grouped into a single row, and `↵` goes to
+the newest of them.
+
+`↵` scrolls the pane to the exact grid line when the terminal emulator still
+holds it. When the line has already scrolled out of the emulator's grid, the
+status line says so and points you to replay (`Alt r`), which has the full
+history.
+
 Matching is **literal** by default: the query is a substring, case-insensitive
 unless it contains an uppercase letter (smart case). Hits are ranked by match
 quality, then most recent first. `Alt+f` in the overlay toggles fuzzy matching
