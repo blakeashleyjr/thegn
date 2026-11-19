@@ -357,10 +357,10 @@ async fn auth_rejection_is_not_retried() {
         out: Vec::new(),
     }]);
     let started = Instant::now();
-    let error = provider(&mock)
-        .open_exec("tgtest1", &tty_spec())
-        .await
-        .unwrap_err();
+    let error = match provider(&mock).open_exec("tgtest1", &tty_spec()).await {
+        Ok(_) => panic!("auth rejection unexpectedly succeeded"),
+        Err(error) => error,
+    };
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(requests(&mock).len(), 1);
     assert!(format!("{error:#}").contains("401"));
@@ -372,10 +372,10 @@ async fn reattach_does_not_retry_a_cold_endpoint() {
         handshake: Hs::Status(503),
         out: Vec::new(),
     }]);
-    let error = provider(&mock)
-        .attach_exec("tgtest1", "1847", 80, 24)
-        .await
-        .unwrap_err();
+    let error = match provider(&mock).attach_exec("tgtest1", "1847", 80, 24).await {
+        Ok(_) => panic!("cold reattach unexpectedly succeeded"),
+        Err(error) => error,
+    };
 
     assert!(format!("{error:#}").contains("503"));
     let recorded = requests(&mock);
