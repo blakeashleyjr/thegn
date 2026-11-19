@@ -28,10 +28,12 @@ THEGN_CHANNEL=dev THEGN_BIN="$TMP/not-called" bash "$SCRIPT" --env x --i-accept-
 [ "$rc" -eq 2 ]
 grep -Fq -- "needs RD_HOLD_AGENT=1" "$TMP/hold-refused"
 
+# shellcheck disable=SC2016 # the literal text is what must be absent from the script
 if grep -Fq 'export XDG_RUNTIME_DIR="$TMP/run"' "$SCRIPT"; then
   echo "FAIL: runtime dir override is back" >&2
   exit 1
 fi
+# shellcheck disable=SC2016 # the literal text is what must be absent from the script
 if grep -Fq 'mkdir -m 700 "$TMP/run"' "$SCRIPT"; then
   echo "FAIL: runtime dir mkdir is back" >&2
   exit 1
