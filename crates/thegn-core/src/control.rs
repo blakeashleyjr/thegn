@@ -538,6 +538,9 @@ pub enum Verb {
     /// Resolve an MCP proxy profile's server env for the Lead (read; the
     /// daemon checks the caller's label and the profile).
     McpProxyProfileEnv,
+    /// The daemon's headless producers: arming, leases and per-account inbox
+    /// state (read; b163, THE-2214).
+    ProducersStatus,
 }
 
 impl Verb {
@@ -652,6 +655,7 @@ impl Verb {
         Verb::ApprovalsRedeem,
         Verb::AutomationsHalt,
         Verb::McpProxyProfileEnv,
+        Verb::ProducersStatus,
     ];
 
     /// Whether this verb produces a *stream* (pane output on attach, the event
@@ -717,6 +721,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         // b155 (THE-2222): the daemon returns a profile's env only to the
         // Lead token for its own profile, or to an admin caller.
         | Verb::McpProxyProfileEnv
+        // b163: producer arming, leases and scrubbed inbox account state.
+        | Verb::ProducersStatus
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -1211,6 +1217,7 @@ mod tests {
             AutomationsRuns,
             ApprovalsList,
             McpProxyProfileEnv,
+            ProducersStatus,
         ];
         let write = [
             OpenSession,

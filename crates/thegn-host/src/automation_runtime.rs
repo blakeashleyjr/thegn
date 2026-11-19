@@ -429,8 +429,9 @@ fn admit_unless_paused(
 }
 
 /// Which automation budget a planned action draws on (6e): a
-/// `pipeline.start` above `propose` starts a lane; `sessions.open` and
-/// `lead.wake` are sessions. Everything else is unbudgeted.
+/// `pipeline.start` above `propose` and `autopilot.run` start a lane;
+/// `sessions.open` and `lead.wake` are sessions. Everything else is
+/// unbudgeted.
 pub(crate) fn budget_kind(
     cap: &str,
     autonomy: thegn_core::automation_autonomy::Autonomy,
@@ -439,6 +440,8 @@ pub(crate) fn budget_kind(
     use thegn_core::automation_budget::SpawnKind;
     match cap.trim() {
         "pipeline.start" if autonomy != Autonomy::Propose => Some(SpawnKind::NewLane),
+        // An autopilot run claims an issue and opens a lane (THE-2196).
+        "autopilot.run" => Some(SpawnKind::NewLane),
         "sessions.open" | "lead.wake" => Some(SpawnKind::Session),
         _ => None,
     }
@@ -847,6 +850,7 @@ pub fn subscribe_daemon_events(
                             origin,
                             issue: None,
                             exit_code: None,
+                            inbox: None,
                         });
                     }
                 }
@@ -904,6 +908,7 @@ mod tests {
             origin: None,
             issue: None,
             exit_code: None,
+            inbox: None,
         };
         enrich_event(&db, &mut event);
         assert_eq!(event.workspace.as_deref(), Some("product"));
@@ -936,6 +941,7 @@ mod tests {
             origin: None,
             issue: None,
             exit_code: None,
+            inbox: None,
         }
     }
 
@@ -1223,6 +1229,10 @@ mod tests {
             Some(SpawnKind::Session)
         );
         assert_eq!(budget_kind("lead.wake", Propose), Some(SpawnKind::Session));
+        assert_eq!(
+            budget_kind("autopilot.run", Review),
+            Some(SpawnKind::NewLane)
+        );
         assert_eq!(budget_kind("notify.push", Merge), None);
     }
 
@@ -1372,6 +1382,7 @@ mod tests {
             origin: None,
             issue: None,
             exit_code: None,
+            inbox: None,
         })
         .unwrap();
         let dropped = AutomationEvent {
@@ -1396,6 +1407,7 @@ mod tests {
             origin: None,
             issue: None,
             exit_code: None,
+            inbox: None,
         };
         try_submit(&tx, dropped)
             .expect("overflow starts durable audit")

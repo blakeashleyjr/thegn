@@ -2350,6 +2350,7 @@ async fn lead_verbs_have_catalog_routes_and_exact_scopes() {
     // catalog row, at exactly the batch's scope.
     let lead = [
         ("overview.get", "/v1/overview", Scope::Read),
+        ("producers.status", "/v1/producers/status", Scope::Read),
         ("notifications.list", "/v1/notifications/list", Scope::Read),
         ("notifications.ack", "/v1/notifications/ack", Scope::Write),
         ("automations.put", "/v1/automations/put", Scope::Write),

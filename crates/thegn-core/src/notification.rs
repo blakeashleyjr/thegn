@@ -103,6 +103,9 @@ pub enum NotificationKind {
     Automation,
     /// A trusted automation action failed or timed out.
     AutomationFailed,
+    /// A new item in a native inbox account (`[inbox]`, THE-2214). The
+    /// message is `[<account>] <title>`, sanitized third-party content.
+    InboxItem,
 }
 
 /// Attention priority of a notification — the single source of truth that drives
@@ -170,7 +173,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 32] = [
+    pub const ALL: [NotificationKind; 33] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -203,6 +206,7 @@ impl NotificationKind {
         Self::UsageLimit,
         Self::Automation,
         Self::AutomationFailed,
+        Self::InboxItem,
     ];
 
     /// The snake_case identifier for this kind — matches both the serde
@@ -242,6 +246,7 @@ impl NotificationKind {
             Self::UsageLimit => "usage_limit",
             Self::Automation => "automation",
             Self::AutomationFailed => "automation_failed",
+            Self::InboxItem => "inbox_item",
         }
     }
 
@@ -295,6 +300,7 @@ impl NotificationKind {
             | Self::CiRunFailed => Priority::Notice,
             Self::QueueHeld => Priority::Notice,
             Self::Automation => Priority::Notice,
+            Self::InboxItem => Priority::Notice,
         }
     }
 
@@ -332,6 +338,7 @@ impl NotificationKind {
             Self::QueueNeedsHuman => "✋",
             Self::QueueHeld => "◆",
             Self::UpstreamBehind => "↓",
+            Self::InboxItem => "✉",
         }
     }
 
@@ -380,6 +387,7 @@ impl NotificationKind {
             Self::UsageLimit => (gl.warn, Hue::Amber),
             Self::Automation => (gl.diamond_filled, Hue::Blue),
             Self::AutomationFailed => (gl.cross, Hue::Red),
+            Self::InboxItem => (gl.mail, Hue::Teal),
         }
     }
 
@@ -417,6 +425,7 @@ impl NotificationKind {
             Self::UsageLimit => "ai usage limit",
             Self::Automation => "automation",
             Self::AutomationFailed => "automation failed",
+            Self::InboxItem => "inbox item",
         }
     }
 }
@@ -499,7 +508,17 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 32, "ALL is missing kinds");
+        assert_eq!(seen.len(), 33, "ALL is missing kinds");
+        assert_eq!(NotificationKind::InboxItem.as_str(), "inbox_item");
+        assert_eq!(
+            NotificationKind::InboxItem.default_priority(),
+            Priority::Notice
+        );
+        assert_eq!(
+            NotificationKind::InboxItem.hued_glyph(&crate::termcaps::UNICODE),
+            (crate::termcaps::UNICODE.mail, crate::theme::Hue::Teal)
+        );
+        assert_eq!(NotificationKind::InboxItem.label(), "inbox item");
     }
 
     #[test]
