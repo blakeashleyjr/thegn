@@ -101,6 +101,7 @@ mod forge_handle;
 mod forward;
 mod frame_write;
 mod frame_writer;
+mod git_audit;
 mod git_handle;
 mod git_watch;
 mod git_worktree;
