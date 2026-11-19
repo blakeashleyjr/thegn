@@ -9,11 +9,13 @@
 // human-run integration test (the repo bans it only in the shipping binaries).
 #![allow(clippy::disallowed_macros)]
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
 
 use thegn_svc::provider::{
-    ProviderCheckpoints, ProviderEgress, ProviderFiles, RemoteProvider, SpritesProvider,
+    InventoryReport, ProviderCheckpoints, ProviderEgress, ProviderFiles, RemoteProvider,
+    SpritesProvider,
 };
 
 /// Retry an op that fails while the sprite is still cold-starting (fs/checkpoint
@@ -34,6 +36,50 @@ where
         }
     }
     panic!("{label} never succeeded: {last:?}");
+}
+
+#[test]
+#[ignore = "live: needs SPRITES_TOKEN and network; read-only (lists, creates nothing)"]
+fn live_inventory_pages_read_only() {
+    let Ok(token) = std::env::var("SPRITES_TOKEN") else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let unpaged = SpritesProvider::new("", &token, "tg-inventory-unpaged")
+            .sandbox_inventory()
+            .await
+            .expect("unpaged inventory");
+        let paged = SpritesProvider::new("", &token, "tg-inventory-paged")
+            .with_list_page_size(2)
+            .sandbox_inventory()
+            .await
+            .expect("paged inventory");
+
+        let InventoryReport::Complete(unpaged) = unpaged else {
+            panic!("unpaged inventory must be Complete");
+        };
+        let InventoryReport::Complete(paged) = paged else {
+            panic!("paged inventory must be Complete");
+        };
+        // There must be at least two continuation pages to prove that paging was used.
+        if unpaged.len() < 3 {
+            return;
+        }
+        let unpaged_ids: HashSet<&str> = unpaged.iter().map(|row| row.id.as_str()).collect();
+        let paged_ids: HashSet<&str> = paged.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(unpaged_ids, paged_ids);
+        assert_eq!(
+            unpaged_ids.len(),
+            unpaged.len(),
+            "unpaged inventory has duplicates"
+        );
+        assert_eq!(
+            paged_ids.len(),
+            paged.len(),
+            "paged inventory has duplicates"
+        );
+    });
 }
 
 /// Live: the sandbox **lifecycle** the worktree open/delete paths depend on —
