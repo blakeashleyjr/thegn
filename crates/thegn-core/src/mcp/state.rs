@@ -3047,9 +3047,10 @@ mod tests {
             json!(["worktree"])
         );
         assert_eq!(entry("overview_get")["inputSchema"]["required"], json!([]));
+        // No declared args: the schema is the bare object form (no `required`).
         assert_eq!(
-            entry("producers_status")["inputSchema"]["required"],
-            json!([])
+            entry("producers_status")["inputSchema"],
+            json!({ "type": "object", "properties": {} })
         );
         // A missing required arg never reaches the fetch closure.
         let refused = r.call("merge_drain", &json!({})).unwrap().unwrap_err();
