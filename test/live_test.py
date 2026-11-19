@@ -2,6 +2,7 @@
 """Private helper tests: no Cargo, live DB, application launch or live signals."""
 
 import contextlib
+import ast
 import importlib.util
 import io
 import json
@@ -127,6 +128,36 @@ class LiveTests(unittest.TestCase):
             self.settings()
         with patch.object(live.os, "geteuid", return_value=os.getuid() + 1), self.assertRaises(live.Refusal):
             self.settings()
+
+    def test_dev_instance_shell_is_refused_with_a_fix(self):
+        for extra in ({"THEGN_CONFIG_DIR": str(self.root / "dev-config")}, {"THEGN_DIR": str(self.home / ".thegn-devel/home")}):
+            with self.subTest(extra=extra), self.assertRaisesRegex(live.Refusal, "another thegn instance.*outside that instance"):
+                self.settings(**extra)
+        try:
+            self.settings(THEGN_CHANNEL="dev")
+        except live.Refusal as error:
+            self.assertNotIn("another thegn instance", str(error))
+
+    def test_every_refusal_says_what_to_do(self):
+        allowed = ("run ", "stop", "remove", "replace", "copy", "rebuild", "relink", "commit", "check out",
+                   "pass ", "use ", "retry", "chmod", "set ", "unset", "choose", "move", "quit", "delete",
+                   "fix", "open ", "upgrade", "check ")
+        tree = ast.parse(Path(live.__file__).read_text())
+        offending = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "Refusal" and node.args):
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant):
+                text = str(first.value)
+            elif isinstance(first, ast.JoinedStr):
+                text = "".join(part.value for part in first.values if isinstance(part, ast.Constant))
+            else:
+                continue
+            if not any(word in text.lower() for word in allowed):
+                offending.append(f"{node.lineno}: {text}")
+        self.assertFalse(offending, "Refusals without an actionable fix:\n" + "\n".join(offending))
 
     def test_settings_paths_pin_and_env_blank_semantics(self):
         if sys.platform != "linux" or os.getuid() == 0:
@@ -751,7 +782,7 @@ class LiveTests(unittest.TestCase):
         self.assertTrue(swap.with_name("legacy-stage-replacement").exists())
 
     def test_plan_and_refusals_have_no_install_effects(self):
-        with self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage") as build, patch.object(live, "thegn_ancestor", return_value=None):
+        with self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage") as build, patch.object(live, "installation_ancestor", return_value=None):
             before = set(self.root.rglob("*"))
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(live.main(["--plan", "--repo", str(self.repo)]), 0)
@@ -770,7 +801,7 @@ class LiveTests(unittest.TestCase):
             self.assertEqual(self.target.read_bytes(), b"old executable")
 
     def test_inside_thegn_relaunches_instead_of_stopping_itself(self):
-        with contextlib.redirect_stdout(io.StringIO()), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "thegn_ancestor", return_value=1234), patch.object(live, "relaunch_outside") as relaunch, patch.object(live, "build_stage") as build, patch.object(live, "stop_running") as stop:
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "installation_ancestor", return_value=1234), patch.object(live, "relaunch_outside") as relaunch, patch.object(live, "build_stage") as build, patch.object(live, "stop_running") as stop:
             self.assertEqual(live.main(["--repo", str(self.repo), "--level", "info"]), 0)
         relaunch.assert_called_once()
         self.assertEqual(relaunch.call_args[0][0], ["--repo", str(self.repo), "--level", "info"])
@@ -780,7 +811,7 @@ class LiveTests(unittest.TestCase):
     def test_a_non_interactive_caller_never_relaunches_an_upgrade(self):
         # The 2026-10-05 incident: an agent's shell (no tty) ran `just live`
         # from inside thegn and it reopened itself in a fresh, unwatched window.
-        with contextlib.redirect_stdout(io.StringIO()), patch.object(live.sys.stdin, "isatty", return_value=False), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "thegn_ancestor", return_value=1234), patch.object(live, "relaunch_outside") as relaunch, patch.object(live, "build_stage") as build:
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(live.sys.stdin, "isatty", return_value=False), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "installation_ancestor", return_value=1234), patch.object(live, "relaunch_outside") as relaunch, patch.object(live, "build_stage") as build:
             with self.assertRaisesRegex(live.Refusal, "terminal"):
                 live.main(["--repo", str(self.repo)])
         relaunch.assert_not_called()
@@ -811,6 +842,20 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(live.thegn_ancestor(proc, start=40), 20)
         self.assertIsNone(live.thegn_ancestor(proc, start=50))
         self.assertIsNone(live.thegn_ancestor(proc, start=999))
+
+    def test_installation_ancestor_ignores_other_instances(self):
+        other = self._other_binary()
+        dev_proc = self._fake_proc({50: ("thegn", 1, other, [str(other).encode()], self._env_of(self.root / "dev-state"))},
+                                   self.root / "dev-proc")
+        self.assertIsNone(live.installation_ancestor(self.paths, dev_proc, start=50))
+        ours_proc = self._fake_proc({50: ("thegn", 1, other, [str(other).encode()], self._env_of(self.paths["state"].parent))},
+                                    self.root / "ours-proc")
+        self.assertEqual(live.installation_ancestor(self.paths, ours_proc, start=50), 50)
+        target_proc = self._fake_proc({50: ("thegn", 1, self.paths["target"], [str(self.paths["target"]).encode()])},
+                                      self.root / "target-proc")
+        self.assertEqual(live.installation_ancestor(self.paths, target_proc, start=50), 50)
+        unreadable_proc = self._fake_proc({50: ("thegn", 1, None, [b"thegn"])}, self.root / "unreadable-proc")
+        self.assertEqual(live.installation_ancestor(self.paths, unreadable_proc, start=50), 50)
 
     def test_target_processes_select_only_this_installations_binary(self):
         other = self.root / "other-checkout-thegn"
@@ -1115,7 +1160,7 @@ class LiveTests(unittest.TestCase):
         return (patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40),
                 patch.object(live, "survey", return_value=[]), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)),
                 patch.object(live, "install", return_value=recovery), patch.object(live.sys.stdin, "isatty", return_value=True),
-                patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None),
+                patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "installation_ancestor", return_value=None),
                 patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"),
                 patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()),
                 patch.object(live, "scope_argv", side_effect=lambda target, _env: [str(target)]))
@@ -1160,7 +1205,7 @@ class LiveTests(unittest.TestCase):
         common = lambda: (patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40),
                   patch.object(live, "survey", return_value=[]), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)),
                   patch.object(live, "install", return_value=recovery), patch.object(live.sys.stdin, "isatty", return_value=True),
-                  patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None),
+                  patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "installation_ancestor", return_value=None),
                   patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"),
                   patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()),
                   patch.object(live, "scope_argv", side_effect=lambda target, _env: [str(target)]))
@@ -1187,7 +1232,7 @@ class LiveTests(unittest.TestCase):
     def test_relink_refusal_happens_before_anything_is_stopped(self):
         bin_dir = self._launchers()
         (bin_dir / "tg-tui").write_text("#!/bin/sh\nexec something-else\n")
-        with contextlib.redirect_stdout(io.StringIO()), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "survey", return_value=[]), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "build_stage") as build, patch.object(live, "stop_running") as stop:
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "survey", return_value=[]), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "installation_ancestor", return_value=None), patch.object(live, "build_stage") as build, patch.object(live, "stop_running") as stop:
             with self.assertRaisesRegex(live.Refusal, "mentions neither"):
                 live.main(["--repo", str(self.repo), "--relink-launchers"])
         build.assert_not_called()
@@ -1239,7 +1284,7 @@ class LiveTests(unittest.TestCase):
                         self.fail("An install lock was not held")
             return recovery
 
-        with contextlib.redirect_stdout(io.StringIO()), self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"), patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", side_effect=spawn), patch.object(live, "scope_argv", side_effect=scoped) as scope:
+        with contextlib.redirect_stdout(io.StringIO()), self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "installation_ancestor", return_value=None), patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"), patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", side_effect=spawn), patch.object(live, "scope_argv", side_effect=scoped) as scope:
             for scope_flag, expected_argv in (([], scoped(self.target, {})), (["--no-scope"], [str(self.target)])):
                 for expected_pin in (None, str(self.target)):
                     for argv, expected_log in (
