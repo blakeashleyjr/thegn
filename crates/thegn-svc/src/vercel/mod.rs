@@ -721,7 +721,7 @@ impl VercelProvider {
         Ok(())
     }
 
-    /// Extend the session timeout when due (bridge-only). `Some(ms)` is the
+    /// Extend the session timeout when due (bridge and one-shot exec). `Some(ms)` is the
     /// extension made; `None` = not due, not running, unbounded by a known
     /// creation time, or at the plan ceiling (warned once per sandbox).
     pub async fn extend_if_due(&self, name: &str) -> Result<Option<u64>> {
@@ -806,10 +806,26 @@ impl VercelProvider {
     ) -> Result<(i32, String)> {
         let body = self.command_body(argv, cwd, env, true)?;
         let session = self.session_for(name, wake).await?;
-        let (code, out, stderr) = self
+        let run = self
             .api()
-            .run_wait_with_stderr(&session, &body, EXEC_OUT_CAP)
-            .await?;
+            .run_wait_with_stderr(&session, &body, EXEC_OUT_CAP);
+        tokio::pin!(run);
+        let mut check =
+            tokio::time::interval(std::time::Duration::from_secs(policy::EXTEND_CHECK_SECS));
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let (code, out, stderr) = loop {
+            tokio::select! {
+                biased;
+                result = &mut run => break result?,
+                _ = check.tick() => {
+                    // A long provisioning step must not outlive its session; the
+                    // lifetime ceiling inside `extend_if_due` still bounds the spend.
+                    if let Err(error) = self.extend_if_due(name).await {
+                        tracing::debug!(target: "thegn::vercel", sandbox = %name, error = %format!("{error:#}"), "vercel: session keep-alive check failed");
+                    }
+                }
+            }
+        };
         let out = String::from_utf8_lossy(&out).into_owned();
         Ok((code, append_vercel_stderr(out, code, &stderr)))
     }
