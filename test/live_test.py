@@ -911,7 +911,8 @@ class LiveTests(unittest.TestCase):
                 patch.object(live, "install", return_value=recovery), patch.object(live.sys.stdin, "isatty", return_value=True),
                 patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None),
                 patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"),
-                patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()))
+                patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()),
+                patch.object(live, "scope_argv", side_effect=lambda target, _env: [str(target)]))
 
     def test_launchers_on_the_checkout_refuse_a_run_without_relink(self):
         bin_dir = self._launchers()
@@ -955,7 +956,8 @@ class LiveTests(unittest.TestCase):
                   patch.object(live, "install", return_value=recovery), patch.object(live.sys.stdin, "isatty", return_value=True),
                   patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None),
                   patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"),
-                  patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()))
+                  patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", return_value=Child()),
+                  patch.object(live, "scope_argv", side_effect=lambda target, _env: [str(target)]))
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.ExitStack() as stack:
             for item in common():
@@ -1002,7 +1004,7 @@ class LiveTests(unittest.TestCase):
         (recovery / "thegn-stderr.log").touch(mode=0o600)
 
         def spawn(argv, **kwargs):
-            self.assertEqual(argv, [str(self.target)])
+            self.assertEqual(argv, expected_argv)
             self.assertEqual(kwargs["env"]["THEGN_NO_MIGRATE"], "1")
             self.assertEqual(kwargs["env"].get("THEGN_DATABASE_MIGRATION_EXECUTABLE"), expected_pin)
             self.assertEqual(kwargs["env"]["THEGN_LOG_ROTATION_SIZE_MB"], "20")
@@ -1020,6 +1022,10 @@ class LiveTests(unittest.TestCase):
 
             return Child()
 
+        def scoped(target, _env):
+            return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                    "-p", "CPUWeight=1000", "-p", "IOWeight=1000", "--", str(target)]
+
         def install(*_args):
             for path, schema in ((self.state / "live-upgrade.lock", False), (self.target.parent / ".thegn-live-install.lock", False), (Path(str(self.db) + ".schema.lock"), True)):
                 with self.assertRaisesRegex(live.Refusal, "busy"):
@@ -1027,20 +1033,133 @@ class LiveTests(unittest.TestCase):
                         self.fail("An install lock was not held")
             return recovery
 
-        with contextlib.redirect_stdout(io.StringIO()), self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"), patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", side_effect=spawn):
-            for expected_pin in (None, str(self.target)):
-                for argv, expected_log in (
-                    (["--repo", str(self.repo)], "info,log=error,tokei=error"),
-                    (["--repo", str(self.repo), "--level", "debug"], "debug,log=error,tokei=error"),
-                ):
-                    # Keep HOME unchanged; test only captured migration override.
-                    env = dict(os.environ, **self.env)
-                    if expected_pin is None:
-                        env.pop("THEGN_DATABASE_MIGRATION_EXECUTABLE", None)
-                    else:
-                        env["THEGN_DATABASE_MIGRATION_EXECUTABLE"] = expected_pin
-                    with patch.dict(live.os.environ, env, clear=True):
-                        self.assertEqual(live.main(argv), 7)
+        with contextlib.redirect_stdout(io.StringIO()), self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"), patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", side_effect=spawn), patch.object(live, "scope_argv", side_effect=scoped) as scope:
+            for scope_flag, expected_argv in (([], scoped(self.target, {})), (["--no-scope"], [str(self.target)])):
+                for expected_pin in (None, str(self.target)):
+                    for argv, expected_log in (
+                        (["--repo", str(self.repo)], "info,log=error,tokei=error"),
+                        (["--repo", str(self.repo), "--level", "debug"], "debug,log=error,tokei=error"),
+                    ):
+                        # Keep HOME unchanged; test only captured migration override.
+                        env = dict(os.environ, **self.env)
+                        if expected_pin is None:
+                            env.pop("THEGN_DATABASE_MIGRATION_EXECUTABLE", None)
+                        else:
+                            env["THEGN_DATABASE_MIGRATION_EXECUTABLE"] = expected_pin
+                        with patch.dict(live.os.environ, env, clear=True):
+                            self.assertEqual(live.main(argv + scope_flag), 7)
+        # --no-scope never even probes for systemd-run.
+        self.assertEqual(scope.call_count, 4)
+
+    def _backup_fixture(self, name, age_days, descriptor=None, stage=None):
+        backup = self.state / name
+        backup.mkdir(mode=0o700)
+        (backup / "thegn.db").write_bytes(b"db")
+        (backup / "thegn.previous").write_bytes(b"old executable")
+        (backup / "thegn-stderr.log").touch(mode=0o600)
+        if descriptor is None:
+            build = {"schema": 3} if stage is None else {"schema": 3, "stage": str(stage)}
+            descriptor = json.dumps({"binary_sha256": "b" * 64, "database_sha256": "d" * 64, "build": build})
+        (backup / "complete.json").write_text(descriptor)
+        stamp = time.time() - age_days * 86400
+        os.utime(backup / "complete.json", (stamp, stamp))
+        os.utime(backup, (stamp, stamp))
+        return backup
+
+    def test_prune_backups_keeps_current_newest_young_and_incomplete(self):
+        backups = {age: self._backup_fixture(f"live-backup-{age}d", age) for age in (1, 2, 9, 10, 11, 12)}
+        current = self._backup_fixture("live-backup-current", 30)  # this run's, whatever its stamp
+        malformed = self._backup_fixture("live-backup-malformed", 40, descriptor="{incomplete")
+        missing = self._backup_fixture("live-backup-missing", 40)
+        (missing / "complete.json").unlink()
+        wrong_shape = self._backup_fixture("live-backup-shape", 40, descriptor=json.dumps(["not", "a", "record"]))
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "complete.json").write_text(json.dumps({"binary_sha256": "b", "database_sha256": "d"}))
+        os.utime(elsewhere / "complete.json", (0, 0))
+        (self.state / "live-backup-x").symlink_to(elsewhere, target_is_directory=True)
+        other = self._backup_fixture("other-backup-old", 40)
+
+        removed = live.prune_backups(self.paths, current)
+
+        # Newest three (1, 2, 9 d) and the under-7-day ones (1, 2 d) stay.
+        self.assertEqual(sorted(removed), sorted([backups[10], backups[11], backups[12]]))
+        for age in (10, 11, 12):
+            self.assertFalse(os.path.lexists(backups[age]))
+        for age in (1, 2, 9):
+            self.assertTrue(backups[age].is_dir())
+        for kept in (current, malformed, missing, wrong_shape, other):
+            self.assertTrue(kept.is_dir())
+        self.assertTrue((self.state / "live-backup-x").is_symlink())
+        self.assertTrue((elsewhere / "complete.json").exists())
+        self.assertTrue(self.db.exists())
+        # A second pass has nothing left to remove.
+        self.assertEqual(live.prune_backups(self.paths, current), [])
+
+    def test_prune_backups_respects_custom_bounds_and_entry_budget(self):
+        old = [self._backup_fixture(f"live-backup-old{index}", 20 + index) for index in range(3)]
+        current = self._backup_fixture("live-backup-current", 0)
+        huge = self._backup_fixture("live-backup-huge", 50)
+        for index in range(10):
+            (huge / f"extra-{index}").write_bytes(b"x")
+        with patch.object(live, "MAX_STAGE_ENTRIES", 8):
+            # The state scan (6 entries) and the 4-entry backups fit the bound;
+            # the 14-entry tree aborts before anything in it is deleted.
+            removed = live.prune_backups(self.paths, current, keep=1, keep_days=21)
+        self.assertEqual(sorted(removed), sorted(old[1:]))
+        self.assertTrue(old[0].is_dir())
+        self.assertTrue(current.is_dir())
+        self.assertEqual(len(list(huge.iterdir())), 14)
+
+    def test_prune_backups_releases_stages_pinned_only_by_removed_backups(self):
+        pinned = self._staged_fixture(live.LIVE_STAGE_PREFIX + "pinned", 100)
+        self._staged_fixture(live.LIVE_STAGE_PREFIX + "middle", 10)
+        newest = self._staged_fixture(live.LIVE_STAGE_PREFIX + "newest", 1)
+        stale = self._backup_fixture("live-backup-stale", 12, stage=pinned / "output" / "thegn")
+        for age in (1, 2, 3):
+            self._backup_fixture(f"live-backup-{age}d", age)
+        current = live.backup(self.paths, dict(self.record, stage=str(newest)))
+
+        self.assertEqual(live.retain_live_stages(self.paths), 0)
+        self.assertTrue(pinned.exists())
+        self.assertEqual(live.prune_backups(self.paths, current), [stale])
+        self.assertEqual(live.retain_live_stages(self.paths), 1)
+        self.assertFalse(pinned.exists())
+        self.assertTrue(newest.exists())
+        self.assertTrue(current.is_dir())
+
+    def test_scope_argv_falls_back_to_a_direct_launch(self):
+        target = self.target
+        self.assertEqual(live.scope_argv(target, {}, which=lambda *_a, **_k: None,
+                                         run=lambda *_a, **_k: self.fail("probe without systemd-run")), [str(target)])
+        failed = lambda argv, **_k: subprocess.CompletedProcess(argv, 1)
+        self.assertEqual(live.scope_argv(target, {}, which=lambda *_a, **_k: "/usr/bin/systemd-run", run=failed), [str(target)])
+
+        def timeout(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        self.assertEqual(live.scope_argv(target, {}, which=lambda *_a, **_k: "/usr/bin/systemd-run", run=timeout), [str(target)])
+
+        def missing(argv, **_k):
+            raise FileNotFoundError(argv[0])
+
+        self.assertEqual(live.scope_argv(target, {}, which=lambda *_a, **_k: "/usr/bin/systemd-run", run=missing), [str(target)])
+
+    def test_scope_argv_wraps_the_target_when_the_probe_succeeds(self):
+        probes = []
+
+        def run(argv, **kwargs):
+            probes.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0)
+
+        env = {"PATH": "/opt/bin"}
+        argv = live.scope_argv(self.target, env, which=lambda name, path=None: f"{path}/{name}", run=run)
+        self.assertEqual(argv, ["/opt/bin/systemd-run", "--user", "--scope", "--quiet", "--collect",
+                                "-p", "CPUWeight=1000", "-p", "IOWeight=1000", "--", str(self.target)])
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0][0], ["/opt/bin/systemd-run", "--user", "--scope", "--quiet", "true"])
+        self.assertEqual(probes[0][1]["timeout"], 5)
+        self.assertIs(probes[0][1]["env"], env)
 
     def test_default_log_level_is_info_and_debug_is_opt_in(self):
         source = Path(live.__file__).read_text()
