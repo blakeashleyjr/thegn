@@ -1,0 +1,20 @@
+{
+  "jobId": "example",
+  "status": {
+    "kind": "Rejected",
+    "reason": "No offering satisfies all requested controls",
+    "missingCapabilities": ["services"]
+  },
+  "shards": [],
+  "summary": {"passed": 0, "failed": 0, "skipped": 0, "flaky": 0, "durationMs": null, "incomplete": false},
+  "failures": [],
+  "diagnostics": [],
+  "truncated": {"failures": false, "diagnostics": false, "logTail": false},
+  "logTail": "",
+  "logs": [],
+  "artifacts": [],
+  "timings": {"wallMs": null, "queuedMs": null, "attempts": {}},
+  "cache": {},
+  "placement": [],
+  "cost": {"currency": "USD", "computeMicros": null, "storageMicros": null, "egressMicros": null, "estimateSource": null}
+}

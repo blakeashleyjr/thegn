@@ -1,0 +1,603 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JobSpec",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "environment",
+    "kind",
+    "metadata",
+    "steps"
+  ],
+  "properties": {
+    "apiVersion": {
+      "$ref": "#/definitions/Version"
+    },
+    "artifacts": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "caches": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Cache"
+      }
+    },
+    "env": {
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "environment": {
+      "$ref": "#/definitions/Environment"
+    },
+    "isolation": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Isolation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "kind": {
+      "$ref": "#/definitions/Kind"
+    },
+    "metadata": {
+      "$ref": "#/definitions/Metadata"
+    },
+    "placement": {
+      "default": {
+        "affinity": [],
+        "providers": null,
+        "regions": null,
+        "spot": "allowed"
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Placement"
+        }
+      ]
+    },
+    "resources": {
+      "default": {
+        "arch": "any",
+        "cpu": null,
+        "disk": null,
+        "memory": null,
+        "shm": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Resources"
+        }
+      ]
+    },
+    "results": {
+      "default": {
+        "cargo": false,
+        "junit": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Parsers"
+        }
+      ]
+    },
+    "retry": {
+      "default": {
+        "escalate": null,
+        "onFailure": {
+          "max": 0
+        },
+        "onPreempt": {
+          "max": 2
+        }
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Retry"
+        }
+      ]
+    },
+    "secrets": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "services": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Service"
+      }
+    },
+    "shards": {
+      "default": 1,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1.0
+    },
+    "source": {
+      "default": {
+        "exclude": [],
+        "snapshot": "auto"
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Source"
+        }
+      ]
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Step"
+      },
+      "minItems": 1
+    },
+    "timeout": {
+      "default": "60m",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Affinity": {
+      "type": "string",
+      "enum": [
+        "cache",
+        "latency",
+        "cost"
+      ]
+    },
+    "Arch": {
+      "type": "string",
+      "enum": [
+        "any",
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    "Auto": {
+      "type": "string",
+      "enum": [
+        "auto"
+      ]
+    },
+    "Cache": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "key",
+            "paths"
+          ],
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "restoreKeys": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "tool": {
+              "$ref": "#/definitions/CacheTool"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CacheTool": {
+      "type": "string",
+      "enum": [
+        "sccache",
+        "nix"
+      ]
+    },
+    "Digest": {
+      "type": "object",
+      "required": [
+        "hash",
+        "sizeBytes"
+      ],
+      "properties": {
+        "hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "format": "int64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Environment": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "image"
+          ],
+          "properties": {
+            "image": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "nix"
+          ],
+          "properties": {
+            "nix": {
+              "$ref": "#/definitions/NixEnv"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Escalation": {
+      "type": "string",
+      "enum": [
+        "on-demand"
+      ]
+    },
+    "Isolation": {
+      "type": "string",
+      "enum": [
+        "none",
+        "process",
+        "container",
+        "gvisor",
+        "microvm",
+        "dedicated-host"
+      ]
+    },
+    "Kind": {
+      "type": "string",
+      "enum": [
+        "Job"
+      ]
+    },
+    "Metadata": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "labels": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "Never": {
+      "type": "string",
+      "enum": [
+        "never"
+      ]
+    },
+    "NixEnv": {
+      "type": "object",
+      "required": [
+        "flake"
+      ],
+      "properties": {
+        "flake": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Parsers": {
+      "type": "object",
+      "properties": {
+        "cargo": {
+          "default": false,
+          "type": "boolean"
+        },
+        "junit": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Placement": {
+      "type": "object",
+      "properties": {
+        "affinity": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Affinity"
+          }
+        },
+        "providers": {
+          "description": "Absent means unrestricted within trusted policy. An explicit empty list admits no candidate.",
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "regions": {
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "spot": {
+          "default": "allowed",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Spot"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Resources": {
+      "type": "object",
+      "properties": {
+        "arch": {
+          "default": "any",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Arch"
+            }
+          ]
+        },
+        "cpu": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "disk": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shm": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Retry": {
+      "type": "object",
+      "properties": {
+        "escalate": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Escalation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "onFailure": {
+          "default": {
+            "max": 0
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/RetryLimit"
+            }
+          ]
+        },
+        "onPreempt": {
+          "default": {
+            "max": 2
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/RetryLimit"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RetryLimit": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "max"
+          ],
+          "properties": {
+            "max": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "$ref": "#/definitions/Never"
+        }
+      ]
+    },
+    "Service": {
+      "type": "object",
+      "required": [
+        "image",
+        "name"
+      ],
+      "properties": {
+        "env": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "image": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Snapshot": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Auto"
+        },
+        {
+          "$ref": "#/definitions/Digest"
+        }
+      ]
+    },
+    "Source": {
+      "type": "object",
+      "properties": {
+        "exclude": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "snapshot": {
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Snapshot"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Spot": {
+      "type": "string",
+      "enum": [
+        "allowed",
+        "preferred",
+        "forbidden"
+      ]
+    },
+    "Step": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "argv": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "run": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Version": {
+      "type": "string",
+      "enum": [
+        "thegn.dev/jobs/v0"
+      ]
+    }
+  }
+}
