@@ -22,6 +22,9 @@ pub const HOST_MUTATION_FENCE: [&str; 4] = [
     "core.fsmonitor=false",
 ];
 
+/// THE-225: thegn's own Git never runs a repository-configured fsmonitor program.
+pub const READ_FENCE: [&str; 2] = ["-c", "core.fsmonitor=false"];
+
 /// Per-call execution and capture budgets. The defaults in [`GitPolicy::read`]
 /// are starting points for callers to override; they are not a global limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +202,7 @@ pub fn git_run(dir: &Path, args: &[&str], policy: &GitPolicy, cancel: &AtomicBoo
     crate::util::note_core_git_spawn();
     crate::git_spawn_stats::record(args);
     let mut cmd = crate::util::git_cmd(dir);
+    cmd.args(READ_FENCE);
     cmd.args(args);
     run_command(&mut cmd, policy, cancel)
 }
@@ -551,3 +555,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "git_run_fence_tests.rs"]
+mod fence_tests;
