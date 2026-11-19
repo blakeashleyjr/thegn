@@ -461,6 +461,13 @@
       "changes": [
         "vercel-sandbox-agent-credentials"
       ]
+    },
+    {
+      "issue": "THE-2234",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-sprites-journey"
+      ]
     }
   ]
 }
