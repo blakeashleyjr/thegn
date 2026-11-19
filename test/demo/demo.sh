@@ -88,6 +88,7 @@ printf '[user]\nname = demo\nemail = demo@example.invalid\n' >"$T/gitconfig" || 
 export HOME="$T/home"
 export XDG_CONFIG_HOME="$T/cfg"
 export XDG_STATE_HOME="$T/state"
+# Safe override (b175): the config above sets backend = "none", so no sandbox is launched whose masks would follow this dir; the demo's own daemon lives here and cleanup_daemon stops it. If the demo ever enables a sandbox backend, drop this override.
 export XDG_RUNTIME_DIR="$T/run"
 export GIT_CONFIG_GLOBAL="$T/gitconfig"
 export GIT_CONFIG_SYSTEM=/dev/null
