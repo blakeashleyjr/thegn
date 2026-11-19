@@ -79,6 +79,16 @@ pub(crate) async fn put(svc: &DaemonService, req: serde_json::Value) -> JsonResu
     let LeadRulePut { rule } = decode(req)?;
     if let Some(name) = rule.get("name").and_then(serde_json::Value::as_str) {
         refuse_autopilot_id(name)?;
+        let slug = name.trim();
+        if slug
+            .strip_prefix(authoring::LEAD_RULE_PREFIX)
+            .unwrap_or(slug)
+            == "manual"
+        {
+            return Err(ControlError::InvalidArgument(
+                "the rule name manual is reserved for the Lead's manual opens".into(),
+            ));
+        }
     }
     let rule = authoring::decode_lead_rule(rule)
         .map_err(|errors| ControlError::InvalidArgument(errors.join("\n")))?;
@@ -551,6 +561,21 @@ mod tests {
             put(&svc, req).await,
             Err(ControlError::InvalidArgument(_))
         ));
+        // `manual` is reserved for the Lead's own manual-open audit id.
+        for name in ["manual", "lead:manual"] {
+            assert!(matches!(
+                put(
+                    &svc,
+                    json!({"rule": {
+                        "name": name,
+                        "when": "agent_finished",
+                        "then": {"cap": "notify.push", "params": {"body": "x"}}
+                    }}),
+                )
+                .await,
+                Err(ControlError::InvalidArgument(_))
+            ));
+        }
         assert!(list_lead_rules(&svc).await.unwrap().is_empty());
         // No repo has [autopilot] enabled: nothing is synthesized.
         assert!(list_autopilot_rules(&svc).await.unwrap().is_empty());

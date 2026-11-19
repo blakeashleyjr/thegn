@@ -437,8 +437,7 @@ fn pickup_inner(
         let account = account.to_owned();
         let issue = issue.clone();
         let repo_root_s = repo_root.to_string_lossy().into_owned();
-        scheduled += 1;
-        crate::sched::report_reserved(crate::sched::spawn_bg_reserved(permit, move || {
+        let admission = crate::sched::spawn_bg_reserved(permit, move || {
             let db = match Db::open() {
                 Ok(db) => db,
                 Err(e) => {
@@ -478,7 +477,13 @@ fn pickup_inner(
             drive_claim(
                 &db, &cfg, &policy, &repo_root, &cwd, &account, &issue, claim.id,
             );
-        }));
+        });
+        if admission == crate::sched::Admission::Admitted {
+            scheduled += 1;
+        } else {
+            finish_pickup_row_open(run_row, "background work not submitted");
+        }
+        crate::sched::report_reserved(admission);
     }
     scheduled
 }
