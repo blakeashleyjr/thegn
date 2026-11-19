@@ -1306,19 +1306,19 @@ impl RemoteProvider for SpritesProvider {
                         let status = resp.status();
                         if status.is_success() {
                             let body = response_json(resp, "sprites", "POST /sprites").await?;
-                            if let Some(echoed) = Self::parse_name(&body) {
-                                if echoed != self.name {
-                                    self.forget_record(&dir, &self.name).await;
-                                    let shown = echoed
-                                        .chars()
-                                        .filter(|character| !character.is_control())
-                                        .take(64)
-                                        .collect::<String>();
-                                    return Err(anyhow!(
-                                        "sprites: create answered with sprite name {shown:?}, not the requested {requested}; refusing it (if a sprite was made, thegn env reap --provider sprites --unrecorded lists it)",
-                                        requested = self.name
-                                    ));
-                                }
+                            if let Some(echoed) =
+                                Self::parse_name(&body).filter(|echoed| *echoed != self.name)
+                            {
+                                self.forget_record(&dir, &self.name).await;
+                                let shown = echoed
+                                    .chars()
+                                    .filter(|character| !character.is_control())
+                                    .take(64)
+                                    .collect::<String>();
+                                return Err(anyhow!(
+                                    "sprites: create answered with sprite name {shown:?}, not the requested {requested}; refusing it (if a sprite was made, thegn env reap --provider sprites --unrecorded lists it)",
+                                    requested = self.name
+                                ));
                             }
                             // The server may omit the name; use the requested one then.
                             created = Some(self.name.clone());
