@@ -16,7 +16,7 @@ can be rebuilt and restarted freely without touching the stable one.
 | Launch      | `thegn`, or `just live` to update it                                | `just devel`                               |
 | Config dir  | `~/.config/thegn`                                                   | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`) |
 | State       | the default state dir                                               | `~/.thegn-devel/state` (`XDG_STATE_HOME`)  |
-| Runtime     | the default runtime dir                                             | `~/.thegn-devel/run` (`XDG_RUNTIME_DIR`)   |
+| Runtime     | the login runtime dir                                               | the login runtime dir (not overridden)     |
 | `THEGN_DIR` | `~/.thegn`                                                          | `~/.thegn-devel/home`                      |
 | Channel     | stable                                                              | dev (`THEGN_CHANNEL=dev`)                  |
 
@@ -49,16 +49,26 @@ just devel-desktop > ~/.local/share/applications/thegn-dev.desktop
 ```
 
 The entry and `just devel` both go through `scripts/devel-launch.sh`, the single
-source of the dev environment. Because the dev instance overrides
-`XDG_RUNTIME_DIR`, the launcher first rewrites a relative `WAYLAND_DISPLAY` to
-`<real runtime dir>/<name>`, and when `DBUS_SESSION_BUS_ADDRESS` is unset and
-`<real runtime dir>/bus` is a socket it sets
-`DBUS_SESSION_BUS_ADDRESS=unix:path=<real runtime dir>/bus`. Without these the
-terminal cannot find the compositor or the session bus.
+source of the dev environment. The dev instance does **not** override
+`XDG_RUNTIME_DIR`: sandbox masks follow the runtime directory in the
+environment, so a private one would leave the dev daemon's socket unmasked or
+hide the stable one. The dev daemon's socket lives under the login runtime dir,
+`/run/user/<uid>/thegn/<hash of the dev state dir>/daemon.sock`, beside the
+stable one, and both instances mask it. `~/.thegn-devel/run` remains only the
+launcher's pidfile dir. Because the runtime dir is the login one, rootless
+podman shares the login runroot, as it does for the stable instance.
 
-Caveat (unverified): rootless podman keeps its runroot under the runtime dir,
-so containers started by the dev instance use a separate runroot from the stable
-instance's.
+The launcher also scrubs pane identity from its environment before it execs the
+dev binary, so a dev instance started from inside a thegn pane does not inherit
+that pane's session. It removes `THEGN_SESSION_ID`, `THEGN_CONTROL_SOCKET`,
+`THEGN_WORKTREE`, `THEGN_BRANCH`, `THEGN_WORKSPACE`, `THEGN_REPO_ROOT`,
+`THEGN_SANDBOX`, `THEGN_SANDBOX_NETWORK`, `THEGN_SANDBOX_ENABLED`,
+`THEGN_FORKED_FROM`, `THEGN_FORK_SCROLLBACK`, `THEGN_ROUTE_TOKEN`,
+`THEGN_ROUTE_ORIGIN`, `THEGN_PROMPT`, `THEGN_EVENT` and `THEGN_BIN`;
+`just devel-env` prints `unset` lines for them.
+
+`scripts/devel-launch.sh --daemon` starts the dev daemon detached from that
+scrubbed environment. It replaces the hand-run `setsid nohup <bin> daemon`.
 
 ## Splitting one instance into two
 
@@ -124,7 +134,8 @@ binary, config dir, state dir, `THEGN_DIR`, channel and daemon socket that pane 
 The block also prints the runtime dir, the sandbox controller id (sandboxes this
 instance created carry it), the addresses `thegn serve` and the model proxy
 would bind, what is shared with other instances (the `thegn.slice` cap and the
-keyring service), and a note when `WAYLAND_DISPLAY` is relative and not under
+keyring service), a "runtime exposure" row, a "share teardowns pending" row
+(both read-only), and a note when `WAYLAND_DISPLAY` is relative and not under
 `XDG_RUNTIME_DIR`, which breaks `wl-copy` and `wl-paste`; start the instance
 with `just devel`.
 
