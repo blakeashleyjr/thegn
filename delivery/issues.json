@@ -42,7 +42,8 @@
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
         "verify-stage-worker-containment",
-        "self-maintaining-state"
+        "self-maintaining-state",
+        "harden-remote-teardown-proof"
       ]
     },
     {
