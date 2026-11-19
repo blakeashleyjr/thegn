@@ -88,8 +88,14 @@ Max spend   : bounded by ${VCPUS} vCPU x 1 h of active CPU plus memory and snaps
               storage; roughly under US\$1 at Pro iad1 rates (estimate).
 Teardown    : trap on EXIT/INT/TERM -> env down, env reap --provider vercel
               --apply --yes (temp state), then fleet list must show 0 rows.
+The preflight prints which credentials enter the sandbox.
 Steps:
-  1   create env config (temp)        2   env test (token works)
+  1   create env config (temp)
+  0   preflight: doctor --json remote_live for ${ENV_NAME} (after the temp
+      config exists); FAIL if the token does not resolve; INFO forwarded_env,
+      git_token, login_upload; WARN lists unbound sandboxes (never touched);
+      SKIP on an older binary
+  2   env test (token works)
   3   provision sandbox (env up)      4   run a command in the sandbox
   5   interactive terminal open       5b  record the interactive host
   6   commit in sandbox               6b  in-sandbox curl must fail (egress)
@@ -102,7 +108,8 @@ Steps:
       7l land --worktree <vx-h path> --release-sandbox and 7r release
       check (only the first sandbox's ledger record remains); needs a
       second sandbox, so max_instances = 2 with --with-headless
-  9   env down (destroy)              10  env reap dry-run, 10a apply
+  9   env down (destroy)              9b  no ledger record for this run's sandbox
+ 10   env reap dry-run, 10a apply
 Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
 PLAN
 }
@@ -133,6 +140,63 @@ keyring:* | file:* | env:*) ;;
   exit 2
   ;;
 esac
+
+# ---- step 0: preflight (doctor's "Remote live readiness" block) ----
+# doctor --json lists names only, never values: whether the token resolves,
+# which env var names, git token and agent logins enter the sandbox, and ledger
+# sandboxes nothing is bound to. The token itself is never read or printed.
+PREFLIGHT_PY='
+import json, os, sys
+env = os.environ["PRE_ENV"]
+required = os.environ.get("PRE_REQUIRED", "1") == "1"
+try:
+    doc = json.loads(sys.stdin.read())
+except ValueError:
+    print("FAIL 0: doctor --json did not print JSON", file=sys.stderr)
+    sys.exit(1)
+rows = doc.get("remote_live") if isinstance(doc, dict) else None
+if rows is None:
+    print("SKIP 0: doctor --json has no remote_live key (older binary): no credential statement")
+    sys.exit(0)
+row = next((r for r in rows if isinstance(r, dict) and r.get("env") == env), None)
+if row is None:
+    if required:
+        print("FAIL 0: doctor remote_live has no row for env " + env, file=sys.stderr)
+        sys.exit(1)
+    print("SKIP 0: doctor remote_live has no row for env " + env + " (it covers sprites and vercel envs)")
+    sys.exit(0)
+def show(v):
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, list):
+        return ",".join(show(x) for x in v) or "none"
+    if isinstance(v, dict):
+        return ",".join(k + "=" + show(x) for k, x in sorted(v.items())) or "none"
+    if v is None or v == "":
+        return "none"
+    return str(v)
+if row.get("token_resolves") is not True:
+    print("FAIL 0: the token for env " + env + " does not resolve (remote_live.token_resolves = " + show(row.get("token_resolves")) + ")", file=sys.stderr)
+    sys.exit(1)
+print("INFO 0: credentials entering the sandbox: forwarded_env=" + show(row.get("forwarded_env")) + "; git_token=" + show(row.get("git_token")) + "; login_upload=" + show(row.get("login_upload")))
+unbound = row.get("unbound") or []
+if not isinstance(unbound, list):
+    unbound = [unbound]
+if unbound:
+    print("WARN 0: unbound ledger sandboxes: " + ", ".join(show(n) for n in unbound) + ": pre-existing sandboxes this run will not touch")
+print("PASS 0")
+'
+DOCTOR_JSON=""
+preflight_capture() { # doctor may exit non-zero on unrelated checks; parse what it printed
+  DOCTOR_JSON="$("$THEGN_BIN" doctor --json 2>/dev/null)" || true
+}
+preflight_check() { # preflight_check <env> [required: 1|0]
+  echo "== step 0: preflight (doctor --json remote_live for env '$1')"
+  printf '%s' "$DOCTOR_JSON" | PRE_ENV="$1" PRE_REQUIRED="${2:-1}" python3 -I -c "$PREFLIGHT_PY" || {
+    echo "FAIL 0: preflight" >&2
+    exit 1
+  }
+}
 
 TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config" THEGN_DIR="$TMP/thegn"
@@ -240,6 +304,7 @@ resolve_vx_path() { # the worktree whose branch ends in vx-h
   echo "   worktree: ${VX_PATH:-(none)}"
   [ -n "$VX_PATH" ] && [ "$(printf '%s\n' "$VX_PATH" | wc -l)" -eq 1 ]
 }
+sandbox_record_gone() { [ ! -f "$(ledger_dir)/$SANDBOX_NAME.json" ]; }
 released_headless() { [ "$(run_records vercel | wc -l)" -eq 1 ]; }
 
 write_config() {
@@ -275,6 +340,9 @@ scratch_repo() {
 step 1 "write temp config + scratch repo" bash -c "true"
 write_config
 scratch_repo
+# The env exists only in the temp config written above, so doctor runs here.
+preflight_capture
+preflight_check "$ENV_NAME"
 step 2 "env test (token resolves, list() works)" "$THEGN_BIN" env test "$ENV_NAME"
 in_repo "$THEGN_BIN" env set "$ENV_NAME" >/dev/null
 CREATED=1
@@ -309,6 +377,7 @@ step 8 "stop (env down --stop)" in_repo "$THEGN_BIN" env down --stop
 step 8a "resume (env up)" in_repo "$THEGN_BIN" env up
 step 8b "tmpfs login dir is gone after stop/resume" ask "/dev/shm/thegn-login-* absent after resume? "
 step 9 "env down destroys the sandbox" in_repo "$THEGN_BIN" env down
+step 9b "no ledger record for this run's sandbox" sandbox_record_gone
 step 10 "reap: dry-run" "$THEGN_BIN" env reap --provider vercel
 step 10a "reap: apply finds nothing left" "$THEGN_BIN" env reap --provider vercel --apply --yes
 echo "ALL STEPS PASS"
