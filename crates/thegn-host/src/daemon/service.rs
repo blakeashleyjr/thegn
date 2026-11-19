@@ -1382,6 +1382,36 @@ fn lead_open_postcheck(
     .map_err(|refusal| lead_refusal(caller, &worktree, &refusal))
 }
 
+/// Whether a Lead's manual `sessions.open` fits the automation budgets
+/// (THE-2196): a session draws on the rolling 24 h spawn budget. An
+/// unreadable usage refuses (fail closed). Pure over the usage read.
+fn lead_open_budget(
+    budgets: &thegn_core::automation_budget::Budgets,
+    usage: anyhow::Result<thegn_core::automation_budget::BudgetUsage>,
+) -> Result<(), thegn_core::automation_budget::BudgetRefusal> {
+    crate::automation_budget::decide(
+        budgets,
+        usage,
+        thegn_core::automation_budget::SpawnKind::Session,
+    )
+}
+
+/// The `automation_runs` row a Lead's manual open is counted by
+/// (`spawns_24h` counts `sessions.open` rows).
+fn lead_manual_run(session: &str, now_ms: i64) -> thegn_core::store::NewAutomationRun {
+    thegn_core::store::NewAutomationRun {
+        rule_id: "lead:manual".into(),
+        event_id: format!("session:{session}"),
+        event_key: format!("session:{session}"),
+        trigger_kind: "lead".into(),
+        event_summary: "Lead sessions.open".into(),
+        action_cap: "sessions.open".into(),
+        action_summary: "Lead manual open".into(),
+        started_at: now_ms / 1000,
+        autonomy: Some("review".into()),
+    }
+}
+
 impl DaemonService {
     /// The pre-launch half of the Lead `sessions.open` rule: the request shape
     /// again (the automation path never crossed a transport check), then the
@@ -1434,6 +1464,10 @@ impl DaemonService {
             // The Lead confinement (`thegn_core::lead_confine`): a Lead
             // transport call, or a Lead-authored rule firing. Checked before
             // any fence, registry or launch work.
+            // A Lead's own transport call (not a Lead rule firing, which the
+            // automation runtime already budgets and audits): THE-2196 counts
+            // it against the automation budgets.
+            let lead_manual = caller.is_some();
             let confine = caller.or_else(|| lead_rule_caller(&spec));
             if let Some(caller) = &confine {
                 // b155 (6f): while paused the Lead can read but not spawn.
@@ -1583,6 +1617,48 @@ impl DaemonService {
             }
 
             let id = fresh_id();
+            // THE-2196: a Lead's manual open draws on the automation budgets
+            // (a session) once its confinement passed and before the launch.
+            // Admission and the `started` run row are one DB critical section,
+            // so two concurrent Lead opens cannot both take the last slot.
+            let lead_run = match (&confine, lead_manual) {
+                (Some(caller), true) => {
+                    let cfg = Arc::clone(&self.config);
+                    let session = id.clone();
+                    let admitted = self
+                        .with_db(move |db| {
+                            use thegn_core::store::AutomationStore;
+                            let now_ms = thegn_core::util::now_ms();
+                            let budgets = thegn_core::automation_budget::Budgets::from_config(
+                                &cfg.effective_automations(),
+                            );
+                            if let Err(refusal) =
+                                lead_open_budget(&budgets, db.automation_budget_usage(now_ms))
+                            {
+                                return Ok(Err(refusal));
+                            }
+                            Ok(Ok(db.start_automation_run(&lead_manual_run(
+                                &session, now_ms,
+                            ))?))
+                        })
+                        .await?;
+                    match admitted {
+                        Ok(run) => Some(run),
+                        Err(refusal) => {
+                            let worktree =
+                                super::agent_open::spec_worktree(&spec).unwrap_or_default();
+                            thegn_svc::control::http::audit_lead_refusal(
+                                &caller.pairing_id,
+                                &caller.label,
+                                thegn_core::control::Verb::OpenSession,
+                                &worktree,
+                            );
+                            return Err(ControlError::FailedPrecondition(refusal.to_string()));
+                        }
+                    }
+                }
+                _ => None,
+            };
             if let Some(native) = assigned {
                 self.native_ids
                     .lock()
@@ -1649,7 +1725,35 @@ impl DaemonService {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&id);
-            })?;
+            });
+            if let Some(run) = lead_run {
+                // A failed spawn is recorded `failed`, which still counts:
+                // the budget errs toward having spent the slot.
+                let (outcome, error) = match &info {
+                    Ok(_) => ("succeeded", None),
+                    Err(error) => ("failed", Some(error.to_string())),
+                };
+                let finished = self
+                    .with_db(move |db| {
+                        use thegn_core::store::AutomationStore;
+                        db.finish_automation_run(
+                            run,
+                            outcome,
+                            None,
+                            error.as_deref(),
+                            thegn_core::util::now(),
+                        )
+                    })
+                    .await;
+                if let Err(error) = finished {
+                    tracing::warn!(
+                        target: "thegn::automation",
+                        %error,
+                        "could not finish the Lead manual-open run row"
+                    );
+                }
+            }
+            let info = info?;
 
             // THE-733: a tracker dispatch names the row it recorded before the
             // session existed; bind the fresh session id to it NOW, in the
@@ -3031,6 +3135,8 @@ impl ControlApi for DaemonService {
                 })
                 .await?;
             rows.extend(super::lead_caps::automations::list_lead_rules(self).await?);
+            // THE-2196: autopilot, visible as a read-only rule per repo.
+            rows.extend(super::lead_caps::automations::list_autopilot_rules(self).await?);
             Ok(rows)
         })
     }
@@ -4947,6 +5053,65 @@ mod tests {
         }
         assert!(lead_open_postcheck(&spec, None, &lead_caller()).is_err());
         assert!(lead_open_postcheck(&spec, Some("bwrap"), &lead_caller()).is_ok());
+    }
+
+    #[test]
+    fn lead_open_budget_refuses_over_budget_and_unreadable_usage() {
+        use thegn_core::automation_budget::{BudgetRefusal, BudgetUsage, Budgets};
+        let budgets = Budgets {
+            max_concurrent_lanes: 2,
+            max_spawns_per_day: 3,
+        };
+        let usage = |active_lanes, spawns_24h| {
+            Ok(BudgetUsage {
+                active_lanes,
+                spawns_24h,
+            })
+        };
+        assert_eq!(lead_open_budget(&budgets, usage(0, 2)), Ok(()));
+        // A session needs no lane slot, only a spawn.
+        assert_eq!(lead_open_budget(&budgets, usage(2, 0)), Ok(()));
+        assert_eq!(
+            lead_open_budget(&budgets, usage(0, 3)),
+            Err(BudgetRefusal::SpawnsPerDay { limit: 3, used: 3 })
+        );
+        assert!(matches!(
+            lead_open_budget(&budgets, Err(anyhow::anyhow!("locked"))),
+            Err(BudgetRefusal::Unreadable { .. })
+        ));
+    }
+
+    #[test]
+    fn lead_manual_open_is_budgeted_after_the_postcheck_and_before_the_launch() {
+        let source = include_str!("service.rs");
+        let production = source.split_once("\n#[cfg(test)]").unwrap().0;
+        let start = production.find("    fn open_with(").unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let postcheck = body.find("lead_open_postcheck(&spec").unwrap();
+        let budget = body.find("lead_open_budget(").unwrap();
+        let row = body.find("lead_manual_run(").unwrap();
+        let launch = body.find("spawn_session(").unwrap();
+        assert!(postcheck < budget && budget < row && row < launch);
+        // Only a Lead's own transport call is counted here; a Lead rule's
+        // open was budgeted by the automation runtime.
+        assert!(body.contains("(Some(caller), true) =>"));
+    }
+
+    #[test]
+    fn lead_manual_open_row_is_counted_by_spawns_24h() {
+        use thegn_core::store::AutomationStore;
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let now_ms = thegn_core::util::now_ms();
+        let run = lead_manual_run("s-1", now_ms);
+        assert_eq!(run.rule_id, "lead:manual");
+        assert_eq!(run.trigger_kind, "lead");
+        assert_eq!(run.action_cap, "sessions.open");
+        assert_eq!(run.autonomy.as_deref(), Some("review"));
+        let id = db.start_automation_run(&run).unwrap();
+        db.finish_automation_run(id, "succeeded", None, None, now_ms / 1000)
+            .unwrap();
+        assert_eq!(db.automation_budget_usage(now_ms).unwrap().spawns_24h, 1);
     }
 
     fn assert_uniform_miss(e: &ControlError, shown: &str) {
