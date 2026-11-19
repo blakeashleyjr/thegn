@@ -60,7 +60,7 @@ pub(crate) fn record_in(
     if file.metadata()?.len() >= max_bytes {
         drop(file);
         dir.remove_file(PREV)?;
-        dir.rename_child_noreplace(FILE, PREV)?;
+        dir.rename_child(FILE, PREV)?;
         file = dir.open_or_create_regular_nofollow_append(FILE)?;
     }
     file.write_all(&line)
@@ -115,14 +115,10 @@ mod tests {
         let contents = std::fs::read_to_string(audit_path(&state, FILE)).unwrap();
         let lines: Vec<_> = contents.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(lines[0])["action"],
-            "seed"
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(lines[1])["action"],
-            "pull"
-        );
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("json line");
+        assert_eq!(first["action"], "seed");
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("json line");
+        assert_eq!(second["action"], "pull");
     }
 
     #[test]
@@ -135,14 +131,12 @@ mod tests {
         let current = std::fs::read_to_string(audit_path(&state, FILE)).unwrap();
         assert_eq!(previous.lines().count(), 1);
         assert_eq!(current.lines().count(), 1);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(previous.trim())["action"],
-            "seed"
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(current.trim())["action"],
-            "pull"
-        );
+        let previous_json: serde_json::Value =
+            serde_json::from_str(previous.trim()).expect("json line");
+        assert_eq!(previous_json["action"], "seed");
+        let current_json: serde_json::Value =
+            serde_json::from_str(current.trim()).expect("json line");
+        assert_eq!(current_json["action"], "pull");
     }
 
     #[test]
