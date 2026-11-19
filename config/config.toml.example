@@ -3181,7 +3181,8 @@ oci_host = ""
 #   "krun"  — libkrun: the container runs inside a hardware-virtualized microVM
 #             (needs /dev/kvm). Reported as isolation class `guest-kernel`.
 # The worktree bind stays path-preserving either way, so host-side git keeps working.
-# `thegn doctor` reports the resolved isolation class.
+# `thegn doctor` reports the resolved isolation class. Only a local Linux
+# placement is probed; remote and macOS placements keep the requested runtime.
 oci_runtime = ""
 
 # ── Isolation floor (demandable minimum boundary) ─────────────────────────────

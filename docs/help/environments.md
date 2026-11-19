@@ -286,6 +286,27 @@ sandboxes recorded in the run's own temporary ledger.
   above the 30 minute provisioning step ceiling, so shorter caller timeouts fire
   first. On expiry the Sprites session is closed.
 
+- **Pull-back survives restarts.** Every successful `data = "sync"` upload
+  writes a journal entry, so closing a worktree or `thegn wt rm` in any process
+  (a restarted UI, or the CLI) pulls the sandbox's changes back first, using the
+  in-memory record when there is one and the journal otherwise. The pull marks
+  the entry `pulling`; success removes it. A failed pull marks it
+  `failed {reason}` and **keeps the sandbox**. A `pulling` entry younger than 15
+  minutes means another process is pulling, and the command refuses and keeps the
+  sandbox. A journal whose target (provider kind, sandbox id, workdir) no longer
+  matches the current env, or an entry that cannot be read, also refuses, keeps
+  the entry and names the file (remove it by hand once you have checked it).
+- **`thegn doctor`** lists a pending pull-back as its own row per sandbox.
+- **`sprite-exec` routes to the owning account.** It reads the sprite's ledger
+  record and uses the Sprites env whose provider account matches. With no record
+  and exactly one Sprites env it uses that env; otherwise it refuses and names
+  the candidates. `vercel-exec` capture mode picks its env the same way as the
+  terminal path and refuses when several Vercel envs are configured and none
+  resolves.
+- **Failed one-shot exec shows stderr.** When a Sprites one-shot exec exits
+  non-zero, the last 8 KiB of stderr, control characters removed, follows the
+  stdout. A zero exit prints exactly what it did before.
+
 A destroy counts as done only when a complete provider inventory no longer
 lists the sandbox. A partial listing proves nothing.
 

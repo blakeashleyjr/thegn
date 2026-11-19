@@ -138,6 +138,15 @@ A Windows Job Object is process-tree lifetime + resource scoping with **no**
 filesystem or network boundary, so it is honestly `host-process`, never a
 container — it satisfies no floor at `shared-kernel` or above.
 
+## Remote and macOS runtimes
+
+Only a local placement on a Linux host probes the runtime binary and
+`/dev/kvm`. A remote placement (ssh, a provider sandbox) or a macOS host keeps
+the runtime you requested, because the local machine cannot tell whether it
+exists there. On a local Linux host, `oci_runtime = "krun"` needs `/dev/kvm`
+to open read-write; otherwise it degrades and `thegn doctor` reports the
+resulting isolation class.
+
 ## Isolation floor
 
 `backend_chain` expresses a _preference_; the isolation floor is a _demand_.

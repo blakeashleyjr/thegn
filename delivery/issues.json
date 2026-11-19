@@ -528,6 +528,27 @@
         "harden-remote-sprites-journey",
         "remote-daily-loop"
       ]
+    },
+    {
+      "issue": "THE-155",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
+    },
+    {
+      "issue": "THE-2142",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
+    },
+    {
+      "issue": "THE-395",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-exec-and-sync-journal"
+      ]
     }
   ]
 }
