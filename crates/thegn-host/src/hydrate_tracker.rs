@@ -432,7 +432,12 @@ fn list_memo_key(
     serde_json::to_string(account)
         .unwrap_or_else(|_| format!("{account:?}"))
         .hash(&mut hasher);
-    let filter_json = serde_json::to_string(filter).unwrap_or_else(|_| format!("{filter:?}"));
+    let mut keyed_filter = filter.clone();
+    if account.provider != thegn_core::config::IssueProviderKind::Github {
+        keyed_filter.repo = None;
+    }
+    let filter_json =
+        serde_json::to_string(&keyed_filter).unwrap_or_else(|_| format!("{keyed_filter:?}"));
     let anchor = if account.provider == thegn_core::config::IssueProviderKind::Github
         && filter.repo.is_none()
     {
@@ -1254,6 +1259,24 @@ mod tests {
                 token: "env:TRACKER_TOKEN".to_owned(),
                 ..IssueAccount::default()
             }
+        }
+
+        #[test]
+        fn repo_scope_only_splits_the_key_for_github() {
+            let f = |r: &str| IssueFilter {
+                repo: Some(r.into()),
+                ..IssueFilter::default()
+            };
+            let lin = account("lin", IssueProviderKind::Linear);
+            assert_eq!(
+                list_memo_key(&lin, &f("o/a"), Path::new("/repo/a")),
+                list_memo_key(&lin, &f("o/b"), Path::new("/repo/b"))
+            );
+            let gh = account("gh", IssueProviderKind::Github);
+            assert_ne!(
+                list_memo_key(&gh, &f("o/a"), Path::new("/repo/a")),
+                list_memo_key(&gh, &f("o/b"), Path::new("/repo/b"))
+            );
         }
 
         fn keyed(
