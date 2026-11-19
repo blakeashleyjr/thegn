@@ -42,6 +42,11 @@ pub fn dir() -> PathBuf {
     thegn_core::util::xdg_state_home().join("thegn/provider-sync")
 }
 
+/// The on-disk path for one worktree's journal entry.
+pub fn entry_path(directory: &Path, worktree: &str) -> PathBuf {
+    directory.join(file_name(worktree))
+}
+
 /// Publish one journal entry atomically beneath an owner-only journal root.
 pub fn record_at(directory: &Path, entry: &SyncJournalEntry) -> Result<()> {
     let root = open_root(directory, true)?.ok_or_else(|| {
