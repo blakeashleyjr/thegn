@@ -159,6 +159,57 @@ inside the sandbox before each agent or shell pane starts. Use it for
 per-pane/container setup; use lifecycle hooks for host-side worktree setup,
 teardown, or session edges.
 
+## Sprites
+
+A sprites env (`provider = "sprites"`, `placement = "provider"`) is paid, so
+thegn is strict about what it creates and deletes. Nothing in this section has
+been verified live against the real Sprites API yet.
+
+- **Ledger before create.** thegn writes a `creating` record to its local
+  ledger before it asks Sprites to create a sprite, and `ready` after. thegn
+  deletes a sprite only when this host recorded it. Sprites that existed
+  before this release, or that were made outside thegn, are never deleted by
+  thegn; remove those with the Sprites CLI or dashboard.
+- **Unrecorded sprites.** `thegn env reap --provider sprites [--apply] [--yes] [--json]`
+  lists orphans, sprites past `max_lifetime_secs` (age from the API
+  `created_at`) and sprites "not recorded by this host". It is a dry run by
+  default. `--apply` destroys only recorded sprites past their lifetime, and
+  removes ledger records whose sprite is gone. It spares records younger than
+  60 seconds, skips unrecorded sprites, and refuses on a partial listing. There is
+  no background sprites reaper; nothing deletes a sprite unless you run it.
+  `thegn env down --all` keeps its prompt, destroys only recorded sprites, and
+  says how many it skipped.
+- **No background creates.** `eager = "workspace"` or `"all"` never creates a
+  sprite for an unfocused worktree. The focused worktree still provisions when
+  you focus it.
+- **Keep-awake.** Headless work on a sprite (`thegn agent run`, a headless
+  `session open`, stage launches, or `thegn sprite-exec --hold <dur>`) runs
+  inside a small `sh` heartbeat that holds the sprite awake. It registers a task
+  `thegn-hold-<16 hex>` with a 5 minute expiry, refreshes it every 60 seconds,
+  deletes it when the command exits, and stops at a ceiling: `max_lifetime_secs`
+  when set, else 4 hours (`--hold` is capped at 24 hours). Ctrl-C stops the
+  command too. Interactive panes get no hold, so an idle open pane does not
+  bill. After a crash the worst case is the ceiling plus 5 minutes. If `curl` or
+  the socket is missing in the VM, one line is printed and the command runs
+  unheld.
+- **Size.** Sprites have a fixed 8 vCPU; `size`, `min_vcpu`, `gpu` and `nvme`
+  are ignored and validate warns. `min_ram_gb > 0` sets the sprite's memory
+  limit to `min_ram_gb * 1024` MB (no autoscale) after create and again at each
+  provision, with a readback.
+- **Instance cap.** `max_instances` applies through the ledger; `0` (the
+  default for sprites) means no cap.
+- **Cost.** `thegn fleet cost` shows a Sprites block with CPU hours and
+  reserved GB-hours per recorded sprite, read from the Sprites usage API only
+  when you run that verb. It is priced only when `[placement.price]` has a
+  `sprites` entry; otherwise it is labelled "usage from the Sprites API;
+  unpriced".
+- **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
+  also runs `env pull` after the agent exits and reports it in text and `--json`.
+
+The live scripts `test/sprites-live.sh` and `test/vercel-live.sh` spend real
+money. They need `THEGN_CHANNEL=dev` and `--i-accept-spend`, and touch only
+sandboxes recorded in the run's own temporary ledger.
+
 ## Remote worktrees
 
 `[sandbox.remote] host` runs worktrees on another machine. Control-plane
