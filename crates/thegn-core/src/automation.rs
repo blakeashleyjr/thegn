@@ -25,13 +25,14 @@ pub const SUPPORTED_ACTION_CAPS: &[&str] = &[
     "merge.drain",
     "pipeline.start",
     "lead.wake",
+    "autopilot.run",
 ];
 
 /// Actions that are not catalog capabilities; reachable only by a rule.
 /// They have no MCP tool, HTTP route, CLI verb or Lead tool of their own, so
 /// a Lead reaches them only by authoring a rule, which the autonomy policy
 /// (`automation_autonomy`) constrains.
-pub const RULE_ONLY_ACTIONS: &[&str] = &["pipeline.start", "lead.wake"];
+pub const RULE_ONLY_ACTIONS: &[&str] = &["pipeline.start", "lead.wake", "autopilot.run"];
 
 /// Longest issue title an [`IssueFacts`] carries (characters).
 pub const MAX_ISSUE_TITLE_CHARS: usize = 300;
@@ -61,6 +62,8 @@ pub const EVENT_TEMPLATE_VARS: &[&str] = &[
     "issue_status",
     "account",
     "exit_code",
+    "inbox_account",
+    "inbox_kind",
 ];
 
 /// Variables a `lead.wake` prompt template may use: [`EVENT_TEMPLATE_VARS`]
@@ -90,6 +93,8 @@ pub const LEAD_WAKE_TEMPLATE_VARS: &[&str] = &[
     "issue_status",
     "account",
     "exit_code",
+    "inbox_account",
+    "inbox_kind",
 ];
 
 /// A normalized fact automation rules can consume.
@@ -111,7 +116,8 @@ pub enum AutomationEventKind {
     IssueMatched,
     /// Any daemon session exited, whatever its role or status.
     SessionExited,
-    /// An item landed in the native inbox (no producer until phase 7).
+    /// An item landed in the native inbox: produced by the daemon inbox
+    /// producer (b163), for new ids after an account's baseline poll.
     InboxItem,
 }
 
@@ -188,6 +194,21 @@ pub struct IssueFacts {
     pub title: String,
 }
 
+/// Inbox facts carried by an `inbox_item` event (THE-2214). Every field except
+/// `title` is structural; all of it passed `inbox::sanitize_item`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxFacts {
+    /// The account's kind (`command`, `todoist`, `imap`).
+    pub kind: String,
+    /// The `[[inbox.accounts]]` name.
+    pub account: String,
+    pub item_id: String,
+    pub url: String,
+    pub labels: Vec<String>,
+    /// UNTRUSTED, <= 300 chars; reaches rules only as `message`.
+    pub title: String,
+}
+
 /// Stable, optional fields projected from existing host/daemon facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutomationEvent {
@@ -221,6 +242,9 @@ pub struct AutomationEvent {
     /// session reported one.
     #[serde(default)]
     pub exit_code: Option<i32>,
+    /// Inbox facts; present only on `inbox_item` events.
+    #[serde(default)]
+    pub inbox: Option<InboxFacts>,
 }
 
 impl AutomationEvent {
@@ -250,12 +274,15 @@ impl AutomationEvent {
             origin: None,
             issue: None,
             exit_code: None,
+            inbox: None,
         }
     }
 
     fn template_vars(&self) -> TaskVars {
         let issue = self.issue.as_ref();
         let issue_field = |field: fn(&IssueFacts) -> &str| issue.map(field).unwrap_or_default();
+        let inbox = self.inbox.as_ref();
+        let inbox_field = |field: fn(&InboxFacts) -> &str| inbox.map(field).unwrap_or_default();
         TaskVars::new()
             .set("event_id", &self.id)
             .set("event_key", &self.key.0)
@@ -296,6 +323,8 @@ impl AutomationEvent {
                     .map(|code| code.to_string())
                     .unwrap_or_default(),
             )
+            .set("inbox_account", inbox_field(|facts| facts.account.as_str()))
+            .set("inbox_kind", inbox_field(|facts| facts.kind.as_str()))
     }
 
     /// Typed PR fixtures must carry the fact their event kind promises. This
@@ -391,6 +420,16 @@ pub struct AutomationPredicate {
     pub assignee: Option<String>,
     /// The issue status, ASCII case-insensitive.
     pub status: Option<String>,
+    /// Inbox selectors. Each is false on an event without [`InboxFacts`].
+    /// Inbox account name, exact.
+    #[serde(default)]
+    pub inbox_account: Option<String>,
+    /// Inbox account kind, exact.
+    #[serde(default)]
+    pub inbox_kind: Option<String>,
+    /// One of the item's labels, ASCII case-insensitive.
+    #[serde(default)]
+    pub inbox_label: Option<String>,
 }
 
 impl AutomationPredicate {
@@ -422,6 +461,23 @@ impl AutomationPredicate {
             && bool_field(self.pr_review_requested, event.pr_review_requested)
             && bool_field(self.pr_merged, event.pr_merged)
             && self.matches_issue(event.issue.as_ref())
+            && self.matches_inbox(event.inbox.as_ref())
+    }
+
+    fn matches_inbox(&self, inbox: Option<&InboxFacts>) -> bool {
+        let has = |selector: &Option<String>, test: &dyn Fn(&InboxFacts, &str) -> bool| {
+            selector
+                .as_deref()
+                .is_none_or(|want| inbox.is_some_and(|facts| test(facts, want)))
+        };
+        has(&self.inbox_account, &|facts, want| facts.account == want)
+            && has(&self.inbox_kind, &|facts, want| facts.kind == want)
+            && has(&self.inbox_label, &|facts, want| {
+                facts
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case(want))
+            })
     }
 
     fn matches_issue(&self, issue: Option<&IssueFacts>) -> bool {
@@ -751,6 +807,7 @@ mod tests {
             origin: None,
             issue: None,
             exit_code: None,
+            inbox: None,
         }
     }
 
@@ -1252,6 +1309,101 @@ mod tests {
         );
     }
 
+    fn inbox_facts() -> InboxFacts {
+        InboxFacts {
+            kind: "imap".into(),
+            account: "work".into(),
+            item_id: "m1".into(),
+            url: "https://example.invalid/m1".into(),
+            labels: vec!["Urgent".into()],
+            title: "hello".into(),
+        }
+    }
+
+    #[test]
+    fn inbox_selectors_match_inbox_facts_and_never_an_event_without_them() {
+        let mut with_inbox = event();
+        with_inbox.inbox = Some(inbox_facts());
+        let p = |f: fn(&mut AutomationPredicate)| {
+            let mut predicate = AutomationPredicate::default();
+            f(&mut predicate);
+            predicate
+        };
+        let cases = [
+            (
+                "account",
+                p(|x| x.inbox_account = Some("work".into())),
+                true,
+            ),
+            (
+                "account other",
+                p(|x| x.inbox_account = Some("Work".into())),
+                false,
+            ),
+            ("kind", p(|x| x.inbox_kind = Some("imap".into())), true),
+            (
+                "kind other",
+                p(|x| x.inbox_kind = Some("todoist".into())),
+                false,
+            ),
+            (
+                "label any case",
+                p(|x| x.inbox_label = Some("URGENT".into())),
+                true,
+            ),
+            (
+                "label other",
+                p(|x| x.inbox_label = Some("later".into())),
+                false,
+            ),
+            (
+                "all",
+                p(|x| {
+                    x.inbox_account = Some("work".into());
+                    x.inbox_kind = Some("imap".into());
+                    x.inbox_label = Some("urgent".into());
+                }),
+                true,
+            ),
+        ];
+        for (name, predicate, expected) in cases {
+            assert_eq!(predicate.matches(&with_inbox), expected, "{name}");
+            assert!(!predicate.matches(&event()), "{name} without inbox facts");
+        }
+        // An issue selector never matches inbox facts.
+        let issue_only = p(|x| x.account = Some("work".into()));
+        assert!(!issue_only.matches(&with_inbox));
+    }
+
+    #[test]
+    fn inbox_template_vars_render_and_default_empty() {
+        let mut r = rule("a");
+        r.action.params = BTreeMap::from([(
+            "body".into(),
+            "{inbox_kind}|{inbox_account}|{message}".into(),
+        )]);
+        let mut e = event();
+        e.inbox = Some(inbox_facts());
+        e.message = Some("[work] hello".into());
+        let decisions = evaluate(std::slice::from_ref(&r), &e, &EvaluationState::new(), 2_000);
+        assert_eq!(planned(&decisions).params["body"], "imap|work|[work] hello");
+        let mut bare = event();
+        bare.message = None;
+        let decisions = evaluate(&[r], &bare, &EvaluationState::new(), 2_000);
+        assert_eq!(planned(&decisions).params["body"], "||");
+        for var in ["inbox_account", "inbox_kind"] {
+            assert!(EVENT_TEMPLATE_VARS.contains(&var), "{var}");
+            assert!(LEAD_WAKE_TEMPLATE_VARS.contains(&var), "{var}");
+        }
+        assert!(!EVENT_TEMPLATE_VARS.contains(&"inbox_title"));
+    }
+
+    #[test]
+    fn autopilot_run_is_a_rule_only_action() {
+        assert!(SUPPORTED_ACTION_CAPS.contains(&"autopilot.run"));
+        assert!(RULE_ONLY_ACTIONS.contains(&"autopilot.run"));
+    }
+
     #[test]
     fn session_exited_event_is_keyed_by_session() {
         let e = session_exited_event("s9", Some("/wt".into()), Some(1), None, 77);
@@ -1271,6 +1423,7 @@ mod tests {
         let object = json.as_object_mut().unwrap();
         object.remove("issue");
         object.remove("exit_code");
+        object.remove("inbox");
         let decoded: AutomationEvent = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, event());
     }

@@ -24,7 +24,7 @@ pub(crate) mod disk;
 pub(crate) mod loc;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::thread::JoinHandle;
 
@@ -114,18 +114,100 @@ pub(crate) fn begin(flag: &'static AtomicBool, what: &'static str) -> Option<Rou
     }
 }
 
+/// Process-wide "nothing due before" gate for one lane. A pump earlier than
+/// `next_due` returns before any DB open or lane job.
+///
+/// Armed after each round with [`thegn_core::scan_sched::next_due_at`]: the
+/// moment the earliest row reaches its TTL. Between sweeps a lane therefore has
+/// no work in hand; the ticker slot still fires, but costs two atomic loads.
+/// A config reload changes the fingerprint and re-opens the gate; a kick
+/// ([`kick`]) re-opens it too.
+pub(crate) struct DueGate {
+    next_due: AtomicI64,
+    shape_fp: AtomicU64,
+    kicked: AtomicBool,
+}
+
+impl DueGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            // Open: the first pump of the process always runs.
+            next_due: AtomicI64::new(0),
+            shape_fp: AtomicU64::new(0),
+            kicked: AtomicBool::new(false),
+        }
+    }
+
+    /// `true` if a round should be submitted for this trigger now. Watch and
+    /// Kick always pass; a Pump passes once the armed time has come or when
+    /// the config fingerprint changed since the gate was armed.
+    pub(crate) fn admit(
+        &self,
+        now: i64,
+        fp: u64,
+        trigger: thegn_core::scan_sched::RoundTrigger,
+    ) -> bool {
+        use thegn_core::scan_sched::RoundTrigger;
+        match trigger {
+            RoundTrigger::Watch | RoundTrigger::Kick => true,
+            RoundTrigger::Pump => {
+                self.shape_fp.load(Ordering::Acquire) != fp
+                    || now >= self.next_due.load(Ordering::Acquire)
+            }
+        }
+    }
+
+    /// Record when the next pump has work. `None` (nothing tracked) closes the
+    /// gate until a kick or a config change.
+    pub(crate) fn arm(&self, next_due: Option<i64>, fp: u64) {
+        self.next_due
+            .store(next_due.unwrap_or(i64::MAX), Ordering::Release);
+        self.shape_fp.store(fp, Ordering::Release);
+    }
+
+    /// Re-open the gate and mark the next round as a kick.
+    pub(crate) fn kick(&self) {
+        self.next_due.store(0, Ordering::Release);
+        self.kicked.store(true, Ordering::Release);
+    }
+
+    /// Consume a pending kick: `true` once per [`DueGate::kick`].
+    pub(crate) fn take_kick(&self) -> bool {
+        self.kicked.swap(false, Ordering::AcqRel)
+    }
+}
+
+pub(crate) static LOC_GATE: DueGate = DueGate::new();
+pub(crate) static DISK_GATE: DueGate = DueGate::new();
+
+/// Config fingerprint (ttl, budget, enabled, ...): a reload re-opens the gate.
+/// FNV-1a over the parts; stable within a process, which is all a gate needs.
+pub(crate) fn shape_fingerprint(parts: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for byte in part.to_le_bytes() {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
 pub(crate) static DISK_LANE: Lane = Lane::new("thegn-msr-disk");
 pub(crate) static LOC_LANE: Lane = Lane::new("thegn-msr-loc");
 
 /// Kick both scans now: startup, a worktree created, a workspace added, a
 /// worktree switched to.
 ///
-/// Cheap to over-call — the planner drops every target still inside its TTL, so
-/// a redundant kick costs one DB read and plans nothing. The point is that a
+/// Cheap to over-call — a kick round plans only the active row and never-measured
+/// rows, so a redundant kick costs one DB read and plans nothing. Both gates are
+/// re-opened first, so the pump after a kick sweeps as well. The point is that a
 /// *cold* path (the freshly created worktree, the workspace you just switched
 /// to) is measured within a second or two instead of waiting out a full pump
 /// interval.
 pub(crate) fn kick(tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>) {
+    LOC_GATE.kick();
+    DISK_GATE.kick();
     let _ = tx.send(crate::hydrate::RefreshKind::Disk); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     let _ = tx.send(crate::hydrate::RefreshKind::Loc { watch: false }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
 }
@@ -166,31 +248,30 @@ fn candidate_paths(db: &Db) -> Vec<String> {
     out
 }
 
-/// [`candidate_paths`] joined with a cache's fetch stamps and the on-screen
-/// Warn once per lane when its registry is larger than one TTL window's
-/// capacity, so a lane that can never go idle says so instead of being
-/// discovered days later by a melted machine.
-///
-/// Once per process, not per round: a saturated lane pumps forever, so warning
-/// every round would be its own log storm — the exact shape of problem being
-/// reported.
-pub(crate) fn warn_if_saturated(lane: &'static str, rows: usize, budget: usize) {
+/// Log once per process per lane when [`thegn_core::scan_sched::lane_shape`]
+/// had to stretch the effective TTL (the registry is larger than one window's
+/// examine ceiling). INFO, not WARN: the lane still idles; it only refreshes
+/// background rows less often.
+pub(crate) fn log_stretched_once(lane: &'static str, rows: usize, ttl: u64) {
     use std::sync::Mutex;
-    use std::sync::OnceLock;
-    static WARNED: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> = OnceLock::new();
-    let Some(message) = thegn_core::scan_sched::saturation(rows, budget).warning() else {
-        return;
-    };
-    let seen = WARNED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+    static LOGGED: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> = OnceLock::new();
+    let seen = LOGGED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
     let Ok(mut seen) = seen.lock() else {
         return; // best-effort: diagnostics only; a poisoned latch must not break a scan
     };
     if !seen.insert(lane) {
         return;
     }
-    tracing::warn!(target: LOG, scan = lane, rows, "{message}");
+    tracing::info!(
+        target: LOG,
+        scan = lane,
+        rows,
+        effective_ttl_secs = ttl,
+        "registry exceeds one window's examine ceiling; stretching the background refresh"
+    );
 }
 
+/// [`candidate_paths`] joined with a cache's fetch stamps and the on-screen
 /// worktree, ready for [`thegn_core::scan_sched::plan`].
 fn targets(
     db: &Db,
@@ -330,6 +411,43 @@ mod tests {
         // And the planner agrees.
         let due = thegn_core::scan_sched::plan(&targets, thegn_core::util::now(), 100, 0);
         assert_eq!(due.first().map(String::as_str), Some("/wt/b"));
+    }
+
+    #[test]
+    fn due_gate_holds_a_pump_until_its_next_due() {
+        use thegn_core::scan_sched::RoundTrigger;
+        let gate = DueGate::new();
+        let fp = shape_fingerprint(&[900, 2, 1]);
+        assert!(
+            gate.admit(100, fp, RoundTrigger::Pump),
+            "a fresh gate is open"
+        );
+        gate.arm(Some(1_000), fp);
+        assert!(!gate.admit(999, fp, RoundTrigger::Pump));
+        assert!(gate.admit(1_000, fp, RoundTrigger::Pump));
+        assert!(gate.admit(5_000, fp, RoundTrigger::Pump));
+        // Watch and Kick are never held.
+        assert!(gate.admit(0, fp, RoundTrigger::Watch));
+        assert!(gate.admit(0, fp, RoundTrigger::Kick));
+        // A config reload re-opens it.
+        let reloaded = shape_fingerprint(&[600, 2, 1]);
+        assert_ne!(fp, reloaded);
+        assert!(gate.admit(0, reloaded, RoundTrigger::Pump));
+        // Nothing tracked: closed until a kick.
+        gate.arm(None, fp);
+        assert!(!gate.admit(i64::MAX - 1, fp, RoundTrigger::Pump));
+        assert!(!gate.take_kick());
+        gate.kick();
+        assert!(gate.admit(0, fp, RoundTrigger::Pump), "kick re-opens");
+        assert!(gate.take_kick());
+        assert!(!gate.take_kick(), "a kick is consumed once");
+    }
+
+    #[test]
+    fn shape_fingerprint_separates_parts() {
+        assert_eq!(shape_fingerprint(&[1, 2]), shape_fingerprint(&[1, 2]));
+        assert_ne!(shape_fingerprint(&[1, 2]), shape_fingerprint(&[2, 1]));
+        assert_ne!(shape_fingerprint(&[]), shape_fingerprint(&[0]));
     }
 
     #[test]

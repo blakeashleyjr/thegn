@@ -265,6 +265,8 @@ pub struct UiConfig {
     /// Ask before destructive project worktree actions (deleting a worktree from disk via the sidebar).
     #[serde(rename = "confirm_delete_project", alias = "confirm_delete_workspace")]
     pub confirm_delete_workspace: bool,
+    /// Ask before Ctrl+Q / quit closes thegn (panes in the daemon keep running). Signals, the CLI and live upgrades never ask.
+    pub confirm_quit: bool,
     /// Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
     pub full_mode_chip: bool,
     /// Dismiss a detail popup when the user left-clicks outside it, like Escape.
@@ -371,13 +373,16 @@ pub struct UiConfig {
     /// Whether the "Other" group starts collapsed. Expanding or collapsing it
     /// is remembered per project.
     pub sidebar_other_group_collapsed: bool,
-    /// Rows a sidebar group shows before a "show more" affordance; `0` = no
-    /// limit.
+    /// Rows a sidebar group shows before a "show more" affordance (default
+    /// 7); `0` = no limit.
     pub sidebar_group_row_limit: usize,
     /// Per-group overrides of `sidebar_group_row_limit`, keyed by the folder
     /// or group label (`{ Other = 5 }`); `0` = no limit for that group.
     /// Overrides match by group label across workspaces.
     pub sidebar_group_row_limits: std::collections::BTreeMap<String, usize>,
+    /// Loose worktrees sharing a batch token (`tg/b158-…` → `b158`) fold into one
+    /// collapsible row per batch once at least this many share it; `0` = off.
+    pub sidebar_batch_group_min: usize,
 }
 
 impl Default for UiConfig {
@@ -385,6 +390,7 @@ impl Default for UiConfig {
         Self {
             language: "auto".to_string(),
             confirm_delete_workspace: true,
+            confirm_quit: true,
             full_mode_chip: true,
             dismiss_overlay_on_click_outside: true,
             sidebar_workspace_sort: WorkspaceSort::default(),
@@ -421,8 +427,9 @@ impl Default for UiConfig {
             sidebar_external_worktrees: ExternalWorktrees::default(),
             sidebar_other_group_label: "Other".to_string(),
             sidebar_other_group_collapsed: true,
-            sidebar_group_row_limit: 15,
+            sidebar_group_row_limit: 7,
             sidebar_group_row_limits: std::collections::BTreeMap::new(),
+            sidebar_batch_group_min: 2,
         }
     }
 }
@@ -564,6 +571,7 @@ mod tests {
         // Defaults survive an empty table.
         let cfg: UiConfig = toml::from_str("").unwrap();
         assert!(cfg.confirm_delete_workspace);
+        assert!(cfg.confirm_quit);
         assert_eq!(cfg.language, "auto");
     }
 
@@ -790,12 +798,12 @@ mod tests {
         assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Group);
         assert_eq!(cfg.sidebar_other_group_label, "Other");
         assert!(cfg.sidebar_other_group_collapsed);
-        assert_eq!(cfg.sidebar_group_row_limit, 15);
+        assert_eq!(cfg.sidebar_group_row_limit, 7);
         assert!(cfg.sidebar_group_row_limits.is_empty());
         // Defaults survive an empty table.
         let cfg: UiConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Group);
-        assert_eq!(cfg.sidebar_group_row_limit, 15);
+        assert_eq!(cfg.sidebar_group_row_limit, 7);
         for (raw, want) in [
             ("show", ExternalWorktrees::Show),
             ("group", ExternalWorktrees::Group),
@@ -804,6 +812,12 @@ mod tests {
             assert_eq!(ExternalWorktrees::from_str_validated(raw).unwrap(), want);
         }
         assert!(ExternalWorktrees::from_str_validated("bogus").is_err());
+        assert_eq!(cfg.sidebar_batch_group_min, 2);
+        assert_eq!(UiConfig::default().sidebar_batch_group_min, 2);
+        let cfg: UiConfig = toml::from_str("sidebar_batch_group_min = 0").unwrap();
+        assert_eq!(cfg.sidebar_batch_group_min, 0);
+        let cfg: UiConfig = toml::from_str("sidebar_batch_group_min = 4").unwrap();
+        assert_eq!(cfg.sidebar_batch_group_min, 4);
         let pretty = r#"
 sidebar_external_worktrees = "hide"
 sidebar_other_group_label = "Elsewhere"

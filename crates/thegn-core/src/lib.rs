@@ -67,8 +67,10 @@ pub mod config_drawer;
 pub mod config_duration;
 pub mod config_env_tables;
 pub mod config_forge;
+pub mod config_gate;
 pub mod config_git;
 pub mod config_host_discovery;
+pub mod config_inbox;
 pub mod config_issues;
 pub mod config_lead;
 pub mod config_loc;
@@ -125,6 +127,7 @@ mod db_gate_attest;
 pub use db_gate_attest::{GateAttestationRefusal, StoredGateAttestation};
 mod db_glyph;
 mod db_hibernate;
+pub mod db_inbox;
 mod db_intent;
 mod db_iroh;
 pub mod db_merge_landed;
@@ -136,6 +139,7 @@ pub mod db_pipeline_supervise;
 pub mod db_placement;
 mod db_pool;
 pub mod db_pr_agent_outcome;
+pub mod db_producer_lease;
 mod db_projects;
 mod db_review_tasks;
 mod db_semantic;
@@ -146,11 +150,13 @@ mod db_vacuum;
 pub mod docx_text;
 pub mod git_spawn_stats;
 pub use db_vacuum::{
-    AUTO_CONVERT_MAX_LIVE_BYTES, AutoVacuum, ConvertOutcome, DbSpace, INCREMENTAL_PAGES_PER_ROUND,
-    MaintenanceReport, MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, VacuumError,
+    AUTO_CONVERT_MAX_LIVE_BYTES, AutoVacuum, CONVERT_HEADROOM_BYTES, ConvertOutcome, DbSpace,
+    HostRoom, INCREMENTAL_PAGES_PER_ROUND, INCREMENTAL_STEPS_PER_PASS, MaintenanceReport,
+    MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, VacuumError, conversion_needs_bytes,
     plan_maintenance,
 };
 mod db_workspace;
+pub mod db_workspace_forget;
 mod db_worktree_identity;
 mod db_zones;
 pub mod debug;
@@ -223,6 +229,7 @@ pub mod i18n_parity;
 mod i18n_pseudo;
 pub mod identity;
 pub mod image;
+pub mod inbox;
 pub mod inventory;
 pub mod iroh_wire;
 pub mod issue;
@@ -306,6 +313,9 @@ pub mod pr_queue;
 pub mod pr_review_tasks;
 pub mod preview;
 pub mod proc_registry;
+pub mod producer_arm;
+pub mod producer_lease;
+pub mod producer_status;
 pub mod profile;
 pub mod progress;
 pub mod project;
@@ -392,6 +402,7 @@ pub mod share;
 pub mod shellinv;
 pub mod snapshot_meta;
 pub mod spillover;
+pub mod sprite_hold;
 pub mod ssh_creds;
 pub mod stage_land;
 pub mod startup;

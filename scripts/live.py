@@ -5,8 +5,14 @@ install, launch. Never a readiness protocol.
 Assumes a stable current-user namespace, not hostile same-UID/root processes.
 /proc observations and cooperative flocks cannot exclude legacy restarts. SQLite
 backup deadlines are checked between backup steps, not cancellation of kernel I/O.
-Only processes whose live executable IS the installation target are signalled;
-other `thegn`/`tg` processes block the upgrade and are named, never touched.
+The installation lives OUTSIDE the checkout (default ~/.local/lib/thegn, from
+the passwd home), so a release build in the repo never replaces it. Only this
+installation's processes are signalled: its binary under its state home, or a
+`thegn` executable under its state home. Other installations (another binary
+and another state home, or this binary under another state home) are reported
+and left alone; a process that cannot be attributed is never signalled and
+blocks the upgrade. Launchers in ~/.local/bin change only with
+--relink-launchers.
 """
 
 import argparse
@@ -15,6 +21,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import signal
@@ -46,6 +53,12 @@ DAEMON_GRACE = 15           # daemon drains its panes after the shutdown request
 KILL_GRACE = 5              # after SIGKILL of the exact-target leftovers
 DOCTOR_DELAY = 20           # let the new controller finish startup/migration first
 STEPS = 6
+THEGN_NAMES = ("thegn", "tg")
+DEFAULT_INSTALL = ".local/lib/thegn"   # under the passwd home, never $HOME
+INSTALL_ENV = "THEGN_LIVE_INSTALL_DIR"
+LAUNCHER_DIR = ".local/bin"
+WRAPPERS = ("tg", "tg-tui")
+MAX_WRAPPER = 1024 * 1024
 
 
 class Refusal(Exception):
@@ -114,7 +127,29 @@ def read_fd_small(fd, maximum):
     raise Refusal("Input exceeds size limit")
 
 
-def settings(repo, env):
+def real_home():
+    """The account's home from the passwd database.
+
+    Not $HOME: this tool is sometimes run from a shell whose HOME is a profile
+    directory, and the stable installation and launchers belong to the account.
+    """
+    return absolute(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def install_dir_for(env, override=None):
+    """--install-dir, else $THEGN_LIVE_INSTALL_DIR, else <passwd home>/.local/lib/thegn."""
+    raw = str(override) if override else env.get(INSTALL_ENV, "").strip()
+    return absolute(raw) if raw else real_home() / DEFAULT_INSTALL
+
+
+def _nearest_existing(path):
+    for candidate in (path, *path.parents):
+        if os.path.lexists(candidate):
+            return candidate
+    return Path("/")
+
+
+def settings(repo, env, install_override=None):
     if sys.platform != "linux" or os.getuid() == 0 or os.geteuid() != os.getuid():
         raise Refusal("This helper supports ordinary-user Linux upgrades only")
     user_home_path = absolute(env.get("HOME", "/"))
@@ -126,9 +161,45 @@ def settings(repo, env):
     if env.get("THEGN_ALLOW_SCHEMA_DOWNGRADE", ""):
         raise Refusal("Schema downgrade opt-in is unsupported")
     directories(state, private=True)
-    directories(repo / "target/release")
-    target, database = repo / "target/release/thegn", state / "thegn.db"
-    regular(target, executable=True)
+    install_dir = install_dir_for(env, install_override)
+    account_state = real_home() / ".local/state"
+    if not install_override and not env.get(INSTALL_ENV, "").strip() and state.parent != account_state:
+        # A profile HOME without XDG_STATE_HOME would "upgrade" the profile's
+        # state while replacing the account's binary under its running instance.
+        raise Refusal(f"State home {state.parent} is not the account's state home {account_state}, but the default "
+                      f"install directory {install_dir} is the account's; set XDG_STATE_HOME to the account's state "
+                      "home or pass --install-dir")
+    if install_dir == repo or repo in install_dir.parents:
+        raise Refusal(f"Install directory {install_dir} is inside the checkout {repo}; a release build there "
+                      "would replace the installation. Choose a directory outside it")
+    if os.path.lexists(install_dir):
+        directories(install_dir)
+        existing = install_dir
+    else:
+        existing = _nearest_existing(install_dir)
+        directories(existing)  # Created only by a real run.
+    if os.statvfs(existing).f_flag & os.ST_NOEXEC:
+        raise Refusal(f"Install directory {install_dir} is on a noexec filesystem ({existing}); the installed "
+                      "binary could not be launched. Choose another directory")
+    target, database = install_dir / "thegn", state / "thegn.db"
+    alacritty, alacritty_source = install_dir / "alacritty.toml", repo / "config/alacritty.toml"
+    legacy = repo / "target/release/thegn"
+    if os.path.lexists(target):
+        regular(target, executable=True)
+        previous = target
+    elif os.path.lexists(legacy):
+        # First run after the move out of the checkout: the in-repo binary is
+        # the installation being upgraded (process attribution and backup).
+        directories(legacy.parent)
+        regular(legacy, executable=True)
+        previous = legacy
+    else:
+        raise Refusal(f"No installed executable at {target} (or the legacy {legacy}); this is not a first-install command")
+    if os.path.lexists(alacritty):
+        info = alacritty.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise Refusal(f"Installed {alacritty} is not a current-user regular file")
+    regular(alacritty_source)
     if regular(database, private=True).st_nlink != 1:
         raise Refusal("Hardlinked database paths use distinct schema locks and are unsupported")
     raw = b""
@@ -164,8 +235,10 @@ def settings(repo, env):
         raise Refusal("Migration authority must be canonical controller or any")
     pin = override("THEGN_DATABASE_MIGRATION_EXECUTABLE", db.get("migration_executable", ""))
     if not isinstance(pin, str) or (pin and absolute(pin).resolve(strict=True) != target):
-        raise Refusal("Configured migration executable must resolve to the installation target")
-    return {"repo": repo, "state": state, "database": database, "target": target, "config": config}
+        raise Refusal(f"Configured migration executable must resolve to the installation target {target}")
+    return {"repo": repo, "state": state, "database": database, "target": target, "config": config,
+            "install_dir": install_dir, "previous": previous, "alacritty": alacritty,
+            "alacritty_source": alacritty_source}
 
 
 @contextlib.contextmanager
@@ -406,6 +479,140 @@ def retain_live_stages(paths, current=None):
             os.close(target_fd)
 
 
+BACKUP_KEEP = 3
+BACKUP_KEEP_DAYS = 7
+BACKUP_PREFIX = "live-backup-"
+MAX_BACKUP_DESCRIPTOR = 256 * 1024
+
+
+def _backup_completed_at(state_fd, name):
+    """mtime of a well-formed complete.json in one backup dir, else None.
+
+    Opened through descriptors without following links, so a symlinked dir or
+    descriptor never counts as complete (and is therefore never removed)."""
+    dir_fd = None
+    file_fd = None
+    try:
+        dir_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+        file_fd = os.open("complete.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        document = json.loads(read_fd_small(file_fd, MAX_BACKUP_DESCRIPTOR))
+        if not isinstance(document, dict) or not all(
+                isinstance(document.get(key), str) for key in ("binary_sha256", "database_sha256")):
+            return None
+        return info.st_mtime
+    except (OSError, Refusal, ValueError, UnicodeError):
+        return None
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
+def prune_backups(paths, current, now=time.time, keep=BACKUP_KEEP, keep_days=BACKUP_KEEP_DAYS):
+    """Delete old live-backup-* dirs in paths["state"].
+
+    Keep: `current`, the newest `keep` dirs that have a well-formed complete.json,
+    every dir younger than keep_days, and every dir without a readable
+    complete.json (failed or in-progress: it may be the only copy). Never follow
+    symlinks; only real dirs owned by this uid. Removal reuses the existing
+    bounded _remove_stage_tree walker (MAX_STAGE_ENTRIES), so a huge tree
+    aborts instead of blocking. Returns the removed paths.
+
+    A backup's age is the mtime of its complete.json (written once, at the end
+    of the backup), not the dir's, which later doctor/stderr files touch."""
+    state = paths["state"]
+    current_name = Path(current).name if current is not None and Path(current).parent == state else None
+    removed = []
+    state_fd = None
+    try:
+        state_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        state_info = os.fstat(state_fd)
+        if not stat.S_ISDIR(state_info.st_mode) or state_info.st_uid != os.getuid():
+            return removed
+        complete = []
+        with os.scandir(state_fd) as entries:
+            for index, entry in enumerate(entries, 1):
+                if index > MAX_STAGE_ENTRIES:
+                    return removed
+                if not entry.name.startswith(BACKUP_PREFIX) or entry.name == current_name:
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                    continue
+                completed = _backup_completed_at(state_fd, entry.name)
+                if completed is None:
+                    continue  # Failed or in progress: possibly the only copy.
+                complete.append((completed, entry.name, (info.st_dev, info.st_ino)))
+        complete.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
+        cutoff = now() - keep_days * 86400
+        for completed, name, expected in complete[keep:]:
+            if completed > cutoff:
+                continue
+            backup_fd = None
+            try:
+                backup_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+                info = os.fstat(backup_fd)
+                if (info.st_dev, info.st_ino) != expected or info.st_uid != os.getuid():
+                    continue
+                if not _validate_stage_tree(backup_fd, [0]):
+                    continue
+                _remove_stage_tree(backup_fd, [0])
+                again = os.stat(name, dir_fd=state_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(again.st_mode) or (again.st_dev, again.st_ino) != expected:
+                    continue
+                os.rmdir(name, dir_fd=state_fd)
+                removed.append(state / name)
+            except (FileNotFoundError, OSError, Refusal):
+                # A changed, oversized or unverifiable backup stays for an operator.
+                continue
+            finally:
+                if backup_fd is not None:
+                    os.close(backup_fd)
+    except OSError:
+        return removed
+    finally:
+        if state_fd is not None:
+            os.close(state_fd)
+    return removed
+
+
+SCOPE_PROBE_SECONDS = 5
+
+
+def scope_argv(target, env, which=shutil.which, run=subprocess.run):
+    """["systemd-run", "--user", "--scope", "--quiet", "--collect",
+        "-p", "CPUWeight=1000", "-p", "IOWeight=1000", "--", target] when
+    systemd-run exists and `systemd-run --user --scope --quiet true` succeeds
+    within 5 s; otherwise [target].
+
+    Why the weight helps: launched from a terminal, the UI shares that
+    terminal's cgroup with whatever builds run beside it (this very helper's
+    cargo, `just` recipes). Its own scope with CPU and IO weight 1000 (default
+    100) wins contention against them. Pane children that join `thegn.slice`
+    (weight 50) are unaffected; uncapped panes inherit the scope. `--scope`
+    execs in place, so the launched PID is thegn's own."""
+    target = str(target)
+    systemd_run = which("systemd-run", path=env.get("PATH"))
+    if not systemd_run:
+        return [target]
+    try:
+        probe = run([systemd_run, "--user", "--scope", "--quiet", "true"], env=env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=SCOPE_PROBE_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return [target]
+    if probe.returncode != 0:
+        return [target]
+    return [systemd_run, "--user", "--scope", "--quiet", "--collect",
+            "-p", "CPUWeight=1000", "-p", "IOWeight=1000", "--", target]
+
+
 def step(number, text):
     print(f"\n==> [{number}/{STEPS}] {text}", flush=True)
 
@@ -479,34 +686,137 @@ def validate_config(binary, env, run=subprocess.run):
         raise Refusal("The new build rejects the configuration; nothing was stopped")
 
 
-def target_processes(target, proc=Path("/proc")):
-    """(pid, is_daemon) for every process whose live executable IS `target`.
+def state_home_of(environ):
+    """The state home a process with NUL-separated ENVIRON resolves, or None.
 
-    Identity comes from `/proc/<pid>/exe` at the moment of the scan, never from
-    a pid file or a command-line pattern, so another checkout's or another
-    profile's thegn is never selected.
+    $XDG_STATE_HOME when absolute, else $HOME/.local/state, which is how thegn
+    itself picks it. The first definition of a key wins, as with getenv(3).
     """
-    want_path, want_identity = str(target), identity(target)
-    found = []
+    values = {}
+    for item in environ.split(b"\0"):
+        key, sep, value = item.partition(b"=")
+        if sep and key in (b"XDG_STATE_HOME", b"HOME"):
+            values.setdefault(key, value)
+    for key, suffix in ((b"XDG_STATE_HOME", ""), (b"HOME", ".local/state")):
+        value = values.get(key, b"")
+        if value.startswith(b"/"):
+            return Path(os.fsdecode(value)) / suffix
+    return None
+
+
+def _process_state_home(base):
+    try:
+        return state_home_of(read_small(base / "environ", MAX_CONFIG))
+    except (OSError, Refusal):
+        return None
+
+
+def _installed_identities(paths):
+    found = {}
+    for key in ("target", "previous"):
+        with contextlib.suppress(FileNotFoundError):
+            found[str(paths[key])] = identity(paths[key])
+    return found
+
+
+def attribute(paths, installed, pid, base, exe_path, exe_id):
+    """Which installation a `thegn`/`tg` process belongs to.
+
+    The rule of `inst_is_ours` in test/lib/instance.sh, widened by the binary:
+    a process is THIS installation's when its environment resolves this run's
+    state home. Running this installation's binary under ANOTHER state home is
+    `same-binary` (not ours, keeps the old binary until restarted); another
+    binary under another state home is `other`. An unreadable environment is
+    `unknown`: never signalled, and the refusal check treats it as blocking.
+    Only an `ours` process whose live executable is this installation's binary
+    or is named `thegn` may be signalled; anything else ours is left to the
+    operator (the refusal names it).
+    """
+    exe_match = exe_id is not None and installed.get(exe_path) == exe_id
+    state = _process_state_home(base)
+    if state is None:
+        kind = "unknown"
+    elif state == paths["state"].parent:
+        kind = "ours"
+    else:
+        kind = "same-binary" if exe_match else "other"
+    signal_ok = kind == "ours" and exe_path is not None and (exe_match or Path(exe_path).name == "thegn")
+    return {"pid": pid, "exe": exe_path, "state": state, "kind": kind, "signal": signal_ok}
+
+
+def survey(paths, proc=Path("/proc")):
+    """Every same-user `thegn`/`tg` process, attributed; tolerant of races."""
+    installed = _installed_identities(paths)
+    records = []
     with os.scandir(proc) as processes:
-        for entry in processes:
+        for index, entry in enumerate(processes):
+            if index > 32768:
+                break
             if not entry.name.isdigit() or int(entry.name) == os.getpid():
                 continue
             base = Path(entry.path)
             try:
-                link = os.readlink(base / "exe")
-            except OSError:
-                continue
-            if link.removesuffix(" (deleted)") != want_path:
-                continue
-            try:
-                if identity(base / "exe") != want_identity:
+                status_text = read_small(base / "status", 65536).decode("ascii", "replace")
+                uids = next(line.split()[1:] for line in status_text.splitlines() if line.startswith("Uid:"))
+                if os.getuid() not in map(int, uids):
                     continue
+                if any(line.split()[1:2] in (["Z"], ["X"]) for line in status_text.splitlines()
+                       if line.startswith("State:")):
+                    continue
+                try:
+                    exe_path = os.readlink(base / "exe").removesuffix(" (deleted)")
+                    exe_id = identity(base / "exe")
+                    named = exe_path in installed or Path(exe_path).name in THEGN_NAMES
+                except PermissionError:
+                    exe_path = exe_id = None
+                    named = comm(status_text) in THEGN_NAMES
+                if not named:
+                    continue
+                record = attribute(paths, installed, int(entry.name), base, exe_path, exe_id)
                 argv = (base / "cmdline").read_bytes().split(b"\0")
-            except OSError:
+                record["daemon"] = len(argv) > 1 and argv[1] == b"daemon"
+                records.append(record)
+            except (OSError, Refusal, StopIteration, ValueError):
                 continue
-            found.append((int(entry.name), len(argv) > 1 and argv[1] == b"daemon"))
-    return found
+    return sorted(records, key=lambda record: record["pid"])
+
+
+def target_processes(paths, proc=Path("/proc")):
+    """(pid, is_daemon) for every process this installation may signal.
+
+    Identity comes from `/proc/<pid>/exe` and `/proc/<pid>/environ` at the
+    moment of the scan, never from a pid file or a command-line pattern, so
+    another installation's or another state home's thegn is never selected.
+    """
+    return [(record["pid"], record["daemon"]) for record in survey(paths, proc) if record["signal"]]
+
+
+def report_processes(records):
+    """Plan lines describing every attributed thegn process."""
+    def row(record):
+        return f"pid {record['pid']}, {record['exe'] or '<exe hidden>'}, state home {record['state'] or '<unreadable>'}"
+
+    groups = {kind: [r for r in records if r["kind"] == kind] for kind in ("ours", "same-binary", "other", "unknown")}
+    stoppable = [r for r in groups["ours"] if r["signal"]]
+    stuck = [r for r in groups["ours"] if not r["signal"]]
+    lines = [f"{len(stoppable)} thegn process(es) of this installation will be stopped"]
+    lines += [f"  {row(r)}" for r in stoppable]
+    if stuck:
+        lines.append(f"{len(stuck)} process(es) use this state home but are not this installation's thegn binary; "
+                     "they are never signalled and block the upgrade until you stop them")
+        lines += [f"  {row(r)}" for r in stuck]
+    if groups["other"]:
+        lines.append(f"{len(groups['other'])} other thegn process(es) belong to another installation and are left alone")
+        lines += [f"  {row(r)}" for r in groups["other"]]
+    if groups["same-binary"]:
+        lines.append(f"{len(groups['same-binary'])} thegn process(es) run this installation's binary under another "
+                     "state home: not stopped, and they keep running the old binary until restarted")
+        lines += [f"  {row(r)}" for r in groups["same-binary"]]
+    if groups["unknown"]:
+        lines.append(f"{len(groups['unknown'])} thegn process(es) cannot be attributed (environment unreadable): "
+                     "never signalled, and the upgrade refuses while they run")
+        lines += [f"  {row(r)}" for r in groups["unknown"]]
+    return lines
 
 
 def wait_quiet(paths, seconds, sleep=time.sleep, now=time.monotonic):
@@ -536,18 +846,19 @@ def stop_running(paths, env, proc=Path("/proc"), sleep=time.sleep, now=time.mono
     path, which persists the session layout) while the daemon still serves
     them; then the daemon gets its own shutdown request.
     """
-    target = paths["target"]
-    controllers = [pid for pid, daemon in target_processes(target, proc) if not daemon]
+    controllers = [pid for pid, daemon in target_processes(paths, proc) if not daemon]
     if controllers:
         print(f"  asking {len(controllers)} thegn controller(s) to quit: {' '.join(map(str, controllers))}")
         _signal_all(controllers, signal.SIGTERM, kill)
         deadline = now() + CONTROLLER_GRACE
-        while now() < deadline and any(not d for _, d in target_processes(target, proc)):
+        while now() < deadline and any(not d for _, d in target_processes(paths, proc)):
             sleep(0.25)
-    if any(d for _, d in target_processes(target, proc)):
+    if any(d for _, d in target_processes(paths, proc)):
         print("  stopping the pane daemon (thegn daemon stop)")
         try:
-            result = run([str(target), "daemon", "stop"], env=env, stdout=subprocess.PIPE,
+            # The binary currently installed (the legacy in-repo one on a first
+            # run); the environment selects this state home's daemon.
+            result = run([str(paths["previous"]), "daemon", "stop"], env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, timeout=DAEMON_STOP_SECONDS)
             if result.returncode != 0:
                 print(f"  daemon stop exited {result.returncode}; falling back to signals")
@@ -556,14 +867,14 @@ def stop_running(paths, env, proc=Path("/proc"), sleep=time.sleep, now=time.mono
     if wait_quiet(paths, DAEMON_GRACE, sleep, now) is None:
         return
     for sig, grace in ((signal.SIGTERM, DAEMON_GRACE), (signal.SIGKILL, KILL_GRACE)):
-        leftovers = [pid for pid, _ in target_processes(target, proc)]
+        leftovers = [pid for pid, _ in target_processes(paths, proc)]
         if leftovers:
             print(f"  sending {sig.name} to {' '.join(map(str, leftovers))}")
             _signal_all(leftovers, sig, kill)
         error = wait_quiet(paths, grace, sleep, now)
         if error is None:
             return
-    raise Refusal(f"{error}. Only processes running this installation's binary are stopped "
+    raise Refusal(f"{error}. Only this installation's own thegn processes are stopped "
                   "automatically; stop the named one yourself and rerun (the staged build is kept)")
 
 
@@ -634,16 +945,27 @@ def comm(status_text):
     raise Refusal("Process status has no name")
 
 
+def _refuse_unless_foreign(record):
+    where = f"pid {record['pid']}, {record['exe'] or '<exe hidden>'}"
+    if record["kind"] == "ours":
+        raise Refusal(f"A controller/daemon of this installation is still running ({where}); stop it manually")
+    if record["kind"] == "unknown":
+        raise Refusal(f"A thegn process whose installation cannot be determined is still running ({where}: "
+                      "environment unreadable, so it is never signalled); stop it manually")
+
+
 def quiescent(paths, proc=Path("/proc")):
     """Bounded observation, never atomic quiescence or future-startup exclusion."""
-    watched = {identity(paths["target"]), identity(paths["database"])}
+    installed = _installed_identities(paths)
+    data = {identity(paths["database"])}
     for suffix in ("-wal", "-shm", "-journal"):
         side = Path(str(paths["database"]) + suffix)
         try:
             regular(side, private=True)
-            watched.add(identity(side))
+            data.add(identity(side))
         except FileNotFoundError:
             pass
+    watched = data | set(installed.values())
     count = 0
     with os.scandir(proc) as processes:
         for entry in processes:
@@ -670,9 +992,16 @@ def quiescent(paths, proc=Path("/proc")):
                     continue
                 try:
                     executable = base / "exe"
-                    name = Path(os.readlink(executable).removesuffix(" (deleted)")).name
-                    if identity(executable) in watched or name in ("thegn", "tg"):
-                        raise Refusal("A controller/daemon or database user is still running; stop it manually")
+                    exe_path = os.readlink(executable).removesuffix(" (deleted)")
+                    exe_id = identity(executable)
+                    if exe_id in data:
+                        raise Refusal("A database user is still running; stop it manually")
+                    if exe_id in watched or Path(exe_path).name in THEGN_NAMES:
+                        # Another installation, or this binary under another
+                        # state home, is left alone and does not block; the
+                        # descriptor scan below still refuses one holding OUR
+                        # database or installed files open.
+                        _refuse_unless_foreign(attribute(paths, installed, int(entry.name), base, exe_path, exe_id))
                     with os.scandir(base / "fd") as handles:
                         for index, handle in enumerate(handles):
                             if index >= 4096:
@@ -699,8 +1028,8 @@ def quiescent(paths, proc=Path("/proc")):
                     # the state directory into a container -- a deliberate act,
                     # not an accident -- and the alternative is a tool that can
                     # never run here at all.
-                    if comm(status_text) in ("thegn", "tg"):
-                        raise Refusal("A controller/daemon is still running; stop it manually") from None
+                    if comm(status_text) in THEGN_NAMES:
+                        _refuse_unless_foreign(attribute(paths, installed, int(entry.name), base, None, None))
                     continue
             except FileNotFoundError:
                 if base.exists():
@@ -759,7 +1088,7 @@ def build_stage(paths, env):
     # One persistent, private build cache for `just live` only: a rebuild after a
     # few commits recompiles just what changed instead of all ~600 crates. It is
     # still isolated from every other worktree's and profile's Cargo output, and
-    # from target/release (the installed binary). Serialized by the launcher
+    # from target/release (no longer the installation). Serialized by the launcher
     # locks and Cargo's own build-dir lock. All cores: the build is the wait.
     build_env = dict(env, RUSTC_WRAPPER="", CARGO_TARGET_DIR=str(cache), CARGO_BUILD_BUILD_DIR=str(cache / "intermediate"),
                      CARGO_BUILD_JOBS=str(os.cpu_count() or 1))
@@ -802,7 +1131,7 @@ def backup(paths, record):
     recovery = Path(tempfile.mkdtemp(prefix="live-backup-", dir=paths["state"]))
     print(f"Recovery directory retained: {recovery}", flush=True)
     deadline = time.monotonic() + BACKUP_SECONDS
-    copy_file(paths["target"], recovery / "thegn.previous", deadline, 0o700)
+    copy_file(paths["previous"], recovery / "thegn.previous", deadline, 0o700)
     output = recovery / "thegn.db"
     fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
@@ -827,7 +1156,8 @@ def backup(paths, record):
     # references remain protected by _recovery_linked_stages.
     persisted_record = {key: value for key, value in record.items() if key != "stage"}
     with (recovery / "complete.json").open("x") as stream:
-        json.dump({"database": str(paths["database"]), "target": str(paths["target"]), "schema": version,
+        json.dump({"database": str(paths["database"]), "target": str(paths["target"]),
+                   "previous": str(paths["previous"]), "schema": version,
                    "binary_sha256": digest(recovery / "thegn.previous"), "database_sha256": digest(output), "build": persisted_record}, stream)
         stream.flush()
         os.fsync(stream.fileno())
@@ -848,39 +1178,203 @@ def sync_directory(path):
         os.close(fd)
 
 
+def _maybe_identity(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _snapshot(paths):
+    return (identity(paths["previous"]), identity(paths["database"]),
+            _maybe_identity(paths["target"]), _maybe_identity(paths["alacritty"]))
+
+
 def install(paths, binary, record, env):
     """Called under both locks, after confirmation; failures never roll DB back."""
-    target_id, db_id = identity(paths["target"]), identity(paths["database"])
+    before = _snapshot(paths)
     quiescent(paths)
     regular(binary, executable=True)
     recovery = backup(paths, record)
     quiescent(paths)
-    if (identity(paths["target"]), identity(paths["database"])) != (target_id, db_id):
+    if _snapshot(paths) != before:
         raise Refusal("Install/database identity changed; retained backup, refusing install")
-    temporary = paths["target"].parent / (".thegn-install-" + recovery.name)
-    copy_file(binary, temporary, time.monotonic() + BACKUP_SECONDS, 0o755)
+    temporary = paths["install_dir"] / (".thegn-install-" + recovery.name)
+    deadline = time.monotonic() + BACKUP_SECONDS
+    copy_file(binary, temporary, deadline, 0o755)
     if digest(temporary) != record["sha256"]:
         raise Refusal("Staged artifact changed; installation refused")
+    config_temporary = paths["install_dir"] / (".thegn-alacritty-" + recovery.name)
+    copy_file(paths["alacritty_source"], config_temporary, deadline, 0o644)
     # Copies may take time: repeat observations at the last replacement point.
     # This still does not exclude a legacy process starting after this scan.
-    if settings(paths["repo"], env) != paths:
+    if settings(paths["repo"], env, paths["install_dir"]) != paths:
         raise Refusal("Policy/path selection changed before replacement")
     quiescent(paths)
-    if (identity(paths["target"]), identity(paths["database"])) != (target_id, db_id):
+    if _snapshot(paths) != before:
         raise Refusal("Install/database identity changed before replacement")
+    # The alacritty config first: a failure there leaves the binary untouched.
+    os.replace(config_temporary, paths["alacritty"])
     os.replace(temporary, paths["target"])
-    sync_directory(paths["target"].parent)
+    sync_directory(paths["install_dir"])
     return recovery
+
+
+# --- launchers ---------------------------------------------------------------
+# ~/.local/bin is the owner's; it changes only with --relink-launchers, and the
+# whole change is validated (relink_plan) before anything is stopped.
+
+_PATH_CHAR = r"[\w./-]"
+
+
+def _exact(path):
+    return re.compile(rf"(?<!{_PATH_CHAR}){re.escape(str(path))}(?!{_PATH_CHAR})")
+
+
+def _read_wrapper(path):
+    """(text, mode) of a current-user regular UTF-8 text file, else Refusal."""
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise Refusal(f"Launcher {path} is not a current-user regular file; relink it yourself")
+    try:
+        text = read_small(path, MAX_WRAPPER).decode("utf-8")
+    except UnicodeError:
+        raise Refusal(f"Launcher {path} is not a UTF-8 text file; relink it yourself") from None
+    if "\0" in text:
+        raise Refusal(f"Launcher {path} is not a text file; relink it yourself")
+    return text, stat.S_IMODE(info.st_mode)
+
+
+def launcher_state(paths, home):
+    """Read-only lines describing ~/.local/bin/{thegn,tg,tg-tui}."""
+    bin_dir = home / LAUNCHER_DIR
+    old_binary, old_config = paths["repo"] / "target/release/thegn", paths["alacritty_source"]
+    lines = []
+    link = bin_dir / "thegn"
+    if link.is_symlink():
+        resolved = Path(os.path.realpath(link))
+        verdict = "resolves to the install target" if resolved == paths["target"] else "does NOT resolve to the install target"
+        lines.append(f"{link} -> {os.readlink(link)} ({verdict} {paths['target']})")
+    elif os.path.lexists(link):
+        lines.append(f"{link} is not a symlink; it does not follow the install target")
+    else:
+        lines.append(f"{link} is absent")
+    for name in WRAPPERS:
+        wrapper = bin_dir / name
+        if not os.path.lexists(wrapper):
+            lines.append(f"{wrapper} is absent")
+            continue
+        try:
+            text, _mode = _read_wrapper(wrapper)
+        except (OSError, Refusal) as error:
+            lines.append(f"{wrapper}: unreadable as a text launcher ({error})")
+            continue
+        mentions = [str(path) for path in (old_binary, old_config) if _exact(path).search(text)]
+        lines.append(f"{wrapper} mentions the old repo path(s): {', '.join(mentions)}" if mentions
+                     else f"{wrapper} mentions no old repo path")
+    return lines
+
+
+def launchers_run_checkout(paths, home):
+    """True when ~/.local/bin/thegn, tg or tg-tui still runs the checkout's binary or config."""
+    bin_dir = home / LAUNCHER_DIR
+    link = bin_dir / "thegn"
+    if link.is_symlink() and Path(os.path.realpath(link)) != paths["target"]:
+        return True
+    old = (_exact(paths["repo"] / "target/release/thegn"), _exact(paths["alacritty_source"]))
+    for name in WRAPPERS:
+        wrapper = bin_dir / name
+        if not os.path.lexists(wrapper):
+            continue
+        try:
+            text, _mode = _read_wrapper(wrapper)
+        except (OSError, Refusal):
+            continue
+        if any(pattern.search(text) for pattern in old):
+            return True
+    return False
+
+
+def relink_plan(paths, home):
+    """Validate every launcher change up front; [] or Refusal, changing nothing."""
+    bin_dir = home / LAUNCHER_DIR
+    info = bin_dir.lstat() if os.path.lexists(bin_dir) else None
+    if info is None or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise Refusal(f"{bin_dir} is not a current-user directory; relink the launchers yourself")
+    actions = []
+    link = bin_dir / "thegn"
+    if link.is_symlink():
+        if Path(os.path.realpath(link)) != paths["target"]:
+            actions.append(("symlink", link, os.readlink(link)))
+    elif os.path.lexists(link):
+        raise Refusal(f"{link} is not a symlink; refusing to replace it (nothing changed)")
+    else:
+        actions.append(("symlink", link, None))
+    replacements = ((paths["repo"] / "target/release/thegn", paths["target"]),
+                    (paths["alacritty_source"], paths["alacritty"]))
+    for name in WRAPPERS:
+        wrapper = bin_dir / name
+        if not os.path.lexists(wrapper):
+            continue
+        text, mode = _read_wrapper(wrapper)
+        updated = text
+        for old, new in replacements:
+            updated = _exact(old).sub(lambda _match, new=new: str(new), updated)
+        if updated != text:
+            actions.append(("wrapper", wrapper, (updated, mode)))
+        elif not any(_exact(new).search(text) for _old, new in replacements):
+            raise Refusal(f"{wrapper} mentions neither {replacements[0][0]} nor {replacements[1][0]}; "
+                          "refusing to edit it (nothing changed)")
+    return actions
+
+
+def _backup_name(path):
+    for index in range(100):
+        candidate = path.with_name(path.name + (".bak" if index == 0 else f".bak.{index}"))
+        if not os.path.lexists(candidate):
+            return candidate
+    raise Refusal(f"Too many backups beside {path}")
+
+
+def apply_relink(paths, actions):
+    for kind, path, detail in actions:
+        temporary = path.with_name(f".{path.name}.thegn-live-{os.getpid()}")
+        if kind == "symlink":
+            os.symlink(paths["target"], temporary)
+            os.replace(temporary, path)
+            print(f"  {path} -> {paths['target']} (was {detail or 'absent'})")
+            continue
+        text, mode = detail
+        backup_path = _backup_name(path)
+        shutil.copy2(path, backup_path, follow_symlinks=False)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        print(f"  rewrote {path} (previous copy: {backup_path})")
+    if actions:
+        sync_directory(actions[0][1].parent)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true")
-    parser.add_argument("--repo", help="Absolute Git root: source and installation are always selected together")
+    parser.add_argument("--repo", help="Absolute Git root to build (the installation is chosen by --install-dir)")
     parser.add_argument("--level", default="info", choices=("trace", "debug", "info", "warn", "error"))
     parser.add_argument("--size-mb", type=int, default=20)
     parser.add_argument("--files", type=int, default=5)
     parser.add_argument("--yes", action="store_true", help="Skip the Ctrl-C window before thegn is stopped")
+    parser.add_argument("--install-dir", help=f"Absolute install directory outside the checkout (default: ${INSTALL_ENV}, "
+                        f"else <passwd home>/{DEFAULT_INSTALL})")
+    parser.add_argument("--relink-launchers", action="store_true",
+                        help="Repoint ~/.local/bin/thegn at the install target and rewrite the old repo paths in "
+                             "~/.local/bin/tg and tg-tui (a .bak copy is kept beside each)")
+    parser.add_argument("--no-scope", action="store_true",
+                        help="Launch thegn directly instead of in a systemd user scope with higher CPU/IO weight")
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(raw_argv)
     if not 1 <= args.size_mb <= 1024 or not 1 <= args.files <= 100:
@@ -888,12 +1382,40 @@ def main(argv=None):
     env = dict(os.environ)
     repo = absolute(args.repo) if args.repo else Path(__file__).resolve().parent.parent
     directories(repo)
-    paths = settings(repo, env)
+    paths = settings(repo, env, args.install_dir)
+    home = real_home()
     revision = source_revision(repo, env, require_clean=not args.plan)
     print(json.dumps({key: str(value) for key, value in paths.items()}, indent=2))
     print("Build:", " ".join(BUILD), "(isolated output + intermediate directories)")
     print("Selected revision:", revision, "(plan does not admit dirty source for a build)")
     print("Brand moves disabled with THEGN_NO_MIGRATE=1; database migration policy is not overridden.")
+    print(f"Install: {paths['target']} and {paths['alacritty']} (outside the checkout)")
+    if paths["previous"] != paths["target"]:
+        print(f"First run at this location: {paths['previous']} is treated as the previous installation "
+              f"(its processes are this installation's, and it is the backed-up binary); "
+              f"the new build installs to {paths['target']}"
+              + ("" if paths["install_dir"].exists() else f", creating {paths['install_dir']}"))
+    for line in report_processes(survey(paths)):
+        print(line)
+    print("Launchers:")
+    for line in launcher_state(paths, home):
+        print(f"  {line}")
+    if args.relink_launchers:
+        actions = relink_plan(paths, home)
+        print(f"--relink-launchers will change {len(actions)} launcher(s) after the install:"
+              if actions else "--relink-launchers: launchers already follow the install target")
+        for _kind, path, _detail in actions:
+            print(f"  {path}")
+    elif not args.plan:
+        print("Launchers are not changed without --relink-launchers.")
+    if not args.relink_launchers and launchers_run_checkout(paths, home):
+        # Otherwise every later start (and every `thegn` CLI call from the
+        # panes) still runs the in-repo binary, which any release build replaces.
+        stale = (f"launchers still run {paths['repo'] / 'target/release/thegn'}; rerun with "
+                 "`python3 -B scripts/live.py --relink-launchers` (or relink them yourself)")
+        if not args.plan:
+            raise Refusal(stale)
+        print(f"WARNING: {stale}")
     if args.plan:
         return 0
     # The terminal check comes FIRST, before the relaunch below: a script or an
@@ -904,19 +1426,32 @@ def main(argv=None):
     if thegn_ancestor() is not None:
         relaunch_outside(raw_argv, env, repo)
         return 0
-    with locked(paths["target"].parent / ".thegn-live-install.lock"), locked(paths["state"] / "live-upgrade.lock"):
+    if not paths["install_dir"].exists():
+        paths["install_dir"].mkdir(mode=0o755, parents=True)
+    directories(paths["install_dir"])
+    with contextlib.ExitStack() as locks:
+        locks.enter_context(locked(paths["target"].parent / ".thegn-live-install.lock"))
+        if paths["previous"].parent != paths["target"].parent:
+            # First run: an older helper serializes on the legacy location.
+            locks.enter_context(locked(paths["previous"].parent / ".thegn-live-install.lock"))
+        locks.enter_context(locked(paths["state"] / "live-upgrade.lock"))
         step(1, "Preflight: clean source and supported paths")
         source_revision(repo, env)
+        # Every launcher change is validated before anything is stopped.
+        relink = relink_plan(paths, home) if args.relink_launchers else []
         step(2, "Build (the running instance keeps working meanwhile)")
-        _stage, binary, record = build_stage(paths, env)
+        stage, binary, record = build_stage(paths, env)
         step(3, "Validate the configuration with the NEW build")
         validate_config(binary, env)
         step(4, "Stop the running thegn (controllers, then the pane daemon)")
+        # Re-surveyed after the build: show exactly what is about to be stopped.
+        for line in report_processes(survey(paths)):
+            print(line)
         if not args.yes:
             countdown(STOP_COUNTDOWN)
         stop_running(paths, env)
         # Re-read policy and path constraints after the potentially long build.
-        if settings(repo, env) != paths:
+        if settings(repo, env, args.install_dir) != paths:
             raise Refusal("Upgrade paths changed while building")
         if source_revision(repo, env) != record["observed_revision"]:
             raise Refusal("Source changed after build; installation refused")
@@ -926,7 +1461,22 @@ def main(argv=None):
             directories(logs)  # Existing normal 0755 logs are under private state.
         with locked(Path(str(paths["database"]) + ".schema.lock"), schema=True):
             recovery = install(paths, binary, record, env)
+            # Still under the launcher and schema locks, and only after a
+            # successful install: this run's backup is `recovery` and is kept.
+            pruned = prune_backups(paths, recovery)
+            for path in pruned:
+                print(f"  removed old backup {path}")
+            print(f"  removed {len(pruned)} old backup(s) (kept the newest {BACKUP_KEEP}, those under "
+                  f"{BACKUP_KEEP_DAYS} days, incomplete ones and this run's)")
+            # Release stages that only the removed backups pinned.
+            retain_live_stages(paths, current=stage)
         print(f"  recovery (database backup + previous binary): {recovery}")
+        if relink:
+            try:
+                apply_relink(paths, relink)
+            except OSError as error:
+                # Installed already: report, never abort the launch over it.
+                print(f"  relinking the launchers failed ({error}); fix them by hand")
         step(6, "Launch (the database migrates on this first start)")
         doctor_report = recovery / "doctor.txt"
         print(f"  `thegn doctor` will be captured to {doctor_report} about {DOCTOR_DELAY}s after launch")
@@ -941,7 +1491,11 @@ def main(argv=None):
             os.close(fd)
             raise Refusal("Reserved launch stderr file changed")
         with os.fdopen(fd, "wb") as stderr:
-            child = subprocess.Popen([str(paths["target"])], cwd=repo, env=child_env, stderr=stderr)
+            # A transient user scope gives the UI CPU/IO weight 1000 over builds
+            # in this terminal's cgroup (see scope_argv); falls back to a direct
+            # launch. systemd-run --scope execs in place: the PID is thegn's.
+            argv = [str(paths["target"])] if args.no_scope else scope_argv(paths["target"], child_env)
+            child = subprocess.Popen(argv, cwd=repo, env=child_env, stderr=stderr)
             while True:
                 try:
                     code = child.wait()
@@ -949,6 +1503,9 @@ def main(argv=None):
                 except KeyboardInterrupt:
                     print("Foreground child still supervised; waiting for its exit.", file=sys.stderr)
         print(f"Child exited {code}; readiness was not verified. Recovery retained at {recovery}")
+        print("Launchers:")
+        for line in launcher_state(paths, home):
+            print(f"  {line}")
         return code if code >= 0 else 128 - code
 
 

@@ -332,7 +332,7 @@ pub(crate) fn on_left_press(
     if hit.kind.is_collapsible() {
         // The derived "Other" group has nothing to select FOR (no rename,
         // file, pin or drag), so a single click folds it.
-        if double || hit.kind == RowKind::OtherGroup {
+        if double || hit.kind == RowKind::OtherGroup || hit.kind == RowKind::BatchGroup {
             return match sb.toggle_collapse(model, session) {
                 SidebarOutcome::Redraw => PressOut::Consumed,
                 out => PressOut::Outcome(out),
@@ -737,8 +737,9 @@ pub(crate) fn spot_for_hover(
                     .filter(|(_, r)| r.workspace_slug == *slug)
                     .fold(None, |acc, (_, r)| match r.kind {
                         RowKind::Folder => r.folder_id,
-                        // The "Other" group's rows belong to no folder.
-                        RowKind::OtherGroup => None,
+                        // The "Other" group's and a batch row's rows belong
+                        // to no folder.
+                        RowKind::OtherGroup | RowKind::BatchGroup => None,
                         RowKind::Worktree if r.depth < 2 => None,
                         _ => acc,
                     })
@@ -1979,6 +1980,18 @@ mod tests {
     fn sidebar_row_heights_follow_the_focus_detail_policy_exactly() {
         use thegn_core::config::FocusDetail as F;
         let (mut model, rect) = slots_fixture();
+        // With no OSC window title the title line IS the branch, so the detail
+        // line's branch field is always echoed away (b164) and a row with no
+        // git metadata has nothing left to expand into. Give `a` and `b` the
+        // git-scan metadata a real worktree row carries (uncommitted files).
+        for row in model.sidebar_rows.iter_mut() {
+            if row.pin_key == "app/a" || row.pin_key == "app/b" {
+                row.branch_meta = Some(thegn_svc::git::BranchMeta {
+                    dirty_files: Some(2),
+                    ..Default::default()
+                });
+            }
+        }
         let height = |model: &crate::chrome::FrameModel, pin: &str| -> usize {
             let hits = hit_rows(model, rect);
             let visible: Vec<&SidebarRow> =
@@ -1988,8 +2001,8 @@ mod tests {
                 .map(|h| h.height)
                 .unwrap()
         };
-        // `a` carries a branch, so it has a detail line to expand into; headers
-        // never do.
+        // `a` carries git metadata, so it has a detail line to expand into;
+        // headers never do.
         for detail in [F::Off, F::Cursor, F::All] {
             model.sidebar_display.focus_detail = detail;
             model.sidebar_focused = false;
@@ -2394,5 +2407,55 @@ mod tests {
         );
         assert!(matches!(out, PressOut::Consumed));
         assert!(sb.view.more_open.contains("app"));
+    }
+
+    #[test]
+    fn a_click_folds_a_batch_row() {
+        let (mut model, rect) = fixture();
+        let _state = crate::testenv::IsolatedState::new();
+        model.sidebar_rows.insert(
+            4,
+            SidebarRow {
+                pin_key: "batch:app/b158".into(),
+                collapsed: true,
+                child_count: 3,
+                ..SidebarRow::base(RowKind::BatchGroup, 1, "b158", "app")
+            },
+        );
+        let y = y_of(&model, rect, "batch:app/b158");
+        let mut sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        let out = on_left_press(
+            &mut MouseUi::default(),
+            &mut sb,
+            &mut model,
+            &session,
+            rect,
+            8,
+            y,
+            false,
+            Instant::now(),
+        );
+        assert!(matches!(out, PressOut::Consumed));
+        assert!(sb.view.batch_open.contains("batch:app/b158"));
+    }
+
+    #[test]
+    fn a_batch_row_is_not_draggable() {
+        let (mut model, rect) = fixture();
+        model.sidebar_rows.insert(
+            4,
+            SidebarRow {
+                pin_key: "batch:app/b158".into(),
+                collapsed: true,
+                ..SidebarRow::base(RowKind::BatchGroup, 1, "b158", "app")
+            },
+        );
+        let y = y_of(&model, rect, "batch:app/b158");
+        let hits = hit_rows(&model, rect);
+        let hit = crate::sidebar_view::row_at(&hits, y).expect("hit the batch row");
+        let sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        assert!(drag_src_for(&sb, &model, &session, hit).is_none());
     }
 }

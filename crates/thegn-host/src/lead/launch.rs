@@ -78,6 +78,10 @@ struct LeadHost<'a> {
     /// The config file (`Config::path()`): its dir is masked and only the
     /// file itself is re-exposed read-only.
     config_path: PathBuf,
+    /// Resolve the agent command's program on the host `PATH`.
+    agent_program: &'a dyn Fn(&str) -> Option<PathBuf>,
+    /// The thegn executable (`thegn mcp serve` runs it inside the Lead).
+    current_exe: &'a dyn Fn() -> Option<PathBuf>,
 }
 
 /// What a Lead launch is for: a tab's interactive TUI, or one bounded
@@ -134,19 +138,37 @@ pub(crate) fn headless_spec(cfg: &Config, prompt: &str) -> anyhow::Result<LeadLa
 
 fn real_host(cfg: &Config) -> LeadHost<'static> {
     LeadHost {
+        daemon_owned: crate::handlers::startup::daemon_active(cfg),
+        ..host_paths()
+    }
+}
+
+/// The real host without the daemon probe (the mask set never reads it).
+fn host_paths() -> LeadHost<'static> {
+    LeadHost {
         bwrap_available: &lead_sandbox::bwrap_available,
         pasta_available: &thegn_core::lead_net::pasta_available,
         repo_roots: &registered_repo_roots,
         control_dirs: &control_dirs,
         mcp: &crate::lead::mcp::prepare,
-        daemon_owned: crate::handlers::startup::daemon_active(cfg),
+        daemon_owned: false,
         state_home: thegn_core::util::xdg_state_home(),
         data_home: xdg_home("XDG_DATA_HOME", ".local/share"),
         cache_home: xdg_home("XDG_CACHE_HOME", ".cache"),
         home: env_home(),
         thegn_dir: thegn_core::util::thegn_dir(),
         config_path: Config::path(),
+        agent_program: &which_program,
+        current_exe: &current_exe,
     }
+}
+
+fn which_program(word: &str) -> Option<PathBuf> {
+    thegn_core::util::which_path(word).map(PathBuf::from)
+}
+
+fn current_exe() -> Option<PathBuf> {
+    std::env::current_exe().ok()
 }
 
 fn env_home() -> Option<PathBuf> {
@@ -252,6 +274,56 @@ fn launch_spec_with(
             render_headless(&template, prompt, &notes)?
         }
     };
+    if host.home.is_none() {
+        bail!("the Lead needs $HOME to locate the credentials it hides");
+    }
+
+    // The writable dirs: the notes dir, the private harness home and the
+    // private MCP dir. The harness home is private to the Lead, never the
+    // shared `~/.claude` (a hook or MCP entry written there would run
+    // unsandboxed in the next worker session). A harness with no credential
+    // home spec (pi) still relocates its state through
+    // `lead_sandbox::private_home_env`; aider writes into its cwd, the notes
+    // dir. The MCP dir holds the hub's upstream caches and OAuth state
+    // (npm/uv/bun, mcp-remote): the read-only root would refuse them.
+    let mut writable = vec![notes.clone()];
+    let harness_home = ensure_harness_home(cfg, &host.state_home)?;
+    if let Some((_, dir)) = &harness_home {
+        writable.push(dir.clone());
+    }
+    let mcp_dir = ensure_mcp_dir(&host.state_home)?;
+    writable.push(mcp_dir.clone());
+    writable.dedup();
+
+    // The masks (missing control and thegn dirs are created first, so a
+    // socket or dir made later is still hidden), then the refusal of an agent
+    // binary or thegn executable they would hide: a Lead whose `claude` or
+    // `thegn mcp serve` cannot start inside is refused here, never launched
+    // half-blind and never with a weaker plan.
+    prepare_masks(host, cfg)?;
+    let masks = mask_set(host, cfg)?;
+    let kept = reexposed_repos(&repo_roots, &masks.state_dirs);
+    let mut reexposed = writable.clone();
+    reexposed.extend(kept.iter().cloned());
+    let program = command
+        .split_whitespace()
+        .next()
+        .and_then(|word| (host.agent_program)(word));
+    for (what, path) in [
+        ("agent binary", program),
+        ("thegn executable", (host.current_exe)()),
+    ] {
+        let Some(path) = path else { continue };
+        if let Some((path, mask)) = hidden_binary(&path, &masks, &reexposed) {
+            bail!(
+                "the Lead's {what} {} is under {}, which the Lead sandbox hides; install it \
+                 elsewhere (for example ~/.local/bin)",
+                path.display(),
+                mask.display()
+            );
+        }
+    }
+
     // The isolated network's resolv.conf, written before the mint so a
     // failed write never leaves a live token behind.
     let resolv_conf = if network == LeadNetwork::Isolated {
@@ -276,6 +348,12 @@ fn launch_spec_with(
     let mut env: Vec<(String, String)> = eff.expanded_env();
     env.extend(mcp.env.iter().cloned());
     env.push(("THEGN_CALLER".to_string(), caller));
+    // Pushed after the agent env so it overrides any agent-env
+    // `CLAUDE_CONFIG_DIR`.
+    if let Some((var, dir)) = harness_home {
+        env.push((var, dir.to_string_lossy().into_owned()));
+    }
+    env.extend(mcp_dir_env(&mcp_dir));
 
     let mut cmd = command;
     for arg in &mcp.agent_args {
@@ -284,179 +362,13 @@ fn launch_spec_with(
     }
     let inner = thegn_core::shellinv::exec_argv(&thegn_core::util::shell(), &cmd);
 
-    // The mount plan.
-    let home = host
-        .home
-        .clone()
-        .context("the Lead needs $HOME to locate the credentials it hides")?;
-    // The harness home is private to the Lead, never the shared `~/.claude`
-    // (a hook or MCP entry written there would run unsandboxed in the next
-    // worker session). Pushed after the agent env so it overrides any
-    // agent-env `CLAUDE_CONFIG_DIR`.
-    // A harness with no credential home spec (pi) still relocates its state
-    // through `lead_sandbox::private_home_env`; aider writes into its cwd,
-    // the notes dir.
-    let mut writable = vec![notes.clone()];
-    if let Some(h) = thegn_core::harness::harness(&eff.harness)
-        && let Some(home_env) = h
-            .home()
-            .map(|s| s.home_env)
-            .filter(|e| !e.is_empty())
-            .or_else(|| lead_sandbox::private_home_env(h.id()))
-    {
-        let rel = Path::new("thegn")
-            .join(lead_sandbox::HARNESS_HOME_DIR)
-            .join(h.id());
-        let dir = thegn_core::fsperm::ensure_private_dir_beneath(&host.state_home, &rel)
-            .context("creating the Lead's private harness home")?;
-        let dir = std::fs::canonicalize(dir.path())
-            .context("resolving the Lead's private harness home")?;
-        env.push((home_env.to_string(), dir.to_string_lossy().into_owned()));
-        writable.push(dir);
-    }
-    writable.dedup();
-    // Parents first, so a dir already covered by a mask is neither created
-    // nor masked twice.
-    let mut control = (host.control_dirs)(cfg);
-    control.sort();
-    control.dedup();
-    let mut masked: Vec<PathBuf> = Vec::new();
-    for dir in control {
-        if masked.iter().any(|m| dir.starts_with(m)) {
-            continue;
-        }
-        if let Some(dir) = prepare_mask_dir(&dir)? {
-            masked.push(dir);
-        }
-    }
-    let mut masked_files = HOST_SOCKETS
-        .iter()
-        .map(PathBuf::from)
-        .filter(|p| std::fs::metadata(p).is_ok_and(|m| !m.is_dir()))
-        .collect::<Vec<_>>();
-    // Key files and forge tokens: the Lead never pushes, and the read-only
-    // root would otherwise expose them.
-    const HOME_CREDENTIALS: &[&str] = &[
-        ".ssh",
-        ".gnupg",
-        ".config/gh",
-        ".config/glab-cli",
-        ".git-credentials",
-        ".netrc",
-    ];
-    for c in HOME_CREDENTIALS {
-        let path = home.join(c);
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.is_dir() => {
-                let dir = std::fs::canonicalize(&path).unwrap_or(path);
-                if !masked.iter().any(|m| dir.starts_with(m)) {
-                    masked.push(dir);
-                }
-            }
-            Ok(_) => masked_files.push(path),
-            Err(_) => {}
-        }
-    }
-    // thegn's own state/data/cache dirs, its home, the legacy pre-rename
-    // dirs and the shared harness homes (THE-2221): canonical, parents
-    // first. thegn's own dirs are created when missing (a dir thegn creates
-    // later would otherwise show through the live root until the Lead
-    // restarts); the rest are masked only when present (a tmpfs needs a
-    // mount point under the read-only root). The notes dir, the private
-    // harness home and the MCP files are re-exposed after them (bwrap binds
-    // every source from the host root and creates the mount points inside
-    // the tmpfs).
-    let created_when_missing = [
-        host.state_home.join("thegn"),
-        host.data_home.join("thegn"),
-        host.cache_home.join("thegn"),
-        host.thegn_dir.clone(),
-    ];
-    let mut state_masked: Vec<PathBuf> = Vec::new();
-    let mut candidates = lead_sandbox::state_masks(
-        &host.state_home,
-        &host.data_home,
-        &host.cache_home,
-        &home,
-        &host.thegn_dir,
-    );
-    candidates.sort();
-    candidates.dedup();
-    for dir in candidates {
-        if !dir.is_absolute() || dir.starts_with("/tmp") {
-            continue;
-        }
-        if created_when_missing.contains(&dir) && std::fs::symlink_metadata(&dir).is_err() {
-            thegn_core::fsperm::ensure_private_dir(&dir)
-                .with_context(|| format!("creating {} to mask it from the Lead", dir.display()))?;
-        }
-        if !std::fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
-            continue;
-        }
-        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-        if state_masked.iter().any(|m| dir.starts_with(m)) {
-            continue;
-        }
-        state_masked.push(dir);
-    }
-    for file in lead_sandbox::state_masked_files(&home) {
-        if std::fs::metadata(&file).is_ok_and(|m| !m.is_dir()) {
-            masked_files.push(file);
-        }
-    }
-    // The config dir holds signing keys, secret files and backups that may
-    // carry old literal tokens: masked, with only `config.toml` re-exposed.
-    // `(source, in-sandbox path)`: a config.toml symlinked out of the dir
-    // (a store path) is bound back at its place inside the mask.
-    let mut config_reexposure: Option<(PathBuf, PathBuf)> = None;
-    if let Some(dir) = host.config_path.parent()
-        && std::fs::metadata(dir).is_ok_and(|m| m.is_dir())
-    {
-        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if !dir.starts_with("/tmp") && !state_masked.iter().any(|m| dir.starts_with(m)) {
-            state_masked.push(dir.clone());
-        }
-        if std::fs::metadata(&host.config_path).is_ok_and(|m| m.is_file())
-            && let (Ok(src), Some(name)) = (
-                std::fs::canonicalize(&host.config_path),
-                host.config_path.file_name(),
-            )
-        {
-            config_reexposure = Some((src, dir.join(name)));
-        }
-    }
-    // Files named by `file:` secret refs read as empty, at both the named
-    // path and its resolved target; `env:` refs of the push and inbox
-    // secrets are unset (both halves of a phone approval must stay out of
-    // the Lead's reach).
-    let mut unset_env: Vec<String> = Vec::new();
-    for field in thegn_core::secret_scan::secret_refs(cfg) {
-        if let thegn_core::secretref::SecretRef::File { path } = &field.reference {
-            hide_secret_file(path, &mut masked_files);
-        }
-    }
-    let push = &cfg.notifications.push;
-    let push_secrets = std::iter::once(&push.token)
-        .chain(std::iter::once(&push.inbox.inbox_secret))
-        .chain(push.sinks.iter().map(|sink| &sink.token));
-    for raw in push_secrets {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        match thegn_core::secretref::SecretRef::parse(raw, thegn_core::secretref::BareAs::Literal) {
-            thegn_core::secretref::SecretRef::Env { var } if !var.is_empty() => {
-                if !unset_env.contains(&var) {
-                    unset_env.push(var);
-                }
-            }
-            thegn_core::secretref::SecretRef::File { path } => {
-                hide_secret_file(&path, &mut masked_files);
-            }
-            _ => {}
-        }
-    }
-    masked_files.sort();
-    masked_files.dedup();
+    let MaskSet {
+        dirs: masked,
+        state_dirs: state_masked,
+        files: masked_files,
+        unset_env,
+        config_reexposure,
+    } = masks;
     let all_masks: Vec<PathBuf> = masked.iter().chain(&state_masked).cloned().collect();
     let mut readable = readable_under_masks(
         &mcp.readable,
@@ -468,25 +380,6 @@ fn launch_spec_with(
         Some((src, dst)) if src == dst => readable.push(src),
         Some(pair) => file_binds.push(pair),
         None => {}
-    }
-    // `thegn_dir()/worktrees` is the default worktree root: every registered
-    // repo beneath a state mask comes back read-only (never writable).
-    let mut reexposed_repos: Vec<PathBuf> = repo_roots
-        .iter()
-        .filter_map(|root| std::fs::canonicalize(root).ok())
-        .filter(|root| {
-            state_masked
-                .iter()
-                .any(|m| root.starts_with(m) && root != m)
-        })
-        .collect();
-    reexposed_repos.sort();
-    reexposed_repos.dedup();
-    let mut kept: Vec<PathBuf> = Vec::new();
-    for root in reexposed_repos {
-        if !kept.iter().any(|k| root.starts_with(k)) {
-            kept.push(root);
-        }
     }
     readable.extend(kept);
 
@@ -730,6 +623,362 @@ fn hide_secret_file(path: &str, masked_files: &mut Vec<PathBuf>) {
     masked_files.push(path);
 }
 
+/// The roots the Lead sandbox masks, for `thegn doctor` and `thegn lead
+/// login`: every masked dir and file on the real host. Read-only: a mask the
+/// launch would create is listed only once it exists.
+#[allow(dead_code, reason = "read by doctor (b161 lane 9)")]
+pub(crate) fn masked_roots(cfg: &Config) -> anyhow::Result<Vec<PathBuf>> {
+    Ok(mask_set(&host_paths(), cfg)?.roots())
+}
+
+/// Key files and forge tokens under `$HOME`: the Lead never pushes, and the
+/// read-only root would otherwise expose them.
+const HOME_CREDENTIALS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".config/gh",
+    ".config/glab-cli",
+    ".git-credentials",
+    ".netrc",
+    // The owner's mcp-remote OAuth tokens (the Lead has its own) and npm
+    // registry auth tokens (read by npx inside the Lead).
+    ".mcp-auth",
+    ".npmrc",
+];
+
+/// The private MCP dir beneath the harness homes (`lead-harness/mcp`): the
+/// hub's upstream caches and OAuth state, writable by the Lead only.
+const MCP_DIR_NAME: &str = "mcp";
+
+/// What the Lead sandbox hides, computed without touching the disk beyond
+/// metadata reads (the launch creates missing mount points first, in
+/// [`prepare_masks`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MaskSet {
+    /// Control-socket dirs and credential dirs (tmpfs).
+    pub dirs: Vec<PathBuf>,
+    /// thegn's state/data/cache dirs, its home, the shared harness homes and
+    /// the config dir (tmpfs; the private dirs are re-exposed beneath them).
+    pub state_dirs: Vec<PathBuf>,
+    /// Files bound to `/dev/null`.
+    pub files: Vec<PathBuf>,
+    /// Secret env vars unset inside.
+    pub unset_env: Vec<String>,
+    /// `(source, in-sandbox path)` of `config.toml` beneath the masked dir.
+    config_reexposure: Option<(PathBuf, PathBuf)>,
+}
+
+impl MaskSet {
+    /// Every masked dir and file.
+    pub(crate) fn roots(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self
+            .dirs
+            .iter()
+            .chain(&self.state_dirs)
+            .chain(&self.files)
+            .cloned()
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// The side-effecting half of the masks: a missing control dir, and thegn's
+/// own state/data/cache dirs and home, are created owner-only (a tmpfs needs a
+/// mount point under the read-only root, and a dir thegn creates later would
+/// otherwise show through until the Lead restarts). A control path that is
+/// not a directory is refused.
+fn prepare_masks(host: &LeadHost<'_>, cfg: &Config) -> anyhow::Result<()> {
+    let mut control = (host.control_dirs)(cfg);
+    control.sort();
+    control.dedup();
+    let mut prepared: Vec<PathBuf> = Vec::new();
+    for dir in control {
+        if prepared.iter().any(|m| dir.starts_with(m)) {
+            continue;
+        }
+        if let Some(dir) = prepare_mask_dir(&dir)? {
+            prepared.push(dir);
+        }
+    }
+    let Some(home) = host.home.as_deref() else {
+        return Ok(());
+    };
+    let candidates = lead_sandbox::state_masks(
+        &host.state_home,
+        &host.data_home,
+        &host.cache_home,
+        home,
+        &host.thegn_dir,
+    );
+    let created_when_missing = [
+        host.state_home.join("thegn"),
+        host.data_home.join("thegn"),
+        host.cache_home.join("thegn"),
+        host.thegn_dir.clone(),
+    ];
+    for dir in created_when_missing {
+        if !dir.is_absolute() || dir.starts_with("/tmp") || !candidates.contains(&dir) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&dir).is_err() {
+            thegn_core::fsperm::ensure_private_dir(&dir)
+                .with_context(|| format!("creating {} to mask it from the Lead", dir.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The mask set for `host`: control-socket dirs, host sockets, `$HOME`
+/// credentials, thegn's state/data/cache dirs and home, the shared harness
+/// homes, the config dir and the secret files. Canonical, parents first; only
+/// what exists is masked. The launch and [`masked_roots`] share it.
+fn mask_set(host: &LeadHost<'_>, cfg: &Config) -> anyhow::Result<MaskSet> {
+    let home = host
+        .home
+        .as_deref()
+        .context("the Lead needs $HOME to locate the credentials it hides")?;
+    let mut control = (host.control_dirs)(cfg);
+    control.sort();
+    control.dedup();
+    let mut masked: Vec<PathBuf> = Vec::new();
+    for dir in control {
+        if !dir.is_absolute() || dir.starts_with("/tmp") {
+            continue;
+        }
+        if masked.iter().any(|m| dir.starts_with(m)) {
+            continue;
+        }
+        if std::fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            masked.push(std::fs::canonicalize(&dir).unwrap_or(dir));
+        }
+    }
+    let mut masked_files = HOST_SOCKETS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| !m.is_dir()))
+        .collect::<Vec<_>>();
+    for c in HOME_CREDENTIALS {
+        let path = home.join(c);
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                let dir = std::fs::canonicalize(&path).unwrap_or(path);
+                if !masked.iter().any(|m| dir.starts_with(m)) {
+                    masked.push(dir);
+                }
+            }
+            Ok(_) => masked_files.push(path),
+            Err(_) => {}
+        }
+    }
+    // thegn's own state/data/cache dirs, its home, the legacy pre-rename
+    // dirs and the shared harness homes (THE-2221): canonical, parents
+    // first. The notes dir, the private harness home, the MCP dir and the MCP
+    // files are re-exposed after them (bwrap binds every source from the host
+    // root and creates the mount points inside the tmpfs).
+    let mut state_masked: Vec<PathBuf> = Vec::new();
+    let mut candidates = lead_sandbox::state_masks(
+        &host.state_home,
+        &host.data_home,
+        &host.cache_home,
+        home,
+        &host.thegn_dir,
+    );
+    candidates.sort();
+    candidates.dedup();
+    for dir in candidates {
+        if !dir.is_absolute() || dir.starts_with("/tmp") {
+            continue;
+        }
+        if !std::fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        if state_masked.iter().any(|m| dir.starts_with(m)) {
+            continue;
+        }
+        state_masked.push(dir);
+    }
+    for file in lead_sandbox::state_masked_files(home) {
+        if std::fs::metadata(&file).is_ok_and(|m| !m.is_dir()) {
+            masked_files.push(file);
+        }
+    }
+    // The config dir holds signing keys, secret files and backups that may
+    // carry old literal tokens: masked, with only `config.toml` re-exposed.
+    // `(source, in-sandbox path)`: a config.toml symlinked out of the dir
+    // (a store path) is bound back at its place inside the mask.
+    let mut config_reexposure: Option<(PathBuf, PathBuf)> = None;
+    if let Some(dir) = host.config_path.parent()
+        && std::fs::metadata(dir).is_ok_and(|m| m.is_dir())
+    {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if !dir.starts_with("/tmp") && !state_masked.iter().any(|m| dir.starts_with(m)) {
+            state_masked.push(dir.clone());
+        }
+        if std::fs::metadata(&host.config_path).is_ok_and(|m| m.is_file())
+            && let (Ok(src), Some(name)) = (
+                std::fs::canonicalize(&host.config_path),
+                host.config_path.file_name(),
+            )
+        {
+            config_reexposure = Some((src, dir.join(name)));
+        }
+    }
+    // Files named by `file:` secret refs read as empty, at both the named
+    // path and its resolved target; `env:` refs of the push and inbox
+    // secrets are unset (both halves of a phone approval must stay out of
+    // the Lead's reach).
+    let mut unset_env: Vec<String> = Vec::new();
+    for field in thegn_core::secret_scan::secret_refs(cfg) {
+        if let thegn_core::secretref::SecretRef::File { path } = &field.reference {
+            hide_secret_file(path, &mut masked_files);
+        }
+    }
+    let push = &cfg.notifications.push;
+    let push_secrets = std::iter::once(&push.token)
+        .chain(std::iter::once(&push.inbox.inbox_secret))
+        .chain(push.sinks.iter().map(|sink| &sink.token));
+    for raw in push_secrets {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        match thegn_core::secretref::SecretRef::parse(raw, thegn_core::secretref::BareAs::Literal) {
+            thegn_core::secretref::SecretRef::Env { var } if !var.is_empty() => {
+                if !unset_env.contains(&var) {
+                    unset_env.push(var);
+                }
+            }
+            thegn_core::secretref::SecretRef::File { path } => {
+                hide_secret_file(&path, &mut masked_files);
+            }
+            _ => {}
+        }
+    }
+    masked_files.sort();
+    masked_files.dedup();
+    Ok(MaskSet {
+        dirs: masked,
+        state_dirs: state_masked,
+        files: masked_files,
+        unset_env,
+        config_reexposure,
+    })
+}
+
+/// `thegn_dir()/worktrees` is the default worktree root: every registered
+/// repo beneath a state mask comes back read-only (never writable). Outermost
+/// only.
+fn reexposed_repos(repo_roots: &[PathBuf], state_masked: &[PathBuf]) -> Vec<PathBuf> {
+    let mut repos: Vec<PathBuf> = repo_roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .filter(|root| {
+            state_masked
+                .iter()
+                .any(|m| root.starts_with(m) && root != m)
+        })
+        .collect();
+    repos.sort();
+    repos.dedup();
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for root in repos {
+        if !kept.iter().any(|k| root.starts_with(k)) {
+            kept.push(root);
+        }
+    }
+    kept
+}
+
+/// `path` (canonicalized) and the mask hiding it, when a mask covers it and no
+/// re-exposed path brings it back.
+fn hidden_binary(
+    path: &Path,
+    masks: &MaskSet,
+    reexposed: &[PathBuf],
+) -> Option<(PathBuf, PathBuf)> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if reexposed.iter().any(|r| path.starts_with(r)) {
+        return None;
+    }
+    let mask = masks.roots().into_iter().find(|m| path.starts_with(m))?;
+    Some((path, mask))
+}
+
+/// The harness-home env var and the dir (relative to `$XDG_STATE_HOME`) of
+/// `harness`'s private Lead home, when the harness has one.
+fn harness_home_spec(harness: &str) -> Option<(&'static str, PathBuf)> {
+    let h = thegn_core::harness::harness(harness)?;
+    let var = h
+        .home()
+        .map(|s| s.home_env)
+        .filter(|e| !e.is_empty())
+        .or_else(|| lead_sandbox::private_home_env(h.id()))?;
+    let rel = Path::new("thegn")
+        .join(lead_sandbox::HARNESS_HOME_DIR)
+        .join(h.id());
+    Some((var, rel))
+}
+
+/// The env var and dir of the configured Lead agent's private harness home
+/// beneath `state_home` (not created). `thegn lead login` and the launch
+/// point the agent at the same place.
+pub(crate) fn harness_home_env(cfg: &Config, state_home: &Path) -> Option<(String, PathBuf)> {
+    let lead = cfg.lead.as_ref()?;
+    let eff = thegn_core::agent_task::effective_agent(cfg, &lead.agent, None).ok()?;
+    let (var, rel) = harness_home_spec(&eff.harness)?;
+    Some((var.to_string(), state_home.join(rel)))
+}
+
+/// Create (owner-only) and resolve the configured Lead agent's private
+/// harness home ([`harness_home_env`]) beneath `state_home`: `(env var,
+/// canonical dir)`, or `None` for a harness with no home to relocate. The
+/// launch and `thegn lead login` both go through here.
+pub(crate) fn ensure_harness_home(
+    cfg: &Config,
+    state_home: &Path,
+) -> anyhow::Result<Option<(String, PathBuf)>> {
+    let Some((var, dir)) = harness_home_env(cfg, state_home) else {
+        return Ok(None);
+    };
+    let rel = dir
+        .strip_prefix(state_home)
+        .context("the Lead's private harness home is outside $XDG_STATE_HOME")?;
+    let dir = thegn_core::fsperm::ensure_private_dir_beneath(state_home, rel)
+        .context("creating the Lead's private harness home")?;
+    let dir =
+        std::fs::canonicalize(dir.path()).context("resolving the Lead's private harness home")?;
+    Ok(Some((var, dir)))
+}
+
+/// Create (owner-only) and resolve the Lead's private MCP dir,
+/// `$XDG_STATE_HOME/thegn/lead-harness/mcp`.
+pub(crate) fn ensure_mcp_dir(state_home: &Path) -> anyhow::Result<PathBuf> {
+    let rel = Path::new("thegn")
+        .join(lead_sandbox::HARNESS_HOME_DIR)
+        .join(MCP_DIR_NAME);
+    let dir = thegn_core::fsperm::ensure_private_dir_beneath(state_home, &rel)
+        .context("creating the Lead's private MCP dir")?;
+    std::fs::canonicalize(dir.path()).context("resolving the Lead's private MCP dir")
+}
+
+/// The env pointing the MCP servers' package caches and OAuth state at the
+/// private MCP dir `dir`.
+pub(crate) fn mcp_dir_env(dir: &Path) -> Vec<(String, String)> {
+    let at = |sub: &str| dir.join(sub).to_string_lossy().into_owned();
+    vec![
+        ("npm_config_cache".to_string(), at("npm")),
+        ("UV_CACHE_DIR".to_string(), at("uv")),
+        ("BUN_INSTALL_CACHE_DIR".to_string(), at("bun")),
+        ("MCP_REMOTE_CONFIG_DIR".to_string(), at("mcp-auth")),
+        (
+            "THEGN_LEAD_MCP_HOME".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ),
+    ]
+}
+
 /// Every control-socket location: the daemon socket dir, the state run dir,
 /// the parent of every control-socket candidate, and `$XDG_RUNTIME_DIR` as a
 /// whole (it also holds the user bus and the podman/systemd sockets).
@@ -826,6 +1075,9 @@ mod tests {
         pasta: bool,
         /// The Lead listener address the injected MCP plan reports.
         listener: Option<std::net::SocketAddr>,
+        /// What the injected `PATH` lookup and `current_exe` answer.
+        program: Option<PathBuf>,
+        exe: Option<PathBuf>,
     }
 
     fn fixture() -> Fixture {
@@ -854,6 +1106,8 @@ mod tests {
             cfg,
             pasta: true,
             listener: None,
+            program: None,
+            exe: None,
         }
     }
 
@@ -903,6 +1157,10 @@ mod tests {
                     ..Default::default()
                 })
             };
+        let program = fx.program.clone();
+        let agent_program = move |_: &str| program.clone();
+        let exe = fx.exe.clone();
+        let current_exe = move || exe.clone();
         launch_spec_with(
             &fx.cfg,
             mode,
@@ -919,6 +1177,8 @@ mod tests {
                 home: Some(fx.root.join("home")),
                 thegn_dir: fx.root.join("thegn-home"),
                 config_path: fx.root.join("config/thegn/config.toml"),
+                agent_program: &agent_program,
+                current_exe: &current_exe,
             },
         )
     }
@@ -1491,6 +1751,188 @@ mod tests {
         let file = tmp.path().join("f");
         std::fs::write(&file, "").unwrap();
         assert!(prepare_mask_dir(&file).is_err());
+    }
+
+    /// The fixture's mask set, without a launch.
+    fn fixture_masks(fx: &Fixture, control: Vec<PathBuf>) -> MaskSet {
+        let no = || false;
+        let roots = || -> anyhow::Result<Vec<PathBuf>> { Ok(Vec::new()) };
+        let dirs = move |_: &Config| control.clone();
+        let mcp =
+            |_: &Config, _: &Path, _: &str| -> anyhow::Result<crate::lead::mcp::LeadMcpPlan> {
+                panic!("the mask set mints nothing")
+            };
+        let none = |_: &str| -> Option<PathBuf> { None };
+        let no_exe = || -> Option<PathBuf> { None };
+        mask_set(
+            &LeadHost {
+                bwrap_available: &no,
+                pasta_available: &no,
+                repo_roots: &roots,
+                control_dirs: &dirs,
+                mcp: &mcp,
+                daemon_owned: false,
+                state_home: fx.root.join("state"),
+                data_home: fx.root.join("data"),
+                cache_home: fx.root.join("cache"),
+                home: Some(fx.root.join("home")),
+                thegn_dir: fx.root.join("thegn-home"),
+                config_path: fx.root.join("config/thegn/config.toml"),
+                agent_program: &none,
+                current_exe: &no_exe,
+            },
+            &fx.cfg,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mask_set_covers_state_data_cache_thegn_dir_harness_homes_and_credentials() {
+        let fx = fixture();
+        let home = fx.root.join("home");
+        for dir in [
+            "state/thegn",
+            "data/thegn",
+            "cache/thegn",
+            "thegn-home",
+            "home/.claude",
+            "home/.ssh",
+            "home/.mcp-auth",
+            "run-sock",
+        ] {
+            std::fs::create_dir_all(fx.root.join(dir)).unwrap();
+        }
+        std::fs::write(home.join(".netrc"), "machine x").unwrap();
+        std::fs::write(home.join(".npmrc"), "//registry/:_authToken=x").unwrap();
+        let masks = fixture_masks(&fx, vec![fx.root.join("run-sock")]);
+        for dir in [
+            "state/thegn",
+            "data/thegn",
+            "cache/thegn",
+            "thegn-home",
+            "home/.claude",
+        ] {
+            assert!(
+                masks.state_dirs.contains(&fx.root.join(dir)),
+                "{dir}: {masks:?}"
+            );
+        }
+        assert!(masks.dirs.contains(&home.join(".ssh")), "{masks:?}");
+        assert!(masks.dirs.contains(&fx.root.join("run-sock")));
+        assert!(masks.files.contains(&home.join(".netrc")));
+        assert!(masks.dirs.contains(&home.join(".mcp-auth")), "{masks:?}");
+        assert!(masks.files.contains(&home.join(".npmrc")), "{masks:?}");
+        let roots = masks.roots();
+        for p in [
+            home.join(".ssh"),
+            home.join(".netrc"),
+            fx.root.join("thegn-home"),
+        ] {
+            assert!(roots.contains(&p), "{}", p.display());
+        }
+        // Read-only: a missing mount point is neither created nor listed.
+        assert!(!home.join(".codex").exists());
+        assert!(!roots.contains(&home.join(".codex")));
+    }
+
+    #[test]
+    fn launch_refuses_an_agent_binary_under_the_masked_claude_home() {
+        let mut fx = fixture();
+        let local = fx.root.join("home/.claude/local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("claude"), "").unwrap();
+        fx.program = Some(local.join("claude"));
+        let err = run(&fx, true, vec![], vec![]).unwrap_err().to_string();
+        assert!(err.starts_with("the Lead's agent binary "), "{err}");
+        assert!(
+            err.contains(&format!(
+                "is under {}, which the Lead sandbox hides",
+                fx.root.join("home/.claude").display()
+            )),
+            "{err}"
+        );
+        assert!(err.contains("~/.local/bin"), "{err}");
+    }
+
+    #[test]
+    fn launch_refuses_a_thegn_executable_under_the_masked_thegn_home() {
+        let mut fx = fixture();
+        let bin = fx.root.join("thegn-home/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("thegn"), "").unwrap();
+        fx.exe = Some(bin.join("thegn"));
+        let err = run(&fx, true, vec![], vec![]).unwrap_err().to_string();
+        assert!(err.starts_with("the Lead's thegn executable "), "{err}");
+        assert!(
+            err.contains(&fx.root.join("thegn-home").display().to_string()),
+            "{err}"
+        );
+        // A thegn built inside a registered worktree beneath the mask comes
+        // back read-only: allowed.
+        let repo = fx.root.join("thegn-home/worktrees/r");
+        let built = repo.join("target/debug");
+        std::fs::create_dir_all(&built).unwrap();
+        std::fs::write(built.join("thegn"), "").unwrap();
+        fx.exe = Some(built.join("thegn"));
+        assert!(run(&fx, true, vec![repo], vec![]).is_ok());
+        // Anything outside the masks is fine.
+        let elsewhere = fx.root.join("bin");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("thegn"), "").unwrap();
+        fx.exe = Some(elsewhere.join("thegn"));
+        fx.program = Some(elsewhere.join("thegn"));
+        assert!(run(&fx, true, vec![], vec![]).is_ok());
+    }
+
+    #[test]
+    fn the_private_mcp_dir_is_writable_and_its_env_is_set() {
+        let fx = fixture();
+        let spec = run(&fx, true, vec![], vec![]).unwrap();
+        let dir = fx.root.join("state/thegn/lead-harness/mcp");
+        assert!(dir.is_dir());
+        let dir_s = dir.display().to_string();
+        assert!(
+            has(&spec.argv, &["--bind", &dir_s, &dir_s]),
+            "{:?}",
+            spec.argv
+        );
+        let env = |k: &str| {
+            spec.env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(env("THEGN_LEAD_MCP_HOME"), Some(dir_s.clone()));
+        for (k, sub) in [
+            ("npm_config_cache", "npm"),
+            ("UV_CACHE_DIR", "uv"),
+            ("BUN_INSTALL_CACHE_DIR", "bun"),
+            ("MCP_REMOTE_CONFIG_DIR", "mcp-auth"),
+        ] {
+            assert_eq!(env(k), Some(dir.join(sub).display().to_string()), "{k}");
+        }
+        assert_eq!(mcp_dir_env(&dir).len(), 5);
+    }
+
+    #[test]
+    fn harness_home_env_matches_the_launch_and_the_login() {
+        for command in ["claude", "pi"] {
+            let mut fx = fixture();
+            set_agent(
+                &mut fx,
+                &format!("name = \"lead-agent\"\ncommand = \"{command}\""),
+            );
+            let state = fx.root.join("state");
+            let (var, dir) = harness_home_env(&fx.cfg, &state).expect(command);
+            let spec = run(&fx, true, vec![], vec![]).unwrap();
+            let dir_s = dir.display().to_string();
+            assert!(
+                spec.env.iter().any(|(k, v)| *k == var && *v == dir_s),
+                "{command}: {:?}",
+                spec.env
+            );
+        }
     }
 
     #[test]

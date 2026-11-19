@@ -238,8 +238,7 @@ fn collect_repo(health: &mut ConfigHealth, discovery: &RepoOverlayDiscovery) {
 fn active_profile_path() -> Option<PathBuf> {
     let profile = thegn_core::profile::active();
     (!profile.is_default()).then(|| {
-        thegn_core::util::xdg_config_home()
-            .join("thegn")
+        thegn_core::util::thegn_config_dir()
             .join("profiles")
             .join(profile.name)
             .join("config.toml")

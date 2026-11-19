@@ -172,6 +172,30 @@ fn selected_profile_without_an_overlay_file_is_an_empty_layer() {
 }
 
 #[test]
+fn absolute_thegn_config_dir_moves_the_base_and_profile_sources() {
+    let dir = std::env::temp_dir().join("thegn-capture-config-dir");
+    let dir_str = dir.to_str().expect("temp dir is UTF-8").to_string();
+    let captured = seed(
+        &[
+            (thegn_core::util::THEGN_CONFIG_DIR_ENV, dir_str.as_str()),
+            ("THEGN_PROFILE", "work"),
+        ],
+        &[],
+    );
+    assert_eq!(captured.base.path, dir.join("config.toml"));
+    assert_eq!(
+        captured.profile.as_ref().map(|source| source.path.clone()),
+        Some(dir.join("profiles").join("work").join("config.toml"))
+    );
+
+    let default_base = seed(&[], &[]).base.path;
+    for ignored in ["relative/config", ""] {
+        let captured = seed(&[(thegn_core::util::THEGN_CONFIG_DIR_ENV, ignored)], &[]);
+        assert_eq!(captured.base.path, default_base, "{ignored:?} is ignored");
+    }
+}
+
+#[test]
 fn selected_empty_profile_is_distinct_from_missing_and_reaches_admission() {
     let captured = seed(&[("THEGN_PROFILE", "work")], &[]);
     let mut sources = Sources::empty();

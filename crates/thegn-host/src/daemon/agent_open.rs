@@ -320,6 +320,16 @@ fn resolve_inner(
     let (key, value) = caller_env(agent);
     spec.env.retain(|(existing, _)| existing != &key);
     spec.env.push((key, value));
+    // Keep-awake for headless sprite work (THE-2052): the host-side
+    // `sprite-exec` reads this and wraps the remote command in the in-sprite
+    // heartbeat. Interactive launches get nothing: an idle open pane must not
+    // bill. The value never reaches the sprite's own exec env.
+    if let Some((key, value)) = sprite_hold_env(cfg, autonomous, &spec, || {
+        effective_env_name(cfg, db, &worktree)
+    }) {
+        spec.env.retain(|(existing, _)| existing != &key);
+        spec.env.push((key, value));
+    }
     // The launch is committed: the daemon-owned session outlives this call, so
     // the prompt file stays until the age sweep in `prompt_file_dir` removes it.
     // Any refusal above dropped the still-armed file instead.
@@ -338,6 +348,61 @@ fn resolve_inner(
     }
 
     Ok(spec)
+}
+
+/// `(THEGN_SPRITE_HOLD_SECS, ceiling)` for an `autonomous` (headless or
+/// staged) launch that really runs remote (not degraded to the host) on a
+/// sprites provider env; the ceiling is the env's `max_lifetime_secs`, else
+/// the 4 h default. `env_name` is resolved only when the rest applies.
+fn sprite_hold_env(
+    cfg: &Config,
+    autonomous: bool,
+    spec: &LaunchSpec,
+    env_name: impl FnOnce() -> Option<String>,
+) -> Option<(String, String)> {
+    use thegn_core::config::PlacementMode;
+    use thegn_core::config_env_tables::EnvProviderKind;
+    use thegn_core::sprite_hold::{HOLD_ENV, ceiling_secs};
+    if !autonomous || !spec.remote || spec.degraded {
+        return None;
+    }
+    let envc = cfg.env.get(&env_name()?)?;
+    let sprites = matches!(envc.placement, PlacementMode::Provider)
+        && matches!(
+            EnvProviderKind::of(&envc.provider.provider),
+            EnvProviderKind::Sprites
+        );
+    sprites.then(|| {
+        (
+            HOLD_ENV.to_owned(),
+            ceiling_secs(None, envc.provider.max_lifetime_secs).to_string(),
+        )
+    })
+}
+
+/// The worktree's effective execution env name, by the same resolution the
+/// launch uses. Best-effort: `None` (no hold) when it cannot be read or the
+/// selection did not resolve to a remote `[env.<name>]`.
+fn effective_env_name(cfg: &Config, db: &Db, worktree: &str) -> Option<String> {
+    let path = std::path::Path::new(worktree);
+    let location = thegn_core::remote::GitLoc::for_worktree_op(path, "sprite keep-awake")
+        .inspect_err(|error| {
+            tracing::debug!(target: "thegn::sprites", %error, "keep-awake: worktree location unreadable; no hold");
+        })
+        .ok()?;
+    let repo_root = thegn_core::db::retry_transient(|| db.repo_root_for(worktree))
+        .ok()
+        .flatten()
+        .filter(|root| !root.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(path))
+        .unwrap_or_else(|| path.to_path_buf());
+    let selected = thegn_core::db::retry_transient(|| {
+        db.effective_env_selection(worktree, &repo_root.to_string_lossy())
+    })
+    .ok()?;
+    let environment = cfg.resolve_env(&repo_root, &location, path, &selected);
+    (!environment.unresolved_selection && environment.is_remote()).then_some(environment.name)
 }
 
 /// `THEGN_CALLER=agent:<name>` for a daemon-launched agent, sanitized
@@ -1920,5 +1985,88 @@ mod tests {
             copy.len()
         );
         assert!(copy.contains("task data omitted"));
+    }
+
+    fn hold_cfg() -> Config {
+        use thegn_core::config::{EnvConfig, PlacementMode};
+        let mut cfg = Config::default();
+        let env = |placement, provider: &str, lifetime| {
+            let mut env = EnvConfig {
+                placement,
+                ..EnvConfig::default()
+            };
+            env.provider.provider = provider.into();
+            env.provider.max_lifetime_secs = lifetime;
+            env
+        };
+        cfg.env
+            .insert("spr".into(), env(PlacementMode::Provider, "sprites", 0));
+        cfg.env.insert(
+            "spr-1h".into(),
+            env(PlacementMode::Provider, "sprites", 3600),
+        );
+        cfg.env
+            .insert("vercel".into(), env(PlacementMode::Provider, "vercel", 0));
+        cfg.env
+            .insert("ssh".into(), env(PlacementMode::Ssh, "sprites", 0));
+        cfg
+    }
+
+    fn launched(remote: bool, degraded: bool) -> LaunchSpec {
+        LaunchSpec {
+            argv: vec!["thegn".into(), "sprite-exec".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "provider".into(),
+            warnings: Vec::new(),
+            degraded,
+            remote,
+        }
+    }
+
+    fn hold(env: &str, autonomous: bool, remote: bool, degraded: bool) -> Option<(String, String)> {
+        sprite_hold_env(&hold_cfg(), autonomous, &launched(remote, degraded), || {
+            Some(env.to_owned())
+        })
+    }
+
+    #[test]
+    fn headless_or_staged_sprite_launches_carry_the_hold_ceiling() {
+        use thegn_core::sprite_hold::{HOLD_DEFAULT_CEILING_SECS, HOLD_ENV};
+        assert_eq!(
+            hold("spr", true, true, false),
+            Some((HOLD_ENV.to_owned(), HOLD_DEFAULT_CEILING_SECS.to_string()))
+        );
+        assert_eq!(
+            hold("spr-1h", true, true, false),
+            Some((HOLD_ENV.to_owned(), "3600".to_owned()))
+        );
+    }
+
+    #[test]
+    fn interactive_degraded_or_non_sprite_launches_get_no_hold() {
+        assert_eq!(hold("spr", false, true, false), None, "interactive");
+        assert_eq!(hold("spr", true, false, false), None, "ran locally");
+        assert_eq!(hold("spr", true, true, true), None, "degraded to the host");
+        assert_eq!(hold("vercel", true, true, false), None, "not sprites");
+        assert_eq!(
+            hold("ssh", true, true, false),
+            None,
+            "not a provider placement"
+        );
+        assert_eq!(hold("missing", true, true, false), None, "unknown env");
+        let none = sprite_hold_env(&hold_cfg(), true, &launched(true, false), || None);
+        assert_eq!(none, None, "unresolvable env");
+    }
+
+    #[test]
+    fn an_interactive_launch_never_resolves_the_env() {
+        let resolved = std::cell::Cell::new(false);
+        let out = sprite_hold_env(&hold_cfg(), false, &launched(true, false), || {
+            resolved.set(true);
+            Some("spr".to_owned())
+        });
+        assert_eq!(out, None);
+        assert!(!resolved.get(), "the DB/env resolution must not run");
     }
 }

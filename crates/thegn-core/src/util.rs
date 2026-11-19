@@ -65,6 +65,48 @@ pub fn xdg_state_home() -> PathBuf {
     xdg_state_home_for(host_os(), &env_os)
 }
 
+/// Environment variable that relocates thegn's own config directory.
+pub const THEGN_CONFIG_DIR_ENV: &str = "THEGN_CONFIG_DIR";
+
+/// Pure form of [`thegn_config_dir`]: `THEGN_CONFIG_DIR` when it is a
+/// non-empty absolute path, otherwise `<config home>/thegn`.
+pub fn thegn_config_dir_for(os: HostOs, env: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+    env(THEGN_CONFIG_DIR_ENV)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| xdg_config_home_for(os, env).join("thegn"))
+}
+
+/// The `THEGN_CONFIG_DIR` value [`thegn_config_dir_for`] ignores because it
+/// is relative (an empty value is ignored silently, so it is not returned).
+pub fn ignored_thegn_config_dir_for(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env(THEGN_CONFIG_DIR_ENV)
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty() && !dir.is_absolute())
+}
+
+/// thegn's own config directory: the one that holds `config.toml`, `themes/`,
+/// `plugins/`, `secrets/` and `profiles/`. Defaults to `<config home>/thegn`.
+///
+/// `THEGN_CONFIG_DIR` (an absolute path) moves it, so a second instance (a dev
+/// build beside the stable one) can keep its own config without changing
+/// `XDG_CONFIG_HOME`, which would also move git and terminal-emulator config
+/// for the whole process tree. Pair it with `XDG_STATE_HOME`,
+/// `XDG_RUNTIME_DIR` and `THEGN_DIR` to separate the instance completely. A
+/// relative or empty value is ignored; a relative one logs a warning once.
+pub fn thegn_config_dir() -> PathBuf {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if let Some(ignored) = ignored_thegn_config_dir_for(&env_os)
+        && !WARNED.swap(true, Ordering::Relaxed)
+    {
+        tracing::warn!(
+            value = %ignored.display(),
+            "{THEGN_CONFIG_DIR_ENV} is not an absolute path; ignoring it"
+        );
+    }
+    thegn_config_dir_for(host_os(), &env_os)
+}
+
 /// thegn's own home — config, worktrees, cache, activity all live under here
 /// (`~/.thegn`). `THEGN_DIR` relocates it so a dev/test instance can run on
 /// a fully separate root (its own cache, config and worktrees) without touching
@@ -2218,6 +2260,78 @@ mod tests {
         assert_eq!(home(), home_for(host_os(), &env_os));
         assert_eq!(xdg_config_home(), xdg_config_home_for(host_os(), &env_os));
         assert_eq!(xdg_state_home(), xdg_state_home_for(host_os(), &env_os));
+        assert_eq!(thegn_config_dir(), thegn_config_dir_for(host_os(), &env_os));
+    }
+
+    #[test]
+    fn thegn_config_dir_for_honours_only_absolute_overrides() {
+        let absolute = std::env::temp_dir().join("thegn-dev-config");
+        let absolute_os = absolute.clone().into_os_string();
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows, HostOs::Other] {
+            let base = |key: &str| match key {
+                "HOME" => Some(OsString::from("/home/test")),
+                "USERPROFILE" => Some(OsString::from("C:/Users/test")),
+                "XDG_CONFIG_HOME" => Some(OsString::from("/cfg")),
+                "APPDATA" => Some(OsString::from("C:/roaming")),
+                _ => None,
+            };
+            let default = xdg_config_home_for(os, &base).join("thegn");
+            assert_eq!(thegn_config_dir_for(os, &base), default);
+            assert_eq!(ignored_thegn_config_dir_for(&base), None);
+
+            let set = |key: &str| {
+                if key == THEGN_CONFIG_DIR_ENV {
+                    Some(absolute_os.clone())
+                } else {
+                    base(key)
+                }
+            };
+            assert_eq!(thegn_config_dir_for(os, &set), absolute);
+            assert_eq!(ignored_thegn_config_dir_for(&set), None);
+
+            let relative = |key: &str| {
+                if key == THEGN_CONFIG_DIR_ENV {
+                    Some(OsString::from("dev/config"))
+                } else {
+                    base(key)
+                }
+            };
+            assert_eq!(thegn_config_dir_for(os, &relative), default);
+            assert_eq!(
+                ignored_thegn_config_dir_for(&relative),
+                Some(PathBuf::from("dev/config"))
+            );
+
+            let empty = |key: &str| {
+                if key == THEGN_CONFIG_DIR_ENV {
+                    Some(OsString::new())
+                } else {
+                    base(key)
+                }
+            };
+            assert_eq!(thegn_config_dir_for(os, &empty), default);
+            assert_eq!(ignored_thegn_config_dir_for(&empty), None);
+        }
+        let windows = |key: &str| (key == "APPDATA").then(|| OsString::from("C:/roaming"));
+        assert_eq!(
+            thegn_config_dir_for(HostOs::Windows, &windows),
+            PathBuf::from("C:/roaming").join("thegn")
+        );
+    }
+
+    #[test]
+    fn thegn_config_dir_wrapper_reads_the_environment() {
+        let absolute = std::env::temp_dir().join("thegn-wrapper-config");
+        let absolute_str = absolute.to_str().expect("temp dir is UTF-8").to_string();
+        {
+            let _env =
+                crate::testenv::EnvGuard::set(&[(THEGN_CONFIG_DIR_ENV, absolute_str.as_str())]);
+            assert_eq!(thegn_config_dir(), absolute);
+        }
+        let _env = crate::testenv::EnvGuard::set(&[(THEGN_CONFIG_DIR_ENV, "relative/config")]);
+        assert_eq!(thegn_config_dir(), xdg_config_home().join("thegn"));
+        // The warning fires once; a second call takes the already-warned path.
+        assert_eq!(thegn_config_dir(), xdg_config_home().join("thegn"));
     }
 
     #[test]

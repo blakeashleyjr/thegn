@@ -159,6 +159,132 @@ inside the sandbox before each agent or shell pane starts. Use it for
 per-pane/container setup; use lifecycle hooks for host-side worktree setup,
 teardown, or session edges.
 
+## Sprites
+
+A sprites env (`provider = "sprites"`, `placement = "provider"`) is paid, so
+thegn is strict about what it creates and deletes. Nothing in this section has
+been verified live against the real Sprites API yet.
+
+- **Ledger before create.** thegn writes a `creating` record to its local
+  ledger before it asks Sprites to create a sprite, and `ready` after. thegn
+  deletes a sprite only when this host recorded it. Sprites that existed
+  before this release, or that were made outside thegn, are never deleted by
+  thegn; remove those with the Sprites CLI or dashboard.
+- **Unrecorded sprites.** `thegn env reap --provider sprites [--apply] [--yes] [--json]`
+  lists orphans, sprites past `max_lifetime_secs` (age from the API
+  `created_at`) and sprites "not recorded by this host". It is a dry run by
+  default. `--apply` destroys only recorded sprites past their lifetime, and
+  removes ledger records whose sprite is gone. It spares records younger than
+  60 seconds, skips unrecorded sprites, and refuses on a partial listing. There is
+  no background reaper unless you opt in with `lifetime_reap` (below).
+  `thegn env down --all` keeps its prompt, destroys only recorded sprites, and
+  says how many it skipped.
+- **No background creates.** `eager = "workspace"` or `"all"` never creates a
+  sprite for an unfocused worktree. The focused worktree still provisions when
+  you focus it.
+- **Keep-awake.** Headless work on a sprite (`thegn agent run`, a headless
+  `session open`, stage launches, or `thegn sprite-exec --hold <dur>`) runs
+  inside a small `sh` heartbeat that holds the sprite awake. It registers a task
+  `thegn-hold-<16 hex>` with a 5 minute expiry, refreshes it every 60 seconds,
+  deletes it when the command exits, and stops at a ceiling: `max_lifetime_secs`
+  when set, else 4 hours (`--hold` is capped at 24 hours). Ctrl-C stops the
+  command too. Interactive panes get no hold, so an idle open pane does not
+  bill. After a crash the worst case is the ceiling plus 5 minutes. If `curl` or
+  the socket is missing in the VM, one line is printed and the command runs
+  unheld.
+- **Size.** Sprites have a fixed 8 vCPU; `size`, `min_vcpu`, `gpu` and `nvme`
+  are ignored and validate warns. `min_ram_gb > 0` sets the sprite's memory
+  limit to `min_ram_gb * 1024` MB (no autoscale) after create and again at each
+  provision, with a readback.
+- **Instance cap.** `max_instances` applies through the ledger; `0` (the
+  default for sprites) means no cap.
+- **Cost.** `thegn fleet cost` shows a Sprites block with CPU hours and
+  reserved GB-hours per recorded sprite, read from the Sprites usage API only
+  when you run that verb. It is priced only when `[placement.price]` has a
+  `sprites` entry; otherwise it is labelled "usage from the Sprites API;
+  unpriced".
+- **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
+  also runs `env pull` after the agent exits and reports it in text and `--json`.
+
+### Adopt, the daily loop and release
+
+Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
+
+- **Adopt.** `thegn env adopt <sprite> --env <S> [--yes] [--json]` records a
+  sprite you made elsewhere so thegn may manage it. It reads the sprite (a 404
+  refuses) and prints its name, status, API `created_at`, this host's
+  controller id and the account fingerprint, then says thegn will be able to
+  destroy it on `env down`, `env reap`, `land`, worktree delete and the opt-in
+  reaper, and that it counts toward `max_instances`. On a tty you type the
+  sprite name back; with no tty you need `--yes`. It writes a `ready` record
+  with `created_at` set to now, so lifetime counts from adoption. It refuses a
+  record owned by another controller, account or provider, refuses when
+  `max_instances` is reached, and says "already recorded" if the sprite is
+  already yours. It never touches the sprite itself.
+- **Daily loop.** `thegn agent run --wait --pull` runs the agent, pulls the
+  commits back and, on a Fly or machine0 env that bills while started,
+  stops the machine and prints `stopped <name> (it bills while started)`.
+  `--keep-running` (needs `--wait`) skips the stop. Sprites and Vercel
+  self-suspend and are untouched. A stop is skipped while another live session
+  is bound to the worktree. Pulls of one worktree are serialised across
+  processes by a lock; a second caller waits up to 120 seconds, then reports
+  `up to date` or "another pull of <worktree> is running".
+- **Land.** `thegn land` on a provider worktree first pulls the sandbox's
+  branch, then lands the local branch. A diverged or dirty pull refuses and
+  names the kept ref; a missing sandbox lands the local branch. The sandbox is
+  kept, because it holds gitignored state that exists nowhere else:
+  `sandbox <name> kept (thegn land --release-sandbox, or env reap, removes it)`.
+  `--release-sandbox` destroys the proven sandbox after a successful land and
+  prints `released sandbox <name>`; a failure there is a warning, not an error.
+  `merge drain` is unchanged.
+- **`lifetime_reap`.** `[env.<n>.provider] lifetime_reap = true` (sprites only,
+  default false, needs `max_lifetime_secs > 0`) lets a running client destroy
+  recorded sprites past their lifetime, checked every 300 seconds. It lists the
+  org once per account and deletes nothing on a partial or unknown listing. A
+  sprite whose API status is `running` is skipped and reported once. It never
+  creates, resumes or execs. With no env opting in it does no I/O at idle.
+- **`login_homes`.** `[env.<n>.provider] login_homes = { claude = "<dir>", codex = "<dir>" }`
+  (your own config only, like `model_credentials`) makes the sprite login copy
+  and resync read that directory instead of your live host login, so a
+  dedicated account can be used. Auth files are written with mode 0600 where the
+  file API supports a mode. The codex list is `.codex/auth.json` and
+  `.codex/config.toml`, plus the two older json paths.
+
+Unverified: whether a Claude refresh token shared between host and sprite is
+invalidated when one side refreshes; whether a Sprites checkpoint can be cloned
+to a new sprite (checkpoints restore in place only, so there is no warm
+golden image); the Fly IPv4 cost; and which login files pi needs.
+
+The live scripts `test/sprites-live.sh` and `test/vercel-live.sh` spend real
+money. They need `THEGN_CHANNEL=dev` and `--i-accept-spend`, and touch only
+sandboxes recorded in the run's own temporary ledger.
+
+### Removing and releasing provider sandboxes
+
+A destroy counts as done only when a complete provider inventory no longer
+lists the sandbox. A partial listing proves nothing.
+
+- `thegn wt rm` refuses when the sandbox cannot be confirmed gone: the provider
+  token is unset, the destroy is not confirmed, or a provider location is
+  stored under a non-provider env. The message names the sandbox and the two
+  ways out: set the token and retry, or `thegn env set --worktree <wt> <local env>`,
+  which clears the location and warns which sandbox is still running.
+  `thegn env reap --provider <p>` keeps listing that sandbox.
+- `thegn land --release-sandbox` clears the stored location only after the
+  destroy is confirmed. Otherwise it prints `! sandbox <name> kept: <why>`
+  after "landed" and keeps the location; the exit code is unchanged. A pool
+  spare prints `returned sandbox <name> to the warm pool`.
+- Closing a provider worktree keeps its sandbox and says so in one notice that
+  names the sandbox and how to remove it.
+- Keep-awake tells the truth: if the first hold call fails, the script runs
+  unheld with a line on stderr, and on exit it does not release a hold it
+  never got.
+- `thegn doctor` has a "Remote live readiness" block per sprites and vercel
+  env (offline; names only, never values): whether the token resolves and the
+  controller id is readable, ledger counts, ledger sandboxes no worktree or
+  spare is bound to, and which env var names, git token and agent logins go
+  into the sandbox. Sprites credential forwarding itself is unchanged.
+
 ## Remote worktrees
 
 `[sandbox.remote] host` runs worktrees on another machine. Control-plane

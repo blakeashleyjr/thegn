@@ -130,16 +130,49 @@ pub(crate) fn format_badge(template: &str, count: u32, fallback: &str) -> String
     display_cell(&template.replace("{n}", &count_text(count)))
 }
 
-fn detail_fields(row: &SidebarRow, disp: &SidebarDisplay, now_unix: i64) -> Vec<Field> {
+/// What the worktree's title line already shows; the detail line never repeats it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TitleEcho {
+    pub branch: bool,
+    pub commits: bool,
+    pub pr: bool,
+    pub upstream: bool,
+}
+
+/// The branch `detail_fields` shows: the row's branch, else its label.
+fn detail_branch(row: &SidebarRow) -> &str {
+    row.branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or(&row.label)
+}
+
+/// Which detail fields the title line already carries. Width-independent, so
+/// the heights pass and the compose pass agree.
+pub(crate) fn title_echo(row: &SidebarRow, disp: &SidebarDisplay, title: &str) -> TitleEcho {
+    TitleEcho {
+        branch: row.kind == RowKind::Worktree
+            && display_cell(title) == display_cell(detail_branch(row)),
+        commits: disp.show_commits || disp.show_behind_base,
+        pr: disp.show_pr_chip && row.pr_number.is_some(),
+        upstream: disp.show_ahead_behind && row.git.is_some(),
+    }
+}
+
+fn detail_fields(
+    row: &SidebarRow,
+    disp: &SidebarDisplay,
+    now_unix: i64,
+    echo: TitleEcho,
+) -> Vec<Field> {
     if row.kind != RowKind::Worktree {
         return Vec::new();
     }
-    let branch = row
-        .branch
-        .as_deref()
-        .filter(|branch| !branch.is_empty())
-        .unwrap_or(&row.label);
+    let branch = detail_branch(row);
     if disp.detail_fields.is_empty() {
+        if echo.branch {
+            return Vec::new();
+        }
         return branch_field(row, branch, FieldId::Branch)
             .into_iter()
             .collect();
@@ -150,6 +183,13 @@ fn detail_fields(row: &SidebarRow, disp: &SidebarDisplay, now_unix: i64) -> Vec<
         .flat_map(|requested| match requested {
             DetailEntry::Builtin(field) => requested_fields(row, disp, *field, branch, now_unix),
             DetailEntry::Plugin { plugin, field } => plugin_fields(row, plugin, field),
+        })
+        .filter(|field| match field.id {
+            FieldId::Branch => !echo.branch,
+            FieldId::Commits => !echo.commits,
+            FieldId::Pr => !echo.pr,
+            FieldId::Upstream => !echo.upstream,
+            _ => true,
         })
         .collect()
 }
@@ -681,7 +721,15 @@ pub(crate) fn compose_detail_line_at(
     cols: usize,
 ) -> Option<Line> {
     let indent = indent.min(cols / 2);
-    compose_detail_line_guided(row, disp, now_unix, vec![sp(indent)], indent, cols)
+    compose_detail_line_guided(
+        row,
+        disp,
+        now_unix,
+        TitleEcho::default(),
+        vec![sp(indent)],
+        indent,
+        cols,
+    )
 }
 
 /// Like `compose_detail_line_at`, but the line starts with `lead` (display
@@ -692,6 +740,7 @@ pub(crate) fn compose_detail_line_guided(
     row: &SidebarRow,
     disp: &SidebarDisplay,
     now_unix: i64,
+    echo: TitleEcho,
     lead: Vec<Seg>,
     lead_cols: usize,
     cols: usize,
@@ -703,7 +752,7 @@ pub(crate) fn compose_detail_line_guided(
         (lead, lead_cols)
     };
     let fields = fit_fields(
-        detail_fields(row, disp, now_unix),
+        detail_fields(row, disp, now_unix, echo),
         cols.saturating_sub(lead_cols),
     );
     if fields.is_empty() {
@@ -720,8 +769,8 @@ pub(crate) fn compose_detail_line_guided(
 }
 
 /// The width-independent content predicate used by the heights pass.
-pub(crate) fn detail_has_content(row: &SidebarRow, disp: &SidebarDisplay) -> bool {
-    !detail_fields(row, disp, 0).is_empty()
+pub(crate) fn detail_has_content(row: &SidebarRow, disp: &SidebarDisplay, echo: TitleEcho) -> bool {
+    !detail_fields(row, disp, 0, echo).is_empty()
 }
 
 /// Stable wrapper retained for sidebar callers and unit tests.
@@ -758,6 +807,110 @@ mod tests {
 
     fn builtin(field: DetailField) -> thegn_core::config::DetailEntry {
         thegn_core::config::DetailEntry::Builtin(field)
+    }
+
+    fn echo_all(branch: bool) -> TitleEcho {
+        TitleEcho {
+            branch,
+            commits: true,
+            pr: true,
+            upstream: true,
+        }
+    }
+
+    fn ids_of(row: &SidebarRow, disp: &SidebarDisplay, echo: TitleEcho) -> Vec<FieldId> {
+        detail_fields(row, disp, 2_000, echo)
+            .into_iter()
+            .map(|f| f.id)
+            .collect()
+    }
+
+    #[test]
+    fn echo_truth_table() {
+        let mut r = row();
+        let d = SidebarDisplay::default();
+        assert!(title_echo(&r, &d, "feature/retry-loop").branch);
+        assert!(!title_echo(&r, &d, "feature").branch);
+        let off = SidebarDisplay {
+            show_commits: false,
+            show_behind_base: false,
+            show_pr_chip: false,
+            show_ahead_behind: false,
+            ..SidebarDisplay::default()
+        };
+        let e = title_echo(&r, &off, "x");
+        assert!(!e.commits && !e.pr && !e.upstream);
+        r.pr_number = Some(3);
+        let on = SidebarDisplay {
+            show_commits: true,
+            show_pr_chip: true,
+            ..off.clone()
+        };
+        let e = title_echo(&r, &on, "x");
+        assert!(e.commits && e.pr && !e.upstream);
+        // Empty branch falls back to label.
+        r.branch = None;
+        assert!(title_echo(&r, &d, "feature").branch);
+        r.kind = RowKind::Folder;
+        assert!(!title_echo(&r, &d, "feature").branch);
+    }
+
+    #[test]
+    fn screenshot_row_has_no_detail_line() {
+        let mut r = SidebarRow::base(RowKind::Worktree, 1, "tg/b158-config-dir-env", "repo");
+        r.branch = Some("tg/b158-config-dir-env".into());
+        r.branch_meta = Some(BranchMeta {
+            ahead_base: Some(1),
+            ..BranchMeta::default()
+        });
+        let d = SidebarDisplay::default();
+        let echo = title_echo(&r, &d, "tg/b158-config-dir-env");
+        assert!(!detail_has_content(&r, &d, echo));
+    }
+
+    #[test]
+    fn home_keeps_its_branch_line() {
+        let mut r = SidebarRow::base(RowKind::Worktree, 1, "home", "repo");
+        r.branch = Some("main".into());
+        let d = SidebarDisplay::default();
+        let echo = title_echo(&r, &d, "home");
+        assert!(!echo.branch);
+        assert!(detail_has_content(&r, &d, echo));
+    }
+
+    #[test]
+    fn a_window_title_keeps_the_branch() {
+        let r = row();
+        let d = SidebarDisplay::default();
+        let echo = title_echo(&r, &d, "retry window");
+        assert!(ids_of(&r, &d, echo).contains(&FieldId::Branch));
+    }
+
+    #[test]
+    fn pr_number_moves_to_the_title_but_a_bare_count_stays() {
+        let mut r = row();
+        let d = SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Pr)],
+            ..SidebarDisplay::default()
+        };
+        r.pr_number = Some(42);
+        let echo = title_echo(&r, &d, "x");
+        assert!(ids_of(&r, &d, echo).is_empty());
+        r.pr_number = None;
+        r.pr_count = Some(2);
+        let echo = title_echo(&r, &d, "x");
+        assert_eq!(ids_of(&r, &d, echo), vec![FieldId::Pr]);
+    }
+
+    #[test]
+    fn dirty_count_and_branch_stat_still_show() {
+        let r = row();
+        let d = SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Dirty), builtin(DetailField::Commits)],
+            ..SidebarDisplay::default()
+        };
+        let ids = ids_of(&r, &d, echo_all(true));
+        assert_eq!(ids, vec![FieldId::Dirty]);
     }
 
     #[test]
@@ -877,7 +1030,7 @@ mod tests {
             ],
             ..SidebarDisplay::default()
         };
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -908,7 +1061,7 @@ mod tests {
         row.unread_count = 0;
         row.disk_bytes = None;
         row.git = Some(crate::sidebar::GitGlyphs::default());
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -1055,7 +1208,7 @@ mod tests {
                 .contains(&builtin(DetailField::Stash))
         );
         assert!(
-            detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000, TitleEcho::default())
                 .iter()
                 .any(|field| field.id == FieldId::Stash)
         );
@@ -1066,7 +1219,7 @@ mod tests {
             detail_fields: ui.detail_entries_resolved(),
             ..SidebarDisplay::default()
         };
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -1141,7 +1294,7 @@ mod tests {
         let defaults = SidebarDisplay::default();
         assert!(defaults.detail_fields.contains(&builtin(DetailField::Ci)));
         assert!(
-            detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000, TitleEcho::default())
                 .iter()
                 .any(|field| field.id == FieldId::Ci)
         );
@@ -1152,7 +1305,7 @@ mod tests {
             detail_fields: ui.detail_entries_resolved(),
             ..SidebarDisplay::default()
         };
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -1260,7 +1413,7 @@ mod tests {
                 .contains(&builtin(DetailField::Issue))
         );
         assert!(
-            detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000, TitleEcho::default())
                 .iter()
                 .any(|field| field.id == FieldId::Issue)
         );
@@ -1271,7 +1424,7 @@ mod tests {
             detail_fields: ui.detail_entries_resolved(),
             ..SidebarDisplay::default()
         };
-        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000, TitleEcho::default())
             .into_iter()
             .map(|field| field.id)
             .collect();
@@ -1310,7 +1463,7 @@ mod tests {
         let row = row();
         let display = SidebarDisplay::default();
         assert_eq!(
-            detail_has_content(&row, &display),
+            detail_has_content(&row, &display, TitleEcho::default()),
             compose_detail_line_at(&row, &display, 2_000, 8, 24).is_some()
         );
     }
@@ -1391,9 +1544,15 @@ mod tests {
             ..SidebarDisplay::default()
         };
         let lead = vec![sp(4), seg(Tok::Slot(S::Ghost2), "| "), sp(2)];
-        let Some(Line::Segs(segs)) =
-            compose_detail_line_guided(&row, &display, 2_000, lead.clone(), 8, 24)
-        else {
+        let Some(Line::Segs(segs)) = compose_detail_line_guided(
+            &row,
+            &display,
+            2_000,
+            TitleEcho::default(),
+            lead.clone(),
+            8,
+            24,
+        ) else {
             panic!("guided detail line is a segment line")
         };
         assert_eq!(&segs[..3], &lead[..]);
@@ -1410,7 +1569,8 @@ mod tests {
             ..SidebarDisplay::default()
         };
         let lead = vec![sp(4), seg(Tok::Slot(S::Ghost2), "| "), sp(2)];
-        let guided = compose_detail_line_guided(&row, &display, 2_000, lead, 8, 8);
+        let guided =
+            compose_detail_line_guided(&row, &display, 2_000, TitleEcho::default(), lead, 8, 8);
         let plain = compose_detail_line_at(&row, &display, 2_000, 8, 8);
         let (Some(Line::Segs(g)), Some(Line::Segs(p))) = (guided, plain) else {
             panic!("both variants render a segment line")
@@ -1471,7 +1631,10 @@ mod tests {
             ],
             ..SidebarDisplay::default()
         };
-        let fitted = fit_fields(detail_fields(&row, &display, 2_000), 20);
+        let fitted = fit_fields(
+            detail_fields(&row, &display, 2_000, TitleEcho::default()),
+            20,
+        );
         assert!(!fitted.iter().any(|field| field.id == FieldId::Plugin));
         assert!(fitted.iter().any(|field| field.id == FieldId::Branch));
     }

@@ -59,6 +59,7 @@ mod completions_health;
 mod compositor;
 mod fold_cancel;
 mod gate_capture;
+mod gate_sandbox;
 mod heavy_slot;
 #[cfg(test)]
 mod tmp_root_ratchet_tests;
@@ -242,6 +243,7 @@ mod proc_worker;
 mod proc_workload;
 #[cfg(test)]
 mod proc_workload_alloc;
+mod producer_yield;
 mod profile;
 mod provider_factory;
 mod provider_git;
@@ -305,6 +307,7 @@ mod snapshot_slot;
 #[cfg(test)]
 mod spawn_ratchet_tests;
 mod sprite_bridge;
+mod sprites_reaper;
 mod ssh_seed;
 mod ssh_shim;
 mod stage_prompt;
@@ -314,6 +317,7 @@ mod worktree_discovery;
 #[rustfmt::skip]
 #[cfg(test)]
 mod flood_sched_tests;
+mod state_gc;
 // THE-603 is an unwired capture primitive; THE-592 owns future startup admission.
 #[allow(dead_code)]
 mod state_host_capture;
@@ -408,6 +412,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::lead::Action,
     },
+    /// The native inbox (mail, Todoist, any command)
+    Inbox {
+        #[command(subcommand)]
+        action: cmd::inbox::Action,
+    },
     /// GitHub PR data + actions for a worktree.
     Pr {
         #[command(subcommand)]
@@ -473,7 +482,8 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::wt::Action,
     },
-    /// Repo discovery + history (`repo list|recent`).
+    /// Repo discovery, history, trust and offline registry pruning
+    /// (`repo list|recent|trust|provenance|forget`).
     Repo {
         #[command(subcommand)]
         action: cmd::repos::Action,
@@ -543,6 +553,11 @@ pub enum Command {
         target: cmd::target::WorktreeTarget,
         #[command(flatten)]
         trust_gate: cmd::target::TrustGateArgs,
+        /// Destroy a provider worktree's sandbox after landing (once its commits
+        /// are local). By default the sandbox is kept: it may hold state that
+        /// exists nowhere else.
+        #[arg(long)]
+        release_sandbox: bool,
     },
     /// Agent-driven merge queue: assign branches (`merge add`) and drain them one
     /// by one (`merge drain`), dispatching a headless CLI agent to resolve
@@ -881,6 +896,10 @@ pub enum Command {
     SpriteExec {
         /// The sprite sandbox id (the resolved provider id).
         id: String,
+        /// Keep the sprite awake while the command runs, for at most this long
+        /// (`90s`, `30m`, `4h`, or bare seconds; capped at 24h). Off by default.
+        #[arg(long, value_name = "DUR", value_parser = parse_hold_duration)]
+        hold: Option<std::time::Duration>,
         /// Command to run (empty ⇒ a login shell).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -973,6 +992,19 @@ async fn sprite_proxy_relay(
         end.into_result()
     } else {
         Ok(())
+    }
+}
+
+/// `sprite-exec --hold`: a cy-style duration (`90s`, `30m`, `1h30m`) or bare
+/// seconds, through the same parser the replay search uses. Zero is refused;
+/// the 24h cap is applied where the ceiling is computed.
+fn parse_hold_duration(raw: &str) -> Result<std::time::Duration, String> {
+    match replay::parse_duration(raw) {
+        Some(duration) if !duration.is_zero() => Ok(duration),
+        Some(_) => Err("the hold must be longer than zero".to_string()),
+        None => Err(format!(
+            "invalid duration {raw:?}: use e.g. 90s, 30m, 4h, or bare seconds"
+        )),
     }
 }
 
@@ -1514,6 +1546,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Voice { action } => cmd::voice::run(&cfg, action, config_path),
         Command::Automations { action } => cmd::automations::run(&cfg, action),
         Command::Lead { action } => cmd::lead::run(&cfg, action),
+        Command::Inbox { action } => cmd::inbox::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action, &config_path),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
@@ -1547,9 +1580,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             json,
         } => cmd::map::run(&cfg, worktree, budget, file, json),
         Command::Integrate { args } => cmd::integrate::run(&cfg, &args),
-        Command::Land { target, trust_gate } => {
-            cmd::land::run(&cfg, target.get(), trust_gate.trust_gate)
-        }
+        Command::Land {
+            target,
+            trust_gate,
+            release_sandbox,
+        } => cmd::land::run(&cfg, target.get(), trust_gate.trust_gate, release_sandbox),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
         Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),
@@ -1688,7 +1723,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         }
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
         Command::Machine0Ssh { name, cmd } => machine0_bridge::run(&cfg, &name, &cmd),
-        Command::SpriteExec { id, cmd } => sprite_bridge::run(&cfg, &id, &cmd),
+        Command::SpriteExec { id, hold, cmd } => sprite_bridge::run(&cfg, &id, &cmd, hold),
         Command::VercelExec { id, cmd } => vercel_bridge::run(&cfg, &id, &cmd),
         Command::SandboxArgv { target } => {
             // Resolve like every other worktree-scoped verb (explicit →

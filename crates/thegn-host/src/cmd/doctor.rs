@@ -1773,7 +1773,7 @@ fn daemon_channel_line(cli: thegn_core::channel::Channel, daemon: Option<Option<
 
 /// Probe an already-running daemon for its channel: probes this state dir's
 /// unix socket only; never opens the state DB or spawns.
-fn probe_daemon_channel(cfg: &Config) -> Option<Option<String>> {
+pub(super) fn probe_daemon_channel(cfg: &Config) -> Option<Option<String>> {
     use crate::daemon::client::{StopProbe, daemon_channel, probe_stop_target};
     use thegn_svc::control::client::{ControlAddr, ControlClient};
     let socket = crate::daemon::socket_path(&cfg.daemon);
@@ -2176,6 +2176,48 @@ fn doctor_json_exposes_monitor_collector_health_for_every_id() {
         collectors[CollectorId::GpuClients.slug()]["health"],
         "visible-only (not probed)"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_json_reports_the_instance_identity() {
+    let config_dir = std::env::temp_dir().join("thegn-doctor-instance-config");
+    let config_dir_str = config_dir.to_str().expect("temp dir is UTF-8").to_string();
+    let state = crate::testenv::IsolatedState::with_env(&[(
+        thegn_core::util::THEGN_CONFIG_DIR_ENV,
+        config_dir_str.as_str(),
+    )]);
+    let report = doctor_json(&Config::default());
+    let instance = report["instance"].as_object().expect("instance object");
+    for key in [
+        "binary",
+        "config_dir",
+        "state_dir",
+        "thegn_dir",
+        "channel",
+        "daemon_socket",
+    ] {
+        assert!(instance[key].is_string(), "{key}: {}", instance[key]);
+    }
+    assert_eq!(instance["config_dir"], config_dir_str.as_str());
+    assert_eq!(
+        instance["state_dir"],
+        state
+            .state_home()
+            .join("thegn")
+            .display()
+            .to_string()
+            .as_str()
+    );
+    assert_eq!(
+        instance["thegn_dir"],
+        state.thegn_dir().display().to_string().as_str()
+    );
+    assert_eq!(
+        instance["channel"],
+        crate::channel_state::current().as_str()
+    );
+    instance_report(&Config::default());
 }
 
 /// `--json` twin of [`system_metrics_report`]: one object keyed by family with
@@ -2770,9 +2812,11 @@ fn build_parity_lines() {
     match Db::open_read_only_current() {
         Ok(Some(db)) => match db.space() {
             Ok(space) => {
-                let step = thegn_core::plan_maintenance(&space, 1);
-                let recommend = space.auto_vacuum != thegn_core::AutoVacuum::Incremental
-                    || matches!(step, thegn_core::MaintenanceStep::TooLargeForAuto { .. });
+                let room = db
+                    .file_path()
+                    .map(|path| crate::db_maintain::host_room(&path))
+                    .unwrap_or_default();
+                let step = thegn_core::plan_maintenance(&space, room, 1);
                 outln!(
                     "  db space      {} MB ({} MB reclaimable, auto_vacuum {}){}",
                     space.file_bytes().div_ceil(1024 * 1024),
@@ -2782,11 +2826,7 @@ fn build_parity_lines() {
                         thegn_core::AutoVacuum::Full => "full",
                         thegn_core::AutoVacuum::Incremental => "incremental",
                     },
-                    if recommend {
-                        "; run 'thegn db vacuum'"
-                    } else {
-                        ""
-                    },
+                    db_space_suffix(step, space.auto_vacuum),
                 );
             }
             Err(error) => outln!("  db space      unavailable ({error})"),
@@ -2834,6 +2874,87 @@ fn build_parity_lines() {
                 .unwrap_or_else(|| format!("(pid {} — unreadable)", d.pid))
         );
     }
+}
+
+/// The `db space` doctor line's suffix for the planner's step: what thegn
+/// does next on its own, or the one case that needs the user.
+fn db_space_suffix(
+    step: thegn_core::MaintenanceStep,
+    auto_vacuum: thegn_core::AutoVacuum,
+) -> std::borrow::Cow<'static, str> {
+    use thegn_core::MaintenanceStep;
+    match step {
+        MaintenanceStep::Convert => "; converts automatically at the next idle pass".into(),
+        MaintenanceStep::TooLargeForAuto { .. } => "; run 'thegn db vacuum'".into(),
+        MaintenanceStep::LowDisk { need_bytes, .. } => format!(
+            "; needs {} MB free to compact",
+            need_bytes.div_ceil(1024 * 1024)
+        )
+        .into(),
+        MaintenanceStep::Incremental { .. } | MaintenanceStep::Nothing
+            if auto_vacuum == thegn_core::AutoVacuum::Incremental =>
+        {
+            "; auto-maintained".into()
+        }
+        MaintenanceStep::Incremental { .. } | MaintenanceStep::Nothing => "".into(),
+    }
+}
+
+/// Which thegn instance this is: the paths that tell a stable and a dev
+/// instance apart on one machine (binary, config dir, state dir, `THEGN_DIR`,
+/// channel, daemon socket). Read-only path resolution: never fails.
+struct InstanceInfo {
+    binary: String,
+    config_dir: String,
+    state_dir: String,
+    thegn_dir: String,
+    channel: String,
+    daemon_socket: String,
+}
+
+fn instance_info(cfg: &Config) -> InstanceInfo {
+    let binary = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("(unknown: {error})"));
+    InstanceInfo {
+        binary,
+        config_dir: thegn_core::util::thegn_config_dir().display().to_string(),
+        state_dir: thegn_core::util::xdg_state_home()
+            .join("thegn")
+            .display()
+            .to_string(),
+        thegn_dir: thegn_core::util::thegn_dir().display().to_string(),
+        channel: crate::channel_state::current().as_str().to_string(),
+        daemon_socket: crate::daemon::socket_path(&cfg.daemon)
+            .display()
+            .to_string(),
+    }
+}
+
+/// Human `doctor` block for [`instance_info`].
+fn instance_report(cfg: &Config) {
+    let info = instance_info(cfg);
+    outln!("Instance");
+    outln!("  binary        {}", info.binary);
+    outln!("  config dir    {}", info.config_dir);
+    outln!("  state dir     {}", info.state_dir);
+    outln!("  THEGN_DIR     {}", info.thegn_dir);
+    outln!("  channel       {}", info.channel);
+    outln!("  daemon socket {}", info.daemon_socket);
+    outln!("");
+}
+
+/// `doctor --json` `instance` object for [`instance_info`].
+fn instance_json(cfg: &Config) -> serde_json::Value {
+    let info = instance_info(cfg);
+    serde_json::json!({
+        "binary": info.binary,
+        "config_dir": info.config_dir,
+        "state_dir": info.state_dir,
+        "thegn_dir": info.thegn_dir,
+        "channel": info.channel,
+        "daemon_socket": info.daemon_socket,
+    })
 }
 
 /// Report thegn's own identity: version, channel, build, OS, the daemon's
@@ -2973,6 +3094,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
     let probe = crate::probe::probe_outer_terminal_cli();
     let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
     serde_json::json!({
+        "instance": instance_json(cfg),
         "identification": identification_json(cfg),
         "channel": channel_json(),
         "completions": completions_json(),
@@ -3024,6 +3146,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "vercel": vercel_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
+        "remote_live": super::doctor_remote::json(cfg),
         "warm_pool": warm_pool_json(cfg),
         "merge_gate_quarantines": crate::integrate::gate_quarantines().iter().map(|(path, reason)| serde_json::json!({
             "path": path.display().to_string(),
@@ -3049,6 +3172,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
             crate::agent_run::headless_unsupported().as_deref()
         ),
         "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
+        "lead_readiness": super::doctor_lead::json(&super::doctor_lead::inspect(cfg)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
         "local_control": local_control_security_json_with_legacy_state(cfg, legacy_state_override),
@@ -3516,6 +3640,7 @@ pub fn run(
     let show = |k: &str, v: &Option<String>| {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
+    instance_report(cfg);
     identification_report(cfg);
     let voice = super::voice::status(&cfg.voice);
     outln!("Voice");
@@ -3673,6 +3798,7 @@ pub fn run(
     macos_report(&env);
     outln!("");
     super::batteries_doctor::print(&super::batteries_doctor::inspect_env());
+    super::doctor_lead::print(&super::doctor_lead::inspect(cfg));
     outln!("");
     let (pin_rows, pin_unread) = pins::collect(cfg);
     pins::print(&pin_rows, pin_unread.as_deref());
@@ -3725,6 +3851,7 @@ pub fn run(
 
     outln!("");
     provider_cache_report(cfg);
+    super::doctor_remote::report(cfg);
 
     outln!("");
     warm_pool_report(cfg);
@@ -4073,6 +4200,12 @@ fn provider_cache_report(cfg: &Config) {
         if let Some(warning) = ignored_cli_bridge(p) {
             outln!("               {warning}");
         }
+        if is_sprites(p) {
+            let ledger = sprites_ledger_counts(&thegn_svc::vps::registry::list());
+            for line in sprites_report_lines(p, bridge.is_some(), ledger) {
+                outln!("               {line}");
+            }
+        }
         if is_vercel(p) {
             let (expired, orphans) = vercel_ledger_counts(&thegn_svc::vps::registry::list());
             for line in vercel_report_lines(p, vercel_token_resolves(p), expired, orphans) {
@@ -4112,6 +4245,62 @@ fn sprite_cli_required(pc: &thegn_core::config::EnvProviderConfig) -> bool {
         EnvProviderKind::of(pc.provider.trim()),
         EnvProviderKind::Sprites
     ) && matches!(pc.exec, thegn_core::config::ProviderExecMode::Cli)
+}
+
+fn is_sprites(pc: &thegn_core::config::EnvProviderConfig) -> bool {
+    matches!(
+        EnvProviderKind::of(pc.provider.trim()),
+        EnvProviderKind::Sprites
+    )
+}
+
+/// `(recorded, creating)` over the local ledger (no network): sprites records.
+fn sprites_ledger_counts(records: &[thegn_svc::vps::registry::VpsRecord]) -> (usize, usize) {
+    let mine = || records.iter().filter(|r| r.provider == "sprites");
+    (
+        mine().count(),
+        mine().filter(|r| r.state == "creating").count(),
+    )
+}
+
+/// The configured sprites memory limit in MiB (`min_ram_gb × 1024`), or `None`
+/// for the platform default.
+fn sprites_memory_limit_mb(pc: &thegn_core::config::EnvProviderConfig) -> Option<u64> {
+    (pc.min_ram_gb > 0).then(|| u64::from(pc.min_ram_gb) * 1024)
+}
+
+/// Hold ceiling (seconds) a headless session keeps the sprite awake for.
+fn sprites_hold_ceiling_secs(pc: &thegn_core::config::EnvProviderConfig) -> u64 {
+    thegn_core::sprite_hold::ceiling_secs(None, pc.max_lifetime_secs)
+}
+
+/// The per-sprites-env doctor lines: bridge binary, ledger, memory limit,
+/// keep-awake. Offline: no sprites API call.
+fn sprites_report_lines(
+    pc: &thegn_core::config::EnvProviderConfig,
+    bridge_present: bool,
+    ledger: (usize, usize),
+) -> Vec<String> {
+    let bridge = if bridge_present {
+        "bridge binary: present".to_string()
+    } else {
+        "bridge binary: MISSING — run `just bridge`".to_string()
+    };
+    let memory = match sprites_memory_limit_mb(pc) {
+        Some(mb) => format!("memory limit: {mb} MiB"),
+        None => "memory limit: platform default".to_string(),
+    };
+    let hold_secs = sprites_hold_ceiling_secs(pc);
+    let hours = hold_secs.div_ceil(3600);
+    vec![
+        bridge,
+        format!(
+            "ownership ledger: {} recorded, {} creating",
+            ledger.0, ledger.1
+        ),
+        memory,
+        format!("keep-awake: headless sessions hold the sprite up to {hours}h"),
+    ]
 }
 
 fn is_vercel(pc: &thegn_core::config::EnvProviderConfig) -> bool {
@@ -4263,6 +4452,15 @@ fn provider_cache_json_with(
         });
         if !vercel.is_null() {
             entry["vercel"] = vercel;
+        }
+        if is_sprites(p) {
+            let (recorded, creating) = sprites_ledger_counts(&thegn_svc::vps::registry::list());
+            entry["sprites_ledger"] = serde_json::json!({
+                "recorded": recorded,
+                "creating": creating,
+            });
+            entry["sprites_memory_limit_mb"] = serde_json::json!(sprites_memory_limit_mb(p));
+            entry["sprites_hold_ceiling_secs"] = serde_json::json!(sprites_hold_ceiling_secs(p));
         }
         map.insert(name.clone(), entry);
     }
@@ -4425,6 +4623,7 @@ fn paths_report(cfg: &Config) {
     for (label, var) in [
         ("XDG_STATE_HOME", "XDG_STATE_HOME"),
         ("XDG_CONFIG_HOME", "XDG_CONFIG_HOME"),
+        ("THEGN_CONFIG_DIR", "THEGN_CONFIG_DIR"),
         ("THEGN_DIR", "THEGN_DIR"),
         ("THEGN_PROFILE", "THEGN_PROFILE"),
     ] {
@@ -6351,6 +6550,104 @@ mod pins;
 mod tests {
     use super::*;
     use thegn_core::notification::{Notification, NotificationKind};
+
+    #[test]
+    fn db_space_suffix_names_the_next_step() {
+        use thegn_core::{AutoVacuum, MaintenanceStep};
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            db_space_suffix(MaintenanceStep::Nothing, AutoVacuum::Incremental),
+            "; auto-maintained"
+        );
+        assert_eq!(
+            db_space_suffix(
+                MaintenanceStep::Incremental { pages: 2048 },
+                AutoVacuum::Incremental
+            ),
+            "; auto-maintained"
+        );
+        assert_eq!(
+            db_space_suffix(MaintenanceStep::Convert, AutoVacuum::None),
+            "; converts automatically at the next idle pass"
+        );
+        assert_eq!(
+            db_space_suffix(
+                MaintenanceStep::TooLargeForAuto {
+                    live_bytes: 300 * MIB,
+                    free_bytes: MIB,
+                },
+                AutoVacuum::None
+            ),
+            "; run 'thegn db vacuum'"
+        );
+        assert_eq!(
+            db_space_suffix(
+                MaintenanceStep::LowDisk {
+                    need_bytes: 464 * MIB,
+                    free_bytes: 10 * MIB,
+                },
+                AutoVacuum::None
+            ),
+            "; needs 464 MB free to compact"
+        );
+        assert_eq!(
+            db_space_suffix(MaintenanceStep::Nothing, AutoVacuum::None),
+            ""
+        );
+    }
+
+    #[test]
+    fn sprites_report_lines_cover_bridge_ledger_memory_and_hold() {
+        use thegn_core::config::EnvProviderConfig;
+        let mut pc = EnvProviderConfig {
+            provider: "sprites".into(),
+            ..Default::default()
+        };
+        let lines = sprites_report_lines(&pc, false, (3, 1));
+        assert!(lines[0].contains("`just bridge`"), "{lines:?}");
+        assert_eq!(lines[1], "ownership ledger: 3 recorded, 1 creating");
+        assert_eq!(lines[2], "memory limit: platform default");
+        assert!(lines[3].contains("up to 4h"), "{lines:?}");
+        pc.min_ram_gb = 4;
+        pc.max_lifetime_secs = 7200;
+        let lines = sprites_report_lines(&pc, true, (0, 0));
+        assert_eq!(lines[0], "bridge binary: present");
+        assert_eq!(lines[2], "memory limit: 4096 MiB");
+        assert!(lines[3].contains("up to 2h"), "{lines:?}");
+    }
+
+    #[test]
+    fn sprites_doctor_json_keys_only_for_sprites_envs() {
+        use thegn_core::config::{EnvConfig, EnvProviderConfig};
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "sprites".into(),
+            EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    min_ram_gb: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        cfg.env.insert(
+            "vps".into(),
+            EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "hetzner".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let v = provider_cache_json(&cfg);
+        assert_eq!(v["sprites"]["sprites_memory_limit_mb"], 2048);
+        assert_eq!(v["sprites"]["sprites_hold_ceiling_secs"], 4 * 3600);
+        assert!(v["sprites"]["sprites_ledger"]["recorded"].is_u64());
+        assert!(v["vps"].get("sprites_ledger").is_none());
+        assert!(v["vps"].get("sprites_hold_ceiling_secs").is_none());
+    }
 
     #[test]
     fn sprite_cli_required_only_for_sprites_pinned_to_cli_exec() {
@@ -8550,7 +8847,7 @@ args = ["--verbose"]
         let routes = value["admission_routes"]
             .as_array()
             .expect("admission_routes is an array");
-        assert_eq!(routes.len(), 11);
+        assert_eq!(routes.len(), 13);
         for route in routes {
             assert!(route["id"].as_str().is_some());
             assert!(route["route"].as_str().is_some());

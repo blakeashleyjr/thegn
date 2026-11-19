@@ -150,6 +150,10 @@ pub static ROUTES: &[Route] = &[
     route("/v1/overview", &["overview.get"], || {
         post(http_lead::overview_get)
     }),
+    // b163 (THE-2214): producer arming, leases and inbox account state.
+    route("/v1/producers/status", &["producers.status"], || {
+        post(http_lead::producers_status)
+    }),
     route("/v1/notifications/list", &["notifications.list"], || {
         post(http_lead::notifications_list)
     }),
@@ -301,6 +305,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("tools.run", "POST", "/v1/tools/run"),
     // Lead tool surface (THE-2172).
     ("overview.get", "POST", "/v1/overview"),
+    ("producers.status", "POST", "/v1/producers/status"),
     ("notifications.list", "POST", "/v1/notifications/list"),
     ("notifications.ack", "POST", "/v1/notifications/ack"),
     ("automations.put", "POST", "/v1/automations/put"),

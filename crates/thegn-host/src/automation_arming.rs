@@ -104,6 +104,7 @@ pub(crate) async fn on_approved(
         ),
     }
     crate::automation_schedule::rearm();
+    crate::daemon::producers::rearm();
     Ok(())
 }
 

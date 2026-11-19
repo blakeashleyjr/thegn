@@ -114,6 +114,8 @@ language = "auto"
 # from disk is the explicit second choice. Set false to skip the prompt
 # (removal then keeps files; it never silently deletes from disk).
 confirm_delete_project = true
+# Ask before Ctrl+Q / quit closes thegn (daemon panes keep running). Signals and the CLI never ask.
+confirm_quit = true
 # Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
 full_mode_chip = true
 # Left-click outside an open detail popup (a stat/badge overlay, e.g. the
@@ -222,8 +224,10 @@ sidebar_other_group_label = "Other"
 sidebar_other_group_collapsed = true
 # Rows a sidebar group shows before "show more"; 0 = no limit. Per-group
 # overrides are keyed by the folder or group label.
-sidebar_group_row_limit = 15
+sidebar_group_row_limit = 7
 # sidebar_group_row_limits = { Other = 5 }
+# Loose worktrees sharing a batch token fold into one row once this many share it; 0 = off.
+sidebar_batch_group_min = 2
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
@@ -490,6 +494,54 @@ forecast_days = 3           # capped by what the provider returns (wttr.in: 3)
 timeout_secs = 10           # clamped to 3..=60
 # api_key = "env:OWM_API_KEY"  # reserved keyed providers only; a raw key here
                                # is a validation ERROR — use env:/file:
+
+# inbox
+# The native inbox (THE-2214): mail, Todoist, or any command, polled by the
+# daemon and shown as notifications of kind "inbox_item". Off by default. It
+# runs only when [daemon] enabled AND headless_producers AND this `enabled` are
+# all on, with at least one enabled account of an implemented kind. Global
+# config only: no repo, workspace or profile overlay can set it. Item text is
+# third-party content: it is sanitized, reaches rules only as {message}, and
+# inbox_item rules are capped at review autonomy. Read-only in this build.
+# The first poll of an account is a baseline: it shows at most 20 newest items
+# and fires no rule events. Restart the daemon after changing this section.
+[inbox]
+enabled = false
+poll_interval_secs = 300    # default for accounts that set 0; floored at 60
+#
+# Account kinds: command, todoist and imap. gmail, jmap, outlook and slack
+# are reserved (config validate refuses them). Credentials (token, password, env
+# values) are secret refs: keyring:NAME, env:VAR or file:PATH. A literal token
+# or password is a validation ERROR.
+#
+# [[inbox.accounts]]
+# name = "work"                  # [a-z0-9][a-z0-9_-]{0,39}; shows as "[work] ..."
+# kind = "command"               # "exec" is an alias
+# enabled = true
+# poll_interval_secs = 0         # 0 inherits [inbox]; floored at 60
+# max_items = 50                 # 1..=500 items per fetch
+# timeout_secs = 30              # 1..=120 seconds per fetch
+# command = ["my-inbox-feed", "--json"]   # argv, no shell; prints items as JSON
+# cwd = ""
+# [inbox.accounts.env]
+# FEED_TOKEN = "env:FEED_TOKEN"  # secret refs or plain values
+#
+# [[inbox.accounts]]
+# name = "tasks"
+# kind = "todoist"
+# token = "keyring:todoist"
+# filter = "today | overdue"
+# base_url = "https://api.todoist.com"   # https (http only for a loopback host)
+#
+# [[inbox.accounts]]
+# name = "mail"
+# kind = "imap"
+# host = "imap.example.com"
+# port = 993                     # TLS
+# username = "me@example.com"
+# password = "env:IMAP_PASSWORD"
+# mailbox = "INBOX"
+# unseen_only = true
 
 # Top-bar stats widget: icons and refresh rate for CPU/RAM/Network/GPU display.
 # Icons can be text ("CPU") or unicode symbols ("⚡"). GPU shows only if detected.
@@ -1718,13 +1770,9 @@ command = "git diff"
 # resolves, that `concurrency` is at least 1, that every `next` names a real
 # stage and closes no cycle, and that every `prompt` placeholder is a real
 # variable) and it DISPLAYS it (stage grouping/labels on the dispatch roster).
-# NO thegn code path advances `next`, enforces `concurrency`, or fires
-# `timeout_secs`. A supervising agent — the "Lead", running the `pipeline`
-# skill — reads the whole structure with `thegn config get pipeline --json`
-# and executes it with its own judgement, recording each dispatch on the
-# durable roster (`thegn dispatch put … --stage --parent --session`; a staged row
-# refuses `--artifact`, its handoff path is assigned).
-# Delete this section and nothing thegn *does* changes.
+# With `[pipeline.supervisor] enabled = true` the daemon's stage executor
+# validates and advances along `next` (see `thegn help automations`); otherwise
+# the structure is advisory.
 #
 #   name         stage id; roster rows record it and `next` points at it. Unique.
 #   agent        the [[agents]]/[[tools]] entry that runs the stage (a bare
@@ -1974,12 +2022,12 @@ command = "git diff"
 #                              #   because an absolute total is permanently red on a machine
 #                              #   with many worktrees — and a permanently-red threshold says
 #                              #   nothing.
-# scan_interval_secs = 45      # per-worktree size TTL; also drives the scan cadence (the
-#                              #   scanner pumps at a quarter of this so a bounded round still
-#                              #   sweeps everything). Runs off the event loop, cached in the DB.
-# max_scan_per_round = 4       # worktrees `du`d per pump. The active worktree and any
-#                              #   never-measured one go first, so a freshly created worktree
-#                              #   never queues behind stale multi-GB re-measurements. 0 = all.
+# scan_interval_secs = 45      # per-worktree size TTL; also drives the pump cadence. The active
+#                              #   worktree's `du` runs at most once per 120 s. Runs off the event
+#                              #   loop, cached in the DB; the lane idles between sweeps.
+# max_scan_per_round = 4       # worktrees `du`d per pump (walks, not rows examined: the examine
+#                              #   budget adapts to the registry). The active worktree and any
+#                              #   never-measured one go first. 0 = all.
 # auto_clean_on_merge = true   # `cargo clean` a worktree's target/ when its PR merges
 #                              #   (checkout kept; active worktree + running builds skipped)
 # clean_on_pr_closed = false   # also clean when a PR is closed without merging
@@ -2022,11 +2070,12 @@ command = "git diff"
 [loc]
 # enabled = true               # count lines of code. false hides the LOC chip, its detail
 #                              #   table and the Files-footer count, and runs no tokei walk.
-# scan_interval_secs = 900     # per-worktree re-count TTL; the scanner pumps at a quarter of
-#                              #   this so a bounded round still sweeps every worktree.
-# max_scan_per_round = 2       # worktrees counted per pump. tokei walks the whole tree, so a
-#                              #   bounded round keeps one background permit from being held
-#                              #   for minutes on a large registry. 0 = all.
+# scan_interval_secs = 900     # re-count TTL for the ACTIVE worktree (also the pump cadence).
+#                              #   Background worktrees are re-counted only when their git state
+#                              #   moved (root mtime, HEAD, index), never on the TTL alone.
+# max_scan_per_round = 2       # tokei walks per pump (not rows examined: that budget adapts to
+#                              #   the registry size). tokei walks the whole tree, so a bounded
+#                              #   round keeps one permit from being held for minutes. 0 = all.
 # watch_invalidate_secs = 60   # editing the ACTIVE worktree lets the diff filesystem watcher
 #                              #   jump the TTL above and recount it — but no more often than
 #                              #   this, so a save storm can't re-walk the tree continuously.
@@ -2161,14 +2210,20 @@ max_spawns_per_day = 12     # automation spawns per rolling 24 h (0..1000; 0 = n
 # assignee = "me"          # "me" = assigned to the account's own user (provenance,
 #                          #   never a display name); otherwise an exact assignee
 # status = "todo"          # issue status, case-insensitive
+# Inbox selectors match only inbox_item events (false on every other kind):
+# inbox_account = "work"   # [[inbox.accounts]] name, exact
+# inbox_kind = "imap"      # command | todoist | imap, exact
+# inbox_label = "urgent"   # one of the item's labels, case-insensitive
 #
 # Action ids are typed strings validated against the v1 catalog set. Parameter
 # templates may use: {event_id}, {event_key}, {event_kind}, {event_time},
 # {workspace}, {repo}, {worktree}, {branch}, {agent_role}, {notification_kind}, {priority},
 # {source_ref}, {message}, {session_id}, {pr_checks_passed},
 # {pr_review_requested}, {pr_merged}, {issue_id}, {issue_number}, {issue_url},
-# {issue_status}, {account}, and {exit_code}. The issue title is never a variable
-# of its own (it reaches rules only as {message}). Values are prose/data
+# {issue_status}, {account}, {exit_code}, {inbox_account} and {inbox_kind}. The
+# issue and inbox titles are never variables of their own (they reach rules only
+# as {message}). An inbox_item rule may not put {message} into a spawn
+# (pipeline.start, sessions.open, lead.wake) and runs at most at review autonomy. Values are prose/data
 # substitution, never shell expansion. `agent`, `stage` and tool `name` must be
 # literal configured names.
 # [automations.rules.then]
@@ -2190,8 +2245,12 @@ max_spawns_per_day = 12     # automation spawns per rolling 24 h (0..1000; 0 = n
 # cap = "lead.wake"         # prompt required; wakes the Lead with the event attached.
 #                           #   The prompt may NOT use {message}: untrusted event text
 #                           #   reaches the Lead only inside the delimited event block
-# pipeline.start and lead.wake are rule-only actions: not catalog capabilities,
-# so nothing but a rule (no MCP tool, HTTP route or CLI verb) can invoke them.
+# cap = "autopilot.run"     # when = "issue_matched" only; no parameters. Runs issue
+#                           #   autopilot for the matched issue; config rules only
+#                           #   (a Lead rule naming it is refused); at most review.
+# pipeline.start, lead.wake and autopilot.run are rule-only actions: not catalog
+# capabilities, so nothing but a rule (no MCP tool, HTTP route or CLI verb) can
+# invoke them.
 #
 # A named profile may refine the settings and replace the rule list:
 # [profiles.work.automations]
@@ -2233,6 +2292,9 @@ max_spawns_per_day = 12     # automation spawns per rolling 24 h (0..1000; 0 = n
 # label = "automate"
 # assignee = "me"
 # status = "todo"
+# inbox_account = "work"   # inbox_item events only: [[inbox.accounts]] name, exact
+# inbox_kind = "imap"      # command | todoist | imap, exact
+# inbox_label = "urgent"   # one of the item's labels, case-insensitive
 # [profiles.work.automations.rules.then]
 # cap = "notify.push"
 # title = "Profile rule"
@@ -2304,7 +2366,7 @@ active_mode = ""
 #   "notice" — assigned, mentioned, status_changed, blocker_resolved,
 #              pr_linked, overdue, pr_state_changed, agent_done, queue_ready,
 #              queue_held, pr_queue_ready, pr_review_task_queued, calendar_reminder,
-#              upstream_behind, automation, ci_run_failed
+#              upstream_behind, automation, ci_run_failed, inbox_item
 # Override any kind below (keys are the snake_case kind names). Unknown
 # keys/values are ignored. The queue_* kinds are the merge queue's settled
 # transitions ([merge_queue]); pr_queue_* are the PR queue's ([pr_queue]).
@@ -3860,6 +3922,23 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 #                            #   Clamped to a DNS-safe length, keeping the hash suffix.
 # api_key_env = "SPRITES_TOKEN"        # empty ⇒ defaults to SPRITES_TOKEN
 # # api_base = "https://api.sprites.dev/v1"   # empty ⇒ this default
+# # Sprites have a fixed 8 vCPU: size, min_vcpu, gpu and nvme are ignored
+# # (`config validate` warns). min_ram_gb > 0 sets the sprite memory limit to
+# # min_ram_gb x 1024 MiB (unit unverified). max_lifetime_secs is reported by
+# # `thegn env reap --provider sprites`; it is enforced in the background only
+# # with lifetime_reap = true (below).
+# # max_lifetime_secs = 0    # lifetime ceiling in seconds (0 = none)
+# # lifetime_reap = false    # opt-in: destroy sprites thegn created (or adopted
+# #                          #   with `thegn env adopt`) once older than
+# #                          #   max_lifetime_secs, in the background while a
+# #                          #   client is up; never a `running` sprite. Needs
+# #                          #   max_lifetime_secs > 0. Deletes paid resources.
+# # login_homes = { claude = "/srv/agent-logins/claude", codex = "/srv/agent-logins/codex" }
+# #                          # claude/codex only: upload the login found in this
+# #                          #   host dir (a dedicated account) instead of the
+# #                          #   live host login. Your own config only; a repo
+# #                          #   overlay cannot set it. Unset = the host login.
+# # A provider table needs placement = "provider" on its env, or it runs locally.
 # # workdir = "/workspace"   # data = "sync" pushes/pulls the worktree here
 # # auto_provision = false   # create the sprite on first open if missing (8-E
 # #                          #   warm-on-open) — over the REST API, so creation is
@@ -4165,6 +4244,10 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # # auto_provision = false                # create the sandbox on first open if missing
 # model_credentials = "none"   # none | upload (claude/codex login into tmpfs; see docs) | proxy, inject (refused)
 # interactive_host_suffixes = []   # empty = vercel.run, vercel.sh, vercel.com
+# # login_homes = { claude = "/srv/agent-logins/claude" }   # with model_credentials =
+# #                                       #   "upload": upload the login in this host dir
+# #                                       #   (a dedicated account) instead of the live
+# #                                       #   host login. Your own config only.
 #
 # ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
@@ -4392,6 +4475,13 @@ lease_grace_secs = 0
 # End a pane after this long of repeated attach-stream sequence gaps. 0 = never
 # end the pane; reconnect backoff still applies.
 stream_gap_window_secs = 600
+# Let the daemon run the headless producers (tracker poll, PR poll, mentions,
+# PR queue) so automation rules and autopilot fire with no UI open. Even when
+# on, a producer runs only while something needs it: an enabled rule on its
+# events, an [autopilot] repo, or [pr_queue] enabled. Only one poller of each
+# kind runs at a time; an open UI reads the daemon's results instead of
+# polling. Read when the daemon starts: restart the daemon after changing it.
+headless_producers = false
 
 # `thegn serve`: pair remote thin clients (desktop/web/mobile) over a pairing
 # URL and let them attach through the scoped control API. Thegn's native TCP
@@ -4539,6 +4629,13 @@ gate_setup_timeout_secs = 1800 # maximum setup duration; defaults to 30 minutes.
 gate_timeout_secs = 3600      # maximum gate duration; defaults to one hour. 0 disables the
                               # deadline. A timeout is an infrastructure hold, never a red build.
 gate_on = true                # run gate_command before advancing main
+gate_sandbox = "off"          # where the gate runs. "off" = on the host (as before). "sealed" =
+                              # gate_setup_command, gate_command and regenerate_command run in
+                              # the repo's sealed sandbox: network none, no credentials, no
+                              # control sockets. A land that needs a download goes red; a
+                              # sandbox that cannot start is an infrastructure hold. Set it in
+                              # your own config: [workspace.<slug>.merge_queue] may only raise
+                              # it to "sealed", and repo .thegn.* files cannot set it.
 gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target dir between folds
                               # (warm incremental rebuild instead of a cold from-scratch compile).
                               # false = throwaway /tmp worktree each fold (cold; use for concurrent gates)
@@ -4971,7 +5068,7 @@ poll_interval_secs = 3
 # surface. Absent = no Lead. Dev channel only; stable clamps it off.
 # [lead]
 # agent = "claude"                  # required: an [[agents]] entry name
-# account = "work"                  # account id whose credentials the Lead uses (unset = the agent's own env)
+# account = "work"                  # NOT supported yet: refused at launch; the Lead logs in once (thegn lead login)
 # scopes = ["read", "write"]        # MCP scopes, clamped by [mcp.serve]; admin and exec are refused
 # mcp_profile = "lead"              # [mcp_proxy.profiles] entry exposing the Lead's own MCP servers
 # skill = "lead"                    # skill seeded into the notes dir

@@ -11,6 +11,8 @@
 # regenerate with `just ratchet-update` (THEGN_RATCHET_UPDATE=1).
 
 # lead.* — Lead is configured per machine; no CI job flips it.
+# inbox.* — global-only config (THE-2214): the switch that lets the daemon poll
+# third-party accounts is a reviewed file setting, never an ambient launcher knob.
 # autopilot.* — issue pickup is a trusted file/workspace policy, not a
 # launcher/environment switch; enabling it can run commands and make forge
 # writes, so every key stays file-only.
@@ -141,6 +143,7 @@ clipboard.max_image_bytes
 clipboard.remote_dir
 confirm_delete
 daemon.enabled
+daemon.headless_producers
 daemon.idle_exit_secs
 daemon.lease_grace_secs
 daemon.socket
@@ -199,6 +202,8 @@ hooks.pre_destroy
 hooks.session_end
 hooks.session_start
 host_discovery.kind
+inbox.enabled
+inbox.poll_interval_secs
 issues.filter_assignee_me
 issues.max_issues
 issues.move_on_merge
@@ -268,6 +273,7 @@ merge_queue.failed_folder
 merge_queue.gate_command
 merge_queue.gate_on
 merge_queue.gate_reuse_worktree
+merge_queue.gate_sandbox
 merge_queue.gate_setup_command
 merge_queue.gate_target_dir
 merge_queue.land_message
@@ -515,11 +521,13 @@ tools.provider
 tools.resume
 tools.route_via_proxy
 ui.confirm_delete_project
+ui.confirm_quit
 ui.dismiss_overlay_on_click_outside
 ui.full_mode_chip
 ui.fullscreen_keep_masthead
 ui.fullscreen_keep_statusbar
 ui.language
+ui.sidebar_batch_group_min
 ui.sidebar_behind_badge
 ui.sidebar_commit_badge
 ui.sidebar_detail_branch

@@ -245,6 +245,12 @@ pub fn config_candidates(kind: SourceKind, cfg: &Config) -> Vec<Candidate> {
             .filter_map(|s| s.stage_name().map(|n| Candidate::described(n, &s.agent)))
             .collect(),
         SourceKind::McpServer => cfg.mcp_servers.keys().map(Candidate::new).collect(),
+        SourceKind::InboxAccount => cfg
+            .inbox
+            .accounts
+            .iter()
+            .map(|a| Candidate::described(&a.name, a.kind.as_str()))
+            .collect(),
         SourceKind::ConfigKey => config_key_candidates(cfg),
         _ => Vec::new(),
     }
@@ -313,7 +319,7 @@ impl CompletionSource for ConfigSource<'_> {
 
 /// The selectable merged built-in and local theme catalog.
 pub fn theme_candidates() -> Vec<Candidate> {
-    theme_candidates_from_dir(&crate::util::xdg_config_home().join("thegn/themes"))
+    theme_candidates_from_dir(&crate::util::thegn_config_dir().join("themes"))
 }
 
 fn theme_candidates_from_dir(dir: &Path) -> Vec<Candidate> {
@@ -737,6 +743,7 @@ mod tests {
         assert_eq!(names(SourceKind::Env), ["docker", "nix"]);
         assert_eq!(names(SourceKind::Profile), ["work"]);
         assert_eq!(names(SourceKind::McpServer), ["git"]);
+        assert!(names(SourceKind::InboxAccount).is_empty());
         assert_eq!(names(SourceKind::Agent), ["claude"]);
         assert_eq!(names(SourceKind::Tool), ["lazygit"]);
         assert_eq!(names(SourceKind::Automation), ["notify-on-done"]);

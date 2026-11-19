@@ -1164,13 +1164,14 @@ fn teardown_runtime(
             false
         }
     };
-    if sync_succeeded
-        && !env.placement.is_local()
-        && let Err(error) =
-            crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name)
-    {
-        failures.push(format!("provider sandbox {}: {error}", env.name));
-    }
+    failures.extend(provider_destroy_step(
+        matches!(loc, thegn_core::remote::GitLoc::Provider { .. }),
+        &env.placement,
+        &env.name,
+        &path,
+        sync_succeeded,
+        &mut || crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name),
+    ));
     crate::agent::deregister_vpn(&path);
     crate::agent::deproject(&path);
     // THE-2055: after a successful provider destroy/recycle the sandbox is gone
@@ -1186,6 +1187,50 @@ fn teardown_runtime(
         Ok(())
     } else {
         Err(failures.join("; "))
+    }
+}
+
+/// Refuse a teardown whose stored location is a provider sandbox while the
+/// env it now resolves to is not a provider env: the destroy would resolve no
+/// sandbox, and deleting the row would orphan a sandbox that may still bill.
+fn orphan_refusal(
+    loc_is_provider: bool,
+    env_is_provider: bool,
+    worktree: &str,
+    env: &str,
+) -> Option<String> {
+    (loc_is_provider && !env_is_provider).then(|| {
+        format!(
+            "worktree {worktree} was placed on a provider sandbox, but env {env} is not a \
+             provider env now; deleting would orphan the sandbox. Restore the env, or run \
+             `thegn env set --worktree {worktree} <env>` first."
+        )
+    })
+}
+
+/// The provider-sandbox step of [`teardown_runtime`]. An orphaning teardown is
+/// refused without calling `destroy`; otherwise a remote env whose sync
+/// succeeded destroys (or recycles) its sandbox, and only an `Err` is a
+/// failure. Returns the failure to record, if any.
+fn provider_destroy_step(
+    loc_is_provider: bool,
+    placement: &thegn_core::placement::Placement,
+    env_name: &str,
+    worktree: &str,
+    sync_succeeded: bool,
+    destroy: &mut dyn FnMut() -> Result<crate::agent_teardown::Teardown, String>,
+) -> Option<String> {
+    if let Some(refusal) =
+        orphan_refusal(loc_is_provider, placement.is_provider(), worktree, env_name)
+    {
+        return Some(refusal);
+    }
+    if !sync_succeeded || placement.is_local() {
+        return None;
+    }
+    match destroy() {
+        Ok(_) => None,
+        Err(error) => Some(format!("provider sandbox {env_name}: {error}")),
     }
 }
 
@@ -2001,6 +2046,95 @@ fn report_log_failure(context: &HookContext, result: &crate::hook_run::HookRunRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type DestroyResult = Result<crate::agent_teardown::Teardown, String>;
+
+    fn provider_placement() -> thegn_core::placement::Placement {
+        thegn_core::placement::Placement::Provider(thegn_core::placement::ProviderPlacement {
+            provider: "sprites".into(),
+            id: "tg-a".into(),
+            interactive_prefix: vec!["x".into()],
+            control_prefix: vec!["x".into()],
+            up_command: vec![],
+            down_command: vec![],
+        })
+    }
+
+    fn run_destroy_step(
+        loc_is_provider: bool,
+        placement: &thegn_core::placement::Placement,
+        outcome: DestroyResult,
+    ) -> (Option<String>, usize) {
+        let mut calls = 0;
+        let failure = provider_destroy_step(
+            loc_is_provider,
+            placement,
+            "box",
+            "/wt/a",
+            true,
+            &mut || {
+                calls += 1;
+                outcome.clone()
+            },
+        );
+        (failure, calls)
+    }
+
+    #[test]
+    fn orphan_refusal_only_for_a_provider_location_under_a_non_provider_env() {
+        assert!(orphan_refusal(false, false, "/wt/a", "local").is_none());
+        assert!(orphan_refusal(false, true, "/wt/a", "box").is_none());
+        assert!(orphan_refusal(true, true, "/wt/a", "box").is_none());
+        let refusal = orphan_refusal(true, false, "/wt/a", "local").expect("refused");
+        assert!(refusal.contains("worktree /wt/a was placed on a provider sandbox"));
+        assert!(refusal.contains("env local is not a provider env now"));
+        assert!(refusal.contains("thegn env set --worktree /wt/a <env>"));
+    }
+
+    #[test]
+    fn teardown_of_a_provider_location_under_a_local_env_refuses_without_destroy() {
+        let (failure, calls) = run_destroy_step(
+            true,
+            &thegn_core::placement::Placement::Local,
+            Ok(crate::agent_teardown::Teardown::NoSandbox),
+        );
+        assert!(failure.expect("refused").contains("orphan the sandbox"));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn teardown_destroy_step_keeps_ok_outcomes_and_fails_on_err() {
+        use crate::agent_teardown::Teardown;
+        let provider = provider_placement();
+        for ok in [
+            Teardown::NoSandbox,
+            Teardown::Recycled {
+                name: "tg-a".into(),
+            },
+            Teardown::Destroyed {
+                name: "tg-a".into(),
+            },
+        ] {
+            let (failure, calls) = run_destroy_step(true, &provider, Ok(ok));
+            assert_eq!(failure, None);
+            assert_eq!(calls, 1);
+        }
+        let (failure, calls) =
+            run_destroy_step(true, &provider, Err("could not be confirmed".into()));
+        assert_eq!(calls, 1);
+        let failure = failure.expect("an unconfirmed destroy refuses the delete");
+        assert!(
+            failure.contains("provider sandbox box: could not be confirmed"),
+            "{failure}"
+        );
+        // A local env with a local location never calls the provider.
+        let (failure, calls) = run_destroy_step(
+            false,
+            &thegn_core::placement::Placement::Local,
+            Err("unreachable".into()),
+        );
+        assert_eq!((failure, calls), (None, 0));
+    }
 
     #[test]
     fn close_checkpoint_wanted_skips_after_provider_destroy() {

@@ -256,6 +256,9 @@ impl IsolatedState {
             }
         }
         vars.push(("THEGN_DIR", temp.path().join(".thegn")));
+        // An empty value is ignored, so the config dir follows the isolated
+        // config home even when the ambient shell sets one.
+        vars.push((crate::util::THEGN_CONFIG_DIR_ENV, PathBuf::new()));
         let strings: Vec<_> = vars
             .iter()
             .map(|(key, value)| (*key, value.to_str().expect("state path is UTF-8")))
@@ -350,6 +353,24 @@ pub fn require_or_skip_in(
 pub fn require_or_skip(prereq: &str, available: bool) -> bool {
     let required = std::env::var(REQUIRE_SECURITY_TESTS_ENV).as_deref() == Ok("1");
     require_or_skip_in(required, prereq, available, &mut std::io::stderr().lock())
+}
+
+/// Bind a listening Unix-domain socket at `path` for a test that only needs
+/// one to exist (a shell `[ -S path ]` probe). The returned guard keeps it
+/// bound until dropped. Non-Unix runners get `Unsupported` and skip, so the
+/// calling test needs no platform `#[cfg]` of its own.
+pub fn bind_unix_socket_for_test(path: &Path) -> std::io::Result<Box<dyn std::any::Any>> {
+    #[cfg(unix)]
+    {
+        Ok(Box::new(std::os::unix::net::UnixListener::bind(path)?))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("no Unix socket fixture at {}", path.display()),
+        ))
+    }
 }
 
 #[cfg(test)]

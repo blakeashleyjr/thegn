@@ -89,6 +89,16 @@ pub enum Action {
         /// Block until the agent exits, then print its output tail.
         #[arg(long)]
         wait: bool,
+        /// After the agent exits, fetch the commits made in a provider
+        /// sandbox back into the worktree branch (like `env pull`); adds
+        /// `pull: {ok, ref, error}` to `--json`. Needs `--wait`.
+        #[arg(long, requires = "wait")]
+        pull: bool,
+        /// Fly/machine0: leave the machine running after the agent exits
+        /// (by default it is stopped, since it bills while started). Needs
+        /// `--wait`.
+        #[arg(long, requires = "wait")]
+        keep_running: bool,
         /// Seconds `--wait` waits before giving up (exit 2; the session keeps
         /// running).
         #[arg(
@@ -142,6 +152,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             var,
             track,
             wait,
+            pull,
+            keep_running,
             timeout,
             json,
         } => super::agent_spawn::run(
@@ -155,6 +167,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 vars: var,
                 track,
                 wait,
+                pull,
+                keep_running,
                 timeout_secs: timeout,
                 json,
             },

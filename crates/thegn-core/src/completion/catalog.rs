@@ -43,6 +43,8 @@ pub enum SourceKind {
     Stage,
     /// `[mcp_servers.<name>]` names.
     McpServer,
+    /// `[[inbox.accounts]]` names.
+    InboxAccount,
     /// Dotted config keys, as `config get`/`config set`/`--set` take them.
     ConfigKey,
 
@@ -158,6 +160,7 @@ impl SourceKind {
         SourceKind::Plugin,
         SourceKind::Stage,
         SourceKind::McpServer,
+        SourceKind::InboxAccount,
         SourceKind::ConfigKey,
         SourceKind::Capability,
         SourceKind::Action,
@@ -188,6 +191,7 @@ impl SourceKind {
             SourceKind::Plugin => "plugin",
             SourceKind::Stage => "stage",
             SourceKind::McpServer => "mcp-server",
+            SourceKind::InboxAccount => "inbox-account",
             SourceKind::ConfigKey => "config-key",
             SourceKind::Capability => "capability",
             SourceKind::Action => "action",
@@ -234,6 +238,7 @@ impl SourceKind {
                 | SourceKind::Plugin
                 | SourceKind::Stage
                 | SourceKind::McpServer
+                | SourceKind::InboxAccount
                 | SourceKind::ConfigKey
         )
     }
@@ -334,6 +339,13 @@ pub const CATALOG: &[Slot] = &[
     slot(
         "env reap",
         "provider",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // A sprite name as the Sprites API lists it: listing would be a network
+    // call on <TAB>, so it stays free text.
+    slot(
+        "env adopt",
+        "name",
         SourceKind::Reserved(Reserved::Freeform),
     ),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
@@ -509,6 +521,9 @@ pub const CATALOG: &[Slot] = &[
     slot("program assign", "repo", SourceKind::Repo),
     slot("repo trust", "path", SourceKind::Repo),
     slot("repo provenance", "path", SourceKind::Repo),
+    // `repo forget`: the workspaces to forget, or (`--keep`) the ones to keep.
+    slot("repo forget", "paths", SourceKind::Repo),
+    slot("repo forget", "keep", SourceKind::Repo),
     // The hidden legacy top-level alias of `repo trust`.
     slot("repo-trust", "path", SourceKind::Repo),
     slot("wt new", "repo", SourceKind::Repo),
@@ -581,6 +596,7 @@ pub const CATALOG: &[Slot] = &[
     // `env create name` is deliberately absent: it names a NEW env, so
     // completing the existing ones would be actively misleading.
     slot("agent run", "env", SourceKind::Env),
+    slot("env adopt", "env", SourceKind::Env),
     slot("env deprovision", "env", SourceKind::Env),
     slot("env rm", "name", SourceKind::Env),
     slot("env set", "name", SourceKind::Env),
@@ -820,6 +836,11 @@ pub const CATALOG: &[Slot] = &[
     slot("session close", "session", SourceKind::Session),
     // --- mcp server (`[mcp_servers.<name>]`) -------------------------------
     slot("mcp install", "name", SourceKind::McpServer),
+    // `thegn lead login --mcp <server>`: a `[mcp_servers.<name>]` entry.
+    slot("lead login", "mcp", SourceKind::McpServer),
+    // --- inbox (`[[inbox.accounts]] name`, b163) ----------------------------
+    slot("inbox list", "account", SourceKind::InboxAccount),
+    slot("inbox test", "account", SourceKind::InboxAccount),
     // The proxy profile is a free-form `[mcp_proxy] profiles` name.
     slot(
         "mcp proxy",
@@ -1112,6 +1133,28 @@ mod tests {
             );
         }
         assert_eq!(lookup("agent result", "json"), None);
+    }
+
+    #[test]
+    fn inbox_account_slots_complete_inbox_account_names() {
+        for path in ["inbox list", "inbox test"] {
+            assert_eq!(
+                lookup(path, "account").map(|slot| slot.source),
+                Some(SourceKind::InboxAccount),
+                "{path}"
+            );
+        }
+        assert!(SourceKind::InboxAccount.reads_config());
+        assert!(!SourceKind::InboxAccount.reads_db());
+        assert_eq!(SourceKind::InboxAccount.kind(), "inbox-account");
+    }
+
+    #[test]
+    fn lead_login_mcp_slot_completes_mcp_server_names() {
+        assert_eq!(
+            lookup("lead login", "mcp").map(|slot| slot.source),
+            Some(SourceKind::McpServer)
+        );
     }
 
     #[test]

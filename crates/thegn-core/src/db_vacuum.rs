@@ -11,9 +11,15 @@ use std::time::Duration;
 
 pub const NOTIFICATION_READ_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 pub const INCREMENTAL_PAGES_PER_ROUND: u32 = 2048;
-pub const AUTO_CONVERT_MAX_LIVE_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest live size a legacy database is converted at automatically.
+pub const AUTO_CONVERT_MAX_LIVE_BYTES: u64 = 256 * 1024 * 1024;
+/// Extra free space beyond 2x live a conversion needs on the DB's filesystem.
+pub const CONVERT_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound on incremental-vacuum steps in one automatic maintenance pass.
+pub const INCREMENTAL_STEPS_PER_PASS: u32 = 16;
 pub(crate) const DISPATCH_TERMINAL_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_RECLAIM_BYTES: u64 = 8 * 1024 * 1024;
+const CHECKPOINT_BUSY: Duration = Duration::from_millis(100);
 const TERMINAL_DISPATCH_STATUSES: [AgentDispatchStatus; 4] = [
     AgentDispatchStatus::Merged,
     AgentDispatchStatus::Abandoned,
@@ -89,12 +95,32 @@ pub struct ConvertOutcome {
     pub after: DbSpace,
 }
 
+/// Free space around the database, measured by the caller (core does no statvfs).
+/// `None` means unknown (statvfs unavailable) and never blocks a conversion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostRoom {
+    /// Bytes available on the filesystem holding the database.
+    pub db_fs_free: Option<u64>,
+    /// Bytes available in the temp directory SQLite's VACUUM may spill into.
+    pub tmp_free: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaintenanceStep {
     Nothing,
-    Incremental { pages: u32 },
+    Incremental {
+        pages: u32,
+    },
     Convert,
-    TooLargeForAuto { live_bytes: u64, free_bytes: u64 },
+    TooLargeForAuto {
+        live_bytes: u64,
+        free_bytes: u64,
+    },
+    /// A conversion would not fit; nothing is attempted.
+    LowDisk {
+        need_bytes: u64,
+        free_bytes: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,9 +310,15 @@ impl Db {
         }
         let before = self.space()?.freelist_count;
         if max_pages > 0 {
-            self.conn()
-                .execute_batch(&format!("PRAGMA incremental_vacuum({max_pages});"))
+            // The pragma yields one result row per page it frees, so it must be
+            // stepped to completion: `execute_batch` steps each statement once
+            // and would free a single page whatever `max_pages` says.
+            let mut stmt = self
+                .conn()
+                .prepare(&format!("PRAGMA incremental_vacuum({max_pages})"))
                 .map_err(map_busy)?;
+            let mut rows = stmt.query([]).map_err(map_busy)?;
+            while rows.next().map_err(map_busy)?.is_some() {}
         }
         let after = self.space()?.freelist_count;
         Ok(before.saturating_sub(after))
@@ -357,7 +389,9 @@ impl Db {
             conversion: None,
         };
         match step {
-            MaintenanceStep::Nothing | MaintenanceStep::TooLargeForAuto { .. } => {}
+            MaintenanceStep::Nothing
+            | MaintenanceStep::TooLargeForAuto { .. }
+            | MaintenanceStep::LowDisk { .. } => {}
             MaintenanceStep::Incremental { pages } => {
                 report.reclaimed_pages = self.incremental_vacuum(pages)?;
             }
@@ -366,6 +400,46 @@ impl Db {
             }
         }
         Ok(report)
+    }
+
+    /// `PRAGMA wal_checkpoint(TRUNCATE)`; when that is blocked by a reader or
+    /// writer, one `PASSIVE` checkpoint instead. Returns whether TRUNCATE
+    /// succeeded (the WAL file is then empty).
+    pub fn checkpoint_truncate(&self) -> Result<bool> {
+        let conn = self.conn();
+        if let Err(error) = conn.busy_timeout(CHECKPOINT_BUSY) {
+            tracing::debug!(%error, "could not shorten the checkpoint busy timeout");
+        }
+        let outcome: Result<bool> = (|| {
+            let truncated = match checkpoint_wal(conn) {
+                Ok(()) => true,
+                Err(error) => {
+                    let busy = match error.downcast_ref::<SqlError>() {
+                        // `checkpoint_wal`'s own "could not acquire the lock" result.
+                        None => true,
+                        Some(SqlError::SqliteFailure(code, _)) => matches!(
+                            code.code,
+                            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                        ),
+                        Some(_) => false,
+                    };
+                    if !busy {
+                        return Err(error);
+                    }
+                    tracing::debug!(%error, "WAL TRUNCATE checkpoint busy; falling back to PASSIVE");
+                    false
+                }
+            };
+            if !truncated {
+                conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(map_busy)?;
+            }
+            Ok(truncated)
+        })();
+        restore_busy_timeout(conn);
+        outcome
     }
 }
 
@@ -419,8 +493,26 @@ fn map_busy_any(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Bytes a backup-free in-place VACUUM needs on the DB filesystem: the new
+/// copy lands in the WAL (about `live` bytes) next to the old file, plus
+/// [`CONVERT_HEADROOM_BYTES`].
+pub fn conversion_needs_bytes(space: &DbSpace) -> u64 {
+    space
+        .live_bytes()
+        .saturating_mul(2)
+        .saturating_add(CONVERT_HEADROOM_BYTES)
+}
+
 /// Decide one bounded maintenance step without touching SQLite.
-pub fn plan_maintenance(space: &DbSpace, auto_attempts_left: u32) -> MaintenanceStep {
+///
+/// Unknown room (`None`) never blocks a conversion on that filesystem
+/// (statvfs unavailable), but a known short one always does. The temp
+/// directory needs `live` bytes for VACUUM's transient copy.
+pub fn plan_maintenance(
+    space: &DbSpace,
+    room: HostRoom,
+    auto_attempts_left: u32,
+) -> MaintenanceStep {
     let threshold = MIN_RECLAIM_BYTES.max(space.file_bytes().div_ceil(10));
     if space.auto_vacuum == AutoVacuum::Incremental && space.free_bytes() >= threshold {
         return MaintenanceStep::Incremental {
@@ -435,14 +527,30 @@ pub fn plan_maintenance(space: &DbSpace, auto_attempts_left: u32) -> Maintenance
     if auto_attempts_left == 0 {
         return MaintenanceStep::Nothing;
     }
-    if space.live_bytes() <= AUTO_CONVERT_MAX_LIVE_BYTES {
-        MaintenanceStep::Convert
-    } else {
-        MaintenanceStep::TooLargeForAuto {
+    if space.live_bytes() > AUTO_CONVERT_MAX_LIVE_BYTES {
+        return MaintenanceStep::TooLargeForAuto {
             live_bytes: space.live_bytes(),
             free_bytes: space.free_bytes(),
-        }
+        };
     }
+    let need = conversion_needs_bytes(space);
+    if let Some(free) = room.db_fs_free
+        && free < need
+    {
+        return MaintenanceStep::LowDisk {
+            need_bytes: need,
+            free_bytes: free,
+        };
+    }
+    if let Some(free) = room.tmp_free
+        && free < space.live_bytes()
+    {
+        return MaintenanceStep::LowDisk {
+            need_bytes: space.live_bytes(),
+            free_bytes: free,
+        };
+    }
+    MaintenanceStep::Convert
 }
 
 #[cfg(test)]
@@ -499,7 +607,8 @@ mod tests {
             .unwrap();
         db.conn().execute("DELETE FROM fixture", []).unwrap();
         assert_eq!(db.incremental_vacuum(0).unwrap(), 0);
-        assert!(db.incremental_vacuum(2048).unwrap() > 0);
+        // More than one page: a single-stepped pragma frees exactly one.
+        assert!(db.incremental_vacuum(2048).unwrap() > 1);
         let (_dir, legacy) = full_db();
         assert!(matches!(
             legacy
@@ -588,20 +697,27 @@ mod tests {
     fn plan_maintenance_thresholds_and_caps() {
         let base = DbSpace {
             page_size: 4096,
-            page_count: 16384,
+            page_count: 65536,
             freelist_count: 0,
             auto_vacuum: AutoVacuum::None,
         };
-        assert_eq!(plan_maintenance(&base, 1), MaintenanceStep::Convert);
+        assert_eq!(base.live_bytes(), AUTO_CONVERT_MAX_LIVE_BYTES);
+        assert_eq!(
+            plan_maintenance(&base, HostRoom::default(), 1),
+            MaintenanceStep::Convert
+        );
         let too_large = DbSpace {
             page_count: base.page_count + 1,
             ..base
         };
         assert!(matches!(
-            plan_maintenance(&too_large, 1),
+            plan_maintenance(&too_large, HostRoom::default(), 1),
             MaintenanceStep::TooLargeForAuto { .. }
         ));
-        assert_eq!(plan_maintenance(&base, 0), MaintenanceStep::Nothing);
+        assert_eq!(
+            plan_maintenance(&base, HostRoom::default(), 0),
+            MaintenanceStep::Nothing
+        );
         let incremental = DbSpace {
             page_count: 20_000,
             freelist_count: 2048,
@@ -609,7 +725,7 @@ mod tests {
             ..base
         };
         assert_eq!(
-            plan_maintenance(&incremental, 0),
+            plan_maintenance(&incremental, HostRoom::default(), 0),
             MaintenanceStep::Incremental { pages: 2048 }
         );
         let ten_percent = DbSpace {
@@ -619,7 +735,7 @@ mod tests {
             ..incremental
         };
         assert_eq!(
-            plan_maintenance(&ten_percent, 0),
+            plan_maintenance(&ten_percent, HostRoom::default(), 0),
             MaintenanceStep::Incremental { pages: 100 }
         );
         let below_ten_percent = DbSpace {
@@ -627,7 +743,7 @@ mod tests {
             ..ten_percent
         };
         assert_eq!(
-            plan_maintenance(&below_ten_percent, 0),
+            plan_maintenance(&below_ten_percent, HostRoom::default(), 0),
             MaintenanceStep::Nothing
         );
         let eight_mib = DbSpace {
@@ -636,7 +752,7 @@ mod tests {
             ..incremental
         };
         assert_eq!(
-            plan_maintenance(&eight_mib, 0),
+            plan_maintenance(&eight_mib, HostRoom::default(), 0),
             MaintenanceStep::Incremental { pages: 2048 }
         );
         let below_eight_mib = DbSpace {
@@ -644,9 +760,178 @@ mod tests {
             ..eight_mib
         };
         assert_eq!(
-            plan_maintenance(&below_eight_mib, 0),
+            plan_maintenance(&below_eight_mib, HostRoom::default(), 0),
             MaintenanceStep::Nothing
         );
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn legacy_of(live_mib: u64) -> DbSpace {
+        DbSpace {
+            page_size: 4096,
+            page_count: live_mib * MIB / 4096,
+            freelist_count: 0,
+            auto_vacuum: AutoVacuum::None,
+        }
+    }
+
+    #[test]
+    fn auto_convert_ceiling_is_256_mib() {
+        assert_eq!(AUTO_CONVERT_MAX_LIVE_BYTES, 256 * MIB);
+        assert_eq!(CONVERT_HEADROOM_BYTES, 64 * MIB);
+        assert_eq!(INCREMENTAL_STEPS_PER_PASS, 16);
+    }
+
+    #[test]
+    fn plan_maintenance_table_with_host_room() {
+        let unknown = HostRoom::default();
+        let plenty = HostRoom {
+            db_fs_free: Some(10_000 * MIB),
+            tmp_free: Some(10_000 * MIB),
+        };
+        // Legacy 200 MiB converts; 300 MiB asks for a manual vacuum.
+        let legacy200 = legacy_of(200);
+        assert_eq!(
+            plan_maintenance(&legacy200, plenty, 1),
+            MaintenanceStep::Convert
+        );
+        assert!(matches!(
+            plan_maintenance(&legacy_of(300), plenty, 1),
+            MaintenanceStep::TooLargeForAuto { live_bytes, .. } if live_bytes == 300 * MIB
+        ));
+        // Unknown room never blocks.
+        assert_eq!(
+            plan_maintenance(&legacy200, unknown, 1),
+            MaintenanceStep::Convert
+        );
+        // The DB filesystem is short of 2x live + headroom.
+        let need = conversion_needs_bytes(&legacy200);
+        assert_eq!(need, 464 * MIB);
+        let short = HostRoom {
+            db_fs_free: Some(need - 1),
+            tmp_free: None,
+        };
+        assert_eq!(
+            plan_maintenance(&legacy200, short, 1),
+            MaintenanceStep::LowDisk {
+                need_bytes: need,
+                free_bytes: need - 1
+            }
+        );
+        let exact = HostRoom {
+            db_fs_free: Some(need),
+            tmp_free: None,
+        };
+        assert_eq!(
+            plan_maintenance(&legacy200, exact, 1),
+            MaintenanceStep::Convert
+        );
+        // The temp dir is short of live bytes.
+        let tmp_short = HostRoom {
+            db_fs_free: None,
+            tmp_free: Some(200 * MIB - 1),
+        };
+        assert_eq!(
+            plan_maintenance(&legacy200, tmp_short, 1),
+            MaintenanceStep::LowDisk {
+                need_bytes: 200 * MIB,
+                free_bytes: 200 * MIB - 1
+            }
+        );
+        // Attempts exhausted: nothing, even with room.
+        assert_eq!(
+            plan_maintenance(&legacy200, plenty, 0),
+            MaintenanceStep::Nothing
+        );
+        // Incremental: below threshold nothing; above, pages capped. Room is
+        // irrelevant to an incremental step.
+        let incremental = DbSpace {
+            page_size: 4096,
+            page_count: 100_000,
+            freelist_count: 1000,
+            auto_vacuum: AutoVacuum::Incremental,
+        };
+        assert_eq!(
+            plan_maintenance(&incremental, short, 1),
+            MaintenanceStep::Nothing
+        );
+        let reclaimable = DbSpace {
+            freelist_count: 50_000,
+            ..incremental
+        };
+        assert_eq!(
+            plan_maintenance(&reclaimable, short, 1),
+            MaintenanceStep::Incremental {
+                pages: INCREMENTAL_PAGES_PER_ROUND
+            }
+        );
+    }
+
+    #[test]
+    fn conversion_needs_twice_live_plus_headroom() {
+        let space = legacy_of(10);
+        assert_eq!(
+            conversion_needs_bytes(&space),
+            20 * MIB + CONVERT_HEADROOM_BYTES
+        );
+        let huge = DbSpace {
+            page_size: u64::MAX,
+            page_count: 2,
+            ..space
+        };
+        assert_eq!(conversion_needs_bytes(&huge), u64::MAX);
+    }
+
+    #[test]
+    fn fresh_open_at_database_reports_incremental_auto_vacuum() {
+        // Pins the fresh-database `auto_vacuum=INCREMENTAL` set in db.rs.
+        let dir = tempfile::Builder::new().tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("fresh.db")).unwrap();
+        assert_eq!(db.space().unwrap().auto_vacuum, AutoVacuum::Incremental);
+    }
+
+    #[test]
+    fn checkpoint_truncate_empties_the_wal() {
+        let dir = tempfile::Builder::new().tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let db = Db::open_at(&path).unwrap();
+        db.conn()
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE wal_fixture(data BLOB);
+                 INSERT INTO wal_fixture(data) VALUES(zeroblob(262144));",
+            )
+            .unwrap();
+        let wal = dir.path().join("state.db-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        assert!(db.checkpoint_truncate().unwrap());
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn checkpoint_truncate_falls_back_to_passive_when_a_reader_pins_the_wal() {
+        let dir = tempfile::Builder::new().tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let db = Db::open_at(&path).unwrap();
+        db.conn()
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE wal_fixture(data BLOB);
+                 INSERT INTO wal_fixture(data) VALUES(zeroblob(65536));",
+            )
+            .unwrap();
+        db.conn().busy_timeout(Duration::from_millis(10)).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM wal_fixture;")
+            .unwrap();
+        db.conn()
+            .execute("INSERT INTO wal_fixture(data) VALUES(zeroblob(65536))", [])
+            .unwrap();
+        assert!(!db.checkpoint_truncate().unwrap());
+        reader.execute_batch("COMMIT").unwrap();
+        restore_busy_timeout(db.conn());
     }
 
     #[test]

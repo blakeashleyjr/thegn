@@ -41,6 +41,8 @@
       "issue": "THE-97",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
+        "harden-remote-teardown-proof",
+        "self-maintaining-state",
         "verify-stage-worker-containment"
       ]
     },
@@ -228,8 +230,9 @@
     {
       "issue": "THE-139",
       "project": "Workspace Product & Observability",
-      "changes": [],
-      "no_spec_rationale": "Zone UI delivered in b149 (sidebar chip, palette assign); core archived 2026-11-17."
+      "changes": [
+        "sidebar-short-worktree-list"
+      ]
     },
     {
       "issue": "THE-140",
@@ -449,6 +452,55 @@
       ]
     },
     {
+      "issue": "THE-2178",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-native-inbox"
+      ]
+    },
+    {
+      "issue": "THE-2196",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "fold-autopilot-into-rules"
+      ]
+    },
+    {
+      "issue": "THE-2200",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-sandboxed-merge-gate"
+      ]
+    },
+    {
+      "issue": "THE-2208",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-lead-headless-producers"
+      ]
+    },
+    {
+      "issue": "THE-2214",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-native-inbox"
+      ]
+    },
+    {
+      "issue": "THE-2215",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-native-inbox"
+      ]
+    },
+    {
+      "issue": "THE-2216",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-native-inbox"
+      ]
+    },
+    {
       "issue": "THE-2223",
       "project": "Client API & Remote Access",
       "changes": [
@@ -460,6 +512,14 @@
       "project": "Client API & Remote Access",
       "changes": [
         "vercel-sandbox-agent-credentials"
+      ]
+    },
+    {
+      "issue": "THE-2234",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "harden-remote-sprites-journey",
+        "remote-daily-loop"
       ]
     }
   ]

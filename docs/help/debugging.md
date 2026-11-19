@@ -74,9 +74,11 @@ optional administrator action; thegn never installs the rule or changes file
 permissions.
 
 The report's `db space` line shows the database size, reclaimable space, and
-vacuum mode. It suggests `thegn db vacuum` when the database is not yet in
-incremental mode or is too large to convert automatically (more than 64 MiB
-of live data).
+vacuum mode, followed by what happens next: `auto-maintained` for an
+incremental database, `converts automatically at the next idle pass` for a
+legacy one, `needs N MB free to compact` when the disk is too full to convert,
+and `run 'thegn db vacuum'` only when a legacy database is too large to convert
+automatically (more than 256 MiB of live data).
 The line reads the database read-only, including changes still in its
 write-ahead log.
 
@@ -166,6 +168,15 @@ The existing tuning variables are `THEGN_PERF_INTERVAL_MS` and
 `THEGN_PERF_WAKE_LIMIT`; `THEGN_PERF_PTY_LIMIT`, `THEGN_FRAME_BUDGET_US`, and
 `THEGN_INPUT_BUDGET_US` adjust the related guards. A `THEGN_LOG` filter that
 selects `thegn::perf` also enables the accounting.
+
+To watch background measurement and database maintenance, launch with
+`THEGN_LOG=info,thegn::measure=debug,thegn::db=debug`. A `planned round` line
+from `thegn::measure` names the scan (`scan="loc"` or `scan="disk"`), how many
+rows it examined and how many it will walk; with defaults expect at most 2
+non-empty `loc` rounds per 15 minutes, and none while nothing changed. Between
+sweeps the `thegn-loc-*` threads should show 0 CPU in `top -H`. A `state
+retention pass` line from `thegn::db` reports what each bounded retention rule
+removed and how long the pass took; a pass that removes nothing is normal.
 
 `input_no_effect_events` counts input keys whose cohort stayed pending while
 the loop went idle and was closed by a frame 250 ms or more after the key,

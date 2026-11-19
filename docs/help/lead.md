@@ -25,6 +25,36 @@ the daemon and its own control listener. `[lead] account` is refused for now,
 and only claude is supported as the Lead's agent. Without `[lead]` there is no Lead section in the
 sidebar and the jump key only says the Lead is not configured.
 
+## First run
+
+Every `thegn lead` step needs the dev channel, because on stable `[lead]` is
+clamped off. Not yet verified live.
+
+1. Install bubblewrap and `pasta` (or set `[lead] network = "host"`).
+2. Set `[daemon] enabled = true` and `[lead] agent = "claude"`.
+3. Run `THEGN_CHANNEL=dev thegn daemon stop`, then open thegn with
+   `THEGN_CHANNEL=dev`. Lead tabs end when the daemon restarts, so reopen them.
+4. Run `THEGN_CHANNEL=dev thegn lead login` once (see below).
+5. Run `THEGN_CHANNEL=dev thegn doctor` and read its Lead checks.
+6. Press `Alt i`.
+
+For rules to fire with no window open, also set `[daemon] headless_producers =
+true` (see [[automations]]).
+
+## Log in
+
+`thegn lead login` runs the Lead agent's own login in your terminal, on the
+host network, from a fresh temporary directory. It copies back only the
+credentials file into the Lead's private home. `thegn lead login --mcp
+<server>` does the same for one of the Lead's MCP servers (it must be listed in
+`[lead] mcp_profile`), using temporary package caches and copying back only
+token files. The Lead cannot influence either login. The verb is refused
+when `THEGN_CALLER` or `THEGN_STAGE_LAUNCH` is set, or when stdin is not a TTY.
+
+The Lead keeps a private MCP dir under `$XDG_STATE_HOME/thegn/lead-harness/mcp`
+for its package caches and tokens. Your own `~/.mcp-auth` and `~/.npmrc` are
+masked inside the Lead.
+
 ## Open it
 
 Press `Alt i` (**Jump to the Lead**, `jump-lead`, or run "lead" from the
@@ -43,6 +73,13 @@ with the normal new-tab key and it starts its own Lead process.
 The Lead only has the tools listed in [[ai-usage]] under "Lead tool
 surface", each gated by its scope. All repositories are read-only to it.
 
+## Mail and tasks
+
+The Lead reads your mail and tasks through `notifications.list kind=inbox_item`,
+fed by the daemon's native inbox (see [[inbox]]). `producers.status` shows which
+producers and inbox accounts are armed and their last error. It does not need
+its own MCP servers for Todoist or mail, and never sees the credentials.
+
 ## Approvals
 
 The Lead never grants an approval. It asks (`approvals_request`) and you
@@ -59,9 +96,12 @@ pipeline at `propose`. They are bounded by the `[automations]` budgets, and
 started. `thegn lead resume` and `thegn lead status` are described in
 [[automations]]. The Lead can pause, but only you can resume.
 
-In this release `merge` autonomy behaves like `review`: every land stops for
-your approval, because the merge gate is not sandboxed yet. Unattended
-validation needs a sealed sandbox for the worktree.
+`merge` autonomy lands unattended only when `[merge_queue] gate_sandbox =
+"sealed"` is set and the sealed gate resolves for the repo; otherwise it
+behaves like `review` and every land stops for your approval. The key is off by
+default. A gate that needs the network or the Nix daemon cannot run sealed, so
+those lands still ask. See [[sandboxing]]. `thegn lead pause` also stops
+daemon-driven PR queue work.
 
 ## The sandbox
 
