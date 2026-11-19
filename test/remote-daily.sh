@@ -12,7 +12,7 @@
 #   test/remote-daily.sh                                   # print plan, no network
 #   THEGN_CHANNEL=dev test/remote-daily.sh --env <name> --i-accept-spend \
 #     [--provider sprites|fly|vercel] [--with-model] [--with-adopt <sprite>] \
-#     [--with-reaper]
+#     [--with-reaper] [--keep-going]
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
@@ -54,6 +54,9 @@ while [ $# -gt 0 ]; do
     accept=1
     shift
     ;;
+  --keep-going)
+    shift
+    ;;
   -h | --help)
     sed -n 2,15p "$0"
     exit 0
@@ -75,6 +78,8 @@ Will create : ONE sandbox/machine via the named [env.<name>] from your real
               daemon and a scratch git repo on branch rd/daily-lane.
 Max spend   : one sandbox for about 10 minutes (a 420 s scripted hold); more
               with --with-model (two real model runs). Teardown destroys it.
+Options     : --keep-going is accepted for plan-only runs; it does not bypass
+              --i-accept-spend.
 Teardown    : trap on EXIT/INT/TERM -> env down --force, env deprovision <name>
               for each name in THIS run's ledger (rd-x's and rd-y's), daemon
               stop; fails (keeps the ledger) if any of this run's names remain
@@ -86,6 +91,9 @@ Steps:
       pre-existing sandboxes (never touched); SKIP on an older binary or fly
   1   env test
   2   wt new rd-x --env <S>
+ 2c   resolve the rd-x worktree path
+ 2u   env up (provision rd-x)
+ 2b   exactly one ready ledger record for this run
   3   agent run --worktree <rd-x path> --agent hold-test --prompt x --wait --pull --json
       (scripted agent: sleep 420; date>f; git commit). No per-run overlay agent
       can be added from here, so the stated fallback is used: the same script
@@ -96,12 +104,16 @@ Steps:
   4   (--with-model) agent run --agent claude, then --agent codex, each
       committing one file
   5   (fly only) fleet list --env shows stopped
-  6   exec bridge: stat -c %a ~/.claude/.credentials.json is 600
+  6   if login_upload=claude, exec bridge stat -c %a ~/.claude/.credentials.json is 600;
+      otherwise no model login entered the sandbox (model_credentials default)
   7   local git log has the commits
   8   land --worktree <rd-x path> --release-sandbox
   9   ledger record gone, sandbox absent from the org listing
  10   env reap --provider <p> --json is clean
- 11   wt new rd-y --env <S>           11b exactly one new ledger record
+ 11   wt new rd-y --env <S>
+11p   resolve the rd-y worktree path
+11u   env up (provision rd-y)
+11b   exactly one new ledger record
       then wt rm <rd-y path> --force exits 0 (the worktree-delete teardown,
       which confirms the destroy)     11c its record is gone and the org
       listing lacks it
@@ -174,6 +186,8 @@ if row.get("token_resolves") is not True:
     print("FAIL 0: the token for env " + env + " does not resolve (remote_live.token_resolves = " + show(row.get("token_resolves")) + ")", file=sys.stderr)
     sys.exit(1)
 print("INFO 0: credentials entering the sandbox: forwarded_env=" + show(row.get("forwarded_env")) + "; git_token=" + show(row.get("git_token")) + "; login_upload=" + show(row.get("login_upload")))
+with open(os.path.join(os.environ["TMP"], "preflight.env"), "w", encoding="utf-8") as f:
+    f.write("LOGIN_UPLOAD=" + show(row.get("login_upload")) + "\n")
 unbound = row.get("unbound") or []
 if not isinstance(unbound, list):
     unbound = [unbound]
@@ -187,7 +201,7 @@ preflight_capture() { # doctor may exit non-zero on unrelated checks; parse what
 }
 preflight_check() { # preflight_check <env> [required: 1|0]
   echo "== step 0: preflight (doctor --json remote_live for env '$1')"
-  printf '%s' "$DOCTOR_JSON" | PRE_ENV="$1" PRE_REQUIRED="${2:-1}" python3 -I -c "$PREFLIGHT_PY" || {
+  printf '%s' "$DOCTOR_JSON" | PRE_ENV="$1" PRE_REQUIRED="${2:-1}" TMP="$TMP" python3 -I -c "$PREFLIGHT_PY" || {
     echo "FAIL 0: preflight" >&2
     exit 1
   }
@@ -323,6 +337,12 @@ step() { # step <id> <description> <command...>
 in_repo() { (cd "$REPO" && "$@"); }
 no_stdin() { "$@" </dev/null; }
 
+LOGIN_UPLOAD=""
+read_login_upload() {
+  [ -f "$TMP/preflight.env" ] || return 0
+  LOGIN_UPLOAD="$(sed -n 's/^LOGIN_UPLOAD=//p' "$TMP/preflight.env")"
+}
+
 name_from_ledger() { # exactly one ready record, safe charset
   local n
   n="$(run_records)"
@@ -373,6 +393,15 @@ cred_mode() {
   out="$(printf '%s' "$out" | tr -d '\r\n ')"
   echo "   mode: $out"
   [ "$out" = 600 ]
+}
+
+no_model_login() {
+  [ -n "$EXEC_BRIDGE" ] || return 0
+  local out
+  # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
+  out="$(no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$NAME" -- sh -c 'test ! -e "$HOME/.claude/.credentials.json" && echo absent')" || return 1
+  echo "   credentials: $out"
+  [ "$out" = absent ]
 }
 
 local_log_has_commits() {
@@ -432,13 +461,15 @@ resolve_rdy_path() { # the worktree whose branch ends in rd-y
 
 # fly envs have no remote_live row (doctor covers sprites and vercel).
 if [ "$provider" = fly ]; then preflight_check "$env_name" 0; else preflight_check "$env_name"; fi
+read_login_upload
 step 1 "env test" "$THEGN_BIN" env test "$env_name"
 scratch_repo
 in_repo "$THEGN_BIN" env set "$env_name" >/dev/null
 CREATED=1
 step 2 "wt new rd-x --env $env_name" in_repo "$THEGN_BIN" wt new rd-x --env "$env_name"
-step 2b "exactly one ready ledger record for this run" name_from_ledger
 step 2c "resolve the rd-x worktree path" resolve_wt_path
+step 2u "env up (provision rd-x)" no_stdin "$THEGN_BIN" env up --worktree "$WT_PATH"
+step 2b "exactly one ready ledger record for this run" name_from_ledger
 echo "sandbox: $NAME"
 if [ "${RD_HOLD_AGENT:-0}" = 1 ]; then
   step 3 "agent run hold-test --wait --pull" in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent hold-test --prompt x --wait --pull --json
@@ -457,7 +488,11 @@ fi
 if [ "$provider" = fly ]; then
   step 5 "fleet list shows the machine stopped" fly_stopped
 fi
-step 6 "credentials file mode is 600" cred_mode
+if [ "$LOGIN_UPLOAD" = claude ]; then
+  step 6 "credentials file mode is 600" cred_mode
+else
+  step 6 "no model login entered the sandbox (model_credentials default)" no_model_login
+fi
 if [ "$with_model" = 1 ]; then want=3; else want=1; fi
 step 7 "local git log has the commits" local_log_has_commits "$want"
 step 8 "land --worktree <rd-x> --release-sandbox" in_repo "$THEGN_BIN" land --worktree "$WT_PATH" --release-sandbox
@@ -466,9 +501,10 @@ step 9b "sandbox absent from the org listing" listing_lacks_name
 step 10 "env reap --provider $provider is clean" reap_clean
 snapshot_records
 step 11 "wt new rd-y --env $env_name" in_repo "$THEGN_BIN" wt new rd-y --env "$env_name"
+step 11p "resolve the rd-y worktree path" resolve_rdy_path
+step 11u "env up (provision rd-y)" no_stdin "$THEGN_BIN" env up --worktree "$RDY_PATH"
 step 11b "exactly one new ledger record for rd-y" one_new_record
 echo "sandbox (rd-y): $RDY_NAME"
-step 11p "resolve the rd-y worktree path" resolve_rdy_path
 # --force only here: rd-y is this run's scratch worktree.
 step 11r "wt rm <rd-y path> --force exits 0" no_stdin in_repo "$THEGN_BIN" wt rm "$RDY_PATH" --force
 step 11c "rd-y's ledger record is gone and the org listing lacks it" rdy_gone
