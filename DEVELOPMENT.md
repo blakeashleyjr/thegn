@@ -46,7 +46,8 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   (8 ms batching, or a deferred frame's remainder — `idle_poll::poll_timeout`).
   Off-thread producers send on a channel **and pulse the `TerminalWaker`**.
   Never blocking I/O (git, DB, subprocess, D-Bus, network) on the loop or
-  before the first frame.
+  before the first frame. Background lanes gate on a next-due time and never
+  re-plan between sweeps.
 - **Render decision is pure.** `render_plan::plan` → `Skip` / `Panes` / `Full`;
   pane output never recomposes chrome.
 - **Degrade at the edges.** Compose in truecolor + Unicode; quantize once in
