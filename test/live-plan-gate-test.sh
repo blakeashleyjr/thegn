@@ -49,6 +49,8 @@ if [ "${STUB_MODE:-}" = continue ]; then
   "fleet list"*)
     if [ -e "$XDG_STATE_HOME/down" ]; then
       echo '{"view":{"rows":[],"down":[{"id":"sp-live"}],"missing":[],"partial":false}}'
+    elif [ "${STUB_FLEET_OTHER_COLD:-}" = 1 ]; then
+      echo '{"view":{"rows":[{"id":"sx-foreign","state":"cold"}],"partial":false}}'
     else
       echo '{"view":{"rows":[{"id":"sp-live","state":"warm"}],"partial":false}}'
     fi
@@ -62,6 +64,8 @@ if [ "${STUB_MODE:-}" = continue ]; then
     fi
     exit 0
     ;;
+  *"exit 3"*) echo boom; exit 3 ;;
+  "sprite-exec sp-live -- true") exit 0 ;;
   *"--hold"*) /usr/bin/sleep 2; exit 0 ;;
   *"git -c user.name=live"*) echo '1111111111111111111111111111111111111111'; exit 0 ;;
   *"rev-parse HEAD"*) echo '1111111111111111111111111111111111111111'; exit 0 ;;
@@ -133,7 +137,14 @@ if rc_is plan-sprites-keep-going 0 && [ ! -s "$T/plan-sprites-keep-going.log" ] 
 else
   fail "sprites-live: --keep-going plan ($(cat "$T/plan-sprites-keep-going.out"))"
 fi
-for want in "--keep-going" "view.rows" "6c " "THE-2450" "8c " "cpu_hours" "zero usage (partial or not)" "FAILED STEPS:"; do
+run plan-sprites-with-agent sprites-live.sh -- --with-agent gate_agent
+if rc_is plan-sprites-with-agent 0 && [ ! -s "$T/plan-sprites-with-agent.log" ] &&
+  has "$T/plan-sprites-with-agent.out" "spends model usage"; then
+  pass "sprites-live: --with-agent without spend flags is plan-only"
+else
+  fail "sprites-live: --with-agent plan ($(cat "$T/plan-sprites-with-agent.out"))"
+fi
+for want in "--keep-going" "view.rows" "4b " "10w " "--with-agent" "6c " "THE-2450" "8c " "cpu_hours" "zero usage (partial or not)" "FAILED STEPS:"; do
   if has "$T/plan-sprites-live.out" "$want"; then
     pass "sprites-live plan names '$want'"
   else
@@ -222,12 +233,14 @@ fi
 run keep-going-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_DOCTOR="$T/tok-true.json" -- \
   "${SX[@]}" --keep-going
 if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
+  has "$T/keep-going-sprites.out" "PASS 4b" &&
   has "$T/keep-going-sprites.out" "== step 13:" &&
   has "$T/keep-going-sprites.out" "trace log path:" &&
   has "$T/keep-going-sprites.out" "trace lines: 1" &&
   has "$T/keep-going-sprites.out" "last 40 sprites exec frame lines:" &&
   has "$T/keep-going-sprites.out" "TRACE sprites exec frame" &&
   has "$T/keep-going-sprites.out" "WARN 10: usage not reported yet for a sprite this young" &&
+  has "$T/keep-going-sprites.out" "PASS 10w" &&
   has "$T/keep-going-sprites.out" "unrecorded entries: 1" &&
   has "$T/keep-going-sprites.log" "thegn-log thegn::provider=trace" &&
   has "$T/keep-going-sprites.out" "FAILED STEPS:" &&
@@ -244,6 +257,14 @@ if ! rc_is reported-false-sprites 0 &&
   pass "sprites-live: fleet cost warns when usage is not reported"
 else
   fail "sprites-live: reported false usage ($(cat "$T/reported-false-sprites.out"))"
+fi
+
+run other-cold-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_FLEET_OTHER_COLD=1 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if ! rc_is other-cold-sprites 0 && has "$T/other-cold-sprites.out" "FAIL 9:"; then
+  pass "sprites-live: row-specific warm/cold check rejects a foreign cold sprite"
+else
+  fail "sprites-live: foreign cold row ($(cat "$T/other-cold-sprites.out"))"
 fi
 
 # Every acting run must clean up its temp state (nothing was created).
