@@ -139,6 +139,12 @@ pub type SearchSource<'a> = (u32, &'a str, &'a HistoryBuffer);
 type RankedSearchHit = (usize, u32, Option<(usize, usize)>);
 type GroupedSearchHit = (usize, u32, Option<(usize, usize)>, u32);
 
+struct RefineCache {
+    fingerprint: Vec<(u32, u64, usize)>,
+    query: String,
+    hits: Vec<usize>,
+}
+
 /// Fuzzy search engine over one or more pane histories.
 ///
 /// Call [`SearchEngine::set_query`] (or the incremental `push_char`/`backspace`)
@@ -152,6 +158,9 @@ pub struct SearchEngine {
     selected: usize,
     max_results: usize,
     mode: MatchMode,
+    refine: Option<RefineCache>,
+    #[cfg(test)]
+    scanned: usize,
 }
 
 impl SearchEngine {
@@ -163,6 +172,9 @@ impl SearchEngine {
             selected: 0,
             max_results: max_results.max(1),
             mode: MatchMode::default(),
+            refine: None,
+            #[cfg(test)]
+            scanned: 0,
         }
     }
 
@@ -173,6 +185,7 @@ impl SearchEngine {
     /// Switch match mode; re-scores against `sources`.
     pub fn set_mode(&mut self, m: MatchMode, sources: &[SearchSource<'_>]) {
         self.mode = m;
+        self.refine = None;
         self.selected = 0;
         self.recompute(sources);
     }
@@ -231,15 +244,25 @@ impl SearchEngine {
     /// Change scope without changing the query; re-score against new sources.
     pub fn set_scope(&mut self, scope: SearchScope, sources: &[SearchSource<'_>]) {
         self.scope = scope;
+        self.refine = None;
         self.selected = 0;
         self.recompute(sources);
     }
 
     fn recompute(&mut self, sources: &[SearchSource<'_>]) {
         self.matches.clear();
+        #[cfg(test)]
+        {
+            self.scanned = 0;
+        }
         let trimmed = self.query.trim().to_string();
         let empty = trimmed.is_empty();
         let mode = self.mode;
+
+        let fingerprint: Vec<(u32, u64, usize)> = sources
+            .iter()
+            .map(|&(id, _, buf)| (id, buf.total_pushed(), buf.len()))
+            .collect();
 
         // Flatten every source line, keeping back-references.
         // (pane_id, idx, line, label, from_tail)
@@ -253,6 +276,152 @@ impl SearchEngine {
             })
             .collect();
 
+        let mk = |f: &(u32, usize, &str, &str, usize), score: u32, span, repeat| SearchMatch {
+            pane_id: f.0,
+            line_idx: f.1,
+            line: f.2.to_string(),
+            score,
+            pane_label: f.3.to_string(),
+            span,
+            from_tail: f.4,
+            repeat,
+        };
+
+        let mut hits: Vec<RankedSearchHit> = Vec::new();
+        if empty {
+            self.refine = None;
+            hits.extend(flat.iter().enumerate().map(|(i, _)| (i, 0, None)));
+        } else {
+            match mode {
+                MatchMode::Literal => {
+                    let refine_hits = self.refine.as_ref().and_then(|cache| {
+                        (cache.fingerprint == fingerprint
+                            && !cache.query.is_empty()
+                            && trimmed.contains(cache.query.as_str()))
+                        .then(|| cache.hits.clone())
+                    });
+                    match refine_hits {
+                        Some(indices) => {
+                            for i in indices {
+                                if let Some(f) = flat.get(i) {
+                                    #[cfg(test)]
+                                    {
+                                        self.scanned += 1;
+                                    }
+                                    if let Some(span) = find_literal(f.2, &trimmed) {
+                                        hits.push((
+                                            i,
+                                            if on_word_boundaries(f.2, span) { 2 } else { 1 },
+                                            Some(span),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            for (i, f) in flat.iter().enumerate() {
+                                #[cfg(test)]
+                                {
+                                    self.scanned += 1;
+                                }
+                                if let Some(span) = find_literal(f.2, &trimmed) {
+                                    hits.push((
+                                        i,
+                                        if on_word_boundaries(f.2, span) { 2 } else { 1 },
+                                        Some(span),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    self.refine = Some(RefineCache {
+                        fingerprint,
+                        query: trimmed.clone(),
+                        hits: hits.iter().map(|&(i, _, _)| i).collect(),
+                    });
+                }
+                MatchMode::Fuzzy => {
+                    self.refine = None;
+                    #[cfg(test)]
+                    {
+                        self.scanned = flat.len();
+                    }
+                    let hay: Vec<&str> = flat.iter().map(|f| f.2).collect();
+                    for m in match_list(&trimmed, &hay, &Config::default()) {
+                        hits.push((m.index as usize, m.score as u32, None));
+                    }
+                }
+            }
+        }
+        let mut groups: HashMap<(u32, &str), usize> = HashMap::with_capacity(hits.len());
+        let mut grouped: Vec<GroupedSearchHit> = Vec::with_capacity(hits.len());
+        for (i, score, span) in hits {
+            let key = (flat[i].0, flat[i].2);
+            if let Some(&group_idx) = groups.get(&key) {
+                grouped[group_idx].3 += 1;
+                if flat[i].4 < flat[grouped[group_idx].0].4 {
+                    grouped[group_idx].0 = i;
+                    grouped[group_idx].1 = score;
+                    grouped[group_idx].2 = span;
+                }
+            } else {
+                groups.insert(key, grouped.len());
+                grouped.push((i, score, span, 1));
+            }
+        }
+        let mut cmp = |a: &GroupedSearchHit, b: &GroupedSearchHit| {
+            b.1.cmp(&a.1)
+                .then(flat[a.0].4.cmp(&flat[b.0].4))
+                .then(a.0.cmp(&b.0))
+        };
+        if grouped.len() > self.max_results {
+            grouped.select_nth_unstable_by(self.max_results - 1, &mut cmp);
+            grouped.truncate(self.max_results);
+        }
+        grouped.sort_by(cmp);
+        self.matches = grouped
+            .into_iter()
+            .map(|(i, score, span, repeat)| mk(&flat[i], score, span, repeat))
+            .collect();
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::HistoryBuffer;
+
+    fn buf_from(lines: &[&str]) -> HistoryBuffer {
+        let mut b = HistoryBuffer::new(10_000);
+        for &l in lines {
+            b.push_line(l.to_string());
+        }
+        b
+    }
+
+    fn engine(scope: SearchScope) -> SearchEngine {
+        SearchEngine::new(scope, 1_000)
+    }
+
+    fn reference_matches(
+        query: &str,
+        mode: MatchMode,
+        max_results: usize,
+        sources: &[SearchSource<'_>],
+    ) -> Vec<SearchMatch> {
+        let trimmed = query.trim().to_string();
+        let empty = trimmed.is_empty();
+        let flat: Vec<(u32, usize, &str, &str, usize)> = sources
+            .iter()
+            .flat_map(|&(pane_id, label, buf)| {
+                let n = buf.len();
+                buf.iter()
+                    .enumerate()
+                    .map(move |(idx, line)| (pane_id, idx, line, label, n - 1 - idx))
+            })
+            .collect();
         let mk = |f: &(u32, usize, &str, &str, usize), score: u32, span, repeat| SearchMatch {
             pane_id: f.0,
             line_idx: f.1,
@@ -306,31 +475,11 @@ impl SearchEngine {
             }
         }
         grouped.sort_by(|a, b| b.1.cmp(&a.1).then(flat[a.0].4.cmp(&flat[b.0].4)));
-        grouped.truncate(self.max_results);
-        self.matches = grouped
+        grouped.truncate(max_results.max(1));
+        grouped
             .into_iter()
             .map(|(i, score, span, repeat)| mk(&flat[i], score, span, repeat))
-            .collect();
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::history::HistoryBuffer;
-
-    fn buf_from(lines: &[&str]) -> HistoryBuffer {
-        let mut b = HistoryBuffer::new(10_000);
-        for &l in lines {
-            b.push_line(l.to_string());
-        }
-        b
-    }
-
-    fn engine(scope: SearchScope) -> SearchEngine {
-        SearchEngine::new(scope, 1_000)
+            .collect()
     }
 
     // ── scope cycling ─────────────────────────────────────────────────────────
@@ -677,5 +826,113 @@ mod tests {
         let mut eng = engine(SearchScope::Pane(1));
         eng.set_query("ssh", &srcs);
         assert_eq!(eng.matches().len(), 1_000);
+    }
+
+    #[test]
+    fn grouped_output_matches_reference() {
+        let words = [
+            "ssh host",
+            "SSH host",
+            "shell prompt",
+            "push changes",
+            "status clean",
+            "other output",
+        ];
+        let queries = ["s", "sh", "ssh", "sh", "s", ""];
+        let mut state = 0xB171_5EED_u64;
+
+        for case in 0..200 {
+            let pane_count = 1 + (next_random(&mut state) % 4) as usize;
+            let mut buffers = Vec::with_capacity(pane_count);
+            for _ in 0..pane_count {
+                let mut buf = HistoryBuffer::new(32);
+                let line_count = 1 + (next_random(&mut state) % 12) as usize;
+                for _ in 0..line_count {
+                    let word = words[next_random(&mut state) as usize % words.len()];
+                    let suffix = next_random(&mut state) % 3;
+                    buf.push_line(if suffix == 0 {
+                        word.to_string()
+                    } else {
+                        format!("{word} {suffix}")
+                    });
+                }
+                buffers.push(buf);
+            }
+            let labels: Vec<String> = (0..pane_count).map(|i| format!("pane {i}")).collect();
+            let sources: Vec<SearchSource<'_>> = buffers
+                .iter()
+                .zip(labels.iter())
+                .enumerate()
+                .map(|(i, (buf, label))| (i as u32, label.as_str(), buf))
+                .collect();
+
+            for mode in [MatchMode::Literal, MatchMode::Fuzzy] {
+                let mut eng = SearchEngine::new(SearchScope::Workspace, 1_000);
+                eng.set_mode(mode, &sources);
+                for query in queries {
+                    eng.set_query(query, &sources);
+                    let expected = reference_matches(query, mode, 1_000, &sources);
+                    assert_eq!(
+                        eng.matches(),
+                        expected.as_slice(),
+                        "case {case}, mode {mode:?}, query {query:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn growing_literal_query_scans_only_previous_hits() {
+        let buf = buf_from(&["s", "ss", "ssh", "other"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_query("s", &sources);
+        let previous_hits = eng.matches().len();
+        eng.push_char('s', &sources);
+        assert!(eng.scanned <= previous_hits);
+    }
+
+    #[test]
+    fn new_lines_invalidate_refine() {
+        let mut buf = buf_from(&["silo", "other"]);
+        let mut eng = engine(SearchScope::Pane(1));
+        {
+            let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+            eng.set_query("s", &sources);
+        }
+        buf.push_line("ss".to_string());
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        eng.push_char('s', &sources);
+        assert_eq!(eng.scanned, buf.len());
+        assert!(eng.matches().iter().any(|m| m.line == "ss"));
+    }
+
+    #[test]
+    fn fuzzy_never_uses_refine() {
+        let buf = buf_from(&["shell", "ssh", "other"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_mode(MatchMode::Fuzzy, &sources);
+        eng.set_query("s", &sources);
+        eng.push_char('s', &sources);
+        assert_eq!(eng.scanned, buf.len());
+        assert!(eng.refine.is_none());
+    }
+
+    #[test]
+    fn max_results_cut_keeps_order() {
+        let buf = buf_from(&["ssh oldest", "ssh middle", "ssh newest", "ssh latest"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = SearchEngine::new(SearchScope::Pane(1), 2);
+        eng.set_query("ssh", &sources);
+        assert_eq!(lines_of(&eng), ["ssh latest", "ssh newest"]);
+    }
+
+    fn next_random(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 32) as u32
     }
 }
