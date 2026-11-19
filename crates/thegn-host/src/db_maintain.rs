@@ -90,6 +90,10 @@ fn run_round_with(
     // background disk round. Both perform idempotent bounded transactions and
     // SQLite's busy timeout handles brief contention.
     prune_round(db, prune_cursor, PRUNE_SLICES_PER_ROUND);
+    let gc = crate::state_gc::run_pass(thegn_core::util::now());
+    if gc != crate::state_gc::GcReport::default() {
+        tracing::debug!(target: "thegn::db", pty_notes = gc.pty_notes, db_copies = gc.db_copies, "state retention pass");
+    }
     let space = match db.space() {
         Ok(space) => space,
         Err(error) => {
