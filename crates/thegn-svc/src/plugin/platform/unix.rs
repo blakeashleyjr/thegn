@@ -20,6 +20,7 @@ const MAX_DESCENDANT_DEPTH: usize = 64;
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     static PROC_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROC_DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GLOBAL_PROC_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Test-only `/proc` root for [`linux_descendants_subtree_only`], so a run
     /// can simulate a failed root walk or a helper orphaned between walks.
@@ -29,6 +30,8 @@ thread_local! {
 
 #[cfg(target_os = "linux")]
 fn proc_read_dir(path: &Path) -> io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    PROC_DIR_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     #[cfg(test)]
     PROC_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     std::fs::read_dir(path)
@@ -340,6 +343,47 @@ pub(crate) fn kill_tracked(pids: &[(libc::pid_t, u64)]) -> usize {
         }
     }
     signalled
+}
+
+/// Live (state not Z/X) members of process group `pgid` among `tracked`,
+/// start-time checked. O(tracked), never a /proc-wide scan.
+#[cfg(target_os = "linux")]
+pub(crate) fn tracked_live_in_group(tracked: &[(libc::pid_t, u64)], pgid: libc::pid_t) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(proc_root) = SUBTREE_PROC_ROOT.with(|cell| cell.borrow().clone()) {
+            return tracked_live_in_group_in(&proc_root, tracked, pgid);
+        }
+    }
+    tracked_live_in_group_in(Path::new("/proc"), tracked, pgid)
+}
+
+#[cfg(target_os = "linux")]
+fn tracked_live_in_group_in(
+    proc_root: &Path,
+    tracked: &[(libc::pid_t, u64)],
+    pgid: libc::pid_t,
+) -> bool {
+    tracked.iter().any(|&(pid, start_time)| {
+        let Ok(stat) = proc_read_to_string(&proc_root.join(pid.to_string()).join("stat")) else {
+            return false;
+        };
+        let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            return false;
+        };
+        let fields = rest.split_whitespace().collect::<Vec<_>>();
+        let live = fields
+            .first()
+            .is_some_and(|state| !matches!(*state, "Z" | "X"));
+        let in_group = fields.get(2).and_then(|f| f.parse::<libc::pid_t>().ok()) == Some(pgid);
+        let same_start = fields.get(19).and_then(|f| f.parse::<u64>().ok()) == Some(start_time);
+        live && in_group && same_start
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn tracked_live_in_group(_tracked: &[(libc::pid_t, u64)], _pgid: libc::pid_t) -> bool {
+    false
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -894,6 +938,49 @@ mod tests {
             vec![(622, 11), (623, 12)]
         );
         GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tracked_live_in_group_checks_state_group_and_start_without_dir_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let stat = |pid: libc::pid_t, state: &str, pgrp: libc::pid_t, start: u64| {
+            let mut fields = vec!["0".to_owned(); 20];
+            fields[0] = state.to_owned();
+            fields[1] = "1".to_owned();
+            fields[2] = pgrp.to_string();
+            fields[19] = start.to_string();
+            format!("{pid} (fixture ) {}", fields.join(" "))
+        };
+        fake_proc_process(root.path(), 801, &stat(801, "S", 800, 10), "");
+        fake_proc_process(root.path(), 802, &stat(802, "Z", 800, 11), "");
+        fake_proc_process(root.path(), 803, &stat(803, "S", 999, 12), "");
+        fake_proc_process(root.path(), 804, &stat(804, "S", 800, 99), "");
+        PROC_DIR_READS.with(|reads| reads.set(0));
+        assert!(tracked_live_in_group_in(root.path(), &[(801, 10)], 800));
+        assert!(
+            !tracked_live_in_group_in(root.path(), &[(802, 11)], 800),
+            "zombie"
+        );
+        assert!(
+            !tracked_live_in_group_in(root.path(), &[(803, 12)], 800),
+            "other group"
+        );
+        assert!(
+            !tracked_live_in_group_in(root.path(), &[(804, 10)], 800),
+            "start mismatch"
+        );
+        assert!(
+            !tracked_live_in_group_in(root.path(), &[(805, 1)], 800),
+            "missing"
+        );
+        assert!(tracked_live_in_group_in(
+            root.path(),
+            &[(802, 11), (801, 10)],
+            800
+        ));
+        assert!(!tracked_live_in_group_in(root.path(), &[], 800));
+        PROC_DIR_READS.with(|reads| assert_eq!(reads.get(), 0, "no /proc directory listing"));
     }
 
     #[test]
