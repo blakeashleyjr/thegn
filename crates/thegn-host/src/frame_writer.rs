@@ -162,6 +162,9 @@ pub(crate) struct FrameWriter {
     sync: bool,
 }
 
+type WriterTask = Box<dyn FnOnce() + Send + 'static>;
+type WriterSpawnResult = std::io::Result<std::thread::JoinHandle<()>>;
+
 /// Max frames in flight before `frame_slot_free` reports Busy.
 const FRAME_QUEUE_DEPTH: usize = 2;
 // CAN aborts a partial control sequence; ST closes an OSC/APC string. Both
@@ -201,6 +204,18 @@ impl FrameWriter {
         wake: impl Fn(&'static str) + Send + Sync + 'static,
         sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
     ) -> Self {
+        Self::spawn_with_spawner(sync, worker_frames, wake, sink, |task| {
+            thegn_core::thread_name::try_spawn_named("thegn-writer", task)
+        })
+    }
+
+    pub(crate) fn spawn_with_spawner(
+        sync: bool,
+        worker_frames: bool,
+        wake: impl Fn(&'static str) + Send + Sync + 'static,
+        sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
+        spawner: impl FnOnce(WriterTask) -> WriterSpawnResult,
+    ) -> Self {
         let inner = Arc::new(Inner {
             q: Mutex::new(Q {
                 msgs: VecDeque::new(),
@@ -233,12 +248,20 @@ impl FrameWriter {
         let worker_inner = Arc::clone(&inner);
         let wake: Arc<dyn Fn(&'static str) + Send + Sync> = Arc::new(wake);
         let worker_wake = Arc::clone(&wake);
-        let handle = Some(
-            thegn_core::thread_name::try_spawn_named("thegn-writer", move || {
-                writer_main(&worker_inner, worker_wake, sink)
-            })
-            .expect("spawn writer thread"),
-        );
+        let task: WriterTask = Box::new(move || writer_main(&worker_inner, worker_wake, sink));
+        let handle = match spawner(task) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+                q.status = WriterStatus::Fatal(format!(
+                    "could not start the terminal writer thread: {error}"
+                ));
+                q.worker_done = true;
+                drop(q);
+                (wake)("writer failed to start");
+                None
+            }
+        };
         FrameWriter {
             inner,
             wake,
@@ -390,14 +413,17 @@ impl FrameWriter {
     /// counters, so a large host copy in flight makes later pane sets wait for
     /// capacity and use their existing latest-wins retry.
     pub(crate) fn try_submit_host_clipboard(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
+        self.inner.clipboard_retry.store(true, Ordering::SeqCst);
+        let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(q.status, WriterStatus::Fatal(_)) {
+            return Err(bytes);
+        }
         if bytes.is_empty() {
             return Ok(());
         }
         if bytes.len() > OOB_QUEUE_BYTES {
             return Err(bytes);
         }
-        self.inner.clipboard_retry.store(true, Ordering::SeqCst);
-        let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
         let target = admit_clipboard(&mut q, bytes, OOB_QUEUE_BYTES)?;
         drop(q);
         self.inner.cv.notify_one();
@@ -487,6 +513,9 @@ fn admit_clipboard(q: &mut Q, bytes: Vec<u8>, byte_budget: usize) -> Result<u64,
 
 impl Drop for FrameWriter {
     fn drop(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
         // Drain-then-join: queued frames (incl. the last one on screen) land
         // before the caller restores the terminal, so the alt-screen exit
         // sequence is last-out.
@@ -1115,6 +1144,66 @@ mod tests {
                 24,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn writer_spawn_failure_is_a_fatal_status_not_a_panic() {
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let writer = FrameWriter::spawn_with_spawner(
+            false,
+            true,
+            move |reason| wake_tx.send(reason).unwrap(),
+            |_| Ok(()),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "thread quota exhausted",
+                ))
+            },
+        );
+
+        assert_eq!(
+            writer.take_status(),
+            WriterStatus::Fatal(
+                "could not start the terminal writer thread: thread quota exhausted".into()
+            )
+        );
+        assert_eq!(wake_rx.recv().unwrap(), "writer failed to start");
+        assert!(writer.handle.is_none());
+        assert!(writer.inner.q.lock().unwrap().worker_done);
+    }
+
+    #[test]
+    fn submit_after_spawn_failure_is_refused() {
+        let writer = FrameWriter::spawn_with_spawner(
+            false,
+            true,
+            |_| {},
+            |_| Ok(()),
+            |_| Err(std::io::Error::other("thread quota exhausted")),
+        );
+
+        assert!(!writer.submit_frame(vec![1], None));
+        assert_eq!(writer.try_submit_oob(OobKind::Other, vec![2]), Err(vec![2]));
+        assert_eq!(writer.try_submit_clipboard(vec![3], || {}), Err(vec![3]));
+        assert_eq!(writer.try_submit_host_clipboard(vec![4]), Err(vec![4]));
+        let q = writer.inner.q.lock().unwrap();
+        assert!(q.msgs.is_empty());
+        assert_eq!(q.submitted_seq, 0);
+    }
+
+    #[test]
+    fn drop_after_spawn_failure_is_immediate() {
+        let writer = FrameWriter::spawn_with_spawner(
+            false,
+            true,
+            |_| {},
+            |_| Ok(()),
+            |_| Err(std::io::Error::other("thread quota exhausted")),
+        );
+        let started = Instant::now();
+        drop(writer);
+        assert!(started.elapsed() < WRITER_SHUTDOWN_BOUND);
     }
 
     #[test]
