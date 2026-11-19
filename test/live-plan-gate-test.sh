@@ -164,6 +164,12 @@ done
 for want in " 11 " "11b " "11c " "wt rm <rd-y path> --force"; do
   if has "$T/plan-remote-daily.out" "$want"; then pass "remote-daily plan names '$want'"; else fail "remote-daily plan lacks '$want'"; fi
 done
+for want in "11k " "11m " "11j "; do
+  if has "$T/plan-remote-daily.out" "$want"; then pass "remote-daily plan names '$want'"; else fail "remote-daily plan lacks '$want'"; fi
+done
+for want in "3s " "7s "; do
+  if has "$T/plan-vercel-live.out" "$want"; then pass "vercel-live plan names '$want'"; else fail "vercel-live plan lacks '$want'"; fi
+done
 if has "$T/plan-vercel-live.out" "9b  no ledger record"; then pass "vercel-live plan names step 9b"; else fail "vercel-live plan lacks step 9b"; fi
 
 # ---- 2. preflight against stubbed doctor output ----

@@ -10,15 +10,15 @@ You can run a **stable** thegn for your daily work and a **dev** thegn built
 from a checkout, side by side, as one user on one machine. The dev instance
 can be rebuilt and restarted freely without touching the stable one.
 
-| Item        | stable                                                         | dev                                                                          |
-| ----------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Binary      | the Nix/home-manager package (a published release)             | `~/.thegn-devel/bin/thegn` (`just live`) or `target/debug/thegn` (`just devel`) |
-| Launch      | `thegn` or the app launcher                                    | `just live` or `just devel`                                                  |
-| Config dir  | `~/.config/thegn`                                              | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`)                                   |
-| State       | the default state dir                                          | `~/.thegn-devel/state` (`XDG_STATE_HOME`)                                    |
-| Runtime     | the login runtime dir (not overridden)                         | the login runtime dir (not overridden)                                       |
-| `THEGN_DIR` | `~/.thegn`                                                     | `~/.thegn-devel/home`                                                        |
-| Channel     | stable                                                         | dev (`THEGN_CHANNEL=dev`)                                                    |
+| Item        | stable                                             | dev                                                                             |
+| ----------- | -------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Binary      | the Nix/home-manager package (a published release) | `~/.thegn-devel/bin/thegn` (`just live`) or `target/debug/thegn` (`just devel`) |
+| Launch      | `thegn` or the app launcher                        | `just live` or `just devel`                                                     |
+| Config dir  | `~/.config/thegn`                                  | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`)                                      |
+| State       | the default state dir                              | `~/.thegn-devel/state` (`XDG_STATE_HOME`)                                       |
+| Runtime     | the login runtime dir (not overridden)             | the login runtime dir (not overridden)                                          |
+| `THEGN_DIR` | `~/.thegn`                                         | `~/.thegn-devel/home`                                                           |
+| Channel     | stable                                             | dev (`THEGN_CHANNEL=dev`)                                                       |
 
 Each instance has its own daemon, database, worktrees and config.
 
@@ -57,6 +57,27 @@ just devel-desktop > ~/.local/share/applications/thegn-dev.desktop
 
 The entry and `just devel` both go through `scripts/devel-launch.sh`, the single
 source of the dev environment. The entry runs `~/.thegn-devel/bin/thegn`.
+
+The dev instance does **not** override `XDG_RUNTIME_DIR`: sandbox masks follow
+the runtime directory in the environment, so a private one would leave the dev
+daemon's socket unmasked or hide the stable one. The dev daemon's socket lives
+under the login runtime dir,
+`/run/user/<uid>/thegn/<hash of the dev state dir>/daemon.sock`, beside the
+stable one, and both instances mask it. `~/.thegn-devel/run` remains only the
+launcher's pidfile dir. Because the runtime dir is the login one, rootless
+podman shares the login runroot, as it does for the stable instance.
+
+The launcher also scrubs pane identity from its environment before it execs the
+dev binary, so a dev instance started from inside a thegn pane does not inherit
+that pane's session. It removes `THEGN_SESSION_ID`, `THEGN_CONTROL_SOCKET`,
+`THEGN_WORKTREE`, `THEGN_BRANCH`, `THEGN_WORKSPACE`, `THEGN_REPO_ROOT`,
+`THEGN_SANDBOX`, `THEGN_SANDBOX_NETWORK`, `THEGN_SANDBOX_ENABLED`,
+`THEGN_FORKED_FROM`, `THEGN_FORK_SCROLLBACK`, `THEGN_ROUTE_TOKEN`,
+`THEGN_ROUTE_ORIGIN`, `THEGN_PROMPT`, `THEGN_EVENT` and `THEGN_BIN`;
+`just devel-env` prints `unset` lines for them.
+
+`scripts/devel-launch.sh --daemon` starts the dev daemon detached from that
+scrubbed environment. It replaces the hand-run `setsid nohup <bin> daemon`.
 
 ## Splitting one instance into two
 
@@ -123,7 +144,8 @@ binary, config dir, state dir, `THEGN_DIR`, channel and daemon socket that pane 
 The block also prints the runtime dir, the sandbox controller id (sandboxes this
 instance created carry it), the addresses `thegn serve` and the model proxy
 would bind, what is shared with other instances (the `thegn.slice` cap and the
-keyring service), and a note when `WAYLAND_DISPLAY` is relative and not under
+keyring service), a "runtime exposure" row, a "share teardowns pending" row
+(both read-only), and a note when `WAYLAND_DISPLAY` is relative and not under
 `XDG_RUNTIME_DIR`, which breaks `wl-copy` and `wl-paste`; start the instance
 with `just devel`.
 
