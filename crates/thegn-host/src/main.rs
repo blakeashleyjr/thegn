@@ -1474,6 +1474,22 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     if !verb_manages_own_logging(&command) {
         crate::diag::register_identity(channel.as_str());
         thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
+    } else {
+        match &command {
+            Command::Daemon { .. } | Command::Serve { .. } => {}
+            Command::Bridge
+            | Command::BridgeRevtunnel { .. }
+            | Command::SpriteProxy { .. }
+            | Command::VpsSsh { .. }
+            | Command::Machine0Ssh { .. }
+            | Command::SpriteExec { .. }
+            | Command::VercelExec { .. } => {
+                if !thegn_core::log_trace::install_bridge_file_trace() {
+                    // Bridge logging is best-effort and must never touch stderr.
+                }
+            }
+            _ => {} // every other verb took the `if` branch above; a new self-logging verb lands here and installs nothing
+        }
     }
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
     // Keep the outcome for actionable tracker refusals and config inspection;
