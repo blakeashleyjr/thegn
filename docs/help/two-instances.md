@@ -10,15 +10,15 @@ You can run a **stable** thegn for your daily work and a **dev** thegn built
 from a checkout, side by side, as one user on one machine. The dev instance
 can be rebuilt and restarted freely without touching the stable one.
 
-| Item        | stable                                                              | dev                                        |
-| ----------- | ------------------------------------------------------------------- | ------------------------------------------ |
-| Binary      | the installed binary (`~/.local/lib/thegn/thegn` after `just live`) | `target/debug/thegn` in the checkout       |
-| Launch      | `thegn`, or `just live` to update it                                | `just devel`                               |
-| Config dir  | `~/.config/thegn`                                                   | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`) |
-| State       | the default state dir                                               | `~/.thegn-devel/state` (`XDG_STATE_HOME`)  |
-| Runtime     | the default runtime dir                                             | `~/.thegn-devel/run` (`XDG_RUNTIME_DIR`)   |
-| `THEGN_DIR` | `~/.thegn`                                                          | `~/.thegn-devel/home`                      |
-| Channel     | stable                                                              | dev (`THEGN_CHANNEL=dev`)                  |
+| Item        | stable                                                         | dev                                                                          |
+| ----------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Binary      | the Nix/home-manager package (a published release)             | `~/.thegn-devel/bin/thegn` (`just live`) or `target/debug/thegn` (`just devel`) |
+| Launch      | `thegn` or the app launcher                                    | `just live` or `just devel`                                                  |
+| Config dir  | `~/.config/thegn`                                              | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`)                                   |
+| State       | the default state dir                                          | `~/.thegn-devel/state` (`XDG_STATE_HOME`)                                    |
+| Runtime     | the login runtime dir (not overridden)                         | the login runtime dir (not overridden)                                       |
+| `THEGN_DIR` | `~/.thegn`                                                     | `~/.thegn-devel/home`                                                        |
+| Channel     | stable                                                         | dev (`THEGN_CHANNEL=dev`)                                                    |
 
 Each instance has its own daemon, database, worktrees and config.
 
@@ -26,19 +26,26 @@ Each instance has its own daemon, database, worktrees and config.
 
 ## Set it up
 
-1. Seed the dev config dir once. `just devel` refuses to start without it and
-   never copies anything for you: `cp -r ~/.config/thegn ~/.config/thegn-dev`.
-   Review the copy before you keep it: it may hold secrets.
-2. Run `just devel`. It builds the debug binary and starts the dev instance,
-   restarting only the previous dev instance.
-3. Register the thegn repo in the dev instance only, so you edit thegn from
+1. Run `just live`. It builds if the source changed, installs the binary to
+   `~/.thegn-devel/bin/thegn` and starts the dev instance. On the first launch,
+   with no `~/.config/thegn-dev`, it seeds that dir once: it copies only
+   `config.toml` from stable and shifts the serve and model-proxy ports by +1.
+   It never overwrites an existing dev config. Review the copy: it may hold
+   secrets.
+2. `just live-plan` shows what `just live` would do without building or
+   starting anything.
+3. The dev daemon is kept across `just live` by default. Pass
+   `--restart-daemon` to end the running dev daemon and start a fresh one
+   (this ends only the dev instance's daemon, never stable's).
+4. Pass `--here` to build and run from the current checkout or worktree rather
+   than the default source.
+5. Register the thegn repo in the dev instance only, so you edit thegn from
    there.
-4. Update the stable instance with `just live` when you choose. Run it from a
-   plain shell, not from the dev instance's environment: `just live` refuses
-   when `THEGN_CONFIG_DIR`, the state or runtime dir, or `THEGN_DIR` point at
-   another instance, and the message names the path and how to fix it.
-   `THEGN_CHANNEL=dev` alone does not make it refuse. It relaunches outside thegn
-   only when the thegn ancestor runs this installation's binary.
+
+`just live` never touches the stable installation. Its old flags
+`--relink-launchers`, `--install-dir`, `--yes` and `--no-scope` are refused with
+a message pointing at home-manager: stable is updated through Nix (see the
+README). `just devel` is the debug-build variant and runs `target/debug/thegn`.
 
 ## Launching the dev instance from a desktop entry
 
@@ -49,16 +56,7 @@ just devel-desktop > ~/.local/share/applications/thegn-dev.desktop
 ```
 
 The entry and `just devel` both go through `scripts/devel-launch.sh`, the single
-source of the dev environment. Because the dev instance overrides
-`XDG_RUNTIME_DIR`, the launcher first rewrites a relative `WAYLAND_DISPLAY` to
-`<real runtime dir>/<name>`, and when `DBUS_SESSION_BUS_ADDRESS` is unset and
-`<real runtime dir>/bus` is a socket it sets
-`DBUS_SESSION_BUS_ADDRESS=unix:path=<real runtime dir>/bus`. Without these the
-terminal cannot find the compositor or the session bus.
-
-Caveat (unverified): rootless podman keeps its runroot under the runtime dir,
-so containers started by the dev instance use a separate runroot from the stable
-instance's.
+source of the dev environment. The entry runs `~/.thegn-devel/bin/thegn`.
 
 ## Splitting one instance into two
 
@@ -114,7 +112,8 @@ These are not separated, and you should know it:
 - `thegn serve` (127.0.0.1:5380) and the model proxy (127.0.0.1:8383) use fixed
   default ports when enabled. Only one instance can bind each. Give the dev
   instance its own in `~/.config/thegn-dev/config.toml`:
-  `[serve] bind = "127.0.0.1:5381"` and `[model_proxy] listen = "127.0.0.1:8384"`.
+  `[serve] bind = "127.0.0.1:5381"` and `[model_proxy] listen = "127.0.0.1:8384"`
+  (seeding does this for you on the first launch).
 - A repo's `.thegn.toml` overlay is read by whichever instance opens the repo.
 
 ## Which instance is this?
