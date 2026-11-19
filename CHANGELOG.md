@@ -7,6 +7,11 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `just live` no longer touches the real installation: it builds if changed, installs to `~/.thegn-devel/bin/thegn` and starts the dev instance, keeping the dev daemon unless `--restart-daemon` is given. `--relink-launchers`, `--install-dir`, `--yes` and `--no-scope` are refused with a pointer at home-manager. The first dev launch seeds `~/.config/thegn-dev` from stable's `config.toml` with the serve and model-proxy ports shifted by +1.
+- Stable is installed from the published gnu release archive through `legacyPackages.<system>.releasePackage`; the home-manager module gains `manageConfig` (default `true`). The README, `RELEASING.md` and `thegn help two-instances` describe the new flow; `docs/live-upgrades.md` is now a short pointer.
+
 ## [0.1.0-alpha.102] — 2026-11-19
 
 ### Changed

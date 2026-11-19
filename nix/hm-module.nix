@@ -707,6 +707,12 @@ in {
       description = "The thegn package to use.";
     };
 
+    manageConfig = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Render ~/.config/thegn/config.toml from these options. Set false to keep a hand-written config (the package and desktop entry are still installed).";
+    };
+
     worktreesDir = lib.mkOption {
       type = lib.types.nullOr (lib.types.str);
       default = null;
@@ -2256,6 +2262,8 @@ in {
     # thegn reads this TOML config. The native host owns its own chrome
     # (sidebar/panel/tabbar/statusbar) in-process — there are no WASM plugins to
     # deploy and no permissions to pre-grant.
-    xdg.configFile."thegn/config.toml".source = configFile;
+    xdg.configFile."thegn/config.toml" = lib.mkIf cfg.manageConfig {
+      source = configFile;
+    };
   };
 }

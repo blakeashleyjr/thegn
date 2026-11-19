@@ -140,6 +140,21 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    > release makes `create-release` fail before uploads and is never deleted;
    > cut a new tag to rebuild a published version.
 
+   **Moving the owner's stable instance.** Once the release is PUBLISHED (not a
+   draft: `releasePackage` fetches the published gnu archive), bump the tag in
+   both thegn inputs of the system flake and rebuild:
+
+   ```sh
+   nix flake lock --override-input thegn github:blakeashleyjr/thegn/v<version> \
+     --override-input thegn-release github:blakeashleyjr/thegn/v<version>
+   sudo nixos-rebuild switch --flake .#<host>
+   ```
+
+   **First release note.** The first stable tag must carry a database schema at
+   least as new as the DB that the old `just live` installs already migrated
+   (schema 116 at `main` 5f8110ee1); otherwise the stable binary refuses the
+   existing state.
+
 7. **Publish generated external metadata only after the draft is published.**
    In Actions, dispatch the `release` workflow from `main`, enter the already
    published tag, and choose `publish-external`. This operation is isolated
