@@ -1,0 +1,22 @@
+[package]
+name = "thegn-job-spec"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable job descriptions for Thegn executors"
+
+[lints]
+workspace = true
+
+[dependencies]
+schemars = "0.8"
+anyhow.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+serde_path_to_error = "0.1"
+thegn-cas = { path = "../thegn-cas", version = "0.1.0" }
+
+[dev-dependencies]
+serde_json.workspace = true
