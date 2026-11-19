@@ -454,7 +454,7 @@ idle_warm_or_cold() {
 cost_has_cpu() {
   local out
   out="$("$THEGN_BIN" fleet cost --json)" || return 1
-  COST_JSON="$out" COST_SPRITE="$SPRITE_NAME" python3 -I -c '
+  COST_JSON="$out" COST_SPRITE="$SPRITE_NAME" COST_ENV="$env_name" python3 -I -c '
 import json, os, sys
 try:
     report = json.loads(os.environ["COST_JSON"])
@@ -468,6 +468,8 @@ if not isinstance(usage, list) or not usage:
 partial_zero = False
 for block in usage:
     print("   sprites_usage: " + json.dumps(block, sort_keys=True))
+    if block.get("env") != os.environ["COST_ENV"]:
+        continue
     if block.get("error") is not None:
         print("fleet cost sprites_usage error: " + str(block["error"]), file=sys.stderr)
         sys.exit(1)
@@ -486,6 +488,9 @@ for block in usage:
         partial_zero = True
         continue
     print("fleet cost sprites_usage cpu_hours is not positive", file=sys.stderr)
+    sys.exit(1)
+if not any(block.get("env") == os.environ["COST_ENV"] for block in usage):
+    print("fleet cost sprites_usage has no block for env " + os.environ["COST_ENV"], file=sys.stderr)
     sys.exit(1)
 if partial_zero:
     print("WARN 10: usage not reported yet (partial)")
