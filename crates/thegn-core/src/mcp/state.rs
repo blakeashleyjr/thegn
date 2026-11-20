@@ -615,9 +615,9 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
     },
     StateToolSpec {
         cap: "sessions.wait",
-        description: "Block until a session reaches a state: exited, idle, blocked, done, \
-                      or its output matches a regex. Read-scoped (observes only). Requires \
-                      a running daemon.",
+        description: "Block until a session reaches a state: exited | idle | blocked | done | \
+                      match:<regex> | screen:<regex> | stable:<ms>. Read-scoped (observes only). \
+                      Requires a running daemon.",
         args: &[
             ArgSpec {
                 name: "session",
@@ -629,7 +629,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                 name: "condition",
                 kind: ArgKind::String,
                 required: true,
-                description: "exited | idle | blocked | done | match:<regex>",
+                description: "exited | idle | blocked | done | match:<regex> | screen:<regex> | stable:<ms>",
             },
             ArgSpec {
                 name: "timeout_ms",
@@ -783,6 +783,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         cap: "sessions.input",
         description: "Send terminal input to a live session — raw bytes to its stdin, \
                       exactly as if typed at its keyboard (control characters included). \
+                      Exactly one of `text`, `bytes_b64` or `keys`. \
                       Write-scoped AND requires `thegn mcp serve --allow-session-input` \
                       (an interlock beyond `write` — see the mcp-write-tools design doc: \
                       typing into an arbitrary live session is a materially larger blast \
@@ -798,7 +799,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                 name: "text",
                 kind: ArgKind::String,
                 required: false,
-                description: "UTF-8 text to send (exactly one of `text`/`bytes_b64`)",
+                description: "UTF-8 text to send (exactly one of `text`, `bytes_b64` or `keys`)",
             },
             ArgSpec {
                 name: "bytes_b64",
@@ -806,6 +807,18 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                 required: false,
                 description: "Base64-encoded raw bytes to send — the only way to send \
                               control characters, e.g. Ctrl-C is base64 of byte 0x03",
+            },
+            ArgSpec {
+                name: "keys",
+                kind: ArgKind::StringArray,
+                required: false,
+                description: "Named keys to send in order (up, esc, enter, ctrl+c, f5…; at most 64), encoded for the pane's cursor-key mode",
+            },
+            ArgSpec {
+                name: "paste",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "With text: paste it (bracketed when the pane enabled bracketed paste)",
             },
             ArgSpec {
                 name: "enter",
@@ -858,7 +871,8 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         cap: "sessions.snapshot",
         description: "The current emulator screen of a live session (the wire mirror of \
                       `GET /v1/sessions/{s}/snapshot`): `{session, seq, cols, rows, \
-                      ansi_b64}`. Read-scoped; requires a running daemon.",
+                      ansi_b64, text, cursor, alt_screen, app_cursor, bracketed_paste}` in \
+                      the answer. Read-scoped; requires a running daemon.",
         args: &[ArgSpec {
             name: "session",
             kind: ArgKind::String,
@@ -1663,6 +1677,9 @@ pub fn redact_for_audit(cap: &str, args: &Value) -> Value {
                     let n = v.len();
                     out.insert(key.to_string(), json!(format!("<{n} bytes>")));
                 }
+            }
+            if let Some(v) = out.get("keys").and_then(Value::as_array) {
+                out.insert("keys".to_string(), json!(format!("<{} keys>", v.len())));
             }
         }
         "issues.comment" => {
@@ -2648,6 +2665,22 @@ mod tests {
     }
 
     #[test]
+    fn sessions_input_advertises_keys_and_paste() {
+        let r = StateRouter::new(vec!["sessions.input"], |_, _| Ok(json!(null)));
+        let entry = &r.tool_entries()[0];
+        let properties = entry["inputSchema"]["properties"].as_object().unwrap();
+        assert_eq!(properties["keys"]["type"], "array");
+        assert_eq!(properties["keys"]["items"]["type"], "string");
+        assert_eq!(properties["paste"]["type"], "boolean");
+        assert!(
+            properties["keys"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("at most 64")
+        );
+    }
+
+    #[test]
     fn every_state_cap_maps_to_the_scope_it_documents() {
         // The deliberate split this change introduces: listing/observing
         // tools stay Read (unchanged default `--scopes read` still covers
@@ -2841,6 +2874,14 @@ mod tests {
         let text = red["text"].as_str().unwrap();
         assert!(!text.contains("secret"), "{text}");
         assert!(text.contains(&format!("{} bytes", secret.len())), "{text}");
+    }
+
+    #[test]
+    fn redact_for_audit_counts_keys_never_names_them() {
+        let args = json!({"session": "s1", "keys": ["ctrl+c", "a"]});
+        let red = redact_for_audit("sessions.input", &args);
+        assert_eq!(red["keys"], "<2 keys>");
+        assert!(!red.to_string().contains("ctrl+c"));
     }
 
     #[test]
