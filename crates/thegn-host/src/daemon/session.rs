@@ -35,7 +35,7 @@ use thegn_svc::control::{
     SessionActivityEvent, SessionInfo,
 };
 
-use crate::emulator::{AlacrittyEmulator, CellColor, PaneEmulator};
+use crate::emulator::{AlacrittyEmulator, CellColor, MouseMode, PaneEmulator};
 use crate::pane::PaneEvent;
 use crate::pane_pty::PtyHandle;
 
@@ -1526,6 +1526,14 @@ pub(crate) fn snapshot_of(
         }
         lines.join("\n")
     };
+    let (mouse_mode, sgr_mouse) = emu.mouse_mode();
+    let mouse = match mouse_mode {
+        MouseMode::None => 0,
+        MouseMode::Press => 9,
+        MouseMode::PressRelease => 1000,
+        MouseMode::ButtonMotion => 1002,
+        MouseMode::AnyMotion => 1003,
+    };
     ScreenSnapshot {
         rows,
         cols,
@@ -1537,6 +1545,9 @@ pub(crate) fn snapshot_of(
         alt_screen,
         app_cursor: emu.application_cursor(),
         bracketed_paste: emu.bracketed_paste(),
+        mouse,
+        sgr_mouse,
+        title: emu.title().unwrap_or_default(),
         history_tail,
         cells,
         seq,
@@ -2245,6 +2256,7 @@ mod tests {
         a.advance(b"plain \x1b[1;31mbold-red\x1b[0m tail\r\n");
         a.advance(b"\x1b[44mblue-bg\x1b[0m and wide: \xe6\xbc\xa2 done\r\n");
         a.advance(b"third line");
+        a.advance(b"\x1b[?1002h\x1b[?1006h\x1b]2;round-trip\x07");
         let history = HistoryBuffer::new(100);
         let snap = snapshot_of(&a, &history, 0, 7);
         assert_eq!(snap.seq, 7);
@@ -2272,6 +2284,8 @@ mod tests {
             }
         }
         assert_eq!(a.cursor(), b.cursor());
+        assert_eq!(a.mouse_mode(), b.mouse_mode());
+        assert_eq!(a.title(), b.title());
     }
 
     // ---- supervision: the primitives a fleet drives ------------------------
