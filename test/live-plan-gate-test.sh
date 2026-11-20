@@ -184,6 +184,9 @@ done
 for want in "11k " "11m " "11j "; do
   if has "$T/plan-remote-daily.out" "$want"; then pass "remote-daily plan names '$want'"; else fail "remote-daily plan lacks '$want'"; fi
 done
+for want in "released sandbox <name>" "pulled tg/rd-y"; do
+  if has "$T/plan-remote-daily.out" "$want"; then pass "remote-daily plan names '$want'"; else fail "remote-daily plan lacks '$want'"; fi
+done
 if has "$T/plan-remote-daily.out" 'gate_command="true"'; then
   pass "remote-daily lands override the scratch repository gate command"
 else
