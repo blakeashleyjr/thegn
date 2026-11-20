@@ -42,8 +42,8 @@ pub(crate) trait ExecSource: Send + Sync {
     fn report_health(&self, _ok: bool) {}
     /// Kill a persisted session server-side. The relay fires this on pane drop
     /// when the pane was NOT marked detached — an explicitly closed pane must
-    /// not leak a live process into a relay lease. Default: no-op (provider
-    /// panes keep their own lifecycle semantics).
+    /// not leak a live process into a relay lease. Default: no-op. A provider
+    /// pane's explicit close ends its remote shell, as a local close does.
     fn kill_session<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
@@ -117,5 +117,13 @@ impl ExecSource for ProviderSource {
 
     fn report_health(&self, ok: bool) {
         crate::agent::native_exec_report(&self.provider_name, ok);
+    }
+
+    fn kill_session<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.provider
+                .kill_exec_session(&self.sandbox_id, session)
+                .await
+        })
     }
 }

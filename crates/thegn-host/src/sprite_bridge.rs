@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use termwiz::caps::{Capabilities, ProbeHints};
-use termwiz::input::{InputEvent, KeyEvent};
+use termwiz::input::{InputEvent, KeyEvent, MouseButtons, MouseEvent};
 use termwiz::terminal::{Terminal, new_terminal};
 use thegn_core::config::Config;
 use thegn_core::config_env_tables::wss_native_provider_kind;
@@ -289,14 +289,32 @@ pub(crate) fn pty_size(cols: usize, rows: usize) -> (u16, u16) {
     (clamp(cols, 80), clamp(rows, 24))
 }
 
+fn tty_env(get: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let term = get("TERM").unwrap_or_default();
+    let colorterm = get("COLORTERM").filter(|value| value == "truecolor" || value == "24bit");
+    let locale = crate::remote_term::host_locale(get);
+    crate::remote_term::apply(
+        &mut env,
+        &thegn_core::config::remote_safe_term(&term),
+        colorterm.as_deref(),
+        locale.as_deref(),
+    );
+    env
+}
+
 /// The terminal modes the REMOTE app set through its output that change how a
-/// decoded local key must be re-encoded: DECCKM application cursor keys
-/// (`CSI ? 1 h/l`) and bracketed paste (`CSI ? 2004 h/l`). Sequences may split
-/// across frames, so an unfinished `CSI ?` sequence is carried over.
+/// decoded local input must be re-encoded: DECCKM application cursor keys
+/// (`CSI ? 1 h/l`), bracketed paste (`CSI ? 2004 h/l`), and mouse reporting
+/// (`CSI ? 9/1000/1002/1003/1006 h/l`). Sequences may split across frames, so
+/// an unfinished `CSI ?` sequence is carried over.
 #[derive(Debug, Default)]
 pub(crate) struct RemoteModes {
     pub(crate) app_cursor: bool,
     pub(crate) bracketed_paste: bool,
+    pub(crate) mouse: crate::emulator::MouseMode,
+    pub(crate) sgr_mouse: bool,
+    mouse_left_down: bool,
     pending: Vec<u8>,
 }
 
@@ -343,6 +361,35 @@ impl RemoteModes {
             match p {
                 b"1" => self.app_cursor = on,
                 b"2004" => self.bracketed_paste = on,
+                b"9" => {
+                    self.mouse = if on {
+                        crate::emulator::MouseMode::Press
+                    } else {
+                        crate::emulator::MouseMode::None
+                    }
+                }
+                b"1000" => {
+                    self.mouse = if on {
+                        crate::emulator::MouseMode::PressRelease
+                    } else {
+                        crate::emulator::MouseMode::None
+                    }
+                }
+                b"1002" => {
+                    self.mouse = if on {
+                        crate::emulator::MouseMode::ButtonMotion
+                    } else {
+                        crate::emulator::MouseMode::None
+                    }
+                }
+                b"1003" => {
+                    self.mouse = if on {
+                        crate::emulator::MouseMode::AnyMotion
+                    } else {
+                        crate::emulator::MouseMode::None
+                    }
+                }
+                b"1006" => self.sgr_mouse = on,
                 _ => {}
             }
         }
@@ -353,15 +400,47 @@ impl RemoteModes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FromTty {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),
     Resize { cols: u16, rows: u16 },
 }
 
 /// The stdin bytes for one decoded local input event, encoded for the remote
 /// app's current modes. `None` for an event with no byte form (or a resize).
-pub(crate) fn encode_input(ev: &FromTty, modes: &RemoteModes) -> Option<Vec<u8>> {
+pub(crate) fn encode_input(ev: &FromTty, modes: &mut RemoteModes) -> Option<Vec<u8>> {
     match ev {
         FromTty::Key(k) => crate::input::key_bytes_mode(&k.key, k.modifiers, modes.app_cursor),
+        FromTty::Mouse(mouse) => {
+            if modes.mouse == crate::emulator::MouseMode::None {
+                modes.mouse_left_down = false;
+                return None;
+            }
+            let left = mouse.mouse_buttons.contains(MouseButtons::LEFT);
+            let pane_mouse = if mouse.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
+                if mouse.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
+                    crate::input::PaneMouse::WheelUp
+                } else {
+                    crate::input::PaneMouse::WheelDown
+                }
+            } else if left && !modes.mouse_left_down {
+                crate::input::PaneMouse::Press(0)
+            } else if left && modes.mouse_left_down {
+                crate::input::PaneMouse::Drag(0)
+            } else if !left && modes.mouse_left_down {
+                crate::input::PaneMouse::Release(0)
+            } else {
+                crate::input::PaneMouse::Move
+            };
+            modes.mouse_left_down = left;
+            // termwiz reports the outer terminal's 1-based SGR cell; encode_mouse wants 0-based (run.rs does the same)
+            crate::input::encode_mouse(
+                pane_mouse,
+                modes.mouse,
+                modes.sgr_mouse,
+                mouse.x.saturating_sub(1),
+                mouse.y.saturating_sub(1),
+            )
+        }
         FromTty::Paste(text) if modes.bracketed_paste => {
             let mut out = b"\x1b[200~".to_vec();
             out.extend_from_slice(text.as_bytes());
@@ -426,6 +505,7 @@ fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
     let mut term = new_terminal(caps).context("open terminal")?;
     let size = term.get_screen_size().context("screen size")?;
     let (cols, rows) = pty_size(size.cols, size.rows);
+    let env = tty_env(&|key| std::env::var(key).ok());
 
     let rt = crate::agent::provider_runtime()?;
     let spec = ExecSpec {
@@ -433,7 +513,7 @@ fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
         tty: true,
         cols,
         rows,
-        env: vec![],
+        env,
         cwd: None,
     };
     // Open BEFORE raw mode so an open failure never leaves the tty altered.
@@ -584,12 +664,13 @@ fn tty_loop<T: Terminal>(
     while !done.load(Ordering::SeqCst) {
         let ev = match term.poll_input(None) {
             Ok(Some(InputEvent::Key(k))) => FromTty::Key(k),
+            Ok(Some(InputEvent::Mouse(m))) => FromTty::Mouse(m),
             Ok(Some(InputEvent::Paste(text))) => FromTty::Paste(text),
             Ok(Some(InputEvent::Resized { cols, rows })) => {
                 let (cols, rows) = pty_size(cols, rows);
                 FromTty::Resize { cols, rows }
             }
-            // Wake (the stop pulse) / mouse (not forwarded): re-check `done`.
+            // Wake / pixel mouse (not forwarded): re-check `done`.
             Ok(Some(_)) | Ok(None) => continue,
             Err(_) => break,
         };
@@ -606,11 +687,11 @@ mod tests {
     use super::{
         EXIT_REMOTE_LOST, FromTty, REATTACH_BUDGET_RESET, RemoteModes, WAKE_NOTICE_AFTER,
         attempts_after_stream, encode_input, hold_ceiling, hold_task_from, lost_line,
-        pick_sprites_env, pty_size, reconnect_delays, should_reattach, with_slow_notice,
+        pick_sprites_env, pty_size, reconnect_delays, should_reattach, tty_env, with_slow_notice,
     };
     use std::cell::Cell;
     use std::time::Duration;
-    use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+    use termwiz::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
     use thegn_core::sprite_hold::{HOLD_ENV, HOLD_MAX_CEILING_SECS, HOLD_SCRIPT, wrap_argv};
 
     #[test]
@@ -746,26 +827,110 @@ mod tests {
     }
 
     #[test]
+    fn tty_env_builds_remote_terminal_identity_from_injected_host_values() {
+        let env = tty_env(&|key| match key {
+            "TERM" => Some("xterm-ghostty".into()),
+            "COLORTERM" => Some("truecolor".into()),
+            "LANG" => Some("en_US.UTF-8".into()),
+            _ => None,
+        });
+        assert_eq!(
+            env,
+            vec![
+                ("TERM".into(), "xterm-256color".into()),
+                ("COLORTERM".into(), "truecolor".into()),
+                ("LANG".into(), "C.UTF-8".into()),
+            ]
+        );
+
+        let env = tty_env(&|key| match key {
+            "TERM" => Some("tmux-256color".into()),
+            _ => None,
+        });
+        assert_eq!(env, vec![("TERM".into(), "tmux-256color".into())]);
+    }
+
+    #[test]
     fn encode_input_honors_remote_modes() {
         let up = FromTty::Key(KeyEvent {
             key: KeyCode::UpArrow,
             modifiers: Modifiers::NONE,
         });
         let mut m = RemoteModes::default();
-        assert_eq!(encode_input(&up, &m).as_deref(), Some(&b"\x1b[A"[..]));
+        assert_eq!(encode_input(&up, &mut m).as_deref(), Some(&b"\x1b[A"[..]));
         m.observe(b"\x1b[?1h");
-        assert_eq!(encode_input(&up, &m).as_deref(), Some(&b"\x1bOA"[..]));
+        assert_eq!(encode_input(&up, &mut m).as_deref(), Some(&b"\x1bOA"[..]));
 
         let paste = FromTty::Paste("ls".into());
-        assert_eq!(encode_input(&paste, &m).as_deref(), Some(&b"ls"[..]));
+        assert_eq!(encode_input(&paste, &mut m).as_deref(), Some(&b"ls"[..]));
         m.observe(b"\x1b[?2004h");
         assert_eq!(
-            encode_input(&paste, &m).as_deref(),
+            encode_input(&paste, &mut m).as_deref(),
             Some(&b"\x1b[200~ls\x1b[201~"[..])
         );
         assert_eq!(
-            encode_input(&FromTty::Resize { cols: 1, rows: 1 }, &m),
+            encode_input(&FromTty::Resize { cols: 1, rows: 1 }, &mut m),
             None
+        );
+    }
+
+    fn mouse(x: u16, y: u16, mouse_buttons: MouseButtons) -> FromTty {
+        FromTty::Mouse(MouseEvent {
+            x,
+            y,
+            mouse_buttons,
+            modifiers: Modifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn encode_input_honors_remote_mouse_modes_and_sgr() {
+        let mut m = RemoteModes::default();
+        let press = mouse(5, 10, MouseButtons::LEFT);
+        let release = mouse(5, 10, MouseButtons::NONE);
+        let wheel = mouse(
+            5,
+            10,
+            MouseButtons::VERT_WHEEL | MouseButtons::WHEEL_POSITIVE,
+        );
+        assert_eq!(encode_input(&press, &mut m), None);
+
+        m.observe(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            encode_input(&press, &mut m).as_deref(),
+            Some(&b"\x1b[<0;5;10M"[..])
+        );
+        assert_eq!(
+            encode_input(&release, &mut m).as_deref(),
+            Some(&b"\x1b[<0;5;10m"[..])
+        );
+        assert_eq!(
+            encode_input(&wheel, &mut m).as_deref(),
+            Some(&b"\x1b[<64;5;10M"[..])
+        );
+    }
+
+    #[test]
+    fn encode_input_uses_legacy_mouse_when_sgr_is_off() {
+        let mut m = RemoteModes::default();
+        m.observe(b"\x1b[?1000h");
+        assert_eq!(
+            encode_input(&mouse(1, 1, MouseButtons::LEFT), &mut m),
+            Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+    }
+
+    #[test]
+    fn encode_input_any_motion_reports_move_and_split_modes_apply() {
+        let mut m = RemoteModes::default();
+        m.observe(b"\x1b[?100");
+        assert!(!m.sgr_mouse);
+        m.observe(b"6h");
+        assert!(m.sgr_mouse);
+        m.observe(b"\x1b[?1003h");
+        assert_eq!(
+            encode_input(&mouse(2, 3, MouseButtons::NONE), &mut m).as_deref(),
+            Some(&b"\x1b[<35;2;3M"[..])
         );
     }
 
