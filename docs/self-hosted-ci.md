@@ -75,10 +75,15 @@ argv of the `thegn-ci`-owned runner process.
 
 The Nix multi-user daemon and `/nix/store` remain shared. There is no shared
 writable Cargo registry or sccache, no runner cache bin directory on PATH, and
-each job's HOME is wiped before use. Authenticated runner/Nix installer bytes
-are not yet pinned and verified (THE-413); untrusted-event rejection,
-task-bound short-lived credentials for protected jobs, authenticated shared
-caches, and canary jobs also remain open on THE-414.
+each job's HOME is wiped before use. The setup script verifies the exact
+Determinate Nix installer v3.24.2 Linux x86_64 release asset by its pinned
+size and SHA-256 before execution. Its digest is taken from GitHub's official
+release asset metadata, so this check still depends on GitHub's release
+metadata and HTTPS delivery. The Actions runner archive remains selected from
+the mutable `releases/latest` endpoint and is not authenticated against a
+reviewed pinned digest (THE-413). Untrusted-event rejection, task-bound
+short-lived credentials for protected jobs, authenticated shared caches, and
+canary jobs also remain open on THE-414.
 
 Two isolation gaps remain open: all concurrent jobs use the same `thegn-ci`
 UID, so one job may inspect or modify another job's processes and files; and

@@ -212,6 +212,64 @@ case_runner_no_token_to_job() {
   job_line="$(printf '%s\n' "$rendered" | grep 'systemd-run --wait')"
   [[ $job_line != *token* && $job_line != *GH_PAT* && $job_line != *NIX_GITHUB_TOKEN* ]]
 }
+stub_curl_payload() {
+  cat >"$STUB_BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+while (($#)); do
+  if [ "$1" = -o ]; then
+    cp -- "$TEST_PAYLOAD" "$2"
+    exit 0
+  fi
+  shift
+done
+exit 93
+STUB
+  chmod 700 "$STUB_BIN/curl"
+}
+case_verified_installer_runs_matching_bytes() {
+  clean_environment
+  rm -f -- "$TEST_ROOT/installer-ran"
+  local payload_sha payload_size
+  cat >"$TEST_ROOT/installer-fixture" <<'FIXTURE'
+#!/bin/sh
+printf '%s\n' "$*" >"$TEST_ROOT/installer-ran"
+FIXTURE
+  payload_sha="$(sha256sum "$TEST_ROOT/installer-fixture" | awk '{print $1}')"
+  payload_size="$(wc -c <"$TEST_ROOT/installer-fixture")"
+  TEST_PAYLOAD="$TEST_ROOT/installer-fixture"
+  export TEST_PAYLOAD
+  stub_curl_payload
+  run_verified_installer https://fixture.invalid/installer "$payload_sha" "$payload_size" install --no-confirm || return 1
+  [[ $(<"$TEST_ROOT/installer-ran") == 'install --no-confirm' ]]
+}
+# shellcheck disable=SC2016  # assertion matches shell source with literal variable names
+case_nix_bootstrap_uses_reviewed_pin() {
+  grep -Fq 'NIX_INSTALLER_VERSION="v3.24.2"' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    grep -Fq 'NIX_INSTALLER_SHA256="22ed14ee1b24d100d388f1fc245e3062bd5982433d159cffa6dec34c0eb15dab"' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    grep -Fq 'NIX_INSTALLER_SIZE=78449072' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    grep -Fq 'run_verified_installer "$NIX_INSTALLER_URL" "$NIX_INSTALLER_SHA256" "$NIX_INSTALLER_SIZE" install --no-confirm' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    ! grep -Fq 'curl -fsSL https://install.determinate.systems/nix | sh' "$ROOT/scripts/ci/ageless-runner-setup.sh"
+}
+case_verified_installer_rejects_bad_digest_before_execution() {
+  clean_environment
+  rm -f -- "$TEST_ROOT/installer-ran"
+  printf '#!/bin/sh\ntouch "%s/installer-ran"\n' "$TEST_ROOT" >"$TEST_ROOT/installer-fixture"
+  TEST_PAYLOAD="$TEST_ROOT/installer-fixture"
+  export TEST_PAYLOAD
+  stub_curl_payload
+  if run_verified_installer https://fixture.invalid/installer "$(printf '0%.0s' {1..64})" "$(wc -c <"$TEST_ROOT/installer-fixture")" install; then return 1; fi
+  [[ ! -e $TEST_ROOT/installer-ran ]]
+}
+case_verified_installer_rejects_oversized_bytes_before_execution() {
+  clean_environment
+  rm -f -- "$TEST_ROOT/installer-ran"
+  printf '#!/bin/sh\ntouch "%s/installer-ran"\n' "$TEST_ROOT" >"$TEST_ROOT/installer-fixture"
+  TEST_PAYLOAD="$TEST_ROOT/installer-fixture"
+  export TEST_PAYLOAD
+  stub_curl_payload
+  if run_verified_installer https://fixture.invalid/installer "$(printf '0%.0s' {1..64})" "$((NIX_INSTALLER_MAX_BYTES + 1))" install; then return 1; fi
+  [[ ! -e $TEST_ROOT/installer-ran ]]
+}
 case_runner_env_clean() {
   local rendered
   rendered="$(render_runner_env)"
@@ -247,6 +305,10 @@ assert_case runner_loop_wipes_work_and_home case_runner_wipes
 assert_case runner_loop_uses_jitconfig_not_replace case_runner_jit
 assert_case runner_loop_runs_job_in_transient_unit case_runner_unit
 assert_case runner_loop_keeps_token_off_argv case_runner_token_off_argv
+assert_case pinned_installer_executes_only_matching_bytes case_verified_installer_runs_matching_bytes
+assert_case nix_bootstrap_uses_reviewed_version_size_and_digest case_nix_bootstrap_uses_reviewed_pin
+assert_case pinned_installer_rejects_wrong_digest_before_execution case_verified_installer_rejects_bad_digest_before_execution
+assert_case pinned_installer_rejects_oversize_before_execution case_verified_installer_rejects_oversized_bytes_before_execution
 assert_case runner_loop_never_passes_token_to_job case_runner_no_token_to_job
 assert_case runner_env_has_no_shared_cargo_cache case_runner_env_clean
 assert_case unit_runs_loop_as_root_template case_unit_root
