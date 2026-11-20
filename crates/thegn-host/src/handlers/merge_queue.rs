@@ -1435,17 +1435,13 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     .map_err(|error| error.to_string())
                 });
             let mut out = landed_outcome_after_record(write, &branch, &target, &old_oid, &commit);
-            let landed_message = format!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
             if !out.bookkeeping_failed.is_empty() {
-                if !notes.is_empty() {
-                    out.warnings
-                        .push(append_lifecycle_notes(landed_message, notes));
-                }
+                out.warnings.extend(notes);
                 return DriveMsg::Done(out);
             }
-            let mut landed_notes = notes;
+            out.warnings.extend(notes);
             if let (Ok(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
-                landed_notes.extend(
+                out.warnings.extend(
                     crate::merge_lifecycle::apply_landed_reported(
                         &cfg.repo_merge_queue(&root),
                         db,
@@ -1457,10 +1453,6 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     .into_iter()
                     .map(|note| note.text().to_owned()),
                 );
-            }
-            if !landed_notes.is_empty() {
-                out.warnings
-                    .push(append_lifecycle_notes(landed_message, landed_notes));
             }
             DriveMsg::Done(out)
         }
@@ -1481,18 +1473,10 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     )
                     .map_err(|error| error.to_string())
                 });
-            let mut landed_notes = notes;
+            let mut warnings = notes;
             if write.is_ok() {
-                landed_notes.extend(lifecycle(LifecycleEvent::Landed, &branch));
+                warnings.extend(lifecycle(LifecycleEvent::Landed, &branch));
             }
-            let warnings = if landed_notes.is_empty() {
-                Vec::new()
-            } else {
-                vec![append_lifecycle_notes(
-                    format!("{branch} already merged."),
-                    landed_notes,
-                )]
-            };
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
                 warnings,

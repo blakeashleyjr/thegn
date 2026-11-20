@@ -98,9 +98,7 @@ fn stale_candidate(
     pre: &crate::provider_git::PreLand,
     expected_tip: Option<&str>,
 ) -> Option<String> {
-    let Some(_expected_tip) = expected_tip else {
-        return None;
-    };
+    expected_tip?;
     let crate::provider_git::PreLand::Ready {
         report: Some(report),
     } = pre
