@@ -190,7 +190,6 @@ mod tests {
             sock.write_all(response.as_bytes()).await.unwrap();
         });
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
         let provider = crate::provider::SpritesProvider::new(&base, "tok-secret", "owned");
         assert_eq!(
             provider.memory_policy_mb("another").await.unwrap(),
