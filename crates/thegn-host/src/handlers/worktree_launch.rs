@@ -229,6 +229,34 @@ fn report_relaunch_refusal(refusal: RelaunchRefusal, worktree: &str) {
     );
 }
 
+/// Return the remembered agent name when it is configured for this worktree.
+fn remembered_agent_with(db: &Db, cfg: &Config, worktree: &str) -> Option<String> {
+    let name = match db.worktree_agent(worktree) {
+        Ok(Some(name)) => name,
+        Ok(None) | Err(_) => return None,
+    };
+    // The native-exec path's exclusions (`panes.rs`): a plain-shell or
+    // transient `clean-shell` watchdog record — or a tool drawer
+    // (yazi/lazygit/…) — is not the worktree's agent; relaunching one would
+    // resurrect an overlay, not the agent the user picked.
+    if name == "shell" || name == "clean-shell" || cfg.tool_command(&name).is_some() {
+        return None;
+    }
+    // Entry no longer configured (config churn): leave the stale record alone
+    // — the sidebar keeps attributing until the agent is re-added — but a
+    // shell pane is still the honest spawn.
+    if cfg.agent_command(&name).is_none() {
+        return None;
+    }
+    Some(name)
+}
+
+/// Return the remembered agent name, if the worktree database is available.
+pub(crate) fn remembered_agent(cfg: &Config, worktree: &str) -> Option<String> {
+    let db = Db::open().ok()?;
+    remembered_agent_with(&db, cfg, worktree)
+}
+
 /// When the THE-85 attach probe found NO live daemon session for `worktree`,
 /// a fresh (re)bring-up relaunches the worktree's remembered agent as
 /// `leaf`'s process — resuming its last harness session when the
@@ -249,23 +277,9 @@ pub(crate) fn remembered_agent_relaunch(
         Ok(db) => db,
         Err(_) => return Ok(None),
     };
-    let name = match db.worktree_agent(worktree) {
-        Ok(Some(name)) => name,
-        Ok(None) | Err(_) => return Ok(None),
+    let Some(name) = remembered_agent_with(&db, cfg, worktree) else {
+        return Ok(None);
     };
-    // The native-exec path's exclusions (`panes.rs`): a plain-shell or
-    // transient `clean-shell` watchdog record — or a tool drawer
-    // (yazi/lazygit/…) — is not the worktree's agent; relaunching one would
-    // resurrect an overlay, not the agent the user picked.
-    if name == "shell" || name == "clean-shell" || cfg.tool_command(&name).is_some() {
-        return Ok(None);
-    }
-    // Entry no longer configured (config churn): leave the stale record alone
-    // — the sidebar keeps attributing until the agent is re-added — but a
-    // shell pane is still the honest spawn.
-    if cfg.agent_command(&name).is_none() {
-        return Ok(None);
-    }
     let stage = match recorded_stage(&db, worktree, &name) {
         Ok(stage) => stage,
         Err(()) => {
@@ -606,6 +620,39 @@ mod tests {
             assert!(remembered_agent_relaunch(&cfg, &wt, 3).unwrap().is_none());
             register(&wt, "shell");
             assert!(remembered_agent_relaunch(&cfg, &wt, 3).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn remembered_agent_filters_shell_tools_and_unconfigured_names() {
+        with_state("remembered-agent", |_| {
+            let mut cfg = cfg_with(&[("claude", false)]);
+            cfg.tools.push(thegn_core::config::NamedCommand {
+                name: "yazi".into(),
+                command: "yazi".into(),
+                hints: Vec::new(),
+                provider: None,
+                harness: None,
+                model: None,
+                env: Default::default(),
+                permissions: Vec::new(),
+                resume: false,
+                route_via_proxy: false,
+                drawer_scope: None,
+                drawer_cwd: None,
+            });
+            let wt = worktree_path("remembered-agent");
+            register(&wt, "shell");
+            assert_eq!(remembered_agent(&cfg, &wt), None);
+            for name in ["clean-shell", "yazi", "missing"] {
+                Db::open().unwrap().set_worktree_agent(&wt, name).unwrap();
+                assert_eq!(remembered_agent(&cfg, &wt), None, "{name}");
+            }
+            Db::open()
+                .unwrap()
+                .set_worktree_agent(&wt, "claude")
+                .unwrap();
+            assert_eq!(remembered_agent(&cfg, &wt), Some("claude".into()));
         });
     }
 

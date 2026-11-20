@@ -126,6 +126,7 @@ pub(crate) fn maybe_materialize(
             rt,
         } = tx;
         let hui = Some(host_ui);
+        let mut handoff: Option<crate::agent::DeferredHandoff> = None;
         // Wrap a spec-resolution stage with the scoped core-progress sink:
         // sandbox phases → observer → the tab's splash. Installed per-stage
         // (not thread-wide) so `provision_worktree`'s own step stream never
@@ -254,20 +255,65 @@ pub(crate) fn maybe_materialize(
                     hui.as_ref(),
                 );
                 match prov {
-                    Ok(_) => observed(&|| {
-                        crate::direnv_warm::launch_spec_synced_with(
-                            &cfg,
-                            &wt,
-                            None,
-                            "shell",
-                            crate::agent::LaunchExtras {
-                                suppress_agent_record: true,
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
-                    .map_err(spec_err),
+                    Ok(outcome) => {
+                        handoff = outcome.deferred;
+                        if !quiet
+                            && handoff.as_ref().is_some_and(|h| {
+                                thegn_core::provision_journal::agent_gate(
+                                    thegn_core::provision_journal::read(&h.sandbox).as_ref(),
+                                ) == thegn_core::provision_journal::AgentGate::Wait
+                            })
+                            && crate::handlers::worktree_launch::remembered_agent(&cfg, &wt)
+                                .is_some()
+                        {
+                            let deferred = handoff.take().expect("handoff checked above");
+                            let gname_p = gname.clone();
+                            let ptx_p = ptx.clone();
+                            let wk_p = wk.clone();
+                            if let Err(error) = crate::provision_bg::finish_blocking(
+                                &cfg,
+                                &wt,
+                                deferred,
+                                &mut |views| {
+                                    if !ptx_p.send((gname_p.clone(), ti, provision_load_steps(views))) {
+                                        tracing::debug!(
+                                            target: "thegn::loading",
+                                            worktree = %wt,
+                                            "relaunch provisioning splash receiver closed"
+                                        );
+                                    }
+                                    if wk_p.wake().is_err() {
+                                        tracing::debug!(
+                                            target: "thegn::loading",
+                                            worktree = %wt,
+                                            "relaunch provisioning wake failed"
+                                        );
+                                    }
+                                },
+                            ) {
+                                tracing::warn!(
+                                    target: "thegn::provider",
+                                    worktree = %wt,
+                                    %error,
+                                    "remembered-agent deferred provisioning failed; opening shell"
+                                );
+                            }
+                        }
+                        observed(&|| {
+                            crate::direnv_warm::launch_spec_synced_with(
+                                &cfg,
+                                &wt,
+                                None,
+                                "shell",
+                                crate::agent::LaunchExtras {
+                                    suppress_agent_record: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
+                        .map_err(spec_err)
+                    }
                     Err(e) => Err(match crate::handlers::provision::sandbox_halt_in(&e) {
                         Some(h) => SpecError::Halt(Box::new(h.clone())),
                         // `{e:#}` keeps the full cause chain (see `ensure sandbox`
@@ -312,7 +358,7 @@ pub(crate) fn maybe_materialize(
         if spec_tx
             .send(SpecBatch {
                 group: gname,
-                worktree: wt,
+                worktree: wt.clone(),
                 tab: ti,
                 target_leaves,
                 origin: SpecOrigin::Materialize,
@@ -321,8 +367,12 @@ pub(crate) fn maybe_materialize(
                 attach,
             })
             .is_ok()
+            && wk.wake().is_err()
         {
-            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            tracing::debug!(target: "thegn::loading", "materialize spec wake failed");
+        }
+        if let Some(handoff) = handoff {
+            crate::provision_bg::finish_in_background(&cfg, &wt, handoff);
         }
     });
 }
