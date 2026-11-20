@@ -95,6 +95,8 @@ pub(crate) struct PullReport {
     pub push: Option<String>,
 }
 
+pub(crate) type CountedPull = (PullReport, Option<u64>);
+
 fn short(oid: &str) -> &str {
     oid.get(..12).unwrap_or(oid)
 }
@@ -749,11 +751,11 @@ pub(crate) fn install_merge_target_lookup(boot: &Config) {
 /// branch (fast-forward only). The caller has already established that the
 /// worktree's env is a provider env named `env_name`.
 // off-loop: CLI path (`thegn env pull`).
-pub(crate) fn pull_back(
+pub(crate) fn pull_back_counted(
     cfg: &Config,
     worktree: &str,
     env_name: &str,
-) -> anyhow::Result<PullReport> {
+) -> anyhow::Result<CountedPull> {
     // Cross-process single flight (`thegn land`, `thegn env pull` and the
     // daemon's exit pull may race on one worktree). Everything below — the
     // branch and the local tip included — is read after the wait, so a second
@@ -785,7 +787,7 @@ pub(crate) fn pull_back(
 
     let result = pull_from_sandbox(&provider, &id, &workdir, wt, &branch, &local_tip);
     let (outcome_label, to) = match &result {
-        Ok(outcome) => (
+        Ok((outcome, _)) => (
             outcome.label(),
             match outcome {
                 PullOutcome::FastForwarded { to, .. } => to.clone(),
@@ -813,7 +815,7 @@ pub(crate) fn pull_back(
         to: &to,
         outcome: outcome_label,
     });
-    let outcome = result?;
+    let (outcome, dirty) = result?;
     let push = match (
         &outcome,
         push_decision(&git, &branch, known_default, &merge_target),
@@ -847,11 +849,22 @@ pub(crate) fn pull_back(
         }
         _ => None,
     };
-    Ok(PullReport {
-        branch,
-        outcome,
-        push,
-    })
+    Ok((
+        PullReport {
+            branch,
+            outcome,
+            push,
+        },
+        dirty,
+    ))
+}
+
+pub(crate) fn pull_back(
+    cfg: &Config,
+    worktree: &str,
+    env_name: &str,
+) -> anyhow::Result<PullReport> {
+    pull_back_counted(cfg, worktree, env_name).map(|(report, _)| report)
 }
 
 /// Whether a stored `location` value is a managed-provider location. Ssh
@@ -1004,6 +1017,11 @@ pub(crate) trait PreLandOps {
     fn is_provider(&self, worktree: &str) -> anyhow::Result<bool>;
     /// [`pull_back_if_provider`].
     fn pull(&self, worktree: &str) -> anyhow::Result<Option<PullReport>>;
+    /// [`Self::pull`] plus the sandbox's dirty-path count (`None` = unknown).
+    fn pull_counted(&self, worktree: &str) -> anyhow::Result<Option<CountedPull>> {
+        self.pull(worktree)
+            .map(|report| report.map(|report| (report, None)))
+    }
     /// Is the worktree's sandbox in the provider's listing? `Some(false)` only
     /// when a complete listing lacks it; `None` when that cannot be proven.
     fn sandbox_listed(&self, worktree: &str) -> Option<bool>;
@@ -1046,6 +1064,10 @@ impl PreLandOps for LivePreLand<'_> {
 
     fn pull(&self, worktree: &str) -> anyhow::Result<Option<PullReport>> {
         pull_back_resolved(self.cfg, worktree)
+    }
+
+    fn pull_counted(&self, worktree: &str) -> anyhow::Result<Option<CountedPull>> {
+        pull_back_resolved_counted(self.cfg, worktree)
     }
 
     fn sandbox_listed(&self, worktree: &str) -> Option<bool> {
@@ -1154,6 +1176,187 @@ pub(crate) fn pull_before_land_with(
     }
 }
 
+/// What a destroy, recycle or release learned about the sandbox first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BeforeDestroy {
+    /// No provider sandbox is bound (the land binding said no).
+    NotBound,
+    /// A complete listing proves the sandbox gone.
+    Gone,
+    /// The pull ran (`report: None` = the read-only policy: no pull is due).
+    Pulled {
+        report: Option<PullReport>,
+        sandbox_dirty: Option<u64>,
+    },
+}
+
+pub(crate) fn pull_before_destroy(cfg: &Config, worktree: &str) -> anyhow::Result<BeforeDestroy> {
+    pull_before_destroy_with(&LivePreLand { cfg }, worktree)
+}
+
+pub(crate) fn pull_before_destroy_with(
+    ops: &dyn PreLandOps,
+    worktree: &str,
+) -> anyhow::Result<BeforeDestroy> {
+    if !ops
+        .is_provider(worktree)
+        .map_err(|e| anyhow::anyhow!("cannot tell whether {worktree} still has a provider sandbox: the provider listing is incomplete or unreachable ({e:#})"))?
+    {
+        return Ok(BeforeDestroy::NotBound);
+    }
+    match ops.pull_counted(worktree) {
+        Ok(None) => Ok(BeforeDestroy::Pulled {
+            report: None,
+            sandbox_dirty: None,
+        }),
+        Ok(Some((report, sandbox_dirty))) => Ok(BeforeDestroy::Pulled {
+            report: Some(report),
+            sandbox_dirty,
+        }),
+        Err(error) => match ops.sandbox_listed(worktree) {
+            Some(false) => Ok(BeforeDestroy::Gone),
+            Some(true) | None => Err(error.context(format!(
+                "pull {worktree} from its sandbox before destroying it"
+            ))),
+        },
+    }
+}
+
+/// One line a destroy path prints after the guard (`warn` = loud).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardNote {
+    pub warn: bool,
+    pub text: String,
+}
+
+/// Pure: may the sandbox be destroyed after `pre`? `Err` is the refusal.
+pub(crate) fn destroy_guard(
+    pre: anyhow::Result<BeforeDestroy>,
+    sandbox: &str,
+    accept_loss: bool,
+) -> Result<Vec<GuardNote>, String> {
+    let pre = match pre {
+        Ok(pre) => pre,
+        Err(error) if !accept_loss => {
+            return Err(format!(
+                "could not pull sandbox {sandbox}'s commits before destroying it: {error:#}; nothing was destroyed. Pull them with `thegn env pull`, or force the destroy (`thegn wt rm --force`, the TUI force delete, `thegn env down --force`)"
+            ));
+        }
+        Err(error) => {
+            return Ok(vec![GuardNote {
+                warn: true,
+                text: format!(
+                    "could not pull sandbox {sandbox}: {error:#}; destroying it anyway (forced): commits made inside it that were not pulled back are lost"
+                ),
+            }]);
+        }
+    };
+    match pre {
+        BeforeDestroy::NotBound | BeforeDestroy::Gone => Ok(Vec::new()),
+        BeforeDestroy::Pulled { report: None, .. } => Ok(vec![GuardNote {
+            warn: false,
+            text: format!(
+                "sandbox {sandbox}: no pull (read-only git policy); commits made inside it are not kept"
+            ),
+        }]),
+        BeforeDestroy::Pulled {
+            report: Some(report),
+            sandbox_dirty,
+        } => {
+            let mut notes = vec![GuardNote {
+                warn: false,
+                text: format!("pulled {}: {}", report.branch, report.summary()),
+            }];
+            if matches!(
+                &report.outcome,
+                &PullOutcome::Diverged { .. } | &PullOutcome::LocalDirty { .. }
+            ) {
+                if !accept_loss {
+                    return Err(format!(
+                        "sandbox {sandbox}: {}; its commits are not on {} and nothing was destroyed. Merge the kept ref first, then retry, or force the destroy",
+                        report.summary(),
+                        report.branch
+                    ));
+                }
+                notes.push(GuardNote {
+                    warn: true,
+                    text: format!(
+                        "sandbox {sandbox} destroyed (forced): its commits are only in the kept ref ({}); merge it before another pull of this worktree overwrites it",
+                        report.summary()
+                    ),
+                });
+            }
+            match sandbox_dirty {
+                Some(0) => Ok(notes),
+                Some(n) if !accept_loss => Err(format!(
+                    "sandbox {sandbox} has {n} uncommitted or untracked path(s) that a pull cannot bring home; nothing was destroyed. Commit them inside the sandbox and retry, or force the destroy"
+                )),
+                None if !accept_loss => Err(format!(
+                    "could not tell whether sandbox {sandbox} has uncommitted changes; nothing was destroyed. Retry, or force the destroy"
+                )),
+                Some(n) => {
+                    notes.push(GuardNote {
+                        warn: true,
+                        text: format!(
+                            "sandbox {sandbox}: {n} uncommitted or untracked path(s) are lost with it (forced)"
+                        ),
+                    });
+                    Ok(notes)
+                }
+                None => {
+                    notes.push(GuardNote {
+                        warn: true,
+                        text: format!(
+                            "sandbox {sandbox}: an unknown number of uncommitted or untracked path(s) are lost with it (forced)"
+                        ),
+                    });
+                    Ok(notes)
+                }
+            }
+        }
+    }
+}
+
+/// The offline answer to "is a provider sandbox bound to this worktree"
+/// ([`land_binding`] with no listing; never wakes a sandbox).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OfflineBinding {
+    Unbound,
+    /// Bound, or cannot be proven unbound without a provider read.
+    Bound {
+        sandbox: String,
+    },
+    /// The stored location is a provider location but the resolved env names no sandbox.
+    BoundUnknown,
+}
+
+pub(crate) fn bound_offline(cfg: &Config, worktree: &str) -> anyhow::Result<OfflineBinding> {
+    use thegn_core::store::WorkspaceStore;
+    let stored = thegn_core::db::Db::open()
+        .and_then(|db| db.location_for(worktree))
+        .with_context(|| format!("read the stored location of {worktree}"))?;
+    let stored = is_provider_location(worktree, stored.as_deref());
+    let env = crate::cmd::env::resolve_for(cfg, Some(worktree.to_string()))?;
+    let name = env
+        .placement
+        .is_provider()
+        .then(|| crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, &env.name))
+        .transpose()?
+        .flatten()
+        .filter(|name| !name.trim().is_empty());
+    let provisioned = name
+        .as_deref()
+        .is_some_and(crate::provider_workdir::is_provisioned_locally);
+    match (
+        land_binding(stored, name.as_deref(), provisioned, &mut || None),
+        name,
+    ) {
+        (Ok(false), _) => Ok(OfflineBinding::Unbound),
+        (Ok(true) | Err(_), Some(name)) => Ok(OfflineBinding::Bound { sandbox: name }),
+        (Ok(true) | Err(_), None) => Ok(OfflineBinding::BoundUnknown),
+    }
+}
+
 /// [`pull_back`] for a worktree whose recorded location is a provider
 /// location and whose env resolves to a provider placement; `Ok(None)` for
 /// anything else (nothing to pull). Blocks on the DB, git and the provider:
@@ -1180,6 +1383,13 @@ pub(crate) fn pull_back_resolved(
     cfg: &Config,
     worktree: &str,
 ) -> anyhow::Result<Option<PullReport>> {
+    pull_back_resolved_counted(cfg, worktree).map(|report| report.map(|(report, _)| report))
+}
+
+pub(crate) fn pull_back_resolved_counted(
+    cfg: &Config,
+    worktree: &str,
+) -> anyhow::Result<Option<CountedPull>> {
     let env = crate::cmd::env::resolve_for(cfg, Some(worktree.to_string()))?;
     if !env.placement.is_provider() {
         return Ok(None);
@@ -1189,7 +1399,7 @@ pub(crate) fn pull_back_resolved(
     if env_git_policy(cfg, &env.name).mode == SandboxGitMode::ReadOnly {
         return Ok(None);
     }
-    pull_back(cfg, worktree, &env.name).map(Some)
+    pull_back_counted(cfg, worktree, &env.name).map(Some)
 }
 
 fn pull_from_sandbox(
@@ -1199,7 +1409,7 @@ fn pull_from_sandbox(
     wt: &Path,
     branch: &str,
     local_tip: &str,
-) -> anyhow::Result<PullOutcome> {
+) -> anyhow::Result<(PullOutcome, Option<u64>)> {
     let dir = stage_dir(provider, id, &[])?;
     let result = download_and_apply(provider, id, workdir, &dir, wt, branch, local_tip);
     remove_stage_dir(provider, id, &dir, &[]);
@@ -1214,7 +1424,7 @@ fn download_and_apply(
     wt: &Path,
     branch: &str,
     local_tip: &str,
-) -> anyhow::Result<PullOutcome> {
+) -> anyhow::Result<(PullOutcome, Option<u64>)> {
     let out_path = syncstate::staged_artifact_path(dir, "pull.bundle");
     let script = syncstate::pull_back_script(workdir, local_tip, &out_path);
     let (code, out) =
@@ -1231,7 +1441,7 @@ fn download_and_apply(
         crate::provision_recover::stderr_gist(&out)
     );
     let Some(size) = markers.bundle_bytes else {
-        return Ok(PullOutcome::UpToDate);
+        return Ok((PullOutcome::UpToDate, markers.dirty));
     };
     anyhow::ensure!(
         size <= MAX_PULL_BUNDLE_BYTES,
@@ -1251,6 +1461,7 @@ fn download_and_apply(
     std::fs::write(&local_bundle, &bytes)
         .with_context(|| format!("write {}", local_bundle.display()))?;
     apply_pulled_bundle(wt, branch, local_tip, &local_bundle, &markers.head)
+        .map(|outcome| (outcome, markers.dirty))
 }
 
 #[cfg(test)]
@@ -1613,6 +1824,34 @@ mod tests {
     }
 
     #[test]
+    fn pull_back_script_counts_dirty_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("sandbox");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "lane"]);
+        git(&repo, &["config", "user.name", "Dirty Test"]);
+        git(&repo, &["config", "user.email", "dirty@example.invalid"]);
+        std::fs::write(repo.join("tracked.txt"), "clean\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-q", "-m", "first"]);
+        let tip = branch_tip(&repo, "lane").unwrap();
+        std::fs::write(repo.join("tracked.txt"), "edited\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "untracked\n").unwrap();
+
+        let out_path = root.path().join("pull.bundle");
+        let markers = thegn_core::syncstate::parse_pull_markers(&sh(
+            &thegn_core::syncstate::pull_back_script(
+                repo.to_str().unwrap(),
+                &tip,
+                out_path.to_str().unwrap(),
+            ),
+        ))
+        .unwrap();
+        assert_eq!(markers.dirty, Some(2));
+        assert_eq!(markers.bundle_bytes, None);
+    }
+
+    #[test]
     fn bundle_seed_then_pull_back_fast_forwards_the_branch() {
         let root = tempfile::tempdir().unwrap();
         let host = root.path().join("host wt");
@@ -1834,6 +2073,12 @@ mod tests {
             crate::provider_factory::provider_sandbox_name_checked(&cfg, &worktree_s, "sprites")
                 .unwrap()
                 .unwrap();
+        assert_eq!(
+            super::bound_offline(&cfg, &worktree_s).unwrap(),
+            super::OfflineBinding::Bound {
+                sandbox: name.clone()
+            }
+        );
         crate::provider_workdir::mark_provisioned(&name);
         assert!(
             super::LivePreLand { cfg: &cfg }
@@ -1848,11 +2093,34 @@ mod tests {
                 .is_provider(&worktree_s)
                 .unwrap()
         );
+        assert_eq!(
+            super::bound_offline(&cfg, &worktree_s).unwrap(),
+            super::OfflineBinding::Unbound
+        );
+
+        let recorded = thegn_core::remote::GitLoc::provider_db_string(
+            &["sprite".into(), "exec".into()],
+            "/workspace",
+        );
+        db.put_worktree(
+            "repo/rd-x",
+            &root_s,
+            &worktree_s,
+            "tg/rd-x",
+            Some(&recorded),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            super::bound_offline(&cfg, &worktree_s).unwrap(),
+            super::OfflineBinding::BoundUnknown
+        );
     }
 
     struct FakePreLand {
         provider: bool,
         pull: std::cell::RefCell<Option<anyhow::Result<Option<PullReport>>>>,
+        dirty: Option<u64>,
         listed: Option<bool>,
         pulls: std::cell::Cell<usize>,
     }
@@ -1866,6 +2134,7 @@ mod tests {
             FakePreLand {
                 provider,
                 pull: std::cell::RefCell::new(Some(pull)),
+                dirty: Some(0),
                 listed,
                 pulls: std::cell::Cell::new(0),
             }
@@ -1879,6 +2148,14 @@ mod tests {
         fn pull(&self, _worktree: &str) -> anyhow::Result<Option<PullReport>> {
             self.pulls.set(self.pulls.get() + 1);
             self.pull.borrow_mut().take().expect("pulled once")
+        }
+        fn pull_counted(&self, _worktree: &str) -> anyhow::Result<Option<super::CountedPull>> {
+            self.pulls.set(self.pulls.get() + 1);
+            self.pull
+                .borrow_mut()
+                .take()
+                .expect("pulled once")
+                .map(|report| report.map(|report| (report, self.dirty)))
         }
         fn sandbox_listed(&self, _worktree: &str) -> Option<bool> {
             self.listed
@@ -1964,6 +2241,155 @@ mod tests {
             let error = pull_before_land_with(&fake, wt).unwrap_err();
             assert!(format!("{error:#}").contains("exec timed out"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn pull_before_destroy_table() {
+        use super::{BeforeDestroy, pull_before_destroy_with};
+        let wt = "/wt/pre-destroy";
+
+        let fake = FakePreLand::new(false, Ok(None), None);
+        assert_eq!(
+            pull_before_destroy_with(&fake, wt).unwrap(),
+            BeforeDestroy::NotBound
+        );
+        assert_eq!(fake.pulls.get(), 0);
+
+        let fake = FakePreLand::new(true, Ok(None), None);
+        assert_eq!(
+            pull_before_destroy_with(&fake, wt).unwrap(),
+            BeforeDestroy::Pulled {
+                report: None,
+                sandbox_dirty: None,
+            }
+        );
+
+        let mut fake = FakePreLand::new(true, Ok(Some(report(PullOutcome::UpToDate))), None);
+        fake.dirty = Some(2);
+        let pulled = report(PullOutcome::UpToDate);
+        assert_eq!(
+            pull_before_destroy_with(&fake, wt).unwrap(),
+            BeforeDestroy::Pulled {
+                report: Some(pulled),
+                sandbox_dirty: Some(2),
+            }
+        );
+
+        let fake = FakePreLand::new(true, Err(anyhow::anyhow!("404 not found")), Some(false));
+        assert_eq!(
+            pull_before_destroy_with(&fake, wt).unwrap(),
+            BeforeDestroy::Gone
+        );
+        for listed in [Some(true), None] {
+            let fake = FakePreLand::new(true, Err(anyhow::anyhow!("exec timed out")), listed);
+            let error = pull_before_destroy_with(&fake, wt).unwrap_err();
+            assert!(format!("{error:#}").contains("before destroying it"));
+        }
+    }
+
+    #[test]
+    fn destroy_guard_table() {
+        use super::{BeforeDestroy, destroy_guard};
+        let clean = report(PullOutcome::FastForwarded {
+            from: "a".repeat(40),
+            to: "b".repeat(40),
+            commits: 1,
+        });
+        for forced in [false, true] {
+            let notes = destroy_guard(Ok(BeforeDestroy::NotBound), "tg-box", forced).unwrap();
+            assert!(notes.is_empty());
+            let notes = destroy_guard(Ok(BeforeDestroy::Gone), "tg-box", forced).unwrap();
+            assert!(notes.is_empty());
+        }
+        let notes = destroy_guard(
+            Ok(BeforeDestroy::Pulled {
+                report: None,
+                sandbox_dirty: None,
+            }),
+            "tg-box",
+            false,
+        )
+        .unwrap();
+        assert!(!notes[0].warn);
+        assert!(notes[0].text.contains("no pull"));
+
+        let notes = destroy_guard(
+            Ok(BeforeDestroy::Pulled {
+                report: Some(clean.clone()),
+                sandbox_dirty: Some(0),
+            }),
+            "tg-box",
+            false,
+        )
+        .unwrap();
+        assert!(notes[0].text.contains("pulled tg/lane:"));
+
+        let diverged = report(PullOutcome::Diverged {
+            kept_ref: "refs/thegn/pull/tg-box".into(),
+            vm_head: "c".repeat(40),
+        });
+        let refusal = destroy_guard(
+            Ok(BeforeDestroy::Pulled {
+                report: Some(diverged.clone()),
+                sandbox_dirty: Some(0),
+            }),
+            "tg-box",
+            false,
+        )
+        .unwrap_err();
+        assert!(refusal.contains("nothing was destroyed"), "{refusal}");
+        let notes = destroy_guard(
+            Ok(BeforeDestroy::Pulled {
+                report: Some(diverged),
+                sandbox_dirty: Some(0),
+            }),
+            "tg-box",
+            true,
+        )
+        .unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.warn && note.text.contains("kept ref"))
+        );
+
+        for dirty in [Some(2), None] {
+            let refusal = destroy_guard(
+                Ok(BeforeDestroy::Pulled {
+                    report: Some(clean.clone()),
+                    sandbox_dirty: dirty,
+                }),
+                "tg-box",
+                false,
+            )
+            .unwrap_err();
+            assert!(refusal.contains("nothing was destroyed"), "{refusal}");
+            let notes = destroy_guard(
+                Ok(BeforeDestroy::Pulled {
+                    report: Some(clean.clone()),
+                    sandbox_dirty: dirty,
+                }),
+                "tg-box",
+                true,
+            )
+            .unwrap();
+            assert!(
+                notes
+                    .iter()
+                    .any(|note| note.warn && note.text.contains("lost"))
+            );
+        }
+
+        let error = destroy_guard(
+            Err::<BeforeDestroy, _>(anyhow::anyhow!("provider unavailable")),
+            "tg-box",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("nothing was destroyed"), "{error}");
+        let notes =
+            destroy_guard(Err(anyhow::anyhow!("provider unavailable")), "tg-box", true).unwrap();
+        assert!(notes[0].warn && notes[0].text.contains("lost"));
     }
 
     #[test]

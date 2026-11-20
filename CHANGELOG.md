@@ -7,6 +7,23 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.119] — 2026-11-20
+
+### Changed
+
+- Commands that now refuse, and what to run instead:
+  - `wt rm` and the TUI delete pull the sandbox's commits first and refuse on a failed pull or a dirty sandbox; use `--force` (or the TUI force delete) to destroy anyway.
+  - `env down` refuses a dirty sandbox or failed pull; use `--force`, or `--stop` to park it.
+  - `env deprovision` refuses sandboxes bound to a registered worktree (`--all` skips them); run `env down --worktree <wt>` or `wt rm <wt>` first.
+  - `env rm` refuses while a registered worktree uses the env; tear the worktrees down or `env set <env> --worktree <wt>` first.
+  - `merge land` and the TUI land pull first and refuse a queued candidate the pull made stale; re-queue with `thegn merge add` or run `thegn land`.
+  - `wt prune` keeps worktrees bound to a provider sandbox.
+- `env set` and `env restore` pull first and name what they leave or discard; closing a worktree names the sandbox it leaves.
+- `land --release-sandbox` re-checks right before releasing and keeps a dirty sandbox.
+- Sprites lifetime reapers keep sandboxes bound to a registered worktree; background passes never wake a sandbox, and the hibernator never execs a sleeping sandbox unless a listing shows it awake.
+- Non-tty `sprite-exec` streams without a cap, sends remote stderr to stderr and forwards a non-terminal stdin.
+- `test/remote-parity.sh` prints a `RUN SUMMARY` (THE-2477).
+
 ## [0.1.0-alpha.118] — 2026-11-20
 
 ### Fixed

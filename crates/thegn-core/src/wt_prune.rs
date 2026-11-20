@@ -8,14 +8,16 @@
 //!
 //! 1. [`KeepReason::PrimaryCheckout`] — the repo's main checkout.
 //! 2. [`KeepReason::TargetBranch`] — the worktree holds the merge target itself.
-//! 3. [`KeepReason::DetachedHead`] — no branch to prove merged.
-//! 4. [`KeepReason::NotMerged`] — the branch is not an ancestor of the target
+//! 3. [`KeepReason::ProviderSandbox`] — a provider sandbox must be landed or
+//!    taken down explicitly.
+//! 4. [`KeepReason::DetachedHead`] — no branch to prove merged.
+//! 5. [`KeepReason::NotMerged`] — the branch is not an ancestor of the target
 //!    (or Git could not say; unknown is never "merged").
-//! 5. [`KeepReason::NoWork`] — the branch tip equals the target tip (freshly
+//! 6. [`KeepReason::NoWork`] — the branch tip equals the target tip (freshly
 //!    cut, never worked), so "merged" proves nothing.
-//! 6. [`KeepReason::Dirty`] — uncommitted or untracked files.
-//! 7. [`KeepReason::LiveProcess`] — a process has its cwd inside the worktree.
-//! 8. [`KeepReason::LiveSession`] — held by a live session or a queue row.
+//! 7. [`KeepReason::Dirty`] — uncommitted or untracked files.
+//! 8. [`KeepReason::LiveProcess`] — a process has its cwd inside the worktree.
+//! 9. [`KeepReason::LiveSession`] — held by a live session or a queue row.
 
 /// Facts about one worktree, gathered by the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub struct PruneFacts {
     pub live_cwd_pids: Vec<u32>,
     /// Held by a running session or an active queue row.
     pub held_by_session: bool,
+    /// Bound to a provider sandbox, which prune never destroys.
+    pub provider_sandbox: bool,
 }
 
 /// Why a worktree is kept.
@@ -50,6 +54,7 @@ pub enum KeepReason {
     Dirty,
     LiveProcess,
     LiveSession,
+    ProviderSandbox,
 }
 
 impl KeepReason {
@@ -64,6 +69,7 @@ impl KeepReason {
             Self::Dirty => "dirty",
             Self::LiveProcess => "live-process",
             Self::LiveSession => "live-session",
+            Self::ProviderSandbox => "provider-sandbox",
         }
     }
 
@@ -78,6 +84,9 @@ impl KeepReason {
             Self::Dirty => "uncommitted or untracked changes",
             Self::LiveProcess => "a process is running inside it",
             Self::LiveSession => "held by a live session",
+            Self::ProviderSandbox => {
+                "bound to a provider sandbox: `thegn land --release-sandbox` or `thegn env down --worktree <wt>` first (prune never destroys a sandbox)"
+            }
         }
     }
 }
@@ -100,6 +109,9 @@ pub fn decide(f: &PruneFacts) -> PruneDecision {
     }
     if f.is_target_branch {
         return PruneDecision::Keep(TargetBranch);
+    }
+    if f.provider_sandbox {
+        return PruneDecision::Keep(ProviderSandbox);
     }
     if f.branch.as_deref().is_none_or(str::is_empty) {
         return PruneDecision::Keep(DetachedHead);
@@ -171,6 +183,7 @@ mod tests {
             tree_clean: true,
             live_cwd_pids: vec![],
             held_by_session: false,
+            provider_sandbox: false,
         }
     }
 
@@ -217,6 +230,10 @@ mod tests {
                 Box::new(|f| f.held_by_session = true),
                 KeepReason::LiveSession,
             ),
+            (
+                Box::new(|f| f.provider_sandbox = true),
+                KeepReason::ProviderSandbox,
+            ),
         ];
         for (mutate, want) in cases {
             let mut f = removable();
@@ -230,6 +247,7 @@ mod tests {
         let mut f = removable();
         f.is_primary = true;
         f.is_target_branch = true;
+        f.provider_sandbox = true;
         f.branch = None;
         f.ancestor_of_target = false;
         f.tip_equals_target = true;
@@ -239,6 +257,7 @@ mod tests {
         let order = [
             KeepReason::PrimaryCheckout,
             KeepReason::TargetBranch,
+            KeepReason::ProviderSandbox,
             KeepReason::DetachedHead,
             KeepReason::NotMerged,
             KeepReason::NoWork,
@@ -251,6 +270,7 @@ mod tests {
             match want {
                 KeepReason::PrimaryCheckout => f.is_primary = false,
                 KeepReason::TargetBranch => f.is_target_branch = false,
+                KeepReason::ProviderSandbox => f.provider_sandbox = false,
                 KeepReason::DetachedHead => f.branch = Some("b".into()),
                 KeepReason::NotMerged => f.ancestor_of_target = true,
                 KeepReason::NoWork => f.tip_equals_target = false,
@@ -296,6 +316,7 @@ mod tests {
         let all = [
             KeepReason::PrimaryCheckout,
             KeepReason::TargetBranch,
+            KeepReason::ProviderSandbox,
             KeepReason::DetachedHead,
             KeepReason::NotMerged,
             KeepReason::NoWork,

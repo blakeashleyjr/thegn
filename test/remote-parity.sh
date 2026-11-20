@@ -110,13 +110,13 @@ Steps:
   P08 Ctrl-\\                              P09 EOF
   P10 bracketed paste                     P11 full-screen program
   P12 arrow keys / DECCKM                 P13 SGR mouse
-  P14 alternate-screen restore            P15 output flood
+  P14 alternate-screen restore            P15 output flood + P15C transfer probes
   P16 1 MiB paste                         P17 title
   P18 cwd and OSC 7                       P19 exit status
   P20 echo latency ($samples samples)     P21 startup step table
   P22 remote close leak check             P23 idle probe (only --idle-probe)
   --startup-only: cold/warm prompt startup table; --fill-spare adds a spare claim.
-Output     : one PASS|WARN|FAIL line per case, a summary table, and FAILED CASES.
+Output     : one PASS|WARN|FAIL line per case, a summary table, a RUN SUMMARY block, and FAILED CASES.
 Known quirk: THE-2450 is reported as WARN when only the first tty line ending differs.
 PLAN
 }
@@ -282,7 +282,7 @@ provider_ledger_all() {
 }
 provider_session_prefix() {
   case "$provider" in
-  sprites) PROVIDER_PREFIX=(env "THEGN_TRACE_FILE=$TMP/bridge.log" THEGN_LOG_LEVEL=debug "$THEGN_BIN" sprite-exec "$1" --) ;;
+  sprites) PROVIDER_PREFIX=(env "THEGN_LOG=thegn::provider=debug,thegn::sprites=debug" "THEGN_TRACE_FILE=$TMP/bridge.log" "$THEGN_BIN" sprite-exec "$1" --) ;;
   *) return 2 ;;
   esac
 }
@@ -413,6 +413,35 @@ print(json.dumps({"argv":json.loads(os.environ["OPEN_ARGV_JSON"]),"cwd":os.envir
 '
 }
 
+confirm_listed() {
+  local id="$1"
+  if "$THEGN_BIN" session list --json 2>/dev/null |
+    SESSION_ID="$id" python3 -I -c '
+import json, os, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+if isinstance(rows, dict):
+    rows = rows.get("sessions", [])
+if not isinstance(rows, list):
+    sys.exit(1)
+sys.exit(0 if any(isinstance(row, dict) and row.get("id") == os.environ["SESSION_ID"] for row in rows) else 1)
+'; then
+    return 0
+  fi
+  echo "FAIL P00: the daemon returned session $id but does not list it" >&2
+  if [ -f "$TMP/daemon.log" ]; then
+    tail -n 20 "$TMP/daemon.log" |
+      python3 -I -c '
+import sys
+text = sys.stdin.read()
+sys.stderr.write("".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 0x20))
+' || true
+  fi
+  return 1
+}
+
 stamped_env_up() {
   local worktree="$1" stem="$2"
   {
@@ -499,6 +528,7 @@ print(json.dumps(json.loads(os.environ["PROVIDER_PREFIX_JSON"])+["/bin/sh","-c",
     open_params_json="$(open_params "$remote_argv_json" "$worktree")" || return 1
     open_json="$("$THEGN_BIN" api call sessions.open --params "$open_params_json")" || return 1
     REMOTE_SESSION="$(printf '%s' "$open_json" | session_id)" || return 1
+    confirm_listed "$REMOTE_SESSION" || return 1
     if ! "$THEGN_BIN" session wait --session "$REMOTE_SESSION" --until 'screen:(?m)^PARITY\$ ?$' --timeout 120000; then
       echo "FAIL $scenario: remote prompt did not arrive" >&2
       return 1
@@ -651,6 +681,9 @@ for line in text.splitlines():
 fi
 
 stamped_env_up "$REPO" up
+up_measure="$(measure_up "$TMP/up.ts")" || up_measure="- -"
+read -r RP_SHELL_READY_S RP_ENV_UP_S <<<"$up_measure"
+export RP_SHELL_READY_S RP_ENV_UP_S
 RUN_RECORDS="$(provider_ledger_name)"
 if [ "$(printf '%s\n' "$RUN_RECORDS" | sed '/^$/d' | wc -l)" -ne 1 ]; then
   echo "FAIL P00: expected exactly one ready $provider ledger record from this run" >&2
@@ -680,10 +713,12 @@ local_open_json="$("$THEGN_BIN" api call sessions.open --params "$local_open_par
 open_end="$(mono_ns)"
 LOCAL_OPEN_MS="$(((open_end - open_start) / 1000000))"
 LOCAL_SESSION="$(printf '%s' "$local_open_json" | session_id)"
+confirm_listed "$LOCAL_SESSION"
 
 provider_session_prefix "$RUN_RECORDS"
-RP_CAPTURE_ARGV_JSON="$(json_argv "")"
-export RP_CAPTURE_ARGV_JSON
+RP_CAPTURE_ARGV_JSON="$(json_argv "${PROVIDER_PREFIX[@]}")"
+RP_REMOTE_PREFIX_JSON="$RP_CAPTURE_ARGV_JSON"
+export RP_CAPTURE_ARGV_JSON RP_REMOTE_PREFIX_JSON
 # shellcheck disable=SC2016 # literal: the remote shell expands these
 remote_cmd='export PS1="PARITY$ "; cd "$HOME/workspace" 2>/dev/null; command -v bash >/dev/null 2>&1 && exec bash --norc --noprofile -i; exec sh -i'
 remote_argv_json="$(PROVIDER_PREFIX_JSON="$(json_argv "${PROVIDER_PREFIX[@]}")" REMOTE_CMD="$remote_cmd" python3 -I -c '
@@ -696,6 +731,7 @@ remote_open_json="$("$THEGN_BIN" api call sessions.open --params "$remote_open_p
 open_end="$(mono_ns)"
 REMOTE_OPEN_MS="$(((open_end - open_start) / 1000000))"
 REMOTE_SESSION="$(printf '%s' "$remote_open_json" | session_id)"
+confirm_listed "$REMOTE_SESSION"
 
 # P00: a remote shell that exits inside ten seconds proves the provider token
 # never reached the daemon's session environment.

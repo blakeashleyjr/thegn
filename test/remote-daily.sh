@@ -116,12 +116,11 @@ Steps:
  2u   env up (provision rd-x)
  2b   exactly one ready ledger record for this run
   3   agent run --worktree <rd-x path> --agent hold-test --prompt x --wait --pull --json
-      (scripted agent: sleep 420; date>f; git commit). No per-run overlay agent
-      can be added from here, so the stated fallback is used: the same script
-      run through the exec bridge (sprite-exec --hold / vercel-exec) followed
-      by env pull. If your config defines a hold-test agent, set
-      RD_HOLD_AGENT=1 to use agent run instead (required for fly, which has
-      no exec bridge).
+      (scripted agent: sleep 420; date>f; git commit). With RD_OVERLAY_AGENT=1,
+      a temporary copied config supplies hold-test; otherwise the stated
+      fallback uses the exec bridge (sprite-exec --hold / vercel-exec) followed
+      by env pull. If your config defines a hold-test agent, set RD_HOLD_AGENT=1
+      to use agent run instead; RD_OVERLAY_AGENT=1 also supplies one for the run.
   4   (--with-model) agent run --agent claude, then --agent codex, each
       committing one file
   5   (fly only) fleet list --env shows stopped
@@ -141,14 +140,21 @@ Steps:
 11k   (sprites/vercel only) land rd-y without --release-sandbox (sandbox kept)
       (requires "pulled tg/rd-y" and the sandbox commit in main)
 11j   (sprites/vercel only) rd-y's record is still ready and the listing has it
-      then wt rm <rd-y path> --force exits 0 (the worktree-delete teardown,
-      which confirms the destroy)     11c its record is gone and the org
-      listing lacks it
+11o   leave an uncommitted file inside rd-y
+11g   land --release-sandbox refuses the dirty sandbox and keeps it
+11e   env down refuses the dirty sandbox and leaves its record ready
+11f   remove the uncommitted file
+11n   commit inside rd-y again, left unpulled
+11d   env deprovision of rd-y's sandbox refuses while it belongs to the worktree
+11r   wt rm <rd-y path> --force exits 0 and pulls tg/rd-y
+11q   local tg/rd-y has the second sandbox commit
+11c   its record is gone and the org listing lacks it
  P0  (--with-pool) wt new rd-p --env <S>, then resolve its worktree path
  P1  (--with-pool) snapshot the ledger, env pool-fill --worktree <rd-p>
      --size 1 --json, and verify exactly one filled spare
  P2  (--with-pool) exactly one new ledger record is the filled spare
- P3  (--with-pool) agent run on rd-p claims the spare without a new record; needs RD_HOLD_AGENT=1 (asserts provision == claimed_spare in the agent JSON)
+ P3  (--with-pool) claims the spare without a new ledger record: RD_HOLD_AGENT=1
+     uses agent run and otherwise env up --worktree <rd-p path>
  P4  (--with-pool) env pool-fill --worktree <rd-p> --size 0 --json
  P5  (--with-pool) wt rm <rd-p> --force, then verify the spare is gone
  A    (--with-adopt <name>) env adopt <name> --env <S> --yes; ledger record
@@ -183,21 +189,20 @@ if [ "${THEGN_CHANNEL:-}" != "dev" ]; then
   exit 2
 fi
 
-if [ "$provider" = fly ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
+if [ "$provider" = fly ] && [ "${RD_HOLD_AGENT:-0}" != 1 ] && [ "${RD_OVERLAY_AGENT:-0}" != 1 ]; then
   echo "fly needs RD_HOLD_AGENT=1 (no exec bridge)" >&2
   exit 2
 fi
-if [ "$with_pool" = 1 ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
-  echo "--with-pool needs RD_HOLD_AGENT=1 (P3 claims the spare through agent run hold-test)" >&2
-  exit 2
-fi
-
 # ---- step 0: preflight (doctor's "Remote live readiness" block) ----
 preflight_capture() { live_preflight_capture; }
 preflight_check() { live_preflight_check "$1" "${2:-1}" "$TMP"; }
 # Run against the owner's real state, before the fresh dirs below, so
 # pre-existing unbound sandboxes are listed.
 preflight_capture
+OVERLAY_OWNER_CONFIG=""
+if [ "${RD_OVERLAY_AGENT:-0}" = 1 ]; then
+  OVERLAY_OWNER_CONFIG="$("$THEGN_BIN" config path 2>/dev/null)" || OVERLAY_OWNER_CONFIG=""
+fi
 
 TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
@@ -209,18 +214,71 @@ CREATED=0
 # shellcheck disable=SC2034 # appended to and read by test/lib/live.sh
 FAILED_STEPS=()
 HOLD_PID=""
+DAEMON_PID=""
 WT_PATH=""
 RDY_NAME=""
 RDY_PATH=""
 POOL_SPARE=""
 POOL_PATH=""
+OVERLAY_CONFIG=""
+CONFIG_ARGS=()
 # shellcheck disable=SC2034 # read by test/lib/live.sh
-LIVE_STARTUP=("2u=cold create (env up rd-x)" "11u=second create (env up rd-y)" "P1=warm spare fill (env pool-fill)" "P3=agent run on the claimed spare")
+LIVE_STARTUP=("2u=cold create (env up rd-x)" "11u=second create (env up rd-y)" "P1=warm spare fill (env pool-fill)" "P3=claim the warm spare")
 case "$provider" in
 sprites) EXEC_BRIDGE="sprite-exec" ;;
 vercel) EXEC_BRIDGE="vercel-exec" ;;
 *) EXEC_BRIDGE="" ;; # fly has no thegn exec bridge verb
 esac
+
+setup_overlay() {
+  [ "${RD_OVERLAY_AGENT:-0}" = 1 ] || return 0
+  if [ -z "$OVERLAY_OWNER_CONFIG" ]; then
+    echo "SKIP overlay: thegn config path failed" >&2
+    return 0
+  fi
+  if [ ! -f "$OVERLAY_OWNER_CONFIG" ]; then
+    echo "SKIP overlay: owner config is not a file: $OVERLAY_OWNER_CONFIG" >&2
+    return 0
+  fi
+  OVERLAY_CONFIG="$TMP/config.toml"
+  if ! cp -- "$OVERLAY_OWNER_CONFIG" "$OVERLAY_CONFIG"; then
+    echo "SKIP overlay: could not copy the owner config" >&2
+    OVERLAY_CONFIG=""
+    return 0
+  fi
+  if ! cat >>"$OVERLAY_CONFIG" <<'OVERLAY'; then
+
+[[agents]]
+name = "hold-test"
+command = "sleep 420 && date > rd-hold.txt && git add rd-hold.txt && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit -q -m rd-hold && :"
+OVERLAY
+    echo "SKIP overlay: could not append hold-test to the copied config" >&2
+    OVERLAY_CONFIG=""
+    return 0
+  fi
+  local out rc
+  out="$("$THEGN_BIN" --config "$OVERLAY_CONFIG" agent list 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "SKIP overlay: agent list failed: $out" >&2
+    OVERLAY_CONFIG=""
+    return 0
+  fi
+  case "$out" in
+  *hold-test*) ;;
+  *)
+    echo "SKIP overlay: agent list did not name hold-test" >&2
+    OVERLAY_CONFIG=""
+    return 0
+    ;;
+  esac
+  CONFIG_ARGS=(--config "$TMP/config.toml")
+}
+
+setup_overlay
+if [ "$provider" = fly ] && [ "${RD_HOLD_AGENT:-0}" != 1 ] && [ -z "$OVERLAY_CONFIG" ]; then
+  echo "fly needs RD_HOLD_AGENT=1 or a working RD_OVERLAY_AGENT=1 (no exec bridge)" >&2
+  exit 2
+fi
 
 print_plan
 echo
@@ -306,6 +364,11 @@ teardown() {
       rc=1
     }
   fi
+  if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    kill "$DAEMON_PID" 2>/dev/null
+    wait "$DAEMON_PID" 2>/dev/null
+    DAEMON_PID=""
+  fi
   if [ "$CREATED" = 1 ]; then
     # rd-y's name came from this run's ledger (11b); keep it even if its
     # record is gone, so the listing check below still covers it.
@@ -316,6 +379,12 @@ teardown() {
     if [ -n "$POOL_SPARE" ] && ! printf '%s\n' "$names" | grep -Fxq "$POOL_SPARE"; then
       names="$names $POOL_SPARE"
     fi
+    for wt in "$RDY_PATH" "$POOL_PATH"; do
+      if [ -n "$wt" ] && [ -d "$wt" ]; then
+        echo "-- teardown: wt rm $wt --force"
+        (cd "$REPO" && "$THEGN_BIN" wt rm "$wt" --force </dev/null)
+      fi
+    done
     echo "-- teardown: env down --force"
     (cd "$REPO" && "$THEGN_BIN" env down --force)
     for n in $names; do
@@ -353,6 +422,7 @@ step() { # step <id> <description> <command...>
 
 in_repo() { (cd "$REPO" && "$@"); }
 no_stdin() { "$@" </dev/null; }
+thegn_cli() { "$THEGN_BIN" "${CONFIG_ARGS[@]}" "$@"; }
 
 LOGIN_UPLOAD=""
 read_login_upload() {
@@ -392,6 +462,21 @@ hold_wait() {
   HOLD_PID=""
 }
 
+start_overlay_daemon() {
+  [ -n "$OVERLAY_CONFIG" ] || return 0
+  "$THEGN_BIN" daemon stop >/dev/null 2>&1 || true
+  no_stdin "$THEGN_BIN" --config "$OVERLAY_CONFIG" daemon >"$TMP/overlay-daemon.log" 2>&1 &
+  DAEMON_PID=$!
+  for _ in $(seq 1 30); do
+    "$THEGN_BIN" --config "$OVERLAY_CONFIG" session list --json >/dev/null 2>&1 && return 0
+    kill -0 "$DAEMON_PID" 2>/dev/null || break
+    sleep 0.5
+  done
+  echo "overlay daemon exited before step 3" >&2
+  sed -n '1,40p' "$TMP/overlay-daemon.log" >&2
+  return 1
+}
+
 agent_json_ok() { # agent_json_ok <file>: validate a completed, pulled agent run
   python3 -I -c '
 import json, sys
@@ -421,7 +506,7 @@ for field, actual, expected in checks:
 }
 
 agent_hold_run() {
-  if in_repo "$THEGN_BIN" agent run --worktree "$WT_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/3.json"; then
+  if in_repo thegn_cli agent run --worktree "$WT_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/3.json"; then
     agent_json_ok "$TMP/3.json" || return 1
     local provision
     provision="$(python3 -I -c '
@@ -472,9 +557,10 @@ print(name)
 }
 
 pool_claim_run() {
-  if in_repo "$THEGN_BIN" agent run --worktree "$POOL_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/p3.json"; then
-    agent_json_ok "$TMP/p3.json" || return 1
-    python3 -I -c '
+  if [ "${RD_HOLD_AGENT:-0}" = 1 ]; then
+    if in_repo thegn_cli agent run --worktree "$POOL_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/p3.json"; then
+      agent_json_ok "$TMP/p3.json" || return 1
+      python3 -I -c '
 import json, sys
 
 try:
@@ -486,18 +572,46 @@ except (KeyError, OSError, TypeError, ValueError):
     print("agent JSON missing provision", file=sys.stderr)
     sys.exit(1)
 ' "$TMP/p3.json" || return 1
+    else
+      local rc="$?"
+      agent_json_ok "$TMP/p3.json" || true
+      return "$rc"
+    fi
   else
-    local rc="$?"
-    agent_json_ok "$TMP/p3.json" || true
-    return "$rc"
+    local out rc
+    if [ -n "$OVERLAY_CONFIG" ]; then
+      out="$(no_stdin "$THEGN_BIN" --config "$TMP/config.toml" env up --worktree "$POOL_PATH" 2>&1)" && rc=0 || rc=$?
+    else
+      out="$(no_stdin "$THEGN_BIN" env up --worktree "$POOL_PATH" 2>&1)" && rc=0 || rc=$?
+    fi
+    printf '%s\n' "$out"
+    [ "$rc" -eq 0 ] || return "$rc"
+    case "$out" in
+    *"claimed a warm spare for "* | *claimed_spare*) ;;
+    *)
+      echo "env up did not report a warm-spare claim" >&2
+      return 1
+      ;;
+    esac
   fi
   local after
   after="$(run_records)"
   echo "   ledger records after pool claim: ${after:-(none)}"
-  [ "$after" = "$RECORDS_BEFORE" ]
+  if [ "$after" = "$RECORDS_BEFORE" ]; then
+    return 0
+  fi
+  return 1
 }
 
-pool_new_record() { [ -n "$POOL_SPARE" ] && one_new_record "$POOL_SPARE"; }
+pool_new_record() {
+  if [ -n "$POOL_SPARE" ]; then
+    if one_new_record "$POOL_SPARE"; then
+      return 0
+    fi
+    return 1
+  fi
+  return 1
+}
 
 pool_remove() {
   no_stdin in_repo "$THEGN_BIN" wt rm "$POOL_PATH" --force || return 1
@@ -635,6 +749,21 @@ rdy_commit() {
   no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
     'cd "$HOME/workspace" && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit --allow-empty -qm rd-y'
 }
+rdy_dirty_file() {
+  # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
+    'cd "$HOME/workspace" && date > rd-dirty.txt'
+}
+rdy_clean_dirty_file() {
+  # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
+    'cd "$HOME/workspace" && rm rd-dirty.txt'
+}
+rdy_commit_again() {
+  # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
+    'cd "$HOME/workspace" && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit --allow-empty -qm rd-y2'
+}
 land_release() {
   local out rc
   out="$(in_repo "$THEGN_BIN" "${LAND_SET[@]}" land --worktree "$WT_PATH" --release-sandbox 2>&1)" && rc=0 || rc=$?
@@ -680,6 +809,81 @@ rdy_land_keep() {
   *) return 1 ;;
   esac
 }
+rdy_land_dirty_release() {
+  local out rc
+  out="$(no_stdin in_repo "$THEGN_BIN" "${LAND_SET[@]}" land --worktree "$RDY_PATH" --release-sandbox 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" -eq 0 ] || return "$rc"
+  case "$out" in
+  *"sandbox $RDY_NAME kept"*) ;;
+  *)
+    echo "dirty land did not keep sandbox $RDY_NAME" >&2
+    return 1
+    ;;
+  esac
+  case "$out" in
+  *uncommitted*) ;;
+  *)
+    echo "dirty land did not report uncommitted work" >&2
+    return 1
+    ;;
+  esac
+}
+rdy_down_dirty() {
+  local out rc state
+  out="$(no_stdin in_repo "$THEGN_BIN" env down --worktree "$RDY_PATH" 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" -ne 0 ] || return 1
+  case "$out" in
+  *uncommitted*) ;;
+  *)
+    echo "env down did not report uncommitted work" >&2
+    return 1
+    ;;
+  esac
+  state="$(sed -n 's/.*"state": *"\([^"]*\)".*/\1/p' "$(ledger_dir)/$RDY_NAME.json")"
+  if [ "$state" = ready ]; then
+    return 0
+  fi
+  return 1
+}
+rdy_deprovision_bound() {
+  local out rc
+  out="$(no_stdin in_repo "$THEGN_BIN" env deprovision "$RDY_NAME" 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" -ne 0 ] || return 1
+  case "$out" in
+  *"belongs to worktree"*) return 0 ;;
+  *)
+    echo "env deprovision did not report worktree ownership" >&2
+    return 1
+    ;;
+  esac
+}
+rdy_rm_force() {
+  local out rc
+  out="$(no_stdin in_repo "$THEGN_BIN" wt rm "$RDY_PATH" --force 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" -eq 0 ] || return "$rc"
+  case "$out" in
+  *"pulled tg/rd-y"*) return 0 ;;
+  *)
+    echo "wt rm did not report pulling tg/rd-y" >&2
+    return 1
+    ;;
+  esac
+}
+rdy_second_commit_landed() {
+  local subjects
+  subjects="$(git -C "$REPO" log --format=%s tg/rd-y)" || return 1
+  case $'\n'"$subjects"$'\n' in
+  *$'\n'rd-y2$'\n'*) return 0 ;;
+  *)
+    echo "local tg/rd-y lacks the second sandbox commit" >&2
+    return 1
+    ;;
+  esac
+}
 rdy_ready_and_listed() {
   grep -Eq '"state": *"ready"' "$(ledger_dir)/$RDY_NAME.json" && listing_has_name "$RDY_NAME"
 }
@@ -697,6 +901,10 @@ step 2u "env up (provision rd-x)" no_stdin "$THEGN_BIN" env up --worktree "$WT_P
 step 2b "exactly one ready ledger record for this run" name_from_ledger
 echo "sandbox: $NAME"
 if [ "${RD_HOLD_AGENT:-0}" = 1 ]; then
+  step 3d "start the overlay daemon" start_overlay_daemon
+  step 3 "agent run hold-test --wait --pull" agent_hold_run
+elif [ -n "$OVERLAY_CONFIG" ]; then
+  step 3d "start the overlay daemon" start_overlay_daemon
   step 3 "agent run hold-test --wait --pull" agent_hold_run
 else
   echo "   (no overlay hold-test agent: using the $EXEC_BRIDGE fallback + env pull)"
@@ -737,9 +945,18 @@ if [ -n "$EXEC_BRIDGE" ]; then
   step 11m "commit inside rd-y" rdy_commit
   step 11k "land rd-y without --release-sandbox keeps the sandbox" rdy_land_keep
   step 11j "rd-y's record is still ready and the listing has it" rdy_ready_and_listed
+  step 11o "leave an uncommitted file inside rd-y" rdy_dirty_file
+  step 11g "land --release-sandbox keeps a dirty sandbox" rdy_land_dirty_release
+  step 11e "env down refuses a dirty sandbox" rdy_down_dirty
+  step 11f "remove the uncommitted file" rdy_clean_dirty_file
+  step 11n "commit inside rd-y again, left unpulled" rdy_commit_again
+  step 11d "env deprovision of rd-y's sandbox refuses" rdy_deprovision_bound
 fi
 # --force only here: rd-y is this run's scratch worktree.
-step 11r "wt rm <rd-y path> --force exits 0" no_stdin in_repo "$THEGN_BIN" wt rm "$RDY_PATH" --force
+step 11r "wt rm <rd-y path> --force exits 0 and pulls tg/rd-y" rdy_rm_force
+if [ -n "$EXEC_BRIDGE" ]; then
+  step 11q "local tg/rd-y has the second sandbox commit" rdy_second_commit_landed
+fi
 step 11c "rd-y's ledger record is gone and the org listing lacks it" rdy_gone
 if [ "$with_pool" = 1 ]; then
   step P0 "wt new rd-p --env $env_name" in_repo "$THEGN_BIN" wt new rd-p --env "$env_name"
@@ -747,7 +964,7 @@ if [ "$with_pool" = 1 ]; then
   step P1 "fill one warm pool spare" pool_fill_one
   step P2 "exactly one new ledger record is the pool spare" pool_new_record
   snapshot_records
-  step P3 "agent run claims the pool spare without a new ledger record" pool_claim_run
+  step P3 "P3 claims the pool spare without a new ledger record" pool_claim_run
   step P4 "pool-fill target 0 exits 0" in_repo "$THEGN_BIN" env pool-fill --worktree "$POOL_PATH" --size 0 --json
   step P5 "wt rm rd-p destroys the spare and removes its record" pool_remove
 fi

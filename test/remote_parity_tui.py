@@ -10,8 +10,8 @@ import json
 import os
 import pty
 import signal
-import statistics
 import struct
+import sys
 import termios
 import threading
 import time
@@ -37,17 +37,55 @@ def result(
     return {
         "status": status,
         "note": note,
-        "first_key_ms": first,
-        "next_key_ms": following,
-        "first_p50": p50(first),
-        "next_p50": p50(following),
+        "first": timing_summary(first),
+        "next": timing_summary(following),
+        "samples_file": os.environ.get("RP_TUI_SAMPLES_OUT") or None,
     }
 
 
-def p50(values: list[int]) -> float | None:
+def percentile(values: list[int], fraction: float) -> float | None:
     if not values:
         return None
-    return round(statistics.median(values), 3)
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    value = ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+    return round(value, 3)
+
+
+def timing_summary(values: list[int]) -> dict[str, int | float | None]:
+    return {
+        "n": len(values),
+        "min": min(values) if values else None,
+        "p50": percentile(values, 0.50),
+        "p95": percentile(values, 0.95),
+        "max": max(values) if values else None,
+    }
+
+
+def write_samples(first_key_ms: list[int], next_key_ms: list[int]) -> None:
+    path = os.environ.get("RP_TUI_SAMPLES_OUT")
+    if path:
+        from pathlib import Path
+
+        Path(path).write_text(
+            json.dumps(
+                {"first_key_ms": first_key_ms, "next_key_ms": next_key_ms},
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
+
+def compact_shape(payload: dict[str, Any]) -> bool:
+    return (
+        list(payload) == ["status", "note", "first", "next", "samples_file"]
+        and isinstance(payload.get("first"), dict)
+        and isinstance(payload.get("next"), dict)
+        and list(payload["first"]) == ["n", "min", "p50", "p95", "max"]
+        and list(payload["next"]) == ["n", "min", "p50", "p95", "max"]
+    )
 
 
 def seconds_text(value: float) -> str:
@@ -260,6 +298,10 @@ def run_probe(
         return result("FAIL", "the TUI parity probe failed", first_key_ms, next_key_ms)
     finally:
         probe.close()
+        try:
+            write_samples(first_key_ms, next_key_ms)
+        except OSError as error:
+            print(f"remote_parity_tui: samples file not written: {error}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -288,6 +330,9 @@ def main(argv: list[str] | None = None) -> int:
             args.timeout,
             args.self_test,
         )
+    if args.self_test and not compact_shape(payload):
+        print("remote_parity_tui: self-test produced a non-compact result", file=sys.stderr)
+        return 1
     print(json.dumps(payload, separators=(",", ":")), flush=True)
     return 0 if payload["status"] in ("PASS", "SKIP") else 1
 
