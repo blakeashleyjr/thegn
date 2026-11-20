@@ -164,6 +164,24 @@ evaluates the repo's flake as you, so running it is your consent. It writes the
 cache (0600 file in a private 0700 directory) that the injection reads, and
 refuses a directory with no `flake.nix`. Nothing runs it automatically.
 
+### Nix daemon access in local NixOS panes
+
+When `[sandbox] nix_daemon` is omitted, a standalone local interactive terminal
+pane on NixOS uses the host Nix daemon only after resolving a native local
+`bwrap` or `systemd` backend, when a compatible socket exists, the effective
+network mode is NAT, no network allow/block/audit or VPN policy is configured,
+and the profile is not sealed. OCI backends are excluded, whether their engine
+is local or remotely addressed. Set `nix_daemon = false` to opt out, or `true`
+to request the existing explicit behavior. This setting is separate from
+`inject_devshell`: it does not evaluate the repository's `.envrc` or devShell
+on the host.
+
+Automatic access is not enabled for agent or unattended runs, SSH worktrees,
+provider placements, sealed profiles, or panes with `network = "none"` or other
+explicit network/VPN policy. A mounted daemon socket lets sandbox processes ask
+the host to build arbitrary derivations and access paths in the host Nix store;
+use it only for work you trust with that authority.
+
 ## Lifecycle hooks and pane setup
 
 `[hooks]` commands are host-side worktree/session lifecycle jobs. They run

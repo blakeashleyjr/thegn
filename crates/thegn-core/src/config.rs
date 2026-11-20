@@ -4492,9 +4492,10 @@ pub struct SandboxConfig {
     /// host dev (the host, with it unset, uses devenv instead).
     pub devshell: String,
     /// Bind-mount the host Nix daemon socket into the sandbox for full in-sandbox
-    /// `nix develop`/`build`/`fmt`. `true` explicitly enables it; `false` never
-    /// auto-enables it.
-    pub nix_daemon: bool,
+    /// `nix develop`/`build`/`fmt`. `None` lets local interactive terminal panes
+    /// auto-enable it on NixOS; `Some(true)` enables it and `Some(false)` disables
+    /// it. Other sandbox launch paths treat `None` as off.
+    pub nix_daemon: Option<bool>,
     /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
     /// at pane-spawn time; else an absolute path or name (e.g. `"zsh"`).
     pub shell: String,
@@ -4622,7 +4623,7 @@ impl Default for SandboxConfig {
             devenv: false,
             inject_devshell: false,
             devshell: String::new(),
-            nix_daemon: false,
+            nix_daemon: None,
             shell: String::new(),
             on_missing: OnMissing::Warn,
             failover: FailoverMode::Halt,

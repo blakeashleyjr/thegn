@@ -2424,8 +2424,9 @@ fn resolve_placed_with(
     // `nix develop`/`build`/`fmt` work there (Tier A only gives read-only tools
     // on PATH). Path-preserving bind of the daemon-socket dir + `NIX_REMOTE`;
     // the daemon mediates store writes, so the read-only `/nix/store` mount is
-    // fine. `nix_daemon = true` is the only way to enable this trusted host
-    // boundary. Host direnv warming and automatic daemon mounting are removed;
+    // fine. Explicit `nix_daemon = true` remains the general opt-in; the host's
+    // standalone terminal path may add it after its narrower local-auto checks.
+    // Host direnv warming and other automatic daemon mounting are removed;
     // an in-sandbox environment must either use target-side policy or remain a
     // normal user-approved shell. The socket is a local unix socket, so this
     // is compatible with `network = none`.
@@ -2436,7 +2437,8 @@ fn resolve_placed_with(
     // share `/nix`. This is the same gate the host-toolchain mounts already use;
     // it reaches here because the socket is injected separately from them.
     let abi_ok = guest_shares_host_abi(backend, crate::sandbox_backend::host_os());
-    if !abi_ok && cfg.nix_daemon {
+    let nix_daemon = cfg.nix_daemon.unwrap_or(false);
+    if !abi_ok && nix_daemon {
         // Explicitly requested and dropped: say so, per the same rule
         // `unsupported_hardening` follows — never ship a quietly different
         // sandbox than the config asked for.
@@ -2447,26 +2449,6 @@ fn resolve_placed_with(
             backend.label()
         ));
     }
-    if abi_ok && cfg.nix_daemon {
-        const SOCK_DIR: &str = "/nix/var/nix/daemon-socket";
-        if std::path::Path::new(SOCK_DIR).join("socket").exists() {
-            mounts.push(Mount {
-                host: SOCK_DIR.to_string(),
-                dest: SOCK_DIR.to_string(),
-                ro: true,
-                cache: false,
-            });
-            env.push(("NIX_REMOTE".to_string(), "daemon".to_string()));
-        } else if cfg.nix_daemon {
-            // Only nag when explicitly requested; the auto backstop stays silent.
-            msg::warn(
-                "sandbox: [sandbox] nix_daemon is on but no host Nix daemon socket was \
-                 found (/nix/var/nix/daemon-socket/socket); leaving it off. Tier A \
-                 (inject_devshell) still provides the devShell tools read-only.",
-            );
-        }
-    }
-
     // THE-2021: `credential = "deploy-key"` binds the configured key
     // read-only and points git's ssh at it. Host token families stay withheld.
     match plan_deploy_key(
@@ -2489,7 +2471,7 @@ fn resolve_placed_with(
         DeployKeyPlan::Withheld(reason) => warn_git_fallback_once(&loc.path(), &reason),
     }
 
-    Some(SandboxSpec {
+    let mut spec = SandboxSpec {
         backend,
         placement,
         image,
@@ -2581,7 +2563,36 @@ fn resolve_placed_with(
         seal_home,
         // WS00-P1-03 stub: no egress plan until WS04-P2-08 resolves one.
         egress: None,
-    })
+    };
+    if abi_ok && nix_daemon && !add_nix_daemon_access(&mut spec) {
+        // Only nag when explicitly requested; the auto backstop stays silent.
+        msg::warn(
+            "sandbox: [sandbox] nix_daemon is on but no host Nix daemon socket was \
+             found (/nix/var/nix/daemon-socket/socket); leaving it off. Tier A \
+             (inject_devshell) still provides the devShell tools read-only.",
+        );
+    }
+    Some(spec)
+}
+
+/// Add the path-preserving daemon socket mount and `NIX_REMOTE=daemon` to a
+/// resolved sandbox spec. Returns false when this host has no Nix daemon socket.
+/// Host callers that use this for automatic access must first establish the
+/// narrower policy (interactive, local, non-sealed profile, and local backend).
+pub fn add_nix_daemon_access(spec: &mut SandboxSpec) -> bool {
+    const SOCK_DIR: &str = "/nix/var/nix/daemon-socket";
+    if !std::path::Path::new(SOCK_DIR).join("socket").exists() {
+        return false;
+    }
+    spec.mounts.push(Mount {
+        host: SOCK_DIR.to_string(),
+        dest: SOCK_DIR.to_string(),
+        ro: true,
+        cache: false,
+    });
+    spec.env
+        .push(("NIX_REMOTE".to_string(), "daemon".to_string()));
+    true
 }
 
 /// Name prefix for every container thegn creates (per-worktree sandboxes).
