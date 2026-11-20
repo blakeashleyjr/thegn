@@ -1074,7 +1074,7 @@ fn down_provider(
     let mut list = || crate::agent::block_on_provider(|| async { provider.inventory().await });
     let mut sleep = std::thread::sleep;
     let mut forget = || forget_destroyed_sandbox(id, wt);
-    destroy_provider_sandbox(
+    let result = destroy_provider_sandbox(
         env_name,
         id,
         opts,
@@ -1088,7 +1088,11 @@ fn down_provider(
             sleep: &mut sleep,
             forget: &mut forget,
         },
-    )
+    );
+    if result.is_err() {
+        crate::provision_bg::resume_cancelled(id, wt, env_name);
+    }
+    result
 }
 
 fn reset_deferred_journal(id: &str, worktree: &str, env_name: &str) {

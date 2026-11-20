@@ -5,7 +5,7 @@ use anyhow::Result;
 use thegn_core::config::Config;
 use thegn_core::provision_journal::{self as journal, AgentGate, DeferredState, Journal};
 
-use crate::agent::{DeferredHandoff, ProvisionState, ProvisionStepView};
+use crate::agent::{DeferredHandoff, ProvisionOutcome, ProvisionState, ProvisionStepView};
 
 const MAX_DISPLAY_CHARS: usize = 200;
 
@@ -14,17 +14,32 @@ pub(crate) fn finish_blocking(
     worktree: &str,
     handoff: DeferredHandoff,
     progress: &mut dyn FnMut(&[ProvisionStepView]),
-) -> Result<()> {
+) -> Result<ProvisionOutcome> {
     match handoff.lease {
         Some(lease) => crate::agent::provision_worktree_mode(
             cfg,
             worktree,
             crate::agent::ProvisionMode::Deferred(lease),
             &mut *progress,
-        )
-        .map(|_| ()),
-        None => crate::agent::provision_worktree(cfg, worktree, &mut *progress).map(|_| ()),
+        ),
+        None => wait_then_finish(cfg, worktree, &handoff.sandbox, progress),
     }
+}
+
+/// Wait for the current holder (no sandbox_lock is held here), then run only
+/// the deferred phase: Deferred mode never creates, admits or restores.
+fn wait_then_finish(
+    cfg: &Config,
+    worktree: &str,
+    id: &str,
+    progress: &mut dyn FnMut(&[ProvisionStepView]),
+) -> Result<ProvisionOutcome> {
+    if journal::read(id).is_some_and(|entry| entry.state == DeferredState::Cancelled) {
+        anyhow::bail!(
+            "background setup for {worktree} did not finish (cancelled, or the sandbox is gone); reopen it or run `thegn env up --worktree {worktree}`"
+        );
+    }
+    crate::agent::finish_deferred_blocking(cfg, worktree, &mut *progress)
 }
 
 pub(crate) fn finish_in_background(cfg: &Config, worktree: &str, handoff: DeferredHandoff) {
@@ -82,7 +97,7 @@ pub(crate) fn ensure_agents_ready(cfg: &Config, worktree: &str, choice: &str) ->
         AgentGate::GoWithWarning => {
             let warning = journal::read(&id)
                 .as_ref()
-                .map(|entry| failed_text(entry))
+                .map(failed_text)
                 .unwrap_or_else(|| "background setup previously failed".to_string());
             if let Some(state) = crate::notify::global() {
                 state.emit_status(&warning);
@@ -91,10 +106,22 @@ pub(crate) fn ensure_agents_ready(cfg: &Config, worktree: &str, choice: &str) ->
         }
         AgentGate::Wait => {
             let choice = clean(choice);
+            if journal::read(&id).is_some_and(|entry| entry.state == DeferredState::Cancelled) {
+                anyhow::bail!(
+                    "background setup for {worktree} did not finish (cancelled, or the sandbox is gone); reopen it or run `thegn env up --worktree {worktree}`"
+                );
+            }
             if let Some(state) = crate::notify::global() {
                 state.emit_status(&format!("{choice} starts when background setup finishes"));
             }
-            crate::agent::provision_worktree(cfg, worktree, |_| {})?;
+            let mut last = None;
+            wait_then_finish(cfg, worktree, &id, &mut |views| {
+                if let Some(text) = status_text(views, &mut last)
+                    && let Some(state) = crate::notify::global()
+                {
+                    state.emit_status(&text);
+                }
+            })?;
             if journal::agent_gate(journal::read(&id).as_ref()) == AgentGate::Wait {
                 anyhow::bail!(
                     "background setup for {worktree} did not finish (cancelled, or the sandbox is gone); reopen it or run `thegn env up --worktree {worktree}`"
@@ -127,7 +154,11 @@ enum Notice {
     Warn(String),
 }
 
-fn finish_notice(result: &Result<()>, journal: Option<&Journal>, worktree: &str) -> Notice {
+fn finish_notice(
+    result: &Result<ProvisionOutcome>,
+    journal: Option<&Journal>,
+    worktree: &str,
+) -> Notice {
     if journal.is_some_and(|entry| entry.state == DeferredState::Cancelled) {
         return Notice::Status("background setup cancelled".to_string());
     }
@@ -149,6 +180,9 @@ fn finish_notice(result: &Result<()>, journal: Option<&Journal>, worktree: &str)
             clean(worktree),
         ));
     }
+    if result.as_ref().is_ok_and(|outcome| !outcome.provisioned) {
+        return Notice::Status("background setup stopped: the sandbox is gone".to_string());
+    }
     Notice::Status("background setup finished; coding agents are ready".to_string())
 }
 
@@ -165,7 +199,7 @@ fn show_line_for(journal: Option<&Journal>) -> Option<String> {
             clean_or(&entry.detail, "unknown error"),
         )),
         DeferredState::Cancelled => {
-            Some("setup:     background steps cancelled; the next open resumes".to_string())
+            Some("setup:     background steps cancelled (sandbox teardown in progress)".to_string())
         }
     }
 }
@@ -196,11 +230,21 @@ fn clean_or(value: &str, fallback: &str) -> String {
 }
 
 fn clean(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(MAX_DISPLAY_CHARS)
-        .collect()
+    thegn_core::inbox::sanitize_text(value, MAX_DISPLAY_CHARS)
+}
+
+/// Undo a teardown's cancel when the sandbox survived (stop, revoke or destroy failed).
+pub(crate) fn resume_cancelled(id: &str, worktree: &str, env: &str) {
+    if journal::read(id).is_some_and(|entry| entry.state == DeferredState::Cancelled)
+        && let Err(error) = journal::write(id, &Journal::pending(worktree, env))
+    {
+        tracing::debug!(
+            target: "thegn::provider",
+            %id,
+            %error,
+            "could not resume cancelled deferred provision journal"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -241,16 +285,20 @@ mod tests {
     #[test]
     fn finish_notice_table() {
         assert_eq!(
-            finish_notice(&Ok(()), None, "/wt"),
+            finish_notice(&Ok(ProvisionOutcome::ready(None)), None, "/wt"),
             Notice::Status("background setup finished; coding agents are ready".to_string())
         );
         assert!(matches!(
-            finish_notice(&Ok(()), Some(&journal(DeferredState::Failed, "agents", "nope")), "/wt"),
+            finish_notice(
+                &Ok(ProvisionOutcome::ready(None)),
+                Some(&journal(DeferredState::Failed, "agents", "nope")),
+                "/wt",
+            ),
             Notice::Warn(text) if text.contains("failed at agents: nope")
         ));
         assert_eq!(
             finish_notice(
-                &Ok(()),
+                &Ok(ProvisionOutcome::ready(None)),
                 Some(&journal(DeferredState::Cancelled, "", "")),
                 "/wt"
             ),
@@ -268,7 +316,7 @@ mod tests {
         assert_eq!(
             show_line_for(Some(&failed)),
             Some(
-                "setup:     background steps failed at ag[31m: badnews; `thegn env up` retries"
+                "setup:     background steps failed at ag[31m: bad news; `thegn env up` retries"
                     .to_string()
             )
         );

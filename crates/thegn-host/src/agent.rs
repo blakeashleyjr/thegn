@@ -2571,12 +2571,12 @@ pub(crate) fn finish_deferred_blocking(
     cfg: &Config,
     worktree: &str,
     progress: &mut dyn FnMut(&[ProvisionStepView]),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ProvisionOutcome> {
     let Some((_, id)) = crate::provision_gate::provider_target(cfg, worktree)? else {
-        return Ok(());
+        return Ok(ProvisionOutcome::not_provisioned());
     };
     let Some(entry) = thegn_core::provision_journal::read(&id) else {
-        return Ok(());
+        return Ok(ProvisionOutcome::not_provisioned());
     };
     if entry.state == thegn_core::provision_journal::DeferredState::Cancelled {
         anyhow::bail!(
@@ -2594,7 +2594,6 @@ pub(crate) fn finish_deferred_blocking(
         ProvisionMode::Deferred(lease),
         &mut *progress,
     )
-    .map(|_| ())
 }
 
 /// The env selection for a provider exec/proxy/cooldown decision. `None` when
