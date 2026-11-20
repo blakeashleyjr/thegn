@@ -2017,31 +2017,60 @@ pub(crate) fn dotted_to_pointer(key: &str) -> String {
     p
 }
 
-fn at(cfg: &Config, ptr: &str) -> serde_json::Value {
-    serde_json::to_value(cfg)
-        .ok()
-        .and_then(|v| v.pointer(ptr).cloned())
-        .unwrap_or(serde_json::Value::Null)
+/// The five layers `explain` replays, read, validated and serialized once.
+pub struct ExplainLayers {
+    stages: [(TrustLevel, serde_json::Value); 5],
+    /// The config file's raw table (after compat normalization), for "does the file name this key".
+    file_raw: serde_json::Value,
 }
 
-/// Explain how `key` resolves through the config layers (defaults → file →
-/// profile → env → `--set`). The Zone/Workspace/Repo layers are constraint
-/// layers handled by the clamp trace (see [`resolve_repo_sandbox`]), not this
-/// preference cascade.
-///
-/// The file and profile layers go through the same compatibility
-/// normalization as admission. An existing source that cannot be read,
-/// normalized, or parsed — or a selected profile overlay that cannot be
-/// applied — is an `Err`: explain never reports a Builtin/default origin that
-/// a hidden failure manufactured. Only a missing file is an empty layer.
-pub fn explain(
+impl ExplainLayers {
+    /// The same answer `explain` gives for `key`.
+    pub fn origin(&self, key: &str) -> KeyOrigin {
+        let ptr = dotted_to_pointer(key);
+        let stages = self
+            .stages
+            .iter()
+            .map(|(trust, cfg)| {
+                (
+                    *trust,
+                    cfg.pointer(&ptr)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Origin = the last stage whose value differs from the previous stage.
+        let mut origin = TrustLevel::Builtin;
+        for i in 1..stages.len() {
+            if stages[i].1 != stages[i - 1].1 {
+                origin = stages[i].0;
+            }
+        }
+        let value = stages
+            .last()
+            .map(|(_, value)| value.clone())
+            .unwrap_or(serde_json::Value::Null);
+        KeyOrigin {
+            key: key.to_string(),
+            value,
+            origin,
+            trace: stages,
+        }
+    }
+
+    /// Whether the config file itself names `key` (a table path).
+    pub fn file_sets(&self, key: &str) -> bool {
+        self.file_raw.pointer(&dotted_to_pointer(key)).is_some()
+    }
+}
+
+/// Read and replay the config layers used by `config explain` once.
+pub fn explain_layers(
     env: &dyn EnvSource,
     cli_overrides: &[String],
     path: Option<std::path::PathBuf>,
-    key: &str,
-) -> Result<KeyOrigin, String> {
-    let ptr = dotted_to_pointer(key);
-
+) -> Result<ExplainLayers, String> {
     // L0: built-in defaults.
     let defaults = Config::default();
     // L1: file (serde fills defaults, so this is defaults+file).
@@ -2103,27 +2132,50 @@ pub fn explain(
     }
     flag_cfg.post_process();
 
-    let stages = [
-        (TrustLevel::Builtin, at(&defaults, &ptr)),
-        (TrustLevel::UserGlobal, at(&file_cfg, &ptr)),
-        (TrustLevel::Profile, at(&profile_cfg, &ptr)),
-        (TrustLevel::Runtime, at(&env_cfg, &ptr)),
-        (TrustLevel::Runtime, at(&flag_cfg, &ptr)),
-    ];
-    // Origin = the last stage whose value differs from the previous stage.
-    let mut origin = TrustLevel::Builtin;
-    for i in 1..stages.len() {
-        if stages[i].1 != stages[i - 1].1 {
-            origin = stages[i].0;
-        }
-    }
-    let value = at(&flag_cfg, &ptr);
-    Ok(KeyOrigin {
-        key: key.to_string(),
-        value,
-        origin,
-        trace: stages.to_vec(),
+    Ok(ExplainLayers {
+        stages: [
+            (
+                TrustLevel::Builtin,
+                serde_json::to_value(defaults).unwrap_or_default(),
+            ),
+            (
+                TrustLevel::UserGlobal,
+                serde_json::to_value(file_cfg).unwrap_or_default(),
+            ),
+            (
+                TrustLevel::Profile,
+                serde_json::to_value(profile_cfg).unwrap_or_default(),
+            ),
+            (
+                TrustLevel::Runtime,
+                serde_json::to_value(env_cfg).unwrap_or_default(),
+            ),
+            (
+                TrustLevel::Runtime,
+                serde_json::to_value(flag_cfg).unwrap_or_default(),
+            ),
+        ],
+        file_raw: raw_json,
     })
+}
+
+/// Explain how `key` resolves through the config layers (defaults → file →
+/// profile → env → `--set`). The Zone/Workspace/Repo layers are constraint
+/// layers handled by the clamp trace (see [`resolve_repo_sandbox`]), not this
+/// preference cascade.
+///
+/// The file and profile layers go through the same compatibility
+/// normalization as admission. An existing source that cannot be read,
+/// normalized, or parsed — or a selected profile overlay that cannot be
+/// applied — is an `Err`: explain never reports a Builtin/default origin that
+/// a hidden failure manufactured. Only a missing file is an empty layer.
+pub fn explain(
+    env: &dyn EnvSource,
+    cli_overrides: &[String],
+    path: Option<std::path::PathBuf>,
+    key: &str,
+) -> Result<KeyOrigin, String> {
+    Ok(explain_layers(env, cli_overrides, path)?.origin(key))
 }
 
 impl TrustLevel {
@@ -3075,6 +3127,75 @@ mod tests {
         .unwrap();
         assert_eq!(e.origin, TrustLevel::Runtime);
         assert_eq!(e.value, serde_json::json!("fzf"));
+    }
+
+    #[test]
+    fn explain_layers_matches_explain_for_every_key() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(
+            &file,
+            "[sandbox]\nbackend = \"auto\"\ndefault_env = \"local\"\n\n[[agents]]\nname = \"codex\"\ncommand = \"codex\"\n",
+        )
+        .unwrap();
+        let profile = crate::config::Config::profile_overlay_path(&crate::config::MapEnv(
+            [("THEGN_PROFILE".to_string(), "work".to_string())]
+                .into_iter()
+                .collect(),
+        ))
+        .unwrap();
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        std::fs::write(profile, "[sandbox]\nbackend = \"podman\"\n").unwrap();
+
+        let env = crate::config::MapEnv(
+            [
+                ("THEGN_PROFILE".to_string(), "work".to_string()),
+                ("THEGN_SANDBOX_NETWORK".to_string(), "none".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let layers = explain_layers(&env, &[], Some(file.clone())).unwrap();
+        for key in [
+            "sandbox.backend",
+            "sandbox.network",
+            "agents",
+            "sandbox.default_env",
+        ] {
+            let expected = explain(&env, &[], Some(file.clone()), key).unwrap();
+            let actual = layers.origin(key);
+            assert_eq!(actual.key, expected.key, "{key}");
+            assert_eq!(actual.value, expected.value, "{key}");
+            assert_eq!(actual.origin, expected.origin, "{key}");
+            assert_eq!(actual.trace, expected.trace, "{key}");
+        }
+        let backend = layers.origin("sandbox.backend");
+        assert_eq!(backend.trace[1].1, serde_json::json!("auto"));
+        assert_eq!(backend.trace[2].0, TrustLevel::Profile);
+        assert_eq!(backend.trace[2].1, serde_json::json!("podman"));
+        let network = layers.origin("sandbox.network");
+        assert_eq!(network.origin, TrustLevel::Runtime);
+        assert_eq!(network.value, serde_json::json!("none"));
+        assert_eq!(
+            layers.origin("sandbox.default_env").trace[1].1,
+            serde_json::json!("local")
+        );
+        assert_eq!(layers.origin("no.such.key").value, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn file_sets_reads_the_raw_table() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "[sandbox]\nbackend = \"auto\"\n").unwrap();
+        let env = crate::config::MapEnv::default();
+        let layers = explain_layers(&env, &[], Some(file)).unwrap();
+
+        assert!(layers.file_sets("sandbox.backend"));
+        assert!(!layers.file_sets("sandbox.network"));
+        assert!(layers.file_sets("sandbox"));
     }
 
     #[test]
