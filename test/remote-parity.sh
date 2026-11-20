@@ -116,7 +116,7 @@ Steps:
   P20 echo latency ($samples samples)     P21 startup step table
   P22 remote close leak check             P23 idle probe (only --idle-probe)
   --startup-only: cold/warm prompt startup table; --fill-spare adds a spare claim.
-Output     : one PASS|WARN|FAIL line per case, a RUN SUMMARY line, a summary table, and FAILED CASES.
+Output     : one PASS|WARN|FAIL line per case, a summary table, a RUN SUMMARY block, and FAILED CASES.
 Known quirk: THE-2450 is reported as WARN when only the first tty line ending differs.
 PLAN
 }
@@ -716,7 +716,7 @@ LOCAL_SESSION="$(printf '%s' "$local_open_json" | session_id)"
 confirm_listed "$LOCAL_SESSION"
 
 provider_session_prefix "$RUN_RECORDS"
-RP_CAPTURE_ARGV_JSON="$(json_argv "")"
+RP_CAPTURE_ARGV_JSON="$(json_argv "${PROVIDER_PREFIX[@]}")"
 RP_REMOTE_PREFIX_JSON="$RP_CAPTURE_ARGV_JSON"
 export RP_CAPTURE_ARGV_JSON RP_REMOTE_PREFIX_JSON
 # shellcheck disable=SC2016 # literal: the remote shell expands these

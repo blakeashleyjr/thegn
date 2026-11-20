@@ -300,8 +300,8 @@ def run_probe(
         probe.close()
         try:
             write_samples(first_key_ms, next_key_ms)
-        except OSError:
-            pass
+        except OSError as error:
+            print(f"remote_parity_tui: samples file not written: {error}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
