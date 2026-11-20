@@ -67,3 +67,15 @@ Named sessions MUST remain on their native identity-bearing transport.
 
 - **WHEN** a persisted native session is restored while an iroh transport is connected
 - **THEN** attachment and absence queries use the native provider that owns the identifier
+
+### Requirement: Explicit provider-pane close kills the remote session
+
+An explicit close of a provider-backed pane SHALL request termination of its
+persistent remote exec session. Detach and process-lifecycle teardown paths
+MUST retain their existing detach semantics.
+
+#### Scenario: Explicitly closing a provider pane
+
+- **WHEN** a provider-backed pane closes without being marked detached
+- **THEN** the provider's persistent exec session is killed, with an already
+  absent session treated as success
