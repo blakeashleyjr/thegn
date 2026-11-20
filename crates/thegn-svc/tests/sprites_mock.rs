@@ -313,9 +313,7 @@ fn handle_exec_websocket(
     if socket.close(None).is_err() {
         return;
     }
-    if socket.flush().is_err() {
-        return;
-    }
+    socket.flush().unwrap_or_default(); // best-effort: test mock: the client may already have hung up
 }
 
 /// The recorded real responses, keyed by (method, path-without-query).
