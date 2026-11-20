@@ -279,15 +279,16 @@ pub fn workspace_stats(
     let (workspace_rows, mut fields) = match db.worktrees() {
         Ok(rows) => {
             let workspace_rows: Vec<_> = rows
-                .iter()
+                .into_iter()
                 .filter(|row| same_path(Path::new(&row.repo_root), repo_root))
                 .collect();
+            let count = workspace_rows.len();
             (
-                workspace_rows.clone(),
+                workspace_rows,
                 vec![Field::value(
                     keys::STATS_WORKTREES,
                     "Worktrees",
-                    workspace_rows.len().to_string(),
+                    count.to_string(),
                     Source::Database,
                 )],
             )
