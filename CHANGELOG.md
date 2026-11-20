@@ -19,6 +19,16 @@ All notable changes to **thegn** are documented here. The format follows
 - Sidebar: a worktree deleted from outside the running TUI (wt rm, wt prune, a landing, plain git) no longer stays in the left bar; a leftover directory with no checkout in it is no longer treated as a live worktree.
 - Observe: the host dashboard now uses the masthead's samples, so it has history from launch and no gaps while the tab is hidden, and no longer runs a second sampler.
 
+### Changed
+
+- The Vercel live check proves that a stop and a resume reached the provider.
+
+### Fixed
+
+- Vercel: a one-shot command refused because its session had stopped is retried once after resume.
+- Vercel: stopping or killing something already stopped is success; an expired saved snapshot gives a clear refusal with the remedy, and nothing is deleted automatically.
+- Vercel: a snapshot listing that does not finish is never treated as complete: destroy keeps its record and can be retried, and cost reports are marked incomplete; snapshots of a sandbox that is gone are priced.
+
 ## [0.1.0-alpha.105] — 2026-11-19
 
 ### Changed
