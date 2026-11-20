@@ -7,6 +7,18 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.116] — 2026-11-20
+
+### Changed
+
+- `thegn land` refuses, naming the sandbox, when the provider cannot say whether a worktree's sandbox exists.
+- The daily remote live check requires land to report releasing and pulling, and no longer depends on the owner's merge gate command.
+
+### Fixed
+
+- `thegn land` on a remote worktree that was never opened in a pane now pulls the sandbox's commits first and honours `--release-sandbox`; before, it landed without pulling, left the sandbox running and said nothing (THE-2477).
+- `--release-sandbox` is never dropped silently: when it cannot act, land says why.
+
 ## [0.1.0-alpha.115] — 2026-11-20
 
 ### Added
@@ -4104,7 +4116,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.115...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.116...HEAD
+[0.1.0-alpha.116]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.115...v0.1.0-alpha.116
 [0.1.0-alpha.115]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.114...v0.1.0-alpha.115
 [0.1.0-alpha.114]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.113...v0.1.0-alpha.114
 [0.1.0-alpha.113]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.112...v0.1.0-alpha.113
