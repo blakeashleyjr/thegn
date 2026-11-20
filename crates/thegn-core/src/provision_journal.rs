@@ -97,7 +97,7 @@ fn default_dir() -> PathBuf {
 
 fn open_default_dir() -> io::Result<crate::fsperm::PrivateDir> {
     let anchor = crate::util::xdg_state_home().join("thegn");
-    crate::fsperm::ensure_private_dir(&anchor)?;
+    std::fs::create_dir_all(&anchor)?;
     crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new(REL))
 }
 
@@ -247,7 +247,10 @@ fn lease_private(
 }
 
 pub fn run_lease(id: &str, wait: LeaseWait) -> io::Result<Option<RunLease>> {
-    run_lease_in(&default_dir(), id, wait)
+    if !valid_id(id) {
+        return Err(invalid_id());
+    }
+    lease_private(&open_default_dir()?, id, wait)
 }
 
 pub fn run_lease_in(dir: &Path, id: &str, wait: LeaseWait) -> io::Result<Option<RunLease>> {
