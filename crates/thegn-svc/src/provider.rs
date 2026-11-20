@@ -680,6 +680,8 @@ pub struct SpritesProvider {
     max_instances: usize,
     /// The ledger directory (`None` = `vps::registry::dir()`); tests isolate it.
     ledger_dir: Option<std::path::PathBuf>,
+    destroy_budget: Duration,
+    destroy_poll: Duration,
     client: reqwest::Client,
 }
 
@@ -739,6 +741,8 @@ impl SpritesProvider {
             list_page_size: None,
             max_instances: 0,
             ledger_dir: None,
+            destroy_budget: DESTROY_CONFIRM_BUDGET,
+            destroy_poll: DESTROY_CONFIRM_POLL,
             client: provider_http_client(),
         }
     }
@@ -795,6 +799,13 @@ impl SpritesProvider {
     /// Use `dir` as the ownership ledger instead of the state directory.
     pub fn with_ledger_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.ledger_dir = Some(dir);
+        self
+    }
+
+    /// Override the post-DELETE confirmation budget and poll (tests; the default is 30 s / 2 s).
+    pub fn with_destroy_confirm(mut self, budget: Duration, poll: Duration) -> Self {
+        self.destroy_budget = budget;
+        self.destroy_poll = poll;
         self
     }
 
@@ -1232,6 +1243,22 @@ fn checked_sprite_name(name: &str) -> Result<&str> {
     crate::vps::registry::checked_name(name).map_err(|_| anyhow!("sprites: invalid sprite name"))
 }
 
+/// An exec session id safe as one URL path segment: 1..=128 of
+/// `[A-Za-z0-9_.-]`, not `.` or `..`.
+fn checked_exec_session(session: &str) -> Result<&str> {
+    if (1..=128).contains(&session.len())
+        && session != "."
+        && session != ".."
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        Ok(session)
+    } else {
+        Err(anyhow!("sprites: invalid exec session id"))
+    }
+}
+
 impl RemoteProvider for SpritesProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
@@ -1409,7 +1436,7 @@ impl RemoteProvider for SpritesProvider {
     }
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
-        Box::pin(self.destroy_confirmed(id, DESTROY_CONFIRM_BUDGET, DESTROY_CONFIRM_POLL))
+        Box::pin(self.destroy_confirmed(id, self.destroy_budget, self.destroy_poll))
     }
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
@@ -1866,6 +1893,11 @@ impl SpritesProvider {
             self.base()?
         ))
     }
+    fn checkpoint_url(&self, name: &str, cp: &str) -> Result<String> {
+        let name = checked_sprite_name(name)?;
+        let cp = checked_sprite_name(cp)?;
+        Ok(format!("{}/sprites/{name}/checkpoints/{cp}", self.base()?))
+    }
     /// Parse a checkpoint list element (`{ "id", "comment"? }`).
     fn parse_checkpoint(v: &serde_json::Value) -> Option<CheckpointInfo> {
         let id = v
@@ -2061,6 +2093,44 @@ impl ProviderCheckpoints for SpritesProvider {
         Box::pin(async move {
             self.prove_listed_sprite(id).await?;
             let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
+            let checkpoint_resp = self
+                .client
+                .get(self.checkpoint_url(id, checkpoint)?)
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+                .context("sprites: GET /checkpoints/{id}")?;
+            let checkpoint_status = checkpoint_resp.status();
+            if checkpoint_status == reqwest::StatusCode::NOT_FOUND {
+                return Err(anyhow!(
+                    "sprites: no checkpoint {checkpoint} on {id}; not restoring"
+                ));
+            }
+            if checkpoint_status.is_success() {
+                let body =
+                    response_text(checkpoint_resp, "sprites", "GET /checkpoints/{id}").await?;
+                let body: serde_json::Value = serde_json::from_str(&body)
+                    .context("sprites: decode GET /checkpoints/{id} response JSON")?;
+                if let Some(health) = body
+                    .get("health")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|health| !health.is_empty())
+                {
+                    let health: String = health
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .take(64)
+                        .collect();
+                    return Err(anyhow!(
+                        "sprites: checkpoint {checkpoint} is unhealthy ({health}); not restoring it"
+                    ));
+                }
+            } else {
+                return Err(anyhow!(
+                    "sprites: checkpoint check failed ({checkpoint_status})"
+                ));
+            }
             let resp = self
                 .client
                 .post(self.restore_url(id, checkpoint)?)
@@ -3594,6 +3664,7 @@ fn exec_ws_url(api_base: &str, id: &str, spec: &ExecSpec) -> Result<String> {
 /// Build the Sprites reattach WSS URL: `wss://…/sprites/{id}/exec/{session}?cols=…&rows=…`.
 fn attach_ws_url(api_base: &str, id: &str, session: &str, cols: u16, rows: u16) -> Result<String> {
     checked_sprite_name(id)?;
+    let session = checked_exec_session(session)?;
     let base = ws_scheme(api_base);
     let mut url = reqwest::Url::parse(&format!("{base}/sprites/{id}/exec/{session}"))
         .context("sprites: bad attach url")?;
@@ -6907,6 +6978,46 @@ mod tests {
         assert!(url.starts_with("wss://api.sprites.dev/v1/sprites/dev/exec/sess-123?"));
         assert!(url.contains("cols=80"));
         assert!(url.contains("rows=24"));
+    }
+
+    #[test]
+    fn attach_ws_url_refuses_a_session_id_that_is_not_one_segment() {
+        for session in ["a/b", "..", "a?b", ""] {
+            let error =
+                attach_ws_url("https://api.sprites.dev/v1", "dev", session, 80, 24).unwrap_err();
+            assert_eq!(error.to_string(), "sprites: invalid exec session id");
+        }
+        let error = attach_ws_url(
+            "https://api.sprites.dev/v1",
+            "dev",
+            &"a".repeat(129),
+            80,
+            24,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "sprites: invalid exec session id");
+    }
+
+    #[tokio::test]
+    async fn with_destroy_confirm_sets_the_budget() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let ledger = tempfile::tempdir().unwrap();
+        let (base, server) = http_sequence_server(
+            vec![("202 Accepted".into(), String::new())],
+            Some(("200 OK".into(), r#"{"name":"sprite"}"#.into())),
+        )
+        .await;
+        let provider = ledgered_sprites(&base, ledger.path(), "sprite")
+            .with_destroy_confirm(Duration::from_millis(50), Duration::from_millis(10));
+        let result = tokio::time::timeout(Duration::from_secs(1), provider.destroy("sprite"))
+            .await
+            .expect("destroy confirmation must honor the injected budget");
+        assert!(
+            result.is_err(),
+            "destroy unexpectedly confirmed: {result:?}"
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

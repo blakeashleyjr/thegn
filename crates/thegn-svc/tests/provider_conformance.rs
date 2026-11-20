@@ -37,6 +37,7 @@ fn scope() -> OwnerScope {
 #[derive(Default)]
 struct State {
     sprites: BTreeSet<String>,
+    held: BTreeSet<String>,
     deletes: HashMap<String, usize>,
     ledger_at_create: Option<bool>,
 }
@@ -153,7 +154,9 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>, ledger_file: &std::path::
             let name = p.trim_start_matches("/v1/sprites/").to_string();
             let mut st = state.lock().unwrap();
             *st.deletes.entry(name.clone()).or_default() += 1;
-            if st.sprites.remove(&name) {
+            if st.held.contains(&name) {
+                ("204 No Content", Vec::new())
+            } else if st.sprites.remove(&name) {
                 ("204 No Content", Vec::new())
             } else {
                 ("404 Not Found", b"missing".to_vec())
@@ -222,9 +225,11 @@ async fn sprites_passes_the_conformance_suite() {
     .unwrap();
     let provider = SpritesProvider::new(&fake.base_url, "tok", NAME)
         .with_scope(scope)
-        .with_ledger_dir(ledger.path().to_path_buf());
+        .with_ledger_dir(ledger.path().to_path_buf())
+        .with_destroy_confirm(Duration::from_millis(200), Duration::from_millis(20));
     let p = Provider::Sprites(provider);
-    let (seen, counts) = (fake.state.clone(), fake.state.clone());
+    let (seen, counts, held) = (fake.state.clone(), fake.state.clone(), fake.state.clone());
+    let ledger_dir = ledger.path().to_path_buf();
     let fx = Fixture {
         created: NAME.into(),
         missing: MISSING.into(),
@@ -248,9 +253,17 @@ async fn sprites_passes_the_conformance_suite() {
         resumes: None,
         cap: None,
         supports_stop: false,
-        // Sprites' 30 s confirmation budget is not injectable from an integration test; the same contract is unit-tested in provider.rs `sprites_destroy_keeps_record_and_custody_when_confirmation_times_out`.
-        hold_after_delete: None,
-        recorded: None,
+        hold_after_delete: Some(Box::new(move |name, hold| {
+            let mut state = held.lock().unwrap();
+            if hold {
+                state.held.insert(name.to_string());
+            } else {
+                state.held.remove(name);
+            }
+        })),
+        recorded: Some(Box::new(move |name| {
+            registry::read_at(&ledger_dir, name).is_some()
+        })),
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
@@ -259,9 +272,12 @@ async fn sprites_passes_the_conformance_suite() {
         vec![
             "reads_never_resume",
             "create_respects_cap",
-            "stop_resume_round_trip",
-            "destroy_keeps_record_until_gone"
+            "stop_resume_round_trip"
         ],
+        "{report:?}"
+    );
+    assert!(
+        report.passed.contains(&"destroy_keeps_record_until_gone"),
         "{report:?}"
     );
 }
