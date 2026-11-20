@@ -1003,6 +1003,13 @@ async fn fetch_state(
         "sessions.snapshot" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let session = str_arg(args, "session").ok_or("missing `session`")?;
+            if session.is_empty()
+                || session == "."
+                || session == ".."
+                || session.contains(['/', '?', '#', '%'])
+            {
+                return Err("invalid `session` id".into());
+            }
             let (seq, rows, cols, ansi) = c.snapshot(session).await.map_err(|e| e.to_string())?;
             let modes = super::session::keys::screen_modes(rows, cols, &ansi);
             Ok(json!({
