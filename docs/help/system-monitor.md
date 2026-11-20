@@ -78,6 +78,10 @@ On the Overview, CPU, Memory, Thermal, Network, Disk and Power history
 graphs, leading gaps before the first reading stay blank; later gaps carry the
 last reading forward.
 
+The dashboard takes the masthead's samples rather than running a second
+sampler, so history starts at launch and keeps filling while the tab is
+hidden. The gap tolerance follows the masthead's sampling rate.
+
 `Space` **pauses**. That freezes the picture. The history graphs keep recording
 at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live

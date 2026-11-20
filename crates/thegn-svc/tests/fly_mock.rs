@@ -9,6 +9,7 @@
 //!
 //! Run: `cargo test -p thegn-svc --test fly_mock`.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -30,17 +31,20 @@ fn start_mock() -> (String, Arc<Mutex<Vec<Recorded>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
+    let deleted = Arc::new(Mutex::new(HashSet::new()));
     let rec = recorded.clone();
+    let deleted_server = deleted.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let rec = rec.clone();
-            thread::spawn(move || handle(stream, rec));
+            let deleted = deleted_server.clone();
+            thread::spawn(move || handle(stream, rec, deleted));
         }
     });
     (format!("http://127.0.0.1:{port}"), recorded)
 }
 
-fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
+fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, deleted: Arc<Mutex<HashSet<String>>>) {
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -89,6 +93,12 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
             r#"{"data":{"app":{"ipAddresses":{"nodes":[]}}}}"#.to_string()
         }
     } else if method == "GET" && path.starts_with("/v1/apps/") && !path.contains("/machines") {
+        if deleted.lock().unwrap().contains(&path) {
+            let _ = writer.write_all(
+                b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
+            );
+            return;
+        }
         // ensure_app: the app already exists.
         r#"{"name":"tg-app","status":"deployed"}"#.to_string()
     } else if method == "POST" && path.ends_with("/machines") {
@@ -96,6 +106,7 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
             r#"{{"id":"90810","name":"tg-fly-1","state":"created","config":{{"metadata":{managed}}}}}"#
         )
     } else if method == "DELETE" && path.starts_with("/v1/apps/") {
+        deleted.lock().unwrap().insert(path.clone());
         r#"{"ok":true}"#.to_string()
     } else {
         let _ = writer.write_all(
@@ -308,12 +319,15 @@ fn create_list_destroy_with_ledger() {
 
     // --- destroy: deletes the app (cascades machine + IP); ledger cleared.
     rt.block_on(p.destroy("tg-fly-1")).expect("destroy");
-    let last = recorded.lock().unwrap().last().unwrap().clone();
-    assert_eq!(last.method, "DELETE");
+    let reqs = recorded.lock().unwrap().clone();
+    let delete = reqs
+        .iter()
+        .find(|request| request.method == "DELETE" && request.path.starts_with("/v1/apps/"))
+        .expect("delete app request");
     assert!(
-        last.path.starts_with("/v1/apps/"),
+        delete.path.starts_with("/v1/apps/"),
         "delete app: {}",
-        last.path
+        delete.path
     );
     assert!(
         registry::read("tg-fly-1").is_none(),

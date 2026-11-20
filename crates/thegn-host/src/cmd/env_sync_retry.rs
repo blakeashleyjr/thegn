@@ -32,23 +32,7 @@ const PULL_IN_PROGRESS: &str = "a pull may be running in another thegn process";
 const PULL_ON_CLOSE: &str = "pull-back runs when the worktree closes";
 
 pub fn run(json: bool) -> Result<()> {
-    let dir = thegn_svc::sync_journal::dir();
-    let entries = thegn_svc::sync_journal::list_at(&dir)?;
-    let rows = retry_with(entries, &|path| Path::new(path).is_dir(), &mut |path| {
-        match thegn_svc::sync_journal::load_at(&dir, path) {
-            Ok(Some(entry)) if matches!(entry.state, SyncState::Failed { .. }) => {
-                crate::agent::deprovision_sync(path)
-            }
-            Ok(Some(_)) => Err(
-                "the journal entry changed since it was listed (no longer failed); not pulled"
-                    .to_owned(),
-            ),
-            Ok(None) => {
-                Err("the journal entry was removed since it was listed; not pulled".to_owned())
-            }
-            Err(error) => Err(format!("journal entry unreadable: {error:#}")),
-        }
-    });
+    let rows = retry_failed()?;
 
     if json {
         super::emit_json(&serde_json::json!({ "rows": rows }))?;
@@ -86,6 +70,89 @@ pub fn run(json: bool) -> Result<()> {
         anyhow::bail!("{failed} pull-back(s) still failing");
     }
     Ok(())
+}
+
+/// Retry every failed pull-back once (the `env sync-retry` core). Never destroys a sandbox.
+pub(crate) fn retry_failed() -> Result<Vec<RetryRow>> {
+    let dir = thegn_svc::sync_journal::dir();
+    let entries = thegn_svc::sync_journal::list_at(&dir)?;
+    Ok(retry_with(
+        entries,
+        &|path| Path::new(path).is_dir(),
+        &mut |path| match thegn_svc::sync_journal::load_at(&dir, path) {
+            Ok(Some(entry)) if matches!(entry.state, SyncState::Failed { .. }) => {
+                crate::agent::deprovision_sync(path)
+            }
+            Ok(Some(_)) => Err(
+                "the journal entry changed since it was listed (no longer failed); not pulled"
+                    .to_owned(),
+            ),
+            Ok(None) => {
+                Err("the journal entry was removed since it was listed; not pulled".to_owned())
+            }
+            Err(error) => Err(format!("journal entry unreadable: {error:#}")),
+        },
+    ))
+}
+
+/// One toast line: "pull-backs: N pulled, M still failing, K skipped" or "no failed pull-backs".
+pub(crate) fn summary_line(rows: &[RetryRow]) -> String {
+    if rows.is_empty() {
+        return "no failed pull-backs".to_owned();
+    }
+
+    let pulled = rows
+        .iter()
+        .filter(|row| row.outcome == RetryOutcome::Pulled)
+        .count();
+    let failed = rows
+        .iter()
+        .filter(|row| row.outcome == RetryOutcome::Failed)
+        .count();
+    let skipped = rows
+        .iter()
+        .filter(|row| row.outcome == RetryOutcome::Skipped)
+        .count();
+    format!("pull-backs: {pulled} pulled, {failed} still failing, {skipped} skipped")
+}
+
+/// The palette action: runs [`retry_failed`] off the loop, then posts one toast and wakes the loop.
+pub(crate) fn spawn_retry(
+    toast_tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: termwiz::terminal::TerminalWaker,
+) {
+    tokio::task::spawn_blocking(move || {
+        let (message, priority) = match retry_failed() {
+            Ok(rows) => {
+                let priority = if rows.iter().any(|row| row.outcome == RetryOutcome::Failed) {
+                    thegn_core::notification::Priority::Alert
+                } else {
+                    thegn_core::notification::Priority::Info
+                };
+                (summary_line(&rows), priority)
+            }
+            Err(error) => {
+                let first_line = format!("{error:#}")
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(160)
+                    .collect::<String>();
+                (
+                    format!("pull-back retry failed: {first_line}"),
+                    thegn_core::notification::Priority::Alert,
+                )
+            }
+        };
+        if let Err(error) = toast_tx.send(crate::hydrate::RefreshKind::Toast { message, priority })
+        {
+            tracing::debug!(target: "thegn::env", %error, "pull-back retry toast receiver is gone");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::env", %error, "pull-back retry toast wake failed");
+        }
+    });
 }
 
 pub(crate) fn retry_with(
@@ -243,6 +310,40 @@ mod tests {
         assert!(!detail.chars().any(char::is_control));
         assert!(detail.len() <= 300);
         assert_eq!(detail, "bad??[31mnetwork?");
+    }
+
+    #[test]
+    fn summary_line_table() {
+        let row = |outcome| RetryRow {
+            worktree: "/worktree/a".into(),
+            env: "remote".into(),
+            sandbox: "sprite-1".into(),
+            outcome,
+            detail: None,
+        };
+        let cases = [
+            (vec![], "no failed pull-backs"),
+            (
+                vec![row(RetryOutcome::Pulled), row(RetryOutcome::Pulled)],
+                "pull-backs: 2 pulled, 0 still failing, 0 skipped",
+            ),
+            (
+                vec![
+                    row(RetryOutcome::Pulled),
+                    row(RetryOutcome::Failed),
+                    row(RetryOutcome::Skipped),
+                ],
+                "pull-backs: 1 pulled, 1 still failing, 1 skipped",
+            ),
+            (
+                vec![row(RetryOutcome::Skipped), row(RetryOutcome::Skipped)],
+                "pull-backs: 0 pulled, 0 still failing, 2 skipped",
+            ),
+        ];
+
+        for (rows, expected) in cases {
+            assert_eq!(summary_line(&rows), expected);
+        }
     }
 
     #[test]

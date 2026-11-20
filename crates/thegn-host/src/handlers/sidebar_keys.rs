@@ -857,6 +857,17 @@ impl SidebarState {
             Id::ToggleFlat => return self.toggle_flat(model, session),
             Id::TogglePin => return self.toggle_pin(model, session),
             Id::CycleDetail => return self.cycle_focus_detail(model),
+            Id::Info => {
+                if self.selected_row(model).is_some_and(|r| {
+                    matches!(
+                        r.kind,
+                        crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::Workspace
+                    )
+                }) {
+                    return SidebarOutcome::Synthetic(crate::keymap::Action::OpenInfo);
+                }
+                model.status = "Info covers project and worktree rows".into();
+            }
             Id::Mark => {
                 // Multi-select toggle (item 26): mark/unmark the cursor row if it
                 // is a worktree or workspace. Collapse now lives solely on
