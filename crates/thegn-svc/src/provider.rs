@@ -3296,6 +3296,37 @@ pub enum ExecFrame {
     Exit(i32),
 }
 
+/// A Sprites exec WebSocket message that breaks the documented frame
+/// protocol (AsyncAPI exec, THE-533). Never treated as output or success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecProtocolError {
+    EmptyFrame,
+    UnknownStream(u8),
+    MalformedExit,
+    DuplicateExit,
+    OutputAfterExit,
+    /// Sanitized: only [a-z0-9_], at most 32 chars, else "<invalid>".
+    UnknownControl(String),
+    MalformedControl,
+}
+
+impl std::fmt::Display for ExecProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::EmptyFrame => "a binary frame has no stream id".to_string(),
+            Self::UnknownStream(id) => format!("stream id {id} is not a server stream"),
+            Self::MalformedExit => "the exit frame is malformed".to_string(),
+            Self::DuplicateExit => "a second exit arrived".to_string(),
+            Self::OutputAfterExit => "output arrived after the exit".to_string(),
+            Self::UnknownControl(t) => format!("unknown control message type {t}"),
+            Self::MalformedControl => "a control message is malformed".to_string(),
+        };
+        write!(f, "sprites exec: protocol error: {message}")
+    }
+}
+
+impl std::error::Error for ExecProtocolError {}
+
 /// Exit status used when a provider reports an absent or invalid exit code.
 /// Matches the host daemon adapter's unknown-exit sentinel.
 pub const EXEC_EXIT_STATUS_UNKNOWN: i32 = 254;
@@ -3339,6 +3370,8 @@ impl StderrTail {
 }
 
 type StderrSink = Arc<Mutex<StderrTail>>;
+type ExecDone = tokio::sync::oneshot::Receiver<Option<ExecProtocolError>>;
+type CapturedExec = (ExecSession, StderrSink, ExecDone);
 
 /// Remove ESC and C0 controls except \n and \t; lossy UTF-8.
 pub(crate) fn sanitize_stderr(bytes: &[u8]) -> String {
@@ -3540,6 +3573,11 @@ pub(crate) const EXEC_WS_MAX_FRAME_SIZE: usize = 4 << 20;
 pub(crate) const EXEC_WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
 /// Maximum provider output retained by one session while its consumer is slow.
 const EXEC_DATA_BYTE_BUDGET: usize = 8 << 20;
+/// Largest Sprites JSON control text frame accepted (THE-533).
+const EXEC_CONTROL_TEXT_MAX: usize = 64 << 10;
+/// How long the exec driver keeps reading after the exit to catch a
+/// duplicate exit or late output (THE-533).
+const EXEC_EXIT_DRAIN: Duration = Duration::from_secs(2);
 /// Item capacity of the provider output channels.
 const EXEC_CHANNEL_CAPACITY: usize = 256;
 /// Largest provider output item queued at once; with EXEC_CHANNEL_CAPACITY
@@ -3725,33 +3763,25 @@ enum StreamMsg {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit(i32),
-    /// Empty/unknown stream id — ignored.
-    Ignore,
 }
 
 /// Split a non-PTY server→client binary frame on its 1-byte stream id.
-fn decode_stream_frame(b: &[u8]) -> StreamMsg {
+fn decode_stream_frame(b: &[u8]) -> std::result::Result<StreamMsg, ExecProtocolError> {
     let Some((&id, rest)) = b.split_first() else {
-        return StreamMsg::Ignore;
+        return Err(ExecProtocolError::EmptyFrame);
     };
-    match id {
+    Ok(match id {
         1 => StreamMsg::Stdout(rest.to_vec()),
         2 => StreamMsg::Stderr(rest.to_vec()),
         3 => {
-            let code = if rest.len() == 1 {
-                // A one-byte payload is the documented binary exit code. It is
-                // ambiguous with one ASCII digit, so the binary form wins.
-                i32::from(rest[0])
-            } else {
-                String::from_utf8_lossy(rest)
-                    .trim()
-                    .parse()
-                    .unwrap_or(EXEC_EXIT_STATUS_UNKNOWN)
-            };
-            StreamMsg::Exit(code)
+            if rest.len() != 1 {
+                return Err(ExecProtocolError::MalformedExit);
+            }
+            // AsyncAPI exec: exit code (single byte), frame prefix 0x03.
+            StreamMsg::Exit(i32::from(rest[0]))
         }
-        _ => StreamMsg::Ignore,
-    }
+        _ => return Err(ExecProtocolError::UnknownStream(id)),
+    })
 }
 
 /// A parsed Sprites exec text (control) frame.
@@ -3763,32 +3793,72 @@ enum SpriteCtrl {
     Exit(i32),
     /// A non-JSON-object text frame that may be output in TTY mode.
     Forward,
-    /// A frame we don't act on (port notifications, unknown shapes).
-    Ignore,
+    /// A port notification that does not affect the exec session.
+    Notice,
 }
 
-/// Classify a Sprites exec text frame: `{"type":"exit","exit_code":N}` ⇒ exit,
-/// a frame carrying `session_id` ⇒ the session announcement, JSON objects ⇒
-/// ignore, and other text ⇒ possible TTY output.
-fn parse_sprite_ctrl(text: &str) -> SpriteCtrl {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return SpriteCtrl::Forward;
-    };
-    if v.get("type").and_then(|t| t.as_str()) == Some("exit") {
-        let code = v
-            .get("exit_code")
-            .and_then(|c| c.as_i64())
-            .and_then(|code| i32::try_from(code).ok())
-            .unwrap_or(EXEC_EXIT_STATUS_UNKNOWN);
-        return SpriteCtrl::Exit(code);
-    }
-    if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
-        return SpriteCtrl::Session(sid.to_string());
-    }
-    if v.is_object() {
-        SpriteCtrl::Ignore
+fn sanitize_control_type(t: &str) -> String {
+    if t.len() <= 32
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        t.to_string()
     } else {
-        SpriteCtrl::Forward
+        "<invalid>".to_string()
+    }
+}
+
+/// Classify a Sprites exec text frame according to the documented control
+/// protocol. Non-JSON text is output only for TTY sessions.
+fn parse_sprite_ctrl(
+    text: &str,
+    tty: bool,
+) -> std::result::Result<SpriteCtrl, ExecProtocolError> {
+    if text.len() > EXEC_CONTROL_TEXT_MAX {
+        return if tty {
+            Ok(SpriteCtrl::Forward)
+        } else {
+            Err(ExecProtocolError::MalformedControl)
+        };
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return if tty {
+            Ok(SpriteCtrl::Forward)
+        } else {
+            Err(ExecProtocolError::MalformedControl)
+        };
+    };
+    let Some(object) = v.as_object() else {
+        return if tty {
+            Ok(SpriteCtrl::Forward)
+        } else {
+            Err(ExecProtocolError::MalformedControl)
+        };
+    };
+    let Some(t) = object.get("type").and_then(|t| t.as_str()) else {
+        return Err(ExecProtocolError::MalformedControl);
+    };
+    match t {
+        "exit" => {
+            let code = object
+                .get("exit_code")
+                .and_then(|code| code.as_i64())
+                .and_then(|code| i32::try_from(code).ok())
+                .ok_or(ExecProtocolError::MalformedExit)?;
+            Ok(SpriteCtrl::Exit(code))
+        }
+        "session_info" => {
+            let Some(session_id) = object
+                .get("session_id")
+                .and_then(|session_id| session_id.as_str())
+                .filter(|session_id| !session_id.is_empty())
+            else {
+                return Err(ExecProtocolError::MalformedControl);
+            };
+            Ok(SpriteCtrl::Session(session_id.to_string()))
+        }
+        "port_opened" | "port_closed" => Ok(SpriteCtrl::Notice),
+        _ => Err(ExecProtocolError::UnknownControl(sanitize_control_type(t))),
     }
 }
 
@@ -3798,19 +3868,25 @@ impl SpritesProvider {
     /// runtime until the socket closes or `ExecControl::Close` is sent.
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         let url = exec_ws_url(self.base()?, id, spec)?;
-        Box::pin(self.start_session(url, spec.tty, None)).await
+        Box::pin(self.start_session(url, spec.tty, None, None)).await
     }
 
     async fn open_exec_capturing(
         &self,
         id: &str,
         spec: &ExecSpec,
-    ) -> Result<(ExecSession, StderrSink)> {
+    ) -> Result<CapturedExec> {
         let url = exec_ws_url(self.base()?, id, spec)?;
         let stderr = Arc::new(Mutex::new(StderrTail::default()));
-        let session =
-            Box::pin(self.start_session(url, spec.tty, Some(Arc::clone(&stderr)))).await?;
-        Ok((session, stderr))
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let session = Box::pin(self.start_session(
+            url,
+            spec.tty,
+            Some(Arc::clone(&stderr)),
+            Some(done_tx),
+        ))
+        .await?;
+        Ok((session, stderr, done_rx))
     }
 
     /// Reattach to a persisted exec session (the server replays its scrollback).
@@ -3823,7 +3899,7 @@ impl SpritesProvider {
         rows: u16,
     ) -> Result<ExecSession> {
         let url = attach_ws_url(self.base()?, id, session, cols, rows)?;
-        Box::pin(self.connect_exec(url, true, false, None)).await
+        Box::pin(self.connect_exec(url, true, false, None, None)).await
     }
 
     /// Run a one-shot command in the sprite over the WSS exec API (NON-tty) and
@@ -3859,7 +3935,7 @@ impl SpritesProvider {
             cwd: cwd.map(str::to_string),
         };
         let until = tokio::time::Instant::now() + deadline;
-        let (mut sess, stderr) =
+        let (mut sess, stderr, done) =
             match tokio::time::timeout_at(until, Box::pin(self.open_exec_capturing(id, &spec)))
                 .await
             {
@@ -3892,6 +3968,15 @@ impl SpritesProvider {
         if let Err(error) = sess.control.send(ExecControl::Close).await {
             tracing::debug!(target: "thegn::provider", %error, "best-effort exec close failed");
         }
+        match tokio::time::timeout_at(
+            until.min(tokio::time::Instant::now() + EXEC_EXIT_DRAIN + Duration::from_secs(1)),
+            done,
+        )
+        .await
+        {
+            Ok(Ok(Some(fault))) => return Err(anyhow::Error::new(fault)),
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {}
+        }
         let Some(code) = collected.code else {
             return Err(anyhow!("exec stream ended without an exit status"));
         };
@@ -3907,8 +3992,9 @@ impl SpritesProvider {
         url: String,
         tty: bool,
         stderr: Option<StderrSink>,
+        done: Option<tokio::sync::oneshot::Sender<Option<ExecProtocolError>>>,
     ) -> Result<ExecSession> {
-        Box::pin(self.connect_exec(url, tty, true, stderr)).await
+        Box::pin(self.connect_exec(url, tty, true, stderr, done)).await
     }
 
     // Fresh exec can wait for cold boot. Reattach is already retried by the
@@ -3919,6 +4005,7 @@ impl SpritesProvider {
         tty: bool,
         cold_open: bool,
         stderr: Option<StderrSink>,
+        done: Option<tokio::sync::oneshot::Sender<Option<ExecProtocolError>>>,
     ) -> Result<ExecSession> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let auth: tokio_tungstenite::tungstenite::http::HeaderValue =
@@ -3998,7 +4085,7 @@ impl SpritesProvider {
         let (sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
 
         tokio::spawn(Box::pin(drive_exec(
-            ws, tty, frames_tx, control_rx, sid_tx, stderr,
+            ws, tty, frames_tx, control_rx, sid_tx, stderr, done,
         )));
 
         Ok(ExecSession {
@@ -4143,7 +4230,9 @@ async fn drive_exec<S>(
     mut control_rx: tokio::sync::mpsc::Receiver<ExecControl>,
     sid_tx: tokio::sync::watch::Sender<Option<String>>,
     stderr: Option<StderrSink>,
-) where
+    done: Option<tokio::sync::oneshot::Sender<Option<ExecProtocolError>>>,
+) -> Option<ExecProtocolError>
+where
     S: futures_util::Sink<tokio_tungstenite::tungstenite::Message>
         + futures_util::Stream<
             Item = std::result::Result<
@@ -4153,33 +4242,92 @@ async fn drive_exec<S>(
         > + Unpin,
 {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::{Message, protocol::{CloseFrame, frame::coding::CloseCode}};
     let (mut write, mut read) = ws.split();
+    let mut exited = None;
+    let mut drain_until = None;
+    let mut control_closed = false;
+    let mut fault = None;
+
+    macro_rules! protocol_fault {
+        ($error:expr) => {{
+            let error = $error;
+            tracing::warn!(
+                target: "thegn::provider",
+                error = %error,
+                "sprites exec protocol error; closing the session"
+            );
+            if write
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Protocol,
+                    reason: "".into(),
+                })))
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    target: "thegn::provider",
+                    "provider exec protocol close could not be sent"
+                );
+            }
+            fault = Some(error);
+            break;
+        }};
+    }
+
     loop {
         tokio::select! {
-            ctrl = control_rx.recv() => match ctrl {
-                Some(ExecControl::Stdin(b)) => {
-                    let frame = if tty { b } else { encode_stream_stdin(&b) };
-                    if write.send(Message::Binary(frame.into())).await.is_err() {
-                        break;
-                    }
+            _ = async {
+                if let Some(deadline) = drain_until {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
                 }
-                Some(ExecControl::Resize { cols, rows }) => {
-                    let _ = write.send(Message::Text(resize_json(cols, rows).into())).await; // best-effort: consumer may be gone
-                }
-                Some(ExecControl::Close) | None => {
-                    if !tty
-                        && write
-                            .send(Message::Binary(encode_stream_stdin_eof().into()))
-                            .await
-                            .is_err()
-                    {
-                        tracing::debug!(target: "thegn::provider", "provider exec stdin EOF could not be sent");
+            } => break,
+            ctrl = control_rx.recv(), if !control_closed => {
+                if exited.is_some() {
+                    match ctrl {
+                        Some(ExecControl::Stdin(_)) => {
+                            tracing::debug!(target: "thegn::provider", "dropping exec stdin after exit");
+                        }
+                        Some(ExecControl::Resize { .. }) => {
+                            tracing::debug!(target: "thegn::provider", "dropping exec resize after exit");
+                        }
+                        Some(ExecControl::Close) | None => {
+                            if write.send(Message::Close(None)).await.is_err() {
+                                tracing::debug!(target: "thegn::provider", "provider exec close could not be sent");
+                            }
+                            control_closed = true;
+                        }
                     }
-                    if write.send(Message::Close(None)).await.is_err() {
-                        tracing::debug!(target: "thegn::provider", "provider exec close could not be sent");
+                } else {
+                    match ctrl {
+                        Some(ExecControl::Stdin(b)) => {
+                            let frame = if tty { b } else { encode_stream_stdin(&b) };
+                            if write.send(Message::Binary(frame.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(ExecControl::Resize { cols, rows }) => {
+                            if write.send(Message::Text(resize_json(cols, rows).into())).await.is_err() {
+                                tracing::debug!(target: "thegn::provider", "provider exec resize could not be sent");
+                            }
+                        }
+                        Some(ExecControl::Close) | None => {
+                            if !tty
+                                && write
+                                    .send(Message::Binary(encode_stream_stdin_eof().into()))
+                                    .await
+                                    .is_err()
+                            {
+                                tracing::debug!(target: "thegn::provider", "provider exec stdin EOF could not be sent");
+                            }
+                            if write.send(Message::Close(None)).await.is_err() {
+                                tracing::debug!(target: "thegn::provider", "provider exec close could not be sent");
+                            }
+                            break;
+                        }
                     }
-                    break;
                 }
             },
             msg = read.next() => match msg {
@@ -4195,30 +4343,49 @@ async fn drive_exec<S>(
                         );
                     }
                     if tty {
-                        if !send_chunked(&frames_tx, b.into(), ExecFrame::Stdout).await {
+                        if exited.is_some() {
+                            protocol_fault!(ExecProtocolError::OutputAfterExit);
+                        } else if !b.is_empty()
+                            && !send_chunked(&frames_tx, b.into(), ExecFrame::Stdout).await
+                        {
                             break;
                         }
                     } else {
-                        match decode_stream_frame(&b) {
+                        let decoded = match decode_stream_frame(&b) {
+                            Ok(decoded) => decoded,
+                            Err(error) => protocol_fault!(error),
+                        };
+                        match decoded {
                             StreamMsg::Stdout(d) => {
-                                if !send_chunked(&frames_tx, d, ExecFrame::Stdout).await {
+                                if exited.is_some() {
+                                    protocol_fault!(ExecProtocolError::OutputAfterExit);
+                                } else if !d.is_empty()
+                                    && !send_chunked(&frames_tx, d, ExecFrame::Stdout).await
+                                {
                                     break;
                                 }
                             }
                             StreamMsg::Exit(code) => {
-                                let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
-                                break;
+                                if exited.is_some() {
+                                    protocol_fault!(ExecProtocolError::DuplicateExit);
+                                }
+                                if frames_tx.send(ExecFrame::Exit(code)).await.is_err() {
+                                    tracing::debug!(target: "thegn::provider", "provider exec exit frame could not be sent");
+                                }
+                                exited = Some(code);
+                                drain_until = Some(tokio::time::Instant::now() + EXEC_EXIT_DRAIN);
                             }
                             // Stderr is never part of the consumer's byte stream.
                             StreamMsg::Stderr(d) => {
-                                if let Some(stderr) = &stderr {
+                                if exited.is_some() {
+                                    protocol_fault!(ExecProtocolError::OutputAfterExit);
+                                } else if let Some(stderr) = &stderr {
                                     stderr
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .push(&d);
                                 }
                             }
-                            StreamMsg::Ignore => {}
                         }
                     }
                 }
@@ -4234,29 +4401,44 @@ async fn drive_exec<S>(
                             "sprites exec frame"
                         );
                     }
-                    match parse_sprite_ctrl(t.as_str()) {
+                    let parsed = match parse_sprite_ctrl(t.as_str(), tty) {
+                        Ok(parsed) => parsed,
+                        Err(error) => protocol_fault!(error),
+                    };
+                    match parsed {
                         SpriteCtrl::Session(s) => {
-                            let _ = sid_tx.send(Some(s)); // best-effort: waiter may have timed out
+                            if sid_tx.send(Some(s)).is_err() {
+                                tracing::debug!(target: "thegn::provider", "provider exec session id receiver was dropped");
+                            }
                         }
                         SpriteCtrl::Exit(code) => {
-                            let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
-                            break;
+                            if exited.is_some() {
+                                protocol_fault!(ExecProtocolError::DuplicateExit);
+                            }
+                            if frames_tx.send(ExecFrame::Exit(code)).await.is_err() {
+                                tracing::debug!(target: "thegn::provider", "provider exec exit frame could not be sent");
+                            }
+                            exited = Some(code);
+                            drain_until = Some(tokio::time::Instant::now() + EXEC_EXIT_DRAIN);
                         }
                         SpriteCtrl::Forward if tty => {
-                            // Defensive fix for the observed missing line break:
-                            // this is where client-side bytes can vanish, but it
-                            // is not a confirmed cause of that incident.
-                            if !send_chunked(&frames_tx, t.as_bytes().to_vec(), ExecFrame::Stdout)
-                                .await
+                            if exited.is_some() {
+                                protocol_fault!(ExecProtocolError::OutputAfterExit);
+                            }
+                            if !t.is_empty()
+                                && !send_chunked(&frames_tx, t.as_bytes().to_vec(), ExecFrame::Stdout).await
                             {
                                 break;
                             }
                         }
-                        SpriteCtrl::Forward | SpriteCtrl::Ignore => {}
+                        SpriteCtrl::Forward => {}
+                        SpriteCtrl::Notice => {}
                     }
                 }
                 Some(Ok(Message::Ping(p))) => {
-                    let _ = write.send(Message::Pong(p)).await; // best-effort: peer may be gone
+                    if write.send(Message::Pong(p)).await.is_err() {
+                        tracing::debug!(target: "thegn::provider", "provider exec pong could not be sent");
+                    }
                 }
                 Some(Ok(Message::Close(_))) | None => {
                     break;
@@ -4268,6 +4450,13 @@ async fn drive_exec<S>(
             },
         }
     }
+
+    if let Some(done) = done
+        && done.send(fault.clone()).is_err()
+    {
+        tracing::debug!(target: "thegn::provider", "provider exec verdict receiver was dropped");
+    }
+    fault
 }
 
 /// One sandbox as a provider's inventory reports it (`thegn fleet`). `id` is
@@ -7039,61 +7228,103 @@ mod tests {
         // server frames split on the 1-byte stream id.
         assert_eq!(
             decode_stream_frame(&[1, b'o', b'k']),
-            StreamMsg::Stdout(b"ok".to_vec())
+            Ok(StreamMsg::Stdout(b"ok".to_vec()))
         );
         assert_eq!(
             decode_stream_frame(&[2, b'e', b'r', b'r']),
-            StreamMsg::Stderr(b"err".to_vec())
+            Ok(StreamMsg::Stderr(b"err".to_vec()))
         );
         assert_eq!(
             decode_stream_frame(&[3, b'1', b'3', b'7']),
-            StreamMsg::Exit(137)
+            Err(ExecProtocolError::MalformedExit)
         );
-        assert_eq!(decode_stream_frame(&[3, 0]), StreamMsg::Exit(0));
-        assert_eq!(decode_stream_frame(&[3, 1]), StreamMsg::Exit(1));
-        assert_eq!(decode_stream_frame(&[3, 137]), StreamMsg::Exit(137));
-        // A one-byte ASCII digit is the documented binary form, not text.
-        assert_eq!(decode_stream_frame(&[3, b'1']), StreamMsg::Exit(49));
+        assert_eq!(decode_stream_frame(&[3]), Err(ExecProtocolError::MalformedExit));
         assert_eq!(
-            decode_stream_frame(&[3, b'x', b'!']),
-            StreamMsg::Exit(EXEC_EXIT_STATUS_UNKNOWN)
+            decode_stream_frame(&[3, 0, 0]),
+            Err(ExecProtocolError::MalformedExit)
         );
-        assert_eq!(decode_stream_frame(&[]), StreamMsg::Ignore);
-        assert_eq!(decode_stream_frame(&[9, 1, 2]), StreamMsg::Ignore);
+        // A one-byte ASCII digit is the documented binary form, not text.
+        assert_eq!(decode_stream_frame(&[3, b'1']), Ok(StreamMsg::Exit(49)));
+        assert_eq!(
+            decode_stream_frame(&[]),
+            Err(ExecProtocolError::EmptyFrame)
+        );
+        assert_eq!(
+            decode_stream_frame(&[9, 1, 2]),
+            Err(ExecProtocolError::UnknownStream(9))
+        );
+        assert_eq!(
+            decode_stream_frame(&[0, b'x']),
+            Err(ExecProtocolError::UnknownStream(0))
+        );
+        assert_eq!(
+            decode_stream_frame(&[4]),
+            Err(ExecProtocolError::UnknownStream(4))
+        );
+        assert_eq!(decode_stream_frame(&[1]), Ok(StreamMsg::Stdout(vec![])));
     }
 
     #[test]
     fn parse_sprite_ctrl_classifies_frames() {
-        assert_eq!(
-            parse_sprite_ctrl(r#"{"type":"exit","exit_code":0}"#),
-            SpriteCtrl::Exit(0)
-        );
-        assert_eq!(
-            parse_sprite_ctrl(r#"{"type":"exit","exit_code":137}"#),
-            SpriteCtrl::Exit(137)
-        );
-        assert_eq!(
-            parse_sprite_ctrl(r#"{"type":"exit"}"#),
-            SpriteCtrl::Exit(EXEC_EXIT_STATUS_UNKNOWN)
-        );
-        assert_eq!(
-            parse_sprite_ctrl(r#"{"type":"exit","exit_code":2147483648}"#),
-            SpriteCtrl::Exit(EXEC_EXIT_STATUS_UNKNOWN)
-        );
-        assert_eq!(
-            parse_sprite_ctrl(r#"{"session_id":"abc","tty":true,"cols":80}"#),
-            SpriteCtrl::Session("abc".into())
-        );
-        // Port notifications and garbage are ignored, not misclassified.
-        assert_eq!(
-            parse_sprite_ctrl(r#"{"type":"port_opened","port":8080}"#),
-            SpriteCtrl::Ignore
-        );
-        assert_eq!(
-            parse_sprite_ctrl(r#"{"message":"not a control frame"}"#),
-            SpriteCtrl::Ignore
-        );
-        assert_eq!(parse_sprite_ctrl("not json"), SpriteCtrl::Forward);
+        for tty in [false, true] {
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"type":"exit","exit_code":0}"#, tty),
+                Ok(SpriteCtrl::Exit(0))
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"type":"exit","exit_code":137}"#, tty),
+                Ok(SpriteCtrl::Exit(137))
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"type":"exit"}"#, tty),
+                Err(ExecProtocolError::MalformedExit)
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"type":"exit","exit_code":2147483648}"#, tty),
+                Err(ExecProtocolError::MalformedExit)
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"session_id":"abc","tty":true,"cols":80}"#, tty),
+                Err(ExecProtocolError::MalformedControl)
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"type":"session_info","session_id":"abc"}"#, tty),
+                Ok(SpriteCtrl::Session("abc".into()))
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"type":"port_opened","port":8080}"#, tty),
+                Ok(SpriteCtrl::Notice)
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"message":"not a control frame"}"#, tty),
+                Err(ExecProtocolError::MalformedControl)
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"type":"Debug!x"}"#, tty),
+                Err(ExecProtocolError::UnknownControl("<invalid>".into()))
+            );
+            assert_eq!(
+                parse_sprite_ctrl(r#"{"type":"debug"}"#, tty),
+                Err(ExecProtocolError::UnknownControl("debug".into()))
+            );
+            assert_eq!(
+                parse_sprite_ctrl("not json", tty),
+                if tty {
+                    Ok(SpriteCtrl::Forward)
+                } else {
+                    Err(ExecProtocolError::MalformedControl)
+                }
+            );
+            let large = "x".repeat(65 * 1024);
+            assert_eq!(
+                parse_sprite_ctrl(&large, tty),
+                if tty {
+                    Ok(SpriteCtrl::Forward)
+                } else {
+                    Err(ExecProtocolError::MalformedControl)
+                }
+            );
+        }
     }
 
     #[tokio::test]
@@ -7151,6 +7382,7 @@ mod tests {
             control_rx,
             sid_tx,
             Some(Arc::clone(&stderr_tail)),
+            None,
         ));
 
         let mut stderr_frame = Vec::with_capacity(stderr.len() + 1);
@@ -7214,6 +7446,198 @@ mod tests {
         );
     }
 
+    async fn drive_exec_messages(
+        tty: bool,
+        messages: Vec<tokio_tungstenite::tungstenite::Message>,
+    ) -> (Vec<ExecFrame>, Option<ExecProtocolError>) {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(16);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client,
+            tty,
+            frames_tx,
+            control_rx,
+            sid_tx,
+            None,
+            None,
+        ));
+
+        for message in messages {
+            if server.send(message).await.is_err() {
+                break;
+            }
+        }
+        let _ = server.send(Message::Close(None)).await;
+
+        let mut frames = Vec::new();
+        while let Some(frame) = frames_rx.recv().await {
+            frames.push(frame);
+        }
+        let fault = driver.await.unwrap();
+        (frames, fault)
+    }
+
+    #[tokio::test]
+    async fn drive_exec_duplicate_exit_is_a_protocol_error() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (frames, fault) = drive_exec_messages(
+            false,
+            vec![Message::Binary(vec![3, 0].into()), Message::Binary(vec![3, 0].into())],
+        )
+        .await;
+        assert_eq!(frames, vec![ExecFrame::Exit(0)]);
+        assert_eq!(fault, Some(ExecProtocolError::DuplicateExit));
+    }
+
+    #[tokio::test]
+    async fn drive_exec_output_after_exit_is_a_protocol_error() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (frames, fault) = drive_exec_messages(
+            false,
+            vec![Message::Binary(vec![3, 0].into()), Message::Binary(vec![1, b'x'].into())],
+        )
+        .await;
+        assert_eq!(frames, vec![ExecFrame::Exit(0)]);
+        assert_eq!(fault, Some(ExecProtocolError::OutputAfterExit));
+
+        let (frames, fault) = drive_exec_messages(
+            true,
+            vec![
+                Message::Text(r#"{"type":"exit","exit_code":0}"#.into()),
+                Message::Binary(b"x".to_vec().into()),
+            ],
+        )
+        .await;
+        assert_eq!(frames, vec![ExecFrame::Exit(0)]);
+        assert_eq!(fault, Some(ExecProtocolError::OutputAfterExit));
+    }
+
+    #[tokio::test]
+    async fn drive_exec_port_closed_after_exit_is_accepted() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (frames, fault) = drive_exec_messages(
+            true,
+            vec![
+                Message::Text(r#"{"type":"exit","exit_code":0}"#.into()),
+                Message::Text(r#"{"type":"port_closed","port":8080}"#.into()),
+            ],
+        )
+        .await;
+        assert_eq!(frames, vec![ExecFrame::Exit(0)]);
+        assert_eq!(fault, None);
+    }
+
+    #[tokio::test]
+    async fn drive_exec_unknown_stream_id_is_refused() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (frames, fault) =
+            drive_exec_messages(false, vec![Message::Binary(vec![5, b'x'].into())]).await;
+        assert!(frames.is_empty());
+        assert_eq!(fault, Some(ExecProtocolError::UnknownStream(5)));
+    }
+
+    #[tokio::test]
+    async fn drive_exec_does_not_assume_line_boundaries() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (frames, fault) = drive_exec_messages(
+            false,
+            vec![
+                Message::Binary([vec![1], b"a\nb\nc".to_vec()].concat().into()),
+                Message::Binary([vec![1], b"par".to_vec()].concat().into()),
+                Message::Binary([vec![1], b"tial\n".to_vec()].concat().into()),
+                Message::Binary(vec![1].into()),
+                Message::Binary(vec![3, 0].into()),
+            ],
+        )
+        .await;
+        let output: Vec<u8> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ExecFrame::Stdout(bytes) => Some(bytes.as_slice()),
+                ExecFrame::Exit(_) => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(output, b"a\nb\ncpartial\n");
+        assert_eq!(frames.last(), Some(&ExecFrame::Exit(0)));
+        assert_eq!(fault, None);
+    }
+
+    #[tokio::test]
+    async fn drive_exec_exit_drain_is_bounded() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None, None,
+        ));
+        server.send(Message::Binary(vec![3, 0].into())).await.unwrap();
+        assert_eq!(frames_rx.recv().await, Some(ExecFrame::Exit(0)));
+        let result = tokio::time::timeout(EXEC_EXIT_DRAIN + Duration::from_secs(2), driver).await;
+        assert_eq!(result.unwrap().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn drive_exec_reports_the_fault_on_done() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(drive_exec(
+            client,
+            false,
+            frames_tx,
+            control_rx,
+            sid_tx,
+            None,
+            Some(done_tx),
+        ));
+        server.send(Message::Binary(vec![3, 0].into())).await.unwrap();
+        server.send(Message::Binary(vec![3, 0].into())).await.unwrap();
+        let _ = server.send(Message::Close(None)).await;
+        assert_eq!(frames_rx.recv().await, Some(ExecFrame::Exit(0)));
+        assert_eq!(frames_rx.recv().await, None);
+        assert_eq!(done_rx.await.unwrap(), Some(ExecProtocolError::DuplicateExit));
+        assert_eq!(driver.await.unwrap(), Some(ExecProtocolError::DuplicateExit));
+    }
+
     #[tokio::test]
     async fn drive_exec_sends_stdin_eof_exactly_once_on_control_close() {
         use futures_util::StreamExt;
@@ -7230,7 +7654,7 @@ mod tests {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client, false, frames_tx, control_rx, sid_tx, None,
+            client, false, frames_tx, control_rx, sid_tx, None, None,
         ));
         drop(control_tx);
 
@@ -7261,7 +7685,7 @@ mod tests {
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client, true, frames_tx, control_rx, sid_tx, None,
+            client, true, frames_tx, control_rx, sid_tx, None, None,
         ));
 
         server
@@ -7294,7 +7718,7 @@ mod tests {
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client, true, frames_tx, control_rx, sid_tx, None,
+            client, true, frames_tx, control_rx, sid_tx, None, None,
         ));
 
         server
@@ -7318,7 +7742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_exec_non_tty_ignores_non_json_text_frames() {
+    async fn drive_exec_non_tty_refuses_non_json_text_frames() {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
@@ -7333,25 +7757,19 @@ mod tests {
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client, false, frames_tx, control_rx, sid_tx, None,
+            client, false, frames_tx, control_rx, sid_tx, None, None,
         ));
 
         let mut first = vec![1];
         first.extend_from_slice(b"/dev/pts/0");
         server.send(Message::Binary(first.into())).await.unwrap();
         server.send(Message::Text("\r\n".into())).await.unwrap();
-        let mut second = vec![1];
-        second.extend_from_slice(b"ok\r\n");
-        server.send(Message::Binary(second.into())).await.unwrap();
-        server
-            .send(Message::Text(r#"{"type":"exit","exit_code":0}"#.into()))
-            .await
-            .unwrap();
-
-        let collected = collect_exec_output(&mut frames_rx, usize::MAX).await;
-        assert_eq!(collected.code, Some(0));
-        assert_eq!(collected.output, b"/dev/pts/0ok\r\n");
-        driver.await.unwrap();
+        assert_eq!(
+            frames_rx.recv().await,
+            Some(ExecFrame::Stdout(b"/dev/pts/0".to_vec()))
+        );
+        assert_eq!(frames_rx.recv().await, None);
+        assert_eq!(driver.await.unwrap(), Some(ExecProtocolError::MalformedControl));
     }
 
     #[tokio::test]
@@ -7370,7 +7788,7 @@ mod tests {
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client, true, frames_tx, control_rx, sid_tx, None,
+            client, true, frames_tx, control_rx, sid_tx, None, None,
         ));
 
         server
@@ -7563,7 +7981,7 @@ mod tests {
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client, true, frames_tx, control_rx, sid_tx, None,
+            client, true, frames_tx, control_rx, sid_tx, None, None,
         ));
 
         drop(server);
@@ -7588,7 +8006,7 @@ mod tests {
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client, true, frames_tx, control_rx, sid_tx, None,
+            client, true, frames_tx, control_rx, sid_tx, None, None,
         ));
 
         server
@@ -7602,7 +8020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_exec_maps_unparseable_non_tty_exit_to_unknown_sentinel() {
+    async fn drive_exec_refuses_a_malformed_non_tty_exit() {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
@@ -7617,7 +8035,7 @@ mod tests {
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client, false, frames_tx, control_rx, sid_tx, None,
+            client, false, frames_tx, control_rx, sid_tx, None, None,
         ));
 
         server
@@ -7625,12 +8043,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            frames_rx.recv().await,
-            Some(ExecFrame::Exit(EXEC_EXIT_STATUS_UNKNOWN))
-        );
         assert_eq!(frames_rx.recv().await, None);
-        driver.await.unwrap();
+        assert_eq!(driver.await.unwrap(), Some(ExecProtocolError::MalformedExit));
     }
 
     #[test]
