@@ -9,7 +9,8 @@
 //! images as `ubuntu`; others as root. The run-as user is a property of the
 //! image, not of thegn.)
 //!
-//! So provisioning probes the sandbox `$HOME` once and caches it here (a tiny
+//! So provisioning probes the sandbox `$HOME` once (or reuses a valid cached
+//! value for a locally marked provisioned sandbox) and caches it here (a tiny
 //! per-sandbox state file, same pattern as `machine0_bridge`'s (ip,user) cache);
 //! every workdir consumer resolves against that cache so they stay consistent
 //! across the process and across restarts (the file persists). An explicit
@@ -232,16 +233,30 @@ fn extract_home(out: &str) -> Option<String> {
     Some(rest[..end].trim().to_string())
 }
 
-/// Provisioning entry point: probe the sandbox `$HOME`, cache it (so every later
-/// workdir consumer resolves the same path), and return `(home, workdir)` — the
-/// home for personal-layer uploads and the effective workspace dir (explicit
-/// `[env] workdir` config wins, else `<home>/workspace`).
+/// Provisioning entry point: reuse a valid cached `$HOME` for a locally marked
+/// provisioned sandbox, otherwise probe and cache it, then return `(home,
+/// workdir)` — the home for personal-layer uploads and the effective workspace
+/// dir (explicit `[env] workdir` config wins, else `<home>/workspace`).
 pub fn probe_and_resolve(
     provider: &Provider,
     id: &str,
     pc: &EnvProviderConfig,
 ) -> (String, String) {
-    let home = probe_sandbox_home(provider, id);
+    probe_and_resolve_with(|| probe_sandbox_home(provider, id), id, pc)
+}
+
+fn probe_and_resolve_with(
+    provider_probe: impl FnOnce() -> String,
+    id: &str,
+    pc: &EnvProviderConfig,
+) -> (String, String) {
+    let home = if is_provisioned_locally(id) {
+        cached_home(id)
+            .filter(|home| is_valid_home(home))
+            .unwrap_or_else(provider_probe)
+    } else {
+        provider_probe()
+    };
     cache_home(id, &home);
     let w = pc.workdir.trim();
     let workdir = if w.is_empty() {
@@ -274,7 +289,8 @@ mod tests {
     use super::{
         EnvProviderConfig, cache_home, cached_home, clear_provisioned, default_workdir,
         extract_home, is_provisioned_locally, is_valid_home, legacy_cache_dir,
-        legacy_provisioned_dir, mark_provisioned, provisioned_dir, resolve, with_workdir_cd,
+        legacy_provisioned_dir, mark_provisioned, probe_and_resolve_with, provisioned_dir, resolve,
+        with_workdir_cd,
     };
 
     // These tests mutate process-global env (HOME / THEGN_DIR / XDG_STATE_HOME)
@@ -486,5 +502,32 @@ mod tests {
         // A re-probe overwrites the cached value.
         cache_home(id, "/home/ubuntu");
         assert_eq!(cached_home(id).as_deref(), Some("/home/ubuntu"));
+    }
+
+    #[test]
+    fn provisioned_cached_home_skips_probe_without_a_provider() {
+        let _state = crate::testenv::IsolatedState::new();
+        let id = "thegn-tg-cached-probe";
+        cache_home(id, "/home/sprite");
+        mark_provisioned(id);
+        let (home, workdir) = probe_and_resolve_with(
+            || panic!("a provisioned cached home must not probe"),
+            id,
+            &pc("machine0", ""),
+        );
+        assert_eq!(home, "/home/sprite");
+        assert_eq!(workdir, "/home/sprite/workspace");
+    }
+
+    #[test]
+    fn probe_and_resolve_with_uses_injected_probe_when_uncached() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (home, workdir) = probe_and_resolve_with(
+            || "/home/injected".to_string(),
+            "thegn-tg-injected-probe",
+            &pc("machine0", ""),
+        );
+        assert_eq!(home, "/home/injected");
+        assert_eq!(workdir, "/home/injected/workspace");
     }
 }
