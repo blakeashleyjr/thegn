@@ -8,6 +8,9 @@
 //! runs when explicitly invoked (never on a schedule).
 
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,6 +20,7 @@ use thegn_core::outln;
 use thegn_core::sandbox::{self, Backend, PruneKinds, PruneReport};
 use thegn_core::sandbox_manage::{self as manage, human_bytes};
 use thegn_core::store::WorkspaceStore;
+use thegn_proc::{Limits, Stream};
 
 /// Bounded per-command deadline for host-side prune (over the control channel).
 const HOST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -27,6 +31,12 @@ pub enum Action {
     Profile {
         #[command(subcommand)]
         action: super::sandbox_profile::Action,
+    },
+    /// Evaluate this repo's flake devShell once (`nix print-dev-env --json`, runs the
+    /// flake as you) and cache its PATH for panes with `inject_devshell = true`.
+    WarmDevshell {
+        #[arg(long)]
+        json: bool,
     },
     /// Remove thegn containers whose worktree no longer exists in the registry
     /// (the startup orphan sweep, on demand). Reports what it removed per
@@ -90,6 +100,7 @@ pub enum Action {
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::Profile { action } => super::sandbox_profile::run(cfg, action),
+        Action::WarmDevshell { json } => warm_devshell(json),
         Action::Gc => gc(),
         Action::Prune {
             host,
@@ -109,6 +120,81 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Ctl { op, name, yes } => super::sandbox_containers::ctl(op, &name, yes),
         Action::Logs { name, tail } => super::sandbox_containers::logs(&name, tail),
     }
+}
+
+fn warm_devshell(json: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    warm_devshell_at(&cwd, json)
+}
+
+fn warm_devshell_at(cwd: &Path, json: bool) -> Result<()> {
+    let cwd_text = cwd.to_string_lossy();
+    let root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(cwd_text.as_ref()).ok().flatten())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(cwd))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let Some(key_before) = thegn_core::devenv::cache_key(&root) else {
+        anyhow::bail!("no flake.nix here: {}", root.display());
+    };
+
+    let mut command = Command::new("nix");
+    command.args(["print-dev-env", "--json"]).current_dir(&root);
+    let limits = Limits {
+        stdout: Stream::HeadOrFail {
+            cap: 8 * 1024 * 1024,
+        },
+        stderr: Stream::Tail { cap: 16 * 1024 },
+        ..Limits::silent(Duration::from_secs(600))
+    };
+    let cancel = AtomicBool::new(false);
+    let run = thegn_proc::run(&mut command, &limits, &cancel);
+    if !run.success() {
+        let stderr = stderr_tail(&run.stderr.bytes);
+        if stderr.is_empty() {
+            anyhow::bail!("nix print-dev-env --json failed");
+        }
+        anyhow::bail!("nix print-dev-env --json failed: {stderr}");
+    }
+    let output = std::str::from_utf8(&run.stdout.bytes)?;
+    let dev = thegn_core::devenv::parse_print_dev_env(output);
+    if thegn_core::devenv::cache_key(&root).as_deref() != Some(key_before.as_str()) {
+        anyhow::bail!(
+            "flake.nix or flake.lock changed during evaluation; run `thegn sandbox warm-devshell` again"
+        );
+    }
+    let path = thegn_core::devenv::store(&root, &dev).map_err(anyhow::Error::msg)?;
+    let vars = dev.vars.len();
+    let has_path = dev.path.is_some();
+    if json {
+        return super::emit_json(&serde_json::json!({
+            "root": root.display().to_string(),
+            "path": path.display().to_string(),
+            "vars": vars,
+            "has_path": has_path,
+        }));
+    }
+    outln!(
+        "devShell cached for {} ({} vars, PATH set: {}) at {}; takes effect in new panes whose env sets [sandbox] inject_devshell = true",
+        root.display(),
+        vars,
+        if has_path { "yes" } else { "no" },
+        path.display()
+    );
+    Ok(())
+}
+
+fn stderr_tail(bytes: &[u8]) -> String {
+    let mut chars: Vec<_> = String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if chars.len() > 400 {
+        chars.drain(..chars.len() - 400);
+    }
+    chars.into_iter().collect()
 }
 
 fn resolve_kinds(containers: bool, images: bool, volumes: bool) -> PruneKinds {
@@ -391,4 +477,30 @@ fn host_execute(
 /// image references and the `{{json .}}` format string all pass through intact.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    #[test]
+    fn clap_parses_warm_devshell_json() {
+        let cli =
+            crate::Cli::try_parse_from(["thegn", "sandbox", "warm-devshell", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::Command::Sandbox {
+                action: Action::WarmDevshell { json: true }
+            })
+        ));
+    }
+
+    #[test]
+    fn warm_devshell_refuses_directory_without_flake_before_spawning() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let error = warm_devshell_at(dir.path(), false).unwrap_err();
+        assert!(error.to_string().contains("no flake.nix here"), "{error:#}");
+    }
 }

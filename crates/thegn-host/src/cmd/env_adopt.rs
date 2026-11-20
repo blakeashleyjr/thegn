@@ -264,6 +264,7 @@ mod tests {
                 name: "sx-dash".into(),
                 status: "cold\x1b[2J".into(),
                 created_at: Some("2026-11-18T10:00:00Z".into()),
+                url_auth: None,
             }),
         }
     }
