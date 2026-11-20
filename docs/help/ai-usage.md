@@ -258,6 +258,17 @@ The view is read from the database and caches only. Live state that exists
 only in the UI, such as which pane an agent has focused, is not visible, so
 activity is approximate and `partial` always says `activity: daemon-only view`.
 
+### Driving sessions over MCP
+
+`sessions_input` takes exactly one of `text`, `bytes_b64` or `keys`. `keys` is
+an array of at most 64 key names, in the syntax of `thegn session send --key`
+(see [[daemon-and-sessions]]). `paste: true` goes with `text` only and sends it
+as a (bracketed, when the pane enabled it) paste. Authorisation is unchanged:
+`write` scope **and** `--allow-session-input`. `sessions_snapshot` also returns
+`seq`, `cursor`, `alt_screen`, `app_cursor` and `bracketed_paste`, and refuses a
+session id containing `/ ? # %` or equal to `.` or `..`. `sessions_wait` takes
+`screen:<regex>` and `stable:<ms>` as well.
+
 ### Wiring the Lead
 
 When `[lead]` is configured, the daemon opens a second control listener on
@@ -334,7 +345,8 @@ A Lead token is confined whatever its scopes. In short:
 - `sessions.input` works only into a live worker a Lead opened, and only as
   plain text plus Enter (no escape sequences or other control characters, at
   most 16 KiB). The MCP tool also needs `--allow-session-input`, which the
-  Lead's wiring does not pass today.
+  Lead's wiring does not pass today. Named keys and paste are refused for a
+  Lead too.
 - `sessions.attach`, `sessions.split`, `sessions.fork`,
   `git.stage`, `git.commit`, `worktrees.open`, `worktrees.create`,
   `editor.open`, `worktrees.sandbox_profile_set` and every admin or exec verb

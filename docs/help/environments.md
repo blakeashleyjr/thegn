@@ -65,7 +65,11 @@ environment's non-empty network allow/block policy when the provider supports
 egress control. If needed, the policy is re-applied and read back. If
 verification fails, `thegn env restore` fails and reports that the sandbox is
 running without verified egress; warm-pool recycle destroys the spare. A
-successful `env restore` reports the verified counts. On the dev channel,
+successful `env restore` reports the verified counts. Before it restores a
+Sprites checkpoint, thegn reads the checkpoint: a missing one (404) refuses with
+"no checkpoint", a non-empty `health` refuses as unhealthy, and any other failed
+read refuses too, so nothing is rolled back to a checkpoint that is gone or
+broken. On the dev channel,
 opening a worktree against an existing provider sandbox with egress control
 also verifies its non-empty network policy and reapplies it if it drifted. If
 the policy cannot be verified, opening is refused and the sandbox is left in
@@ -265,7 +269,9 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   GB-hours for all sprites in the account (`GET /v1/usage` from the start of the
   UTC month), deduplicated by account fingerprint (a second env on the same
   account says "same account as <env>") and marked `(partial)` when the API says
-  the figures are incomplete. A failed account read shows "account usage
+  the figures are incomplete. A sprite younger than an hour (by its ledger `created_at`) is marked
+  `recent` (JSON `recent: true`) in the partial column, because the usage API may
+  not have reported it yet; read a low figure on it as "not yet". A failed account read shows "account usage
   unavailable" and never hides the per-sprite rows.
 - **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
   also runs `env pull` after the agent exits and reports it in text and `--json`.
@@ -398,7 +404,7 @@ Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
   file API supports a mode. The codex list is `.codex/auth.json` and
   `.codex/config.toml`, plus the two older json paths.
 
-Unverified: which file-write parameter the Sprites server honours (file write and delete send both the documented and the previous form); whether the policy GET wakes a cold sprite; Fly's 404 timing after an app DELETE; whether a Claude refresh token shared between host and sprite is
+Unverified: how long the Sprites usage API lags behind a new sprite (the one-hour `recent` window is a guess); whether Sprites reports `health` on a fresh checkpoint; which file-write parameter the Sprites server honours (file write and delete send both the documented and the previous form); whether the policy GET wakes a cold sprite; Fly's 404 timing after an app DELETE; whether a Claude refresh token shared between host and sprite is
 invalidated when one side refreshes; whether a Sprites checkpoint can be cloned
 to a new sprite (checkpoints restore in place only, so there is no warm
 golden image); the Fly IPv4 cost; and which login files pi needs.

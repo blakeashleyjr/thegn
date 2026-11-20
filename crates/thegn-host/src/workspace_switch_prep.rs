@@ -108,6 +108,11 @@ impl PendingSwitch {
 
 #[derive(Debug)]
 pub(crate) enum SwitchResult {
+    /// THE-2463: a project create resolved its repo; show its row now.
+    CreatePreview {
+        seq: u64,
+        entry: (String, String, String, String),
+    },
     Cold {
         request: SwitchRequest,
         result: anyhow::Result<PreparedWorkspaceSwitch>,
@@ -195,6 +200,16 @@ pub(crate) fn request_workspace_create(
         let resolve_ms = resolve_started.elapsed().as_millis() as u64;
         match resolved {
             Ok(crate::workspace_create::WorkspaceResolution::Repo { root, name }) => {
+                let entry = preview_entry(&root, &name);
+                if let Err(error) = tx.send(SwitchResult::CreatePreview {
+                    seq: job_request.seq,
+                    entry,
+                }) {
+                    tracing::debug!(target: "thegn::workspace_switch", %error, "workspace create preview receiver is gone");
+                }
+                if let Err(error) = wake.wake() {
+                    tracing::debug!(target: "thegn::workspace_switch", %error, "workspace create preview wake failed");
+                }
                 let enqueued_at = std::time::Instant::now();
                 crate::db_task::persist_critical(move |db| {
                     let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
@@ -533,6 +548,59 @@ pub(crate) fn adopt_sidebar_entry(
     } else {
         list.push(entry);
     }
+}
+
+/// Build the row shown while a newly-created repository is still switching.
+pub(crate) fn preview_entry(
+    root: &std::path::Path,
+    name: &str,
+) -> (String, String, String, String) {
+    let fallback = root
+        .file_name()
+        .map(|part| part.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    let slug_source = if name.is_empty() {
+        fallback.as_str()
+    } else {
+        name
+    };
+    (
+        thegn_core::util::slugify(slug_source),
+        name.to_owned(),
+        "repo".to_owned(),
+        root.to_string_lossy().into_owned(),
+    )
+}
+
+/// Append `entry` only when no listed workspace has its slug or repo path.
+/// Returns true when the entry was added.
+pub(crate) fn preview_sidebar_entry(
+    list: &mut Vec<(String, String, String, String)>,
+    entry: (String, String, String, String),
+) -> bool {
+    if list
+        .iter()
+        .any(|(slug, _, _, repo_path)| *slug == entry.0 || *repo_path == entry.3)
+    {
+        return false;
+    }
+    list.push(entry);
+    true
+}
+
+/// Remove the entry whose repo path is `root`.
+pub(crate) fn remove_preview_entry(
+    list: &mut Vec<(String, String, String, String)>,
+    root: &str,
+) -> bool {
+    let Some(index) = list
+        .iter()
+        .position(|(_, _, _, repo_path)| repo_path == root)
+    else {
+        return false;
+    };
+    list.remove(index);
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1088,6 +1156,68 @@ mod tests {
         );
         assert_eq!(list.len(), 2);
         assert_eq!(list[1].1, "Project");
+    }
+
+    #[test]
+    fn preview_entry_uses_the_name_and_root() {
+        assert_eq!(
+            preview_entry(std::path::Path::new("/repo/New Project"), "New Project"),
+            (
+                "new-project".into(),
+                "New Project".into(),
+                "repo".into(),
+                "/repo/New Project".into(),
+            )
+        );
+    }
+
+    #[test]
+    fn preview_is_not_added_over_an_existing_slug_or_path() {
+        let mut list = vec![
+            (
+                "new-project".into(),
+                "Existing".into(),
+                "repo".into(),
+                "/old".into(),
+            ),
+            (
+                "other".into(),
+                "Other".into(),
+                "repo".into(),
+                "/repo/new".into(),
+            ),
+        ];
+        assert!(!preview_sidebar_entry(
+            &mut list,
+            (
+                "new-project".into(),
+                "New".into(),
+                "repo".into(),
+                "/new".into()
+            ),
+        ));
+        assert!(!preview_sidebar_entry(
+            &mut list,
+            (
+                "new".into(),
+                "New".into(),
+                "repo".into(),
+                "/repo/new".into()
+            ),
+        ));
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn remove_preview_entry_removes_only_that_root() {
+        let mut list = vec![
+            ("one".into(), "One".into(), "repo".into(), "/same".into()),
+            ("two".into(), "Two".into(), "repo".into(), "/other".into()),
+        ];
+        assert!(remove_preview_entry(&mut list, "/same"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "two");
+        assert!(!remove_preview_entry(&mut list, "/same"));
     }
 
     #[test]
