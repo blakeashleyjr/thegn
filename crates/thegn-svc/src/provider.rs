@@ -3589,6 +3589,58 @@ const EXEC_DATA_CHUNK: usize = 32 << 10;
 const _: () = assert!(EXEC_DATA_CHUNK * EXEC_CHANNEL_CAPACITY <= EXEC_DATA_BYTE_BUDGET);
 const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Byte and message counters for one exec socket, logged at debug: one line
+/// per MiB received (instantaneous rate) and a summary when the driver ends.
+/// Integer adds per WebSocket message in the driver task; nothing on the UI loop.
+struct ExecWireStats {
+    started: tokio::time::Instant,
+    in_msgs: u64,
+    in_bytes: u64,
+    out_msgs: u64,
+    out_bytes: u64,
+    max_in: usize,
+    mark_bytes: u64,
+    mark_at: tokio::time::Instant,
+}
+
+impl ExecWireStats {
+    const MARK: u64 = 1 << 20;
+
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            started: now,
+            in_msgs: 0,
+            in_bytes: 0,
+            out_msgs: 0,
+            out_bytes: 0,
+            max_in: 0,
+            mark_bytes: 0,
+            mark_at: now,
+        }
+    }
+
+    /// Count one inbound message; `Some((bytes_since_mark, ms_since_mark))`
+    /// when a MiB boundary was crossed.
+    fn inbound(&mut self, len: usize, now: tokio::time::Instant) -> Option<(u64, u64)> {
+        self.in_msgs += 1;
+        self.in_bytes += len as u64;
+        self.max_in = self.max_in.max(len);
+        if self.in_bytes.saturating_sub(self.mark_bytes) < Self::MARK {
+            return None;
+        }
+        let bytes = self.in_bytes - self.mark_bytes;
+        let ms = now.duration_since(self.mark_at).as_millis() as u64;
+        self.mark_bytes = self.in_bytes;
+        self.mark_at = now;
+        Some((bytes, ms))
+    }
+
+    fn outbound(&mut self, len: usize) {
+        self.out_msgs += 1;
+        self.out_bytes += len as u64;
+    }
+}
+
 #[derive(Debug)]
 struct ProxyConnectTimeout {
     deadline: std::time::Duration,
@@ -3740,6 +3792,23 @@ fn resize_json(cols: u16, rows: u16) -> String {
     format!("{{\"type\":\"resize\",\"cols\":{cols},\"rows\":{rows}}}")
 }
 
+/// Queue the PTY size as the first control message of a tty exec. Measured
+/// (batch 186 parity P03): the Sprites server left the PTY at 0x0 although the
+/// open URL carried cols/rows, so an interactive transport states its size
+/// explicitly after connect. A zero dimension is not a size: skip.
+fn send_initial_size(session: &ExecSession, cols: u16, rows: u16) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    if let Err(error) = session.control.try_send(ExecControl::Resize { cols, rows }) {
+        tracing::debug!(
+            target: "thegn::provider",
+            %error,
+            "initial exec resize could not be queued"
+        );
+    }
+}
+
 // --- non-PTY (tty=false) binary stream framing -----------------------------
 // In non-PTY mode each binary frame is prefixed with a 1-byte stream id:
 //   0=stdin (client→server), 1=stdout, 2=stderr, 3=exit, 4=stdin-EOF.
@@ -3855,6 +3924,12 @@ fn parse_sprite_ctrl(text: &str, tty: bool) -> std::result::Result<SpriteCtrl, E
             else {
                 return Err(ExecProtocolError::MalformedControl);
             };
+            tracing::debug!(
+                target: "thegn::provider",
+                cols = object.get("cols").and_then(serde_json::Value::as_u64),
+                rows = object.get("rows").and_then(serde_json::Value::as_u64),
+                "sprites exec session_info size"
+            );
             Ok(SpriteCtrl::Session(session_id.to_string()))
         }
         "port_opened" | "port_closed" => Ok(SpriteCtrl::Notice),
@@ -3878,7 +3953,11 @@ impl SpritesProvider {
     /// runtime until the socket closes or `ExecControl::Close` is sent.
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         let url = exec_ws_url(self.base()?, id, spec)?;
-        Box::pin(self.start_session(url, spec.tty, None, None)).await
+        let session = Box::pin(self.start_session(url, spec.tty, None, None)).await?;
+        if spec.tty {
+            send_initial_size(&session, spec.cols, spec.rows);
+        }
+        Ok(session)
     }
 
     async fn open_exec_capturing(&self, id: &str, spec: &ExecSpec) -> Result<CapturedExec> {
@@ -3901,7 +3980,9 @@ impl SpritesProvider {
         rows: u16,
     ) -> Result<ExecSession> {
         let url = attach_ws_url(self.base()?, id, session, cols, rows)?;
-        Box::pin(self.connect_exec(url, true, false, None, None)).await
+        let session = Box::pin(self.connect_exec(url, true, false, None, None)).await?;
+        send_initial_size(&session, cols, rows);
+        Ok(session)
     }
 
     /// Run a one-shot command in the sprite over the WSS exec API (NON-tty) and
@@ -4256,6 +4337,7 @@ where
         protocol::{CloseFrame, frame::coding::CloseCode},
     };
     let (mut write, mut read) = ws.split();
+    let mut stats = ExecWireStats::new(tokio::time::Instant::now());
     let mut exited = None;
     let mut drain_until = None;
     let mut probe_at: Option<tokio::time::Instant> = None;
@@ -4366,9 +4448,11 @@ where
                     match ctrl {
                         Some(ExecControl::Stdin(b)) => {
                             let frame = if tty { b } else { encode_stream_stdin(&b) };
+                            let frame_len = frame.len();
                             if write.send(Message::Binary(frame.into())).await.is_err() {
                                 break;
                             }
+                            stats.outbound(frame_len);
                             if tty && !probe_disabled_logged {
                                 let now = tokio::time::Instant::now();
                                 match probe_at {
@@ -4422,6 +4506,16 @@ where
                 }
                 match msg {
                 Some(Ok(Message::Binary(b))) => {
+                    if let Some((bytes, ms)) = stats.inbound(b.len(), tokio::time::Instant::now()) {
+                        tracing::debug!(
+                            target: "thegn::provider",
+                            kib = bytes / 1024,
+                            ms,
+                            in_msgs = stats.in_msgs,
+                            max_in = stats.max_in,
+                            "sprites exec inbound MiB mark"
+                        );
+                    }
                     if tracing::enabled!(target: "thegn::provider", tracing::Level::TRACE) {
                         let preview = &b[..b.len().min(64)];
                         tracing::trace!(
@@ -4481,6 +4575,16 @@ where
                     }
                 }
                 Some(Ok(Message::Text(t))) => {
+                    if let Some((bytes, ms)) = stats.inbound(t.len(), tokio::time::Instant::now()) {
+                        tracing::debug!(
+                            target: "thegn::provider",
+                            kib = bytes / 1024,
+                            ms,
+                            in_msgs = stats.in_msgs,
+                            max_in = stats.max_in,
+                            "sprites exec inbound MiB mark"
+                        );
+                    }
                     if tracing::enabled!(target: "thegn::provider", tracing::Level::TRACE) {
                         let bytes = t.as_bytes();
                         let preview = &bytes[..bytes.len().min(64)];
@@ -4547,6 +4651,17 @@ where
         }
     }
 
+    let secs = stats.started.elapsed().as_secs_f64();
+    tracing::debug!(
+        target: "thegn::provider",
+        in_msgs = stats.in_msgs,
+        in_bytes = stats.in_bytes,
+        out_msgs = stats.out_msgs,
+        out_bytes = stats.out_bytes,
+        max_in = stats.max_in,
+        secs,
+        "sprites exec wire stats"
+    );
     if let Some(done) = done
         && done.send(fault.clone()).is_err()
     {
@@ -7438,6 +7553,57 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn send_initial_size_queues_one_resize() {
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel(1);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let (_sid_tx, session_id) = tokio::sync::watch::channel(None::<String>);
+        let session = ExecSession {
+            frames: frames_rx,
+            control: control_tx,
+            session_id,
+        };
+
+        send_initial_size(&session, 120, 40);
+        assert_eq!(
+            control_rx.try_recv(),
+            Ok(ExecControl::Resize {
+                cols: 120,
+                rows: 40
+            })
+        );
+        send_initial_size(&session, 0, 40);
+        send_initial_size(&session, 120, 0);
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(frames_tx);
+    }
+
+    #[test]
+    fn exec_wire_stats_marks_each_mib() {
+        let start = tokio::time::Instant::now();
+        let later = start + Duration::from_millis(37);
+        let mut stats = ExecWireStats::new(start);
+        let half_mib = 512 * 1024;
+
+        assert_eq!(stats.inbound(half_mib, start), None);
+        assert_eq!(
+            stats.inbound(half_mib, later),
+            Some((ExecWireStats::MARK, 37))
+        );
+        assert_eq!(stats.inbound(half_mib, later), None);
+        assert_eq!(stats.in_msgs, 3);
+        assert_eq!(stats.in_bytes, 3 * half_mib as u64);
+        assert_eq!(stats.max_in, half_mib);
+
+        stats.outbound(17);
+        assert_eq!(stats.out_msgs, 1);
+        assert_eq!(stats.out_bytes, 17);
     }
 
     #[tokio::test]

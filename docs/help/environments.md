@@ -567,6 +567,38 @@ key of the same line, on any row, and never past the right edge. It is shown
 only when the echoed cell holds the typed character, so nothing is predicted at
 a password prompt.
 
+Output retires only the keys the server actually echoed: output confirming k
+predicted keys drops exactly those k and keeps the rest. Output that does not
+move the cursor keeps the overlay, which is dropped at the next event once the
+oldest unconfirmed key is over 2 s old (checked on events, not by a timer). A
+mismatch, or pending non-ASCII text, clears everything. The first key of a line
+is never predicted.
+
+### Size, input batching and pastes
+
+- **A tty exec states its size after connect.** The Sprites driver queues one
+  resize on the fresh control channel right after an open or a reattach, so the
+  remote never has to assume it from the open request (the URL still carries
+  cols and rows, harmlessly). Before this, the first `stty size` in a remote
+  pane was `0 0` until the first resize.
+- **A pump that forwards decoded input coalesces queued input.** The
+  `sprite-exec` bridge joins the keys already queued behind one event into a
+  single stdin write, up to 32 KiB per message; one larger event, such as a
+  bracketed paste, is sent whole. A lone keystroke and a lone Escape are sent
+  at once: an Escape always travels alone so it cannot merge with the next key.
+  A resize ends a batch and is sent after the bytes. `TCP_NODELAY` stays on.
+  A 1 MiB paste took about 17 s before batching; the figure after it is not yet
+  measured.
+- **A paste sent just after Enter can arrive bracketed**, as it does over
+  `ssh`: the remote shell enables bracketed paste once its prompt redraws, so a
+  paste landing after that point is wrapped in the paste markers.
+
+Measured on a live Sprites sandbox (alpha.113): 19 of 23 parity cases matched a
+local pane; keystroke echo was about 123 ms slower than local; an output flood
+was about 15 times slower, with the cause not yet established (no fix is
+claimed); a new worktree's shell was ready about 21 s after the request, with
+the agent install continuing in the background.
+
 ### Background setup (prompt first)
 
 On every remote provider, a worktree's shell opens as soon as its workspace is
@@ -596,6 +628,14 @@ Login sync copies an agent's config into the sandbox in two phases.
 - **An agent thegn does not know**, whose tree has more than 2,000 allowlisted
   files, ships its top-level files only, with one warning.
 
+### Agent install log
+
+The agent install step never fails the environment. It runs one `npm install -g`
+for every missing npm agent (retrying per package if that fails) while hermes's
+curl installer runs in parallel. Output and per-agent seconds go to
+`~/.cache/thegn-agent-install.log` in the sandbox; read it when an agent
+launched in the pane exits 127.
+
 ### Parity script
 
 `test/remote-parity.sh` checks that a remote pane behaves like a local one:
@@ -605,13 +645,21 @@ the title, cwd, exit status, echo latency and a leak check after close. It takes
 the env as an argument:
 
 ```
-THEGN_CHANNEL=dev test/remote-parity.sh --env <name> --i-accept-spend [--keep-going] [--samples N] [--idle-probe]
+THEGN_CHANNEL=dev test/remote-parity.sh --env <name> --i-accept-spend [--keep-going] [--samples N] [--idle-probe] [--startup-only [--fill-spare]] [--tui-probe]
 ```
 
 Without flags it only prints its plan and creates nothing. `--self-test` runs
 the same cases with a local pane on both sides, using no provider and no
 network. `just remote-parity` runs it. Each case prints PASS, WARN or FAIL;
 THE-2450 is reported as a WARN.
+
+- `--startup-only` measures only the cold and warm time to a first prompt.
+- `--fill-spare` (needs `--startup-only`) also measures a warm-spare claim and
+  spends one more sandbox; without it that row is skipped.
+- `--tui-probe` turns on the full-screen-program probe
+  (`test/remote_parity_tui.py`) for the run.
+
+Latency and throughput are measured and printed, not held to fixed budgets.
 
 ## Unverified
 
@@ -620,7 +668,11 @@ Not confirmed against a live provider:
 - the guest has the `C.UTF-8` locale;
 - the shape of the server's replay on reattach;
 - the largest WebSocket message the server accepts;
-- whether an open, idle exec keeps a sprite awake.
+- whether an open, idle exec keeps a sprite awake;
+- whether Sprites applies the cols and rows in the exec URL itself (the explicit
+  resize makes it moot, and the live log will say);
+- where the limit on a very large paste is;
+- whether the hermes installer uses npm.
 
 ## Remote worktrees
 

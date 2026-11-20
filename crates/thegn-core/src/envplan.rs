@@ -1686,7 +1686,10 @@ fn agents_install_script(agents: &[String]) -> String {
         "log=\"$HOME/.cache/thegn-agent-install.log\"".to_string(),
         "mkdir -p \"$HOME/.cache\" 2>/dev/null".to_string(),
         "true 2>/dev/null >\"$log\" || log=/dev/null".to_string(),
-        "npm_g() { if ! have npm; then echo \"npm not found: cannot install $1\" >>\"$log\"; return 1; fi; npm install -g \"$1\" >>\"$log\" 2>&1; }".to_string(),
+        "npm_g() { if ! have npm; then echo \"npm not found: cannot install $*\" >>\"$log\"; return 1; fi; npm install -g \"$@\" >>\"$log\" 2>&1; }".to_string(),
+        "t0=$(date +%s 2>/dev/null || echo 0)".to_string(),
+        "pkgs=\"\"".to_string(),
+        "hermes_pid=\"\"".to_string(),
         "missing=\"\"".to_string(),
     ];
     let mut known_programs = Vec::new();
@@ -1694,26 +1697,29 @@ fn agents_install_script(agents: &[String]) -> String {
         let line = match a.trim() {
             "claude" | "claude-code" => {
                 known_programs.push("claude");
-                "have claude || npm_g @anthropic-ai/claude-code || true".to_string()
+                "have claude || pkgs=\"$pkgs @anthropic-ai/claude-code\"".to_string()
             }
             "codex" => {
                 known_programs.push("codex");
-                "have codex || npm_g @openai/codex || true".to_string()
+                "have codex || pkgs=\"$pkgs @openai/codex\"".to_string()
             }
             // thegn's own agent; pi >=0.80 bundles its extension deps.
             "pi" => {
                 known_programs.push("pi");
-                "have pi || npm_g @earendil-works/pi-coding-agent || true".to_string()
+                "have pi || pkgs=\"$pkgs @earendil-works/pi-coding-agent\"".to_string()
             }
             // Nous Research hermes-agent (Python/uv) — its own curl installer.
             "hermes" => {
                 known_programs.push("hermes");
-                "have hermes || (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash) >>\"$log\" 2>&1 || true".to_string()
+                "{ have hermes || (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash) >>\"$log\" 2>&1 || true; echo \"thegn-agent-install: hermes $(( $(date +%s) - t0 ))s\" >>\"$log\"; } & hermes_pid=$!".to_string()
             }
             other => format!("# {other}: install via [sandbox.home] setup/tools"),
         };
         lines.push(line);
     }
+    // shellcheck disable=SC2086: package names are intentionally word-split.
+    lines.push("if [ -n \"$pkgs\" ]; then t1=$(date +%s 2>/dev/null || echo 0); npm_g $pkgs || for p in $pkgs; do npm_g \"$p\" || true; done; echo \"thegn-agent-install: npm$pkgs $(( $(date +%s) - t1 ))s\" >>\"$log\"; fi".into());
+    lines.push("[ -z \"$hermes_pid\" ] || wait \"$hermes_pid\"".into());
     for program in known_programs {
         lines.push(format!("have {program} || missing=\"$missing {program}\""));
     }
@@ -3002,6 +3008,8 @@ mod tests {
         assert!(s.contains("@earendil-works/pi-coding-agent"));
         // hermes (Nous) installs via its own curl installer.
         assert!(s.contains("hermes-agent.nousresearch.com/install.sh"));
+        assert!(s.contains("npm_g $pkgs"));
+        assert!(s.contains("wait \"$hermes_pid\""));
         // a genuinely unknown agent doesn't fabricate an installer.
         let unknown = agents_install_script(&["frobnicator".into()]);
         assert!(unknown.contains("frobnicator: install via"));
@@ -3014,6 +3022,7 @@ mod tests {
         assert!(s.contains("thegn-agent-install.log"));
         assert!(s.contains("npm not found"));
         assert!(s.contains("agent CLI not installed"));
+        assert!(s.contains("thegn-agent-install: npm"));
         assert!(s.ends_with("true"));
     }
 
@@ -3021,6 +3030,26 @@ mod tests {
     fn agents_installer_never_fails_the_step() {
         let s = agents_install_script(&["claude".into(), "hermes".into()]);
         assert_eq!(s.split("; ").last(), Some("true"));
+    }
+
+    #[test]
+    fn agents_installer_background_join_is_shell_safe() {
+        let s = agents_install_script(&["claude".into(), "hermes".into()]);
+        assert!(!s.contains("& ;"));
+        assert!(!s.contains("&;"));
+    }
+
+    #[test]
+    fn agents_installer_does_not_background_without_hermes() {
+        let s = agents_install_script(&["codex".into()]);
+        assert!(!s.contains("} &"));
+        assert!(!s.contains("hermes_pid=$!"));
+    }
+
+    #[test]
+    fn agents_installer_hermes_background_captures_pid() {
+        let s = agents_install_script(&["hermes".into()]);
+        assert!(s.contains("& hermes_pid=$!"));
     }
 
     #[test]
