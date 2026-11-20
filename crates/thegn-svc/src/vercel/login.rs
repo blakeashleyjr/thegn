@@ -155,7 +155,15 @@ impl LoginOps for VercelProvider {
     fn mkdir<'a>(&'a self, name: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let session = self.session_for(name, Wake::Never).await?;
-            self.client.fs_mkdir(&session, path).await
+            match self.api().fs_mkdir(&session, path).await {
+                Ok(()) => Ok(()),
+                Err(error) if Self::is_session_stopped(&error) => {
+                    self.forget_session(name);
+                    let session = self.session_for(name, Wake::Never).await?;
+                    self.api().fs_mkdir(&session, path).await
+                }
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -167,7 +175,19 @@ impl LoginOps for VercelProvider {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let session = self.session_for(name, Wake::Never).await?;
-            self.client.fs_write_targz(&session, cwd, targz).await
+            match self
+                .api()
+                .fs_write_targz(&session, cwd, targz.clone())
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(error) if Self::is_session_stopped(&error) => {
+                    self.forget_session(name);
+                    let session = self.session_for(name, Wake::Never).await?;
+                    self.api().fs_write_targz(&session, cwd, targz).await
+                }
+                Err(error) => Err(error),
+            }
         })
     }
 }
