@@ -198,6 +198,7 @@ fn land_branch_pinned_with_options(
 /// A provider worktree first pulls its sandbox commits home
 /// ([`crate::provider_git::pull_before_land`]) and then lands the **local**
 /// branch; a sandbox head kept in a scratch ref refuses the land.
+/// `--release-sandbox` on a worktree with no provider sandbox prints why nothing was released.
 pub fn run(
     cfg: &Config,
     worktree: Option<String>,
@@ -235,18 +236,10 @@ pub fn run(
         crate::provider_git::PreLand::NotProvider
     };
     let provider_land = pre_land_plan(&pre_land)?;
-    let release_sandbox = if release_sandbox
-        && matches!(
-            pre_land,
-            crate::provider_git::PreLand::Ready { report: None }
-        ) {
-        outln!(
-            "! --release-sandbox ignored: no pull ran for this worktree (read-only git policy, or not a provider env); the sandbox is kept"
-        );
-        false
-    } else {
-        release_sandbox
-    };
+    let (release_sandbox, dropped) = release_flag(&pre_land, release_sandbox);
+    if let Some(line) = dropped {
+        outln!("{line}");
+    }
     let branch_loc_override = provider_land
         .is_some()
         .then(|| thegn_core::remote::GitLoc::Local(wt.clone()));
@@ -431,6 +424,31 @@ fn pre_land_plan(pre: &crate::provider_git::PreLand) -> Result<Option<bool>> {
             Ok(Some(true))
         }
         PreLand::Refused(message) => bail!("{message}"),
+    }
+}
+
+/// Whether `--release-sandbox` can act after this pre-land result, and the
+/// line to print when it cannot. Never silent: a dropped flag always says so.
+fn release_flag(pre: &crate::provider_git::PreLand, asked: bool) -> (bool, Option<&'static str>) {
+    use crate::provider_git::PreLand;
+    if !asked {
+        return (false, None);
+    }
+    match pre {
+        PreLand::NotProvider => (
+            false,
+            Some(
+                "! --release-sandbox ignored: this worktree has no provider sandbox (its env is not provider-placed, or a complete provider listing lacks it); nothing was released",
+            ),
+        ),
+        PreLand::Ready { report: None } => (
+            false,
+            Some(
+                "! --release-sandbox ignored: no pull ran for this worktree (read-only git policy, or not a provider env); the sandbox is kept",
+            ),
+        ),
+        PreLand::Ready { report: Some(_) } | PreLand::SandboxGone => (true, None),
+        PreLand::Refused(_) => (asked, None),
     }
 }
 
@@ -980,6 +998,50 @@ mod landed_row_tests {
         ))
         .unwrap_err();
         assert!(format!("{error:#}").contains("land refused"), "{error:#}");
+    }
+
+    #[test]
+    fn release_flag_is_never_silent() {
+        use super::release_flag;
+        use crate::provider_git::{PreLand, PullOutcome, PullReport};
+
+        let ready = PreLand::Ready {
+            report: Some(PullReport {
+                branch: "tg/lane".into(),
+                outcome: PullOutcome::UpToDate,
+                push: None,
+            }),
+        };
+        let refused = PreLand::Refused("land refused".into());
+        let legacy_line = "! --release-sandbox ignored: no pull ran for this worktree (read-only git policy, or not a provider env); the sandbox is kept";
+        let cases = [
+            (
+                PreLand::NotProvider,
+                true,
+                false,
+                Some("nothing was released"),
+            ),
+            (
+                PreLand::Ready { report: None },
+                true,
+                false,
+                Some(legacy_line),
+            ),
+            (ready, true, true, None),
+            (PreLand::SandboxGone, true, true, None),
+            (refused, true, true, None),
+            (PreLand::NotProvider, false, false, None),
+        ];
+
+        for (pre, asked, expected_release, expected_line) in cases {
+            let (release, dropped) = release_flag(&pre, asked);
+            assert_eq!(release, expected_release);
+            match expected_line {
+                Some(expected) if expected == legacy_line => assert_eq!(dropped, Some(expected)),
+                Some(expected) => assert!(dropped.unwrap().contains(expected)),
+                None => assert_eq!(dropped, None),
+            }
+        }
     }
 
     type DestroyOutcome = Result<crate::agent_teardown::Teardown, String>;
