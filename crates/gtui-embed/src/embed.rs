@@ -32,6 +32,16 @@ use tg_kit::theme::{Theme, Tok};
 use tg_kit::tile::{AppTile, ChangeHook};
 use thegn_core::config_observe::ObserveConfig;
 
+pub use gtui_query::host::HostFeed;
+
+/// Where the built-in `host` datasource gets its samples.
+pub enum HostSourceInit {
+    /// Its own sampler thread; the closure runs first on it (QoS hook).
+    Sample(Box<dyn FnOnce() + Send + 'static>),
+    /// Samples the embedding host pushes through this feed; no sampler thread.
+    Fed(HostFeed),
+}
+
 pub struct ObserveTile {
     app: ObserveApp,
     theme: Theme,
@@ -49,7 +59,7 @@ impl ObserveTile {
         cfg: &ObserveConfig,
         rt: tokio::runtime::Handle,
         theme: Theme,
-        sampler_thread_start: impl FnOnce() + Send + 'static,
+        host: HostSourceInit,
     ) -> Result<Self, ObserveTileError> {
         let mut source_ids = HashSet::from(["host".to_string()]);
         if !cfg.prometheus.base_url.trim().is_empty() {
@@ -63,10 +73,11 @@ impl ObserveTile {
         // config). Prometheus/Loki register only when an endpoint is configured;
         // tokens resolve through thegn's `env:`/`file:` indirection.
         let mut sources: HashMap<String, Arc<dyn DataSource>> = HashMap::new();
-        sources.insert(
-            "host".to_string(),
-            Arc::new(HostSource::try_new_with(sampler_thread_start)?),
-        );
+        let host_source = match host {
+            HostSourceInit::Sample(start) => HostSource::try_new_with(start)?,
+            HostSourceInit::Fed(feed) => HostSource::fed(&feed),
+        };
+        sources.insert("host".to_string(), Arc::new(host_source));
         if !cfg.prometheus.base_url.trim().is_empty() {
             let token =
                 thegn_core::config::expand_env_ref(&cfg.prometheus.token).unwrap_or_default();
@@ -1356,7 +1367,7 @@ mod tests {
                 &ObserveConfig::default(),
                 tokio::runtime::Handle::current(),
                 Theme::prism(),
-                || {},
+                HostSourceInit::Sample(Box::new(|| {})),
             )
             .unwrap();
             tile.is_panicked = true;
@@ -1372,6 +1383,24 @@ mod tests {
             tile.render(area, &mut buf);
 
             assert_eq!(buf.cell((0, 0)).unwrap().fg, next_theme.color(Tok::Border));
+        });
+    }
+
+    #[test]
+    fn fed_observe_tile_builds() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(ObserveTile::new(
+                Arc::new(|| {}),
+                &ObserveConfig::default(),
+                tokio::runtime::Handle::current(),
+                Theme::prism(),
+                HostSourceInit::Fed(HostFeed::new()),
+            )
+            .is_ok());
         });
     }
 

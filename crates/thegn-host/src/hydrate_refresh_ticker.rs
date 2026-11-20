@@ -789,7 +789,13 @@ impl TickerIo for LiveIo {
         let mut sampler =
             thegn_metrics::StatsSampler::new(self.disk_path.take().expect("one prime"));
         // Best-effort initial sends preserve the existing startup behavior.
-        drop(self.stats_tx.send(StatsTick::now(sampler.sample())));
+        let tick = StatsTick::now(sampler.sample());
+        crate::apps::feed_observe_sample(
+            tick.at_ms,
+            &tick.snap,
+            self.stats_interval_ms.load(Ordering::Relaxed).max(500) as f64 / 1000.0,
+        );
+        drop(self.stats_tx.send(tick));
         self.last_stats = Some(Instant::now());
         self.sampler = Some(sampler);
     }
@@ -829,7 +835,8 @@ impl TickerIo for LiveIo {
     fn send_stats_if_due(&mut self) -> Result<bool, ()> {
         let interval =
             Duration::from_millis(self.stats_interval_ms.load(Ordering::Relaxed).max(500));
-        if !self.stats_live.load(Ordering::Relaxed)
+        let live = self.stats_live.load(Ordering::Relaxed);
+        if !live
             && self.last_stats.expect("stats primed").elapsed() < interval
         {
             return Ok(false);
@@ -849,7 +856,13 @@ impl TickerIo for LiveIo {
             let _guard = crate::perf::measure(crate::perf::Subsys::Stats);
             sampler.sample()
         };
-        self.stats_tx.send(StatsTick::now(snap)).map_err(|_| ())?;
+        let tick = StatsTick::now(snap);
+        crate::apps::feed_observe_sample(
+            tick.at_ms,
+            &tick.snap,
+            if live { 0.5 } else { interval.as_secs_f64() },
+        );
+        self.stats_tx.send(tick).map_err(|_| ())?;
         Ok(true)
     }
 
