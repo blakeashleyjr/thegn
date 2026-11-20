@@ -74,12 +74,12 @@ With `[lead]` configured (dev channel only), the right panel carries a pinned
 Lead footer at the bottom, whichever tab is open. There is no setting to hide
 it. Its height follows the panel:
 
-| Panel size                   | Footer                                     |
-| ---------------------------- | ------------------------------------------ |
-| under 8 rows                 | none                                       |
-| under 16 rows or 30 columns  | 1 row: mark, state, approvals chip, lanes  |
-| under 60 columns             | 2 rows: status line, last action and keys  |
-| 60 columns and wider         | 3 rows: a `LEAD` header rule, then the two |
+| Panel size                  | Footer                                     |
+| --------------------------- | ------------------------------------------ |
+| under 8 rows                | none                                       |
+| under 16 rows or 30 columns | 1 row: mark, state, approvals chip, lanes  |
+| under 60 columns            | 2 rows: status line, last action and keys  |
+| 60 columns and wider        | 3 rows: a `LEAD` header rule, then the two |
 
 ```
  LEAD ---------------------------------------
