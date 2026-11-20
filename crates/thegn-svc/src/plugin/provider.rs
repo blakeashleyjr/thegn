@@ -350,8 +350,8 @@ fn verify_patch_applied(patch: &IssuePatch, issue: &Issue) -> Result<(), IssueEr
 }
 
 /// Refuse a reply that names one issue id twice, then bound the rows.
-/// `limit == 0` reports an over-cap reply as partial; a positive limit
-/// truncates to the requested limit and the plugin row cap.
+/// A positive limit up to the cap truncates. With limit 0 or a limit above
+/// the cap, a reply longer than the cap is a PartialList, never a complete list.
 fn bound_rows(rows: Vec<Issue>, limit: usize) -> Result<Vec<Issue>, IssueError> {
     let mut ids = HashSet::with_capacity(rows.len());
     for issue in &rows {
@@ -362,20 +362,16 @@ fn bound_rows(rows: Vec<Issue>, limit: usize) -> Result<Vec<Issue>, IssueError> 
         }
     }
 
-    if limit == 0 {
-        if rows.len() > MAX_PLUGIN_ISSUE_ROWS {
-            return Err(IssueError::PartialList {
-                issues: rows.into_iter().take(MAX_PLUGIN_ISSUE_ROWS).collect(),
-                reason: "plugin listing exceeded the row cap",
-            });
-        }
-        return Ok(rows);
+    if limit > 0 && limit <= MAX_PLUGIN_ISSUE_ROWS {
+        return Ok(rows.into_iter().take(limit).collect());
     }
-
-    Ok(rows
-        .into_iter()
-        .take(limit.min(MAX_PLUGIN_ISSUE_ROWS))
-        .collect())
+    if rows.len() > MAX_PLUGIN_ISSUE_ROWS {
+        return Err(IssueError::PartialList {
+            issues: rows.into_iter().take(MAX_PLUGIN_ISSUE_ROWS).collect(),
+            reason: "plugin listing exceeded the row cap",
+        });
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +809,23 @@ done
 
         let rows = bound_rows(rows, 0).unwrap();
         assert_eq!(rows.len(), MAX_PLUGIN_ISSUE_ROWS);
+    }
+
+    #[test]
+    fn bound_rows_reports_a_limit_above_the_cap_as_partial() {
+        let rows = (0..=MAX_PLUGIN_ISSUE_ROWS)
+            .map(|index| Issue {
+                id: format!("plugin:demo:{index}"),
+                ..Default::default()
+            })
+            .collect();
+
+        let Err(IssueError::PartialList { issues, .. }) =
+            bound_rows(rows, MAX_PLUGIN_ISSUE_ROWS * 2)
+        else {
+            panic!("expected a partial list");
+        };
+        assert_eq!(issues.len(), MAX_PLUGIN_ISSUE_ROWS);
     }
 
     fn live_bridge() -> (FixtureSupervisor, ResidentSession, Arc<ProviderBridge>) {
