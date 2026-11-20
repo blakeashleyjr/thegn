@@ -1394,7 +1394,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Info screen",
         message_key: "action-open-info",
         hint: "info",
-        default_chords: &["Alt I"],
+        default_chords: &[],
         palette: true,
         keywords: &[
             "info",
