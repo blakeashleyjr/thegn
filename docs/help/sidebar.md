@@ -424,7 +424,9 @@ reading, it shows an amber `?`.
 - `I` — Info screen for the row under the cursor (also "Info screen"
   in the palette): identity, the effective settings with the layer that set
   each one (env, sandbox backend and what would launch here, profile, network,
-  agent, merge gate), overrides, sessions and stats. Esc closes it.
+  agent, merge gate), overrides, sessions and stats. Esc closes it. The row's
+  context menu has the same thing as "Info…" (id `info`), for a workspace row
+  and a worktree row.
 
 ### Row detail
 
