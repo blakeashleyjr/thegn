@@ -123,6 +123,7 @@ Steps:
       poll /v1/tasks every 15 s while it runs
   7h  (only with --with-agent <name>) agent JSON is exited 0 and pull.ok is true
   7i  (only with --with-agent <name>) /v1/tasks includes thegn-hold- during the run
+      (7g first starts this run's own pane daemon on the fresh state; teardown stops it)
   9   after 120 s idle, fleet list --env shows warm or cold
   9b  /v1/tasks is empty
   10  fleet cost --json: print sprites_usage; error fails, cpu_hours > 0 passes,
@@ -220,6 +221,7 @@ SPRITE_NAME="(unknown)"
 CREATED=0
 HOLD_PID=""
 AGENT_POLL_PID=""
+DAEMON_PID=""
 HOLD_ERR="$TMP/hold.err"
 STEP_11_PASSED=0
 FAILED_STEPS=()
@@ -311,6 +313,22 @@ teardown() {
         echo "TEARDOWN INCOMPLETE: sprite $n may still exist; the ledger is kept in $TMP" >&2
       fi
     done
+  fi
+  if [ -n "$DAEMON_PID" ]; then
+    echo "-- teardown: daemon stop (this run's pane daemon, pid $DAEMON_PID)"
+    "$THEGN_BIN" daemon stop
+    kill "$DAEMON_PID" 2>/dev/null
+    local daemon_tries=0
+    while [ "$daemon_tries" -lt 10 ] && kill -0 "$DAEMON_PID" 2>/dev/null; do
+      sleep 1
+      daemon_tries=$((daemon_tries + 1))
+    done
+    if kill -0 "$DAEMON_PID" 2>/dev/null; then
+      echo "-- teardown: pane daemon $DAEMON_PID ignored TERM; sending KILL" >&2
+      kill -KILL "$DAEMON_PID" 2>/dev/null
+    fi
+    wait "$DAEMON_PID" 2>/dev/null
+    DAEMON_PID=""
   fi
   if [ "$left" = 1 ]; then
     echo "-- keeping $TMP (ledger needed for a later reap); ledger records:" >&2
@@ -796,8 +814,36 @@ agent_tasks_poll() {
   done
 }
 
+# agent run connects to a pane daemon and never spawns one, and this run's
+# state is fresh: start this run's own daemon (same binary, same state) in
+# the background; teardown stops it. THEGN_CONTROL_ADDR is unset so neither
+# the probe nor agent run can reach another instance's daemon.
+agent_daemon_start() {
+  local tries=0
+  [ -z "$DAEMON_PID" ] || return 0
+  unset THEGN_CONTROL_ADDR
+  "$THEGN_BIN" "${MIN_RAM_SET[@]}" daemon </dev/null >"$TMP/daemon.log" 2>&1 &
+  DAEMON_PID=$!
+  while [ "$tries" -lt 30 ]; do
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+      echo "pane daemon exited at start; log: $TMP/daemon.log" >&2
+      tail -n 20 "$TMP/daemon.log" >&2
+      return 1
+    fi
+    if "$THEGN_BIN" session list --json >/dev/null 2>&1; then
+      echo "   pane daemon up (pid $DAEMON_PID)"
+      return 0
+    fi
+    sleep 1
+    tries=$((tries + 1))
+  done
+  echo "pane daemon did not answer session list within 30 s; log: $TMP/daemon.log" >&2
+  return 1
+}
+
 agent_run() {
   local started ended rc
+  agent_daemon_start || return 1
   started="$(date +%s)" || return 1
   agent_tasks_poll &
   AGENT_POLL_PID=$!
