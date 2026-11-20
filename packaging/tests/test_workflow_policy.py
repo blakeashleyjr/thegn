@@ -63,7 +63,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             ]
             with self.subTest(job=job_name):
                 self.assertEqual(1, len(checkouts))
-                self.assertNotIn("ref", checkouts[0].get("with", {}))
+                self.assertEqual("${{ github.sha }}", checkouts[0].get("with", {}).get("ref"))
 
     def test_no_workflow_trusts_first_seen_host_keys(self) -> None:
         for path in sorted((ROOT / ".github" / "workflows").rglob("*.yml")):
@@ -92,6 +92,39 @@ class WorkflowPolicyTests(unittest.TestCase):
                     ):
                         with self.subTest(required=required):
                             self.assertIn(required, script)
+
+    def test_external_publishers_reverify_signed_identity_before_keys(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        helper = (ROOT / ".github" / "scripts" / "verify-release-publication-identity.sh").read_text(
+            encoding="utf-8"
+        )
+        for job_name in ("publish-homebrew", "publish-aur"):
+            job = jobs[job_name]
+            steps = job.get("steps", [])
+            names = [step.get("name") for step in steps]
+            identity_index = names.index("Re-verify immutable release identity before publication")
+            key_index = names.index(
+                "Materialize Homebrew deploy key"
+                if job_name == "publish-homebrew"
+                else "Materialize AUR deploy key"
+            )
+            step_script = steps[identity_index].get("run", "")
+            with self.subTest(job=job_name):
+                self.assertLess(identity_index, key_index)
+                self.assertEqual("read", job.get("permissions", {}).get("actions"))
+                self.assertIn(".github/scripts/verify-release-publication-identity.sh", step_script)
+                for required in (
+                    "actions/runs/$run_id",
+                    "git ls-remote origin",
+                    "gh attestation verify",
+                    "--source-digest \"$run_head_sha\"",
+                    "verify-publication-identity",
+                    '[[ ${GITHUB_REF:-} == refs/heads/main ]]',
+                    'workflow_checkout_sha == "${GITHUB_SHA:-}"',
+                    "--tag-object",
+                    "--commit",
+                ):
+                    self.assertIn(required, helper)
 
     def test_committed_known_hosts_match_published_fingerprints(self) -> None:
         known_hosts = ROOT / ".github" / "known_hosts"

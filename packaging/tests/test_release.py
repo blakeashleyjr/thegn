@@ -1513,6 +1513,88 @@ class AttestationVerificationTests(unittest.TestCase):
             run_id=self.RUN,
         )
 
+    def publication_fixture(self):
+        manifest_path = self.temp / "thegn-v1.2.3-manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "tag": "v1.2.3",
+                    "commit": self.SHA,
+                    "tag_object": "a" * 40,
+                    "workflow_sha": self.SHA,
+                    "run_id": self.RUN,
+                    "assets": [
+                        {
+                            "name": "thegn-v1.2.3-x.tar.gz",
+                            "sha256": "b" * 64,
+                            "size": 10,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        verification = [
+            self.entry(
+                subject=[
+                    {
+                        "name": manifest_path.name,
+                        "digest": {"sha256": manifest_digest},
+                    }
+                ]
+            )
+        ]
+        workflow_run = {
+            "id": int(self.RUN),
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+            "path": ".github/workflows/release.yml",
+            "head_repository": {"full_name": self.REPO},
+            "head_sha": self.SHA,
+        }
+        return manifest_path, verification, workflow_run
+
+    def check_publication(self, manifest_path, verification, initial_workflow_run, **overrides):
+        values = {
+            "manifest_path": manifest_path,
+            "verification": verification,
+            "workflow_run": initial_workflow_run,
+            "tag": "v1.2.3",
+            "tag_object": "a" * 40,
+            "commit": self.SHA,
+            "repository": self.REPO,
+            "server_url": self.SERVER,
+        }
+        values.update(overrides)
+        return release.check_publication_identity(**values)
+
+    def test_publication_identity_binds_manifest_attestation_to_current_tag_and_run(self) -> None:
+        manifest, verification, workflow_run = self.publication_fixture()
+        self.assertEqual(
+            self.RUN,
+            self.check_publication(manifest, verification, workflow_run),
+        )
+
+    def test_publication_identity_refuses_moved_tag_or_wrong_run(self) -> None:
+        manifest, verification, workflow_run = self.publication_fixture()
+        cases = (
+            ({"tag_object": "c" * 40}, "tag identity"),
+            ({"commit": "d" * 40}, "tag identity"),
+            ({"workflow_run": {**workflow_run, "id": 54321}}, "run id"),
+            ({"workflow_run": {**workflow_run, "run_attempt": 2}}, "not bound to this workflow run"),
+            ({"workflow_run": {**workflow_run, "conclusion": "failure"}}, "successful release"),
+            ({"workflow_run": {**workflow_run, "head_repository": {"full_name": "fork/r"}}}, "wrong repository"),
+            ({"workflow_run": {**workflow_run, "head_sha": "e" * 40}}, "wrong source commit"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                release.ReleaseError, message
+            ):
+                self.check_publication(manifest, verification, workflow_run, **overrides)
+
     def test_valid_attestations_are_accepted(self) -> None:
         self.assertEqual(1, self.check([self.entry()]))
         self.assertEqual(2, self.check([self.entry(), self.entry()]))

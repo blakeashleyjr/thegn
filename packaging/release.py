@@ -696,7 +696,7 @@ def load_staged_digests(path: Path) -> dict[str, str]:
     return value
 
 
-def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
+def load_release_manifest_record(path: Path, tag: str) -> dict[str, Any]:
     descriptor: int | None = None
     try:
         path_metadata = path.lstat()
@@ -766,7 +766,15 @@ def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
         if name in entries:
             raise ReleaseError(f"release manifest {path} has duplicate asset name {name}")
         entries[name] = (digest, size)
-    return entries
+    return value
+
+
+def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
+    record = load_release_manifest_record(path, tag)
+    return {
+        item["name"]: (item["sha256"], item["size"])
+        for item in record["assets"]
+    }
 
 
 def verify_release_asset_files(
@@ -1383,6 +1391,7 @@ def check_attestation_verification(
     server_url: str,
     source_digest: str,
     run_id: str,
+    run_attempt: int | None = None,
 ) -> int:
     arguments = {
         "archive_sha256": (archive_sha256, SHA256_RE),
@@ -1394,6 +1403,10 @@ def check_attestation_verification(
             raise ReleaseError(f"invalid attestation check argument {name}: {shown}")
     if not isinstance(run_id, str) or re.fullmatch(r"[0-9]+", run_id) is None:
         raise ReleaseError(f"invalid attestation check argument run_id: {repr(run_id)[:200]}")
+    if run_attempt is not None and (
+        isinstance(run_attempt, bool) or not isinstance(run_attempt, int) or run_attempt < 1
+    ):
+        raise ReleaseError(f"invalid attestation check argument run_attempt: {run_attempt!r}")
     if (
         not isinstance(repository, str)
         or repository.count("/") != 1
@@ -1456,7 +1469,12 @@ def check_attestation_verification(
                 f"attestation was built by an untrusted runner: {_attestation_excerpt(runner)}"
             )
         invocation = _attestation_string(certificate, "runInvocationURI")
-        if not invocation.startswith(expected_run):
+        invocation_matches = (
+            invocation == f"{expected_run}attempts/{run_attempt}"
+            if run_attempt is not None
+            else invocation.startswith(expected_run)
+        )
+        if not invocation_matches:
             raise ReleaseError(
                 "attestation is not bound to this workflow run: "
                 f"{_attestation_excerpt(invocation)}"
@@ -1523,6 +1541,61 @@ def load_attestation_verification(path: Path) -> Any:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def check_publication_identity(
+    *,
+    manifest_path: Path,
+    verification: Any,
+    workflow_run: Any,
+    tag: str,
+    tag_object: str,
+    commit: str,
+    repository: str,
+    server_url: str,
+) -> str:
+    """Bind a published manifest to its successful release run and current tag."""
+    record = load_release_manifest_record(manifest_path, tag)
+    oid_pattern = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+    for name, value in (("tag object", tag_object), ("tag commit", commit)):
+        if not isinstance(value, str) or oid_pattern.fullmatch(value) is None:
+            raise ReleaseError(f"invalid publication {name}")
+    if record["tag_object"] != tag_object or record["commit"] != commit:
+        raise ReleaseError("published tag identity does not match the signed release manifest")
+    if not isinstance(record["workflow_sha"], str) or oid_pattern.fullmatch(record["workflow_sha"]) is None:
+        raise ReleaseError("release manifest workflow_sha is invalid")
+
+    run_id = record["run_id"]
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9]{1,20}", run_id) is None:
+        raise ReleaseError("release manifest run_id is invalid")
+    if not isinstance(workflow_run, dict):
+        raise ReleaseError("malformed workflow run metadata")
+    run_record_id = workflow_run.get("id")
+    if isinstance(run_record_id, bool) or str(run_record_id) != run_id:
+        raise ReleaseError("workflow run id does not match the signed release manifest")
+    if (
+        workflow_run.get("status") != "completed"
+        or workflow_run.get("conclusion") != "success"
+        or workflow_run.get("path") != ".github/workflows/release.yml"
+    ):
+        raise ReleaseError("manifest run is not a successful release workflow run")
+    head_repository = workflow_run.get("head_repository")
+    if not isinstance(head_repository, dict) or head_repository.get("full_name") != repository:
+        raise ReleaseError("manifest run belongs to the wrong repository")
+    source_digest = workflow_run.get("head_sha")
+    if not isinstance(source_digest, str) or oid_pattern.fullmatch(source_digest) is None:
+        raise ReleaseError("manifest run has an invalid source commit")
+    run_attempt = workflow_run.get("run_attempt")
+    check_attestation_verification(
+        verification,
+        archive_sha256=_sha256(manifest_path),
+        repository=repository,
+        server_url=server_url,
+        source_digest=source_digest,
+        run_id=run_id,
+        run_attempt=run_attempt,
+    )
+    return run_id
 
 
 def check_release_asset_sizes(document: Any, patterns: Sequence[str]) -> list[str]:
@@ -1622,6 +1695,23 @@ def _run(args: argparse.Namespace) -> None:
             run_id=args.run_id,
         )
         print(f"{args.archive.name}: {count} attestation(s) bound to this run")
+        return
+    if args.command == "verify-publication-identity":
+        try:
+            workflow_run = json.loads(args.workflow_run.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ReleaseError(f"cannot read workflow run metadata {args.workflow_run}: {error}") from error
+        run_id = check_publication_identity(
+            manifest_path=args.release_manifest,
+            verification=load_attestation_verification(args.verification),
+            workflow_run=workflow_run,
+            tag=args.tag,
+            tag_object=args.tag_object,
+            commit=args.commit,
+            repository=args.repository,
+            server_url=args.server_url,
+        )
+        print(f"{args.tag}: signed release manifest is bound to run {run_id} and current tag")
         return
     if args.command == "check-asset-sizes":
         selected = check_release_asset_sizes(
@@ -1785,6 +1875,15 @@ def build_parser() -> argparse.ArgumentParser:
     verify_attestation_parser.add_argument("--server-url", required=True)
     verify_attestation_parser.add_argument("--source-digest", required=True)
     verify_attestation_parser.add_argument("--run-id", required=True)
+    publication_identity_parser = subparsers.add_parser("verify-publication-identity")
+    publication_identity_parser.add_argument("--release-manifest", required=True, type=Path)
+    publication_identity_parser.add_argument("--verification", required=True, type=Path)
+    publication_identity_parser.add_argument("--workflow-run", required=True, type=Path)
+    publication_identity_parser.add_argument("--tag", required=True)
+    publication_identity_parser.add_argument("--tag-object", required=True)
+    publication_identity_parser.add_argument("--commit", required=True)
+    publication_identity_parser.add_argument("--repository", required=True)
+    publication_identity_parser.add_argument("--server-url", required=True)
     check_sizes_parser = subparsers.add_parser("check-asset-sizes")
     check_sizes_parser.add_argument("--assets-json", required=True, type=Path)
     check_sizes_parser.add_argument("--pattern", action="append")

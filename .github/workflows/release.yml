@@ -917,6 +917,7 @@ jobs:
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
       - name: Check AUR metadata generation enablement
@@ -993,6 +994,7 @@ jobs:
     environment: package-publication-homebrew
     permissions:
       contents: read
+      actions: read
       attestations: read
     steps:
       - name: Require a main-branch dispatch
@@ -1013,6 +1015,7 @@ jobs:
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/ci-setup
         with:
@@ -1064,12 +1067,6 @@ jobs:
             echo "::error::release manifest missing: run the build to completion (verify-manifest) before publishing"
             exit 1
           fi
-          if ! gh attestation verify "$manifest" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-            --deny-self-hosted-runners; then
-            echo "::error::release manifest attestation did not verify"
-            exit 1
-          fi
           formula="thegn-$TAG-homebrew.rb"
           if ! python3 packaging/release.py verify-assets --tag "$TAG" \
             --release-manifest "$manifest" --asset "$publish_root/metadata/$formula"; then
@@ -1077,6 +1074,14 @@ jobs:
               "(release.py verify-assets refused; see its message above)"
             exit 1
           fi
+      - name: Re-verify immutable release identity before publication
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/verify-release-publication-identity.sh" \
+            "$TAG" "$PUBLISH_ROOT/metadata/thegn-$TAG-manifest.json"
       - name: Screen Homebrew metadata bytes
         if: steps.publication.outputs.ready == 'true'
         env:
@@ -1213,6 +1218,7 @@ jobs:
     environment: package-publication-aur
     permissions:
       contents: read
+      actions: read
       attestations: read
     steps:
       - name: Require a main-branch dispatch
@@ -1233,6 +1239,7 @@ jobs:
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Check AUR publication enablement
         id: publication
@@ -1302,12 +1309,6 @@ jobs:
             echo "::error::release manifest missing: run the build to completion (verify-manifest) before publishing"
             exit 1
           fi
-          if ! gh attestation verify "$manifest" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-            --deny-self-hosted-runners; then
-            echo "::error::release manifest attestation did not verify"
-            exit 1
-          fi
           pkgbuild="thegn-$TAG-PKGBUILD"
           if ! python3 packaging/release.py verify-assets --tag "$TAG" \
             --release-manifest "$manifest" --asset "$publish_root/metadata/$pkgbuild"; then
@@ -1321,6 +1322,14 @@ jobs:
             echo "::error::The generated AUR metadata does not match the release PKGBUILD."
             exit 1
           fi
+      - name: Re-verify immutable release identity before publication
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/verify-release-publication-identity.sh" \
+            "$TAG" "$PUBLISH_ROOT/metadata/thegn-$TAG-manifest.json"
       - name: Screen AUR metadata bytes
         if: steps.publication.outputs.ready == 'true'
         env:
