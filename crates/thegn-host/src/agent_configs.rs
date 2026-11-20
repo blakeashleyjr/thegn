@@ -642,10 +642,7 @@ fn phase2_allowed(agent: &str, rel: &str) -> bool {
                 ) {
                     return true;
                 }
-                matches!(
-                    second,
-                    "auth.json" | "models.json" | "AGENTS.md" | "trust.json"
-                ) && rest.next().is_none()
+                rest.next().is_none()
             }
             _ => false,
         },
@@ -1134,7 +1131,7 @@ pub(crate) fn upload_agent_configs(
         let (files, dirs) = thegn_core::envplan::agent_config_paths(agent);
         let mut agent_uploads = Vec::new();
         for f in files {
-            if already_uploaded.contains(&f) || !phase2_allowed(agent, &f) {
+            if already_uploaded.contains(&f) {
                 continue;
             }
             let Some(src) = agent_source_path(&host_home, &f, source) else {
@@ -1153,7 +1150,13 @@ pub(crate) fn upload_agent_configs(
             if !src.is_dir() {
                 continue;
             }
-            let (collected, walked) = collect_allowed_agent_files(agent, &src);
+            let (mut collected, walked) = collect_allowed_agent_files(agent, &src);
+            let warning_key = agent.trim().to_owned();
+            cap_unknown_agent_files(agent, &mut collected, &mut |message| {
+                if unknown_cap_warnings.insert(warning_key.clone()) {
+                    thegn_core::msg::warn(message);
+                }
+            });
             tracing::info!(
                 target: "thegn::startup",
                 agent = %agent,
@@ -1174,12 +1177,6 @@ pub(crate) fn upload_agent_configs(
                 agent_uploads.push((host_rel, data, exec));
             }
         }
-        let warning_key = agent.trim().to_owned();
-        cap_unknown_agent_files(agent, &mut agent_uploads, &mut |message| {
-            if unknown_cap_warnings.insert(warning_key.clone()) {
-                thegn_core::msg::warn(message);
-            }
-        });
         all_uploads.extend(agent_uploads);
     }
 
@@ -1959,9 +1956,10 @@ mod tests {
             ("codex", "prompts/a.md", true),
             ("codex", "AGENTS.md", true),
             ("codex", "auth.json", true),
-            ("pi", "agent/npm", false),
-            ("pi", "agent/git", false),
-            ("pi", "agent/sessions", false),
+            ("pi", "agent/npm/x", false),
+            ("pi", "agent/git/x", false),
+            ("pi", "agent/sessions/x", false),
+            ("pi", "agent/settings.json", true),
             ("pi", "agent/auth.json", true),
             ("pi", "agent/skills/a/SKILL.md", true),
             ("pi", "settings.json", true),
