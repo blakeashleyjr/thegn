@@ -7,6 +7,21 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- New worktree checkout directories end in a 16-character digest instead of 64. Existing checkouts are not moved.
+
+### Fixed
+
+- Vercel sandboxes: the egress policy is sent in the shape the API accepts; one-shot commands request their output; streamed commands can receive stdin; the interactive shell sends its environment in the documented form.
+- Vercel: an egress change now also reaches the running or starting session; snapshot listings read every page; a pending or failed session is no longer shown as running; extending a session that is gone is an error, not "at the plan ceiling"; CPU usage is shown while a session runs.
+- An issue plugin's update is checked against what was asked; oversized listings are reported as partial; duplicate issue ids in a reply are refused.
+- A config file rewritten with the same length during a capture is detected by comparing bytes.
+
+### Security
+
+- A plugin manifest is opened without following symlinks, and a manifest listing a capability twice is refused.
+
 ## [0.1.0-alpha.104] — 2026-11-19
 
 ### Added
