@@ -211,8 +211,14 @@ pub trait PaneEmulator: Send {
     /// distance from the bottom is closest to `hint_from_bottom`.
     /// None when the alt screen is active or the line is not in the grid. One
     /// lock.
-    fn locate_line(&self, _text: &str, _hint_from_bottom: usize) -> Option<usize> {
+    /// As `locate_line`, plus the logical line's top absolute grid line and its
+    /// row count (wrapped rows included): `(offset, top_line, rows)`.
+    fn locate_line_span(&self, _text: &str, _hint_from_bottom: usize) -> Option<(usize, i32, u16)> {
         None
+    }
+    fn locate_line(&self, text: &str, hint_from_bottom: usize) -> Option<usize> {
+        self.locate_line_span(text, hint_from_bottom)
+            .map(|(offset, _, _)| offset)
     }
     /// Borrow a visible row as a single plain string when it carries no
     /// styling, else `None`. The compositor composes cell-by-cell (so this is
@@ -676,7 +682,7 @@ impl PaneEmulator for AlacrittyEmulator {
         Some(newest)
     }
 
-    fn locate_line(&self, text: &str, hint_from_bottom: usize) -> Option<usize> {
+    fn locate_line_span(&self, text: &str, hint_from_bottom: usize) -> Option<(usize, i32, u16)> {
         use alacritty_terminal::index::{Column, Line, Point};
         use alacritty_terminal::term::cell::Flags;
 
@@ -696,16 +702,17 @@ impl PaneEmulator for AlacrittyEmulator {
         let last = screen as i32;
         let mut current: Option<String> = None;
         let mut current_top = 0i32;
-        let mut best: Option<(usize, usize)> = None;
+        let mut current_rows = 0u16;
+        let mut best: Option<(usize, i32, u16, usize)> = None;
 
-        let mut consider = |logical: String, top: i32| {
+        let mut consider = |logical: String, top: i32, rows: u16| {
             if logical.trim_end_matches(' ') != target {
                 return;
             }
             let offset = if top < 0 { (-top) as usize } else { 0 };
             let distance = offset.abs_diff(hint_from_bottom);
-            if best.is_none_or(|(_, best_distance)| distance < best_distance) {
-                best = Some((offset, distance));
+            if best.is_none_or(|(_, _, _, best_distance)| distance < best_distance) {
+                best = Some((offset, top, rows, distance));
             }
         };
 
@@ -728,29 +735,36 @@ impl PaneEmulator for AlacrittyEmulator {
                     segment.push_str(&logical);
                     current = Some(segment);
                     current_top = line_no;
+                    current_rows = current_rows.saturating_add(1);
                 }
                 Some(logical) => {
-                    consider(logical, current_top);
+                    consider(logical, current_top, current_rows);
                     current = Some(segment);
                     current_top = line_no;
+                    current_rows = 1;
                 }
                 None => {
                     current = Some(segment);
                     current_top = line_no;
+                    current_rows = 1;
                 }
             }
         }
 
         if let Some(logical) = current {
-            consider(logical, current_top);
+            consider(logical, current_top, current_rows);
         }
 
-        best.map(|(offset, _)| {
-            if offset == 0 {
-                0
-            } else {
-                offset.saturating_add(JUMP_CONTEXT_ROWS)
-            }
+        best.map(|(offset, top, rows, _)| {
+            (
+                if offset == 0 {
+                    0
+                } else {
+                    offset.saturating_add(JUMP_CONTEXT_ROWS)
+                },
+                top,
+                rows,
+            )
         })
     }
 
@@ -1080,6 +1094,17 @@ mod tests {
         e.advance(text.as_bytes());
 
         assert!(e.locate_line(&text, 0).is_some());
+    }
+
+    #[test]
+    fn locate_line_span_reports_top_and_rows_of_a_wrapped_line() {
+        let mut e = AlacrittyEmulator::new(5, 80, 100);
+        let text = "x".repeat(300);
+        e.advance(text.as_bytes());
+
+        let (_, top, rows) = e.locate_line_span(&text, 0).expect("wrapped history line");
+        assert!(rows >= 2);
+        assert_eq!(top, 0, "top should be the first wrapped row");
     }
 
     #[test]
