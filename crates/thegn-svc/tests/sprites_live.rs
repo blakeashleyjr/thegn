@@ -38,6 +38,32 @@ where
     panic!("{label} never succeeded: {last:?}");
 }
 
+/// A provider that may create and destroy: scoped like the host builds it
+/// (`provider_factory::sprites_policy`), with a throwaway ledger dir.
+fn scoped(token: &str, name: &str, owner: &str) -> (SpritesProvider, tempfile::TempDir) {
+    let ledger = tempfile::tempdir().expect("temporary sprites ledger");
+    let provider = SpritesProvider::new("", token, name)
+        .with_scope(thegn_svc::sprites::ledger::OwnerScope {
+            owner: owner.into(),
+            account: format!("acct1-{owner}"),
+        })
+        .with_ledger_dir(ledger.path().to_path_buf());
+    (provider, ledger)
+}
+
+/// On panic, name the sprite so it can be found and removed by hand (its
+/// temporary ledger is gone, so `thegn env reap --provider sprites --unrecorded`
+/// lists it).
+struct LeakNote(String);
+
+impl Drop for LeakNote {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("sprite may have leaked; remove it by hand: {}", self.0);
+        }
+    }
+}
+
 #[test]
 #[ignore = "live: needs SPRITES_TOKEN and network; read-only (lists, creates nothing)"]
 fn live_inventory_pages_read_only() {
@@ -95,15 +121,9 @@ fn live_sandbox_lifecycle() {
         return;
     };
     let name = format!("tglc-{}", std::process::id());
-    let ledger = tempfile::tempdir().unwrap();
-    let prov = thegn_svc::provider::Provider::Sprites(
-        SpritesProvider::new("", &token, &name)
-            .with_scope(thegn_svc::sprites::ledger::OwnerScope {
-                owner: "tglc-live".into(),
-                account: "acct1-tglc-live".into(),
-            })
-            .with_ledger_dir(ledger.path().to_path_buf()),
-    );
+    let (sprites, _ledger) = scoped(&token, &name, "tglc-live");
+    let prov = thegn_svc::provider::Provider::Sprites(sprites);
+    let _leak_note = LeakNote(name.clone());
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // Clean slate (ignore: may not exist yet).
@@ -151,7 +171,8 @@ fn live_agent_customizations() {
         return;
     };
     let name = format!("tgac-{}", std::process::id());
-    let p = SpritesProvider::new("", &token, &name);
+    let (p, _ledger) = scoped(&token, &name, "tgac-live");
+    let _leak_note = LeakNote(name.clone());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let sh = |s: &str| vec!["/bin/sh".to_string(), "-lc".to_string(), s.to_string()];
     rt.block_on(async {
@@ -232,7 +253,8 @@ fn live_provision_nix() {
         .expect("plan has a nix step");
 
     let name = format!("tgnix-{}", std::process::id());
-    let prov = SpritesProvider::new("", &token, &name);
+    let (prov, _ledger) = scoped(&token, &name, "tgnix-live");
+    let _leak_note = LeakNote(name.clone());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let sh = |s: &str| vec!["/bin/sh".to_string(), "-lc".to_string(), s.to_string()];
     rt.block_on(async {
@@ -286,8 +308,17 @@ fn live_reverse_tunnel() {
     };
     let bin = std::fs::read(&musl).expect("read musl thegn");
     let name = format!("tgtun-{}", std::process::id());
-    let p = SpritesProvider::new("", &token, &name);
-    let prov = thegn_svc::provider::Provider::Sprites(SpritesProvider::new("", &token, &name));
+    let owner = "tgtun-live";
+    let (p, ledger) = scoped(&token, &name, owner);
+    let prov = thegn_svc::provider::Provider::Sprites(
+        SpritesProvider::new("", &token, &name)
+            .with_scope(thegn_svc::sprites::ledger::OwnerScope {
+                owner: owner.into(),
+                account: format!("acct1-{owner}"),
+            })
+            .with_ledger_dir(ledger.path().to_path_buf()),
+    );
+    let _leak_note = LeakNote(name.clone());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let sh = |s: &str| vec!["/bin/sh".to_string(), "-lc".to_string(), s.to_string()];
 
@@ -376,7 +407,8 @@ fn live_provision_clone() {
         return;
     };
     let name = format!("tgprov-{}", std::process::id());
-    let p = SpritesProvider::new("", &token, &name);
+    let (p, _ledger) = scoped(&token, &name, "tgprov-live");
+    let _leak_note = LeakNote(name.clone());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let sh = |s: &str| vec!["/bin/sh".to_string(), "-lc".to_string(), s.to_string()];
 
@@ -421,7 +453,9 @@ fn live_end_to_end() {
         return;
     };
     let name = format!("tglive-{}", std::process::id());
-    let p = SpritesProvider::new("", &token, &name);
+    let owner = "tglive-live";
+    let (p, ledger) = scoped(&token, &name, owner);
+    let _leak_note = LeakNote(name.clone());
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     rt.block_on(async {
@@ -517,7 +551,14 @@ fn live_end_to_end() {
         // resident-bridge binary push: idempotent content handshake (8-B.3).
         // A small fake stands in for the musl thegn — the handshake is what we
         // verify (push once, no-op on identical bytes, bytes land at the path).
-        let prov = thegn_svc::provider::Provider::Sprites(SpritesProvider::new("", &token, &name));
+        let prov = thegn_svc::provider::Provider::Sprites(
+            SpritesProvider::new("", &token, &name)
+                .with_scope(thegn_svc::sprites::ledger::OwnerScope {
+                    owner: owner.into(),
+                    account: format!("acct1-{owner}"),
+                })
+                .with_ledger_dir(ledger.path().to_path_buf()),
+        );
         let fake = b"#!/bin/sh\necho fake-thegn\n";
         let pushed = warm_retry("ensure_executable", || {
             prov.ensure_executable(&name, "/workspace/.tg/thegn", fake)
