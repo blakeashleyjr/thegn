@@ -2218,6 +2218,7 @@ async fn iroh_control_stream(
             TransportAddr::Custom(_) => {
                 anyhow::bail!("Iroh direct control refuses custom addresses")
             }
+            _ => anyhow::bail!("Iroh direct control refuses unknown address transports"),
         }
     }
     anyhow::ensure!(
