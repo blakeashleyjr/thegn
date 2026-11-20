@@ -514,6 +514,8 @@ pub struct SidebarStatus {
     pub zones: crate::chrome::ZoneCatalog,
     /// Zone names that have no `[zone.<name>]` config policy (chip shows `!`).
     pub zones_unpoliced: std::collections::BTreeSet<String>,
+    /// The Lead indicator's facts (batch 180), gathered off-loop by `lead::status::gather`. None without `[lead]`, on stable, or under the e2e freeze. In `PartialEq`, so a change repaints (model_eq.rs:123).
+    pub lead: Option<thegn_core::lead_bar::LeadBar>,
     pub git: std::collections::BTreeMap<String, GitGlyphs>,
     pub branch_meta: std::collections::BTreeMap<String, BranchMeta>,
     /// The worktree's LIVE `HEAD` branch, keyed by path — read by the same git
@@ -942,6 +944,7 @@ fn push_lead_section(
     rows: &mut Vec<SidebarRow>,
     session: &Session,
     db_terminals: &[thegn_core::models::TerminalRow],
+    lead: Option<&thegn_core::lead_bar::LeadBar>,
 ) {
     use crate::lead::group::LEAD_GROUP_NAME;
     rows.push(SidebarRow::base(RowKind::SectionHeading, 0, "LEAD", "lead"));
@@ -950,7 +953,7 @@ fn push_lead_section(
         .iter()
         .position(|w| w.name == LEAD_GROUP_NAME && w.kind == crate::session::GroupKind::Terminal);
     let registered = crate::lead::group::lead_row(db_terminals).is_some();
-    let label = match live {
+    let mut label = match live {
         Some(i) => {
             let n = session.worktrees[i].tabs.len();
             format!("Lead ({n} {})", if n == 1 { "tab" } else { "tabs" })
@@ -958,6 +961,25 @@ fn push_lead_section(
         None if registered => "Lead".to_string(),
         None => "Lead \u{2014} Enter to start".to_string(),
     };
+    let state = lead.map(|bar| bar.state).filter(|state| {
+        matches!(
+            state,
+            thegn_core::lead_bar::LeadState::Working
+                | thegn_core::lead_bar::LeadState::WaitingOnYou
+                | thegn_core::lead_bar::LeadState::Paused
+                | thegn_core::lead_bar::LeadState::Unknown
+                | thegn_core::lead_bar::LeadState::Error
+        )
+    });
+    if (live.is_some() || registered)
+        && let Some(state) = state
+    {
+        label.push_str(&format!(
+            " {} {}",
+            crate::caps::active_glyphs().middot,
+            state.word()
+        ));
+    }
     let active = live.is_some_and(|i| i == session.active);
     rows.push(SidebarRow {
         tab_target: Some(match live {
@@ -1029,7 +1051,7 @@ pub fn build_rows(
 
     // The Lead is pinned at the very top: outside workspace ordering/reorder.
     if view.lead_enabled {
-        push_lead_section(&mut rows, session, db_terminals);
+        push_lead_section(&mut rows, session, db_terminals, status.lead.as_ref());
     }
 
     // Every ordering key the computed sorts read, in one place: the live status
@@ -2734,6 +2756,20 @@ mod tests {
         SidebarStatus::default()
     }
 
+    fn bar_with(state: thegn_core::lead_bar::LeadState) -> thegn_core::lead_bar::LeadBar {
+        thegn_core::lead_bar::LeadBar {
+            state,
+            tabs: 1,
+            approvals: Some(0),
+            first_request: None,
+            lanes: None,
+            spawns: None,
+            last: None,
+            last_age: None,
+            error: None,
+        }
+    }
+
     #[test]
     fn new_worktree_renders_below_current_under_manual_sort() {
         // home(gi0), feat-a(gi1, current), then add feat-b(gi2) at the end.
@@ -4085,6 +4121,23 @@ mod tests {
         // Not yet registered: still shown, with the start hint.
         let none = build_rows(&s, &[], &view, &no_activity(), &[], &[], &[]);
         assert!(none[1].label.contains("Enter to start"));
+    }
+
+    #[test]
+    fn lead_row_label_carries_the_state() {
+        let session = session(vec![WorktreeGroup::terminal("lead")], 0);
+        let view = ViewState {
+            lead_enabled: true,
+            ..Default::default()
+        };
+        let mut status = no_activity();
+        status.lead = Some(bar_with(thegn_core::lead_bar::LeadState::Working));
+        let rows = build_rows(&session, &[], &view, &status, &[], &[], &[]);
+        assert!(rows[1].label.contains("working"));
+
+        status.lead = Some(bar_with(thegn_core::lead_bar::LeadState::Idle));
+        let rows = build_rows(&session, &[], &view, &status, &[], &[], &[]);
+        assert_eq!(rows[1].label, "Lead (1 tab)");
     }
 
     #[test]
