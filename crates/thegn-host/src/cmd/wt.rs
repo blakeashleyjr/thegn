@@ -156,7 +156,7 @@ pub enum Action {
         /// Also delete the branch (`git branch -D`).
         #[arg(long)]
         delete_branch: bool,
-        /// Skip the confirmation prompt (teardown still runs).
+        /// Skip the confirmation prompt (teardown still runs). A provider sandbox's commits are still pulled first; with --force it is destroyed even when that pull fails or it has uncommitted changes.
         #[arg(long)]
         force: bool,
     },
