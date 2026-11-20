@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The documentation build passes again: doc links that could not be resolved are plain code text (THE-2389).
+
 ## [0.1.0-alpha.117] — 2026-11-20
 
 ### Changed
