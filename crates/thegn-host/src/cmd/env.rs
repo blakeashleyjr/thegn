@@ -386,6 +386,7 @@ pub(crate) fn create_env(a: CreateArgs) -> Result<()> {
 
 fn remove(cfg: &Config, name: &str) -> Result<()> {
     let rows = Db::open()?.worktrees()?;
+    let mut unresolved = Vec::new();
     let using: Vec<String> = rows
         .iter()
         .filter_map(|row| match resolve_for(cfg, Some(row.worktree.clone())) {
@@ -393,9 +394,18 @@ fn remove(cfg: &Config, name: &str) -> Result<()> {
                 Some(row.worktree.clone())
             }
             Ok(_) => None,
-            Err(_) => Some(row.worktree.clone()),
+            Err(_) => {
+                unresolved.push(row.worktree.clone());
+                None
+            }
         })
         .collect();
+    if !unresolved.is_empty() {
+        let wts = unresolved.join(", ");
+        anyhow::bail!(
+            "cannot resolve the env of {wts}; nothing was removed — fix or `thegn wt rm` them first"
+        );
+    }
     if let Some(refusal) = rm_refusal(name, &using) {
         anyhow::bail!(refusal);
     }
@@ -471,7 +481,7 @@ fn deprovision(
     if all {
         if let Err(rows) = owner_of("", &bindings) {
             anyhow::bail!(
-                "cannot tell whether registered worktrees use these sandboxes ({rows}); nothing was destroyed — repair or remove those worktrees first"
+                "cannot tell whether registered worktrees use these sandboxes ({rows}); nothing was destroyed — remove a stale one with `thegn wt rm <wt>`, or move it with `thegn env set <env> --worktree <wt>`"
             );
         }
         let listed = crate::agent::block_on_provider(|| async { provider.list().await })
@@ -492,7 +502,7 @@ fn deprovision(
                 }
                 Ok(None) => ids.push(id),
                 Err(rows) => anyhow::bail!(
-                    "cannot tell whether registered worktrees use these sandboxes ({rows}); nothing was destroyed — repair or remove those worktrees first"
+                    "cannot tell whether registered worktrees use these sandboxes ({rows}); nothing was destroyed — remove a stale one with `thegn wt rm <wt>`, or move it with `thegn env set <env> --worktree <wt>`"
                 ),
             }
         }
@@ -544,7 +554,7 @@ fn deprovision(
         ),
         Ok(None) => {}
         Err(rows) => anyhow::bail!(
-            "cannot tell whether a registered worktree uses sandbox {id} ({rows}); nothing was destroyed — repair or remove those worktrees first"
+            "cannot tell whether a registered worktree uses sandbox {id} ({rows}); nothing was destroyed — remove a stale one with `thegn wt rm <wt>`, or move it with `thegn env set <env> --worktree <wt>`"
         ),
     }
     crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, &id, worktree.as_deref())
@@ -1373,7 +1383,9 @@ fn destroy_provider_sandbox(
                     id,
                     opts.force,
                 )
-                .map_err(anyhow::Error::msg)?;
+                .map_err(|e| {
+                    anyhow::anyhow!("env down: {e} (`thegn env down --force` destroys it anyway)")
+                })?;
                 for note in notes.into_iter().filter(|note| note.warn) {
                     msg::warn(&note.text);
                 }
@@ -1423,7 +1435,7 @@ fn wait_until_gone(
         if now >= deadline {
             return match listed {
                 Ok(_) => Err(anyhow::anyhow!(
-                    "env down failed: sandbox {id} still exists after destroy (the provider still lists it); retry, or `thegn env deprovision {id}`"
+                    "env down failed: sandbox {id} still exists after destroy (the provider still lists it); retry `thegn env down`"
                 )),
                 Err(e) => Err(anyhow::anyhow!(
                     "env down: destroy was sent but could not be verified: {e:#}"
@@ -2093,8 +2105,9 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
                 .with_context(|| format!("read the stored location of {wt}"))?
                 .as_deref(),
         );
+        let mut left_work = false;
         if let Some(crate::provider_git::OfflineBinding::Bound { sandbox }) = old.as_ref()
-            && old_env.as_ref().is_ok_and(|old_env| old_env.name != name)
+            && env_changed(&old_env, name)
         {
             match crate::provider_git::pull_before_destroy(cfg, &wt) {
                 Ok(crate::provider_git::BeforeDestroy::Pulled {
@@ -2103,15 +2116,21 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
                 }) => {
                     outln!("pulled {}: {}", report.branch, report.summary());
                     if let Some(dirty) = sandbox_dirty.filter(|dirty| *dirty > 0) {
+                        left_work = true;
                         msg::warn(&format!(
                             "sandbox {sandbox}: {dirty} uncommitted or untracked path(s) stay in the sandbox"
                         ));
+                    } else if sandbox_dirty.is_none() {
+                        left_work = true;
                     }
                 }
-                Err(error) => msg::warn(&format!(
-                    "could not pull sandbox {sandbox} before switching ({error:#}); it is kept with any commits not pulled — switch back and run `thegn env pull`, or `thegn env down`"
-                )),
-                _ => {}
+                Err(error) => {
+                    left_work = true;
+                    msg::warn(&format!(
+                        "could not pull sandbox {sandbox} before switching ({error:#}); it is kept with any commits not pulled — switch back and run `thegn env pull`, or `thegn env down`"
+                    ));
+                }
+                _ => left_work = true,
             }
         }
         db.set_worktree_env(&wt, name)?;
@@ -2120,14 +2139,22 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
         } else {
             outln!("worktree {wt} → env {name}");
         }
-        if let Some(sandbox) = set_notice(old.as_ref(), stored_is_provider) {
+        if env_changed(&old_env, name)
+            && let Some(sandbox) = set_notice(old.as_ref(), stored_is_provider)
+        {
             let old_name = old_env
                 .as_ref()
                 .map(|old_env| old_env.name.as_str())
                 .unwrap_or(name);
-            msg::warn(&format!(
-                "the previous provider sandbox {sandbox} is still running; destroy it with `thegn env deprovision --env {old_name} {sandbox}`"
-            ));
+            if left_work {
+                msg::warn(&format!(
+                    "the previous provider sandbox {sandbox} is still running and may hold work that was not pulled; switch back (`thegn env set {old_name} --worktree {wt}`) and run `thegn env down --worktree {wt}`, which pulls first"
+                ));
+            } else {
+                msg::warn(&format!(
+                    "the previous provider sandbox {sandbox} is still running; destroy it with `thegn env deprovision --env {old_name} {sandbox}`"
+                ));
+            }
         }
         reconcile_location_after_set(cfg, &db, &wt, old_env.as_ref().ok())?;
     }
@@ -2145,6 +2172,10 @@ fn set_notice(
         Some(crate::provider_git::OfflineBinding::Bound { sandbox }) => Some(sandbox),
         _ => None,
     }
+}
+
+fn env_changed(old_env: &Result<thegn_core::env::Environment>, name: &str) -> bool {
+    old_env.as_ref().is_ok_and(|old_env| old_env.name != name)
 }
 
 /// What `env set` does with a worktree's stored location after the switch.
@@ -3115,7 +3146,7 @@ mod down_tests {
         let ids: Vec<String> = ["mine", "theirs", "broken"].map(String::from).to_vec();
         let mut deleted = Vec::new();
         let (mut out, mut warns) = (Vec::new(), Vec::new());
-        let outcome = super::destroy_all(
+        let mut outcome = super::destroy_all(
             &ids,
             |_| Ok(()),
             |id| match id {
@@ -3226,7 +3257,7 @@ mod down_tests {
             error.contains("env down failed: sandbox sbx-1 still exists after destroy"),
             "{error}"
         );
-        assert!(error.contains("thegn env deprovision sbx-1"), "{error}");
+        assert!(error.contains("retry `thegn env down`"), "{error}");
         assert!(sleeps.is_empty(), "{sleeps:?}");
     }
 
@@ -3354,7 +3385,7 @@ mod down_tests {
 
 #[cfg(test)]
 mod env_safety_tests {
-    use super::{owner_of, rm_refusal, set_notice};
+    use super::{env_changed, owner_of, rm_refusal, set_notice};
     use crate::provider_git::OfflineBinding;
 
     #[test]
@@ -3417,6 +3448,20 @@ mod env_safety_tests {
         ] {
             assert_eq!(set_notice(old, stored_is_provider), expected);
         }
+    }
+
+    #[test]
+    fn set_notice_skips_an_unchanged_environment() {
+        let old_env: anyhow::Result<thegn_core::env::Environment> =
+            Ok(thegn_core::env::Environment {
+                name: "sprites".into(),
+                placement: thegn_core::placement::Placement::Local,
+                sandbox: Default::default(),
+                data: thegn_core::config::DataMode::InEnv,
+                unresolved_selection: false,
+            });
+        assert!(!env_changed(&old_env, "sprites"));
+        assert!(env_changed(&old_env, "daytona"));
     }
 }
 
