@@ -70,6 +70,7 @@ pub fn resolve(secret_ref: &str) -> Option<String> {
 /// owner-only file fallback used by [`store`]. Use this when a long-lived
 /// identity must survive keyring-unavailable sessions after it was initially
 /// persisted to the fallback file.
+#[cfg(feature = "iroh")]
 pub fn resolve_stored(account: &str) -> Option<String> {
     let keyring_ref = format!("keyring:{account}");
     if let Some(value) = resolve_for(&keyring_ref, "stored-account") {
@@ -79,6 +80,7 @@ pub fn resolve_stored(account: &str) -> Option<String> {
     resolve_stored_from_dir(account, &dir)
 }
 
+#[cfg(feature = "iroh")]
 fn resolve_stored_from_dir(account: &str, dir: &std::path::Path) -> Option<String> {
     let path = resolve_token_path_in(dir, account).ok()?;
     resolve_for(&format!("file:{}", path.display()), "stored-account")
@@ -2837,6 +2839,7 @@ mod tests {
         assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok");
     }
 
+    #[cfg(feature = "iroh")]
     #[test]
     fn stored_account_reuses_file_fallback_when_keyring_is_missing() {
         let temp = private_temp();

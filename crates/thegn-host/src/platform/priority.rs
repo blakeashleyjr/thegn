@@ -17,8 +17,11 @@ pub enum IoClass {
     BestEffort(u8),
     Idle,
     #[cfg_attr(
-        not(target_os = "linux"),
-        expect(dead_code, reason = "constructed only by the Linux ioprio decoder")
+        all(not(target_os = "linux"), not(test)),
+        expect(
+            dead_code,
+            reason = "constructed only by non-Linux tests; Linux production uses it"
+        )
     )]
     None,
 }
