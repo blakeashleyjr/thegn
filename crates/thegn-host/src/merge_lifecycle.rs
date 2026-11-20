@@ -2944,7 +2944,7 @@ mod tests {
             &root,
             &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -2994,7 +2994,7 @@ mod tests {
             &root,
             &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -3058,7 +3058,7 @@ mod tests {
             ),
             "{second:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -3076,8 +3076,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let commit = record_private_land(&db, &root, &feat_s, "feat");
         db.del_worktree(&feat_s).unwrap();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
         db.set_workspace_env(&root_s, "kube").unwrap();
         git(
             &root,
@@ -3109,7 +3109,7 @@ mod tests {
             &root,
             &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -3118,8 +3118,8 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "crash-unregistered-local");
         let feat_s = feat.to_string_lossy().to_string();
-        let commit = record_private_land(&db, &root, &feat_s, "feat");
         db.del_worktree(&feat_s).unwrap();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
         git(
             &root,
             &["worktree", "remove", "--force", feat.to_str().unwrap()],
@@ -3154,7 +3154,7 @@ mod tests {
             "{outcome:?}"
         );
         assert!(db.list_merge_queue().unwrap().is_empty(), "row retired");
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// A checkout that still exists never takes the already-gone path.
