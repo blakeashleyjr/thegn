@@ -70,6 +70,7 @@ fn every_configured_top_level_variant_parses_without_static_authority() {
     case!(Command::Project { .. }, ["program", "list"]);
     case!(Command::Placement { .. }, ["placement", "list"]);
     case!(Command::Fleet { .. }, ["fleet", "list"]);
+    case!(Command::Info(..), ["info"]);
     case!(Command::Mcp { .. }, ["mcp", "list"]);
     case!(Command::Agent { .. }, ["agent", "list"]);
     case!(Command::Skills { .. }, ["skills", "list"]);
