@@ -11,6 +11,45 @@ fail() {
   exit 1
 }
 
+python3 - "$root/test/macos/apple-container-list-probe.py" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("apple_list_probe", sys.argv[1])
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+
+marker = "mixedCaseMarker"
+fixtures = [
+    (
+        '[{"Name":"/thegn-run-label","Config":{"Labels":{"thegn.spike":"mixedCaseMarker"}}}]',
+        (True, True, True),
+    ),
+    (
+        '{"containers":[{"names":["thegn-run-label"],"labels":["thegn.spike=mixedCaseMarker"]}]}',
+        (True, True, True),
+    ),
+    (
+        '[{"Name":"thegn-run-label-extra","Labels":{"thegn.spike":"mixedCaseMarker"}}]',
+        (True, False, False),
+    ),
+    (
+        '[{"Name":"thegn-run-label","Labels":{"thegn.spike":"other"}},'
+        '{"Name":"another-container","Labels":{"thegn.spike":"mixedCaseMarker"}}]',
+        (True, True, False),
+    ),
+    ("not json", (False, False, False)),
+]
+for payload, expected in fixtures:
+    actual = probe.proof_flags(payload, "thegn-run-label", marker)
+    if actual != expected:
+        raise SystemExit("apple list parser fixture mismatch: %r != %r" % (actual, expected))
+PY
+
+resource_id="$(printf '%s' 's05xlAQhI' | macos_ws05_resource_id)"
+[ "$resource_id" = s05xlaqhi ] || fail "mixed-case resource suffix was not normalized: $resource_id"
+case "$resource_id" in *[!a-z0-9]* | "") fail "resource id is not portable lowercase: $resource_id" ;; esac
+
 expect_contains() {
   case "$1" in *"$2"*) ;; *) fail "expected '$1' to contain '$2'" ;; esac
 }
