@@ -7,6 +7,16 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The Vercel live check proves that a stop and a resume reached the provider.
+
+### Fixed
+
+- Vercel: a one-shot command refused because its session had stopped is retried once after resume.
+- Vercel: stopping or killing something already stopped is success; an expired saved snapshot gives a clear refusal with the remedy, and nothing is deleted automatically.
+- Vercel: a snapshot listing that does not finish is never treated as complete: destroy keeps its record and can be retried, and cost reports are marked incomplete; snapshots of a sandbox that is gone are priced.
+
 ## [0.1.0-alpha.105] — 2026-11-19
 
 ### Changed
