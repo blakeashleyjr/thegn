@@ -1976,13 +1976,11 @@ fn prune_reaps_a_removed_group_whose_registry_row_is_already_gone() {
 
 #[test]
 fn prune_reaps_a_branch_group_whose_dir_is_a_dot_git_less_remnant() {
-    let base = std::env::temp_dir().join(format!(
-        "tg-the73-prune-remnant-{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("tg-the73-prune-remnant-{}", std::process::id()));
+    let state_home = base.join("state");
     let repo = base.join("repo");
     let far = base.join("way-over-here").join("wt");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
 
     #[expect(clippy::disallowed_methods)]
@@ -2004,6 +2002,8 @@ fn prune_reaps_a_branch_group_whose_dir_is_a_dot_git_less_remnant() {
         active: 0,
     };
 
+    let _env =
+        crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
     assert_eq!(
         prune_stale_worktree_groups(&mut session, &db, "s", &Default::default()),
         1
@@ -2011,12 +2011,13 @@ fn prune_reaps_a_branch_group_whose_dir_is_a_dot_git_less_remnant() {
     assert!(session.worktrees.is_empty());
     assert!(db.worktrees().unwrap().is_empty());
 
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
 fn prune_keeps_the_home_group_of_a_plain_dir_workspace() {
     let dir = tempfile::tempdir().unwrap();
+    let state_home = dir.path().join("state");
     let mut session = Session {
         id: dir.path().to_string_lossy().into_owned(),
         worktrees: vec![WorktreeGroup::new(
@@ -2027,23 +2028,33 @@ fn prune_keeps_the_home_group_of_a_plain_dir_workspace() {
         active: 0,
     };
     let db = thegn_core::db::Db::open_memory().unwrap();
+    let _env =
+        crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
 
     assert_eq!(
         prune_stale_worktree_groups(&mut session, &db, "s", &Default::default()),
         0
     );
     assert_eq!(session.worktrees.len(), 1);
+    let p = dir.path().to_string_lossy().into_owned();
+    assert!(group_checkout_present(
+        &WorktreeGroup::new("app/home", GroupKind::Home, p.clone()),
+        Some(&p),
+    ));
+    assert!(!group_checkout_present(
+        &WorktreeGroup::new("app/x", GroupKind::Branch, p),
+        None,
+    ));
 }
 
 #[test]
 fn db_worktree_list_reaps_a_remnant_registry_row_git_no_longer_lists() {
-    let base = std::env::temp_dir().join(format!(
-        "tg-the73-db-remnant-gone-{}",
-        std::process::id()
-    ));
+    let base =
+        std::env::temp_dir().join(format!("tg-the73-db-remnant-gone-{}", std::process::id()));
+    let state_home = base.join("state");
     let repo = base.join("repo");
     let far = base.join("way-over-here").join("wt");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
 
     #[expect(clippy::disallowed_methods)]
@@ -2060,15 +2071,18 @@ fn db_worktree_list_reaps_a_remnant_registry_row_git_no_longer_lists() {
     db.put_worktree("repo/feat", &root_s, &far_s, "feat", None, None)
         .unwrap();
 
+    let _env =
+        crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
     assert!(db_worktree_list(&db, &thegn_core::config::Config::default()).is_empty());
     assert!(db.worktrees().unwrap().is_empty());
 
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
 fn db_worktree_list_keeps_a_remnant_row_git_still_lists() {
     let dir = tempfile::tempdir().unwrap();
+    let state_home = dir.path().join("state");
     let (root_s, far_s) =
         git_repo_with_linked_worktree(&dir.path().join("repo"), &dir.path().join("linked"));
     std::fs::remove_file(std::path::Path::new(&far_s).join(".git")).unwrap();
@@ -2078,6 +2092,8 @@ fn db_worktree_list_keeps_a_remnant_row_git_still_lists() {
     db.put_worktree("repo/feat", &root_s, &far_s, "feat", None, None)
         .unwrap();
 
+    let _env =
+        crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
     let listed = db_worktree_list(&db, &thegn_core::config::Config::default());
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].path, far_s);
