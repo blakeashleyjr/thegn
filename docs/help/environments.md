@@ -319,8 +319,11 @@ Newer steps (dev channel, unverified live until a paid run passes them):
 `test/remote-daily.sh` checks the `agent run` JSON and adds three steps for
 sprites and vercel: `11m` commits inside the worktree through the exec bridge,
 `11k` lands it without `--release-sandbox` (the sandbox is kept), and `11j`
-confirms the record is still `ready` and still listed. All of these stay
-plan-only without the spend flags.
+confirms the record is still `ready` and still listed. Step 8 requires the land
+to report releasing the sandbox; `11k` requires the land to report pulling the
+sandbox's branch and the commit to be in main. Both lands pass a gate command
+that always succeeds, because the scratch repository has no build. All of these
+stay plan-only without the spend flags.
 
 ### Warm claim, agent preflight and progress
 
@@ -391,8 +394,19 @@ Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
   is bound to the worktree. Pulls of one worktree are serialised across
   processes by a lock; a second caller waits up to 120 seconds, then reports
   `up to date` or "another pull of <worktree> is running".
-- **Land.** `thegn land` on a provider worktree first pulls the sandbox's
-  branch, then lands the local branch. A diverged or dirty pull refuses and
+- **Land.** A worktree has a sandbox when its stored location is a provider
+  location, or its environment is a provider environment and the sandbox exists
+  (the local provisioned marker, or a complete provider listing shows it). So a
+  worktree created from the command line (`thegn wt new --env`, then
+  `thegn env up`) is handled the same as one opened in a pane. `thegn land` on
+  such a worktree first pulls the sandbox's branch, then lands the local
+  branch, then prints `released sandbox <name>` (with `--release-sandbox`) or
+  `sandbox <name> kept`. When the provider's listing cannot say whether the
+  sandbox exists, land is refused and names the sandbox: retry when the provider
+  answers, or move the worktree to a local environment with `thegn env set`.
+  `--release-sandbox` on a worktree with no provider sandbox prints
+  `! --release-sandbox ignored: this worktree has no provider sandbox (its env is not provider-placed, or a complete provider listing lacks it); nothing was released`
+  and still exits 0. A diverged or dirty pull refuses and
   names the kept ref; a missing sandbox lands the local branch. The sandbox is
   kept, because it holds gitignored state that exists nowhere else:
   `sandbox <name> kept (thegn land --release-sandbox, or env reap, removes it)`.
