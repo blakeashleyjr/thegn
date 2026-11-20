@@ -942,6 +942,44 @@ scope checks.
 - **THEN** diagnostics may name the endpoint/topology but omit the token and
   persisted URLs contain no reusable bearer credential
 
+### Requirement: Direct Iroh pairing uses the existing scoped control authority
+
+The opt-in direct Iroh control listener SHALL use a dedicated control ALPN,
+explicit direct IP socket addresses, and an endpoint ID authenticated by the
+Iroh handshake. It SHALL disable relay and address lookup and SHALL serve the
+existing control router with implicit local administration disabled. Pairing
+SHALL redeem the existing expiring single-use code and every later request
+SHALL verify the resulting scoped token against the existing revocation store.
+The direct control transport SHALL remain separate from sandbox `ExecReq`
+transport and existing SSH/dumbpipe host behavior.
+
+#### Scenario: A direct invitation is redeemed and reused
+
+- **WHEN** a peer redeems a valid invitation and then reconnects to the
+  invited endpoint ID using its explicit direct addresses
+- **THEN** the peer receives only the code's scopes and can make an authorized
+  control request over the separate Iroh control ALPN
+
+#### Scenario: Direct control has no implicit local administrator
+
+- **WHEN** a QUIC peer connects to the direct control listener without a
+  bearer token
+- **THEN** protected routes reject the request even if the listener process
+  also owns a local Unix socket that grants same-UID administrator access
+
+#### Scenario: Direct pairing is revoked or cannot be redeemed
+
+- **WHEN** a code is expired, already redeemed, or presented to a different
+  endpoint, or a redeemed token is revoked
+- **THEN** the normal pairing/authentication path refuses it and does not grant
+  broader local administrator authority
+
+#### Scenario: No direct IP path exists
+
+- **WHEN** the invited peer cannot reach an explicit IP socket address
+- **THEN** connection fails with a direct-connect error; the client does not
+  query an address lookup service or fall back to a relay
+
 ### Requirement: Unsafe or incomplete topology is diagnosable
 
 Config validation, startup, and `thegn doctor` SHALL distinguish safe loopback,

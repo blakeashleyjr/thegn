@@ -66,6 +66,24 @@ pub fn resolve(secret_ref: &str) -> Option<String> {
     resolve_for(secret_ref, "host")
 }
 
+/// Resolve a stored account by checking the keyring and then the managed
+/// owner-only file fallback used by [`store`]. Use this when a long-lived
+/// identity must survive keyring-unavailable sessions after it was initially
+/// persisted to the fallback file.
+pub fn resolve_stored(account: &str) -> Option<String> {
+    let keyring_ref = format!("keyring:{account}");
+    if let Some(value) = resolve_for(&keyring_ref, "stored-account") {
+        return Some(value);
+    }
+    let dir = secrets_dir_path().ok()?;
+    resolve_stored_from_dir(account, &dir)
+}
+
+fn resolve_stored_from_dir(account: &str, dir: &std::path::Path) -> Option<String> {
+    let path = resolve_token_path_in(dir, account).ok()?;
+    resolve_for(&format!("file:{}", path.display()), "stored-account")
+}
+
 /// [`resolve`] with an explicit consumer tag for the audit trail
 /// (`provider:fly`, `snapshot`, …). Bare strings are env-var **names** (the
 /// `api_key_env` family). For fields whose bare string is a literal value
@@ -2817,6 +2835,20 @@ mod tests {
         .unwrap();
         assert!(result.starts_with("file:"));
         assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok");
+    }
+
+    #[test]
+    fn stored_account_reuses_file_fallback_when_keyring_is_missing() {
+        let temp = private_temp();
+        let token_ref = store_in(temp.path(), "iroh-control-node", "stable-key", |_, _, _| {
+            KeyringOutcome::Completed(Err(KeyringWriteError::Denied("offline".into())))
+        })
+        .unwrap();
+        assert!(token_ref.starts_with("file:"));
+        assert_eq!(
+            resolve_stored_from_dir("iroh-control-node", temp.path()).as_deref(),
+            Some("stable-key")
+        );
     }
 
     #[test]

@@ -200,6 +200,21 @@ uses its existing bearer token and read scope; filters only narrow an already
 authorized subscription. A missing daemon returns the usual recoverable
 no-daemon error. There is no new config key.
 
+### Direct Iroh pairing
+
+`thegn serve --iroh-direct --no-pair-url` opts into a separate Iroh control
+listener and prints only its stable peer ID and concrete direct IP addresses.
+Direct mode requires a reachable IP path and does not use relays, address
+lookup, Tailscale, or the sandbox `ExecReq` protocol. Run
+`thegn pair direct new --endpoint-id <id> --address <ip:port> --out invite.json`
+to mint a scoped one-time code and write an owner-only invitation file using
+the printed direct address. Transfer the file securely. On the receiving peer,
+`thegn pair direct redeem <name> --invitation-file <path>` saves the token via
+the OS keyring or protected secret-file fallback without printing it. The
+saved profile can reconnect with `thegn pair direct me <name>`; server-side
+`thegn pair revoke <pairing-id>` continues to revoke the token. This is a
+dev-channel feature.
+
 ## Which worktree am I acting on?
 
 Every verb that acts **on** a worktree takes `--worktree <path>`. Omit it

@@ -1218,6 +1218,9 @@ pub(crate) struct ServeOpts {
     pub advertise_host: Option<String>,
     /// Trusted CLI override for the client-facing port.
     pub advertise_port: Option<u16>,
+    /// Start the separate direct-only Iroh control listener.
+    #[cfg(feature = "iroh")]
+    pub iroh_direct: bool,
 }
 
 fn registry_control_origin(
@@ -1227,10 +1230,65 @@ fn registry_control_origin(
     transport.advertised_origin(actual_bind_port)
 }
 
+#[cfg(feature = "iroh")]
+fn direct_invitation_command(
+    executable: &std::path::Path,
+    profile: &str,
+    peer_id: &str,
+    addresses: &[String],
+) -> String {
+    let mut command = format!(
+        "THEGN_CHANNEL=dev {} --profile {} pair direct new --endpoint-id {}",
+        shell_quote_arg(&executable.display().to_string()),
+        shell_quote_arg(profile),
+        shell_quote_arg(peer_id)
+    );
+    for address in addresses {
+        command.push_str(" --address ");
+        command.push_str(&shell_quote_arg(address));
+    }
+    command.push_str(" --scope read --out invite.json");
+    command
+}
+
+#[cfg(feature = "iroh")]
+fn shell_quote_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// `[lead] token_ttl_secs` for a listener's sliding Lead-token refresh; `0`
 /// (no slide) without a configured Lead.
 fn lead_token_ttl_secs(cfg: &Config) -> u64 {
     cfg.lead.as_ref().map_or(0, |lead| lead.token_ttl_secs)
+}
+
+#[cfg(feature = "iroh")]
+fn direct_control_secret() -> Result<[u8; 32]> {
+    const ACCOUNT: &str = "iroh-control-node";
+    let decode = |value: &str| -> Option<[u8; 32]> {
+        let value = value.trim().as_bytes();
+        if value.len() != 64 || !value.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let pair = std::str::from_utf8(&value[index * 2..index * 2 + 2]).ok()?;
+            *byte = u8::from_str_radix(pair, 16).ok()?;
+        }
+        Some(bytes)
+    };
+    if let Some(existing) = crate::secret::resolve_stored(ACCOUNT) {
+        return decode(&existing).context("stored direct Iroh control identity is malformed");
+    }
+    let mut bytes = [0; 32];
+    getrandom::fill(&mut bytes).context("generate direct Iroh control identity")?;
+    let encoded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let secret_ref = crate::secret::store(ACCOUNT, &encoded)
+        .context("persist direct Iroh control identity in keyring or owner-only secret file")?;
+    crate::secret::resolve(&secret_ref)
+        .as_deref()
+        .and_then(decode)
+        .context("verify persisted direct Iroh control identity")
 }
 
 /// Entry point for the hidden `thegn daemon` subcommand: builds the runtime
@@ -1648,6 +1706,8 @@ async fn run(
             lead_listener: false,
             lead_token_ttl_secs: lead_token_ttl_secs(cfg),
         };
+        #[cfg(feature = "iroh")]
+        let direct_state = tcp_state.clone();
         let grpc = thegn_svc::control::grpc::GrpcControl {
             api: svc.clone(),
             store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
@@ -1659,6 +1719,36 @@ async fn run(
             tonic::service::Routes::new(thegn_svc::control::grpc::ControlServer::new(grpc))
                 .into_axum_router(),
         );
+        #[cfg(feature = "iroh")]
+        if opts.iroh_direct {
+            let endpoint = thegn_svc::control::iroh::bind_direct(direct_control_secret()?).await?;
+            let direct_addr = thegn_svc::control::iroh::direct_address(&endpoint)?;
+            let addresses: Vec<String> = direct_addr.ip_addrs().map(ToString::to_string).collect();
+            thegn_core::outln!("direct Iroh control peer: {}", direct_addr.id);
+            for address in &addresses {
+                thegn_core::outln!("  direct address: {address}");
+            }
+            thegn_core::outln!(
+                "create a protected direct invitation: {}",
+                direct_invitation_command(
+                    &std::env::current_exe().context("resolve current CLI executable")?,
+                    &thegn_core::profile::name(),
+                    &direct_addr.id.to_string(),
+                    &addresses,
+                )
+            );
+            let shutdown_direct = shutdown.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown_direct.cancelled_owned() => {}
+                    result = thegn_svc::control::iroh::serve(endpoint, direct_state) => {
+                        if let Err(error) = result {
+                            tracing::warn!(target: "thegn::daemon", error = %format!("{error:#}"), "direct Iroh control listener exited");
+                        }
+                    }
+                }
+            });
+        }
         let shutdown_tcp = shutdown.clone();
         tokio::spawn(async move {
             if let Err(e) = axum::serve(tcp, tcp_app)
@@ -1684,7 +1774,11 @@ async fn run(
                 "WARNING: explicit unsafe plaintext non-loopback exposure is enabled; bearer credentials and terminal traffic are observable in transit"
             );
         }
-        if !opts.no_pair_url {
+        #[cfg(feature = "iroh")]
+        let print_startup_pair_url = !opts.no_pair_url && !opts.iroh_direct;
+        #[cfg(not(feature = "iroh"))]
+        let print_startup_pair_url = !opts.no_pair_url;
+        if print_startup_pair_url {
             let now = now_ms();
             let minted = thegn_svc::control::auth::mint(
                 thegn_core::control::TokenKind::PairingCode,
@@ -1992,6 +2086,21 @@ fn daemon_busy(sessions: usize, schedule_or_producer_armed: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn direct_pair_startup_hint_uses_runnable_protected_invitation_command() {
+        let command = direct_invitation_command(
+            std::path::Path::new("/nix/store/dev package/bin/thegn-dev"),
+            "work profile",
+            "peer-id",
+            &["192.0.2.7:4567".into(), "[fd00::1]:4568".into()],
+        );
+        assert_eq!(
+            command,
+            "THEGN_CHANNEL=dev '/nix/store/dev package/bin/thegn-dev' --profile 'work profile' pair direct new --endpoint-id 'peer-id' --address '192.0.2.7:4567' --address '[fd00::1]:4568' --scope read --out invite.json"
+        );
+    }
 
     #[test]
     fn an_armed_schedule_or_producer_keeps_an_otherwise_idle_daemon_busy() {

@@ -163,6 +163,8 @@ fn addr_key(addr: &ControlAddr) -> String {
         ControlAddr::Unix(path) => format!("unix:{}", path.display()),
         ControlAddr::Tcp { addr, .. } => format!("tcp:{addr}"),
         ControlAddr::HttpOrigin { origin, .. } => format!("origin:{origin}"),
+        #[cfg(feature = "iroh")]
+        ControlAddr::Iroh { endpoint, .. } => format!("iroh:{}", endpoint.id),
     }
 }
 
@@ -171,6 +173,8 @@ fn addr_label(addr: &ControlAddr) -> String {
         ControlAddr::Unix(path) => path.display().to_string(),
         ControlAddr::Tcp { addr, .. } => addr.clone(),
         ControlAddr::HttpOrigin { origin, .. } => origin.clone(),
+        #[cfg(feature = "iroh")]
+        ControlAddr::Iroh { endpoint, .. } => format!("iroh:{}", endpoint.id),
     }
 }
 
