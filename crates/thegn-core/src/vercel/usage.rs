@@ -46,8 +46,13 @@ pub struct Accrual {
 /// The current session's accrued spend at `now_ms`, or `None` when the
 /// response lacks the fields to price it.
 ///
-/// CPU = `active_cpu_ms / 3_600_000 × rate`; it is NOT multiplied by vCPUs
-/// (UNVERIFIED whether the API value is already per-vCPU). Memory is `memory_mb / 1024 × wall hours × rate`; the API's `memory` unit is UNVERIFIED (read as MB; live step).
+/// CPU = `active_cpu_ms / 3_600_000 × rate`; active CPU time is summed across
+/// the sandbox's vCPUs (Vercel pricing page), so the CPU figure is NOT
+/// multiplied by the vCPU count. Memory is `memory_mb / 1024 × wall hours ×
+/// rate`; the sandbox `memory` field is in megabytes (OpenAPI: GET
+/// `/v2/sandboxes/{name}`, field `memory`). Vercel bills provisioned memory in
+/// one-minute minimum increments; this estimate does not round up, so it can
+/// be slightly low for very short sessions.
 pub fn session_accrual(u: &SessionUsage, now_ms: i64, r: &Rates) -> Option<Accrual> {
     let start = u.started_at_ms?;
     let end = u.stopped_at_ms.unwrap_or(now_ms);
@@ -94,6 +99,19 @@ mod tests {
         let a = session_accrual(&u(), 0, &PRO_IAD1).unwrap();
         assert!((a.cpu_usd - 0.128).abs() < 1e-9);
         assert!((a.memory_usd - 2.0 * 2.0 * 0.0212).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cpu_cost_is_not_multiplied_by_vcpus() {
+        let mut one_vcpu = u();
+        one_vcpu.vcpus = Some(1);
+        let mut four_vcpus = one_vcpu.clone();
+        four_vcpus.vcpus = Some(4);
+
+        let one = session_accrual(&one_vcpu, 0, &PRO_IAD1).unwrap();
+        let four = session_accrual(&four_vcpus, 0, &PRO_IAD1).unwrap();
+
+        assert_eq!(one.cpu_usd, four.cpu_usd);
     }
 
     #[test]
