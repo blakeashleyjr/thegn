@@ -30,7 +30,7 @@ done
 plan="$("$python" packaging/release.py "${plan_args[@]}")"
 mapfile -t upload_assets < <(jq -r '.[]' <<<"$plan")
 if ((${#upload_assets[@]})); then
-  # No --clobber: a concurrent same-name upload fails closed.
+  # Replacement is intentionally omitted; a same-name race fails closed.
   gh release upload "$tag" "${upload_assets[@]}"
 else
   echo "::notice::all requested release assets already match their SHA-256 digests"

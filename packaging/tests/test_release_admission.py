@@ -232,6 +232,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
                     for index, step in enumerate(steps)
                     if "gh release create" in step.get("run", "")
                     or "gh release upload" in step.get("run", "")
+                    or ".github/scripts/upload-release-assets.sh" in step.get("run", "")
                     or str(step.get("uses", "")).startswith("actions/attest-")
                 ),
                 None,
@@ -239,7 +240,10 @@ class ReleaseAdmissionTests(unittest.TestCase):
             self.assertIsNotNone(first_privileged_index, f"{job_name} must expose a write/attest step")
             if job_name == "package" and first_check_index == first_privileged_index:
                 script = check_step["run"]
-                self.assertLess(script.index("git ls-remote"), script.index("gh release upload"))
+                self.assertLess(
+                    script.index("git ls-remote"),
+                    script.index(".github/scripts/upload-release-assets.sh"),
+                )
             else:
                 self.assertLess(first_check_index, first_privileged_index, job_name)
 
