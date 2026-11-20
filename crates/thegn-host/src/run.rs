@@ -14917,6 +14917,13 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
+                RefreshKind::Info(p) => {
+                    dirty |= crate::detail::info::apply(
+                        &mut bar_detail,
+                        *p,
+                        crate::compositor::Rect::full(cols, rows),
+                    )
+                }
                 RefreshKind::Onboarding(r) => {
                     dirty |=
                         crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
@@ -26412,6 +26419,13 @@ async fn event_loop<T: Terminal>(
                                     model.status = msg;
                                 }
                             }
+                            Action::RetryPullbacks => {
+                                crate::cmd::env_sync_retry::spawn_retry(
+                                    refresh_tx.clone(),
+                                    waker.clone(),
+                                );
+                                model.status = "Retrying failed pull-backs…".into();
+                            }
                             Action::TogglePanel => {
                                 panel_auto_revealed = None;
                                 // Toggle on what the user SEES: if the panel
@@ -26823,6 +26837,39 @@ async fn event_loop<T: Terminal>(
                                     current_config.model_proxy.enabled,
                                     current_config.model_proxy.budget.clone(),
                                 );
+                            }
+                            Action::OpenInfo => {
+                                let row =
+                                    focus.sidebar().then(|| sb.selected_row(&model)).flatten();
+                                let active = session
+                                    .active_group()
+                                    .map(|g| g.path.clone())
+                                    .filter(|p| !p.is_empty());
+                                match crate::detail::info::target_for(
+                                    row,
+                                    &model,
+                                    active,
+                                    &panel_ui.docs.daemon_sessions,
+                                    panel_ui.docs.daemon_sessions_at,
+                                ) {
+                                    Some((target, facts, title)) => {
+                                        let screen = crate::compositor::Rect::full(cols, rows);
+                                        bar_detail =
+                                            Some(crate::detail::info::loading(&title, screen));
+                                        crate::detail::info::spawn(
+                                            refresh_tx.clone(),
+                                            waker.clone(),
+                                            current_config.clone(),
+                                            target,
+                                            facts,
+                                            title,
+                                        );
+                                    }
+                                    None => {
+                                        model.status =
+                                            "Info covers project and worktree rows".into();
+                                    }
+                                }
                             }
                             Action::OpenShares => {
                                 panel_auto_revealed = None;

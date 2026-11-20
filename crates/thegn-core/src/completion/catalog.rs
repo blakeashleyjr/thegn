@@ -287,6 +287,7 @@ pub const CATALOG: &[Slot] = &[
     slot("clean", "worktree", SourceKind::Worktree),
     slot("diff", "worktree", SourceKind::Worktree),
     slot("disk", "worktree", SourceKind::Worktree),
+    slot("info", "worktree", SourceKind::Worktree),
     slot("dispatch put", "worktree_path", SourceKind::Worktree),
     slot("env clear", "worktree", SourceKind::Worktree),
     slot("env clear", "worktree_pos", SourceKind::Worktree),
@@ -348,6 +349,13 @@ pub const CATALOG: &[Slot] = &[
     // call on <TAB>, so it stays free text.
     slot(
         "env adopt",
+        "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // A sprite name as the Sprites API lists it: listing would be a network
+    // call on <TAB>, so it stays free text.
+    slot(
+        "fleet inspect",
         "name",
         SourceKind::Reserved(Reserved::Freeform),
     ),
@@ -519,6 +527,7 @@ pub const CATALOG: &[Slot] = &[
     slot("autopilot status", "repo", SourceKind::Repo),
     slot("config explain", "repo", SourceKind::Repo),
     slot("open", "repo", SourceKind::Repo),
+    slot("info", "workspace", SourceKind::Repo),
     // `program` is the canonical spelling; clap's visible `project` alias
     // resolves to the same command tree, so one canonical path covers both.
     slot("program assign", "repo", SourceKind::Repo),
@@ -607,6 +616,7 @@ pub const CATALOG: &[Slot] = &[
     slot("env set", "name", SourceKind::Env),
     slot("env test", "name", SourceKind::Env),
     slot("fleet list", "env", SourceKind::Env),
+    slot("fleet inspect", "env", SourceKind::Env),
     slot("wt new", "env", SourceKind::Env),
     // --- profile (`[profiles.<name>]`) -------------------------------------
     // A `global = true` arg: classified once at the root, and clap propagates

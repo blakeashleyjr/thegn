@@ -3,7 +3,8 @@ id: environments
 title: Environments
 parent: sandboxing
 order: 5
-actions: [warm-pool-increment, warm-pool-decrement, toolchain-install]
+actions:
+  [warm-pool-increment, warm-pool-decrement, toolchain-install, retry-pullbacks]
 contexts: [panel:environments]
 ---
 
@@ -153,6 +154,12 @@ environment), or approve a repository's `.thegn.toml` request with
 `thegn repo trust . --approve <id>`; an unapproved request is listed as pending
 and changes nothing.
 
+`thegn sandbox warm-devshell [--json]` fills the cache explicitly. It runs
+`nix print-dev-env --json` in the current repository's main checkout, which
+evaluates the repo's flake as you, so running it is your consent. It writes the
+cache (0600 file in a private 0700 directory) that the injection reads, and
+refuses a directory with no `flake.nix`. Nothing runs it automatically.
+
 ## Lifecycle hooks and pane setup
 
 `[hooks]` commands are host-side worktree/session lifecycle jobs. They run
@@ -187,6 +194,17 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   `env adopt` line if the sprite is yours. This also applies when a record was
   lost, and to the dev instance for a sprite the stable instance created for the
   same worktree path: the two instances do not share records.
+- **Checkpoint and restore need a record too.** `thegn env snapshot` and
+  `thegn env restore` run the same ledger proof first. Without a record they
+  refuse with the `thegn env adopt` line. A sprite made before the ledger
+  existed needs `env adopt` once before it can be checkpointed or restored.
+- **Create pins URL auth.** Create sends `"url_settings": {"auth": "sprite"}`,
+  the documented default, so the sprite's URL never depends on that default.
+  If create answers with a different name than the one asked for, thegn errors
+  and keeps no record, because a kept record would prove ownership of a
+  sprite it did not name. A sprite that answer made shows under
+  `thegn env reap --provider sprites --unrecorded`; a 409 names that verb and
+  `env adopt`.
 - **Unrecorded sprites.** `thegn env reap --provider sprites [--apply] [--yes] [--json]`
   (or `--unrecorded`, below) lists orphans, sprites past `max_lifetime_secs` (age from the API
   `created_at`) and sprites "not recorded by this host". It is a dry run by
@@ -229,8 +247,10 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   unheld.
 - **Size.** Sprites have a fixed 8 vCPU; `size`, `min_vcpu`, `gpu` and `nvme`
   are ignored and validate warns. `min_ram_gb > 0` sets the sprite's memory
-  limit to `min_ram_gb * 1024` MB (no autoscale) after create and again at each
-  provision, with a readback.
+  limit to `min_ram_gb * 1024` MB (no autoscale) once, at create. The policy is
+  a per-sprite document the API stores, so reuse, resume and a warm-spare claim
+  do not re-apply it. Read it back with
+  `thegn fleet inspect <sprite> --env <S> --policy`.
 - **Instance cap.** `max_instances` applies through the ledger; `0` (the
   default for sprites) means no cap.
 - **Cost.** `thegn fleet cost` shows a Sprites block with CPU hours and
@@ -311,6 +331,29 @@ plan-only without the spend flags.
   are channel-clamped and no rows remain, doctor adds a `warning` row. Doctor
   makes no network calls.
 
+### Retry, inspect, drain and provision
+
+Dev channel, unverified live.
+
+- **Retry failed pull-backs.** The palette action "Retry failed pull-backs"
+  (`retry-pullbacks`, no default chord) runs the same code as
+  `thegn env sync-retry`, off the loop, and posts one toast with the counts. It
+  never destroys a sandbox.
+- **Inspect.** `thegn fleet inspect <sprite> --env <S> [--policy] [--json]`
+  reads one sprite from the org-level API: name, status, `created_at` and URL
+  auth, with a warning when URL auth is public. It never runs or resumes the
+  sprite. `--policy` also reads the memory policy and your configured
+  `min_ram_gb`; that read is separate because it may wake a cold sprite. Its
+  errors never print the request URL.
+- **Provision field.** `thegn agent run --json` and a headless `session open`
+  carry `provision`: `none` (not a provider env, or already provisioned),
+  `claimed_spare` or `provisioned`.
+- **Drain warning.** `thegn merge drain` prints one line, and adds it to the
+  `--json` `warnings`, for each queued worktree whose effective env is a
+  provider env: commits made inside the sandbox are not in the drain until
+  pulled (`thegn env pull`, or `thegn land`, which pulls first). It still
+  drains them.
+
 ### Adopt, the daily loop and release
 
 Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
@@ -355,7 +398,7 @@ Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
   file API supports a mode. The codex list is `.codex/auth.json` and
   `.codex/config.toml`, plus the two older json paths.
 
-Unverified: whether a Claude refresh token shared between host and sprite is
+Unverified: which file-write parameter the Sprites server honours (file write and delete send both the documented and the previous form); whether the policy GET wakes a cold sprite; Fly's 404 timing after an app DELETE; whether a Claude refresh token shared between host and sprite is
 invalidated when one side refreshes; whether a Sprites checkpoint can be cloned
 to a new sprite (checkpoints restore in place only, so there is no warm
 golden image); the Fly IPv4 cost; and which login files pi needs.
@@ -382,6 +425,10 @@ sandboxes recorded in the run's own temporary ledger.
   definite 404. Only then does it revoke custody and forget the record.
   Otherwise the record is kept and destroy fails, so a second `wt rm` or
   `env reap` can finish the job. A 404 on the DELETE itself counts as done.
+- **Fly destroy needs proof.** After the DELETE answers 2xx, thegn polls
+  `GET /v1/apps/{app}` every 2 seconds for up to 30 seconds. Only a 404
+  retires the record. Otherwise destroy errors, naming the app being
+  destroyed, and keeps the record so `wt rm` or `env reap` can finish.
 - **Closing keeps the environment.** Closing a worktree tab or pane never
   destroys its sandbox. The close resolves the worktree's location, repo root
   and env first and then forgets the worktree, so the background close and
