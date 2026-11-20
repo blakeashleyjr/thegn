@@ -121,6 +121,8 @@ fn direct_iroh_serve_and_pair_actions_parse_as_dev_channel_controls() {
     );
 
     let invite = parse(&[
+        "--profile",
+        "work",
         "pair",
         "direct",
         "new",
@@ -131,6 +133,7 @@ fn direct_iroh_serve_and_pair_actions_parse_as_dev_channel_controls() {
         "--out",
         "invite.json",
     ]);
+    assert_eq!(invite.profile.as_deref(), Some("work"));
     assert!(matches!(
         invite.command.as_ref(),
         Some(Command::Pair {

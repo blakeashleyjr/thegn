@@ -8111,6 +8111,7 @@ dependencies = [
  "gtui-embed",
  "ignore",
  "image",
+ "iroh",
  "keyring",
  "libc",
  "neo_frizbee",

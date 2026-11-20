@@ -1231,9 +1231,16 @@ fn registry_control_origin(
 }
 
 #[cfg(feature = "iroh")]
-fn direct_invitation_command(peer_id: &str, addresses: &[String]) -> String {
+fn direct_invitation_command(
+    executable: &std::path::Path,
+    profile: &str,
+    peer_id: &str,
+    addresses: &[String],
+) -> String {
     let mut command = format!(
-        "thegn pair direct new --endpoint-id {}",
+        "THEGN_CHANNEL=dev {} --profile {} pair direct new --endpoint-id {}",
+        shell_quote_arg(&executable.display().to_string()),
+        shell_quote_arg(profile),
         shell_quote_arg(peer_id)
     );
     for address in addresses {
@@ -1723,7 +1730,12 @@ async fn run(
             }
             thegn_core::outln!(
                 "create a protected direct invitation: {}",
-                direct_invitation_command(&direct_addr.id.to_string(), &addresses)
+                direct_invitation_command(
+                    &std::env::current_exe().context("resolve current CLI executable")?,
+                    &thegn_core::profile::name(),
+                    &direct_addr.id.to_string(),
+                    &addresses,
+                )
             );
             let shutdown_direct = shutdown.clone();
             tokio::spawn(async move {
@@ -2079,12 +2091,14 @@ mod tests {
     #[test]
     fn direct_pair_startup_hint_uses_runnable_protected_invitation_command() {
         let command = direct_invitation_command(
+            std::path::Path::new("/nix/store/dev package/bin/thegn-dev"),
+            "work profile",
             "peer-id",
             &["192.0.2.7:4567".into(), "[fd00::1]:4568".into()],
         );
         assert_eq!(
             command,
-            "thegn pair direct new --endpoint-id 'peer-id' --address '192.0.2.7:4567' --address '[fd00::1]:4568' --scope read --out invite.json"
+            "THEGN_CHANNEL=dev '/nix/store/dev package/bin/thegn-dev' --profile 'work profile' pair direct new --endpoint-id 'peer-id' --address '192.0.2.7:4567' --address '[fd00::1]:4568' --scope read --out invite.json"
         );
     }
 
