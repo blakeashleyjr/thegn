@@ -78,9 +78,17 @@ impl VercelProvider {
         anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
         let body = self.command_body(&spec.argv, spec.cwd.as_deref(), &spec.env, false)?;
         let body = api::with_attach_stdin(body);
-        let session = self.interactive_session(name).await?;
-        let cmd = self.client.run_detached(&session, &body).await?;
-        let logs = match self.client.logs(&session, &cmd).await {
+        let mut session = self.interactive_session(name).await?;
+        let cmd = match self.api().run_detached(&session, &body).await {
+            Ok(cmd) => cmd,
+            Err(error) if Self::is_session_stopped(&error) => {
+                self.forget_session(name);
+                session = self.interactive_session(name).await?;
+                self.api().run_detached(&session, &body).await?
+            }
+            Err(error) => return Err(error),
+        };
+        let logs = match self.api().logs(&session, &cmd).await {
             Ok(logs) => logs,
             Err(e) => {
                 // Nothing will ever read this command: don't leave it running.
