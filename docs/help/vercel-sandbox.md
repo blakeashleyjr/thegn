@@ -151,6 +151,12 @@ refused (use `[sandbox.home] agents` there).
   that fails and exactly one vercel env exists, that one is used; otherwise
   upload is skipped with one warning (mode `none` behaviour).
 
+### Egress policy
+
+An allow list from `[sandbox.network]` is sent to Vercel as a custom policy;
+`*` means allow everything. An egress change is applied to the sandbox and to
+its running or starting session, and a failed session update is an error.
+
 ### Recipe: a dedicated login
 
 The shipped default stays `none`. To use a login that is not your daily one,
@@ -239,7 +245,9 @@ GB-month snapshots). It is an estimate. Earlier sessions are not included.
 
 ## Unverified
 
-Not yet checked on a live account; each is shown as unverified:
+The client was checked against Vercel's published API document on 2026-11-19
+and corrected where it differed. It has still not been run against a live
+account. Not yet checked on a live account; each is shown as unverified:
 
 - Whether the interactive PTY WebSocket works as implemented (hence the stream
   fallback), and the real WebSocket host (the default suffix list may narrow).
