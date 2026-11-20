@@ -143,9 +143,9 @@ live_preflight_check() {
   echo "== step 0: preflight (doctor --json remote_live for env '$1')"
   printf '%s' "$LIVE_DOCTOR_JSON" |
     PRE_ENV="$1" PRE_REQUIRED="${2:-1}" PRE_STATE_DIR="${3:-}" python3 -I -c "$LIVE_PREFLIGHT_PY" || {
-      echo "FAIL 0: preflight" >&2
-      exit 1
-    }
+    echo "FAIL 0: preflight" >&2
+    exit 1
+  }
 }
 
 live_listing() {
