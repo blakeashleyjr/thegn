@@ -3297,16 +3297,16 @@ pub enum ExecFrame {
 }
 
 /// A Sprites exec WebSocket message that breaks the documented frame
-/// protocol (AsyncAPI exec, THE-533). Never treated as output or success.
+/// protocol (AsyncAPI exec, THE-533); unknown well-formed control types are tolerated and ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecProtocolError {
     EmptyFrame,
     UnknownStream(u8),
     MalformedExit,
+    /// The server repeats the exit in binary and JSON forms; a repeat with the
+    /// same code is accepted, but a different code is a protocol error.
     DuplicateExit,
     OutputAfterExit,
-    /// Sanitized: only [a-z0-9_], at most 32 chars, else "<invalid>".
-    UnknownControl(String),
     MalformedControl,
 }
 
@@ -3316,9 +3316,8 @@ impl std::fmt::Display for ExecProtocolError {
             Self::EmptyFrame => "a binary frame has no stream id".to_string(),
             Self::UnknownStream(id) => format!("stream id {id} is not a server stream"),
             Self::MalformedExit => "the exit frame is malformed".to_string(),
-            Self::DuplicateExit => "a second exit arrived".to_string(),
+            Self::DuplicateExit => "a second exit arrived with a different code".to_string(),
             Self::OutputAfterExit => "output arrived after the exit".to_string(),
-            Self::UnknownControl(t) => format!("unknown control message type {t}"),
             Self::MalformedControl => "a control message is malformed".to_string(),
         };
         write!(f, "sprites exec: protocol error: {message}")
@@ -3809,7 +3808,7 @@ fn sanitize_control_type(t: &str) -> String {
 }
 
 /// Classify a Sprites exec text frame according to the documented control
-/// protocol. Non-JSON text is output only for TTY sessions.
+/// protocol; unknown well-formed control types are tolerated and ignored. Non-JSON text is output only for TTY sessions.
 fn parse_sprite_ctrl(text: &str, tty: bool) -> std::result::Result<SpriteCtrl, ExecProtocolError> {
     if text.len() > EXEC_CONTROL_TEXT_MAX {
         return if tty {
@@ -3855,7 +3854,17 @@ fn parse_sprite_ctrl(text: &str, tty: bool) -> std::result::Result<SpriteCtrl, E
             Ok(SpriteCtrl::Session(session_id.to_string()))
         }
         "port_opened" | "port_closed" => Ok(SpriteCtrl::Notice),
-        _ => Err(ExecProtocolError::UnknownControl(sanitize_control_type(t))),
+        _ => {
+            // The server sends control types the AsyncAPI exec document does not list
+            // (seen live: "debug"). A well-formed control message of an unknown type
+            // is tolerated so a new server message cannot break every command.
+            tracing::debug!(
+                target: "thegn::provider",
+                control = %sanitize_control_type(t),
+                "sprites exec: ignoring an unknown control message type"
+            );
+            Ok(SpriteCtrl::Notice)
+        }
     }
 }
 
@@ -4212,7 +4221,9 @@ async fn drive_proxy<S>(
 /// Generic over the socket so the concrete (TLS) stream type need not be named.
 /// `tty` selects the wire framing: raw bytes (PTY) vs 1-byte stream-id prefixes
 /// (non-PTY — stdin gets a `0` prefix; only stdout/exit are surfaced, while an
-/// optional stderr sink captures stream id 2).
+/// optional stderr sink captures stream id 2). The server repeats the exit in
+/// binary and JSON forms; a repeat with the same code is accepted, while a
+/// different code is a protocol error.
 async fn drive_exec<S>(
     ws: S,
     tty: bool,
@@ -4359,13 +4370,14 @@ where
                                 }
                             }
                             StreamMsg::Exit(code) => {
-                                if exited.is_some() {
-                                    protocol_fault!(ExecProtocolError::DuplicateExit);
+                                match record_exec_exit(&mut exited, code) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(error) => protocol_fault!(error),
                                 }
                                 if frames_tx.send(ExecFrame::Exit(code)).await.is_err() {
                                     tracing::debug!(target: "thegn::provider", "provider exec exit frame could not be sent");
                                 }
-                                exited = Some(code);
                                 drain_until = Some(tokio::time::Instant::now() + EXEC_EXIT_DRAIN);
                             }
                             // Stderr is never part of the consumer's byte stream.
@@ -4405,13 +4417,14 @@ where
                             }
                         }
                         SpriteCtrl::Exit(code) => {
-                            if exited.is_some() {
-                                protocol_fault!(ExecProtocolError::DuplicateExit);
+                            match record_exec_exit(&mut exited, code) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => protocol_fault!(error),
                             }
                             if frames_tx.send(ExecFrame::Exit(code)).await.is_err() {
                                 tracing::debug!(target: "thegn::provider", "provider exec exit frame could not be sent");
                             }
-                            exited = Some(code);
                             drain_until = Some(tokio::time::Instant::now() + EXEC_EXIT_DRAIN);
                         }
                         SpriteCtrl::Forward if tty => {
@@ -4450,6 +4463,23 @@ where
         tracing::debug!(target: "thegn::provider", "provider exec verdict receiver was dropped");
     }
     fault
+}
+
+fn record_exec_exit(exited: &mut Option<i32>, code: i32) -> Result<bool, ExecProtocolError> {
+    match *exited {
+        Some(previous) if previous == code => {
+            tracing::trace!(
+                target: "thegn::provider",
+                "sprites exec: the exit was repeated in its other form"
+            );
+            Ok(false)
+        }
+        Some(_) => Err(ExecProtocolError::DuplicateExit),
+        None => {
+            *exited = Some(code);
+            Ok(true)
+        }
+    }
 }
 
 /// One sandbox as a provider's inventory reports it (`thegn fleet`). `id` is
@@ -7294,11 +7324,11 @@ mod tests {
             );
             assert_eq!(
                 parse_sprite_ctrl(r#"{"type":"Debug!x"}"#, tty),
-                Err(ExecProtocolError::UnknownControl("<invalid>".into()))
+                Ok(SpriteCtrl::Notice)
             );
             assert_eq!(
                 parse_sprite_ctrl(r#"{"type":"debug"}"#, tty),
-                Err(ExecProtocolError::UnknownControl("debug".into()))
+                Ok(SpriteCtrl::Notice)
             );
             assert_eq!(
                 parse_sprite_ctrl("not json", tty),
@@ -7485,12 +7515,37 @@ mod tests {
             false,
             vec![
                 Message::Binary(vec![3, 0].into()),
-                Message::Binary(vec![3, 0].into()),
+                Message::Binary(vec![3, 1].into()),
             ],
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
         assert_eq!(fault, Some(ExecProtocolError::DuplicateExit));
+    }
+
+    #[tokio::test]
+    async fn drive_exec_accepts_the_exit_repeated_in_both_forms() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        for messages in [
+            vec![
+                Message::Binary(vec![1, b'o', b'k'].into()),
+                Message::Binary(vec![3, 7].into()),
+                Message::Text(r#"{"type":"exit","exit_code":7}"#.into()),
+            ],
+            vec![
+                Message::Binary(vec![1, b'o', b'k'].into()),
+                Message::Text(r#"{"type":"exit","exit_code":7}"#.into()),
+                Message::Binary(vec![3, 7].into()),
+            ],
+        ] {
+            let (frames, fault) = drive_exec_messages(false, messages).await;
+            assert_eq!(
+                frames,
+                vec![ExecFrame::Stdout(b"ok".to_vec()), ExecFrame::Exit(7)]
+            );
+            assert_eq!(fault, None);
+        }
     }
 
     #[tokio::test]
@@ -7533,6 +7588,26 @@ mod tests {
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
+        assert_eq!(fault, None);
+    }
+
+    #[tokio::test]
+    async fn drive_exec_ignores_an_unknown_control_type() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (frames, fault) = drive_exec_messages(
+            false,
+            vec![
+                Message::Text(r#"{"type":"debug","message":"x"}"#.into()),
+                Message::Binary(vec![1, b'o', b'k'].into()),
+                Message::Binary(vec![3, 0].into()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            frames,
+            vec![ExecFrame::Stdout(b"ok".to_vec()), ExecFrame::Exit(0)]
+        );
         assert_eq!(fault, None);
     }
 
@@ -7632,7 +7707,7 @@ mod tests {
             .await
             .unwrap();
         server
-            .send(Message::Binary(vec![3, 0].into()))
+            .send(Message::Binary(vec![3, 1].into()))
             .await
             .unwrap();
         if server.send(Message::Close(None)).await.is_err() {
