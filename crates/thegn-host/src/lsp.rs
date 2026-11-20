@@ -427,7 +427,7 @@ impl LspInner {
         Ok(AdmittedClient::new(permit, client))
     }
 
-    /// [`LspInner::client`] with an injectable starter (tests drive the
+    /// `LspInner::client` with an injectable starter (tests drive the
     /// lifecycle with in-memory transports). The starter receives the bus and
     /// the freshly registered generation it must publish under.
     pub(crate) fn client_with(

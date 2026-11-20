@@ -4,7 +4,7 @@
 //! Network and userspace filesystems (NFS, SMB/CIFS, FUSE, 9p, AFP, WebDAV)
 //! deliver no events for changes made by other clients or behind the kernel's
 //! back, so a change generation built on them would stay put while the tree
-//! moves. [`unwatchable`] says "do not claim coverage here". It is an
+//! moves. `unwatchable` says "do not claim coverage here". It is an
 //! ALLOWLIST of known-local filesystems: an unlisted type is unwatchable.
 //!
 //! Fail toward today's behaviour: anything it cannot positively classify as a

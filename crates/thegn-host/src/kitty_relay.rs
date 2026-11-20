@@ -32,7 +32,7 @@
 //!
 //! ## What the relay does
 //!
-//! [`KittyRelay::feed_with`] splits a PTY chunk into [`Piece`]s: non-graphics bytes go
+//! `KittyRelay::feed_with` splits a PTY chunk into [`Piece`]s: non-graphics bytes go
 //! to the emulator (so its cursor tracks mpv's home); APC-`G` commands are pulled
 //! out, validated, and rebuilt for the outer terminal. A DISPLAY command
 //! (`a=T`/`a=p`) is prefixed with an absolute CUP to the corner origin ([`cup`])

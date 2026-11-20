@@ -128,7 +128,7 @@ impl PreviewSupervisor {
         self.submit_inner(Box::new(work), None);
     }
 
-    /// [`submit`](Self::submit) plus a `fallback` that runs (and should deliver
+    /// `submit` plus a `fallback` that runs (and should deliver
     /// an error for this generation) if `work` panics or no worker thread could
     /// be started.
     pub fn submit_guarded(

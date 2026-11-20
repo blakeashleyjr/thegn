@@ -16,7 +16,7 @@
 //! run or flush message arrives. The session-layout persist is routed through this thread
 //! (`run::persist_session_layout` captures rows on the loop and queues the
 //! transaction): main.rs performs a bounded shutdown flush, and the cold
-//! workspace-switch path calls [`flush`] before resurrecting a session whose
+//! workspace-switch path calls `flush` before resurrecting a session whose
 //! rows may still be queued. Queue overflow and critical loss are counted and
 //! reported both in-session and during shutdown.
 //!

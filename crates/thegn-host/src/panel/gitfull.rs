@@ -1359,7 +1359,7 @@ fn help_row(view: GitView) -> PanelRow {
 }
 
 /// [`help_row`] with the panel-width word right-aligned when it fits (these
-/// frames have no tab bar). The returned [`ColHit`] sits on `row` and resolves
+/// frames have no tab bar). The returned `ColHit` sits on `row` and resolves
 /// to `Expand`, the same as the tab-row chip.
 fn help_row_with_chip(
     ui: &PanelUi,
