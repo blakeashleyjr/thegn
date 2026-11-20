@@ -115,7 +115,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertIn(".github/scripts/verify-release-publication-identity.sh", step_script)
                 for required in (
                     "actions/runs/$run_id",
-                    "git ls-remote origin",
+                    'git -C "$GITHUB_WORKSPACE" ls-remote origin',
                     "gh attestation verify",
                     "--source-digest \"$run_head_sha\"",
                     "verify-publication-identity",

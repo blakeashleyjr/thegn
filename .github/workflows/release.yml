@@ -1067,6 +1067,12 @@ jobs:
             echo "::error::release manifest missing: run the build to completion (verify-manifest) before publishing"
             exit 1
           fi
+          if ! gh attestation verify "$manifest" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --deny-self-hosted-runners; then
+            echo "::error::release manifest attestation did not verify"
+            exit 1
+          fi
           formula="thegn-$TAG-homebrew.rb"
           if ! python3 packaging/release.py verify-assets --tag "$TAG" \
             --release-manifest "$manifest" --asset "$publish_root/metadata/$formula"; then
@@ -1307,6 +1313,12 @@ jobs:
           if ! gh release download "$TAG" --dir "$publish_root/metadata" \
             --pattern "thegn-$TAG-manifest.json" || [ ! -f "$manifest" ]; then
             echo "::error::release manifest missing: run the build to completion (verify-manifest) before publishing"
+            exit 1
+          fi
+          if ! gh attestation verify "$manifest" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --deny-self-hosted-runners; then
+            echo "::error::release manifest attestation did not verify"
             exit 1
           fi
           pkgbuild="thegn-$TAG-PKGBUILD"

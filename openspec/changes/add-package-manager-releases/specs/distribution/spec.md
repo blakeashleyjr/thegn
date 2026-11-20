@@ -43,6 +43,18 @@ configuration. It SHALL publish the exact rendered metadata, regenerate AUR
 only when content differs. Failure MUST NOT alter/retract release assets and a
 same-tag rerun MUST be idempotent.
 
+Before either publisher materializes a deploy key, it SHALL reverify the signed
+release manifest against the live approved annotated tag object and peeled
+commit, and against the exact successful release workflow run, attempt, and
+source commit recorded by the attestation. A mismatch MUST refuse publication.
+
+#### Scenario: Published release identity has changed or cannot be verified
+
+- **WHEN** the manifest signature, live annotated tag identity, or exact
+  successful workflow run/attempt/source identity does not match
+- **THEN** publication stops before deploy-key materialization and makes no
+  package-manager update
+
 #### Scenario: Missing setup blocks publication clearly
 
 - **WHEN** a tap/package repository or deploy credential is absent
