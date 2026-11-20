@@ -314,7 +314,9 @@ def case_p02():
                 hard = True
                 break
         remote_lang = identity[1][2]
-        if not hard and not re.search(r"(?i)utf-?8", remote_lang):
+        local_utf8 = bool(re.search(r"(?i)utf-?8", identity[0][2]))
+        # The remote only gets a UTF-8 LANG when the host locale is UTF-8, so only then is its absence a failure.
+        if not hard and local_utf8 and not re.search(r"(?i)utf-?8", remote_lang):
             status, note = "FAIL", "remote LANG is not UTF-8"
         elif not hard and identity[0][2] != identity[1][2] and re.search(r"(?i)utf-?8", identity[0][2]):
             status, note = "WARN", "LANG differs (D1: remote C.UTF-8)"
