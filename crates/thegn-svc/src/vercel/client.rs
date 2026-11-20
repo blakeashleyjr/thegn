@@ -184,6 +184,15 @@ pub struct LogStream {
 }
 
 impl LogStream {
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        LogStream {
+            rx,
+            task: tokio::spawn(async {}),
+        }
+    }
+
     /// Whether the reader task has finished (EOF, error or consumer gone).
     pub fn reader_finished(&self) -> bool {
         self.task.is_finished()
@@ -853,7 +862,7 @@ impl VercelClient {
                     .body(body))
             })
             .await?;
-        self.ok(resp, p.op, false).await.map(drop)
+        self.ok_session(resp, p.op).await.map(drop)
     }
 
     /// Read one file. `None` on 404; over `cap` bytes is an error (never a
@@ -876,9 +885,13 @@ impl VercelClient {
                     .json(&body))
             })
             .await?;
-        let Some(mut resp) = self.ok_or_404(resp, p.op).await? else {
+        let resp = if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            drain_quietly(resp).await;
             return Ok(None);
+        } else {
+            self.ok_session(resp, p.op).await?
         };
+        let mut resp = resp;
         if let Some(declared) = resp.content_length()
             && declared > cap as u64
         {
@@ -912,7 +925,7 @@ impl VercelClient {
         let resp = self
             .send(p, || Ok(self.http.post(url.clone()).json(&body)))
             .await?;
-        self.ok(resp, p.op, false).await.map(drop)
+        self.ok_session(resp, p.op).await.map(drop)
     }
 
     // --- interactive ----------------------------------------------------------
@@ -930,7 +943,7 @@ impl VercelClient {
                 Ok(self.http.post(url.clone()).json(&serde_json::json!({})))
             })
             .await?;
-        let resp = self.ok(resp, p.op, false).await?;
+        let resp = self.ok_session(resp, p.op).await?;
         let v = response_json(resp, PROVIDER, p.op).await?;
         let raw_url = v
             .get("url")

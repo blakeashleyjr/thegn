@@ -155,6 +155,33 @@ trait Api: Send + Sync {
             Ok((code, out, String::new()))
         })
     }
+    fn run_detached<'a>(
+        &'a self,
+        session: &'a str,
+        body: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<String>>;
+    fn logs<'a>(
+        &'a self,
+        session: &'a str,
+        cmd: &'a str,
+    ) -> BoxFuture<'a, Result<client::LogStream>>;
+    fn interactive<'a>(
+        &'a self,
+        session: &'a str,
+    ) -> BoxFuture<'a, Result<client::InteractiveTicket>>;
+    fn fs_write_targz<'a>(
+        &'a self,
+        session: &'a str,
+        cwd: &'a str,
+        targz: Vec<u8>,
+    ) -> BoxFuture<'a, Result<()>>;
+    fn fs_read<'a>(
+        &'a self,
+        session: &'a str,
+        path: &'a str,
+        cap: usize,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>>>;
+    fn fs_mkdir<'a>(&'a self, session: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>>;
     fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(Vec<String>, bool)>>;
     fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
     /// The current session's usage (a GET; never resumes).
@@ -221,6 +248,47 @@ impl Api for client::VercelClient {
         Box::pin(client::VercelClient::run_wait_with_stderr(
             self, session, body, out_cap,
         ))
+    }
+    fn run_detached<'a>(
+        &'a self,
+        session: &'a str,
+        body: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(client::VercelClient::run_detached(self, session, body))
+    }
+    fn logs<'a>(
+        &'a self,
+        session: &'a str,
+        cmd: &'a str,
+    ) -> BoxFuture<'a, Result<client::LogStream>> {
+        Box::pin(client::VercelClient::logs(self, session, cmd))
+    }
+    fn interactive<'a>(
+        &'a self,
+        session: &'a str,
+    ) -> BoxFuture<'a, Result<client::InteractiveTicket>> {
+        Box::pin(client::VercelClient::interactive(self, session))
+    }
+    fn fs_write_targz<'a>(
+        &'a self,
+        session: &'a str,
+        cwd: &'a str,
+        targz: Vec<u8>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(client::VercelClient::fs_write_targz(
+            self, session, cwd, targz,
+        ))
+    }
+    fn fs_read<'a>(
+        &'a self,
+        session: &'a str,
+        path: &'a str,
+        cap: usize,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(client::VercelClient::fs_read(self, session, path, cap))
+    }
+    fn fs_mkdir<'a>(&'a self, session: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(client::VercelClient::fs_mkdir(self, session, path))
     }
     fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(Vec<String>, bool)>> {
         Box::pin(client::VercelClient::snapshots_for(self, name))
@@ -624,6 +692,12 @@ impl VercelProvider {
     fn forget_session(&self, name: &str) {
         self.sessions.lock().unwrap().remove(name);
         self.expiry.lock().unwrap().remove(name);
+    }
+
+    /// Whether a session-scoped request was refused because the session stopped
+    /// before the provider accepted the request.
+    pub(crate) fn is_session_stopped(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<client::SessionStopped>().is_some()
     }
 
     /// The current session id for `name`, resuming only under
