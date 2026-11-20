@@ -11,11 +11,12 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use anyhow::bail;
 use thegn_svc::provider::{
-    InventoryReport, ProviderCheckpoints, ProviderEgress, ProviderFiles, RemoteProvider,
-    SpritesProvider,
+    ExecControl, ExecFrame, ExecSession, ExecSpec, InventoryReport, Provider, ProviderCheckpoints,
+    ProviderEgress, ProviderFiles, RemoteProvider, SpritesProvider,
 };
 
 /// Retry an op that fails while the sprite is still cold-starting (fs/checkpoint
@@ -61,6 +62,116 @@ impl Drop for LeakNote {
         if std::thread::panicking() {
             eprintln!("sprite may have leaked; remove it by hand: {}", self.0);
         }
+    }
+}
+
+async fn recv_until(
+    session: &mut ExecSession,
+    needle: &[u8],
+    budget: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut output = Vec::new();
+    loop {
+        let frame = tokio::time::timeout_at(deadline, session.frames.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for {:?}", needle))?;
+        let Some(frame) = frame else {
+            bail!("exec stream closed while waiting for {:?}", needle);
+        };
+        match frame {
+            ExecFrame::Stdout(bytes) => {
+                output.extend(bytes);
+                if output.windows(needle.len()).any(|window| window == needle) {
+                    return Ok(output);
+                }
+                const MAX_CAPTURE: usize = 4 * 1024 * 1024;
+                if output.len() > MAX_CAPTURE {
+                    let excess = output.len() - MAX_CAPTURE;
+                    output.drain(..excess);
+                }
+            }
+            ExecFrame::Exit(code) => {
+                bail!("exec exited with {code} while waiting for {:?}", needle);
+            }
+        }
+    }
+}
+
+async fn wait_session_id(session: &mut ExecSession, budget: Duration) -> anyhow::Result<String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Some(id) = session.session_id.borrow().clone() {
+            return Ok(id);
+        }
+        tokio::time::timeout_at(deadline, session.session_id.changed())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the exec session id"))??;
+    }
+}
+
+async fn collect_for(session: &mut ExecSession, budget: Duration, cap: usize) -> (Vec<u8>, bool) {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut output = Vec::new();
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, session.frames.recv()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return (output, true),
+            Err(_) => return (output, false),
+        };
+        if let ExecFrame::Stdout(bytes) = frame {
+            output.extend(bytes);
+            if output.len() > cap {
+                output.drain(..output.len() - cap);
+            }
+        }
+    }
+}
+
+async fn collect_until_end(
+    session: &mut ExecSession,
+    budget: Duration,
+    cap: usize,
+) -> (Vec<u8>, bool) {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut output = Vec::new();
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, session.frames.recv()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return (output, true),
+            Err(_) => return (output, false),
+        };
+        match frame {
+            ExecFrame::Stdout(bytes) => {
+                output.extend(bytes);
+                if output.len() > cap {
+                    output.drain(..output.len() - cap);
+                }
+            }
+            ExecFrame::Exit(_) => return (output, false),
+        }
+    }
+}
+
+async fn session_absent_within(
+    provider: &Provider,
+    name: &str,
+    session: &str,
+    budget: Duration,
+) -> anyhow::Result<bool> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let absent = tokio::time::timeout_at(deadline, provider.exec_session_absent(name, session))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out querying the exec session roster"))??;
+        if absent {
+            return Ok(true);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep_until((now + Duration::from_millis(500)).min(deadline)).await;
     }
 }
 
@@ -589,4 +700,208 @@ fn live_end_to_end() {
         p.destroy(&name).await.expect("destroy");
         println!("destroyed {name}");
     });
+}
+
+#[test]
+#[ignore = "live: needs SPRITES_TOKEN, network, creates a real sprite"]
+fn live_exec_session_semantics() {
+    let Ok(token) = std::env::var("SPRITES_TOKEN") else {
+        eprintln!("SPRITES_TOKEN unset — skipping");
+        return;
+    };
+    let name = format!("tgexec-{}", std::process::id());
+    let (sprites, _ledger) = scoped(&token, &name, "tgexec-live");
+    let provider = Provider::Sprites(sprites);
+    let _leak_note = LeakNote(name.clone());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let result: anyhow::Result<()> = rt.block_on(async {
+        let result = async {
+            provider.ensure_exists(&name).await?;
+            provider.wait_ready(&name, Duration::from_secs(120)).await?;
+
+            let spec = ExecSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "exec bash --norc --noprofile -i".into(),
+                ],
+                tty: true,
+                cols: 120,
+                rows: 40,
+                env: vec![("TERM".into(), "xterm-256color".into())],
+                cwd: None,
+            };
+            let connected_at = Instant::now();
+            let mut session = provider.open_exec(&name, &spec).await?;
+            println!(
+                "INFO exec connect: {} ms",
+                connected_at.elapsed().as_millis()
+            );
+
+            session
+                .control
+                .send(ExecControl::Stdin(b"stty size\r".to_vec()))
+                .await?;
+            let initial_size = recv_until(&mut session, b"40 120", Duration::from_secs(10)).await?;
+            println!(
+                "INFO stty size initial: {}",
+                String::from_utf8_lossy(&initial_size).trim()
+            );
+
+            session
+                .control
+                .send(ExecControl::Resize {
+                    cols: 100,
+                    rows: 30,
+                })
+                .await?;
+            session
+                .control
+                .send(ExecControl::Stdin(b"stty size\r".to_vec()))
+                .await?;
+            let resized = recv_until(&mut session, b"30 100", Duration::from_secs(10)).await?;
+            let resized_text = String::from_utf8_lossy(&resized);
+            println!("INFO stty size resized: {}", resized_text.trim());
+            anyhow::ensure!(
+                resized_text.contains("30 100"),
+                "resized stty answer did not contain 30 100: {resized_text:?}"
+            );
+
+            let mut rtts = Vec::with_capacity(20);
+            for _ in 0..20 {
+                let started = Instant::now();
+                session
+                    .control
+                    .send(ExecControl::Stdin(b"x".to_vec()))
+                    .await?;
+                recv_until(&mut session, b"x", Duration::from_secs(5)).await?;
+                rtts.push(started.elapsed());
+                session
+                    .control
+                    .send(ExecControl::Stdin(b"\x15".to_vec()))
+                    .await?;
+            }
+            rtts.sort_unstable();
+            let p50 = rtts[(rtts.len() - 1) * 50 / 100];
+            let p95 = rtts[(rtts.len() - 1) * 95 / 100];
+            println!("INFO keystroke RTT: p50={p50:?}, p95={p95:?}");
+
+            session
+                .control
+                .send(ExecControl::Stdin(b"echo REPLAY-MARK\r".to_vec()))
+                .await?;
+            let replay_marker =
+                recv_until(&mut session, b"REPLAY-MARK", Duration::from_secs(10)).await?;
+            let session_id = wait_session_id(&mut session, Duration::from_secs(10)).await?;
+            session.control.send(ExecControl::Close).await?;
+            drop(session);
+
+            let mut attached = provider.attach_exec(&name, &session_id, 120, 40).await?;
+            let (replay, _) =
+                collect_for(&mut attached, Duration::from_secs(2), 4 * 1024 * 1024).await;
+            let replay_has_marker = replay
+                .windows(b"REPLAY-MARK".len())
+                .any(|window| window == b"REPLAY-MARK");
+            let replay_starts_with_clear =
+                replay.starts_with(b"\x1bc") || replay.starts_with(b"\x1b[2J");
+            println!(
+                "INFO reattach replay: bytes={}, REPLAY-MARK={}, starts-with-clear={}",
+                replay.len(),
+                replay_has_marker,
+                replay_starts_with_clear
+            );
+            let _ = attached.control.send(ExecControl::Close).await;
+            drop(attached);
+            let session_persists =
+                match session_absent_within(&provider, &name, &session_id, Duration::from_secs(5))
+                    .await
+                {
+                    Ok(absent) => !absent,
+                    Err(error) => {
+                        println!("INFO session roster probe error: {error:#}");
+                        true
+                    }
+                };
+            println!(
+                "INFO session persists after disconnect: {}",
+                if session_persists { "yes" } else { "no" }
+            );
+
+            let mut kill_url = reqwest::Url::parse("https://api.sprites.dev/v1")?;
+            kill_url
+                .path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("Sprites API URL cannot hold a path"))?
+                .push("sprites")
+                .push(&name)
+                .push("exec")
+                .push(&session_id)
+                .push("kill");
+            kill_url
+                .query_pairs_mut()
+                .append_pair("signal", "SIGHUP")
+                .append_pair("timeout", "5s");
+            let kill_response = reqwest::Client::new()
+                .post(kill_url)
+                .bearer_auth(&token)
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await?;
+            let kill_status = kill_response.status();
+            println!("INFO kill session status: {kill_status}");
+            if kill_status.is_success() {
+                anyhow::ensure!(
+                    session_absent_within(&provider, &name, &session_id, Duration::from_secs(10),)
+                        .await?,
+                    "exec session {session_id} remained present after SIGHUP"
+                );
+            }
+
+            let big_spec = ExecSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "cat > /tmp/big; wc -c < /tmp/big".into(),
+                ],
+                tty: true,
+                cols: 120,
+                rows: 40,
+                env: vec![("TERM".into(), "xterm-256color".into())],
+                cwd: None,
+            };
+            let mut big_session = provider.open_exec(&name, &big_spec).await?;
+            let big_input = vec![b'x'; 1024 * 1024];
+            let big_send = big_session
+                .control
+                .send(ExecControl::Stdin(big_input))
+                .await;
+            let eof_send = big_session
+                .control
+                .send(ExecControl::Stdin(b"\x04".to_vec()))
+                .await;
+            let (big_output, receiver_dropped) =
+                collect_until_end(&mut big_session, Duration::from_secs(15), 2 * 1024 * 1024).await;
+            let byte_count = String::from_utf8_lossy(&big_output)
+                .split_whitespace()
+                .find_map(|word| word.parse::<usize>().ok());
+            println!(
+                "INFO 1 MiB stdin: socket dropped={}, byte count={byte_count:?}",
+                big_send.is_err() || eof_send.is_err() || receiver_dropped
+            );
+            let _ = big_session.control.send(ExecControl::Close).await;
+            drop(big_session);
+
+            // Keep the first observed marker available in the live trace even
+            // when the provider's replay buffer is empty.
+            println!("INFO command marker bytes: {}", replay_marker.len());
+            anyhow::Ok(())
+        }
+        .await;
+
+        let destroy = provider.destroy(&name).await;
+        destroy.expect("destroy live exec sprite");
+        result
+    });
+
+    result.expect("live exec session semantics");
 }
