@@ -245,9 +245,7 @@ fn remembered_agent_with(db: &Db, cfg: &Config, worktree: &str) -> Option<String
     // Entry no longer configured (config churn): leave the stale record alone
     // — the sidebar keeps attributing until the agent is re-added — but a
     // shell pane is still the honest spawn.
-    if cfg.agent_command(&name).is_none() {
-        return None;
-    }
+    cfg.agent_command(&name)?;
     Some(name)
 }
 
