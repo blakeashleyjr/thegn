@@ -1561,6 +1561,7 @@ mod process_tree_deadline_tests {
 
     /// Detach a setsid grandchild (pid published atomically in `$1`), wait
     /// for its pid file, give the supervision loop time to see it, then exit 0.
+    #[cfg(target_os = "linux")]
     const SUCCESSFUL_SETSID_GRANDCHILD_SCRIPT: &str = "setsid sh -c 'echo $$ > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; exec sleep 300' sh \"$1\" & i=0; while [ ! -s \"$1\" ]; do i=$((i+1)); [ \"$i\" -gt 500 ] && exit 97; sleep 0.01; done; sleep 0.2; exit 0";
 
     #[cfg(target_os = "linux")]
