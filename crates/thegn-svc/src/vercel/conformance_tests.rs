@@ -30,6 +30,10 @@ async fn vercel_passes_the_conformance_suite() {
     vp.poll = std::time::Duration::from_millis(20);
     let p = Provider::Vercel(vp);
     let (seen, counts, resumes) = (fake.clone(), fake.clone(), fake.clone());
+    let refuse = fake.clone();
+    let runs = fake.clone();
+    let pages = fake.clone();
+    let policies = fake.clone();
     let hold_fake = fake.clone();
     let ledger_path = ledger.path().to_path_buf();
     let fx = Fixture {
@@ -63,12 +67,45 @@ async fn vercel_passes_the_conformance_suite() {
         recorded: Some(Box::new(move |name| {
             ledger_path.join(format!("{name}.json")).exists()
         })),
+        // Vercel judges a missing exitCode in client.rs, below FakeApi (client test: `without an exit status`).
+        drop_exit: None,
+        refuse_runs_stopped: Some(Box::new(move |n| {
+            *refuse.run_stopped.lock().unwrap() = n;
+        })),
+        runs: Some(Box::new(move || runs.count("run"))),
+        unfinished_listing: Some(Box::new(move |on| {
+            let mut pages = pages.pages.lock().unwrap();
+            pages.clear();
+            if on {
+                pages.push_back((Vec::new(), Some("tgconf-loop".to_string())));
+                pages.push_back((Vec::new(), Some("tgconf-loop".to_string())));
+            }
+        })),
+        egress_allows_all: Some(Box::new(move |name| {
+            let policies = policies.policies.lock().unwrap();
+            let body = policies.get(name)?;
+            let mode = body.get("mode").and_then(serde_json::Value::as_str);
+            let wildcard = body
+                .get("allowedDomains")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|domains| domains.iter().any(|domain| domain.as_str() == Some("*")));
+            Some(mode == Some("allow-all") || wildcard)
+        })),
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
-    assert!(report.skipped.is_empty(), "{report:?}");
+    assert_eq!(
+        report.skipped,
+        vec!["exec_without_exit_fails"],
+        "{report:?}"
+    );
     assert!(
-        report.passed.contains(&"destroy_keeps_record_until_gone"),
+        report.passed.contains(&"stopped_run_is_retried_once")
+            && report
+                .passed
+                .contains(&"unfinished_listing_is_never_complete")
+            && report.passed.contains(&"egress_never_widens")
+            && report.passed.contains(&"destroy_keeps_record_until_gone"),
         "{report:?}"
     );
     assert!(fake.count("stop") >= 1, "{report:?}");
