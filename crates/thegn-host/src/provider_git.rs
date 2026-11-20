@@ -1754,22 +1754,22 @@ mod tests {
 
     #[test]
     fn land_binding_table() {
-        let mut calls = 0;
+        let calls = std::cell::Cell::new(0);
         let mut listed = || {
-            calls += 1;
+            calls.set(calls.get() + 1);
             Some(false)
         };
         assert_eq!(land_binding(true, None, false, &mut listed), Ok(true));
-        assert_eq!(calls, 0);
+        assert_eq!(calls.get(), 0);
 
         assert_eq!(land_binding(false, None, false, &mut listed), Ok(false));
-        assert_eq!(calls, 0);
+        assert_eq!(calls.get(), 0);
 
         assert_eq!(
             land_binding(false, Some("tg-rd-x-sandbox"), true, &mut listed),
             Ok(true)
         );
-        assert_eq!(calls, 0);
+        assert_eq!(calls.get(), 0);
 
         let mut present = || Some(true);
         assert_eq!(
@@ -1815,6 +1815,7 @@ mod tests {
         let db = Db::open().unwrap();
         db.put_worktree("repo/rd-x", &root_s, &worktree_s, "tg/rd-x", None, None)
             .unwrap();
+        db.put_workspace(&root_s, "repo", "repo").unwrap();
         db.set_workspace_env(&root_s, "sprites").unwrap();
 
         let mut cfg = Config::default();
