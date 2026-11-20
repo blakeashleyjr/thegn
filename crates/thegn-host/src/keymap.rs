@@ -204,6 +204,7 @@ pub enum Action {
     PrReviewTaskHandle,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
+    OpenInfo,
     /// Open the tabbed system monitor.
     OpenMonitor,
     /// Open the system monitor straight onto the agent-pipeline board.
@@ -649,6 +650,7 @@ impl Action {
             Action::PrQueueRefresh => "pr-queue-refresh",
             Action::PrReviewTaskHandle => "pr-review-task-handle",
             Action::OpenUsage => "open-usage",
+            Action::OpenInfo => "open-info",
             Action::OpenMonitor => "open-monitor",
             Action::OpenPipelineBoard => "open-pipeline-board",
             Action::OpenCalendar => "open-calendar",
@@ -810,6 +812,7 @@ impl Action {
             "pr-queue-refresh" => Action::PrQueueRefresh,
             "pr-review-task-handle" | "review-task-handle" => Action::PrReviewTaskHandle,
             "open-usage" => Action::OpenUsage,
+            "open-info" | "info" => Action::OpenInfo,
             "open-monitor" => Action::OpenMonitor,
             "open-pipeline-board" | "pipeline-board" => Action::OpenPipelineBoard,
             "open-calendar" => Action::OpenCalendar,
@@ -1544,6 +1547,7 @@ pub fn default_keymap() -> KeyMap {
     // AI-account usage overlay. `Alt u` was the last free plain-Alt letter with
     // a working mnemonic; `Ctrl Alt u` is already SwitchBundle.
     map.insert_all("Alt u", Action::OpenUsage).unwrap();
+    map.insert_all("Alt I", Action::OpenInfo).unwrap();
     // Close (rule 3): `Alt x` is one smart "close this" — pane if the tab is
     // split, else the tab; Shift escalates to worktree removal (`Alt X`). This
     // folds the old separate pane-close (`Alt w`) and tab-close together, and
@@ -2368,6 +2372,12 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn open_info_key_round_trips() {
+        assert_eq!(Action::from_key("open-info"), Some(Action::OpenInfo));
+        assert_eq!(Action::OpenInfo.key(), "open-info");
     }
 
     /// The registry is complete: every `Action::key()` id that `from_key`
