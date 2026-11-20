@@ -2945,7 +2945,6 @@ pub(crate) fn provision_step_timeout(step_id: &str) -> std::time::Duration {
     }
 }
 
-
 /// Provision a provider env into a sandbox. `name_override` forces the sandbox
 /// name (used for warm-pool SPARES, which aren't bound to a worktree); `None`
 /// derives it from the worktree as usual. `worktree` always provides the env-
