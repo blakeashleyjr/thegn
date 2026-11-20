@@ -253,6 +253,7 @@ pub use calendar::{CalendarPayload, apply_calendar, retick_open};
 pub(crate) mod cpu_attrib;
 /// The masthead `fleet` widget's provider-VM cost popup.
 pub(crate) mod fleet;
+pub(crate) mod info;
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
 pub use usage_dash::{

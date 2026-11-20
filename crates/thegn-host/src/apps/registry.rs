@@ -41,9 +41,7 @@ pub static APP_BUILDERS: &[AppBuilder] = &[AppBuilder {
             &cfg.observe,
             rt,
             super::kit_theme(&crate::chrome::palette_snapshot()),
-            || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            },
+            super::observe_host_feed().clone(),
         )
     },
 }];

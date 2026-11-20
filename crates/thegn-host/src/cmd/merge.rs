@@ -1094,6 +1094,24 @@ fn sweep(cfg: &Config, force: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The drain warning for a queued worktree whose effective env is a provider env.
+fn provider_row_warning(branch: &str, worktree: &str, env: &str, sandbox: &str) -> String {
+    let sanitize = |value: &str| {
+        value
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(120)
+            .collect::<String>()
+    };
+    format!(
+        "{} ({}) runs on provider env {} (sandbox {}): commits made inside the sandbox are not in this drain until pulled (thegn env pull, or thegn land, which pulls first)",
+        sanitize(branch),
+        sanitize(worktree),
+        sanitize(env),
+        sanitize(sandbox),
+    )
+}
+
 fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     let root = repo_root()?;
     let mq = &cfg.repo_merge_queue(&root);
@@ -1165,6 +1183,29 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             location: r.location,
         })
         .collect();
+    let provider_warnings: Vec<String> = items
+        .iter()
+        .filter_map(
+            |item| match crate::provision_gate::provider_target(cfg, &item.worktree) {
+                Ok(Some((env, sandbox))) => Some(provider_row_warning(
+                    &item.branch,
+                    &item.worktree,
+                    &env,
+                    &sandbox,
+                )),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "thegn::merge",
+                        worktree = %item.worktree,
+                        error = %format!("{error:#}"),
+                        "provider target resolution failed for merge drain"
+                    );
+                    None
+                }
+            },
+        )
+        .collect();
     if items.is_empty() {
         // The empty path is the one a cron/CI loop hits most often, so it must
         // honour `--json` like every other path rather than printing prose.
@@ -1196,6 +1237,9 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
                 _ => " (UNGATED — no gate_command)".to_string(),
             }
         );
+        for warning in &provider_warnings {
+            outln!("Warning: {warning}");
+        }
     }
 
     let db = Db::open()?;
@@ -1261,6 +1305,9 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         }
     });
     let mut out = out;
+    if json {
+        out.warnings.extend(provider_warnings);
+    }
     out.warnings.extend(
         held_branches
             .into_iter()
@@ -1787,6 +1834,20 @@ mod gate_verdict_tests {
         assert_eq!(json["gate_verdicts"][0]["verdict"], "error");
         assert_eq!(json["gate_verdicts"][0]["phase"], "setup");
         assert_eq!(json["gate_verdicts"][0]["class"], "timeout");
+    }
+}
+
+#[cfg(test)]
+mod provider_warning_tests {
+    use super::provider_row_warning;
+
+    #[test]
+    fn provider_row_warning_names_the_pull() {
+        let warning = provider_row_warning("feature\n", "/tmp/wt\t", "dev\0", "sandbox\r");
+
+        assert!(warning.contains("thegn env pull"));
+        assert!(warning.contains("thegn land"));
+        assert!(!warning.chars().any(char::is_control), "{warning:?}");
     }
 }
 
