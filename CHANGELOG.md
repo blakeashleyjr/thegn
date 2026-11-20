@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.111] — 2026-11-20
+
 ### Added
 
 - Right panel: with `[lead]` configured (dev channel), a pinned Lead footer shows the Lead's state, pending approvals across all repos (click to answer them), lane and spawn budgets and the last action; the sidebar LEAD row gains a state suffix.
@@ -4039,7 +4041,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.110...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.111...HEAD
+[0.1.0-alpha.111]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.110...v0.1.0-alpha.111
 [0.1.0-alpha.110]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.109...v0.1.0-alpha.110
 [0.1.0-alpha.109]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.108...v0.1.0-alpha.109
 [0.1.0-alpha.108]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.107...v0.1.0-alpha.108
