@@ -2985,6 +2985,8 @@ pub(crate) fn build_model(
         .filter(|name| !app_cfg.zone.contains_key(name.as_str()))
         .cloned()
         .collect();
+    sidebar_status.lead =
+        crate::lead::status::gather(&app_cfg, db, session, thegn_core::util::now_ms());
     let sidebar_us = sidebar_t0.map(|t| t.elapsed().as_micros() as u64);
     // Self-throttled housekeeping (network/DB on own threads): VPS leak reaper
     // + placement engine + hibernator (snapshot-then-destroy for idle VMs).
