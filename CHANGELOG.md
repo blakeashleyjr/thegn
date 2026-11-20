@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.117] — 2026-11-20
+
 ### Changed
 
 - The Sprites live check's wake check after a cost read (step 10b) fails only if the sprite stays running, and warns on a single running reading or an unreadable provider listing (THE-2476).
@@ -4125,7 +4127,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.116...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.117...HEAD
+[0.1.0-alpha.117]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.116...v0.1.0-alpha.117
 [0.1.0-alpha.116]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.115...v0.1.0-alpha.116
 [0.1.0-alpha.115]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.114...v0.1.0-alpha.115
 [0.1.0-alpha.114]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.113...v0.1.0-alpha.114
