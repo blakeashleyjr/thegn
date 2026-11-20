@@ -209,12 +209,23 @@ impl VercelProvider {
             Ok(start) => start,
             Err(e) => return (None, Err(e)),
         };
-        let session = match self.interactive_session(name).await {
+        let mut session = match self.interactive_session(name).await {
             Ok(session) => session,
             Err(e) => return (None, Err(e)),
         };
-        let ticket = match self.client.interactive(&session).await {
+        let ticket = match self.api().interactive(&session).await {
             Ok(ticket) => ticket,
+            Err(error) if Self::is_session_stopped(&error) => {
+                self.forget_session(name);
+                session = match self.interactive_session(name).await {
+                    Ok(session) => session,
+                    Err(error) => return (None, Err(error)),
+                };
+                match self.api().interactive(&session).await {
+                    Ok(ticket) => ticket,
+                    Err(error) => return (None, Err(error)),
+                }
+            }
             Err(e) => return (None, Err(e)),
         };
         let hosts = match interactive_hosts(&ticket.url) {
