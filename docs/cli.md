@@ -130,6 +130,20 @@ argument-parse code (`2`) and is **permanent — do not retry it** (see the
 exit-code note below); it is distinct from the retryable runtime failures the
 table describes.
 
+### thegn info
+
+`thegn info` explains the effective workspace or worktree settings and the
+layer that supplied each value. Use `--workspace` or `--worktree` to inspect a
+different target, or `--json` for the stable machine-readable report.
+
+```sh
+thegn info [--workspace SLUG|PATH] [--worktree PATH|BRANCH] [--json]
+```
+
+The JSON document has top-level keys such as `schema`, `target`, `workspace`,
+`workspace_stats`, `worktree`, `sessions`, `settings`, `backends`, `overrides`,
+and `notes`.
+
 ## Headless worktree lifecycle
 
 ```sh

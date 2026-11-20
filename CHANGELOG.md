@@ -7,6 +7,12 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.107] — 2026-11-19
+
+### Added
+
+- Info screen: `thegn info` (with `--workspace`, `--worktree`, `--json`), the sidebar key `I` and the palette action "Info screen" show what is in force for a workspace or worktree, which layer set each value, and which sandbox backend would launch, using the same rule as a real launch. Remote and provider placements are never probed.
+
 ## [0.1.0-alpha.106] — 2026-11-19
 
 - Docs: help pages for Sprites checkpoint and restore ledger proof, URL auth pinning, the create-time memory policy, `fleet inspect`, the `provision` field of `agent run --json`, the drain warning, the Fly destroy check, `sandbox warm-devshell`, the masthead instance tag and the "Retry failed pull-backs" action. `env snapshot` and `env restore` now refuse a sprite another instance made for the same worktree path.
@@ -3993,7 +3999,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.106...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.107...HEAD
+[0.1.0-alpha.107]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.106...v0.1.0-alpha.107
 [0.1.0-alpha.106]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.105...v0.1.0-alpha.106
 [0.1.0-alpha.105]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.104...v0.1.0-alpha.105
 [0.1.0-alpha.104]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.103...v0.1.0-alpha.104
