@@ -930,8 +930,9 @@ check "merge add re-queues the branch after rm" \
 # the pipe, which can end the command before it records the land: read all of its output instead.
 check "merge drain lands the clean branch" \
   "'$SZ' merge drain | grep 'landed' >/dev/null"
+# No pipe into `grep -q` here: under pipefail it can exit at the first match and fail the check through git's SIGPIPE.
 check "drain advanced the target to include the branch's commit" \
-  "git -C '$R' log --oneline | grep -q 'smoke merge change'"
+  "[[ -n \"\$(git -C '$R' log --oneline --grep='smoke merge change')\" ]]"
 # organize_folders + on_landed = "expire" are on by default: a clean land KEEPS
 # the merged worktree and its branch, filed into merged_folder, until the
 # merged_ttl_secs grace period is up. The worktree directory holds gitignored
