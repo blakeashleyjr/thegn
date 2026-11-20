@@ -579,10 +579,17 @@ pub(crate) fn kick_eager(
                 // On success, clear the lock so a now-ready worktree shows no
                 // stale splash (materialize takes over on open). On failure,
                 // leave the failed steps visible.
-                if prov.is_ok() {
-                    let _ = ptx.send((gname.clone(), ti, Vec::new())); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                }
+                let deferred = match prov {
+                    Ok(outcome) => {
+                        let _ = ptx.send((gname.clone(), ti, Vec::new())); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                        outcome.deferred
+                    }
+                    Err(_) => None,
+                };
                 let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                if let Some(handoff) = deferred {
+                    crate::provision_bg::finish_in_background(&cfg, &wt, handoff);
+                }
             }
         });
     }

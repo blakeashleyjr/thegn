@@ -650,11 +650,66 @@ pub struct EnvPlan {
 /// workdir. The `git_exclude` step hides it from `git status` (THE-2043).
 pub const PROVISION_MARKER: &str = ".thegn-provisioned";
 
+/// Step ids a shell does not need. Prompt-first runs them after the pane's
+/// prompt (agents' CLIs and logins, shell history, the base checkpoint).
+pub const DEFERRED_STEP_IDS: &[&str] = &[
+    "agents_install",
+    "agents_config",
+    "atuin_sync",
+    "checkpoint",
+];
+
+/// Whether a provisioning step can run after the shell prompt appears.
+pub fn is_deferred_step(id: &str) -> bool {
+    DEFERRED_STEP_IDS.contains(&id)
+}
+
+/// Marker contents: done, and foreground-done-with-deferred-pending.
+pub const MARKER_DONE: &[u8] = b"ok\n";
+pub const MARKER_DEFERRED: &[u8] = b"deferred\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerState {
+    Done,
+    Deferred,
+}
+
+/// `Deferred` iff the bytes, ASCII-whitespace-trimmed, equal `deferred`;
+/// anything else (legacy `ok`, empty, unknown) is `Done`.
+pub fn marker_state(bytes: &[u8]) -> MarkerState {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    if &bytes[start..end] == b"deferred" {
+        MarkerState::Deferred
+    } else {
+        MarkerState::Done
+    }
+}
+
 impl EnvPlan {
-    /// Sentinel file the applier drops after a full successful run so a later
-    /// open skips re-provisioning. Lives directly in the workdir (the repo
-    /// checkout root), so the `git_exclude` provisioning step lists it in the
-    /// checkout's `.git/info/exclude` to keep it out of `git status`.
+    /// Split this plan into prompt-critical and post-prompt steps, preserving
+    /// plan order within both lists. A warm spare is never split.
+    pub fn split_deferred(&self, defer: bool) -> (Vec<ProvisionStep>, Vec<ProvisionStep>) {
+        if !defer {
+            return (self.steps.clone(), Vec::new());
+        }
+        self.steps
+            .iter()
+            .cloned()
+            .partition(|step| !is_deferred_step(&step.id))
+    }
+
+    /// Sentinel file the applier drops after a successful run. It contains
+    /// [`MARKER_DONE`] when all steps completed or [`MARKER_DEFERRED`] when
+    /// only the foreground steps completed. Lives directly in the workdir
+    /// (the repo checkout root), so the `git_exclude` provisioning step lists
+    /// it in the checkout's `.git/info/exclude` to keep it out of `git status`.
     pub fn marker_path(workdir: &str) -> String {
         format!("{}/{PROVISION_MARKER}", workdir.trim_end_matches('/'))
     }
@@ -3369,6 +3424,93 @@ mod tests {
     fn marker_path_uses_the_marker_const() {
         assert_eq!(EnvPlan::marker_path("/w"), format!("/w/{PROVISION_MARKER}"));
         assert_eq!(PROVISION_MARKER, ".thegn-provisioned");
+    }
+
+    #[test]
+    fn split_deferred_preserves_foreground_and_deferred_order() {
+        let plan = plan(
+            &EnvRequirements::default(),
+            &PlanOpts {
+                agents: vec!["codex".into()],
+                atuin: true,
+                checkpoint: true,
+                dotfiles: vec![".bashrc".into()],
+                strategy: crate::config::ShellStrategy::Portable,
+                ..Default::default()
+            },
+        );
+        let (foreground, deferred) = plan.split_deferred(true);
+        assert_eq!(
+            deferred
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "agents_install",
+                "agents_config",
+                "atuin_sync",
+                "checkpoint"
+            ]
+        );
+        assert_eq!(
+            foreground
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace", "dotfiles"]
+        );
+    }
+
+    #[test]
+    fn split_deferred_false_keeps_everything_in_the_foreground() {
+        let plan = plan(
+            &EnvRequirements::default(),
+            &PlanOpts {
+                agents: vec!["codex".into()],
+                atuin: true,
+                checkpoint: true,
+                ..Default::default()
+            },
+        );
+        let (foreground, deferred) = plan.split_deferred(false);
+        assert_eq!(foreground, plan.steps);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn split_deferred_without_agents_only_defers_checkpoint() {
+        let plan = plan(
+            &EnvRequirements::default(),
+            &PlanOpts {
+                checkpoint: true,
+                ..Default::default()
+            },
+        );
+        let (_, deferred) = plan.split_deferred(true);
+        assert_eq!(
+            deferred
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["checkpoint"]
+        );
+    }
+
+    #[test]
+    fn marker_state_accepts_only_deferred_as_pending() {
+        for bytes in [b"ok\n".as_slice(), b"".as_slice(), b"garbage".as_slice()] {
+            assert_eq!(marker_state(bytes), MarkerState::Done);
+        }
+        for bytes in [
+            b"deferred".as_slice(),
+            b"deferred\n".as_slice(),
+            b" deferred\r\n".as_slice(),
+        ] {
+            assert_eq!(marker_state(bytes), MarkerState::Deferred);
+        }
+        assert_eq!(MARKER_DEFERRED, b"deferred\n");
+        assert_eq!(marker_state(MARKER_DEFERRED), MarkerState::Deferred);
+        assert_eq!(MARKER_DONE, b"ok\n");
     }
 
     fn exec_script<'a>(p: &'a EnvPlan, id: &str) -> &'a str {
