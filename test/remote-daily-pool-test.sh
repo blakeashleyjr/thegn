@@ -13,31 +13,32 @@ plan="$(THEGN_BIN="$TMP/stub" bash "$SCRIPT")"
 grep -Fq "fresh XDG_STATE_HOME and THEGN_DIR" <<<"$plan"
 
 pool_plan="$(THEGN_BIN="$TMP/stub" bash "$SCRIPT" --with-pool)"
-for step in "P0" "P1" "P2" "P3" "P4" "P5"; do
+for step in "11o" "11g" "11e" "11f" "11n" "11d" "11r" "11q" "P0" "P1" "P2" "P3" "P4" "P5"; do
   grep -Fq "$step" <<<"$pool_plan"
 done
 grep -Fq -- "--with-pool" <<<"$pool_plan"
+grep -Fq -- "otherwise env up --worktree <rd-p path>" <<<"$pool_plan"
 
 rc=0
 THEGN_BIN="$TMP/stub" bash "$SCRIPT" --provider fly --with-pool >"$TMP/refused" 2>&1 || rc=$?
 [ "$rc" -eq 2 ]
 grep -Fq -- "--with-pool is supported only with --provider sprites" "$TMP/refused"
 
-rc=0
-THEGN_CHANNEL=dev THEGN_BIN="$TMP/not-called" bash "$SCRIPT" --env x --i-accept-spend --with-pool >"$TMP/hold-refused" 2>&1 || rc=$?
-[ "$rc" -eq 2 ]
-grep -Fq -- "needs RD_HOLD_AGENT=1" "$TMP/hold-refused"
-
-# shellcheck disable=SC2016 # the literal text is what must be absent from the script
+# shellcheck disable=SC2016 # literal text searched for in the script
 if grep -Fq 'export XDG_RUNTIME_DIR="$TMP/run"' "$SCRIPT"; then
   echo "FAIL: runtime dir override is back" >&2
   exit 1
 fi
-# shellcheck disable=SC2016 # the literal text is what must be absent from the script
+# shellcheck disable=SC2016 # literal text searched for in the script
 if grep -Fq 'mkdir -m 700 "$TMP/run"' "$SCRIPT"; then
   echo "FAIL: runtime dir mkdir is back" >&2
   exit 1
 fi
+grep -Fq 'RD_OVERLAY_AGENT' "$SCRIPT"
+grep -Fq 'agent list' "$SCRIPT"
+grep -Fq 'daemon >"$TMP/overlay-daemon.log"' "$SCRIPT"
+grep -Fq 'no_stdin "$THEGN_BIN" env up --worktree "$POOL_PATH"' "$SCRIPT"
+grep -Fq 'rd-y2' "$SCRIPT"
 [ ! -e "$TMP/called" ]
 
 echo "remote-daily-pool-test: PASS"
