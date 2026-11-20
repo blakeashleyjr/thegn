@@ -3,7 +3,9 @@
 //! daemon, so issuing/revoking access is never blocked on one.
 
 use anyhow::{Context, Result};
+#[cfg(feature = "iroh")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "iroh")]
 use std::io::Read as _;
 use thegn_core::config::Config;
 use thegn_core::control::{PairingUrl, ScopeSet, TokenKind};
@@ -292,19 +294,27 @@ fn profile_dir() -> Result<thegn_core::fsperm::PrivateDir> {
 
 #[cfg(feature = "iroh")]
 fn read_invitation(file: Option<std::path::PathBuf>) -> Result<DirectInvitation> {
-    let mut bytes = Vec::new();
     match file {
         Some(path) => {
             let text = thegn_core::fsperm::read_owner_only_secret_file(&path, 16 * 1024)
                 .map_err(|error| anyhow::anyhow!("invitation file refused: {error:?}"))?;
-            bytes.extend_from_slice(text.as_bytes());
+            parse_invitation(text.as_bytes())
         }
-        None => {
-            std::io::stdin().take(16 * 1024).read_to_end(&mut bytes)?;
-        }
+        None => read_invitation_from(std::io::stdin()),
     }
+}
+
+#[cfg(feature = "iroh")]
+fn read_invitation_from(mut reader: impl std::io::Read) -> Result<DirectInvitation> {
+    let mut bytes = Vec::new();
+    reader.take(16 * 1024).read_to_end(&mut bytes)?;
+    parse_invitation(&bytes)
+}
+
+#[cfg(feature = "iroh")]
+fn parse_invitation(bytes: &[u8]) -> Result<DirectInvitation> {
     anyhow::ensure!(bytes.len() < 16 * 1024, "direct invitation exceeds 16 KiB");
-    serde_json::from_slice(&bytes).context("parse direct Iroh invitation JSON")
+    serde_json::from_slice(bytes).context("parse direct Iroh invitation JSON")
 }
 
 #[cfg(feature = "iroh")]
@@ -469,4 +479,52 @@ fn run_direct(action: DirectAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "iroh"))]
+mod direct_tests {
+    use super::*;
+
+    const INVITATION: &str = r#"{"endpoint_id":"peer-id","addresses":["192.0.2.7:4567"],"code":"tgc1_single-use-code","label":"laptop"}"#;
+
+    #[test]
+    fn direct_redeem_reads_json_from_stdin_without_putting_code_in_argv() {
+        let invite = read_invitation_from(std::io::Cursor::new(INVITATION)).unwrap();
+        assert_eq!(invite.endpoint_id, "peer-id");
+        assert_eq!(invite.addresses, ["192.0.2.7:4567"]);
+        assert_eq!(invite.code, "tgc1_single-use-code");
+        assert_eq!(invite.label, "laptop");
+    }
+
+    #[test]
+    fn direct_redeem_accepts_owner_only_file_and_refuses_world_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invite.json");
+        thegn_core::fsperm::write_owner_only_new(&path, INVITATION.as_bytes()).unwrap();
+        assert_eq!(
+            read_invitation(Some(path.clone())).unwrap().code,
+            "tgc1_single-use-code"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let error = read_invitation(Some(path)).err().unwrap().to_string();
+            assert!(error.contains("invitation file refused"));
+            assert!(!error.contains("tgc1_single-use-code"));
+        }
+    }
+
+    #[test]
+    fn direct_redeem_bounds_and_rejects_unknown_invitation_fields() {
+        let oversized = vec![b' '; 16 * 1024];
+        assert!(parse_invitation(&oversized).is_err());
+        assert!(
+            parse_invitation(
+                br#"{"endpoint_id":"peer","addresses":[],"code":"x","unexpected":true}"#
+            )
+            .is_err()
+        );
+    }
 }

@@ -1230,6 +1230,25 @@ fn registry_control_origin(
     transport.advertised_origin(actual_bind_port)
 }
 
+#[cfg(feature = "iroh")]
+fn direct_invitation_command(peer_id: &str, addresses: &[String]) -> String {
+    let mut command = format!(
+        "thegn pair direct new --endpoint-id {}",
+        shell_quote_arg(peer_id)
+    );
+    for address in addresses {
+        command.push_str(" --address ");
+        command.push_str(&shell_quote_arg(address));
+    }
+    command.push_str(" --scope read --out invite.json");
+    command
+}
+
+#[cfg(feature = "iroh")]
+fn shell_quote_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// `[lead] token_ttl_secs` for a listener's sliding Lead-token refresh; `0`
 /// (no slide) without a configured Lead.
 fn lead_token_ttl_secs(cfg: &Config) -> u64 {
@@ -1251,7 +1270,7 @@ fn direct_control_secret() -> Result<[u8; 32]> {
         }
         Some(bytes)
     };
-    if let Some(existing) = crate::secret::resolve(&format!("keyring:{ACCOUNT}")) {
+    if let Some(existing) = crate::secret::resolve_stored(ACCOUNT) {
         return decode(&existing).context("stored direct Iroh control identity is malformed");
     }
     let mut bytes = [0; 32];
@@ -1703,7 +1722,8 @@ async fn run(
                 thegn_core::outln!("  direct address: {address}");
             }
             thegn_core::outln!(
-                "pair with `thegn pair new --scope read` and transfer endpoint ID, addresses, and the single-use code in an invitation file"
+                "create a protected direct invitation: {}",
+                direct_invitation_command(&direct_addr.id.to_string(), &addresses)
             );
             let shutdown_direct = shutdown.clone();
             tokio::spawn(async move {
@@ -2054,6 +2074,19 @@ fn daemon_busy(sessions: usize, schedule_or_producer_armed: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn direct_pair_startup_hint_uses_runnable_protected_invitation_command() {
+        let command = direct_invitation_command(
+            "peer-id",
+            &["192.0.2.7:4567".into(), "[fd00::1]:4568".into()],
+        );
+        assert_eq!(
+            command,
+            "thegn pair direct new --endpoint-id 'peer-id' --address '192.0.2.7:4567' --address '[fd00::1]:4568' --scope read --out invite.json"
+        );
+    }
 
     #[test]
     fn an_armed_schedule_or_producer_keeps_an_otherwise_idle_daemon_busy() {
