@@ -6,12 +6,12 @@
 //! The rows table carries a cursor (`↑↓`). A row bound to a worktree takes
 //! `s` (stop: park the VM) and `d` (destroy: pull commits back, then delete),
 //! both as [`DetailAction::FleetDown`]; the loop confirms and then runs
-//! `thegn env down [--stop] --worktree=<wt>` ([`fleet_down_argv`]) in a
+//! `thegn env down [--stop] --worktree=<wt>` (`fleet_down_argv`) in a
 //! visible tab, so the CLI's pull-back and refusals are reused and never
 //! forced. Orphan rows (no worktree) take no keys.
 //!
 //! Built from the loop-owned `FrameModel::fleet` snapshot only, so opening it
-//! costs no I/O; [`refresh_open`] rebuilds it in place when a new read lands
+//! costs no I/O; `refresh_open` rebuilds it in place when a new read lands
 //! (riding the `RefreshKind::Fleet` drain, no wake source of its own). A child
 //! module of `detail` so it reaches the private [`DetailOverlay`] fields.
 

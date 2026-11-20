@@ -1,6 +1,6 @@
 //! Config-reload hooks: the swap groups the UI loop runs when the config
 //! watcher publishes a new [`Config`], gated on the
-//! [`ReloadPlan`](thegn_core::config::reload_class::ReloadPlan) so a hook runs
+//! [`ReloadPlan`] so a hook runs
 //! only when one of its keys changed (or the diff was incomplete).
 //!
 //! Extracted from the reload handler in `run.rs`. Every hook runs ON the loop

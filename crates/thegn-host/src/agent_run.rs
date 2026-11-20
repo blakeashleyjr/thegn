@@ -783,7 +783,7 @@ pub(crate) fn agent_floor_gate(
 }
 
 /// Resolve the sandbox an uncontained (`agent_sandbox = false`) queue agent
-/// would run under. Returns the effective [`SandboxConfig`] plus whether its
+/// would run under. Returns the effective `SandboxConfig` plus whether its
 /// profile is KNOWN for this worktree: `true` after a full local resolve
 /// (env overlay + zone), and `true` when the worktree has a pin — but
 /// `false` on the early returns (worktree path unresolved, repo root missing,
