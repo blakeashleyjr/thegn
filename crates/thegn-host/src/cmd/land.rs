@@ -76,12 +76,72 @@ pub(crate) fn land_branch(
 /// `(branch, target, outcome)`. Queue bookkeeping is intentionally left to the
 /// caller because this helper is also used by `thegn merge land` and the TUI.
 /// This shared helper must not install process-wide signal handlers.
+#[cfg(test)]
 pub(crate) fn land_branch_pinned(
     cfg: &Config,
     worktree: &Path,
     expected_tip: Option<&str>,
 ) -> Result<(String, String, AttemptOutcome)> {
     land_branch_pinned_with_options(cfg, worktree, expected_tip, None, false, None)
+}
+
+/// What a queue land did, with the lines to show (CLI prints, TUI appends).
+pub(crate) struct PulledLand {
+    pub branch: String,
+    pub target: String,
+    pub outcome: AttemptOutcome,
+    pub notes: Vec<String>,
+}
+
+/// Pure: the refusal when a pull moved the branch past the queued candidate.
+fn stale_candidate(
+    pre: &crate::provider_git::PreLand,
+    expected_tip: Option<&str>,
+) -> Option<String> {
+    expected_tip?;
+    let crate::provider_git::PreLand::Ready {
+        report: Some(report),
+    } = pre
+    else {
+        return None;
+    };
+    let crate::provider_git::PullOutcome::FastForwarded { commits, .. } = &report.outcome else {
+        return None;
+    };
+    Some(format!(
+        "pulled {commits} commit(s) from the sandbox into {}; the queued candidate is stale — re-queue it (`thegn merge add`) or land it with `thegn land`",
+        report.branch
+    ))
+}
+
+/// `land_branch_pinned` after `pull_before_land`, as `thegn land` does (THE-2477 Q3).
+pub(crate) fn land_branch_pinned_pulled(
+    cfg: &Config,
+    worktree: &Path,
+    expected_tip: Option<&str>,
+) -> Result<PulledLand> {
+    let pre = crate::provider_git::pull_before_land(cfg, &worktree.to_string_lossy())?;
+    let (provider_land, line) = pre_land_quiet(&pre)?;
+    if let Some(refusal) = stale_candidate(&pre, expected_tip) {
+        bail!("{refusal}");
+    }
+    let branch_loc_override = provider_land
+        .is_some()
+        .then(|| thegn_core::remote::GitLoc::Local(worktree.to_path_buf()));
+    let (branch, target, outcome) = land_branch_pinned_with_options(
+        cfg,
+        worktree,
+        expected_tip,
+        None,
+        false,
+        branch_loc_override,
+    )?;
+    Ok(PulledLand {
+        branch,
+        target,
+        outcome,
+        notes: line.into_iter().collect(),
+    })
 }
 
 /// The loc `attempt_land` folds from. `thegn land` lands the branch checked
@@ -410,19 +470,27 @@ pub fn run(
 /// worktree (land from its stored loc); `Some(sandbox_gone)` = land the local
 /// branch. A kept sandbox head is an error.
 fn pre_land_plan(pre: &crate::provider_git::PreLand) -> Result<Option<bool>> {
+    let (provider_land, line) = pre_land_quiet(pre)?;
+    if let Some(line) = line {
+        outln!("{line}");
+    }
+    Ok(provider_land)
+}
+
+fn pre_land_quiet(pre: &crate::provider_git::PreLand) -> Result<(Option<bool>, Option<String>)> {
     use crate::provider_git::PreLand;
     match pre {
-        PreLand::NotProvider => Ok(None),
+        PreLand::NotProvider => Ok((None, None)),
         PreLand::Ready { report } => {
-            if let Some(report) = report {
-                outln!("pulled {}: {}", report.branch, report.summary());
-            }
-            Ok(Some(false))
+            let line = report
+                .as_ref()
+                .map(|report| format!("pulled {}: {}", report.branch, report.summary()));
+            Ok((Some(false), line))
         }
-        PreLand::SandboxGone => {
-            outln!("sandbox gone; landing the local branch");
-            Ok(Some(true))
-        }
+        PreLand::SandboxGone => Ok((
+            Some(true),
+            Some("sandbox gone; landing the local branch".to_owned()),
+        )),
         PreLand::Refused(message) => bail!("{message}"),
     }
 }
@@ -496,6 +564,18 @@ impl SandboxRelease for LiveRelease<'_> {
     ) -> std::result::Result<crate::agent_teardown::Teardown, String> {
         if !self.cfg.env.contains_key(env) {
             return Err(format!("env {env} is not configured"));
+        }
+        let sandbox = self
+            .target(worktree)
+            .map(|(_, name)| name)
+            .unwrap_or_else(|_| "of this worktree".into());
+        let notes = crate::provider_git::destroy_guard(
+            crate::provider_git::pull_before_destroy(self.cfg, worktree),
+            &sandbox,
+            false,
+        )?;
+        for note in &notes {
+            self.say(&note.text);
         }
         crate::agent_teardown::destroy_provider_sandbox_with(self.cfg, worktree, env)
     }
@@ -998,6 +1078,72 @@ mod landed_row_tests {
         ))
         .unwrap_err();
         assert!(format!("{error:#}").contains("land refused"), "{error:#}");
+    }
+
+    #[test]
+    fn pre_land_quiet_table() {
+        use crate::provider_git::{PreLand, PullOutcome, PullReport};
+
+        assert_eq!(
+            super::pre_land_quiet(&PreLand::NotProvider).unwrap(),
+            (None, None)
+        );
+        assert_eq!(
+            super::pre_land_quiet(&PreLand::Ready { report: None }).unwrap(),
+            (Some(false), None)
+        );
+        let report = PullReport {
+            branch: "tg/lane".into(),
+            outcome: PullOutcome::UpToDate,
+            push: None,
+        };
+        assert_eq!(
+            super::pre_land_quiet(&PreLand::Ready {
+                report: Some(report),
+            })
+            .unwrap(),
+            (Some(false), Some("pulled tg/lane: up to date".into()))
+        );
+        assert_eq!(
+            super::pre_land_quiet(&PreLand::SandboxGone).unwrap(),
+            (
+                Some(true),
+                Some("sandbox gone; landing the local branch".into())
+            )
+        );
+        let error = super::pre_land_quiet(&PreLand::Refused("land refused".into())).unwrap_err();
+        assert_eq!(format!("{error:#}"), "land refused");
+    }
+
+    #[test]
+    fn stale_candidate_after_a_fast_forward() {
+        use crate::provider_git::{PreLand, PullOutcome, PullReport};
+
+        let fast_forwarded = PreLand::Ready {
+            report: Some(PullReport {
+                branch: "tg/lane".into(),
+                outcome: PullOutcome::FastForwarded {
+                    from: "old".into(),
+                    to: "new".into(),
+                    commits: 2,
+                },
+                push: None,
+            }),
+        };
+        assert_eq!(
+            super::stale_candidate(&fast_forwarded, Some("candidate")),
+            Some("pulled 2 commit(s) from the sandbox into tg/lane; the queued candidate is stale — re-queue it (`thegn merge add`) or land it with `thegn land`".into())
+        );
+
+        let up_to_date = PreLand::Ready {
+            report: Some(PullReport {
+                branch: "tg/lane".into(),
+                outcome: PullOutcome::UpToDate,
+                push: None,
+            }),
+        };
+        assert_eq!(super::stale_candidate(&up_to_date, Some("candidate")), None);
+        assert_eq!(super::stale_candidate(&fast_forwarded, None), None);
     }
 
     #[test]
