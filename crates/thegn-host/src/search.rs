@@ -64,6 +64,8 @@ pub enum SearchOutcome {
     Pending,
     /// User confirmed a result — jump to this match.
     Jump(SearchMatch),
+    /// The scope changed; the caller must rebuild sources and apply it.
+    Rescope(SearchScope),
     /// User dismissed (Esc / Ctrl+g) — close the overlay.
     Dismiss,
 }
@@ -146,7 +148,7 @@ impl SearchOverlay {
                 } else {
                     self.engine.scope().widen(self.anchor_pane)
                 };
-                self.engine.set_scope(new_scope, sources);
+                return SearchOutcome::Rescope(new_scope);
             }
 
             KeyCode::Char('f') | KeyCode::Char('F') if mods == Modifiers::ALT => {
@@ -199,6 +201,11 @@ impl SearchOverlay {
         self.refresh_preview(sources);
 
         SearchOutcome::Pending
+    }
+
+    pub fn apply_scope(&mut self, scope: SearchScope, sources: &[SearchSource<'_>]) {
+        self.engine.set_scope(scope, sources);
+        self.refresh_preview(sources);
     }
 
     fn refresh_preview(&mut self, sources: &[SearchSource<'_>]) {
@@ -761,14 +768,30 @@ mod tests {
         let srcs = sources(5, &buf);
         let mut ov = SearchOverlay::new(SearchScope::Pane(5), 5, 100);
         assert_eq!(ov.scope(), SearchScope::Pane(5));
-        ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs);
+        assert!(matches!(
+            ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs),
+            SearchOutcome::Rescope(SearchScope::Tab)
+        ));
+        ov.apply_scope(SearchScope::Tab, &srcs);
         assert_eq!(ov.scope(), SearchScope::Tab);
-        ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs);
+        assert!(matches!(
+            ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs),
+            SearchOutcome::Rescope(SearchScope::Worktree)
+        ));
+        ov.apply_scope(SearchScope::Worktree, &srcs);
         assert_eq!(ov.scope(), SearchScope::Worktree);
-        ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs);
+        assert!(matches!(
+            ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs),
+            SearchOutcome::Rescope(SearchScope::Workspace)
+        ));
+        ov.apply_scope(SearchScope::Workspace, &srcs);
         assert_eq!(ov.scope(), SearchScope::Workspace);
         // Profile is skipped: wrap back to Pane.
-        ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs);
+        assert!(matches!(
+            ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs),
+            SearchOutcome::Rescope(SearchScope::Pane(5))
+        ));
+        ov.apply_scope(SearchScope::Pane(5), &srcs);
         assert_eq!(ov.scope(), SearchScope::Pane(5));
     }
 
@@ -777,8 +800,31 @@ mod tests {
         let buf = buf_from(&["x"]);
         let srcs = sources(3, &buf);
         let mut ov = SearchOverlay::new(SearchScope::Tab, 3, 100);
-        ov.handle_key(&KeyCode::Tab, Modifiers::SHIFT, &srcs);
+        assert!(matches!(
+            ov.handle_key(&KeyCode::Tab, Modifiers::SHIFT, &srcs),
+            SearchOutcome::Rescope(SearchScope::Pane(3))
+        ));
+        ov.apply_scope(SearchScope::Pane(3), &srcs);
         assert_eq!(ov.scope(), SearchScope::Pane(3));
+    }
+
+    #[test]
+    fn tab_returns_rescope_and_apply_scope_recomputes() {
+        let first = buf_from(&["target"]);
+        let second = buf_from(&["target"]);
+        let first_src = sources(1, &first);
+        let both = vec![(1, "first", &first), (2, "second", &second)];
+        let mut ov = overlay(1);
+        typed(&mut ov, "target", &first_src);
+        assert_eq!(ov.engine().matches().len(), 1);
+
+        assert!(matches!(
+            ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &first_src),
+            SearchOutcome::Rescope(SearchScope::Tab)
+        ));
+        assert_eq!(ov.engine().matches().len(), 1);
+        ov.apply_scope(SearchScope::Tab, &both);
+        assert_eq!(ov.engine().matches().len(), 2);
     }
 
     #[test]

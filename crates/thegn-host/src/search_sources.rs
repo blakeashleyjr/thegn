@@ -103,6 +103,13 @@ pub(crate) fn build_search_sources<'a>(
 
 /// Jump to the matched line: switch tab if needed, scroll the pane so the
 /// matched line is visible, and focus the center terminal.
+pub(crate) struct SearchJump {
+    /// The found line as a selection in absolute lines (copymode::Selection).
+    pub(crate) highlight: Option<(u32, crate::copymode::Selection)>,
+    /// The jump changed the active worktree group.
+    pub(crate) switched_group: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_search_jump(
     m: thegn_core::search::SearchMatch,
@@ -112,16 +119,18 @@ pub(crate) fn apply_search_jump(
     model: &mut crate::chrome::FrameModel,
     sb: &mut crate::run::SidebarState,
     need_relayout: &mut bool,
-) {
+) -> SearchJump {
     use crate::focus::Zone;
 
     let mut switched = false;
+    let mut switched_group = false;
     'outer: for (gi, group) in session.worktrees.iter().enumerate() {
         for (ti, tab) in group.tabs.iter().enumerate() {
             if tab.center.pane_ids().contains(&m.pane_id) {
                 if gi != session.active {
                     session.switch_to(gi);
                     switched = true;
+                    switched_group = true;
                 }
                 if gi == session.active {
                     let group = &mut session.worktrees[gi];
@@ -144,9 +153,20 @@ pub(crate) fn apply_search_jump(
         tab.focused_pane = m.pane_id;
     }
 
+    let mut highlight = None;
     match panes.table.get_mut(&m.pane_id) {
         Some(pane) => {
-            if let Some(offset) = pane.emulator().locate_line(&m.line, m.from_tail) {
+            if let Some((offset, top, rows)) =
+                pane.emulator().locate_line_span(&m.line, m.from_tail)
+            {
+                let (_, cols) = pane.emulator().size();
+                highlight = Some((
+                    m.pane_id,
+                    crate::copymode::Selection {
+                        anchor: (top, 0),
+                        cursor: (top + rows as i32 - 1, cols.saturating_sub(1)),
+                    },
+                ));
                 pane.scroll_down(usize::MAX / 2);
                 pane.scroll_up(offset);
             } else {
@@ -154,6 +174,11 @@ pub(crate) fn apply_search_jump(
             }
         }
         None => model.status = SEARCH_JUMP_MISSING.into(),
+    }
+
+    SearchJump {
+        highlight,
+        switched_group,
     }
 }
 
