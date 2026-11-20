@@ -7,6 +7,24 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.115] — 2026-11-20
+
+### Added
+
+- `test/remote-parity.sh` gains `--startup-only`, `--fill-spare` and `--tui-probe` for startup timing, a warm-spare claim and a full-screen-program probe.
+- The remote agent install logs per-agent seconds to `~/.cache/thegn-agent-install.log` in the sandbox.
+
+### Changed
+
+- Remote panes on Sprites state their size right after connect, so the first `stty size` is no longer `0 0`.
+- The `sprite-exec` bridge batches queued input into one write (up to 32 KiB); a lone keystroke and a lone Escape still travel alone.
+- Local echo prediction retires only the keys the server echoed and drops stale ones after 2 s.
+- The agent install runs one `npm install -g` for all missing npm agents.
+
+### Fixed
+
+- `session open` prints an id only for a session the daemon holds, a stage-launch replay of a vanished session is refused, and `session attach` exits non-zero when the session vanished.
+
 ## [0.1.0-alpha.114] — 2026-11-20
 
 ### Added
@@ -4086,7 +4104,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.114...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.115...HEAD
+[0.1.0-alpha.115]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.114...v0.1.0-alpha.115
 [0.1.0-alpha.114]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.113...v0.1.0-alpha.114
 [0.1.0-alpha.113]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.112...v0.1.0-alpha.113
 [0.1.0-alpha.112]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.111...v0.1.0-alpha.112
