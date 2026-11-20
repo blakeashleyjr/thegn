@@ -2027,6 +2027,18 @@ class PublicationSagaTests(unittest.TestCase):
         self.assertIn("not evidence", release.publication_saga_summary(ledger))
         self.assertIn("outcome hint: committed", release.publication_saga_summary(ledger))
 
+    def test_disabled_and_skipped_targets_remain_distinct_from_unknown(self) -> None:
+        ledger = self.saga(
+            homebrew_job_result="failure",
+            homebrew_ready="false",
+            aur_job_result="skipped",
+            aur_ready="unknown",
+        )
+        self.assertEqual("pending", ledger["state"])
+        self.assertEqual("pending", ledger["targets"]["homebrew"]["state"])
+        self.assertEqual("skipped", ledger["targets"]["aur"]["state"])
+        self.assertFalse(ledger["reconcile_required"])
+
     def test_rerun_uses_prior_success_receipt_and_current_attempt_receipt(self) -> None:
         homebrew = self.receipt("homebrew", 1)
         aur = self.receipt("aur", 2)

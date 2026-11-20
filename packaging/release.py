@@ -1972,8 +1972,10 @@ def _publication_saga_target(
         result.update(state="unknown", reason="invalid publisher job result")
         return result
     if receipt is None:
-        if ready == "false" and job_result == "success" and not receipt_artifact_id:
+        if ready == "false" and not receipt_artifact_id:
             result.update(state="pending", reason="publisher was not configured; push steps were skipped")
+        elif job_result == "skipped" and not receipt_artifact_id:
+            result.update(state="skipped", reason="publisher job was skipped; no push step ran")
         else:
             result.update(
                 state="unknown",
@@ -2187,7 +2189,7 @@ def build_publication_saga_ledger(
             state = "complete"
         else:
             state = "inconsistent"
-    elif homebrew["state"] == "pending" and aur["state"] == "pending":
+    elif homebrew["state"] in {"pending", "skipped"} and aur["state"] in {"pending", "skipped"}:
         state = "pending"
     elif homebrew["state"] == "verified" or aur["state"] == "verified":
         state = "partial"
@@ -2247,7 +2249,7 @@ def publication_saga_summary(ledger: Mapping[str, Any]) -> str:
             ]
         )
     elif state == "pending":
-        lines.extend(["", "No target was configured; no publisher push step ran."])
+        lines.extend(["", "No target has a verified publication; pending/skipped publisher jobs did not run their push steps."])
     else:
         lines.extend(["", f"Ledger artifact retention: {ledger['retention_days']} days."])
     return "\n".join(lines) + "\n"
