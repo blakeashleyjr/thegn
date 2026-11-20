@@ -66,8 +66,12 @@ existing `--session` spelling: `session snapshot [SESSION]`, `session attach
 [SESSION]`, and `session wait [SESSION]`. `snapshot` emits the raw ANSI screen
 by default, or plain rows with `--text` and geometry plus base64 ANSI with
 `--json`; `attach` streams live output until Ctrl-C without stopping the
-session. `wait` accepts `--until exited|idle|blocked|done|match:<regex>` and
-optional `--timeout <ms>`; a timeout exits 2.
+session. `wait` accepts
+`--until exited|idle|blocked|done|match:<regex>|screen:<regex>|stable:<ms>` and
+optional `--timeout <ms>`; a timeout exits 2. `session send` types text, or with
+`--key <KEY>` (repeatable, at most 64) presses named keys such as `up`, `esc`,
+`f5` or `ctrl+c`; `--paste` sends the text as a paste and cannot be combined
+with `--key`.
 
 `session fork <id>` asks the daemon to start a new PTY from a live session.
 Use `--scrollback` for a bounded handoff, `--tab` for a new tab, and

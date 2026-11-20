@@ -586,6 +586,79 @@ fn routed_params(
     Ok(params)
 }
 
+enum InputPayload {
+    Text { text: String, paste: bool },
+    Bytes(Vec<u8>),
+    Keys(Vec<String>),
+}
+
+fn input_payload(args: &serde_json::Value) -> Result<InputPayload, String> {
+    let obj = args
+        .as_object()
+        .ok_or("state tool arguments must be an object")?;
+    let has_text = obj.contains_key("text");
+    let has_bytes = obj.contains_key("bytes_b64");
+    let has_keys = obj.contains_key("keys");
+    let sources = [has_text, has_bytes, has_keys]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if sources != 1 {
+        return Err(
+            "exactly one of `text`, `bytes_b64` or `keys` is required (not more than one)".into(),
+        );
+    }
+
+    let paste = match obj.get("paste") {
+        None => false,
+        Some(value) => value.as_bool().ok_or("`paste` must be a boolean")?,
+    };
+    if has_text {
+        let text = obj
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("`text` must be a string")?;
+        return Ok(InputPayload::Text {
+            text: text.to_string(),
+            paste,
+        });
+    }
+    if paste {
+        return Err("`paste` may only be used with `text`".into());
+    }
+    if has_bytes {
+        let b64 = obj
+            .get("bytes_b64")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("`bytes_b64` must be a string")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("bad `bytes_b64`: {e}"))?;
+        return Ok(InputPayload::Bytes(bytes));
+    }
+
+    let values = obj
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("`keys` must be an array of strings")?;
+    if values.len() > super::session::keys::MAX_KEYS {
+        return Err(format!(
+            "`keys` must contain at most {} keys",
+            super::session::keys::MAX_KEYS
+        ));
+    }
+    let mut keys = Vec::with_capacity(values.len());
+    for value in values {
+        keys.push(
+            value
+                .as_str()
+                .ok_or("`keys` must be an array of strings")?
+                .to_string(),
+        );
+    }
+    Ok(InputPayload::Keys(keys))
+}
+
 /// Fetch (or perform) one state capability's payload against the pane daemon
 /// (control client). `args` is the already-schema-validated `tools/call`
 /// arguments object (`StateRouter::call` runs `validate_args` before this is
@@ -792,9 +865,16 @@ async fn fetch_state(
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let session = str_arg(args, "session").ok_or("missing `session`")?;
             let condition_str = str_arg(args, "condition").ok_or("missing `condition`")?;
+            let timeout_ms = args.get("timeout_ms").and_then(serde_json::Value::as_i64);
+            if let Some(w) = super::session::keys::parse_screen_wait(condition_str)
+                .map_err(|e| e.to_string())?
+            {
+                return super::session::keys::wait_screen(&c, session, &w, timeout_ms)
+                    .await
+                    .map_err(|e| e.to_string());
+            }
             let condition =
                 super::session::parse_wait_condition(condition_str).map_err(|e| e.to_string())?;
-            let timeout_ms = args.get("timeout_ms").and_then(serde_json::Value::as_i64);
             c.wait(session, condition, timeout_ms)
                 .await
                 .map_err(|e| e.to_string())
@@ -854,23 +934,48 @@ async fn fetch_state(
                 .get("enter")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let bytes = match (str_arg(args, "text"), str_arg(args, "bytes_b64")) {
-                (Some(_), Some(_)) => {
-                    return Err("exactly one of `text`/`bytes_b64` may be given, not both".into());
+            let payload = input_payload(args)?;
+            let (bytes, key_count) = match payload {
+                InputPayload::Text { text, paste } => {
+                    let bytes = if paste {
+                        let (_, rows, cols, ansi) = c
+                            .snapshot(session)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let modes = super::session::keys::screen_modes(rows, cols, &ansi);
+                        super::session::keys::paste_bytes(&text, modes.bracketed_paste)
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        text.into_bytes()
+                    };
+                    (bytes, None)
                 }
-                (Some(text), None) => text.as_bytes().to_vec(),
-                (None, Some(b64)) => base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .map_err(|e| format!("bad `bytes_b64`: {e}"))?,
-                (None, None) => {
-                    return Err("exactly one of `text`/`bytes_b64` is required".into());
+                InputPayload::Bytes(bytes) => (bytes, None),
+                InputPayload::Keys(keys) => {
+                    let (_, rows, cols, ansi) = c
+                        .snapshot(session)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let modes = super::session::keys::screen_modes(rows, cols, &ansi);
+                    let parsed = keys
+                        .iter()
+                        .map(|key| super::session::keys::parse_key(key).map_err(|e| e.to_string()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let n = parsed.len();
+                    let bytes = super::session::keys::encode_keys(&parsed, modes.app_cursor)
+                        .map_err(|e| e.to_string())?;
+                    (bytes, Some(n))
                 }
             };
             let n = bytes.len();
             c.send_input(session, &bytes, enter)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(json!({ "sent_bytes": n, "session": session, "enter": enter }))
+            let mut answer = json!({ "sent_bytes": n, "session": session, "enter": enter });
+            if let Some(key_count) = key_count {
+                answer["keys"] = json!(key_count);
+            }
+            Ok(answer)
         }
         "sessions.kill" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
@@ -881,11 +986,9 @@ async fn fetch_state(
         // Reversible writes routed generically through the control catalog,
         // under the same `write` scope the HTTP and plugin paths require (no
         // extra interlock: neither sends input nor creates anything on disk).
-        // `sessions.snapshot` is a read: same `read` scope as HTTP and plugins.
         // The dispatch-roster writes need `write`, as `POST /v1/dispatches`
         // and `POST /v1/dispatches/{id}/status` do; no extra interlock.
         "sessions.resize"
-        | "sessions.snapshot"
         | "sessions.split"
         | "worktrees.open"
         | "dispatches.put"
@@ -896,6 +999,31 @@ async fn fetch_state(
             c.call_raw(method, &path, body)
                 .await
                 .map_err(|e| e.to_string())
+        }
+        "sessions.snapshot" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let session = str_arg(args, "session").ok_or("missing `session`")?;
+            if session.is_empty()
+                || session == "."
+                || session == ".."
+                || session.contains(['/', '?', '#', '%'])
+            {
+                return Err("invalid `session` id".into());
+            }
+            let (seq, rows, cols, ansi) = c.snapshot(session).await.map_err(|e| e.to_string())?;
+            let modes = super::session::keys::screen_modes(rows, cols, &ansi);
+            Ok(json!({
+                "session": session,
+                "seq": seq,
+                "rows": rows,
+                "cols": cols,
+                "ansi_b64": base64::engine::general_purpose::STANDARD.encode(&ansi),
+                "text": super::session::snapshot_text(rows, cols, &ansi),
+                "cursor": { "row": modes.cursor_row, "col": modes.cursor_col },
+                "alt_screen": modes.alt_screen,
+                "app_cursor": modes.app_cursor,
+                "bracketed_paste": modes.bracketed_paste,
+            }))
         }
         // Tracker writes: `write`, as `POST /v1/issues/{id}` and its comment
         // route require. `account`/`repo` travel in the query string.
@@ -1208,6 +1336,7 @@ mod tests {
     use super::allowed_state_caps;
     use super::explain_key;
     use super::host_install_choice;
+    use super::input_payload;
     use super::issue_write_call;
     use super::routed_params;
     use thegn_core::control::ScopeSet;
@@ -1497,6 +1626,56 @@ mod tests {
         ] {
             assert!(routed_params("sessions.split", &bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn input_payload_enforces_exactly_one_source_and_key_limit() {
+        assert!(input_payload(&serde_json::json!({})).is_err());
+        assert!(
+            input_payload(&serde_json::json!({
+                "text": "hello",
+                "bytes_b64": "aGVsbG8="
+            }))
+            .is_err()
+        );
+        assert!(
+            input_payload(&serde_json::json!({
+                "text": "hello",
+                "keys": ["enter"]
+            }))
+            .is_err()
+        );
+
+        let text = input_payload(&serde_json::json!({
+            "text": "hello",
+            "paste": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            text,
+            super::InputPayload::Text { text, paste: true } if text == "hello"
+        ));
+        assert!(
+            input_payload(&serde_json::json!({
+                "bytes_b64": "aGVsbG8=",
+                "paste": true
+            }))
+            .is_err()
+        );
+        assert!(
+            input_payload(&serde_json::json!({
+                "keys": ["enter"],
+                "paste": true
+            }))
+            .is_err()
+        );
+
+        let too_many = serde_json::Value::Array(
+            (0..=super::super::session::keys::MAX_KEYS)
+                .map(|_| serde_json::json!("a"))
+                .collect(),
+        );
+        assert!(input_payload(&serde_json::json!({ "keys": too_many })).is_err());
     }
 
     #[test]
