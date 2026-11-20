@@ -126,8 +126,9 @@ impl VanishedTabs {
 static RECONCILIATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// Groups (path, epoch) this process already decided to keep; re-probed only
 /// when the epoch changes, or when a git-kept group reaches its reprobe deadline.
-static SETTLED_GROUPS: OnceLock<Mutex<HashMap<String, (u64, Option<std::time::Instant>)>>> =
-    OnceLock::new();
+static SETTLED_GROUPS: OnceLock<Mutex<SettledGroups>> = OnceLock::new();
+/// Group path -> (epoch it was settled at, when a git-kept group is probed again).
+type SettledGroups = HashMap<String, (u64, Option<std::time::Instant>)>;
 const GIT_KEPT_REPROBE: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct ReconciliationCompletionGuard;

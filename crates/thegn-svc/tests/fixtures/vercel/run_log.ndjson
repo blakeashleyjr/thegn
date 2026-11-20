@@ -1,3 +1,4 @@
+{"command":{"id":"cmd_1","exitCode":null}}
 {"stream":"stdout","data":"hello\n"}
 {"stream":"stderr","data":"warn\n"}
 {"command":{"id":"cmd_1","exitCode":3}}
