@@ -61,7 +61,13 @@ fn branch_tip(dir: &Path, branch: &str) -> Result<Option<String>> {
 /// Gather the facts for one worktree. Git read failures (status, target ref,
 /// branch tip) are returned as errors; only an absent branch ref reads as no
 /// tip. `git merge-base --is-ancestor` failures still count against removal.
-fn facts_for(path: &str, branch: &str, target: &str, root: &Path) -> Result<PruneFacts> {
+fn facts_for(
+    path: &str,
+    branch: &str,
+    target: &str,
+    root: &Path,
+    provider_sandbox: bool,
+) -> Result<PruneFacts> {
     let dir = Path::new(path);
     let branch_opt = (!branch.is_empty()).then(|| branch.to_string());
     let ancestor_of_target = branch_opt
@@ -89,6 +95,7 @@ fn facts_for(path: &str, branch: &str, target: &str, root: &Path) -> Result<Prun
         tree_clean,
         live_cwd_pids: crate::platform::proc::pids_with_cwd_under(dir),
         held_by_session: false,
+        provider_sandbox,
     })
 }
 
@@ -114,7 +121,11 @@ pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
         .map(|w| {
             let tip = branch_tip(Path::new(&w.path), &w.branch)?;
             branches.push((w.path.clone(), w.branch.clone(), tip));
-            facts_for(&w.path, &w.branch, &target, &root)
+            let provider_sandbox = !matches!(
+                crate::provider_git::bound_offline(cfg, &w.path),
+                Ok(crate::provider_git::OfflineBinding::Unbound)
+            );
+            facts_for(&w.path, &w.branch, &target, &root, provider_sandbox)
         })
         .collect::<Result<Vec<_>>>()?;
     let plan = wt_prune::plan(facts);
@@ -136,6 +147,7 @@ pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
             &plan,
             &tips,
             &branch_of,
+            cfg,
             &target,
             &root,
             &mut |path, del| super::wt::rm_with(cfg, path, del, true, !args.json),
@@ -214,6 +226,7 @@ fn apply_plan(
     plan: &[(String, PruneDecision)],
     tips: &HashMap<String, Option<String>>,
     branch_of: &HashMap<&str, &str>,
+    cfg: &Config,
     target: &str,
     root: &Path,
     remove: &mut dyn FnMut(&str, bool) -> Result<()>,
@@ -224,7 +237,11 @@ fn apply_plan(
             continue;
         }
         let branch = branch_of.get(path.as_str()).copied().unwrap_or("");
-        let fresh = match facts_for(path, branch, target, root) {
+        let provider_sandbox = !matches!(
+            crate::provider_git::bound_offline(cfg, path),
+            Ok(crate::provider_git::OfflineBinding::Unbound)
+        );
+        let fresh = match facts_for(path, branch, target, root, provider_sandbox) {
             Ok(fresh) => fresh,
             Err(error) => {
                 out.skipped.push((
@@ -316,7 +333,14 @@ mod tests {
             main.path(),
             &["merge", "--no-ff", "-q", "-m", "merge", "tg/merged"],
         );
-        let f = facts_for(wt.to_str().unwrap(), "tg/merged", "main", main.path()).unwrap();
+        let f = facts_for(
+            wt.to_str().unwrap(),
+            "tg/merged",
+            "main",
+            main.path(),
+            false,
+        )
+        .unwrap();
         assert!(f.ancestor_of_target && f.tree_clean && !f.is_primary && !f.is_target_branch);
         assert!(matches!(
             wt_prune::decide(&f),
@@ -326,7 +350,14 @@ mod tests {
         ));
 
         git(&wt, &["commit", "--allow-empty", "-q", "-m", "ahead"]);
-        let f = facts_for(wt.to_str().unwrap(), "tg/merged", "main", main.path()).unwrap();
+        let f = facts_for(
+            wt.to_str().unwrap(),
+            "tg/merged",
+            "main",
+            main.path(),
+            false,
+        )
+        .unwrap();
         assert!(!f.ancestor_of_target);
     }
 
@@ -334,7 +365,14 @@ mod tests {
     fn untracked_file_marks_the_tree_dirty_and_primary_is_flagged() {
         let main = repo();
         std::fs::write(main.path().join("stray"), "x").unwrap();
-        let f = facts_for(main.path().to_str().unwrap(), "main", "main", main.path()).unwrap();
+        let f = facts_for(
+            main.path().to_str().unwrap(),
+            "main",
+            "main",
+            main.path(),
+            false,
+        )
+        .unwrap();
         assert!(!f.tree_clean && f.is_primary && f.is_target_branch);
     }
 
@@ -342,7 +380,14 @@ mod tests {
     fn a_process_cwd_inside_the_worktree_is_reported() {
         // This test process's own cwd is inside the tree being probed.
         let cwd = std::env::current_dir().unwrap();
-        let f = facts_for(cwd.to_str().unwrap(), "", "main", Path::new("/nonexistent")).unwrap();
+        let f = facts_for(
+            cwd.to_str().unwrap(),
+            "",
+            "main",
+            Path::new("/nonexistent"),
+            false,
+        )
+        .unwrap();
         if cfg!(target_os = "linux") {
             assert!(f.live_cwd_pids.contains(&std::process::id()));
         }
@@ -362,6 +407,7 @@ mod tests {
             "main",
             "main",
             Path::new("/nonexistent"),
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("git"), "{error}");
@@ -376,6 +422,7 @@ mod tests {
             "main",
             "no-such-target",
             main.path(),
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("no-such-target"), "{error}");
@@ -420,7 +467,7 @@ mod tests {
     fn one(main: &Path, wt: &Path, name: &str) -> OneResult {
         let path = wt.to_str().unwrap().to_string();
         let branch = format!("tg/{name}");
-        let f = facts_for(&path, &branch, "main", main).unwrap();
+        let f = facts_for(&path, &branch, "main", main, false).unwrap();
         let tips = HashMap::from([(path.clone(), branch_tip(wt, &branch).unwrap())]);
         (wt_prune::plan(vec![f]), tips, branch)
     }
@@ -440,7 +487,7 @@ mod tests {
                 wt.to_str().unwrap(),
             ],
         );
-        let f = facts_for(wt.to_str().unwrap(), "tg/fresh", "main", main.path()).unwrap();
+        let f = facts_for(wt.to_str().unwrap(), "tg/fresh", "main", main.path(), false).unwrap();
         assert!(f.tip_equals_target && f.ancestor_of_target);
         assert!(matches!(
             wt_prune::decide(&f),
@@ -449,7 +496,26 @@ mod tests {
     }
 
     #[test]
+    fn prune_keeps_a_provider_bound_worktree() {
+        let main = repo();
+        let wt = merged_lane(main.path(), "provider-bound");
+        let f = facts_for(
+            wt.to_str().unwrap(),
+            "tg/provider-bound",
+            "main",
+            main.path(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            wt_prune::decide(&f),
+            PruneDecision::Keep(wt_prune::KeepReason::ProviderSandbox)
+        );
+    }
+
+    #[test]
     fn apply_removes_merged_lane_and_passes_delete_branch() {
+        let _state = crate::testenv::IsolatedState::new();
         let main = repo();
         let wt = merged_lane(main.path(), "ok");
         let (plan, tips, branch) = one(main.path(), &wt, "ok");
@@ -459,6 +525,7 @@ mod tests {
             &plan,
             &tips,
             &branch_of,
+            &Config::default(),
             "main",
             main.path(),
             &mut |p, d| {
@@ -472,6 +539,7 @@ mod tests {
 
     #[test]
     fn lane_dirtied_between_plan_and_apply_is_kept() {
+        let _state = crate::testenv::IsolatedState::new();
         let main = repo();
         let wt = merged_lane(main.path(), "dirty");
         let (plan, tips, branch) = one(main.path(), &wt, "dirty");
@@ -483,6 +551,7 @@ mod tests {
             &plan,
             &tips,
             &branch_of,
+            &Config::default(),
             "main",
             main.path(),
             &mut |_, _| {
@@ -495,6 +564,7 @@ mod tests {
 
     #[test]
     fn lane_gaining_a_commit_between_plan_and_apply_is_kept() {
+        let _state = crate::testenv::IsolatedState::new();
         let main = repo();
         let wt = merged_lane(main.path(), "moved");
         let (plan, tips, branch) = one(main.path(), &wt, "moved");
@@ -505,6 +575,7 @@ mod tests {
             &plan,
             &tips,
             &branch_of,
+            &Config::default(),
             "main",
             main.path(),
             &mut |_, _| {
@@ -517,6 +588,7 @@ mod tests {
 
     #[test]
     fn a_failed_removal_does_not_stop_the_rest_and_exits_nonzero() {
+        let _state = crate::testenv::IsolatedState::new();
         let main = repo();
         let a = merged_lane(main.path(), "a");
         let b = merged_lane(main.path(), "b");
@@ -538,6 +610,7 @@ mod tests {
             &plan,
             &tips,
             &branch_of,
+            &Config::default(),
             "main",
             main.path(),
             &mut |p, _| {

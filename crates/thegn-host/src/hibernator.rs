@@ -400,6 +400,24 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
         anyhow::bail!("provider has no file API; capture impossible");
     }
 
+    if sleeps(thegn_core::config::EnvProviderKind::of(
+        &env.provider.provider,
+    )) {
+        let state = block_on_provider(|| async { provider.inventory().await })
+            .ok()
+            .and_then(|r| listed_state(&r, &name));
+        if !listed_awake(state.as_deref()) {
+            tracing::debug!(
+                target: "thegn::hibernate",
+                worktree,
+                sandbox = %name,
+                ?state,
+                "hibernation skipped: the listing does not show the sandbox awake; a background pass never wakes a sandbox to decide"
+            );
+            return Ok(());
+        }
+    }
+
     // Sandbox-side pane guard: an attached interactive shell (an ssh pts
     // session on a VPS) means someone may be mid-something — skip quietly.
     // An unknown count fails the cycle, so the caller keeps the sandbox,
@@ -459,6 +477,38 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
     db.put_hibernation(&row)?;
     finish_destroy(cfg, &row);
     Ok(())
+}
+
+/// Provider kinds whose exec wakes a sleeping sandbox.
+fn sleeps(kind: thegn_core::config::EnvProviderKind) -> bool {
+    matches!(
+        kind,
+        thegn_core::config::EnvProviderKind::Sprites
+            | thegn_core::config::EnvProviderKind::Fly
+            | thegn_core::config::EnvProviderKind::Machine0
+    )
+}
+
+/// A listed state that is awake (`running`, `started`, `active`; trimmed, ASCII case-insensitive).
+fn listed_awake(state: Option<&str>) -> bool {
+    state.is_some_and(|state| {
+        matches!(
+            state.trim().to_ascii_lowercase().as_str(),
+            "running" | "started" | "active"
+        )
+    })
+}
+
+fn listed_state(report: &thegn_svc::provider::InventoryReport, id: &str) -> Option<String> {
+    let matches =
+        |info: &thegn_svc::provider::SandboxInfo| info.id == id || info.name.as_deref() == Some(id);
+    match report {
+        thegn_svc::provider::InventoryReport::Complete(rows)
+        | thegn_svc::provider::InventoryReport::Partial { rows, .. } => rows
+            .iter()
+            .find(matches)
+            .and_then(|info| info.state.clone()),
+    }
 }
 
 /// Attached interactive sessions from [`ATTACHED_SESSIONS_SCRIPT`]'s output:
@@ -1684,5 +1734,50 @@ mod tests {
     fn attached_sessions_script_checks_for_who() {
         assert!(ATTACHED_SESSIONS_SCRIPT.contains("command -v who"));
         assert!(ATTACHED_SESSIONS_SCRIPT.contains("TG-WHO-UNAVAILABLE"));
+    }
+
+    #[test]
+    fn sleeping_provider_kinds_need_an_awake_listing() {
+        use thegn_core::config::EnvProviderKind;
+
+        assert!(sleeps(EnvProviderKind::Sprites));
+        assert!(sleeps(EnvProviderKind::Fly));
+        assert!(sleeps(EnvProviderKind::Machine0));
+        assert!(!sleeps(EnvProviderKind::Hetzner));
+    }
+
+    #[test]
+    fn listed_awake_accepts_known_states_case_insensitively() {
+        assert!(listed_awake(Some(" running ")));
+        assert!(listed_awake(Some("STARTED")));
+        assert!(listed_awake(Some("Active")));
+        assert!(!listed_awake(Some("stopped")));
+        assert!(!listed_awake(None));
+    }
+
+    #[test]
+    fn listed_state_reads_ids_and_names_from_complete_and_partial_reports() {
+        use thegn_svc::provider::{InventoryReport, SandboxInfo};
+
+        let complete = InventoryReport::Complete(vec![SandboxInfo {
+            id: "id-1".into(),
+            name: Some("name-1".into()),
+            state: Some("running".into()),
+            ..SandboxInfo::default()
+        }]);
+        assert_eq!(listed_state(&complete, "id-1"), Some("running".into()));
+        assert_eq!(listed_state(&complete, "name-1"), Some("running".into()));
+
+        let partial = InventoryReport::Partial {
+            rows: vec![SandboxInfo {
+                id: "id-2".into(),
+                name: Some("name-2".into()),
+                state: Some("started".into()),
+                ..SandboxInfo::default()
+            }],
+            reason: "page 2 failed".into(),
+        };
+        assert_eq!(listed_state(&partial, "name-2"), Some("started".into()));
+        assert_eq!(listed_state(&partial, "missing"), None);
     }
 }
