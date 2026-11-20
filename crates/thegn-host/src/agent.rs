@@ -2350,12 +2350,7 @@ fn host_fallback_allowed(
 /// lists the host (`host`/`none`). Only the user's own chain counts — the
 /// implicit host tail `launch_backend::candidates` appends is not consent.
 fn auto_chain_names_host(sandbox: &thegn_core::config::SandboxConfig) -> bool {
-    sandbox.enabled
-        && sandbox.backend == thegn_core::config::SandboxBackend::Auto
-        && sandbox.backend_chain.iter().any(|name| {
-            thegn_core::config::SandboxBackend::from_str_validated(name)
-                .is_ok_and(|b| b == thegn_core::config::SandboxBackend::None)
-        })
+    thegn_core::launch_backend::auto_chain_names_host(sandbox)
 }
 
 /// Un-pin `worktree` from the host so an explicit retry re-attempts the real env.
