@@ -246,13 +246,12 @@ setup_overlay() {
     OVERLAY_CONFIG=""
     return 0
   fi
-  if ! cat >>"$OVERLAY_CONFIG" <<'OVERLAY'
+  if ! cat >>"$OVERLAY_CONFIG" <<'OVERLAY'; then
 
 [[agents]]
 name = "hold-test"
 command = "sleep 420 && date > rd-hold.txt && git add rd-hold.txt && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit -q -m rd-hold && :"
 OVERLAY
-  then
     echo "SKIP overlay: could not append hold-test to the copied config" >&2
     OVERLAY_CONFIG=""
     return 0
@@ -560,8 +559,8 @@ print(name)
 pool_claim_run() {
   if [ "${RD_HOLD_AGENT:-0}" = 1 ]; then
     if in_repo thegn_cli agent run --worktree "$POOL_PATH" --agent hold-test --prompt x --wait --pull --json >"$TMP/p3.json"; then
-    agent_json_ok "$TMP/p3.json" || return 1
-    python3 -I -c '
+      agent_json_ok "$TMP/p3.json" || return 1
+      python3 -I -c '
 import json, sys
 
 try:
