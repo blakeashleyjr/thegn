@@ -19,7 +19,7 @@
 //! the loopback mock needs the `http`-for-loopback rule `validate_api_base`
 //! already enforces.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
@@ -54,7 +54,8 @@ const STDIN_ATTEMPTS: u32 = 6;
 /// fails the call with "retry after Ns".
 pub const MAX_RETRY_AFTER_S: u64 = 20;
 
-/// Most snapshot-listing pages [`VercelClient::snapshot_usage`] reads.
+/// Most snapshot-listing pages [`VercelClient::snapshot_usage`] and
+/// [`VercelClient::snapshots_for`] read.
 pub const SNAPSHOT_PAGE_CAP: usize = 20;
 
 /// The refusal for a ticket on a host outside the pin (names no URL, query or
@@ -116,6 +117,47 @@ impl fmt::Display for SessionGone {
 }
 
 impl std::error::Error for SessionGone {}
+
+/// A session-scoped call refused because the session stopped or is stopping:
+/// HTTP 410, or 422 with `error.code` `sandbox_stopping` / `sandbox_snapshotting`
+/// (SDK `withResume`). The request was refused in the response head, so the
+/// command was not started; the caller may resolve the session again.
+#[derive(Debug)]
+pub struct SessionStopped {
+    pub op: &'static str,
+    pub status: u16,
+}
+
+impl fmt::Display for SessionStopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{PROVIDER}: {}: the sandbox session has stopped (HTTP {})",
+            self.op, self.status
+        )
+    }
+}
+
+impl std::error::Error for SessionStopped {}
+
+/// A sandbox GET answered 410 with `error.code` `snapshot_not_found`: the
+/// sandbox's saved state has expired and it cannot be resumed.
+#[derive(Debug)]
+pub struct SnapshotExpired {
+    pub name: String,
+}
+
+impl fmt::Display for SnapshotExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{PROVIDER}: sandbox {} cannot be resumed: Vercel reports its saved snapshot has expired; destroy it (thegn env down) and create a new one",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for SnapshotExpired {}
 
 /// The `/interactive` WebSocket ticket. `token` is a secret; `Debug` redacts it.
 /// The API token is never sent to `url`: callers present `token` alone.
@@ -327,14 +369,28 @@ impl VercelClient {
     /// The snapshots of sandbox `name` with their sizes and status, paged
     /// through at most [`SNAPSHOT_PAGE_CAP`] listing pages (a repeated cursor
     /// also stops it).
-    pub async fn snapshot_usage(&self, name: &str) -> Result<Vec<SnapshotUsage>> {
+    pub async fn snapshot_usage(&self, name: &str) -> Result<(Vec<SnapshotUsage>, bool)> {
+        self.snapshot_pages(name).await
+    }
+
+    /// Every snapshot listing page for `name` (`limit=50`, the documented
+    /// maximum), at most [`SNAPSHOT_PAGE_CAP`] pages. `complete` is false when
+    /// the cap ends the walk with a next cursor left, or a cursor repeats.
+    async fn snapshot_pages(&self, name: &str) -> Result<(Vec<SnapshotUsage>, bool)> {
         let p = retried("list snapshots");
         let name = checked_name(name)?;
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        // A row the parser refused (an id that is not a valid snapshot id) is
+        // a snapshot this listing cannot name, so the listing is not complete.
+        let mut dropped = false;
         for _page in 0..SNAPSHOT_PAGE_CAP {
-            let mut extra: Vec<(&str, &str)> =
-                vec![("project", self.scope.project_id.as_str()), ("name", name)];
+            let mut extra: Vec<(&str, &str)> = vec![
+                ("project", self.scope.project_id.as_str()),
+                ("name", name),
+                ("limit", "50"),
+            ];
             if let Some(c) = cursor.as_deref() {
                 extra.push(("cursor", c));
             }
@@ -344,13 +400,21 @@ impl VercelClient {
             let v = response_json(resp, PROVIDER, p.op).await?;
             let (items, next) =
                 parse_snapshots(&v).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+            let listed = v
+                .get("snapshots")
+                .and_then(|rows| rows.as_array())
+                .map_or(0, Vec::len);
+            if items.len() != listed {
+                dropped = true;
+            }
             out.extend(items);
             match next {
-                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
-                _ => break,
+                None => return Ok((out, !dropped)),
+                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Ok((out, false)),
             }
         }
-        Ok(out)
+        Ok((out, false))
     }
 
     // --- control plane ----------------------------------------------------
@@ -376,9 +440,20 @@ impl VercelClient {
     /// a stopped sandbox (buys compute): only `Wake::Allow` callers pass true.
     pub async fn get(&self, name: &str, resume: bool) -> Result<Option<SandboxView>> {
         let p = retried("get sandbox");
+        let name = checked_name(name)?;
         let extra: &[(&str, &str)] = if resume { &[("resume", "true")] } else { &[] };
-        let url = self.url(&["v2", "sandboxes", checked_name(name)?], extra, true)?;
+        let url = self.url(&["v2", "sandboxes", name], extra, true)?;
         let resp = self.send(p, || Ok(self.http.get(url.clone()))).await?;
+        if resp.status() == reqwest::StatusCode::GONE {
+            let body = self.error_body(resp).await;
+            if api_error_code(&body).as_deref() == Some("snapshot_not_found") {
+                return Err(SnapshotExpired {
+                    name: name.to_string(),
+                }
+                .into());
+            }
+            return Err(self.error_from(reqwest::StatusCode::GONE, &body, p.op));
+        }
         let Some(resp) = self.ok_or_404(resp, p.op).await? else {
             return Ok(None);
         };
@@ -427,6 +502,11 @@ impl VercelClient {
         let p = priority("stop session");
         let url = self.session_url(session, &["stop"])?;
         let resp = self.send(p, || Ok(self.http.post(url.clone()))).await?;
+        // OpenAPI lists 410; the SDK treats 410 on a session as stopped (sandbox.ts isSandboxStoppedError)
+        if resp.status() == reqwest::StatusCode::GONE {
+            drain_quietly(resp).await;
+            return Ok(());
+        }
         self.ok(resp, p.op, true).await.map(drop)
     }
 
@@ -548,7 +628,7 @@ impl VercelClient {
                         .json(&body))
                 })
                 .await?;
-            let mut resp = self.ok(resp, p.op, false).await?;
+            let mut resp = self.ok_session(resp, p.op).await?;
 
             let mut lines = LineSplitter::new(LOG_LINE_CAP);
             let mut out = TailBuffer::new(out_cap);
@@ -628,7 +708,7 @@ impl VercelClient {
         let resp = self
             .send(p, || Ok(self.http.post(url.clone()).json(&body)))
             .await?;
-        let resp = self.ok(resp, p.op, false).await?;
+        let resp = self.ok_session(resp, p.op).await?;
         let v = response_json(resp, PROVIDER, p.op).await?;
         let id = v
             .get("command")
@@ -739,6 +819,11 @@ impl VercelClient {
         let resp = self
             .send(p, || Ok(self.http.post(url.clone()).json(&body)))
             .await?;
+        // OpenAPI lists 410; the SDK treats 410 on a session as stopped (sandbox.ts isSandboxStoppedError)
+        if resp.status() == reqwest::StatusCode::GONE {
+            drain_quietly(resp).await;
+            return Ok(());
+        }
         self.ok(resp, p.op, true).await.map(drop)
     }
 
@@ -839,7 +924,12 @@ impl VercelClient {
     pub async fn interactive(&self, session: &str) -> Result<InteractiveTicket> {
         let p = policy("open interactive session");
         let url = self.session_url(session, &["interactive"])?;
-        let resp = self.send(p, || Ok(self.http.post(url.clone()))).await?;
+        // the SDK sends `{}` (openInteractive)
+        let resp = self
+            .send(p, || {
+                Ok(self.http.post(url.clone()).json(&serde_json::json!({})))
+            })
+            .await?;
         let resp = self.ok(resp, p.op, false).await?;
         let v = response_json(resp, PROVIDER, p.op).await?;
         let raw_url = v
@@ -872,35 +962,20 @@ impl VercelClient {
     // --- snapshots ------------------------------------------------------------
 
     /// Snapshot ids recorded for sandbox `name`, following pagination.
-    pub async fn snapshots_for(&self, name: &str) -> Result<Vec<String>> {
-        let p = retried("list snapshots");
-        let name = checked_name(name)?;
-        let mut out = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _page in 0..SNAPSHOT_PAGE_CAP {
-            let mut extra: Vec<(&str, &str)> =
-                vec![("project", self.scope.project_id.as_str()), ("name", name)];
-            if let Some(c) = cursor.as_deref() {
-                extra.push(("cursor", c));
-            }
-            let url = self.url(&["v2", "sandboxes", "snapshots"], &extra, false)?;
-            let resp = self.send(p, || Ok(self.http.get(url.clone()))).await?;
-            let resp = self.ok(resp, p.op, false).await?;
-            let v = response_json(resp, PROVIDER, p.op).await?;
-            let (items, next) =
-                parse_snapshots(&v).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
-            out.extend(
-                items
-                    .into_iter()
-                    .map(|snapshot| snapshot.id)
-                    .filter(|id| valid_id(id)),
-            );
-            match next {
-                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
-                _ => break,
-            }
-        }
-        Ok(out)
+    pub async fn snapshots_for(&self, name: &str) -> Result<(Vec<String>, bool)> {
+        let (snapshots, mut complete) = self.snapshot_pages(name).await?;
+        let ids = snapshots
+            .into_iter()
+            .filter_map(|snapshot| {
+                if valid_id(&snapshot.id) {
+                    Some(snapshot.id)
+                } else {
+                    complete = false;
+                    None
+                }
+            })
+            .collect();
+        Ok((ids, complete))
     }
 
     /// Delete one snapshot. 404 = Ok.
@@ -1040,6 +1115,39 @@ impl VercelClient {
         Err(self.status_error(resp, op).await)
     }
 
+    /// Like [`Self::ok`], plus the stopped-session responses recognized by the
+    /// SDK's `withResume` rule.
+    async fn ok_session(
+        &self,
+        resp: reqwest::Response,
+        op: &'static str,
+    ) -> Result<reqwest::Response> {
+        let status = resp.status();
+        if status == reqwest::StatusCode::GONE {
+            drain_quietly(resp).await;
+            return Err(SessionStopped {
+                op,
+                status: status.as_u16(),
+            }
+            .into());
+        }
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let body = self.error_body(resp).await;
+            if matches!(
+                api_error_code(&body).as_deref(),
+                Some("sandbox_stopping" | "sandbox_snapshotting")
+            ) {
+                return Err(SessionStopped {
+                    op,
+                    status: status.as_u16(),
+                }
+                .into());
+            }
+            return Err(self.error_from(status, &body, op));
+        }
+        self.ok(resp, op, false).await
+    }
+
     async fn ok_or_404(
         &self,
         resp: reqwest::Response,
@@ -1052,14 +1160,8 @@ impl VercelClient {
         self.ok(resp, op, false).await.map(Some)
     }
 
-    async fn status_error(&self, mut resp: reqwest::Response, op: &str) -> anyhow::Error {
-        let status = resp.status();
-        if status.is_redirection() {
-            return anyhow!(
-                "{PROVIDER}: {op}: redirect refused (HTTP {})",
-                status.as_u16()
-            );
-        }
+    /// Read at most [`ERROR_BODY_READ`] bytes of an error response.
+    async fn error_body(&self, mut resp: reqwest::Response) -> Vec<u8> {
         let mut body = Vec::new();
         while body.len() < ERROR_BODY_READ {
             match resp.chunk().await {
@@ -1070,12 +1172,32 @@ impl VercelClient {
                 Ok(None) | Err(_) => break,
             }
         }
-        let text = self.snippet(&String::from_utf8_lossy(&body));
+        body
+    }
+
+    /// The sanitized error for `status` and an already-read `body` (same text as today).
+    fn error_from(&self, status: reqwest::StatusCode, body: &[u8], op: &str) -> anyhow::Error {
+        if status.is_redirection() {
+            return anyhow!(
+                "{PROVIDER}: {op}: redirect refused (HTTP {})",
+                status.as_u16()
+            );
+        }
+        let text = self.snippet(&String::from_utf8_lossy(body));
         if text.is_empty() {
             anyhow!("{PROVIDER}: {op} returned HTTP {}", status.as_u16())
         } else {
             anyhow!("{PROVIDER}: {op} returned HTTP {}: {text}", status.as_u16())
         }
+    }
+
+    async fn status_error(&self, resp: reqwest::Response, op: &str) -> anyhow::Error {
+        let status = resp.status();
+        if status.is_redirection() {
+            return self.error_from(status, &[], op);
+        }
+        let body = self.error_body(resp).await;
+        self.error_from(status, &body, op)
     }
 
     fn snippet(&self, text: &str) -> String {
@@ -1169,6 +1291,22 @@ fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// `error.code` from a Vercel error body (`{"error":{"code":..}}`, the SDK's
+/// `APIError.json` shape). `None` unless it is 1..=64 chars of [A-Za-z0-9_-].
+fn api_error_code(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let code = value.get("error")?.get("code")?.as_str()?;
+    if (1..=64).contains(&code.len())
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        Some(code.to_string())
+    } else {
+        None
+    }
 }
 
 fn checked_id<'a>(id: &'a str, what: &str) -> Result<&'a str> {
