@@ -224,7 +224,12 @@ mkdir -p "$owner_race" "$owner_foreign/Contents"
 run_make_app --dest "$owner_race" >/dev/null || fail "owner-race seed bundle failed"
 printf original >"$owner_race/thegn.app/Contents/Resources/keep"
 printf foreign >"$owner_foreign/Contents/sentinel"
-real_python="$(command -v python3)"
+# The native runner may put Apple's /usr/bin shims before the Nix PATH. Pin the
+# helper to the interpreter selected by the test environment before HOME/PATH
+# changes below make those shims unusable. The override is intentionally scoped
+# to this fixture; normal runs still use python3 from PATH.
+real_python="${THEGN_TEST_PYTHON:-$(command -v python3)}"
+[[ -x $real_python ]] || fail "owner-race helper Python is not executable: $real_python"
 cat >"$race_bin/python3" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
