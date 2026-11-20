@@ -981,9 +981,18 @@ fn remove_landed_with_config_unaudited(
     // retire it; the branch is never touched here. A checkout that still
     // exists, or is still registered (even if its directory is missing), keeps
     // the normal path, and an unreadable registry is "unknown", not "gone".
+    // A row with no registry record is gone only when the repo's ambient env is
+    // local (ssh and k8s rows store no location).
     let row_is_local = (expected_queue.location.is_empty() || expected_queue.location == "local")
         && match db.worktree_record(worktree) {
-            Ok(None) => true,
+            Ok(None) => !crate::hydrate::row_is_remote_effective(
+                db,
+                cfg,
+                "",
+                None,
+                &repo_root.to_string_lossy(),
+                &mut HashMap::new(),
+            ),
             Ok(Some(row)) => !registry_row_is_remote(db, cfg, &row, &mut HashMap::new()),
             Err(_) => false, // unknown is never "gone"
         };
@@ -2886,6 +2895,265 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(db.list_merge_queue().unwrap(), rows_before, "row kept");
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn crash_recovery_keeps_the_row_of_a_pinned_ssh_worktree() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-ssh");
+        let feat_s = feat.to_string_lossy().to_string();
+        db.set_worktree_env(&feat_s, "build").unwrap();
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "build".into(),
+            EnvConfig {
+                placement: PlacementMode::Ssh,
+                ..Default::default()
+            },
+        );
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        git(
+            &root,
+            &["worktree", "remove", "--force", feat.to_str().unwrap()],
+        );
+        let rows_before = db.list_merge_queue().unwrap();
+        let selected = rows_before
+            .iter()
+            .find(|row| row.worktree == feat_s)
+            .expect("landed queue row")
+            .clone();
+        let outcome = remove_landed_with_config(
+            &cfg,
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            "main",
+            Some(&commit),
+            &selected,
+            true,
+        );
+        assert!(
+            !matches!(outcome, CleanupOutcome::Removed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(db.list_merge_queue().unwrap(), rows_before, "row kept");
+        assert!(util::git_ok(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+        ));
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn crash_recovery_keeps_the_row_of_an_ambient_k8s_repo() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-k8s");
+        let root_s = root.to_string_lossy().to_string();
+        let feat_s = feat.to_string_lossy().to_string();
+        db.set_workspace_env(&root_s, "kube").unwrap();
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "kube".into(),
+            EnvConfig {
+                placement: PlacementMode::K8s,
+                ..Default::default()
+            },
+        );
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        git(
+            &root,
+            &["worktree", "remove", "--force", feat.to_str().unwrap()],
+        );
+        let rows_before = db.list_merge_queue().unwrap();
+        let selected = rows_before
+            .iter()
+            .find(|row| row.worktree == feat_s)
+            .expect("landed queue row")
+            .clone();
+        let outcome = remove_landed_with_config(
+            &cfg,
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            "main",
+            Some(&commit),
+            &selected,
+            true,
+        );
+        assert!(
+            !matches!(outcome, CleanupOutcome::Removed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(db.list_merge_queue().unwrap(), rows_before, "row kept");
+        assert!(util::git_ok(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+        ));
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn crash_recovery_converges_under_a_local_ambient_env() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-local");
+        let root_s = root.to_string_lossy().to_string();
+        let feat_s = feat.to_string_lossy().to_string();
+        db.set_workspace_env(&root_s, "host").unwrap();
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "host".into(),
+            EnvConfig {
+                placement: PlacementMode::Local,
+                ..Default::default()
+            },
+        );
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        git(
+            &root,
+            &["worktree", "remove", "--force", feat.to_str().unwrap()],
+        );
+        let selected = db
+            .list_merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == feat_s)
+            .expect("landed queue row");
+        let first = remove_landed_with_config(
+            &cfg,
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            "main",
+            Some(&commit),
+            &selected,
+            true,
+        );
+        assert!(
+            matches!(
+                first,
+                CleanupOutcome::Removed {
+                    queue_removed: true,
+                    branch_deleted: false,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        assert!(db.list_merge_queue().unwrap().is_empty(), "row retired");
+        let second = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), true);
+        assert!(
+            matches!(
+                second,
+                CleanupOutcome::Refused {
+                    class: CleanupRefusal::Identity,
+                    ..
+                }
+            ),
+            "{second:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn crash_recovery_without_a_registry_row_keeps_a_remote_repo_row() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-unregistered-remote");
+        let root_s = root.to_string_lossy().to_string();
+        let feat_s = feat.to_string_lossy().to_string();
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "kube".into(),
+            EnvConfig {
+                placement: PlacementMode::K8s,
+                ..Default::default()
+            },
+        );
+        db.del_worktree(&feat_s).unwrap();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        db.set_workspace_env(&root_s, "kube").unwrap();
+        git(
+            &root,
+            &["worktree", "remove", "--force", feat.to_str().unwrap()],
+        );
+        let rows_before = db.list_merge_queue().unwrap();
+        let selected = rows_before
+            .iter()
+            .find(|row| row.worktree == feat_s)
+            .expect("landed queue row")
+            .clone();
+        let outcome = remove_landed_with_config(
+            &cfg,
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            "main",
+            Some(&commit),
+            &selected,
+            true,
+        );
+        assert!(
+            !matches!(outcome, CleanupOutcome::Removed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(db.list_merge_queue().unwrap(), rows_before, "row kept");
+        assert!(util::git_ok(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+        ));
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn crash_recovery_without_a_registry_row_converges_locally() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-unregistered-local");
+        let feat_s = feat.to_string_lossy().to_string();
+        db.del_worktree(&feat_s).unwrap();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        git(
+            &root,
+            &["worktree", "remove", "--force", feat.to_str().unwrap()],
+        );
+        let cfg = Config::default();
+        let selected = db
+            .list_merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == feat_s)
+            .expect("landed queue row");
+        let outcome = remove_landed_with_config(
+            &cfg,
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            "main",
+            Some(&commit),
+            &selected,
+            true,
+        );
+        assert!(
+            matches!(
+                outcome,
+                CleanupOutcome::Removed {
+                    queue_removed: true,
+                    branch_deleted: false,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(db.list_merge_queue().unwrap().is_empty(), "row retired");
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
