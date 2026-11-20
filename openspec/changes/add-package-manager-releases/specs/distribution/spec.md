@@ -95,6 +95,38 @@ source commit recorded by the attestation. A mismatch MUST refuse publication.
 - **WHEN** published metadata already equals the rendered release output
 - **THEN** the job performs no new commit and succeeds without changing assets
 
+### Requirement: External publication outcomes are recorded as one resumable saga
+
+After both target publishers finish, the workflow SHALL write a read-only
+cross-target ledger from their exact receipt artifact IDs and explicit job
+outcomes. The ledger SHALL report `complete` only when both receipts verify for
+the same tag, release manifest, source, and publication workflow run. A
+successful publisher receipt from an earlier attempt of the same workflow run
+MAY be reused during a failed-job rerun; its original attempt SHALL remain
+recorded. A missing receipt when the target was ready SHALL be `unknown` and
+require reconciliation, even if the publisher reported a successful push.
+Missing receipt MUST NOT be treated as unchanged or as proof that retry is safe.
+The ledger SHALL remain credential-free and be retained as a workflow artifact
+for 90 days. It MUST NOT modify release assets or automatically retry a target.
+
+#### Scenario: Only Homebrew has a verified receipt
+
+- **WHEN** Homebrew has a valid receipt and AUR has no receipt
+- **THEN** the ledger reports partial publication and requires reconciliation
+
+#### Scenario: A receipt is lost after a possible push
+
+- **WHEN** a publisher was ready or reported a push but its receipt artifact is
+  absent or unreadable
+- **THEN** the ledger reports unknown remote state and does not infer unchanged
+
+#### Scenario: A failed-job rerun reuses the earlier successful target
+
+- **WHEN** Homebrew succeeded on an earlier attempt and AUR succeeds on the
+  current retry attempt for the same workflow run
+- **THEN** the ledger downloads both exact artifact IDs and records both receipt
+  attempts against the same release manifest
+
 #### Scenario: A verified external publication leaves a durable receipt
 
 - **WHEN** Homebrew or AUR publication succeeds after its remote branch is

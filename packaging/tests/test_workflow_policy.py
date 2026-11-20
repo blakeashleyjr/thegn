@@ -792,6 +792,70 @@ class WorkflowPolicyTests(unittest.TestCase):
                     ):
                         self.assertIn(required, write_script)
 
+    def test_publication_saga_uses_exact_receipts_and_records_partial_state(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        saga = jobs["publication-saga"]
+        self.assertEqual(["publish-homebrew", "publish-aur"], saga["needs"])
+        self.assertIn("always()", saga["if"])
+        self.assertEqual(
+            {"actions": "read", "contents": "read"},
+            saga["permissions"],
+        )
+        for target, job_name in (("homebrew", "publish-homebrew"), ("aur", "publish-aur")):
+            display = "Homebrew" if target == "homebrew" else "AUR"
+            publisher = jobs[job_name]
+            steps = publisher["steps"]
+            upload = next(step for step in steps if step.get("name") == f"Upload {display} publication receipt")
+            self.assertEqual("upload-receipt", upload.get("id"))
+            self.assertEqual(
+                "${{ steps.upload-receipt.outputs.artifact-id }}",
+                publisher["outputs"]["receipt_artifact_id"],
+            )
+            download = next(
+                step
+                for step in saga["steps"]
+                if step.get("name") == f"Download {display} receipt by immutable artifact ID"
+            )
+            self.assertEqual(upload["uses"], download["uses"])
+            self.assertEqual("${{ secrets.GITHUB_TOKEN }}", download["with"]["github-token"])
+            self.assertIn(
+                f"${{{{ needs.{job_name}.outputs.receipt_artifact_id }}}}",
+                download["with"]["artifact-ids"],
+            )
+            self.assertTrue(download["continue-on-error"])
+        writer = next(step for step in saga["steps"] if step.get("name") == "Write read-only cross-target saga ledger")
+        writer_script = writer["run"]
+        for required in (
+            "publication-saga",
+            "--homebrew-result",
+            "--homebrew-ready",
+            "--homebrew-outcome",
+            "--homebrew-artifact-id",
+            "--aur-result",
+            "--aur-ready",
+            "--aur-outcome",
+            "--aur-artifact-id",
+            "--output",
+            "--summary",
+        ):
+            self.assertIn(required, writer_script)
+        self.assertIn("needs.publish-homebrew.result", str(writer["env"]))
+        self.assertIn("needs.publish-aur.result", str(writer["env"]))
+        artifact = next(
+            step for step in saga["steps"]
+            if step.get("name") == "Upload durable cross-target saga ledger"
+        )
+        self.assertEqual(90, artifact["with"]["retention-days"])
+        self.assertIn("always()", artifact["if"])
+        fail_closed = next(
+            step for step in saga["steps"]
+            if step.get("name") == "Fail on incomplete or ambiguous publication state"
+        )
+        self.assertIn("$state" , fail_closed["run"])
+        self.assertIn("state" , fail_closed["run"])
+        self.assertNotIn("actions: write", str(saga["permissions"]))
+        self.assertNotIn("contents: write", str(saga["permissions"]))
+
     def test_publish_cas_rehearsal(self) -> None:
         if shutil.which("git") is None or shutil.which("bash") is None:
             self.skipTest("git and bash are required for the local publication rehearsal")

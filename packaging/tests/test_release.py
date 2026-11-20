@@ -1917,6 +1917,155 @@ class AttestationVerificationTests(unittest.TestCase):
         self.assertEqual(2, raised.exception.code)
 
 
+class PublicationSagaTests(unittest.TestCase):
+    TAG = "v1.2.3"
+    REPOSITORY = "owner/thegn"
+    RUN_ID = "67890"
+    SOURCE_SHA = "a" * 40
+    MANIFEST_SHA = "b" * 64
+
+    def receipt(self, target: str, attempt: int) -> dict[str, object]:
+        homebrew = target == "homebrew"
+        return {
+            "schema_version": 1,
+            "target": target,
+            "target_repository": "owner/homebrew-tap" if homebrew else "thegn-bin",
+            "branch": "main" if homebrew else "master",
+            "outcome": "committed",
+            "old_oid": "c" * 40,
+            "new_oid": "d" * 40,
+            "observed_oid": "d" * 40,
+            "published_blobs": (
+                [{"path": "Formula/thegn.rb", "sha256": "3" * 64}]
+                if homebrew
+                else [
+                    {"path": "PKGBUILD", "sha256": "3" * 64},
+                    {"path": ".SRCINFO", "sha256": "4" * 64},
+                ]
+            ),
+            "metadata_sidecar_sha256": None if homebrew else "5" * 64,
+            "metadata_artifact_id": None if homebrew else "98765",
+            "metadata_producer": None
+            if homebrew
+            else {"run_id": self.RUN_ID, "attempt": attempt, "source_sha": self.SOURCE_SHA},
+            "release": {
+                "tag": self.TAG,
+                "tag_object": "e" * 40,
+                "source_commit": "f" * 40,
+                "workflow_sha": "1" * 40,
+                "run_id": "12345",
+                "run_attempt": 1,
+                "run_source_sha": "f" * 40,
+                "repository": self.REPOSITORY,
+                "manifest_sha256": self.MANIFEST_SHA,
+            },
+            "publication_run": {
+                "id": self.RUN_ID,
+                "attempt": attempt,
+                "source_sha": self.SOURCE_SHA,
+            },
+        }
+
+    def saga(self, **overrides):
+        values = {
+            "tag": self.TAG,
+            "repository": self.REPOSITORY,
+            "publication_run_id": self.RUN_ID,
+            "publication_run_attempt": 1,
+            "publication_source_sha": self.SOURCE_SHA,
+            "homebrew_job_result": "success",
+            "homebrew_ready": "false",
+            "homebrew_outcome_hint": "",
+            "homebrew_receipt_artifact_id": "",
+            "homebrew_receipt": None,
+            "homebrew_receipt_sha256": None,
+            "aur_job_result": "success",
+            "aur_ready": "false",
+            "aur_outcome_hint": "",
+            "aur_receipt_artifact_id": "",
+            "aur_receipt": None,
+            "aur_receipt_sha256": None,
+        }
+        values.update(overrides)
+        return release.build_publication_saga_ledger(**values)
+
+    def test_homebrew_only_receipt_is_partial_and_requires_reconciliation(self) -> None:
+        ledger = self.saga(
+            homebrew_ready="true",
+            homebrew_receipt_artifact_id="101",
+            homebrew_receipt=self.receipt("homebrew", 1),
+            homebrew_receipt_sha256="3" * 64,
+        )
+        self.assertEqual("partial", ledger["state"])
+        self.assertTrue(ledger["reconcile_required"])
+        self.assertEqual("verified", ledger["targets"]["homebrew"]["state"])
+        self.assertEqual("pending", ledger["targets"]["aur"]["state"])
+
+    def test_aur_only_receipt_is_partial_and_requires_reconciliation(self) -> None:
+        ledger = self.saga(
+            aur_ready="true",
+            aur_receipt_artifact_id="202",
+            aur_receipt=self.receipt("aur", 1),
+            aur_receipt_sha256="4" * 64,
+        )
+        self.assertEqual("partial", ledger["state"])
+        self.assertTrue(ledger["reconcile_required"])
+        self.assertEqual("pending", ledger["targets"]["homebrew"]["state"])
+        self.assertEqual("verified", ledger["targets"]["aur"]["state"])
+
+    def test_missing_receipt_after_a_possible_push_is_unknown_not_unchanged(self) -> None:
+        ledger = self.saga(
+            homebrew_job_result="failure",
+            homebrew_ready="true",
+            homebrew_outcome_hint="committed",
+        )
+        homebrew = ledger["targets"]["homebrew"]
+        self.assertEqual("unknown", homebrew["state"])
+        self.assertIsNone(homebrew.get("outcome"))
+        self.assertTrue(ledger["reconcile_required"])
+        self.assertIn("receipt is missing", homebrew["reason"])
+        self.assertIn("not evidence", release.publication_saga_summary(ledger))
+        self.assertIn("outcome hint: committed", release.publication_saga_summary(ledger))
+
+    def test_rerun_uses_prior_success_receipt_and_current_attempt_receipt(self) -> None:
+        homebrew = self.receipt("homebrew", 1)
+        aur = self.receipt("aur", 2)
+        ledger = self.saga(
+            publication_run_attempt=2,
+            homebrew_job_result="success",
+            homebrew_ready="true",
+            homebrew_receipt_artifact_id="303",
+            homebrew_receipt=homebrew,
+            homebrew_receipt_sha256="5" * 64,
+            aur_job_result="success",
+            aur_ready="true",
+            aur_receipt_artifact_id="404",
+            aur_receipt=aur,
+            aur_receipt_sha256="6" * 64,
+        )
+        self.assertEqual("complete", ledger["state"])
+        self.assertFalse(ledger["reconcile_required"])
+        self.assertEqual(1, ledger["targets"]["homebrew"]["receipt_publication_attempt"])
+        self.assertEqual(2, ledger["targets"]["aur"]["receipt_publication_attempt"])
+        self.assertEqual(self.MANIFEST_SHA, ledger["release_manifest_sha256"])
+
+    def test_mismatched_manifest_receipts_are_inconsistent(self) -> None:
+        aur = self.receipt("aur", 1)
+        aur["release"]["manifest_sha256"] = "9" * 64
+        ledger = self.saga(
+            homebrew_ready="true",
+            homebrew_receipt_artifact_id="501",
+            homebrew_receipt=self.receipt("homebrew", 1),
+            homebrew_receipt_sha256="7" * 64,
+            aur_ready="true",
+            aur_receipt_artifact_id="502",
+            aur_receipt=aur,
+            aur_receipt_sha256="8" * 64,
+        )
+        self.assertEqual("inconsistent", ledger["state"])
+        self.assertTrue(ledger["reconcile_required"])
+
+
 class ReleaseAssetSizePrecheckTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

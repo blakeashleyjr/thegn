@@ -39,6 +39,21 @@ are configured, handles key files outside argv/log output, regenerates AUR
 `.SRCINFO`, and commits/pushes only when the rendered content changes. Failure
 does not retract release assets. Re-running the same tag must be idempotent.
 
+After both publishers finish, a credential-free, read-only job downloads their
+receipts by immutable artifact ID and writes one saga ledger. The artifact IDs
+preserve the successful publisher output when GitHub reruns only a failed job;
+the ledger records each receipt's original publication attempt. A missing
+receipt after a ready publisher is unknown remote state, not proof of no push or
+unchanged content. Partial and unknown states are surfaced in the workflow
+summary and require an operator to inspect both target tips and reconcile.
+Per-target receipts and the combined ledger have 90-day artifact retention;
+longer-term retention needs a separate archival policy.
+
+This closes the outcome-reporting gap only. Draft asset uploads still use
+`--clobber` within a draft, and the create/retry path is not yet bound to an
+immutable generation-qualified asset namespace. Break-glass release retraction
+also remains separate work.
+
 ## Verified-before-advertised rule
 
 A channel is public/supported only after a recorded real release rehearsal
