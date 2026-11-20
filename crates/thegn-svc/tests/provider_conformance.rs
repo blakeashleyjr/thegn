@@ -198,6 +198,7 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>, ledger_file: &std::path::
 
 /// Complete the exec WebSocket handshake and answer every command with one
 /// stdout frame and exit status 7 (the non-tty framing the provider reads).
+/// With `drop_exit` the socket closes after the stdout frame, with no exit status.
 fn exec_websocket(mut stream: TcpStream, headers: &HashMap<String, String>, drop_exit: bool) {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::protocol::{Role, WebSocket};
@@ -260,7 +261,8 @@ async fn sprites_passes_the_conformance_suite() {
         .with_ledger_dir(ledger.path().to_path_buf())
         .with_destroy_confirm(Duration::from_millis(200), Duration::from_millis(20));
     let p = Provider::Sprites(provider);
-    let (seen, counts, wakes) = (fake.state.clone(), fake.state.clone(), fake.state.clone());
+    let (seen, counts, held) = (fake.state.clone(), fake.state.clone(), fake.state.clone());
+    let wakes = fake.state.clone();
     let drop_exit = fake.state.clone();
     let unfinished_listing = fake.state.clone();
     let policies = fake.state.clone();
