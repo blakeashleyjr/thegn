@@ -58,6 +58,7 @@ fn source(fields: &[Field], key: &str) -> &Source {
 
 #[test]
 fn repo_network_is_reported_as_repo_source() {
+    let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture("", Some("[sandbox]\nnetwork = \"none\"\n"));
     let cfg = loaded(&fixture);
     let db = crate::db::Db::open_memory().unwrap();
@@ -83,6 +84,7 @@ fn repo_network_is_reported_as_repo_source() {
 
 #[test]
 fn backend_uses_global_or_builtin_source() {
+    let _state = crate::testenv::IsolatedState::new();
     let global_fixture = fixture("[sandbox]\nbackend = \"podman\"\n", None);
     let global_cfg = loaded(&global_fixture);
     let global_db = crate::db::Db::open_memory().unwrap();
@@ -114,6 +116,7 @@ fn backend_uses_global_or_builtin_source() {
 
 #[test]
 fn loaded_value_difference_is_not_misreported_as_global() {
+    let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture("[sandbox]\nbackend = \"podman\"\n", None);
     let cfg = Config::default();
     let db = crate::db::Db::open_memory().unwrap();
@@ -132,6 +135,7 @@ fn loaded_value_difference_is_not_misreported_as_global() {
 
 #[test]
 fn worktree_and_workspace_environment_db_sources_win_in_order() {
+    let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture(
         "[env.x]\nplacement = \"local\"\n[env.y]\nplacement = \"local\"\n",
         None,
@@ -182,6 +186,7 @@ fn worktree_and_workspace_environment_db_sources_win_in_order() {
 
 #[test]
 fn unresolved_environment_name_is_warned() {
+    let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture("", None);
     let cfg = loaded(&fixture);
     let db = crate::db::Db::open_memory().unwrap();
@@ -205,6 +210,7 @@ fn unresolved_environment_name_is_warned() {
 
 #[test]
 fn workspace_gate_is_selected_and_text_secrets_are_redacted() {
+    let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture(
         "[workspace.app.merge_queue]\ngate_command = \"TOKEN=abc just test\"\n",
         None,
@@ -233,6 +239,7 @@ fn workspace_gate_is_selected_and_text_secrets_are_redacted() {
 
 #[test]
 fn provider_summary_excludes_api_credentials_and_commands() {
+    let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture(
         "[env.cloud]\nplacement = \"provider\"\n[env.cloud.provider]\nprovider = \"sprite\"\nid = \"box\"\ntemplate = \"dev\"\napi_key_env = \"TOKEN\"\nexec_command = [\"sprite\", \"exec\", \"--token\", \"abc\"]\n",
         None,
@@ -256,4 +263,31 @@ fn provider_summary_excludes_api_credentials_and_commands() {
     assert!(!provider.contains("api_key_env"));
     assert!(!provider.contains("abc"));
     assert!(!provider.contains("exec_command"));
+}
+
+#[test]
+fn worktree_environment_does_not_report_repo_hint_as_unapplied() {
+    let _state = crate::testenv::IsolatedState::new();
+    let fixture = fixture("[env.x]\nplacement = \"local\"\n", Some("env = \"x\"\n"));
+    let cfg = loaded(&fixture);
+    let db = crate::db::Db::open_memory().unwrap();
+    db.set_worktree_env(&fixture.worktree.to_string_lossy(), "x")
+        .unwrap();
+    let selection = db
+        .effective_env_selection(
+            &fixture.worktree.to_string_lossy(),
+            &fixture.repo.to_string_lossy(),
+        )
+        .unwrap();
+    let env = resolved(&cfg, &fixture, &selection);
+    let (_, notes) = settings(
+        &cfg,
+        Some(fixture.config.clone()),
+        &db,
+        &fixture.repo,
+        &fixture.worktree,
+        &env,
+    );
+
+    assert!(!notes.iter().any(|note| note.contains("was not applied")));
 }
