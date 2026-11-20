@@ -620,7 +620,7 @@ checkpoint_listed() {
   fi
   while IFS= read -r line; do
     case "$line" in
-    "$CHECKPOINT_ID"*)
+    "$CHECKPOINT_ID" | "$CHECKPOINT_ID "*)
       echo "   listed checkpoint: $CHECKPOINT_ID"
       return 0
       ;;
