@@ -200,6 +200,7 @@ mkdir -p "$XDG_STATE_HOME" "$THEGN_DIR" "$TMP/repo"
 REPO="$TMP/repo"
 NAME="(unknown)"
 CREATED=0
+# shellcheck disable=SC2034 # appended to and read by test/lib/live.sh
 FAILED_STEPS=()
 HOLD_PID=""
 WT_PATH=""
