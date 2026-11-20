@@ -36,32 +36,38 @@ pub(crate) fn parse_key(spec: &str) -> Result<KeySpec> {
         rest = &rest[prefix.len()..];
     }
 
-    let code = match rest.to_ascii_lowercase().as_str() {
-        "up" => KeyCode::UpArrow,
-        "down" => KeyCode::DownArrow,
-        "left" => KeyCode::LeftArrow,
-        "right" => KeyCode::RightArrow,
-        "home" => KeyCode::Home,
-        "end" => KeyCode::End,
-        "pgup" => KeyCode::PageUp,
-        "pgdn" => KeyCode::PageDown,
-        "insert" => KeyCode::Insert,
-        "delete" => KeyCode::Delete,
-        "esc" => KeyCode::Escape,
-        "enter" => KeyCode::Enter,
-        "tab" => KeyCode::Tab,
-        "backspace" => KeyCode::Backspace,
-        "space" => KeyCode::Char(' '),
-        name if name.starts_with('f') => {
-            let number = name[1..].parse::<u8>().unwrap_or(0);
-            if (1..=12).contains(&number) {
-                KeyCode::Function(number)
-            } else {
-                bail!("unknown key '{spec}'")
-            }
-        }
-        name if name.chars().count() == 1 => KeyCode::Char(name.chars().next().unwrap()),
-        _ => bail!("unknown key '{spec}'"),
+    let lower = rest.to_ascii_lowercase();
+    let mut chars = rest.chars();
+    let code = match (chars.next(), chars.next()) {
+        // One character is sent as itself (case kept): `f`, `G`, `:`.
+        (Some(c), None) => KeyCode::Char(c),
+        _ => match lower.as_str() {
+            "up" => KeyCode::UpArrow,
+            "down" => KeyCode::DownArrow,
+            "left" => KeyCode::LeftArrow,
+            "right" => KeyCode::RightArrow,
+            "home" => KeyCode::Home,
+            "end" => KeyCode::End,
+            "pgup" => KeyCode::PageUp,
+            "pgdn" => KeyCode::PageDown,
+            "insert" => KeyCode::Insert,
+            "delete" => KeyCode::Delete,
+            "esc" => KeyCode::Escape,
+            "enter" => KeyCode::Enter,
+            "tab" => KeyCode::Tab,
+            "backspace" => KeyCode::Backspace,
+            "space" => KeyCode::Char(' '),
+            name => match name
+                .strip_prefix('f')
+                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|n| n.parse::<u8>().ok())
+            {
+                Some(n @ 1..=12) => KeyCode::Function(n),
+                _ => bail!(
+                    "unknown key name (expected up, down, left, right, home, end, pgup, pgdn, insert, delete, esc, enter, tab, backspace, space, f1-f12 or one character)"
+                ),
+            },
+        },
     };
 
     Ok(KeySpec { code, mods })
@@ -162,7 +168,9 @@ pub(crate) async fn wait_screen(
     timeout_ms: Option<i64>,
 ) -> Result<serde_json::Value> {
     let started = Instant::now();
-    let timeout = timeout_ms.map(|ms| Duration::from_millis(ms.max(0) as u64));
+    let timeout = timeout_ms
+        .filter(|ms| *ms >= 0)
+        .map(|ms| Duration::from_millis(ms.unsigned_abs()));
     let condition = match wait {
         ScreenWait::Matches(regex) => format!("screen:{}", regex.as_str()),
         ScreenWait::Stable(duration) => format!("stable:{}", duration.as_millis()),
@@ -171,6 +179,7 @@ pub(crate) async fn wait_screen(
         seq: None,
         since: started,
     };
+    let mut last_seq: Option<u64> = None;
 
     loop {
         let (seq, rows, cols, ansi) = client.snapshot(session).await?;
@@ -188,6 +197,17 @@ pub(crate) async fn wait_screen(
                 "exit_code": null,
             }));
         }
+        if last_seq == Some(seq) {
+            // A dead session's screen never changes (the daemon serves its tombstone);
+            // answer as the daemon's own wait does for a corpse.
+            let probe = client
+                .wait(session, serde_json::json!({ "kind": "exited" }), Some(1))
+                .await?;
+            if probe.get("matched").and_then(serde_json::Value::as_bool) == Some(true) {
+                return Ok(probe);
+            }
+        }
+        last_seq = Some(seq);
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
             return Ok(serde_json::json!({
                 "matched": false,
@@ -215,13 +235,15 @@ mod tests {
             ("M-x", KeyCode::Char('x'), Modifiers::ALT),
             ("shift+tab", KeyCode::Tab, Modifiers::SHIFT),
             ("f12", KeyCode::Function(12), Modifiers::NONE),
+            ("f", KeyCode::Char('f'), Modifiers::NONE),
+            ("G", KeyCode::Char('G'), Modifiers::NONE),
             ("space", KeyCode::Char(' '), Modifiers::NONE),
             ("a", KeyCode::Char('a'), Modifiers::NONE),
         ];
         for (input, code, mods) in cases {
             assert_eq!(parse_key(input).unwrap(), KeySpec { code, mods });
         }
-        for input in ["f13", "ctrl+", "", "hyper+x"] {
+        for input in ["f13", "f+5", "ctrl+", "", "hyper+x"] {
             assert!(parse_key(input).is_err(), "{input} should be rejected");
         }
     }

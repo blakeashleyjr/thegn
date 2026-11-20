@@ -503,7 +503,7 @@ pub(crate) fn parse_wait_condition(s: &str) -> Result<serde_json::Value> {
             Some(rx) => serde_json::json!({ "kind": "output_matches", "regex": rx }),
             None => anyhow::bail!(
                 "unknown wait condition '{other}' \
-                 (expected exited|idle|blocked|done|match:<regex>)"
+                 (expected exited|idle|blocked|done|match:<regex>|screen:<regex>|stable:<ms>)"
             ),
         },
     };
@@ -2599,7 +2599,19 @@ mod session_target_tests {
 
     #[test]
     fn send_paste_requires_text() {
-        assert!(parse(&["thegn", "session", "send", "--session", "s", "--paste",]).is_err());
+        assert!(
+            parse(&[
+                "thegn",
+                "session",
+                "send",
+                "--session",
+                "s",
+                "--key",
+                "up",
+                "--paste",
+            ])
+            .is_err()
+        );
     }
 }
 
