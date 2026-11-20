@@ -36,7 +36,9 @@ if grep -Fq 'mkdir -m 700 "$TMP/run"' "$SCRIPT"; then
 fi
 grep -Fq 'RD_OVERLAY_AGENT' "$SCRIPT"
 grep -Fq 'agent list' "$SCRIPT"
+# shellcheck disable=SC2016 # literal text searched for in the script
 grep -Fq 'daemon >"$TMP/overlay-daemon.log"' "$SCRIPT"
+# shellcheck disable=SC2016 # literal text searched for in the script
 grep -Fq 'no_stdin "$THEGN_BIN" env up --worktree "$POOL_PATH"' "$SCRIPT"
 grep -Fq 'rd-y2' "$SCRIPT"
 [ ! -e "$TMP/called" ]
