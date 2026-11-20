@@ -130,6 +130,20 @@ argument-parse code (`2`) and is **permanent — do not retry it** (see the
 exit-code note below); it is distinct from the retryable runtime failures the
 table describes.
 
+### thegn info
+
+`thegn info` explains the effective workspace or worktree settings and the
+layer that supplied each value. Use `--workspace` or `--worktree` to inspect a
+different target, or `--json` for the stable machine-readable report.
+
+```sh
+thegn info [--workspace SLUG|PATH] [--worktree PATH|BRANCH] [--json]
+```
+
+The JSON document has top-level keys such as `schema`, `target`, `workspace`,
+`workspace_stats`, `worktree`, `sessions`, `settings`, `backends`, `overrides`,
+and `notes`.
+
 ## Headless worktree lifecycle
 
 ```sh
@@ -204,6 +218,25 @@ it prints a hint to run this verb. See [Environments](help/environments.md).
 state `Failed` whose worktree directory exists. It never destroys a sandbox, and
 exits nonzero while any entry still fails. A failed pull-back on close shows a
 warning that names this verb.
+
+## Inspecting a sprite (`fleet inspect`)
+
+`thegn fleet inspect <sprite> --env <S> [--policy] [--json]` (dev channel) reads
+one sprite's status, `created_at` and URL auth without waking it. `--policy`
+also reads the memory policy, which may wake a cold sprite; errors never print
+the request URL.
+
+## Warming the devShell cache (`sandbox warm-devshell`)
+
+`thegn sandbox warm-devshell [--json]` runs `nix print-dev-env --json` in the
+current repository's main checkout and writes the cache read by
+`[sandbox] inject_devshell` (0600 file, 0700 directory). It evaluates the
+flake as you; nothing runs it automatically.
+
+## Provisioning in `agent run --json`
+
+`thegn agent run --json` carries `provision`: `none`, `claimed_spare` or
+`provisioned`.
 
 ## Forgetting projects (`repo forget`)
 
