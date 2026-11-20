@@ -1019,13 +1019,14 @@ pub(crate) fn destroy_one_checked(
         return (false, error);
     }
 
-    let teardown = match automatic_teardown {
-        Some(teardown) => teardown(),
+    let notes = match automatic_teardown {
+        Some(teardown) => teardown().map(|()| Vec::new()),
         None => teardown_runtime(cfg, repo_root, worktree, &location, db, mode),
     };
-    if let Err(error) = teardown {
-        return (false, error);
-    }
+    let notes = match notes {
+        Ok(notes) => notes,
+        Err(error) => return (false, error),
+    };
 
     let moved = delete_branch
         && !branch.is_empty()
@@ -1118,9 +1119,23 @@ pub(crate) fn destroy_one_checked(
     );
     if post.results.iter().any(|result| !result.succeeded()) {
         // Post-destroy is warn-only, so physical success remains success.
-        return (true, post.message());
+        return (
+            true,
+            if notes.is_empty() {
+                post.message()
+            } else {
+                format!("{}; {}", post.message(), notes.join("; "))
+            },
+        );
     }
-    (true, "removed".into())
+    (
+        true,
+        if notes.is_empty() {
+            "removed".into()
+        } else {
+            format!("removed; {}", notes.join("; "))
+        },
+    )
 }
 
 /// Whether `teardown_runtime` should checkpoint on close. The destroy/recycle is
@@ -1136,9 +1151,13 @@ fn accept_loss(mode: HookExecutionMode) -> bool {
 
 /// THE-2477: bring a bound sandbox's commits home before it is destroyed
 /// or recycled; refuse (unless forced) when that fails or it is dirty.
-fn sandbox_pull_guard(cfg: &Config, worktree: &str, accept_loss: bool) -> Result<(), String> {
+fn sandbox_pull_guard(
+    cfg: &Config,
+    worktree: &str,
+    accept_loss: bool,
+) -> Result<Vec<String>, String> {
     let sandbox = match crate::provider_git::bound_offline(cfg, worktree) {
-        Ok(crate::provider_git::OfflineBinding::Unbound) => return Ok(()),
+        Ok(crate::provider_git::OfflineBinding::Unbound) => return Ok(Vec::new()),
         Ok(crate::provider_git::OfflineBinding::Bound { sandbox }) => sandbox,
         Ok(crate::provider_git::OfflineBinding::BoundUnknown) => "of this worktree".into(),
         Err(error) if !accept_loss => {
@@ -1147,10 +1166,11 @@ fn sandbox_pull_guard(cfg: &Config, worktree: &str, accept_loss: bool) -> Result
             ));
         }
         Err(error) => {
-            thegn_core::msg::warn(&format!(
+            let note = format!(
                 "cannot tell whether {worktree} has a provider sandbox ({error:#}); removing it anyway (forced)"
-            ));
-            return Ok(());
+            );
+            thegn_core::msg::warn(&note);
+            return Ok(vec![note]);
         }
     };
     let notes = crate::provider_git::destroy_guard(
@@ -1158,14 +1178,18 @@ fn sandbox_pull_guard(cfg: &Config, worktree: &str, accept_loss: bool) -> Result
         &sandbox,
         accept_loss,
     )?;
-    for note in notes {
-        if note.warn {
-            thegn_core::msg::warn(&note.text);
-        } else {
-            thegn_core::msg::info(&note.text);
-        }
-    }
-    Ok(())
+    let notes = notes
+        .into_iter()
+        .map(|note| {
+            if note.warn {
+                thegn_core::msg::warn(&note.text);
+            } else {
+                thegn_core::msg::info(&note.text);
+            }
+            note.text
+        })
+        .collect();
+    Ok(notes)
 }
 
 fn local_branch_tip(repo_root: &Path, branch: &str) -> Option<String> {
@@ -1218,6 +1242,8 @@ fn teardown_runtime(
     );
     let path = worktree.to_string_lossy().into_owned();
     let loss_ok = accept_loss(mode);
+    let mut guard_notes: Vec<String> = Vec::new();
+    let mut refused: Option<String> = None;
     let mut failures = Vec::new();
 
     if let thegn_core::placement::Placement::Ssh(ssh) = &env.placement {
@@ -1244,6 +1270,7 @@ fn teardown_runtime(
             false
         }
     };
+    let is_provider = env.placement.is_provider();
     failures.extend(provider_destroy_step(
         matches!(loc, thegn_core::remote::GitLoc::Provider { .. }),
         &env.placement,
@@ -1251,10 +1278,21 @@ fn teardown_runtime(
         &path,
         sync_succeeded,
         &mut || {
-            sandbox_pull_guard(cfg, &path, loss_ok)?;
+            if is_provider {
+                match sandbox_pull_guard(cfg, &path, loss_ok) {
+                    Ok(notes) => guard_notes.extend(notes),
+                    Err(r) => {
+                        refused = Some(r.clone());
+                        return Err(r);
+                    }
+                }
+            }
             crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name)
         },
     ));
+    if refused.is_some() {
+        return Err(failures.join("; "));
+    }
     crate::agent::deregister_vpn(&path);
     crate::agent::deproject(&path);
     // THE-2055: after a successful provider destroy/recycle the sandbox is gone
@@ -1267,7 +1305,7 @@ fn teardown_runtime(
     crate::placement_flow::release(&path);
 
     if failures.is_empty() {
-        Ok(())
+        Ok(guard_notes)
     } else {
         Err(failures.join("; "))
     }

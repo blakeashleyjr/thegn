@@ -1198,7 +1198,10 @@ pub(crate) fn pull_before_destroy_with(
     ops: &dyn PreLandOps,
     worktree: &str,
 ) -> anyhow::Result<BeforeDestroy> {
-    if !ops.is_provider(worktree)? {
+    if !ops
+        .is_provider(worktree)
+        .map_err(|e| anyhow::anyhow!("cannot tell whether {worktree} still has a provider sandbox: the provider listing is incomplete or unreachable ({e:#})"))?
+    {
         return Ok(BeforeDestroy::NotBound);
     }
     match ops.pull_counted(worktree) {
@@ -1264,6 +1267,25 @@ pub(crate) fn destroy_guard(
                 warn: false,
                 text: format!("pulled {}: {}", report.branch, report.summary()),
             }];
+            if matches!(
+                &report.outcome,
+                &PullOutcome::Diverged { .. } | &PullOutcome::LocalDirty { .. }
+            ) {
+                if !accept_loss {
+                    return Err(format!(
+                        "sandbox {sandbox}: {}; its commits are not on {} and nothing was destroyed. Merge the kept ref first, then retry, or force the destroy",
+                        report.summary(),
+                        report.branch
+                    ));
+                }
+                notes.push(GuardNote {
+                    warn: true,
+                    text: format!(
+                        "sandbox {sandbox} destroyed (forced): its commits are only in the kept ref ({}); merge it before another pull of this worktree overwrites it",
+                        report.summary()
+                    ),
+                });
+            }
             match sandbox_dirty {
                 Some(0) => Ok(notes),
                 Some(n) if !accept_loss => Err(format!(
@@ -2006,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_offline_table() {
+    fn headless_provider_worktree_is_a_provider_for_land() {
         use thegn_core::config::{Config, EnvConfig, EnvProviderConfig, PlacementMode};
         use thegn_core::db::Db;
         use thegn_core::store::WorkspaceStore;
@@ -2288,7 +2310,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(notes[0].warn, false);
+        assert!(!notes[0].warn);
         assert!(notes[0].text.contains("no pull"));
 
         let notes = destroy_guard(
@@ -2301,6 +2323,35 @@ mod tests {
         )
         .unwrap();
         assert!(notes[0].text.contains("pulled tg/lane:"));
+
+        let diverged = report(PullOutcome::Diverged {
+            kept_ref: "refs/thegn/pull/tg-box".into(),
+            vm_head: "c".repeat(40),
+        });
+        let refusal = destroy_guard(
+            Ok(BeforeDestroy::Pulled {
+                report: Some(diverged.clone()),
+                sandbox_dirty: Some(0),
+            }),
+            "tg-box",
+            false,
+        )
+        .unwrap_err();
+        assert!(refusal.contains("nothing was destroyed"), "{refusal}");
+        let notes = destroy_guard(
+            Ok(BeforeDestroy::Pulled {
+                report: Some(diverged),
+                sandbox_dirty: Some(0),
+            }),
+            "tg-box",
+            true,
+        )
+        .unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.warn && note.text.contains("kept ref"))
+        );
 
         for dirty in [Some(2), None] {
             let refusal = destroy_guard(
