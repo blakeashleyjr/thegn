@@ -7012,9 +7012,12 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), provider.destroy("sprite"))
             .await
             .expect("destroy confirmation must honor the injected budget");
+        let error = result.expect_err("destroy unexpectedly confirmed");
         assert!(
-            result.is_err(),
-            "destroy unexpectedly confirmed: {result:?}"
+            error
+                .to_string()
+                .contains("was accepted but the sprite still exists"),
+            "{error:#}"
         );
         server.abort();
         let _ = server.await;
