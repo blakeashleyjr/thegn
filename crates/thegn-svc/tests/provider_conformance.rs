@@ -6,7 +6,8 @@
 //!
 //! WS08-P1-08 slice 2 (fly, vps): minimal fakes copied from `fly_mock.rs` and
 //! `vps_mock.rs` run the same suite below. Slice 3: record kept until proven
-//! gone.
+//! gone. Slice 4: unfinished listings, missing exit status, stopped retry,
+//! egress.
 //!
 //! Run: `cargo test -p thegn-svc --test provider_conformance`.
 
@@ -40,6 +41,10 @@ struct State {
     held: BTreeSet<String>,
     deletes: HashMap<String, usize>,
     ledger_at_create: Option<bool>,
+    drop_exit: bool,
+    unfinished: bool,
+    wakes: usize,
+    policies: HashMap<String, String>,
 }
 
 struct Fake {
@@ -113,7 +118,12 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>, ledger_file: &std::path::
     }
     let path = target.split('?').next().unwrap_or(&target).to_string();
     if method == "GET" && path.ends_with("/exec") {
-        exec_websocket(stream, &headers);
+        let drop_exit = {
+            let mut st = state.lock().unwrap();
+            st.wakes += 1;
+            st.drop_exit
+        };
+        exec_websocket(stream, &headers, drop_exit);
         return;
     }
     let (status, resp): (&str, Vec<u8>) = match (method.as_str(), path.as_str()) {
@@ -135,8 +145,23 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>, ledger_file: &std::path::
                 .collect();
             (
                 "200 OK",
-                format!(r#"{{"sprites":[{}],"has_more":false}}"#, rows.join(",")).into_bytes(),
+                if st.unfinished {
+                    format!(r#"{{"sprites":[{}],"has_more":true}}"#, rows.join(",")).into_bytes()
+                } else {
+                    format!(r#"{{"sprites":[{}],"has_more":false}}"#, rows.join(",")).into_bytes()
+                },
             )
+        }
+        ("POST", p) if p.starts_with("/v1/sprites/") && p.ends_with("/policy/network") => {
+            let name = p
+                .trim_start_matches("/v1/sprites/")
+                .trim_end_matches("/policy/network");
+            let mut st = state.lock().unwrap();
+            st.policies.insert(
+                name.to_string(),
+                String::from_utf8_lossy(&body).into_owned(),
+            );
+            ("200 OK", b"{}".to_vec())
         }
         ("GET", p) if p.starts_with("/v1/sprites/") => {
             let name = p.trim_start_matches("/v1/sprites/");
@@ -173,7 +198,8 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>, ledger_file: &std::path::
 
 /// Complete the exec WebSocket handshake and answer every command with one
 /// stdout frame and exit status 7 (the non-tty framing the provider reads).
-fn exec_websocket(mut stream: TcpStream, headers: &HashMap<String, String>) {
+/// With `drop_exit` the socket closes after the stdout frame, with no exit status.
+fn exec_websocket(mut stream: TcpStream, headers: &HashMap<String, String>, drop_exit: bool) {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::protocol::{Role, WebSocket};
     let Some(key) = headers.get("sec-websocket-key") else {
@@ -190,6 +216,15 @@ fn exec_websocket(mut stream: TcpStream, headers: &HashMap<String, String>) {
     let mut out = vec![1];
     out.extend_from_slice(b"conformance-out\n");
     if socket.send(Message::Binary(out.into())).is_err() {
+        return;
+    }
+    if drop_exit {
+        if socket.close(None).is_err() {
+            return;
+        }
+        if socket.flush().is_err() {
+            return;
+        }
         return;
     }
     let exit = vec![0x03, 7];
@@ -227,6 +262,10 @@ async fn sprites_passes_the_conformance_suite() {
         .with_destroy_confirm(Duration::from_millis(200), Duration::from_millis(20));
     let p = Provider::Sprites(provider);
     let (seen, counts, held) = (fake.state.clone(), fake.state.clone(), fake.state.clone());
+    let wakes = fake.state.clone();
+    let drop_exit = fake.state.clone();
+    let unfinished_listing = fake.state.clone();
+    let policies = fake.state.clone();
     let ledger_dir = ledger.path().to_path_buf();
     let fx = Fixture {
         created: NAME.into(),
@@ -247,8 +286,8 @@ async fn sprites_passes_the_conformance_suite() {
                     .unwrap_or(0)
             })
         })),
-        // Sprites reads never resume anything: the case is n/a.
-        resumes: None,
+        // Sprites wakes on exec; a read must not open one.
+        resumes: Some(Box::new(move || wakes.lock().unwrap().wakes)),
         cap: None,
         supports_stop: false,
         hold_after_delete: Some(Box::new(move |name, hold| {
@@ -262,20 +301,44 @@ async fn sprites_passes_the_conformance_suite() {
         recorded: Some(Box::new(move |name| {
             registry::read_at(&ledger_dir, name).is_some()
         })),
+        drop_exit: Some(Box::new(move |on| {
+            drop_exit.lock().unwrap().drop_exit = on;
+        })),
+        refuse_runs_stopped: None,
+        runs: None,
+        unfinished_listing: Some(Box::new(move |on| {
+            unfinished_listing.lock().unwrap().unfinished = on;
+        })),
+        egress_allows_all: Some(Box::new(move |name| {
+            let st = policies.lock().unwrap();
+            let body = st.policies.get(name)?;
+            let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+            let rules = value.get("rules")?.as_array()?;
+            Some(!rules.iter().any(|rule| {
+                rule.get("domain").and_then(serde_json::Value::as_str) == Some("*")
+                    && rule.get("action").and_then(serde_json::Value::as_str) == Some("deny")
+            }))
+        })),
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
     assert_eq!(
         report.skipped,
         vec![
-            "reads_never_resume",
+            "stopped_run_is_retried_once",
             "create_respects_cap",
             "stop_resume_round_trip"
         ],
         "{report:?}"
     );
     assert!(
-        report.passed.contains(&"destroy_keeps_record_until_gone"),
+        report.passed.contains(&"exec_without_exit_fails")
+            && report.passed.contains(&"reads_never_resume")
+            && report
+                .passed
+                .contains(&"unfinished_listing_is_never_complete")
+            && report.passed.contains(&"egress_never_widens")
+            && report.passed.contains(&"destroy_keeps_record_until_gone"),
         "{report:?}"
     );
 }
@@ -448,9 +511,30 @@ async fn fly_passes_the_conformance_suite() {
         recorded: Some(Box::new(|name| {
             thegn_svc::vps::registry::read(name).is_some()
         })),
+        drop_exit: None,
+        refuse_runs_stopped: None,
+        runs: None,
+        unfinished_listing: None,
+        egress_allows_all: None,
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
+    assert_eq!(
+        report.skipped,
+        vec![
+            "create_records_before_request",
+            "destroy_unrecorded_refused",
+            "run_captures_exit_and_output",
+            "exec_without_exit_fails",
+            "stopped_run_is_retried_once",
+            "reads_never_resume",
+            "unfinished_listing_is_never_complete",
+            "create_respects_cap",
+            "egress_never_widens",
+            "stop_resume_round_trip",
+        ],
+        "{report:?}"
+    );
     assert!(
         report.passed.contains(&"destroy_keeps_record_until_gone"),
         "{report:?}"
@@ -468,10 +552,21 @@ async fn vps_passes_the_conformance_suite() {
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
     let present = Arc::new(AtomicBool::new(true));
     let hold = Arc::new(AtomicBool::new(false));
-    let (shared, present_srv, hold_srv) = (requests.clone(), present.clone(), hold.clone());
+    let unfinished = Arc::new(AtomicBool::new(false));
+    let (shared, present_srv, hold_srv, unfinished_srv) = (
+        requests.clone(),
+        present.clone(),
+        hold.clone(),
+        unfinished.clone(),
+    );
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (shared, present, hold) = (shared.clone(), present_srv.clone(), hold_srv.clone());
+            let (shared, present, hold, unfinished) = (
+                shared.clone(),
+                present_srv.clone(),
+                hold_srv.clone(),
+                unfinished_srv.clone(),
+            );
             thread::spawn(move || {
                 let Some((method, path, body)) = read_request(&stream) else {
                     return;
@@ -487,13 +582,19 @@ async fn vps_passes_the_conformance_suite() {
                     )),
                     ("POST", "/v1/ssh_keys") => Some(r#"{"ssh_key":{"id":42}}"#.to_string()),
                     ("POST", "/v1/servers") => Some(r#"{"server":{"id":101,"name":"tg-mock-1","status":"initializing","created":"2026-07-01T12:00:00+00:00"}}"#.to_string()),
-                    ("GET", p) if p.starts_with("/v1/servers?") => Some(
-                        if present.load(Ordering::Acquire) {
-                            format!(r#"{{"servers":[{{"id":101,"name":"tg-mock-1","status":"running","created":"2026-07-01T12:00:00+00:00","public_net":{{"ipv4":{{"ip":"203.0.113.9"}}}},"labels":{{"managed-by":"thegn","tg-host":"h1"}}}}],{page}}}"#)
+                    ("GET", p) if p.starts_with("/v1/servers?") => {
+                        let present = u8::from(present.load(Ordering::Acquire));
+                        let unfinished = u8::from(unfinished.load(Ordering::Acquire));
+                        let total_entries = u64::from(present) + u64::from(unfinished);
+                        let server_page = format!(
+                            r#""meta":{{"pagination":{{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":{total_entries}}}}}"#
+                        );
+                        Some(if present != 0 {
+                            format!(r#"{{"servers":[{{"id":101,"name":"tg-mock-1","status":"running","created":"2026-07-01T12:00:00+00:00","public_net":{{"ipv4":{{"ip":"203.0.113.9"}}}},"labels":{{"managed-by":"thegn","tg-host":"h1"}}}}],{server_page}}}"#)
                         } else {
-                            r#"{"servers":[],"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":0}}}"#.to_string()
-                        },
-                    ),
+                            format!(r#"{{"servers":[],{server_page}}}"#)
+                        })
+                    },
                     ("DELETE", "/v1/servers/101") => {
                         if !hold.load(Ordering::Acquire) {
                             present.store(false, Ordering::Release);
@@ -540,11 +641,36 @@ async fn vps_passes_the_conformance_suite() {
         recorded: Some(Box::new(|name| {
             thegn_svc::vps::registry::read(name).is_some()
         })),
+        unfinished_listing: Some(Box::new(move |on| {
+            unfinished.store(on, Ordering::Release);
+        })),
+        drop_exit: None,
+        refuse_runs_stopped: None,
+        runs: None,
+        egress_allows_all: None,
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
+    assert_eq!(
+        report.skipped,
+        vec![
+            "create_records_before_request",
+            "destroy_unrecorded_refused",
+            "run_captures_exit_and_output",
+            "exec_without_exit_fails",
+            "stopped_run_is_retried_once",
+            "reads_never_resume",
+            "create_respects_cap",
+            "egress_never_widens",
+            "stop_resume_round_trip",
+        ],
+        "{report:?}"
+    );
     assert!(
-        report.passed.contains(&"destroy_keeps_record_until_gone"),
+        report
+            .passed
+            .contains(&"unfinished_listing_is_never_complete")
+            && report.passed.contains(&"destroy_keeps_record_until_gone"),
         "{report:?}"
     );
 }
