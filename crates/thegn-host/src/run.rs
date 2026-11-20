@@ -7868,6 +7868,9 @@ async fn event_loop<T: Terminal>(
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
+    // Alt+[ is ambiguous with a split CSI introducer. Give a following marker
+    // a brief chance to arrive, then replay the standalone chord to dispatch.
+    let mut residue_deadline: Option<std::time::Instant> = None;
     // Events read ahead of their turn by the key-repeat coalescer; consumed
     // before blocking on poll_input again.
     let mut pending_input: std::collections::VecDeque<InputEvent> =
@@ -17429,7 +17432,9 @@ async fn event_loop<T: Terminal>(
             plugins_state.next_loop_deadline(),
             std::time::Instant::now(),
         );
-        let polled = match pending_input.pop_front() {
+        let timeout =
+            crate::idle_poll::fold_deadline(timeout, residue_deadline, std::time::Instant::now());
+        let mut polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
             None => {
                 if crate::perf::enabled() {
@@ -17447,6 +17452,19 @@ async fn event_loop<T: Terminal>(
                 event
             }
         };
+        let residue_expired =
+            residue_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if residue_expired {
+            residue_deadline = None;
+            if residue.has_pending_introducer()
+                && let Ok(event) = &mut polled
+            {
+                let ready = event.take();
+                if residue.flush_before_ready_event(ready, &mut pending_input) {
+                    polled = Ok(None);
+                }
+            }
+        }
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
                 plugins_state.user_input();
@@ -19216,7 +19234,15 @@ async fn event_loop<T: Terminal>(
                 // Recover xterm's split modified tilde keys before termwiz's
                 // keymap can turn their suffix into pane text; mouse residue
                 // continues to be discarded here as before.
-                let k = match residue.feed(&k.key, k.modifiers) {
+                let verdict = residue.feed(&k.key, k.modifiers);
+                if residue.has_pending_introducer() {
+                    residue_deadline.get_or_insert_with(|| {
+                        std::time::Instant::now() + std::time::Duration::from_millis(40)
+                    });
+                } else {
+                    residue_deadline = None;
+                }
+                let k = match verdict {
                     crate::mousefilter::Verdict::Swallow => continue,
                     crate::mousefilter::Verdict::Pass => k,
                     crate::mousefilter::Verdict::Emit(key) => key,

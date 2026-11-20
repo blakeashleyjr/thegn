@@ -44,6 +44,11 @@ A focus-lock action SHALL pin keyboard focus to the center panes so that movemen
 
 Alt+Left/Right SHALL cycle tabs within the active worktree and Alt+Up/Down SHALL move between worktrees, with each worktree restoring its own active tab — distinct from the directional focus-zone movement.
 
+When multiple top-level app tabs are available, Alt+] and Alt+[ SHALL cycle
+forward and backward through those tabs, respectively. An Alt+[ key SHALL reach
+app-tab dispatch after a bounded wait when no split terminal control sequence
+continues it.
+
 #### Scenario: Cycle tabs in the active worktree
 
 - **WHEN** the user presses Alt+Right
@@ -54,6 +59,12 @@ Alt+Left/Right SHALL cycle tabs within the active worktree and Alt+Up/Down SHALL
 - **WHEN** the user presses Alt+Down
 - **THEN** the next worktree is activated, restoring that worktree's own active
   tab
+
+#### Scenario: Cycle top-level app tabs backward
+
+- **WHEN** the user presses Alt+[ and no split terminal control sequence
+  continues the input
+- **THEN** the previous top-level app tab is shown
 
 ### Requirement: Workspaces and worktrees are openable via a frecency-ranked palette mode
 

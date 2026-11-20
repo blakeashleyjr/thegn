@@ -9,7 +9,9 @@
 //! Those bodies are buffered only up to a fixed bound, then decoded or replayed
 //! as ordinary keys when malformed or unknown.
 
-use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+use std::collections::VecDeque;
+
+use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 
 const CSI_KEY_BUFFER_LIMIT: usize = 8;
 
@@ -39,13 +41,19 @@ pub enum Verdict {
 #[derive(Debug, Default)]
 pub struct MouseResidueFilter {
     state: State,
+    /// Replayed input must bypass the parser once; otherwise replaying the
+    /// ambiguous Alt+[ prefix would start the same CSI probe again.
+    replay_count: usize,
 }
 
 impl MouseResidueFilter {
-    /// Reassemble xterm modified tilde keys as well as discarding split SGR
-    /// mouse reports. The swallowed `Alt+[` remains swallowed on malformed
-    /// sequences, matching the historical Alt+[ policy.
+    /// Reassemble xterm modified tilde keys and discard split SGR mouse
+    /// reports while preserving standalone or malformed Alt+[ input.
     pub fn feed(&mut self, key: &KeyCode, mods: Modifiers) -> Verdict {
+        if self.replay_count > 0 {
+            self.replay_count -= 1;
+            return Verdict::Pass;
+        }
         let state = std::mem::replace(&mut self.state, State::Idle);
         match state {
             State::Idle => {
@@ -65,10 +73,10 @@ impl MouseResidueFilter {
                     self.state = State::InKeyCsi(vec![key_event(key, mods)]);
                     Verdict::Swallow
                 }
-                _ => {
-                    self.state = State::Idle;
-                    Verdict::Pass
-                }
+                _ => self.replay(vec![
+                    key_event(&KeyCode::Char('['), Modifiers::ALT),
+                    key_event(key, mods),
+                ]),
             },
             State::InMouse => match key {
                 KeyCode::Char(c) if mods.is_empty() && (c.is_ascii_digit() || *c == ';') => {
@@ -88,6 +96,47 @@ impl MouseResidueFilter {
         }
     }
 
+    /// Whether the event loop should keep a short deadline for a possible
+    /// split CSI body. Only the introducer itself is time-ambiguous; once a
+    /// mouse marker or key body arrives, its parser handles the rest.
+    pub fn has_pending_introducer(&self) -> bool {
+        matches!(&self.state, State::SawCsi)
+    }
+
+    /// Flush a standalone Alt+[ after the event loop's bounded wait expires.
+    /// The replay bypasses this filter exactly once before normal dispatch.
+    pub fn flush_pending_introducer(&mut self) -> Option<Verdict> {
+        if !self.has_pending_introducer() {
+            return None;
+        }
+        self.state = State::Idle;
+        Some(self.replay(vec![key_event(&KeyCode::Char('['), Modifiers::ALT)]))
+    }
+
+    /// Expire an ambiguous introducer before a ready event is dispatched.
+    /// The event is queued after the one-shot replay, preserving input order.
+    pub fn flush_before_ready_event(
+        &mut self,
+        ready: Option<InputEvent>,
+        pending: &mut VecDeque<InputEvent>,
+    ) -> bool {
+        let Some(Verdict::Replay(keys)) = self.flush_pending_introducer() else {
+            return false;
+        };
+        if let Some(event) = ready {
+            pending.push_front(event);
+        }
+        for key in keys.into_iter().rev() {
+            pending.push_front(InputEvent::Key(key));
+        }
+        true
+    }
+
+    fn replay(&mut self, keys: Vec<KeyEvent>) -> Verdict {
+        self.replay_count = keys.len();
+        Verdict::Replay(keys)
+    }
+
     fn feed_key_csi(
         &mut self,
         mut buffer: Vec<KeyEvent>,
@@ -102,7 +151,7 @@ impl MouseResidueFilter {
             }
             let mut replay = buffer;
             replay.push(key_event(key, mods));
-            return Verdict::Replay(replay);
+            return self.replay(replay);
         }
         if mods.is_empty() && *key == KeyCode::Char('~') {
             let event = parse_tilde_key(&buffer);
@@ -112,7 +161,7 @@ impl MouseResidueFilter {
         }
         let mut replay = buffer;
         replay.push(key_event(key, mods));
-        Verdict::Replay(replay)
+        self.replay(replay)
     }
 
     /// Compatibility wrapper for the existing mouse-filter call sites/tests.
@@ -236,6 +285,53 @@ mod tests {
         // Next key isn't '<': not a mouse report; it passes.
         assert!(!f.swallow(&KeyCode::Char('a'), Modifiers::NONE));
         assert!(!f.swallow(&KeyCode::Char('b'), Modifiers::NONE));
+    }
+
+    #[test]
+    fn standalone_alt_bracket_flushes_and_replay_bypasses_filter() {
+        let mut f = MouseResidueFilter::default();
+        assert_eq!(
+            f.feed(&KeyCode::Char('['), Modifiers::ALT),
+            Verdict::Swallow
+        );
+        assert!(f.has_pending_introducer());
+        let replay = f.flush_pending_introducer();
+        assert_eq!(
+            replay,
+            Some(Verdict::Replay(vec![key_event(
+                &KeyCode::Char('['),
+                Modifiers::ALT
+            )]))
+        );
+        // The event loop requeues this key. Its one-shot bypass lets it reach
+        // app-tab dispatch without opening another CSI probe.
+        assert_eq!(f.feed(&KeyCode::Char('['), Modifiers::ALT), Verdict::Pass);
+        assert!(!f.has_pending_introducer());
+    }
+
+    #[test]
+    fn expired_introducer_precedes_ready_event_and_replay_does_not_loop() {
+        let mut filter = MouseResidueFilter::default();
+        let mut pending = VecDeque::new();
+        assert_eq!(
+            filter.feed(&KeyCode::Char('['), Modifiers::ALT),
+            Verdict::Swallow
+        );
+        assert!(filter.flush_before_ready_event(Some(InputEvent::Wake), &mut pending));
+        assert_eq!(
+            pending.pop_front(),
+            Some(InputEvent::Key(key_event(
+                &KeyCode::Char('['),
+                Modifiers::ALT,
+            )))
+        );
+        assert_eq!(pending.pop_front(), Some(InputEvent::Wake));
+        assert_eq!(
+            filter.feed(&KeyCode::Char('['), Modifiers::ALT),
+            Verdict::Pass
+        );
+        assert!(!filter.has_pending_introducer());
+        assert!(!filter.flush_before_ready_event(None, &mut pending));
     }
 
     #[test]
