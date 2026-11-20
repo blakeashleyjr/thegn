@@ -459,6 +459,10 @@ fn is_lone_escape(ev: &FromTty, bytes: &[u8]) -> bool {
     matches!(ev, FromTty::Key(_)) && bytes == [0x1b]
 }
 
+/// One coalesced batch: the bytes to send, a resize to send after them, and a
+/// lone Escape held back for its own message.
+pub(crate) type CoalescedInput = (Vec<u8>, Option<(u16, u16)>, Option<Vec<u8>>);
+
 /// Encode `first` plus every input event already queued behind it as ONE
 /// stdin write, up to STDIN_COALESCE_MAX bytes (a single larger event, e.g.
 /// a bracketed paste, is sent whole). A lone Escape is returned as a separate
@@ -469,7 +473,7 @@ pub(crate) fn coalesce_input(
     first: &FromTty,
     rx: &mut tokio::sync::mpsc::Receiver<FromTty>,
     modes: &mut RemoteModes,
-) -> (Vec<u8>, Option<(u16, u16)>, Option<Vec<u8>>) {
+) -> CoalescedInput {
     let mut bytes = encode_input(first, modes).unwrap_or_default();
     if is_lone_escape(first, &bytes) {
         return (bytes, None, None);
