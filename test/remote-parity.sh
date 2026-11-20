@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Provider-neutral interactive remote parity run. Plan mode is offline.
 # Usage: THEGN_CHANNEL=dev test/remote-parity.sh --env <name> --i-accept-spend
-#        [--keep-going] [--samples N] [--idle-probe] [--self-test]
+#        [--keep-going] [--samples N] [--idle-probe] [--startup-only] [--fill-spare] [--tui-probe] [--self-test]
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
@@ -10,6 +10,9 @@ accept=0
 keep_going=0
 samples=20
 idle_probe=0
+startup_only=0
+fill_spare=0
+tui_probe=0
 self_test=0
 
 while [ "$#" -gt 0 ]; do
@@ -52,6 +55,18 @@ while [ "$#" -gt 0 ]; do
     idle_probe=1
     shift
     ;;
+  --startup-only)
+    startup_only=1
+    shift
+    ;;
+  --fill-spare)
+    fill_spare=1
+    shift
+    ;;
+  --tui-probe)
+    tui_probe=1
+    shift
+    ;;
   --self-test)
     self_test=1
     shift
@@ -67,6 +82,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$fill_spare" -eq 1 ] && [ "$startup_only" -eq 0 ]; then
+  echo "--fill-spare requires --startup-only" >&2
+  exit 2
+fi
+
 print_plan() {
   cat <<PLAN
 remote-parity plan (nothing is created without both --env <name> and
@@ -76,6 +96,8 @@ Will create : ONE provider sandbox via [env.$env_name] in fresh XDG_STATE_HOME
               and THEGN_DIR, with a scratch git repo on branch rp/parity.
               No agent is started and no model usage is spent.
 Max spend   : one sprite for about 10 minutes; --idle-probe adds 2.5 minutes.
+              --startup-only measures cold and warm prompt startup only;
+              --fill-spare adds one warm spare sandbox; --tui-probe exports RP_TUI_PROBE=1.
 Teardown    : close both sessions, stop the daemon, env down, deprovision only
               this run's ledger records, env reap --provider <kind> --apply --yes,
               then verify fleet list --env <name> has no owned sandbox.
@@ -93,6 +115,7 @@ Steps:
   P18 cwd and OSC 7                       P19 exit status
   P20 echo latency ($samples samples)     P21 startup step table
   P22 remote close leak check             P23 idle probe (only --idle-probe)
+  --startup-only: cold/warm prompt startup table; --fill-spare adds a spare claim.
 Output     : one PASS|WARN|FAIL line per case, a summary table, and FAILED CASES.
 Known quirk: THE-2450 is reported as WARN when only the first tty line ending differs.
 PLAN
@@ -161,7 +184,7 @@ if [ "$self_test" -eq 1 ]; then
 fi
 
 # This gate is before every command that could touch state or the network.
-if [ -z "$env_name" ] && [ "$accept" -eq 0 ]; then
+if [ -z "$env_name" ] && [ "$accept" -eq 0 ] && [ "$startup_only" -eq 0 ]; then
   print_plan
   exit 0
 fi
@@ -222,8 +245,10 @@ fi
 printf '%s\n' "$preflight"
 provider="$(printf '%s\n' "$preflight" | sed -n 's/^PROVIDER=//p')"
 
-# Provider-specific code lives in this table. The live parity bridge currently
-# supports Sprites; Vercel remains explicit until THE-2234 lands.
+# Provider-specific code lives in this table. Keep these functions shaped as
+# the provider table so test/lib/live.sh can replace the implementations later;
+# do not source that library here. The live parity bridge currently supports
+# Sprites; Vercel remains explicit until THE-2234 lands.
 provider_ledger_name() {
   case "$provider" in
   sprites)
@@ -257,7 +282,7 @@ provider_ledger_all() {
 }
 provider_session_prefix() {
   case "$provider" in
-  sprites) PROVIDER_PREFIX=("$THEGN_BIN" sprite-exec "$1" --) ;;
+  sprites) PROVIDER_PREFIX=(env "THEGN_TRACE_FILE=$TMP/bridge.log" THEGN_LOG_LEVEL=debug "$THEGN_BIN" sprite-exec "$1" --) ;;
   *) return 2 ;;
   esac
 }
@@ -294,6 +319,7 @@ export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
 unset THEGN_CONFIG_DIR THEGN_CONTROL_ADDR THEGN_CONTROL_TOKEN
 mkdir -p "$XDG_STATE_HOME" "$THEGN_DIR" "$TMP/repo"
 REPO="$TMP/repo"
+REPO2="$TMP/repo2"
 DAEMON_PID=""
 LOCAL_SESSION=""
 REMOTE_SESSION=""
@@ -329,6 +355,9 @@ teardown() {
     "$THEGN_BIN" daemon stop >/dev/null 2>&1 || true
     kill "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
+  fi
+  if [ -e "$REPO2/.git" ]; then
+    (cd "$REPO2" && "$THEGN_BIN" env down --force) >/dev/null 2>&1 || rc=1
   fi
   if [ "$ENV_DOWN" -eq 0 ] && [ -d "$REPO/.git" ]; then
     (cd "$REPO" && "$THEGN_BIN" env down --force) >/dev/null 2>&1 || rc=1
@@ -372,6 +401,67 @@ scratch_repo() {
     git -C "$REPO" switch -q -c rp/parity
 }
 
+stamp() { python3 -I -c 'import sys,time
+for l in sys.stdin: sys.stdout.write(f"{time.monotonic():.3f} {l}"); sys.stdout.flush()'; }
+json_argv() { python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"; }
+session_id() { python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
+mono_ns() { python3 -I -c 'import time; print(time.monotonic_ns())'; }
+open_params() {
+  OPEN_ARGV_JSON="$1" OPEN_CWD="$2" python3 -I -c '
+import json, os
+print(json.dumps({"argv":json.loads(os.environ["OPEN_ARGV_JSON"]),"cwd":os.environ["OPEN_CWD"],"env":[["PS1","PARITY$ "]],"rows":40,"cols":120}, separators=(",", ":")))
+'
+}
+
+stamped_env_up() {
+  local worktree="$1" stem="$2"
+  {
+    printf 'RP-START\n'
+    (cd "$worktree" && "$THEGN_BIN" env up) 2>&1
+  } |
+    stamp |
+    tee "$TMP/$stem.ts" |
+    sed -E -e 's/^[0-9]+\.[0-9]{3} //' -e '/^RP-START$/d' |
+    tee "$TMP/$stem.out"
+}
+
+measure_up() {
+  python3 -I - "$1" <<'PY'
+import sys
+
+path = sys.argv[1]
+rows = []
+with open(path, encoding="utf-8", errors="replace") as stream:
+    for line in stream:
+        try:
+            stamp, text = line.rstrip("\n").split(" ", 1)
+            rows.append((float(stamp), text))
+        except ValueError:
+            pass
+if not rows:
+    raise SystemExit("no stamped env up output")
+start = rows[0][0]
+ready = next((stamp for stamp, text in rows if "provision: shell ready on" in text), None)
+if ready is None:
+    ready = next((stamp for stamp, text in rows if "is up" in text), None)
+if ready is None:
+    raise SystemExit("env up output did not contain shell-ready or is-up marker")
+print(f"{ready - start:.3f} {rows[-1][0] - start:.3f}")
+PY
+}
+
+new_ledger_record() {
+  local before="$1" after="$2" name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if ! grep -Fxq -- "$name" <<<"$before"; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  done <<<"$after"
+  return 1
+}
+
 print_plan
 echo
 echo "== About to create: 1 $provider sandbox via env '$env_name' =="
@@ -379,7 +469,188 @@ echo "== temp state: $TMP =="
 scratch_repo
 (cd "$REPO" && "$THEGN_BIN" env set "$env_name" >/dev/null)
 export THEGN_LOG="thegn::startup=info" THEGN_TRACE_FILE="$TMP/up.log"
-(cd "$REPO" && "$THEGN_BIN" env up) > >(tee "$TMP/up.out") 2>&1
+RP_BRIDGE_TRACE="$TMP/bridge.log"
+RP_CAPTURE_ARGV_JSON=""
+export RP_BRIDGE_TRACE RP_CAPTURE_ARGV_JSON
+if [ "$tui_probe" -eq 1 ]; then
+  export RP_TUI_PROBE=1
+else
+  unset RP_TUI_PROBE
+fi
+
+if [ "$startup_only" -eq 1 ]; then
+  startup_failed=0
+  startup_rows=()
+  startup_open_ms=0
+  startup_note=""
+
+  startup_row() {
+    startup_rows+=("$1 $2 $3 $4 $5")
+  }
+
+  startup_open_prompt() {
+    local ledger="$1" worktree="$2" scenario="$3" open_json open_start open_end
+    provider_session_prefix "$ledger"
+    remote_argv_json="$(PROVIDER_PREFIX_JSON="$(json_argv "${PROVIDER_PREFIX[@]}")" REMOTE_CMD="$remote_cmd" python3 -I -c '
+import json, os
+print(json.dumps(json.loads(os.environ["PROVIDER_PREFIX_JSON"])+["/bin/sh","-c",os.environ["REMOTE_CMD"]]))
+')"
+    open_start="$(mono_ns)"
+    open_params_json="$(open_params "$remote_argv_json" "$worktree")" || return 1
+    open_json="$("$THEGN_BIN" api call sessions.open --params "$open_params_json")" || return 1
+    REMOTE_SESSION="$(printf '%s' "$open_json" | session_id)" || return 1
+    if ! "$THEGN_BIN" session wait --session "$REMOTE_SESSION" --until 'screen:(?m)^PARITY\$ ?$' --timeout 120000; then
+      echo "FAIL $scenario: remote prompt did not arrive" >&2
+      return 1
+    fi
+    open_end="$(mono_ns)"
+    startup_open_ms="$(((open_end - open_start) / 1000000))"
+    return 0
+  }
+
+  # shellcheck disable=SC2016 # literal: the remote shell expands these
+  remote_cmd='export PS1="PARITY$ "; cd "$HOME/workspace" 2>/dev/null; command -v bash >/dev/null 2>&1 && exec bash --norc --noprofile -i; exec sh -i'
+
+  echo "== startup-only: cold sandbox and first prompt =="
+  if stamped_env_up "$REPO" cold >/dev/null; then
+    up_measure="$(measure_up "$TMP/cold.ts")" || {
+      echo "FAIL cold: could not measure env up" >&2
+      startup_failed=1
+      shell_ready_s="-"
+      env_up_s="-"
+    }
+    [ -n "$up_measure" ] && read -r shell_ready_s env_up_s <<<"$up_measure"
+    RUN_RECORDS="$(provider_ledger_name)"
+    if [ "$(printf '%s\n' "$RUN_RECORDS" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+      echo "FAIL cold: expected exactly one ready $provider ledger record" >&2
+      startup_failed=1
+      startup_row cold "${env_up_s:--}" "${shell_ready_s:--}" "-" "ledger record missing"
+    elif
+      "$THEGN_BIN" daemon >"$TMP/daemon.log" 2>&1 &
+      DAEMON_PID=$!
+      daemon_ready=0
+      for _ in $(seq 1 30); do
+        if "$THEGN_BIN" session list --json >"$TMP/sessions.json" 2>/dev/null; then
+          daemon_ready=1
+          break
+        fi
+        sleep 0.5
+      done
+      [ "$daemon_ready" -eq 1 ] &&
+        startup_open_prompt "$RUN_RECORDS" "$REPO" cold
+    then
+      startup_row cold "$env_up_s" "$shell_ready_s" "$startup_open_ms" "cold"
+      "$THEGN_BIN" session close "$REMOTE_SESSION" --json >/dev/null 2>&1 || startup_failed=1
+      REMOTE_SESSION=""
+    else
+      startup_failed=1
+      startup_row cold "$env_up_s" "$shell_ready_s" "-" "prompt failed"
+    fi
+  else
+    startup_failed=1
+    startup_row cold "-" "-" "-" "env up failed"
+  fi
+
+  if [ -n "$REMOTE_SESSION" ]; then
+    "$THEGN_BIN" session close "$REMOTE_SESSION" --json >/dev/null 2>&1 || startup_failed=1
+    REMOTE_SESSION=""
+  fi
+  echo "== startup-only: warm sandbox and first prompt =="
+  if stamped_env_up "$REPO" warm >/dev/null; then
+    up_measure="$(measure_up "$TMP/warm.ts")" || {
+      echo "FAIL warm: could not measure env up" >&2
+      startup_failed=1
+      shell_ready_s="-"
+      env_up_s="-"
+    }
+    [ -n "$up_measure" ] && read -r shell_ready_s env_up_s <<<"$up_measure"
+    if startup_open_prompt "$RUN_RECORDS" "$REPO" warm; then
+      startup_row warm "$env_up_s" "$shell_ready_s" "$startup_open_ms" "warm"
+      "$THEGN_BIN" session close "$REMOTE_SESSION" --json >/dev/null 2>&1 || startup_failed=1
+      REMOTE_SESSION=""
+    else
+      startup_failed=1
+      startup_row warm "$env_up_s" "$shell_ready_s" "-" "prompt failed"
+    fi
+  else
+    startup_failed=1
+    startup_row warm "-" "-" "-" "env up failed"
+  fi
+
+  capture_ledger="$RUN_RECORDS"
+  if [ "$fill_spare" -eq 1 ]; then
+    spare_before="$RUN_RECORDS"
+    pool_start="$(mono_ns)"
+    if (cd "$REPO" && "$THEGN_BIN" env pool-fill --size 1) >"$TMP/pool-fill.out" 2>&1; then
+      pool_end="$(mono_ns)"
+      pool_fill_ms="$(((pool_end - pool_start) / 1000000))"
+      cat "$TMP/pool-fill.out"
+      spare_after="$(provider_ledger_name)"
+      spare_ledger="$(new_ledger_record "$spare_before" "$spare_after" || true)"
+      git -C "$REPO" worktree add -q "$REPO2" -b rp/spare
+      (cd "$REPO2" && "$THEGN_BIN" env set "$env_name" >/dev/null)
+      if stamped_env_up "$REPO2" spare >/dev/null; then
+        if [ -z "$spare_ledger" ]; then
+          echo "FAIL spare: no new ready ledger record" >&2
+          startup_failed=1
+          startup_row spare "-" "-" "-" "pool-fill=${pool_fill_ms}ms; ledger record missing"
+        else
+          capture_ledger="$spare_ledger"
+          up_measure="$(measure_up "$TMP/spare.ts")" || {
+            echo "FAIL spare: could not measure env up" >&2
+            startup_failed=1
+            shell_ready_s="-"
+            env_up_s="-"
+          }
+          [ -n "$up_measure" ] && read -r shell_ready_s env_up_s <<<"$up_measure"
+          startup_note="pool-fill=${pool_fill_ms}ms"
+          claimed="$(grep -Eio 'claimed(_spare)?' "$TMP/spare.out" | head -n 1 || true)"
+          if [ -n "$claimed" ]; then
+            startup_note="$startup_note; $claimed"
+          else
+            startup_note="$startup_note; claim not reported"
+          fi
+          if startup_open_prompt "$spare_ledger" "$REPO2" spare; then
+            startup_row spare "$env_up_s" "$shell_ready_s" "$startup_open_ms" "$startup_note"
+            "$THEGN_BIN" session close "$REMOTE_SESSION" --json >/dev/null 2>&1 || startup_failed=1
+            REMOTE_SESSION=""
+          else
+            startup_failed=1
+            startup_row spare "$env_up_s" "$shell_ready_s" "-" "$startup_note; prompt failed"
+          fi
+        fi
+      else
+        startup_failed=1
+        startup_row spare "-" "-" "-" "pool-fill=${pool_fill_ms}ms; env up failed"
+      fi
+    else
+      startup_failed=1
+      cat "$TMP/pool-fill.out" >&2
+      startup_row spare "-" "-" "-" "pool-fill failed"
+    fi
+  else
+    echo "SKIP: pool empty (pass --fill-spare; spends one more sandbox)"
+    startup_row spare "-" "-" "-" "SKIP: pool empty (pass --fill-spare; spends one more sandbox)"
+  fi
+
+  provider_session_prefix "$capture_ledger"
+  # shellcheck disable=SC2016 # literal: the remote shell expands $HOME.
+  install_log="$("${PROVIDER_PREFIX[@]}" /bin/sh -c 'if [ -f "$HOME/.cache/thegn-agent-install.log" ]; then sed -n "/^thegn-agent-install:/p" "$HOME/.cache/thegn-agent-install.log"; fi' 2>/dev/null | python3 -I -c '
+import re, sys
+text = sys.stdin.read()
+text = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))", "", text)
+text = "".join(ch for ch in text if ch in "\t\n\r" or ord(ch) >= 0x20)
+for line in text.splitlines():
+    if line.startswith("thegn-agent-install:"):
+        print(line)
+')" || install_log="(agent install log unavailable)"
+  printf '%s\n' "${install_log:-(no agent install log lines)}"
+  printf '\nscenario env_up_s shell_ready_s open_to_prompt_ms note\n'
+  printf '%s\n' "${startup_rows[@]}"
+  exit "$startup_failed"
+fi
+
+stamped_env_up "$REPO" up
 RUN_RECORDS="$(provider_ledger_name)"
 if [ "$(printf '%s\n' "$RUN_RECORDS" | sed '/^$/d' | wc -l)" -ne 1 ]; then
   echo "FAIL P00: expected exactly one ready $provider ledger record from this run" >&2
@@ -402,25 +673,17 @@ if [ "$daemon_ready" -ne 1 ]; then
   exit 1
 fi
 
-open_params() {
-  OPEN_ARGV_JSON="$1" OPEN_CWD="$REPO" python3 -I -c '
-import json, os
-print(json.dumps({"argv":json.loads(os.environ["OPEN_ARGV_JSON"]),"cwd":os.environ["OPEN_CWD"],"env":[["PS1","PARITY$ "]],"rows":40,"cols":120}, separators=(",", ":")))
-'
-}
-json_argv() { python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"; }
-session_id() { python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
-mono_ns() { python3 -I -c 'import time; print(time.monotonic_ns())'; }
-
 local_argv_json="$(json_argv bash --norc --noprofile -i)"
 open_start="$(mono_ns)"
-local_open_params="$(open_params "$local_argv_json")"
+local_open_params="$(open_params "$local_argv_json" "$REPO")"
 local_open_json="$("$THEGN_BIN" api call sessions.open --params "$local_open_params")"
 open_end="$(mono_ns)"
 LOCAL_OPEN_MS="$(((open_end - open_start) / 1000000))"
 LOCAL_SESSION="$(printf '%s' "$local_open_json" | session_id)"
 
 provider_session_prefix "$RUN_RECORDS"
+RP_CAPTURE_ARGV_JSON="$(json_argv "")"
+export RP_CAPTURE_ARGV_JSON
 # shellcheck disable=SC2016 # literal: the remote shell expands these
 remote_cmd='export PS1="PARITY$ "; cd "$HOME/workspace" 2>/dev/null; command -v bash >/dev/null 2>&1 && exec bash --norc --noprofile -i; exec sh -i'
 remote_argv_json="$(PROVIDER_PREFIX_JSON="$(json_argv "${PROVIDER_PREFIX[@]}")" REMOTE_CMD="$remote_cmd" python3 -I -c '
@@ -428,7 +691,7 @@ import json, os
 print(json.dumps(json.loads(os.environ["PROVIDER_PREFIX_JSON"])+["/bin/sh","-c",os.environ["REMOTE_CMD"]]))
 ')"
 open_start="$(mono_ns)"
-remote_open_params="$(open_params "$remote_argv_json")"
+remote_open_params="$(open_params "$remote_argv_json" "$REPO")"
 remote_open_json="$("$THEGN_BIN" api call sessions.open --params "$remote_open_params")"
 open_end="$(mono_ns)"
 REMOTE_OPEN_MS="$(((open_end - open_start) / 1000000))"
