@@ -899,6 +899,8 @@
             act
             # smoke.sh validates `--json` output with python's json module
             python3
+            # `just smoke` inspects merge-queue rows directly with sqlite3.
+            sqlite
             # a login shell for sandbox panes: thegn injects this devShell's PATH
             # into bwrap/OCI panes (which ship no zsh of their own), so the pane's
             # shell probe finds zsh instead of dropping to a bare `/bin/sh`.
