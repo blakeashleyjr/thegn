@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.115] — 2026-11-20
+
 ### Added
 
 - `test/remote-parity.sh` gains `--startup-only`, `--fill-spare` and `--tui-probe` for startup timing, a warm-spare claim and a full-screen-program probe.
@@ -4102,7 +4104,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.114...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.115...HEAD
+[0.1.0-alpha.115]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.114...v0.1.0-alpha.115
 [0.1.0-alpha.114]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.113...v0.1.0-alpha.114
 [0.1.0-alpha.113]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.112...v0.1.0-alpha.113
 [0.1.0-alpha.112]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.111...v0.1.0-alpha.112
