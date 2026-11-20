@@ -17,6 +17,8 @@
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
+# The scratch repository has no build: the owner's merge gate command must not decide these lands.
+LAND_SET=(--set merge_queue.gate_command=true)
 
 env_name="" accept=0 provider="sprites" with_model=0 adopt_name="" with_reaper=0 with_pool=0 keep_going=0
 while [ $# -gt 0 ]; do
@@ -126,6 +128,7 @@ Steps:
       otherwise no model login entered the sandbox (model_credentials default)
   7   local git log has the commits
   8   land --worktree <rd-x path> --release-sandbox
+       (both lands pass --set merge_queue.gate_command=true: the scratch repository has no build)
   9   ledger record gone, sandbox absent from the org listing
  10   env reap --provider <p> --json is clean
  11   wt new rd-y --env <S>
@@ -631,7 +634,7 @@ rdy_commit() {
 }
 rdy_land_keep() {
   local out
-  if out="$(in_repo "$THEGN_BIN" land --worktree "$RDY_PATH" 2>&1)"; then
+  if out="$(in_repo "$THEGN_BIN" "${LAND_SET[@]}" land --worktree "$RDY_PATH" 2>&1)"; then
     printf '%s\n' "$out"
   else
     local rc=$?
@@ -683,7 +686,7 @@ case ",$LOGIN_UPLOAD," in
 esac
 if [ "$with_model" = 1 ]; then want=3; else want=1; fi
 step 7 "local git log has the commits" local_log_has_commits "$want"
-step 8 "land --worktree <rd-x> --release-sandbox" in_repo "$THEGN_BIN" land --worktree "$WT_PATH" --release-sandbox
+step 8 "land --worktree <rd-x> --release-sandbox" in_repo "$THEGN_BIN" "${LAND_SET[@]}" land --worktree "$WT_PATH" --release-sandbox
 step 9a "ledger record gone" record_gone
 step 9b "sandbox absent from the org listing" listing_lacks_name
 step 10 "env reap --provider $provider is clean" reap_clean
