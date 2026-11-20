@@ -778,31 +778,34 @@ pub(crate) fn prune_stale_worktree_groups(
                 // group the three cheap tests have already condemned. This
                 // runs before the first frame — do not restructure into an
                 // eager form (a `Vec` of bools, an `any` over all tests).
-                g.path.is_empty() || remote.contains(&g.path) || group_checkout_present(g) || {
-                    let root = session_root
-                        .clone()
-                        .or_else(|| {
-                            repo_root_by_path
-                                .get(g.path.as_str())
-                                .map(|r| (*r).to_string())
-                        })
-                        .or_else(|| {
-                            thegn_core::repo::main_worktree(Path::new(&g.path))
-                                .map(|p| p.to_string_lossy().into_owned())
-                        })
-                        .unwrap_or_default();
-                    let listed = row_is_git_listed(&root, &g.path, &mut git_cache);
-                    if listed {
-                        tracing::debug!(
-                            target: "thegn::hydrate",
-                            worktree = %g.path,
-                            group = %g.name,
-                            repo_root = %root,
-                            "session group kept: dir missing but git still lists this worktree"
-                        );
+                g.path.is_empty()
+                    || remote.contains(&g.path)
+                    || group_checkout_present(g, session_root.as_deref())
+                    || {
+                        let root = session_root
+                            .clone()
+                            .or_else(|| {
+                                repo_root_by_path
+                                    .get(g.path.as_str())
+                                    .map(|r| (*r).to_string())
+                            })
+                            .or_else(|| {
+                                thegn_core::repo::main_worktree(Path::new(&g.path))
+                                    .map(|p| p.to_string_lossy().into_owned())
+                            })
+                            .unwrap_or_default();
+                        let listed = row_is_git_listed(&root, &g.path, &mut git_cache);
+                        if listed {
+                            tracing::debug!(
+                                target: "thegn::hydrate",
+                                worktree = %g.path,
+                                group = %g.name,
+                                repo_root = %root,
+                                "session group kept: dir missing but git still lists this worktree"
+                            );
+                        }
+                        listed
                     }
-                    listed
-                }
             },
         );
         session.worktrees = live;
@@ -1439,10 +1442,17 @@ pub(crate) fn checkout_present(worktree: &str, repo_root: &str) -> bool {
     }
 }
 
-fn group_checkout_present(group: &crate::session::WorktreeGroup) -> bool {
+fn group_checkout_present(
+    group: &crate::session::WorktreeGroup,
+    session_root: Option<&str>,
+) -> bool {
     match group.kind {
         crate::session::GroupKind::Branch => {
-            std::fs::symlink_metadata(Path::new(&group.path).join(".git")).is_ok()
+            if session_root.is_some_and(|r| Path::new(r) == Path::new(&group.path)) {
+                Path::new(&group.path).is_dir()
+            } else {
+                std::fs::symlink_metadata(Path::new(&group.path).join(".git")).is_ok()
+            }
         }
         crate::session::GroupKind::Home | crate::session::GroupKind::Terminal => {
             Path::new(&group.path).is_dir()

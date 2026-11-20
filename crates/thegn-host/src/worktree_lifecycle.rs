@@ -2959,19 +2959,21 @@ mod tests {
         };
         let mut sb = crate::run::SidebarState::default();
 
-        assert!(apply_completion_batch(
-            vec![LifecycleCompletion::WorktreeDelete {
-                group_name: "repo/feature".into(),
-                path: "/tmp/repo-feature".into(),
-                success: true,
-                message: String::new(),
-            }],
-            &mut session,
-            &mut panes,
-            &mut model,
-            &mut sb,
-        )
-        .changed);
+        assert!(
+            apply_completion_batch(
+                vec![LifecycleCompletion::WorktreeDelete {
+                    group_name: "repo/feature".into(),
+                    path: "/tmp/repo-feature".into(),
+                    success: true,
+                    message: String::new(),
+                }],
+                &mut session,
+                &mut panes,
+                &mut model,
+                &mut sb,
+            )
+            .changed
+        );
         assert!(model.sidebar_db_worktrees.is_empty());
     }
 
