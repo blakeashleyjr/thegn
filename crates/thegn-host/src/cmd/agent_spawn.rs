@@ -541,7 +541,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             .await
             .map_err(|e| anyhow::anyhow!("agent run env pin task failed: {e}"))??
     };
-    crate::cmd::env::provision_for_headless_open(cfg, wt.clone()).await?;
+    let provision = crate::cmd::env::provision_for_headless_open(cfg, wt.clone()).await?;
     let warn = {
         let (cfg, wt, agent) = (cfg.clone(), wt.clone(), agent.clone());
         tokio::task::spawn_blocking(move || agent_cli_preflight_blocking(&cfg, &wt, &agent))
@@ -575,6 +575,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
                 "session": info.id,
                 "row": row,
                 "env": pinned,
+                "provision": provision.as_str(),
             }))?;
         } else {
             outln!("{}", display_cell(&info.id));
@@ -623,6 +624,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             "session": info.id,
             "row": row,
             "env": pinned,
+            "provision": provision.as_str(),
             "status": status.label(),
             "exit_code": status.exit_code(),
             "output_tail": tail,

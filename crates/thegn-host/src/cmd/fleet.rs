@@ -70,6 +70,9 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// One sprite's status, URL auth and (with --policy) memory policy, read
+    /// from the Sprites API without exec (`--policy` may wake a cold sprite).
+    Inspect(super::fleet_inspect::InspectArgs),
 }
 
 #[derive(serde::Serialize)]
@@ -141,7 +144,7 @@ fn unix_to_rfc3339(secs: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn sanitize_text(value: &str, max_chars: usize) -> String {
+pub(crate) fn sanitize_text(value: &str, max_chars: usize) -> String {
     value
         .chars()
         .filter(|c| !c.is_control())
@@ -604,9 +607,13 @@ fn remote_agents(view: &FleetView) -> std::collections::BTreeMap<String, FleetAg
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
+    if let Action::Inspect(args) = &action {
+        return super::fleet_inspect::run(cfg, args.clone());
+    }
     let (only_env, json, list) = match action {
         Action::List { env, json } => (env, json, true),
         Action::Cost { json } => (None, json, false),
+        Action::Inspect(_) => unreachable!(),
     };
     if let Some(name) = &only_env {
         anyhow::ensure!(
