@@ -181,7 +181,7 @@ fn build_report(
     }
     crate::cmd::info::gather(
         cfg,
-        Some(thegn_core::config::Config::path()),
+        Some(crate::hydrate::config_source_path().unwrap_or_else(thegn_core::config::Config::path)),
         &target,
         facts,
     )

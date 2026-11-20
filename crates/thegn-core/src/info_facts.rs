@@ -182,9 +182,15 @@ pub fn workspace_identity(cfg: &Config, db: &crate::db::Db, repo_root: &Path) ->
     };
     let mut fields = vec![
         Field::value(keys::WORKSPACE_NAME, "Name", row.name, Source::Database),
-        match db.repo_slug_lookup(&row.repo_path).ok().flatten() {
-            Some(slug) => Field::value(keys::WORKSPACE_SLUG, "Slug", slug, Source::Database),
-            None => Field::unset(keys::WORKSPACE_SLUG, "Slug", Source::Database),
+        match db.repo_slug_lookup(&row.repo_path) {
+            Ok(Some(slug)) => Field::value(keys::WORKSPACE_SLUG, "Slug", slug, Source::Database),
+            Ok(None) => Field::unset(keys::WORKSPACE_SLUG, "Slug", Source::Database),
+            Err(error) => Field::unknown(
+                keys::WORKSPACE_SLUG,
+                "Slug",
+                format!("state db read failed: {error}"),
+            )
+            .warned(),
         },
         Field::value(
             keys::WORKSPACE_REPO,
@@ -678,26 +684,32 @@ pub fn worktree_fields(
     } else {
         fields.push(Field::not_measured(keys::WORKTREE_CI, "CI"));
     }
-    match db
-        .linked_issues(&wt)
-        .ok()
-        .and_then(|ids| ids.first().map(|first| (first.clone(), ids.len())))
-    {
-        Some((first, count)) => fields.push(Field::value(
-            keys::WORKTREE_ISSUE,
-            "Issue",
-            if count > 1 {
-                format!("{first} (+{})", count - 1)
-            } else {
-                first
-            },
-            Source::Database,
-        )),
-        None => fields.push(Field::unset(
-            keys::WORKTREE_ISSUE,
-            "Issue",
-            Source::Database,
-        )),
+    match db.linked_issues(&wt) {
+        Ok(ids) => match ids.first().map(|first| (first.clone(), ids.len())) {
+            Some((first, count)) => fields.push(Field::value(
+                keys::WORKTREE_ISSUE,
+                "Issue",
+                if count > 1 {
+                    format!("{first} (+{})", count - 1)
+                } else {
+                    first
+                },
+                Source::Database,
+            )),
+            None => fields.push(Field::unset(
+                keys::WORKTREE_ISSUE,
+                "Issue",
+                Source::Database,
+            )),
+        },
+        Err(error) => fields.push(
+            Field::unknown(
+                keys::WORKTREE_ISSUE,
+                "Issue",
+                format!("state db read failed: {error}"),
+            )
+            .warned(),
+        ),
     }
     if let Ok(dispatches) = db.list_dispatches() {
         let active = dispatches
@@ -759,8 +771,8 @@ pub fn worktree_fields(
             Source::Database,
         ));
     }
-    match db.get_worktree_disk(&wt).ok().flatten() {
-        Some((size, _, fetched_at)) => fields.push(Field::value(
+    match db.get_worktree_disk(&wt) {
+        Ok(Some((size, _, fetched_at))) => fields.push(Field::value(
             keys::WORKTREE_DISK,
             "Disk",
             crate::sandbox_manage::human_bytes(size.max(0) as u64),
@@ -769,7 +781,15 @@ pub fn worktree_fields(
                 at: Some(fetched_at),
             },
         )),
-        None => fields.push(Field::not_measured(keys::WORKTREE_DISK, "Disk")),
+        Ok(None) => fields.push(Field::not_measured(keys::WORKTREE_DISK, "Disk")),
+        Err(error) => fields.push(
+            Field::unknown(
+                keys::WORKTREE_DISK,
+                "Disk",
+                format!("state db read failed: {error}"),
+            )
+            .warned(),
+        ),
     }
     fields.push(live.activity.as_ref().map_or_else(
         || Field::not_measured(keys::WORKTREE_ACTIVITY, "Activity"),
@@ -798,50 +818,86 @@ pub fn overrides(
 ) -> Vec<Field> {
     let mut fields = Vec::new();
     let wt = worktree.map(path_string);
-    if let Some(value) = wt
-        .as_deref()
-        .and_then(|path| db.worktree_env(path).ok().flatten())
-    {
-        fields.push(Field::value(
-            keys::OVERRIDE_WORKTREE_ENV,
-            "Worktree env",
-            value,
-            Source::WorktreeDb,
-        ));
+    if let Some(path) = wt.as_deref() {
+        match db.worktree_env(path) {
+            Ok(Some(value)) => fields.push(Field::value(
+                keys::OVERRIDE_WORKTREE_ENV,
+                "Worktree env",
+                value,
+                Source::WorktreeDb,
+            )),
+            Ok(None) => {}
+            Err(error) => fields.push(
+                Field::unknown(
+                    keys::OVERRIDE_WORKTREE_ENV,
+                    "Worktree env",
+                    format!("state db read failed: {error}"),
+                )
+                .warned(),
+            ),
+        }
     }
-    if let Some(value) = wt
-        .as_deref()
-        .and_then(|path| db.worktree_sandbox_profile(path).ok().flatten())
-    {
-        fields.push(Field::value(
-            keys::OVERRIDE_PROFILE_PIN,
-            "Profile pin",
-            value.as_str(),
-            Source::WorktreeDb,
-        ));
+    if let Some(path) = wt.as_deref() {
+        match db.worktree_sandbox_profile(path) {
+            Ok(Some(value)) => fields.push(Field::value(
+                keys::OVERRIDE_PROFILE_PIN,
+                "Profile pin",
+                value.as_str(),
+                Source::WorktreeDb,
+            )),
+            Ok(None) => {}
+            Err(error) => fields.push(
+                Field::unknown(
+                    keys::OVERRIDE_PROFILE_PIN,
+                    "Profile pin",
+                    format!("state db read failed: {error}"),
+                )
+                .warned(),
+            ),
+        }
     }
-    if let Some(value) = wt
-        .as_deref()
-        .and_then(|path| db.worktree_sandbox(path).ok().flatten())
-        .filter(|value| {
-            let value = value.trim();
-            !value.is_empty() && value != "auto"
-        })
-    {
-        fields.push(Field::value(
-            keys::OVERRIDE_BACKEND_PICK,
-            "Backend pick",
-            value,
-            Source::WorktreePick,
-        ));
+    if let Some(path) = wt.as_deref() {
+        match db.worktree_sandbox(path) {
+            Ok(Some(value))
+                if {
+                    let value = value.trim();
+                    !value.is_empty() && value != "auto"
+                } =>
+            {
+                fields.push(Field::value(
+                    keys::OVERRIDE_BACKEND_PICK,
+                    "Backend pick",
+                    value,
+                    Source::WorktreePick,
+                ))
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => fields.push(
+                Field::unknown(
+                    keys::OVERRIDE_BACKEND_PICK,
+                    "Backend pick",
+                    format!("state db read failed: {error}"),
+                )
+                .warned(),
+            ),
+        }
     }
-    if let Some(value) = db.workspace_env(&path_string(repo_root)).ok().flatten() {
-        fields.push(Field::value(
+    match db.workspace_env(&path_string(repo_root)) {
+        Ok(Some(value)) => fields.push(Field::value(
             keys::OVERRIDE_WORKSPACE_ENV,
             "Workspace env",
             value,
             Source::WorkspaceDb,
-        ));
+        )),
+        Ok(None) => {}
+        Err(error) => fields.push(
+            Field::unknown(
+                keys::OVERRIDE_WORKSPACE_ENV,
+                "Workspace env",
+                format!("state db read failed: {error}"),
+            )
+            .warned(),
+        ),
     }
     if let crate::workspace_overlay::WorkspaceOverlay::Selected { key, overlay } =
         cfg.workspace_overlay(repo_root)
@@ -1174,6 +1230,81 @@ mod tests {
             field.key == keys::OVERRIDE_ZONE
                 && field.shown == crate::info_model::Shown::Value("client".to_string())
         }));
+    }
+
+    #[test]
+    fn db_read_errors_are_unknown_not_unset() {
+        let assert_unknown_warned = |fields: &[Field], key: &str| {
+            let field = fields.iter().find(|field| field.key == key).unwrap();
+            assert!(
+                matches!(field.shown, crate::info_model::Shown::Unknown(ref why) if why.starts_with("state db read failed: "))
+            );
+            assert!(field.warn, "{key} should be warned");
+        };
+
+        let db = crate::db::Db::open_memory().unwrap();
+        db.put_workspace("/repo", "Repo", "repo").unwrap();
+        db.conn().execute_batch("DROP TABLE repo_slugs").unwrap();
+        assert_unknown_warned(
+            &workspace_identity(&Config::default(), &db, Path::new("/repo")),
+            keys::WORKSPACE_SLUG,
+        );
+
+        let db = crate::db::Db::open_memory().unwrap();
+        db.put_worktree("repo/a", "/repo", "/repo/a", "a", None, None)
+            .unwrap();
+        db.conn().execute_batch("DROP TABLE issue_links").unwrap();
+        assert_unknown_warned(
+            &worktree_fields(
+                &db,
+                Path::new("/repo"),
+                Path::new("/repo/a"),
+                &LiveFacts::default(),
+                0,
+            ),
+            keys::WORKTREE_ISSUE,
+        );
+
+        let db = crate::db::Db::open_memory().unwrap();
+        db.put_worktree("repo/a", "/repo", "/repo/a", "a", None, None)
+            .unwrap();
+        db.conn().execute_batch("DROP TABLE worktree_disk").unwrap();
+        assert_unknown_warned(
+            &worktree_fields(
+                &db,
+                Path::new("/repo"),
+                Path::new("/repo/a"),
+                &LiveFacts::default(),
+                0,
+            ),
+            keys::WORKTREE_DISK,
+        );
+
+        let db = crate::db::Db::open_memory().unwrap();
+        db.put_workspace("/repo", "Repo", "repo").unwrap();
+        db.put_worktree("repo/a", "/repo", "/repo/a", "a", None, None)
+            .unwrap();
+        db.conn().execute_batch("DROP TABLE worktrees").unwrap();
+        let fields = overrides(
+            &Config::default(),
+            &db,
+            Path::new("/repo"),
+            Some(Path::new("/repo/a")),
+        );
+        for key in [
+            keys::OVERRIDE_WORKTREE_ENV,
+            keys::OVERRIDE_PROFILE_PIN,
+            keys::OVERRIDE_BACKEND_PICK,
+        ] {
+            assert_unknown_warned(&fields, key);
+        }
+
+        let db = crate::db::Db::open_memory().unwrap();
+        db.conn().execute_batch("DROP TABLE workspaces").unwrap();
+        assert_unknown_warned(
+            &overrides(&Config::default(), &db, Path::new("/repo"), None),
+            keys::OVERRIDE_WORKSPACE_ENV,
+        );
     }
 
     #[test]
