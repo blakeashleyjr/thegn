@@ -3957,14 +3957,15 @@ impl SpritesProvider {
         if let Err(error) = sess.control.send(ExecControl::Close).await {
             tracing::debug!(target: "thegn::provider", %error, "best-effort exec close failed");
         }
-        match tokio::time::timeout_at(
+        // No verdict (driver gone or still draining) falls through to the
+        // exit-status check below; the driver's own drain bound ends it.
+        if let Ok(Ok(Some(fault))) = tokio::time::timeout_at(
             until.min(tokio::time::Instant::now() + EXEC_EXIT_DRAIN + Duration::from_secs(1)),
             done,
         )
         .await
         {
-            Ok(Ok(Some(fault))) => return Err(anyhow::Error::new(fault)),
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {}
+            return Err(anyhow::Error::new(fault));
         }
         let Some(code) = collected.code else {
             return Err(anyhow!("exec stream ended without an exit status"));
