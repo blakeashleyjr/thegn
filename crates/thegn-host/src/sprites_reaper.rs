@@ -42,6 +42,68 @@ const STALE_CREATING_SECS: i64 = 3600;
 /// committed after the listing was taken).
 const ORPHAN_GRACE_SECS: i64 = 60;
 
+/// Sandbox names bound to registered worktrees (offline: never wakes).
+#[derive(Debug, Default)]
+pub(crate) struct BoundSet {
+    by_name: BTreeMap<String, String>,
+    unresolved: Vec<String>,
+}
+
+impl BoundSet {
+    pub(crate) fn unresolved(label: &str) -> Self {
+        Self {
+            unresolved: vec![label.into()],
+            ..Default::default()
+        }
+    }
+
+    /// The worktree holding `name`; when any binding is unresolved every
+    /// name is held (fail closed).
+    pub(crate) fn holder(&self, name: &str) -> Option<String> {
+        self.by_name.get(name).cloned().or_else(|| {
+            (!self.unresolved.is_empty()).then(|| {
+                format!(
+                    "{} (a worktree whose sandbox could not be resolved)",
+                    self.unresolved[0]
+                )
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with(pairs: &[(&str, &str)], unresolved: &[&str]) -> Self {
+        Self {
+            by_name: pairs
+                .iter()
+                .map(|(name, worktree)| ((*name).into(), (*worktree).into()))
+                .collect(),
+            unresolved: unresolved
+                .iter()
+                .map(|worktree| (*worktree).into())
+                .collect(),
+        }
+    }
+}
+
+pub(crate) fn bound_sandboxes(cfg: &Config) -> anyhow::Result<BoundSet> {
+    use thegn_core::store::WorkspaceStore;
+
+    let rows = thegn_core::db::Db::open()?.worktrees()?;
+    let mut bound = BoundSet::default();
+    for row in rows {
+        match crate::provider_git::bound_offline(cfg, &row.worktree) {
+            Ok(crate::provider_git::OfflineBinding::Bound { sandbox }) => {
+                bound.by_name.insert(sandbox, row.worktree);
+            }
+            Ok(crate::provider_git::OfflineBinding::BoundUnknown) | Err(_) => {
+                bound.unresolved.push(row.worktree);
+            }
+            Ok(crate::provider_git::OfflineBinding::Unbound) => {}
+        }
+    }
+    Ok(bound)
+}
+
 /// Threads started by [`tick`] (the test seam for "no thread at idle").
 static PASSES_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -77,8 +139,9 @@ pub fn tick(cfg: &Config) {
         .filter(|(_, env)| is_sprites_provider_env(env))
         .map(|(name, env)| (name.clone(), env.clone()))
         .collect();
+    let cfg = cfg.clone();
     let spawned = crate::reaper_policy::spawn_pass(token, "thegn-sprt-reap", move || {
-        run_pass(&envs);
+        run_pass(&cfg, &envs);
     });
     if spawned {
         PASSES_STARTED.fetch_add(1, Ordering::Relaxed);
@@ -142,7 +205,7 @@ pub(crate) struct ReapEnv<'a> {
     pub max_lifetime_secs: u64,
 }
 
-fn run_pass(envs: &[(String, EnvConfig)]) {
+fn run_pass(cfg: &Config, envs: &[(String, EnvConfig)]) {
     let _lease = match crate::reaper_policy::try_reaper_lease(KIND) {
         Ok(Some(lease)) => lease,
         Ok(None) => {
@@ -152,6 +215,17 @@ fn run_pass(envs: &[(String, EnvConfig)]) {
         Err(reason) => {
             tracing::debug!(target: "thegn::provider", %reason, "sprites reaper: no lease; skipped");
             return;
+        }
+    };
+    let bound = match bound_sandboxes(cfg) {
+        Ok(bound) => bound,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::provider",
+                error = %format!("{error:#}"),
+                "sprites reaper: worktree registry unreadable; every past-lifetime sprite is kept"
+            );
+            BoundSet::unresolved("registry unreadable")
         }
     };
     let rt = match crate::agent::provider_runtime() {
@@ -175,12 +249,25 @@ fn run_pass(envs: &[(String, EnvConfig)]) {
             max_lifetime_secs: env.provider.max_lifetime_secs,
         })
         .collect();
-    let summary = pass(&reap_envs, thegn_core::util::now_ms());
+    let summary = pass(&reap_envs, &bound, thegn_core::util::now_ms());
     for name in &summary.running {
         if first_running_warning(name) {
             thegn_core::msg::warn(&format!(
                 "sprite {name} is past its lifetime but running; not reaped"
             ));
+        }
+    }
+    for (name, holder) in &summary.kept {
+        if first_bound_warning(name) {
+            if holder.ends_with("could not be resolved)") || holder == "registry unreadable" {
+                thegn_core::msg::warn(&format!(
+                    "sprite {name} is past its lifetime but kept: {holder}; fix or `thegn wt rm` that worktree so the reaper can judge it"
+                ));
+            } else {
+                thegn_core::msg::warn(&format!(
+                    "sprite {name} is past its lifetime but bound to worktree {holder}; not reaped — `thegn env down --worktree {holder}` pulls its commits and destroys it"
+                ));
+            }
         }
     }
     if let Some(line) = summary.info_line() {
@@ -191,6 +278,14 @@ fn run_pass(envs: &[(String, EnvConfig)]) {
 /// Whether this process has not yet warned about `name` running past its
 /// lifetime (and records that it now has).
 fn first_running_warning(name: &str) -> bool {
+    static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut warned = WARNED.lock().unwrap_or_else(PoisonError::into_inner);
+    warned
+        .get_or_insert_with(HashSet::new)
+        .insert(name.to_string())
+}
+
+fn first_bound_warning(name: &str) -> bool {
     static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let mut warned = WARNED.lock().unwrap_or_else(PoisonError::into_inner);
     warned
@@ -287,6 +382,7 @@ pub(crate) struct Summary {
     pub destroyed: Vec<String>,
     pub forgotten: Vec<String>,
     pub running: Vec<String>,
+    pub kept: Vec<(String, String)>,
     pub failed: Vec<(String, String)>,
 }
 
@@ -323,7 +419,7 @@ fn account_lifetime(envs: &[(bool, u64)]) -> u64 {
 
 /// The reap pass (testable core: no config, no stdout). The ledger is the
 /// process registry dir (tests isolate it with `IsolatedState`).
-pub(crate) fn pass(envs: &[ReapEnv<'_>], now_ms: i64) -> Summary {
+pub(crate) fn pass(envs: &[ReapEnv<'_>], bound: &BoundSet, now_ms: i64) -> Summary {
     struct Account<'e> {
         envs: Vec<String>,
         policy: Vec<(bool, u64)>,
@@ -383,12 +479,24 @@ pub(crate) fn pass(envs: &[ReapEnv<'_>], now_ms: i64) -> Summary {
             match classify(record, row, lifetime, now_ms) {
                 Decision::Keep => {}
                 Decision::SkipRunning => summary.running.push(record.name.clone()),
-                Decision::Destroy => match account.api.destroy(&record.name) {
-                    Ok(()) => summary.destroyed.push(record.name.clone()),
-                    Err(error) => summary
-                        .failed
-                        .push((record.name.clone(), format!("{error:#}"))),
-                },
+                Decision::Destroy => {
+                    if let Some(holder) = bound.holder(&record.name) {
+                        tracing::debug!(
+                            target: "thegn::provider",
+                            sprite = %record.name,
+                            worktree = %holder,
+                            "sprites reaper: kept a past-lifetime sprite bound to a worktree; a reaper never wakes a sandbox to look for unpulled work"
+                        );
+                        summary.kept.push((record.name.clone(), holder));
+                    } else {
+                        match account.api.destroy(&record.name) {
+                            Ok(()) => summary.destroyed.push(record.name.clone()),
+                            Err(error) => summary
+                                .failed
+                                .push((record.name.clone(), format!("{error:#}"))),
+                        }
+                    }
+                }
                 decision @ (Decision::ForgetStaleCreating | Decision::ForgetOrphan) => {
                     match remove_record(&record.name, &account.scope, decision) {
                         Ok(true) => summary.forgotten.push(record.name.clone()),
@@ -729,7 +837,11 @@ mod tests {
     fn pass_destroys_exactly_the_over_lifetime_idle_sprite() {
         let _state = thegn_core::testenv::IsolatedState::new();
         let fake = seed();
-        let summary = pass(&[reap_env("sx", &fake, true, 3600)], NOW_MS);
+        let summary = pass(
+            &[reap_env("sx", &fake, true, 3600)],
+            &BoundSet::default(),
+            NOW_MS,
+        );
         assert_eq!(*fake.destroys.lock().unwrap(), vec!["sx-old".to_string()]);
         assert_eq!(summary.destroyed, vec!["sx-old".to_string()]);
         assert_eq!(summary.running, vec!["sx-busy".to_string()]);
@@ -757,7 +869,11 @@ mod tests {
             write("sx-old", "ready", NOW_S - 7200, "ctl-a");
             write("sx-gone", "ready", NOW_S - 600, "ctl-a");
             let fake = fake(listing);
-            let summary = pass(&[reap_env("sx", &fake, true, 60)], NOW_MS);
+            let summary = pass(
+                &[reap_env("sx", &fake, true, 60)],
+                &BoundSet::default(),
+                NOW_MS,
+            );
             assert!(fake.destroys.lock().unwrap().is_empty());
             assert_eq!(summary, Summary::default());
             assert!(summary.info_line().is_none());
@@ -776,6 +892,7 @@ mod tests {
                 reap_env("a", &fake, true, 60),
                 reap_env("b", &fake, false, 0),
             ],
+            &BoundSet::default(),
             NOW_MS,
         );
         assert_eq!(fake.lists.load(Ordering::Relaxed), 1);
@@ -798,11 +915,39 @@ mod tests {
                 reap_env("a", &unscoped, true, 60),
                 reap_env("b", &off, false, 60),
             ],
+            &BoundSet::default(),
             NOW_MS,
         );
         assert_eq!(unscoped.lists.load(Ordering::Relaxed), 0);
         assert_eq!(off.lists.load(Ordering::Relaxed), 0);
         assert_eq!(summary, Summary::default());
+    }
+
+    #[test]
+    fn pass_keeps_a_bound_over_lifetime_sprite() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let fake = seed();
+        let bound = BoundSet::with(&[("sx-old", "/wt/sx")], &[]);
+        let summary = pass(&[reap_env("sx", &fake, true, 3600)], &bound, NOW_MS);
+        assert!(fake.destroys.lock().unwrap().is_empty());
+        assert_eq!(summary.kept, vec![("sx-old".into(), "/wt/sx".into())]);
+        assert!(summary.destroyed.is_empty());
+    }
+
+    #[test]
+    fn pass_keeps_all_when_a_binding_is_unresolved() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let fake = seed();
+        let bound = BoundSet::with(&[], &["/wt/unresolved"]);
+        let summary = pass(&[reap_env("sx", &fake, true, 3600)], &bound, NOW_MS);
+        assert!(fake.destroys.lock().unwrap().is_empty());
+        assert_eq!(
+            summary.kept,
+            vec![(
+                "sx-old".into(),
+                "/wt/unresolved (a worktree whose sandbox could not be resolved)".into()
+            )]
+        );
     }
 
     #[test]
