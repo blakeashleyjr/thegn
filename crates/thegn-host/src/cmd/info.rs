@@ -82,11 +82,10 @@ pub(crate) fn gather(
 
     let (environment_result, environment_notes) = resolve_environment(cfg, &db, root, wt);
     notes.extend(environment_notes);
-    let environment_error = environment_result
-        .as_ref()
-        .err()
-        .map(|error| format!("{error:#}"));
-    let environment = environment_result.ok();
+    let (environment, environment_error) = match environment_result {
+        Ok(environment) => (Some(environment), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
 
     let (settings, mut settings_notes, backends) = match environment.as_ref() {
         Some(env) => {
