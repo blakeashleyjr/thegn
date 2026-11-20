@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.113] — 2026-11-20
+
 ### Added
 
 - Remote worktrees on every provider: the shell opens as soon as the workspace is ready; agent install, agent logins, shell history and the snapshot finish in the background with progress on the status line. An agent launched meanwhile waits for its CLI and login. `thegn env up` still waits for everything, and `--shell-ready` returns early. An interrupted or failed background phase resumes on the next open and shows in `thegn env show`; `env down` and deleting the worktree cancel it. On Vercel the agent install and snapshot now also run after the prompt.
@@ -4068,7 +4070,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.112...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.113...HEAD
+[0.1.0-alpha.113]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.112...v0.1.0-alpha.113
 [0.1.0-alpha.112]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.111...v0.1.0-alpha.112
 [0.1.0-alpha.111]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.110...v0.1.0-alpha.111
 [0.1.0-alpha.110]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.109...v0.1.0-alpha.110
