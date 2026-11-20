@@ -12,7 +12,8 @@
 //! Encoding order: attribute reset → alt-screen enter *or* scrollback context
 //! (the plain-text history tail, CRLF-normalized exactly like resurrect's
 //! `repaint_scrollback`) → clear+home → per-row SGR-run-coalesced cell paint →
-//! mode restores (app-cursor, bracketed paste) → cursor place + visibility.
+//! mode restores (app-cursor, bracketed paste, mouse, SGR mouse, title) →
+//! cursor place + visibility.
 //! The history tail ends with a plain-text copy of roughly the current screen
 //! (the history ring records all output), which lands in the client's
 //! scrollback just above the repainted grid — the same benign duplication the
@@ -58,6 +59,12 @@ pub struct ScreenSnapshot {
     pub alt_screen: bool,
     pub app_cursor: bool,
     pub bracketed_paste: bool,
+    #[serde(default)]
+    pub mouse: u16,
+    #[serde(default)]
+    pub sgr_mouse: bool,
+    #[serde(default)]
+    pub title: String,
     /// Bounded plain-text scrollback context (empty when `alt_screen` — the
     /// alternate screen has no scrollback).
     pub history_tail: String,
@@ -159,6 +166,23 @@ pub fn encode_ansi(s: &ScreenSnapshot) -> Vec<u8> {
     if s.bracketed_paste {
         out.extend_from_slice(b"\x1b[?2004h");
     }
+    if s.mouse != 0 {
+        out.extend_from_slice(format!("\x1b[?{}h", s.mouse).as_bytes());
+    }
+    if s.sgr_mouse {
+        out.extend_from_slice(b"\x1b[?1006h");
+    }
+    if !s.title.is_empty() {
+        let title: String = s
+            .title
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(256)
+            .collect();
+        out.extend_from_slice(b"\x1b]2;");
+        out.extend_from_slice(title.as_bytes());
+        out.push(0x07);
+    }
     out.extend_from_slice(format!("\x1b[{};{}H", s.cursor.0 + 1, s.cursor.1 + 1).as_bytes());
     out.extend_from_slice(if s.cursor_visible {
         b"\x1b[?25h"
@@ -182,6 +206,9 @@ mod tests {
             alt_screen: false,
             app_cursor: false,
             bracketed_paste: false,
+            mouse: 0,
+            sgr_mouse: false,
+            title: String::new(),
             history_tail: String::new(),
             cells: vec![SnapCell::default(); rows as usize * cols as usize],
             seq: 0,
@@ -313,6 +340,37 @@ mod tests {
         assert!(out.contains("\x1b[?1h"));
         assert!(out.contains("\x1b[?2004h"));
         assert!(out.ends_with("\x1b[3;4H\x1b[?25l\x1b[0m"));
+    }
+
+    #[test]
+    fn mouse_sgr_and_title_restore_after_paint() {
+        let mut s = blank_snapshot(1, 1);
+        s.mouse = 1002;
+        s.sgr_mouse = true;
+        s.title = "pane".into();
+
+        assert_eq!(
+            ansi(&s),
+            "\x1b[0m\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b]2;pane\x07\x1b[1;1H\x1b[?25h\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn title_control_characters_are_stripped() {
+        let mut s = blank_snapshot(1, 1);
+        s.title = "a\x1b[31m\x07b".into();
+
+        assert!(ansi(&s).contains("\x1b]2;a[31mb\x07"));
+    }
+
+    #[test]
+    fn title_is_clipped_to_256_characters() {
+        let mut s = blank_snapshot(1, 1);
+        s.title = "x".repeat(257);
+        let out = ansi(&s);
+        let start = out.find("\x1b]2;").unwrap() + 4;
+        let end = start + out[start..].find('\x07').unwrap();
+        assert_eq!(&out[start..end], "x".repeat(256));
     }
 
     #[test]
