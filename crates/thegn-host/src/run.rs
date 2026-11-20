@@ -26412,6 +26412,13 @@ async fn event_loop<T: Terminal>(
                                     model.status = msg;
                                 }
                             }
+                            Action::RetryPullbacks => {
+                                crate::cmd::env_sync_retry::spawn_retry(
+                                    refresh_tx.clone(),
+                                    waker.clone(),
+                                );
+                                model.status = "Retrying failed pull-backs…".into();
+                            }
                             Action::TogglePanel => {
                                 panel_auto_revealed = None;
                                 // Toggle on what the user SEES: if the panel

@@ -1224,6 +1224,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "retry-pullbacks",
+        label: "Retry failed pull-backs",
+        message_key: "action-retry-pullbacks",
+        hint: "pull",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "sync retry",
+            "pull back",
+            "pullback",
+            "retry pull",
+            "sandbox sync",
+            "failed pull",
+        ],
+    },
+    ActionSpec {
         id: "toggle-panel",
         label: "Toggle diff / PR panel",
         message_key: "action-toggle-panel",
