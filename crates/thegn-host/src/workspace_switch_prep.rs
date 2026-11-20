@@ -10,6 +10,10 @@ type ConnectRegistry = (Vec<WorktreeRegistryRow>, Vec<String>);
 pub(crate) struct AfterSwitch {
     pub(crate) focus_center: bool,
     pub(crate) landed_status: Option<String>,
+    /// The DB-shaped sidebar entry `(slug, name, kind, repo_path)` of a project
+    /// just created, so its row shows the display name at once instead of the
+    /// slug until hydration.
+    pub(crate) sidebar_entry: Option<(String, String, String, String)>,
     pub(crate) set_region_last_w: bool,
     pub(crate) reveal_active: bool,
     pub(crate) focus_active_row: bool,
@@ -140,6 +144,7 @@ pub(crate) enum CreateOutcome {
     Repo {
         root: String,
         prepared: PreparedWorkspaceSwitch,
+        sidebar_entry: Option<(String, String, String, String)>,
     },
     NotARepo(std::path::PathBuf),
 }
@@ -178,6 +183,7 @@ pub(crate) fn request_workspace_create(
     let resolve_cfg = cfg.clone();
     let cfg = cfg.clone();
     tokio::spawn(async move {
+        let resolve_started = std::time::Instant::now();
         let resolved = match tokio::task::spawn_blocking(move || {
             crate::workspace_create::resolve_workspace_input(&input, &resolve_cfg)
         })
@@ -186,11 +192,23 @@ pub(crate) fn request_workspace_create(
             Ok(resolved) => resolved,
             Err(error) => Err(anyhow::anyhow!("workspace resolver failed: {error}")),
         };
+        let resolve_ms = resolve_started.elapsed().as_millis() as u64;
         match resolved {
             Ok(crate::workspace_create::WorkspaceResolution::Repo { root, name }) => {
+                let enqueued_at = std::time::Instant::now();
                 crate::db_task::persist_critical(move |db| {
+                    let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
+                    let seed_started = std::time::Instant::now();
                     let result =
                         crate::workspace_create::seed_workspace_create(db, &root, &name, &cfg);
+                    let seed_ms = seed_started.elapsed().as_millis() as u64;
+                    tracing::debug!(
+                        target: "thegn::workspace_switch",
+                        resolve_ms,
+                        seed_ms,
+                        queue_wait_ms,
+                        "workspace create stages"
+                    );
                     send_created(&tx, &wake, job_request, result);
                 });
             }
@@ -216,6 +234,8 @@ fn send_created(
     }
 }
 
+// One route per created project, consumed at once; boxing the result would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum CreatedRoute {
     Drop { seq: u64 },
@@ -249,12 +269,17 @@ pub(crate) fn route_created(
                 status: format!("project already open: {root}"),
             }
         }
-        Ok(CreateOutcome::Repo { root, prepared }) => {
+        Ok(CreateOutcome::Repo {
+            root,
+            prepared,
+            sidebar_entry,
+        }) => {
             let mut request = request;
             request.target = root.clone();
             request.after = AfterSwitch {
                 focus_center: true,
                 landed_status: Some(format!("project created: {root}")),
+                sidebar_entry,
                 ..request.after
             };
             CreatedRoute::Apply(SwitchResult::Cold {
@@ -493,6 +518,21 @@ pub(crate) fn applied_switch_hydrates_inline(
     landed: &std::path::Path,
 ) -> bool {
     last_active == Some(landed)
+}
+
+/// Put `entry` into the sidebar's workspace list, replacing any entry with the
+/// same slug or the same non-empty repo path (the live fallback for it).
+pub(crate) fn adopt_sidebar_entry(
+    list: &mut Vec<(String, String, String, String)>,
+    entry: (String, String, String, String),
+) {
+    if let Some(index) = list.iter().position(|(slug, _, _, repo_path)| {
+        *slug == entry.0 || (!entry.3.is_empty() && *repo_path == entry.3)
+    }) {
+        list[index] = entry;
+    } else {
+        list.push(entry);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn created_repo_routes_to_a_cold_apply_with_the_resolved_root() {
+    fn created_repo_carries_its_sidebar_entry_into_the_cold_apply() {
         let mut pending = PendingSwitch::default();
         let request = pending.begin(workspace_create_spec("~/typed"));
         let prepared = PreparedWorkspaceSwitch {
@@ -834,6 +874,12 @@ mod tests {
             Ok(CreateOutcome::Repo {
                 root: "/r/new".into(),
                 prepared,
+                sidebar_entry: Some((
+                    "new-project".into(),
+                    "New Project".into(),
+                    "repo".into(),
+                    "/r/new".into(),
+                )),
             }),
             pending.current(request.seq),
             "/r/old",
@@ -848,6 +894,15 @@ mod tests {
         assert_eq!(cold.seq, request.seq);
         assert_eq!(cold.target, "/r/new");
         assert!(cold.after.focus_center);
+        assert_eq!(
+            cold.after.sidebar_entry,
+            Some((
+                "new-project".into(),
+                "New Project".into(),
+                "repo".into(),
+                "/r/new".into(),
+            ))
+        );
         assert_eq!(
             cold.after.landed_status.as_deref(),
             Some("project created: /r/new")
@@ -873,6 +928,7 @@ mod tests {
                 Ok(CreateOutcome::Repo {
                     root: "/r/new".into(),
                     prepared,
+                    sidebar_entry: None,
                 }),
                 pending.current(request.seq),
                 "/r/new",
@@ -933,6 +989,7 @@ mod tests {
                 Ok(CreateOutcome::Repo {
                     root: "/one".into(),
                     prepared,
+                    sidebar_entry: None,
                 }),
                 pending.current(first.seq),
                 "/old",
@@ -946,6 +1003,7 @@ mod tests {
         let after = AfterSwitch {
             focus_center: true,
             landed_status: None,
+            sidebar_entry: None,
             set_region_last_w: true,
             reveal_active: true,
             focus_active_row: true,
@@ -966,6 +1024,70 @@ mod tests {
         assert_eq!(effects.region_last_w, Some(Some("repo/main".into())));
         assert!(effects.focus_center && effects.reveal_active && effects.focus_active_row);
         assert!(effects.open_merge_queue);
+    }
+
+    #[test]
+    fn adopt_sidebar_entry_replaces_the_live_fallback_by_slug() {
+        let mut list = vec![(
+            "project".into(),
+            "project".into(),
+            "repo".into(),
+            String::new(),
+        )];
+        adopt_sidebar_entry(
+            &mut list,
+            (
+                "project".into(),
+                "Project".into(),
+                "repo".into(),
+                "/repo/project".into(),
+            ),
+        );
+        assert_eq!(list[0].1, "Project");
+        assert_eq!(list[0].3, "/repo/project");
+    }
+
+    #[test]
+    fn adopt_sidebar_entry_replaces_by_repo_path() {
+        let mut list = vec![(
+            "old-name".into(),
+            "Old Name".into(),
+            "repo".into(),
+            "/repo/project".into(),
+        )];
+        adopt_sidebar_entry(
+            &mut list,
+            (
+                "project".into(),
+                "Project".into(),
+                "repo".into(),
+                "/repo/project".into(),
+            ),
+        );
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "project");
+        assert_eq!(list[0].1, "Project");
+    }
+
+    #[test]
+    fn adopt_sidebar_entry_appends_when_new() {
+        let mut list = vec![(
+            "existing".into(),
+            "Existing".into(),
+            "repo".into(),
+            "/repo/existing".into(),
+        )];
+        adopt_sidebar_entry(
+            &mut list,
+            (
+                "project".into(),
+                "Project".into(),
+                "repo".into(),
+                "/repo/project".into(),
+            ),
+        );
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].1, "Project");
     }
 
     #[test]

@@ -27,6 +27,14 @@ warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable). The
 target update runs in the background: `warm pool: updating target…` appears
 while it is queued, followed by the result, and raising the target stops at
 eight spares for the workspace's environment.
+To fill the pool by hand, run `thegn env pool-fill` (see
+[the CLI reference](../cli.md)). A short-lived process (a CLI command or the
+daemon) never refills the pool after a claim: it prints `warm pool for <worktree>
+is one spare short; the thegn TUI refills it, or run: thegn env pool-fill
+--worktree <worktree>`. Only the TUI refills in the background. `thegn doctor`
+shows a `warm pool: N ready, M provisioning` line per provider env (Vercel
+shows `not used for vercel`).
+
 If the spare ledger cannot be read, reconciliation warns and makes no pool
 changes rather than treating the pool as empty.
 When a worktree opens and its spare ledger cannot be read, a warning appears on
@@ -170,6 +178,15 @@ been verified live against the real Sprites API yet.
   deletes a sprite only when this host recorded it. Sprites that existed
   before this release, or that were made outside thegn, are never deleted by
   thegn; remove those with the Sprites CLI or dashboard.
+- **Reuse needs proof.** When a sprite with the wanted name already exists,
+  thegn reuses it only if this instance's ledger holds a record of creating it
+  under its own scope. Without that proof it refuses: `sprites: a sprite named
+X exists in this Sprites account but this thegn instance has no record of
+creating it; refusing to use it (it may belong to another thegn instance or
+another person). If it is yours: thegn env adopt X --env <env>`. Run that
+  `env adopt` line if the sprite is yours. This also applies when a record was
+  lost, and to the dev instance for a sprite the stable instance created for the
+  same worktree path: the two instances do not share records.
 - **Unrecorded sprites.** `thegn env reap --provider sprites [--apply] [--yes] [--json]`
   (or `--unrecorded`, below) lists orphans, sprites past `max_lifetime_secs` (age from the API
   `created_at`) and sprites "not recorded by this host". It is a dry run by
@@ -223,7 +240,13 @@ been verified live against the real Sprites API yet.
   unpriced". The usage window starts at the ledger `created_at` floored to its
   UTC hour. A sprite whose usage rows carry no `last_recorded_at` shows "no
   usage reported yet" (JSON `reported: false`) rather than 0.00, and a failed
-  usage request marks that row only.
+  usage request marks that row only. Below the per-sprite rows `fleet cost`
+  adds one **account** row per distinct Sprites account: month-to-date CPU and
+  GB-hours for all sprites in the account (`GET /v1/usage` from the start of the
+  UTC month), deduplicated by account fingerprint (a second env on the same
+  account says "same account as <env>") and marked `(partial)` when the API says
+  the figures are incomplete. A failed account read shows "account usage
+  unavailable" and never hides the per-sprite rows.
 - **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
   also runs `env pull` after the agent exits and reports it in text and `--json`.
 
