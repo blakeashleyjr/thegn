@@ -1504,8 +1504,16 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let _scope = crate::fold_cancel::scope(move || guard.fired());
     // Share the fold/gate/CAS core with `thegn land`; this queue-aware path
     // additionally records the outcome on the worktree's merge-queue row.
-    let (branch, target, outcome) =
-        super::land::land_branch_pinned(cfg, &wt, Some(&admission.candidate_oid))?;
+    let pulled = super::land::land_branch_pinned_pulled(cfg, &wt, Some(&admission.candidate_oid))?;
+    for note in &pulled.notes {
+        outln!("{note}");
+    }
+    let super::land::PulledLand {
+        branch,
+        target,
+        outcome,
+        ..
+    } = pulled;
     let db = Db::open()?;
     // Apply the sidebar-folder lifecycle for this worktree once we know its fate.
     let lifecycle = |event: LifecycleEvent| {
