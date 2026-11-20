@@ -508,6 +508,110 @@ lists the sandbox. A partial listing proves nothing.
   spare is bound to, and which env var names, git token and agent logins go
   into the sandbox. Sprites credential forwarding itself is unchanged.
 
+## Interactive remote panes
+
+This section applies to every remote provider that opens panes through its own
+exec API. Where only Sprites behaves a given way, it says so.
+
+### Terminal identity
+
+A remote pane is thegn's own terminal, so the remote shell gets what a local
+pane gets, never the host terminal's own type.
+
+- **Native panes** get `TERM=xterm-256color` and `COLORTERM=truecolor`.
+- **`sprite-exec`** sends the host `TERM` when the remote is sure to have its
+  terminfo (`xterm-256color`, `screen-256color`, `tmux`, `vt100`…), and
+  `xterm-256color` for anything exotic such as `xterm-ghostty`. It adds
+  `COLORTERM` when the host's is `truecolor` or `24bit`.
+- **Locale.** The first non-empty of the host's `LC_ALL`, `LC_CTYPE` and `LANG`
+  is read. When it names a UTF-8 codeset, the remote gets `LANG=C.UTF-8`.
+  Otherwise no locale is sent. Any `LC_ALL` or `LC_CTYPE` from the host is
+  dropped, so a stale value cannot override it.
+
+### Close versus quit
+
+Closing a remote pane (its close key, or `thegn session close`) ends its remote
+shell: on Sprites thegn asks the server to kill the exec session with SIGHUP and
+waits up to 5 s. Quitting thegn, or a dropped connection, only detaches: the
+shell keeps running and the next open reattaches to it.
+
+### Connection liveness
+
+Interactive remote transports share one rule, and a new one should adopt it.
+
+- **Armed only by input.** Typing starts a 5 s timer. Any message from the
+  server, data or control, cancels it. Nothing runs while you are idle.
+- **Two strikes.** At the first expiry thegn sends a WebSocket ping and waits
+  5 s more. If still nothing arrives, thegn treats the connection as dropped,
+  and the pane reattaches.
+- **Self-calibrating.** It acts only on a connection that has already answered
+  a ping, and only for interactive panes. A server that never answers pings is
+  left alone, so a quiet but healthy session is never cut.
+- **`TCP_NODELAY`** is set on the exec and proxy sockets, so a keystroke is not
+  held back to be batched.
+
+### Local echo
+
+Local echo prediction draws a burst only after the server has echoed an earlier
+key of the same line, on any row, and never past the right edge. It is shown
+only when the echoed cell holds the typed character, so nothing is predicted at
+a password prompt.
+
+### Background setup (prompt first)
+
+On every remote provider, a worktree's shell opens as soon as its workspace is
+ready. Coding-agent install, agent logins, shell history and the snapshot finish
+in the background, with progress on the status line (`background setup: <step>…`).
+On Vercel the agent install and snapshot also run after the prompt now.
+
+- An agent launched meanwhile waits for its CLI and login before it starts.
+- `thegn env up` still waits for everything. `thegn env up --shell-ready`
+  returns as soon as a shell can open.
+- A background phase that was interrupted or failed resumes on the next open and
+  shows in `thegn env show`. A failure also raises a notice.
+- `thegn env down` and deleting the worktree cancel it.
+
+### Agent login sync
+
+Login sync copies an agent's config into the sandbox in two phases.
+
+- **Phase 1** always runs and carries only the small set the agent needs to be
+  logged in. For hermes that includes its auth files.
+- **Phase 2** is an allowlist of top-level entries per agent: claude, codex, pi
+  (`settings.json` and the `agent/` tree's settings, extensions, skills, agents,
+  prompts and themes) and hermes (`config.yaml`, `SOUL.md`, skills, hooks,
+  prompts, memories, scripts, plugins without their cache; no `.db` files and no
+  `cache` directories). Telemetry, transcripts and runtime state never ship.
+- **Dependency trees** such as `node_modules` are skipped for every agent.
+- **An agent thegn does not know**, whose tree has more than 2,000 allowlisted
+  files, ships its top-level files only, with one warning.
+
+### Parity script
+
+`test/remote-parity.sh` checks that a remote pane behaves like a local one:
+identity and locale, size, colours, UTF-8, Ctrl-C, job control, paste, a
+full-screen program, arrow keys, mouse, the alternate screen, an output flood,
+the title, cwd, exit status, echo latency and a leak check after close. It takes
+the env as an argument:
+
+```
+THEGN_CHANNEL=dev test/remote-parity.sh --env <name> --i-accept-spend [--keep-going] [--samples N] [--idle-probe]
+```
+
+Without flags it only prints its plan and creates nothing. `--self-test` runs
+the same cases with a local pane on both sides, using no provider and no
+network. `just remote-parity` runs it. Each case prints PASS, WARN or FAIL;
+THE-2450 is reported as a WARN.
+
+## Unverified
+
+Not confirmed against a live provider:
+
+- the guest has the `C.UTF-8` locale;
+- the shape of the server's replay on reattach;
+- the largest WebSocket message the server accepts;
+- whether an open, idle exec keeps a sprite awake.
+
 ## Remote worktrees
 
 `[sandbox.remote] host` runs worktrees on another machine. Control-plane

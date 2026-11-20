@@ -7,6 +7,8 @@
 //! append to a *prediction overlay* + advance a *predicted cursor*, render it
 //! immediately (dimmed) at the prompt, and DROP the overlay the moment real server
 //! output arrives (the server bytes already carry the echoed text / correct state).
+//! Password prompts and other no-echo input never predict: a burst is eligible
+//! only after server output confirms that an earlier key advanced the cursor.
 //!
 //! This module is the **pure, substrate-free half**: the prediction state machine,
 //! a smoothed round-trip estimator, and the safety-gate decision. The pane wires
@@ -66,10 +68,10 @@ pub struct ScreenState {
     pub alt_screen: bool,
     /// Application cursor-key / raw mode — never predict.
     pub app_mode: bool,
-    /// The cursor's row and the grid height — predict only on the last row
-    /// (a prompt line), not mid-screen.
+    /// The cursor's row and column in the grid.
     pub cursor_row: usize,
-    pub rows: usize,
+    pub cursor_col: usize,
+    pub cols: usize,
 }
 
 /// Per-pane predictive-echo state.
@@ -80,6 +82,12 @@ pub struct Predictor {
     srtt: Srtt,
     /// Timestamp (ms) of the first un-echoed keystroke in this burst, for srtt.
     last_key_ms: Option<u64>,
+    /// Cursor at the first un-echoed key in this burst.
+    key_cursor: Option<(usize, usize)>,
+    /// Character typed at the first un-echoed key in this burst.
+    key_char: Option<char>,
+    /// Row on which server output confirmed that an earlier key was echoed.
+    confirmed_row: Option<usize>,
 }
 
 /// Latency floor (ms) below which local echo is imperceptible, so we don't
@@ -101,17 +109,25 @@ impl Predictor {
     }
 
     /// Should we locally echo, given the screen state + measured latency? Gates
-    /// out full-screen/raw apps, mid-screen cursors, and fast links.
+    /// out full-screen/raw apps, no-echo prompts, right-edge cursors, and fast
+    /// links.
     pub fn should_predict(&self, s: &ScreenState) -> bool {
         if s.alt_screen || s.app_mode {
             return false;
         }
-        // Only the prompt (last) row.
-        if s.rows > 0 && s.cursor_row + 1 != s.rows {
+        if self.confirmed_row != Some(s.cursor_row) {
             return false;
         }
         // Only once the link is actually slow enough to feel.
-        self.srtt.get().is_some_and(|ms| ms >= PREDICT_MIN_SRTT_MS)
+        if !self.srtt.get().is_some_and(|ms| ms >= PREDICT_MIN_SRTT_MS) {
+            return false;
+        }
+        // Leave room for the next predicted character; never paint past the
+        // right edge of the terminal.
+        s.cursor_col
+            .saturating_add(self.pending.len())
+            .saturating_add(1)
+            < s.cols
     }
 
     /// Record that a keystroke was sent (for the srtt estimate), WITHOUT
@@ -119,16 +135,20 @@ impl Predictor {
     /// latency gate opens — otherwise `should_predict` (which needs srtt) and
     /// the srtt (which needs keystroke timing) would deadlock. Stamps only the
     /// first un-echoed keystroke of a burst.
-    pub fn note_key(&mut self, now_ms: u64) {
+    pub fn note_key(&mut self, now_ms: u64, cursor: (usize, usize), c: char) {
         if self.last_key_ms.is_none() {
             self.last_key_ms = Some(now_ms);
+        }
+        if self.key_cursor.is_none() {
+            self.key_cursor = Some(cursor);
+            self.key_char = Some(c);
         }
     }
 
     /// A printable keystroke was sent AND we're predicting: note it (srtt) and
     /// add it to the overlay. Caller has already checked `should_predict`.
-    pub fn on_key(&mut self, c: char, now_ms: u64) {
-        self.note_key(now_ms);
+    pub fn on_key(&mut self, c: char, now_ms: u64, cursor: (usize, usize)) {
+        self.note_key(now_ms, cursor, c);
         self.pending.push(c);
     }
 
@@ -145,17 +165,37 @@ impl Predictor {
     /// Real server output arrived: it's authoritative (and carries the echoed
     /// text), so drop the overlay. Also folds a round-trip sample into the srtt
     /// when this output plausibly echoes the pending burst.
-    pub fn on_server_output(&mut self, now_ms: u64) {
+    pub fn on_server_output(&mut self, now_ms: u64, cursor: (usize, usize), echoed: Option<&str>) {
         if let Some(start) = self.last_key_ms.take() {
             self.srtt.observe(now_ms.saturating_sub(start) as f64);
         }
+        self.confirmed_row = match self.key_cursor {
+            Some((row, col))
+                if self.key_char.is_some()
+                    && cursor.0 == row
+                    && cursor.1 > col
+                    && echoed.and_then(|text| text.chars().next()) == self.key_char =>
+            {
+                Some(row)
+            }
+            _ => None,
+        };
         self.pending.clear();
+        self.key_cursor = None;
+        self.key_char = None;
+    }
+
+    pub fn echo_cell(&self) -> Option<(usize, usize)> {
+        self.key_cursor
     }
 
     /// Drop predictions without taking an srtt sample (resize, focus loss, …).
     pub fn clear(&mut self) {
         self.pending.clear();
         self.last_key_ms = None;
+        self.key_cursor = None;
+        self.key_char = None;
+        self.confirmed_row = None;
     }
 
     /// Current smoothed RTT estimate (ms), for diagnostics.
@@ -168,12 +208,13 @@ impl Predictor {
 mod tests {
     use super::*;
 
-    fn prompt(rows: usize, cursor_row: usize) -> ScreenState {
+    fn prompt(cursor_row: usize, cursor_col: usize, cols: usize) -> ScreenState {
         ScreenState {
             alt_screen: false,
             app_mode: false,
             cursor_row,
-            rows,
+            cursor_col,
+            cols,
         }
     }
 
@@ -191,8 +232,8 @@ mod tests {
     #[test]
     fn key_backspace_enter_and_output_manage_the_overlay() {
         let mut p = Predictor::new();
-        p.on_key('l', 0);
-        p.on_key('s', 1);
+        p.on_key('l', 0, (0, 0));
+        p.on_key('s', 1, (0, 1));
         assert_eq!(p.pending(), &['l', 's']);
         p.on_backspace();
         assert_eq!(p.pending(), &['l']);
@@ -200,42 +241,79 @@ mod tests {
         p.on_enter();
         assert!(p.is_empty());
         // A fresh burst, then server output clears it + records the rtt.
-        p.on_key('x', 100);
-        p.on_server_output(420); // 320 ms round-trip
+        p.on_key('x', 100, (0, 0));
+        p.on_server_output(420, (0, 1), None); // 320 ms round-trip
         assert!(p.is_empty());
         assert_eq!(p.srtt_ms(), Some(320.0));
     }
 
     #[test]
-    fn gate_blocks_fullscreen_rawmode_midscreen_and_fast_links() {
+    fn gate_blocks_fullscreen_rawmode_no_echo_and_fast_links() {
         let mut p = Predictor::new();
         // No srtt yet ⇒ don't predict.
-        assert!(!p.should_predict(&prompt(24, 23)));
+        assert!(!p.should_predict(&prompt(23, 0, 80)));
         // Seed a slow link.
-        p.on_key('a', 0);
-        p.on_server_output(320);
+        p.on_key('a', 0, (23, 0));
+        p.on_server_output(320, (23, 1), Some("a"));
         assert!(
-            p.should_predict(&prompt(24, 23)),
+            p.should_predict(&prompt(23, 1, 80)),
             "slow link, prompt row ⇒ predict"
         );
         // Full-screen / raw apps never predict.
         assert!(!p.should_predict(&ScreenState {
             alt_screen: true,
-            ..prompt(24, 23)
+            ..prompt(23, 1, 80)
         }));
         assert!(!p.should_predict(&ScreenState {
             app_mode: true,
-            ..prompt(24, 23)
+            ..prompt(23, 1, 80)
         }));
-        // Mid-screen cursor (not the prompt line) ⇒ don't predict.
-        assert!(!p.should_predict(&prompt(24, 10)));
+        // A server response that did not advance the cursor is not echo.
+        p.on_key('p', 400, (10, 4));
+        p.on_server_output(720, (10, 4), None);
+        assert!(!p.should_predict(&prompt(10, 4, 80)));
     }
 
     #[test]
     fn fast_link_does_not_predict() {
         let mut p = Predictor::new();
-        p.on_key('a', 0);
-        p.on_server_output(8); // 8 ms — local/fast
-        assert!(!p.should_predict(&prompt(24, 23)));
+        p.on_key('a', 0, (23, 0));
+        p.on_server_output(8, (23, 1), None); // 8 ms — local/fast
+        assert!(!p.should_predict(&prompt(23, 1, 80)));
+    }
+
+    #[test]
+    fn confirmed_row_predicts_mid_screen() {
+        let mut p = Predictor::new();
+        p.on_key('a', 0, (10, 4));
+        p.on_server_output(320, (10, 5), Some("a"));
+        assert!(p.should_predict(&prompt(10, 5, 80)));
+    }
+
+    #[test]
+    fn right_edge_guard_accounts_for_pending_chars() {
+        let mut p = Predictor::new();
+        p.on_key('a', 0, (10, 4));
+        p.on_server_output(320, (10, 5), Some("a"));
+        p.on_key('b', 321, (10, 5));
+        assert!(!p.should_predict(&prompt(10, 78, 80)));
+    }
+
+    #[test]
+    fn enter_resets_confirmation() {
+        let mut p = Predictor::new();
+        p.on_key('a', 0, (10, 4));
+        p.on_server_output(320, (10, 5), Some("a"));
+        assert!(p.should_predict(&prompt(10, 5, 80)));
+        p.on_enter();
+        assert!(!p.should_predict(&prompt(10, 5, 80)));
+    }
+
+    #[test]
+    fn mask_echo_never_confirms() {
+        let mut p = Predictor::new();
+        p.on_key('p', 0, (5, 10));
+        p.on_server_output(320, (5, 11), Some("*"));
+        assert!(!p.should_predict(&prompt(5, 11, 80)));
     }
 }
