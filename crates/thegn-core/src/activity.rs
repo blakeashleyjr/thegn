@@ -1585,6 +1585,7 @@ mod tests {
                 .spawn()
                 .expect("spawn cpu burner"),
         );
+        let burner_pid = child.0.id();
         std::thread::sleep(std::time::Duration::from_millis(1200));
 
         let sums = scan_proc(&[(dir.clone(), "wt/burn".to_string())]);
@@ -1592,7 +1593,11 @@ mod tests {
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
 
-        let jiffies = sums.get("wt/burn").copied().unwrap_or(0);
+        let jiffies = sums
+            .get("wt/burn")
+            .and_then(|by_pid| by_pid.get(&burner_pid))
+            .copied()
+            .unwrap_or(0);
         // ~0.5s of a busy core is ~50 jiffies. Assert only the ORDER of
         // magnitude — the bug this guards divides by ~41, landing at ~1.
         assert!(
