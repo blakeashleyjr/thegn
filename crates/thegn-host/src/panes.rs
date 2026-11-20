@@ -615,6 +615,8 @@ fn should_auto_enable_nix_daemon_for_local_terminal(
         && spec.placement.is_local()
         && spec.backend.is_host_toolchain()
         && spec.network == thegn_core::config::Network::Nat
+        && sandbox.network_allow.is_empty()
+        && sandbox.network_block.is_empty()
         && spec.network_allow.is_empty()
         && spec.network_block.is_empty()
         && !sandbox.network_audit
@@ -1799,6 +1801,22 @@ mod tests {
         assert!(!should_auto_enable_nix_daemon_for_local_terminal(
             &network_allow,
             &local,
+            true
+        ));
+
+        let mut requested_block = thegn_core::config::SandboxConfig::default();
+        requested_block.network_block.push("example.com".into());
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &requested_block,
+            &local,
+            true
+        ));
+
+        let mut resolved_allow = spec(thegn_core::sandbox::Backend::Bwrap);
+        resolved_allow.network_allow.push("example.com".into());
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &standard,
+            &resolved_allow,
             true
         ));
 
