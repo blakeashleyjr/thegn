@@ -60,6 +60,8 @@ if [ "${STUB_MODE:-}" = continue ]; then
       echo '{"view":{"rows":[],"down":[{"id":"sp-live"}],"missing":[],"partial":false}}'
     elif [ "${STUB_FLEET_OTHER_COLD:-}" = 1 ]; then
       echo '{"view":{"rows":[{"id":"sx-foreign","state":"cold"}],"partial":false}}'
+    elif [ "${STUB_FLEET_PARTIAL:-}" = 1 ]; then
+      echo '{"view":{"rows":[],"partial":true}}'
     else
       echo '{"view":{"rows":[{"id":"sp-live","state":"warm"}],"partial":false}}'
     fi
@@ -134,7 +136,8 @@ for s in sprites-live remote-daily vercel-live; do
     fail "$s: no flags (rc $(cat "$T/plan-$s.rc"); calls: $(tr '\n' ';' <"$T/plan-$s.log"))"
   fi
   if has "$T/plan-$s.out" "The preflight prints which credentials enter the sandbox." &&
-    has "$T/plan-$s.out" "0   preflight"; then
+    has "$T/plan-$s.out" "0   preflight" &&
+    has "$T/plan-$s.out" "STARTUP lines (start-up numbers)"; then
     pass "$s: plan names the preflight"
   else
     fail "$s: plan lacks the preflight statement"
@@ -236,6 +239,11 @@ if has "$T/pf-fly.out" "SKIP 0: doctor remote_live has no row for env sx" && has
 else
   fail "preflight: remote-daily fly ($(cat "$T/pf-fly.out"))"
 fi
+if has "$T/pf-fly.out" "TIME 1 "; then
+  pass "preflight: remote-daily records step timing"
+else
+  fail "preflight: remote-daily missing step timing"
+fi
 
 run pf-vx vercel-live.sh THEGN_CHANNEL=dev STUB_DOCTOR="$T/vx.json" -- \
   --token-ref env:VX_NAME_ONLY --team-id team_x --project-id prj_x --i-accept-spend
@@ -245,11 +253,19 @@ if has "$T/pf-vx.out" "INFO 0: credentials entering the sandbox: forwarded_env=n
 else
   fail "preflight: vercel-live ($(cat "$T/pf-vx.out"))"
 fi
+if has "$T/pf-vx.out" "TIME 2 "; then
+  pass "preflight: vercel-live records step timing"
+else
+  fail "preflight: vercel-live missing step timing"
+fi
 
 run keep-going-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_DOCTOR="$T/tok-true.json" -- \
   "${SX[@]}" --keep-going
 if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
   has "$T/keep-going-sprites.out" "PASS 4b" &&
+  has "$T/keep-going-sprites.out" "TIME 4b " &&
+  has "$T/keep-going-sprites.out" "STARTUP cold create (env up): " &&
+  has "$T/keep-going-sprites.out" "STARTUP wake from cold (sprite-exec -- true): " &&
   has "$T/keep-going-sprites.out" "== step 13:" &&
   has "$T/keep-going-sprites.out" "trace log path:" &&
   has "$T/keep-going-sprites.out" "trace lines: 1" &&
@@ -309,6 +325,80 @@ if [ -z "$(ls -A "$T/tmp")" ]; then
   pass "acting runs removed their temp state"
 else
   fail "temp state left behind: $(ls "$T/tmp")"
+fi
+
+# ---- 3. shared live library ----
+listing_present="$(PATH="$T/bin:$PATH" STUB_LOG="$LOG" STUB_MODE=continue XDG_STATE_HOME="$T/libstate" THEGN_BIN=thegn bash -c '
+# shellcheck disable=SC2016
+. "$1"
+live_listing sx sp-live
+' bash "$ROOT/test/lib/live.sh")"
+if [ "$listing_present" = "present warm" ]; then
+  pass "live library: present row reports its state"
+else
+  fail "live library: present row ($listing_present)"
+fi
+listing_absent="$(PATH="$T/bin:$PATH" STUB_LOG="$LOG" STUB_MODE=continue STUB_FLEET_OTHER_COLD=1 XDG_STATE_HOME="$T/libstate" THEGN_BIN=thegn bash -c '
+# shellcheck disable=SC2016
+. "$1"
+live_listing sx sp-live
+' bash "$ROOT/test/lib/live.sh")"
+if [ "$listing_absent" = "absent" ]; then
+  pass "live library: complete listing proves absence"
+else
+  fail "live library: absent row ($listing_absent)"
+fi
+listing_partial="$(PATH="$T/bin:$PATH" STUB_LOG="$LOG" STUB_MODE=continue STUB_FLEET_PARTIAL=1 XDG_STATE_HOME="$T/libstate" THEGN_BIN=thegn bash -c '
+# shellcheck disable=SC2016
+. "$1"
+live_listing sx sp-live
+' bash "$ROOT/test/lib/live.sh")"
+if [ "$listing_partial" = "unknown" ]; then
+  pass "live library: partial listing is unknown"
+else
+  fail "live library: partial listing ($listing_partial)"
+fi
+live_keep_output="$T/live-keep.out"
+live_keep_rc=0
+bash -c '
+# shellcheck disable=SC2016
+. "$1"
+FAILED_STEPS=()
+LIVE_KEEP_GOING=1
+LIVE_STARTUP=("x=demo" "z=never")
+live_step x ok true
+live_step y no false
+live_finish
+' bash "$ROOT/test/lib/live.sh" >"$live_keep_output" 2>&1 || live_keep_rc=$?
+if [ "$live_keep_rc" -eq 1 ] &&
+  has "$live_keep_output" "PASS x" &&
+  has "$live_keep_output" "TIME x " &&
+  has "$live_keep_output" "FAIL y: no" &&
+  has "$live_keep_output" "STARTUP demo: " &&
+  has "$live_keep_output" "STARTUP never: not measured (step z did not run)" &&
+  has "$live_keep_output" "FAILED STEPS: y"; then
+  pass "live library: keep-going records failures and startup times"
+else
+  fail "live library: keep-going ($(cat "$live_keep_output"))"
+fi
+live_stop_output="$T/live-stop.out"
+live_stop_rc=0
+bash -c '
+# shellcheck disable=SC2016
+. "$1"
+FAILED_STEPS=()
+LIVE_KEEP_GOING=0
+LIVE_STARTUP=("x=demo" "z=never")
+live_step x ok true
+live_step y no false
+live_finish
+' bash "$ROOT/test/lib/live.sh" >"$live_stop_output" 2>&1 || live_stop_rc=$?
+if [ "$live_stop_rc" -eq 1 ] &&
+  has "$live_stop_output" "FAIL y: no" &&
+  ! has "$live_stop_output" "STARTUP"; then
+  pass "live library: default failure stops before summary"
+else
+  fail "live library: stop-on-failure ($(cat "$live_stop_output"))"
 fi
 
 if [ "$fails" -gt 0 ]; then
