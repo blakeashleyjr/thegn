@@ -14,26 +14,56 @@ self_test=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --env)
-      [ "$#" -ge 2 ] || { echo "--env needs a value" >&2; exit 2; }
-      env_name="$2"
-      shift 2
+  --env)
+    [ "$#" -ge 2 ] || {
+      echo "--env needs a value" >&2
+      exit 2
+    }
+    env_name="$2"
+    shift 2
+    ;;
+  --i-accept-spend)
+    accept=1
+    shift
+    ;;
+  --keep-going)
+    keep_going=1
+    shift
+    ;;
+  --samples)
+    [ "$#" -ge 2 ] || {
+      echo "--samples needs a value" >&2
+      exit 2
+    }
+    samples="$2"
+    case "$samples" in
+    '' | *[!0-9]*)
+      echo "--samples needs a whole number" >&2
+      exit 2
       ;;
-    --i-accept-spend) accept=1; shift ;;
-    --keep-going) keep_going=1; shift ;;
-    --samples)
-      [ "$#" -ge 2 ] || { echo "--samples needs a value" >&2; exit 2; }
-      samples="$2"
-      case "$samples" in
-        ''|*[!0-9]*) echo "--samples needs a whole number" >&2; exit 2 ;;
-      esac
-      [ "$samples" -gt 0 ] || { echo "--samples needs a positive number" >&2; exit 2; }
-      shift 2
-      ;;
-    --idle-probe) idle_probe=1; shift ;;
-    --self-test) self_test=1; shift ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
-    *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+    [ "$samples" -gt 0 ] || {
+      echo "--samples needs a positive number" >&2
+      exit 2
+    }
+    shift 2
+    ;;
+  --idle-probe)
+    idle_probe=1
+    shift
+    ;;
+  --self-test)
+    self_test=1
+    shift
+    ;;
+  -h | --help)
+    sed -n '2,12p' "$0"
+    exit 0
+    ;;
+  *)
+    echo "unknown argument: $1" >&2
+    exit 2
+    ;;
   esac
 done
 
@@ -117,7 +147,8 @@ print(json.dumps({"argv":json.loads(os.environ["SELF_ARGV_JSON"]),"cwd":os.envir
   remote_open_json="$("$THEGN_BIN" api call sessions.open --params "$self_open_params")"
   remote_session="$(printf '%s' "$remote_open_json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 
-  export RP_THEGN_BIN="$THEGN_BIN" RP_LOCAL_SESSION="$local_session" RP_REMOTE_SESSION="$remote_session" RP_REPO="$test_tmp/repo" RP_TMP="$test_tmp" RP_PROVIDER="self-test" RP_SAMPLES="$samples" RP_KEEP_GOING=1 RP_IDLE_PROBE=0 RP_LOCAL_OPEN_MS=0 RP_REMOTE_OPEN_MS=0 RP_PROVIDER_QUIRK="" RP_LOCAL_ARGV_JSON="$self_argv_json" RP_REMOTE_ARGV_JSON="$self_argv_json" RP_REMOTE_WORKDIR_EXPR="\$HOME/workspace" RP_ENV_NAME="self-test"
+  # shellcheck disable=SC2016 # literal: the session shell expands $HOME, not this script
+  export RP_THEGN_BIN="$THEGN_BIN" RP_LOCAL_SESSION="$local_session" RP_REMOTE_SESSION="$remote_session" RP_REPO="$test_tmp/repo" RP_TMP="$test_tmp" RP_PROVIDER="self-test" RP_SAMPLES="$samples" RP_KEEP_GOING=1 RP_IDLE_PROBE=0 RP_LOCAL_OPEN_MS=0 RP_REMOTE_OPEN_MS=0 RP_PROVIDER_QUIRK="" RP_LOCAL_ARGV_JSON="$self_argv_json" RP_REMOTE_ARGV_JSON="$self_argv_json" RP_REMOTE_WORKDIR_EXPR='$HOME/workspace' RP_ENV_NAME="self-test"
   set +e
   python3 -I test/remote_parity.py
   status=$?
@@ -195,56 +226,60 @@ provider="$(printf '%s\n' "$preflight" | sed -n 's/^PROVIDER=//p')"
 # supports Sprites; Vercel remains explicit until THE-2234 lands.
 provider_ledger_name() {
   case "$provider" in
-    sprites)
-      local f id state kind
-      for f in "$XDG_STATE_HOME"/thegn/vps/*.json; do
-        [ -f "$f" ] || continue
-        kind="$(sed -n 's/.*"provider"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
-        state="$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
-        [ "$kind" = sprites ] && [ "$state" = ready ] || continue
-        id="${f##*/}"
-        printf '%s\n' "${id%.json}"
-      done
-      ;;
-    *) return 2 ;;
+  sprites)
+    local f id state kind
+    for f in "$XDG_STATE_HOME"/thegn/vps/*.json; do
+      [ -f "$f" ] || continue
+      kind="$(sed -n 's/.*"provider"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
+      state="$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
+      [ "$kind" = sprites ] && [ "$state" = ready ] || continue
+      id="${f##*/}"
+      printf '%s\n' "${id%.json}"
+    done
+    ;;
+  *) return 2 ;;
   esac
 }
 provider_ledger_all() {
   case "$provider" in
-    sprites)
-      local f id kind
-      for f in "$XDG_STATE_HOME"/thegn/vps/*.json; do
-        [ -f "$f" ] || continue
-        kind="$(sed -n 's/.*"provider"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
-        [ "$kind" = sprites ] || continue
-        id="${f##*/}"
-        printf '%s\n' "${id%.json}"
-      done
-      ;;
-    *) return 2 ;;
+  sprites)
+    local f id kind
+    for f in "$XDG_STATE_HOME"/thegn/vps/*.json; do
+      [ -f "$f" ] || continue
+      kind="$(sed -n 's/.*"provider"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
+      [ "$kind" = sprites ] || continue
+      id="${f##*/}"
+      printf '%s\n' "${id%.json}"
+    done
+    ;;
+  *) return 2 ;;
   esac
 }
 provider_session_prefix() {
   case "$provider" in
-    sprites) PROVIDER_PREFIX=("$THEGN_BIN" sprite-exec "$1" --) ;;
-    *) return 2 ;;
+  sprites) PROVIDER_PREFIX=("$THEGN_BIN" sprite-exec "$1" --) ;;
+  *) return 2 ;;
   esac
 }
 provider_workdir_expr() {
+  # shellcheck disable=SC2016 # literal: the remote shell expands $HOME, not this one
   case "$provider" in
-    sprites) printf '%s\n' '$HOME/workspace' ;;
-    *) return 2 ;;
+  sprites) printf '%s\n' '$HOME/workspace' ;;
+  *) return 2 ;;
   esac
 }
 provider_known_quirks() {
   case "$provider" in
-    sprites) printf '%s\n' 'THE-2450 (first tty chunk without its line ending)' ;;
-    *) return 2 ;;
+  sprites) printf '%s\n' 'THE-2450 (first tty chunk without its line ending)' ;;
+  *) return 2 ;;
   esac
 }
 case "$provider" in
-  sprites) ;;
-  *) echo "remote-parity: no headless exec bridge for provider $provider yet" >&2; exit 2 ;;
+sprites) ;;
+*)
+  echo "remote-parity: no headless exec bridge for provider $provider yet" >&2
+  exit 2
+  ;;
 esac
 
 pinned_socket="$("$THEGN_BIN" config get daemon.socket 2>/dev/null || true)"
@@ -382,10 +417,11 @@ open_start="$(mono_ns)"
 local_open_params="$(open_params "$local_argv_json")"
 local_open_json="$("$THEGN_BIN" api call sessions.open --params "$local_open_params")"
 open_end="$(mono_ns)"
-LOCAL_OPEN_MS="$(( (open_end - open_start) / 1000000 ))"
+LOCAL_OPEN_MS="$(((open_end - open_start) / 1000000))"
 LOCAL_SESSION="$(printf '%s' "$local_open_json" | session_id)"
 
 provider_session_prefix "$RUN_RECORDS"
+# shellcheck disable=SC2016 # literal: the remote shell expands these
 remote_cmd='export PS1="PARITY$ "; cd "$HOME/workspace" 2>/dev/null; command -v bash >/dev/null 2>&1 && exec bash --norc --noprofile -i; exec sh -i'
 remote_argv_json="$(PROVIDER_PREFIX_JSON="$(json_argv "${PROVIDER_PREFIX[@]}")" REMOTE_CMD="$remote_cmd" python3 -I -c '
 import json, os
@@ -395,7 +431,7 @@ open_start="$(mono_ns)"
 remote_open_params="$(open_params "$remote_argv_json")"
 remote_open_json="$("$THEGN_BIN" api call sessions.open --params "$remote_open_params")"
 open_end="$(mono_ns)"
-REMOTE_OPEN_MS="$(( (open_end - open_start) / 1000000 ))"
+REMOTE_OPEN_MS="$(((open_end - open_start) / 1000000))"
 REMOTE_SESSION="$(printf '%s' "$remote_open_json" | session_id)"
 
 # P00: a remote shell that exits inside ten seconds proves the provider token
@@ -430,5 +466,7 @@ sys.stdout.write(s)
   exit 1
 fi
 
-export RP_THEGN_BIN="$THEGN_BIN" RP_LOCAL_SESSION="$LOCAL_SESSION" RP_REMOTE_SESSION="$REMOTE_SESSION" RP_REPO="$REPO" RP_TMP="$TMP" RP_PROVIDER="$provider" RP_SAMPLES="$samples" RP_KEEP_GOING="$keep_going" RP_IDLE_PROBE="$idle_probe" RP_LOCAL_OPEN_MS="$LOCAL_OPEN_MS" RP_REMOTE_OPEN_MS="$REMOTE_OPEN_MS" RP_PROVIDER_QUIRK="$(provider_known_quirks)" RP_LOCAL_ARGV_JSON="$local_argv_json" RP_REMOTE_ARGV_JSON="$remote_argv_json" RP_REMOTE_WORKDIR_EXPR="$(provider_workdir_expr)" RP_ENV_NAME="$env_name"
+provider_quirk="$(provider_known_quirks)"
+workdir_expr="$(provider_workdir_expr)"
+export RP_THEGN_BIN="$THEGN_BIN" RP_LOCAL_SESSION="$LOCAL_SESSION" RP_REMOTE_SESSION="$REMOTE_SESSION" RP_REPO="$REPO" RP_TMP="$TMP" RP_PROVIDER="$provider" RP_SAMPLES="$samples" RP_KEEP_GOING="$keep_going" RP_IDLE_PROBE="$idle_probe" RP_LOCAL_OPEN_MS="$LOCAL_OPEN_MS" RP_REMOTE_OPEN_MS="$REMOTE_OPEN_MS" RP_PROVIDER_QUIRK="$provider_quirk" RP_LOCAL_ARGV_JSON="$local_argv_json" RP_REMOTE_ARGV_JSON="$remote_argv_json" RP_REMOTE_WORKDIR_EXPR="$workdir_expr" RP_ENV_NAME="$env_name"
 python3 -I test/remote_parity.py
