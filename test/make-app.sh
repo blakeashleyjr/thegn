@@ -317,23 +317,61 @@ if [[ $command_text == *TG_PROBE* || $command_text == *pwned* ]]; then
   fail "terminal command contains an environment value"
 fi
 
+# Negative launcher tests must not open a GUI dialog on macOS. Replace the
+# absolute osascript path only in these copied test bundles; generated app
+# bundles and their normal user-facing alerts remain unchanged.
+alert_stub="$tmp/osascript-alert-stub"
+alert_log="$tmp/osascript-alerts.log"
+cat >"$alert_stub" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "${2-}" >>"$THEGN_TEST_ALERT_LOG"
+EOF
+chmod 0755 "$alert_stub"
+install_headless_alert_stub() {
+  local common="$1" quoted
+  printf -v quoted '%q' "$alert_stub"
+  python3 - "$common" "$quoted" <<'PY'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+contents = path.read_bytes()
+needle = b"/usr/bin/osascript"
+if contents.count(needle) != 1:
+    raise SystemExit("expected exactly one GUI-alert command in common.sh")
+path.write_bytes(contents.replace(needle, sys.argv[2].encode(), 1))
+PY
+}
+assert_malformed_refusal() {
+  local bundle="$1" stderr="$2" expected_message expected_alert
+  expected_message="invalid launcher environment entry in $bundle/Contents/Resources/env"
+  expected_alert="display alert \"thegn\" message \"$expected_message\" as critical"
+  grep -Fxq "thegn: $expected_message" "$stderr" || fail "malformed environment refusal diagnostic changed"
+  [[ "$(cat "$alert_log")" == "$expected_alert" ]] || fail "malformed environment refusal did not issue exactly the expected alert"
+}
+
 # A tampered key record refuses before the target process can run.
 tampered_bundle="$tmp/tampered.app"
 cp -R "$probe_bundle" "$tampered_bundle"
+install_headless_alert_stub "$tampered_bundle/Contents/Resources/common.sh"
 printf 'BAD;KEY=x\0' >>"$tampered_bundle/Contents/Resources/env"
-if ENVDUMP_OUT="$tmp/tampered.out" USER="$test_user" bash "$tampered_bundle/Contents/Resources/thegn.command" >"$tmp/tampered.stdout" 2>"$tmp/tampered.stderr"; then
+if THEGN_TEST_ALERT_LOG="$alert_log" ENVDUMP_OUT="$tmp/tampered.out" USER="$test_user" bash "$tampered_bundle/Contents/Resources/thegn.command" >"$tmp/tampered.stdout" 2>"$tmp/tampered.stderr"; then
   fail "tampered environment key was accepted"
 fi
 [[ ! -e "$tmp/tampered.out" ]] || fail "tampered environment reached the target process"
+assert_malformed_refusal "$tampered_bundle" "$tmp/tampered.stderr"
 
 # A record without '=' is malformed even though its text resembles a valid key.
 no_value_bundle="$tmp/no-value.app"
 cp -R "$probe_bundle" "$no_value_bundle"
+install_headless_alert_stub "$no_value_bundle/Contents/Resources/common.sh"
+: >"$alert_log"
 printf 'FOO\0' >>"$no_value_bundle/Contents/Resources/env"
-if ENVDUMP_OUT="$tmp/no-value.out" USER="$test_user" bash "$no_value_bundle/Contents/Resources/thegn.command" >"$tmp/no-value.stdout" 2>"$tmp/no-value.stderr"; then
+if THEGN_TEST_ALERT_LOG="$alert_log" ENVDUMP_OUT="$tmp/no-value.out" USER="$test_user" bash "$no_value_bundle/Contents/Resources/thegn.command" >"$tmp/no-value.stdout" 2>"$tmp/no-value.stderr"; then
   fail "environment record without '=' was accepted"
 fi
 [[ ! -e "$tmp/no-value.out" ]] || fail "malformed environment record reached the target process"
+assert_malformed_refusal "$no_value_bundle" "$tmp/no-value.stderr"
 
 python3 -B "$repo/test/app_bundle_fs_test.py" || fail "bundle filesystem race tests failed"
 
