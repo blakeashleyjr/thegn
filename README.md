@@ -398,7 +398,8 @@ thegn is a TUI, so on macOS the launcher entry is a generated `thegn.app` in
 `~/Applications` that opens a terminal emulator running thegn — Spotlight,
 Raycast, Alfred and the Dock all index it. `./install.sh` writes it
 automatically; for Nix installs, or Homebrew if published, generate it from a
-checkout:
+checkout. Safe staging requires Python 3.9 or newer (`python3`); the generator
+checks for it before changing the app destination:
 
 ```sh
 just macos-app                                  # points at `thegn` on PATH
