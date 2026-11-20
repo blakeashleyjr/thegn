@@ -3,6 +3,11 @@ use crate::hydrate_tuning::DEFAULT_MODEL_REFRESH_MS;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
 #[test]
+fn config_source_path_is_none_until_set() {
+    assert!(super::config_source_path().is_none());
+}
+
+#[test]
 fn diff_read_failure_marks_change_rows_unavailable() {
     let status = [thegn_svc::git::FileStatus {
         path: "src/a.rs".into(),
