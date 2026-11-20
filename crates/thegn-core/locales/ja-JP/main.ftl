@@ -122,6 +122,7 @@ action-focus-panel = Focus diff / PR panel
 action-toggle-notifications = Toggle Notifications panel
 action-open-ci = Open CI/CD runs panel
 action-open-usage = AI account usage
+action-open-info = Info screen
 action-open-monitor = System monitor
 action-open-pipeline-board = Pipeline board
 action-open-calendar = Calendar & world clocks
