@@ -2433,17 +2433,21 @@ fn disk_health_report(report: crate::platform::DiskHealthReport) {
         crate::platform::DiskHealthReport::Unavailable(reason) => {
             outln!("  health: n/a (udisks2 unavailable): {reason}");
         }
+        #[cfg(target_os = "linux")]
         crate::platform::DiskHealthReport::Degraded { drives, reason } => {
             outln!("  health: partial ({reason})");
             disk_health_drives_report(drives);
         }
+        #[cfg(target_os = "linux")]
         crate::platform::DiskHealthReport::Available(drives) if drives.is_empty() => {
             outln!("  health: n/a (udisks2 unavailable): no drives reported");
         }
+        #[cfg(target_os = "linux")]
         crate::platform::DiskHealthReport::Available(drives) => disk_health_drives_report(drives),
     }
 }
 
+#[cfg(target_os = "linux")]
 fn disk_health_drives_report(drives: Vec<crate::platform::DiskHealth>) {
     for drive in drives {
         let serial = drive.serial_last4.as_deref().unwrap_or("n/a");

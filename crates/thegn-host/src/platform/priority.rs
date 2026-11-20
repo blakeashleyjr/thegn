@@ -16,10 +16,6 @@ pub enum IoClass {
     RealTime(u8),
     BestEffort(u8),
     Idle,
-    #[cfg_attr(
-        not(target_os = "linux"),
-        expect(dead_code, reason = "constructed only by the Linux ioprio decoder")
-    )]
     None,
 }
 
