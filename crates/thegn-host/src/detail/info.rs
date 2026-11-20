@@ -37,8 +37,7 @@ pub(crate) fn target_for(
     let row = row.or_else(|| {
         active.as_deref().and_then(|path| {
             model.sidebar_rows.iter().find(|candidate| {
-                candidate.kind == RowKind::Worktree
-                    && candidate.worktree_path.as_deref() == Some(path)
+                candidate.kind.is_worktree() && candidate.worktree_path.as_deref() == Some(path)
             })
         })
     })?;
@@ -51,7 +50,7 @@ pub(crate) fn target_for(
             },
             row.label.clone(),
         ),
-        RowKind::Worktree => {
+        RowKind::Worktree | RowKind::PipelineWorktree => {
             let worktree = row.worktree_path.clone()?;
             (
                 InfoTarget {
@@ -73,7 +72,7 @@ pub(crate) fn target_for(
         let mut known = 0;
         for sibling in model.sidebar_rows.iter().filter(|candidate| {
             candidate.visible
-                && candidate.kind == RowKind::Worktree
+                && candidate.kind.is_worktree()
                 && candidate.workspace_slug == row.workspace_slug
         }) {
             if let Some(meta) = sibling.branch_meta.as_ref() {

@@ -48,10 +48,11 @@ pub enum RowKind {
     /// the same reason: there is no `folders` row behind it.
     PipelineLane,
     /// A pipeline-owned worktree's primary row, nested inside its lane folder.
-    /// It carries the usual worktree target/status/action fields and a stable,
-    /// path-qualified `pin_key`; bulk actions and pinning work as they do on
-    /// ordinary worktree rows. Drag reordering remains unavailable because
-    /// pipeline lane order comes from the dispatch roster.
+    /// It carries the same worktree target/status/action contract as an
+    /// ordinary row. Its `{workspace}/{label}` pin identity is shared with the
+    /// ordinary grouped and flat layouts, so pins survive ownership changes.
+    /// Drag reordering remains unavailable because lane order comes from the
+    /// dispatch roster.
     PipelineWorktree,
     /// A **derived** "Other (N)" group under a workspace holding its
     /// *external* worktrees — git worktrees thegn did not create (see
@@ -436,16 +437,12 @@ impl SidebarRow {
     /// with a stable identity. Excludes section headings / empty hints (no
     /// `pin_key`) and folders / terminals (no bulk or reorder action).
     pub fn is_markable(&self) -> bool {
-        !self.pin_key.is_empty()
-            && matches!(
-                self.kind,
-                RowKind::Workspace | RowKind::Worktree | RowKind::PipelineWorktree
-            )
+        !self.pin_key.is_empty() && (self.kind == RowKind::Workspace || self.is_worktree())
     }
 
     /// Whether this row can be pinned (floated to the top of its sibling run).
-    /// Groups carry a key for collapse state. A pipeline worktree leaf has a
-    /// path-stable key and can be pinned within its derived lane.
+    /// Groups carry a key for collapse state. Worktree leaves share one
+    /// identity across ordinary and pipeline layouts.
     pub fn is_pinnable(&self) -> bool {
         !self.pin_key.is_empty()
             && !matches!(
@@ -1817,7 +1814,7 @@ fn push_pipeline_group(
                     SidebarRow::base(RowKind::PipelineWorktree, 3, wt.name.clone(), group_slug)
                 });
             row.kind = RowKind::PipelineWorktree;
-            row.pin_key = format!("pipeline/worktree:{identity}");
+            row.pin_key = format!("{group_slug}/{}", row.label);
             row.label = wt.name.clone();
             row.visible = !parent_collapsed && !group_collapsed && !lane_collapsed;
             row.worktree_path = Some(wt.path.clone());
@@ -2393,7 +2390,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     }
                 }
             }
-            RowKind::Worktree => {
+            RowKind::Worktree | RowKind::PipelineWorktree => {
                 if keep[i] {
                     if let Some(w) = last_workspace {
                         keep[w] = true; // surface the parent repo header
@@ -2478,7 +2475,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     keep[i] = true;
                 }
             }
-            RowKind::Worktree => {
+            RowKind::Worktree | RowKind::PipelineWorktree => {
                 // Loose worktrees (depth 1) follow the workspace's reveal;
                 // filed worktrees (depth 2) also reveal when their folder did.
                 if reveal_ws || (rows[i].depth >= 2 && reveal_folder) {
@@ -5423,7 +5420,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pipeline_worktree_uses_the_existing_target_and_path_qualified_identity() {
+    fn a_pipeline_worktree_uses_the_existing_target_and_ordinary_pin_identity() {
         let s = session(vec![tab("app/home", "/wt/home")], 0);
         let rows = build_rows(
             &s,
@@ -5446,11 +5443,70 @@ mod tests {
                     && r.worktree_path.as_deref() == Some("/wt/home")),
             "the pipeline leaf is the only default-layout row for this path"
         );
-        // The identity is path-scoped, so it survives lane roster changes and
-        // display-name collisions.
-        assert_eq!(mirror.pin_key, "pipeline/worktree:/wt/home");
+        // Existing pins use {workspace}/{label}; retaining that identity
+        // preserves them through flat/grouped layout and ownership changes.
+        assert_eq!(mirror.pin_key, "app/home");
         assert!(mirror.is_markable());
         assert!(mirror.is_pinnable());
+    }
+
+    #[test]
+    fn existing_worktree_pin_identity_survives_pipeline_layout_transitions() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let view = ViewState {
+            pins: vec!["app/home".into()],
+            ..ViewState::default()
+        };
+        let pipeline = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let pipeline_key = pipeline
+            .iter()
+            .find(|row| row.kind == RowKind::PipelineWorktree)
+            .unwrap()
+            .pin_key
+            .clone();
+
+        let mut flat_view = view.clone();
+        flat_view.flat = true;
+        let flat = build_rows(
+            &s,
+            &app_workspace(),
+            &flat_view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let flat_key = flat
+            .iter()
+            .find(|row| {
+                row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/home")
+            })
+            .unwrap()
+            .pin_key
+            .clone();
+
+        let ordinary = build_rows(&s, &app_workspace(), &view, &no_activity(), &[], &[], &[]);
+        let ordinary_key = ordinary
+            .iter()
+            .find(|row| {
+                row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/home")
+            })
+            .unwrap()
+            .pin_key
+            .clone();
+
+        assert_eq!(pipeline_key, "app/home");
+        assert_eq!(flat_key, pipeline_key);
+        assert_eq!(ordinary_key, pipeline_key);
+        assert!(view.pins.contains(&pipeline_key));
     }
 
     #[test]

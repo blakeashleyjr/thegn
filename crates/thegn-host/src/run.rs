@@ -8728,6 +8728,7 @@ async fn event_loop<T: Terminal>(
                             matches!(
                                 r.kind,
                                 crate::sidebar::RowKind::Worktree
+                                    | crate::sidebar::RowKind::PipelineWorktree
                                     | crate::sidebar::RowKind::Workspace
                             )
                         })
@@ -27523,7 +27524,8 @@ async fn event_loop<T: Terminal>(
                                     // cursor, matching the two arms above —
                                     // this used to move the *active* worktree
                                     // no matter where the cursor sat.
-                                    Some(crate::sidebar::RowKind::Worktree) => {
+                                    Some(crate::sidebar::RowKind::Worktree)
+                                    | Some(crate::sidebar::RowKind::PipelineWorktree) => {
                                         sb.move_cursor_worktree(&mut model, &mut session, up)
                                     }
                                     _ => sb.move_active_worktree(&mut model, &mut session, up),

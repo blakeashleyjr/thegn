@@ -16,9 +16,12 @@ legacy-held stage rows without artifacts. A worktree whose persisted selected
 environment is exactly the reserved `pipeline` environment SHALL also be filed
 under Pipelines while no stage row exists. Other environment names SHALL NOT
 establish pipeline ownership. Roster stage references and environment
-ownership for one normalized path SHALL produce one actionable leaf with
-stable path identity. An explicit user folder assignment MAY override the
-default Pipelines filing.
+ownership for one normalized path SHALL produce one actionable leaf. The leaf
+SHALL share the ordinary worktree's rendering, Info, attention navigation,
+quick-jump, and exact-target action behavior. Its pin identity SHALL remain the
+existing `{project}/{worktree label}` key across grouped and flat layouts and
+ownership changes, preserving existing pins. An explicit user folder
+assignment MAY override the default Pipelines filing.
 
 A lane's project SHALL be resolved from the first of its worktrees that
 resolves through live session groups or DB-registered worktrees; when none does,
@@ -28,8 +31,9 @@ ambiguous and ignored. A lane that resolves to no project SHALL contribute no
 rows to the tree; it remains on the pipeline board, which is the complete view
 of the roster.
 
-The leaf SHALL retain the ordinary worktree's target and status so activation,
-worktree actions, filtering, and cursor anchoring continue to work. If that
+The leaf SHALL retain the ordinary worktree's target and complete status
+rendering so activation, worktree actions, filtering, and cursor anchoring
+continue to work. If that
 worktree is the active session worktree, its Pipelines and lane ancestors SHALL
 be rendered open for that frame even when their persisted collapsed keys are
 set; the collapsed state itself MUST NOT be changed. The flat layout has no
@@ -94,6 +98,19 @@ via `Action::OpenPipelineBoard`.
 - **WHEN** the user selects flat layout
 - **THEN** pipeline worktrees remain ordinary rows in the flat list and no
   pipeline group, lane, or leaf rows are emitted
+
+#### Scenario: Pipeline leaves keep ordinary worktree interactions
+
+- **WHEN** a pipeline-owned worktree appears under a lane
+- **THEN** it shows the ordinary activity, Git, PR, environment, and detail
+  fields, supports Info and attention navigation, receives its Alt-number
+  slot, and move actions target that selected leaf
+
+#### Scenario: Existing pins survive layout and ownership changes
+
+- **WHEN** an ordinary worktree is already pinned and becomes pipeline-owned,
+  or the user switches between grouped and flat layouts
+- **THEN** its existing pin continues to identify the same worktree
 
 #### Scenario: An unattributable lane is left out of the tree
 

@@ -2062,7 +2062,7 @@ mod tests {
         let model = FrameModel {
             sidebar_rows: vec![SidebarRow {
                 worktree_path: Some("/repos/app-pipeline".into()),
-                pin_key: "pipeline/worktree:/repos/app-pipeline".into(),
+                pin_key: "app/app-pipeline".into(),
                 branch: Some("feature".into()),
                 tab_target: Some(RowTarget::Tab(0, 0)),
                 ..SidebarRow::base(RowKind::PipelineWorktree, 3, "app-pipeline", "app")
@@ -2087,6 +2087,11 @@ mod tests {
             );
         }
         assert!(menu.entries.iter().any(|entry| entry.id == "pin"));
+        assert!(matches!(
+            sb.folder_outcome(&model),
+            Some(SidebarOutcome::MoveToFolder { worktree_path, .. })
+                if worktree_path == "/repos/app-pipeline"
+        ));
     }
 
     /// The "show more" row toggles on Enter and on Space, `j` lands on it,
