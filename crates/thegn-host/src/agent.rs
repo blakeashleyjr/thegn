@@ -2490,7 +2490,7 @@ impl ProvisionOutcome {
 
 /// Provision the worktree's environment if it runs on a managed **provider**
 /// (sprites, …) — a no-op (`Ok(false)`) for local/ssh/k8s envs. Resolves the env
-/// from the worktree, then delegates to [`provision_provider_env`]. This is the
+/// from the worktree, then delegates to `provision_provider_env_inner`. This is the
 /// entry point the run loop calls off-thread before resolving the pane's launch
 /// spec, so a fresh sandbox is set up (and the loading screen streamed) before
 /// the pane attaches.
