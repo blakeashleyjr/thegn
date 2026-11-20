@@ -71,7 +71,7 @@ impl HostFeed {
 
     /// Push one sample taken at `ts_secs` (Unix seconds). `cadence_secs` is
     /// the producer's interval for this sample; it sets the gap tolerance
-    /// before it. Samples under [`MIN_FEED_SPACING_SECS`] after the newest
+    /// before it. Samples under `MIN_FEED_SPACING_SECS` after the newest
     /// retained one are dropped.
     pub fn push(&self, ts_secs: f64, snap: &StatsSnapshot, cadence_secs: f64) {
         if let Ok(mut r) = self.ring.lock() {

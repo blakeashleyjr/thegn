@@ -281,6 +281,9 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   `recent` (JSON `recent: true`) in the partial column, because the usage API may
   not have reported it yet; read a low figure on it as "not yet". A failed account read shows "account usage
   unavailable" and never hides the per-sprite rows.
+  On Sprites, reading costs calls the provider's usage endpoints, and a sprite
+  has been seen to read `running` once right after such a read; thegn makes no
+  command or wake call for a cost read.
 - **Results.** A sprite pulls its commits back on exit. `thegn agent run --wait --pull`
   also runs `env pull` after the agent exits and reports it in text and `--json`.
 
@@ -307,12 +310,20 @@ list page, `#[ignore]`d and read-only) compares paged and unpaged results.
 Newer steps (dev channel, unverified live until a paid run passes them):
 
 - `4b` checks that `sprite-exec` returns the command's exit status (3) and its
-  stderr to the caller.
+  stderr to the caller, accepting the remote command's error text on either
+  output stream.
+- `10b` reads the sprite's state up to four times, ten seconds apart, after the
+  cost read. It fails only if the sprite reads running every time it can be
+  read, and warns on a single running reading or an unreadable listing.
 - `10w` wakes a cold sprite with `sprite-exec -- true` and prints how long the
   wake took (it must finish within 150 s).
 - `--with-agent <name>` is opt-in. It adds the agent steps (7g-7i), which run
   `agent run --wait --pull --json` and so spend model usage. Without it those
   steps are skipped and the plan prints no spend.
+  A failed agent step prints the agent's status, exit code, error and last
+  output lines, never secrets.
+- The teardown removes a sandbox through its worktree when `env deprovision`
+  refuses it.
 - The state checks are specific to the row they exercise, not to the whole
   fleet.
 

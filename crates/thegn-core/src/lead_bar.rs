@@ -70,7 +70,7 @@ pub struct LeadBar {
     pub tabs: u32,
     /// Pending approval requests; None means unreadable.
     pub approvals: Option<u32>,
-    /// "<issue> <stage>" of the newest pending request.
+    /// `<issue> <stage>` of the newest pending request.
     pub first_request: Option<String>,
     pub lanes: Option<Meter>,
     pub spawns: Option<Meter>,
