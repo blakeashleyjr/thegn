@@ -266,12 +266,12 @@ The Info screen answers "what is actually in force here, and who set it" for a
 workspace or one worktree: identity, git facts, live sessions, the effective
 sandbox settings, which backend would launch, and any per-worktree overrides.
 
-| Surface     | How                                                              |
-| ----------- | ---------------------------------------------------------------- |
-| Sidebar     | `I` on a row (workspace or worktree)                             |
-| Anywhere | the palette action "Info screen" (`open-info`); no chord is bound by default |
-| CLI         | `thegn info [--workspace SLUG\|PATH] [--worktree PATH\|BRANCH]`  |
-| CLI, JSON   | `thegn info --json`                                              |
+| Surface   | How                                                                          |
+| --------- | ---------------------------------------------------------------------------- |
+| Sidebar   | `I` on a row (workspace or worktree)                                         |
+| Anywhere  | the palette action "Info screen" (`open-info`); no chord is bound by default |
+| CLI       | `thegn info [--workspace SLUG\|PATH] [--worktree PATH\|BRANCH]`              |
+| CLI, JSON | `thegn info --json`                                                          |
 
 The target is the row under the sidebar cursor when the sidebar is focused,
 otherwise the active worktree. The CLI defaults to the worktree you are in. The
@@ -285,21 +285,21 @@ shape is a stable API: changes are additive only.
 
 Every value names the layer that set it, or says why it has none.
 
-| Label                | Meaning                                                              |
-| -------------------- | -------------------------------------------------------------------- |
-| builtin              | the compiled-in default                                              |
-| global, profile file | your global or profile config file                                   |
-| runtime              | a runtime override                                                   |
-| loaded (differs)     | the file on disk no longer matches what thegn loaded; restart or reload |
-| profile table, workspace, repo, zone | the named layer or table in your own config     |
-| env NAME             | the environment definition that supplied it                          |
-| placement            | forced by where the worktree runs                                    |
-| worktree pick, worktree db | a choice saved for this worktree                               |
-| probed now           | checked while building the report                                    |
-| recorded             | the last value thegn saw, not a fresh check                          |
-| cache NAME, 3m ago   | a cached value and its age                                           |
-| git, daemon, database, sidebar | where a live fact was read from                            |
-| not measured         | nothing was read; the TUI only shows ahead/behind/dirty from the sidebar cache |
+| Label                                | Meaning                                                                        |
+| ------------------------------------ | ------------------------------------------------------------------------------ |
+| builtin                              | the compiled-in default                                                        |
+| global, profile file                 | your global or profile config file                                             |
+| runtime                              | a runtime override                                                             |
+| loaded (differs)                     | the file on disk no longer matches what thegn loaded; restart or reload        |
+| profile table, workspace, repo, zone | the named layer or table in your own config                                    |
+| env NAME                             | the environment definition that supplied it                                    |
+| placement                            | forced by where the worktree runs                                              |
+| worktree pick, worktree db           | a choice saved for this worktree                                               |
+| probed now                           | checked while building the report                                              |
+| recorded                             | the last value thegn saw, not a fresh check                                    |
+| cache NAME, 3m ago                   | a cached value and its age                                                     |
+| git, daemon, database, sidebar       | where a live fact was read from                                                |
+| not measured                         | nothing was read; the TUI only shows ahead/behind/dirty from the sidebar cache |
 
 Secrets and credential-bearing URLs are never shown, and error text from the
 merge queue and pull requests is redacted.
