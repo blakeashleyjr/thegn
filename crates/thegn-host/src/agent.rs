@@ -2564,6 +2564,39 @@ pub(crate) fn provision_worktree_mode(
     provision_provider_env_inner(cfg, worktree, &environment.name, None, mode, &mut progress)
 }
 
+/// Finish an existing deferred provision without creating or recreating its
+/// sandbox. The run lease is acquired before `provision_worktree_mode` takes
+/// `sandbox_lock`, so callers may use this from headless and attach paths.
+pub(crate) fn finish_deferred_blocking(
+    cfg: &Config,
+    worktree: &str,
+    progress: &mut dyn FnMut(&[ProvisionStepView]),
+) -> anyhow::Result<()> {
+    let Some((_, id)) = crate::provision_gate::provider_target(cfg, worktree)? else {
+        return Ok(());
+    };
+    let Some(entry) = thegn_core::provision_journal::read(&id) else {
+        return Ok(());
+    };
+    if entry.state == thegn_core::provision_journal::DeferredState::Cancelled {
+        anyhow::bail!(
+            "background setup for {worktree} was cancelled; reopen it or run `thegn env up --worktree {worktree}` to retry"
+        );
+    }
+    let lease = thegn_core::provision_journal::run_lease(
+        &id,
+        thegn_core::provision_journal::LeaseWait::Block,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("could not acquire the deferred provision lease for {id}"))?;
+    provision_worktree_mode(
+        cfg,
+        worktree,
+        ProvisionMode::Deferred(lease),
+        &mut *progress,
+    )
+    .map(|_| ())
+}
+
 /// The env selection for a provider exec/proxy/cooldown decision. `None` when
 /// it cannot be read: the caller refuses instead of resolving the default env.
 fn env_selection_or_refuse(
@@ -3025,19 +3058,23 @@ fn provision_provider_env_inner(
     }
     let loc = GitLoc::for_worktree_op(Path::new(worktree), "provider provisioning")
         .map_err(anyhow::Error::msg)?;
-    // Serialize concurrent provisions of the same sandbox (eager vs focused
-    // materialize): the loser blocks here (off-loop by contract), then the
-    // marker short-circuit below makes its run a no-op. The marker alone only
-    // guards SEQUENTIAL re-runs — it is written at the END of the pipeline.
+    // Prompt-first fast path: a pane opened during the deferred phase never waits on sandbox_lock (D-pf-c).
     if matches!(&mode, ProvisionMode::Foreground)
         && name_override.is_none()
         && crate::provider_workdir::is_provisioned_locally(&id)
         && journal::read(&id).is_some()
     {
-        return Ok(ProvisionOutcome::pending(
-            &id,
-            journal::run_lease(&id, journal::LeaseWait::Try)?,
-        ));
+        match journal::run_lease(&id, journal::LeaseWait::Try) {
+            Ok(lease) => return Ok(ProvisionOutcome::pending(&id, lease)),
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::provider",
+                    %id,
+                    %error,
+                    "D-pf-f: could not acquire the deferred run lease; continuing with the locked path"
+                );
+            }
+        }
     }
     let phase = mode.phase();
     let mut _held = match mode {
@@ -3045,6 +3082,10 @@ fn provision_provider_env_inner(
         ProvisionMode::Deferred(lease) => Some(lease),
     };
     let mut deferred_only = phase == Phase::Deferred;
+    // Serialize concurrent provisions of the same sandbox (eager vs focused
+    // materialize): the loser blocks here (off-loop by contract), then the
+    // marker short-circuit below makes its run a no-op. The marker alone only
+    // guards SEQUENTIAL re-runs — it is written at the END of the pipeline.
     // Blocking acquisition belongs off the event loop. In particular, do not
     // wait for a run lease while this sandbox lock is held.
     let mut _gate = Some(crate::provision_gate::sandbox_lock(&id));
@@ -3232,15 +3273,40 @@ fn provision_provider_env_inner(
                     tracing::warn!(target: "thegn::provider", %id, %error, "could not write deferred provision journal");
                 }
             }
-            return Ok(ProvisionOutcome::pending(
-                &id,
-                journal::run_lease(&id, journal::LeaseWait::Try)?,
-            ));
+            let lease = match journal::run_lease(&id, journal::LeaseWait::Try) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "thegn::provider",
+                        %id,
+                        %error,
+                        "D-pf-f: could not acquire the deferred run lease; reporting pending"
+                    );
+                    None
+                }
+            };
+            return Ok(ProvisionOutcome::pending(&id, lease));
         }
         journal::PhaseAction::RunAll
         | journal::PhaseAction::RunForeground
         | journal::PhaseAction::RunDeferred => {}
         journal::PhaseAction::WaitThenRunDeferred => unreachable!("wait action is resolved above"),
+    }
+    let run_started_ms = thegn_core::util::now_ms();
+    if deferred_only
+        && let Some(entry) = journal::read(&id)
+        && entry.state == journal::DeferredState::Cancelled
+        && entry.updated_ms + 600_000 < run_started_ms
+    {
+        let pending = journal::Journal::pending(worktree, env_name);
+        if let Err(error) = journal::write(&id, &pending) {
+            tracing::warn!(
+                target: "thegn::provider",
+                %id,
+                %error,
+                "could not reset stale cancelled deferred provision journal"
+            );
+        }
     }
 
     // Resolve the repo origin so the sprite can clone it.
@@ -3267,7 +3333,8 @@ fn provision_provider_env_inner(
     if !grant.login_files {
         withheld.push("agent logins".to_string());
     }
-    if kind == thegn_core::config::EnvProviderKind::Sprites
+    if !deferred_only
+        && kind == thegn_core::config::EnvProviderKind::Sprites
         && let Some(message) = sprites_withheld_notice(env_name, &withheld)
     {
         thegn_core::msg::info(&message);
@@ -3558,7 +3625,13 @@ fn provision_provider_env_inner(
     let fg_tail = |base: Option<&str>| -> anyhow::Result<(
         Option<thegn_core::provision_journal::RunLease>,
         bool,
+        bool,
     )> {
+        // Install only after the base checkpoint step so a bearer token is never
+        // captured in a reusable image/artifact. This is a fatal provisioning
+        // boundary: route mode must not open a remote shell that could silently
+        // enqueue into a sprite-local queue.
+        // A credential-free kind never holds a route-to-host bearer; `false` revokes and removes one.
         if !bg_has_checkpoint {
             crate::remote_enqueue_auth::reconcile_provider_credential(
                 cfg,
@@ -3572,30 +3645,44 @@ fn provision_provider_env_inner(
         }
         let mut lease = None;
         let mut journaled = false;
+        let mut busy = false;
         if !deferred_steps.is_empty() {
-            lease = journal::run_lease(&id, journal::LeaseWait::Try)?;
-            let pending = journal::Journal::pending(worktree, env_name);
-            journaled = match journal::write(&id, &pending) {
-                Ok(()) => true,
+            match journal::run_lease(&id, journal::LeaseWait::Try) {
+                Ok(Some(found)) => lease = Some(found),
+                Ok(None) => busy = true,
                 Err(error) => {
                     tracing::warn!(
                         target: "thegn::provider",
                         %id,
                         %error,
-                        "could not write deferred provision journal; continuing in foreground"
+                        "D-pf-f: could not acquire the deferred run lease; continuing in line"
                     );
-                    false
                 }
-            };
+            }
+            if lease.is_some() {
+                let pending = journal::Journal::pending(worktree, env_name);
+                journaled = match journal::write(&id, &pending) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "thegn::provider",
+                            %id,
+                            %error,
+                            "could not write deferred provision journal; continuing in foreground"
+                        );
+                        false
+                    }
+                };
+            }
         }
         let marker_bytes = if deferred_steps.is_empty() {
             envplan::MARKER_DONE
         } else {
             envplan::MARKER_DEFERRED
         };
-        if let Err(error) = block_on_provider(|| async {
-            provider.write(&id, &marker, marker_bytes).await
-        }) {
+        if let Err(error) =
+            block_on_provider(|| async { provider.write(&id, &marker, marker_bytes).await })
+        {
             tracing::debug!(target: "thegn::provider", %id, %error, "could not write provision marker");
         }
         if deferred_steps.is_empty()
@@ -3604,6 +3691,9 @@ fn provision_provider_env_inner(
             tracing::debug!(target: "thegn::provider", %id, %error, "could not clear completed provision journal");
         }
         if let Some((account, key, public)) = &managed_ssh {
+            // Verify that the exact key made it into the remote authorization file
+            // before publishing custody. A failed SSH setup must not become an
+            // apparently-authorized ledger row.
             let key_id = crate::managed_ssh_rotation::key_id(public)?;
             let script = crate::managed_ssh_rotation::authorized_probe_script(&key_id);
             let argv = vec!["sh".to_string(), "-lc".to_string(), script];
@@ -3636,7 +3726,7 @@ fn provision_provider_env_inner(
                 tracing::debug!(target: "thegn::provider", %id, %error, "could not record base snapshot");
             }
         }
-        Ok((lease, journaled))
+        Ok((lease, journaled, busy))
     };
 
     let mut tail_done = false;
@@ -3646,7 +3736,7 @@ fn provision_provider_env_inner(
 
     for (i, step) in steps.iter().enumerate() {
         if i == fg_len && !deferred_only && !tail_done {
-            let (lease, journaled) = fg_tail(base_checkpoint.as_deref())?;
+            let (lease, journaled, busy) = fg_tail(base_checkpoint.as_deref())?;
             if phase == Phase::Foreground && journaled {
                 return Ok(ProvisionOutcome {
                     provisioned: true,
@@ -3657,7 +3747,7 @@ fn provision_provider_env_inner(
                     }),
                 });
             }
-            if lease.is_none() {
+            if busy {
                 anyhow::bail!(
                     "{id}: another thegn process is finishing this sandbox's background setup; retry when it is done"
                 );
@@ -3965,21 +4055,30 @@ fn provision_provider_env_inner(
         }
         journal::JournalAction::MarkFailed => {
             if let Some((label, detail)) = deferred_failure {
-                let failed = journal::Journal::failed(worktree, env_name, &label, &detail);
-                if let Err(error) = journal::write(&id, &failed) {
-                    tracing::warn!(target: "thegn::provider", %id, %error, "could not record failed deferred provision");
+                if !journal::read(&id)
+                    .is_some_and(|entry| entry.state == journal::DeferredState::Cancelled)
+                {
+                    let failed = journal::Journal::failed(worktree, env_name, &label, &detail);
+                    if let Err(error) = journal::write(&id, &failed) {
+                        tracing::warn!(target: "thegn::provider", %id, %error, "could not record failed deferred provision");
+                    }
                 }
             }
         }
         journal::JournalAction::Keep => {}
     }
+    let deferred = if tail.write_done_marker {
+        None
+    } else {
+        Some(DeferredHandoff {
+            sandbox: id,
+            lease: None,
+        })
+    };
     Ok(ProvisionOutcome {
         provisioned: true,
         checkpoint: base_checkpoint,
-        deferred: (!tail.write_done_marker).then(|| DeferredHandoff {
-            sandbox: id,
-            lease: None,
-        }),
+        deferred,
     })
 }
 
