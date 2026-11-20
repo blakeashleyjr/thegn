@@ -3303,6 +3303,8 @@ pub enum ExecProtocolError {
     EmptyFrame,
     UnknownStream(u8),
     MalformedExit,
+    /// The server repeats the exit in binary and JSON forms; a repeat with the
+    /// same code is accepted, but a different code is a protocol error.
     DuplicateExit,
     OutputAfterExit,
     MalformedControl,
@@ -3314,7 +3316,7 @@ impl std::fmt::Display for ExecProtocolError {
             Self::EmptyFrame => "a binary frame has no stream id".to_string(),
             Self::UnknownStream(id) => format!("stream id {id} is not a server stream"),
             Self::MalformedExit => "the exit frame is malformed".to_string(),
-            Self::DuplicateExit => "a second exit arrived".to_string(),
+            Self::DuplicateExit => "a second exit arrived with a different code".to_string(),
             Self::OutputAfterExit => "output arrived after the exit".to_string(),
             Self::MalformedControl => "a control message is malformed".to_string(),
         };
@@ -4219,7 +4221,9 @@ async fn drive_proxy<S>(
 /// Generic over the socket so the concrete (TLS) stream type need not be named.
 /// `tty` selects the wire framing: raw bytes (PTY) vs 1-byte stream-id prefixes
 /// (non-PTY — stdin gets a `0` prefix; only stdout/exit are surfaced, while an
-/// optional stderr sink captures stream id 2).
+/// optional stderr sink captures stream id 2). The server repeats the exit in
+/// binary and JSON forms; a repeat with the same code is accepted, while a
+/// different code is a protocol error.
 async fn drive_exec<S>(
     ws: S,
     tty: bool,
@@ -4366,13 +4370,14 @@ where
                                 }
                             }
                             StreamMsg::Exit(code) => {
-                                if exited.is_some() {
-                                    protocol_fault!(ExecProtocolError::DuplicateExit);
+                                match record_exec_exit(&mut exited, code) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(error) => protocol_fault!(error),
                                 }
                                 if frames_tx.send(ExecFrame::Exit(code)).await.is_err() {
                                     tracing::debug!(target: "thegn::provider", "provider exec exit frame could not be sent");
                                 }
-                                exited = Some(code);
                                 drain_until = Some(tokio::time::Instant::now() + EXEC_EXIT_DRAIN);
                             }
                             // Stderr is never part of the consumer's byte stream.
@@ -4412,13 +4417,14 @@ where
                             }
                         }
                         SpriteCtrl::Exit(code) => {
-                            if exited.is_some() {
-                                protocol_fault!(ExecProtocolError::DuplicateExit);
+                            match record_exec_exit(&mut exited, code) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => protocol_fault!(error),
                             }
                             if frames_tx.send(ExecFrame::Exit(code)).await.is_err() {
                                 tracing::debug!(target: "thegn::provider", "provider exec exit frame could not be sent");
                             }
-                            exited = Some(code);
                             drain_until = Some(tokio::time::Instant::now() + EXEC_EXIT_DRAIN);
                         }
                         SpriteCtrl::Forward if tty => {
@@ -4457,6 +4463,23 @@ where
         tracing::debug!(target: "thegn::provider", "provider exec verdict receiver was dropped");
     }
     fault
+}
+
+fn record_exec_exit(exited: &mut Option<i32>, code: i32) -> Result<bool, ExecProtocolError> {
+    match *exited {
+        Some(previous) if previous == code => {
+            tracing::trace!(
+                target: "thegn::provider",
+                "sprites exec: the exit was repeated in its other form"
+            );
+            Ok(false)
+        }
+        Some(_) => Err(ExecProtocolError::DuplicateExit),
+        None => {
+            *exited = Some(code);
+            Ok(true)
+        }
+    }
 }
 
 /// One sandbox as a provider's inventory reports it (`thegn fleet`). `id` is
@@ -7492,12 +7515,37 @@ mod tests {
             false,
             vec![
                 Message::Binary(vec![3, 0].into()),
-                Message::Binary(vec![3, 0].into()),
+                Message::Binary(vec![3, 1].into()),
             ],
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
         assert_eq!(fault, Some(ExecProtocolError::DuplicateExit));
+    }
+
+    #[tokio::test]
+    async fn drive_exec_accepts_the_exit_repeated_in_both_forms() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        for messages in [
+            vec![
+                Message::Binary(vec![1, b'o', b'k'].into()),
+                Message::Binary(vec![3, 7].into()),
+                Message::Text(r#"{"type":"exit","exit_code":7}"#.into()),
+            ],
+            vec![
+                Message::Binary(vec![1, b'o', b'k'].into()),
+                Message::Text(r#"{"type":"exit","exit_code":7}"#.into()),
+                Message::Binary(vec![3, 7].into()),
+            ],
+        ] {
+            let (frames, fault) = drive_exec_messages(false, messages).await;
+            assert_eq!(
+                frames,
+                vec![ExecFrame::Stdout(b"ok".to_vec()), ExecFrame::Exit(7)]
+            );
+            assert_eq!(fault, None);
+        }
     }
 
     #[tokio::test]
@@ -7659,7 +7707,7 @@ mod tests {
             .await
             .unwrap();
         server
-            .send(Message::Binary(vec![3, 0].into()))
+            .send(Message::Binary(vec![3, 1].into()))
             .await
             .unwrap();
         if server.send(Message::Close(None)).await.is_err() {

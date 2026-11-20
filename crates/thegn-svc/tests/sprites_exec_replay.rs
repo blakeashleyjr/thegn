@@ -288,7 +288,7 @@ async fn non_tty_nonzero_exit_appends_the_stderr_tail() {
 async fn non_tty_duplicate_exit_is_a_typed_protocol_error() {
     let mock = start_mock(vec![script(vec![
         Out::Bin(vec![3, 0]),
-        Out::Bin(vec![3, 0]),
+        Out::Bin(vec![3, 1]),
         Out::Close,
     ])]);
 
@@ -300,6 +300,22 @@ async fn non_tty_duplicate_exit_is_a_typed_protocol_error() {
         error.downcast_ref::<ExecProtocolError>(),
         Some(&ExecProtocolError::DuplicateExit)
     );
+}
+
+#[tokio::test]
+async fn non_tty_exit_repeated_in_both_forms_is_accepted() {
+    let mock = start_mock(vec![script(vec![
+        Out::Bin(vec![1, b'o', b'k']),
+        Out::Bin(vec![3, 0]),
+        Out::Text(r#"{"type":"exit","exit_code":0}"#),
+        Out::Close,
+    ])]);
+
+    let result = provider(&mock)
+        .run_exec("tgtest1", &["sh".into()], None, &[])
+        .await
+        .unwrap();
+    assert_eq!(result, (0, "ok".to_string()));
 }
 
 #[tokio::test]
