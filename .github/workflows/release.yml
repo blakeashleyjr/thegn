@@ -638,7 +638,7 @@ jobs:
             --digests-out "$PACKAGE_ROOT/stage-digests.json"
           # validate already proved this tag is exactly v<workspace version>.
           version="${TAG#v}"
-          nfpm_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#nfpm)"
+          nfpm_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#nfpm^out)"
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
           (
@@ -655,9 +655,9 @@ jobs:
       - name: Verify packaged payload against staged bytes
         run: |
           set -euo pipefail
-          dpkg_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#dpkg)"
-          rpm_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#rpm)"
-          cpio_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#cpio)"
+          dpkg_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#dpkg^out)"
+          rpm_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#rpm^out)"
+          cpio_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#cpio^out)"
           version="${TAG#v}"
           mkdir -p "$PACKAGE_ROOT/payload/deb" "$PACKAGE_ROOT/payload/rpm"
           "$dpkg_store/bin/dpkg-deb" -x \
@@ -954,7 +954,7 @@ jobs:
           work_root="$(mktemp -d "$RUNNER_TEMP/srcinfo-work.XXXXXX")"
           home_root="$(mktemp -d "$RUNNER_TEMP/srcinfo-home.XXXXXX")"
           cp "$SOURCE_ROOT/thegn-$TAG-PKGBUILD" "$work_root/PKGBUILD"
-          pacman_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#pacman)"
+          pacman_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#pacman^out)"
           (
             cd "$work_root"
             env -i PATH="$pacman_store/bin:/usr/bin:/bin" HOME="$home_root" \

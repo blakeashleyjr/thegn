@@ -10,6 +10,23 @@ All notable changes to **thegn** are documented here. The format follows
 - Sidebar: a worktree deleted from outside the running TUI (wt rm, wt prune, a landing, plain git) no longer stays in the left bar; a leftover directory with no checkout in it is no longer treated as a live worktree.
 - Observe: the host dashboard now uses the masthead's samples, so it has history from launch and no gaps while the tab is hidden, and no longer runs a second sampler.
 
+## [0.1.0-alpha.105] — 2026-11-19
+
+### Changed
+
+- New worktree checkout directories end in a 16-character digest instead of 64. Existing checkouts are not moved.
+
+### Fixed
+
+- Vercel sandboxes: the egress policy is sent in the shape the API accepts; one-shot commands request their output; streamed commands can receive stdin; the interactive shell sends its environment in the documented form.
+- Vercel: an egress change now also reaches the running or starting session; snapshot listings read every page; a pending or failed session is no longer shown as running; extending a session that is gone is an error, not "at the plan ceiling"; CPU usage is shown while a session runs.
+- An issue plugin's update is checked against what was asked; oversized listings are reported as partial; duplicate issue ids in a reply are refused.
+- A config file rewritten with the same length during a capture is detected by comparing bytes.
+
+### Security
+
+- A plugin manifest is opened without following symlinks, and a manifest listing a capability twice is refused.
+
 ## [0.1.0-alpha.104] — 2026-11-19
 
 ### Added
@@ -3973,7 +3990,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.104...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.105...HEAD
+[0.1.0-alpha.105]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.104...v0.1.0-alpha.105
 [0.1.0-alpha.104]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.103...v0.1.0-alpha.104
 [0.1.0-alpha.103]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.102...v0.1.0-alpha.103
 [0.1.0-alpha.102]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...v0.1.0-alpha.102
