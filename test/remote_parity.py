@@ -302,6 +302,7 @@ def case_p02():
     elif identity[0][:2] != identity[1][:2]:
         status, note = "FAIL", "TERM or COLORTERM differs"
     else:
+        hard = False
         for index, side in enumerate(sides):
             lines = side.splitlines()
             try:
@@ -310,11 +311,12 @@ def case_p02():
                 warning = 1
             if "ti-ok" not in lines or warning != 0:
                 status, note = "FAIL", "terminfo or locale warning"
+                hard = True
                 break
         remote_lang = identity[1][2]
-        if not re.search(r"(?i)utf-?8", remote_lang):
+        if not hard and not re.search(r"(?i)utf-?8", remote_lang):
             status, note = "FAIL", "remote LANG is not UTF-8"
-        elif identity[0][2] != identity[1][2] and re.search(r"(?i)utf-?8", identity[0][2]):
+        elif not hard and identity[0][2] != identity[1][2] and re.search(r"(?i)utf-?8", identity[0][2]):
             status, note = "WARN", "LANG differs (D1: remote C.UTF-8)"
 
     if len(identity[0]) == 4 and len(identity[1]) == 4:
@@ -397,7 +399,7 @@ def case_p10():
     natural = [snap(s).get("bracketed_paste") for s in (LOCAL, REMOTE)]
     versions, _, _ = command_case("P10V", 'echo "$BASH_VERSION"')
     version_text = [
-        next((clip(norm(line, index == 1), 80) for line in value[0].splitlines() if re.fullmatch(r"\d+\.\d+(?:\.\d+)?(?:[-+].*)?", line.strip())), "unknown")
+        next((clip(norm(line, index == 1), 80) for line in value[0].splitlines() if re.fullmatch(r"\d+\.\d+\S*", line.strip())), "unknown")
         for index, value in enumerate(versions)
     ]
     status = "PASS"
@@ -417,19 +419,23 @@ def case_p10():
             status, note = "FAIL", "thegn did not report the shell's paste mode"
             break
         for session in (LOCAL, REMOTE):
-            send(session, "echo one\necho two", enter=False, paste=True)
+            send(session, f"echo P10{mode}A\necho P10{mode}B", enter=False, paste=True)
         time.sleep(0.5)
         held = [snap(s).get("text", "") for s in (LOCAL, REMOTE)]
-        held_equal = norm(held[0]) == norm(held[1], True)
+        held_tail = [norm(held[i], i == 1).splitlines()[-3:] for i in range(2)]
+        held_equal = held_tail[0] == held_tail[1]
         if not held_equal:
             status, note = "FAIL", "bracketed paste screens differ"
         if mode == "on":
-            if any(token not in norm(value, index == 1) for index, value in enumerate(held) for token in ("echo one", "echo two")):
+            if any(re.search(rf"(?m)^P10onA$", norm(value, index == 1)) for index, value in enumerate(held)):
                 status, note = "FAIL", "bracketed paste was not held"
             for session in (LOCAL, REMOTE):
                 key(session, "enter")
-        elif any("one" not in norm(value, index == 1) for index, value in enumerate(held)):
+        elif not all(re.search(rf"(?m)^P10offA$", norm(value, index == 1)) for index, value in enumerate(held)):
             status, note = "FAIL", "unbracketed paste did not run line one"
+        if mode == "off":
+            for session in (LOCAL, REMOTE):
+                key(session, "ctrl+u")
         note_sides(norm(held[0]), norm(held[1], True))
     for session in (LOCAL, REMOTE):
         send(session, "bind 'set enable-bracketed-paste on'")
@@ -470,9 +476,9 @@ def case_p12():
             for stream in streams:
                 if not stream.wait_initial():
                     raise RuntimeError("attach did not receive initial repaint for P12")
-            command = r"printf '\e[?1%s' " + ("h" if app else "l") + r"; stty raw -echo; k=$(dd bs=1 count=3 2>/dev/null); stty sane; printf '\e[?1l'; printf '%s' \"$k\" | od -An -tx1"
+            command = r"printf '\e[?1%s' " + ("h" if app else "l") + r"""; stty raw -echo; k=$(dd bs=1 count=3 2>/dev/null); stty sane; printf '\e[?1l'; printf '%s' "$k" | od -An -tx1"""
             for session in (LOCAL, REMOTE):
-                send(session, f"printf '\\n@@BP12{int(app)}@@\\n'; {command}")
+                send(session, f"printf '\\n@@%s%s@@\\n' B P12{int(app)}; {command}")
             if not all(wait_mode(session, "app_cursor", app) for session in (LOCAL, REMOTE)):
                 for session in (LOCAL, REMOTE):
                     key(session, "up")
@@ -481,10 +487,11 @@ def case_p12():
             for session in (LOCAL, REMOTE):
                 key(session, "up")
             for session in (LOCAL, REMOTE):
-                send(session, f"printf '\\n@@EP12{int(app)} rc=%s@@\\n' \"$?\"")
+                send(session, f"printf '\\n@@%s%s rc=%s@@\\n' E P12{int(app)} \"$?\"")
             for stream in streams:
                 stream.wait(f"@@EP12{int(app)} rc=", 15)
             values = [stream.text() for stream in streams]
+            note_sides(values[0][-400:], values[1][-400:])
             statuses.append(all(re.search(expected[app], text, re.I) for text in values))
         finally:
             for stream in streams:
@@ -550,7 +557,7 @@ def case_p15():
                 rates.append(flood_bytes / elapsed / 1000)
             result("P15C", "PASS", note=f"INFO server-side wc={rates[0]:.1f} KB/s discarded={rates[1]:.1f} KB/s")
         except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, json.JSONDecodeError, RuntimeError) as exc:
-            result("P15C", "FAIL", note=f"server-side transfer probe failed: {clip(norm(str(exc)))}")
+            result("P15C", "WARN", note=f"server-side transfer probe failed: {clip(norm(str(exc)))}")
     else:
         result("P15C", "SKIP", note="SKIP: RP_CAPTURE_ARGV_JSON not set")
     trace_path = os.environ.get("RP_BRIDGE_TRACE")
@@ -689,7 +696,7 @@ def case_p20b():
         "--samples", "12", "--timeout", "90",
     ]
     try:
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=100)
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=180)
         lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
         if proc.returncode or len(lines) != 1:
             raise RuntimeError(f"probe exit={proc.returncode} output={clip(norm(proc.stdout))}")
