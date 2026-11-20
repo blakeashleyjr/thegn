@@ -24,12 +24,12 @@ THEGN_BIN="$TMP/stub" bash "$SCRIPT" --provider fly --with-pool >"$TMP/refused" 
 [ "$rc" -eq 2 ]
 grep -Fq -- "--with-pool is supported only with --provider sprites" "$TMP/refused"
 
-# shellcheck disable=SC2016 # the literal text is what must be absent from the script
+# shellcheck disable=SC2016 # literal text searched for in the script
 if grep -Fq 'export XDG_RUNTIME_DIR="$TMP/run"' "$SCRIPT"; then
   echo "FAIL: runtime dir override is back" >&2
   exit 1
 fi
-# shellcheck disable=SC2016 # the literal text is what must be absent from the script
+# shellcheck disable=SC2016 # literal text searched for in the script
 if grep -Fq 'mkdir -m 700 "$TMP/run"' "$SCRIPT"; then
   echo "FAIL: runtime dir mkdir is back" >&2
   exit 1

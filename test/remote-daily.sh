@@ -223,7 +223,7 @@ POOL_PATH=""
 OVERLAY_CONFIG=""
 CONFIG_ARGS=()
 # shellcheck disable=SC2034 # read by test/lib/live.sh
-LIVE_STARTUP=("2u=cold create (env up rd-x)" "11u=second create (env up rd-y)" "P1=warm spare fill (env pool-fill)" "P3=agent run on the claimed spare")
+LIVE_STARTUP=("2u=cold create (env up rd-x)" "11u=second create (env up rd-y)" "P1=warm spare fill (env pool-fill)" "P3=claim the warm spare")
 case "$provider" in
 sprites) EXEC_BRIDGE="sprite-exec" ;;
 vercel) EXEC_BRIDGE="vercel-exec" ;;
@@ -276,6 +276,10 @@ OVERLAY
 }
 
 setup_overlay
+if [ "$provider" = fly ] && [ "${RD_HOLD_AGENT:-0}" != 1 ] && [ -z "$OVERLAY_CONFIG" ]; then
+  echo "fly needs RD_HOLD_AGENT=1 or a working RD_OVERLAY_AGENT=1 (no exec bridge)" >&2
+  exit 2
+fi
 
 print_plan
 echo
@@ -376,6 +380,12 @@ teardown() {
     if [ -n "$POOL_SPARE" ] && ! printf '%s\n' "$names" | grep -Fxq "$POOL_SPARE"; then
       names="$names $POOL_SPARE"
     fi
+    for wt in "$RDY_PATH" "$POOL_PATH"; do
+      if [ -n "$wt" ] && [ -d "$wt" ]; then
+        echo "-- teardown: wt rm $wt --force"
+        (cd "$REPO" && "$THEGN_BIN" wt rm "$wt" --force </dev/null)
+      fi
+    done
     echo "-- teardown: env down --force"
     (cd "$REPO" && "$THEGN_BIN" env down --force)
     for n in $names; do
@@ -443,7 +453,7 @@ hold_script_fallback() { # exec-bridge fallback for the scripted hold-test agent
   # Only sprite-exec has --hold; vercel-exec takes none.
   [ "$provider" = sprites ] && hold=(--hold 10m)
   # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
-  no_stdin thegn_cli "$EXEC_BRIDGE" "${hold[@]}" "$NAME" -- sh -c \
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "${hold[@]}" "$NAME" -- sh -c \
     'cd "$HOME/workspace" && sleep 420 && date > rd-hold.txt && git add rd-hold.txt && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit -q -m rd-hold' &
   HOLD_PID=$!
 }
@@ -455,12 +465,14 @@ hold_wait() {
 
 start_overlay_daemon() {
   [ -n "$OVERLAY_CONFIG" ] || return 0
+  "$THEGN_BIN" daemon stop >/dev/null 2>&1 || true
   no_stdin "$THEGN_BIN" --config "$OVERLAY_CONFIG" daemon >"$TMP/overlay-daemon.log" 2>&1 &
   DAEMON_PID=$!
-  sleep 1
-  if kill -0 "$DAEMON_PID" 2>/dev/null; then
-    return 0
-  fi
+  for _ in $(seq 1 30); do
+    "$THEGN_BIN" --config "$OVERLAY_CONFIG" session list --json >/dev/null 2>&1 && return 0
+    kill -0 "$DAEMON_PID" 2>/dev/null || break
+    sleep 0.5
+  done
   echo "overlay daemon exited before step 3" >&2
   sed -n '1,40p' "$TMP/overlay-daemon.log" >&2
   return 1
@@ -740,17 +752,17 @@ rdy_commit() {
 }
 rdy_dirty_file() {
   # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
-  no_stdin thegn_cli "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
     'cd "$HOME/workspace" && date > rd-dirty.txt'
 }
 rdy_clean_dirty_file() {
   # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
-  no_stdin thegn_cli "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
     'cd "$HOME/workspace" && rm rd-dirty.txt'
 }
 rdy_commit_again() {
   # shellcheck disable=SC2016 # $HOME must expand inside the sandbox
-  no_stdin thegn_cli "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
+  no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
     'cd "$HOME/workspace" && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit --allow-empty -qm rd-y2'
 }
 land_release() {
@@ -800,12 +812,13 @@ rdy_land_keep() {
 }
 rdy_land_dirty_release() {
   local out rc
-  out="$(in_repo thegn_cli "${LAND_SET[@]}" land --worktree "$RDY_PATH" --release-sandbox 2>&1)" && rc=0 || rc=$?
+  out="$(no_stdin in_repo "$THEGN_BIN" "${LAND_SET[@]}" land --worktree "$RDY_PATH" --release-sandbox 2>&1)" && rc=0 || rc=$?
   printf '%s\n' "$out"
   [ "$rc" -eq 0 ] || return "$rc"
   case "$out" in
-  *"sandbox $RDY_NAME kept"*)
-    echo "dirty land incorrectly kept sandbox $RDY_NAME" >&2
+  *"sandbox $RDY_NAME kept"*) ;;
+  *)
+    echo "dirty land did not keep sandbox $RDY_NAME" >&2
     return 1
     ;;
   esac
@@ -819,7 +832,7 @@ rdy_land_dirty_release() {
 }
 rdy_down_dirty() {
   local out rc state
-  out="$(in_repo thegn_cli env down --worktree "$RDY_PATH" 2>&1)" && rc=0 || rc=$?
+  out="$(no_stdin in_repo "$THEGN_BIN" env down --worktree "$RDY_PATH" 2>&1)" && rc=0 || rc=$?
   printf '%s\n' "$out"
   [ "$rc" -ne 0 ] || return 1
   case "$out" in
@@ -837,7 +850,7 @@ rdy_down_dirty() {
 }
 rdy_deprovision_bound() {
   local out rc
-  out="$(in_repo thegn_cli env deprovision "$RDY_NAME" 2>&1)" && rc=0 || rc=$?
+  out="$(no_stdin in_repo "$THEGN_BIN" env deprovision "$RDY_NAME" 2>&1)" && rc=0 || rc=$?
   printf '%s\n' "$out"
   [ "$rc" -ne 0 ] || return 1
   case "$out" in
@@ -850,7 +863,7 @@ rdy_deprovision_bound() {
 }
 rdy_rm_force() {
   local out rc
-  out="$(no_stdin in_repo thegn_cli wt rm "$RDY_PATH" --force 2>&1)" && rc=0 || rc=$?
+  out="$(no_stdin in_repo "$THEGN_BIN" wt rm "$RDY_PATH" --force 2>&1)" && rc=0 || rc=$?
   printf '%s\n' "$out"
   [ "$rc" -eq 0 ] || return "$rc"
   case "$out" in
@@ -889,16 +902,16 @@ step 2u "env up (provision rd-x)" no_stdin "$THEGN_BIN" env up --worktree "$WT_P
 step 2b "exactly one ready ledger record for this run" name_from_ledger
 echo "sandbox: $NAME"
 if [ "${RD_HOLD_AGENT:-0}" = 1 ]; then
-  start_overlay_daemon
+  step 3d "start the overlay daemon" start_overlay_daemon
   step 3 "agent run hold-test --wait --pull" agent_hold_run
 elif [ -n "$OVERLAY_CONFIG" ]; then
-  start_overlay_daemon
+  step 3d "start the overlay daemon" start_overlay_daemon
   step 3 "agent run hold-test --wait --pull" agent_hold_run
 else
   echo "   (no overlay hold-test agent: using the $EXEC_BRIDGE fallback + env pull)"
   step 3a "scripted hold starts" hold_script_fallback
   step 3b "scripted hold finishes (420 s)" hold_wait
-  step 3c "env pull" in_repo thegn_cli env pull --worktree "$WT_PATH"
+  step 3c "env pull" in_repo "$THEGN_BIN" env pull --worktree "$WT_PATH"
 fi
 if [ "$with_model" = 1 ]; then
   step 4a "agent run claude commits one file" agent_run claude
@@ -952,7 +965,7 @@ if [ "$with_pool" = 1 ]; then
   step P1 "fill one warm pool spare" pool_fill_one
   step P2 "exactly one new ledger record is the pool spare" pool_new_record
   snapshot_records
-  step P3 "agent run claims the pool spare without a new ledger record" pool_claim_run
+  step P3 "P3 claims the pool spare without a new ledger record" pool_claim_run
   step P4 "pool-fill target 0 exits 0" in_repo "$THEGN_BIN" env pool-fill --worktree "$POOL_PATH" --size 0 --json
   step P5 "wt rm rd-p destroys the spare and removes its record" pool_remove
 fi
