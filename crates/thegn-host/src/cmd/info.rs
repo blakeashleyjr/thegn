@@ -31,10 +31,7 @@ pub fn run(cfg: &Config, args: Args, config_path: PathBuf) -> Result<()> {
         args.worktree.as_deref(),
         &here,
     )?;
-    let (sessions, sessions_source) = daemon_sessions(cfg);
-    let daemon_note = sessions
-        .is_none()
-        .then(|| "sessions: daemon did not answer (no daemon?)".to_string());
+    let (sessions, sessions_source, daemon_note) = daemon_sessions(cfg);
     let live = LiveFacts {
         read_git: true,
         git: None,
@@ -53,7 +50,7 @@ pub fn run(cfg: &Config, args: Args, config_path: PathBuf) -> Result<()> {
     if args.json {
         super::emit_json(&report)
     } else {
-        thegn_core::out!("{}", thegn_core::info_model::render_text(&report));
+        thegn_core::outln!("{}", thegn_core::info_model::render_text(&report));
         Ok(())
     }
 }
@@ -91,7 +88,7 @@ pub(crate) fn gather(
         .map(|error| format!("{error:#}"));
     let environment = environment_result.ok();
 
-    let (mut settings, mut settings_notes, backends) = match environment.as_ref() {
+    let (settings, mut settings_notes, backends) = match environment.as_ref() {
         Some(env) => {
             let (settings, notes) =
                 thegn_core::info_resolve::settings(cfg, config_path, &db, root, wt, env);
@@ -124,16 +121,27 @@ pub(crate) fn gather(
     );
     notes.push("sealed-home and compose gates are applied at launch".into());
 
+    let worktree_paths = if target.worktree.is_some() {
+        None
+    } else {
+        match db.worktrees() {
+            Ok(rows) => Some(
+                rows.into_iter()
+                    .filter(|row| row.repo_root == target.repo_root)
+                    .map(|row| row.worktree)
+                    .collect(),
+            ),
+            Err(error) => {
+                notes.push(format!("sessions: worktree list unreadable: {error:#}"));
+                Some(Vec::new())
+            }
+        }
+    };
     let sessions = live.sessions.map(|rows| {
         let paths: Vec<String> = if let Some(worktree) = target.worktree.as_deref() {
             vec![worktree.to_string()]
         } else {
-            db.worktrees()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|row| row.repo_root == target.repo_root)
-                .map(|row| row.worktree)
-                .collect()
+            worktree_paths.unwrap_or_default()
         };
         thegn_core::info_facts::sessions_for(
             &rows,
@@ -153,7 +161,10 @@ pub(crate) fn gather(
                 .map(|row| row.branch)
         })
         .map(|branch| format!("worktree {branch}"))
-        .unwrap_or_else(|| "workspace root checkout".to_string());
+        .unwrap_or_else(|| match target.worktree.as_deref() {
+            Some(path) => format!("worktree {path}"),
+            None => "workspace root checkout".to_string(),
+        });
 
     Ok(InfoReport {
         schema: INFO_SCHEMA,
@@ -166,7 +177,12 @@ pub(crate) fn gather(
         settings_scope,
         settings,
         backends,
-        overrides: Vec::new(),
+        overrides: thegn_core::info_facts::overrides(
+            cfg,
+            &db,
+            root,
+            target.worktree.as_deref().map(Path::new),
+        ),
         notes,
     })
 }
@@ -235,7 +251,7 @@ pub(crate) fn session_row(s: &thegn_svc::control::SessionInfo) -> SessionRow {
     }
 }
 
-fn daemon_sessions(cfg: &Config) -> (Option<Vec<SessionRow>>, Option<Source>) {
+fn daemon_sessions(cfg: &Config) -> (Option<Vec<SessionRow>>, Option<Source>, Option<String>) {
     match crate::agent::block_on_provider(|| async {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             super::session::connect(cfg).await?.sessions().await
@@ -252,10 +268,15 @@ fn daemon_sessions(cfg: &Config) -> (Option<Vec<SessionRow>>, Option<Source>) {
                     .collect(),
             ),
             Some(Source::Daemon),
+            None,
         ),
         Err(error) => {
             tracing::debug!(target: "thegn::info", "sessions: {error:#} (no daemon?)");
-            (None, None)
+            (
+                None,
+                None,
+                Some(format!("sessions: {error:#} (no daemon?)")),
+            )
         }
     }
 }
