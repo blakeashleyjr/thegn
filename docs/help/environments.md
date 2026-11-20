@@ -255,6 +255,14 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   a per-sprite document the API stores, so reuse, resume and a warm-spare claim
   do not re-apply it. Read it back with
   `thegn fleet inspect <sprite> --env <S> --policy`.
+- **Exec protocol errors.** A command stream that ends without a valid exit
+  status is a failure, never a success, on any remote. On Sprites, a stream that
+  breaks what the client relies on (a malformed exit, two exits with different
+  codes, output after the exit, an unknown stream) is reported as
+  `sprites exec: protocol error: <what>` and the command fails. The server
+  repeats the exit in two forms and sends control messages the protocol document
+  does not list; a repeated exit with the same code and a control message of an
+  unknown type are accepted.
 - **Instance cap.** `max_instances` applies through the ledger; `0` (the
   default for sprites) means no cap.
 - **Cost.** `thegn fleet cost` shows a Sprites block with CPU hours and
@@ -391,6 +399,9 @@ Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
   `--release-sandbox` destroys the proven sandbox after a successful land and
   prints `released sandbox <name>`; a failure there is a warning, not an error.
   `merge drain` is unchanged.
+- **Crash recovery.** After a crash during cleanup, a merge-queue row whose
+  worktree has no registry record is kept and retried when the repository's
+  environment is remote; it is retired only when the environment is local.
 - **`lifetime_reap`.** `[env.<n>.provider] lifetime_reap = true` (sprites only,
   default false, needs `max_lifetime_secs > 0`) lets a running client destroy
   recorded sprites past their lifetime, checked every 300 seconds. It lists the
@@ -412,6 +423,11 @@ golden image); the Fly IPv4 cost; and which login files pi needs.
 The live scripts `test/sprites-live.sh` and `test/vercel-live.sh` spend real
 money. They need `THEGN_CHANNEL=dev` and `--i-accept-spend`, and touch only
 sandboxes recorded in the run's own temporary ledger.
+
+With `--min-ram-gb N`, step 5d proves the memory limit: a process inside the
+sprite allocates past it. The step passes when the process is stopped at the
+limit. It prints a WARN, not a failure, when the provider accepts the limit but
+does not enforce it inside the guest.
 
 ### Removing and releasing provider sandboxes
 
