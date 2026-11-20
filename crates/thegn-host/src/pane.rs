@@ -888,16 +888,14 @@ impl PtyPane {
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
         if let PaneIo::Stream { control, .. } = &self.io
             && let Some((pending_rows, pending_cols)) = self.pending_resize
-        {
-            if control
+            && control
                 .try_send(ExecControl::Resize {
                     cols: pending_cols,
                     rows: pending_rows,
                 })
                 .is_ok()
-            {
-                self.pending_resize = None;
-            }
+        {
+            self.pending_resize = None;
         }
         // No-op when the geometry is unchanged. Re-issuing the winsize would
         // SIGWINCH the child for nothing, and a stray relayout (e.g. a same-size
