@@ -107,7 +107,7 @@ pub(crate) fn fetch(
             .get(current.clone())
             .timeout(remaining)
             .send()
-            .map_err(request_error)?;
+            .map_err(|error| request_error(error, started, timeout))?;
 
         if response.status().is_redirection()
             && let Some(location) = response.headers().get(reqwest::header::LOCATION)
@@ -146,7 +146,17 @@ pub(crate) fn fetch(
             .by_ref()
             .take(config.max_body_bytes as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|error| FetchError::Transport(error.to_string()))?;
+            .map_err(|error| {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) || started.elapsed() >= timeout
+                {
+                    FetchError::Timeout
+                } else {
+                    FetchError::Transport(error.to_string())
+                }
+            })?;
         let truncated = bytes.len() > config.max_body_bytes;
         bytes.truncate(config.max_body_bytes);
         let (console_errors, diagnostics_source) = diagnostics(request.include_console, diagnostic);
@@ -162,8 +172,8 @@ pub(crate) fn fetch(
     }
 }
 
-fn request_error(error: reqwest::Error) -> FetchError {
-    if error.is_timeout() {
+fn request_error(error: reqwest::Error, started: Instant, timeout: Duration) -> FetchError {
+    if error.is_timeout() || started.elapsed() >= timeout {
         FetchError::Timeout
     } else {
         FetchError::Transport(error.to_string())
@@ -260,9 +270,9 @@ mod tests {
             for (index, incoming) in listener.incoming().take(count).enumerate() {
                 let mut stream = incoming.unwrap();
                 let request = read_request(&mut stream);
-                stream
-                    .write_all(handler(index, &request).as_bytes())
-                    .unwrap();
+                if let Err(error) = stream.write_all(handler(index, &request).as_bytes()) {
+                    drop(error);
+                }
             }
         });
         format!("http://{addr}/")
@@ -350,11 +360,11 @@ mod tests {
         );
 
         let url = serve(1, |_, _| {
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(1500));
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".into()
         });
         let config = PreviewConfig {
-            fetch_timeout_ms: 100,
+            fetch_timeout_ms: 200,
             ..PreviewConfig::default()
         };
         assert!(matches!(
