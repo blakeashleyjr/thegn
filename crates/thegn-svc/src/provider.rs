@@ -4386,7 +4386,7 @@ where
                                 tracing::debug!(target: "thegn::provider", "provider exec resize could not be sent");
                             }
                         }
-                        Some(ExecControl::Close) | None => {
+                        Some(ExecControl::Close) => {
                             if !tty
                                 && write
                                     .send(Message::Binary(encode_stream_stdin_eof().into()))
@@ -4399,6 +4399,18 @@ where
                                 tracing::debug!(target: "thegn::provider", "provider exec close could not be sent");
                             }
                             break;
+                        }
+                        None => {
+                            if !tty
+                                && write
+                                    .send(Message::Binary(encode_stream_stdin_eof().into()))
+                                    .await
+                                    .is_err()
+                            {
+                                tracing::debug!(target: "thegn::provider", "provider exec stdin EOF could not be sent");
+                                break;
+                            }
+                            control_closed = true;
                         }
                     }
                 }
@@ -7595,10 +7607,11 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message;
 
         loop {
-            match server.next().await? {
-                Ok(Message::Ping(_)) => {}
-                Ok(message) => return Some(message),
-                Err(_) => return None,
+            match server.next().await {
+                None => return None,
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(message)) => return Some(message),
+                Some(Err(_)) => {}
             }
         }
     }
@@ -8057,6 +8070,7 @@ mod tests {
 
     #[tokio::test]
     async fn drive_exec_sends_stdin_eof_exactly_once_on_control_close() {
+        use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -8066,7 +8080,7 @@ mod tests {
         let mut server =
             tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
                 .await;
-        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
@@ -8078,10 +8092,50 @@ mod tests {
             next_non_ping(&mut server).await.unwrap(),
             Message::Binary(vec![4].into())
         );
-        assert!(matches!(
-            next_non_ping(&mut server).await.unwrap(),
-            Message::Close(_)
+        assert!(!driver.is_finished());
+        server
+            .send(Message::Binary(vec![3, 0].into()))
+            .await
+            .unwrap();
+        assert_eq!(frames_rx.recv().await, Some(ExecFrame::Exit(0)));
+        server.send(Message::Close(None)).await.unwrap();
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_tty_keeps_reading_after_control_close() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None, None,
         ));
+        drop(control_tx);
+
+        server
+            .send(Message::Binary(b"ok".to_vec().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            frames_rx.recv().await,
+            Some(ExecFrame::Stdout(b"ok".to_vec()))
+        );
+        server
+            .send(Message::Text(r#"{"type":"exit","exit_code":0}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(frames_rx.recv().await, Some(ExecFrame::Exit(0)));
+        server.send(Message::Close(None)).await.unwrap();
         driver.await.unwrap();
     }
 
