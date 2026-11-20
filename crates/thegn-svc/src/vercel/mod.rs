@@ -155,12 +155,15 @@ trait Api: Send + Sync {
             Ok((code, out, String::new()))
         })
     }
-    fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>>;
+    fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(Vec<String>, bool)>>;
     fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
     /// The current session's usage (a GET; never resumes).
     fn usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<SessionUsage>>>;
     /// The sandbox's snapshots with sizes and status.
-    fn snapshot_usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<SnapshotUsage>>>;
+    fn snapshot_usage<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(Vec<SnapshotUsage>, bool)>>;
 }
 
 impl Api for client::VercelClient {
@@ -219,7 +222,7 @@ impl Api for client::VercelClient {
             self, session, body, out_cap,
         ))
     }
-    fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
+    fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(Vec<String>, bool)>> {
         Box::pin(client::VercelClient::snapshots_for(self, name))
     }
     fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
@@ -228,7 +231,10 @@ impl Api for client::VercelClient {
     fn usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<SessionUsage>>> {
         Box::pin(client::VercelClient::usage(self, name))
     }
-    fn snapshot_usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<SnapshotUsage>>> {
+    fn snapshot_usage<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(Vec<SnapshotUsage>, bool)>> {
         Box::pin(client::VercelClient::snapshot_usage(self, name))
     }
 }
@@ -799,28 +805,22 @@ impl VercelProvider {
             .map_err(|e| anyhow!("vercel: command refused: {e}"))
     }
 
-    /// One-shot command: `(exit_code, output)`. The env is allowlisted.
-    pub async fn run_exec(
+    /// One `/cmd` run on `session` with the keep-alive checks (today's loop body).
+    async fn run_exec_once(
         &self,
         name: &str,
-        argv: &[String],
-        cwd: Option<&str>,
-        env: &[(String, String)],
-        wake: Wake,
-    ) -> Result<(i32, String)> {
-        let body = self.command_body(argv, cwd, env, true)?;
-        let session = self.session_for(name, wake).await?;
-        let run = self
-            .api()
-            .run_wait_with_stderr(&session, &body, EXEC_OUT_CAP);
+        session: &str,
+        body: &serde_json::Value,
+    ) -> Result<(i32, Vec<u8>, String)> {
+        let run = self.api().run_wait_with_stderr(session, body, EXEC_OUT_CAP);
         tokio::pin!(run);
         let mut check =
             tokio::time::interval(std::time::Duration::from_secs(policy::EXTEND_CHECK_SECS));
         check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let (code, out, stderr) = loop {
+        loop {
             tokio::select! {
                 biased;
-                result = &mut run => break result?,
+                result = &mut run => break result,
                 _ = check.tick() => {
                     // A long provisioning step must not outlive its session; the
                     // lifetime ceiling inside `extend_if_due` still bounds the spend.
@@ -832,9 +832,43 @@ impl VercelProvider {
                     }
                 }
             }
-        };
-        let out = String::from_utf8_lossy(&out).into_owned();
-        Ok((code, append_vercel_stderr(out, code, &stderr)))
+        }
+    }
+
+    /// One-shot command: `(exit_code, output)`. The env is allowlisted.
+    /// A refusal because the session stopped (`client::SessionStopped`: the command never
+    /// started) resolves the session again and retries once under `Wake::Allow` (the SDK's
+    /// withResume rule).
+    pub async fn run_exec(
+        &self,
+        name: &str,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        wake: Wake,
+    ) -> Result<(i32, String)> {
+        let body = self.command_body(argv, cwd, env, true)?;
+        let mut retried = false;
+        loop {
+            let session = self.session_for(name, wake).await?;
+            match self.run_exec_once(name, &session, &body).await {
+                Err(error) if error.downcast_ref::<client::SessionStopped>().is_some() => {
+                    self.forget_session(name);
+                    if wake == Wake::Never {
+                        bail!(STOPPED_TEXT);
+                    }
+                    if retried {
+                        return Err(error);
+                    }
+                    retried = true;
+                }
+                result => {
+                    let (code, out, stderr) = result?;
+                    let out = String::from_utf8_lossy(&out).into_owned();
+                    return Ok((code, append_vercel_stderr(out, code, &stderr)));
+                }
+            }
+        }
     }
 
     /// Delete the sandbox, then every snapshot of it (404-tolerant). Never
@@ -868,7 +902,7 @@ impl VercelProvider {
         }
         self.forget_session(name);
         self.policies.lock().unwrap().remove(name);
-        let snapshots = self.api().snapshots_for(name).await?;
+        let (snapshots, complete) = self.api().snapshots_for(name).await?;
         let mut failed = 0usize;
         for id in &snapshots {
             if let Err(error) = self.api().delete_snapshot(id).await {
@@ -879,6 +913,12 @@ impl VercelProvider {
         if failed > 0 {
             bail!(
                 "vercel: {failed} of {} snapshots of {name} could not be deleted",
+                snapshots.len()
+            );
+        }
+        if !complete {
+            bail!(
+                "vercel: the snapshot listing of {name} did not finish (page cap or repeated cursor); {} listed snapshots were deleted; run thegn env down again to continue",
                 snapshots.len()
             );
         }
