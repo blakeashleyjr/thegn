@@ -350,7 +350,7 @@ pub(crate) struct PreparedWorkspaceSwitch {
 /// for ordering.
 ///
 /// Shared by the cold resurrect ([`Session::resurrect_with_cfg`]) and the warm
-/// workspace restore ([`Session::adopt_missing_registered`]) so both arms see
+/// workspace restore (`Session::adopt_missing_registered`) so both arms see
 /// the same registry: the warm arm used to replay a parked in-memory tree
 /// verbatim, so worktrees registered while a workspace sat in the pool
 /// (`thegn wt new` from another shell) never became live groups (THE-73).

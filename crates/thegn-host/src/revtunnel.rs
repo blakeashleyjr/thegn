@@ -7,7 +7,7 @@
 //! embedded host nix cache, a host `localhost` DB/API, or a host-bound MCP
 //! server.
 //!
-//! The tunnel mechanics ([`run_host`]/`run_sandbox`/`exec_stream`) are mock-tested
+//! The tunnel mechanics (`run_host`/`run_sandbox`/`exec_stream`) are mock-tested
 //! in `thegn-svc`; this is the thin lifecycle glue (start per worktree, stop on
 //! close), modeled on the forward/VPN supervisors. `Clone` (Arc inside) so it can
 //! be captured into the off-loop `spawn_blocking` bridge-setup task.

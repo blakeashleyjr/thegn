@@ -5,7 +5,7 @@
 //! equivalent, so the pane `cd`-ed to the LOCAL worktree path on the remote
 //! host. [`seed_if_needed`] bundles the local branch, seeds it into
 //! `$HOME/thegn-worktrees/<repo>/<worktree>` on the host through the shared
-//! [`seed_from_bundle_with`](crate::provider_git::seed_from_bundle_with), and
+//! [`seed_from_bundle_with`], and
 //! only then records the worktree's location as that remote checkout.
 
 use std::cell::RefCell;
