@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Right panel: with `[lead]` configured (dev channel), a pinned Lead footer shows the Lead's state, pending approvals across all repos (click to answer them), lane and spawn budgets and the last action; the sidebar LEAD row gains a state suffix.
+
 ## [0.1.0-alpha.110] — 2026-11-19
 
 ### Fixed
