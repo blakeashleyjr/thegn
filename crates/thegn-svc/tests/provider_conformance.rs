@@ -467,10 +467,11 @@ async fn vps_passes_the_conformance_suite() {
     let port = listener.local_addr().unwrap().port();
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
     let present = Arc::new(AtomicBool::new(true));
-    let (shared, present_srv) = (requests.clone(), present.clone());
+    let hold = Arc::new(AtomicBool::new(false));
+    let (shared, present_srv, hold_srv) = (requests.clone(), present.clone(), hold.clone());
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (shared, present) = (shared.clone(), present_srv.clone());
+            let (shared, present, hold) = (shared.clone(), present_srv.clone(), hold_srv.clone());
             thread::spawn(move || {
                 let Some((method, path, body)) = read_request(&stream) else {
                     return;
@@ -494,7 +495,9 @@ async fn vps_passes_the_conformance_suite() {
                         },
                     ),
                     ("DELETE", "/v1/servers/101") => {
-                        present.store(false, Ordering::Release);
+                        if !hold.load(Ordering::Acquire) {
+                            present.store(false, Ordering::Release);
+                        }
                         Some("{}".to_string())
                     }
                     _ => None,
@@ -530,14 +533,18 @@ async fn vps_passes_the_conformance_suite() {
         cap: None,
         // A powered-off VPS still bills: no stop by construction.
         supports_stop: false,
-        // UNVERIFIED: whether VPS keeps the record until absent is queued.
-        hold_after_delete: None,
-        recorded: None,
+        // VPS keeps the ledger record until the inventory confirms the instance is gone (confirm_absent).
+        hold_after_delete: Some(Box::new(move |_name, held| {
+            hold.store(held, Ordering::Release);
+        })),
+        recorded: Some(Box::new(|name| {
+            thegn_svc::vps::registry::read(name).is_some()
+        })),
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
     assert!(
-        report.skipped.contains(&"destroy_keeps_record_until_gone"),
+        report.passed.contains(&"destroy_keeps_record_until_gone"),
         "{report:?}"
     );
 }
