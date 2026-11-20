@@ -675,6 +675,44 @@ THE-2450 is reported as a WARN.
 
 Latency and throughput are measured and printed, not held to fixed budgets.
 
+## Sandbox safety on delete, down, deprovision, rm, set, restore, land and reap
+
+Every command that would destroy, recycle or release a provider sandbox first
+pulls its commits home, and refuses when the pull fails or the sandbox holds
+uncommitted or untracked paths (any `git status --porcelain` line). Force skips
+only the refusal and says what is lost.
+
+| command | behaviour | instead |
+| --- | --- | --- |
+| `wt rm`, TUI delete | pulls first; refuses on a failed pull or a dirty sandbox. `--force` (and the TUI force delete) destroys anyway. With `--delete-branch`, a branch that received sandbox commits is kept, with a warning | commit inside the sandbox and retry, or `--force` |
+| `env down` | refuses a dirty sandbox or a failed pull: `could not pull back from sandbox <id>: ...; nothing was destroyed. Re-run with --force to destroy anyway`. `--stop` never refuses | `env down --force`, or `env down --stop` to park it |
+| `env deprovision <id>` | never destroys a sandbox bound to a registered worktree; `--all` skips those and refuses when a binding cannot be resolved | `env down --worktree <wt>` or `wt rm <wt>` first |
+| `env rm` | refuses while a registered worktree resolves to that env with a provider sandbox | `env down --worktree <wt>`, `wt rm <wt>`, or `env set <env> --worktree <wt>` |
+| `env set` | away from a provider env, pulls best-effort and names the sandbox it leaves, for headless worktrees too | |
+| `env restore` | pulls the sandbox's commits first and says what uncommitted work it discards | |
+| `land --release-sandbox` | re-checks right before releasing; a dirty sandbox is kept (exit 0, `!` line) | |
+| `merge land`, TUI land | pull first, as `thegn land` does. A pull that fast-forwards the branch makes the queued candidate stale: refused | re-queue with `thegn merge add`, or `thegn land` |
+| `wt prune` | never removes a worktree bound to a provider sandbox (keep reason `provider-sandbox`) | |
+| closing (forgetting) a worktree | names the sandbox it leaves, for headless worktrees too | |
+
+Lifetime reapers (Sprites) keep a sandbox bound to a registered worktree and
+warn once; when any worktree's binding cannot be resolved they keep every
+sandbox. Fly and VPS reaping is unchanged. Background passes decide "bound"
+offline and never wake a sandbox; the hibernator only execs a sandbox of a
+sleeping kind (Sprites, Fly, machine0) when a listing shows it awake.
+
+## Exec streaming
+
+Non-tty `sprite-exec` streams output without a cap, sends remote stderr to
+stderr (stdout no longer carries the stderr tail or the 1 MiB marker) and
+forwards a non-terminal stdin. TTY mode runs only when stdin and stdout are
+both terminals. Provisioning (`run_exec`) is unchanged.
+
+## Parity run summary
+
+`test/remote-parity.sh` ends with a `RUN SUMMARY` block listing each step's
+result and timing.
+
 ## Unverified
 
 Not confirmed against a live provider:
@@ -686,7 +724,9 @@ Not confirmed against a live provider:
 - whether Sprites applies the cols and rows in the exec URL itself (the explicit
   resize makes it moot, and the live log will say);
 - where the limit on a very large paste is;
-- whether the hermes installer uses npm.
+- whether the hermes installer uses npm;
+- the cause of the parity P15 failure (pending the live run);
+- the P15C exit 1.
 
 ## Remote worktrees
 
