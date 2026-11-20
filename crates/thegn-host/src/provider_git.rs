@@ -1830,13 +1830,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let name = crate::provider_factory::provider_sandbox_name_checked(
-            &cfg,
-            &worktree_s,
-            "sprites",
-        )
-        .unwrap()
-        .unwrap();
+        let name =
+            crate::provider_factory::provider_sandbox_name_checked(&cfg, &worktree_s, "sprites")
+                .unwrap()
+                .unwrap();
         crate::provider_workdir::mark_provisioned(&name);
         assert!(
             super::LivePreLand { cfg: &cfg }
