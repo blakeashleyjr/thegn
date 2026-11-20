@@ -297,8 +297,11 @@ be combined with `--prompt`, `--issue` or `--resume-work`, and `--vars` requires
 [SESSION]` also accept `--session SESSION`. `snapshot` emits the current raw
 ANSI screen, or plain rows with `--text` and JSON geometry/base64 output with
 `--json`; `attach` streams live output and Ctrl-C only detaches. `wait` accepts
-`--until exited|idle|blocked|done|match:<regex>` and optional `--timeout <ms>`;
-timeouts exit 2.
+`--until exited|idle|blocked|done|match:<regex>|screen:<regex>|stable:<ms>` and
+optional `--timeout <ms>`; timeouts exit 2. `session send` types text, or with
+`--key <KEY>` (repeatable, at most 64) presses named keys such as `up`, `esc`,
+`f5` or `ctrl+c`; `--paste` sends the text as a paste and cannot be combined
+with `--key`.
 
 `wt new --from-issue` and batched project creation use the same lifecycle
 seam. The pipeline board itself is structure-only: an external supervisor

@@ -52,6 +52,10 @@ nothing, and the footer leaves them out.
 
 ## Reading the graphs
 
+A plot whose history does not cover the whole window is labelled `partial`.
+When the retained data starts inside the window, the label says how much is
+covered, for example `partial: last 3m of 15m`.
+
 Every plot has "now" at its right edge. Three toggles change how the history is
 drawn, and each one is remembered **per tab** — so CPU can sit on a ten-minute
 log scale while Network stays on a live linear one.

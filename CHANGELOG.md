@@ -7,7 +7,33 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn session send --key` presses named keys (`up`, `esc`, `f5`, `ctrl+c`…) and `--paste` sends bracketed paste; `session wait --until` takes `screen:<regex>` and `stable:<ms>`; MCP `sessions_input` takes `keys` and `paste`, and `sessions_snapshot` reports the cursor and screen modes. Who may type is unchanged (THE-2475).
+- Sidebar row menu: "Info…" opens the Info screen for the row.
+
+### Changed
+
+- Sprites restore reads the checkpoint first and refuses a missing or unhealthy one. `fleet cost` marks a sprite younger than an hour `recent`, as its usage may not be reported yet (THE-2451).
+- Observe: a partial window says how much it covers, e.g. `partial: last 3m of 15m`.
+
+### Fixed
+
+- The reaper no longer retires worktrees whose location is remote or whose effective environment is ssh, k8s or a provider (THE-2472).
+- A deleted worktree no longer reappears in the sidebar from an older refresh (THE-2470).
+- Info explains against the `--config` path the TUI started with, and shows a failed state-database read as "unknown" instead of unset.
+
 ## [0.1.0-alpha.108] — 2026-11-19
+
+### Changed
+
+- The Vercel live check proves that a stop and a resume reached the provider.
+
+### Fixed
+
+- Vercel: a one-shot command refused because its session had stopped is retried once after resume.
+- Vercel: stopping or killing something already stopped is success; an expired saved snapshot gives a clear refusal with the remedy, and nothing is deleted automatically.
+- Vercel: a snapshot listing that does not finish is never treated as complete: destroy keeps its record and can be retried, and cost reports are marked incomplete; snapshots of a sandbox that is gone are priced.
 
 ## [0.1.0-alpha.107] — 2026-11-19
 
@@ -20,16 +46,6 @@ All notable changes to **thegn** are documented here. The format follows
 - Docs: help pages for Sprites checkpoint and restore ledger proof, URL auth pinning, the create-time memory policy, `fleet inspect`, the `provision` field of `agent run --json`, the drain warning, the Fly destroy check, `sandbox warm-devshell`, the masthead instance tag and the "Retry failed pull-backs" action. `env snapshot` and `env restore` now refuse a sprite another instance made for the same worktree path.
 - Sidebar: a worktree deleted from outside the running TUI (wt rm, wt prune, a landing, plain git) no longer stays in the left bar; a leftover directory with no checkout in it is no longer treated as a live worktree.
 - Observe: the host dashboard now uses the masthead's samples, so it has history from launch and no gaps while the tab is hidden, and no longer runs a second sampler.
-
-### Changed
-
-- The Vercel live check proves that a stop and a resume reached the provider.
-
-### Fixed
-
-- Vercel: a one-shot command refused because its session had stopped is retried once after resume.
-- Vercel: stopping or killing something already stopped is success; an expired saved snapshot gives a clear refusal with the remedy, and nothing is deleted automatically.
-- Vercel: a snapshot listing that does not finish is never treated as complete: destroy keeps its record and can be retried, and cost reports are marked incomplete; snapshots of a sandbox that is gone are priced.
 
 ## [0.1.0-alpha.105] — 2026-11-19
 
