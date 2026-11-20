@@ -3458,6 +3458,49 @@ fn provision_worktree_refuses_an_unreadable_location_when_a_provider_env_is_conf
 }
 
 #[test]
+fn prompt_first_outcome_constructors_name_all_fields() {
+    let not_ready = ProvisionOutcome::not_provisioned();
+    assert!(!not_ready.provisioned);
+    assert!(not_ready.checkpoint.is_none());
+    assert!(not_ready.deferred.is_none());
+
+    let ready = ProvisionOutcome::ready(Some("checkpoint-1".into()));
+    assert!(ready.provisioned);
+    assert_eq!(ready.checkpoint.as_deref(), Some("checkpoint-1"));
+    assert!(ready.deferred.is_none());
+
+    let pending = ProvisionOutcome::pending("sandbox-1", None);
+    assert!(pending.provisioned);
+    assert!(pending.checkpoint.is_none());
+    assert_eq!(
+        pending
+            .deferred
+            .as_ref()
+            .map(|handoff| handoff.sandbox.as_str()),
+        Some("sandbox-1")
+    );
+    assert!(
+        pending
+            .deferred
+            .as_ref()
+            .is_some_and(|handoff| handoff.lease.is_none())
+    );
+}
+
+#[test]
+fn prompt_first_provision_modes_map_to_journal_phases() {
+    use thegn_core::provision_journal::{self, LeaseWait, Phase};
+
+    assert_eq!(ProvisionMode::All.phase(), Phase::All);
+    assert_eq!(ProvisionMode::Foreground.phase(), Phase::Foreground);
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let lease = provision_journal::run_lease("sandbox-1", LeaseWait::Try)
+        .unwrap()
+        .expect("test lease");
+    assert_eq!(ProvisionMode::Deferred(lease).phase(), Phase::Deferred);
+}
+
+#[test]
 fn auto_provision_sandbox_refuses_an_unreadable_provider_location() {
     use thegn_core::config::{Config, EnvConfig, EnvProviderConfig, PlacementMode};
     use thegn_core::store::WorkspaceStore;
