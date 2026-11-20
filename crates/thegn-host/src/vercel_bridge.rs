@@ -864,7 +864,7 @@ async fn pump(
                     }
                 }
                 Some(ev) => {
-                    let Some(bytes) = encode_input(&ev, &modes) else { continue };
+                    let Some(bytes) = encode_input(&ev, &mut modes) else { continue };
                     let send = match mode {
                         Mode::Pty => bytes,
                         Mode::Stream => {
