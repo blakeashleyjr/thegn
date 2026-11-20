@@ -14,7 +14,10 @@ pub(crate) fn host_locale(get: &dyn Fn(&str) -> Option<String>) -> Option<String
 
 /// `Some("C.UTF-8")` when `locale` names a UTF-8 codeset, else `None`.
 pub(crate) fn remote_locale(locale: Option<&str>) -> Option<&'static str> {
-    let codeset = locale?.split_once('.')?.1;
+    let locale = locale?;
+    let codeset = locale
+        .split_once('.')
+        .map_or(locale, |(_, codeset)| codeset);
     let codeset = codeset
         .split_once('@')
         .map_or(codeset, |(codeset, _)| codeset);
@@ -101,7 +104,9 @@ mod tests {
         for (locale, expected) in [
             (Some("en_US.UTF-8"), Some("C.UTF-8")),
             (Some("C.utf8"), Some("C.UTF-8")),
+            (Some("UTF-8"), Some("C.UTF-8")),
             (Some("de_DE.ISO-8859-1"), None),
+            (Some("C"), None),
             (Some(""), None),
             (None, None),
         ] {
