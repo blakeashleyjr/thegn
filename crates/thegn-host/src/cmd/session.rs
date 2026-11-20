@@ -260,7 +260,7 @@ pub enum SessionAction {
         #[arg(long = "key", value_name = "KEY", conflicts_with = "text")]
         key: Vec<String>,
         /// Paste the text (bracketed when the pane enabled bracketed paste).
-        #[arg(long, requires = "text")]
+        #[arg(long, requires = "text", conflicts_with = "key")]
         paste: bool,
         /// Append a carriage return (send-and-run).
         #[arg(long)]
