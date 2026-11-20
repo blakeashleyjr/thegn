@@ -23,6 +23,7 @@ cat >"$T/bin/thegn" <<'STUB'
 #!/usr/bin/env bash
 printf 'thegn %s\n' "$*" >>"$STUB_LOG"
 printf 'thegn-log %s\n' "${THEGN_LOG:-unset}" >>"$STUB_LOG"
+if [ "${1:-}" = --set ]; then shift 2; fi
 if [ "${THEGN_LOG:-}" = 'thegn::provider=trace' ]; then
   if [ -n "${THEGN_TRACE_FILE:-}" ]; then
     printf '%s\n' '2026-11-19T00:00:00Z TRACE sprites exec frame' >>"$THEGN_TRACE_FILE"
@@ -34,6 +35,14 @@ if [ "${1:-}" = doctor ] && [ -n "${STUB_DOCTOR:-}" ]; then
 fi
 if [ "${STUB_MODE:-}" = continue ]; then
   case "$*" in
+  *thegn-memprobe*)
+    case "${STUB_MEMPROBE:-}" in
+    enforced) printf 'reached 1984\n'; exit 137 ;;
+    *) printf 'reached 2560\ndone 2560\n'; exit 0 ;;
+    esac
+    ;;
+  *"command -v python3"*) printf '/usr/bin/python3\n/usr/bin/timeout\n'; exit 0 ;;
+  *memory.max*) echo max; exit 0 ;;
   "env test sx") exit 1 ;;
   "env set sx") exit 0 ;;
   "env up")
@@ -64,6 +73,7 @@ if [ "${STUB_MODE:-}" = continue ]; then
     fi
     exit 0
     ;;
+  "fleet inspect"*) echo '{"memory_limit_mb":2048}'; exit 0 ;;
   *"exit 3"*) echo boom; exit 3 ;;
   "sprite-exec sp-live -- true") exit 0 ;;
   *"--hold"*) /usr/bin/sleep 2; exit 0 ;;
@@ -158,7 +168,7 @@ for want in "11b " "view.down" "view.missing" "binary predates batch 170" "13 " 
     fail "sprites-live plan lacks '$want'"
   fi
 done
-for want in "5b " "6b " "7e " "8d " "8f " "10b "; do
+for want in "5b " "5d " "6b " "7e " "8d " "8f " "10b "; do
   if has "$T/plan-sprites-live.out" "$want"; then pass "sprites-live plan names step $want"; else fail "sprites-live plan lacks step $want"; fi
 done
 for want in " 11 " "11b " "11c " "wt rm <rd-y path> --force"; do
@@ -247,6 +257,7 @@ if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
   has "$T/keep-going-sprites.out" "TRACE sprites exec frame" &&
   has "$T/keep-going-sprites.out" "WARN 10: usage not reported yet for a sprite this young" &&
   has "$T/keep-going-sprites.out" "PASS 10w" &&
+  has "$T/keep-going-sprites.out" "SKIP 5, 5b, 5c, 5d" &&
   has "$T/keep-going-sprites.out" "unrecorded entries: 1" &&
   has "$T/keep-going-sprites.log" "thegn-log thegn::provider=trace" &&
   has "$T/keep-going-sprites.out" "FAILED STEPS:" &&
@@ -254,6 +265,26 @@ if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
   pass "sprites-live: --keep-going records a failure, continues, and avoids repeat force-down"
 else
   fail "sprites-live: --keep-going acting run ($(cat "$T/keep-going-sprites.out"))"
+fi
+
+run memprobe-enforced sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_MEMPROBE=enforced STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --min-ram-gb 2 --keep-going
+if has "$T/memprobe-enforced.out" "PASS 5d" &&
+  has "$T/memprobe-enforced.out" "memory limit enforced" &&
+  has "$T/memprobe-enforced.out" "INFO 5d: guest cgroup memory.max: max"; then
+  pass "sprites-live: memory probe reports enforcement"
+else
+  fail "sprites-live: enforced memory probe ($(cat "$T/memprobe-enforced.out"))"
+fi
+
+run memprobe-unenforced sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_MEMPROBE=unenforced STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --min-ram-gb 2 --keep-going
+if has "$T/memprobe-unenforced.out" "WARN 5d: limit accepted by the API but not enforced in the guest" &&
+  has "$T/memprobe-unenforced.out" "PASS 5d" &&
+  has "$T/memprobe-unenforced.out" "INFO 5d: guest cgroup memory.max: max"; then
+  pass "sprites-live: memory probe warns when unenforced"
+else
+  fail "sprites-live: unenforced memory probe ($(cat "$T/memprobe-unenforced.out"))"
 fi
 
 run reported-false-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_COST_REPORTED_FALSE=1 STUB_DOCTOR="$T/tok-true.json" -- \
