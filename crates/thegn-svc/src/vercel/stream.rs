@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use thegn_core::vercel::admit::valid_sandbox_name;
-use thegn_core::vercel::api::LogLine;
+use thegn_core::vercel::api::{self, LogLine};
 
 use super::VercelProvider;
 use super::client::WAIT_COMMAND_DEADLINE;
@@ -77,6 +77,7 @@ impl VercelProvider {
     pub async fn open_stream(self: Arc<Self>, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
         anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
         let body = self.command_body(&spec.argv, spec.cwd.as_deref(), &spec.env, false)?;
+        let body = api::with_attach_stdin(body);
         let session = self.interactive_session(name).await?;
         let cmd = self.client.run_detached(&session, &body).await?;
         let logs = match self.client.logs(&session, &cmd).await {
