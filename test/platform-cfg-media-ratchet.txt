@@ -12,3 +12,6 @@ lib.rs
 mpd.rs
 mpv.rs
 platform/mod.rs
+# helper.rs: Linux MPRIS and Windows SMTC share bounded text helpers; the
+# test-only cfgs keep the helper unit tests available on every host.
+helper.rs
