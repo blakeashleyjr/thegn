@@ -50,6 +50,8 @@ struct Registry {
     pane_wt: HashMap<u32, String>,
     /// worktree path → unix secs of the last unsolicited agent-pane output.
     hints: BTreeMap<String, f64>,
+    /// unix secs of the freshest unsolicited output from any Lead pane (the Lead group has no path, so the per-worktree map skips it).
+    lead_output: Option<f64>,
     /// pane id → the agent CLI name running in it (the worktree's bound agent).
     /// This is the per-pane attribution the CPU/output signals lack: a pane
     /// qualifies when it is a non-shell/non-tool pane in an agent-bearing
@@ -81,6 +83,7 @@ fn cell() -> &'static Mutex<Registry> {
         Mutex::new(Registry {
             pane_wt: HashMap::new(),
             hints: BTreeMap::new(),
+            lead_output: None,
             pane_agent: HashMap::new(),
             live_agent_wts: std::collections::BTreeSet::new(),
         })
@@ -144,6 +147,19 @@ fn unsolicited_age(
         cfg,
     )
     .map(Duration::from_secs_f64)
+}
+
+/// Pane ids of every tab of the live Lead group.
+fn lead_pane_ids(session: &crate::session::Session) -> Vec<u32> {
+    session
+        .worktrees
+        .iter()
+        .filter(|g| {
+            crate::lead::group::is_lead_group(&g.name)
+                && g.kind == crate::session::GroupKind::Terminal
+        })
+        .flat_map(|g| g.tabs.iter().flat_map(|tab| tab.center.pane_ids()))
+        .collect()
 }
 
 /// Refresh the pane→worktree registry from the live session and publish fresh
@@ -239,7 +255,25 @@ pub(crate) fn publish(
         let e = hints.entry(wt.clone()).or_insert(stamp);
         *e = e.max(stamp);
     }
+    let mut lead_output = None;
+    for id in lead_pane_ids(session) {
+        let Some(pane) = panes.table.get(&id) else {
+            continue;
+        };
+        let (out_at, in_at) = pane.output_stamps();
+        let Some(age) = unsolicited_age(
+            out_at.map(|t| t.elapsed()),
+            in_at.map(|t| t.elapsed()),
+            panes.pane_age(id),
+            &cfg.activity,
+        ) else {
+            continue;
+        };
+        let stamp = unix_now - age.as_secs_f64();
+        lead_output = Some(lead_output.map_or(stamp, |old: f64| old.max(stamp)));
+    }
     reg.hints = hints;
+    reg.lead_output = lead_output;
     reg.pane_agent = pane_agent;
     reg.live_agent_wts = live_agent_wts;
 }
@@ -251,6 +285,12 @@ pub(crate) fn snapshot() -> BTreeMap<String, f64> {
         .lock()
         .map(|reg| reg.hints.clone())
         .unwrap_or_default()
+}
+
+/// The freshest unsolicited output stamp from any live Lead pane, for the
+/// hydration thread's Lead indicator.
+pub(crate) fn snapshot_lead_output() -> Option<f64> {
+    cell().lock().unwrap_or_else(|p| p.into_inner()).lead_output
 }
 
 /// Worktrees seen running an agent by live probe, for the hydration thread to
@@ -400,6 +440,19 @@ mod tests {
             reg.hints.clear();
         }
         assert!(snapshot().is_empty());
+    }
+
+    #[test]
+    fn lead_pane_ids_include_only_the_live_lead_group() {
+        let session = crate::session::Session {
+            id: "s1".into(),
+            worktrees: vec![
+                crate::session::WorktreeGroup::terminal("lead"),
+                crate::session::WorktreeGroup::terminal("other"),
+            ],
+            active: 0,
+        };
+        assert_eq!(lead_pane_ids(&session), vec![0]);
     }
 
     #[test]
