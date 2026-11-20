@@ -3810,10 +3810,7 @@ fn sanitize_control_type(t: &str) -> String {
 
 /// Classify a Sprites exec text frame according to the documented control
 /// protocol. Non-JSON text is output only for TTY sessions.
-fn parse_sprite_ctrl(
-    text: &str,
-    tty: bool,
-) -> std::result::Result<SpriteCtrl, ExecProtocolError> {
+fn parse_sprite_ctrl(text: &str, tty: bool) -> std::result::Result<SpriteCtrl, ExecProtocolError> {
     if text.len() > EXEC_CONTROL_TEXT_MAX {
         return if tty {
             Ok(SpriteCtrl::Forward)
@@ -3871,21 +3868,13 @@ impl SpritesProvider {
         Box::pin(self.start_session(url, spec.tty, None, None)).await
     }
 
-    async fn open_exec_capturing(
-        &self,
-        id: &str,
-        spec: &ExecSpec,
-    ) -> Result<CapturedExec> {
+    async fn open_exec_capturing(&self, id: &str, spec: &ExecSpec) -> Result<CapturedExec> {
         let url = exec_ws_url(self.base()?, id, spec)?;
         let stderr = Arc::new(Mutex::new(StderrTail::default()));
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let session = Box::pin(self.start_session(
-            url,
-            spec.tty,
-            Some(Arc::clone(&stderr)),
-            Some(done_tx),
-        ))
-        .await?;
+        let session =
+            Box::pin(self.start_session(url, spec.tty, Some(Arc::clone(&stderr)), Some(done_tx)))
+                .await?;
         Ok((session, stderr, done_rx))
     }
 
@@ -4242,7 +4231,10 @@ where
         > + Unpin,
 {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::{Message, protocol::{CloseFrame, frame::coding::CloseCode}};
+    use tokio_tungstenite::tungstenite::{
+        Message,
+        protocol::{CloseFrame, frame::coding::CloseCode},
+    };
     let (mut write, mut read) = ws.split();
     let mut exited = None;
     let mut drain_until = None;
@@ -7238,17 +7230,17 @@ mod tests {
             decode_stream_frame(&[3, b'1', b'3', b'7']),
             Err(ExecProtocolError::MalformedExit)
         );
-        assert_eq!(decode_stream_frame(&[3]), Err(ExecProtocolError::MalformedExit));
+        assert_eq!(
+            decode_stream_frame(&[3]),
+            Err(ExecProtocolError::MalformedExit)
+        );
         assert_eq!(
             decode_stream_frame(&[3, 0, 0]),
             Err(ExecProtocolError::MalformedExit)
         );
         // A one-byte ASCII digit is the documented binary form, not text.
         assert_eq!(decode_stream_frame(&[3, b'1']), Ok(StreamMsg::Exit(49)));
-        assert_eq!(
-            decode_stream_frame(&[]),
-            Err(ExecProtocolError::EmptyFrame)
-        );
+        assert_eq!(decode_stream_frame(&[]), Err(ExecProtocolError::EmptyFrame));
         assert_eq!(
             decode_stream_frame(&[9, 1, 2]),
             Err(ExecProtocolError::UnknownStream(9))
@@ -7464,13 +7456,7 @@ mod tests {
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
-            client,
-            tty,
-            frames_tx,
-            control_rx,
-            sid_tx,
-            None,
-            None,
+            client, tty, frames_tx, control_rx, sid_tx, None, None,
         ));
 
         for message in messages {
@@ -7478,7 +7464,9 @@ mod tests {
                 break;
             }
         }
-        let _ = server.send(Message::Close(None)).await;
+        if server.send(Message::Close(None)).await.is_err() {
+            tracing::debug!(target: "thegn::provider", "test server close could not be sent");
+        }
 
         let mut frames = Vec::new();
         while let Some(frame) = frames_rx.recv().await {
@@ -7494,7 +7482,10 @@ mod tests {
 
         let (frames, fault) = drive_exec_messages(
             false,
-            vec![Message::Binary(vec![3, 0].into()), Message::Binary(vec![3, 0].into())],
+            vec![
+                Message::Binary(vec![3, 0].into()),
+                Message::Binary(vec![3, 0].into()),
+            ],
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
@@ -7507,7 +7498,10 @@ mod tests {
 
         let (frames, fault) = drive_exec_messages(
             false,
-            vec![Message::Binary(vec![3, 0].into()), Message::Binary(vec![1, b'x'].into())],
+            vec![
+                Message::Binary(vec![3, 0].into()),
+                Message::Binary(vec![1, b'x'].into()),
+            ],
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
@@ -7598,7 +7592,10 @@ mod tests {
         let driver = tokio::spawn(drive_exec(
             client, false, frames_tx, control_rx, sid_tx, None, None,
         ));
-        server.send(Message::Binary(vec![3, 0].into())).await.unwrap();
+        server
+            .send(Message::Binary(vec![3, 0].into()))
+            .await
+            .unwrap();
         assert_eq!(frames_rx.recv().await, Some(ExecFrame::Exit(0)));
         let result = tokio::time::timeout(EXEC_EXIT_DRAIN + Duration::from_secs(2), driver).await;
         assert_eq!(result.unwrap().unwrap(), None);
@@ -7629,13 +7626,27 @@ mod tests {
             None,
             Some(done_tx),
         ));
-        server.send(Message::Binary(vec![3, 0].into())).await.unwrap();
-        server.send(Message::Binary(vec![3, 0].into())).await.unwrap();
-        let _ = server.send(Message::Close(None)).await;
+        server
+            .send(Message::Binary(vec![3, 0].into()))
+            .await
+            .unwrap();
+        server
+            .send(Message::Binary(vec![3, 0].into()))
+            .await
+            .unwrap();
+        if server.send(Message::Close(None)).await.is_err() {
+            tracing::debug!(target: "thegn::provider", "test server close could not be sent");
+        }
         assert_eq!(frames_rx.recv().await, Some(ExecFrame::Exit(0)));
         assert_eq!(frames_rx.recv().await, None);
-        assert_eq!(done_rx.await.unwrap(), Some(ExecProtocolError::DuplicateExit));
-        assert_eq!(driver.await.unwrap(), Some(ExecProtocolError::DuplicateExit));
+        assert_eq!(
+            done_rx.await.unwrap(),
+            Some(ExecProtocolError::DuplicateExit)
+        );
+        assert_eq!(
+            driver.await.unwrap(),
+            Some(ExecProtocolError::DuplicateExit)
+        );
     }
 
     #[tokio::test]
@@ -7769,7 +7780,10 @@ mod tests {
             Some(ExecFrame::Stdout(b"/dev/pts/0".to_vec()))
         );
         assert_eq!(frames_rx.recv().await, None);
-        assert_eq!(driver.await.unwrap(), Some(ExecProtocolError::MalformedControl));
+        assert_eq!(
+            driver.await.unwrap(),
+            Some(ExecProtocolError::MalformedControl)
+        );
     }
 
     #[tokio::test]
@@ -8044,7 +8058,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(frames_rx.recv().await, None);
-        assert_eq!(driver.await.unwrap(), Some(ExecProtocolError::MalformedExit));
+        assert_eq!(
+            driver.await.unwrap(),
+            Some(ExecProtocolError::MalformedExit)
+        );
     }
 
     #[test]
