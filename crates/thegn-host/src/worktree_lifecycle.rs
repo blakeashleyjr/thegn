@@ -177,6 +177,10 @@ fn apply_completion_batch(
                     model.sidebar_db_worktrees.retain(|w| {
                         w.path != path && gone_path.as_deref() != Some(w.path.as_str())
                     });
+                    sb.note_deleted(&path);
+                    if let Some(gone_path) = gone_path.as_deref() {
+                        sb.note_deleted(gone_path);
+                    }
                     // Also on a concurrent reap, so the cleared `deleting` marker is re-applied by the rebuild.
                     changed = true;
                 } else {
@@ -2975,6 +2979,7 @@ mod tests {
             .changed
         );
         assert!(model.sidebar_db_worktrees.is_empty());
+        assert_eq!(sb.recently_deleted.get("/tmp/repo-feature"), Some(&None));
     }
 
     #[test]
