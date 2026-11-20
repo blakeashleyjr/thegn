@@ -1737,6 +1737,12 @@ fly-image-publish registry tag="v1":
 sprites-live *args:
     bash test/sprites-live.sh "$@"
 
+# Interactive provider-neutral remote parity run (plan-only without
+# --env <name> --i-accept-spend and THEGN_CHANNEL=dev).
+[positional-arguments]
+remote-parity *args:
+    bash test/remote-parity.sh "$@"
+
 # Daily live remote run: headless agent, pull, land, reap (real spend; plan-only
 # without `--env <name> --i-accept-spend` and THEGN_CHANNEL=dev). Not in ci/smoke.
 [positional-arguments]
