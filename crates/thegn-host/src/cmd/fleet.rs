@@ -40,7 +40,7 @@
 //!
 //! - `sprites_usage[]` (`fleet cost` only; absent when no `provider = "sprites"`
 //!   env is configured): `envs`, `error`, `rows[]` with `name`, `status`,
-//!   `cpu_hours`, `gb_hours`, `partial`, `usd` (`null` = unpriced; priced only
+//!   `cpu_hours`, `gb_hours`, `partial`, `recent`, `usd` (`null` = unpriced; priced only
 //!   when `[placement.price]` has a `sprites` entry), `reported`,
 //!   `last_recorded_at`, and per-row `error`. Only sprites this host proves it
 //!   owns (the ledger); usage comes from the Sprites API.
@@ -120,6 +120,8 @@ struct SpritesAccountUsage {
     error: Option<String>,
 }
 
+const SPRITES_USAGE_LAG_SECS: i64 = 3600; // UNVERIFIED: the Sprites usage lag.
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct SpritesUsageRow {
     name: String,
@@ -127,6 +129,8 @@ struct SpritesUsageRow {
     cpu_hours: f64,
     gb_hours: f64,
     partial: bool,
+    /// The sprite is younger than SPRITES_USAGE_LAG_SECS: the API may not have reported it yet.
+    recent: bool,
     reported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_recorded_at: Option<String>,
@@ -142,6 +146,10 @@ fn unix_to_rfc3339(secs: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
         .unwrap_or_default()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn usage_is_recent(created_at: i64, now_secs: i64) -> bool {
+    now_secs.saturating_sub(created_at) < SPRITES_USAGE_LAG_SECS
 }
 
 pub(crate) fn sanitize_text(value: &str, max_chars: usize) -> String {
@@ -177,9 +185,8 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
         .copied()
         .filter(|p| p.is_finite() && *p >= 0.0);
     let mut out = Vec::new();
-    let since = unix_to_rfc3339(thegn_svc::sprites::usage::month_start_utc(
-        thegn_core::util::now_ms() / 1000,
-    ));
+    let now = thegn_core::util::now_ms() / 1000;
+    let since = unix_to_rfc3339(thegn_svc::sprites::usage::month_start_utc(now));
     let mut account_first_env = std::collections::BTreeMap::<String, String>::new();
     for (name, envc) in &cfg.env {
         if envc.provider.provider.trim() != "sprites" {
@@ -244,7 +251,13 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
                                     });
                                     usage.rows.push(match read {
                                         Ok(Some(reading)) => {
-                                            sprites_row(&rec.name, &rec.state, &reading, price)
+                                            sprites_row(
+                                                &rec.name,
+                                                &rec.state,
+                                                &reading,
+                                                price,
+                                                usage_is_recent(rec.created_at, now),
+                                            )
                                         }
                                         Ok(None) => SpritesUsageRow {
                                             name: rec.name.clone(),
@@ -252,6 +265,7 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
                                             cpu_hours: 0.0,
                                             gb_hours: 0.0,
                                             partial: false,
+                                            recent: usage_is_recent(rec.created_at, now),
                                             reported: false,
                                             last_recorded_at: None,
                                             error: None,
@@ -264,6 +278,7 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
                                             cpu_hours: 0.0,
                                             gb_hours: 0.0,
                                             partial: false,
+                                            recent: usage_is_recent(rec.created_at, now),
                                             reported: false,
                                             last_recorded_at: None,
                                             error: Some(sanitize_text(&format!("{error:#}"), 256)),
@@ -305,6 +320,7 @@ fn sprites_row(
     status: &str,
     reading: &thegn_svc::sprites::usage::UsageReading,
     price: Option<f64>,
+    recent: bool,
 ) -> SpritesUsageRow {
     let u = &reading.usage;
     let cpu_hours = finite_cpu_hours(u.cpu_seconds);
@@ -315,6 +331,7 @@ fn sprites_row(
         cpu_hours,
         gb_hours,
         partial: u.partial,
+        recent,
         reported: reading.reported,
         last_recorded_at: reading
             .last_recorded_at
@@ -387,7 +404,14 @@ fn render_sprites(usage: &[SpritesUsage]) -> String {
                 row.status.clone(),
                 cpu,
                 gb,
-                if row.partial { "yes" } else { "no" }.to_string(),
+                if row.partial {
+                    "yes"
+                } else if row.recent {
+                    "recent"
+                } else {
+                    "no"
+                }
+                .to_string(),
                 row.usd.map_or_else(|| "-".to_string(), |v| usd(v, 4)),
             ]);
         }
@@ -949,6 +973,14 @@ mod tests {
     const NOW: i64 = 2 * 3_600_000 + 5 * 60_000;
 
     #[test]
+    fn usage_is_recent_window() {
+        let now = 10_000;
+        assert!(usage_is_recent(now - SPRITES_USAGE_LAG_SECS + 1, now));
+        assert!(!usage_is_recent(now - SPRITES_USAGE_LAG_SECS, now));
+        assert!(!usage_is_recent(now - SPRITES_USAGE_LAG_SECS - 1, now));
+    }
+
+    #[test]
     fn list_table_aligns_marks_orphans_and_unpriced() {
         let view = view();
         let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
@@ -1194,6 +1226,7 @@ mod tests {
                         reported: true,
                     },
                     None,
+                    false,
                 ),
                 sprites_row(
                     "tg-b",
@@ -1208,6 +1241,7 @@ mod tests {
                         reported: true,
                     },
                     Some(0.5),
+                    false,
                 ),
             ],
         }]
@@ -1320,6 +1354,7 @@ mod tests {
                 cpu_hours: 0.0,
                 gb_hours: 0.0,
                 partial: false,
+                recent: true,
                 reported: false,
                 last_recorded_at: None,
                 error: None,
@@ -1330,6 +1365,11 @@ mod tests {
 
         let text = render_sprites(&usage);
         assert!(text.contains("tg-late"), "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("tg-late") && line.contains("recent")),
+            "{text}"
+        );
         assert!(
             text.lines()
                 .any(|line| line.contains("tg-late") && line.matches('-').count() >= 2),
@@ -1358,6 +1398,7 @@ mod tests {
                     cpu_hours: 1.5,
                     gb_hours: 2.0,
                     partial: false,
+                    recent: false,
                     reported: true,
                     last_recorded_at: Some("2026-01-01T02:00:00Z".into()),
                     error: None,
@@ -1370,6 +1411,7 @@ mod tests {
                     cpu_hours: 0.0,
                     gb_hours: 0.0,
                     partial: false,
+                    recent: false,
                     reported: false,
                     last_recorded_at: None,
                     error: Some("request failed".into()),
