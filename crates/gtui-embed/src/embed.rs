@@ -137,6 +137,26 @@ fn fmt_dur(secs: i64) -> String {
     }
 }
 
+/// " · partial" plus, when the retained data starts inside the window, how
+/// much of it is covered: " · partial: last 3m of 15m".
+fn partial_suffix(retained_from: Option<f64>, window: Option<[f64; 2]>) -> String {
+    let Some(t) = retained_from else {
+        return " · partial".to_string();
+    };
+    let Some([from, to]) = window else {
+        return " · partial".to_string();
+    };
+    if from < t && t < to {
+        format!(
+            " · partial: last {} of {}",
+            fmt_dur((to - t) as i64),
+            fmt_dur((to - from) as i64)
+        )
+    } else {
+        " · partial".to_string()
+    }
+}
+
 impl AppTile for ObserveTile {
     fn id(&self) -> &str {
         "observe"
@@ -680,8 +700,8 @@ fn render_targets(
                             .unwrap_or_else(|| (index + 1).to_string());
                         format!("{title} · {} · {series}", target.label)
                     };
-                    if let Coverage::Partial { .. } = frame.coverage {
-                        label.push_str(" · partial");
+                    if let Coverage::Partial { retained_from } = frame.coverage {
+                        label.push_str(&partial_suffix(retained_from, context.window));
                     }
                     if matches!(
                         frame.coverage,
@@ -1830,5 +1850,23 @@ mod tests {
         assert_eq!(fmt_dur(45), "45s");
         assert_eq!(fmt_dur(900), "15m");
         assert_eq!(fmt_dur(7200), "2h");
+    }
+
+    #[test]
+    fn partial_suffix_table() {
+        let cases = [
+            (None, None, " · partial"),
+            (Some(5.0), None, " · partial"),
+            (Some(-1.0), Some([0.0, 900.0]), " · partial"),
+            (Some(1000.0), Some([0.0, 900.0]), " · partial"),
+            (
+                Some(720.0),
+                Some([0.0, 900.0]),
+                " · partial: last 3m of 15m",
+            ),
+        ];
+        for (retained_from, window, expected) in cases {
+            assert_eq!(partial_suffix(retained_from, window), expected);
+        }
     }
 }
