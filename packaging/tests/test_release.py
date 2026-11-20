@@ -1781,7 +1781,7 @@ class ReleaseAssetSizePrecheckTests(unittest.TestCase):
         document = self.listing(
             ("linux.tar.gz", 700),
             ("darwin.tar.gz", 700),
-            ("unselected.tar.gz", 1000),
+            ("unselected.bin", 1000),
         )
         with (
             mock.patch.object(release, "MAX_ARCHIVE_BYTES", 1000),
