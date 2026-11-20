@@ -7,6 +7,16 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `thegn land` refuses, naming the sandbox, when the provider cannot say whether a worktree's sandbox exists.
+- The daily remote live check requires land to report releasing and pulling, and no longer depends on the owner's merge gate command.
+
+### Fixed
+
+- `thegn land` on a remote worktree that was never opened in a pane now pulls the sandbox's commits first and honours `--release-sandbox`; before, it landed without pulling, left the sandbox running and said nothing (THE-2477).
+- `--release-sandbox` is never dropped silently: when it cannot act, land says why.
+
 ## [0.1.0-alpha.115] — 2026-11-20
 
 ### Added
