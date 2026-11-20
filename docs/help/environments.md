@@ -257,9 +257,12 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   `thegn fleet inspect <sprite> --env <S> --policy`.
 - **Exec protocol errors.** A command stream that ends without a valid exit
   status is a failure, never a success, on any remote. On Sprites, a stream that
-  breaks the documented frame protocol (a second exit, output after the exit,
-  an unknown stream or control message, a malformed exit) is reported as
-  `sprites exec: protocol error: <what>` and the command fails.
+  breaks what the client relies on (a malformed exit, two exits with different
+  codes, output after the exit, an unknown stream) is reported as
+  `sprites exec: protocol error: <what>` and the command fails. The server
+  repeats the exit in two forms and sends control messages the protocol document
+  does not list; a repeated exit with the same code and a control message of an
+  unknown type are accepted.
 - **Instance cap.** `max_instances` applies through the ledger; `0` (the
   default for sprites) means no cap.
 - **Cost.** `thegn fleet cost` shows a Sprites block with CPU hours and
