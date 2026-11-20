@@ -421,7 +421,7 @@ reading, it shows an amber `?`.
   sidebar focus is controlled separately by `sidebar_detail_when`; `i` cycles
   only `sidebar_focus_detail`. Both settings are in [[config-reference]] `[ui]`
   and the `sidebar_focus_detail` runtime choice persists.
-- `I` — Info screen for the row under the cursor (also `Alt I`, or "Info screen"
+- `I` — Info screen for the row under the cursor (also "Info screen"
   in the palette): identity, the effective settings with the layer that set
   each one (env, sandbox backend and what would launch here, profile, network,
   agent, merge gate), overrides, sessions and stats. Esc closes it.
