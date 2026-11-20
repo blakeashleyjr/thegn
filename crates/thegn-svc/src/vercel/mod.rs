@@ -820,7 +820,7 @@ impl VercelProvider {
         loop {
             tokio::select! {
                 biased;
-                result = &mut run => break result?,
+                result = &mut run => break result,
                 _ = check.tick() => {
                     // A long provisioning step must not outlive its session; the
                     // lifetime ceiling inside `extend_if_due` still bounds the spend.
