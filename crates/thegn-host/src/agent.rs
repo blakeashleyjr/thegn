@@ -2428,6 +2428,66 @@ pub struct ProvisionStepView {
     pub detail: Option<String>,
 }
 
+/// How much of a provider provision one call runs (prompt-first).
+pub(crate) enum ProvisionMode {
+    All,
+    Foreground,
+    Deferred(thegn_core::provision_journal::RunLease),
+}
+
+impl ProvisionMode {
+    fn phase(&self) -> thegn_core::provision_journal::Phase {
+        match self {
+            Self::All => thegn_core::provision_journal::Phase::All,
+            Self::Foreground => thegn_core::provision_journal::Phase::Foreground,
+            Self::Deferred(_) => thegn_core::provision_journal::Phase::Deferred,
+        }
+    }
+}
+
+pub(crate) struct DeferredHandoff {
+    pub(crate) sandbox: String,
+    pub(crate) lease: Option<thegn_core::provision_journal::RunLease>,
+}
+
+pub(crate) struct ProvisionOutcome {
+    pub(crate) provisioned: bool,
+    pub(crate) checkpoint: Option<String>,
+    pub(crate) deferred: Option<DeferredHandoff>,
+}
+
+impl ProvisionOutcome {
+    pub(crate) fn not_provisioned() -> Self {
+        Self {
+            provisioned: false,
+            checkpoint: None,
+            deferred: None,
+        }
+    }
+
+    pub(crate) fn ready(checkpoint: Option<String>) -> Self {
+        Self {
+            provisioned: true,
+            checkpoint,
+            deferred: None,
+        }
+    }
+
+    pub(crate) fn pending(
+        id: &str,
+        lease: Option<thegn_core::provision_journal::RunLease>,
+    ) -> Self {
+        Self {
+            provisioned: true,
+            checkpoint: None,
+            deferred: Some(DeferredHandoff {
+                sandbox: id.to_string(),
+                lease,
+            }),
+        }
+    }
+}
+
 /// Provision the worktree's environment if it runs on a managed **provider**
 /// (sprites, …) — a no-op (`Ok(false)`) for local/ssh/k8s envs. Resolves the env
 /// from the worktree, then delegates to [`provision_provider_env`]. This is the
@@ -2439,6 +2499,15 @@ pub fn provision_worktree(
     worktree: &str,
     progress: impl FnMut(&[ProvisionStepView]),
 ) -> anyhow::Result<bool> {
+    provision_worktree_mode(cfg, worktree, ProvisionMode::All, progress).map(|o| o.provisioned)
+}
+
+pub(crate) fn provision_worktree_mode(
+    cfg: &Config,
+    worktree: &str,
+    mode: ProvisionMode,
+    mut progress: impl FnMut(&[ProvisionStepView]),
+) -> anyhow::Result<ProvisionOutcome> {
     // Tag every log line this (blocking) provisioning run emits with the
     // worktree, so a sprite/remote failure is attributable and the Logs panel
     // keeps it out of *other* worktrees' views.
@@ -2452,7 +2521,7 @@ pub fn provision_worktree(
                 .values()
                 .any(|env| env.placement == thegn_core::config::PlacementMode::Provider) =>
         {
-            return Ok(false);
+            return Ok(ProvisionOutcome::not_provisioned());
         }
         Err(error) => return Err(anyhow::anyhow!(error)),
     };
@@ -2467,7 +2536,7 @@ pub fn provision_worktree(
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
     let selected_env = match provision_selection(cfg, read)? {
         ProvisionSelection::Resolve(selected_env) => selected_env,
-        ProvisionSelection::Skip => return Ok(false),
+        ProvisionSelection::Skip => return Ok(ProvisionOutcome::not_provisioned()),
     };
     let mut selection =
         Db::open()?.effective_env_selection(worktree, &repo_root.to_string_lossy())?;
@@ -2479,7 +2548,7 @@ pub fn provision_worktree(
         environment.placement,
         thegn_core::placement::Placement::Provider(_)
     ) {
-        return Ok(false);
+        return Ok(ProvisionOutcome::not_provisioned());
     }
     if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal_for(
         true,
@@ -2492,7 +2561,40 @@ pub fn provision_worktree(
     // Flag the in-flight provision so the warm-claim fast path won't bind a
     // spare (and clear the splash) under this run — see `provision_gate`.
     let _live = crate::provision_gate::worktree_live_guard(worktree);
-    provision_provider_env(cfg, worktree, &environment.name, progress)
+    provision_provider_env_inner(cfg, worktree, &environment.name, None, mode, &mut progress)
+}
+
+/// Finish an existing deferred provision without creating or recreating its
+/// sandbox. The run lease is acquired before `provision_worktree_mode` takes
+/// `sandbox_lock`, so callers may use this from headless and attach paths.
+pub(crate) fn finish_deferred_blocking(
+    cfg: &Config,
+    worktree: &str,
+    progress: &mut dyn FnMut(&[ProvisionStepView]),
+) -> anyhow::Result<()> {
+    let Some((_, id)) = crate::provision_gate::provider_target(cfg, worktree)? else {
+        return Ok(());
+    };
+    let Some(entry) = thegn_core::provision_journal::read(&id) else {
+        return Ok(());
+    };
+    if entry.state == thegn_core::provision_journal::DeferredState::Cancelled {
+        anyhow::bail!(
+            "background setup for {worktree} was cancelled; reopen it or run `thegn env up --worktree {worktree}` to retry"
+        );
+    }
+    let lease = thegn_core::provision_journal::run_lease(
+        &id,
+        thegn_core::provision_journal::LeaseWait::Block,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("could not acquire the deferred provision lease for {id}"))?;
+    provision_worktree_mode(
+        cfg,
+        worktree,
+        ProvisionMode::Deferred(lease),
+        &mut *progress,
+    )
+    .map(|_| ())
 }
 
 /// The env selection for a provider exec/proxy/cooldown decision. `None` when
@@ -2850,7 +2952,15 @@ pub fn provision_provider_env(
     env_name: &str,
     mut progress: impl FnMut(&[ProvisionStepView]),
 ) -> anyhow::Result<bool> {
-    provision_provider_env_named(cfg, worktree, env_name, None, &mut progress).map(|(ok, _)| ok)
+    provision_provider_env_inner(
+        cfg,
+        worktree,
+        env_name,
+        None,
+        ProvisionMode::All,
+        &mut progress,
+    )
+    .map(|o| o.provisioned)
 }
 
 /// Provision a provider env into a sandbox. `name_override` forces the sandbox
@@ -2869,21 +2979,41 @@ pub fn provision_provider_env_named(
     name_override: Option<&str>,
     progress: &mut impl FnMut(&[ProvisionStepView]),
 ) -> anyhow::Result<(bool, Option<String>)> {
+    provision_provider_env_inner(
+        cfg,
+        worktree,
+        env_name,
+        name_override,
+        ProvisionMode::All,
+        progress,
+    )
+    .map(|o| (o.provisioned, o.checkpoint))
+}
+
+fn provision_provider_env_inner(
+    cfg: &Config,
+    worktree: &str,
+    env_name: &str,
+    name_override: Option<&str>,
+    mode: ProvisionMode,
+    progress: &mut impl FnMut(&[ProvisionStepView]),
+) -> anyhow::Result<ProvisionOutcome> {
     use thegn_core::envplan::{self, EnvPlan, PlanOpts, StepKind};
+    use thegn_core::provision_journal::{self as journal, Phase};
 
     let Some(env) = cfg.env.get(env_name) else {
-        return Ok((false, None));
+        return Ok(ProvisionOutcome::not_provisioned());
     };
     let pc = &env.provider;
     let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
-    let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
+    let credential_mode = if kind == thegn_core::config::EnvProviderKind::Sprites
         && !pc.model_credentials_is_explicit()
     {
         thegn_core::config::ModelCredentials::Upload
     } else {
         pc.model_credentials
     };
-    let grant = thegn_core::provider_credentials::model_grant(kind, mode);
+    let grant = thegn_core::provider_credentials::model_grant(kind, credential_mode);
     // Credential-free kinds (Vercel): the repo goes in only as a host bundle and
     // no host credential is uploaded. Refuse BEFORE anything billable exists
     // when the bundle seed is impossible — never fall back to an origin clone.
@@ -2909,7 +3039,7 @@ pub fn provision_provider_env_named(
         None => crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, env_name)?,
     };
     let Some(id) = id.filter(|s| !s.is_empty()) else {
-        return Ok((false, None));
+        return Ok(ProvisionOutcome::not_provisioned());
     };
     // Bake the resolved id so a recreate (`ensure_exists`→`create`) names the
     // sandbox correctly (the id embeds the repo/worktree tokens + a path-hash).
@@ -2921,23 +3051,49 @@ pub fn provision_provider_env_named(
     let Some(provider) =
         crate::provider_factory::provider_for_named_owned(pc, &id, owner.as_deref())
     else {
-        return Ok((false, None));
+        return Ok(ProvisionOutcome::not_provisioned());
     };
     if !provider.caps().files {
-        return Ok((false, None)); // can't provision without the fs API
+        return Ok(ProvisionOutcome::not_provisioned()); // can't provision without the fs API
     }
     let loc = GitLoc::for_worktree_op(Path::new(worktree), "provider provisioning")
         .map_err(anyhow::Error::msg)?;
+    // Prompt-first fast path: a pane opened during the deferred phase never waits on sandbox_lock (D-pf-c).
+    if matches!(&mode, ProvisionMode::Foreground)
+        && name_override.is_none()
+        && crate::provider_workdir::is_provisioned_locally(&id)
+        && journal::read(&id).is_some()
+    {
+        match journal::run_lease(&id, journal::LeaseWait::Try) {
+            Ok(lease) => return Ok(ProvisionOutcome::pending(&id, lease)),
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::provider",
+                    %id,
+                    %error,
+                    "D-pf-f: could not acquire the deferred run lease; continuing with the locked path"
+                );
+            }
+        }
+    }
+    let phase = mode.phase();
+    let mut _held = match mode {
+        ProvisionMode::All | ProvisionMode::Foreground => None,
+        ProvisionMode::Deferred(lease) => Some(lease),
+    };
+    let mut deferred_only = phase == Phase::Deferred;
     // Serialize concurrent provisions of the same sandbox (eager vs focused
     // materialize): the loser blocks here (off-loop by contract), then the
     // marker short-circuit below makes its run a no-op. The marker alone only
     // guards SEQUENTIAL re-runs — it is written at the END of the pipeline.
-    let _gate = crate::provision_gate::sandbox_lock(&id);
+    // Blocking acquisition belongs off the event loop. In particular, do not
+    // wait for a run lease while this sandbox lock is held.
+    let mut _gate = Some(crate::provision_gate::sandbox_lock(&id));
 
     // A hibernated worktree resumes by overlaying its snapshot on the fresh
     // clone. Read it before any sandbox create: an unreadable record must
     // refuse here rather than provision an empty clone over the snapshot.
-    let snapshot_restore = if name_override.is_none() {
+    let snapshot_restore = if !deferred_only && name_override.is_none() {
         crate::hibernator::begin_restore(worktree, pc.hibernate_enabled())?
     } else {
         None
@@ -2945,7 +3101,9 @@ pub fn provision_provider_env_named(
 
     // THE-2020: a provider at its `[placement.fleet_budget] max_hourly` refuses
     // a NEW sandbox before anything billable is created (resume never refused).
-    crate::fleet_read::admit_new_sandbox(cfg, env_name, &id).map_err(anyhow::Error::msg)?;
+    if !deferred_only {
+        crate::fleet_read::admit_new_sandbox(cfg, env_name, &id).map_err(anyhow::Error::msg)?;
+    }
 
     // Recreate-if-missing: the sandbox may have been cleaned up out-of-band (TTL,
     // manual delete, provider GC). `ensure_exists` recreates it before we read the
@@ -2955,19 +3113,23 @@ pub fn provision_provider_env_named(
     // Surface the create/list phase (which precedes the step plan below) as a
     // labeled active step + a log breadcrumb — this is the phase that, untimed,
     // hung provisioning on startup, so make it observable rather than a blank.
-    progress(&[ProvisionStepView {
-        label: "Preparing sandbox".to_string(),
-        state: ProvisionState::Active,
-        detail: None,
-    }]);
-    tracing::debug!(target: "thegn::startup", %id, "provider ensure_exists (create/list)");
-    let created = match block_on_provider(|| async { provider.ensure_exists(&id).await }) {
-        Ok(created) => created,
-        // `{e:#}` (alternate) flattens the whole anyhow cause chain into the
-        // message — without it, Display keeps only the outermost context and the
-        // real cause (e.g. machine0's `vm_create` `isError` text) is dropped
-        // before it can reach the loading screen / logs.
-        Err(e) => return Err(anyhow::anyhow!("ensure sandbox {id}: {e:#}")),
+    let created = if deferred_only {
+        false
+    } else {
+        progress(&[ProvisionStepView {
+            label: "Preparing sandbox".to_string(),
+            state: ProvisionState::Active,
+            detail: None,
+        }]);
+        tracing::debug!(target: "thegn::startup", %id, "provider ensure_exists (create/list)");
+        match block_on_provider(|| async { provider.ensure_exists(&id).await }) {
+            Ok(created) => created,
+            // `{e:#}` (alternate) flattens the whole anyhow cause chain into the
+            // message — without it, Display keeps only the outermost context and the
+            // real cause (e.g. machine0's `vm_create` `isError` text) is dropped
+            // before it can reach the loading screen / logs.
+            Err(e) => return Err(anyhow::anyhow!("ensure sandbox {id}: {e:#}")),
+        }
     };
     tracing::debug!(target: "thegn::startup", %id, created, "sandbox ensured");
 
@@ -3017,8 +3179,9 @@ pub fn provision_provider_env_named(
             &id,
         );
     }
-    if let crate::egress_admit::EgressAdmission::AdmitFresh
-    | crate::egress_admit::EgressAdmission::VerifyExisting = admission
+    if !deferred_only
+        && let crate::egress_admit::EgressAdmission::AdmitFresh
+        | crate::egress_admit::EgressAdmission::VerifyExisting = admission
     {
         let egress_steps = crate::egress_admit::BlockingProviderEgress {
             provider: &provider,
@@ -3052,26 +3215,98 @@ pub fn provision_provider_env_named(
     let (sprite_home, workdir) = crate::provider_workdir::probe_and_resolve(&provider, &id, pc);
     let marker = EnvPlan::marker_path(&workdir);
 
-    // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint) — but
-    // still refresh auth creds: the host's OAuth token rotates, so the
-    // provision-time snapshot goes stale and the in-sandbox agent 401s.
-    if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
-        crate::provider_workdir::mark_provisioned(&id);
-        // A credential-free kind never receives agent auth, and never holds a
-        // route-to-host bearer (`false` revokes + removes any installed one).
-        if !credential_free && grant.login_files {
-            crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, &loc, env_name);
+    let read_marker = || {
+        block_on_provider(|| async { provider.read(&id, &marker).await })
+            .ok()
+            .map(|bytes| envplan::marker_state(&bytes))
+    };
+    let mut action = journal::phase_action(phase, read_marker());
+    if action == journal::PhaseAction::WaitThenRunDeferred {
+        drop(_gate.take());
+        _held = journal::run_lease(&id, journal::LeaseWait::Block)?;
+        _gate = Some(crate::provision_gate::sandbox_lock(&id));
+        deferred_only = true;
+        action = journal::phase_action(Phase::Deferred, read_marker());
+    }
+    match action {
+        journal::PhaseAction::ShortCircuit => {
+            if let Err(error) = journal::clear(&id) {
+                tracing::debug!(target: "thegn::provider", %id, %error, "could not clear completed provision journal");
+            }
+            crate::provider_workdir::mark_provisioned(&id);
+            // A credential-free kind never receives agent auth, and never holds a
+            // route-to-host bearer (`false` revokes + removes any installed one).
+            if !credential_free && grant.login_files {
+                crate::agent_configs::resync_agent_auth(
+                    &provider, &id, cfg, worktree, &loc, env_name,
+                );
+            }
+            crate::remote_enqueue_auth::reconcile_provider_credential(
+                cfg,
+                &provider,
+                pc,
+                &id,
+                &repo_root,
+                worktree,
+                name_override.is_none() && !credential_free,
+            )?;
+            return Ok(ProvisionOutcome::ready(None));
         }
-        crate::remote_enqueue_auth::reconcile_provider_credential(
-            cfg,
-            &provider,
-            pc,
-            &id,
-            &repo_root,
-            worktree,
-            name_override.is_none() && !credential_free,
-        )?;
-        return Ok((true, None));
+        journal::PhaseAction::AlreadyDone => {
+            if let Err(error) = journal::clear(&id) {
+                tracing::debug!(target: "thegn::provider", %id, %error, "could not clear completed provision journal");
+            }
+            return Ok(ProvisionOutcome::ready(None));
+        }
+        journal::PhaseAction::Abandon => {
+            if let Err(error) = journal::clear(&id) {
+                tracing::debug!(target: "thegn::provider", %id, %error, "could not clear abandoned provision journal");
+            }
+            crate::provider_workdir::clear_provisioned(&id);
+            return Ok(ProvisionOutcome::not_provisioned());
+        }
+        journal::PhaseAction::ReportPending => {
+            crate::provider_workdir::mark_provisioned(&id);
+            if journal::read(&id).is_none() {
+                let pending = journal::Journal::pending(worktree, env_name);
+                if let Err(error) = journal::write(&id, &pending) {
+                    tracing::warn!(target: "thegn::provider", %id, %error, "could not write deferred provision journal");
+                }
+            }
+            let lease = match journal::run_lease(&id, journal::LeaseWait::Try) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "thegn::provider",
+                        %id,
+                        %error,
+                        "D-pf-f: could not acquire the deferred run lease; reporting pending"
+                    );
+                    None
+                }
+            };
+            return Ok(ProvisionOutcome::pending(&id, lease));
+        }
+        journal::PhaseAction::RunAll
+        | journal::PhaseAction::RunForeground
+        | journal::PhaseAction::RunDeferred => {}
+        journal::PhaseAction::WaitThenRunDeferred => unreachable!("wait action is resolved above"),
+    }
+    let run_started_ms = thegn_core::util::now_ms();
+    if deferred_only
+        && let Some(entry) = journal::read(&id)
+        && entry.state == journal::DeferredState::Cancelled
+        && entry.updated_ms + 600_000 < run_started_ms
+    {
+        let pending = journal::Journal::pending(worktree, env_name);
+        if let Err(error) = journal::write(&id, &pending) {
+            tracing::warn!(
+                target: "thegn::provider",
+                %id,
+                %error,
+                "could not reset stale cancelled deferred provision journal"
+            );
+        }
     }
 
     // Resolve the repo origin so the sprite can clone it.
@@ -3098,7 +3333,8 @@ pub fn provision_provider_env_named(
     if !grant.login_files {
         withheld.push("agent logins".to_string());
     }
-    if kind == thegn_core::config::EnvProviderKind::Sprites
+    if !deferred_only
+        && kind == thegn_core::config::EnvProviderKind::Sprites
         && let Some(message) = sprites_withheld_notice(env_name, &withheld)
     {
         thegn_core::msg::info(&message);
@@ -3334,7 +3570,8 @@ pub fn provision_provider_env_named(
     // only when a push cache is set — nixpkgs paths otherwise substitute from the
     // default caches (cache.nixos.org) with no push. A failure just means the
     // sandbox falls back to whatever its substituters can serve.
-    if opts.strategy == thegn_core::config::ShellStrategy::HostParity
+    if !deferred_only
+        && opts.strategy == thegn_core::config::ShellStrategy::HostParity
         && !opts.home_store_roots.is_empty()
         && pc.binary_cache_push
         && !pc.binary_cache_url.trim().is_empty()
@@ -3347,6 +3584,23 @@ pub fn provision_provider_env_named(
         ));
     }
 
+    let (foreground_steps, deferred_steps) = plan.split_deferred(name_override.is_none());
+    let bg_has_checkpoint = deferred_steps.iter().any(|step| step.id == "checkpoint");
+    let fg_len = if deferred_only {
+        0
+    } else {
+        foreground_steps.len()
+    };
+    let steps: Vec<thegn_core::envplan::ProvisionStep> = if deferred_only {
+        deferred_steps.clone()
+    } else {
+        foreground_steps
+            .iter()
+            .chain(deferred_steps.iter())
+            .cloned()
+            .collect()
+    };
+
     // `sprite_home` (the sandbox login's real `$HOME`) was resolved + cached above,
     // right after the sandbox came Ready — reused here for the uploads.
 
@@ -3354,8 +3608,12 @@ pub fn provision_provider_env_named(
     // step (if the plan has one) — persisted below + returned to the caller.
     let mut base_checkpoint: Option<String> = None;
     // Seed the loading screen with every step pending (the original dot).
-    let mut views: Vec<ProvisionStepView> = plan
-        .steps
+    let shown = if phase == Phase::Foreground {
+        fg_len
+    } else {
+        steps.len()
+    };
+    let mut views: Vec<ProvisionStepView> = steps[..shown]
         .iter()
         .map(|s| ProvisionStepView {
             label: s.label.clone(),
@@ -3364,7 +3622,160 @@ pub fn provision_provider_env_named(
         })
         .collect();
 
-    for (i, step) in plan.steps.iter().enumerate() {
+    let fg_tail = |base: Option<&str>| -> anyhow::Result<(
+        Option<thegn_core::provision_journal::RunLease>,
+        bool,
+        bool,
+    )> {
+        // Install only after the base checkpoint step so a bearer token is never
+        // captured in a reusable image/artifact. This is a fatal provisioning
+        // boundary: route mode must not open a remote shell that could silently
+        // enqueue into a sprite-local queue.
+        // A credential-free kind never holds a route-to-host bearer; `false` revokes and removes one.
+        if !bg_has_checkpoint {
+            crate::remote_enqueue_auth::reconcile_provider_credential(
+                cfg,
+                &provider,
+                pc,
+                &id,
+                &repo_root,
+                worktree,
+                name_override.is_none() && !credential_free,
+            )?;
+        }
+        let mut lease = None;
+        let mut journaled = false;
+        let mut busy = false;
+        if !deferred_steps.is_empty() {
+            match journal::run_lease(&id, journal::LeaseWait::Try) {
+                Ok(Some(found)) => lease = Some(found),
+                Ok(None) => busy = true,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "thegn::provider",
+                        %id,
+                        %error,
+                        "D-pf-f: could not acquire the deferred run lease; continuing in line"
+                    );
+                }
+            }
+            if lease.is_some() {
+                let pending = journal::Journal::pending(worktree, env_name);
+                journaled = match journal::write(&id, &pending) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "thegn::provider",
+                            %id,
+                            %error,
+                            "could not write deferred provision journal; continuing in foreground"
+                        );
+                        false
+                    }
+                };
+            }
+        }
+        let marker_bytes = if deferred_steps.is_empty() {
+            envplan::MARKER_DONE
+        } else {
+            envplan::MARKER_DEFERRED
+        };
+        if let Err(error) =
+            block_on_provider(|| async { provider.write(&id, &marker, marker_bytes).await })
+        {
+            tracing::debug!(target: "thegn::provider", %id, %error, "could not write provision marker");
+        }
+        if deferred_steps.is_empty()
+            && let Err(error) = journal::clear(&id)
+        {
+            tracing::debug!(target: "thegn::provider", %id, %error, "could not clear completed provision journal");
+        }
+        if let Some((account, key, public)) = &managed_ssh {
+            // Verify that the exact key made it into the remote authorization file
+            // before publishing custody. A failed SSH setup must not become an
+            // apparently-authorized ledger row.
+            let key_id = crate::managed_ssh_rotation::key_id(public)?;
+            let script = crate::managed_ssh_rotation::authorized_probe_script(&key_id);
+            let argv = vec!["sh".to_string(), "-lc".to_string(), script];
+            let (code, _) =
+                block_on_provider(|| async { provider.run_exec(&id, &argv, None, &[]).await })?;
+            if code != 0 {
+                anyhow::bail!(
+                    "managed SSH key was not authorized on {} sandbox {id}",
+                    pc.provider
+                );
+            }
+            thegn_core::managed_ssh::record_authorized_with_proxy_worktree(
+                pc.provider.trim(),
+                account,
+                &id,
+                key,
+                public,
+                Some(worktree),
+            )?;
+        }
+        crate::provider_workdir::mark_provisioned(&id);
+        if deferred_steps.is_empty()
+            && let Some(cp) = base
+        {
+            let lock = crate::provision_gate::flake_lock_hash(&repo_root);
+            if let Ok(db) = Db::open()
+                && let Err(error) =
+                    db.set_base_snapshot(&repo_root.to_string_lossy(), env_name, cp, &lock)
+            {
+                tracing::debug!(target: "thegn::provider", %id, %error, "could not record base snapshot");
+            }
+        }
+        Ok((lease, journaled, busy))
+    };
+
+    let mut tail_done = false;
+    let mut bg_failed = false;
+    let mut cancelled = false;
+    let mut deferred_failure: Option<(String, String)> = None;
+
+    for (i, step) in steps.iter().enumerate() {
+        if i == fg_len && !deferred_only && !tail_done {
+            let (lease, journaled, busy) = fg_tail(base_checkpoint.as_deref())?;
+            if phase == Phase::Foreground && journaled {
+                return Ok(ProvisionOutcome {
+                    provisioned: true,
+                    checkpoint: None,
+                    deferred: Some(DeferredHandoff {
+                        sandbox: id.clone(),
+                        lease,
+                    }),
+                });
+            }
+            if busy {
+                anyhow::bail!(
+                    "{id}: another thegn process is finishing this sandbox's background setup; retry when it is done"
+                );
+            }
+            _held = lease;
+            if shown < steps.len() {
+                views.extend(steps[shown..].iter().map(|step| ProvisionStepView {
+                    label: step.label.clone(),
+                    state: ProvisionState::Pending,
+                    detail: None,
+                }));
+            }
+            tail_done = true;
+        }
+        if i >= fg_len {
+            if journal::read(&id)
+                .is_some_and(|journal| journal.state == journal::DeferredState::Cancelled)
+            {
+                cancelled = true;
+                break;
+            }
+            if step.id == "checkpoint" && bg_failed {
+                views[i].state = ProvisionState::Failed;
+                views[i].detail = Some("skipped: an earlier background step failed".into());
+                progress(&views);
+                continue;
+            }
+        }
         for (j, v) in views.iter_mut().enumerate() {
             v.state = match j.cmp(&i) {
                 // A best-effort step that already failed stays Failed (with its
@@ -3533,6 +3944,15 @@ pub fn provision_provider_env_named(
         };
 
         if let Err(e) = result {
+            if i >= fg_len {
+                bg_failed = true;
+                if deferred_failure.is_none() {
+                    deferred_failure = Some((
+                        step.label.clone(),
+                        crate::provision_recover::sanitize_detail(&e.to_string()),
+                    ));
+                }
+            }
             // A pure target-side devShell pre-warm that failed is invisible
             // to the user — the pane rebuilds it lazily — so don't alarm with a red
             // `Failed` row (its usual failure is an OOM/timeout on a heavy Nix build
@@ -3579,58 +3999,87 @@ pub fn provision_provider_env_named(
         progress(&views);
     }
 
-    // Install only after the base checkpoint step so a bearer token is never
-    // captured in a reusable image/artifact. This is a fatal provisioning
-    // boundary: route mode must not open a remote shell that could silently
-    // enqueue into a sprite-local queue.
-    // A credential-free kind never holds a route-to-host bearer; `false` revokes and removes one.
-    crate::remote_enqueue_auth::reconcile_provider_credential(
-        cfg,
-        &provider,
-        pc,
-        &id,
-        &repo_root,
-        worktree,
-        name_override.is_none() && !credential_free,
-    )?;
+    if !deferred_only && !tail_done {
+        fg_tail(base_checkpoint.as_deref())?;
+        return Ok(ProvisionOutcome::ready(base_checkpoint));
+    }
 
-    // Drop the marker (+ local mirror for the attach gate) so a later open skips it.
-    let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await }); // best-effort: marker write: a failed write just re-provisions on the next open
-    if let Some((account, key, public)) = &managed_ssh {
-        // Verify that the exact key made it into the remote authorization file
-        // before publishing custody. A failed SSH setup must not become an
-        // apparently-authorized ledger row.
-        let key_id = crate::managed_ssh_rotation::key_id(public)?;
-        let script = crate::managed_ssh_rotation::authorized_probe_script(&key_id);
-        let argv = vec!["sh".to_string(), "-lc".to_string(), script];
-        let (code, _) =
-            block_on_provider(|| async { provider.run_exec(&id, &argv, None, &[]).await })?;
-        if code != 0 {
-            anyhow::bail!(
-                "managed SSH key was not authorized on {} sandbox {id}",
-                pc.provider
-            );
-        }
-        thegn_core::managed_ssh::record_authorized_with_proxy_worktree(
-            pc.provider.trim(),
-            account,
+    let tail = journal::deferred_tail(journal::DeferredOutcome {
+        cancelled,
+        failed: bg_failed,
+        checkpoint_planned: bg_has_checkpoint,
+        checkpoint_ok: base_checkpoint.is_some(),
+    });
+    if tail.reconcile_credential {
+        crate::remote_enqueue_auth::reconcile_provider_credential(
+            cfg,
+            &provider,
+            pc,
             &id,
-            key,
-            public,
-            Some(worktree),
+            &repo_root,
+            worktree,
+            name_override.is_none() && !credential_free,
         )?;
-    }
-    crate::provider_workdir::mark_provisioned(&id);
-    // Record the provisioned-base checkpoint per (repo, env), keyed by the
-    // flake.lock hash so a lockfile change invalidates it (see env_base_snapshots).
-    if let Some(cp) = &base_checkpoint {
-        let lock = crate::provision_gate::flake_lock_hash(&repo_root);
-        if let Ok(db) = Db::open() {
-            // best-effort: the DB is a cache
-            let _ = db.set_base_snapshot(&repo_root.to_string_lossy(), env_name, cp, &lock);
+        if journal::read(&id)
+            .is_some_and(|journal| journal.state == journal::DeferredState::Cancelled)
+        {
+            if let Err(error) =
+                crate::remote_enqueue_auth::revoke_for_sandbox(pc, &id, Some(worktree))
+            {
+                tracing::warn!(target: "thegn::provider", %id, %error, "could not revoke cancelled sandbox credential");
+            }
+            return Ok(ProvisionOutcome::not_provisioned());
         }
     }
-    Ok((true, base_checkpoint))
+    if tail.write_done_marker {
+        if let Err(error) =
+            block_on_provider(|| async { provider.write(&id, &marker, envplan::MARKER_DONE).await })
+        {
+            tracing::debug!(target: "thegn::provider", %id, %error, "could not write completed provision marker");
+        }
+        if let Some(cp) = &base_checkpoint {
+            let lock = crate::provision_gate::flake_lock_hash(&repo_root);
+            if let Ok(db) = Db::open()
+                && let Err(error) =
+                    db.set_base_snapshot(&repo_root.to_string_lossy(), env_name, cp, &lock)
+            {
+                tracing::debug!(target: "thegn::provider", %id, %error, "could not record base snapshot");
+            }
+        }
+    }
+    match tail.journal {
+        journal::JournalAction::Clear => {
+            if let Err(error) = journal::clear(&id) {
+                tracing::debug!(target: "thegn::provider", %id, %error, "could not clear completed provision journal");
+            }
+        }
+        journal::JournalAction::MarkFailed => {
+            if let Some((label, detail)) = deferred_failure {
+                if !journal::read(&id)
+                    .is_some_and(|entry| entry.state == journal::DeferredState::Cancelled)
+                {
+                    let failed = journal::Journal::failed(worktree, env_name, &label, &detail);
+                    if let Err(error) = journal::write(&id, &failed) {
+                        tracing::warn!(target: "thegn::provider", %id, %error, "could not record failed deferred provision");
+                    }
+                }
+            }
+        }
+        journal::JournalAction::Keep => {}
+    }
+    let deferred = if tail.write_done_marker {
+        None
+    } else {
+        Some(DeferredHandoff {
+            sandbox: id,
+            lease: None,
+        })
+    };
+    Ok(ProvisionOutcome {
+        provisioned: true,
+        checkpoint: base_checkpoint,
+        deferred,
+    })
 }
 
 pub(crate) use crate::agent_home::{resolve_personal_dotfiles, resolve_setup};
