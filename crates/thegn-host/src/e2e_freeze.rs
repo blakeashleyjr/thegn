@@ -3,7 +3,7 @@
 //! text/styled/pixel snapshot regression under muse.
 //!
 //! What it pins (and where the pin is applied):
-//! - system stats (`run.rs` stats ingestion) → a fixed [`stats`] snapshot;
+//! - system stats (`run.rs` stats ingestion, and the Observe feed in `apps::feed_if_armed`) → a fixed [`stats`] snapshot;
 //! - the masthead clock/date (`chrome::masthead_widget`) → [`now`];
 //! - the version in the brand widget → [`VERSION`];
 //! - the activity-dot FSM (`hydrate.rs`) → not polled, so dots never decay
