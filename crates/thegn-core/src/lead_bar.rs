@@ -133,7 +133,7 @@ pub fn summarize(inputs: LeadInputs) -> LeadBar {
             )
         })
     });
-    let usage = inputs.usage.ok();
+    let usage = inputs.usage.as_ref().ok().cloned();
     let lanes = usage.map(|usage| Meter {
         used: usage.active_lanes,
         limit: inputs.limits.max_concurrent_lanes,
@@ -170,11 +170,10 @@ pub fn summarize(inputs: LeadInputs) -> LeadBar {
         }
     };
 
-    let (last, last_age) = if inputs.pending.is_ok() && inputs.runs.is_ok() {
-        last_action(
-            inputs.runs.as_ref().expect("checked above"),
-            inputs.pending.as_ref().expect("checked above"),
-        )
+    let (last, last_age) = if let (Ok(runs), Ok(pending)) =
+        (inputs.runs.as_ref(), inputs.pending.as_ref())
+    {
+        last_action(runs, pending)
         .map(|(label, at)| {
             (
                 Some(label),
