@@ -155,11 +155,16 @@ impl VercelProvider {
         let targz = single_file_targz(&base, data, mode)?;
         let session = self.session_for(id, Wake::Allow).await?;
         match self
-            .client
+            .api()
             .fs_write_targz(&session, &parent, targz.clone())
             .await
         {
             Ok(()) => Ok(()),
+            Err(error) if Self::is_session_stopped(&error) => {
+                self.forget_session(id);
+                let session = self.session_for(id, Wake::Allow).await?;
+                self.api().fs_write_targz(&session, &parent, targz).await
+            }
             Err(first) => {
                 let argv = ["mkdir", "-p", "--", parent.as_str()].map(String::from);
                 let (code, _) = self
@@ -170,7 +175,19 @@ impl VercelProvider {
                     return Err(first.context("vercel: upload parent dir is not creatable"));
                 }
                 let session = self.session_for(id, Wake::Allow).await?;
-                self.client.fs_write_targz(&session, &parent, targz).await
+                match self
+                    .api()
+                    .fs_write_targz(&session, &parent, targz.clone())
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) if Self::is_session_stopped(&error) => {
+                        self.forget_session(id);
+                        let session = self.session_for(id, Wake::Allow).await?;
+                        self.api().fs_write_targz(&session, &parent, targz).await
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
     }
@@ -181,10 +198,22 @@ impl ProviderFiles for VercelProvider {
         Box::pin(async move {
             check_abs_path(path)?;
             let session = self.session_for(id, Wake::Allow).await?;
-            self.client
+            let data = match self
+                .api()
                 .fs_read(&session, path, FILE_TRANSFER_BODY_LIMIT)
-                .await?
-                .ok_or_else(|| anyhow!("vercel: sandbox file not found"))
+                .await
+            {
+                Ok(data) => data,
+                Err(error) if Self::is_session_stopped(&error) => {
+                    self.forget_session(id);
+                    let session = self.session_for(id, Wake::Allow).await?;
+                    self.api()
+                        .fs_read(&session, path, FILE_TRANSFER_BODY_LIMIT)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
+            data.ok_or_else(|| anyhow!("vercel: sandbox file not found"))
         })
     }
 
