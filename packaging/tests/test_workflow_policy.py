@@ -816,7 +816,14 @@ class WorkflowPolicyTests(unittest.TestCase):
                 for step in saga["steps"]
                 if step.get("name") == f"Download {display} receipt by immutable artifact ID"
             )
-            self.assertEqual(upload["uses"], download["uses"])
+            self.assertEqual(
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                upload["uses"],
+            )
+            self.assertEqual(
+                "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+                download["uses"],
+            )
             self.assertEqual("${{ secrets.GITHUB_TOKEN }}", download["with"]["github-token"])
             self.assertIn(
                 f"${{{{ needs.{job_name}.outputs.receipt_artifact_id }}}}",
