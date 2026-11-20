@@ -50,13 +50,7 @@ pub(crate) fn feed_observe_sample(
     snap: &thegn_metrics::StatsSnapshot,
     cadence_secs: f64,
 ) {
-    feed_if_armed(
-        &OBSERVE_FEED_ARMED,
-        observe_host_feed(),
-        at_ms,
-        snap,
-        cadence_secs,
-    );
+    feed_if_armed(&OBSERVE_FEED_ARMED, observe_host_feed(), at_ms, snap, cadence_secs);
 }
 
 fn feed_if_armed(
@@ -245,11 +239,7 @@ impl AppHost {
     /// When the configured default changes, it takes effect immediately. If
     /// the active tile is removed or disabled, the configured default wins.
     pub fn reconcile(&mut self, cfg: &thegn_core::config::Config) {
-        arm_feed(
-            &OBSERVE_FEED_ARMED,
-            observe_host_feed(),
-            cfg.observe.enabled,
-        );
+        arm_feed(&OBSERVE_FEED_ARMED, observe_host_feed(), cfg.observe.enabled);
         if self.observe_config_snapshot != cfg.observe {
             if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == "observe") {
                 *slot = AppSlot::new(slot.id.clone(), slot.label.clone());
@@ -930,7 +920,7 @@ pub fn build_observe_tile(
         theme,
         gtui_embed::embed::HostSourceInit::Fed(host_feed),
     )
-        .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?;
     Ok(Box::new(tile))
 }
 
