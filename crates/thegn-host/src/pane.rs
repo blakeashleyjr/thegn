@@ -686,16 +686,13 @@ impl PtyPane {
         // Reader-fed panes already advanced their emulator on the reader thread.
         let now = self.predict_now_ms();
         let cursor = self.emulator.cursor();
-        let echoed = self
-            .predictor
-            .echo_cell()
-            .and_then(|(row, col)| self.emulator.cell(row as u16, col as u16))
-            .map(|grid_cell| grid_cell.text);
-        self.predictor.on_server_output(
-            now,
-            (cursor.0 as usize, cursor.1 as usize),
-            echoed.as_deref(),
-        );
+        let emulator = &self.emulator;
+        let cell = |r: usize, c: usize| {
+            let (r, c) = (u16::try_from(r).ok()?, u16::try_from(c).ok()?);
+            emulator.cell(r, c).map(|g| g.text)
+        };
+        self.predictor
+            .on_server_output(now, (cursor.0 as usize, cursor.1 as usize), &cell);
         feed_bytes_to_history(
             bytes,
             &mut self.history,
