@@ -724,8 +724,8 @@ pub(crate) use refresh_ticker::{RefreshTicker, spawn_refresh_ticker};
 /// it lives. Remote worktrees (a `location` in the registry) are exempt — their
 /// path isn't local. Active focus is re-pinned by name and the session
 /// re-persisted. Returns how many were pruned. Cheap in the steady state (one
-/// `is_dir` stat per group; the git probe is reap-branch-only and memoised per
-/// repo root); call on a real event, never idle.
+/// checkout-presence stat per group; the git probe is reap-branch-only and
+/// memoised per repo root); call on a real event, never idle.
 pub(crate) fn prune_stale_worktree_groups(
     session: &mut crate::session::Session,
     db: &thegn_core::db::Db,
@@ -778,7 +778,7 @@ pub(crate) fn prune_stale_worktree_groups(
                 // group the three cheap tests have already condemned. This
                 // runs before the first frame — do not restructure into an
                 // eager form (a `Vec` of bools, an `any` over all tests).
-                g.path.is_empty() || remote.contains(&g.path) || Path::new(&g.path).is_dir() || {
+                g.path.is_empty() || remote.contains(&g.path) || group_checkout_present(g) || {
                     let root = session_root
                         .clone()
                         .or_else(|| {
@@ -1375,7 +1375,7 @@ pub(crate) fn row_is_remote_effective(
 /// truth for worktrees; "the directory is not readable right now" is not "git no
 /// longer lists this worktree", and only the second claim may destroy a row.
 ///
-/// Consulted **only on the reap branch**, after the cheap `is_dir` stat and
+/// Consulted **only on the reap branch**, after the cheap checkout-presence stat and
 /// [`row_is_remote_effective`] have already said "this looks dead". In the steady
 /// state (no missing dirs) it spawns nothing, so neither the hydration pass nor
 /// the pre-first-frame prune pays for it. Do NOT hoist this onto the happy path:
@@ -1427,8 +1427,31 @@ pub(crate) fn row_is_git_listed(
     }
 }
 
+/// One stat in the steady state. A linked worktree is alive only while its
+/// `.git` entry exists; a `.git`-less directory is the remnant of an
+/// interrupted removal. The workspace root (and an unknown root) keeps the
+/// plain directory test: a "dir" workspace has no `.git`.
+pub(crate) fn checkout_present(worktree: &str, repo_root: &str) -> bool {
+    if repo_root.is_empty() || Path::new(worktree) == Path::new(repo_root) {
+        Path::new(worktree).is_dir()
+    } else {
+        std::fs::symlink_metadata(Path::new(worktree).join(".git")).is_ok()
+    }
+}
+
+fn group_checkout_present(group: &crate::session::WorktreeGroup) -> bool {
+    match group.kind {
+        crate::session::GroupKind::Branch => {
+            std::fs::symlink_metadata(Path::new(&group.path).join(".git")).is_ok()
+        }
+        crate::session::GroupKind::Home | crate::session::GroupKind::Terminal => {
+            Path::new(&group.path).is_dir()
+        }
+    }
+}
+
 /// Worktrees registered in the DB, ready for the sidebar's cross-workspace
-/// rows: one entry per registry row whose dir still exists (or is remote).
+/// rows: one entry per registry row whose checkout still exists (or is remote).
 ///
 /// Only the tests want the rows without the branch snapshot; production takes
 /// both from [`db_worktree_list_with_snapshot`] so one git observation serves
@@ -1496,7 +1519,7 @@ pub(crate) fn db_worktree_list_with_snapshot(
             continue;
         }
         // git is the source of truth: a LOCAL registry row that git no longer
-        // lists and whose dir vanished (deleted outside thegn) is dead — delete
+        // lists and whose checkout vanished (deleted outside thegn) is dead — delete
         // it here (we're on the hydration thread) instead of merely hiding it,
         // so deceased worktrees stop resurfacing in the tree. Remote rows (a set
         // `location` OR a non-local env placement, including one INHERITED from
@@ -1512,7 +1535,7 @@ pub(crate) fn db_worktree_list_with_snapshot(
             w.env_name.as_deref(),
             &w.repo_root,
             &mut ambient_cache,
-        ) && !std::path::Path::new(&w.worktree).is_dir()
+        ) && !checkout_present(&w.worktree, &w.repo_root)
         {
             if row_is_git_listed(&w.repo_root, &w.worktree, &mut git_cache) {
                 // An unreadable dir is not proof of deletion (THE-73): a
@@ -1522,7 +1545,7 @@ pub(crate) fn db_worktree_list_with_snapshot(
                     worktree = %w.worktree,
                     tab = %w.tab_name,
                     repo_root = %w.repo_root,
-                    "registry row kept: dir missing but git still lists this worktree"
+                    "registry row kept: checkout missing but git still lists this worktree"
                 );
             } else {
                 tracing::warn!(
@@ -1530,7 +1553,7 @@ pub(crate) fn db_worktree_list_with_snapshot(
                     worktree = %w.worktree,
                     tab = %w.tab_name,
                     repo_root = %w.repo_root,
-                    "reaping registry row: git no longer lists this worktree, its local dir is gone and its env resolves local"
+                    "reaping registry row: git no longer lists this worktree, its checkout is gone and its env resolves local"
                 );
                 // `del_worktree` cascades caches + merge-queue; the activity-FSM
                 // entry is file-based and pruned separately.
