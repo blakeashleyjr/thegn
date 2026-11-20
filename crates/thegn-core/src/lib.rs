@@ -242,6 +242,7 @@ pub mod launch_backend;
 pub mod launch_class;
 pub mod launch_kind;
 pub mod layout_import;
+pub mod lead_bar;
 pub mod lead_confine;
 pub mod lead_input;
 pub mod lead_net;
