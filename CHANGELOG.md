@@ -7,6 +7,15 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The Sprites live check's wake check after a cost read (step 10b) fails only if the sprite stays running, and warns on a single running reading or an unreadable provider listing (THE-2476).
+- A failed agent step in the Sprites live check says why: the agent's status, exit code, error and last output lines, never secrets.
+
+### Fixed
+
+- Four doc comments that broke the documentation build.
+
 ## [0.1.0-alpha.116] — 2026-11-20
 
 ### Changed
