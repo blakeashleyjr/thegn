@@ -811,7 +811,7 @@ fn live_exec_session_semantics() {
                 replay_has_marker,
                 replay_starts_with_clear
             );
-            let _ = attached.control.send(ExecControl::Close).await;
+            let _ = attached.control.send(ExecControl::Close).await; // best-effort: the driver may already have ended
             drop(attached);
             let session_persists =
                 match session_absent_within(&provider, &name, &session_id, Duration::from_secs(5))
@@ -870,7 +870,7 @@ fn live_exec_session_semantics() {
                 cwd: None,
             };
             let mut big_session = provider.open_exec(&name, &big_spec).await?;
-            let big_input = vec![b'x'; 1024 * 1024];
+            let big_input = ("x".repeat(63) + "\n").repeat(16_384).into_bytes();
             let big_send = big_session
                 .control
                 .send(ExecControl::Stdin(big_input))
@@ -888,7 +888,7 @@ fn live_exec_session_semantics() {
                 "INFO 1 MiB stdin: socket dropped={}, byte count={byte_count:?}",
                 big_send.is_err() || eof_send.is_err() || receiver_dropped
             );
-            let _ = big_session.control.send(ExecControl::Close).await;
+            let _ = big_session.control.send(ExecControl::Close).await; // best-effort: the driver may already have ended
             drop(big_session);
 
             // Keep the first observed marker available in the live trace even
