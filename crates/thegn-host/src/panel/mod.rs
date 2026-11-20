@@ -26,6 +26,7 @@ pub mod gitfull;
 pub mod gitui;
 pub mod graph;
 pub mod hints;
+pub(crate) mod lead_bar;
 pub(crate) mod media;
 pub mod rollback;
 pub mod scope;
@@ -130,6 +131,10 @@ pub enum PanelHit {
     /// A click on the tab bar: resolved by x-position via `panel_tab_hit`.
     #[allow(dead_code)]
     Tab(PanelTab),
+    /// The pinned Lead footer: jump to the Lead (`jump-lead`).
+    LeadJump,
+    /// The footer's approvals chip: open System ▸ Notifications at the pending request.
+    LeadApprovals,
 }
 
 /// Transport controls painted by the Media section. The panel owns only the

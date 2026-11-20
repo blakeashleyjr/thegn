@@ -37,6 +37,9 @@ accordion — four tabs, one open section at a time:
 - **help** — this documentation, docked (a scrollable reader alongside the
   `F1` overlay)
 
+With `[lead]` configured, a pinned Lead footer takes up to 3 rows at the bottom
+of the panel at every width; see [[lead]].
+
 ## Keys
 
 - `Tab` / `Shift-Tab` — cycle tabs; `1`–`9`, `0` jump to the tab's first ten
