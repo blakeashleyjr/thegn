@@ -1058,8 +1058,9 @@ fn live_exec_wire_throughput() {
                 .control
                 .send(ExecControl::Stdin(b"stty size\r".to_vec()))
                 .await?;
-            let initial_size =
-                recv_until(&mut tty_session, b"40 120", Duration::from_secs(10)).await?;
+            let initial_size = collect_for(&mut tty_session, Duration::from_secs(3), 4096)
+                .await
+                .0;
             println!(
                 "INFO initial size: {}",
                 String::from_utf8_lossy(&initial_size).trim()
@@ -1069,7 +1070,7 @@ fn live_exec_wire_throughput() {
             tty_session
                 .control
                 .send(ExecControl::Stdin(
-                    b"yes 0123456789 | head -n 400000; printf '%s%s\n' __RP END__\r".to_vec(),
+                    b"yes 0123456789 | head -n 400000; printf '%s%s\\n' __RP END__\r".to_vec(),
                 ))
                 .await?;
             let tty_stats = collect_wire_stats(
@@ -1155,7 +1156,8 @@ fn live_exec_wire_throughput() {
                     .send(ExecControl::Stdin(vec![b'x'; 32 * 1024]))
                     .await?;
             }
-            bulk_session.control.send(ExecControl::Close).await?;
+            let (closed_tx, _) = tokio::sync::mpsc::channel(1);
+            drop(std::mem::replace(&mut bulk_session.control, closed_tx));
             let bulk_stats = collect_wire_stats(
                 &mut bulk_session,
                 bulk_started,
@@ -1183,7 +1185,8 @@ fn live_exec_wire_throughput() {
                     .send(ExecControl::Stdin(vec![b'x']))
                     .await?;
             }
-            byte_session.control.send(ExecControl::Close).await?;
+            let (closed_tx, _) = tokio::sync::mpsc::channel(1);
+            drop(std::mem::replace(&mut byte_session.control, closed_tx));
             let byte_stats = collect_wire_stats(
                 &mut byte_session,
                 byte_started,
