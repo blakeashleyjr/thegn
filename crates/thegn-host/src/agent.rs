@@ -530,51 +530,14 @@ pub fn prepare_sandbox_env_with_selection(
     // Set when a provider bring-up failure degrades this open to the host (below),
     // so the outcome can heal a stale remote `worktrees.location` back to local.
     let mut degraded_from_provider = false;
-    let mut sb = environment.sandbox;
-    let mut explicit_backend =
-        sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
-    // A fresh/explicit choice always wins over config; a non-explicit DB value
-    // only overrides when config is "auto" (an explicit `backend = "bwrap"` must
-    // beat a stale entry). An explicit choice may be "host"/"none" — keep those.
-    // A saved backend is a LOCAL-session artifact (only the wizard writes it, for
-    // a local choice), so it must not resurrect a backend on a remote/provider
-    // placement — those default to `none` (the sandbox brings its own isolation).
-    let config_is_auto = sb.backend == thegn_core::config::SandboxBackend::Auto;
-    if placement.is_local()
-        && let Some(saved) = backend_choice.map(str::trim)
-        && !saved.is_empty()
-        && (choice_is_explicit || (config_is_auto && saved != "auto"))
-        && let Ok(b) = thegn_core::config::SandboxBackend::from_str_validated(saved)
-    {
-        explicit_backend =
-            sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
-        sb.backend = b;
-    }
-    // A host-toolchain backend (bwrap, systemd-nspawn, win-native) only makes
-    // sense on the LOCAL box — it isolates via host-namespace syscalls. On a
-    // non-local placement (ssh / k8s / provider) the placement is already the
-    // isolation boundary, so a nested bwrap is meaningless: probing for it over
-    // the remote exec channel answers Unreachable and the resolver stalls, then
-    // hard-fails "sandbox backend 'bwrap' could not be resolved". This value is
-    // almost always inherited from the base `[sandbox]` (or a per-worktree choice
-    // saved from a prior LOCAL session), not a deliberate ask for THIS env — so
-    // drop it to Auto and let the chain pick an in-placement runtime or run
-    // natively in the placement, instead of treating it as an explicit demand.
-    if !placement.is_local() && explicit_backend.is_some_and(|b| b.is_host_toolchain()) {
-        // Expected, not a problem the user must fix: running natively in the
-        // placement IS correct here (the provider/pod/host is the sandbox). So
-        // trace it for `THEGN_LOG` / debugging rather than warning on every open —
-        // the noisy hard-failure this replaces is gone, and `config explain`
-        // still reports the configured value honestly.
-        tracing::debug!(
-            target: "thegn::sandbox",
-            backend = %sb.backend,
-            placement = %placement.label(),
-            "host-local backend can't nest in a non-local placement; running natively in the placement",
-        );
-        explicit_backend = None;
-        sb.backend = thegn_core::config::SandboxBackend::Auto;
-    }
+    let request = thegn_core::launch_backend::launch_request(
+        environment.sandbox,
+        &placement,
+        backend_choice,
+        choice_is_explicit,
+    );
+    let mut sb = request.sandbox;
+    let mut explicit_backend = request.explicit;
     let degrade_allowed = host_fallback_allowed(&placement, &sb, force_host_requested(worktree));
     let mut explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == thegn_core::config::SandboxBackend::Auto;
@@ -794,8 +757,8 @@ pub fn prepare_sandbox_env_with_selection(
         _ => None,
     };
     let loc = provider_loc.as_ref().unwrap_or(loc);
-    for candidate in sandbox_candidates(&sb) {
-        // `resolve_placed_exact`, not `resolve_placed`: `sandbox_candidates` has
+    for candidate in thegn_core::launch_backend::candidates(&sb) {
+        // `resolve_placed_exact`, not `resolve_placed`: `launch_backend::candidates` has
         // ALREADY expanded the chain into one explicit candidate per entry, so a
         // resolver that degrades into the chain on a miss makes each candidate
         // re-walk every entry — N² probes and N copies of the host-fallback
@@ -2385,14 +2348,9 @@ fn host_fallback_allowed(
 
 /// Whether an enabled `auto` sandbox's configured `backend_chain` explicitly
 /// lists the host (`host`/`none`). Only the user's own chain counts — the
-/// implicit host tail `sandbox_candidates` appends is not consent.
+/// implicit host tail `launch_backend::candidates` appends is not consent.
 fn auto_chain_names_host(sandbox: &thegn_core::config::SandboxConfig) -> bool {
-    sandbox.enabled
-        && sandbox.backend == thegn_core::config::SandboxBackend::Auto
-        && sandbox.backend_chain.iter().any(|name| {
-            thegn_core::config::SandboxBackend::from_str_validated(name)
-                .is_ok_and(|b| b == thegn_core::config::SandboxBackend::None)
-        })
+    thegn_core::launch_backend::auto_chain_names_host(sandbox)
 }
 
 /// Un-pin `worktree` from the host so an explicit retry re-attempts the real env.
@@ -5827,10 +5785,8 @@ pub fn launch_spec_full(
     // A recorded per-worktree backend is a deliberate override (only the wizard
     // writes it, when divergent); honour it as explicit so it sticks across
     // restarts even against a non-"auto" config. Empty/NULL → auto (re-resolve).
-    let saved_is_override = saved_backend
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty() && s != "auto");
+    let saved_is_override =
+        thegn_core::launch_backend::saved_pick_is_override(saved_backend.as_deref());
     let mut outcome = prepare_sandbox_env_with_selection(
         cfg,
         &repo_root,
@@ -6476,39 +6432,6 @@ pub(crate) fn repo_slug_checked(db: &Db, repo_root: &Path) -> anyhow::Result<Opt
     let base = file_name.to_string_lossy().into_owned();
     db.slug_for_repo(&repo_root.to_string_lossy(), &base)
         .map(Some)
-}
-
-fn sandbox_candidates(
-    sb: &thegn_core::config::SandboxConfig,
-) -> Vec<thegn_core::config::SandboxConfig> {
-    // Disabled sandboxing is an intentional host decision. Keep the final host
-    // admission check below (so an explicitly demanded isolation floor still
-    // applies), but do not walk or probe the configured backend chain.
-    if !sb.enabled {
-        let mut host = sb.clone();
-        host.backend = thegn_core::config::SandboxBackend::None;
-        return vec![host];
-    }
-    if sb.backend != thegn_core::config::SandboxBackend::Auto {
-        return vec![sb.clone()];
-    }
-    let mut out = Vec::new();
-    for name in &sb.backend_chain {
-        if let Ok(backend) = thegn_core::config::SandboxBackend::from_str_validated(name) {
-            let mut c = sb.clone();
-            c.backend = backend;
-            out.push(c);
-        }
-    }
-    if !out
-        .iter()
-        .any(|c| c.backend == thegn_core::config::SandboxBackend::None)
-    {
-        let mut c = sb.clone();
-        c.backend = thegn_core::config::SandboxBackend::None;
-        out.push(c);
-    }
-    out
 }
 
 #[cfg(test)]
