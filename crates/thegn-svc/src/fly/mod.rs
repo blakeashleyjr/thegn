@@ -25,6 +25,7 @@ pub mod machines;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -39,6 +40,8 @@ use thegn_core::remote::SshTarget;
 const LEDGER_PROVIDER: &str = "fly";
 /// The remote user (Fly machines boot as root; sshd admits the injected key).
 const FLY_USER: &str = "root";
+const FLY_DESTROY_CONFIRM_BUDGET: Duration = Duration::from_secs(30);
+const FLY_DESTROY_CONFIRM_POLL: Duration = Duration::from_secs(2);
 
 pub(crate) fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -227,6 +230,8 @@ pub struct FlyProvider {
     owner: Option<String>,
     credential_ref: Option<String>,
     ips: Mutex<HashMap<String, String>>,
+    destroy_budget: Duration,
+    destroy_poll: Duration,
 }
 
 impl FlyProvider {
@@ -237,6 +242,8 @@ impl FlyProvider {
             owner: None,
             credential_ref: None,
             ips: Mutex::new(HashMap::new()),
+            destroy_budget: FLY_DESTROY_CONFIRM_BUDGET,
+            destroy_poll: FLY_DESTROY_CONFIRM_POLL,
         }
     }
 
@@ -255,6 +262,12 @@ impl FlyProvider {
 
     pub fn with_credential_ref(mut self, credential_ref: &str) -> Self {
         self.credential_ref = Some(credential_ref.to_owned());
+        self
+    }
+
+    pub fn with_destroy_confirm(mut self, budget: Duration, poll: Duration) -> Self {
+        self.destroy_budget = budget;
+        self.destroy_poll = poll;
         self
     }
 
@@ -757,7 +770,12 @@ impl FlyProvider {
                     })?
                     .status()
             };
-            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                self.ips.lock().unwrap().remove(id);
+                return Ok(());
+            }
+            if status.is_success() {
+                self.confirm_app_gone(id, &url).await?;
                 self.ips.lock().unwrap().remove(id);
                 return Ok(());
             }
@@ -775,6 +793,45 @@ impl FlyProvider {
                 .map(|status| status.to_string())
                 .unwrap_or_else(|| "no response".into())
         ))
+    }
+
+    /// Poll `GET /v1/apps/{app}` until 404 (gone), within the budget. A
+    /// non-404 answer or a transport error keeps polling; the budget ends it
+    /// with an error so local ownership remains available for retry.
+    async fn confirm_app_gone(&self, id: &str, url: &str) -> Result<()> {
+        let authority = crate::provider::authority_key(url)?;
+        let deadline = tokio::time::Instant::now() + self.destroy_budget;
+        loop {
+            let status = match crate::provider::CONTROL_GATE
+                .acquire_priority(&authority)
+                .await
+            {
+                Ok(_permit) => self
+                    .client
+                    .get(url)
+                    .bearer_auth(&self.spec.token)
+                    .timeout(crate::provider::CONTROL_TIMEOUT)
+                    .send()
+                    .await
+                    .map(|response| response.status())
+                    .map_err(|error| {
+                        crate::provider::redacted_transport_error("fly", "GET", &error)
+                    }),
+                Err(error) => Err(error),
+            };
+            if matches!(status, Ok(status) if status == reqwest::StatusCode::NOT_FOUND) {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(anyhow!(
+                    "fly: DELETE for {} was accepted but the app still exists after {}s; its record is kept so thegn wt rm or the reaper can finish it",
+                    id,
+                    self.destroy_budget.as_secs()
+                ));
+            }
+            tokio::time::sleep(self.destroy_poll.min(deadline - now)).await;
+        }
     }
 
     /// Retire local key custody and lifecycle registry only after every remote
@@ -1243,6 +1300,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destroy_waits_until_the_app_is_gone() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _srv) = fake_fly_server_with_destroy_state(hits.clone(), Some(2), false).await;
+        let provider = FlyProvider::new(FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            name: "tg-fly-confirm".into(),
+            ..spec()
+        })
+        .with_destroy_confirm(Duration::from_secs(5), Duration::from_millis(20));
+        let account = thegn_core::managed_ssh::account_label(&provider.spec.key_path);
+        thegn_core::managed_ssh::record_authorized(
+            "fly",
+            &account,
+            "tg-fly-confirm",
+            &provider.spec.key_path,
+            TEST_PUBKEY,
+        )
+        .unwrap();
+
+        provider
+            .destroy_remote_only("tg-fly-confirm")
+            .await
+            .unwrap();
+        let seen = hits.lock().unwrap();
+        assert_eq!(
+            seen.iter()
+                .filter(|hit| hit.starts_with("GET ") && hit.contains("/apps/"))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_keeps_the_record_when_the_app_stays() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _srv) = fake_fly_server_with_destroy_state(hits, None, true).await;
+        let provider = FlyProvider::new(FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            name: "tg-fly-stuck".into(),
+            ..spec()
+        })
+        .with_destroy_confirm(Duration::from_millis(200), Duration::from_millis(20));
+        let account = thegn_core::managed_ssh::account_label(&provider.spec.key_path);
+        thegn_core::managed_ssh::record_authorized(
+            "fly",
+            &account,
+            "tg-fly-stuck",
+            &provider.spec.key_path,
+            TEST_PUBKEY,
+        )
+        .unwrap();
+        registry::write(&registry::VpsRecord {
+            name: "tg-fly-stuck".into(),
+            provider: LEDGER_PROVIDER.into(),
+            state: "ready".into(),
+            instance_id: "machine-stuck".into(),
+            ip: "192.0.2.81".into(),
+            created_at: 1,
+            owner: String::new(),
+            account: String::new(),
+        })
+        .unwrap();
+
+        let error = provider.destroy("tg-fly-stuck").await.unwrap_err();
+        assert!(
+            error.to_string().contains("its record is kept"),
+            "{error:#}"
+        );
+        assert!(registry::read("tg-fly-stuck").is_some());
+    }
+
+    #[tokio::test]
     async fn invalid_names_are_rejected_before_fly_custody_or_registry_access() {
         let _state = thegn_core::testenv::IsolatedState::new();
         let provider = FlyProvider::new(spec());
@@ -1592,16 +1725,26 @@ mod tests {
     async fn fake_fly_server(
         hits: std::sync::Arc<Mutex<Vec<String>>>,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        fake_fly_server_with_destroy_state(hits, Some(0), false).await
+    }
+
+    async fn fake_fly_server_with_destroy_state(
+        hits: std::sync::Arc<Mutex<Vec<String>>>,
+        confirm_successes: Option<usize>,
+        hold_after_delete: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
+        let deleted = std::sync::Arc::new(Mutex::new((false, confirm_successes)));
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
                 let hits = hits.clone();
+                let deleted = deleted.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
@@ -1618,6 +1761,7 @@ mod tests {
                         (422, r#"{"error":"invalid region"}"#.into())
                     } else if method == "DELETE" {
                         // The best-effort teardown lands: app + IP + machine gone.
+                        deleted.lock().unwrap().0 = true;
                         (200, "{}".into())
                     } else if method == "POST" && path == "/" {
                         // GraphQL: app_ips (no v4 yet) then allocate (mints a v4).
@@ -1630,8 +1774,18 @@ mod tests {
                             )
                         }
                     } else if method == "GET" && path.contains("/apps/") {
-                        // App does not exist yet ⇒ create is taken.
-                        (404, r#"{"error":"not found"}"#.into())
+                        let mut state = deleted.lock().unwrap();
+                        if !state.0 {
+                            // App does not exist yet ⇒ create is taken.
+                            (404, r#"{"error":"not found"}"#.into())
+                        } else if hold_after_delete {
+                            (200, r#"{"name":"tg-app","status":"deployed"}"#.into())
+                        } else if let Some(remaining) = state.1.as_mut().filter(|n| **n > 0) {
+                            *remaining -= 1;
+                            (200, r#"{"name":"tg-app","status":"deployed"}"#.into())
+                        } else {
+                            (404, r#"{"error":"not found"}"#.into())
+                        }
                     } else if method == "POST" && path.contains("/apps") {
                         // App create succeeds — the FIRST billable resource.
                         (200, r#"{"name":"tg-app"}"#.into())

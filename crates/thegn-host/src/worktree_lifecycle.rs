@@ -153,27 +153,30 @@ fn apply_completion_batch(
             } => {
                 sb.deleting.remove(&path);
                 if success {
+                    let mut gone_path = None;
                     if let Some(gi) = session
                         .worktrees
                         .iter()
                         .position(|g| g.name == group_name || g.path == path)
                     {
-                        let gone_path = session.worktrees[gi].path.clone();
-                        sb.deleting.remove(&gone_path);
+                        let group_path = session.worktrees[gi].path.clone();
+                        gone_path = Some(group_path.clone());
+                        sb.deleting.remove(&group_path);
                         if crate::handlers::worktree_delete::remove_group(session, panes, gi) {
                             landing.land(session);
                         }
-                        if !gone_path.is_empty() {
-                            crate::drawer_state::request_worktree_eviction(Path::new(&gone_path));
+                        if !group_path.is_empty() {
+                            crate::drawer_state::request_worktree_eviction(Path::new(&group_path));
                         }
-                        // The worker already forgot the registry row; drop the
-                        // in-memory copy too, or the sidebar's registry union
-                        // keeps a ghost row for it until the next hydration.
-                        model
-                            .sidebar_db_worktrees
-                            .retain(|w| w.path != gone_path && w.path != path);
                         model.status = format!("Deleted worktree {path}");
                     }
+                    // The worker already forgot the registry row; drop the
+                    // in-memory copy too, or the sidebar's registry union
+                    // keeps a ghost row for it until the next hydration. Do
+                    // this even when a concurrent reap removed the group.
+                    model.sidebar_db_worktrees.retain(|w| {
+                        w.path != path && gone_path.as_deref() != Some(w.path.as_str())
+                    });
                     // Also on a concurrent reap, so the cleared `deleting` marker is re-applied by the rebuild.
                     changed = true;
                 } else {
@@ -2930,6 +2933,48 @@ mod tests {
         ));
         assert!(session.worktrees.is_empty());
         assert!(model.sidebar_workspaces.is_empty());
+    }
+
+    #[test]
+    fn delete_completion_drops_the_registry_ghost_even_when_the_group_was_already_reaped() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let mut session = completion_test_session();
+        session.worktrees.clear();
+        let mut model = crate::chrome::FrameModel {
+            sidebar_db_worktrees: vec![crate::sidebar::DbWorktree {
+                slug: "repo".into(),
+                branch: "feature".into(),
+                repo_path: "/tmp/repo".into(),
+                tab_name: "repo/feature".into(),
+                path: "/tmp/repo-feature".into(),
+                folder_id: None,
+                sandbox_backend: None,
+                env_name: None,
+                sandbox_profile: None,
+                env_degraded: false,
+                external: false,
+            }],
+            ..Default::default()
+        };
+        let mut sb = crate::run::SidebarState::default();
+
+        assert!(
+            apply_completion_batch(
+                vec![LifecycleCompletion::WorktreeDelete {
+                    group_name: "repo/feature".into(),
+                    path: "/tmp/repo-feature".into(),
+                    success: true,
+                    message: String::new(),
+                }],
+                &mut session,
+                &mut panes,
+                &mut model,
+                &mut sb,
+            )
+            .changed
+        );
+        assert!(model.sidebar_db_worktrees.is_empty());
     }
 
     #[test]

@@ -1354,6 +1354,27 @@ fn step_line(step: &ProvisionStepView) -> String {
 /// bounded by `provision_step_timeout`; this caps the whole run).
 const HEADLESS_PROVISION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// What a headless open did before the session started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadlessProvision {
+    /// Not a provider env, or the sandbox was already provisioned here.
+    None,
+    /// A ready warm-pool spare now serves the worktree.
+    ClaimedSpare,
+    /// The sandbox was provisioned now.
+    Provisioned,
+}
+
+impl HeadlessProvision {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ClaimedSpare => "claimed_spare",
+            Self::Provisioned => "provisioned",
+        }
+    }
+}
+
 /// Before a headless `session open`: when `worktree` resolves to a provider env
 /// whose sandbox is not provisioned on this host, provision it HERE (the CLI
 /// process, which has the user's PATH and provider credentials), streaming the
@@ -1362,7 +1383,10 @@ const HEADLESS_PROVISION_DEADLINE: std::time::Duration = std::time::Duration::fr
 /// for an already-provisioned sandbox. Runs on a named worker thread, off the
 /// async runtime, bounded by [`HEADLESS_PROVISION_DEADLINE`]; past the deadline
 /// the worker is abandoned (it dies with the process) and the open fails.
-pub(crate) async fn provision_for_headless_open(cfg: &Config, worktree: String) -> Result<()> {
+pub(crate) async fn provision_for_headless_open(
+    cfg: &Config,
+    worktree: String,
+) -> Result<HeadlessProvision> {
     let cfg = cfg.clone();
     tokio::task::spawn_blocking(move || {
         provision_headless_blocking(cfg, worktree, HEADLESS_PROVISION_DEADLINE)
@@ -1375,7 +1399,7 @@ fn provision_headless_blocking(
     cfg: Config,
     worktree: String,
     deadline: std::time::Duration,
-) -> Result<()> {
+) -> Result<HeadlessProvision> {
     // An ssh `in_env` worktree is seeded onto its host before the open, so the
     // headless session lands in the checkout (a no-op for every other env).
     crate::ssh_seed::seed_if_needed(&cfg, &worktree).with_context(|| {
@@ -1384,10 +1408,11 @@ fn provision_headless_blocking(
         )
     })?;
     if crate::provision_gate::claim_spare_for_headless(&cfg, &worktree) {
-        return Ok(());
+        msg::info(&format!("claimed a warm spare for {worktree}"));
+        return Ok(HeadlessProvision::ClaimedSpare);
     }
     let Some(env_name) = crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? else {
-        return Ok(());
+        return Ok(HeadlessProvision::None);
     };
     msg::info(&format!(
         "provider env {env_name} for {worktree} is not provisioned yet — provisioning before the headless open"
@@ -1411,7 +1436,7 @@ fn provision_headless_blocking(
                     "provisioning {worktree} (env {env_name}) failed; `thegn env up --worktree {worktree}` retries it"
                 )
             })?;
-            Ok(())
+            Ok(HeadlessProvision::Provisioned)
         }
         Err(_) => anyhow::bail!(
             "provisioning {worktree} (env {env_name}) did not finish within {} min; run `thegn env up --worktree {worktree}` and retry",
@@ -2428,6 +2453,13 @@ mod up_tests {
         ] {
             assert!(git_write_scope(mode).starts_with(prefix), "{mode:?}");
         }
+    }
+
+    #[test]
+    fn headless_provision_names() {
+        assert_eq!(HeadlessProvision::None.as_str(), "none");
+        assert_eq!(HeadlessProvision::ClaimedSpare.as_str(), "claimed_spare");
+        assert_eq!(HeadlessProvision::Provisioned.as_str(), "provisioned");
     }
 
     #[test]

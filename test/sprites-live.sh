@@ -95,8 +95,9 @@ Steps:
   4   sprite workspace HEAD == local HEAD (sprite-exec, \$HOME/workspace)
   4b  sprite-exec exit status and stderr reach the caller (exit 3, boom)
   5   (only with --min-ram-gb N) doctor --json provider_cache.<name>.sprites_memory_limit_mb shows N*1024
-  5b  (only with --min-ram-gb N) /sys/fs/cgroup/memory.max in the sprite is
-      N GiB in bytes (raw value printed; SKIP if the file is absent)
+  5b  (only with --min-ram-gb N) INFO: the guest's MemTotal from /proc/meminfo
+      (never FAIL; the policy is not a guest cgroup)
+  5c  (only with --min-ram-gb N) fleet inspect --policy reads back N*1024 MiB
   6   interactive exec under script(1): /dev/pts/<n> and ok; print the trace
       log path and the last 40 "sprites exec frame" lines
   6c  interactive output line breaks: WARN (not FAIL) when /dev/pts/<n> and ok
@@ -385,18 +386,43 @@ exec_exit_and_stderr() {
   [ "$rc" -eq 3 ] && [[ $out == *boom* ]]
 }
 
-memory_max_matches() { # memory.max in bytes equals N GiB; absent file skips
-  local out want
-  want=$((min_ram * 1024 * 1024 * 1024))
-  out="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- \
-    sh -c 'if [ -r /sys/fs/cgroup/memory.max ]; then cat /sys/fs/cgroup/memory.max; else echo thegn-absent; fi')" || return 1
-  out="$(printf '%s' "$out" | tr -d '\r\n ')"
-  echo "   memory.max raw value: $out (want $want)"
-  if [ "$out" = thegn-absent ]; then
-    echo "SKIP 5b: /sys/fs/cgroup/memory.max is absent in the sprite"
+memory_reported() { # INFO only: the guest's MemTotal; the Sprites policy is not a guest cgroup
+  local out
+  if ! out="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'grep "^MemTotal:" /proc/meminfo')"; then
+    echo "INFO 5b: could not read /proc/meminfo in the sprite"
     return 0
   fi
-  [ "$out" = "$want" ]
+  out="$(printf '%s' "$out" | tr -d '\r')"
+  echo "INFO 5b: guest $out (the memory policy is read back in 5c, not from the guest)"
+  return 0
+}
+
+policy_read_back() { # fleet inspect --policy reflects min_ram_gb=N as N*1024 MiB
+  local err
+  err="$TMP/5c.stderr"
+  if ! "$THEGN_BIN" "${MIN_RAM_SET[@]}" fleet inspect "$SPRITE_NAME" --env "$env_name" --policy --json >"$TMP/5c.json" 2>"$err"; then
+    echo "fleet inspect stderr:" >&2
+    sed 's/^/  /' "$err" >&2
+    return 1
+  fi
+  if ! MIN_RAM_EXPECTED="$((min_ram * 1024))" python3 -I -c '
+import json, os, sys
+try:
+    report = json.load(sys.stdin)
+    got = report["memory_limit_mb"]
+except (KeyError, TypeError, ValueError) as exc:
+    print("fleet inspect JSON is missing memory_limit_mb: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+expected = int(os.environ["MIN_RAM_EXPECTED"])
+if got != expected:
+    print("fleet inspect JSON reports memory_limit_mb=" + str(got) + ", want " + str(expected), file=sys.stderr)
+    sys.exit(1)
+print("   fleet inspect memory policy: " + str(got) + " MiB")
+' <"$TMP/5c.json"; then
+    echo "fleet inspect stderr:" >&2
+    sed 's/^/  /' "$err" >&2
+    return 1
+  fi
 }
 
 curl_present() { # the keep-awake hold needs curl inside the sprite
@@ -878,9 +904,10 @@ step 4 "sprite workspace HEAD matches the local lane HEAD" head_matches
 step 4b "sprite-exec exit status and stderr reach the caller" exec_exit_and_stderr
 if [ -n "$min_ram" ]; then
   step 5 "doctor shows min_ram_gb=$min_ram as $((min_ram * 1024)) MiB" min_ram_shown
-  step 5b "sprite memory.max is $min_ram GiB" memory_max_matches
+  step 5b "guest MemTotal (INFO only)" memory_reported
+  step 5c "memory policy reads back $((min_ram * 1024)) MiB (fleet inspect --policy)" policy_read_back
 else
-  echo "SKIP 5, 5b (needs --min-ram-gb N)"
+  echo "SKIP 5, 5b, 5c (needs --min-ram-gb N)"
 fi
 step 6 "interactive exec has /dev/pts/<n> and ok" interactive_tty
 step 6c "interactive output keeps its line breaks" interactive_line_breaks
