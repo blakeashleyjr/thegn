@@ -998,7 +998,9 @@ pub(crate) enum PreLand {
 
 /// The I/O [`pull_before_land`] needs, as a seam for tests.
 pub(crate) trait PreLandOps {
-    /// Is the worktree's stored location a provider location?
+    /// Is the worktree bound to a provider sandbox for `thegn land`? This is
+    /// true for a stored provider location, or for a resolved provider env
+    /// whose sandbox exists locally or in a complete provider inventory.
     fn is_provider(&self, worktree: &str) -> anyhow::Result<bool>;
     /// [`pull_back_if_provider`].
     fn pull(&self, worktree: &str) -> anyhow::Result<Option<PullReport>>;
@@ -1017,11 +1019,33 @@ impl PreLandOps for LivePreLand<'_> {
         let stored = thegn_core::db::Db::open()
             .and_then(|db| db.location_for(worktree))
             .with_context(|| format!("read the stored location of {worktree}"))?;
-        Ok(is_provider_location(worktree, stored.as_deref()))
+        let stored = is_provider_location(worktree, stored.as_deref());
+        if stored {
+            return Ok(true);
+        }
+        let env = crate::cmd::env::resolve_for(self.cfg, Some(worktree.to_string()))?;
+        let name = env
+            .placement
+            .is_provider()
+            .then(|| {
+                crate::provider_factory::provider_sandbox_name_checked(
+                    self.cfg, worktree, &env.name,
+                )
+            })
+            .transpose()?
+            .flatten()
+            .filter(|name| !name.trim().is_empty());
+        let provisioned = name
+            .as_deref()
+            .is_some_and(crate::provider_workdir::is_provisioned_locally);
+        land_binding(stored, name.as_deref(), provisioned, &mut || {
+            self.sandbox_listed(worktree)
+        })
+        .map_err(anyhow::Error::msg)
     }
 
     fn pull(&self, worktree: &str) -> anyhow::Result<Option<PullReport>> {
-        pull_back_if_provider(self.cfg, worktree)
+        pull_back_resolved(self.cfg, worktree)
     }
 
     fn sandbox_listed(&self, worktree: &str) -> Option<bool> {
@@ -1053,6 +1077,35 @@ pub(crate) fn sandbox_in_inventory(
     match report {
         InventoryReport::Complete(rows) => Some(rows.iter().any(matches)),
         InventoryReport::Partial { rows, .. } => rows.iter().any(matches).then_some(true),
+    }
+}
+
+/// Whether `thegn land` must treat `worktree` as bound to a provider sandbox.
+/// `resolved` is the sandbox name when the worktree's RESOLVED env is
+/// provider-placed (`None` = not provider-placed, or no name). A headless
+/// worktree (`wt new --env` + `env up`) stores no location, so the stored row
+/// alone is not proof of "no sandbox". `listed` is called only when the local
+/// provisioned marker is missing; `None` from it refuses. Pure.
+pub(crate) fn land_binding(
+    stored_is_provider: bool,
+    resolved: Option<&str>,
+    provisioned_locally: bool,
+    listed: &mut dyn FnMut() -> Option<bool>,
+) -> Result<bool, String> {
+    if stored_is_provider {
+        return Ok(true);
+    }
+    let Some(name) = resolved else {
+        return Ok(false);
+    };
+    if provisioned_locally {
+        return Ok(true);
+    }
+    match listed() {
+        Some(bound) => Ok(bound),
+        None => Err(format!(
+            "cannot tell whether sandbox {name} exists (the provider listing is incomplete or unreachable); land refused so no sandbox commit is skipped: retry when the provider answers, or move the worktree to a local env with `thegn env set <env> --worktree <wt>`"
+        )),
     }
 }
 
@@ -1117,6 +1170,16 @@ pub(crate) fn pull_back_if_provider(
     if !is_provider_location(worktree, stored.as_deref()) {
         return Ok(None);
     }
+    pull_back_resolved(cfg, worktree)
+}
+
+/// [`pull_back`] for a worktree whose resolved env is provider-placed,
+/// without the stored-location gate (`thegn land` has already proven the
+/// sandbox exists); `Ok(None)` for a non-provider env or a `read-only` policy.
+pub(crate) fn pull_back_resolved(
+    cfg: &Config,
+    worktree: &str,
+) -> anyhow::Result<Option<PullReport>> {
     let env = crate::cmd::env::resolve_for(cfg, Some(worktree.to_string()))?;
     if !env.placement.is_provider() {
         return Ok(None);
@@ -1193,10 +1256,11 @@ fn download_and_apply(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SEED_BUNDLE_BYTES, PULL_REF_PREFIX, PullOutcome, PullReport, SeedTransport,
+        MAX_SEED_BUNDLE_BYTES, PULL_REF_PREFIX, PreLandOps, PullOutcome, PullReport, SeedTransport,
         apply_pulled_bundle, branch_tip, bundle_branch, check_pull_policy, check_pull_target,
-        classify_pull, is_protected_branch, no_exec_channel_message, pull_ref_for, push_decision,
-        seed_cap_message, seed_from_bundle_with, should_pull_on_exit, try_begin_pull,
+        classify_pull, is_protected_branch, land_binding, no_exec_channel_message, pull_ref_for,
+        push_decision, seed_cap_message, seed_from_bundle_with, should_pull_on_exit,
+        try_begin_pull,
     };
     use std::path::Path;
     use thegn_core::config::{SandboxGitConfig, SandboxGitMode};
@@ -1687,6 +1751,104 @@ mod tests {
     }
 
     // ---- b162: pull lock + pull_before_land ---------------------------------
+
+    #[test]
+    fn land_binding_table() {
+        let calls = std::cell::Cell::new(0);
+        let mut listed = || {
+            calls.set(calls.get() + 1);
+            Some(false)
+        };
+        assert_eq!(land_binding(true, None, false, &mut listed), Ok(true));
+        assert_eq!(calls.get(), 0);
+
+        assert_eq!(land_binding(false, None, false, &mut listed), Ok(false));
+        assert_eq!(calls.get(), 0);
+
+        assert_eq!(
+            land_binding(false, Some("tg-rd-x-sandbox"), true, &mut listed),
+            Ok(true)
+        );
+        assert_eq!(calls.get(), 0);
+
+        let mut present = || Some(true);
+        assert_eq!(
+            land_binding(false, Some("tg-rd-x-sandbox"), false, &mut present),
+            Ok(true)
+        );
+        let mut absent = || Some(false);
+        assert_eq!(
+            land_binding(false, Some("tg-rd-x-sandbox"), false, &mut absent),
+            Ok(false)
+        );
+        let mut unreachable = || None;
+        let error =
+            land_binding(false, Some("tg-rd-x-sandbox"), false, &mut unreachable).unwrap_err();
+        assert!(error.contains("tg-rd-x-sandbox"), "{error}");
+        assert!(error.contains("land refused"), "{error}");
+    }
+
+    #[test]
+    fn headless_provider_worktree_is_a_provider_for_land() {
+        use thegn_core::config::{Config, EnvConfig, EnvProviderConfig, PlacementMode};
+        use thegn_core::db::Db;
+        use thegn_core::store::WorkspaceStore;
+
+        let _state = IsolatedState::new();
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        let worktree = parent.path().join("wt");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "Land Test"]);
+        git(&repo, &["config", "user.email", "land@example.invalid"]);
+        std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+        git(&repo, &["add", "seed.txt"]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        let worktree_s = worktree.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "tg/rd-x", &worktree_s],
+        );
+
+        let root_s = repo.to_string_lossy().into_owned();
+        let db = Db::open().unwrap();
+        db.put_worktree("repo/rd-x", &root_s, &worktree_s, "tg/rd-x", None, None)
+            .unwrap();
+        db.put_workspace(&root_s, "repo", "repo").unwrap();
+        db.set_workspace_env(&root_s, "sprites").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "sprites".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let name =
+            crate::provider_factory::provider_sandbox_name_checked(&cfg, &worktree_s, "sprites")
+                .unwrap()
+                .unwrap();
+        crate::provider_workdir::mark_provisioned(&name);
+        assert!(
+            super::LivePreLand { cfg: &cfg }
+                .is_provider(&worktree_s)
+                .unwrap()
+        );
+
+        crate::provider_workdir::clear_provisioned(&name);
+        cfg.env.get_mut("sprites").unwrap().placement = PlacementMode::Local;
+        assert!(
+            !super::LivePreLand { cfg: &cfg }
+                .is_provider(&worktree_s)
+                .unwrap()
+        );
+    }
 
     struct FakePreLand {
         provider: bool,

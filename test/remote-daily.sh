@@ -7,7 +7,7 @@
 # owner's REAL config read-only (secrets are never read or printed) with a fresh
 # XDG_STATE_HOME and THEGN_DIR (the login runtime dir is kept so sandbox masks
 # cover every instance's control socket; daemon sockets are hashed per state
-# dir), its own daemon and a scratch repo on branch rd/daily-lane.
+# dir), and a scratch repo on branch rd/daily-lane.
 #
 # Usage:
 #   test/remote-daily.sh                                   # print plan, no network
@@ -17,6 +17,9 @@
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
+# The scratch repository has no build: the owner's merge gate command must not decide these lands.
+# The value is TOML: a bare true is a boolean and is refused, so the string is quoted.
+LAND_SET=(--set 'merge_queue.gate_command="true"')
 
 env_name="" accept=0 provider="sprites" with_model=0 adopt_name="" with_reaper=0 with_pool=0 keep_going=0
 while [ $# -gt 0 ]; do
@@ -89,8 +92,8 @@ remote-daily plan (nothing is created without both --env <name> and
 Will create : ONE sandbox/machine via the named [env.<name>] from your real
               config (read-only), in a fresh XDG_STATE_HOME and THEGN_DIR (the
               login runtime dir is kept so sandbox masks cover every instance's
-              control socket; daemon sockets are hashed per state dir), with its
-              own daemon and a scratch git repo on branch rd/daily-lane.
+              control socket; daemon sockets are hashed per state dir), with
+              a scratch git repo on branch rd/daily-lane.
 Max spend   : one sandbox for about 10 minutes (a 420 s scripted hold); more
               with --with-model (two real model runs) or --with-pool (one
               warm spare). Teardown destroys it.
@@ -126,6 +129,8 @@ Steps:
       otherwise no model login entered the sandbox (model_credentials default)
   7   local git log has the commits
   8   land --worktree <rd-x path> --release-sandbox
+      (requires the land to report "released sandbox <name>")
+       (both lands pass --set merge_queue.gate_command="true": the scratch repository has no build)
   9   ledger record gone, sandbox absent from the org listing
  10   env reap --provider <p> --json is clean
  11   wt new rd-y --env <S>
@@ -134,6 +139,7 @@ Steps:
 11b   exactly one new ledger record
 11m   (sprites/vercel only) commit inside rd-y through the exec bridge
 11k   (sprites/vercel only) land rd-y without --release-sandbox (sandbox kept)
+      (requires "pulled tg/rd-y" and the sandbox commit in main)
 11j   (sprites/vercel only) rd-y's record is still ready and the listing has it
       then wt rm <rd-y path> --force exits 0 (the worktree-delete teardown,
       which confirms the destroy)     11c its record is gone and the org
@@ -629,16 +635,50 @@ rdy_commit() {
   no_stdin "$THEGN_BIN" "$EXEC_BRIDGE" "$RDY_NAME" -- sh -c \
     'cd "$HOME/workspace" && git -c user.name=rd -c user.email=rd@example.invalid -c commit.gpgsign=false commit --allow-empty -qm rd-y'
 }
+land_release() {
+  local out rc
+  out="$(in_repo "$THEGN_BIN" "${LAND_SET[@]}" land --worktree "$WT_PATH" --release-sandbox 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" -eq 0 ] || return "$rc"
+  case "$out" in
+  *"! --release-sandbox ignored"* | *$'\n'"! sandbox "* | "! sandbox "*) return 1 ;;
+  esac
+  case "$out" in
+  *"released sandbox $NAME"* | *"returned sandbox $NAME"*) ;;
+  *)
+    echo "land did not report releasing sandbox $NAME" >&2
+    return 1
+    ;;
+  esac
+}
 rdy_land_keep() {
-  local out
-  if out="$(in_repo "$THEGN_BIN" land --worktree "$RDY_PATH" 2>&1)"; then
+  local out subjects
+  if out="$(in_repo "$THEGN_BIN" "${LAND_SET[@]}" land --worktree "$RDY_PATH" 2>&1)"; then
     printf '%s\n' "$out"
   else
     local rc=$?
     printf '%s\n' "$out"
     return "$rc"
   fi
-  printf '%s' "$out" | grep -Fq "sandbox $RDY_NAME kept"
+  case "$out" in
+  *"pulled tg/rd-y"*) ;;
+  *)
+    echo "land did not report pulling tg/rd-y" >&2
+    return 1
+    ;;
+  esac
+  subjects="$(git -C "$REPO" log --format=%s main)" || return 1
+  case $'\n'"$subjects"$'\n' in
+  *$'\n'rd-y$'\n'*) ;;
+  *)
+    echo "scratch repository main lacks the rd-y commit" >&2
+    return 1
+    ;;
+  esac
+  case "$out" in
+  *"sandbox $RDY_NAME kept"*) ;;
+  *) return 1 ;;
+  esac
 }
 rdy_ready_and_listed() {
   grep -Eq '"state": *"ready"' "$(ledger_dir)/$RDY_NAME.json" && listing_has_name "$RDY_NAME"
@@ -683,7 +723,7 @@ case ",$LOGIN_UPLOAD," in
 esac
 if [ "$with_model" = 1 ]; then want=3; else want=1; fi
 step 7 "local git log has the commits" local_log_has_commits "$want"
-step 8 "land --worktree <rd-x> --release-sandbox" in_repo "$THEGN_BIN" land --worktree "$WT_PATH" --release-sandbox
+step 8 "land --worktree <rd-x> --release-sandbox" land_release
 step 9a "ledger record gone" record_gone
 step 9b "sandbox absent from the org listing" listing_lacks_name
 step 10 "env reap --provider $provider is clean" reap_clean
