@@ -37,8 +37,9 @@ if [ "${STUB_MODE:-}" = continue ]; then
   case "$*" in
   *thegn-memprobe*)
     case "${STUB_MEMPROBE:-}" in
-    enforced) printf 'reached 1984\n'; exit 137 ;;
-    *) printf 'reached 2560\ndone 2560\n'; exit 0 ;;
+    enforced) printf 'avail 2041\nreached 1984\n'; exit 137 ;;
+    overshoot) printf 'avail 16000\nreached 2496\n'; exit 137 ;;
+    *) printf 'avail 16000\nreached 2560\ndone 2560\n'; exit 0 ;;
     esac
     ;;
   *"command -v python3"*) printf '/usr/bin/python3\n/usr/bin/timeout\n'; exit 0 ;;
@@ -290,7 +291,8 @@ run memprobe-enforced sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_
   "${SX[@]}" --min-ram-gb 2 --keep-going
 if has "$T/memprobe-enforced.out" "PASS 5d" &&
   has "$T/memprobe-enforced.out" "memory limit enforced" &&
-  has "$T/memprobe-enforced.out" "INFO 5d: guest cgroup memory.max: max"; then
+  has "$T/memprobe-enforced.out" "INFO 5d: guest cgroup memory.max: max" &&
+  has "$T/memprobe-enforced.out" "INFO 5d: guest MemAvailable: 2041 MiB (policy 2048 MiB)"; then
   pass "sprites-live: memory probe reports enforcement"
 else
   fail "sprites-live: enforced memory probe ($(cat "$T/memprobe-enforced.out"))"
@@ -300,10 +302,20 @@ run memprobe-unenforced sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STU
   "${SX[@]}" --min-ram-gb 2 --keep-going
 if has "$T/memprobe-unenforced.out" "WARN 5d: limit accepted by the API but not enforced in the guest" &&
   has "$T/memprobe-unenforced.out" "PASS 5d" &&
-  has "$T/memprobe-unenforced.out" "INFO 5d: guest cgroup memory.max: max"; then
+  has "$T/memprobe-unenforced.out" "INFO 5d: guest cgroup memory.max: max" &&
+  has "$T/memprobe-unenforced.out" "INFO 5d: guest MemAvailable: 16000 MiB (policy 2048 MiB)"; then
   pass "sprites-live: memory probe warns when unenforced"
 else
   fail "sprites-live: unenforced memory probe ($(cat "$T/memprobe-unenforced.out"))"
+fi
+
+run memprobe-overshoot sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_MEMPROBE=overshoot STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --min-ram-gb 2 --keep-going
+if has "$T/memprobe-overshoot.out" "WARN 5d: the probe was stopped at 2496 MiB, above the 2048 MiB limit" &&
+  has "$T/memprobe-overshoot.out" "PASS 5d"; then
+  pass "sprites-live: memory probe warns on overshoot"
+else
+  fail "sprites-live: overshoot memory probe ($(cat "$T/memprobe-overshoot.out"))"
 fi
 
 run reported-false-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_COST_REPORTED_FALSE=1 STUB_DOCTOR="$T/tok-true.json" -- \

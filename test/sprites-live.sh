@@ -190,9 +190,10 @@ try:
                 avail = int(line.split()[1]) // 1024
 except (OSError, ValueError):
     pass
-if avail is not None and target + 256 > avail:
-    print("headroom", avail, flush=True)
-    sys.exit(0)
+if avail is None:
+    print("avail unknown", flush=True)
+else:
+    print("avail", avail, flush=True)
 held = []
 reached = 0
 try:
@@ -425,7 +426,7 @@ print("   fleet inspect memory policy: " + str(got) + " MiB")
 }
 
 memory_enforced() {
-  local out rc limit target verdict verdict_rc cgroup
+  local out rc limit target verdict verdict_rc cgroup probe_info
   if ! no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'command -v python3 && command -v timeout'; then
     echo "WARN 5d: python3 or timeout is missing in the guest; memory enforcement unproven"
     return 0
@@ -451,36 +452,54 @@ rc = int(os.environ["MEMPROBE_RC"])
 limit = int(os.environ["MEMPROBE_LIMIT"])
 target = int(os.environ["MEMPROBE_TARGET"])
 lines = out.replace("\r", "").splitlines()
+avail = [line for line in lines if re.fullmatch(r"avail (?:unknown|\d+)", line)]
+if avail:
+    print(avail[-1])
+else:
+    print("avail unknown")
 if rc == 124:
     print("timeout 0")
 else:
-    headroom = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"headroom (\d+)", line))]
     done = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"done (\d+)", line))]
     reached = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"reached (\d+)", line))]
     errors = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"memoryerror (\d+)", line))]
-    if headroom:
-        print("headroom " + str(headroom[-1]))
-    elif rc == 0 and done:
+    stopped = reached[-1] if reached else (errors[-1] if errors else 0)
+    was_stopped = rc in (137, 3) or bool(errors)
+    if rc == 0 and done:
         print("unenforced " + str(done[-1]))
+    elif was_stopped and stopped < limit // 2:
+        print("early " + str(stopped))
+    elif was_stopped and stopped <= limit + 256:
+        print("enforced " + str(stopped))
+    elif was_stopped and stopped > limit + 256:
+        print("overshoot " + str(stopped))
     else:
-        stopped = reached[-1] if reached else (errors[-1] if errors else 0)
-        if (rc in (137, 3) or errors) and stopped >= limit // 2:
-            print("enforced " + str(stopped))
-        elif reached or errors:
-            print("early " + str(stopped))
-        else:
-            print("noout 0")
+        print("noout 0")
 ';
   })"; then
     verdict="noout 0"
     verdict_rc=1
   fi
+  probe_info="${verdict%%$'\n'*}"
+  case "$probe_info" in
+  "avail unknown")
+    echo "INFO 5d: guest MemAvailable: unknown"
+    ;;
+  "avail "*)
+    echo "INFO 5d: guest MemAvailable: ${probe_info#avail } MiB (policy ${limit} MiB)"
+    ;;
+  *)
+    echo "INFO 5d: guest MemAvailable: unknown"
+    ;;
+  esac
+  if [ "$probe_info" != "$verdict" ]; then
+    verdict="${verdict#*$'\n'}"
+  else
+    verdict="noout 0"
+  fi
   case "$verdict" in
   timeout\ *)
     echo "WARN 5d: the memory probe timed out after 120 s; memory enforcement unproven"
-    ;;
-  headroom\ *)
-    echo "WARN 5d: the guest has only ${verdict#headroom } MiB available, so a probe past the limit cannot tell the limit from the guest size; memory enforcement unproven"
     ;;
   unenforced\ *)
     echo "WARN 5d: limit accepted by the API but not enforced in the guest: one process held ${verdict#unenforced } MiB under a ${limit} MiB limit (Sprites provider behaviour, not a thegn failure)"
@@ -490,6 +509,9 @@ else:
     ;;
   early\ *)
     echo "WARN 5d: the probe was stopped early at ${verdict#early } MiB (limit ${limit} MiB); inconclusive"
+    ;;
+  overshoot\ *)
+    echo "WARN 5d: the probe was stopped at ${verdict#overshoot } MiB, above the ${limit} MiB limit; the limit is not enforced at its stated value"
     ;;
   noout\ *)
     printf '%s\n' "$out" | sed 's/^/  /'
