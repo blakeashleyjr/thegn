@@ -287,6 +287,7 @@ pub const CATALOG: &[Slot] = &[
     slot("clean", "worktree", SourceKind::Worktree),
     slot("diff", "worktree", SourceKind::Worktree),
     slot("disk", "worktree", SourceKind::Worktree),
+    slot("info", "worktree", SourceKind::Worktree),
     slot("dispatch put", "worktree_path", SourceKind::Worktree),
     slot("env clear", "worktree", SourceKind::Worktree),
     slot("env clear", "worktree_pos", SourceKind::Worktree),
@@ -526,6 +527,7 @@ pub const CATALOG: &[Slot] = &[
     slot("autopilot status", "repo", SourceKind::Repo),
     slot("config explain", "repo", SourceKind::Repo),
     slot("open", "repo", SourceKind::Repo),
+    slot("info", "workspace", SourceKind::Repo),
     // `program` is the canonical spelling; clap's visible `project` alias
     // resolves to the same command tree, so one canonical path covers both.
     slot("program assign", "repo", SourceKind::Repo),
