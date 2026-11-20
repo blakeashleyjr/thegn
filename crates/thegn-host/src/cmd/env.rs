@@ -1029,6 +1029,11 @@ fn down_provider(
     if opts.mode == DownMode::Stop && !provider_has_stop(&kind) {
         anyhow::bail!(no_stop_message(&kind));
     }
+    if let Err(error) = thegn_core::provision_journal::cancel(id) {
+        msg::warn(&format!(
+            "could not cancel background setup for {id}: {error}"
+        ));
+    }
     let provider_config = cfg
         .env
         .get(env_name)
@@ -1080,6 +1085,9 @@ fn down_provider(
 /// already gone.
 fn forget_destroyed_sandbox(id: &str, wt: &str) {
     crate::provider_workdir::clear_provisioned(id);
+    if let Err(error) = thegn_core::provision_journal::clear(id) {
+        tracing::debug!(target: "thegn::provider", %id, %error, "could not clear deferred provision journal");
+    }
     crate::lifecycle::forget_destroyed_spare(id);
     match Db::open() {
         Ok(db) => {
@@ -1761,6 +1769,12 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
         &home,
     );
     for line in show_lines(&env, &location, provisioned, &env.sandbox.git, &warnings) {
+        outln!("{line}");
+    }
+    if let thegn_core::placement::Placement::Provider(p) = &env.placement
+        && !p.id.trim().is_empty()
+        && let Some(line) = crate::provision_bg::show_line(&p.id)
+    {
         outln!("{line}");
     }
     Ok(())

@@ -162,6 +162,9 @@ pub fn destroy_provider_sandbox_with(
     // Revoke before recycle/destroy. If SQLite is unavailable, fail closed and
     // leave the sandbox intact so the lifecycle can retry rather than orphaning
     // an unrevoked return credential with no remaining owner metadata.
+    if let Err(error) = thegn_core::provision_journal::cancel(&name) {
+        tracing::debug!(target: "thegn::provider", sandbox = %name, %error, "could not cancel deferred provision journal");
+    }
     crate::remote_enqueue_auth::revoke_for_sandbox(pc, &name, Some(worktree))
         .map_err(|error| format!("revoke route-to-host credential: {error:#}"))?;
     // A CLAIMED pool spare with a fresh provisioned-base checkpoint is RECYCLED
@@ -187,6 +190,9 @@ pub fn destroy_provider_sandbox_with(
     // Drop the local provisioned marker so a later sandbox reusing this id isn't
     // treated as provisioned (the attach gate would skip re-provisioning).
     crate::provider_workdir::clear_provisioned(&name);
+    if let Err(error) = thegn_core::provision_journal::clear(&name) {
+        tracing::debug!(target: "thegn::provider", sandbox = %name, %error, "could not clear deferred provision journal");
+    }
     Ok(Teardown::Destroyed { name })
 }
 
