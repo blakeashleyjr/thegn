@@ -347,6 +347,38 @@ mod tests {
     }
 
     #[test]
+    fn state_words_are_the_documented_strings() {
+        let words = [
+            (LeadState::NotStarted, "not started"),
+            (LeadState::Idle, "idle"),
+            (LeadState::Working, "working"),
+            (LeadState::WaitingOnYou, "needs you"),
+            (LeadState::Paused, "paused"),
+            (LeadState::Unknown, "unknown"),
+            (LeadState::Error, "error"),
+        ];
+        for (state, word) in words {
+            assert_eq!(state.word(), word);
+        }
+    }
+
+    #[test]
+    fn unreadable_runs_hide_last_action_and_never_work() {
+        let mut input = inputs();
+        input.started = true;
+        input.pending = Ok(vec![req("THE-1", "review", 1_000)]);
+        input.runs = Err("unreadable".to_string());
+        let bar = summarize(input);
+        assert_eq!(bar.last, None);
+        assert_eq!(bar.last_age, None);
+
+        let mut input = inputs();
+        input.started = true;
+        input.runs = Err("unreadable".to_string());
+        assert_eq!(summarize(input).state, LeadState::Idle);
+    }
+
+    #[test]
     fn state_precedence_table_covers_each_state() {
         let cases = [
             (inputs(), LeadState::NotStarted),
