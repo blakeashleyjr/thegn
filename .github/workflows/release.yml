@@ -3,7 +3,7 @@
 # Trigger: push a `v*` tag (e.g. `v0.1.0-alpha.1`). Builds the `thegn` binary for
 # the supported targets and attaches per-target archives, checksums, provenance,
 # rendered manager metadata, and standalone Linux packages to a GitHub Release.
-# External manager repositories are a separate protected manual operation.
+# Release publication and external manager repositories are protected manual operations.
 # Uses taiki-e/upload-rust-binary-action, whose archive
 # naming (`thegn-<tag>-<target>.{tar.gz,zip}`) matches the `[package.metadata.
 # binstall]` pkg-url in crates/thegn-host/Cargo.toml, so a future `cargo binstall`
@@ -43,24 +43,25 @@ on:
         required: true
         type: string
       operation:
-        description: "Build a draft, or publish generated metadata after the draft is published"
+        description: "Build a draft, publish the verified release, or publish external metadata"
         required: true
         type: choice
         default: build
         options:
           - build
+          - publish-release
           - publish-external
 permissions:
   contents: read
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}-${{ inputs.operation || 'build' }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 jobs:
   # Resolve one policy-valid tag to an immutable commit before any build job
   # checks out release content. This job runs only pinned actions and inline
   # policy code; the policy/version source is checked out from protected main.
   admit:
-    if: github.event_name == 'push' || inputs.operation == 'build'
+    if: github.event_name == 'push' || inputs.operation == 'build' || inputs.operation == 'publish-release'
     runs-on: ubuntu-latest
     environment: release-admission
     permissions:
@@ -127,8 +128,8 @@ jobs:
           echo "workflow_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   # Create the draft before the read-only build legs start. The trusted upload
   # broker publishes verified artifacts here after every build leg succeeds.
-  # Draft so a maintainer writes notes by hand before publishing (RELEASING.md
-  # step 4); no `changelog:` input — notes are pasted manually.
+  # Draft so a maintainer writes notes by hand before the protected
+  # publish-release operation (RELEASING.md step 4); no changelog input.
   #
   # Re-dispatching a build resumes an existing draft without changing its
   # notes or assets, and creates a draft only when the tag has no release.
@@ -372,18 +373,7 @@ jobs:
             ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz
             ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-aarch64-apple-darwin.tar.gz
             ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-completions.tar.gz
-      - name: Upload verified release assets
-        env:
-          TAG: ${{ needs.admit.outputs.tag }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          release="$RUNNER_TEMP/release"
-          assets=("$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256)
-          python3 packaging/release.py require-draft \
-            --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          gh release upload "$TAG" "${assets[@]}" --clobber
-      - name: Write and publish release record
+      - name: Bind generation and upload verified release assets
         id: record
         env:
           TAG: ${{ needs.admit.outputs.tag }}
@@ -436,7 +426,9 @@ jobs:
           echo "asset_digests=$asset_digests" >> "$GITHUB_OUTPUT"
           python3 packaging/release.py require-draft \
             --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          gh release upload "$TAG" "$release/thegn-$TAG-release.json" --clobber
+          assets=("$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256)
+          assets+=("$release/thegn-$TAG-release.json")
+          bash .github/scripts/upload-release-assets.sh "${assets[@]}"
   # Read-only completion build ships ONCE, as a single arch-independent artifact, rather than
   # riding inside each per-target archive. Three reasons:
   #   - the CLI tree has no `#[cfg]`-gated `Command` variants, so every target
@@ -571,7 +563,22 @@ jobs:
             --pattern "thegn-$TAG-*.sha256"
           gh release download "$TAG" --dir "$PACKAGE_ROOT/assets" \
             --pattern "thegn-$TAG-*.tar.gz" \
-            --pattern "thegn-$TAG-*.sha256"
+            --pattern "thegn-$TAG-*.sha256" \
+            --pattern "thegn-$TAG-release.json"
+      - name: Require this workflow's draft generation
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
+          ADMITTED_TAG_OBJECT: ${{ needs.admit.outputs.tag_object }}
+          ADMITTED_WORKFLOW_SHA: ${{ needs.admit.outputs.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 packaging/release.py verify-generation \
+            --record "$PACKAGE_ROOT/assets/thegn-$TAG-release.json" \
+            --tag "$TAG" --commit "$ADMITTED_SHA" \
+            --tag-object "$ADMITTED_TAG_OBJECT" \
+            --workflow-sha "$ADMITTED_WORKFLOW_SHA" --run-id "$RUN_ID"
       - name: Verify assets against the upload broker's digests
         env:
           TRUSTED_DIGESTS: ${{ needs.upload.outputs.asset_digests }}
@@ -727,8 +734,8 @@ jobs:
             echo "::error::release tag moved after admission"
             exit 1
           }
-          # This directory contains no source archive, so --clobber cannot
-          # retract or overwrite any matrix output.
+          # This directory contains no source archive; the upload planner only
+          # adds absent package names and reuses exact digest matches.
           : > "$PACKAGE_ROOT/package-digests.jsonl"
           for asset in "$PACKAGE_ROOT/release-assets/"*; do
             [ -f "$asset" ] || {
@@ -749,7 +756,8 @@ jobs:
           echo "package_digests=$package_digests" >> "$GITHUB_OUTPUT"
           python3 packaging/release.py require-draft \
             --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          gh release upload "$TAG" "$PACKAGE_ROOT/release-assets/"* --clobber
+          package_assets=("$PACKAGE_ROOT/release-assets/"*)
+          bash .github/scripts/upload-release-assets.sh "${package_assets[@]}"
       - name: Summarize package outputs
         env:
           PUBLICATION_ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED || 'false' }}
@@ -802,6 +810,20 @@ jobs:
           python3 packaging/release.py check-asset-sizes \
             --assets-json "$RUNNER_TEMP/release-assets.json"
           gh release download "$TAG" --dir "$root/assets"
+      - name: Require this workflow's draft generation
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
+          ADMITTED_TAG_OBJECT: ${{ needs.admit.outputs.tag_object }}
+          ADMITTED_WORKFLOW_SHA: ${{ needs.admit.outputs.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 packaging/release.py verify-generation \
+            --record "$VERIFY_ROOT/assets/thegn-$TAG-release.json" \
+            --tag "$TAG" --commit "$ADMITTED_SHA" \
+            --tag-object "$ADMITTED_TAG_OBJECT" \
+            --workflow-sha "$ADMITTED_WORKFLOW_SHA" --run-id "$RUN_ID"
       - name: Verify archive provenance
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -887,9 +909,71 @@ jobs:
           manifest="$RUNNER_TEMP/manifest/thegn-$TAG-manifest.json"
           python3 packaging/release.py require-draft \
             --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          gh release upload "$TAG" "$manifest" --clobber
+          bash .github/scripts/upload-release-assets.sh "$manifest"
           asset_count="$(jq '.assets | length' "$manifest")"
           echo "Verified and attached $asset_count release assets in the manifest for $TAG." >> "$GITHUB_STEP_SUMMARY"
+  publish-release:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-release'
+    needs: admit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Require main-branch release approval
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          if [ "$DISPATCH_REF" != refs/heads/main ]; then
+            echo "::error::Release publication must be dispatched from the protected main branch."
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.admit.outputs.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download and verify the exact release asset set
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.admit.outputs.tag }}
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d "$RUNNER_TEMP/publish-release.XXXXXX")"
+          echo "PUBLISH_RELEASE_ROOT=$root" >> "$GITHUB_ENV"
+          release_json="$RUNNER_TEMP/publish-release.json"
+          gh release view "$TAG" --json isDraft,assets > "$release_json"
+          python3 packaging/release.py check-asset-sizes --assets-json "$release_json"
+          gh release download "$TAG" --dir "$root"
+          manifest="$root/thegn-$TAG-manifest.json"
+          [ -f "$manifest" ] || {
+            echo "::error::draft is missing its signed release manifest"
+            exit 1
+          }
+          shopt -s nullglob
+          paths=("$root"/*)
+          assets=()
+          for asset in "${paths[@]}"; do
+            [ "${asset##*/}" = "thegn-$TAG-manifest.json" ] || assets+=("$asset")
+          done
+          verify_args=(verify-assets --tag "$TAG" --release-manifest "$manifest" --exact)
+          for asset in "${assets[@]}"; do
+            verify_args+=(--asset "$asset")
+          done
+          python3 packaging/release.py "${verify_args[@]}"
+      - name: Reverify signed release identity and live tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.admit.outputs.tag }}
+          EXPECTED_WORKFLOW_SHA: ${{ needs.admit.outputs.workflow_sha }}
+        run: |
+          bash .github/scripts/verify-release-publication-identity.sh \
+            "$TAG" "$PUBLISH_RELEASE_ROOT/thegn-$TAG-manifest.json"
+      - name: Publish or confirm the verified release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.admit.outputs.tag }}
+        run: bash .github/scripts/finalize-release.sh
   # Publication is deliberately a separate manual operation. It cannot reach
   # create-release or mutate release assets. A credential-free worker renders
   # AUR metadata before isolated, separately protected publishers receive keys.
@@ -1009,6 +1093,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-external'
     runs-on: ubuntu-latest
     environment: package-publication-homebrew
+    outputs:
+      ready: ${{ steps.publication.outputs.ready }}
+      outcome: ${{ steps.publish.outputs.outcome }}
+      receipt_artifact_id: ${{ steps.upload-receipt.outputs.artifact-id }}
     permissions:
       contents: read
       actions: read
@@ -1034,10 +1122,6 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: ./.github/actions/ci-setup
-        with:
-          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
-          cache-lane: release-publication
       - name: Check Homebrew publication enablement
         id: publication
         env:
@@ -1288,6 +1372,7 @@ jobs:
             rm -rf "$PUBLISH_ROOT"
           fi
       - name: Upload Homebrew publication receipt
+        id: upload-receipt
         if: steps.receipt.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1300,6 +1385,10 @@ jobs:
     needs: aur-srcinfo
     runs-on: ubuntu-latest
     environment: package-publication-aur
+    outputs:
+      ready: ${{ steps.publication.outputs.ready }}
+      outcome: ${{ steps.publish.outputs.outcome }}
+      receipt_artifact_id: ${{ steps.upload-receipt.outputs.artifact-id }}
     permissions:
       contents: read
       actions: read
@@ -1631,6 +1720,7 @@ jobs:
             rm -rf "$PUBLISH_ROOT"
           fi
       - name: Upload AUR publication receipt
+        id: upload-receipt
         if: steps.receipt.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1638,3 +1728,91 @@ jobs:
           path: ${{ runner.temp }}/release-publication-aur.json
           if-no-files-found: error
           retention-days: 90
+  publication-saga:
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-external'
+    needs: [publish-homebrew, publish-aur]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare receipt download directories
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/publication-saga/homebrew" "$RUNNER_TEMP/publication-saga/aur"
+      - name: Download Homebrew receipt by immutable artifact ID
+        if: needs.publish-homebrew.outputs.receipt_artifact_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.publish-homebrew.outputs.receipt_artifact_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.run_id }}
+          path: ${{ runner.temp }}/publication-saga/homebrew
+      - name: Download AUR receipt by immutable artifact ID
+        if: needs.publish-aur.outputs.receipt_artifact_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.publish-aur.outputs.receipt_artifact_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.run_id }}
+          path: ${{ runner.temp }}/publication-saga/aur
+      - name: Write read-only cross-target saga ledger
+        env:
+          TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          PUBLICATION_RUN_ID: ${{ github.run_id }}
+          PUBLICATION_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PUBLICATION_SOURCE_SHA: ${{ github.sha }}
+          HOMEBREW_RESULT: ${{ needs.publish-homebrew.result }}
+          HOMEBREW_READY: ${{ needs.publish-homebrew.outputs.ready || 'unknown' }}
+          HOMEBREW_OUTCOME: ${{ needs.publish-homebrew.outputs.outcome }}
+          HOMEBREW_ARTIFACT_ID: ${{ needs.publish-homebrew.outputs.receipt_artifact_id }}
+          AUR_RESULT: ${{ needs.publish-aur.result }}
+          AUR_READY: ${{ needs.publish-aur.outputs.ready || 'unknown' }}
+          AUR_OUTCOME: ${{ needs.publish-aur.outputs.outcome }}
+          AUR_ARTIFACT_ID: ${{ needs.publish-aur.outputs.receipt_artifact_id }}
+        run: |
+          set -euo pipefail
+          python3 packaging/release.py publication-saga \
+            --tag "$TAG" \
+            --repository "$REPOSITORY" \
+            --publication-run-id "$PUBLICATION_RUN_ID" \
+            --publication-run-attempt "$PUBLICATION_RUN_ATTEMPT" \
+            --publication-source-sha "$PUBLICATION_SOURCE_SHA" \
+            --homebrew-result "$HOMEBREW_RESULT" \
+            --homebrew-ready "$HOMEBREW_READY" \
+            --homebrew-outcome "$HOMEBREW_OUTCOME" \
+            --homebrew-artifact-id "$HOMEBREW_ARTIFACT_ID" \
+            --homebrew-receipt "$RUNNER_TEMP/publication-saga/homebrew/release-publication-homebrew.json" \
+            --aur-result "$AUR_RESULT" \
+            --aur-ready "$AUR_READY" \
+            --aur-outcome "$AUR_OUTCOME" \
+            --aur-artifact-id "$AUR_ARTIFACT_ID" \
+            --aur-receipt "$RUNNER_TEMP/publication-saga/aur/release-publication-aur.json" \
+            --output "$RUNNER_TEMP/publication-saga/ledger.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload durable cross-target saga ledger
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-publication-saga-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publication-saga/ledger.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Fail on incomplete or ambiguous publication state
+        if: always()
+        env:
+          LEDGER: ${{ runner.temp }}/publication-saga/ledger.json
+        run: |
+          set -euo pipefail
+          state="$(jq -r '.state' "$LEDGER")"
+          [ "$state" = complete ] || {
+            echo "::error::External publication state is $state; inspect the saga ledger and reconcile both targets."
+            exit 1
+          }

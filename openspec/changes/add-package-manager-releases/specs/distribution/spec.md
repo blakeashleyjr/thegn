@@ -34,6 +34,75 @@ resolve only assets produced for the same release contract.
 - **THEN** the attestation identifies this repository's release workflow and
   its checksum matches the published checksum asset
 
+### Requirement: Draft producer uploads preserve one immutable workflow generation
+
+Every producer SHALL inspect the current GitHub Release asset inventory before
+upload. A missing name MAY be uploaded; an existing name MAY be reused only
+when GitHub's SHA-256 asset digest matches the local bytes. Missing or malformed
+digest metadata for an existing intended name, duplicate inventory names, or a
+digest conflict MUST fail closed. Uploads MUST NOT use replacement semantics;
+a same-name race MUST fail without replacing the existing asset.
+
+The release record SHALL bind the draft generation to the admitted tag object,
+commit, trusted workflow revision, and workflow run ID. Package and manifest
+producers MUST verify that identity before uploading. Re-running jobs in the
+same workflow run MAY reuse exact matching assets because the run ID is stable
+across attempts. A different workflow run MUST refuse a draft whose release
+record names another generation.
+
+#### Scenario: A same-run retry finds exact producer bytes
+
+- **WHEN** a rerun sees an existing intended asset with the exact SHA-256
+- **THEN** it skips that upload and uploads only absent names
+
+#### Scenario: A draft contains an asset from a conflicting generation
+
+- **WHEN** an existing intended asset's digest differs, or its release record
+  binds another workflow run
+- **THEN** the producer stops before replacing that asset or uploading later
+  producer outputs
+
+#### Scenario: GitHub reports an unusable asset inventory
+
+- **WHEN** an intended existing asset has no valid SHA-256 metadata or the
+  inventory contains duplicate names
+- **THEN** the producer refuses to upload
+
+### Requirement: Release publication is workflow-owned and serialized with producers
+
+Build, release-publication, and external-publication runs for the same tag SHALL
+share one concurrency group independent of operation and MUST NOT cancel an
+active run. The normal transition from draft to published SHALL be performed
+only by the protected `publish-release` workflow operation after it downloads
+and verifies the exact manifest asset set and rechecks the signed manifest
+against the successful release run and live annotated tag identity.
+
+A replay for an already-published release MAY succeed only after the same full
+verification and MUST make no release mutation. Missing, extra, mismatched, or
+unverifiable assets or identity MUST fail closed. The `publish-release` job
+MUST NOT upload, replace, or delete release assets. Manual GitHub UI publication
+is break-glass: an owner MUST first stop all workflow runs for the tag and MUST
+not resume or dispatch producers against the draft afterward.
+
+#### Scenario: Producer and publish operation target the same tag
+
+- **WHEN** a build and `publish-release` are dispatched for the same tag
+- **THEN** the shared tag concurrency group prevents them from executing at
+  the same time, and a producer that starts after publication refuses the
+  non-draft release
+
+#### Scenario: A verified publication is replayed
+
+- **WHEN** `publish-release` sees the exact release already published
+- **THEN** it verifies the complete asset set and release identity, then exits
+  successfully without changing the release
+
+#### Scenario: Release identity or assets fail verification
+
+- **WHEN** the signed manifest, live tag identity, or exact asset set is
+  missing or inconsistent
+- **THEN** the workflow refuses to publish
+
 ### Requirement: Release downloads have a selected aggregate byte budget
 
 Before downloading release assets, the workflow SHALL validate each selected
@@ -94,6 +163,38 @@ source commit recorded by the attestation. A mismatch MUST refuse publication.
 
 - **WHEN** published metadata already equals the rendered release output
 - **THEN** the job performs no new commit and succeeds without changing assets
+
+### Requirement: External publication outcomes are recorded as one resumable saga
+
+After both target publishers finish, the workflow SHALL write a read-only
+cross-target ledger from their exact receipt artifact IDs and explicit job
+outcomes. The ledger SHALL report `complete` only when both receipts verify for
+the same tag, release manifest, source, and publication workflow run. A
+successful publisher receipt from an earlier attempt of the same workflow run
+MAY be reused during a failed-job rerun; its original attempt SHALL remain
+recorded. A missing receipt when the target was ready SHALL be `unknown` and
+require reconciliation, even if the publisher reported a successful push.
+Missing receipt MUST NOT be treated as unchanged or as proof that retry is safe.
+The ledger SHALL remain credential-free and be retained as a workflow artifact
+for 90 days. It MUST NOT modify release assets or automatically retry a target.
+
+#### Scenario: Only Homebrew has a verified receipt
+
+- **WHEN** Homebrew has a valid receipt and AUR has no receipt
+- **THEN** the ledger reports partial publication and requires reconciliation
+
+#### Scenario: A receipt is lost after a possible push
+
+- **WHEN** a publisher was ready or reported a push but its receipt artifact is
+  absent or unreadable
+- **THEN** the ledger reports unknown remote state and does not infer unchanged
+
+#### Scenario: A failed-job rerun reuses the earlier successful target
+
+- **WHEN** Homebrew succeeded on an earlier attempt and AUR succeeds on the
+  current retry attempt for the same workflow run
+- **THEN** the ledger downloads both exact artifact IDs and records both receipt
+  attempts against the same release manifest
 
 #### Scenario: A verified external publication leaves a durable receipt
 
