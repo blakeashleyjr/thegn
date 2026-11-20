@@ -8670,6 +8670,35 @@ async fn event_loop<T: Terminal>(
         }};
     }
 
+    macro_rules! jump_lead {
+        () => {{
+            match crate::lead::group::jump(
+                keymap.config(),
+                &mut session,
+                &mut panes,
+                &mut model.status,
+                &model.sidebar_db_terminals,
+                &pending_db_tx,
+                &waker,
+            ) {
+                crate::lead::group::JumpOutcome::Handled => {}
+                crate::lead::group::JumpOutcome::Activate(t) => {
+                    let (hydrate, _pending) = activate_row!(t);
+                    sb.focus_active_row(&mut model);
+                    if hydrate {
+                        kick_model_hydration!();
+                    }
+                }
+                crate::lead::group::JumpOutcome::Created => {
+                    focus.zone = crate::focus::Zone::Center;
+                    refresh_tab_model(&mut model, &session, &mut sb);
+                    persist_session_layout(&mut session, &panes);
+                    need_relayout = true;
+                }
+            }
+        }};
+    }
+
     // Dispatch a [`SidebarOutcome`] using the loop's locals — shared by the
     // keyboard path (sidebar `handle_key`) and the mouse path (row clicks and
     // context-menu picks), so the two input methods can never diverge.
@@ -18918,6 +18947,38 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.switch_tab(t);
                                 persist_panel_state(&panel_ui);
                             }
+                            Some(crate::panel::PanelHit::LeadJump) => {
+                                jump_lead!();
+                                focus.zone = crate::focus::Zone::Center;
+                            }
+                            Some(crate::panel::PanelHit::LeadApprovals) => {
+                                open_panel_section(
+                                    crate::panel::Section::Notifications,
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                panel_ui.row_mode = true;
+                                let first_is_approval =
+                                    crate::panel::sections::notifications::visible_indices(
+                                        &model.panel,
+                                        &panel_ui,
+                                    )
+                                    .first()
+                                    .and_then(|&i| model.panel.notifications.get(i))
+                                    .is_some_and(
+                                        crate::panel::sections::notifications::is_approval,
+                                    );
+                                if !first_is_approval {
+                                    model.status = "The pending request is in another repo: press g in Notifications to show every repo".into();
+                                }
+                            }
                         }
                     }
                     dirty = true;
@@ -29012,30 +29073,7 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::JumpLead => {
-                                match crate::lead::group::jump(
-                                    keymap.config(),
-                                    &mut session,
-                                    &mut panes,
-                                    &mut model.status,
-                                    &model.sidebar_db_terminals,
-                                    &pending_db_tx,
-                                    &waker,
-                                ) {
-                                    crate::lead::group::JumpOutcome::Handled => {}
-                                    crate::lead::group::JumpOutcome::Activate(t) => {
-                                        let (hydrate, _pending) = activate_row!(t);
-                                        sb.focus_active_row(&mut model);
-                                        if hydrate {
-                                            kick_model_hydration!();
-                                        }
-                                    }
-                                    crate::lead::group::JumpOutcome::Created => {
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        persist_session_layout(&mut session, &panes);
-                                        need_relayout = true;
-                                    }
-                                }
+                                jump_lead!();
                             }
                             Action::MarkAllRead => {
                                 crate::handlers::attention::mark_all_read(
