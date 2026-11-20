@@ -1304,14 +1304,24 @@ fn provision_reporting(
 #[derive(Default)]
 struct StepReporter {
     seen: Vec<(String, ProvisionState)>,
+    started: Vec<(String, Instant)>,
 }
 
 impl StepReporter {
     fn changed(&mut self, steps: &[ProvisionStepView]) -> Vec<String> {
+        self.changed_at(steps, Instant::now())
+    }
+
+    fn changed_at(&mut self, steps: &[ProvisionStepView], now: Instant) -> Vec<String> {
         let mut lines = Vec::new();
         for step in steps {
             if step.state == ProvisionState::Pending {
                 continue;
+            }
+            if step.state == ProvisionState::Active
+                && !self.started.iter().any(|(label, _)| label == &step.label)
+            {
+                self.started.push((step.label.clone(), now));
             }
             let changed = match self.seen.iter_mut().find(|(label, _)| *label == step.label) {
                 Some((_, state)) if *state == step.state => false,
@@ -1325,28 +1335,39 @@ impl StepReporter {
                 }
             };
             if changed {
-                lines.push(step_line(step));
+                let elapsed = match step.state {
+                    ProvisionState::Done | ProvisionState::Failed => self
+                        .started
+                        .iter()
+                        .find(|(label, _)| label == &step.label)
+                        .map(|(_, started)| now.saturating_duration_since(*started)),
+                    ProvisionState::Pending | ProvisionState::Active => None,
+                };
+                lines.push(step_line(step, elapsed));
             }
         }
         lines
     }
 }
 
-fn step_line(step: &ProvisionStepView) -> String {
+fn step_line(step: &ProvisionStepView, elapsed: Option<Duration>) -> String {
     let state = match step.state {
         ProvisionState::Pending => "pending",
         ProvisionState::Active => "running",
         ProvisionState::Done => "done",
         ProvisionState::Failed => "FAILED",
     };
+    let took = elapsed
+        .map(|elapsed| format!(" ({:.1} s)", elapsed.as_secs_f64()))
+        .unwrap_or_default();
     let detail = step
         .detail
         .as_deref()
         .map(str::trim)
         .filter(|d| step.state == ProvisionState::Failed && !d.is_empty());
     match detail {
-        Some(detail) => format!("provision: {} — {state}: {detail}", step.label),
-        None => format!("provision: {} — {state}", step.label),
+        Some(detail) => format!("provision: {} — {state}{took}: {detail}", step.label),
+        None => format!("provision: {} — {state}{took}", step.label),
     }
 }
 
@@ -2343,26 +2364,55 @@ mod up_tests {
     #[test]
     fn step_reporter_prints_each_state_change_once() {
         let mut reporter = StepReporter::default();
-        let first = reporter.changed(&[
-            step("workspace", ProvisionState::Active, None),
-            step("clone", ProvisionState::Pending, None),
-        ]);
+        let started = Instant::now();
+        let first = reporter.changed_at(
+            &[
+                step("workspace", ProvisionState::Active, None),
+                step("clone", ProvisionState::Pending, None),
+            ],
+            started,
+        );
         assert_eq!(first, vec!["provision: workspace — running".to_string()]);
-        let again = reporter.changed(&[
-            step("workspace", ProvisionState::Active, Some("mkdir")),
-            step("clone", ProvisionState::Pending, None),
-        ]);
+        let again = reporter.changed_at(
+            &[
+                step("workspace", ProvisionState::Active, Some("mkdir")),
+                step("clone", ProvisionState::Pending, None),
+            ],
+            started + Duration::from_secs(1),
+        );
         assert!(again.is_empty(), "{again:?}");
-        let next = reporter.changed(&[
-            step("workspace", ProvisionState::Done, None),
-            step("clone", ProvisionState::Failed, Some("git: auth failed")),
-        ]);
+        let next = reporter.changed_at(
+            &[
+                step("workspace", ProvisionState::Done, None),
+                step("clone", ProvisionState::Failed, Some("git: auth failed")),
+            ],
+            started + Duration::from_secs(2),
+        );
         assert_eq!(
             next,
             vec![
-                "provision: workspace — done".to_string(),
+                "provision: workspace — done (2.0 s)".to_string(),
                 "provision: clone — FAILED: git: auth failed".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn step_reporter_includes_elapsed_time_for_failed_steps() {
+        let mut reporter = StepReporter::default();
+        let started = Instant::now();
+        reporter.changed_at(&[step("clone", ProvisionState::Active, None)], started);
+        let lines = reporter.changed_at(
+            &[step(
+                "clone",
+                ProvisionState::Failed,
+                Some("git: auth failed"),
+            )],
+            started + Duration::from_millis(1_234),
+        );
+        assert_eq!(
+            lines,
+            vec!["provision: clone — FAILED (1.2 s): git: auth failed".to_string()]
         );
     }
 
