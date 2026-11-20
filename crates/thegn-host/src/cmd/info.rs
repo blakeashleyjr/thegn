@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use thegn_core::config::Config;
+use thegn_core::config::{Config, ProcessEnv};
 use thegn_core::db::Db;
 use thegn_core::info_model::{
     Field, INFO_SCHEMA, InfoReport, InfoTarget, LiveFacts, SessionRow, Source,
@@ -90,8 +90,15 @@ pub(crate) fn gather(
 
     let (settings, mut settings_notes, backends) = match environment.as_ref() {
         Some(env) => {
-            let (settings, notes) =
-                thegn_core::info_resolve::settings(cfg, config_path, &db, root, wt, env);
+            let (settings, notes) = thegn_core::info_resolve::settings(
+                cfg,
+                config_path,
+                &db,
+                root,
+                wt,
+                env,
+                &ProcessEnv,
+            );
             let saved = db
                 .worktree_record(&wt_s)?
                 .and_then(|row| row.sandbox_backend);
