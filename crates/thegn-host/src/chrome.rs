@@ -961,7 +961,7 @@ impl LoadStep {
 /// Action ids whose chords the chrome prints inline, resolved into
 /// [`FrameModel::chord_hints`] each frame. Add an id here when a draw site
 /// needs to name a key, rather than writing the chord as a literal.
-pub const INLINE_CHORD_IDS: &[&str] = &["help", "palette", "toggle-key-lock"];
+pub const INLINE_CHORD_IDS: &[&str] = &["help", "palette", "toggle-key-lock", "jump-lead"];
 
 impl FrameModel {
     /// The live chord for an action id, for chrome that names a key inline.
@@ -2284,8 +2284,10 @@ pub fn draw_panel(
         crate::panel::skeleton::draw(surface, rect);
         return;
     }
+    let foot = lead_foot(model, rect);
+    let body = panel_body(rect, &foot);
     let frame =
-        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+        crate::panel::frame::build_panel(model, ui, body.cols, body.rows, model.panel_focused);
     for (i, row) in frame.rows.iter().enumerate() {
         crate::seg::draw_line(
             surface,
@@ -2307,20 +2309,50 @@ pub fn draw_panel(
     if model.panel_focused {
         let pairs: Vec<(String, String)> = model.keyhints.iter().take(6).cloned().collect();
         let hint_h = pairs.len() + 1; // rule/title + one row per tip
-        let avail = rect.rows.saturating_sub(frame.rows.len());
+        let avail = body.rows.saturating_sub(frame.rows.len());
         // Require a one-row gap between the last panel row and the footer.
         if !pairs.is_empty() && avail > hint_h {
             draw_panel_hints(
                 surface,
                 Rect {
                     x: rect.x,
-                    y: rect.y + rect.rows - hint_h,
+                    y: body.y + body.rows - hint_h,
                     cols: rect.cols,
                     rows: hint_h,
                 },
                 &pairs,
             );
         }
+    }
+    for (i, row) in foot.rows.iter().enumerate() {
+        crate::seg::draw_line(
+            surface,
+            rect.x,
+            rect.y + body.rows + i,
+            rect.cols,
+            &row.line,
+            row.bg.unwrap_or(crate::seg::Tok::Slot(S::Panel)),
+        );
+    }
+}
+
+fn lead_foot(model: &FrameModel, rect: Rect) -> crate::panel::lead_bar::LeadFoot {
+    model
+        .sidebar_status
+        .lead
+        .as_ref()
+        .map(|bar| {
+            crate::panel::lead_bar::footer(bar, rect.cols, rect.rows, model.chord("jump-lead"))
+        })
+        .unwrap_or_default()
+}
+
+fn panel_body(rect: Rect, foot: &crate::panel::lead_bar::LeadFoot) -> Rect {
+    Rect {
+        x: rect.x,
+        y: rect.y,
+        cols: rect.cols,
+        rows: rect.rows.saturating_sub(foot.rows.len()),
     }
 }
 
@@ -2397,7 +2429,9 @@ pub fn panel_hits(
     ui: &crate::panel::PanelUi,
     rect: Rect,
 ) -> Vec<(usize, crate::panel::PanelHit)> {
-    crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused)
+    let foot = lead_foot(model, rect);
+    let body = panel_body(rect, &foot);
+    crate::panel::frame::build_panel(model, ui, body.cols, body.rows, model.panel_focused)
         .rows
         .iter()
         .enumerate()
@@ -2415,10 +2449,23 @@ pub fn panel_hit_at(
     x: usize,
     y: usize,
 ) -> Option<crate::panel::PanelHit> {
-    let frame =
-        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+    let foot = lead_foot(model, rect);
+    let body = panel_body(rect, &foot);
     let row = y.checked_sub(rect.y)?;
     let rel_x = x.checked_sub(rect.x)?;
+    if row >= body.rows {
+        let foot_row = row - body.rows;
+        if foot
+            .approvals
+            .as_ref()
+            .is_some_and(|(approval_row, cols)| *approval_row == foot_row && cols.contains(&rel_x))
+        {
+            return Some(crate::panel::PanelHit::LeadApprovals);
+        }
+        return foot.rows.get(foot_row).and_then(|panel_row| panel_row.hit);
+    }
+    let frame =
+        crate::panel::frame::build_panel(model, ui, body.cols, body.rows, model.panel_focused);
     if frame.col_hits.iter().any(|span| span.row == row) {
         return frame
             .col_hits
@@ -2437,8 +2484,10 @@ pub fn panel_column_at(
     x: usize,
     y: usize,
 ) -> Option<crate::panel::frame::PanelColumn> {
+    let foot = lead_foot(model, rect);
+    let body = panel_body(rect, &foot);
     let frame =
-        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+        crate::panel::frame::build_panel(model, ui, body.cols, body.rows, model.panel_focused);
     let zone = frame.col_zone?;
     let row = y.checked_sub(rect.y)?;
     let col = x.checked_sub(rect.x)?;
@@ -2462,8 +2511,10 @@ pub fn panel_drill_drag_hit(
     x: usize,
     y: usize,
 ) -> Option<(usize, crate::panel::gitui::DragOverflow)> {
+    let foot = lead_foot(model, rect);
+    let body = panel_body(rect, &foot);
     let frame =
-        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+        crate::panel::frame::build_panel(model, ui, body.cols, body.rows, model.panel_focused);
     if let Some(zone) = frame.col_zone {
         if zone.rows.is_empty() || zone.main.is_empty() {
             return None;
@@ -2551,8 +2602,10 @@ pub fn panel_rail_hit(
     x: usize,
     y: usize,
 ) -> Option<crate::panel::Section> {
+    let foot = lead_foot(model, rect);
+    let body = panel_body(rect, &foot);
     let frame =
-        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+        crate::panel::frame::build_panel(model, ui, body.cols, body.rows, model.panel_focused);
     let rel_x = x.checked_sub(rect.x)?;
     frame
         .rail
@@ -2578,8 +2631,10 @@ pub fn panel_tab_hit(
     if y != rect.y {
         return None;
     }
+    let foot = lead_foot(model, rect);
+    let body = panel_body(rect, &foot);
     let frame =
-        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+        crate::panel::frame::build_panel(model, ui, body.cols, body.rows, model.panel_focused);
     let rel_x = x.checked_sub(rect.x)?;
     frame
         .tab_spans
