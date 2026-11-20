@@ -17,7 +17,7 @@ pub(crate) fn parse_diskstats_line(line: &[u8]) -> Option<(&[u8], u64, u64)> {
     ))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn sum_physical(buf: &[u8], names: &[String]) -> (u64, u64) {
     let (mut read, mut written) = (0_u64, 0_u64);
     for line in buf.split(|byte| *byte == b'\n') {
