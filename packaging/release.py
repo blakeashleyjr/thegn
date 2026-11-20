@@ -1195,6 +1195,7 @@ def build_release_manifest(
         "run_id": run_id,
         "assets": result_assets,
     }
+    return value
 
 
 def write_release_manifest(output: Path, assets_dir: Path, value: Mapping[str, Any]) -> None:
