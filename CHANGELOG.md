@@ -25,6 +25,10 @@ All notable changes to **thegn** are documented here. The format follows
 - A deleted worktree no longer reappears in the sidebar from an older refresh (THE-2470).
 - Info explains against the `--config` path the TUI started with, and shows a failed state-database read as "unknown" instead of unset.
 
+### Fixed
+
+- Vercel: streamed commands, interactive shells and file transfers refused because the session had stopped are retried once after resume, like one-shot commands.
+
 ## [0.1.0-alpha.108] — 2026-11-19
 
 ### Changed
