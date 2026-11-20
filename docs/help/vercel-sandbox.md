@@ -82,7 +82,10 @@ lifetime ceiling both run before any resume.
 
 - A one-shot command that Vercel refused because the session had stopped is
   retried once after the sandbox is resumed, and only when waking is allowed.
-  The refusal comes before the command starts, so nothing runs twice.
+  The same single retry applies to streamed commands, interactive shells and
+  file transfers (uploads, downloads and the login upload). It happens only
+  when Vercel refused the request before starting anything, so nothing runs or
+  is written twice; a second refusal is reported as the error.
 - If Vercel reports that a stopped sandbox's saved snapshot has expired, thegn
   refuses to resume it and says to destroy it (`thegn env down`) and create a
   new one. thegn never deletes it on its own.
