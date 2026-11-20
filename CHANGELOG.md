@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.107] — 2026-11-19
+
 ### Added
 
 - Info screen: `thegn info` (with `--workspace`, `--worktree`, `--json`), the sidebar key `I` and the palette action "Info screen" show what is in force for a workspace or worktree, which layer set each value, and which sandbox backend would launch, using the same rule as a real launch. Remote and provider placements are never probed.
@@ -3997,7 +3999,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.106...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.107...HEAD
+[0.1.0-alpha.107]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.106...v0.1.0-alpha.107
 [0.1.0-alpha.106]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.105...v0.1.0-alpha.106
 [0.1.0-alpha.105]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.104...v0.1.0-alpha.105
 [0.1.0-alpha.104]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.103...v0.1.0-alpha.104
