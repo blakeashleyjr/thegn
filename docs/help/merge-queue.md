@@ -45,6 +45,9 @@ branch, when that history should be landed.
 - **Integrate** (palette, or the section's key) drains the queue once:
   each queued branch is folded into `main` and gated before the ref
   advances; conflicted branches stay queued.
+- **Drain warning.** A drain prints one line (and adds it to `--json`
+  `warnings`) for each queued worktree on a provider env, since commits inside
+  the sandbox are not in the drain until pulled. It still drains them.
 - **Drain (agent autopilot)** hands conflicts to a coding agent to
   resolve, then continues.
   Each eligible row is claimed by the drain working it, so a concurrent drain
