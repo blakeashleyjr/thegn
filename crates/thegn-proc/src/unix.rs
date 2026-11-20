@@ -479,7 +479,10 @@ fn group_exists(pid: libc::pid_t) -> bool {
 /// process's BSD state; a group containing only zombies has no live work left.
 /// Any incomplete or denied observation fails closed as live.
 #[cfg(target_os = "macos")]
-fn macos_group_has_live_members(pgid: libc::pid_t) -> bool {
+fn macos_group_has_live_members(
+    pgid: libc::pid_t,
+    pinned_exited_leader: Option<libc::pid_t>,
+) -> bool {
     const MAX_GROUP_MEMBERS: usize = 1024;
 
     let mut pids = [0 as libc::pid_t; MAX_GROUP_MEMBERS];
@@ -500,6 +503,13 @@ fn macos_group_has_live_members(pgid: libc::pid_t) -> bool {
     pids[..count as usize].iter().any(|&pid| {
         if pid <= 0 {
             return true;
+        }
+        // `waitid(WNOWAIT)` proves this exact owned child has exited while
+        // keeping its PID pinned for safe group signalling. libproc can list
+        // that zombie but cannot inspect it (`ESRCH`), so it is the only
+        // listed member that may be skipped without a state read.
+        if pinned_exited_leader == Some(pid) {
+            return false;
         }
         // SAFETY: zero is a valid initial value, and libproc is given the exact
         // size of the caller-owned structure.
@@ -565,7 +575,11 @@ fn own_group_live(
     {
         #[cfg(target_os = "macos")]
         {
-            macos_group_has_live_members(guard.pid)
+            match leader_exited(guard.pid) {
+                Ok(true) => macos_group_has_live_members(guard.pid, Some(guard.pid)),
+                Ok(false) => macos_group_has_live_members(guard.pid, None),
+                Err(_error) => true,
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {

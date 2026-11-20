@@ -5,7 +5,9 @@
 A local Git identity probe SHALL return captured stdout only after its leader is
 reaped successfully, its stdout pipe reaches EOF, and its owned process group is
 proven drained. On macOS, zombie-only process groups SHALL count as drained
-while the leader remains pinned for safe signalling. Live descendants and
+while the leader remains pinned for safe signalling. The supervisor SHALL
+ignore only that exact leader PID when owned `waitid(WNOWAIT)` proves it exited;
+every other listed member must have an inspectable state. Live descendants and
 incomplete process-state observations SHALL remain owned by the bounded
 supervisor and SHALL fail closed if they do not drain within its existing
 limits.

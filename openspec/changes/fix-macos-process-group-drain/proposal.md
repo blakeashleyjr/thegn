@@ -10,7 +10,8 @@ command can otherwise look like it has descendants holding stdout open.
 ## What Changes
 
 - Determine macOS process-group liveness from libproc member states, treating
-  zombie-only groups as drained and uncertain observations as live.
+  zombie-only groups as drained and uncertain observations as live. Ignore the
+  unreaped leader only when owned `waitid(WNOWAIT)` proves that exact PID exited.
 - Keep the leader pinned through drain proof and preserve bounded termination,
   reap, pipe, and fail-closed behavior.
 - Add deterministic Darwin state coverage and portable supervisor regressions.
