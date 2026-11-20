@@ -181,8 +181,7 @@ if [[ -z ${THEGN_MAKE_APP_PINNED-} ]]; then
   python3 "$fs_helper" pin --dest "$dest" -- "$here/make-app.sh" "${original_args[@]}"
   exit $?
 fi
-if [[ ! $THEGN_MAKE_APP_PINNED =~ ^[0-9]+$ ]] || [[ ! -d /dev/fd/$THEGN_MAKE_APP_PINNED ]] ||
-  [[ ! /dev/fd/$THEGN_MAKE_APP_PINNED -ef . ]]; then
+if [[ ! $THEGN_MAKE_APP_PINNED =~ ^[0-9]+$ ]] || ! python3 "$fs_helper" verify --fd "$THEGN_MAKE_APP_PINNED"; then
   echo "make-app.sh: invalid pinned destination descriptor; refusing filesystem changes" >&2
   exit 1
 fi
@@ -193,14 +192,14 @@ app="$dest/$name.app"
 app_display="$dest_display/$name.app"
 
 staging=""
-old=""
 lock=""
 lock_held=0
+lock_identity=""
 staging_owned=0
 cleanup() {
   if ((lock_held)); then
-    rm -f -- "$lock/pid"
-    rmdir -- "$lock" 2>/dev/null || true
+    python3 "$fs_helper" release-lock --path "${lock#./}" --pid "$$" --identity "$lock_identity" ||
+      echo "make-app.sh: could not safely release generation lock $lock" >&2
   fi
   if [[ -n $staging && -e $staging ]]; then
     if ((staging_owned)); then
@@ -209,22 +208,15 @@ cleanup() {
       rmdir -- "$staging" 2>/dev/null || true
     fi
   fi
-  if [[ -n $old && -d $old && ! -e $old/app ]]; then
-    rmdir "$old" 2>/dev/null || true
-  elif [[ -n $old && -e $old/app ]]; then
-    echo "make-app.sh: previous bundle remains at $old/app after rollback failure" >&2
-  fi
 }
 trap cleanup EXIT
 
 lock="$dest/.$name.app.lock"
-# Record our pid in a freshly created lock dir; fail closed (and drop the dir)
-# when the write fails, so a pid-less lock is never left behind by us.
+# Record our pid through a no-follow directory descriptor and retain that
+# directory's identity so cleanup cannot follow a replaced lock symlink.
 claim_lock() {
-  if ! printf '%s\n' "$$" >"$lock/pid"; then
-    echo "make-app.sh: cannot record pid in lock $lock" >&2
-    rm -f -- "$lock/pid"
-    rmdir -- "$lock" 2>/dev/null || true
+  if ! lock_identity="$(python3 "$fs_helper" claim-lock --path "${lock#./}" --pid "$$")"; then
+    echo "make-app.sh: cannot claim generation lock $lock safely" >&2
     return 1
   fi
   lock_held=1
@@ -240,12 +232,12 @@ pid_is_alive() {
   [[ $err == *[Nn]ot\ permitted* || $err == *EPERM* ]]
 }
 acquire_lock() {
-  if mkdir -- "$lock" 2>/dev/null; then
+  if mkdir -m 700 -- "$lock" 2>/dev/null; then
     claim_lock
     return
   fi
   local holder=""
-  if [[ -f $lock/pid && ! -L $lock/pid ]]; then
+  if [[ -d $lock && ! -L $lock && -f $lock/pid && ! -L $lock/pid ]]; then
     holder="$(head -c 32 -- "$lock/pid" 2>/dev/null | tr -d '[:space:]')" || holder=""
   fi
   if [[ $holder =~ ^[0-9]+$ ]]; then
@@ -263,7 +255,7 @@ acquire_lock() {
     fi
     # We must have renamed the dead holder's lock, not a live run's fresh one.
     local renamed=""
-    if [[ -f $stale/pid && ! -L $stale/pid ]]; then
+    if [[ -d $stale && ! -L $stale && -f $stale/pid && ! -L $stale/pid ]]; then
       renamed="$(head -c 32 -- "$stale/pid" 2>/dev/null | tr -d '[:space:]')" || renamed=""
     fi
     if [[ $renamed != "$holder" ]]; then
@@ -272,7 +264,7 @@ acquire_lock() {
       return 1
     fi
     rm -rf -- "$stale"
-    if mkdir -- "$lock" 2>/dev/null; then
+    if mkdir -m 700 -- "$lock" 2>/dev/null; then
       claim_lock
       return
     fi

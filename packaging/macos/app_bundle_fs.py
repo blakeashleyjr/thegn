@@ -68,6 +68,16 @@ def pinned_exec(args: argparse.Namespace) -> None:
     os.execvpe(command[0], command, os.environ)
 
 
+def verify_pinned(args: argparse.Namespace) -> None:
+    descriptor = int(args.fd)
+    opened = os.fstat(descriptor)
+    current = os.stat(".")
+    if not stat.S_ISDIR(opened.st_mode) or not stat.S_ISDIR(current.st_mode):
+        raise OSError(errno.EINVAL, "pinned descriptor and current directory must both be directories")
+    if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        raise OSError(errno.EPERM, "pinned descriptor does not name the current directory")
+
+
 def open_child_dir(parent_fd: int, name: str) -> int:
     info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if not stat.S_ISDIR(info.st_mode):
@@ -226,13 +236,13 @@ def promote(args: argparse.Namespace) -> None:
             raise SystemExit(75)
         try:
             remove_owned(parent_fd, args.stage, args.bundle_id, args.legacy_bundle_id, app_info)
-        except OSError:
-            try:
-                rename_with_flags(parent_fd, args.stage, args.app, 2)
-            except OSError as rollback_error:
-                print(f"make-app: atomic promotion succeeded but rollback and cleanup failed; old bundle remains at {args.stage}: {rollback_error}", file=sys.stderr)
-                raise SystemExit(75)
-            raise
+        except OSError as cleanup_error:
+            # The verified exchange is the commit point. Recursive retirement
+            # may already have removed part of the old tree, so swapping it back
+            # could replace the complete new app with a damaged old generation.
+            # Preserve the residue and leave the verified new app active.
+            print(f"make-app: new bundle is active; previous bundle cleanup incomplete and residue is preserved at {args.stage}: {cleanup_error}", file=sys.stderr)
+            raise SystemExit(75)
     finally:
         os.close(parent_fd)
 
@@ -245,12 +255,57 @@ def remove(args: argparse.Namespace) -> None:
         os.close(parent_fd)
 
 
+def claim_lock(args: argparse.Namespace) -> None:
+    parent_fd = os.open(".", os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    try:
+        lock_fd = open_child_dir(parent_fd, args.path)
+        try:
+            pid_fd = os.open("pid", os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o600, dir_fd=lock_fd)
+            try:
+                os.write(pid_fd, (args.pid + "\n").encode("ascii"))
+            finally:
+                os.close(pid_fd)
+            identity = os.fstat(lock_fd)
+            print(f"{identity.st_dev}:{identity.st_ino}")
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def release_lock(args: argparse.Namespace) -> None:
+    expected = tuple(int(value) for value in args.identity.split(":"))
+    if len(expected) != 2:
+        raise OSError(errno.EINVAL, "invalid lock identity")
+    parent_fd = os.open(".", os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    try:
+        lock_fd = open_child_dir(parent_fd, args.path)
+        try:
+            identity = os.fstat(lock_fd)
+            if (identity.st_dev, identity.st_ino) != expected:
+                raise OSError(errno.EAGAIN, "lock path no longer names this generator's lock", args.path)
+            pid_data = read_regular_at(lock_fd, "pid", 64)
+            if pid_data != (args.pid + "\n").encode("ascii"):
+                raise OSError(errno.EPERM, "lock pid does not match this generator", args.path)
+            os.unlink("pid", dir_fd=lock_fd)
+        finally:
+            os.close(lock_fd)
+        current = os.stat(args.path, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != expected:
+            return
+        os.rmdir(args.path, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="operation", required=True)
     pin_parser = sub.add_parser("pin")
     pin_parser.add_argument("--dest", required=True)
     pin_parser.add_argument("command", nargs=argparse.REMAINDER)
+    verify_parser = sub.add_parser("verify")
+    verify_parser.add_argument("--fd", required=True)
     promote_parser = sub.add_parser("promote")
     promote_parser.add_argument("--stage", required=True)
     promote_parser.add_argument("--app", required=True)
@@ -260,6 +315,13 @@ def main() -> None:
     remove_parser.add_argument("--path", required=True)
     remove_parser.add_argument("--bundle-id", required=True)
     remove_parser.add_argument("--legacy-bundle-id", required=True)
+    claim_parser = sub.add_parser("claim-lock")
+    claim_parser.add_argument("--path", required=True)
+    claim_parser.add_argument("--pid", required=True)
+    release_parser = sub.add_parser("release-lock")
+    release_parser.add_argument("--path", required=True)
+    release_parser.add_argument("--pid", required=True)
+    release_parser.add_argument("--identity", required=True)
     args = parser.parse_args()
     try:
         if args.operation == "pin":
@@ -268,8 +330,14 @@ def main() -> None:
                 raise OSError(errno.EINVAL, "missing pinned command")
             args.command = command
             pinned_exec(args)
+        elif args.operation == "verify":
+            verify_pinned(args)
         elif args.operation == "promote":
             promote(args)
+        elif args.operation == "claim-lock":
+            claim_lock(args)
+        elif args.operation == "release-lock":
+            release_lock(args)
         else:
             remove(args)
     except OSError as exc:

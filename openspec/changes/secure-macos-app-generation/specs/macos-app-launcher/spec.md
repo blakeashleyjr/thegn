@@ -29,3 +29,11 @@ clear diagnostic if Python or the host atomic rename primitive is unavailable.
 - **WHEN** the host does not provide a safe atomic exchange operation
 - **THEN** an upgrade fails closed before changing the existing app path
 - **AND** the previous complete bundle remains intact
+
+#### Scenario: Retirement of the displaced bundle fails after exchange
+
+- **WHEN** a verified atomic exchange has installed the new complete bundle
+  but safe removal of the old generation fails
+- **THEN** the new complete bundle remains active
+- **AND** the generator reports and preserves the old cleanup residue without
+  swapping a partially removed old generation back into the app path
