@@ -42,6 +42,8 @@ pub(crate) const EXIT_REMOTE_LOST: i32 = 75;
 
 pub(crate) const WAKE_NOTICE_AFTER: Duration = Duration::from_secs(3);
 
+const STDERR_TAIL_CAP: u64 = 8 * 1024;
+
 fn tty_mode(stdin_tty: bool, stdout_tty: bool) -> bool {
     stdin_tty && stdout_tty
 }
@@ -93,9 +95,9 @@ const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Largest stdin message built from queued input (pane.rs STREAM_STDIN_CHUNK).
 const STDIN_COALESCE_MAX: usize = 32 << 10;
 
-/// Run `cmd` inside sprite `id` over the native exec API. A tty on stdin gets
-/// the streaming PTY bridge; anything else the one-shot capture used by the
-/// control reads. `cmd` arrives already shaped by `GitLoc::provider_command`
+/// Run `cmd` inside sprite `id` over the native exec API. When stdin and stdout
+/// are both terminals, use the streaming PTY bridge; anything else streams.
+/// `cmd` arrives already shaped by `GitLoc::provider_command`
 /// (`/bin/sh -lc <script>`) or the launch argv; empty falls back to a login
 /// shell.
 ///
@@ -567,7 +569,16 @@ async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Resu
             let mut chunk = [0u8; 32 * 1024];
             loop {
                 match input.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "thegn::provider",
+                            error = %error,
+                            "sprite-exec: stdin read failed; sending EOF"
+                        );
+                        break;
+                    }
                     Ok(len) => {
                         if input_control
                             .blocking_send(ExecControl::Stdin(chunk[..len].to_vec()))
@@ -583,7 +594,7 @@ async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Resu
     drop(control);
 
     let frame_result = {
-        let mut stdout = std::io::stdout();
+        let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
         stream_frames(&mut frames, &mut stdout).await
     };
@@ -593,40 +604,53 @@ async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Resu
         _ => frame_result.map_err(anyhow::Error::msg),
     };
     let rendered = stderr.render();
-    if !rendered.is_empty() {
-        stderr_line(&rendered);
+    let total = stderr.total();
+    if total > STDERR_TAIL_CAP || !rendered.is_empty() {
+        let mut output = std::io::stderr();
+        if total > STDERR_TAIL_CAP {
+            let marker = format!(
+                "[thegn: remote stderr, last {STDERR_TAIL_CAP} of {} bytes]\n",
+                total
+            );
+            if output.write_all(marker.as_bytes()).is_err() {
+                tracing::debug!(target: "thegn::provider", "sprite-exec: stderr gone");
+            }
+        }
+        if !rendered.is_empty() && output.write_all(rendered.as_bytes()).is_err() {
+            tracing::debug!(target: "thegn::provider", "sprite-exec: stderr gone");
+        }
     }
     result
 }
 
 async fn stream_frames(
     frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
-    out: &mut dyn Write,
+    out: &mut dyn std::io::Write,
 ) -> std::result::Result<i32, String> {
-    let mut write_error = None;
     while let Some(frame) = frames.recv().await {
         match frame {
             ExecFrame::Stdout(bytes) => {
-                if write_error.is_none() {
-                    if let Err(error) = out.write_all(&bytes) {
-                        write_error = Some(error.to_string());
-                    }
+                if let Err(error) = out.write_all(&bytes).and_then(|()| out.flush()) {
+                    return if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        Ok(141)
+                    } else {
+                        Err(error.to_string())
+                    };
                 }
             }
             ExecFrame::Exit(code) => {
-                if write_error.is_none()
-                    && let Err(error) = out.flush()
-                {
-                    write_error = Some(error.to_string());
+                if let Err(error) = out.flush() {
+                    return if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        Ok(141)
+                    } else {
+                        Err(error.to_string())
+                    };
                 }
-                return match write_error {
-                    Some(error) => Err(error),
-                    None => Ok(code),
-                };
+                return Ok(code);
             }
         }
     }
-    Err(write_error.unwrap_or_else(|| "exec stream ended without an exit status".to_string()))
+    Err("exec stream ended without an exit status".to_string())
 }
 
 /// Stream `argv` in sprite `id` over a PTY exec with the local tty in raw mode.
@@ -850,7 +874,10 @@ async fn pump(
                         }
                     }
                 }
-                None => return StreamEnd::LocalGone,
+                None => {
+                    log_stats(&stats);
+                    return StreamEnd::LocalGone;
+                }
             },
         }
     }
@@ -990,6 +1017,58 @@ mod tests {
         assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(0));
         assert_eq!(output, vec![b'x'; 3 << 20]);
         assert!(!output.starts_with(b"[thegn:"));
+    }
+
+    struct FlushCountingWriter {
+        flushes: usize,
+    }
+
+    impl std::io::Write for FlushCountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    struct BrokenPipeWriter;
+
+    impl std::io::Write for BrokenPipeWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_frames_flushes_each_frame() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        tx.send(ExecFrame::Stdout(b"one".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Stdout(b"two".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Exit(0)).await.unwrap();
+
+        let mut output = FlushCountingWriter { flushes: 0 };
+        assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(0));
+        assert!(output.flushes >= 2);
+    }
+
+    #[tokio::test]
+    async fn stream_frames_stops_on_a_closed_pipe() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        tx.send(ExecFrame::Stdout(b"first".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Stdout(b"second".to_vec()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut output = BrokenPipeWriter;
+        assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(141));
     }
 
     #[tokio::test]

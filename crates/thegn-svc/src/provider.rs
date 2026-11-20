@@ -3368,7 +3368,7 @@ impl StderrTail {
     }
 }
 
-/// Bounded tail (last [`STDERR_TAIL_CAP`] bytes) of a streaming exec's stderr.
+/// Bounded tail (last `STDERR_TAIL_CAP` bytes) of a streaming exec's stderr.
 pub struct ExecStderr(StderrSink);
 
 impl ExecStderr {
@@ -4619,6 +4619,12 @@ where
                                     tracing::debug!(target: "thegn::provider", "provider exec exit frame could not be sent");
                                 }
                                 drain_until = Some(tokio::time::Instant::now() + EXEC_EXIT_DRAIN);
+                                if !tty
+                                    && control_closed
+                                    && write.send(Message::Close(None)).await.is_err()
+                                {
+                                    tracing::debug!(target: "thegn::provider", "provider exec close could not be sent");
+                                }
                             }
                             // Stderr is never part of the consumer's byte stream.
                             StreamMsg::Stderr(d) => {
@@ -4679,6 +4685,12 @@ where
                                 tracing::debug!(target: "thegn::provider", "provider exec exit frame could not be sent");
                             }
                             drain_until = Some(tokio::time::Instant::now() + EXEC_EXIT_DRAIN);
+                            if !tty
+                                && control_closed
+                                && write.send(Message::Close(None)).await.is_err()
+                            {
+                                tracing::debug!(target: "thegn::provider", "provider exec close could not be sent");
+                            }
                         }
                         SpriteCtrl::Forward if tty => {
                             if exited.is_some() {
@@ -7845,7 +7857,12 @@ mod tests {
     async fn drive_exec_messages(
         tty: bool,
         messages: Vec<tokio_tungstenite::tungstenite::Message>,
-    ) -> (Vec<ExecFrame>, Option<ExecProtocolError>) {
+        close_stdin: bool,
+    ) -> (
+        Vec<ExecFrame>,
+        Option<ExecProtocolError>,
+        Option<tokio_tungstenite::tungstenite::Message>,
+    ) {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
@@ -7857,17 +7874,32 @@ mod tests {
             tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
                 .await;
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(16);
-        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let _control_guard = (!close_stdin).then_some(control_tx);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let driver = tokio::spawn(drive_exec(
             client, tty, frames_tx, control_rx, sid_tx, None, None,
         ));
 
+        if close_stdin {
+            assert_eq!(
+                next_non_ping(&mut server).await,
+                Some(Message::Binary(vec![4].into()))
+            );
+        }
         for message in messages {
             if server.send(message).await.is_err() {
                 break;
             }
         }
+        let client_close = if close_stdin {
+            tokio::time::timeout(Duration::from_secs(1), next_non_ping(&mut server))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         if server.send(Message::Close(None)).await.is_err() {
             tracing::debug!(target: "thegn::provider", "test server close could not be sent");
         }
@@ -7877,7 +7909,17 @@ mod tests {
             frames.push(frame);
         }
         let fault = driver.await.unwrap();
-        (frames, fault)
+        (frames, fault, client_close)
+    }
+
+    #[tokio::test]
+    async fn drive_exec_non_tty_closes_after_exit_when_stdin_is_closed() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (_, fault, client_close) =
+            drive_exec_messages(false, vec![Message::Binary(vec![3, 0].into())], true).await;
+        assert_eq!(fault, None);
+        assert_eq!(client_close, Some(Message::Close(None)));
     }
 
     async fn next_non_ping<S>(
@@ -8137,12 +8179,13 @@ mod tests {
     async fn drive_exec_duplicate_exit_is_a_protocol_error() {
         use tokio_tungstenite::tungstenite::Message;
 
-        let (frames, fault) = drive_exec_messages(
+        let (frames, fault, _) = drive_exec_messages(
             false,
             vec![
                 Message::Binary(vec![3, 0].into()),
                 Message::Binary(vec![3, 1].into()),
             ],
+            false,
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
@@ -8165,7 +8208,7 @@ mod tests {
                 Message::Binary(vec![3, 7].into()),
             ],
         ] {
-            let (frames, fault) = drive_exec_messages(false, messages).await;
+            let (frames, fault, _) = drive_exec_messages(false, messages, false).await;
             assert_eq!(
                 frames,
                 vec![ExecFrame::Stdout(b"ok".to_vec()), ExecFrame::Exit(7)]
@@ -8178,23 +8221,25 @@ mod tests {
     async fn drive_exec_output_after_exit_is_a_protocol_error() {
         use tokio_tungstenite::tungstenite::Message;
 
-        let (frames, fault) = drive_exec_messages(
+        let (frames, fault, _) = drive_exec_messages(
             false,
             vec![
                 Message::Binary(vec![3, 0].into()),
                 Message::Binary(vec![1, b'x'].into()),
             ],
+            false,
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
         assert_eq!(fault, Some(ExecProtocolError::OutputAfterExit));
 
-        let (frames, fault) = drive_exec_messages(
+        let (frames, fault, _) = drive_exec_messages(
             true,
             vec![
                 Message::Text(r#"{"type":"exit","exit_code":0}"#.into()),
                 Message::Binary(b"x".to_vec().into()),
             ],
+            false,
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
@@ -8205,12 +8250,13 @@ mod tests {
     async fn drive_exec_port_closed_after_exit_is_accepted() {
         use tokio_tungstenite::tungstenite::Message;
 
-        let (frames, fault) = drive_exec_messages(
+        let (frames, fault, _) = drive_exec_messages(
             true,
             vec![
                 Message::Text(r#"{"type":"exit","exit_code":0}"#.into()),
                 Message::Text(r#"{"type":"port_closed","port":8080}"#.into()),
             ],
+            false,
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
@@ -8221,13 +8267,14 @@ mod tests {
     async fn drive_exec_ignores_an_unknown_control_type() {
         use tokio_tungstenite::tungstenite::Message;
 
-        let (frames, fault) = drive_exec_messages(
+        let (frames, fault, _) = drive_exec_messages(
             false,
             vec![
                 Message::Text(r#"{"type":"debug","message":"x"}"#.into()),
                 Message::Binary(vec![1, b'o', b'k'].into()),
                 Message::Binary(vec![3, 0].into()),
             ],
+            false,
         )
         .await;
         assert_eq!(
@@ -8241,8 +8288,8 @@ mod tests {
     async fn drive_exec_unknown_stream_id_is_refused() {
         use tokio_tungstenite::tungstenite::Message;
 
-        let (frames, fault) =
-            drive_exec_messages(false, vec![Message::Binary(vec![5, b'x'].into())]).await;
+        let (frames, fault, _) =
+            drive_exec_messages(false, vec![Message::Binary(vec![5, b'x'].into())], false).await;
         assert!(frames.is_empty());
         assert_eq!(fault, Some(ExecProtocolError::UnknownStream(5)));
     }
@@ -8251,7 +8298,7 @@ mod tests {
     async fn drive_exec_does_not_assume_line_boundaries() {
         use tokio_tungstenite::tungstenite::Message;
 
-        let (frames, fault) = drive_exec_messages(
+        let (frames, fault, _) = drive_exec_messages(
             false,
             vec![
                 Message::Binary([vec![1], b"a\nb\nc".to_vec()].concat().into()),
@@ -8260,6 +8307,7 @@ mod tests {
                 Message::Binary(vec![1].into()),
                 Message::Binary(vec![3, 0].into()),
             ],
+            false,
         )
         .await;
         let output: Vec<u8> = frames
