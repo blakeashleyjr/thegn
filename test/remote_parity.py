@@ -85,7 +85,8 @@ class Attach:
         def reader():
             assert self.proc.stdout is not None
             while True:
-                chunk = self.proc.stdout.read(4096)
+                # read1 returns what is available; read(n) on a pipe blocks until n bytes or EOF.
+                chunk = self.proc.stdout.read1(4096)
                 if not chunk:
                     break
                 with self.lock:
@@ -161,7 +162,16 @@ def norm(text, remote=False):
     return text
 
 
+LAST = {}
+
+
+def note_sides(left, right):
+    """Remember what the two sides looked like, so a FAIL can show both."""
+    LAST["left"], LAST["right"] = left, right
+
+
 def compare(left, right):
+    note_sides(norm(left), norm(right, True))
     raw_left = ESC.sub("", CSI.sub("", DCS.sub("", OSC.sub("", left)))).replace("\r", "")
     raw_right = ESC.sub("", CSI.sub("", DCS.sub("", OSC.sub("", right)))).replace("\r", "")
     if raw_left != raw_right and (raw_left.lstrip("\n") == raw_right or raw_left == raw_right.lstrip("\n")):
@@ -174,8 +184,14 @@ def compare(left, right):
 def result(case, status, local=0, remote=0, note=""):
     print(f"{status} {case} local={local}ms remote={remote}ms {note}".rstrip(), flush=True)
     results.append((case, status, local, remote, note))
-    if status == "FAIL" and case not in failed:
-        failed.append(case)
+    if status == "FAIL":
+        if case not in failed:
+            failed.append(case)
+        for side in ("left", "right"):
+            if side in LAST:
+                label = "local " if side == "left" else "remote"
+                print(f"DETAIL {case} {label} {LAST[side][-700:]!r}", flush=True)
+    LAST.clear()
 
 
 def wrap(case, command):
@@ -335,6 +351,7 @@ def case_p10():
     time.sleep(0.8)
     after = [snap(s).get("text", "") for s in (LOCAL, REMOTE)]
     status = "PASS" if norm(held[0]) == norm(held[1], True) else "FAIL"
+    note_sides(norm(held[0]) + "\n--after--\n" + norm(after[0]), norm(held[1], True) + "\n--after--\n" + norm(after[1], True))
     if any(token not in norm(value) for value in held for token in ("echo one", "echo two")):
         status = "FAIL"
     if "one" not in norm(after[0]) or "two" not in norm(after[1], True):
@@ -413,9 +430,10 @@ def case_p13():
 
 
 def case_p14():
-    values, local_ms, remote_ms = command_case("P14", r"""printf '\e[?1049hALT'; sleep 1; printf '\e[?1049l'""")
+    # The token is joined by the shell, so it never appears in the echoed command line on the primary screen.
+    values, local_ms, remote_ms = command_case("P14", r"""printf '\e[?1049h%s%s' RPALT SCREEN; sleep 1; printf '\e[?1049l'""")
     after = [snap(s).get("text", "") for s in (LOCAL, REMOTE)]
-    status = "PASS" if all("ALT" not in value for value in after) and all(not snap(s).get("alt_screen") for s in (LOCAL, REMOTE)) else "FAIL"
+    status = "PASS" if all("RPALTSCREEN" not in value for value in after) and all(not snap(s).get("alt_screen") for s in (LOCAL, REMOTE)) else "FAIL"
     result("P14", status, local_ms, remote_ms, "" if status == "PASS" else "alternate screen was not restored")
 
 
@@ -440,8 +458,10 @@ def case_p16():
         key(session, "ctrl+d")
     values, local_ms, remote_ms = command_case("P16", "wc -c < /tmp/rp.paste; cksum < /tmp/rp.paste", timeout=60)
     status, note = compare(values[0][0], values[1][0])
+    sides = (norm(values[0][0]), norm(values[1][0], True))
     if any("1048576" not in norm(value[0], i == 1) for i, value in enumerate(values)):
         status, note = "FAIL", "paste byte count is not 1048576"
+    note_sides(*sides)
     result("P16", status, local_ms, remote_ms, note or "INFO paste times")
 
 
@@ -604,7 +624,7 @@ def main():
     for case, status, local, remote, note in results:
         print(f"{case:>3} {status:>4} {local:>6}ms {remote:>6}ms {note}")
     print("FAILED CASES: " + (", ".join(failed) if failed else "none"))
-    if failed and not KEEP_GOING:
+    if failed:
         raise SystemExit(1)
 
 
