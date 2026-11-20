@@ -1011,16 +1011,33 @@ pub(crate) fn destroy_one_checked(
         return (false, pre.message());
     }
 
+    let tip_before = (delete_branch && !branch.is_empty())
+        .then(|| local_branch_tip(repo_root, branch))
+        .flatten();
+
     if let Err(error) = guard() {
         return (false, error);
     }
 
     let teardown = match automatic_teardown {
         Some(teardown) => teardown(),
-        None => teardown_runtime(cfg, repo_root, worktree, &location, db),
+        None => teardown_runtime(cfg, repo_root, worktree, &location, db, mode),
     };
     if let Err(error) = teardown {
         return (false, error);
+    }
+
+    let moved = delete_branch
+        && !branch.is_empty()
+        && branch_moved(
+            tip_before.as_deref(),
+            local_branch_tip(repo_root, branch).as_deref(),
+        );
+    let delete_branch = delete_branch && !moved;
+    if moved {
+        thegn_core::msg::warn(&format!(
+            "branch {branch} kept: it received commits from the sandbox before the worktree was removed"
+        ));
     }
 
     if let Err(error) = guard() {
@@ -1113,6 +1130,60 @@ fn close_checkpoint_wanted(placement_is_local: bool, sync_succeeded: bool) -> bo
     placement_is_local || !sync_succeeded
 }
 
+fn accept_loss(mode: HookExecutionMode) -> bool {
+    mode == HookExecutionMode::Force
+}
+
+/// THE-2477: bring a bound sandbox's commits home before it is destroyed
+/// or recycled; refuse (unless forced) when that fails or it is dirty.
+fn sandbox_pull_guard(cfg: &Config, worktree: &str, accept_loss: bool) -> Result<(), String> {
+    let sandbox = match crate::provider_git::bound_offline(cfg, worktree) {
+        Ok(crate::provider_git::OfflineBinding::Unbound) => return Ok(()),
+        Ok(crate::provider_git::OfflineBinding::Bound { sandbox }) => sandbox,
+        Ok(crate::provider_git::OfflineBinding::BoundUnknown) => "of this worktree".into(),
+        Err(error) if !accept_loss => {
+            return Err(format!(
+                "cannot tell whether {worktree} has a provider sandbox ({error:#}); nothing was removed — retry, or force the delete"
+            ));
+        }
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "cannot tell whether {worktree} has a provider sandbox ({error:#}); removing it anyway (forced)"
+            ));
+            return Ok(());
+        }
+    };
+    let notes = crate::provider_git::destroy_guard(
+        crate::provider_git::pull_before_destroy(cfg, worktree),
+        &sandbox,
+        accept_loss,
+    )?;
+    for note in notes {
+        if note.warn {
+            thegn_core::msg::warn(&note.text);
+        } else {
+            thegn_core::msg::info(&note.text);
+        }
+    }
+    Ok(())
+}
+
+fn local_branch_tip(repo_root: &Path, branch: &str) -> Option<String> {
+    thegn_core::remote::GitLoc::Local(repo_root.to_path_buf())
+        .git_text(&[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ])
+        .ok()
+        .filter(|tip| !tip.is_empty())
+}
+
+fn branch_moved(before: Option<&str>, after: Option<&str>) -> bool {
+    before != after
+}
+
 /// Tear down every runtime resource that was attached to the worktree while
 /// its DB row and selected environment are still available. The caller has
 /// already resolved the worktree location. These operations are deliberately
@@ -1124,6 +1195,7 @@ fn teardown_runtime(
     worktree: &Path,
     loc: &thegn_core::remote::GitLoc,
     db: Option<&Db>,
+    mode: HookExecutionMode,
 ) -> Result<(), String> {
     #[cfg(test)]
     teardown_fixture::refuse_observed_path(worktree)?;
@@ -1145,6 +1217,7 @@ fn teardown_runtime(
         },
     );
     let path = worktree.to_string_lossy().into_owned();
+    let loss_ok = accept_loss(mode);
     let mut failures = Vec::new();
 
     if let thegn_core::placement::Placement::Ssh(ssh) = &env.placement {
@@ -1177,7 +1250,10 @@ fn teardown_runtime(
         &env.name,
         &path,
         sync_succeeded,
-        &mut || crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name),
+        &mut || {
+            sandbox_pull_guard(cfg, &path, loss_ok)?;
+            crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name)
+        },
     ));
     crate::agent::deregister_vpn(&path);
     crate::agent::deproject(&path);
@@ -2149,6 +2225,23 @@ mod tests {
         assert!(close_checkpoint_wanted(true, false));
         assert!(close_checkpoint_wanted(false, false));
         assert!(!close_checkpoint_wanted(false, true));
+    }
+
+    #[test]
+    fn accept_loss_only_for_force() {
+        assert!(!accept_loss(HookExecutionMode::User));
+        assert!(!accept_loss(HookExecutionMode::Unattended));
+        assert!(accept_loss(HookExecutionMode::Force));
+    }
+
+    #[test]
+    fn branch_moved_table() {
+        let tip = "a";
+        assert!(!branch_moved(None, None));
+        assert!(branch_moved(None, Some(tip)));
+        assert!(branch_moved(Some(tip), None));
+        assert!(!branch_moved(Some(tip), Some(tip)));
+        assert!(branch_moved(Some(tip), Some("b")));
     }
 
     #[test]

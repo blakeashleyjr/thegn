@@ -439,6 +439,7 @@ pub const SEED_SCRATCH_REF: &str = "refs/thegn/seed";
 ///
 /// ```text
 /// TG-PULL-HEAD <oid>
+/// TG-PULL-DIRTY <n>|?      (uncommitted or untracked paths, or unknown)
 /// TG-PULL-NONE              (HEAD is host_tip, or behind it: nothing new)
 /// TG-PULL-BUNDLE <bytes>    (a bundle of HEAD was written to out_path)
 /// ```
@@ -456,6 +457,7 @@ pub fn pull_back_script(workdir: &str, host_tip: &str, out_path: &str) -> String
          cd {wd} || fail checkout; \
          h=$(git rev-parse -q --verify HEAD) || fail head; \
          echo \"TG-PULL-HEAD $h\"; \
+         if d=$(git status --porcelain 2>/dev/null); then n=0; [ -z \"$d\" ] || n=$(printf '%s\\n' \"$d\" | wc -l | tr -d ' '); echo \"TG-PULL-DIRTY $n\"; else echo 'TG-PULL-DIRTY ?'; fi; \
          if [ \"$h\" = {tip} ]; then echo TG-PULL-NONE; exit 0; fi; \
          rm -f -- {out}; \
          if git cat-file -e {tip_commit} 2>/dev/null; then \
@@ -474,6 +476,8 @@ pub fn pull_back_script(workdir: &str, host_tip: &str, out_path: &str) -> String
 pub struct PullMarkers {
     /// The sandbox `HEAD`.
     pub head: String,
+    /// The number of uncommitted or untracked paths, or None when unknown.
+    pub dirty: Option<u64>,
     /// `Some(bytes)` when a bundle was written; `None` for `TG-PULL-NONE`.
     pub bundle_bytes: Option<u64>,
 }
@@ -483,6 +487,7 @@ pub struct PullMarkers {
 /// malformed oid or size, or neither `NONE` nor `BUNDLE` is an error.
 pub fn parse_pull_markers(out: &str) -> Result<PullMarkers, String> {
     let mut head = None;
+    let mut dirty = None;
     let mut none = false;
     let mut bytes = None;
     for line in out.lines() {
@@ -498,6 +503,16 @@ pub fn parse_pull_markers(out: &str) -> Result<PullMarkers, String> {
                 return Err(format!("bad sandbox HEAD in {line:?}"));
             }
             head = Some(oid.to_ascii_lowercase());
+        } else if let Some(rest) = line.strip_prefix("TG-PULL-DIRTY ") {
+            let rest = rest.trim();
+            dirty = if rest == "?" {
+                None
+            } else {
+                Some(
+                    rest.parse()
+                        .map_err(|_| format!("bad dirty count in {line:?}"))?,
+                )
+            };
         } else if line == "TG-PULL-NONE" {
             none = true;
         } else if let Some(rest) = line.strip_prefix("TG-PULL-BUNDLE ") {
@@ -512,10 +527,12 @@ pub fn parse_pull_markers(out: &str) -> Result<PullMarkers, String> {
     match (none, bytes) {
         (true, None) => Ok(PullMarkers {
             head,
+            dirty,
             bundle_bytes: None,
         }),
         (false, Some(n)) => Ok(PullMarkers {
             head,
+            dirty,
             bundle_bytes: Some(n),
         }),
         (true, Some(_)) => Err("pull-back report has both TG-PULL-NONE and TG-PULL-BUNDLE".into()),
@@ -565,6 +582,7 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("TG-PULL-HEAD"));
+        assert!(s.contains("TG-PULL-DIRTY"));
         assert!(s.contains(&format!("\"$h\" = {OID}")));
         assert!(s.contains("TG-PULL-NONE"));
         assert!(
@@ -588,6 +606,7 @@ mod tests {
             parse_pull_markers(&pretty).unwrap(),
             PullMarkers {
                 head: OID.into(),
+                dirty: None,
                 bundle_bytes: Some(2048)
             }
         );
@@ -599,6 +618,7 @@ mod tests {
             parse_pull_markers(&noisy).unwrap(),
             PullMarkers {
                 head: OID.into(),
+                dirty: None,
                 bundle_bytes: None
             }
         );
@@ -618,6 +638,25 @@ mod tests {
         );
         let err = parse_pull_markers("TG-PULL-ERROR:bundle\n").unwrap_err();
         assert!(err.contains("bundle"), "{err}");
+    }
+
+    #[test]
+    fn parse_pull_markers_reads_dirty_counts() {
+        let base = format!("TG-PULL-HEAD {OID}\nTG-PULL-NONE\n");
+        assert_eq!(
+            parse_pull_markers(&format!("TG-PULL-DIRTY 3\n{base}"))
+                .unwrap()
+                .dirty,
+            Some(3)
+        );
+        assert_eq!(
+            parse_pull_markers(&format!("TG-PULL-DIRTY ?\n{base}"))
+                .unwrap()
+                .dirty,
+            None
+        );
+        let error = parse_pull_markers(&format!("TG-PULL-DIRTY x\n{base}")).unwrap_err();
+        assert!(error.contains("bad dirty count"), "{error}");
     }
 
     #[test]
