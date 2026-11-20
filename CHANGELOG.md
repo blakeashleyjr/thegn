@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.109] — 2026-11-19
+
 ### Added
 
 - `thegn session send --key` presses named keys (`up`, `esc`, `f5`, `ctrl+c`…) and `--paste` sends bracketed paste; `session wait --until` takes `screen:<regex>` and `stable:<ms>`; MCP `sessions_input` takes `keys` and `paste`, and `sessions_snapshot` reports the cursor and screen modes. Who may type is unchanged (THE-2475).
@@ -4027,7 +4029,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.108...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.109...HEAD
+[0.1.0-alpha.109]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.108...v0.1.0-alpha.109
 [0.1.0-alpha.108]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.107...v0.1.0-alpha.108
 [0.1.0-alpha.107]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.106...v0.1.0-alpha.107
 [0.1.0-alpha.106]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.105...v0.1.0-alpha.106
