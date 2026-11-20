@@ -3578,6 +3578,10 @@ const EXEC_CONTROL_TEXT_MAX: usize = 64 << 10;
 /// How long the exec driver keeps reading after the exit to catch a
 /// duplicate exit or late output (THE-533).
 const EXEC_EXIT_DRAIN: Duration = Duration::from_secs(2);
+/// Input with no inbound frame this long sends a WebSocket Ping.
+const EXEC_PROBE_AFTER: Duration = Duration::from_secs(5);
+/// A Ping with no inbound frame this long ends the session as dropped.
+const EXEC_PROBE_DEAD: Duration = Duration::from_secs(5);
 /// Item capacity of the provider output channels.
 const EXEC_CHANNEL_CAPACITY: usize = 256;
 /// Largest provider output item queued at once; with EXEC_CHANNEL_CAPACITY
@@ -4026,12 +4030,13 @@ impl SpritesProvider {
                     start.elapsed().as_secs()
                 ));
             };
+            // Interactive keystrokes should not wait behind Nagle, as with ssh.
             match tokio::time::timeout(
                 attempt_timeout,
                 Box::pin(tokio_tungstenite::connect_async_with_config(
                     req,
                     Some(exec_ws_config()),
-                    false,
+                    true,
                 )),
             )
             .await
@@ -4126,8 +4131,9 @@ async fn connect_proxy_ws(
     let result = tokio::time::timeout(
         deadline,
         Box::pin(async move {
+            // Interactive keystrokes should not wait behind Nagle, as with ssh.
             let (mut ws, _resp) =
-                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false)
+                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), true)
                     .await
                     .context("sprites: proxy ws connect")?;
             // The init frame selects the target; after it, the socket is a raw relay.
@@ -4239,6 +4245,8 @@ where
     let (mut write, mut read) = ws.split();
     let mut exited = None;
     let mut drain_until = None;
+    let mut probe_at: Option<tokio::time::Instant> = None;
+    let mut probed = false;
     let mut control_closed = false;
     let mut fault = None;
 
@@ -4277,6 +4285,31 @@ where
                     std::future::pending::<()>().await;
                 }
             } => break,
+            _ = async {
+                if let Some(deadline) = probe_at {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if exited.is_none() => {
+                if !probed {
+                    if write
+                        .send(Message::Ping(b"thegn".to_vec().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    probed = true;
+                    probe_at = Some(tokio::time::Instant::now() + EXEC_PROBE_DEAD);
+                } else {
+                    tracing::debug!(
+                        target: "thegn::provider",
+                        "exec socket unanswered after input; treating as dropped"
+                    );
+                    break;
+                }
+            },
             ctrl = control_rx.recv(), if !control_closed => {
                 if exited.is_some() {
                     match ctrl {
@@ -4299,6 +4332,9 @@ where
                             let frame = if tty { b } else { encode_stream_stdin(&b) };
                             if write.send(Message::Binary(frame.into())).await.is_err() {
                                 break;
+                            }
+                            if probe_at.is_none() {
+                                probe_at = Some(tokio::time::Instant::now() + EXEC_PROBE_AFTER);
                             }
                         }
                         Some(ExecControl::Resize { cols, rows }) => {
@@ -4323,7 +4359,12 @@ where
                     }
                 }
             },
-            msg = read.next() => match msg {
+            msg = read.next() => {
+                if matches!(&msg, Some(Ok(_))) {
+                    probe_at = None;
+                    probed = false;
+                }
+                match msg {
                 Some(Ok(Message::Binary(b))) => {
                     if tracing::enabled!(target: "thegn::provider", tracing::Level::TRACE) {
                         let preview = &b[..b.len().min(64)];
@@ -4439,6 +4480,7 @@ where
                 Some(Ok(_)) => {}
                 Some(Err(_)) => {
                     break;
+                }
                 }
             },
         }
@@ -7475,6 +7517,117 @@ mod tests {
         }
         let fault = driver.await.unwrap();
         (frames, fault)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_probe_ends_an_unanswered_session() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let _server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        control_tx
+            .send(ExecControl::Stdin(b"x".to_vec()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        assert_eq!(frames_rx.recv().await, None);
+        assert_eq!(driver.await.unwrap(), None);
+        drop(control_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_probe_is_disarmed_by_any_inbound_frame() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        control_tx
+            .send(ExecControl::Stdin(b"x".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Binary(vec![0, b'x'].into())
+        );
+        server
+            .send(Message::Binary(vec![1, b'a'].into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            frames_rx.recv().await,
+            Some(ExecFrame::Stdout(b"a".to_vec()))
+        );
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(!driver.is_finished());
+        assert!(
+            control_tx
+                .send(ExecControl::Stdin(b"y".to_vec()))
+                .await
+                .is_ok()
+        );
+
+        control_tx.send(ExecControl::Close).await.unwrap();
+        assert_eq!(driver.await.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_idle_session_never_pings() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        let observed = tokio::time::timeout(Duration::from_secs(60), server.next());
+        tokio::pin!(observed);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(observed.await.is_err(), "idle exec session sent a frame");
+
+        drop(control_tx);
+        assert_eq!(driver.await.unwrap(), None);
     }
 
     #[tokio::test]
