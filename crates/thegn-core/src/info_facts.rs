@@ -915,7 +915,6 @@ pub fn sessions_for(
 mod tests {
     use super::*;
 
-    #[expect(clippy::disallowed_methods, reason = "test fixture invokes git")]
     fn git(dir: &Path, args: &[&str]) {
         let output = crate::util::git_cmd(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
