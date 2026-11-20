@@ -10608,18 +10608,15 @@ async fn event_loop<T: Terminal>(
                                 }
                             };
                             pending_switch.clear_spinner_if_matches(seq, &mut model.status);
-                            if sb
+                            if let Some((_, root)) = sb
                                 .create_preview
-                                .as_ref()
-                                .is_some_and(|(preview_seq, _)| *preview_seq == seq)
+                                .take_if(|(preview_seq, _)| *preview_seq == seq)
                             {
-                                if let Some((_, root)) = sb.create_preview.take() {
-                                    crate::workspace_switch_prep::remove_preview_entry(
-                                        &mut model.sidebar_workspaces,
-                                        &root,
-                                    );
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                }
+                                crate::workspace_switch_prep::remove_preview_entry(
+                                    &mut model.sidebar_workspaces,
+                                    &root,
+                                );
+                                refresh_tab_model(&mut model, &session, &mut sb);
                             }
                             match route {
                                 crate::workspace_switch_prep::CreatedRoute::AlreadyOpen {
