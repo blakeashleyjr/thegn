@@ -150,7 +150,7 @@ live_preflight_check() {
 
 live_listing() {
   local env_name="$1" name="$2" out
-  out="$("$THEGN_BIN" "${LIVE_THEGN_ARGS[@]+"${LIVE_THEGN_ARGS[@]}"}" fleet list --env "$env_name" --json 2>/dev/null)" || {
+  out="$("$THEGN_BIN" "${LIVE_THEGN_ARGS[@]+"${LIVE_THEGN_ARGS[@]}"}" fleet list --env "$env_name" --json)" || {
     echo unknown
     return 0
   }

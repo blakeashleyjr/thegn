@@ -43,6 +43,9 @@ if [ "${STUB_MODE:-}" = continue ]; then
     ;;
   *"command -v python3"*) printf '/usr/bin/python3\n/usr/bin/timeout\n'; exit 0 ;;
   *memory.max*) echo max; exit 0 ;;
+  daemon) printf '%s\n' "$$" >"$STUB_LOG.daemon-pid"; exec tail -f /dev/null ;;
+  "daemon stop") echo 'no thegn pane daemon is running'; exit 0 ;;
+  "session list --json") echo '[]'; exit 0 ;;
   "env test sx") exit 1 ;;
   "env set sx") exit 0 ;;
   "env up")
@@ -318,6 +321,29 @@ if ! rc_is other-cold-sprites 0 && has "$T/other-cold-sprites.out" "FAIL 9:"; th
   pass "sprites-live: row-specific warm/cold check rejects a foreign cold sprite"
 else
   fail "sprites-live: foreign cold row ($(cat "$T/other-cold-sprites.out"))"
+fi
+
+rm -f "$LOG.daemon-pid"
+run agent-daemon-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going --with-agent stubagent
+daemon_pid="$(cat "$LOG.daemon-pid" 2>/dev/null)" || daemon_pid=""
+if [ -n "$daemon_pid" ] &&
+  ! kill -0 "$daemon_pid" 2>/dev/null &&
+  grep -Fxq "thegn daemon" "$T/agent-daemon-sprites.log" &&
+  grep -Fxq "thegn session list --json" "$T/agent-daemon-sprites.log" &&
+  grep -Fxq "thegn daemon stop" "$T/agent-daemon-sprites.log" &&
+  has "$T/agent-daemon-sprites.out" "pane daemon up (pid $daemon_pid)" &&
+  has "$T/agent-daemon-sprites.out" "-- teardown: daemon stop (this run's pane daemon" &&
+  has "$T/agent-daemon-sprites.out" "== step 7g:"; then
+  pass "sprites-live: --with-agent starts and stops its own pane daemon"
+else
+  if [ -n "$daemon_pid" ]; then kill "$daemon_pid" 2>/dev/null || true; fi
+  fail "sprites-live: --with-agent pane daemon ($(cat "$T/agent-daemon-sprites.out"))"
+fi
+if ! grep -Fq "thegn daemon" "$T/keep-going-sprites.log"; then
+  pass "sprites-live: no pane daemon without --with-agent"
+else
+  fail "sprites-live: a pane daemon was started without --with-agent"
 fi
 
 # Every acting run must clean up its temp state (nothing was created).
