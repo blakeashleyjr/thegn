@@ -115,7 +115,6 @@ pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
     };
     let root_s = root.to_string_lossy().into_owned();
     let mut branches: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut bound: HashMap<String, bool> = HashMap::new();
     let facts: Vec<PruneFacts> = super::list::collect(cfg)?
         .into_iter()
         .filter(|w| w.repo == root_s && w.exists)
@@ -126,7 +125,6 @@ pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
                 crate::provider_git::bound_offline(cfg, &w.path),
                 Ok(crate::provider_git::OfflineBinding::Unbound)
             );
-            bound.insert(w.path.clone(), provider_sandbox);
             facts_for(&w.path, &w.branch, &target, &root, provider_sandbox)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -149,7 +147,7 @@ pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
             &plan,
             &tips,
             &branch_of,
-            &bound,
+            cfg,
             &target,
             &root,
             &mut |path, del| super::wt::rm_with(cfg, path, del, true, !args.json),
@@ -228,7 +226,7 @@ fn apply_plan(
     plan: &[(String, PruneDecision)],
     tips: &HashMap<String, Option<String>>,
     branch_of: &HashMap<&str, &str>,
-    bound: &HashMap<String, bool>,
+    cfg: &Config,
     target: &str,
     root: &Path,
     remove: &mut dyn FnMut(&str, bool) -> Result<()>,
@@ -239,13 +237,11 @@ fn apply_plan(
             continue;
         }
         let branch = branch_of.get(path.as_str()).copied().unwrap_or("");
-        let fresh = match facts_for(
-            path,
-            branch,
-            target,
-            root,
-            bound.get(path).copied().unwrap_or(true),
-        ) {
+        let provider_sandbox = !matches!(
+            crate::provider_git::bound_offline(cfg, path),
+            Ok(crate::provider_git::OfflineBinding::Unbound)
+        );
+        let fresh = match facts_for(path, branch, target, root, provider_sandbox) {
             Ok(fresh) => fresh,
             Err(error) => {
                 out.skipped.push((
@@ -519,6 +515,7 @@ mod tests {
 
     #[test]
     fn apply_removes_merged_lane_and_passes_delete_branch() {
+        let _state = crate::testenv::IsolatedState::new();
         let main = repo();
         let wt = merged_lane(main.path(), "ok");
         let (plan, tips, branch) = one(main.path(), &wt, "ok");
@@ -528,7 +525,7 @@ mod tests {
             &plan,
             &tips,
             &branch_of,
-            &HashMap::new(),
+            &Config::default(),
             "main",
             main.path(),
             &mut |p, d| {
@@ -542,6 +539,7 @@ mod tests {
 
     #[test]
     fn lane_dirtied_between_plan_and_apply_is_kept() {
+        let _state = crate::testenv::IsolatedState::new();
         let main = repo();
         let wt = merged_lane(main.path(), "dirty");
         let (plan, tips, branch) = one(main.path(), &wt, "dirty");
@@ -553,7 +551,7 @@ mod tests {
             &plan,
             &tips,
             &branch_of,
-            &HashMap::new(),
+            &Config::default(),
             "main",
             main.path(),
             &mut |_, _| {
@@ -566,6 +564,7 @@ mod tests {
 
     #[test]
     fn lane_gaining_a_commit_between_plan_and_apply_is_kept() {
+        let _state = crate::testenv::IsolatedState::new();
         let main = repo();
         let wt = merged_lane(main.path(), "moved");
         let (plan, tips, branch) = one(main.path(), &wt, "moved");
@@ -576,7 +575,7 @@ mod tests {
             &plan,
             &tips,
             &branch_of,
-            &HashMap::new(),
+            &Config::default(),
             "main",
             main.path(),
             &mut |_, _| {
@@ -589,6 +588,7 @@ mod tests {
 
     #[test]
     fn a_failed_removal_does_not_stop_the_rest_and_exits_nonzero() {
+        let _state = crate::testenv::IsolatedState::new();
         let main = repo();
         let a = merged_lane(main.path(), "a");
         let b = merged_lane(main.path(), "b");
@@ -610,7 +610,7 @@ mod tests {
             &plan,
             &tips,
             &branch_of,
-            &HashMap::new(),
+            &Config::default(),
             "main",
             main.path(),
             &mut |p, _| {

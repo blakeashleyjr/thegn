@@ -69,7 +69,7 @@ impl KeepReason {
             Self::Dirty => "dirty",
             Self::LiveProcess => "live-process",
             Self::LiveSession => "live-session",
-            Self::ProviderSandbox => "provider_sandbox",
+            Self::ProviderSandbox => "provider-sandbox",
         }
     }
 
@@ -85,7 +85,7 @@ impl KeepReason {
             Self::LiveProcess => "a process is running inside it",
             Self::LiveSession => "held by a live session",
             Self::ProviderSandbox => {
-                "bound to a provider sandbox: land it or `thegn env down` it first (prune never destroys a sandbox)"
+                "bound to a provider sandbox: `thegn land --release-sandbox` or `thegn env down --worktree <wt>` first (prune never destroys a sandbox)"
             }
         }
     }
@@ -247,6 +247,7 @@ mod tests {
         let mut f = removable();
         f.is_primary = true;
         f.is_target_branch = true;
+        f.provider_sandbox = true;
         f.branch = None;
         f.ancestor_of_target = false;
         f.tip_equals_target = true;
@@ -256,6 +257,7 @@ mod tests {
         let order = [
             KeepReason::PrimaryCheckout,
             KeepReason::TargetBranch,
+            KeepReason::ProviderSandbox,
             KeepReason::DetachedHead,
             KeepReason::NotMerged,
             KeepReason::NoWork,
@@ -268,6 +270,7 @@ mod tests {
             match want {
                 KeepReason::PrimaryCheckout => f.is_primary = false,
                 KeepReason::TargetBranch => f.is_target_branch = false,
+                KeepReason::ProviderSandbox => f.provider_sandbox = false,
                 KeepReason::DetachedHead => f.branch = Some("b".into()),
                 KeepReason::NotMerged => f.ancestor_of_target = true,
                 KeepReason::NoWork => f.tip_equals_target = false,
@@ -313,6 +316,7 @@ mod tests {
         let all = [
             KeepReason::PrimaryCheckout,
             KeepReason::TargetBranch,
+            KeepReason::ProviderSandbox,
             KeepReason::DetachedHead,
             KeepReason::NotMerged,
             KeepReason::NoWork,

@@ -293,9 +293,15 @@ pub(crate) fn kept_sandbox_notice(kept: &[(String, String)]) -> Option<String> {
         [(provider, name)] => {
             let name = crate::merge_sweep::safe_display(name);
             let provider = crate::merge_sweep::safe_display(provider);
-            Some(format!(
-                "Closed. Sandbox {name} ({provider}) was kept and may still bill when awake; reopen the worktree to use it, or run `thegn env reap --provider {provider}` to remove it."
-            ))
+            if provider == "provider" {
+                Some(format!(
+                    "Closed. Sandbox {name} ({provider}) was kept and may still bill when awake; reopen the worktree to use it."
+                ))
+            } else {
+                Some(format!(
+                    "Closed. Sandbox {name} ({provider}) was kept and may still bill when awake; reopen the worktree to use it, or run `thegn env reap --provider {provider}` to remove it."
+                ))
+            }
         }
         many => {
             let names = many
@@ -1229,6 +1235,8 @@ mod tests {
         let one = kept_sandbox_notice(&[("sprites".into(), "wt-a".into())]).unwrap();
         assert!(one.contains("Sandbox wt-a (sprites) was kept"));
         assert!(one.contains("thegn env reap --provider sprites"));
+        let unknown = kept_sandbox_notice(&[("provider".into(), "wt-a".into())]).unwrap();
+        assert!(!unknown.contains("thegn env reap --provider provider"));
         let many = kept_sandbox_notice(&[
             ("sprites".into(), "a".into()),
             ("vercel".into(), "b".into()),

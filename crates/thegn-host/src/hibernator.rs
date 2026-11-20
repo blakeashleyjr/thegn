@@ -188,12 +188,7 @@ pub fn tick(session: &crate::session::Session, cfg: &Config) {
             continue;
         }
         let loc = GitLoc::for_worktree(Path::new(&g.path));
-        if !loc.is_remote()
-            && !matches!(
-                crate::provider_git::bound_offline(cfg, &g.path),
-                Ok(crate::provider_git::OfflineBinding::Bound { .. })
-            )
-        {
+        if !loc.is_remote() {
             continue;
         }
         let env_name = match hibernate_selection(
