@@ -74,6 +74,10 @@ choose **Open merge queue** from the project's `m` menu. Narrow headers drop
 the count before hiding the marker, and the token is never painted in rail
 mode.
 
+A worktree deleted outside the running TUI (`wt rm`, `wt prune`, a landing or
+plain git) leaves the bar without a restart. A leftover directory with no
+checkout in it is not a live worktree, so it gets no row.
+
 ## Navigate
 
 - `↑↓` / `j` `k` — move; `↵` opens the row (or folds a header; on the
