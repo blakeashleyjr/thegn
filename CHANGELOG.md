@@ -7,6 +7,7 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+- Sidebar: a worktree deleted from outside the running TUI (wt rm, wt prune, a landing, plain git) no longer stays in the left bar; a leftover directory with no checkout in it is no longer treated as a live worktree.
 - Observe: the host dashboard now uses the masthead's samples, so it has history from launch and no gaps while the tab is hidden, and no longer runs a second sampler.
 
 ## [0.1.0-alpha.104] — 2026-11-19
