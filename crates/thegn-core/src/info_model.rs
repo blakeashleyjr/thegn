@@ -298,21 +298,21 @@ pub fn sections(report: &InfoReport) -> Vec<InfoSection> {
         report.generated_at,
     );
 
-    if let Some(sessions) = &report.sessions {
-        if !sessions.is_empty() {
-            result.push(InfoSection {
-                title: "SESSIONS".to_string(),
-                lines: sessions
-                    .iter()
-                    .map(|session| InfoLine {
-                        label: session.program.clone(),
-                        value: format!("{}, attached {}", session.id, session.attached),
-                        source: "".to_string(),
-                        tone: Tone::Normal,
-                    })
-                    .collect(),
-            });
-        }
+    if let Some(sessions) = &report.sessions
+        && !sessions.is_empty()
+    {
+        result.push(InfoSection {
+            title: "SESSIONS".to_string(),
+            lines: sessions
+                .iter()
+                .map(|session| InfoLine {
+                    label: session.program.clone(),
+                    value: format!("{}, attached {}", session.id, session.attached),
+                    source: "".to_string(),
+                    tone: Tone::Normal,
+                })
+                .collect(),
+        });
     }
 
     push_fields(
@@ -470,7 +470,7 @@ pub fn scrub_url(url: &str) -> String {
     };
     let authority_start = scheme_end + 3;
     let authority_end = url[authority_start..]
-        .find(|character| matches!(character, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .map(|offset| authority_start + offset)
         .unwrap_or(url.len());
     let authority = &url[authority_start..authority_end];
@@ -489,7 +489,16 @@ pub fn scrub_url(url: &str) -> String {
 pub fn clean(text: &str, max: usize) -> String {
     let cleaned: String = text
         .chars()
-        .filter(|character| !character.is_control())
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{FEFF}'
+                )
+        })
         .collect();
     let count = cleaned.chars().count();
     if count <= max {
@@ -615,9 +624,9 @@ mod tests {
             origin_of(&[
                 (builtin, json!(1)),
                 (global.clone(), json!(2)),
-                (profile, json!(1))
+                (profile.clone(), json!(1))
             ]),
-            Some(global)
+            Some(profile)
         );
     }
 
@@ -651,7 +660,8 @@ mod tests {
     fn clean_drops_controls_and_clips_at_character_boundaries() {
         assert_eq!(clean("a\n😀b", 4), "a😀b");
         assert_eq!(clean("😀ab", 2), "😀…");
-        assert_eq!(clean("éclair", 3), "é…");
+        assert_eq!(clean("éclair", 3), "éc…");
+        assert_eq!(clean("a\u{202E}b\u{2066}c", 10), "abc");
     }
 
     #[test]

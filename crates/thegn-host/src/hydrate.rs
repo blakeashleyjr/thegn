@@ -439,6 +439,9 @@ pub(crate) enum RefreshKind {
     /// the model — feeding the statusbar badge and the panel section — and is
     /// also delivered into the usage overlay if it happens to be open.
     Usage(Box<crate::detail::UsagePayload>),
+    /// The Info screen's report, built off the loop when it opens (applied iff
+    /// that screen is still open).
+    Info(Box<crate::detail::info::InfoPayload>),
     /// Time to consider a weather refresh: read the cache, and fetch if stale.
     /// Emitted by the ticker on `[weather] refresh_interval_secs` (floored at
     /// 600) plus a one-shot slot shortly after launch. No slot at all when
