@@ -1098,7 +1098,108 @@ fn fs_read_returns_bytes_none_on_404_and_fails_over_the_cap() {
     mock.assert_custody(&[&declared, &streamed]);
 }
 
+#[test]
+fn fs_calls_on_a_stopped_session_are_session_stopped() {
+    let mock = Mock::start(|r| {
+        if r.path().ends_with("/fs/read") && r.json()["path"] == "/missing" {
+            return not_found();
+        }
+        let code = if r.target.contains("sess_gone") {
+            "sandbox_stopped"
+        } else if r.target.contains("sess_stopping") {
+            "sandbox_stopping"
+        } else if r.target.contains("sess_bad") {
+            "bad_request"
+        } else if r.path().ends_with("/fs/read") {
+            return Reply::new("200 OK", "application/octet-stream", "ok");
+        } else {
+            return Reply::json("200 OK", serde_json::json!({}));
+        };
+        let status = if r.target.contains("sess_gone") {
+            "410 Gone"
+        } else {
+            "422 Unprocessable Entity"
+        };
+        Reply::json(status, serde_json::json!({"error": {"code": code}}))
+    });
+    let client = mock.client();
+    let rt = rt();
+    let mut errors = Vec::new();
+    for session in ["sess_gone", "sess_stopping", "sess_bad"] {
+        let write = rt
+            .block_on(client.fs_write_targz(session, "/tmp", vec![1, 2, 3]))
+            .unwrap_err();
+        let read = rt
+            .block_on(client.fs_read(session, "/file", 16))
+            .unwrap_err();
+        let mkdir = rt.block_on(client.fs_mkdir(session, "/tmp")).unwrap_err();
+        errors.extend([write, read, mkdir]);
+    }
+    for (index, error) in errors.iter().enumerate() {
+        let stopped = index < 6;
+        if stopped {
+            let typed = error
+                .downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+                .expect("stopped session error");
+            assert_eq!(typed.status, if index < 3 { 410 } else { 422 });
+        } else {
+            assert!(
+                error
+                    .downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+                    .is_none()
+            );
+        }
+    }
+    let missing = rt
+        .block_on(client.fs_read("sess_missing", "/missing", 16))
+        .expect("404 is a missing file");
+    assert_eq!(missing, None);
+    let refs: Vec<&anyhow::Error> = errors.iter().collect();
+    mock.assert_custody(&refs);
+}
+
 // --- interactive -----------------------------------------------------------------
+
+#[test]
+fn interactive_on_a_stopped_session_is_session_stopped() {
+    let mock = Mock::start(|r| {
+        let (status, code) = if r.target.contains("sess_gone") {
+            ("410 Gone", "sandbox_stopped")
+        } else if r.target.contains("sess_stopping") {
+            ("422 Unprocessable Entity", "sandbox_stopping")
+        } else if r.target.contains("sess_bad") {
+            ("422 Unprocessable Entity", "bad_request")
+        } else {
+            return Reply::json(
+                "200 OK",
+                serde_json::json!({"url": "wss://x.vercel.run/pty", "token": "ticket"}),
+            );
+        };
+        Reply::json(status, serde_json::json!({"error": {"code": code}}))
+    });
+    let client = mock.client();
+    let rt = rt();
+    let mut errors = Vec::new();
+    for session in ["sess_gone", "sess_stopping", "sess_bad"] {
+        errors.push(rt.block_on(client.interactive(session)).unwrap_err());
+    }
+    for (index, error) in errors.iter().enumerate() {
+        if index < 2 {
+            let typed = error
+                .downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+                .expect("stopped session error");
+            assert_eq!(typed.status, if index == 0 { 410 } else { 422 });
+        } else {
+            assert!(
+                error
+                    .downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+                    .is_none()
+            );
+        }
+    }
+    let refs: Vec<&anyhow::Error> = errors.iter().collect();
+    mock.assert_custody(&refs);
+}
 
 #[test]
 fn interactive_ticket_is_wss_and_its_token_is_redacted() {
