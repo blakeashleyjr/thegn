@@ -250,15 +250,13 @@ fn sprites_usage(cfg: &Config) -> Option<Vec<SpritesUsage>> {
                                         provider.usage_reading_since(&rec.name, &start).await
                                     });
                                     usage.rows.push(match read {
-                                        Ok(Some(reading)) => {
-                                            sprites_row(
-                                                &rec.name,
-                                                &rec.state,
-                                                &reading,
-                                                price,
-                                                usage_is_recent(rec.created_at, now),
-                                            )
-                                        }
+                                        Ok(Some(reading)) => sprites_row(
+                                            &rec.name,
+                                            &rec.state,
+                                            &reading,
+                                            price,
+                                            usage_is_recent(rec.created_at, now),
+                                        ),
                                         Ok(None) => SpritesUsageRow {
                                             name: rec.name.clone(),
                                             status: rec.state.clone(),
