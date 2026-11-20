@@ -170,20 +170,19 @@ pub fn summarize(inputs: LeadInputs) -> LeadBar {
         }
     };
 
-    let (last, last_age) = if let (Ok(runs), Ok(pending)) =
-        (inputs.runs.as_ref(), inputs.pending.as_ref())
-    {
-        last_action(runs, pending)
-        .map(|(label, at)| {
-            (
-                Some(label),
-                Some(crate::info_model::age(inputs.now_secs, at)),
-            )
-        })
-        .unwrap_or((None, None))
-    } else {
-        (None, None)
-    };
+    let (last, last_age) =
+        if let (Ok(runs), Ok(pending)) = (inputs.runs.as_ref(), inputs.pending.as_ref()) {
+            last_action(runs, pending)
+                .map(|(label, at)| {
+                    (
+                        Some(label),
+                        Some(crate::info_model::age(inputs.now_secs, at)),
+                    )
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
 
     LeadBar {
         state,
