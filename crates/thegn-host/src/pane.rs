@@ -25,6 +25,8 @@ use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession};
 use crate::emulator::{AlacrittyEmulator, PaneEmulator};
 use crate::pane_writer::StdinSendError;
 
+const STREAM_STDIN_CHUNK: usize = 32 << 10;
+
 #[cfg(test)]
 #[path = "platform/pty_drop_witness.rs"]
 mod pty_drop_witness;
@@ -186,6 +188,8 @@ pub struct PtyPane {
     /// go through [`Self::write_reply`] and deliberately don't stamp, so an app's
     /// answer to a DA/DSR query isn't masked as echo.
     last_input_at: Option<std::time::Instant>,
+    /// A stream resize queued while its bounded control channel was full.
+    pending_resize: Option<(u16, u16)>,
 }
 
 /// Reap a PTY pane's child off the dropping thread when the pane goes away.
@@ -424,6 +428,7 @@ impl PtyPane {
             loop_fed,
             last_output_at: None,
             last_input_at: None,
+            pending_resize: None,
         })
     }
 
@@ -512,6 +517,7 @@ impl PtyPane {
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             last_output_at: None,
             last_input_at: None,
+            pending_resize: None,
         }
     }
 
@@ -671,13 +677,16 @@ impl PtyPane {
     /// a subsequent compose.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.last_output_at = Some(std::time::Instant::now());
-        // Server output is authoritative (and carries the echoed keystrokes), so
-        // it retires the prediction overlay + folds a round-trip sample into srtt.
-        let now = self.predict_now_ms();
-        self.predictor.on_server_output(now);
         if self.loop_fed.load(std::sync::atomic::Ordering::Relaxed) {
             self.emulator.advance(bytes);
         }
+        // Server output is authoritative (and carries the echoed keystrokes), so
+        // it retires the prediction overlay + folds a round-trip sample into srtt.
+        // Reader-fed panes already advanced their emulator on the reader thread.
+        let now = self.predict_now_ms();
+        let cursor = self.emulator.cursor();
+        self.predictor
+            .on_server_output(now, (cursor.0 as usize, cursor.1 as usize));
         feed_bytes_to_history(
             bytes,
             &mut self.history,
@@ -728,10 +737,10 @@ impl PtyPane {
     }
 
     /// The screen state the predictor's safety gate reads (never predict in a
-    /// full-screen/raw TUI, or off the prompt row).
+    /// full-screen/raw TUI or before echo has been confirmed on this row).
     fn predict_screen_state(&self) -> crate::predict::ScreenState {
-        let (rows, _) = self.emulator.size();
-        let (cur_row, _) = self.emulator.cursor();
+        let (rows, cols) = self.emulator.size();
+        let (cur_row, cur_col) = self.emulator.cursor();
         crate::predict::ScreenState {
             alt_screen: self.emulator.alt_screen(),
             // NB: do NOT gate on bracketed-paste — bash/zsh enable DECSET 2004 at
@@ -739,21 +748,24 @@ impl PtyPane {
             // application-cursor (DECCKM) is the real raw/TUI signal.
             app_mode: self.emulator.application_cursor(),
             cursor_row: cur_row as usize,
+            cursor_col: cur_col as usize,
             rows: rows as usize,
+            cols: cols as usize,
         }
     }
 
     /// A printable keystroke is being sent: time it (for srtt) and, when the gate
-    /// is open (slow link + prompt row + not a TUI), add it to the prediction
+    /// is open (slow link + echo-confirmed row + not a TUI), add it to the prediction
     /// overlay. Returns whether the overlay changed (caller marks the pane dirty).
     pub fn predict_key(&mut self, c: char) -> bool {
         let now = self.predict_now_ms();
         let s = self.predict_screen_state();
+        let cursor = (s.cursor_row, s.cursor_col);
         if self.predictor.should_predict(&s) {
-            self.predictor.on_key(c, now);
+            self.predictor.on_key(c, now, cursor);
             true
         } else {
-            self.predictor.note_key(now);
+            self.predictor.note_key(now, cursor);
             false
         }
     }
@@ -819,16 +831,63 @@ impl PtyPane {
     fn write_bytes(&mut self, bytes: Vec<u8>) -> Result<(), StdinSendError> {
         match &mut self.io {
             PaneIo::Pty { stdin, .. } => stdin.send(bytes),
-            PaneIo::Stream { control, .. } => match control.try_send(ExecControl::Stdin(bytes)) {
-                Ok(()) => Ok(()),
-                Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(StdinSendError::Full),
-                Err(tokio_mpsc::error::TrySendError::Closed(_)) => Err(StdinSendError::Closed),
-            },
+            PaneIo::Stream { control, .. } => {
+                if let Some((rows, cols)) = self.pending_resize {
+                    match control.try_send(ExecControl::Resize { cols, rows }) {
+                        Ok(()) => self.pending_resize = None,
+                        Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                            return Err(StdinSendError::Full);
+                        }
+                        Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                            return Err(StdinSendError::Closed);
+                        }
+                    }
+                }
+
+                if bytes.len() > STREAM_STDIN_CHUNK {
+                    let n = bytes.len().div_ceil(STREAM_STDIN_CHUNK);
+                    if control.capacity() < n {
+                        return Err(StdinSendError::Full);
+                    }
+                    for chunk in bytes.chunks(STREAM_STDIN_CHUNK) {
+                        match control.try_send(ExecControl::Stdin(chunk.to_vec())) {
+                            Ok(()) => {}
+                            Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                                return Err(StdinSendError::Full);
+                            }
+                            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                                return Err(StdinSendError::Closed);
+                            }
+                        }
+                    }
+                    Ok(())
+                } else {
+                    match control.try_send(ExecControl::Stdin(bytes)) {
+                        Ok(()) => Ok(()),
+                        Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(StdinSendError::Full),
+                        Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                            Err(StdinSendError::Closed)
+                        }
+                    }
+                }
+            }
         }
     }
 
     /// Resize the transport and the emulator together.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        if let PaneIo::Stream { control, .. } = &self.io
+            && let Some((pending_rows, pending_cols)) = self.pending_resize
+        {
+            match control.try_send(ExecControl::Resize {
+                cols: pending_cols,
+                rows: pending_rows,
+            }) {
+                Ok(()) => self.pending_resize = None,
+                Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
+                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
         // No-op when the geometry is unchanged. Re-issuing the winsize would
         // SIGWINCH the child for nothing, and a stray relayout (e.g. a same-size
         // window re-configure on Wayland refocus) must not make full-screen TUIs
@@ -851,7 +910,13 @@ impl PtyPane {
                     .context("pty resize")?;
             }
             PaneIo::Stream { control, .. } => {
-                let _ = control.try_send(ExecControl::Resize { cols, rows }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                match control.try_send(ExecControl::Resize { cols, rows }) {
+                    Ok(()) => {}
+                    Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                        self.pending_resize = Some((rows, cols));
+                    }
+                    Err(tokio_mpsc::error::TrySendError::Closed(_)) => {}
+                }
             }
         }
         self.emulator.resize(rows, cols);
@@ -938,6 +1003,7 @@ impl PtyPane {
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             last_output_at: None,
             last_input_at: None,
+            pending_resize: None,
         }
     }
 
@@ -1876,6 +1942,84 @@ mod tests {
             pane.write_reply(b"third"),
             Err(StdinSendError::Closed)
         ));
+    }
+
+    #[test]
+    fn stream_large_input_is_sent_as_ordered_chunks() {
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(4);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+        let input = vec![b'x'; 100 * 1024];
+
+        pane.write_input(&input).unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            match ctrl_rx.try_recv().unwrap() {
+                ExecControl::Stdin(chunk) => received.extend(chunk),
+                other => panic!("expected stdin chunk, got {other:?}"),
+            }
+        }
+        assert_eq!(received, input);
+        assert!(ctrl_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_large_input_checks_capacity_before_sending() {
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(2);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+        let input = vec![b'x'; 100 * 1024];
+
+        assert!(matches!(
+            pane.write_input(&input),
+            Err(StdinSendError::Full)
+        ));
+        assert!(ctrl_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_resize_while_full_is_delivered_on_next_write() {
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(1);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+
+        pane.write_input(b"occupied").unwrap();
+        pane.resize(30, 90).unwrap();
+        assert_eq!(
+            ctrl_rx.try_recv(),
+            Ok(ExecControl::Stdin(b"occupied".to_vec()))
+        );
+
+        pane.write_input(b"after").unwrap();
+        assert_eq!(
+            ctrl_rx.try_recv(),
+            Ok(ExecControl::Resize { cols: 90, rows: 30 })
+        );
+        assert_eq!(
+            ctrl_rx.try_recv(),
+            Ok(ExecControl::Stdin(b"after".to_vec()))
+        );
+    }
+
+    #[test]
+    fn stream_newer_resize_replaces_pending_size() {
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(1);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+
+        pane.write_input(b"occupied").unwrap();
+        pane.resize(30, 90).unwrap();
+        pane.resize(40, 100).unwrap();
+        assert_eq!(
+            ctrl_rx.try_recv(),
+            Ok(ExecControl::Stdin(b"occupied".to_vec()))
+        );
+
+        pane.write_input(b"after").unwrap();
+        assert_eq!(
+            ctrl_rx.try_recv(),
+            Ok(ExecControl::Resize {
+                cols: 100,
+                rows: 40
+            })
+        );
     }
 
     #[test]
