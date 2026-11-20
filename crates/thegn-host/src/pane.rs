@@ -26,6 +26,7 @@ use crate::emulator::{AlacrittyEmulator, PaneEmulator};
 use crate::pane_writer::StdinSendError;
 
 const STREAM_STDIN_CHUNK: usize = 32 << 10;
+const STREAM_STDIN_MAX_CHUNKS: usize = 64;
 
 #[cfg(test)]
 #[path = "platform/pty_drop_witness.rs"]
@@ -685,8 +686,16 @@ impl PtyPane {
         // Reader-fed panes already advanced their emulator on the reader thread.
         let now = self.predict_now_ms();
         let cursor = self.emulator.cursor();
-        self.predictor
-            .on_server_output(now, (cursor.0 as usize, cursor.1 as usize));
+        let echoed = self
+            .predictor
+            .echo_cell()
+            .and_then(|(row, col)| self.emulator.cell(row as u16, col as u16))
+            .map(|grid_cell| grid_cell.text);
+        self.predictor.on_server_output(
+            now,
+            (cursor.0 as usize, cursor.1 as usize),
+            echoed.as_deref(),
+        );
         feed_bytes_to_history(
             bytes,
             &mut self.history,
@@ -739,7 +748,7 @@ impl PtyPane {
     /// The screen state the predictor's safety gate reads (never predict in a
     /// full-screen/raw TUI or before echo has been confirmed on this row).
     fn predict_screen_state(&self) -> crate::predict::ScreenState {
-        let (rows, cols) = self.emulator.size();
+        let (_, cols) = self.emulator.size();
         let (cur_row, cur_col) = self.emulator.cursor();
         crate::predict::ScreenState {
             alt_screen: self.emulator.alt_screen(),
@@ -749,7 +758,6 @@ impl PtyPane {
             app_mode: self.emulator.application_cursor(),
             cursor_row: cur_row as usize,
             cursor_col: cur_col as usize,
-            rows: rows as usize,
             cols: cols as usize,
         }
     }
@@ -765,7 +773,7 @@ impl PtyPane {
             self.predictor.on_key(c, now, cursor);
             true
         } else {
-            self.predictor.note_key(now, cursor);
+            self.predictor.note_key(now, cursor, c);
             false
         }
     }
@@ -845,11 +853,13 @@ impl PtyPane {
                 }
 
                 if bytes.len() > STREAM_STDIN_CHUNK {
-                    let n = bytes.len().div_ceil(STREAM_STDIN_CHUNK);
+                    let chunk =
+                        STREAM_STDIN_CHUNK.max(bytes.len().div_ceil(STREAM_STDIN_MAX_CHUNKS));
+                    let n = bytes.len().div_ceil(chunk);
                     if control.capacity() < n {
                         return Err(StdinSendError::Full);
                     }
-                    for chunk in bytes.chunks(STREAM_STDIN_CHUNK) {
+                    for chunk in bytes.chunks(chunk) {
                         match control.try_send(ExecControl::Stdin(chunk.to_vec())) {
                             Ok(()) => {}
                             Err(tokio_mpsc::error::TrySendError::Full(_)) => {
@@ -879,13 +889,14 @@ impl PtyPane {
         if let PaneIo::Stream { control, .. } = &self.io
             && let Some((pending_rows, pending_cols)) = self.pending_resize
         {
-            match control.try_send(ExecControl::Resize {
-                cols: pending_cols,
-                rows: pending_rows,
-            }) {
-                Ok(()) => self.pending_resize = None,
-                Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
-                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {}
+            if control
+                .try_send(ExecControl::Resize {
+                    cols: pending_cols,
+                    rows: pending_rows,
+                })
+                .is_ok()
+            {
+                self.pending_resize = None;
             }
         }
         // No-op when the geometry is unchanged. Re-issuing the winsize would
@@ -1978,15 +1989,14 @@ mod tests {
 
     #[test]
     fn stream_resize_while_full_is_delivered_on_next_write() {
-        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(1);
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(2);
         let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
 
-        pane.write_input(b"occupied").unwrap();
+        pane.write_input(b"a").unwrap();
+        pane.write_input(b"b").unwrap();
         pane.resize(30, 90).unwrap();
-        assert_eq!(
-            ctrl_rx.try_recv(),
-            Ok(ExecControl::Stdin(b"occupied".to_vec()))
-        );
+        assert_eq!(ctrl_rx.try_recv(), Ok(ExecControl::Stdin(b"a".to_vec())));
+        assert_eq!(ctrl_rx.try_recv(), Ok(ExecControl::Stdin(b"b".to_vec())));
 
         pane.write_input(b"after").unwrap();
         assert_eq!(
@@ -2001,16 +2011,15 @@ mod tests {
 
     #[test]
     fn stream_newer_resize_replaces_pending_size() {
-        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(1);
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(2);
         let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
 
-        pane.write_input(b"occupied").unwrap();
+        pane.write_input(b"a").unwrap();
+        pane.write_input(b"b").unwrap();
         pane.resize(30, 90).unwrap();
         pane.resize(40, 100).unwrap();
-        assert_eq!(
-            ctrl_rx.try_recv(),
-            Ok(ExecControl::Stdin(b"occupied".to_vec()))
-        );
+        assert_eq!(ctrl_rx.try_recv(), Ok(ExecControl::Stdin(b"a".to_vec())));
+        assert_eq!(ctrl_rx.try_recv(), Ok(ExecControl::Stdin(b"b".to_vec())));
 
         pane.write_input(b"after").unwrap();
         assert_eq!(
@@ -2019,6 +2028,10 @@ mod tests {
                 cols: 100,
                 rows: 40
             })
+        );
+        assert_eq!(
+            ctrl_rx.try_recv(),
+            Ok(ExecControl::Stdin(b"after".to_vec()))
         );
     }
 
