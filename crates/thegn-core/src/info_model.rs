@@ -232,7 +232,7 @@ pub struct InfoSection {
     pub lines: Vec<InfoLine>,
 }
 
-/// WORKSPACE, WORKTREE (when present), EFFECTIVE SETTINGS (<scope>), BACKEND CANDIDATES,
+/// WORKSPACE, WORKTREE (when present), EFFECTIVE SETTINGS (`<scope>`), BACKEND CANDIDATES,
 /// OVERRIDES, SESSIONS, STATS, NOTES; empty sections are skipped.
 pub fn sections(report: &InfoReport) -> Vec<InfoSection> {
     let mut result = Vec::new();
