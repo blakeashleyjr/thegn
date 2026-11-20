@@ -687,7 +687,7 @@ mod sprites {
             Err(error) if apply && !unrecorded => bail!(
                 "env reap: cannot read the worktree registry ({error:#}); refusing --apply so no sprite holding unpulled work is destroyed"
             ),
-            Err(_) => crate::sprites_reaper::BoundSet::default(),
+            Err(_) => crate::sprites_reaper::BoundSet::unresolved("registry unreadable"),
         };
         let _lease = if apply && !unrecorded {
             match crate::reaper_policy::try_reaper_lease(KIND) {

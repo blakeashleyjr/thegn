@@ -50,6 +50,13 @@ pub(crate) struct BoundSet {
 }
 
 impl BoundSet {
+    pub(crate) fn unresolved(label: &str) -> Self {
+        Self {
+            unresolved: vec![label.into()],
+            ..Default::default()
+        }
+    }
+
     /// The worktree holding `name`; when any binding is unresolved every
     /// name is held (fail closed).
     pub(crate) fn holder(&self, name: &str) -> Option<String> {
@@ -218,10 +225,7 @@ fn run_pass(cfg: &Config, envs: &[(String, EnvConfig)]) {
                 error = %format!("{error:#}"),
                 "sprites reaper: worktree registry unreadable; every past-lifetime sprite is kept"
             );
-            BoundSet {
-                unresolved: vec!["registry unreadable".into()],
-                ..Default::default()
-            }
+            BoundSet::unresolved("registry unreadable")
         }
     };
     let rt = match crate::agent::provider_runtime() {
@@ -255,9 +259,15 @@ fn run_pass(cfg: &Config, envs: &[(String, EnvConfig)]) {
     }
     for (name, holder) in &summary.kept {
         if first_bound_warning(name) {
-            thegn_core::msg::warn(&format!(
-                "sprite {name} is past its lifetime but bound to worktree {holder}; not reaped — `thegn env down --worktree <wt>` pulls its commits and destroys it"
-            ));
+            if holder.ends_with("could not be resolved)") || holder == "registry unreadable" {
+                thegn_core::msg::warn(&format!(
+                    "sprite {name} is past its lifetime but kept: {holder}; fix or `thegn wt rm` that worktree so the reaper can judge it"
+                ));
+            } else {
+                thegn_core::msg::warn(&format!(
+                    "sprite {name} is past its lifetime but bound to worktree {holder}; not reaped — `thegn env down --worktree {holder}` pulls its commits and destroys it"
+                ));
+            }
         }
     }
     if let Some(line) = summary.info_line() {
