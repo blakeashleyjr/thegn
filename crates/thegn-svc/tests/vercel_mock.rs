@@ -221,7 +221,44 @@ fn handle(mut stream: TcpStream, rec: &Mutex<Vec<Recorded>>, router: &Router) {
         body,
     };
     rec.lock().unwrap().push(req.clone());
-    let reply = (**router)(&req);
+    let reply = if req.method == "PATCH"
+        && req.path().starts_with("/v2/sandboxes/")
+        && req
+            .json()
+            .get("networkPolicy")
+            .and_then(|p| p.get("type"))
+            .is_some()
+    {
+        Reply::json(
+            "400 Bad Request",
+            serde_json::json!({"error": "legacy network policy"}),
+        )
+    } else if req.path().ends_with("/stdin") {
+        let has_attached_command = rec.lock().unwrap().iter().any(|prior| {
+            prior.method == "POST"
+                && prior.path().ends_with("/cmd")
+                && prior
+                    .json()
+                    .get("attachStdin")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
+        if has_attached_command {
+            (**router)(&req)
+        } else {
+            Reply::json(
+                "400 Bad Request",
+                serde_json::json!({"error": "stdin not attached"}),
+            )
+        }
+    } else if req.path().ends_with("/cmd")
+        && req.json().get("wait") == Some(&serde_json::Value::Bool(true))
+        && req.json().get("logs") != Some(&serde_json::Value::Bool(true))
+    {
+        Reply::new("200 OK", "application/x-ndjson", Vec::new())
+    } else {
+        (**router)(&req)
+    };
     let mut head = format!("HTTP/1.1 {}\r\n", reply.status);
     for (name, value) in &reply.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -267,9 +304,16 @@ fn sandbox_json(name: &str) -> serde_json::Value {
             "name": name,
             "status": "running",
             "currentSessionId": "sess_1",
-            "resources": { "vcpus": 2 },
+            "vcpus": 2,
+            "memory": 4096,
             "createdAt": 1_700_000_000_000_i64
-        }
+        },
+        "session": {
+            "id": "sess_1",
+            "status": "running"
+        },
+        "routes": [],
+        "resumed": false
     })
 }
 
@@ -345,7 +389,24 @@ fn create_get_list_encode_method_path_scope_and_auth() {
     assert_eq!(reqs[4].path(), "/v2/sandboxes");
     assert_eq!(q.get("project").map(String::as_str), Some(PROJECT));
     assert_eq!(q.get("namePrefix").map(String::as_str), Some("tg-"));
+    assert_eq!(q.get("sortBy").map(String::as_str), Some("name"));
     assert_eq!(q.get("cursor").map(String::as_str), Some("1699"));
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn list_without_a_prefix_does_not_send_sort_by() {
+    let mock = Mock::start(|_| {
+        Reply::json(
+            "200 OK",
+            serde_json::json!({"sandboxes": [], "pagination": {"next": null}}),
+        )
+    });
+    rt().block_on(mock.client().list_page(None, ""))
+        .expect("list");
+    let query = mock.requests()[0].query();
+    assert!(!query.contains_key("namePrefix"));
+    assert!(!query.contains_key("sortBy"));
     mock.assert_custody(&[]);
 }
 
@@ -419,6 +480,7 @@ fn delete_and_stop_treat_404_as_success_and_use_their_paths() {
     );
     assert_eq!(reqs[1].method, "POST");
     assert_eq!(reqs[1].path(), "/v2/sandboxes/sessions/sess_1/stop");
+    assert!(!reqs[1].query().contains_key("projectId"));
     assert_eq!(reqs[2].method, "DELETE");
     assert_eq!(reqs[2].path(), "/v2/sandboxes/snapshots/snap_1");
     mock.assert_custody(&[]);
@@ -465,13 +527,22 @@ fn a_redirect_is_refused_not_followed() {
 }
 
 #[test]
-fn extend_reports_extended_or_the_plan_ceiling() {
+fn extend_reports_extended_or_the_plan_ceiling_and_missing_sessions() {
     let mock = Mock::start(|r| {
         if r.target.contains("sess_full") {
             Reply::json(
                 "400 Bad Request",
                 serde_json::json!({"error": "max duration"}),
             )
+        } else if r.target.contains("sess_422") {
+            Reply::json(
+                "422 Unprocessable Entity",
+                serde_json::json!({"error": "max duration"}),
+            )
+        } else if r.target.contains("sess_404") {
+            Reply::json("404 Not Found", serde_json::json!({"error": "gone"}))
+        } else if r.target.contains("sess_410") {
+            Reply::json("410 Gone", serde_json::json!({"error": "gone"}))
         } else {
             Reply::json("200 OK", serde_json::json!({}))
         }
@@ -486,12 +557,30 @@ fn extend_reports_extended_or_the_plan_ceiling() {
         rt.block_on(client.extend("sess_full", 900_000)).unwrap(),
         ExtendOutcome::AtCeiling
     );
+    assert_eq!(
+        rt.block_on(client.extend("sess_422", 900_000)).unwrap(),
+        ExtendOutcome::AtCeiling
+    );
+    for session in ["sess_404", "sess_410"] {
+        let err = rt.block_on(client.extend(session, 900_000)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("session no longer exists"),
+            "{err:#}"
+        );
+        assert!(
+            err.downcast_ref::<thegn_svc::vercel::client::SessionGone>()
+                .is_some(),
+            "{err:#}"
+        );
+    }
     let reqs = mock.requests();
     assert_eq!(
         reqs[0].path(),
         "/v2/sandboxes/sessions/sess_1/extend-timeout"
     );
     assert_eq!(reqs[0].json(), serde_json::json!({"duration": 900_000}));
+    assert!(reqs[1].query().contains_key("teamId"));
+    assert!(!reqs[1].query().contains_key("projectId"));
     mock.assert_custody(&[]);
 }
 
@@ -564,10 +653,6 @@ fn run_wait_relays_stdout_drops_stderr_and_reports_the_exit() {
     let reqs = mock.requests();
     assert_eq!(reqs[0].method, "POST");
     assert_eq!(reqs[0].path(), "/v2/sandboxes/sessions/sess_1/cmd");
-    assert_eq!(
-        reqs[0].query().get("projectId").map(String::as_str),
-        Some(PROJECT)
-    );
     assert!(
         reqs[0]
             .header("content-type")
@@ -575,6 +660,8 @@ fn run_wait_relays_stdout_drops_stderr_and_reports_the_exit() {
     );
     // `wait: true` is forced whatever the caller sent.
     assert_eq!(reqs[0].json()["wait"], serde_json::json!(true));
+    assert_eq!(reqs[0].json()["logs"], serde_json::json!(true));
+    assert!(!reqs[0].query().contains_key("projectId"));
     assert_eq!(reqs[0].json()["command"], serde_json::json!("git"));
     mock.assert_custody(&[]);
 }
@@ -641,8 +728,8 @@ fn run_wait_surfaces_an_error_line_sanitized() {
         Reply::ndjson(&[
             out("before"),
             serde_json::json!({"stream": "error", "data": {
-                "code": "sandbox_stopped",
-                "message": format!("session ended; token {TOKEN}\n{}", "q".repeat(400))
+                "code": "sandbox_stream_closed",
+                "message": format!("stream closed; token {TOKEN}\n{}", "q".repeat(400))
             }}),
             exit(0),
         ])
@@ -651,7 +738,7 @@ fn run_wait_surfaces_an_error_line_sanitized() {
         .block_on(mock.client().run_wait("sess_1", &serde_json::json!({}), 64))
         .unwrap_err();
     let shown = format!("{err:#}");
-    assert!(shown.contains("sandbox_stopped"), "{shown}");
+    assert!(shown.contains("sandbox_stream_closed"), "{shown}");
     assert!(!shown.contains('\n'), "{shown}");
     assert!(shown.len() < 400, "{}", shown.len());
     mock.assert_custody(&[&err]);
@@ -675,13 +762,17 @@ fn run_detached_returns_the_command_id() {
     let mock =
         Mock::start(|_| Reply::json("200 OK", serde_json::json!({"command": {"id": "cmd_42"}})));
     let id = rt()
-        .block_on(
-            mock.client()
-                .run_detached("sess_1", &serde_json::json!({"command": "sh"})),
-        )
+        .block_on(mock.client().run_detached(
+            "sess_1",
+            &serde_json::json!({"command": "sh", "attachStdin": true}),
+        ))
         .expect("detached");
     assert_eq!(id, "cmd_42");
     assert_eq!(mock.requests()[0].json()["wait"], serde_json::json!(false));
+    assert_eq!(
+        mock.requests()[0].json()["attachStdin"],
+        serde_json::json!(true)
+    );
     mock.assert_custody(&[]);
 }
 
@@ -735,26 +826,37 @@ fn dropping_a_live_log_stream_aborts_its_reader() {
 
 #[test]
 fn stdin_and_kill_encode_their_requests() {
-    let mock = Mock::start(|_| Reply::json("200 OK", serde_json::json!({})));
+    let mock = Mock::start(|r| {
+        if r.path().ends_with("/cmd") {
+            Reply::json("200 OK", serde_json::json!({"command": {"id": "cmd_1"}}))
+        } else {
+            Reply::json("200 OK", serde_json::json!({}))
+        }
+    });
     let client = mock.client();
     let rt = rt();
+    rt.block_on(client.run_detached(
+        "sess_1",
+        &serde_json::json!({"command": "sh", "attachStdin": true}),
+    ))
+    .expect("start stdin command");
     rt.block_on(client.stdin("sess_1", "cmd_1", b"hello\n", true))
         .expect("stdin");
     rt.block_on(client.kill("sess_1", "cmd_1", 15))
         .expect("kill");
     let reqs = mock.requests();
     assert_eq!(
-        reqs[0].path(),
+        reqs[1].path(),
         "/v2/sandboxes/sessions/sess_1/cmd/cmd_1/stdin"
     );
-    assert_eq!(reqs[0].json()["data"], serde_json::json!("aGVsbG8K"));
-    assert_eq!(reqs[0].json()["close"], serde_json::json!(true));
-    assert!(!reqs[0].query().contains_key("close"));
+    assert_eq!(reqs[1].json()["data"], serde_json::json!("aGVsbG8K"));
+    assert_eq!(reqs[1].json()["close"], serde_json::json!(true));
+    assert!(!reqs[1].query().contains_key("close"));
     assert_eq!(
-        reqs[1].path(),
+        reqs[2].path(),
         "/v2/sandboxes/sessions/sess_1/cmd/cmd_1/kill"
     );
-    assert_eq!(reqs[1].json(), serde_json::json!({"signal": 15}));
+    assert_eq!(reqs[2].json(), serde_json::json!({"signal": 15}));
     mock.assert_custody(&[]);
 }
 
@@ -910,16 +1012,45 @@ fn interactive_refuses_a_ticket_carrying_the_api_token() {
 
 #[test]
 fn snapshots_for_lists_ids_scoped_by_name() {
-    let mock = Mock::start(|_| {
-        Reply::json(
-            "200 OK",
-            serde_json::json!({"snapshots": [{"id": "snap_1"}, {"id": "bad/id"}, {"id": "snap_2"}]}),
-        )
+    let mock = Mock::start(|r| {
+        let query = r.query();
+        let page = query.get("cursor").map(String::as_str);
+        match page {
+            None => Reply::json(
+                "200 OK",
+                serde_json::json!({
+                    "snapshots": [{"id": "snap_1"}, {"id": "bad/id"}],
+                    "pagination": {"next": "page-2"}
+                }),
+            ),
+            Some("page-2") => Reply::json(
+                "200 OK",
+                serde_json::json!({
+                    "snapshots": [{"id": "snap_2"}],
+                    "pagination": {"next": "page-3"}
+                }),
+            ),
+            Some("page-3") => Reply::json(
+                "200 OK",
+                serde_json::json!({
+                    "snapshots": [{"id": "snap_3"}],
+                    "pagination": {"next": null}
+                }),
+            ),
+            _ => Reply::json("500 Internal Server Error", serde_json::json!({})),
+        }
     });
     let ids = rt()
         .block_on(mock.client().snapshots_for("tg-a"))
         .expect("snapshots");
-    assert_eq!(ids, vec!["snap_1".to_string(), "snap_2".to_string()]);
+    assert_eq!(
+        ids,
+        vec![
+            "snap_1".to_string(),
+            "snap_2".to_string(),
+            "snap_3".to_string()
+        ]
+    );
     let reqs = mock.requests();
     assert_eq!(reqs[0].path(), "/v2/sandboxes/snapshots");
     assert_eq!(
@@ -930,13 +1061,29 @@ fn snapshots_for_lists_ids_scoped_by_name() {
         reqs[0].query().get("project").map(String::as_str),
         Some(PROJECT)
     );
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(
+        reqs[1].query().get("cursor").map(String::as_str),
+        Some("page-2")
+    );
+    assert_eq!(
+        reqs[2].query().get("cursor").map(String::as_str),
+        Some("page-3")
+    );
     mock.assert_custody(&[]);
 }
 
 #[test]
 fn set_network_policy_patches_the_sandbox() {
-    let mock = Mock::start(|_| Reply::json("200 OK", serde_json::json!({})));
-    let policy = serde_json::json!({"allow": ["example.com"]});
+    let mock = Mock::start(|r| match (r.method.as_str(), r.path()) {
+        ("PATCH", "/v2/sandboxes/tg-a") => Reply::json("200 OK", serde_json::json!({})),
+        ("GET", "/v2/sandboxes/tg-a") => Reply::json("200 OK", sandbox_json("tg-a")),
+        ("POST", "/v2/sandboxes/sessions/sess_1/network-policy") => {
+            Reply::json("200 OK", serde_json::json!({}))
+        }
+        _ => Reply::json("500 Internal Server Error", serde_json::json!({})),
+    });
+    let policy = serde_json::json!({"mode": "custom", "allowedDomains": ["example.com"]});
     rt().block_on(mock.client().set_network_policy("tg-a", &policy))
         .expect("set network policy");
     let reqs = mock.requests();
@@ -947,7 +1094,85 @@ fn set_network_policy_patches_the_sandbox() {
         Some(PROJECT)
     );
     assert_eq!(reqs[0].json()["networkPolicy"], policy);
+    assert_eq!(reqs[1].method, "GET");
+    assert_eq!(reqs[2].method, "POST");
+    assert_eq!(reqs[2].json(), policy);
+    assert!(!reqs[2].query().contains_key("projectId"));
     mock.assert_custody(&[]);
+}
+
+#[test]
+fn set_network_policy_patches_without_a_session_post_when_stopped() {
+    let mock = Mock::start(|r| match (r.method.as_str(), r.path()) {
+        ("PATCH", "/v2/sandboxes/tg-a") => Reply::json("200 OK", serde_json::json!({})),
+        ("GET", "/v2/sandboxes/tg-a") => Reply::json(
+            "200 OK",
+            serde_json::json!({"sandbox": {"name": "tg-a", "status": "stopped"}}),
+        ),
+        _ => Reply::json("500 Internal Server Error", serde_json::json!({})),
+    });
+    let policy = serde_json::json!({"mode": "allow-all"});
+    rt().block_on(mock.client().set_network_policy("tg-a", &policy))
+        .expect("set network policy");
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].method, "PATCH");
+    assert_eq!(reqs[1].method, "GET");
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn set_network_policy_patches_and_posts_for_a_pending_session() {
+    let mock = Mock::start(|r| match (r.method.as_str(), r.path()) {
+        ("PATCH", "/v2/sandboxes/tg-a") => Reply::json("200 OK", serde_json::json!({})),
+        ("GET", "/v2/sandboxes/tg-a") => Reply::json(
+            "200 OK",
+            serde_json::json!({
+                "sandbox": {
+                    "name": "tg-a",
+                    "status": "pending",
+                    "currentSessionId": "sess_1"
+                },
+                "session": {"id": "sess_1", "status": "pending"}
+            }),
+        ),
+        ("POST", "/v2/sandboxes/sessions/sess_1/network-policy") => {
+            Reply::json("200 OK", serde_json::json!({}))
+        }
+        _ => Reply::json("500 Internal Server Error", serde_json::json!({})),
+    });
+    let policy = serde_json::json!({"mode": "allow-all"});
+    rt().block_on(mock.client().set_network_policy("tg-a", &policy))
+        .expect("set network policy");
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(reqs[0].method, "PATCH");
+    assert_eq!(reqs[1].method, "GET");
+    assert_eq!(reqs[2].method, "POST");
+    assert_eq!(reqs[2].json(), policy);
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn set_network_policy_returns_a_session_failure() {
+    let mock = Mock::start(|r| match (r.method.as_str(), r.path()) {
+        ("PATCH", "/v2/sandboxes/tg-a") => Reply::json("200 OK", serde_json::json!({})),
+        ("GET", "/v2/sandboxes/tg-a") => Reply::json("200 OK", sandbox_json("tg-a")),
+        ("POST", "/v2/sandboxes/sessions/sess_1/network-policy") => Reply::json(
+            "500 Internal Server Error",
+            serde_json::json!({"error": "failed"}),
+        ),
+        _ => Reply::json("500 Internal Server Error", serde_json::json!({})),
+    });
+    let policy = serde_json::json!({"mode": "allow-all"});
+    let err = rt()
+        .block_on(mock.client().set_network_policy("tg-a", &policy))
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("set session network policy"),
+        "{err:#}"
+    );
+    mock.assert_custody(&[&err]);
 }
 
 #[test]
@@ -987,10 +1212,7 @@ fn wait_command_polls_until_the_exit_code_arrives() {
         assert_eq!(r.method, "GET");
         assert_eq!(r.path(), "/v2/sandboxes/sessions/sess_1/cmd/cmd_1");
         assert_eq!(r.query().get("wait").map(String::as_str), Some("true"));
-        assert_eq!(
-            r.query().get("projectId").map(String::as_str),
-            Some(PROJECT)
-        );
+        assert!(!r.query().contains_key("projectId"));
     }
     mock.assert_custody(&[]);
 }
@@ -1336,14 +1558,22 @@ fn a_429_on_create_or_run_is_not_retried() {
 fn stdin_retries_a_429_like_the_sdk() {
     let hits = Arc::new(AtomicUsize::new(0));
     let seen = hits.clone();
-    let mock = Mock::start(move |_| {
-        if seen.fetch_add(1, Ordering::SeqCst) < 2 {
+    let mock = Mock::start(move |r| {
+        if r.path().ends_with("/cmd") {
+            Reply::json("200 OK", serde_json::json!({"command": {"id": "cmd_1"}}))
+        } else if seen.fetch_add(1, Ordering::SeqCst) < 2 {
             rate_limited("0")
         } else {
             Reply::json("200 OK", serde_json::json!({}))
         }
     });
-    rt().block_on(mock.client().stdin("sess_1", "cmd_1", b"hi", false))
+    let client = mock.client();
+    rt().block_on(client.run_detached(
+        "sess_1",
+        &serde_json::json!({"command": "sh", "attachStdin": true}),
+    ))
+    .expect("start stdin command");
+    rt().block_on(client.stdin("sess_1", "cmd_1", b"hi", false))
         .expect("stdin retried through two 429s");
     assert_eq!(hits.load(Ordering::SeqCst), 3);
     mock.assert_custody(&[]);
@@ -1376,7 +1606,7 @@ fn usage_reads_the_current_session_without_resuming() {
                 "sandbox": {
                     "name": "tg-a",
                     "status": "stopped",
-                    "resources": {"vcpus": 2},
+                    "vcpus": 2,
                     "memory": 4096
                 },
                 "session": {
