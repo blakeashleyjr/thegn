@@ -66,6 +66,18 @@ stable one, and both instances mask it. `~/.thegn-devel/run` remains only the
 launcher's pidfile dir. Because the runtime dir is the login one, rootless
 podman shares the login runroot, as it does for the stable instance.
 
+The launcher also puts the dev binary's directory (`~/.thegn-devel/bin`) first
+on `PATH` for the dev TUI, the dev daemon and `--print-env`, so a pane in the dev
+instance finds the dev `thegn`. NixOS login shells reset `PATH`, so a pane's
+shell may still resolve the stable `thegn`; run `$THEGN_BIN` there.
+`thegn doctor` names that mismatch ("`thegn` on PATH is X, not this binary
+(Y)") and a pane that belongs to the other instance.
+
+The live scripts and the first-run net trace no longer override
+`XDG_RUNTIME_DIR` either. Daemon sockets are hashed per state dir, so a fresh
+state dir cannot collide with the real daemon. The e2e prelude and `demo.sh`
+keep their override, with a comment saying why it is safe.
+
 The launcher also scrubs pane identity from its environment before it execs the
 dev binary, so a dev instance started from inside a thegn pane does not inherit
 that pane's session. It removes `THEGN_SESSION_ID`, `THEGN_CONTROL_SOCKET`,

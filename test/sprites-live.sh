@@ -6,7 +6,9 @@
 # justfile, workflows or nix checks globs `test/*live*.sh`; it runs only through
 # `just sprites-live`. It reads the owner's REAL config read-only
 # (XDG_CONFIG_HOME as given; the sprites token is never read or printed) with a
-# fresh XDG_STATE_HOME, XDG_RUNTIME_DIR and THEGN_DIR and a scratch repo.
+# fresh XDG_STATE_HOME and THEGN_DIR and a scratch repo. The login runtime dir
+# is kept so sandbox masks and the control guard cover every instance's control
+# directory.
 #
 # The daily headless/land/reap run lives in test/remote-daily.sh (just remote-daily).
 #
@@ -70,7 +72,7 @@ sprites-live plan (nothing is created without both --env <name> and
 --i-accept-spend, plus THEGN_CHANNEL=dev)
 
 Will create : ONE sprite via the named [env.<name>] from your real config
-              (read-only), in a fresh state/runtime/THEGN_DIR and a scratch git
+              (read-only), in a fresh XDG_STATE_HOME and THEGN_DIR (login runtime dir kept) and a scratch git
               repo on branch sx/live-lane. No config is written.
 Max spend   : one sprite for the length of this run (about 15 minutes, incl. a
               420 s hold and 120 s idle); teardown destroys it.
@@ -85,12 +87,14 @@ Steps:
   0   preflight: doctor --json remote_live for <name>; FAIL if the token does
       not resolve; INFO forwarded_env, git_token, login_upload; WARN lists
       unbound pre-existing sandboxes (never touched); SKIP on an older binary
-  1   scratch repo + env test          1b  env test
+  1   scratch repo + env test (with the requested --set when given)
+      1b  env test
   2   no sprites ledger record before create
-  3   provision (env up)               3b  exactly one ready sprites ledger record
+  3   provision (env up, with the requested --set when given)
+      3b  exactly one ready sprites ledger record
   4   sprite workspace HEAD == local HEAD (sprite-exec, \$HOME/workspace)
   4b  sprite-exec exit status and stderr reach the caller (exit 3, boom)
-  5   (only with --min-ram-gb N) doctor --json under --set min_ram_gb=N shows N*1024
+  5   (only with --min-ram-gb N) doctor --json provider_cache.<name>.sprites_memory_limit_mb shows N*1024
   5b  (only with --min-ram-gb N) /sys/fs/cgroup/memory.max in the sprite is
       N GiB in bytes (raw value printed; SKIP if the file is absent)
   6   interactive exec under script(1): /dev/pts/<n> and ok; print the trace
@@ -114,7 +118,8 @@ Steps:
   9b  /v1/tasks is empty
   10  fleet cost --json: print sprites_usage; error fails, cpu_hours > 0 passes,
       or zero usage (partial or not) warns and passes; reported false warns
-  10b fleet list --env still shows warm or cold (the usage call did not wake it)
+  10b fleet list --env remains in the pre-cost warm/cold class (wait up to 90 s
+      first if the pre-cost row is running; timeout warns; usage did not wake it)
   10w wake from cold: sprite-exec -- true completes within 150 s; print wake time
   10x wake row is running or warm (a lagging cold state warns and passes)
   11  env down                         11b fleet list puts this sprite in view.down,
@@ -146,6 +151,11 @@ fi
 if [ "${THEGN_CHANNEL:-}" != "dev" ]; then
   echo "refusing: THEGN_CHANNEL=dev is required" >&2
   exit 2
+fi
+
+MIN_RAM_SET=()
+if [ -n "$min_ram" ]; then
+  MIN_RAM_SET=(--set "env.$env_name.provider.min_ram_gb=$min_ram")
 fi
 
 # ---- step 0: preflight (doctor's "Remote live readiness" block) ----
@@ -195,7 +205,7 @@ print("PASS 0")
 '
 DOCTOR_JSON=""
 preflight_capture() { # doctor may exit non-zero on unrelated checks; parse what it printed
-  DOCTOR_JSON="$("$THEGN_BIN" doctor --json 2>/dev/null)" || true
+  DOCTOR_JSON="$("$THEGN_BIN" "${MIN_RAM_SET[@]}" doctor --json 2>/dev/null)" || true
 }
 preflight_check() { # preflight_check <env> [required: 1|0]
   echo "== step 0: preflight (doctor --json remote_live for env '$1')"
@@ -213,8 +223,6 @@ TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" THEGN_DIR="$TMP/thegn"
 unset THEGN_CONFIG_DIR
 mkdir -p "$XDG_STATE_HOME" "$THEGN_DIR" "$TMP/repo"
-mkdir -m 700 "$TMP/run"
-export XDG_RUNTIME_DIR="$TMP/run"
 REPO="$TMP/repo"
 SPRITE_NAME="(unknown)"
 CREATED=0
@@ -227,6 +235,8 @@ INTERACTIVE_OUT=""
 PULL_SHA=""
 AGENT_JSON=""
 AGENT_RUN_SECONDS=0
+COST_PRE_STATE=""
+COST_PRE_WAIT_TIMED_OUT=0
 
 print_plan
 echo
@@ -245,7 +255,7 @@ run_records() { # run_records <provider>: names of this run's ledger records
 
 listing_lacks_name() { # listing_lacks_name <name>: partial/failed listing is unknown
   local name="$1" out
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json 2>/dev/null)" || return 1
+  out="$("$THEGN_BIN" "${MIN_RAM_SET[@]}" fleet list --env "$env_name" --json 2>/dev/null)" || return 1
   printf '%s' "$out" | LISTED_NAME="$name" python3 -I -c '
 import json, os, sys
 try:
@@ -288,12 +298,12 @@ teardown() {
     names="$(run_records sprites)"
     if [ "$STEP_11_PASSED" = 0 ]; then
       echo "-- teardown: env down"
-      (cd "$REPO" && "$THEGN_BIN" env down --force)
+      (cd "$REPO" && "$THEGN_BIN" "${MIN_RAM_SET[@]}" env down --force)
     fi
     for n in $names; do
       case "$n" in *[!a-z0-9-]*) continue ;; esac
       echo "-- teardown: env deprovision $n"
-      "$THEGN_BIN" env deprovision "$n" --env "$env_name" # destroy proves ownership via this run's ledger
+      "$THEGN_BIN" "${MIN_RAM_SET[@]}" env deprovision "$n" --env "$env_name" # destroy proves ownership via this run's ledger
     done
     echo "-- teardown: env reap"
     "$THEGN_BIN" env reap --provider sprites --apply --yes
@@ -394,9 +404,31 @@ curl_present() { # the keep-awake hold needs curl inside the sprite
 }
 
 min_ram_shown() { # doctor reflects min_ram_gb=N as N*1024 MiB
-  local out
-  out="$("$THEGN_BIN" --set "env.$env_name.provider.min_ram_gb=$min_ram" doctor --json 2>&1)" || return 1
-  printf '%s' "$out" | grep -Eq "(^|[^0-9])$((min_ram * 1024))([^0-9]|$)"
+  local out err
+  err="$TMP/doctor-min-ram.stderr"
+  if ! out="$("$THEGN_BIN" "${MIN_RAM_SET[@]}" doctor --json 2>"$err")"; then
+    echo "doctor stderr:" >&2
+    sed 's/^/  /' "$err" >&2
+    return 1
+  fi
+  if ! printf '%s' "$out" | MIN_RAM_EXPECTED="$((min_ram * 1024))" MIN_RAM_ENV="$env_name" python3 -I -c '
+import json, os, sys
+try:
+    report = json.load(sys.stdin)
+    got = report["provider_cache"][os.environ["MIN_RAM_ENV"]]["sprites_memory_limit_mb"]
+except (KeyError, TypeError, ValueError) as exc:
+    print("doctor JSON is missing provider_cache.<env>.sprites_memory_limit_mb: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+expected = int(os.environ["MIN_RAM_EXPECTED"])
+if got != expected:
+    print("doctor JSON reports sprites_memory_limit_mb=" + str(got) + ", want " + str(expected), file=sys.stderr)
+    sys.exit(1)
+print("   doctor provider_cache memory: " + str(got) + " MiB")
+'; then
+    echo "doctor stderr:" >&2
+    sed 's/^/  /' "$err" >&2
+    return 1
+  fi
 }
 
 interactive_tty() { # values reach script(1) via the environment, never the command text
@@ -429,7 +461,8 @@ interactive_line_breaks() {
 import os, re, sys
 lines = os.environ["INTERACTIVE_OUT"].replace("\r", "").splitlines()
 tty = next((i for i, line in enumerate(lines) if re.search(r"/dev/pts/[0-9]+", line)), None)
-ok = next((i for i, line in enumerate(lines) if re.search(r"(^|\s)ok(\s|$)", line)), None)
+# The server can send the tty path with no line ending, so "ok" may follow it directly ("/dev/pts/0ok").
+ok = next((i for i, line in enumerate(lines) if re.search(r"(^|\s|/dev/pts/[0-9]+)ok(\s|$)", line)), None)
 if tty is None or ok is None:
     print("fail")
 elif tty != ok:
@@ -499,7 +532,7 @@ pull_fast_forwarded() {
   PULL_SHA="$(printf '%s' "$PULL_SHA" | tr -d '\r\n ')"
   [ -n "$PULL_SHA" ] || return 1
   local out
-  out="$(in_repo "$THEGN_BIN" env pull 2>&1)" || {
+  out="$(in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env pull 2>&1)" || {
     printf '%s\n' "$out"
     return 1
   }
@@ -517,8 +550,22 @@ pull_head_matches() {
 pull_refs_empty() { [ -z "$(git -C "$REPO" for-each-ref refs/thegn/pull)" ]; }
 
 warm_or_cold() {
+  local state
+  state="$(fleet_row_state)" || return 1
+  case "$state" in
+  warm | cold)
+    echo "   sprite state: $state"
+    ;;
+  *)
+    echo "sprite row state is not warm or cold: $state" >&2
+    return 1
+    ;;
+  esac
+}
+
+fleet_row_state() {
   local out
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
+  out="$("$THEGN_BIN" "${MIN_RAM_SET[@]}" fleet list --env "$env_name" --json)" || return 1
   FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
 import json, os, sys
 try:
@@ -534,10 +581,11 @@ row = next((r for r in rows if isinstance(r, dict) and r.get("id") == os.environ
 if row is None:
     print("sprite row absent from the listing", file=sys.stderr)
     sys.exit(1)
-if row.get("state") not in {"warm", "cold"}:
-    print("sprite row state is not warm or cold: " + str(row.get("state")), file=sys.stderr)
+state = row.get("state")
+if not isinstance(state, str):
+    print("sprite row has no state", file=sys.stderr)
     sys.exit(1)
-print("   sprite state: " + row["state"])
+print(state)
 '
 }
 idle_warm_or_cold() {
@@ -557,7 +605,7 @@ wake_from_cold() {
 
 wake_state() {
   local out
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
+  out="$("$THEGN_BIN" "${MIN_RAM_SET[@]}" fleet list --env "$env_name" --json)" || return 1
   FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
 import json, os, sys
 try:
@@ -644,7 +692,22 @@ agent_task_log_ok() {
 }
 
 cost_has_cpu() {
-  local out
+  local out pre_state polls
+  COST_PRE_WAIT_TIMED_OUT=0
+  pre_state="$(fleet_row_state)" || return 1
+  polls=0
+  while [ "$pre_state" = running ] && [ "$polls" -lt 18 ]; do
+    sleep 5
+    pre_state="$(fleet_row_state)" || return 1
+    polls=$((polls + 1))
+  done
+  COST_PRE_STATE="$pre_state"
+  if [ "$pre_state" = running ]; then
+    COST_PRE_WAIT_TIMED_OUT=1
+    echo "WARN 10b: sprite row remained running before fleet cost after 90 s"
+  else
+    echo "   sprite state before fleet cost: $pre_state"
+  fi
   out="$("$THEGN_BIN" fleet cost --json)" || return 1
   COST_JSON="$out" COST_SPRITE="$SPRITE_NAME" COST_ENV="$env_name" python3 -I -c '
 import json, os, sys
@@ -704,13 +767,32 @@ if not_reported:
 '
 }
 
+cost_state_ok() {
+  local after
+  after="$(fleet_row_state)" || return 1
+  echo "   sprite state after fleet cost: $after"
+  if [ "$COST_PRE_WAIT_TIMED_OUT" = 1 ]; then
+    echo "WARN 10b: comparing after-cost state against timed-out pre-cost state $COST_PRE_STATE"
+    return 0
+  fi
+  case "$COST_PRE_STATE:$after" in
+  warm:warm | warm:cold | cold:warm | cold:cold)
+    return 0
+    ;;
+  *)
+    echo "sprite row state changed from $COST_PRE_STATE to $after (fleet cost may have woken it)" >&2
+    return 1
+    ;;
+  esac
+}
+
 fleet_down_not_missing() {
   local out
   [ ! -f "$(ledger_dir)/$SPRITE_NAME.json" ] || {
     echo "   ledger record for $SPRITE_NAME is still present" >&2
     return 1
   }
-  out="$("$THEGN_BIN" fleet list --env "$env_name" --json)" || return 1
+  out="$("$THEGN_BIN" "${MIN_RAM_SET[@]}" fleet list --env "$env_name" --json)" || return 1
   FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
 import json, os, sys
 
@@ -785,11 +867,11 @@ print("   unrecorded entries: " + str(count))
 preflight_check "$env_name"
 step 1 "scratch repo + env test (token resolves)" bash -c "true"
 scratch_repo
-step 1b "env test" "$THEGN_BIN" env test "$env_name"
+step 1b "env test" "$THEGN_BIN" "${MIN_RAM_SET[@]}" env test "$env_name"
 step 2 "no sprites ledger record before create" ledger_empty
-in_repo "$THEGN_BIN" env set "$env_name" >/dev/null
+in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env set "$env_name" >/dev/null
 CREATED=1
-step 3 "provision sprite (env up)" in_repo "$THEGN_BIN" env up
+step 3 "provision sprite (env up)" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env up
 step 3b "exactly one ready sprites ledger record (plan step 3)" name_from_ledger
 echo "sprite: $SPRITE_NAME"
 step 4 "sprite workspace HEAD matches the local lane HEAD" head_matches
@@ -821,10 +903,10 @@ fi
 step 9 "after 120 s idle the sprite is warm or cold" idle_warm_or_cold
 step 9b "/v1/tasks is empty" tasks_empty
 step 10 "fleet cost reports sprites_usage CPU hours or zero usage (partial or not)" cost_has_cpu
-step 10b "fleet list still shows warm or cold after fleet cost" warm_or_cold
+step 10b "fleet list remains in the pre-cost warm/cold class after fleet cost" cost_state_ok
 step 10w "wake from cold (sprite-exec -- true within 150 s)" wake_from_cold
 step 10x "wake row is running or warm" wake_state
-step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" env down
+step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env down
 step 11b "ledger record gone; fleet list classifies the sprite as down, not missing" fleet_down_not_missing
 step 12 "reap dry-run: 0 recorded orphans" reap_dry_clean
 step 13 "unrecorded reap is read-only and empty" reap_unrecorded_read_only
