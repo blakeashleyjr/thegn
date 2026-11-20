@@ -47,6 +47,12 @@ if [ "${STUB_MODE:-}" = continue ]; then
   daemon) printf '%s\n' "$$" >"$STUB_LOG.daemon-pid"; exec tail -f /dev/null ;;
   "daemon stop") echo 'no thegn pane daemon is running'; exit 0 ;;
   "session list --json") echo '[]'; exit 0 ;;
+  *"agent run"*)
+    if [ "${STUB_AGENT_FAILURE:-}" = 1 ]; then
+      printf '%s\n' '{"status":"failed","exit_code":7,"error":"agent boom","token":"SECRET"}'
+      exit 3
+    fi
+    ;;
   "env test sx") exit 1 ;;
   "env set sx") exit 0 ;;
   "env up")
@@ -64,7 +70,20 @@ if [ "${STUB_MODE:-}" = continue ]; then
       echo '{"view":{"rows":[],"down":[{"id":"sp-live"}],"missing":[],"partial":false}}'
     elif [ "${STUB_FLEET_OTHER_COLD:-}" = 1 ]; then
       echo '{"view":{"rows":[{"id":"sx-foreign","state":"cold"}],"partial":false}}'
-    elif [ "${STUB_FLEET_PARTIAL:-}" = 1 ]; then
+    elif [ -e "$STUB_LOG.fleet-cost" ] && [ "${STUB_FLEET_PARTIAL_AFTER_COST:-}" = 1 ] && [ "${STUB_FLEET_PARTIAL:-}" = 1 ]; then
+      echo '{"view":{"rows":[],"partial":true}}'
+    elif [ -e "$STUB_LOG.fleet-cost" ] && [ "${STUB_FLEET_RUNNING_READS:-0}" -gt 0 ]; then
+      running_reads=0
+      if [ -f "$STUB_LOG.fleet-running-reads" ]; then
+        read -r running_reads <"$STUB_LOG.fleet-running-reads" || running_reads=0
+      fi
+      if [ "$running_reads" -lt "${STUB_FLEET_RUNNING_READS:-0}" ]; then
+        printf '%s\n' "$((running_reads + 1))" >"$STUB_LOG.fleet-running-reads"
+        echo '{"view":{"rows":[{"id":"sp-live","state":"running"}],"partial":false}}'
+      else
+        echo '{"view":{"rows":[{"id":"sp-live","state":"warm"}],"partial":false}}'
+      fi
+    elif [ "${STUB_FLEET_PARTIAL:-}" = 1 ] && [ "${STUB_FLEET_PARTIAL_AFTER_COST:-}" != 1 ]; then
       echo '{"view":{"rows":[],"partial":true}}'
     else
       echo '{"view":{"rows":[{"id":"sp-live","state":"warm"}],"partial":false}}'
@@ -72,6 +91,8 @@ if [ "${STUB_MODE:-}" = continue ]; then
     exit 0
     ;;
   "fleet cost"*)
+    : >"$STUB_LOG.fleet-cost"
+    : >"$STUB_LOG.fleet-running-reads"
     if [ "${STUB_COST_REPORTED_FALSE:-}" = 1 ]; then
       echo '{"sprites_usage":[{"env":"sx","error":null,"rows":[{"name":"sp-live","cpu_hours":0.0,"partial":false,"reported":false}]}]}'
     else
@@ -178,6 +199,16 @@ done
 for want in "5b " "5d " "6b " "7e " "8d " "8f " "10b "; do
   if has "$T/plan-sprites-live.out" "$want"; then pass "sprites-live plan names step $want"; else fail "sprites-live plan lacks step $want"; fi
 done
+if has "$T/plan-sprites-live.out" "fails only if it stays running"; then
+  pass "sprites-live plan explains the post-cost wake gate"
+else
+  fail "sprites-live plan lacks the post-cost wake gate explanation"
+fi
+if has "$T/plan-sprites-live.out" "never secrets"; then
+  pass "sprites-live plan explains sanitized agent failures"
+else
+  fail "sprites-live plan lacks sanitized agent failure text"
+fi
 for want in " 11 " "11b " "11c " "wt rm <rd-y path> --force"; do
   if has "$T/plan-remote-daily.out" "$want"; then pass "remote-daily plan names '$want'"; else fail "remote-daily plan lacks '$want'"; fi
 done
@@ -343,6 +374,33 @@ else
   fail "sprites-live: foreign cold row ($(cat "$T/other-cold-sprites.out"))"
 fi
 
+run cost-running-once-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_FLEET_RUNNING_READS=1 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if has "$T/cost-running-once-sprites.out" "WARN 10b: the sprite read running 1 time(s)" &&
+  has "$T/cost-running-once-sprites.out" "PASS 10b"; then
+  pass "sprites-live: one post-cost running read settles with a warning"
+else
+  fail "sprites-live: one post-cost running read ($(cat "$T/cost-running-once-sprites.out"))"
+fi
+
+run cost-running-stuck-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_FLEET_RUNNING_READS=9 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if has "$T/cost-running-stuck-sprites.out" "FAIL 10b" &&
+  has "$T/cost-running-stuck-sprites.out" "stayed running"; then
+  pass "sprites-live: four post-cost running reads fail the wake gate"
+else
+  fail "sprites-live: stuck post-cost running row ($(cat "$T/cost-running-stuck-sprites.out"))"
+fi
+
+run cost-list-partial-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_FLEET_PARTIAL=1 STUB_FLEET_PARTIAL_AFTER_COST=1 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if has "$T/cost-list-partial-sprites.out" "WARN 10b: the provider listing could not be read after fleet cost; the wake check is unproven" &&
+  has "$T/cost-list-partial-sprites.out" "PASS 10b"; then
+  pass "sprites-live: an unreadable post-cost listing warns and passes"
+else
+  fail "sprites-live: partial post-cost listing ($(cat "$T/cost-list-partial-sprites.out"))"
+fi
+
 rm -f "$LOG.daemon-pid"
 run agent-daemon-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_DOCTOR="$T/tok-true.json" -- \
   "${SX[@]}" --keep-going --with-agent stubagent
@@ -359,6 +417,17 @@ if [ -n "$daemon_pid" ] &&
 else
   if [ -n "$daemon_pid" ]; then kill "$daemon_pid" 2>/dev/null || true; fi
   fail "sprites-live: --with-agent pane daemon ($(cat "$T/agent-daemon-sprites.out"))"
+fi
+
+rm -f "$LOG.daemon-pid"
+run agent-failure-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_AGENT_FAILURE=1 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going --with-agent stubagent
+if has "$T/agent-failure-sprites.out" "agent boom" &&
+  has "$T/agent-failure-sprites.out" "exit_code" &&
+  ! has "$T/agent-failure-sprites.out" "SECRET"; then
+  pass "sprites-live: agent failure summary is bounded and sanitized"
+else
+  fail "sprites-live: agent failure summary ($(cat "$T/agent-failure-sprites.out"))"
 fi
 if ! grep -Fq "thegn daemon" "$T/keep-going-sprites.log"; then
   pass "sprites-live: no pane daemon without --with-agent"
