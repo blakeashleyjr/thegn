@@ -125,14 +125,19 @@ class PtyProbe:
         with self._condition:
             return len(self.output)
 
-    def wait_for_byte(self, value: int, offset: int, deadline: float) -> float | None:
+    def wait_for_byte(
+        self, value: int, offset: int, started: float, deadline: float
+    ) -> float | None:
         while True:
             with self._condition:
                 found = self.output.find(bytes((value,)), offset)
-                if found >= 0:
+                while found >= 0:
                     for timestamp, start, end in self._chunks:
                         if start <= found < end:
-                            return timestamp
+                            if timestamp >= started:
+                                return timestamp
+                            break
+                    found = self.output.find(bytes((value,)), found + 1)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
@@ -221,7 +226,9 @@ def run_probe(
         for _ in range(samples):
             for index, value in enumerate(WORD):
                 offset, started = probe.write(bytes((value,)))
-                found = probe.wait_for_byte(value, offset, time.monotonic() + timeout)
+                found = probe.wait_for_byte(
+                    value, offset, started, time.monotonic() + min(timeout, 10.0)
+                )
                 if found is None:
                     return result(
                         "FAIL",
@@ -257,17 +264,30 @@ def run_probe(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bin", default="/bin/sh", help="thegn executable")
-    parser.add_argument("--repo", default=".", help="repository used as the child cwd")
+    parser.add_argument("--bin", default=None, help="thegn executable")
+    parser.add_argument("--repo", default=None, help="repository used as the child cwd")
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
 
+    if not args.self_test and (args.bin is None or args.repo is None):
+        print(
+            "remote_parity_tui: plan only; pass --bin BIN --repo REPO to drive the TUI, "
+            "or --self-test",
+            flush=True,
+        )
+        return 0
     if args.samples <= 0 or args.timeout <= 0:
         payload = result("FAIL", "samples and timeout must be positive")
     else:
-        payload = run_probe(args.bin, args.repo, args.samples, args.timeout, args.self_test)
+        payload = run_probe(
+            args.bin or "/bin/sh",
+            args.repo or ".",
+            args.samples,
+            args.timeout,
+            args.self_test,
+        )
     print(json.dumps(payload, separators=(",", ":")), flush=True)
     return 0 if payload["status"] in ("PASS", "SKIP") else 1
 
