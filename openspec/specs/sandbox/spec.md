@@ -115,8 +115,14 @@ and a mount whose host path is or contains a protected path SHALL refuse the
 launch. A sealed compose-backed spec SHALL be refused (compose volumes cannot be
 verified). A non-sealed local compose spec SHALL be refused before `up` when its
 effective config binds a protected host path; an uninspectable config SHALL
-launch with a warning and report host-process isolation. A kept OCI container
-SHALL be reused for a sealed spec only when it
+launch with a warning and report host-process isolation. Compose-backed OCI
+launches SHALL also be refused before Compose inspection or
+launch side effects whenever the resolved spec requests restrictions Compose
+does not apply: read-only root, no-new-privileges, PID or per-pane resource
+limits, dropped capabilities, sealed home, host or disabled networking,
+hostname filters, egress policy, a custom OCI runtime, or a VPN. A Compose
+recipe with none of those unsupported requests remains launchable. A kept OCI
+container SHALL be reused for a sealed spec only when it
 carries `thegn.seal_home=1` and binds exactly the required mounts, and a
 non-sealed spec SHALL NOT reuse a sealed container. The devenv `/nix` bind SHALL
 be tolerated only when the current spec would itself emit it. Apple containers

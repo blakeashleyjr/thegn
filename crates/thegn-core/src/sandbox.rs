@@ -1334,7 +1334,8 @@ pub fn compose_policy_refusal(spec: &SandboxSpec) -> Option<String> {
         || {
             "Compose cannot enforce the requested sandbox restrictions on OCI backends: \
          read_only_root, no_new_privileges, pids_limit, dropped capabilities, sealed home, \
-         network-none or network filters, oci_runtime, per-pane CPU/memory limits, and VPN. \
+         host or disabled networking, network filters, egress policy, oci_runtime, \
+         per-pane CPU/memory limits, and VPN. \
          Remove the conflicting restriction or Compose config."
                 .to_string()
         },
@@ -1347,9 +1348,10 @@ fn compose_cannot_enforce(spec: &SandboxSpec) -> bool {
         || spec.pids_limit.is_some()
         || !spec.drop_capabilities.is_empty()
         || spec.seal_home.is_some()
-        || spec.network == Network::None
+        || matches!(spec.network, Network::Host | Network::None)
         || !spec.network_allow.is_empty()
         || !spec.network_block.is_empty()
+        || spec.egress.is_some()
         || spec.oci_runtime.is_some()
         || spec.limits.cpu.is_some()
         || spec.limits.memory.is_some()

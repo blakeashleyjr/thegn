@@ -111,8 +111,9 @@ malformed entries are ignored with a warning and listed by
 path (the worktree being `$HOME` itself, a `~` mount) refuses the launch.
 Compose on OCI backends is refused whenever the resolved spec requests
 `read_only_root`, `no_new_privileges`, a PID limit, dropped capabilities,
-sealed home, network-none or network filters, an OCI runtime, per-pane
-CPU/memory limits, or a VPN; Compose cannot enforce those restrictions. This
+sealed home, host or disabled networking, network filters, egress policy, an
+OCI runtime, per-pane CPU/memory limits, or a VPN; Compose cannot enforce
+those restrictions. This
 applies under every profile, including `open`. Compose remains available when
 none of those restrictions is requested. Before `up`, thegn inspects the
 effective Compose config and refuses a service that binds thegn state, its
