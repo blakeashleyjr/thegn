@@ -177,6 +177,7 @@ REPO="$TMP/repo"
 SANDBOX_NAME="(unknown)"
 CREATED=0
 STEP_9_PASSED=0
+# shellcheck disable=SC2034 # appended to and read by test/lib/live.sh
 FAILED_STEPS=()
 # shellcheck disable=SC2034 # read by test/lib/live.sh
 LIVE_STARTUP=("3=create (env up)" "4=first command (vercel-exec -- true)" "8=stop (env down --stop)" "8a=resume (env up)")

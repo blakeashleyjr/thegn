@@ -225,6 +225,7 @@ AGENT_POLL_PID=""
 DAEMON_PID=""
 HOLD_ERR="$TMP/hold.err"
 STEP_11_PASSED=0
+# shellcheck disable=SC2034 # appended to and read by test/lib/live.sh
 FAILED_STEPS=()
 INTERACTIVE_OUT=""
 PULL_SHA=""
@@ -475,7 +476,7 @@ else:
         print("overshoot " + str(stopped))
     else:
         print("noout 0")
-';
+'
   })"; then
     verdict="noout 0"
     verdict_rc=1
