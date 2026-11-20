@@ -509,7 +509,7 @@ else:
             print("early " + str(stopped))
         else:
             print("noout 0")
-';
+'
   })"; then
     verdict="noout 0"
     verdict_rc=1
