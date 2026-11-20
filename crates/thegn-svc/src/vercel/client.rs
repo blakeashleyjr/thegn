@@ -1173,7 +1173,7 @@ impl VercelClient {
                 status.as_u16()
             );
         }
-        let text = self.snippet(&String::from_utf8_lossy(&body));
+        let text = self.snippet(&String::from_utf8_lossy(body));
         if text.is_empty() {
             anyhow!("{PROVIDER}: {op} returned HTTP {}", status.as_u16())
         } else {
@@ -1183,6 +1183,9 @@ impl VercelClient {
 
     async fn status_error(&self, resp: reqwest::Response, op: &str) -> anyhow::Error {
         let status = resp.status();
+        if status.is_redirection() {
+            return self.error_from(status, &[], op);
+        }
         let body = self.error_body(resp).await;
         self.error_from(status, &body, op)
     }
