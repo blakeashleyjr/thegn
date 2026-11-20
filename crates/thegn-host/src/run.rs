@@ -1657,8 +1657,11 @@ impl SidebarState {
                         .iter()
                         .filter(|r| r.visible)
                         .position(|r| {
-                            r.kind == crate::sidebar::RowKind::Worktree
-                                && r.worktree_path.as_ref() == Some(p)
+                            matches!(
+                                r.kind,
+                                crate::sidebar::RowKind::Worktree
+                                    | crate::sidebar::RowKind::PipelineWorktree
+                            ) && r.worktree_path.as_ref() == Some(p)
                         })
                 })
             };
