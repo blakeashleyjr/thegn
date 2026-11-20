@@ -1903,7 +1903,7 @@ pub(crate) async fn open_stage_dispatch(
         };
         let info = crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await?;
         confirm_opened(client, &info.id).await?;
-        Ok(info)
+        anyhow::Ok(info)
     }
     .await;
     match opened {
@@ -2382,7 +2382,7 @@ async fn resume_work(
         };
         let info = crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await?;
         confirm_opened(client, &info.id).await?;
-        Ok(info)
+        anyhow::Ok(info)
     }
     .await;
     match opened {
