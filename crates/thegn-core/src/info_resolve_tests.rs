@@ -33,8 +33,8 @@ fn fixture(config: &str, repo_overlay: Option<&str>) -> Fixture {
     }
 }
 
-fn loaded(fixture: &Fixture) -> Config {
-    Config::load_layered(&MapEnv(BTreeMap::new()), &[], Some(fixture.config.clone()))
+fn loaded(fixture: &Fixture, env: &MapEnv) -> Config {
+    Config::load_layered(env, &[], Some(fixture.config.clone()))
 }
 
 fn resolved(cfg: &Config, fixture: &Fixture, selection: &EnvSelection) -> crate::env::Environment {
@@ -60,7 +60,8 @@ fn source<'a>(fields: &'a [Field], key: &str) -> &'a Source {
 fn repo_network_is_reported_as_repo_source() {
     let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture("", Some("[sandbox]\nnetwork = \"none\"\n"));
-    let cfg = loaded(&fixture);
+    let source_env = MapEnv::default();
+    let cfg = loaded(&fixture, &source_env);
     let db = crate::db::Db::open_memory().unwrap();
     let env = resolved(&cfg, &fixture, &EnvSelection::none());
     let (fields, notes) = settings(
@@ -70,6 +71,7 @@ fn repo_network_is_reported_as_repo_source() {
         &fixture.repo,
         &fixture.worktree,
         &env,
+        &source_env,
     );
 
     assert!(notes.is_empty());
@@ -86,7 +88,8 @@ fn repo_network_is_reported_as_repo_source() {
 fn backend_uses_global_or_builtin_source() {
     let _state = crate::testenv::IsolatedState::new();
     let global_fixture = fixture("[sandbox]\nbackend = \"podman\"\n", None);
-    let global_cfg = loaded(&global_fixture);
+    let source_env = MapEnv::default();
+    let global_cfg = loaded(&global_fixture, &source_env);
     let global_db = crate::db::Db::open_memory().unwrap();
     let global_env = resolved(&global_cfg, &global_fixture, &EnvSelection::none());
     let (global_fields, _) = settings(
@@ -96,11 +99,12 @@ fn backend_uses_global_or_builtin_source() {
         &global_fixture.repo,
         &global_fixture.worktree,
         &global_env,
+        &source_env,
     );
     assert_eq!(source(&global_fields, "sandbox.backend"), &Source::Global);
 
     let builtin_fixture = fixture("", None);
-    let builtin_cfg = loaded(&builtin_fixture);
+    let builtin_cfg = loaded(&builtin_fixture, &source_env);
     let builtin_db = crate::db::Db::open_memory().unwrap();
     let builtin_env = resolved(&builtin_cfg, &builtin_fixture, &EnvSelection::none());
     let (builtin_fields, _) = settings(
@@ -110,14 +114,60 @@ fn backend_uses_global_or_builtin_source() {
         &builtin_fixture.repo,
         &builtin_fixture.worktree,
         &builtin_env,
+        &source_env,
     );
     assert_eq!(source(&builtin_fields, "sandbox.backend"), &Source::Builtin);
+}
+
+#[test]
+fn global_value_equal_to_builtin_default_uses_global_source() {
+    let _state = crate::testenv::IsolatedState::new();
+    let fixture = fixture("[sandbox]\nbackend = \"auto\"\n", None);
+    let env = MapEnv::default();
+    let cfg = Config::load_layered(&env, &[], Some(fixture.config.clone()));
+    let db = crate::db::Db::open_memory().unwrap();
+    let resolved_env = resolved(&cfg, &fixture, &EnvSelection::none());
+    let (fields, _) = settings(
+        &cfg,
+        Some(fixture.config.clone()),
+        &db,
+        &fixture.repo,
+        &fixture.worktree,
+        &resolved_env,
+        &env,
+    );
+
+    assert_eq!(source(&fields, "sandbox.backend"), &Source::Global);
+}
+
+#[test]
+fn backend_env_override_uses_env_source() {
+    let _state = crate::testenv::IsolatedState::new();
+    let fixture = fixture("[sandbox]\nbackend = \"podman\"\n", None);
+    let mut vars = BTreeMap::new();
+    vars.insert("THEGN_SANDBOX_BACKEND".into(), "docker".into());
+    let env = MapEnv(vars);
+    let cfg = Config::load_layered(&env, &[], Some(fixture.config.clone()));
+    let db = crate::db::Db::open_memory().unwrap();
+    let resolved_env = resolved(&cfg, &fixture, &EnvSelection::none());
+    let (fields, _) = settings(
+        &cfg,
+        Some(fixture.config.clone()),
+        &db,
+        &fixture.repo,
+        &fixture.worktree,
+        &resolved_env,
+        &env,
+    );
+
+    assert_eq!(source(&fields, "sandbox.backend"), &Source::Runtime);
 }
 
 #[test]
 fn loaded_value_difference_is_not_misreported_as_global() {
     let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture("[sandbox]\nbackend = \"podman\"\n", None);
+    let source_env = MapEnv::default();
     let cfg = Config::default();
     let db = crate::db::Db::open_memory().unwrap();
     let env = resolved(&cfg, &fixture, &EnvSelection::none());
@@ -128,6 +178,7 @@ fn loaded_value_difference_is_not_misreported_as_global() {
         &fixture.repo,
         &fixture.worktree,
         &env,
+        &source_env,
     );
 
     assert_eq!(source(&fields, "sandbox.backend"), &Source::LoadedDiffers);
@@ -140,7 +191,8 @@ fn worktree_and_workspace_environment_db_sources_win_in_order() {
         "[env.x]\nplacement = \"local\"\n[env.y]\nplacement = \"local\"\n",
         None,
     );
-    let cfg = loaded(&fixture);
+    let source_env = MapEnv::default();
+    let cfg = loaded(&fixture, &source_env);
     let db = crate::db::Db::open_memory().unwrap();
     db.put_workspace(&fixture.repo.to_string_lossy(), "app", "repo")
         .unwrap();
@@ -161,6 +213,7 @@ fn worktree_and_workspace_environment_db_sources_win_in_order() {
         &fixture.repo,
         &fixture.worktree,
         &workspace_env,
+        &source_env,
     );
     assert_eq!(source(&workspace_fields, ENV_NAME), &Source::WorkspaceDb);
 
@@ -180,6 +233,7 @@ fn worktree_and_workspace_environment_db_sources_win_in_order() {
         &fixture.repo,
         &fixture.worktree,
         &worktree_env,
+        &source_env,
     );
     assert_eq!(source(&worktree_fields, ENV_NAME), &Source::WorktreeDb);
 }
@@ -188,7 +242,8 @@ fn worktree_and_workspace_environment_db_sources_win_in_order() {
 fn unresolved_environment_name_is_warned() {
     let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture("", None);
-    let cfg = loaded(&fixture);
+    let source_env = MapEnv::default();
+    let cfg = loaded(&fixture, &source_env);
     let db = crate::db::Db::open_memory().unwrap();
     let env = resolved(&cfg, &fixture, &EnvSelection::named("missing"));
     let (fields, _) = settings(
@@ -198,6 +253,7 @@ fn unresolved_environment_name_is_warned() {
         &fixture.repo,
         &fixture.worktree,
         &env,
+        &source_env,
     );
 
     let environment = field(&fields, ENV_NAME);
@@ -215,7 +271,8 @@ fn workspace_gate_is_selected_and_text_secrets_are_redacted() {
         "[workspace.app.merge_queue]\ngate_command = \"TOKEN=abc just test\"\n",
         None,
     );
-    let cfg = loaded(&fixture);
+    let source_env = MapEnv::default();
+    let cfg = loaded(&fixture, &source_env);
     let db = crate::db::Db::open_memory().unwrap();
     let env = resolved(&cfg, &fixture, &EnvSelection::none());
     let (fields, _) = settings(
@@ -225,6 +282,7 @@ fn workspace_gate_is_selected_and_text_secrets_are_redacted() {
         &fixture.repo,
         &fixture.worktree,
         &env,
+        &source_env,
     );
 
     assert_eq!(
@@ -244,7 +302,8 @@ fn provider_summary_excludes_api_credentials_and_commands() {
         "[env.cloud]\nplacement = \"provider\"\n[env.cloud.provider]\nprovider = \"sprite\"\nid = \"box\"\ntemplate = \"dev\"\napi_key_env = \"TOKEN\"\nexec_command = [\"sprite\", \"exec\", \"--token\", \"abc\"]\n",
         None,
     );
-    let cfg = loaded(&fixture);
+    let source_env = MapEnv::default();
+    let cfg = loaded(&fixture, &source_env);
     let db = crate::db::Db::open_memory().unwrap();
     let env = resolved(&cfg, &fixture, &EnvSelection::named("cloud"));
     let (fields, _) = settings(
@@ -254,6 +313,7 @@ fn provider_summary_excludes_api_credentials_and_commands() {
         &fixture.repo,
         &fixture.worktree,
         &env,
+        &source_env,
     );
 
     let Shown::Value(provider) = &field(&fields, ENV_PROVIDER).shown else {
@@ -269,7 +329,8 @@ fn provider_summary_excludes_api_credentials_and_commands() {
 fn worktree_environment_does_not_report_repo_hint_as_unapplied() {
     let _state = crate::testenv::IsolatedState::new();
     let fixture = fixture("[env.x]\nplacement = \"local\"\n", Some("env = \"x\"\n"));
-    let cfg = loaded(&fixture);
+    let source_env = MapEnv::default();
+    let cfg = loaded(&fixture, &source_env);
     let db = crate::db::Db::open_memory().unwrap();
     db.set_worktree_env(&fixture.worktree.to_string_lossy(), "x")
         .unwrap();
@@ -287,6 +348,7 @@ fn worktree_environment_does_not_report_repo_hint_as_unapplied() {
         &fixture.repo,
         &fixture.worktree,
         &env,
+        &source_env,
     );
 
     assert!(!notes.iter().any(|note| note.contains("was not applied")));

@@ -1,6 +1,6 @@
 //! Effective settings for the Info screen, each with the layer that set it.
 
-use crate::config::{Config, ProcessEnv, SandboxConfig};
+use crate::config::{Config, EnvSource, SandboxConfig};
 use crate::config_resolve::Approvals;
 use crate::info_model::{Field, Source, clean, config_value_text, origin_of};
 use crate::store::{RepoTrustStore, WorkspaceStore, ZoneStore};
@@ -17,16 +17,45 @@ fn json_value<T: serde::Serialize>(value: &T) -> Value {
 }
 
 fn explain_source(
+    env: &dyn EnvSource,
     config_path: Option<&PathBuf>,
     key: &str,
     loaded: Value,
 ) -> Result<Source, String> {
-    let origin = crate::config_resolve::explain(&ProcessEnv, &[], config_path.cloned(), key)?;
+    let origin = crate::config_resolve::explain(env, &[], config_path.cloned(), key)?;
     Ok(if origin.value != loaded {
         Source::LoadedDiffers
+    } else if origin.origin == crate::config_resolve::TrustLevel::Builtin
+        && config_file_sets_key(config_path, key)
+    {
+        Source::Global
     } else {
         Source::from_trust(origin.origin)
     })
+}
+
+fn config_file_sets_key(config_path: Option<&PathBuf>, key: &str) -> bool {
+    let path = config_path.cloned().unwrap_or_else(Config::path);
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(normalized) = crate::config_compat::normalize(&body) else {
+        return false;
+    };
+    let Ok(raw) = normalized.body.parse::<toml::Value>() else {
+        return false;
+    };
+    let mut value = &raw;
+    for segment in key.split('.') {
+        let Some(table) = value.as_table() else {
+            return false;
+        };
+        let Some(next) = table.get(segment) else {
+            return false;
+        };
+        value = next;
+    }
+    true
 }
 
 fn sandbox_value(sandbox: &SandboxConfig, key: &str) -> Value {
@@ -48,6 +77,7 @@ struct Stages<'a> {
 
 fn sandbox_field(
     cfg: &Config,
+    env: &dyn EnvSource,
     config_path: Option<&PathBuf>,
     environment: &crate::env::Environment,
     key: &str,
@@ -55,7 +85,7 @@ fn sandbox_field(
     stages: &Stages<'_>,
 ) -> Result<Field, String> {
     let loaded = sandbox_value(&cfg.sandbox, key);
-    let base = explain_source(config_path, &format!("sandbox.{key}"), loaded.clone())?;
+    let base = explain_source(env, config_path, &format!("sandbox.{key}"), loaded.clone())?;
 
     let mut profile_sandbox = cfg.sandbox.clone();
     if let Some(profile) = cfg.active_profile() {
@@ -157,6 +187,7 @@ pub fn settings(
     repo_root: &Path,
     worktree: &Path,
     environment: &crate::env::Environment,
+    env: &dyn EnvSource,
 ) -> (Vec<Field>, Vec<String>) {
     let mut fields = Vec::new();
     let mut notes = Vec::new();
@@ -231,6 +262,7 @@ pub fn settings(
         Some(Source::Repo(repo_source.clone()))
     } else if worktree == repo_root && !cfg.sandbox.main_env.is_empty() {
         explain_source(
+            env,
             base_path,
             "sandbox.main_env",
             json_value(&cfg.sandbox.main_env),
@@ -238,6 +270,7 @@ pub fn settings(
         .ok()
     } else if !cfg.sandbox.default_env.is_empty() || environment.name == "default" {
         explain_source(
+            env,
             base_path,
             "sandbox.default_env",
             json_value(&cfg.sandbox.default_env),
@@ -297,7 +330,7 @@ pub fn settings(
         ("profile", "Sandbox profile"),
         ("network", "Sandbox network"),
     ] {
-        match sandbox_field(cfg, base_path, environment, key, label, &stages) {
+        match sandbox_field(cfg, env, base_path, environment, key, label, &stages) {
             Ok(field) => fields.push(field),
             Err(error) => fields.push(Field::unknown(&format!("sandbox.{key}"), label, error)),
         }
@@ -315,7 +348,7 @@ pub fn settings(
             "default_env" => cfg.sandbox.default_env.clone(),
             _ => cfg.sandbox.main_env.clone(),
         };
-        match explain_source(base_path, &format!("sandbox.{key}"), loaded) {
+        match explain_source(env, base_path, &format!("sandbox.{key}"), loaded) {
             Ok(source) => fields.push(if value.is_empty() {
                 Field::unset(&format!("sandbox.{key}"), label, source)
             } else {
@@ -341,7 +374,7 @@ pub fn settings(
 
     let agent_value = cfg.default_agent_name().map(str::to_string);
     if let Some(agent) = agent_value {
-        match explain_source(base_path, "agents", json_value(&cfg.agents)) {
+        match explain_source(env, base_path, "agents", json_value(&cfg.agents)) {
             Ok(source) => fields.push(Field::value(
                 "agents.default",
                 "Default agent",
@@ -388,6 +421,7 @@ pub fn settings(
             })
         }
         _ => match explain_source(
+            env,
             base_path,
             "merge_queue.gate_command",
             json_value(&cfg.merge_queue.gate_command),
@@ -408,7 +442,12 @@ pub fn settings(
         },
     }
 
-    match explain_source(base_path, "worktrees_dir", json_value(&cfg.worktrees_dir)) {
+    match explain_source(
+        env,
+        base_path,
+        "worktrees_dir",
+        json_value(&cfg.worktrees_dir),
+    ) {
         Ok(source) => fields.push(Field::value(
             "worktrees_dir",
             "Worktrees directory",
@@ -437,6 +476,7 @@ pub fn settings(
         Source::Repo(repo_source)
     } else {
         match explain_source(
+            env,
             base_path,
             "issues.provider",
             json_value(&cfg.issues.provider),
