@@ -304,6 +304,15 @@ Every value names the layer that set it, or says why it has none.
 Secrets and credential-bearing URLs are never shown, and error text from the
 merge queue and pull requests is redacted.
 
+### Config path and unknown values
+
+The TUI explains against the `--config` path it was started with (the default
+path when none was given). `--set` overrides are not replayed by the explain, so
+a value you set that way can show its file layer instead. A value that could not
+be read says "unknown", never "unset": a failed state-database read shows
+`unknown: state db read failed: <error>` and is marked as a warning. That
+includes the per-worktree disk size.
+
 ### Which backend would launch
 
 The backend candidates list shows each candidate's state, isolation class and

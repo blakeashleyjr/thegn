@@ -452,6 +452,7 @@ impl SidebarState {
                 if row.worktree_path.is_some() {
                     entries.push(e("copy-path", "Copy path", Some(chord_of(Id::CopyPath))));
                 }
+                entries.push(e("info", "Info…", Some(chord_of(Id::Info))));
                 // Merge-queue controls (status-aware, mirroring the panel keys).
                 // Skipped for the home row (it sits on the target branch).
                 if !is_home && row.worktree_path.is_some() {
@@ -498,6 +499,7 @@ impl SidebarState {
                     "Sort worktrees by…",
                     Some(chord_of(Id::SortMenu)),
                 ));
+                entries.push(e("info", "Info…", Some(chord_of(Id::Info))));
                 entries.push(e(
                     "toggle-flat",
                     "Flat / grouped view",
@@ -1386,6 +1388,7 @@ impl SidebarState {
                     return SidebarOutcome::CopyText(p);
                 }
             }
+            "info" => return SidebarOutcome::Synthetic(crate::keymap::Action::OpenInfo),
             "open-in-ide" => {
                 if let Some(row) = self.selected_row(model)
                     && let Some(path) = row.worktree_path.as_deref()
@@ -2007,8 +2010,13 @@ mod tests {
                 .iter()
                 .any(|entry| entry.id == "open-merge-queue")
         );
+        assert!(menu.entries.iter().any(|entry| entry.id == "info"));
 
         let mut sb = sb;
+        assert!(matches!(
+            sb.run_menu_action("info", &mut model, &crate::session::Session::default(),),
+            SidebarOutcome::Synthetic(crate::keymap::Action::OpenInfo)
+        ));
         let out = sb.run_menu_action(
             "open-merge-queue",
             &mut model,
@@ -2038,6 +2046,7 @@ mod tests {
             .menu_for_cursor(&model, &crate::session::Session::default())
             .expect("worktree menu");
         assert!(menu.entries.iter().any(|entry| entry.id == "open-in-ide"));
+        assert!(menu.entries.iter().any(|entry| entry.id == "info"));
 
         assert!(matches!(
             sb.run_menu_action(

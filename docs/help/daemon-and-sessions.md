@@ -83,16 +83,17 @@ daemon-backed; select it for the full session rollup. See [[bars]].
 `thegn session list` shows what the daemon is holding. Each row has an id
 the other verbs take:
 
-| Command                                    | What it does                                                                    |
-| ------------------------------------------ | ------------------------------------------------------------------------------- |
-| `thegn session list`                       | every live session (`--json` for scripts)                                       |
-| `thegn attach [id]`                        | grab one interactively; `Ctrl-\` detaches                                       |
-| `thegn session attach --session <id>`      | stream its output to stdout                                                     |
-| `thegn session snapshot --session <id>`    | dump its current screen (`--text` for plain rows, `--json` for geometry + ANSI) |
-| `thegn session send --session <id> <text>` | type into it (`--enter` to run)                                                 |
-| `thegn session wait --session <id>`        | block until it's `exited`, `idle`, `blocked`, `done`, or `match:<regex>`        |
-| `thegn session fork <id>`                  | start a new daemon session from a live session; `--tab` places it in a new tab  |
-| `thegn session record <id>`                | record its output to a `.cast` file; `--stop` finalizes, `--status` reports     |
+| Command                                         | What it does                                                                                        |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `thegn session list`                            | every live session (`--json` for scripts)                                                           |
+| `thegn attach [id]`                             | grab one interactively; `Ctrl-\` detaches                                                           |
+| `thegn session attach --session <id>`           | stream its output to stdout                                                                         |
+| `thegn session snapshot --session <id>`         | dump its current screen (`--text` for plain rows, `--json` for geometry + ANSI)                     |
+| `thegn session send --session <id> <text>`      | type into it (`--enter` to run)                                                                     |
+| `thegn session send --session <id> --key <KEY>` | press named keys (repeatable); `--paste` pastes text instead                                        |
+| `thegn session wait --session <id>`             | block until `exited`, `idle`, `blocked`, `done`, `match:<regex>`, `screen:<regex>` or `stable:<ms>` |
+| `thegn session fork <id>`                       | start a new daemon session from a live session; `--tab` places it in a new tab                      |
+| `thegn session record <id>`                     | record its output to a `.cast` file; `--stop` finalizes, `--status` reports                         |
 
 `session snapshot`, `session attach`, and `session wait` accept the id either positionally or with `--session`.
 
@@ -134,6 +135,36 @@ local-only — it speaks the unix socket and never dials the TCP listener.
 `session wait` is the one built for scripting: it exits 0 on match, 2 on
 timeout, and 1 if there is no daemon, so a shell script can drive a long
 build and block on it.
+
+### Driving a full-screen program
+
+`session send` types text. To press keys, use `--key` (repeatable, at most 64
+per call): `thegn session send --session <id> --key esc --key ctrl+c`. A name
+is one of `up down left right home end pgup pgdn insert delete esc enter tab
+backspace space` or `f1`…`f12`, or a single character. A single letter is a
+valid key name and its case is kept, so `G` is not `g`. Names are
+case-insensitive. Modifiers are `ctrl+`, `alt+`, `shift+` or `C-`, `M-`, `S-`,
+and combine (`ctrl+alt+x`). The keys are encoded the way the TUI itself would,
+using the pane's cursor-key mode, read from a snapshot taken just before. A
+refused key name is not echoed back.
+
+`--paste` sends the text as a paste: wrapped in the bracketed-paste markers
+when the pane asked for them, plain otherwise. Text containing the end marker
+is refused. `--paste` needs text and cannot be combined with `--key`.
+
+`session snapshot --json` reports `seq`, `rows`, `cols`, the base64 ANSI, and
+the pane's `cursor` (`row`, `col`), `alt_screen`, `app_cursor` and
+`bracketed_paste`.
+
+`session wait --until` also takes `screen:<regex>`, which matches the rendered
+screen text, and `stable:<ms>`, which holds once the snapshot `seq` has been
+unchanged for that long. The client polls every 100 ms; there is no daemon
+change. Both end when the session exits, as the daemon's own `exited` wait does.
+
+Who may type is unchanged. The CLI uses the daemon's control socket, or
+`THEGN_CONTROL_ADDR` with `THEGN_CONTROL_TOKEN`, and the daemon applies that
+token's scope and confinement. A Lead token is still refused anything but
+plain text plus Enter, so named keys cannot work for a Lead.
 
 `session fork` starts a fresh PTY from a live daemon session. It preserves the
 launch recipe and reports the parent in `forked_from`; it never clones the
