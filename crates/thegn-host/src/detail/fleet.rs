@@ -11,7 +11,7 @@
 //! forced. Orphan rows (no worktree) take no keys.
 //!
 //! Built from the loop-owned `FrameModel::fleet` snapshot only, so opening it
-//! costs no I/O; [`refresh_open`] rebuilds it in place when a new read lands
+//! costs no I/O; `refresh_open` rebuilds it in place when a new read lands
 //! (riding the `RefreshKind::Fleet` drain, no wake source of its own). A child
 //! module of `detail` so it reaches the private [`DetailOverlay`] fields.
 

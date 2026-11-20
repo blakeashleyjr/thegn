@@ -5,7 +5,7 @@
 //! process group, kills it on timeout or cancel and reaps it. Off unix there is
 //! no equivalent supervision, so validation refuses rather than run unbounded
 //! on the host. The caller (`daemon/stage_executor.rs`) stays platform-free and
-//! maps the portable [`ValidationEnd`] to its own result.
+//! maps the portable `ValidationEnd` to its own result.
 
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
