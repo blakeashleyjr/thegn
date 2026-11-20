@@ -249,6 +249,8 @@ fn stop(cfg: &Config) -> Result<()> {
                         .filter_map(|addr| match addr {
                             ControlAddr::Unix(path) => Some(path),
                             ControlAddr::Tcp { .. } | ControlAddr::HttpOrigin { .. } => None,
+                            #[cfg(feature = "iroh")]
+                            ControlAddr::Iroh { .. } => None,
                         })
                         .collect::<Vec<_>>())
                 }

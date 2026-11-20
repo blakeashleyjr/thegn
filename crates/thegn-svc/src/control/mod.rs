@@ -32,6 +32,8 @@ pub mod grpc;
 pub mod http;
 pub mod http_ci;
 pub mod http_lead;
+#[cfg(feature = "iroh")]
+pub mod iroh;
 pub mod open_fields;
 pub mod route_docs;
 pub mod route_types;

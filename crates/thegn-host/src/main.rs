@@ -781,6 +781,10 @@ pub enum Command {
         /// Port clients dial; overrides `[serve] advertise_port`.
         #[arg(long)]
         advertise_port: Option<u16>,
+        /// Enable a separate direct-only Iroh control listener; never uses relays or lookup.
+        #[cfg(feature = "iroh")]
+        #[arg(long)]
+        iroh_direct: bool,
     },
     /// Drive a running pane daemon: list sessions, send input, dump
     /// snapshots, stream output, inspect relay leases.
@@ -1358,6 +1362,14 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
         Command::Fleet { .. } => ("fleet", Feature::Providers),
+        #[cfg(feature = "iroh")]
+        Command::Serve {
+            iroh_direct: true, ..
+        } => ("serve --iroh-direct", Feature::Remote),
+        #[cfg(feature = "iroh")]
+        Command::Pair {
+            action: cmd::pair::PairAction::Direct { .. },
+        } => ("pair direct", Feature::Remote),
         _ => return None,
     })
 }
@@ -1658,6 +1670,8 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             unsafe_allow_plaintext_non_loopback,
             advertise_host,
             advertise_port,
+            #[cfg(feature = "iroh")]
+            iroh_direct,
         } => daemon::serve_blocking(
             &cfg,
             daemon::ServeOpts {
@@ -1666,6 +1680,8 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
                 unsafe_allow_plaintext_non_loopback,
                 advertise_host,
                 advertise_port,
+                #[cfg(feature = "iroh")]
+                iroh_direct,
             },
         ),
         Command::Session { action } => cmd::session::run(&cfg, action),

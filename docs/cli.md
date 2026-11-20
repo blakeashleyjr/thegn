@@ -349,6 +349,45 @@ or a unique repo basename) and:
   compositor on that workspace;
 - `--no-launch` — records the pointer/intent only (for scripts).
 
+## Direct Iroh control pairing
+
+On the server, start the foreground control service with its separate direct
+Iroh listener enabled:
+
+```sh
+thegn serve --iroh-direct --no-pair-url
+```
+
+The listener prints its stable peer ID and concrete IP socket addresses. The
+peers need a working direct IP path (for example, the same LAN with the
+relevant UDP traffic allowed). This mode does not use Tailscale, a relay,
+endpoint lookup, or the sandbox `ExecReq` transport. Existing HTTP pairing is
+unchanged.
+
+On the server, use the printed peer ID and addresses to create a protected
+invitation file. This command mints the existing scoped one-time code and
+writes it directly to an owner-only file:
+
+```sh
+thegn pair direct new --endpoint-id <peer-id> --address 192.0.2.7:12345 \\
+  --scope read --out invite.json
+```
+
+On the receiving peer, redeem the invitation from a file (or pipe it to stdin)
+and verify the saved profile with an authenticated read request:
+
+```sh
+thegn pair direct redeem home --invitation-file invite.json
+thegn pair direct me home
+```
+
+The bearer is stored through Thegn's OS keyring, with its protected secret-file
+fallback; it is not printed or accepted in argv. Profile metadata is kept in a
+private state directory. The client pins the invited peer ID and uses only the
+explicit IP addresses. Requests use the existing scoped token and revocation
+state. Revoke it on the server with `thegn pair revoke <pairing-id>`. This
+experimental surface requires the dev release channel.
+
 ## Docs + live-state endpoint for agents (`mcp serve`)
 
 `thegn mcp serve` runs thegn itself as an MCP server over stdio — a

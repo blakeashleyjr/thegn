@@ -48,6 +48,9 @@ pub enum PeerIdentity {
     LocalPipe,
     /// A daemon-internal dispatch whose caller already authenticated it.
     TrustedInternal,
+    /// An Iroh endpoint identity authenticated by the QUIC handshake.
+    /// Remote identity is auditable, but never substitutes for a bearer token.
+    IrohEndpointId(String),
     /// The platform could not authenticate this peer. Such a peer must use a
     /// normal scoped token even when implicit local admin is enabled.
     Unavailable(String),
