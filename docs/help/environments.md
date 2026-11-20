@@ -429,6 +429,16 @@ sprite allocates past it. The step passes when the process is stopped at the
 limit. It prints a WARN, not a failure, when the provider accepts the limit but
 does not enforce it inside the guest.
 
+Step 5d also reports the guest's available memory next to the policy and
+classifies the allocation as enforced, not enforced, stopped above the limit, or
+inconclusive.
+
+The live scripts print `TIME <step> <seconds> s` after each step and
+`STARTUP <label>: <seconds> s` lines at the end: cold create, first interactive
+output and wake for Sprites; create, first command, stop and resume for Vercel.
+With `--with-agent` the Sprites check starts and stops its own pane daemon for
+the agent step.
+
 ### Removing and releasing provider sandboxes
 
 - **Sprites `model_credentials`.** `[env.<n>.provider] model_credentials` is

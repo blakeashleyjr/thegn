@@ -592,6 +592,12 @@
       ]
     },
     {
+      "issue": "THE-2351",
+      "project": "Client API & Remote Access",
+      "changes": [],
+      "no_spec_rationale": "Test and documentation work with no OpenSpec change: it adds conformance cases, shared live-check helpers and a contributor page, recorded in the changelog."
+    },
+    {
       "issue": "THE-2354",
       "project": "Client API & Remote Access",
       "changes": [],

@@ -24,6 +24,20 @@ All notable changes to **thegn** are documented here. The format follows
 - Agent login sync has phase-2 allowlists for pi and hermes, skips dependency trees for every agent, and ships only top-level files for an unknown agent with more than 2,000 allowlisted files, with one warning. Hermes auth files move into phase 1.
 - The Sprites quirk that prints the tty line without its line ending is documented (THE-2450).
 
+### Added
+
+- The shared provider conformance suite gains four opt-in cases any remote provider can back: a command stream without an exit status fails; a call refused because the session stopped is retried exactly once; an unfinished listing is never reported complete; an egress allow list never widens to allow-all (THE-2351).
+- A contributor page, "Add a remote sandbox provider", lists each rule with the test or live step that enforces it.
+
+### Changed
+
+- The live checks for Sprites, Vercel and the daily remote run share one step runner and print per-step times and start-up times (THE-2351, THE-2223).
+- The Sprites memory step reports the guest's available memory and gives a clear verdict on whether the limit is enforced.
+
+### Fixed
+
+- The Sprites live check's agent step starts its own pane daemon (it failed at once before).
+
 ## [0.1.0-alpha.112] — 2026-11-20
 
 ### Changed
