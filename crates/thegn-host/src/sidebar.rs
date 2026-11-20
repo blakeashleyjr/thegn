@@ -953,7 +953,7 @@ fn push_lead_section(
         .iter()
         .position(|w| w.name == LEAD_GROUP_NAME && w.kind == crate::session::GroupKind::Terminal);
     let registered = crate::lead::group::lead_row(db_terminals).is_some();
-    let label = match live {
+    let mut label = match live {
         Some(i) => {
             let n = session.worktrees[i].tabs.len();
             format!("Lead ({n} {})", if n == 1 { "tab" } else { "tabs" })
@@ -971,7 +971,9 @@ fn push_lead_section(
                 | thegn_core::lead_bar::LeadState::Error
         )
     });
-    if let Some(state) = state {
+    if (live.is_some() || registered)
+        && let Some(state) = state
+    {
         label.push_str(&format!(
             " {} {}",
             crate::caps::active_glyphs().middot,
