@@ -3575,6 +3575,10 @@ const EXEC_CONTROL_TEXT_MAX: usize = 64 << 10;
 /// How long the exec driver keeps reading after the exit to catch a
 /// duplicate exit or late output (THE-533).
 const EXEC_EXIT_DRAIN: Duration = Duration::from_secs(2);
+/// Input with no inbound frame this long sends a WebSocket Ping.
+const EXEC_PROBE_AFTER: Duration = Duration::from_secs(5);
+/// A Ping with no inbound frame this long ends the session as dropped.
+const EXEC_PROBE_DEAD: Duration = Duration::from_secs(5);
 /// Item capacity of the provider output channels.
 const EXEC_CHANNEL_CAPACITY: usize = 256;
 /// Largest provider output item queued at once; with EXEC_CHANNEL_CAPACITY
@@ -4033,12 +4037,13 @@ impl SpritesProvider {
                     start.elapsed().as_secs()
                 ));
             };
+            // Interactive keystrokes should not wait behind Nagle, as with ssh.
             match tokio::time::timeout(
                 attempt_timeout,
                 Box::pin(tokio_tungstenite::connect_async_with_config(
                     req,
                     Some(exec_ws_config()),
-                    false,
+                    true,
                 )),
             )
             .await
@@ -4133,8 +4138,9 @@ async fn connect_proxy_ws(
     let result = tokio::time::timeout(
         deadline,
         Box::pin(async move {
+            // Interactive keystrokes should not wait behind Nagle, as with ssh.
             let (mut ws, _resp) =
-                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false)
+                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), true)
                     .await
                     .context("sprites: proxy ws connect")?;
             // The init frame selects the target; after it, the socket is a raw relay.
@@ -4220,6 +4226,8 @@ async fn drive_proxy<S>(
 /// `tty` selects the wire framing: raw bytes (PTY) vs 1-byte stream-id prefixes
 /// (non-PTY — stdin gets a `0` prefix; only stdout/exit are surfaced, while an
 /// optional stderr sink captures stream id 2).
+/// The self-calibrating liveness rule is provider-neutral and can be adopted by
+/// any WebSocket exec transport.
 async fn drive_exec<S>(
     ws: S,
     tty: bool,
@@ -4246,6 +4254,10 @@ where
     let (mut write, mut read) = ws.split();
     let mut exited = None;
     let mut drain_until = None;
+    let mut probe_at: Option<tokio::time::Instant> = None;
+    let mut probed = false;
+    let mut pong_seen = false;
+    let mut probe_disabled_logged = false;
     let mut control_closed = false;
     let mut fault = None;
 
@@ -4275,7 +4287,18 @@ where
         }};
     }
 
+    let initial_ping_failed = write
+        .send(Message::Ping(b"thegn".to_vec().into()))
+        .await
+        .is_err();
+    if initial_ping_failed {
+        tracing::debug!(target: "thegn::provider", "provider exec initial ping could not be sent");
+    }
+
     loop {
+        if initial_ping_failed {
+            break;
+        }
         tokio::select! {
             _ = async {
                 if let Some(deadline) = drain_until {
@@ -4284,6 +4307,41 @@ where
                     std::future::pending::<()>().await;
                 }
             } => break,
+            _ = async {
+                if let Some(deadline) = probe_at {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if exited.is_none() => {
+                if !pong_seen {
+                    if !probe_disabled_logged {
+                        tracing::debug!(
+                            target: "thegn::provider",
+                            "peer does not answer pings; liveness probe disabled for this connection"
+                        );
+                        probe_disabled_logged = true;
+                    }
+                    probe_at = None;
+                    probed = false;
+                } else if !probed {
+                    if write
+                        .send(Message::Ping(b"thegn".to_vec().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    probed = true;
+                    probe_at = Some(tokio::time::Instant::now() + EXEC_PROBE_DEAD);
+                } else {
+                    tracing::debug!(
+                        target: "thegn::provider",
+                        "exec socket unanswered after input; treating as dropped"
+                    );
+                    break;
+                }
+            },
             ctrl = control_rx.recv(), if !control_closed => {
                 if exited.is_some() {
                     match ctrl {
@@ -4306,6 +4364,17 @@ where
                             let frame = if tty { b } else { encode_stream_stdin(&b) };
                             if write.send(Message::Binary(frame.into())).await.is_err() {
                                 break;
+                            }
+                            if tty && !probe_disabled_logged {
+                                let now = tokio::time::Instant::now();
+                                match probe_at {
+                                    None => probe_at = Some(now + EXEC_PROBE_AFTER),
+                                    // Time spent blocked in our own send is not time the peer failed to answer.
+                                    Some(at) if at <= now => {
+                                        probe_at = Some(now + EXEC_PROBE_DEAD)
+                                    }
+                                    Some(_) => {}
+                                }
                             }
                         }
                         Some(ExecControl::Resize { cols, rows }) => {
@@ -4330,7 +4399,12 @@ where
                     }
                 }
             },
-            msg = read.next() => match msg {
+            msg = read.next() => {
+                if matches!(&msg, Some(Ok(_))) {
+                    probe_at = None;
+                    probed = false;
+                }
+                match msg {
                 Some(Ok(Message::Binary(b))) => {
                     if tracing::enabled!(target: "thegn::provider", tracing::Level::TRACE) {
                         let preview = &b[..b.len().min(64)];
@@ -4440,12 +4514,16 @@ where
                         tracing::debug!(target: "thegn::provider", "provider exec pong could not be sent");
                     }
                 }
+                Some(Ok(Message::Pong(_))) => {
+                    pong_seen = true;
+                }
                 Some(Ok(Message::Close(_))) | None => {
                     break;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(_)) => {
                     break;
+                }
                 }
             },
         }
@@ -7371,7 +7449,7 @@ mod tests {
         let mut server =
             tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
                 .await;
-        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
@@ -7482,6 +7560,241 @@ mod tests {
         }
         let fault = driver.await.unwrap();
         (frames, fault)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_probe_without_pong_keeps_a_quiet_session() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let _server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        control_tx
+            .send(ExecControl::Stdin(b"x".to_vec()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+
+        assert!(!driver.is_finished());
+        control_tx.send(ExecControl::Close).await.unwrap();
+        assert_eq!(driver.await.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_probe_after_initial_pong_ends_silent_session() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        assert!(matches!(
+            server.next().await.unwrap().unwrap(),
+            Message::Ping(_)
+        ));
+        server
+            .send(Message::Pong(b"thegn".to_vec().into()))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        control_tx
+            .send(ExecControl::Stdin(b"x".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Binary(b"x".to_vec().into())
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            server.next().await.unwrap().unwrap(),
+            Message::Ping(_)
+        ));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(driver.is_finished());
+        assert_eq!(driver.await.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_probe_is_disarmed_by_any_inbound_frame() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        assert!(matches!(
+            server.next().await.unwrap().unwrap(),
+            Message::Ping(_)
+        ));
+        server
+            .send(Message::Pong(b"thegn".to_vec().into()))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        control_tx
+            .send(ExecControl::Stdin(b"x".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Binary(vec![b'x'].into())
+        );
+        server
+            .send(Message::Binary(vec![1, b'a'].into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            frames_rx.recv().await,
+            Some(ExecFrame::Stdout(b"a".to_vec()))
+        );
+
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(!driver.is_finished());
+        assert!(
+            control_tx
+                .send(ExecControl::Stdin(b"y".to_vec()))
+                .await
+                .is_ok()
+        );
+
+        control_tx.send(ExecControl::Close).await.unwrap();
+        assert_eq!(driver.await.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_probe_answered_by_pong_keeps_a_quiet_session() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let server_task =
+            tokio::spawn(async move { while let Some(Ok(_)) = server.next().await {} });
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, true, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        control_tx
+            .send(ExecControl::Stdin(b"x".to_vec()))
+            .await
+            .unwrap();
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(!driver.is_finished());
+
+        control_tx.send(ExecControl::Close).await.unwrap();
+        assert_eq!(driver.await.unwrap(), None);
+        server_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_non_tty_never_arms_probe() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        assert!(matches!(
+            server.next().await.unwrap().unwrap(),
+            Message::Ping(_)
+        ));
+        control_tx
+            .send(ExecControl::Stdin(b"x".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Binary(vec![0, b'x'].into())
+        );
+
+        let observed = tokio::time::timeout(Duration::from_secs(60), server.next());
+        tokio::pin!(observed);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            observed.await.is_err(),
+            "non-tty exec armed a liveness probe"
+        );
+
+        control_tx.send(ExecControl::Close).await.unwrap();
+        assert_eq!(driver.await.unwrap(), None);
     }
 
     #[tokio::test]
