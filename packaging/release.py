@@ -783,7 +783,7 @@ def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
 
 
 def verify_release_asset_files(
-    entries: Mapping[str, tuple[str, int]], paths: Sequence[Path]
+    entries: Mapping[str, tuple[str, int]], paths: Sequence[Path], *, exact: bool = False
 ) -> dict[str, str]:
     verified: dict[str, str] = {}
     for path in paths:
@@ -822,6 +822,12 @@ def verify_release_asset_files(
                 f"{name} does not match the release manifest: expected {expected_digest}, got {actual_digest}"
             )
         verified[name] = actual_digest
+    if exact and set(verified) != set(entries):
+        missing = sorted(set(entries) - set(verified))
+        raise ReleaseError(
+            "release asset files do not exactly match the manifest; missing: "
+            f"{', '.join(missing) or '(none)'}"
+        )
     return verified
 
 
@@ -2473,7 +2479,7 @@ def _run(args: argparse.Namespace) -> None:
         if RELEASE_TAG_RE.fullmatch(args.tag) is None:
             raise ReleaseError(f"invalid release tag {args.tag!r}")
         entries = load_release_manifest(args.release_manifest, args.tag)
-        verified = verify_release_asset_files(entries, args.asset)
+        verified = verify_release_asset_files(entries, args.asset, exact=args.exact)
         for name in verified:
             print(f"{name}: matches the release manifest")
         return
@@ -2790,6 +2796,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_assets_parser.add_argument("--release-manifest", required=True, type=Path)
     verify_assets_parser.add_argument("--asset", required=True, type=Path, action="append")
+    verify_assets_parser.add_argument("--exact", action="store_true")
     verify_assets_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     verify_assets_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
     verify_attestation_parser = subparsers.add_parser("verify-attestation")

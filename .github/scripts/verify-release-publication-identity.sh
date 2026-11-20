@@ -11,7 +11,8 @@ manifest=${2:?usage: verify-release-publication-identity.sh <tag> <manifest>}
   exit 1
 }
 workflow_checkout_sha=$(git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD)
-[[ $workflow_checkout_sha == "${GITHUB_SHA:-}" ]] || {
+expected_workflow_sha=${EXPECTED_WORKFLOW_SHA:-${GITHUB_SHA:-}}
+[[ $workflow_checkout_sha == "$expected_workflow_sha" ]] || {
   echo 'publication helper checkout does not match the workflow revision' >&2
   exit 1
 }

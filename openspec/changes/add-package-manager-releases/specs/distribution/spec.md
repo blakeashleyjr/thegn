@@ -68,6 +68,41 @@ record names another generation.
   inventory contains duplicate names
 - **THEN** the producer refuses to upload
 
+### Requirement: Release publication is workflow-owned and serialized with producers
+
+Build, release-publication, and external-publication runs for the same tag SHALL
+share one concurrency group independent of operation and MUST NOT cancel an
+active run. The normal transition from draft to published SHALL be performed
+only by the protected `publish-release` workflow operation after it downloads
+and verifies the exact manifest asset set and rechecks the signed manifest
+against the successful release run and live annotated tag identity.
+
+A replay for an already-published release MAY succeed only after the same full
+verification and MUST make no release mutation. Missing, extra, mismatched, or
+unverifiable assets or identity MUST fail closed. The `publish-release` job
+MUST NOT upload, replace, or delete release assets. Manual GitHub UI publication
+is break-glass: an owner MUST first stop all workflow runs for the tag and MUST
+not resume or dispatch producers against the draft afterward.
+
+#### Scenario: Producer and publish operation target the same tag
+
+- **WHEN** a build and `publish-release` are dispatched for the same tag
+- **THEN** the shared tag concurrency group prevents them from executing at
+  the same time, and a producer that starts after publication refuses the
+  non-draft release
+
+#### Scenario: A verified publication is replayed
+
+- **WHEN** `publish-release` sees the exact release already published
+- **THEN** it verifies the complete asset set and release identity, then exits
+  successfully without changing the release
+
+#### Scenario: Release identity or assets fail verification
+
+- **WHEN** the signed manifest, live tag identity, or exact asset set is
+  missing or inconsistent
+- **THEN** the workflow refuses to publish
+
 ### Requirement: Release downloads have a selected aggregate byte budget
 
 Before downloading release assets, the workflow SHALL validate each selected

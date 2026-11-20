@@ -3,7 +3,7 @@
 # Trigger: push a `v*` tag (e.g. `v0.1.0-alpha.1`). Builds the `thegn` binary for
 # the supported targets and attaches per-target archives, checksums, provenance,
 # rendered manager metadata, and standalone Linux packages to a GitHub Release.
-# External manager repositories are a separate protected manual operation.
+# Release publication and external manager repositories are protected manual operations.
 # Uses taiki-e/upload-rust-binary-action, whose archive
 # naming (`thegn-<tag>-<target>.{tar.gz,zip}`) matches the `[package.metadata.
 # binstall]` pkg-url in crates/thegn-host/Cargo.toml, so a future `cargo binstall`
@@ -43,24 +43,25 @@ on:
         required: true
         type: string
       operation:
-        description: "Build a draft, or publish generated metadata after the draft is published"
+        description: "Build a draft, publish the verified release, or publish external metadata"
         required: true
         type: choice
         default: build
         options:
           - build
+          - publish-release
           - publish-external
 permissions:
   contents: read
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}-${{ inputs.operation || 'build' }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 jobs:
   # Resolve one policy-valid tag to an immutable commit before any build job
   # checks out release content. This job runs only pinned actions and inline
   # policy code; the policy/version source is checked out from protected main.
   admit:
-    if: github.event_name == 'push' || inputs.operation == 'build'
+    if: github.event_name == 'push' || inputs.operation == 'build' || inputs.operation == 'publish-release'
     runs-on: ubuntu-latest
     environment: release-admission
     permissions:
@@ -127,8 +128,8 @@ jobs:
           echo "workflow_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   # Create the draft before the read-only build legs start. The trusted upload
   # broker publishes verified artifacts here after every build leg succeeds.
-  # Draft so a maintainer writes notes by hand before publishing (RELEASING.md
-  # step 4); no `changelog:` input — notes are pasted manually.
+  # Draft so a maintainer writes notes by hand before the protected
+  # publish-release operation (RELEASING.md step 4); no changelog input.
   #
   # Re-dispatching a build resumes an existing draft without changing its
   # notes or assets, and creates a draft only when the tag has no release.
@@ -911,6 +912,68 @@ jobs:
           bash .github/scripts/upload-release-assets.sh "$manifest"
           asset_count="$(jq '.assets | length' "$manifest")"
           echo "Verified and attached $asset_count release assets in the manifest for $TAG." >> "$GITHUB_STEP_SUMMARY"
+  publish-release:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-release'
+    needs: admit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Require main-branch release approval
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          if [ "$DISPATCH_REF" != refs/heads/main ]; then
+            echo "::error::Release publication must be dispatched from the protected main branch."
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.admit.outputs.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download and verify the exact release asset set
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.admit.outputs.tag }}
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d "$RUNNER_TEMP/publish-release.XXXXXX")"
+          echo "PUBLISH_RELEASE_ROOT=$root" >> "$GITHUB_ENV"
+          release_json="$RUNNER_TEMP/publish-release.json"
+          gh release view "$TAG" --json isDraft,assets > "$release_json"
+          python3 packaging/release.py check-asset-sizes --assets-json "$release_json"
+          gh release download "$TAG" --dir "$root"
+          manifest="$root/thegn-$TAG-manifest.json"
+          [ -f "$manifest" ] || {
+            echo "::error::draft is missing its signed release manifest"
+            exit 1
+          }
+          shopt -s nullglob
+          paths=("$root"/*)
+          assets=()
+          for asset in "${paths[@]}"; do
+            [ "${asset##*/}" = "thegn-$TAG-manifest.json" ] || assets+=("$asset")
+          done
+          verify_args=(verify-assets --tag "$TAG" --release-manifest "$manifest" --exact)
+          for asset in "${assets[@]}"; do
+            verify_args+=(--asset "$asset")
+          done
+          python3 packaging/release.py "${verify_args[@]}"
+      - name: Reverify signed release identity and live tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.admit.outputs.tag }}
+          EXPECTED_WORKFLOW_SHA: ${{ needs.admit.outputs.workflow_sha }}
+        run: |
+          bash .github/scripts/verify-release-publication-identity.sh \
+            "$TAG" "$PUBLISH_RELEASE_ROOT/thegn-$TAG-manifest.json"
+      - name: Publish or confirm the verified release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.admit.outputs.tag }}
+        run: bash .github/scripts/finalize-release.sh
   # Publication is deliberately a separate manual operation. It cannot reach
   # create-release or mutate release assets. A credential-free worker renders
   # AUR metadata before isolated, separately protected publishers receive keys.
@@ -1059,10 +1122,6 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: ./.github/actions/ci-setup
-        with:
-          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
-          cache-lane: release-publication
       - name: Check Homebrew publication enablement
         id: publication
         env:

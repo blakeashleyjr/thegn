@@ -120,11 +120,82 @@ class WorkflowPolicyTests(unittest.TestCase):
                     "--source-digest \"$run_head_sha\"",
                     "verify-publication-identity",
                     '[[ ${GITHUB_REF:-} == refs/heads/main ]]',
-                    'workflow_checkout_sha == "${GITHUB_SHA:-}"',
+                    'workflow_checkout_sha == "$expected_workflow_sha"',
                     "--tag-object",
                     "--commit",
                 ):
                     self.assertIn(required, helper)
+
+    def test_publish_release_is_serialized_and_verifies_before_transition(self) -> None:
+        workflow = read_workflow("release.yml")
+        self.assertEqual("release-${{ inputs.tag || github.ref_name }}", workflow["concurrency"]["group"])
+        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertIn(
+            "publish-release",
+            triggers["workflow_dispatch"]["inputs"]["operation"]["options"],
+        )
+        job = workflow["jobs"]["publish-release"]
+        self.assertEqual("admit", job["needs"])
+        self.assertEqual({"contents": "write", "attestations": "read"}, job["permissions"])
+        steps = job["steps"]
+        names = [step.get("name", "") for step in steps]
+        inventory_index = names.index("Download and verify the exact release asset set")
+        identity_index = names.index("Reverify signed release identity and live tag")
+        publish_index = names.index("Publish or confirm the verified release")
+        self.assertLess(inventory_index, identity_index)
+        self.assertLess(identity_index, publish_index)
+        self.assertIn("--exact", steps[inventory_index]["run"])
+        self.assertIn("verify-release-publication-identity.sh", steps[identity_index]["run"])
+        self.assertIn("finalize-release.sh", steps[publish_index]["run"])
+        self.assertNotIn("gh release upload", "\n".join(step.get("run", "") for step in steps))
+        releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+        self.assertIn("Manual UI publication is break-glass only", releasing)
+        self.assertIn("stop every queued or running workflow for that tag first", releasing)
+
+    def test_release_publication_replay_is_read_only_after_verified_publish(self) -> None:
+        script = (ROOT / ".github/scripts/finalize-release.sh").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bindir = root / "bin"
+            bindir.mkdir()
+            state_path = root / "state"
+            log_path = root / "gh.log"
+            stub = bindir / "gh"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [[ "$1 $2" == "release view" ]]; then cat "$STATE_PATH"; exit 0; fi\n'
+                'if [[ "$1 $2" == "release edit" ]]; then echo edit >> "$LOG_PATH"; echo false > "$STATE_PATH"; exit 0; fi\n'
+                "exit 2\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{bindir}{os.pathsep}{environment.get('PATH', '')}",
+                    "TAG": "v1.2.3",
+                    "GITHUB_TOKEN": "fixture",
+                    "STATE_PATH": str(state_path),
+                    "LOG_PATH": str(log_path),
+                }
+            )
+            state_path.write_text("true\n", encoding="utf-8")
+            first = subprocess.run(["bash", str(ROOT / ".github/scripts/finalize-release.sh")], env=environment, check=False)
+            self.assertEqual(0, first.returncode)
+            self.assertEqual(["edit"], log_path.read_text(encoding="utf-8").splitlines())
+            second = subprocess.run(["bash", str(ROOT / ".github/scripts/finalize-release.sh")], env=environment, check=False)
+            self.assertEqual(0, second.returncode)
+            self.assertEqual(["edit"], log_path.read_text(encoding="utf-8").splitlines())
+            state_path.write_text("unknown\n", encoding="utf-8")
+            invalid = subprocess.run(["bash", str(ROOT / ".github/scripts/finalize-release.sh")], env=environment, check=False)
+            self.assertNotEqual(0, invalid.returncode)
+            self.assertEqual(["edit"], log_path.read_text(encoding="utf-8").splitlines())
+
+    def test_homebrew_publisher_does_not_receive_nix_setup_or_pat(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["publish-homebrew"]
+        self.assertFalse(any(step.get("uses") == "./.github/actions/ci-setup" for step in job["steps"]))
+        self.assertNotIn("NIX_GITHUB_TOKEN", yaml.safe_dump(job))
 
     def test_committed_known_hosts_match_published_fingerprints(self) -> None:
         known_hosts = ROOT / ".github" / "known_hosts"

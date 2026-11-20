@@ -1170,6 +1170,22 @@ class ReleaseAssetManifestTests(unittest.TestCase):
         path.write_bytes(self.content)
         self.assertEqual({self.asset: self.digest}, release.verify_release_asset_files({self.asset: (self.digest, len(self.content))}, [path]))
 
+    def test_verify_release_asset_files_exact_requires_every_manifest_entry(self) -> None:
+        path = self.temp / self.asset
+        path.write_bytes(self.content)
+        entries = {
+            self.asset: (self.digest, len(self.content)),
+            "thegn-extra.txt": (hashlib.sha256(b"x").hexdigest(), 1),
+        }
+        with self.assertRaisesRegex(release.ReleaseError, "do not exactly match"):
+            release.verify_release_asset_files(entries, [path], exact=True)
+        extra = self.temp / "thegn-extra.txt"
+        extra.write_bytes(b"x")
+        self.assertEqual(
+            {self.asset: self.digest, extra.name: hashlib.sha256(b"x").hexdigest()},
+            release.verify_release_asset_files(entries, [path, extra], exact=True),
+        )
+
     def test_verify_release_asset_files_rejects_digest_mismatch(self) -> None:
         path = self.temp / self.asset
         path.write_bytes(self.content)

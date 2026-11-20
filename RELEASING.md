@@ -127,8 +127,14 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    set, then requires every release asset to match the digest output of its
    producer. It also checks archive attestations, checksums, and the upload
    record, then attaches the deterministic `thegn-<tag>-manifest.json`. Write
-   the release notes (crib from the changelog) and publish the draft only after
-   `verify-manifest` is green and that manifest is attached.
+   After `verify-manifest` is green and the manifest is attached, write the
+   release notes in the draft, then dispatch `release.yml` from `main` with
+   `operation=publish-release` (for example,
+   `gh workflow run release.yml --ref main -f tag=v<version> -f operation=publish-release`).
+   The protected workflow downloads and verifies
+   the complete exact asset set, verifies the manifest attestation and live
+   tag identity, then publishes the draft. Build, release-publication, and
+   external-publication runs share one tag-scoped concurrency group.
    Pre-release tags (`-alpha.N` / `-beta.N`) are auto-marked as a prerelease
    by the workflow — no manual checkbox needed.
 
@@ -139,8 +145,11 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    > matches the exact local bytes; conflicting or unverifiable assets stop the
    > workflow without replacement. A fresh workflow run cannot take over a
    > draft whose release record names another run. Keep the draft notes, then
-   > use the original run for retries. A published release is never deleted;
-   > cut a new tag to rebuild a published version.
+   > use the original run for retries. Do not publish a draft from the GitHub
+   > UI during normal release work. Manual UI publication is break-glass only:
+   > stop every queued or running workflow for that tag first, then never
+   > resume or dispatch a producer against that draft. A published release is
+   > never deleted; cut a new tag to rebuild a published version.
 
    **Moving the owner's stable instance.** Once the release is PUBLISHED (not a
    draft: `releasePackage` fetches the published gnu archive), bump the tag in

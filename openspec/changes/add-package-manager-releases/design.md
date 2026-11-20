@@ -57,7 +57,15 @@ tag, source, trusted workflow revision, and workflow run ID. Failed-job retries
 within the same run can reuse exact assets; a new workflow run cannot take over
 a populated draft whose generation record belongs to another run. A same-name
 race fails closed because the final `gh release upload` has no replacement
-option. Break-glass release retraction remains separate work.
+option. The release workflow uses one tag-only concurrency group for builds,
+release publication, and external metadata publication. A protected
+`publish-release` operation verifies the downloaded exact asset set, signed
+manifest, successful producer run, and live tag identity before transitioning
+the draft. A verified replay of an already-published release is read-only.
+GitHub's UI publication cannot participate in workflow concurrency; it is
+documented as break-glass only after all runs for that tag are stopped, with no
+later producer retry against that draft. Break-glass release retraction remains
+separate work.
 
 ## Verified-before-advertised rule
 
