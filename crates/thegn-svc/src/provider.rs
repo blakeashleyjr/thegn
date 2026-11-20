@@ -3368,6 +3368,35 @@ impl StderrTail {
     }
 }
 
+/// Bounded tail (last [`STDERR_TAIL_CAP`] bytes) of a streaming exec's stderr.
+pub struct ExecStderr(StderrSink);
+
+impl ExecStderr {
+    /// The sanitized tail (controls stripped, lossy UTF-8).
+    pub fn render(&self) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .render()
+    }
+
+    /// Total stderr bytes seen.
+    pub fn total(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total
+    }
+}
+
+/// A non-tty exec whose stdout the caller streams itself (no output cap).
+pub struct StreamingExec {
+    pub session: ExecSession,
+    pub stderr: ExecStderr,
+    /// `Some(error)` when the driver ended on a protocol violation.
+    pub verdict: tokio::sync::oneshot::Receiver<Option<ExecProtocolError>>,
+}
+
 type StderrSink = Arc<Mutex<StderrTail>>;
 type ExecDone = tokio::sync::oneshot::Receiver<Option<ExecProtocolError>>;
 type CapturedExec = (ExecSession, StderrSink, ExecDone);
@@ -3601,6 +3630,8 @@ struct ExecWireStats {
     max_in: usize,
     mark_bytes: u64,
     mark_at: tokio::time::Instant,
+    consumer_wait: Duration,
+    mark_wait: Duration,
 }
 
 impl ExecWireStats {
@@ -3616,12 +3647,19 @@ impl ExecWireStats {
             max_in: 0,
             mark_bytes: 0,
             mark_at: now,
+            consumer_wait: Duration::ZERO,
+            mark_wait: Duration::ZERO,
         }
     }
 
-    /// Count one inbound message; `Some((bytes_since_mark, ms_since_mark))`
-    /// when a MiB boundary was crossed.
-    fn inbound(&mut self, len: usize, now: tokio::time::Instant) -> Option<(u64, u64)> {
+    fn waited(&mut self, duration: Duration) {
+        self.consumer_wait += duration;
+        self.mark_wait += duration;
+    }
+
+    /// Count one inbound message; `Some((bytes_since_mark, ms_since_mark,
+    /// wait_ms_since_mark))` when a MiB boundary was crossed.
+    fn inbound(&mut self, len: usize, now: tokio::time::Instant) -> Option<(u64, u64, u64)> {
         self.in_msgs += 1;
         self.in_bytes += len as u64;
         self.max_in = self.max_in.max(len);
@@ -3630,9 +3668,11 @@ impl ExecWireStats {
         }
         let bytes = self.in_bytes - self.mark_bytes;
         let ms = now.duration_since(self.mark_at).as_millis() as u64;
+        let wait_ms = self.mark_wait.as_millis() as u64;
         self.mark_bytes = self.in_bytes;
         self.mark_at = now;
-        Some((bytes, ms))
+        self.mark_wait = Duration::ZERO;
+        Some((bytes, ms, wait_ms))
     }
 
     fn outbound(&mut self, len: usize) {
@@ -3958,6 +3998,16 @@ impl SpritesProvider {
             send_initial_size(&session, spec.cols, spec.rows);
         }
         Ok(session)
+    }
+
+    pub async fn open_exec_streaming(&self, id: &str, spec: &ExecSpec) -> Result<StreamingExec> {
+        anyhow::ensure!(!spec.tty, "sprites: a streaming exec is non-tty");
+        let (session, stderr, verdict) = Box::pin(self.open_exec_capturing(id, spec)).await?;
+        Ok(StreamingExec {
+            session,
+            stderr: ExecStderr(stderr),
+            verdict,
+        })
     }
 
     async fn open_exec_capturing(&self, id: &str, spec: &ExecSpec) -> Result<CapturedExec> {
@@ -4506,11 +4556,14 @@ where
                 }
                 match msg {
                 Some(Ok(Message::Binary(b))) => {
-                    if let Some((bytes, ms)) = stats.inbound(b.len(), tokio::time::Instant::now()) {
+                    if let Some((bytes, ms, wait_ms)) =
+                        stats.inbound(b.len(), tokio::time::Instant::now())
+                    {
                         tracing::debug!(
                             target: "thegn::provider",
                             kib = bytes / 1024,
                             ms,
+                            wait_ms,
                             in_msgs = stats.in_msgs,
                             max_in = stats.max_in,
                             "sprites exec inbound MiB mark"
@@ -4529,10 +4582,14 @@ where
                     if tty {
                         if exited.is_some() {
                             protocol_fault!(ExecProtocolError::OutputAfterExit);
-                        } else if !b.is_empty()
-                            && !send_chunked(&frames_tx, b.into(), ExecFrame::Stdout).await
-                        {
-                            break;
+                        } else if !b.is_empty() {
+                            let began = tokio::time::Instant::now();
+                            let sent =
+                                send_chunked(&frames_tx, b.into(), ExecFrame::Stdout).await;
+                            stats.waited(began.elapsed());
+                            if !sent {
+                                break;
+                            }
                         }
                     } else {
                         let decoded = match decode_stream_frame(&b) {
@@ -4543,10 +4600,13 @@ where
                             StreamMsg::Stdout(d) => {
                                 if exited.is_some() {
                                     protocol_fault!(ExecProtocolError::OutputAfterExit);
-                                } else if !d.is_empty()
-                                    && !send_chunked(&frames_tx, d, ExecFrame::Stdout).await
-                                {
-                                    break;
+                                } else if !d.is_empty() {
+                                    let began = tokio::time::Instant::now();
+                                    let sent = send_chunked(&frames_tx, d, ExecFrame::Stdout).await;
+                                    stats.waited(began.elapsed());
+                                    if !sent {
+                                        break;
+                                    }
                                 }
                             }
                             StreamMsg::Exit(code) => {
@@ -4575,11 +4635,14 @@ where
                     }
                 }
                 Some(Ok(Message::Text(t))) => {
-                    if let Some((bytes, ms)) = stats.inbound(t.len(), tokio::time::Instant::now()) {
+                    if let Some((bytes, ms, wait_ms)) =
+                        stats.inbound(t.len(), tokio::time::Instant::now())
+                    {
                         tracing::debug!(
                             target: "thegn::provider",
                             kib = bytes / 1024,
                             ms,
+                            wait_ms,
                             in_msgs = stats.in_msgs,
                             max_in = stats.max_in,
                             "sprites exec inbound MiB mark"
@@ -4621,10 +4684,18 @@ where
                             if exited.is_some() {
                                 protocol_fault!(ExecProtocolError::OutputAfterExit);
                             }
-                            if !t.is_empty()
-                                && !send_chunked(&frames_tx, t.as_bytes().to_vec(), ExecFrame::Stdout).await
-                            {
-                                break;
+                            if !t.is_empty() {
+                                let began = tokio::time::Instant::now();
+                                let sent = send_chunked(
+                                    &frames_tx,
+                                    t.as_bytes().to_vec(),
+                                    ExecFrame::Stdout,
+                                )
+                                .await;
+                                stats.waited(began.elapsed());
+                                if !sent {
+                                    break;
+                                }
                             }
                         }
                         SpriteCtrl::Forward => {}
@@ -4659,6 +4730,7 @@ where
         out_msgs = stats.out_msgs,
         out_bytes = stats.out_bytes,
         max_in = stats.max_in,
+        consumer_wait_ms = stats.consumer_wait.as_millis() as u64,
         secs,
         "sprites exec wire stats"
     );
@@ -5411,6 +5483,13 @@ impl Provider {
             // The iroh reach carries interactive panes: route to the home endpoint.
             Provider::Iroh { home, .. } => home.open_exec(id, spec.clone()).await,
             _ => Err(anyhow!("provider '{}' has no native exec API", self.name())),
+        }
+    }
+
+    pub async fn open_exec_streaming(&self, id: &str, spec: &ExecSpec) -> Result<StreamingExec> {
+        match self {
+            Provider::Sprites(p) => p.open_exec_streaming(id, spec).await,
+            _ => Err(anyhow!("provider '{}' has no streaming exec", self.name())),
         }
     }
 
@@ -7594,7 +7673,7 @@ mod tests {
         assert_eq!(stats.inbound(half_mib, start), None);
         assert_eq!(
             stats.inbound(half_mib, later),
-            Some((ExecWireStats::MARK, 37))
+            Some((ExecWireStats::MARK, 37, 0))
         );
         assert_eq!(stats.inbound(half_mib, later), None);
         assert_eq!(stats.in_msgs, 3);
@@ -7604,6 +7683,44 @@ mod tests {
         stats.outbound(17);
         assert_eq!(stats.out_msgs, 1);
         assert_eq!(stats.out_bytes, 17);
+    }
+
+    #[tokio::test]
+    async fn streaming_exec_refuses_a_tty_spec() {
+        let provider = sprites();
+        let spec = ExecSpec {
+            argv: vec!["/bin/true".into()],
+            tty: true,
+            cols: 80,
+            rows: 24,
+            env: Vec::new(),
+            cwd: None,
+        };
+        let result = provider.open_exec_streaming("sprite", &spec).await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a tty spec must be refused"),
+        };
+        assert_eq!(error.to_string(), "sprites: a streaming exec is non-tty");
+    }
+
+    #[test]
+    fn exec_wire_stats_accumulates_consumer_wait() {
+        let start = tokio::time::Instant::now();
+        let mut stats = ExecWireStats::new(start);
+
+        stats.waited(Duration::from_millis(7));
+        assert_eq!(
+            stats.inbound(ExecWireStats::MARK as usize, start),
+            Some((ExecWireStats::MARK, 0, 7))
+        );
+        stats.waited(Duration::from_millis(11));
+        assert_eq!(
+            stats.inbound(ExecWireStats::MARK as usize, start),
+            Some((ExecWireStats::MARK, 0, 11))
+        );
+        assert_eq!(stats.consumer_wait, Duration::from_millis(18));
+        assert_eq!(stats.mark_wait, Duration::ZERO);
     }
 
     #[tokio::test]
