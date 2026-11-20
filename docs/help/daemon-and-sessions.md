@@ -95,6 +95,13 @@ the other verbs take:
 | `thegn session fork <id>`                       | start a new daemon session from a live session; `--tab` places it in a new tab                      |
 | `thegn session record <id>`                     | record its output to a `.cast` file; `--stop` finalizes, `--status` reports                         |
 
+`session open` prints an id only for a session the daemon holds: it confirms
+the id against the session list first (one extra round trip). A stage-launch
+replay whose session the daemon no longer knows is refused as a conflict rather
+than answered with the stale id. `session attach` exits non-zero when the
+session vanished; it exits zero only after seeing the session exit, or when the
+daemon lists it as exited.
+
 `session snapshot`, `session attach`, and `session wait` accept the id either positionally or with `--session`.
 
 Session output replaces terminal control and invisible formatting characters
