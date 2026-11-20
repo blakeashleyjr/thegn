@@ -1,8 +1,9 @@
 //! `HostSource` — the zero-dependency datasource backing the built-in Observe
-//! dashboard. It samples the local machine's CPU/mem/load with the host's own
-//! [`thegn_metrics::StatsSampler`] on a dedicated thread (the sampler is
-//! blocking, stateful, and primes a CPU delta over two reads — so it can never
-//! touch the UI thread), keeps a rolling ring of recent snapshots, and answers
+//! dashboard. It either samples the local machine's CPU/mem/load with the
+//! host's own [`thegn_metrics::StatsSampler`] on a dedicated thread, or reads
+//! samples pushed by a host-owned [`HostFeed`]. The sampler is blocking,
+//! stateful, and primes a CPU delta over two reads — so it can never touch the
+//! UI thread. Both modes keep a rolling ring of recent snapshots and answer
 //! queries by slicing that ring into a [`Frame`].
 //!
 //! Recognized exprs: `host_cpu_pct`, `host_mem_used` (GiB), `host_load1`.
@@ -30,25 +31,77 @@ const COVERAGE_SLACK_SECS: f64 = 2.0;
 /// One nominal sampling interval plus the same tolerance used for leading
 /// coverage. Larger intervals between retained samples indicate a hole.
 const MAX_SAMPLE_GAP_SECS: f64 = 1.0 + COVERAGE_SLACK_SECS;
+/// Fed samples closer than this to the newest retained one are dropped, so
+/// RING_CAP still covers RETENTION_SECS at any feed cadence.
+const MIN_FEED_SPACING_SECS: f64 = 1.0;
 
 #[derive(Clone, Copy)]
 struct HostSample {
     cpu_pct: Option<u8>,
     mem_used: Option<f32>,
     load1: Option<f32>,
+    max_gap_secs: f32,
 }
 
-impl From<&StatsSnapshot> for HostSample {
-    fn from(snapshot: &StatsSnapshot) -> Self {
+impl HostSample {
+    fn new(snapshot: &StatsSnapshot, max_gap_secs: f64) -> Self {
         Self {
             cpu_pct: snapshot.cpu_pct,
             mem_used: snapshot.mem_gib.map(|(used, _total)| used),
             load1: snapshot.load_avg.map(|(one, _, _)| one),
+            max_gap_secs: max_gap_secs as f32,
         }
     }
 }
 
 type Ring = Arc<Mutex<VecDeque<(f64, HostSample)>>>;
+
+/// A cloneable handle a host pushes its own stats samples into. A source built
+/// with [`HostSource::fed`] reads the same ring and runs no sampler thread.
+#[derive(Clone, Default)]
+pub struct HostFeed {
+    ring: Ring,
+}
+
+impl HostFeed {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push one sample taken at `ts_secs` (Unix seconds). `cadence_secs` is
+    /// the producer's interval for this sample; it sets the gap tolerance
+    /// before it. Samples under [`MIN_FEED_SPACING_SECS`] after the newest
+    /// retained one are dropped.
+    pub fn push(&self, ts_secs: f64, snap: &StatsSnapshot, cadence_secs: f64) {
+        if let Ok(mut r) = self.ring.lock() {
+            if r.back().is_some_and(|(last, _)| {
+                ts_secs >= *last && ts_secs - *last < MIN_FEED_SPACING_SECS
+            }) {
+                return;
+            }
+            admit_sample(
+                &mut r,
+                ts_secs,
+                HostSample::new(snap, fed_max_gap_secs(cadence_secs)),
+            );
+        }
+    }
+
+    /// Drop all retained samples and free the ring's storage.
+    pub fn clear(&self) {
+        if let Ok(mut r) = self.ring.lock() {
+            *r = VecDeque::new();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ring.lock().map(|r| r.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 pub struct HostSource {
     ring: Ring,
@@ -168,6 +221,18 @@ impl HostSource {
         })
     }
 
+    /// A source over a host-fed ring: no worker thread, `set_active` is a no-op.
+    pub fn fed(feed: &HostFeed) -> Self {
+        Self {
+            ring: feed.ring.clone(),
+            stop: Arc::new(AtomicBool::new(false)),
+            parked: Arc::new(AtomicBool::new(false)),
+            in_park: Arc::new(AtomicBool::new(false)),
+            exited: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }
+    }
+
     /// Build a frame using the current host wall clock as the live-clock bound.
     fn frame_for(&self, expr: &str, range: &gtui_core::datasource::TimeRange) -> Frame {
         self.frame_for_at(expr, range, now_secs())
@@ -204,7 +269,10 @@ impl HostSource {
         let coverage = if recognized {
             match self.ring.lock() {
                 Ok(r) => {
-                    let mut coverage = coverage_for(r.front().map(|(ts, _)| *ts), from);
+                    let slack = r.front().map_or(COVERAGE_SLACK_SECS, |(_, s)| {
+                        (f64::from(s.max_gap_secs) - 1.0).max(COVERAGE_SLACK_SECS)
+                    });
+                    let mut coverage = coverage_for(r.front().map(|(ts, _)| *ts), from, slack);
                     // Samples are sorted; both UTC endpoints are inclusive.
                     let start = r.partition_point(|(ts, _)| *ts < from);
                     let end = r.partition_point(|(ts, _)| *ts <= to);
@@ -222,16 +290,21 @@ impl HostSource {
                             && last_point.is_some_and(|last| effective_end > last))
                         .then_some(effective_end)
                     };
+                    let trailing_gap = r
+                        .get(end)
+                        .or(r.back())
+                        .map_or(MAX_SAMPLE_GAP_SECS, |(_, s)| f64::from(s.max_gap_secs));
                     let has_gap = has_interior_gap(
                         std::iter::once(from)
                             .filter(|_| sample_start > 0)
+                            .map(|point| (point, MAX_SAMPLE_GAP_SECS))
                             .chain(
                                 r.iter()
                                     .skip(sample_start)
                                     .take(end - sample_start)
-                                    .map(|(ts, _)| *ts),
+                                    .map(|(ts, s)| (*ts, f64::from(s.max_gap_secs))),
                             )
-                            .chain(trailing_point),
+                            .chain(trailing_point.map(|point| (point, trailing_gap))),
                     );
                     if has_gap && matches!(coverage, Coverage::Complete) {
                         coverage = Coverage::Partial {
@@ -326,6 +399,10 @@ fn now_secs() -> f64 {
 /// window. Samples newer than `ts` are discarded after a backward clock step;
 /// equal timestamps retain arrival order.
 fn admit(ring: &mut VecDeque<(f64, HostSample)>, ts: f64, snap: StatsSnapshot) {
+    admit_sample(ring, ts, HostSample::new(&snap, MAX_SAMPLE_GAP_SECS));
+}
+
+fn admit_sample(ring: &mut VecDeque<(f64, HostSample)>, ts: f64, sample: HostSample) {
     let cutoff = ts - RETENTION_SECS;
     while ring
         .front()
@@ -337,7 +414,7 @@ fn admit(ring: &mut VecDeque<(f64, HostSample)>, ts: f64, snap: StatsSnapshot) {
         ring.pop_back();
     }
     let index = ring.partition_point(|(sample_ts, _)| *sample_ts <= ts);
-    ring.insert(index, (ts, HostSample::from(&snap)));
+    ring.insert(index, (ts, sample));
     while ring.len() > RING_CAP {
         ring.pop_front();
     }
@@ -349,9 +426,20 @@ fn timestamp_secs(now: SystemTime) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn coverage_for(front: Option<f64>, from: f64) -> Coverage {
+/// Gap tolerance for a fed sample: two feed intervals (one missed beat plus
+/// ticker jitter) plus the coverage slack, never tighter than the 1 Hz one.
+fn fed_max_gap_secs(cadence_secs: f64) -> f64 {
+    let cadence = if cadence_secs.is_finite() {
+        cadence_secs.max(MIN_FEED_SPACING_SECS)
+    } else {
+        MIN_FEED_SPACING_SECS
+    };
+    (2.0 * cadence + COVERAGE_SLACK_SECS).max(MAX_SAMPLE_GAP_SECS)
+}
+
+fn coverage_for(front: Option<f64>, from: f64, slack: f64) -> Coverage {
     match front {
-        Some(retained_from) if retained_from <= from + COVERAGE_SLACK_SECS => Coverage::Complete,
+        Some(retained_from) if retained_from <= from + slack => Coverage::Complete,
         Some(retained_from) => Coverage::Partial {
             retained_from: Some(retained_from),
         },
@@ -361,11 +449,11 @@ fn coverage_for(front: Option<f64>, from: f64) -> Coverage {
     }
 }
 
-fn has_interior_gap(points: impl IntoIterator<Item = f64>) -> bool {
+fn has_interior_gap(points: impl IntoIterator<Item = (f64, f64)>) -> bool {
     let mut previous = None;
-    for point in points {
+    for (point, max_gap) in points {
         if let Some(previous) = previous
-            && point - previous > MAX_SAMPLE_GAP_SECS
+            && point - previous > max_gap
         {
             return true;
         }
@@ -385,6 +473,17 @@ mod tests {
             from: chrono::DateTime::from_timestamp(from, 0).unwrap(),
             to: chrono::DateTime::from_timestamp(to, 0).unwrap(),
         }
+    }
+
+    fn push_cpu(feed: &HostFeed, ts: f64, cpu: u8, cadence_secs: f64) {
+        feed.push(
+            ts,
+            &StatsSnapshot {
+                cpu_pct: Some(cpu),
+                ..Default::default()
+            },
+            cadence_secs,
+        );
     }
 
     fn admit_cpu_range(source: &HostSource, ranges: &[std::ops::RangeInclusive<i64>]) {
@@ -650,8 +749,20 @@ mod tests {
     #[test]
     fn interior_gap_boundary_is_strict() {
         for (points, expected) in [
-            (vec![10.0, 10.0 + MAX_SAMPLE_GAP_SECS], false),
-            (vec![10.0, 10.0 + MAX_SAMPLE_GAP_SECS + 0.000_001], true),
+            (
+                vec![
+                    (10.0, MAX_SAMPLE_GAP_SECS),
+                    (10.0 + MAX_SAMPLE_GAP_SECS, MAX_SAMPLE_GAP_SECS),
+                ],
+                false,
+            ),
+            (
+                vec![
+                    (10.0, MAX_SAMPLE_GAP_SECS),
+                    (10.0 + MAX_SAMPLE_GAP_SECS + 0.000_001, MAX_SAMPLE_GAP_SECS),
+                ],
+                true,
+            ),
         ] {
             assert_eq!(has_interior_gap(points), expected);
         }
@@ -681,19 +792,181 @@ mod tests {
 
     #[test]
     fn coverage_slack_boundary_is_inclusive() {
-        assert_eq!(coverage_for(Some(102.0), 100.0), Coverage::Complete);
         assert_eq!(
-            coverage_for(Some(102.000_001), 100.0),
+            coverage_for(Some(102.0), 100.0, COVERAGE_SLACK_SECS),
+            Coverage::Complete
+        );
+        assert_eq!(
+            coverage_for(Some(102.000_001), 100.0, COVERAGE_SLACK_SECS),
             Coverage::Partial {
                 retained_from: Some(102.000_001)
             }
         );
         assert_eq!(
-            coverage_for(None, 100.0),
+            coverage_for(None, 100.0, COVERAGE_SLACK_SECS),
             Coverage::Partial {
                 retained_from: None
             }
         );
+    }
+
+    #[test]
+    fn fed_source_runs_no_worker_and_reads_pushed_samples() {
+        let feed = HostFeed::new();
+        let source = HostSource::fed(&feed);
+        assert!(source.worker.is_none());
+        source.set_active(false);
+        source.set_active(true);
+        push_cpu(&feed, 100.0, 7, 2.0);
+        push_cpu(&feed, 102.0, 9, 2.0);
+
+        let frame = source.frame_for_at("host_cpu_pct", &range(100, 102), 102.0);
+        assert_eq!(frame.fields[0].floats(), &[100.0, 102.0]);
+        assert_eq!(frame.fields[1].floats(), &[7.0, 9.0]);
+        assert_eq!(frame.coverage, Coverage::Complete);
+    }
+
+    #[test]
+    fn fed_samples_pushed_before_the_source_exists_are_visible() {
+        let feed = HostFeed::new();
+        for ts in 100..=110 {
+            push_cpu(&feed, ts as f64, ts as u8, 1.0);
+        }
+        let source = HostSource::fed(&feed);
+        let frame = source.frame_for_at("host_cpu_pct", &range(100, 110), 110.0);
+        assert_eq!(frame.fields[0].len(), 11);
+        assert_eq!(frame.coverage, Coverage::Complete);
+    }
+
+    #[test]
+    fn fed_cadence_widens_gap_tolerance_but_flags_real_holes() {
+        let feed = HostFeed::new();
+        for ts in (100..=130).step_by(2) {
+            push_cpu(&feed, ts as f64, ts as u8, 2.0);
+        }
+        let source = HostSource::fed(&feed);
+        assert_eq!(
+            source.frame_for_at("host_cpu_pct", &range(100, 130), 130.0).coverage,
+            Coverage::Complete
+        );
+
+        let wide_feed = HostFeed::new();
+        for ts in (100..=200).step_by(10) {
+            push_cpu(&wide_feed, ts as f64, ts as u8, 10.0);
+        }
+        let wide_source = HostSource::fed(&wide_feed);
+        assert_eq!(
+            wide_source
+                .frame_for_at("host_cpu_pct", &range(100, 200), 200.0)
+                .coverage,
+            Coverage::Complete
+        );
+
+        let hole_feed = HostFeed::new();
+        for ts in (100..=120).step_by(2) {
+            push_cpu(&hole_feed, ts as f64, ts as u8, 2.0);
+        }
+        for ts in (160..=170).step_by(2) {
+            push_cpu(&hole_feed, ts as f64, ts as u8, 2.0);
+        }
+        let hole_source = HostSource::fed(&hole_feed);
+        assert_eq!(
+            hole_source
+                .frame_for_at("host_cpu_pct", &range(100, 170), 170.0)
+                .coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 200), 135.0)
+                .coverage,
+            Coverage::Complete
+        );
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 200), 140.0)
+                .coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+    }
+
+    #[test]
+    fn fed_cadence_change_uses_each_samples_tolerance() {
+        let feed = HostFeed::new();
+        for (ts, cadence) in [(100.0, 2.0), (102.0, 2.0), (104.0, 2.0)] {
+            push_cpu(&feed, ts, ts as u8, cadence);
+        }
+        for (ts, cadence) in [(114.0, 10.0), (124.0, 10.0)] {
+            push_cpu(&feed, ts, ts as u8, cadence);
+        }
+        let source = HostSource::fed(&feed);
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 124), 124.0)
+                .coverage,
+            Coverage::Complete
+        );
+        push_cpu(&feed, 134.0, 134, 2.0);
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 134), 134.0)
+                .coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+    }
+
+    #[test]
+    fn fed_push_keeps_at_most_one_sample_per_second() {
+        let feed = HostFeed::new();
+        for i in 0..=20 {
+            push_cpu(&feed, 100.0 + i as f64 * 0.5, i as u8, 0.5);
+        }
+        assert_eq!(feed.len(), 11);
+    }
+
+    #[test]
+    fn fed_ring_stays_bounded() {
+        let feed = HostFeed::new();
+        for ts in 0..(RING_CAP as i64 + 10) {
+            push_cpu(&feed, ts as f64, ts as u8, 1.0);
+        }
+        assert_eq!(feed.len(), RING_CAP);
+    }
+
+    #[test]
+    fn clearing_the_feed_empties_the_shared_source() {
+        let feed = HostFeed::new();
+        push_cpu(&feed, 100.0, 7, 1.0);
+        let source = HostSource::fed(&feed);
+        feed.clear();
+        assert!(feed.is_empty());
+        assert_eq!(
+            source.frame_for("host_cpu_pct", &range(100, 110)).coverage,
+            Coverage::Partial {
+                retained_from: None
+            }
+        );
+    }
+
+    #[test]
+    fn fed_gap_tolerance_table() {
+        for (cadence, expected) in [
+            (0.5, 4.0),
+            (1.0, 4.0),
+            (2.0, 6.0),
+            (10.0, 22.0),
+            (f64::NAN, 4.0),
+            (f64::INFINITY, 4.0),
+        ] {
+            assert_eq!(fed_max_gap_secs(cadence), expected);
+        }
     }
 
     #[test]
