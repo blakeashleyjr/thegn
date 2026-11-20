@@ -125,8 +125,10 @@ impl VanishedTabs {
 
 static RECONCILIATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// Groups (path, epoch) this process already decided to keep; re-probed only
-/// when the epoch changes.
-static SETTLED_GROUPS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+/// when the epoch changes, or when a git-kept group reaches its reprobe deadline.
+static SETTLED_GROUPS: OnceLock<Mutex<HashMap<String, (u64, Option<std::time::Instant>)>>> =
+    OnceLock::new();
+const GIT_KEPT_REPROBE: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct ReconciliationCompletionGuard;
 
@@ -205,7 +207,8 @@ fn sample_vanished_tabs(
         Vec<thegn_core::models::WorkspaceRow>,
     )>,
     mut git_unlisted: impl FnMut(&str, Option<&str>) -> bool,
-    settled_groups: &Mutex<HashMap<String, u64>>,
+    settled_groups: &Mutex<HashMap<String, (u64, Option<std::time::Instant>)>>,
+    now: std::time::Instant,
 ) -> anyhow::Result<Vec<String>> {
     let current = groups
         .iter()
@@ -216,13 +219,22 @@ fn sample_vanished_tabs(
     let mut settled = settled_groups
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    settled.retain(|path, epoch| current.contains(&(path.as_str(), *epoch)));
-    let missing: Vec<&VanishedGroup> = groups
+    settled.retain(|path, (epoch, _)| current.contains(&(path.as_str(), *epoch)));
+    let missing: Vec<(&VanishedGroup, PathState)> = groups
         .iter()
-        .filter(|group| settled.get(&group.path) != Some(&group.epoch))
-        .filter(|group| {
-            Path::new(&group.path).is_absolute()
-                && path_state(&group.path) != PathState::Checkout
+        .filter_map(|group| {
+            if matches!(
+                settled.get(&group.path),
+                Some((epoch, deadline))
+                    if *epoch == group.epoch && deadline.is_none_or(|deadline| now < deadline)
+            ) {
+                return None;
+            }
+            if !Path::new(&group.path).is_absolute() {
+                return None;
+            }
+            let state = path_state(&group.path);
+            (state != PathState::Checkout).then_some((group, state))
         })
         .collect();
     if missing.is_empty() {
@@ -233,34 +245,30 @@ fn sample_vanished_tabs(
     let mut unregistered_reaped = 0;
     let mut unregistered_kept = 0;
     let mut first_unregistered_path = None;
-    for group in missing {
+    for (group, state) in missing {
         let path = &group.path;
         let is_workspace_root = workspaces
             .iter()
             .any(|workspace| workspace.repo_path == *path);
         match rows.iter().find(|row| row.worktree == *path) {
-            Some(row) if row.location.is_empty() || row.location == "local" => {
-                match path_state(path) {
-                    PathState::Missing => gone.push(path.clone()),
-                    PathState::Remnant => {
-                        if git_unlisted(path, Some(&row.repo_root)) {
-                            gone.push(path.clone());
-                        } else {
-                            settled.insert(path.clone(), group.epoch);
-                        }
-                    }
-                    PathState::Checkout => {
-                        settled.insert(path.clone(), group.epoch);
+            Some(row) if row.location.is_empty() || row.location == "local" => match state {
+                PathState::Missing => gone.push(path.clone()),
+                PathState::Remnant => {
+                    if git_unlisted(path, Some(row.repo_root.as_str())) {
+                        gone.push(path.clone());
+                    } else {
+                        settled.insert(path.clone(), (group.epoch, Some(now + GIT_KEPT_REPROBE)));
                     }
                 }
-            }
+                PathState::Checkout => {}
+            },
             Some(_) => {
                 tracing::debug!(path, "skipping vanished-tab probe for remote worktree");
-                settled.insert(path.clone(), group.epoch);
+                settled.insert(path.clone(), (group.epoch, None));
             }
             None if is_workspace_root => {
-                if path_state(path) == PathState::Remnant {
-                    settled.insert(path.clone(), group.epoch);
+                if state == PathState::Remnant {
+                    settled.insert(path.clone(), (group.epoch, None));
                 } else {
                     gone.push(path.clone());
                 }
@@ -278,7 +286,7 @@ fn sample_vanished_tabs(
                 if is_unlisted {
                     gone.push(path.clone());
                 } else {
-                    settled.insert(path.clone(), group.epoch);
+                    settled.insert(path.clone(), (group.epoch, Some(now + GIT_KEPT_REPROBE)));
                 }
             }
         }
@@ -292,6 +300,21 @@ fn sample_vanished_tabs(
         );
     }
     Ok(gone)
+}
+
+fn git_confirms_unlisted(
+    branch_paths: &HashSet<String>,
+    session_root: Option<&str>,
+    path: &str,
+    row_root: Option<&str>,
+    cache: &mut HashMap<String, Option<Vec<String>>>,
+) -> bool {
+    branch_paths.contains(path)
+        && !crate::hydrate::row_is_git_listed(
+            session_root.or(row_root).unwrap_or_default(),
+            path,
+            cache,
+        )
 }
 
 /// Apply the lifecycle policy for one worktree branch in response to `event`.
@@ -1212,12 +1235,16 @@ pub(crate) fn spawn_reconcile_removed_tabs(
                 Ok((rows, workspaces))
             },
             |path, row_root| {
-                branch_paths.contains(path) && {
-                    let root = session_root.as_deref().or(row_root).unwrap_or_default();
-                    !crate::hydrate::row_is_git_listed(root, path, &mut git_cache)
-                }
+                git_confirms_unlisted(
+                    &branch_paths,
+                    session_root.as_deref(),
+                    path,
+                    row_root,
+                    &mut git_cache,
+                )
             },
             settled,
+            std::time::Instant::now(),
         );
         let gone = match sample {
             Ok(gone) => gone,
@@ -1343,6 +1370,7 @@ mod tests {
             || anyhow::bail!("injected database open failure"),
             |_, _| false,
             &remote,
+            std::time::Instant::now(),
         );
         assert!(sample.is_err());
         assert!(
@@ -1381,6 +1409,7 @@ mod tests {
                 },
                 |_, _| false,
                 &remote,
+                std::time::Instant::now(),
             );
             assert_eq!(sample.unwrap(), Vec::<String>::new());
         }
@@ -1406,6 +1435,7 @@ mod tests {
             || Ok((db.worktrees()?, db.workspaces()?)),
             |_, _| false,
             &remote,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert!(gone.is_empty());
@@ -1432,6 +1462,7 @@ mod tests {
             },
             |_, _| false,
             &remote,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert!(sample.is_empty());
@@ -1462,6 +1493,7 @@ mod tests {
             },
             |_, _| false,
             &remote,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert!(first.is_empty());
@@ -1477,6 +1509,7 @@ mod tests {
             },
             |_, _| false,
             &remote,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert!(second.is_empty());
@@ -1492,6 +1525,7 @@ mod tests {
             },
             |_, _| false,
             &remote,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert!(third.is_empty());
@@ -1536,6 +1570,7 @@ mod tests {
             || Ok((db.worktrees()?, db.workspaces()?)),
             |_, _| false,
             &remote,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert_eq!(gone, [gone_worktree.to_string_lossy().into_owned()]);
@@ -1579,6 +1614,7 @@ mod tests {
             || Ok((db.worktrees()?, db.workspaces()?)),
             |_, _| false,
             &remote,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert_eq!(gone, [gone_worktree.to_string_lossy().into_owned()]);
@@ -1597,6 +1633,7 @@ mod tests {
             || Ok((Vec::new(), Vec::new())),
             |_, _| true,
             &settled,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert_eq!(gone, ["/missing/feature"]);
@@ -1611,6 +1648,7 @@ mod tests {
         let settled = Mutex::new(HashMap::new());
         let loads = std::cell::Cell::new(0);
         let git_calls = std::cell::Cell::new(0);
+        let now = std::time::Instant::now();
         let sample = |groups: &[VanishedGroup]| {
             sample_vanished_tabs(
                 groups,
@@ -1624,6 +1662,7 @@ mod tests {
                     false
                 },
                 &settled,
+                now,
             )
         };
         assert!(sample(&groups).unwrap().is_empty());
@@ -1636,6 +1675,45 @@ mod tests {
             epoch: 2,
         }];
         assert!(sample(&new_epoch).unwrap().is_empty());
+        assert_eq!(loads.get(), 2);
+        assert_eq!(git_calls.get(), 2);
+    }
+
+    #[test]
+    fn git_kept_group_is_reprobed_after_the_deadline() {
+        let groups = [VanishedGroup {
+            path: "/listed/feature".into(),
+            epoch: 1,
+        }];
+        let settled = Mutex::new(HashMap::new());
+        let loads = std::cell::Cell::new(0);
+        let git_calls = std::cell::Cell::new(0);
+        let now = std::time::Instant::now();
+        let sample = |now| {
+            sample_vanished_tabs(
+                &groups,
+                |_| PathState::Missing,
+                || {
+                    loads.set(loads.get() + 1);
+                    Ok((Vec::new(), Vec::new()))
+                },
+                |_, _| {
+                    git_calls.set(git_calls.get() + 1);
+                    git_calls.get() > 1
+                },
+                &settled,
+                now,
+            )
+        };
+
+        assert!(sample(now).unwrap().is_empty());
+        assert_eq!(loads.get(), 1);
+        assert_eq!(git_calls.get(), 1);
+
+        assert_eq!(
+            sample(now + std::time::Duration::from_secs(61)).unwrap(),
+            ["/listed/feature"]
+        );
         assert_eq!(loads.get(), 2);
         assert_eq!(git_calls.get(), 2);
     }
@@ -1660,6 +1738,7 @@ mod tests {
             || Ok((db.worktrees()?, db.workspaces()?)),
             |_, _| false,
             &settled,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert!(kept.is_empty());
@@ -1673,6 +1752,7 @@ mod tests {
             || Ok((db.worktrees()?, db.workspaces()?)),
             |_, _| true,
             &settled,
+            std::time::Instant::now(),
         )
         .unwrap();
         assert_eq!(gone, [remnant_s]);
@@ -1702,6 +1782,7 @@ mod tests {
                     false
                 },
                 &settled,
+                std::time::Instant::now(),
             )
             .unwrap();
             assert!(kept.is_empty());
@@ -1730,6 +1811,7 @@ mod tests {
             || Ok((db.worktrees()?, db.workspaces()?)),
             |_, _| panic!("missing registered rows do not need git confirmation"),
             &Mutex::new(HashMap::new()),
+            std::time::Instant::now(),
         )
         .unwrap();
         assert_eq!(gone, ["/missing/feature"]);
@@ -1760,7 +1842,10 @@ mod tests {
         };
         let inputs = sample_inputs(&session);
         assert_eq!(inputs.groups.len(), 3);
-        assert_eq!(inputs.branch_paths, ["/feature".to_owned()].into_iter().collect());
+        assert_eq!(
+            inputs.branch_paths,
+            ["/feature".to_owned()].into_iter().collect()
+        );
         assert_eq!(inputs.session_root, None);
     }
 
@@ -1773,9 +1858,18 @@ mod tests {
         std::fs::create_dir(&checkout).unwrap();
         std::fs::write(checkout.join(".git"), "gitdir: /tmp/admin\n").unwrap();
         std::fs::create_dir(&remnant).unwrap();
-        assert_eq!(branch_path_state(checkout.to_str().unwrap()), PathState::Checkout);
-        assert_eq!(branch_path_state(remnant.to_str().unwrap()), PathState::Remnant);
-        assert_eq!(branch_path_state(absent.to_str().unwrap()), PathState::Missing);
+        assert_eq!(
+            branch_path_state(checkout.to_str().unwrap()),
+            PathState::Checkout
+        );
+        assert_eq!(
+            branch_path_state(remnant.to_str().unwrap()),
+            PathState::Remnant
+        );
+        assert_eq!(
+            branch_path_state(absent.to_str().unwrap()),
+            PathState::Missing
+        );
     }
 
     #[test]
@@ -1803,14 +1897,16 @@ mod tests {
             },
             || Ok((db.worktrees()?, db.workspaces()?)),
             |path, row_root| {
-                branch_paths.contains(path)
-                    && !crate::hydrate::row_is_git_listed(
-                        row_root.unwrap_or(root_s.as_str()),
-                        path,
-                        &mut git_cache,
-                    )
+                git_confirms_unlisted(
+                    &branch_paths,
+                    Some(root_s.as_str()),
+                    path,
+                    row_root,
+                    &mut git_cache,
+                )
             },
             &Mutex::new(HashMap::new()),
+            std::time::Instant::now(),
         )
         .unwrap();
         assert_eq!(gone, [feat_s]);
@@ -1844,14 +1940,16 @@ mod tests {
             },
             || Ok((db.worktrees()?, db.workspaces()?)),
             |path, row_root| {
-                branch_paths.contains(path)
-                    && !crate::hydrate::row_is_git_listed(
-                        row_root.unwrap_or(root_s.as_str()),
-                        path,
-                        &mut git_cache,
-                    )
+                git_confirms_unlisted(
+                    &branch_paths,
+                    Some(root_s.as_str()),
+                    path,
+                    row_root,
+                    &mut git_cache,
+                )
             },
             &Mutex::new(HashMap::new()),
+            std::time::Instant::now(),
         )
         .unwrap();
         assert_eq!(gone, [feat_s]);
