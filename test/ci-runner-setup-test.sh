@@ -242,6 +242,7 @@ FIXTURE
   run_verified_installer https://fixture.invalid/installer "$payload_sha" "$payload_size" install --no-confirm || return 1
   [[ $(<"$TEST_ROOT/installer-ran") == 'install --no-confirm' ]]
 }
+# shellcheck disable=SC2016  # assertion matches shell source with literal variable names
 case_nix_bootstrap_uses_reviewed_pin() {
   grep -Fq 'NIX_INSTALLER_VERSION="v3.24.2"' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
     grep -Fq 'NIX_INSTALLER_SHA256="22ed14ee1b24d100d388f1fc245e3062bd5982433d159cffa6dec34c0eb15dab"' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
