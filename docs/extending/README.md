@@ -13,6 +13,7 @@ answer. Architecture context: [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 | a CLI subcommand                                       | [cli-subcommand.md](cli-subcommand.md)       |
 | a completion value source (`<TAB>` on an argument)     | [completion-source.md](completion-source.md) |
 | a provider (forge / CI / tracker / …)                  | [provider-impl.md](provider-impl.md)         |
+| a remote sandbox provider                              | [remote-provider.md](remote-provider.md)     |
 | an issue tracker provider                              | [tracker-provider.md](tracker-provider.md)   |
 | a calendar command plugin                              | [calendar-plugin.md](calendar-plugin.md)     |
 | a plugin (out of process, or a plugin-backed provider) | [plugin.md](plugin.md)                       |
