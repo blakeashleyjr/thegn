@@ -204,6 +204,7 @@ pub enum Action {
     PrReviewTaskHandle,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
+    /// Open the Info screen for the sidebar row under the cursor, else the active worktree.
     OpenInfo,
     /// Open the tabbed system monitor.
     OpenMonitor,

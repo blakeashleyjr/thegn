@@ -58,7 +58,11 @@ pub(crate) fn target_for(
                     repo_root: String::new(),
                     worktree: Some(worktree),
                 },
-                row.branch.clone().unwrap_or_else(|| row.label.clone()),
+                format!(
+                    "{}/{}",
+                    row.workspace_slug,
+                    row.branch.clone().unwrap_or_else(|| row.label.clone())
+                ),
             )
         }
         _ => return None,
@@ -86,8 +90,8 @@ pub(crate) fn target_for(
         dirty_files: row.branch_meta.as_ref().and_then(|meta| meta.dirty_files),
         ahead_base: row.branch_meta.as_ref().and_then(|meta| meta.ahead_base),
         behind_base: row.branch_meta.as_ref().and_then(|meta| meta.behind_base),
-        ahead_upstream: row.git.as_ref().map(|git| git.ahead as u32),
-        behind_upstream: row.git.as_ref().map(|git| git.behind as u32),
+        ahead_upstream: None,
+        behind_upstream: None,
         upstream: None,
     });
 
@@ -146,31 +150,7 @@ pub(crate) fn spawn(
     title: String,
 ) {
     tokio::task::spawn_blocking(move || {
-        let report = (|| {
-            let mut target = target;
-            if target.repo_root.is_empty() {
-                let worktree = target
-                    .worktree
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("Info target has no worktree path"))?;
-                let db = thegn_core::db::Db::open()?;
-                target.repo_root = thegn_core::info_facts::resolve_target(
-                    &db,
-                    None,
-                    Some(worktree),
-                    Path::new(worktree),
-                )
-                .map_err(anyhow::Error::msg)?;
-            }
-            crate::cmd::info::gather(
-                &cfg,
-                Some(thegn_core::config::Config::path()),
-                &target,
-                facts,
-            )
-            .map_err(|error| anyhow::anyhow!("{error:#}"))
-        })()
-        .map_err(|error: anyhow::Error| format!("{error:#}"));
+        let report = build_report(&cfg, target, facts).map_err(|error| format!("{error:#}"));
 
         if let Err(error) = tx.send(RefreshKind::Info(Box::new(InfoPayload { title, report }))) {
             tracing::debug!(target: "thegn::info", %error, "info result receiver is gone");
@@ -179,6 +159,32 @@ pub(crate) fn spawn(
             tracing::debug!(target: "thegn::info", %error, "info result wake failed");
         }
     });
+}
+
+fn build_report(
+    cfg: &Config,
+    mut target: InfoTarget,
+    facts: LiveFacts,
+) -> anyhow::Result<InfoReport> {
+    if target.repo_root.is_empty() {
+        let worktree = target
+            .worktree
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Info target has no worktree path"))?;
+        let db = thegn_core::db::Db::open()?;
+        target = thegn_core::info_facts::resolve_target(
+            &db,
+            None,
+            Some(&worktree),
+            Path::new(&worktree),
+        )?;
+    }
+    crate::cmd::info::gather(
+        cfg,
+        Some(thegn_core::config::Config::path()),
+        &target,
+        facts,
+    )
 }
 
 pub(crate) fn apply(
