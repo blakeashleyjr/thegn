@@ -154,9 +154,7 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>, ledger_file: &std::path::
             let name = p.trim_start_matches("/v1/sprites/").to_string();
             let mut st = state.lock().unwrap();
             *st.deletes.entry(name.clone()).or_default() += 1;
-            if st.held.contains(&name) {
-                ("204 No Content", Vec::new())
-            } else if st.sprites.remove(&name) {
+            if st.held.contains(&name) || st.sprites.remove(&name) {
                 ("204 No Content", Vec::new())
             } else {
                 ("404 Not Found", b"missing".to_vec())
