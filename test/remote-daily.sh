@@ -73,6 +73,8 @@ while [ $# -gt 0 ]; do
     ;;
   esac
 done
+# shellcheck disable=SC2034 # read by test/lib/live.sh
+LIVE_KEEP_GOING="$keep_going"
 
 if [ "$with_pool" = 1 ] && [ "$provider" != sprites ]; then
   echo "--with-pool is supported only with --provider sprites" >&2
@@ -151,9 +153,12 @@ Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
 With --keep-going, failed steps print FAIL <id>, the run continues, and the
 end prints FAILED STEPS: <ids> before exiting non-zero. ALL STEPS PASS prints
 only when no step failed.
+Each step also prints TIME <id> <seconds> s; the end prints STARTUP lines (start-up numbers).
 PLAN
 }
 
+# shellcheck source=test/lib/live.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib/live.sh"
 # ---- flag gate: nothing above this line touches the network or thegn ----
 if [ -z "$env_name" ] && [ "$accept" = 0 ]; then
   print_plan
@@ -182,63 +187,8 @@ if [ "$with_pool" = 1 ] && [ "${RD_HOLD_AGENT:-0}" != 1 ]; then
 fi
 
 # ---- step 0: preflight (doctor's "Remote live readiness" block) ----
-# doctor --json lists names only, never values: whether the token resolves,
-# which env var names, git token and agent logins enter the sandbox, and ledger
-# sandboxes nothing is bound to. The token itself is never read or printed.
-PREFLIGHT_PY='
-import json, os, sys
-env = os.environ["PRE_ENV"]
-required = os.environ.get("PRE_REQUIRED", "1") == "1"
-try:
-    doc = json.loads(sys.stdin.read())
-except ValueError:
-    print("FAIL 0: doctor --json did not print JSON", file=sys.stderr)
-    sys.exit(1)
-rows = doc.get("remote_live") if isinstance(doc, dict) else None
-if rows is None:
-    print("SKIP 0: doctor --json has no remote_live key (older binary): no credential statement")
-    sys.exit(0)
-row = next((r for r in rows if isinstance(r, dict) and r.get("env") == env), None)
-if row is None:
-    if required:
-        print("FAIL 0: doctor remote_live has no row for env " + env, file=sys.stderr)
-        sys.exit(1)
-    print("SKIP 0: doctor remote_live has no row for env " + env + " (it covers sprites and vercel envs)")
-    sys.exit(0)
-def show(v):
-    if isinstance(v, bool):
-        return "yes" if v else "no"
-    if isinstance(v, list):
-        return ",".join(show(x) for x in v) or "none"
-    if isinstance(v, dict):
-        return ",".join(k + "=" + show(x) for k, x in sorted(v.items())) or "none"
-    if v is None or v == "":
-        return "none"
-    return str(v)
-if row.get("token_resolves") is not True:
-    print("FAIL 0: the token for env " + env + " does not resolve (remote_live.token_resolves = " + show(row.get("token_resolves")) + ")", file=sys.stderr)
-    sys.exit(1)
-print("INFO 0: credentials entering the sandbox: forwarded_env=" + show(row.get("forwarded_env")) + "; git_token=" + show(row.get("git_token")) + "; login_upload=" + show(row.get("login_upload")))
-with open(os.path.join(os.environ["TMP"], "preflight.env"), "w", encoding="utf-8") as f:
-    f.write("LOGIN_UPLOAD=" + show(row.get("login_upload")) + "\n")
-unbound = row.get("unbound") or []
-if not isinstance(unbound, list):
-    unbound = [unbound]
-if unbound:
-    print("WARN 0: unbound ledger sandboxes: " + ", ".join(show(n) for n in unbound) + ": pre-existing sandboxes this run will not touch")
-print("PASS 0")
-'
-DOCTOR_JSON=""
-preflight_capture() { # doctor may exit non-zero on unrelated checks; parse what it printed
-  DOCTOR_JSON="$("$THEGN_BIN" doctor --json 2>/dev/null)" || true
-}
-preflight_check() { # preflight_check <env> [required: 1|0]
-  echo "== step 0: preflight (doctor --json remote_live for env '$1')"
-  printf '%s' "$DOCTOR_JSON" | PRE_ENV="$1" PRE_REQUIRED="${2:-1}" TMP="$TMP" python3 -I -c "$PREFLIGHT_PY" || {
-    echo "FAIL 0: preflight" >&2
-    exit 1
-  }
-}
+preflight_capture() { live_preflight_capture; }
+preflight_check() { live_preflight_check "$1" "${2:-1}" "$TMP"; }
 # Run against the owner's real state, before the fresh dirs below, so
 # pre-existing unbound sandboxes are listed.
 preflight_capture
@@ -250,6 +200,7 @@ mkdir -p "$XDG_STATE_HOME" "$THEGN_DIR" "$TMP/repo"
 REPO="$TMP/repo"
 NAME="(unknown)"
 CREATED=0
+# shellcheck disable=SC2034 # appended to and read by test/lib/live.sh
 FAILED_STEPS=()
 HOLD_PID=""
 WT_PATH=""
@@ -257,6 +208,8 @@ RDY_NAME=""
 RDY_PATH=""
 POOL_SPARE=""
 POOL_PATH=""
+# shellcheck disable=SC2034 # read by test/lib/live.sh
+LIVE_STARTUP=("2u=cold create (env up rd-x)" "11u=second create (env up rd-y)" "P1=warm spare fill (env pool-fill)" "P3=agent run on the claimed spare")
 case "$provider" in
 sprites) EXEC_BRIDGE="sprite-exec" ;;
 vercel) EXEC_BRIDGE="vercel-exec" ;;
@@ -389,19 +342,7 @@ teardown() {
 trap teardown EXIT INT TERM
 
 step() { # step <id> <description> <command...>
-  local id="$1" desc="$2"
-  shift 2
-  echo "== step $id: $desc"
-  if "$@"; then
-    echo "PASS $id"
-  else
-    echo "FAIL $id: $desc" >&2
-    FAILED_STEPS+=("$id")
-    if [ "$keep_going" != 1 ]; then
-      exit 1
-    fi
-  fi
-  return 0
+  live_step "$@"
 }
 
 in_repo() { (cd "$REPO" && "$@"); }
@@ -777,8 +718,4 @@ if [ "$with_reaper" = 1 ]; then
   echo "NOTE R: lifetime_reap needs a client up and a throwaway env with max_lifetime_secs > 0;" >&2
   echo "        verify manually with: thegn fleet list after the 300 s hydrate cadence" >&2
 fi
-if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
-  echo "FAILED STEPS: ${FAILED_STEPS[*]}"
-  exit 1
-fi
-echo "ALL STEPS PASS"
+live_finish
