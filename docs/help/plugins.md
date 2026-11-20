@@ -236,6 +236,11 @@ provider error. Re-invoking a running one-shot reports that the contribution
 is already running. `CiProvider`/`ForgeProvider`
 are reserved wire vocabulary for the same pattern.
 
+A manifest that is a symlink, or that lists the same capability twice, is
+refused. An issue plugin's update reply is checked against the requested
+fields. A listing over 1000 rows is reported as partial, and a reply naming
+one issue id twice is refused.
+
 The standalone `thegn doctor` does not start resident plugins, but it lists
 the native-trust state of each enabled plugin. Use `thegn plugin list` and
 `thegn plugin check` to inspect and validate plugin declarations.
