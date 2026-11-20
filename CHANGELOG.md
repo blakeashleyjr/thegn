@@ -7,21 +7,29 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0-alpha.110] — 2026-11-19
-
-### Fixed
-
-- Vercel: streamed commands, interactive shells and file transfers refused because the session had stopped are retried once after resume, like one-shot commands.
+## [0.1.0-alpha.112] — 2026-11-20
 
 ### Changed
 
-- Sprites command streams are checked strictly against the documented frame protocol; a violation is a typed protocol error and the command fails (THE-533).
+- Sprites command streams are checked against the frame protocol: a malformed exit, two exits that disagree, output after the exit or an unknown stream is a typed protocol error and the command fails; a repeated exit with the same code and control messages of an unknown type are accepted, as the live server sends both (THE-533).
 - The Sprites live check proves whether the memory limit is enforced by allocating past it (step 5d).
 - The VPS provider's destroy is now covered by the shared conformance case that keeps the record until the server is confirmed gone (THE-530).
 
 ### Fixed
 
 - After a crash during cleanup, the merge-queue row of a remote worktree with no registry record is kept and retried instead of retired (THE-236).
+
+## [0.1.0-alpha.111] — 2026-11-20
+
+### Added
+
+- Right panel: with `[lead]` configured (dev channel), a pinned Lead footer shows the Lead's state, pending approvals across all repos (click to answer them), lane and spawn budgets and the last action; the sidebar LEAD row gains a state suffix.
+
+## [0.1.0-alpha.110] — 2026-11-19
+
+### Fixed
+
+- Vercel: streamed commands, interactive shells and file transfers refused because the session had stopped are retried once after resume, like one-shot commands.
 
 ## [0.1.0-alpha.109] — 2026-11-19
 
@@ -4045,7 +4053,9 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.110...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.112...HEAD
+[0.1.0-alpha.112]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.111...v0.1.0-alpha.112
+[0.1.0-alpha.111]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.110...v0.1.0-alpha.111
 [0.1.0-alpha.110]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.109...v0.1.0-alpha.110
 [0.1.0-alpha.109]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.108...v0.1.0-alpha.109
 [0.1.0-alpha.108]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.107...v0.1.0-alpha.108

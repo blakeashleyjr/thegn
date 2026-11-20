@@ -123,8 +123,10 @@ pub(crate) fn launch_spec(
     group: &str,
     tab: usize,
 ) -> anyhow::Result<crate::agent::LaunchSpec> {
-    launch_spec_with(cfg, LeadMode::Interactive { group, tab }, &real_host(cfg))
-        .map(|launch| launch.spec)
+    let spec = launch_spec_with(cfg, LeadMode::Interactive { group, tab }, &real_host(cfg))
+        .map(|launch| launch.spec);
+    super::status::note_launch(&spec);
+    spec
 }
 
 /// The launch of one headless Lead turn carrying `prompt` (the `lead.wake`
