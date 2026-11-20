@@ -855,6 +855,8 @@
             pkgs.just
             # `just test` runs `cargo nextest run --workspace`.
             pkgs.cargo-nextest
+            # `just test-packaging` runs the pure release-policy Python suite.
+            (pkgs.python3.withPackages (ps: [ps.pyyaml]))
             # libgit2-sys → libz-sys wants pkg-config + zlib; sqlite is vendored.
             pkgs.pkg-config
             pkgs.zlib
