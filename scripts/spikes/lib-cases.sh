@@ -21,22 +21,37 @@ sc_json() { # sc_json STRING -> quoted JSON string
 }
 
 sc_init() {
+  umask 077
   SP_ITEM="$1"
   [ -n "${2:-}" ] || sp_die "usage: $0 OUTDIR   (see docs/superpowers/specs/sandbox-remote-spikes/${SP_ITEM}.md)"
   SP_OUT="$2"
   mkdir -p "$SP_OUT/$SP_ITEM"
   SP_EVID="$SP_OUT/$SP_ITEM.evidence.jsonl"
+  python3 - "$SP_OUT/$SP_ITEM" <<'PY' || sp_die "evidence directory must be owned by this user and private (mode 0700)"
+import os, stat, sys
+p = os.stat(sys.argv[1], follow_symlinks=False)
+if not stat.S_ISDIR(p.st_mode) or p.st_uid != os.getuid() or (p.st_mode & 0o077):
+    raise SystemExit(1)
+PY
+  [ ! -e "$SP_EVID" ] && [ ! -L "$SP_EVID" ] || sp_die "evidence already exists: $SP_EVID (choose a new OUTDIR)"
   : >"$SP_EVID"
-  SC_COMMIT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse HEAD 2>/dev/null || echo unknown)"
+  SC_COMMIT="$(git -C "$(dirname "${BASH_SOURCE[0]}")/../.." rev-parse HEAD 2>/dev/null || echo unknown)"
   SC_MACOS="$(sw_vers -productVersion 2>/dev/null || uname -sr)"
   SC_ARCH="$(uname -m)"
+  SC_HOST="$(hostname 2>/dev/null || true)"
+  export SP_REDACT_USER="${USER:-$(id -un)}" SP_REDACT_HOST="$SC_HOST"
+  script_path="$(printf '%s' "$0" | sp_redact)"
   printf '{"id":"_meta","item":"%s","date_utc":"%s","macos":%s,"arch":"%s","thegn_commit":"%s","script":%s}\n' \
-    "$SP_ITEM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(sc_json "$SC_MACOS")" "$SC_ARCH" "$SC_COMMIT" "$(sc_json "$0")" >>"$SP_EVID"
+    "$SP_ITEM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(sc_json "$SC_MACOS")" "$SC_ARCH" "$SC_COMMIT" "$(sc_json "$script_path")" >>"$SP_EVID"
 }
 
 sc_line() { # sc_line ID CMD RC EXPECT SHA OUT ERR VERDICT
+  local command_text stdout_text stderr_text
+  command_text="$(printf '%s' "$2" | sp_redact)"
+  stdout_text="$(printf '%s' "$6" | sp_redact)"
+  stderr_text="$(printf '%s' "$7" | sp_redact)"
   printf '{"id":"%s","macos":%s,"arch":"%s","thegn_commit":"%s","cmd":%s,"rc":%s,"expect":"%s","stdout_sha":"%s","stdout_head":%s,"stderr_head":%s,"verdict":"%s"}\n' \
-    "$1" "$(sc_json "$SC_MACOS")" "$SC_ARCH" "$SC_COMMIT" "$(sc_json "$2")" "$3" "$4" "$5" "$(sc_json "$6")" "$(sc_json "$7")" "$8" >>"$SP_EVID"
+    "$1" "$(sc_json "$SC_MACOS")" "$SC_ARCH" "$SC_COMMIT" "$(sc_json "$command_text")" "$3" "$4" "$5" "$(sc_json "$stdout_text")" "$(sc_json "$stderr_text")" "$8" >>"$SP_EVID"
 }
 
 sc_skip() {
@@ -62,8 +77,13 @@ sc_case() {
   any) verdict=recorded ;;
   *) if [ "$rc" -eq "$expect" ]; then verdict=pass; else verdict=fail; fi ;;
   esac
-  out="$(head -c 400 "$base.out")"
-  err="$(head -c 400 "$base.err")"
+  if [ "${SC_SUMMARY_PRIVATE:-0}" = 1 ]; then
+    out="[private raw capture omitted from JSONL]"
+    err="[private raw capture omitted from JSONL]"
+  else
+    out="$(head -c 400 "$base.out")"
+    err="$(head -c 400 "$base.err")"
+  fi
   sc_line "$id" "$*" "$rc" "$expect" "$sha" "$out" "$err" "$verdict"
   # shellcheck disable=SC2034 # read by the sourcing scripts
   SC_LAST_RC=$rc
