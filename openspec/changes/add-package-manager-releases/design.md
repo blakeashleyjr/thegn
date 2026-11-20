@@ -49,10 +49,15 @@ summary and require an operator to inspect both target tips and reconcile.
 Per-target receipts and the combined ledger have 90-day artifact retention;
 longer-term retention needs a separate archival policy.
 
-This closes the outcome-reporting gap only. Draft asset uploads still use
-`--clobber` within a draft, and the create/retry path is not yet bound to an
-immutable generation-qualified asset namespace. Break-glass release retraction
-also remains separate work.
+Draft producer uploads preserve the public asset names but never replace an
+existing asset. A shared planner compares GitHub's per-asset SHA-256 metadata
+with local bytes, uploads only missing names, and refuses conflicts or unusable
+metadata. The release record binds package and manifest uploads to the admitted
+tag, source, trusted workflow revision, and workflow run ID. Failed-job retries
+within the same run can reuse exact assets; a new workflow run cannot take over
+a populated draft whose generation record belongs to another run. A same-name
+race fails closed because the final `gh release upload` has no replacement
+option. Break-glass release retraction remains separate work.
 
 ## Verified-before-advertised rule
 

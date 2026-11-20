@@ -34,6 +34,40 @@ resolve only assets produced for the same release contract.
 - **THEN** the attestation identifies this repository's release workflow and
   its checksum matches the published checksum asset
 
+### Requirement: Draft producer uploads preserve one immutable workflow generation
+
+Every producer SHALL inspect the current GitHub Release asset inventory before
+upload. A missing name MAY be uploaded; an existing name MAY be reused only
+when GitHub's SHA-256 asset digest matches the local bytes. Missing or malformed
+digest metadata for an existing intended name, duplicate inventory names, or a
+digest conflict MUST fail closed. Uploads MUST NOT use replacement semantics;
+a same-name race MUST fail without replacing the existing asset.
+
+The release record SHALL bind the draft generation to the admitted tag object,
+commit, trusted workflow revision, and workflow run ID. Package and manifest
+producers MUST verify that identity before uploading. Re-running jobs in the
+same workflow run MAY reuse exact matching assets because the run ID is stable
+across attempts. A different workflow run MUST refuse a draft whose release
+record names another generation.
+
+#### Scenario: A same-run retry finds exact producer bytes
+
+- **WHEN** a rerun sees an existing intended asset with the exact SHA-256
+- **THEN** it skips that upload and uploads only absent names
+
+#### Scenario: A draft contains an asset from a conflicting generation
+
+- **WHEN** an existing intended asset's digest differs, or its release record
+  binds another workflow run
+- **THEN** the producer stops before replacing that asset or uploading later
+  producer outputs
+
+#### Scenario: GitHub reports an unusable asset inventory
+
+- **WHEN** an intended existing asset has no valid SHA-256 metadata or the
+  inventory contains duplicate names
+- **THEN** the producer refuses to upload
+
 ### Requirement: Release downloads have a selected aggregate byte budget
 
 Before downloading release assets, the workflow SHALL validate each selected

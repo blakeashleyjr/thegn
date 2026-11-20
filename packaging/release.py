@@ -71,7 +71,7 @@ POSIX_PAX_HEADERS = frozenset(
         "hdrcharset",
     }
 )
-DRAFT_RELEASE_ERROR = "release is already published; refusing to replace assets with --clobber"
+DRAFT_RELEASE_ERROR = "release is already published; refusing to upload or replace assets"
 MANAGER_PLACEHOLDERS = {
     "homebrew": {
         "VERSION",
@@ -1201,6 +1201,50 @@ def build_release_manifest(
         "assets": result_assets,
     }
     return value
+
+
+def verify_release_generation(
+    path: Path, *, tag: str, commit: str, tag_object: str, workflow_sha: str, run_id: str
+) -> None:
+    """Require the draft's producer record to name this admitted workflow run."""
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"release generation record is not a regular file: {path}")
+        if metadata.st_size > MAX_TRUSTED_DIGESTS_BYTES:
+            raise ReleaseError(
+                f"release generation record {path} exceeds {MAX_TRUSTED_DIGESTS_BYTES} bytes"
+            )
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ReleaseError(f"cannot inspect release generation record {path}: {error}") from error
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for field, item in pairs:
+            if field in value:
+                raise ReleaseError(f"release generation record {path} has duplicate field {field}")
+            value[field] = item
+        return value
+
+    try:
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            record = json.load(handle, object_pairs_hook=unique_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ReleaseError(f"cannot read release generation record {path}: {error}") from error
+    record = _object(record, "release generation record")
+    required_fields = {"tag", "commit", "tag_object", "workflow_sha", "run_id", "assets"}
+    if set(record) != required_fields or not isinstance(record.get("assets"), list):
+        raise ReleaseError("release generation record has an invalid field set")
+    expected = {
+        "tag": tag,
+        "commit": commit,
+        "tag_object": tag_object,
+        "workflow_sha": workflow_sha,
+        "run_id": run_id,
+    }
+    for field, value in expected.items():
+        if record.get(field) != value:
+            raise ReleaseError(f"release draft generation {field} does not match this workflow")
 
 
 def write_release_manifest(output: Path, assets_dir: Path, value: Mapping[str, Any]) -> None:
@@ -2354,9 +2398,76 @@ def load_release_asset_listing(path: Path) -> Any:
             os.close(descriptor)
 
 
+def plan_release_asset_uploads(document: Any, assets: Sequence[Path]) -> list[Path]:
+    """Select absent draft assets; accept existing names only at the same SHA-256."""
+    requested_names = {path.name for path in assets}
+    pages: list[Any]
+    if isinstance(document, list) and document and all(isinstance(page, list) for page in document):
+        pages = document
+    elif isinstance(document, list):
+        pages = [document]
+    else:
+        raise ReleaseError("GitHub release asset inventory must be a JSON array")
+
+    existing: dict[str, str | None] = {}
+    for page in pages:
+        for entry in page:
+            item = _object(entry, "GitHub release asset")
+            name = item.get("name")
+            if not isinstance(name, str) or TRUSTED_NAME_RE.fullmatch(name) is None:
+                raise ReleaseError("GitHub release asset inventory has an invalid name")
+            if name in existing:
+                raise ReleaseError(f"GitHub release asset inventory repeats {name}")
+            digest = item.get("digest")
+            if name in requested_names and digest is not None and (
+                not isinstance(digest, str)
+                or not digest.startswith("sha256:")
+                or SHA256_RE.fullmatch(digest.removeprefix("sha256:")) is None
+            ):
+                raise ReleaseError(f"GitHub release asset {name} has unusable digest metadata")
+            existing[name] = digest
+
+    seen: set[str] = set()
+    upload: list[Path] = []
+    for path in assets:
+        name = path.name
+        if name in seen:
+            raise ReleaseError(f"local release upload repeats asset {name}")
+        seen.add(name)
+        if name in (".", "..") or TRUSTED_NAME_RE.fullmatch(name) is None:
+            raise ReleaseError(f"local release asset name is invalid: {name!r}")
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise ReleaseError(f"cannot inspect local release asset {path}: {error}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"local release asset is not a regular file: {path}")
+        remote_digest = existing.get(name)
+        if name not in existing:
+            upload.append(path)
+            continue
+        if remote_digest is None:
+            raise ReleaseError(f"existing release asset {name} has no trusted SHA-256 metadata")
+        local_digest = _sha256(path)
+        if remote_digest != f"sha256:{local_digest}":
+            raise ReleaseError(f"existing release asset {name} conflicts with this generation")
+    return upload
+
+
 def _run(args: argparse.Namespace) -> None:
     if args.command == "require-draft":
         require_draft(args.is_draft)
+        return
+    if args.command == "verify-generation":
+        verify_release_generation(
+            args.record,
+            tag=args.tag,
+            commit=args.commit,
+            tag_object=args.tag_object,
+            workflow_sha=args.workflow_sha,
+            run_id=args.run_id,
+        )
+        print(f"{args.tag}: draft is bound to workflow run {args.run_id}")
         return
     if args.command == "verify-assets":
         if RELEASE_TAG_RE.fullmatch(args.tag) is None:
@@ -2517,6 +2628,12 @@ def _run(args: argparse.Namespace) -> None:
         )
         print(f"{len(selected)} release asset(s) within download limits")
         return
+    if args.command == "plan-upload":
+        plan = plan_release_asset_uploads(
+            load_release_asset_listing(args.assets_json), args.asset
+        )
+        print(json.dumps([str(path) for path in plan]))
+        return
     manifest_path = args.manifest.resolve()
     root = args.repo_root.resolve()
     manifest = load_manifest(manifest_path)
@@ -2609,9 +2726,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     draft_parser = subparsers.add_parser(
-        "require-draft", help="refuse asset replacement unless the release is a draft"
+        "require-draft", help="refuse release asset uploads unless the release is a draft"
     )
     draft_parser.add_argument("--is-draft", required=True)
+    generation_parser = subparsers.add_parser(
+        "verify-generation", help="bind a draft to the current admitted workflow run"
+    )
+    generation_parser.add_argument("--record", required=True, type=Path)
+    generation_parser.add_argument("--tag", required=True)
+    generation_parser.add_argument("--commit", required=True)
+    generation_parser.add_argument("--tag-object", required=True)
+    generation_parser.add_argument("--workflow-sha", required=True)
+    generation_parser.add_argument("--run-id", required=True)
     for command in ("validate", "render"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
@@ -2753,6 +2879,11 @@ def build_parser() -> argparse.ArgumentParser:
     check_sizes_parser = subparsers.add_parser("check-asset-sizes")
     check_sizes_parser.add_argument("--assets-json", required=True, type=Path)
     check_sizes_parser.add_argument("--pattern", action="append")
+    upload_plan_parser = subparsers.add_parser(
+        "plan-upload", help="select absent draft assets without replacing existing names"
+    )
+    upload_plan_parser.add_argument("--assets-json", required=True, type=Path)
+    upload_plan_parser.add_argument("--asset", required=True, action="append", type=Path)
     return parser
 
 

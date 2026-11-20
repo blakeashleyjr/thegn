@@ -2193,5 +2193,87 @@ class ReleaseAssetSizePrecheckTests(unittest.TestCase):
         self.assertEqual(2, raised.exception.code)
 
 
+class ReleaseAssetUploadPlanTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def asset(self, name: str, payload: bytes) -> Path:
+        path = self.root / name
+        path.write_bytes(payload)
+        return path
+
+    @staticmethod
+    def remote(path: Path) -> dict[str, str]:
+        return {
+            "name": path.name,
+            "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    def test_same_run_retry_reuses_exact_assets_and_selects_only_absent(self) -> None:
+        archive = self.asset("thegn-v1.2.3-x86_64-unknown-linux-gnu.tar.gz", b"archive")
+        checksum = self.asset("thegn-v1.2.3-x86_64-unknown-linux-gnu.sha256", b"sum")
+        missing = self.asset("thegn-v1.2.3-completions.tar.gz", b"completions")
+        inventory = [[self.remote(archive)], [self.remote(checksum)]]
+
+        self.assertEqual(
+            [missing], release.plan_release_asset_uploads(inventory, [archive, checksum, missing])
+        )
+
+    def test_fresh_run_release_record_conflict_fails_closed(self) -> None:
+        record = self.asset("thegn-v1.2.3-release.json", b'{"run_id":"old"}')
+        inventory = [self.remote(record)]
+        record.write_bytes(b'{"run_id":"new"}')
+
+        with self.assertRaisesRegex(release.ReleaseError, "conflicts with this generation"):
+            release.plan_release_asset_uploads(inventory, [record])
+
+    def test_generation_record_allows_same_run_retry_and_rejects_new_run(self) -> None:
+        record_path = self.asset(
+            "thegn-v1.2.3-release.json",
+            json.dumps(
+                {
+                    "tag": "v1.2.3",
+                    "commit": "a" * 40,
+                    "tag_object": "b" * 40,
+                    "workflow_sha": "c" * 40,
+                    "run_id": "12345",
+                    "assets": [],
+                }
+            ).encode(),
+        )
+        expected = {
+            "tag": "v1.2.3",
+            "commit": "a" * 40,
+            "tag_object": "b" * 40,
+            "workflow_sha": "c" * 40,
+            "run_id": "12345",
+        }
+        release.verify_release_generation(record_path, **expected)
+        with self.assertRaisesRegex(release.ReleaseError, "run_id does not match"):
+            release.verify_release_generation(record_path, **(expected | {"run_id": "67890"}))
+
+    def test_extra_and_malformed_inventory_fail_closed(self) -> None:
+        requested = self.asset("thegn-v1.2.3-release.json", b"record")
+        unrelated = {"name": "thegn-v1.2.3-extra.txt", "digest": "md5:bad"}
+        self.assertEqual(
+            [requested], release.plan_release_asset_uploads([unrelated], [requested])
+        )
+        malformed_existing = {"name": requested.name, "digest": "md5:bad"}
+        with self.assertRaisesRegex(release.ReleaseError, "unusable digest metadata"):
+            release.plan_release_asset_uploads([malformed_existing], [requested])
+
+        missing_digest = {"name": requested.name}
+        with self.assertRaisesRegex(release.ReleaseError, "no trusted SHA-256"):
+            release.plan_release_asset_uploads([missing_digest], [requested])
+
+        duplicate = [self.remote(requested), self.remote(requested)]
+        with self.assertRaisesRegex(release.ReleaseError, "repeats"):
+            release.plan_release_asset_uploads(duplicate, [requested])
+
+
 if __name__ == "__main__":
     unittest.main()

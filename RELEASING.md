@@ -134,10 +134,12 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
 
    > **Warning — retrying a failed run.** If a build leg fails, the broker does
    > not publish any archives. Use **"Re-run failed jobs" on the original
-   > workflow run** so the leg and then the broker run against the same admitted
-   > revision. Re-dispatching a build for a tag with an existing draft resumes
-   > that draft without changing its notes or existing assets. A published
-   > release makes `create-release` fail before uploads and is never deleted;
+   > workflow run** so the leg and broker reuse its admitted generation.
+   > Existing draft assets are reused only when their GitHub SHA-256 digest
+   > matches the exact local bytes; conflicting or unverifiable assets stop the
+   > workflow without replacement. A fresh workflow run cannot take over a
+   > draft whose release record names another run. Keep the draft notes, then
+   > use the original run for retries. A published release is never deleted;
    > cut a new tag to rebuild a published version.
 
    **Moving the owner's stable instance.** Once the release is PUBLISHED (not a

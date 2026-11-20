@@ -304,97 +304,31 @@ class WorkflowPolicyTests(unittest.TestCase):
             any(step.get("uses", "").startswith("actions/attest-build-provenance@") for step in steps)
         )
         job_text = yaml.safe_dump(job)
-        self.assertIn("gh release upload", job_text)
+        self.assertIn("upload-release-assets.sh", job_text)
         self.assertIn("sha256sum", job_text)
 
-    def test_clobber_uploads_require_draft_rehearsal(self) -> None:
+    def test_producer_uploads_use_immutable_draft_planner(self) -> None:
         workflow = read_workflow("release.yml")
         upload_steps = (
-            ("upload", "Upload verified release assets"),
-            ("upload", "Write and publish release record"),
+            ("upload", "Bind generation and upload verified release assets"),
             ("package", "Upload packages and rendered metadata"),
             ("verify-manifest", "Upload release manifest"),
         )
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            temporary_path = Path(temporary_directory)
-            stub_dir = temporary_path / "bin"
-            stub_dir.mkdir()
-            log_path = temporary_path / "gh.log"
-            (stub_dir / "gh").write_text(
-                "#!/bin/sh\n"
-                'if [ "$1" = release ] && [ "$2" = view ]; then\n'
-                '  printf \'%s\\n\' "$GH_DRAFT"\n'
-                "  exit 0\n"
-                "fi\n"
-                'if [ "$1" = release ] && [ "$2" = upload ]; then\n'
-                '  printf \'upload\\n\' >> "$GH_LOG"\n'
-                "  exit 0\n"
-                "fi\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
-            (stub_dir / "gh").chmod(0o755)
-            for job_name, step_name in upload_steps:
-                with self.subTest(job=job_name, step=step_name):
-                    step = next(
-                        candidate
-                        for candidate in workflow["jobs"][job_name]["steps"]
-                        if candidate.get("name") == step_name
-                    )
-                    lines = step["run"].splitlines()
-                    guard_index = next(
-                        index
-                        for index, line in enumerate(lines)
-                        if "packaging/release.py require-draft" in line
-                    )
-                    guard = "\n".join(lines[guard_index : guard_index + 2])
-                    upload = next(line for line in lines if "gh release upload" in line)
-                    self.assertLess(guard_index, lines.index(upload))
-                    self.assertIn('gh release view "$TAG" --json isDraft --jq .isDraft', guard)
-                    self.assertIn("--clobber", upload)
-                    harness = "\n".join(
-                        (
-                            "set -euo pipefail",
-                            'release="$PWD/release"',
-                            'manifest="$PWD/manifest.json"',
-                            'PACKAGE_ROOT="$PWD"',
-                            'TAG="v1.2.3"',
-                            guard,
-                            upload,
-                        )
-                    )
-                    for draft, expected_status, expected_uploads in (
-                        ("true", 0, 1),
-                        ("false", 2, 0),
-                    ):
-                        log_path.write_text("", encoding="utf-8")
-                        environment = os.environ.copy()
-                        environment.update(
-                            {
-                                "PATH": f"{stub_dir}{os.pathsep}{environment.get('PATH', '')}",
-                                "GH_DRAFT": draft,
-                                "GH_LOG": str(log_path),
-                            }
-                        )
-                        result = subprocess.run(
-                            ["bash", "-c", harness],
-                            cwd=ROOT,
-                            env=environment,
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                        )
-                        message = (
-                            f"job={job_name} step={step_name} draft={draft} "
-                            f"returncode={result.returncode}\n"
-                            f"stdout={result.stdout}\nstderr={result.stderr}"
-                        )
-                        self.assertEqual(expected_status, result.returncode, message)
-                        self.assertEqual(
-                            expected_uploads,
-                            len(log_path.read_text(encoding="utf-8").splitlines()),
-                            message,
-                        )
+        helper = (ROOT / ".github/scripts/upload-release-assets.sh").read_text(encoding="utf-8")
+        self.assertIn("require-draft", helper)
+        self.assertIn("plan-upload", helper)
+        self.assertIn("--paginate --slurp", helper)
+        self.assertIn('gh release upload "$tag" "${upload_assets[@]}"', helper)
+        self.assertNotIn("--clobber", helper)
+        for job_name, step_name in upload_steps:
+            with self.subTest(job=job_name, step=step_name):
+                step = next(
+                    candidate
+                    for candidate in workflow["jobs"][job_name]["steps"]
+                    if candidate.get("name") == step_name
+                )
+                self.assertIn(".github/scripts/upload-release-assets.sh", step["run"])
+                self.assertNotIn("gh release upload", step["run"])
 
     def test_release_record_asset(self) -> None:
         job = read_workflow("release.yml")["jobs"]["upload"]
@@ -1561,6 +1495,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             name: names.index(name)
             for name in (
                 "Download every draft asset",
+                "Require this workflow's draft generation",
                 "Verify archive provenance",
                 "Build the release manifest",
                 "Verify tag still names the admitted commit",
@@ -1580,11 +1515,14 @@ class WorkflowPolicyTests(unittest.TestCase):
         download = steps[positions["Download every draft asset"]]["run"]
         self.assertIn('gh release download "$TAG" --dir "$root/assets"', download)
         self.assertNotIn("--pattern", download)
+        generation = steps[positions["Require this workflow's draft generation"]]["run"]
+        self.assertIn("release.py verify-generation", generation)
+        self.assertIn('--run-id "$RUN_ID"', generation)
         attest = steps[positions["Attest release manifest"]]
         self.assertTrue(attest["uses"].startswith("actions/attest-build-provenance@"))
         self.assertIn("manifest.json", attest["with"]["subject-path"])
         upload = steps[positions["Upload release manifest"]]["run"]
-        self.assertIn('gh release upload "$TAG" "$manifest" --clobber', upload)
+        self.assertIn("upload-release-assets.sh", upload)
         self.assertNotIn('release upload "$TAG" "$VERIFY_ROOT/assets/', upload)
 
     def test_publishers_require_the_release_manifest(self) -> None:
@@ -1759,7 +1697,11 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_upload_publishes_trusted_asset_digests(self) -> None:
         job = read_workflow("release.yml")["jobs"]["upload"]
         self.assertEqual("${{ steps.record.outputs.asset_digests }}", job["outputs"]["asset_digests"])
-        step = next(item for item in job["steps"] if item.get("name") == "Write and publish release record")
+        step = next(
+            item
+            for item in job["steps"]
+            if item.get("name") == "Bind generation and upload verified release assets"
+        )
         self.assertEqual("record", step["id"])
         self.assertIn('echo "asset_digests=$asset_digests" >> "$GITHUB_OUTPUT"', step["run"])
         self.assertIn('sha256sum "$asset"', step["run"])
@@ -1776,6 +1718,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertLess(
             names.index("Verify archive provenance"),
             names.index("Validate all active inputs and render metadata"),
+        )
+        self.assertLess(
+            names.index("Require this workflow's draft generation"),
+            names.index("Upload packages and rendered metadata"),
         )
         verify = job["steps"][verify_index]
         self.assertEqual(
@@ -1795,7 +1741,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn('[ -f "$asset" ] || {', packages["run"])
         self.assertLess(
             packages["run"].index('echo "package_digests='),
-            packages["run"].index('gh release upload'),
+            packages["run"].index("upload-release-assets.sh"),
         )
 
     def test_verify_manifest_binds_producer_digests(self) -> None:

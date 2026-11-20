@@ -372,18 +372,7 @@ jobs:
             ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz
             ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-aarch64-apple-darwin.tar.gz
             ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-completions.tar.gz
-      - name: Upload verified release assets
-        env:
-          TAG: ${{ needs.admit.outputs.tag }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          release="$RUNNER_TEMP/release"
-          assets=("$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256)
-          python3 packaging/release.py require-draft \
-            --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          gh release upload "$TAG" "${assets[@]}" --clobber
-      - name: Write and publish release record
+      - name: Bind generation and upload verified release assets
         id: record
         env:
           TAG: ${{ needs.admit.outputs.tag }}
@@ -436,7 +425,9 @@ jobs:
           echo "asset_digests=$asset_digests" >> "$GITHUB_OUTPUT"
           python3 packaging/release.py require-draft \
             --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          gh release upload "$TAG" "$release/thegn-$TAG-release.json" --clobber
+          assets=("$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256)
+          assets+=("$release/thegn-$TAG-release.json")
+          bash .github/scripts/upload-release-assets.sh "${assets[@]}"
   # Read-only completion build ships ONCE, as a single arch-independent artifact, rather than
   # riding inside each per-target archive. Three reasons:
   #   - the CLI tree has no `#[cfg]`-gated `Command` variants, so every target
@@ -571,7 +562,22 @@ jobs:
             --pattern "thegn-$TAG-*.sha256"
           gh release download "$TAG" --dir "$PACKAGE_ROOT/assets" \
             --pattern "thegn-$TAG-*.tar.gz" \
-            --pattern "thegn-$TAG-*.sha256"
+            --pattern "thegn-$TAG-*.sha256" \
+            --pattern "thegn-$TAG-release.json"
+      - name: Require this workflow's draft generation
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
+          ADMITTED_TAG_OBJECT: ${{ needs.admit.outputs.tag_object }}
+          ADMITTED_WORKFLOW_SHA: ${{ needs.admit.outputs.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 packaging/release.py verify-generation \
+            --record "$PACKAGE_ROOT/assets/thegn-$TAG-release.json" \
+            --tag "$TAG" --commit "$ADMITTED_SHA" \
+            --tag-object "$ADMITTED_TAG_OBJECT" \
+            --workflow-sha "$ADMITTED_WORKFLOW_SHA" --run-id "$RUN_ID"
       - name: Verify assets against the upload broker's digests
         env:
           TRUSTED_DIGESTS: ${{ needs.upload.outputs.asset_digests }}
@@ -727,8 +733,8 @@ jobs:
             echo "::error::release tag moved after admission"
             exit 1
           }
-          # This directory contains no source archive, so --clobber cannot
-          # retract or overwrite any matrix output.
+          # This directory contains no source archive; the upload planner only
+          # adds absent package names and reuses exact digest matches.
           : > "$PACKAGE_ROOT/package-digests.jsonl"
           for asset in "$PACKAGE_ROOT/release-assets/"*; do
             [ -f "$asset" ] || {
@@ -749,7 +755,8 @@ jobs:
           echo "package_digests=$package_digests" >> "$GITHUB_OUTPUT"
           python3 packaging/release.py require-draft \
             --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          gh release upload "$TAG" "$PACKAGE_ROOT/release-assets/"* --clobber
+          package_assets=("$PACKAGE_ROOT/release-assets/"*)
+          bash .github/scripts/upload-release-assets.sh "${package_assets[@]}"
       - name: Summarize package outputs
         env:
           PUBLICATION_ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED || 'false' }}
@@ -802,6 +809,20 @@ jobs:
           python3 packaging/release.py check-asset-sizes \
             --assets-json "$RUNNER_TEMP/release-assets.json"
           gh release download "$TAG" --dir "$root/assets"
+      - name: Require this workflow's draft generation
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
+          ADMITTED_TAG_OBJECT: ${{ needs.admit.outputs.tag_object }}
+          ADMITTED_WORKFLOW_SHA: ${{ needs.admit.outputs.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 packaging/release.py verify-generation \
+            --record "$VERIFY_ROOT/assets/thegn-$TAG-release.json" \
+            --tag "$TAG" --commit "$ADMITTED_SHA" \
+            --tag-object "$ADMITTED_TAG_OBJECT" \
+            --workflow-sha "$ADMITTED_WORKFLOW_SHA" --run-id "$RUN_ID"
       - name: Verify archive provenance
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -887,7 +908,7 @@ jobs:
           manifest="$RUNNER_TEMP/manifest/thegn-$TAG-manifest.json"
           python3 packaging/release.py require-draft \
             --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          gh release upload "$TAG" "$manifest" --clobber
+          bash .github/scripts/upload-release-assets.sh "$manifest"
           asset_count="$(jq '.assets | length' "$manifest")"
           echo "Verified and attached $asset_count release assets in the manifest for $TAG." >> "$GITHUB_STEP_SUMMARY"
   # Publication is deliberately a separate manual operation. It cannot reach
