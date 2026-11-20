@@ -9,7 +9,9 @@
 //! Those bodies are buffered only up to a fixed bound, then decoded or replayed
 //! as ordinary keys when malformed or unknown.
 
-use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+use std::collections::VecDeque;
+
+use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 
 const CSI_KEY_BUFFER_LIMIT: usize = 8;
 
@@ -109,6 +111,25 @@ impl MouseResidueFilter {
         }
         self.state = State::Idle;
         Some(self.replay(vec![key_event(&KeyCode::Char('['), Modifiers::ALT)]))
+    }
+
+    /// Expire an ambiguous introducer before a ready event is dispatched.
+    /// The event is queued after the one-shot replay, preserving input order.
+    pub fn flush_before_ready_event(
+        &mut self,
+        ready: Option<InputEvent>,
+        pending: &mut VecDeque<InputEvent>,
+    ) -> bool {
+        let Some(Verdict::Replay(keys)) = self.flush_pending_introducer() else {
+            return false;
+        };
+        if let Some(event) = ready {
+            pending.push_front(event);
+        }
+        for key in keys.into_iter().rev() {
+            pending.push_front(InputEvent::Key(key));
+        }
+        true
     }
 
     fn replay(&mut self, keys: Vec<KeyEvent>) -> Verdict {
@@ -286,6 +307,31 @@ mod tests {
         // app-tab dispatch without opening another CSI probe.
         assert_eq!(f.feed(&KeyCode::Char('['), Modifiers::ALT), Verdict::Pass);
         assert!(!f.has_pending_introducer());
+    }
+
+    #[test]
+    fn expired_introducer_precedes_ready_event_and_replay_does_not_loop() {
+        let mut filter = MouseResidueFilter::default();
+        let mut pending = VecDeque::new();
+        assert_eq!(
+            filter.feed(&KeyCode::Char('['), Modifiers::ALT),
+            Verdict::Swallow
+        );
+        assert!(filter.flush_before_ready_event(Some(InputEvent::Wake), &mut pending));
+        assert_eq!(
+            pending.pop_front(),
+            Some(InputEvent::Key(key_event(
+                &KeyCode::Char('['),
+                Modifiers::ALT,
+            )))
+        );
+        assert_eq!(pending.pop_front(), Some(InputEvent::Wake));
+        assert_eq!(
+            filter.feed(&KeyCode::Char('['), Modifiers::ALT),
+            Verdict::Pass
+        );
+        assert!(!filter.has_pending_introducer());
+        assert!(!filter.flush_before_ready_event(None, &mut pending));
     }
 
     #[test]

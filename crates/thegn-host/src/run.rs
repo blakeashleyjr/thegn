@@ -17434,7 +17434,7 @@ async fn event_loop<T: Terminal>(
         );
         let timeout =
             crate::idle_poll::fold_deadline(timeout, residue_deadline, std::time::Instant::now());
-        let polled = match pending_input.pop_front() {
+        let mut polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
             None => {
                 if crate::perf::enabled() {
@@ -17452,15 +17452,16 @@ async fn event_loop<T: Terminal>(
                 event
             }
         };
-        if matches!(&polled, Ok(None))
-            && residue_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
+        let residue_expired =
+            residue_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if residue_expired {
             residue_deadline = None;
-            if let Some(crate::mousefilter::Verdict::Replay(keys)) =
-                residue.flush_pending_introducer()
+            if residue.has_pending_introducer()
+                && let Ok(event) = &mut polled
             {
-                for key in keys.into_iter().rev() {
-                    pending_input.push_front(InputEvent::Key(key));
+                let ready = event.take();
+                if residue.flush_before_ready_event(ready, &mut pending_input) {
+                    polled = Ok(None);
                 }
             }
         }
