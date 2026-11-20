@@ -187,7 +187,7 @@ impl AsyncWrite for QuicControlIo {
 }
 
 impl axum::serve::Listener for IrohControlListener {
-    type Io = tokio::io::DuplexStream;
+    type Io = QuicControlIo;
     type Addr = IpcConnectInfo;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
