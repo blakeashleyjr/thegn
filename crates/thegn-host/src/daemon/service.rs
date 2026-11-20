@@ -1522,8 +1522,7 @@ impl DaemonService {
                                     "stage launch replay names a session this daemon no longer knows"
                                 );
                                 return Err(ControlError::Conflict(format!(
-                                    "stage launch {id} already opened session {}, which this daemon no longer knows (it ended and was evicted, or the daemon restarted); dispatch again with a new launch id",
-                                    safe_session_id
+                                    "stage launch {id} already opened session {safe_session_id}, which this daemon no longer knows (it ended and was evicted, or the daemon restarted); dispatch again with a new launch id",
                                 )));
                             }
                             return Ok(info);
