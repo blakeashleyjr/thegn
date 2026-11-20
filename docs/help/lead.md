@@ -68,6 +68,56 @@ with the normal new-tab key and it starts its own Lead process.
 
 `lead` is a reserved terminal name, so the new-terminal wizard refuses it.
 
+## The indicator
+
+With `[lead]` configured (dev channel only), the right panel carries a pinned
+Lead footer at the bottom, whichever tab is open. There is no setting to hide
+it. Its height follows the panel:
+
+| Panel size                   | Footer                                     |
+| ---------------------------- | ------------------------------------------ |
+| under 8 rows                 | none                                       |
+| under 16 rows or 30 columns  | 1 row: mark, state, approvals chip, lanes  |
+| under 60 columns             | 2 rows: status line, last action and keys  |
+| 60 columns and wider         | 3 rows: a `LEAD` header rule, then the two |
+
+```
+ LEAD ---------------------------------------
+ * working  [2 approvals]  lanes 1/4  spawns 3/20
+ PROJ-12 review asked 4m              Alt i
+```
+
+The state word is the first of these that applies:
+
+1. **error**: the last launch of the Lead was refused;
+2. **needs you**: at least one approval is waiting;
+3. **paused**: the kill switch is on;
+4. **unknown**: the pause flag could not be read;
+5. **working**: a Lead pane printed output on its own within the activity
+   quiet grace, or a `lead.wake` automation run is started, unfinished and
+   under six hours old;
+6. **idle**: the Lead is open and quiet;
+7. **not started**: the Lead has not been opened yet.
+
+The approval count covers every repo, the same list `approvals.list` returns;
+the chip is amber and inverse, and reads `99+` at the cap. Click it to open
+System > Notifications on the first row (approvals sort first) with row mode
+on, so `y` and `n` work at once. If that row is not an approval, the request
+is in another repo: the status line says so and names `g` to widen the scope.
+Clicking anywhere else on the footer jumps to the Lead, exactly like `Alt i`.
+
+The last-action line shows the newest Lead rule or `lead.wake` run (skipped
+and dropped runs are ignored), or the newest pending request ("asked
+<issue> <stage>") if that is newer. The right side shows `y/n` while you are
+needed, `thegn lead resume` when paused or `thegn lead pause` otherwise (wide
+footers only), and the live chord for **Jump to the Lead**.
+
+Limits: the footer sees automation rule runs and approval requests only.
+Interactive tool calls you make in a Lead tab are not recorded, so they never
+appear. The working mark is a static dot, with no spinner. The sidebar `LEAD`
+row also gains a suffix for working, needs you, paused, unknown and error
+("Lead (1 tab) · working"); it stays "Lead — Enter to start" until first use.
+
 ## What it can reach
 
 The Lead only has the tools listed in [[ai-usage]] under "Lead tool
