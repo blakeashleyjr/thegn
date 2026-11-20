@@ -217,11 +217,12 @@ sidebar, a notification, the command palette, or connect is refused with
 
 New worktrees live under `~/.thegn/worktrees/<repo>/<label>--<digest>` by
 default; `worktree_mode = "in_repo"` keeps them in `<repo>/.worktrees`. The
-label is a readable slug of the branch; the 64-hex digest is derived from the
-repository's Git common directory plus the exact branch name, so `feat/a`,
-`feat-a` and `feat_a` — or two repos that share a basename — never share a
-checkout. Existing worktrees are never moved; they stay where Git has them. A
-destination that already exists is refused rather than reused, and a rename
+label is a readable slug of the branch; the 16-hex suffix is the first 64 bits
+of a digest of the repository's Git common directory plus the exact branch
+name, so `feat/a`, `feat-a` and `feat_a` — or two repos that share a basename —
+get distinct checkouts. A digest collision cannot alias two checkouts; it can
+only make a later create refuse. Existing worktrees are never moved and keep
+their longer 64-hex names; they stay where Git has them. A destination that already exists is refused rather than reused, and a rename
 whose `git worktree move` fails rolls the branch rename back. Each rename
 writes an owner-only intent record in the repository Git directory; the next
 rename or worktree creation in that repository, and a check at every launch,
