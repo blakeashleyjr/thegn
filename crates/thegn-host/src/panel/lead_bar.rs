@@ -56,7 +56,7 @@ pub(crate) fn footer(bar: &LeadBar, cols: usize, rows: usize, jump_chord: &str) 
     };
 
     let narrow = cols < 60;
-    let chip = approval_seg(bar, g, narrow);
+    let chip = approval_seg(bar, g, narrow || height == 1);
     let chip_width = chip
         .as_ref()
         .map(|s| seg::seg_width(std::slice::from_ref(s)));
@@ -81,7 +81,7 @@ pub(crate) fn footer(bar: &LeadBar, cols: usize, rows: usize, jump_chord: &str) 
         seg(word_tok, bar.state.word()),
     ];
     if let Some(chip) = chip {
-        status.extend([sp(2), chip, sp(2)]);
+        status.extend([sp(2), chip]);
     }
     status.extend([sp(2)]);
     status.extend(lanes);
@@ -131,7 +131,7 @@ pub(crate) fn footer(bar: &LeadBar, cols: usize, rows: usize, jump_chord: &str) 
                 ]),
             )
         } else {
-            (1, chip_start)
+            (height - 2, chip_start)
         };
         (row, start..start + width)
     });
@@ -151,7 +151,7 @@ pub(crate) fn footer(bar: &LeadBar, cols: usize, rows: usize, jump_chord: &str) 
 fn approval_seg(bar: &LeadBar, g: &thegn_core::termcaps::GlyphSet, narrow: bool) -> Option<Seg> {
     if let Some(text) = bar.approvals_text() {
         if narrow {
-            Some(seg(
+            Some(Seg::chip(
                 Tok::State(StateRole::Warn),
                 format!(
                     " {} {} ",
@@ -278,7 +278,7 @@ fn lanes_for_single(bar: &LeadBar) -> Vec<Seg> {
 
 fn chip_for_single(bar: &LeadBar, g: &thegn_core::termcaps::GlyphSet) -> Option<Seg> {
     if bar.approvals_text().is_some() {
-        Some(seg(
+        Some(Seg::chip(
             Tok::State(StateRole::Warn),
             format!(
                 " {} {} ",

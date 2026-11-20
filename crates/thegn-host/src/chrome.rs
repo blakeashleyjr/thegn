@@ -2356,6 +2356,12 @@ fn panel_body(rect: Rect, foot: &crate::panel::lead_bar::LeadFoot) -> Rect {
     }
 }
 
+/// The panel rect minus the pinned Lead footer: the area the body (and every
+/// scroll/viewport computation on the loop) actually gets.
+pub(crate) fn panel_body_rect(model: &FrameModel, rect: Rect) -> Rect {
+    panel_body(rect, &lead_foot(model, rect))
+}
+
 /// Paint the panel's navigation-hints footer: a rule + " NAVIGATE " title over a
 /// column of dim chord / label pairs. Mirrors the sidebar's `draw_sidebar_hints`
 /// so the two focus footers read identically; the pairs are the live
