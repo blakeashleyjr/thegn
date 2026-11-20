@@ -78,6 +78,16 @@ thegn env pull
 `thegn env down --stop` parks the sandbox without deleting it. A stop and the
 lifetime ceiling both run before any resume.
 
+## Stop, resume and expired snapshots
+
+- A one-shot command that Vercel refused because the session had stopped is
+  retried once after the sandbox is resumed, and only when waking is allowed.
+  The refusal comes before the command starts, so nothing runs twice.
+- If Vercel reports that a stopped sandbox's saved snapshot has expired, thegn
+  refuses to resume it and says to destroy it (`thegn env down`) and create a
+  new one. thegn never deletes it on its own.
+- Stopping a session that is already stopped counts as success.
+
 This fetches the bundle into `refs/thegn/pull/<worktree>`; only the lane's own
 branch fast-forwards. See [[sandboxing]].
 
@@ -88,6 +98,8 @@ branch fast-forwards. See [[sandboxing]].
   up to 30 s. A 404 removes the ledger record and deletes the snapshots. A
   sandbox that is still present keeps the record and returns an error, which
   matches the 60 s listing proof `env down` already requires.
+- **A snapshot listing that did not finish** deletes what it listed, reports
+  an error and keeps the record. Run the destroy again to continue.
 - **Exec ceiling.** One exec request may run for up to 31 minutes; the
   facade's outer deadline governs. A stream that ends with no command exit is
   an error: "vercel: run command ended without an exit status".
@@ -100,6 +112,7 @@ branch fast-forwards. See [[sandboxing]].
   `fleet list --json` response shapes parse, and `7s` does the same for
   `fleet cost --json`. Step `4b` checks the exec exit code. Both sentinels
   WARN rather than fail when a field is missing.
+  Steps `8s` and `8r` prove that a stop and a resume reached Vercel.
 - **Fixtures.** `crates/thegn-svc/tests/fixtures/vercel/README.md` records
   that those JSON files are the shapes thegn parses, not captured bodies.
   After the first live run (THE-2234), replace each file with a captured body
@@ -242,6 +255,12 @@ resume and no timer.
 CPU time, memory and run time, plus snapshot sizes, priced at Pro iad1 rates
 ($0.128 per vCPU-hour active CPU, $0.0212 per GB-hour memory, $0.08 per
 GB-month snapshots). It is an estimate. Earlier sessions are not included.
+
+Active CPU time is already summed across vCPUs. Vercel bills memory in
+one-minute minimum increments; the estimate does not round up to them.
+
+A report built from a snapshot listing that did not finish is marked
+incomplete. Snapshots left behind by a sandbox that is gone are priced too.
 
 ## Unverified
 
