@@ -4,7 +4,7 @@
 //! grace period, or at once when its worktree is gone. Never creates or
 //! resumes. Inert with no vercel env (an early-return config scan).
 //!
-//! - Every remote read is [`VercelProvider::reaper_view`] (a GET that never
+//! - Every remote read is `VercelProvider::reaper_view` (a GET that never
 //!   resumes), so a pass never buys compute.
 //! - A `creating` record older than [`CREATING_STALE_SECS`] is a crashed create:
 //!   best-effort delete of whatever landed, then drop the record.

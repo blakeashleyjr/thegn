@@ -299,7 +299,7 @@ impl SoundRuntime {
     /// Stop accepting sound work, cancel active helper playback, discard the
     /// coalesced reload request, and wait for both owned workers.
     ///
-    /// The wait is bounded by [`SHUTDOWN_JOIN_BOUND`] in total. A worker that
+    /// The wait is bounded by `SHUTDOWN_JOIN_BOUND` in total. A worker that
     /// has not finished by then (a child in uninterruptible I/O or a hung pack
     /// directory) is logged and detached
     /// rather than blocking exit; it holds only a weak runtime reference and

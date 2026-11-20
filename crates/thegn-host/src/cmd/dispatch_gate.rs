@@ -133,7 +133,7 @@ pub(crate) fn trusted_land_gate(
     trusted_land_gate_id(db, worktree, folded_commit, target_tip, repo).map(|_| ())
 }
 
-/// Return the trusted attestation id for [`trusted_land_gate`], for the CLI's
+/// Return the trusted attestation id for `trusted_land_gate`, for the CLI's
 /// success message. Keeping the public check's return type as `()` makes it
 /// clear that callers must not treat the id as a new authority.
 pub(crate) fn trusted_land_gate_id(
