@@ -437,7 +437,7 @@ impl SidebarRow {
     /// with a stable identity. Excludes section headings / empty hints (no
     /// `pin_key`) and folders / terminals (no bulk or reorder action).
     pub fn is_markable(&self) -> bool {
-        !self.pin_key.is_empty() && (self.kind == RowKind::Workspace || self.is_worktree())
+        !self.pin_key.is_empty() && (self.kind == RowKind::Workspace || self.kind.is_worktree())
     }
 
     /// Whether this row can be pinned (floated to the top of its sibling run).
@@ -1652,10 +1652,7 @@ pub fn build_rows(
         let workspace_slug = &rows[index].workspace_slug;
         let mq_rollup = thegn_core::merge_queue_view::rollup(
             rows.iter()
-                .filter(|child| {
-                    matches!(child.kind, RowKind::Worktree | RowKind::PipelineWorktree)
-                        && child.workspace_slug == *workspace_slug
-                })
+                .filter(|child| child.kind.is_worktree() && child.workspace_slug == *workspace_slug)
                 .filter_map(|child| child.mq_status),
         );
         rows[index].mq_rollup = mq_rollup;
@@ -2425,19 +2422,6 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     }
                 }
             }
-            RowKind::PipelineWorktree => {
-                if keep[i] {
-                    if let Some(l) = last_lane {
-                        keep[l] = true;
-                    }
-                    if let Some(g) = last_group {
-                        keep[g] = true;
-                    }
-                    if let Some(w) = last_workspace {
-                        keep[w] = true;
-                    }
-                }
-            }
             RowKind::EmptyHint | RowKind::ShowMore => {}
         }
     }
@@ -2494,11 +2478,6 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
             }
             RowKind::PipelineLane => {
                 reveal_lane = self_match[i] || reveal_group;
-                if reveal_lane {
-                    keep[i] = true;
-                }
-            }
-            RowKind::PipelineWorktree => {
                 if reveal_lane {
                     keep[i] = true;
                 }

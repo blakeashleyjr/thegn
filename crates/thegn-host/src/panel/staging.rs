@@ -47,7 +47,7 @@ pub(crate) fn active_worktree_jj(model: &crate::chrome::FrameModel) -> bool {
     model
         .sidebar_rows
         .iter()
-        .find(|row| row.kind == crate::sidebar::RowKind::Worktree && row.active)
+        .find(|row| row.kind.is_worktree() && row.active)
         .and_then(|row| row.worktree_path.as_ref())
         .and_then(|path| model.sidebar_status.git.get(path))
         .is_some_and(|glyphs| glyphs.jj)
@@ -446,6 +446,26 @@ mod tests {
             ..Default::default()
         };
         assert!(!active_worktree_jj(&model));
+
+        let pipeline = crate::sidebar::SidebarRow {
+            active: true,
+            worktree_path: Some("/repo/pipeline".into()),
+            ..crate::sidebar::SidebarRow::base(
+                crate::sidebar::RowKind::PipelineWorktree,
+                3,
+                "pipeline",
+                "repo",
+            )
+        };
+        let model = crate::chrome::FrameModel {
+            sidebar_rows: vec![pipeline],
+            sidebar_status: crate::sidebar::SidebarStatus {
+                git: [("/repo/pipeline".into(), status)].into_iter().collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(active_worktree_jj(&model));
 
         let model = crate::chrome::FrameModel {
             sidebar_rows: vec![crate::sidebar::SidebarRow {

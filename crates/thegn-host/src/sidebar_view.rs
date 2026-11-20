@@ -822,7 +822,6 @@ fn sidebar_geom_from(
     rect: Rect,
     visible: &[&crate::sidebar::SidebarRow],
 ) -> SidebarGeom {
-    use crate::sidebar::RowKind;
     let rail = model.sidebar_rail;
     // The full panel reserves a header + blank row at the top and a metrics
     // section at the bottom; the rail reserves only row 0, for its mode glyph.
@@ -2615,7 +2614,7 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
             .unwrap_or_default()
     };
     match row.kind {
-        RowKind::Worktree | RowKind::Terminal => {
+        RowKind::Worktree | RowKind::PipelineWorktree | RowKind::Terminal => {
             let dot = if matches!(row.activity, ActivityState::None) {
                 seg(Tok::Slot(S::Ghost2), gl.middot) // · placeholder keeps the column
             } else {
@@ -5336,6 +5335,32 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn pipeline_worktree_keeps_worktree_identity_in_rail_mode() {
+        let mut row = SidebarRow::base(RowKind::PipelineWorktree, 3, "feature", "app");
+        row.active = true;
+        row.activity = crate::sidebar::ActivityState::Active;
+
+        let line = compose_rail_line(&row);
+        let text = match line {
+            crate::seg::Line::Segs(segments) => segments
+                .into_iter()
+                .map(|segment| segment.text)
+                .collect::<String>(),
+            other => panic!("expected worktree rail line, got {other:?}"),
+        };
+
+        assert!(
+            text.contains(&crate::caps::active_glyphs().dot_filled),
+            "{text:?}"
+        );
+        assert!(text.contains('f'), "{text:?}");
+        assert!(
+            !text.contains(&crate::caps::active_glyphs().box_h),
+            "{text:?}"
+        );
     }
 
     #[test]

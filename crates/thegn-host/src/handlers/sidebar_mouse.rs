@@ -575,7 +575,7 @@ fn drag_src_for(
         .filter(|r| r.visible)
         .nth(hit.visible_index)?;
     match row.kind {
-        RowKind::Worktree => {
+        RowKind::Worktree | RowKind::PipelineWorktree => {
             // Live, non-home worktrees only: the step-move machinery needs a
             // session group, and home is anchored first.
             let Some(RowTarget::Tab(gi, _)) = row.tab_target else {
@@ -971,7 +971,7 @@ fn move_to_end_of_run(
     let Some(slug) = model
         .sidebar_rows
         .iter()
-        .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some(path))
+        .find(|r| r.kind.is_worktree() && r.worktree_path.as_deref() == Some(path))
         .map(|r| r.workspace_slug.clone())
     else {
         return;
@@ -995,7 +995,7 @@ fn path_of_pin_key(model: &FrameModel, key: &str) -> Option<String> {
     model
         .sidebar_rows
         .iter()
-        .find(|r| r.kind == RowKind::Worktree && r.pin_key == key)
+        .find(|r| r.kind.is_worktree() && r.pin_key == key)
         .and_then(|r| r.worktree_path.clone())
 }
 

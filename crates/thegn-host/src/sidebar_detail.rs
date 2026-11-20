@@ -10,7 +10,7 @@ use thegn_svc::git::{DiffCount, META_COUNT_CAP};
 
 use crate::chrome::S;
 use crate::seg::{Line, Seg, Tok, seg, seg_width, sp};
-use crate::sidebar::{CiBadge, PluginFieldValue, RowKind, SidebarRow};
+use crate::sidebar::{CiBadge, PluginFieldValue, SidebarRow};
 use crate::sidebar_view::SidebarDisplay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -787,6 +787,7 @@ pub(crate) fn compose_detail_line(row: &SidebarRow, disp: &SidebarDisplay) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::RowKind;
     use thegn_svc::git::BranchMeta;
 
     fn row() -> SidebarRow {
