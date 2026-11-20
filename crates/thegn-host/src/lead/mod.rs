@@ -9,6 +9,7 @@ pub(crate) mod launch;
 pub(crate) mod login;
 pub(crate) mod mcp;
 pub(crate) mod skill;
+pub(crate) mod status;
 pub(crate) mod wake;
 
 /// Whether the Lead is configured (`[lead]` present after the channel clamp).
