@@ -305,7 +305,7 @@ fn read_invitation(file: Option<std::path::PathBuf>) -> Result<DirectInvitation>
 }
 
 #[cfg(feature = "iroh")]
-fn read_invitation_from(mut reader: impl std::io::Read) -> Result<DirectInvitation> {
+fn read_invitation_from(reader: impl std::io::Read) -> Result<DirectInvitation> {
     let mut bytes = Vec::new();
     reader.take(16 * 1024).read_to_end(&mut bytes)?;
     parse_invitation(&bytes)
