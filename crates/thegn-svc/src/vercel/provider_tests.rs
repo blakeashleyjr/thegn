@@ -24,6 +24,12 @@ pub(super) struct FakeApi {
     pub(super) stateful: bool,
     pub(super) delete_fails: bool,
     pub(super) snapshots: Vec<String>,
+    /// `run` answers SessionStopped this many times before succeeding.
+    pub(super) run_stopped: Mutex<u32>,
+    /// Whether the snapshot listing reports itself complete (default false: set it).
+    pub(super) snapshots_incomplete: bool,
+    /// The resume (`get … resume=true`) answers SnapshotExpired.
+    pub(super) resume_expired: bool,
     /// Every create and run body sent, in order.
     pub(super) bodies: Mutex<Vec<serde_json::Value>>,
     /// Delay before a one-shot command answers.
@@ -89,6 +95,9 @@ impl Api for FakeApi {
         Box::pin(async move {
             if resume {
                 self.record(format!("resume {name}"));
+                if self.resume_expired {
+                    return Err(client::SnapshotExpired { name: name.into() }.into());
+                }
                 if self.stateful {
                     let n = self.count("resume");
                     if let Some(view) = self.by_name.lock().unwrap().get_mut(name) {
@@ -216,6 +225,22 @@ impl Api for FakeApi {
     ) -> BoxFuture<'a, Result<(i32, Vec<u8>, String)>> {
         Box::pin(async move {
             self.record(format!("run {session}"));
+            let stopped = {
+                let mut run_stopped = self.run_stopped.lock().unwrap();
+                if *run_stopped > 0 {
+                    *run_stopped -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if stopped {
+                return Err(client::SessionStopped {
+                    op: "run command",
+                    status: 410,
+                }
+                .into());
+            }
             self.bodies.lock().unwrap().push(body.clone());
             let delay = *self.run_delay.lock().unwrap();
             if let Some(delay) = delay {
@@ -225,10 +250,10 @@ impl Api for FakeApi {
         })
     }
 
-    fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
+    fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(Vec<String>, bool)>> {
         Box::pin(async move {
             self.record(format!("snapshots {name}"));
-            Ok(self.snapshots.clone())
+            Ok((self.snapshots.clone(), !self.snapshots_incomplete))
         })
     }
 
@@ -244,10 +269,23 @@ impl Api for FakeApi {
             Ok(None)
         })
     }
-    fn snapshot_usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<SnapshotUsage>>> {
+    fn snapshot_usage<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(Vec<SnapshotUsage>, bool)>> {
         Box::pin(async move {
             self.record(format!("snapshot_usage {name}"));
-            Ok(vec![])
+            let snapshots = self
+                .snapshots
+                .iter()
+                .map(|id| SnapshotUsage {
+                    id: id.clone(),
+                    size_bytes: 1024,
+                    expires_at_ms: None,
+                    status: "created".into(),
+                })
+                .collect();
+            Ok((snapshots, !self.snapshots_incomplete))
         })
     }
 }
@@ -521,6 +559,32 @@ async fn destroy_deletes_the_snapshots() {
 }
 
 #[tokio::test]
+async fn delete_with_an_incomplete_snapshot_listing_deletes_what_it_saw_and_errs() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let controller = crate::vps::controller::controller_id().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    registry::write_at(ledger.path(), &ledger_record(NAME, "ready")).unwrap();
+    let fake = Arc::new(FakeApi {
+        snapshots: vec!["snap_1".into(), "snap_2".into()],
+        snapshots_incomplete: true,
+        ..FakeApi::default()
+    });
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(tagged(NAME, &controller)));
+    fake.gets.lock().unwrap().push_back(None);
+
+    let error = provider(&fake, ledger.path(), 2)
+        .destroy(NAME)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("did not finish"), "{error:#}");
+    assert_eq!(fake.count("delete_snapshot"), 2, "{:?}", fake.calls());
+    assert!(registry::read_at(ledger.path(), NAME).is_some());
+}
+
+#[tokio::test]
 async fn destroy_keeps_the_record_while_the_sandbox_is_still_listed() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let controller = crate::vps::controller::controller_id().unwrap();
@@ -599,6 +663,31 @@ async fn wake_allow_resumes_a_stopped_sandbox() {
     let p = provider(&fake, ledger.path(), 2);
     assert_eq!(p.session_for(NAME, Wake::Allow).await.unwrap(), "sess_2");
     assert_eq!(fake.count("resume"), 1);
+}
+
+#[tokio::test]
+async fn resume_of_an_expired_snapshot_is_refused_and_nothing_is_deleted() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        resume_expired: true,
+        ..FakeApi::default()
+    });
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Stopped, None)));
+
+    let error = provider(&fake, ledger.path(), 2)
+        .session_for(NAME, Wake::Allow)
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<client::SnapshotExpired>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("resume"), 1, "{:?}", fake.calls());
+    assert_eq!(fake.count("delete"), 0, "{:?}", fake.calls());
 }
 
 #[tokio::test(start_paused = true)]
@@ -681,6 +770,77 @@ async fn run_exec_short_command_checks_once() {
         .unwrap();
     assert_eq!(result.0, 0);
     assert!(fake.count("get") <= 2, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn run_exec_retries_once_when_the_session_stopped_under_allow() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        run_stopped: Mutex::new(1),
+        ..FakeApi::default()
+    });
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Running, Some("sess_1"))));
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Running, Some("sess_2"))));
+
+    let result = provider(&fake, ledger.path(), 2)
+        .run_exec(NAME, &["true".to_string()], None, &[], Wake::Allow)
+        .await
+        .unwrap();
+    assert_eq!(result, (0, "ok".to_string()));
+    assert_eq!(fake.count("run"), 2, "{:?}", fake.calls());
+    assert_eq!(fake.count("get"), 2, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn run_exec_gives_up_after_the_second_stop() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        run_stopped: Mutex::new(2),
+        ..FakeApi::default()
+    });
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Running, Some("sess_1"))));
+
+    let error = provider(&fake, ledger.path(), 2)
+        .run_exec(NAME, &["true".to_string()], None, &[], Wake::Allow)
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<client::SessionStopped>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("run"), 2, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn run_exec_under_never_reports_stopped_without_retry() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        run_stopped: Mutex::new(1),
+        ..FakeApi::default()
+    });
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Running, Some("sess_1"))));
+
+    let error = provider(&fake, ledger.path(), 2)
+        .run_exec(NAME, &["true".to_string()], None, &[], Wake::Never)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), STOPPED_TEXT);
+    assert_eq!(fake.count("run"), 1, "{:?}", fake.calls());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1210,4 +1370,29 @@ async fn usage_report_is_incomplete_on_a_partial_listing() {
         .expect("usage report");
     assert!(!complete, "a page-cap listing is a gap");
     assert_eq!(fake.count("resume"), 0);
+}
+
+#[tokio::test]
+async fn usage_report_prices_snapshots_of_a_gone_sandbox_and_marks_partial_listings() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    registry::write_at(ledger.path(), &ledger_record(NAME, "ready")).unwrap();
+    let fake = Arc::new(FakeApi {
+        snapshots: vec!["snap_1".into()],
+        snapshots_incomplete: true,
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().push_back(None);
+
+    let (rows, complete) = provider(&fake, ledger.path(), 2)
+        .usage_report()
+        .await
+        .expect("usage report");
+    assert!(!complete, "the snapshot listing was partial");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].status, "gone");
+    assert!(rows[0].session.is_none());
+    assert!(rows[0].snapshots_usd_month > 0.0, "{rows:?}");
+    assert_eq!(rows[0].snapshot_bytes, 1024);
+    assert_eq!(fake.count("snapshot_usage"), 1, "{:?}", fake.calls());
 }
