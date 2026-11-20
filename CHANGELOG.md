@@ -19,6 +19,16 @@ All notable changes to **thegn** are documented here. The format follows
 
 - Vercel: streamed commands, interactive shells and file transfers refused because the session had stopped are retried once after resume, like one-shot commands.
 
+### Changed
+
+- Sprites command streams are checked strictly against the documented frame protocol; a violation is a typed protocol error and the command fails (THE-533).
+- The Sprites live check proves whether the memory limit is enforced by allocating past it (step 5d).
+- The VPS provider's destroy is now covered by the shared conformance case that keeps the record until the server is confirmed gone (THE-530).
+
+### Fixed
+
+- After a crash during cleanup, the merge-queue row of a remote worktree with no registry record is kept and retried instead of retired (THE-236).
+
 ## [0.1.0-alpha.109] — 2026-11-19
 
 ### Added

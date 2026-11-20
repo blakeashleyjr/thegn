@@ -262,6 +262,7 @@ mod refresh_schedule;
 mod remote_enqueue_auth;
 mod remote_poll;
 mod remote_sync;
+mod remote_term;
 mod render_plan;
 mod replay;
 mod replay_overlay;

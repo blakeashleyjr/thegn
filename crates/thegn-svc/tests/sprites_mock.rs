@@ -202,8 +202,8 @@ fn read_line(reader: &mut TcpStream, out: &mut String) -> Option<()> {
 }
 
 /// Complete the Sprites exec WebSocket handshake and emulate the install shell
-/// steps and `mv -f --` used to publish a staged executable. The two binary
-/// frames mirror the provider's non-tty stdout and exit-status framing.
+/// steps and `mv -f --` used to publish a staged executable. The stdout frame,
+/// the single-byte exit frame `[0x03, code]`, then a close.
 fn handle_exec_websocket(
     mut stream: TcpStream,
     headers: &HashMap<String, String>,
@@ -304,8 +304,16 @@ fn handle_exec_websocket(
         }
     }
     let exit = vec![0x03, code as u8];
-    // best-effort: test mock: the client may already have hung up.
-    let _ = socket.send(tokio_tungstenite::tungstenite::Message::Binary(exit.into()));
+    if socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(exit.into()))
+        .is_err()
+    {
+        return;
+    }
+    if socket.close(None).is_err() {
+        return;
+    }
+    socket.flush().unwrap_or_default(); // best-effort: test mock: the client may already have hung up
 }
 
 /// The recorded real responses, keyed by (method, path-without-query).
