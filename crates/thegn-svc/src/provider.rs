@@ -7585,6 +7585,24 @@ mod tests {
         (frames, fault)
     }
 
+    async fn next_non_ping<S>(
+        server: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> Option<tokio_tungstenite::tungstenite::Message>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        loop {
+            match server.next().await? {
+                Ok(Message::Ping(_)) => {}
+                Ok(message) => return Some(message),
+                Err(_) => return None,
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn drive_exec_probe_without_pong_keeps_a_quiet_session() {
         use tokio_tungstenite::tungstenite::protocol::Role;
@@ -7652,7 +7670,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            server.next().await.unwrap().unwrap(),
+            next_non_ping(&mut server).await.unwrap(),
             Message::Binary(b"x".to_vec().into())
         );
 
@@ -7708,11 +7726,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            server.next().await.unwrap().unwrap(),
+            next_non_ping(&mut server).await.unwrap(),
             Message::Binary(vec![b'x'].into())
         );
         server
-            .send(Message::Binary(vec![1, b'a'].into()))
+            .send(Message::Binary(vec![b'a'].into()))
             .await
             .unwrap();
         assert_eq!(
@@ -7739,7 +7757,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn drive_exec_probe_answered_by_pong_keeps_a_quiet_session() {
-        use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::protocol::Role;
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -7750,7 +7767,7 @@ mod tests {
             tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
                 .await;
         let server_task =
-            tokio::spawn(async move { while let Some(Ok(_)) = server.next().await {} });
+            tokio::spawn(async move { while next_non_ping(&mut server).await.is_some() {} });
         let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
@@ -8040,7 +8057,6 @@ mod tests {
 
     #[tokio::test]
     async fn drive_exec_sends_stdin_eof_exactly_once_on_control_close() {
-        use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -8059,11 +8075,11 @@ mod tests {
         drop(control_tx);
 
         assert_eq!(
-            server.next().await.unwrap().unwrap(),
+            next_non_ping(&mut server).await.unwrap(),
             Message::Binary(vec![4].into())
         );
         assert!(matches!(
-            server.next().await.unwrap().unwrap(),
+            next_non_ping(&mut server).await.unwrap(),
             Message::Close(_)
         ));
         driver.await.unwrap();
