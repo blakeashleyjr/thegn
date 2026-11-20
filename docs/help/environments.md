@@ -3,7 +3,8 @@ id: environments
 title: Environments
 parent: sandboxing
 order: 5
-actions: [warm-pool-increment, warm-pool-decrement, toolchain-install]
+actions:
+  [warm-pool-increment, warm-pool-decrement, toolchain-install, retry-pullbacks]
 contexts: [panel:environments]
 ---
 

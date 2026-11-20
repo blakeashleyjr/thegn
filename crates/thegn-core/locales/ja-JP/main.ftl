@@ -111,6 +111,7 @@ action-sidebar-narrower = Sidebar: narrower
 action-sidebar-wider = Sidebar: wider
 action-warm-pool-increment = Warm pool: add a spare
 action-warm-pool-decrement = Warm pool: remove a spare
+action-retry-pullbacks = Retry failed pull-backs
 action-toggle-panel = Toggle diff / PR panel
 action-files-drawer = Toggle files drawer
 action-drawer-cycle = ドロワーの表示項目を切り替え

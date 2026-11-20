@@ -40,6 +40,7 @@ pub mod env_reap;
 pub mod env_sync_retry;
 pub mod events;
 pub mod fleet;
+pub mod fleet_inspect;
 pub mod forward;
 pub mod host;
 pub mod inbox;
