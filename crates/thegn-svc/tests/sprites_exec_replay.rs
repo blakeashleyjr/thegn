@@ -232,6 +232,49 @@ async fn tty_replay_matches_the_live_trace() {
 }
 
 #[tokio::test]
+async fn tty_replay_preserves_a_newline_split_across_sprite_frames() {
+    // Synthetic `tty && echo ok` output: Sprite may put the PTY's CRLF in its
+    // own text frame between binary output chunks. Keep this separate from the
+    // live symptom replay above, whose received bytes already lack that CRLF.
+    let mock = start_mock(vec![script(vec![
+        session_info(),
+        Out::Bin(b"\x1b[>4;2m/dev/pts/0".to_vec()),
+        Out::Text("\r\n"),
+        Out::Bin(b"ok\r\n".to_vec()),
+        Out::Text(r#"{"type":"exit","exit_code":0}"#),
+    ])]);
+    let mut session = provider(&mock)
+        .open_exec("tgtest1", &tty_spec())
+        .await
+        .unwrap();
+
+    let mut output = Vec::new();
+    let mut trace = Vec::new();
+    while let Some(frame) = session.frames.recv().await {
+        match frame {
+            ExecFrame::Stdout(bytes) => {
+                output.extend_from_slice(&bytes);
+                trace.push(bytes);
+            }
+            ExecFrame::Exit(code) => {
+                assert_eq!(code, 0);
+                break;
+            }
+        }
+    }
+
+    assert_eq!(
+        trace,
+        vec![
+            b"\x1b[>4;2m/dev/pts/0".to_vec(),
+            b"\r\n".to_vec(),
+            b"ok\r\n".to_vec(),
+        ]
+    );
+    assert_eq!(output, b"\x1b[>4;2m/dev/pts/0\r\nok\r\n");
+}
+
+#[tokio::test]
 async fn tty_forwards_plain_text_frames_as_output() {
     let mock = start_mock(vec![script(vec![
         Out::Text("hello"),
