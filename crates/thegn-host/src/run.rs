@@ -1882,9 +1882,10 @@ pub(crate) fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Opti
 
 /// The panel's current geometry for content building, falling back to the
 /// resting width and a tall default when the panel rect is hidden.
-fn panel_geom(chrome: &layout::ChromeLayout) -> (usize, usize) {
+fn panel_geom(chrome: &layout::ChromeLayout, model: &FrameModel) -> (usize, usize) {
     chrome
         .panel
+        .map(|r| crate::chrome::panel_body_rect(model, r))
         .map(|r| (r.cols, r.rows))
         .unwrap_or((layout::PANEL_COLS, 40))
 }
@@ -8670,6 +8671,35 @@ async fn event_loop<T: Terminal>(
         }};
     }
 
+    macro_rules! jump_lead {
+        () => {{
+            match crate::lead::group::jump(
+                keymap.config(),
+                &mut session,
+                &mut panes,
+                &mut model.status,
+                &model.sidebar_db_terminals,
+                &pending_db_tx,
+                &waker,
+            ) {
+                crate::lead::group::JumpOutcome::Handled => {}
+                crate::lead::group::JumpOutcome::Activate(t) => {
+                    let (hydrate, _pending) = activate_row!(t);
+                    sb.focus_active_row(&mut model);
+                    if hydrate {
+                        kick_model_hydration!();
+                    }
+                }
+                crate::lead::group::JumpOutcome::Created => {
+                    focus.zone = crate::focus::Zone::Center;
+                    refresh_tab_model(&mut model, &session, &mut sb);
+                    persist_session_layout(&mut session, &panes);
+                    need_relayout = true;
+                }
+            }
+        }};
+    }
+
     // Dispatch a [`SidebarOutcome`] using the loop's locals — shared by the
     // keyboard path (sidebar `handle_key`) and the mouse path (row clicks and
     // context-menu picks), so the two input methods can never diverge.
@@ -9574,7 +9604,7 @@ async fn event_loop<T: Terminal>(
         // bounds but stay in section-navigation mode — Enter drills into rows.
         if prev_zone != crate::focus::Zone::Panel && focus.panel() {
             panel_ui.row_mode = false;
-            let (pc, pr) = panel_geom(&chrome);
+            let (pc, pr) = panel_geom(&chrome, &model);
             let max =
                 crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr).saturating_sub(1);
             panel_ui.cursor = panel_ui.cursor.min(max);
@@ -12984,7 +13014,7 @@ async fn event_loop<T: Terminal>(
             // change) used to strand the cursor past the end: the highlight
             // vanished and every action key became a silent no-op.
             if focus.panel() {
-                let (pc, pr) = panel_geom(&chrome);
+                let (pc, pr) = panel_geom(&chrome, &model);
                 let max = crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr)
                     .saturating_sub(1);
                 if panel_ui.cursor > max {
@@ -17268,8 +17298,14 @@ async fn event_loop<T: Terminal>(
             // ride on top" approach as the corner relay above.
             {
                 let open_preview = panel_ui.file_preview.as_ref().map(|fp| fp.path.as_str());
-                let blob =
-                    preview_gfx.frame(chrome.panel, open_preview, overlays.any(), corner_kitty);
+                let blob = preview_gfx.frame(
+                    chrome
+                        .panel
+                        .map(|r| crate::chrome::panel_body_rect(&model, r)),
+                    open_preview,
+                    overlays.any(),
+                    corner_kitty,
+                );
                 pending_preview_oob.offer(blob, |bytes| {
                     writer.try_submit_oob(crate::frame_writer::OobKind::Graphics, bytes)
                 });
@@ -18021,7 +18057,7 @@ async fn event_loop<T: Terminal>(
                                 // Front, not back: the leftover precedes whatever is still queued.
                                 pending_input.push_front(ev);
                             }
-                            let (_, panel_rows) = panel_geom(&chrome);
+                            let (_, panel_rows) = panel_geom(&chrome, &model);
                             let viewport = panel_rows.saturating_sub(4).max(1);
                             if let Some(fp) = panel_ui.file_preview.as_mut() {
                                 let delta = (ticks * 3) as isize;
@@ -18036,7 +18072,7 @@ async fn event_loop<T: Terminal>(
                         {
                             let col =
                                 crate::chrome::panel_column_at(&model, &panel_ui, rect, mx, my);
-                            let (pc, pr) = panel_geom(&chrome);
+                            let (pc, pr) = panel_geom(&chrome, &model);
                             let has_detail_scroll = crate::panel::sections::scroll_extent(
                                 panel_ui.open,
                                 &model,
@@ -18111,7 +18147,7 @@ async fn event_loop<T: Terminal>(
                                 gitui::GitWheel::Legacy => {}
                             }
                         }
-                        let (pc, pr) = panel_geom(&chrome);
+                        let (pc, pr) = panel_geom(&chrome, &model);
                         if let Some(ext) = crate::panel::sections::scroll_extent(
                             panel_ui.open,
                             &model,
@@ -18160,7 +18196,7 @@ async fn event_loop<T: Terminal>(
                                     panel_ui.git.step_view_cursor(!up);
                                 }
                             } else {
-                                let (pc, pr) = panel_geom(&chrome);
+                                let (pc, pr) = panel_geom(&chrome, &model);
                                 let max =
                                     crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr)
                                         .saturating_sub(1);
@@ -18918,6 +18954,38 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.switch_tab(t);
                                 persist_panel_state(&panel_ui);
                             }
+                            Some(crate::panel::PanelHit::LeadJump) => {
+                                jump_lead!();
+                                focus.zone = crate::focus::Zone::Center;
+                            }
+                            Some(crate::panel::PanelHit::LeadApprovals) => {
+                                open_panel_section(
+                                    crate::panel::Section::Notifications,
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                panel_ui.row_mode = true;
+                                let first_is_approval =
+                                    crate::panel::sections::notifications::visible_indices(
+                                        &model.panel,
+                                        &panel_ui,
+                                    )
+                                    .first()
+                                    .and_then(|&i| model.panel.notifications.get(i))
+                                    .is_some_and(
+                                        crate::panel::sections::notifications::is_approval,
+                                    );
+                                if !first_is_approval {
+                                    model.status = "The pending request is in another repo: press g in Notifications to show every repo".into();
+                                }
+                            }
                         }
                     }
                     dirty = true;
@@ -19210,7 +19278,7 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.scroll = crate::panel::sections::help::scroll_for_anchor(
                                     reg,
                                     &panel_ui.help.page,
-                                    panel_geom(&chrome).0.saturating_sub(indent),
+                                    panel_geom(&chrome, &model).0.saturating_sub(indent),
                                     anchor,
                                 );
                             }
@@ -22664,7 +22732,7 @@ async fn event_loop<T: Terminal>(
                     && panel_ui.open == crate::panel::Section::Files
                     && panel_ui.file_preview.is_some()
                 {
-                    let (_, panel_rows) = panel_geom(&chrome);
+                    let (_, panel_rows) = panel_geom(&chrome, &model);
                     // Body viewport ≈ panel rows minus the preview's 2-row
                     // header and the surrounding chrome.
                     let viewport = panel_rows.saturating_sub(4).max(1);
@@ -22749,11 +22817,11 @@ async fn event_loop<T: Terminal>(
                         panel_ui.open,
                         &model,
                         &panel_ui,
-                        panel_geom(&chrome).0,
-                        panel_geom(&chrome).1,
+                        panel_geom(&chrome, &model).0,
+                        panel_geom(&chrome, &model).1,
                     )
                 {
-                    let (cols, rows) = panel_geom(&chrome);
+                    let (cols, rows) = panel_geom(&chrome, &model);
                     let page =
                         crate::panel::sections::scroll_viewport(&model, &panel_ui, cols, rows)
                             .max(1);
@@ -23031,7 +23099,7 @@ async fn event_loop<T: Terminal>(
                                 }
                                 // Hitless panel bodies own j/k at every supported
                                 // width; Stash detail leaves these keys to its list.
-                                let geom = panel_geom(&chrome);
+                                let geom = panel_geom(&chrome, &model);
                                 if let Some(ext) = crate::panel::sections::scroll_extent(
                                     panel_ui.open,
                                     &model,
@@ -23065,7 +23133,7 @@ async fn event_loop<T: Terminal>(
                                     dirty = true;
                                     continue;
                                 }
-                                let geom = panel_geom(&chrome);
+                                let geom = panel_geom(&chrome, &model);
                                 let count = crate::panel::frame::actionable_rows(
                                     &model, &panel_ui, geom.0, geom.1,
                                 );
@@ -23849,7 +23917,7 @@ async fn event_loop<T: Terminal>(
                                                     "widen the panel (e) to look up a binding"
                                                         .into();
                                             } else {
-                                                let (cols, rows) = panel_geom(&chrome);
+                                                let (cols, rows) = panel_geom(&chrome, &model);
                                                 let viewport =
                                                     crate::panel::sections::scroll_viewport(
                                                         &model, &panel_ui, cols, rows,
@@ -27942,7 +28010,7 @@ async fn event_loop<T: Terminal>(
                                                 // persist + rehydrate is deferred
                                                 // until after the loop).
                                                 if panel_ui.row_mode {
-                                                    let (pc, pr) = panel_geom(&chrome);
+                                                    let (pc, pr) = panel_geom(&chrome, &model);
                                                     let max = crate::panel::frame::actionable_rows(
                                                         &model, &panel_ui, pc, pr,
                                                     )
@@ -29012,30 +29080,7 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::JumpLead => {
-                                match crate::lead::group::jump(
-                                    keymap.config(),
-                                    &mut session,
-                                    &mut panes,
-                                    &mut model.status,
-                                    &model.sidebar_db_terminals,
-                                    &pending_db_tx,
-                                    &waker,
-                                ) {
-                                    crate::lead::group::JumpOutcome::Handled => {}
-                                    crate::lead::group::JumpOutcome::Activate(t) => {
-                                        let (hydrate, _pending) = activate_row!(t);
-                                        sb.focus_active_row(&mut model);
-                                        if hydrate {
-                                            kick_model_hydration!();
-                                        }
-                                    }
-                                    crate::lead::group::JumpOutcome::Created => {
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        persist_session_layout(&mut session, &panes);
-                                        need_relayout = true;
-                                    }
-                                }
+                                jump_lead!();
                             }
                             Action::MarkAllRead => {
                                 crate::handlers::attention::mark_all_read(
