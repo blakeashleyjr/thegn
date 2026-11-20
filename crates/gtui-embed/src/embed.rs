@@ -1393,14 +1393,16 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            assert!(ObserveTile::new(
-                Arc::new(|| {}),
-                &ObserveConfig::default(),
-                tokio::runtime::Handle::current(),
-                Theme::prism(),
-                HostSourceInit::Fed(HostFeed::new()),
-            )
-            .is_ok());
+            assert!(
+                ObserveTile::new(
+                    Arc::new(|| {}),
+                    &ObserveConfig::default(),
+                    tokio::runtime::Handle::current(),
+                    Theme::prism(),
+                    HostSourceInit::Fed(HostFeed::new()),
+                )
+                .is_ok()
+            );
         });
     }
 

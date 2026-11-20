@@ -836,9 +836,7 @@ impl TickerIo for LiveIo {
         let interval =
             Duration::from_millis(self.stats_interval_ms.load(Ordering::Relaxed).max(500));
         let live = self.stats_live.load(Ordering::Relaxed);
-        if !live
-            && self.last_stats.expect("stats primed").elapsed() < interval
-        {
+        if !live && self.last_stats.expect("stats primed").elapsed() < interval {
             return Ok(false);
         }
         self.last_stats = Some(Instant::now());

@@ -61,6 +61,7 @@ type Ring = Arc<Mutex<VecDeque<(f64, HostSample)>>>;
 #[derive(Clone, Default)]
 pub struct HostFeed {
     ring: Ring,
+    last_own_gap: Arc<Mutex<f64>>,
 }
 
 impl HostFeed {
@@ -79,11 +80,12 @@ impl HostFeed {
             }) {
                 return;
             }
-            admit_sample(
-                &mut r,
-                ts_secs,
-                HostSample::new(snap, fed_max_gap_secs(cadence_secs)),
-            );
+            let own = fed_max_gap_secs(cadence_secs);
+            let prev = self.last_own_gap.lock().map(|g| *g).unwrap_or(0.0);
+            admit_sample(&mut r, ts_secs, HostSample::new(snap, own.max(prev)));
+            if let Ok(mut g) = self.last_own_gap.lock() {
+                *g = own;
+            }
         }
     }
 
@@ -91,6 +93,9 @@ impl HostFeed {
     pub fn clear(&self) {
         if let Ok(mut r) = self.ring.lock() {
             *r = VecDeque::new();
+            if let Ok(mut g) = self.last_own_gap.lock() {
+                *g = 0.0;
+            }
         }
     }
 
@@ -241,10 +246,11 @@ impl HostSource {
     /// Build a `(time, value)` frame for `expr` from the ring, keeping only
     /// samples where the metric is present. Both UTC range endpoints are
     /// inclusive. Coverage uses Unix seconds and marks a leading gap when the
-    /// earliest retained sample is more than two seconds after `from`. For
-    /// recognized metrics, a gap in the retained timestamps clipped to the
-    /// requested window is partial when consecutive points are more than one
-    /// sampling interval plus the coverage slack apart. `now` is the live host
+    /// earliest retained sample is more than the oldest retained sample's gap
+    /// tolerance minus one second after `from`. For recognized metrics, a gap
+    /// in the retained timestamps clipped to the requested window is partial
+    /// when consecutive points are farther apart than the later point's
+    /// per-sample tolerance (`HostSample::max_gap_secs`). `now` is the live host
     /// wall-clock bound for the effective window end, `min(to, now)`; when no
     /// retained sample follows the requested end, this endpoint detects a
     /// trailing gap without extending coverage into the future.
@@ -846,7 +852,9 @@ mod tests {
         }
         let source = HostSource::fed(&feed);
         assert_eq!(
-            source.frame_for_at("host_cpu_pct", &range(100, 130), 130.0).coverage,
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 130), 130.0)
+                .coverage,
             Coverage::Complete
         );
 
@@ -916,9 +924,33 @@ mod tests {
             source
                 .frame_for_at("host_cpu_pct", &range(100, 134), 134.0)
                 .coverage,
+            Coverage::Complete
+        );
+        push_cpu(&feed, 136.0, 136, 2.0);
+        push_cpu(&feed, 146.0, 146, 2.0);
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 146), 146.0)
+                .coverage,
             Coverage::Partial {
                 retained_from: Some(100.0)
             }
+        );
+    }
+
+    #[test]
+    fn fed_live_switch_from_slow_cadence_is_not_a_hole() {
+        let feed = HostFeed::new();
+        push_cpu(&feed, 100.0, 100, 10.0);
+        push_cpu(&feed, 110.0, 110, 10.0);
+        push_cpu(&feed, 119.5, 119, 0.5);
+        let source = HostSource::fed(&feed);
+
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 119), 119.5)
+                .coverage,
+            Coverage::Complete
         );
     }
 
