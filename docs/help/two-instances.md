@@ -150,6 +150,11 @@ These are not separated, and you should know it:
 
 ## Which instance is this?
 
+The masthead shows the instance after the brand. When `THEGN_CONFIG_DIR` moves
+the config dir away from `<XDG_CONFIG_HOME>/thegn`, it shows `[<basename of the
+config dir>]`, so the dev instance shows `[thegn-dev]`. Nothing shows for the
+default instance, under the e2e freeze or in tests.
+
 `thegn doctor` prints an instance block: run it in a pane to see the
 binary, config dir, state dir, `THEGN_DIR`, channel and daemon socket that pane belongs to.
 The block also prints the runtime dir, the sandbox controller id (sandboxes this
