@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Provider-neutral interactive remote parity run. Plan mode is offline.
 # Usage: THEGN_CHANNEL=dev test/remote-parity.sh --env <name> --i-accept-spend
-#        [--keep-going] [--samples N] [--idle-probe]
+#        [--keep-going] [--samples N] [--idle-probe] [--self-test]
 set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
@@ -10,6 +10,7 @@ accept=0
 keep_going=0
 samples=20
 idle_probe=0
+self_test=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -30,6 +31,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --idle-probe) idle_probe=1; shift ;;
+    --self-test) self_test=1; shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -65,6 +67,67 @@ Output     : one PASS|WARN|FAIL line per case, a summary table, and FAILED CASES
 Known quirk: THE-2450 is reported as WARN when only the first tty line ending differs.
 PLAN
 }
+
+self_test_run() {
+  local test_tmp daemon_pid="" local_session="" remote_session="" status
+  test_tmp="$(mktemp -d)"
+  export XDG_STATE_HOME="$test_tmp/state" THEGN_DIR="$test_tmp/thegn"
+  unset THEGN_CONFIG_DIR THEGN_CONTROL_ADDR THEGN_CONTROL_TOKEN
+  mkdir -p "$XDG_STATE_HOME" "$THEGN_DIR" "$test_tmp/repo"
+
+  self_test_cleanup() {
+    local rc="${1:-$?}"
+    trap - EXIT INT TERM
+    set +e
+    [ -z "$local_session" ] || "$THEGN_BIN" session close "$local_session" --json >/dev/null 2>&1 || true
+    [ -z "$remote_session" ] || "$THEGN_BIN" session close "$remote_session" --json >/dev/null 2>&1 || true
+    "$THEGN_BIN" daemon stop >/dev/null 2>&1 || true
+    if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+      kill "$daemon_pid" 2>/dev/null || true
+      wait "$daemon_pid" 2>/dev/null || true
+    fi
+    rm -rf "$test_tmp"
+    exit "$rc"
+  }
+  trap self_test_cleanup EXIT INT TERM
+
+  echo "remote-parity self-test: two local sessions, no provider or network"
+  "$THEGN_BIN" daemon >"$test_tmp/daemon.log" 2>&1 &
+  daemon_pid=$!
+  daemon_ready=0
+  for _ in $(seq 1 30); do
+    if "$THEGN_BIN" session list --json >/dev/null 2>&1; then
+      daemon_ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "$daemon_ready" -ne 1 ]; then
+    echo "self-test: daemon did not answer session list within 15 s" >&2
+    return 1
+  fi
+
+  self_argv_json="$(python3 -I -c 'import json; print(json.dumps(["bash", "--norc", "--noprofile", "-i"]))')"
+  self_open_params="$(SELF_ARGV_JSON="$self_argv_json" SELF_OPEN_CWD="$test_tmp/repo" python3 -I -c '
+import json, os
+print(json.dumps({"argv":json.loads(os.environ["SELF_ARGV_JSON"]),"cwd":os.environ["SELF_OPEN_CWD"],"env":[["PS1","PARITY$ "]],"rows":40,"cols":120}, separators=(",", ":")))
+')"
+  local_open_json="$("$THEGN_BIN" api call sessions.open --params "$self_open_params")"
+  local_session="$(printf '%s' "$local_open_json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  remote_open_json="$("$THEGN_BIN" api call sessions.open --params "$self_open_params")"
+  remote_session="$(printf '%s' "$remote_open_json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+
+  export RP_THEGN_BIN="$THEGN_BIN" RP_LOCAL_SESSION="$local_session" RP_REMOTE_SESSION="$remote_session" RP_REPO="$test_tmp/repo" RP_TMP="$test_tmp" RP_PROVIDER="self-test" RP_SAMPLES="$samples" RP_KEEP_GOING=1 RP_IDLE_PROBE=0 RP_LOCAL_OPEN_MS=0 RP_REMOTE_OPEN_MS=0 RP_PROVIDER_QUIRK="" RP_LOCAL_ARGV_JSON="$self_argv_json" RP_REMOTE_ARGV_JSON="$self_argv_json" RP_REMOTE_WORKDIR_EXPR="\$HOME/workspace" RP_ENV_NAME="self-test"
+  set +e
+  python3 -I test/remote_parity.py
+  status=$?
+  set -e
+  self_test_cleanup "$status"
+}
+
+if [ "$self_test" -eq 1 ]; then
+  self_test_run
+fi
 
 # This gate is before every command that could touch state or the network.
 if [ -z "$env_name" ] && [ "$accept" -eq 0 ]; then
@@ -146,6 +209,21 @@ provider_ledger_name() {
     *) return 2 ;;
   esac
 }
+provider_ledger_all() {
+  case "$provider" in
+    sprites)
+      local f id kind
+      for f in "$XDG_STATE_HOME"/thegn/vps/*.json; do
+        [ -f "$f" ] || continue
+        kind="$(sed -n 's/.*"provider"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
+        [ "$kind" = sprites ] || continue
+        id="${f##*/}"
+        printf '%s\n' "${id%.json}"
+      done
+      ;;
+    *) return 2 ;;
+  esac
+}
 provider_session_prefix() {
   case "$provider" in
     sprites) PROVIDER_PREFIX=("$THEGN_BIN" sprite-exec "$1" --) ;;
@@ -209,6 +287,7 @@ teardown() {
   local rc=$?
   trap - EXIT INT TERM
   set +e
+  RUN_RECORDS="$(provider_ledger_all 2>/dev/null || true)"
   [ -z "$LOCAL_SESSION" ] || "$THEGN_BIN" session close "$LOCAL_SESSION" --json >/dev/null 2>&1 || true
   [ -z "$REMOTE_SESSION" ] || "$THEGN_BIN" session close "$REMOTE_SESSION" --json >/dev/null 2>&1 || true
   if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
@@ -234,6 +313,15 @@ teardown() {
       echo "TEARDOWN INCOMPLETE: sandbox $n may still exist; keeping $TMP" >&2
     fi
   done <<<"$RUN_RECORDS"
+  local leftover
+  leftover="$(provider_ledger_all 2>/dev/null || true)"
+  if [ -n "$(printf '%s\n' "$leftover" | sed '/^$/d')" ]; then
+    TEARDOWN_LEFT=1
+    rc=1
+    while IFS= read -r n; do
+      [ -z "$n" ] || echo "TEARDOWN INCOMPLETE: sandbox $n may still exist; keeping $TMP" >&2
+    done <<<"$leftover"
+  fi
   if [ "$TEARDOWN_LEFT" -eq 0 ]; then
     rm -rf "$TMP"
   else
@@ -256,7 +344,7 @@ echo "== temp state: $TMP =="
 scratch_repo
 (cd "$REPO" && "$THEGN_BIN" env set "$env_name" >/dev/null)
 export THEGN_LOG="thegn::startup=info" THEGN_TRACE_FILE="$TMP/up.log"
-(cd "$REPO" && "$THEGN_BIN" env up)
+(cd "$REPO" && "$THEGN_BIN" env up) > >(tee "$TMP/up.out") 2>&1
 RUN_RECORDS="$(provider_ledger_name)"
 if [ "$(printf '%s\n' "$RUN_RECORDS" | sed '/^$/d' | wc -l)" -ne 1 ]; then
   echo "FAIL P00: expected exactly one ready $provider ledger record from this run" >&2
@@ -342,5 +430,5 @@ sys.stdout.write(s)
   exit 1
 fi
 
-export RP_THEGN_BIN="$THEGN_BIN" RP_LOCAL_SESSION="$LOCAL_SESSION" RP_REMOTE_SESSION="$REMOTE_SESSION" RP_REPO="$REPO" RP_TMP="$TMP" RP_PROVIDER="$provider" RP_SAMPLES="$samples" RP_KEEP_GOING="$keep_going" RP_IDLE_PROBE="$idle_probe" RP_LOCAL_OPEN_MS="$LOCAL_OPEN_MS" RP_REMOTE_OPEN_MS="$REMOTE_OPEN_MS" RP_PROVIDER_QUIRK="$(provider_known_quirks)" RP_REMOTE_ARGV_JSON="$remote_argv_json" RP_REMOTE_WORKDIR_EXPR="$(provider_workdir_expr)" RP_ENV_NAME="$env_name"
+export RP_THEGN_BIN="$THEGN_BIN" RP_LOCAL_SESSION="$LOCAL_SESSION" RP_REMOTE_SESSION="$REMOTE_SESSION" RP_REPO="$REPO" RP_TMP="$TMP" RP_PROVIDER="$provider" RP_SAMPLES="$samples" RP_KEEP_GOING="$keep_going" RP_IDLE_PROBE="$idle_probe" RP_LOCAL_OPEN_MS="$LOCAL_OPEN_MS" RP_REMOTE_OPEN_MS="$REMOTE_OPEN_MS" RP_PROVIDER_QUIRK="$(provider_known_quirks)" RP_LOCAL_ARGV_JSON="$local_argv_json" RP_REMOTE_ARGV_JSON="$remote_argv_json" RP_REMOTE_WORKDIR_EXPR="$(provider_workdir_expr)" RP_ENV_NAME="$env_name"
 python3 -I test/remote_parity.py
