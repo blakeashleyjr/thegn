@@ -82,6 +82,8 @@ pub struct Predictor {
     srtt: Srtt,
     /// Timestamp (ms) of the first un-echoed keystroke in this burst, for srtt.
     last_key_ms: Option<u64>,
+    /// A partial retirement re-armed `last_key_ms` as a staleness stamp; the next retirement takes no srtt sample.
+    resampled: bool,
     /// Cursor at the first un-echoed key in this burst.
     key_cursor: Option<(usize, usize)>,
     /// Character typed at the first un-echoed key in this burst.
@@ -174,9 +176,13 @@ impl Predictor {
         cell: &dyn Fn(usize, usize) -> Option<String>,
     ) {
         let Some((row, col)) = self.key_cursor else {
-            if let Some(start) = self.last_key_ms.take() {
+            let start = self.last_key_ms.take();
+            if !std::mem::take(&mut self.resampled)
+                && let Some(start) = start
+            {
                 self.srtt.observe(now_ms.saturating_sub(start) as f64);
             }
+            self.resampled = false;
             self.confirmed_row = None;
             self.pending.clear();
             self.key_char = None;
@@ -195,9 +201,11 @@ impl Predictor {
 
         let advanced_same_row = cursor.0 == row && cursor.1 > col;
         let pending_is_ascii = self.pending.iter().all(|c| c.is_ascii());
-        let n = advanced_same_row
-            .then(|| (cursor.1 - col).min(self.pending.len().max(1)))
-            .unwrap_or(0);
+        let n = if advanced_same_row {
+            (cursor.1 - col).min(self.pending.len().max(1))
+        } else {
+            0
+        };
         let all_match = advanced_same_row
             && pending_is_ascii
             && (0..n).all(|i| {
@@ -207,7 +215,10 @@ impl Predictor {
             });
 
         if all_match {
-            if let Some(start) = self.last_key_ms.take() {
+            let start = self.last_key_ms.take();
+            if !std::mem::take(&mut self.resampled)
+                && let Some(start) = start
+            {
                 self.srtt.observe(now_ms.saturating_sub(start) as f64);
             }
             self.confirmed_row = Some(row);
@@ -219,12 +230,19 @@ impl Predictor {
                 self.key_cursor = Some((row, col + n));
                 self.key_char = self.pending.first().copied();
                 self.last_key_ms = Some(now_ms);
+                self.resampled = true;
             }
         } else {
-            if let Some(start) = self.last_key_ms.take() {
+            let start = self.last_key_ms.take();
+            if !std::mem::take(&mut self.resampled)
+                && let Some(start) = start
+            {
                 self.srtt.observe(now_ms.saturating_sub(start) as f64);
             }
-            self.confirmed_row = None;
+            self.confirmed_row = (advanced_same_row
+                && self.key_char.is_some()
+                && cell(row, col).and_then(|text| text.chars().next()) == self.key_char)
+                .then_some(row);
             self.pending.clear();
             self.key_cursor = None;
             self.key_char = None;
@@ -235,6 +253,7 @@ impl Predictor {
     pub fn clear(&mut self) {
         self.pending.clear();
         self.last_key_ms = None;
+        self.resampled = false;
         self.key_cursor = None;
         self.key_char = None;
         self.confirmed_row = None;
@@ -363,6 +382,9 @@ mod tests {
         });
         assert_eq!(p.pending(), &['c']);
         assert!(p.should_predict(&prompt(10, 6, 80)));
+        p.on_server_output(645, (10, 7), &|_, _| Some("c".into()));
+        assert!(p.is_empty());
+        assert_eq!(p.srtt_ms(), Some(319.75));
     }
 
     #[test]
@@ -403,7 +425,7 @@ mod tests {
         p.on_key('é', 0, (10, 4));
         p.on_server_output(320, (10, 5), &|_, _| Some("é".into()));
         assert!(p.is_empty());
-        assert_eq!(p.confirmed_row, None);
+        assert_eq!(p.confirmed_row, Some(10));
     }
 
     #[test]
