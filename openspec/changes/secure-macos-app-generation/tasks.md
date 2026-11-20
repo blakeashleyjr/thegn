@@ -6,4 +6,4 @@
       preserved bytes in the Linux generator seam.
 - [x] Update the macOS launcher specification with the runtime prerequisite
       and fail-closed atomic-promotion behavior.
-- [ ] Run the focused generator test on native macOS.
+- [x] Run the focused generator test on native macOS.
