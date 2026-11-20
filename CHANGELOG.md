@@ -7,6 +7,21 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Remote worktrees on every provider: the shell opens as soon as the workspace is ready; agent install, agent logins, shell history and the snapshot finish in the background with progress on the status line. An agent launched meanwhile waits for its CLI and login. `thegn env up` still waits for everything, and `--shell-ready` returns early. An interrupted or failed background phase resumes on the next open and shows in `thegn env show`; `env down` and deleting the worktree cancel it. On Vercel the agent install and snapshot now also run after the prompt.
+- `test/remote-parity.sh` (`just remote-parity`) checks a remote pane against a local one; it takes `--env`, has a `--self-test` mode with a local pane on both sides, and only prints its plan without flags.
+- `thegn session snapshot --json` and MCP `sessions_snapshot` report `mouse`, `sgr_mouse` and `title`.
+
+### Changed
+
+- Remote panes get `TERM=xterm-256color`, `COLORTERM` and, when the host locale is UTF-8, `LANG=C.UTF-8`; `sprite-exec` keeps a host `TERM` the remote is sure to know.
+- Closing a remote pane ends its remote shell; quitting thegn or a dropped connection still detaches.
+- Interactive remote connections check liveness after input: a ping after 5 s, a reattach after 5 s more. It only acts on a connection that has answered a ping. `TCP_NODELAY` is set on the exec and proxy sockets.
+- Local echo prediction on a remote pane is drawn only after the server echoed an earlier key of the same line and only when the echoed cell holds the typed character, so nothing shows at a password prompt.
+- Agent login sync has phase-2 allowlists for pi and hermes, skips dependency trees for every agent, and ships only top-level files for an unknown agent with more than 2,000 allowlisted files, with one warning. Hermes auth files move into phase 1.
+- The Sprites quirk that prints the tty line without its line ending is documented (THE-2450).
+
 ## [0.1.0-alpha.112] — 2026-11-20
 
 ### Changed

@@ -154,7 +154,11 @@ is refused. `--paste` needs text and cannot be combined with `--key`.
 
 `session snapshot --json` reports `seq`, `rows`, `cols`, the base64 ANSI, and
 the pane's `cursor` (`row`, `col`), `alt_screen`, `app_cursor` and
-`bracketed_paste`.
+`bracketed_paste`. It also reports `mouse` (`none`, `press`, `press_release`,
+`button_motion` or `any_motion`), `sgr_mouse` (whether the app asked for SGR
+mouse encoding) and `title` (the window title the app set, with control
+characters removed; `null` when none). A snapshot saved before these fields
+existed still reads, with the defaults `none`, `false` and no title.
 
 `session wait --until` also takes `screen:<regex>`, which matches the rendered
 screen text, and `stable:<ms>`, which holds once the snapshot `seq` has been
