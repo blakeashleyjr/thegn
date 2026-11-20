@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::provider::ExecSpec;
+use crate::provider::{ExecSpec, ProviderFiles};
 
 /// One scripted control plane. Every call is recorded as `"<op> <arg>"`.
 #[derive(Default)]
@@ -26,6 +26,12 @@ pub(super) struct FakeApi {
     pub(super) snapshots: Vec<String>,
     /// `run` answers SessionStopped this many times before succeeding.
     pub(super) run_stopped: Mutex<u32>,
+    /// `run_detached` answers SessionStopped this many times before succeeding.
+    pub(super) detached_stopped: Mutex<u32>,
+    /// `interactive` answers SessionStopped this many times before succeeding.
+    pub(super) interactive_stopped: Mutex<u32>,
+    /// File calls answer SessionStopped this many times before succeeding.
+    pub(super) fs_stopped: Mutex<u32>,
     /// Whether the snapshot listing reports itself complete (default false: set it).
     pub(super) snapshots_incomplete: bool,
     /// The resume (`get … resume=true`) answers SnapshotExpired.
@@ -247,6 +253,136 @@ impl Api for FakeApi {
                 tokio::time::sleep(delay).await;
             }
             Ok((0, b"ok".to_vec(), String::new()))
+        })
+    }
+
+    fn run_detached<'a>(
+        &'a self,
+        session: &'a str,
+        _body: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            self.record(format!("run_detached {session}"));
+            let stopped = {
+                let mut remaining = self.detached_stopped.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if stopped {
+                return Err(client::SessionStopped {
+                    op: "start command",
+                    status: 410,
+                }
+                .into());
+            }
+            Ok("cmd_1".into())
+        })
+    }
+
+    fn logs<'a>(
+        &'a self,
+        session: &'a str,
+        cmd: &'a str,
+    ) -> BoxFuture<'a, Result<client::LogStream>> {
+        Box::pin(async move {
+            self.record(format!("logs {session} {cmd}"));
+            Ok(client::LogStream::empty())
+        })
+    }
+
+    fn interactive<'a>(
+        &'a self,
+        session: &'a str,
+    ) -> BoxFuture<'a, Result<client::InteractiveTicket>> {
+        Box::pin(async move {
+            self.record(format!("interactive {session}"));
+            let stopped = {
+                let mut remaining = self.interactive_stopped.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if stopped {
+                return Err(client::SessionStopped {
+                    op: "open interactive session",
+                    status: 410,
+                }
+                .into());
+            }
+            Ok(client::InteractiveTicket {
+                url: url::Url::parse("ftp://x.vercel.run/pty").unwrap(),
+                token: zeroize::Zeroizing::new("ticket".into()),
+            })
+        })
+    }
+
+    fn fs_write_targz<'a>(
+        &'a self,
+        session: &'a str,
+        cwd: &'a str,
+        _targz: Vec<u8>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(format!("fs_write {session} {cwd}"));
+            let stopped = {
+                let mut remaining = self.fs_stopped.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if stopped {
+                return Err(client::SessionStopped {
+                    op: "write files",
+                    status: 410,
+                }
+                .into());
+            }
+            Ok(())
+        })
+    }
+
+    fn fs_read<'a>(
+        &'a self,
+        session: &'a str,
+        path: &'a str,
+        _cap: usize,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            self.record(format!("fs_read {session} {path}"));
+            let stopped = {
+                let mut remaining = self.fs_stopped.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if stopped {
+                return Err(client::SessionStopped {
+                    op: "read file",
+                    status: 410,
+                }
+                .into());
+            }
+            Ok(Some(b"ok".to_vec()))
+        })
+    }
+
+    fn fs_mkdir<'a>(&'a self, session: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(format!("fs_mkdir {session} {path}"));
+            Ok(())
         })
     }
 
@@ -841,6 +977,202 @@ async fn run_exec_under_never_reports_stopped_without_retry() {
         .unwrap_err();
     assert_eq!(error.to_string(), STOPPED_TEXT);
     assert_eq!(fake.count("run"), 1, "{:?}", fake.calls());
+}
+
+fn stream_spec() -> ExecSpec {
+    ExecSpec {
+        argv: vec!["true".into()],
+        tty: false,
+        cols: 80,
+        rows: 24,
+        env: Vec::new(),
+        cwd: None,
+    }
+}
+
+#[tokio::test]
+async fn stream_retries_a_stopped_detached_command_once() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        detached_stopped: Mutex::new(1),
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().extend([
+        Some(view(NAME, SessionStatus::Running, Some("sess_1"))),
+        Some(view(NAME, SessionStatus::Running, Some("sess_2"))),
+    ]);
+    let p = Arc::new(provider(&fake, ledger.path(), 2));
+    let _session = p.clone().open_stream(NAME, &stream_spec()).await.unwrap();
+    assert_eq!(fake.count("run_detached"), 2, "{:?}", fake.calls());
+    assert_eq!(fake.count("get"), 4, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn stream_gives_up_after_the_second_stopped_detached_command() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        detached_stopped: Mutex::new(2),
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().extend([
+        Some(view(NAME, SessionStatus::Running, Some("sess_1"))),
+        Some(view(NAME, SessionStatus::Running, Some("sess_2"))),
+    ]);
+    let p = Arc::new(provider(&fake, ledger.path(), 2));
+    let error = match p.open_stream(NAME, &stream_spec()).await {
+        Ok(_) => panic!("second stopped detached command unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        error.downcast_ref::<client::SessionStopped>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("run_detached"), 2, "{:?}", fake.calls());
+}
+
+fn pty_spec() -> ExecSpec {
+    ExecSpec {
+        argv: vec!["sh".into()],
+        tty: true,
+        cols: 80,
+        rows: 24,
+        env: Vec::new(),
+        cwd: None,
+    }
+}
+
+#[tokio::test]
+async fn interactive_retries_a_stopped_ticket_once() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        interactive_stopped: Mutex::new(1),
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().extend([
+        Some(view(NAME, SessionStatus::Running, Some("sess_1"))),
+        Some(view(NAME, SessionStatus::Running, Some("sess_2"))),
+    ]);
+    let p = provider(&fake, ledger.path(), 2);
+    let (_, result) = p.open_exec_reported(NAME, &pty_spec()).await;
+    let error = match result {
+        Ok(_) => panic!("interactive connect unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(error.downcast_ref::<client::SessionStopped>().is_none());
+    assert_eq!(fake.count("interactive"), 2, "{:?}", fake.calls());
+    assert_eq!(fake.count("get"), 4, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn interactive_gives_up_after_the_second_stopped_ticket() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        interactive_stopped: Mutex::new(2),
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().extend([
+        Some(view(NAME, SessionStatus::Running, Some("sess_1"))),
+        Some(view(NAME, SessionStatus::Running, Some("sess_2"))),
+    ]);
+    let p = provider(&fake, ledger.path(), 2);
+    let (_, result) = p.open_exec_reported(NAME, &pty_spec()).await;
+    let error = match result {
+        Ok(_) => panic!("second stopped interactive ticket unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        error.downcast_ref::<client::SessionStopped>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("interactive"), 2, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn file_write_retries_a_stopped_upload_once() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        fs_stopped: Mutex::new(1),
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().extend([
+        Some(view(NAME, SessionStatus::Running, Some("sess_1"))),
+        Some(view(NAME, SessionStatus::Running, Some("sess_2"))),
+    ]);
+    let p = provider(&fake, ledger.path(), 2);
+    ProviderFiles::write(&p, NAME, "/tmp/file", b"data")
+        .await
+        .unwrap();
+    assert_eq!(fake.count("fs_write"), 2, "{:?}", fake.calls());
+    assert_eq!(fake.count("get"), 2, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn file_write_gives_up_after_the_second_stopped_upload() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        fs_stopped: Mutex::new(2),
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().extend([
+        Some(view(NAME, SessionStatus::Running, Some("sess_1"))),
+        Some(view(NAME, SessionStatus::Running, Some("sess_2"))),
+    ]);
+    let p = provider(&fake, ledger.path(), 2);
+    let error = ProviderFiles::write(&p, NAME, "/tmp/file", b"data")
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<client::SessionStopped>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("fs_write"), 2, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn file_read_retries_a_stopped_read_once() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        fs_stopped: Mutex::new(1),
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().extend([
+        Some(view(NAME, SessionStatus::Running, Some("sess_1"))),
+        Some(view(NAME, SessionStatus::Running, Some("sess_2"))),
+    ]);
+    let p = provider(&fake, ledger.path(), 2);
+    let data = ProviderFiles::read(&p, NAME, "/tmp/file").await.unwrap();
+    assert_eq!(data, b"ok".to_vec());
+    assert_eq!(fake.count("fs_read"), 2, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn file_read_gives_up_after_the_second_stopped_read() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        fs_stopped: Mutex::new(2),
+        ..FakeApi::default()
+    });
+    fake.gets.lock().unwrap().extend([
+        Some(view(NAME, SessionStatus::Running, Some("sess_1"))),
+        Some(view(NAME, SessionStatus::Running, Some("sess_2"))),
+    ]);
+    let p = provider(&fake, ledger.path(), 2);
+    let error = ProviderFiles::read(&p, NAME, "/tmp/file")
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<client::SessionStopped>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("fs_read"), 2, "{:?}", fake.calls());
 }
 
 #[tokio::test(start_paused = true)]
