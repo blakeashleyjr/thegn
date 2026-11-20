@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Driver for the two-session remote terminal parity run."""
+"""Driver for the two-session remote terminal parity run.
+
+Cases: P00H host, P01 startup, P02 environment, P03 resize, P04 color,
+P05 unicode, P06-P09 signals and input, P10 bracketed paste, P11 shell-only
+alternate screen, P12 DECCKM arrows, P13 mouse, P14 alternate-screen restore,
+P15 throughput, P16 large paste, P17 title, P18 cwd, P19 exit status, P20
+echo latency and P20B TUI probe, P21 startup detail, P22 close, and P23 idle.
+"""
 import base64
 import atexit
 import json
@@ -65,6 +72,19 @@ def snap(session):
     return json.loads(out)
 
 
+def wait_mode(session, field, want, timeout=10):
+    """Wait for a snapshot mode field to reach the requested value."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if snap(session).get(field) == want:
+                return True
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def resize(session, rows, cols):
     params = json.dumps({"s": session, "rows": rows, "cols": cols}, separators=(",", ":"))
     return cli("api", "call", "sessions.resize", "--params", params, timeout=20)
@@ -85,7 +105,8 @@ class Attach:
         def reader():
             assert self.proc.stdout is not None
             while True:
-                chunk = self.proc.stdout.read(4096)
+                # read1 returns what is available; read(n) on a pipe blocks until n bytes or EOF.
+                chunk = self.proc.stdout.read1(4096)
                 if not chunk:
                     break
                 with self.lock:
@@ -161,7 +182,20 @@ def norm(text, remote=False):
     return text
 
 
+def clip(text, limit=240):
+    return str(text).replace("\n", " ")[:limit]
+
+
+LAST = {}
+
+
+def note_sides(left, right):
+    """Remember what the two sides looked like, so a FAIL can show both."""
+    LAST["left"], LAST["right"] = left, right
+
+
 def compare(left, right):
+    note_sides(norm(left), norm(right, True))
     raw_left = ESC.sub("", CSI.sub("", DCS.sub("", OSC.sub("", left)))).replace("\r", "")
     raw_right = ESC.sub("", CSI.sub("", DCS.sub("", OSC.sub("", right)))).replace("\r", "")
     if raw_left != raw_right and (raw_left.lstrip("\n") == raw_right or raw_left == raw_right.lstrip("\n")):
@@ -174,8 +208,14 @@ def compare(left, right):
 def result(case, status, local=0, remote=0, note=""):
     print(f"{status} {case} local={local}ms remote={remote}ms {note}".rstrip(), flush=True)
     results.append((case, status, local, remote, note))
-    if status == "FAIL" and case not in failed:
-        failed.append(case)
+    if status == "FAIL":
+        if case not in failed:
+            failed.append(case)
+        for side in ("left", "right"):
+            if side in LAST:
+                label = "local " if side == "left" else "remote"
+                print(f"DETAIL {case} {label} {LAST[side][-700:]!r}", flush=True)
+    LAST.clear()
 
 
 def wrap(case, command):
@@ -191,14 +231,14 @@ def extract(text, case):
     return text[begin + len(f"@@B{case}@@"):end.start()], int(end.group(2))
 
 
-def command_case(case, command, timeout=30):
+def command_case(case, command, timeout=30, start_at=None):
     streams = [Attach(LOCAL), Attach(REMOTE)]
     for stream in streams:
         stream.start()
     for stream in streams:
         if not stream.wait_initial():
             raise RuntimeError(f"attach did not receive initial repaint for {case}")
-    started = time.monotonic()
+    started = time.monotonic() if start_at is None else start_at
     for session in (LOCAL, REMOTE):
         send(session, wrap(case, command))
     waited = []
@@ -243,7 +283,7 @@ def case_p01():
         began = time.monotonic()
         rc, out, err = cli("session", "wait", "--session", session, "--until", r"screen:(?m)^PARITY\$ ?$", "--timeout", 120000, timeout=130)
         if rc:
-            result("P01", "FAIL", note=f"prompt timeout: {err or out}")
+            result("P01", "FAIL", note=f"prompt timeout: {clip(norm(err or out))}")
             return
         elapsed.append(opened + int((time.monotonic() - began) * 1000))
     result("P01", "PASS", elapsed[0], elapsed[1], "INFO prompt times")
@@ -251,17 +291,44 @@ def case_p01():
 
 def case_p02():
     values, local_ms, remote_ms = command_case("P02", r"""printf '%s|%s|%s|%s\n' "$TERM" "$(printenv COLORTERM)" "$(printenv LANG)" "$(printenv LC_ALL)"; infocmp "$TERM" >/dev/null 2>&1 && echo ti-ok; locale 2>&1 | grep -c 'Cannot set'""")
-    status, note = compare(values[0][0], values[1][0])
+    sides = [norm(value[0], index == 1) for index, value in enumerate(values)]
     identity = []
-    for index, value in enumerate(values):
-        first = next((line for line in norm(value[0], index == 1).splitlines() if "|" in line), "")
-        identity.append(first.split("|", 3))
-    if len(identity[0]) >= 2 and len(identity[1]) >= 2 and identity[0][:2] != identity[1][:2]:
+    for side in sides:
+        fields = next((line.split("|", 3) for line in side.splitlines() if line.count("|") == 3), [])
+        identity.append(fields)
+    status, note = compare(values[0][0], values[1][0])
+    if any(len(fields) != 4 for fields in identity):
+        status, note = "FAIL", "TERM environment line missing"
+    elif identity[0][:2] != identity[1][:2]:
         status, note = "FAIL", "TERM or COLORTERM differs"
-    elif len(identity[0]) >= 3 and len(identity[1]) >= 3 and identity[0][2] != identity[1][2] and status == "PASS":
-        status, note = "WARN", "LANG differs"
-    if any("ti-ok" not in norm(v[0], index == 1) or re.search(r"(?m)^[1-9]\d*$", norm(v[0], index == 1)) for index, v in enumerate(values)):
-        status, note = "FAIL", "terminfo or locale warning"
+    else:
+        hard = False
+        for index, side in enumerate(sides):
+            lines = side.splitlines()
+            try:
+                warning = next(int(line) for line in lines[lines.index("ti-ok") + 1:] if re.fullmatch(r"\d+", line))
+            except (StopIteration, ValueError):
+                warning = 1
+            if "ti-ok" not in lines or warning != 0:
+                status, note = "FAIL", "terminfo or locale warning"
+                hard = True
+                break
+        remote_lang = identity[1][2]
+        local_utf8 = bool(re.search(r"(?i)utf-?8", identity[0][2]))
+        # The remote only gets a UTF-8 LANG when the host locale is UTF-8, so only then is its absence a failure.
+        if not hard and local_utf8 and not re.search(r"(?i)utf-?8", remote_lang):
+            status, note = "FAIL", "remote LANG is not UTF-8"
+        elif not hard and identity[0][2] != identity[1][2] and re.search(r"(?i)utf-?8", identity[0][2]):
+            status, note = "WARN", "LANG differs (D1: remote C.UTF-8)"
+
+    if len(identity[0]) == 4 and len(identity[1]) == 4:
+        comparable = []
+        for side, fields in zip(sides, identity):
+            replacement = "|".join(fields[:2] + ["<LANG>", fields[3]])
+            comparable.append(side.replace("|".join(fields), replacement, 1))
+        rest_status, rest_note = compare(comparable[0], comparable[1])
+        if rest_status == "FAIL" and status not in ("FAIL",):
+            status, note = rest_status, rest_note
     result("P02", status, local_ms, remote_ms, note)
 
 
@@ -273,8 +340,13 @@ def case_p03():
     left = first[0][0] + second[0][0]
     right = first[1][0] + second[1][0]
     status, note = compare(left, right)
+    sizes = [
+        next((line.strip() for line in norm(value[0], index == 1).splitlines() if re.fullmatch(r"\d+ \d+", line.strip())), "?")
+        for index, value in enumerate((first[0], first[1]))
+    ]
     if "40 120" not in norm(left) or "30 100" not in norm(left):
         status, note = "FAIL", "expected 40 120 then 30 100"
+    note = f"first stty size: local {sizes[0]} remote {sizes[1]}" + (f"; {note}" if note else "")
     result("P03", status, local_a + local_b, remote_a + remote_b, note)
 
 
@@ -326,71 +398,107 @@ def case_p09():
 
 
 def case_p10():
-    for session in (LOCAL, REMOTE):
-        send(session, "echo one\necho two", enter=False, paste=True)
-    time.sleep(0.5)
-    held = [snap(s).get("text", "") for s in (LOCAL, REMOTE)]
-    for session in (LOCAL, REMOTE):
-        key(session, "enter")
-    time.sleep(0.8)
-    after = [snap(s).get("text", "") for s in (LOCAL, REMOTE)]
-    status = "PASS" if norm(held[0]) == norm(held[1], True) else "FAIL"
-    if any(token not in norm(value) for value in held for token in ("echo one", "echo two")):
-        status = "FAIL"
-    if "one" not in norm(after[0]) or "two" not in norm(after[1], True):
-        status = "FAIL"
-    result("P10", status, note="" if status == "PASS" else "bracketed paste differs")
+    natural = [snap(s).get("bracketed_paste") for s in (LOCAL, REMOTE)]
+    versions, _, _ = command_case("P10V", 'echo "$BASH_VERSION"')
+    version_text = [
+        next((clip(norm(line, index == 1), 80) for line in value[0].splitlines() if re.fullmatch(r"\d+\.\d+\S*", line.strip())), "unknown")
+        for index, value in enumerate(versions)
+    ]
+    status = "PASS"
+    note = f"INFO natural bracketed-paste={natural[0]}/{natural[1]} BASH_VERSION={version_text[0]}/{version_text[1]}"
+    if natural[0] != natural[1]:
+        status, note = "WARN", note + "; the two shells' bracketed-paste defaults differ (local inputrc?)"
+    bind_values, _, _ = command_case("P10B", "command -V bind")
+    bindable = ["builtin" in norm(value[0], index == 1).lower() for index, value in enumerate(bind_values)]
+    if not all(bindable):
+        result("P10", "SKIP", note=note + "; SKIP: bind is not a builtin (remote sh)")
+        return
 
-
-def common_program():
-    values, _, _ = command_case("P11C", "command -v less || command -v vi || command -v top")
-    found = []
-    for index, value in enumerate(values):
-        found.append(next((p for p in ("less", "vi", "top") if re.search(rf"(?m)^{p}$", norm(value[0], index == 1))), None))
-    return found[0] if found[0] and found[0] == found[1] else None
-
-
-def full_command(program):
-    return {"less": "seq 1 500 > /tmp/rp.$$; LESS= LESSOPEN= LESSCLOSE= less /tmp/rp.$$", "vi": "vi -u NONE", "top": "top"}[program]
-
-
-def leave_fullscreen(program):
-    for session in (LOCAL, REMOTE):
-        key(session, "q" if program != "vi" else "esc")
-    if program == "vi":
+    for mode in ("on", "off"):
         for session in (LOCAL, REMOTE):
-            send(session, ":qa!")
+            send(session, f"bind 'set enable-bracketed-paste {mode}'")
+        if not all(wait_mode(session, "bracketed_paste", mode == "on") for session in (LOCAL, REMOTE)):
+            status, note = "FAIL", "thegn did not report the shell's paste mode"
+            break
+        for session in (LOCAL, REMOTE):
+            send(session, f"echo P10{mode}A\necho P10{mode}B", enter=False, paste=True)
+        time.sleep(0.5)
+        held = [snap(s).get("text", "") for s in (LOCAL, REMOTE)]
+        held_tail = [norm(held[i], i == 1).splitlines()[-3:] for i in range(2)]
+        held_equal = held_tail[0] == held_tail[1]
+        if not held_equal:
+            status, note = "FAIL", "bracketed paste screens differ"
+        if mode == "on":
+            if any(re.search(rf"(?m)^P10onA$", norm(value, index == 1)) for index, value in enumerate(held)):
+                status, note = "FAIL", "bracketed paste was not held"
+            for session in (LOCAL, REMOTE):
+                key(session, "enter")
+        elif not all(re.search(rf"(?m)^P10offA$", norm(value, index == 1)) for index, value in enumerate(held)):
+            status, note = "FAIL", "unbracketed paste did not run line one"
+        if mode == "off":
+            for session in (LOCAL, REMOTE):
+                key(session, "ctrl+u")
+        note_sides(norm(held[0]), norm(held[1], True))
+    for session in (LOCAL, REMOTE):
+        send(session, "bind 'set enable-bracketed-paste on'")
+    result("P10", status, note=note)
 
 
 def case_p11():
-    program = common_program()
-    if not program:
-        result("P11", "PASS", note="SKIP: no common less, vi or top")
-        return
+    command = r"printf '\e[?1049h\e[2J\e[5;10HRP%s' FULL; read -r _; printf '\e[?1049l'"
     for session in (LOCAL, REMOTE):
-        send(session, full_command(program))
-    time.sleep(1)
+        send(session, command)
+    if not all(wait_mode(session, "alt_screen", True) for session in (LOCAL, REMOTE)):
+        for session in (LOCAL, REMOTE):
+            key(session, "enter")
+        for session in (LOCAL, REMOTE):
+            wait_mode(session, "alt_screen", False)
+        result("P11", "FAIL", note="shell-only full screen did not enter alternate screen")
+        return
     screens = [snap(s) for s in (LOCAL, REMOTE)]
-    leave_fullscreen(program)
-    status = "PASS" if all(screen.get("alt_screen") for screen in screens) else "FAIL"
-    result("P11", status, note="" if status == "PASS" else "alt_screen false")
+    rows = [norm(screen.get("text", ""), index == 1).splitlines() for index, screen in enumerate(screens)]
+    cursor = [screen.get("cursor") for screen in screens]
+    status = "PASS" if rows[0] == rows[1] and cursor[0] == cursor[1] else "FAIL"
+    for session in (LOCAL, REMOTE):
+        key(session, "enter")
+    if not all(wait_mode(session, "alt_screen", False) for session in (LOCAL, REMOTE)):
+        status = "FAIL"
+    note_sides("\n".join(rows[0]) + f"\ncursor={cursor[0]}", "\n".join(rows[1]) + f"\ncursor={cursor[1]}")
+    result("P11", status, note="" if status == "PASS" else "alternate-screen rows or cursor differ")
 
 
 def case_p12():
-    program = common_program()
-    if not program:
-        result("P12", "PASS", note="SKIP: no common full-screen program")
-        return
-    for session in (LOCAL, REMOTE):
-        send(session, full_command(program))
-    time.sleep(1)
-    for session in (LOCAL, REMOTE):
-        for value in ("down", "down", "down", "pgdn"):
-            key(session, value)
-    screens = [snap(s) for s in (LOCAL, REMOTE)]
-    leave_fullscreen(program)
-    status = "PASS" if screens[0].get("app_cursor") == screens[1].get("app_cursor") and screens[0].get("text", "").splitlines()[:1] == screens[1].get("text", "").splitlines()[:1] else "FAIL"
-    result("P12", status, note="" if status == "PASS" else "arrow/DECCKM differs")
+    expected = {True: r"1b\s+4f\s+41", False: r"1b\s+5b\s+41"}
+    statuses = []
+    for app in (True, False):
+        streams = [Attach(LOCAL), Attach(REMOTE)]
+        for stream in streams:
+            stream.start()
+        try:
+            for stream in streams:
+                if not stream.wait_initial():
+                    raise RuntimeError("attach did not receive initial repaint for P12")
+            command = r"printf '\e[?1%s' " + ("h" if app else "l") + r"""; stty raw -echo; k=$(dd bs=1 count=3 2>/dev/null); stty sane; printf '\e[?1l'; printf '%s' "$k" | od -An -tx1"""
+            for session in (LOCAL, REMOTE):
+                send(session, f"printf '\\n@@%s%s@@\\n' B P12{int(app)}; {command}")
+            if not all(wait_mode(session, "app_cursor", app) for session in (LOCAL, REMOTE)):
+                for session in (LOCAL, REMOTE):
+                    key(session, "up")
+                statuses.append(False)
+                continue
+            for session in (LOCAL, REMOTE):
+                key(session, "up")
+            for session in (LOCAL, REMOTE):
+                send(session, f"printf '\\n@@%s%s rc=%s@@\\n' E P12{int(app)} \"$?\"")
+            for stream in streams:
+                stream.wait(f"@@EP12{int(app)} rc=", 15)
+            values = [stream.text() for stream in streams]
+            note_sides(values[0][-400:], values[1][-400:])
+            statuses.append(all(re.search(expected[app], text, re.I) for text in values))
+        finally:
+            for stream in streams:
+                stream.stop()
+    result("P12", "PASS" if all(statuses) and len(statuses) == 2 else "FAIL", note="" if all(statuses) and len(statuses) == 2 else "arrow/DECCKM bytes differ")
 
 
 def case_p13():
@@ -413,17 +521,58 @@ def case_p13():
 
 
 def case_p14():
-    values, local_ms, remote_ms = command_case("P14", r"""printf '\e[?1049hALT'; sleep 1; printf '\e[?1049l'""")
+    # The token is joined by the shell, so it never appears in the echoed command line on the primary screen.
+    values, local_ms, remote_ms = command_case("P14", r"""printf '\e[?1049h%s%s' RPALT SCREEN; sleep 1; printf '\e[?1049l'""")
     after = [snap(s).get("text", "") for s in (LOCAL, REMOTE)]
-    status = "PASS" if all("ALT" not in value for value in after) and all(not snap(s).get("alt_screen") for s in (LOCAL, REMOTE)) else "FAIL"
+    status = "PASS" if all("RPALTSCREEN" not in value for value in after) and all(not snap(s).get("alt_screen") for s in (LOCAL, REMOTE)) else "FAIL"
     result("P14", status, local_ms, remote_ms, "" if status == "PASS" else "alternate screen was not restored")
 
 
 def case_p15():
     first, local_ms, remote_ms = command_case("P15A", "yes 0123456789 | head -n 400000", timeout=60)
     second, local_ms2, remote_ms2 = interactive_case("P15B", "yes 0123456789", [(1, lambda s: key(s, "ctrl+c"))], timeout=60)
-    status = "PASS" if all(value[1] is not None for value in first + second) else "FAIL"
-    result("P15", status, local_ms + local_ms2, remote_ms + remote_ms2, "INFO flood prompt times" if status == "PASS" else "flood prompt did not return")
+    flood_bytes = 400000 * len("0123456789\n")
+    flood_kbps = [flood_bytes / max(ms, 1) for ms in (local_ms, remote_ms)]
+    drain_ms = [max(ms - 1000, 0) for ms in (local_ms2, remote_ms2)]
+    status_a = "PASS" if all(value[1] is not None for value in first) else "FAIL"
+    status_b = "PASS" if all(value[1] is not None for value in second) else "FAIL"
+    result("P15A", status_a, local_ms, remote_ms, f"INFO flood={local_ms}/{remote_ms}ms (≈{flood_kbps[0]:.1f}/{flood_kbps[1]:.1f} KB/s)")
+    result("P15B", status_b, local_ms2, remote_ms2, f"INFO ctrl-c-drain={drain_ms[0]}/{drain_ms[1]}ms")
+    capture_arg = os.environ.get("RP_CAPTURE_ARGV_JSON")
+    if capture_arg:
+        try:
+            prefix = json.loads(capture_arg)
+            if not isinstance(prefix, list) or not all(isinstance(item, str) for item in prefix):
+                raise ValueError("RP_CAPTURE_ARGV_JSON must be a JSON argv list")
+            probes = [
+                ["/bin/sh", "-c", "yes 0123456789 | head -n 400000 | wc -c"],
+                ["/bin/sh", "-c", "yes 0123456789 | head -n 400000"],
+            ]
+            rates = []
+            for argv in probes:
+                began = time.monotonic()
+                kwargs = {"capture_output": True} if len(rates) == 0 else {"stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE}
+                proc = subprocess.run(prefix + argv, timeout=90, **kwargs)
+                elapsed = max(time.monotonic() - began, 0.001)
+                if proc.returncode:
+                    raise RuntimeError(f"capture probe exited {proc.returncode}")
+                rates.append(flood_bytes / elapsed / 1000)
+            result("P15C", "PASS", note=f"INFO server-side wc={rates[0]:.1f} KB/s discarded={rates[1]:.1f} KB/s")
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, json.JSONDecodeError, RuntimeError) as exc:
+            result("P15C", "WARN", note=f"server-side transfer probe failed: {clip(norm(str(exc)))}")
+    else:
+        result("P15C", "SKIP", note="SKIP: RP_CAPTURE_ARGV_JSON not set")
+    trace_path = os.environ.get("RP_BRIDGE_TRACE")
+    if trace_path and Path(trace_path).exists():
+        try:
+            controls = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+            lines = [controls.sub("", line).strip() for line in Path(trace_path).read_text(errors="replace").splitlines() if "inbound MiB mark" in line]
+            for line in lines[-3:]:
+                print(f"INFO P15 trace {clip(norm(line), 200)}", flush=True)
+        except OSError as exc:
+            print(f"SKIP P15 trace {clip(norm(str(exc)), 200)}", flush=True)
+    else:
+        print("SKIP P15 trace: RP_BRIDGE_TRACE not set", flush=True)
 
 
 def case_p16():
@@ -433,16 +582,26 @@ def case_p16():
         raise RuntimeError("1 MiB payload did not split into 11 chunks")
     for session in (LOCAL, REMOTE):
         send(session, "stty -echo; cat > /tmp/rp.paste; stty echo")
+    if not all(wait_mode(session, "bracketed_paste", False) for session in (LOCAL, REMOTE)):
+        for session in (LOCAL, REMOTE):
+            key(session, "ctrl+d")
+        result("P16", "FAIL", note="paste mode never turned off")
+        return
+    paste_started = time.monotonic()
     for chunk in chunks:
         for session in (LOCAL, REMOTE):
             send(session, chunk, enter=False, paste=True)
     for session in (LOCAL, REMOTE):
         key(session, "ctrl+d")
-    values, local_ms, remote_ms = command_case("P16", "wc -c < /tmp/rp.paste; cksum < /tmp/rp.paste", timeout=60)
+    values, local_ms, remote_ms = command_case("P16", "wc -c < /tmp/rp.paste; cksum < /tmp/rp.paste", timeout=60, start_at=paste_started)
     status, note = compare(values[0][0], values[1][0])
+    sides = (norm(values[0][0]), norm(values[1][0], True))
     if any("1048576" not in norm(value[0], i == 1) for i, value in enumerate(values)):
         status, note = "FAIL", "paste byte count is not 1048576"
-    result("P16", status, local_ms, remote_ms, note or "INFO paste times")
+    note_sides(*sides)
+    rate = [1024 * 1000 / max(ms, 1) for ms in (local_ms, remote_ms)]
+    info = f"INFO paste_ms={local_ms}/{remote_ms} rate={rate[0]:.1f}/{rate[1]:.1f} KB/s"
+    result("P16", status, local_ms, remote_ms, info + (f"; {note}" if note else ""))
 
 
 def case_p17():
@@ -526,6 +685,34 @@ def case_p20():
     result("P20", status, int(p50[0]), int(p50[1]), note)
 
 
+def case_p20b():
+    if os.environ.get("RP_TUI_PROBE") != "1":
+        result("P20B", "SKIP", note="SKIP: RP_TUI_PROBE not set")
+        return
+    probe = Path(__file__).with_name("remote_parity_tui.py")
+    if not probe.exists():
+        result("P20B", "FAIL", note="TUI probe script is missing")
+        return
+    command = [
+        "python3", "-I", str(probe), "--bin", BIN, "--repo", REPO,
+        "--samples", "12", "--timeout", "90",
+    ]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=180)
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if proc.returncode or len(lines) != 1:
+            raise RuntimeError(f"probe exit={proc.returncode} output={clip(norm(proc.stdout))}")
+        payload = json.loads(lines[0])
+        if not isinstance(payload, dict):
+            raise ValueError("TUI probe JSON was not an object")
+        probe_status = str(payload.get("status", "PASS")).upper()
+        if payload.get("ok") is False or probe_status not in ("PASS", "WARN", "SKIP"):
+            probe_status = "FAIL"
+        result("P20B", probe_status, note=f"INFO tui-probe {clip(norm(json.dumps(payload, sort_keys=True)), 220)}")
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, json.JSONDecodeError, RuntimeError) as exc:
+        result("P20B", "FAIL", note=f"TUI probe failed: {clip(norm(str(exc)), 220)}")
+
+
 def case_p21():
     text = ""
     for name in ("up.log", "up.out"):
@@ -554,7 +741,7 @@ def case_p23():
     params = json.dumps({"argv": REMOTE_ARGV, "cwd": REPO, "env": [["PS1", "PARITY$ "]], "rows": 40, "cols": 120}, separators=(",", ":"))
     rc, out, err = cli("api", "call", "sessions.open", "--params", params, timeout=30)
     if rc:
-        result("P23", "FAIL", note=err or out)
+        result("P23", "FAIL", note=clip(norm(err or out)))
         return
     session = json.loads(out)["id"]
     time.sleep(150)
@@ -574,7 +761,7 @@ def safe(case, function):
         function()
     except Exception as exc:
         if case not in failed:
-            result(case, "FAIL", note=str(exc).replace("\n", " ")[:240])
+            result(case, "FAIL", note=clip(norm(str(exc).replace("\n", " ")), 240))
 
 
 def main():
@@ -584,6 +771,7 @@ def main():
         ("P09", case_p09), ("P10", case_p10), ("P11", case_p11), ("P12", case_p12),
         ("P13", case_p13), ("P14", case_p14), ("P15", case_p15), ("P16", case_p16),
         ("P17", case_p17), ("P18", case_p18), ("P19", case_p19), ("P20", case_p20),
+        ("P20B", case_p20b),
         ("P21", case_p21), ("P22", case_p22), ("P23", case_p23),
     ]
     try:
@@ -592,7 +780,7 @@ def main():
         if not all(HOSTS):
             raise RuntimeError("uname -n did not return both hostnames")
     except Exception as exc:
-        print(f"FAIL P00H: {str(exc).replace(chr(10), ' ')[:240]}", flush=True)
+        print(f"FAIL P00H: {clip(norm(str(exc)))}", flush=True)
         failed.append("P00H")
     for case, function in cases:
         before = len(failed)
@@ -604,7 +792,7 @@ def main():
     for case, status, local, remote, note in results:
         print(f"{case:>3} {status:>4} {local:>6}ms {remote:>6}ms {note}")
     print("FAILED CASES: " + (", ".join(failed) if failed else "none"))
-    if failed and not KEEP_GOING:
+    if failed:
         raise SystemExit(1)
 
 
