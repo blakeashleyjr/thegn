@@ -55,6 +55,11 @@ pub enum Action {
     /// Bring a worktree's environment up (k8s: spawn the pod and wait for Ready;
     /// provider: provision the sandbox headlessly, streaming each step).
     Up {
+        /// Provider envs: return once a shell can open; the background steps
+        /// (coding agents, agent logins, shell history, snapshot) finish on
+        /// the next open or the next plain env up.
+        #[arg(long)]
+        shell_ready: bool,
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
@@ -220,7 +225,10 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             target,
         } => set(cfg, &name, target.get(), workspace),
         Action::Clear { workspace, target } => set(cfg, "", target.get(), workspace),
-        Action::Up { target } => lifecycle(cfg, target.get(), Lifecycle::Up),
+        Action::Up {
+            target,
+            shell_ready,
+        } => lifecycle(cfg, target.get(), Lifecycle::Up { shell_ready }),
         Action::Down {
             stop,
             force,
@@ -878,7 +886,7 @@ struct DownOpts {
 }
 
 enum Lifecycle {
-    Up,
+    Up { shell_ready: bool },
     Down(DownOpts),
 }
 
@@ -922,14 +930,14 @@ fn provider_kind(cfg: &Config, env_name: &str) -> String {
 fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Result<()> {
     let env = resolve_for(cfg, worktree.clone())?;
     match action {
-        Lifecycle::Up => {
+        Lifecycle::Up { shell_ready } => {
             outln!("bringing up env {} ({})…", env.name, env.placement.label());
             let wt = super::resolve_worktree(worktree)
                 .to_string_lossy()
                 .into_owned();
             resume_parked_sandbox(cfg, &env, &wt);
             bring_up(&env, &wt, |progress| {
-                crate::agent::provision_worktree(cfg, &wt, progress)
+                up_provision(cfg, &wt, shell_ready, progress)
             })?;
             crate::ssh_seed::seed_if_needed(cfg, &wt)
                 .with_context(|| format!("env up failed: seeding {wt} on env {}", env.name))?;
@@ -1286,6 +1294,36 @@ fn bring_up(
     Ok(())
 }
 
+fn up_provision(
+    cfg: &Config,
+    wt: &str,
+    shell_ready: bool,
+    progress: &mut dyn FnMut(&[ProvisionStepView]),
+) -> Result<bool> {
+    let outcome = crate::agent::provision_worktree_mode(
+        cfg,
+        wt,
+        crate::agent::ProvisionMode::Foreground,
+        &mut *progress,
+    )?;
+    let Some(deferred) = outcome.deferred else {
+        return Ok(outcome.provisioned);
+    };
+    msg::info("provision: shell ready; background steps follow");
+    if shell_ready {
+        msg::info(&format!(
+            "provision: background steps pending; they finish on the next open or `thegn env up --worktree {wt}`"
+        ));
+        return Ok(true);
+    }
+    let mode = match deferred.lease {
+        Some(lease) => crate::agent::ProvisionMode::Deferred(lease),
+        None => crate::agent::ProvisionMode::All,
+    };
+    crate::agent::provision_worktree_mode(cfg, wt, mode, &mut *progress)?;
+    Ok(true)
+}
+
 /// Run `provision`, printing each step transition as one stderr line.
 fn provision_reporting(
     provision: impl FnOnce(&mut dyn FnMut(&[ProvisionStepView])) -> Result<bool>,
@@ -1432,11 +1470,15 @@ fn provision_headless_blocking(
         msg::info(&format!("claimed a warm spare for {worktree}"));
         return Ok(HeadlessProvision::ClaimedSpare);
     }
-    let Some(env_name) = crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? else {
+    let pending = match crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? {
+        Some(env_name) => Some(env_name),
+        None => crate::provision_gate::deferred_pending_env(&cfg, &worktree)?,
+    };
+    let Some(env_name) = pending else {
         return Ok(HeadlessProvision::None);
     };
     msg::info(&format!(
-        "provider env {env_name} for {worktree} is not provisioned yet — provisioning before the headless open"
+        "provider env {env_name} for {worktree} is not fully provisioned yet — provisioning before the headless open"
     ));
     let (tx, rx) = std::sync::mpsc::channel();
     let wt = worktree.clone();
@@ -3109,6 +3151,28 @@ mod b162_cli_tests {
     #[test]
     fn env_adopt_requires_env() {
         assert!(parse(&["thegn", "env", "adopt", "foo", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn env_up_shell_ready_is_optional() {
+        for (args, shell_ready) in [
+            (&["thegn", "env", "up", "--shell-ready"][..], true),
+            (&["thegn", "env", "up"][..], false),
+        ] {
+            let Ok(cli) = parse(args) else {
+                panic!("{args:?} must parse");
+            };
+            match cli.command {
+                Some(crate::Command::Env {
+                    action:
+                        super::Action::Up {
+                            shell_ready: actual,
+                            ..
+                        },
+                }) => assert_eq!(actual, shell_ready, "{args:?}"),
+                _ => panic!("expected env up"),
+            }
+        }
     }
 
     #[test]
