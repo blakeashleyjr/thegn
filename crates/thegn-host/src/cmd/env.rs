@@ -55,6 +55,11 @@ pub enum Action {
     /// Bring a worktree's environment up (k8s: spawn the pod and wait for Ready;
     /// provider: provision the sandbox headlessly, streaming each step).
     Up {
+        /// Provider envs: return once a shell can open; the background steps
+        /// (coding agents, agent logins, shell history, snapshot) finish on
+        /// the next open or the next plain env up.
+        #[arg(long)]
+        shell_ready: bool,
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
@@ -220,7 +225,10 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             target,
         } => set(cfg, &name, target.get(), workspace),
         Action::Clear { workspace, target } => set(cfg, "", target.get(), workspace),
-        Action::Up { target } => lifecycle(cfg, target.get(), Lifecycle::Up),
+        Action::Up {
+            target,
+            shell_ready,
+        } => lifecycle(cfg, target.get(), Lifecycle::Up { shell_ready }),
         Action::Down {
             stop,
             force,
@@ -878,7 +886,7 @@ struct DownOpts {
 }
 
 enum Lifecycle {
-    Up,
+    Up { shell_ready: bool },
     Down(DownOpts),
 }
 
@@ -922,14 +930,14 @@ fn provider_kind(cfg: &Config, env_name: &str) -> String {
 fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Result<()> {
     let env = resolve_for(cfg, worktree.clone())?;
     match action {
-        Lifecycle::Up => {
+        Lifecycle::Up { shell_ready } => {
             outln!("bringing up env {} ({})…", env.name, env.placement.label());
             let wt = super::resolve_worktree(worktree)
                 .to_string_lossy()
                 .into_owned();
             resume_parked_sandbox(cfg, &env, &wt);
             bring_up(&env, &wt, |progress| {
-                crate::agent::provision_worktree(cfg, &wt, progress)
+                up_provision(cfg, &wt, shell_ready, progress)
             })?;
             crate::ssh_seed::seed_if_needed(cfg, &wt)
                 .with_context(|| format!("env up failed: seeding {wt} on env {}", env.name))?;
@@ -1021,6 +1029,13 @@ fn down_provider(
     if opts.mode == DownMode::Stop && !provider_has_stop(&kind) {
         anyhow::bail!(no_stop_message(&kind));
     }
+    if opts.mode == DownMode::Destroy
+        && let Err(error) = thegn_core::provision_journal::cancel(id)
+    {
+        msg::warn(&format!(
+            "could not mark deferred provider setup cancelled for {id}: {error}"
+        ));
+    }
     let provider_config = cfg
         .env
         .get(env_name)
@@ -1040,18 +1055,26 @@ fn down_provider(
             .map_err(|e| anyhow::anyhow!("env down failed: stop {id} failed: {e:#}"))
     };
     let mut revoke = || {
-        crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, id, Some(wt))
+        let result = crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, id, Some(wt))
             .map(|_| ())
-            .context("route-to-host credential revocation failed; sandbox left intact")
+            .context("route-to-host credential revocation failed; sandbox left intact");
+        if result.is_err() {
+            reset_deferred_journal(id, wt, env_name);
+        }
+        result
     };
     let mut destroy = || {
-        crate::agent::block_on_provider(|| async { provider.destroy(id).await })
-            .map_err(|e| anyhow::anyhow!("env down failed: destroy {id} failed: {e}"))
+        let result = crate::agent::block_on_provider(|| async { provider.destroy(id).await })
+            .map_err(|e| anyhow::anyhow!("env down failed: destroy {id} failed: {e}"));
+        if result.is_err() {
+            reset_deferred_journal(id, wt, env_name);
+        }
+        result
     };
     let mut list = || crate::agent::block_on_provider(|| async { provider.inventory().await });
     let mut sleep = std::thread::sleep;
     let mut forget = || forget_destroyed_sandbox(id, wt);
-    destroy_provider_sandbox(
+    let result = destroy_provider_sandbox(
         env_name,
         id,
         opts,
@@ -1065,13 +1088,29 @@ fn down_provider(
             sleep: &mut sleep,
             forget: &mut forget,
         },
-    )
+    );
+    if result.is_err() {
+        crate::provision_bg::resume_cancelled(id, wt, env_name);
+    }
+    result
+}
+
+fn reset_deferred_journal(id: &str, worktree: &str, env_name: &str) {
+    let pending = thegn_core::provision_journal::Journal::pending(worktree, env_name);
+    if let Err(error) = thegn_core::provision_journal::write(id, &pending) {
+        msg::warn(&format!(
+            "could not restore deferred provider setup journal for {id}: {error}"
+        ));
+    }
 }
 
 /// Clear local state after a verified destroy. Failures warn: the sandbox is
 /// already gone.
 fn forget_destroyed_sandbox(id: &str, wt: &str) {
     crate::provider_workdir::clear_provisioned(id);
+    if let Err(error) = thegn_core::provision_journal::clear(id) {
+        tracing::debug!(target: "thegn::provider", %id, %error, "could not clear deferred provision journal");
+    }
     crate::lifecycle::forget_destroyed_spare(id);
     match Db::open() {
         Ok(db) => {
@@ -1286,6 +1325,39 @@ fn bring_up(
     Ok(())
 }
 
+fn up_provision(
+    cfg: &Config,
+    wt: &str,
+    shell_ready: bool,
+    progress: &mut dyn FnMut(&[ProvisionStepView]),
+) -> Result<bool> {
+    let outcome = crate::agent::provision_worktree_mode(
+        cfg,
+        wt,
+        crate::agent::ProvisionMode::Foreground,
+        &mut *progress,
+    )?;
+    let Some(deferred) = outcome.deferred else {
+        return Ok(outcome.provisioned);
+    };
+    msg::info(&format!(
+        "provision: shell ready on {}; background steps follow",
+        deferred.sandbox
+    ));
+    if shell_ready {
+        msg::info(&format!(
+            "provision: background steps pending; they finish on the next open or `thegn env up --worktree {wt}`"
+        ));
+        return Ok(true);
+    }
+    let mode = match deferred.lease {
+        Some(lease) => crate::agent::ProvisionMode::Deferred(lease),
+        None => crate::agent::ProvisionMode::All,
+    };
+    let finished = crate::agent::provision_worktree_mode(cfg, wt, mode, &mut *progress)?;
+    Ok(finished.provisioned)
+}
+
 /// Run `provision`, printing each step transition as one stderr line.
 fn provision_reporting(
     provision: impl FnOnce(&mut dyn FnMut(&[ProvisionStepView])) -> Result<bool>,
@@ -1304,14 +1376,24 @@ fn provision_reporting(
 #[derive(Default)]
 struct StepReporter {
     seen: Vec<(String, ProvisionState)>,
+    started: Vec<(String, Instant)>,
 }
 
 impl StepReporter {
     fn changed(&mut self, steps: &[ProvisionStepView]) -> Vec<String> {
+        self.changed_at(steps, Instant::now())
+    }
+
+    fn changed_at(&mut self, steps: &[ProvisionStepView], now: Instant) -> Vec<String> {
         let mut lines = Vec::new();
         for step in steps {
             if step.state == ProvisionState::Pending {
                 continue;
+            }
+            if step.state == ProvisionState::Active
+                && !self.started.iter().any(|(label, _)| label == &step.label)
+            {
+                self.started.push((step.label.clone(), now));
             }
             let changed = match self.seen.iter_mut().find(|(label, _)| *label == step.label) {
                 Some((_, state)) if *state == step.state => false,
@@ -1325,28 +1407,39 @@ impl StepReporter {
                 }
             };
             if changed {
-                lines.push(step_line(step));
+                let elapsed = match step.state {
+                    ProvisionState::Done | ProvisionState::Failed => self
+                        .started
+                        .iter()
+                        .find(|(label, _)| label == &step.label)
+                        .map(|(_, started)| now.saturating_duration_since(*started)),
+                    ProvisionState::Pending | ProvisionState::Active => None,
+                };
+                lines.push(step_line(step, elapsed));
             }
         }
         lines
     }
 }
 
-fn step_line(step: &ProvisionStepView) -> String {
+fn step_line(step: &ProvisionStepView, elapsed: Option<Duration>) -> String {
     let state = match step.state {
         ProvisionState::Pending => "pending",
         ProvisionState::Active => "running",
         ProvisionState::Done => "done",
         ProvisionState::Failed => "FAILED",
     };
+    let took = elapsed
+        .map(|elapsed| format!(" ({:.1} s)", elapsed.as_secs_f64()))
+        .unwrap_or_default();
     let detail = step
         .detail
         .as_deref()
         .map(str::trim)
         .filter(|d| step.state == ProvisionState::Failed && !d.is_empty());
     match detail {
-        Some(detail) => format!("provision: {} — {state}: {detail}", step.label),
-        None => format!("provision: {} — {state}", step.label),
+        Some(detail) => format!("provision: {} — {state}{took}: {detail}", step.label),
+        None => format!("provision: {} — {state}{took}", step.label),
     }
 }
 
@@ -1407,15 +1500,33 @@ fn provision_headless_blocking(
             "seeding {worktree} onto its ssh host failed; `thegn env up --worktree {worktree}` retries it"
         )
     })?;
+    if let Some((env_name, id)) = crate::provision_gate::provider_target(&cfg, &worktree)?
+        && let Some(entry) = thegn_core::provision_journal::read(&id)
+    {
+        if entry.state == thegn_core::provision_journal::DeferredState::Cancelled {
+            anyhow::bail!(
+                "background setup for {worktree} was cancelled; reopen it or run `thegn env up --worktree {worktree}` to retry"
+            );
+        }
+        msg::info(&format!(
+            "provider env {env_name} for {worktree} has background setup pending — finishing before the headless open"
+        ));
+        crate::agent::finish_deferred_blocking(&cfg, &worktree, &mut |_| {})?;
+        return Ok(HeadlessProvision::Provisioned);
+    }
     if crate::provision_gate::claim_spare_for_headless(&cfg, &worktree) {
         msg::info(&format!("claimed a warm spare for {worktree}"));
         return Ok(HeadlessProvision::ClaimedSpare);
     }
-    let Some(env_name) = crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? else {
+    let pending = match crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? {
+        Some(env_name) => Some(env_name),
+        None => crate::provision_gate::deferred_pending_env(&cfg, &worktree)?,
+    };
+    let Some(env_name) = pending else {
         return Ok(HeadlessProvision::None);
     };
     msg::info(&format!(
-        "provider env {env_name} for {worktree} is not provisioned yet — provisioning before the headless open"
+        "provider env {env_name} for {worktree} is not fully provisioned yet — provisioning before the headless open"
     ));
     let (tx, rx) = std::sync::mpsc::channel();
     let wt = worktree.clone();
@@ -1698,6 +1809,12 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
         &home,
     );
     for line in show_lines(&env, &location, provisioned, &env.sandbox.git, &warnings) {
+        outln!("{line}");
+    }
+    if let thegn_core::placement::Placement::Provider(p) = &env.placement
+        && !p.id.trim().is_empty()
+        && let Some(line) = crate::provision_bg::show_line(&p.id)
+    {
         outln!("{line}");
     }
     Ok(())
@@ -2343,26 +2460,55 @@ mod up_tests {
     #[test]
     fn step_reporter_prints_each_state_change_once() {
         let mut reporter = StepReporter::default();
-        let first = reporter.changed(&[
-            step("workspace", ProvisionState::Active, None),
-            step("clone", ProvisionState::Pending, None),
-        ]);
+        let started = Instant::now();
+        let first = reporter.changed_at(
+            &[
+                step("workspace", ProvisionState::Active, None),
+                step("clone", ProvisionState::Pending, None),
+            ],
+            started,
+        );
         assert_eq!(first, vec!["provision: workspace — running".to_string()]);
-        let again = reporter.changed(&[
-            step("workspace", ProvisionState::Active, Some("mkdir")),
-            step("clone", ProvisionState::Pending, None),
-        ]);
+        let again = reporter.changed_at(
+            &[
+                step("workspace", ProvisionState::Active, Some("mkdir")),
+                step("clone", ProvisionState::Pending, None),
+            ],
+            started + Duration::from_secs(1),
+        );
         assert!(again.is_empty(), "{again:?}");
-        let next = reporter.changed(&[
-            step("workspace", ProvisionState::Done, None),
-            step("clone", ProvisionState::Failed, Some("git: auth failed")),
-        ]);
+        let next = reporter.changed_at(
+            &[
+                step("workspace", ProvisionState::Done, None),
+                step("clone", ProvisionState::Failed, Some("git: auth failed")),
+            ],
+            started + Duration::from_secs(2),
+        );
         assert_eq!(
             next,
             vec![
-                "provision: workspace — done".to_string(),
+                "provision: workspace — done (2.0 s)".to_string(),
                 "provision: clone — FAILED: git: auth failed".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn step_reporter_includes_elapsed_time_for_failed_steps() {
+        let mut reporter = StepReporter::default();
+        let started = Instant::now();
+        reporter.changed_at(&[step("clone", ProvisionState::Active, None)], started);
+        let lines = reporter.changed_at(
+            &[step(
+                "clone",
+                ProvisionState::Failed,
+                Some("git: auth failed"),
+            )],
+            started + Duration::from_millis(1_234),
+        );
+        assert_eq!(
+            lines,
+            vec!["provision: clone — FAILED (1.2 s): git: auth failed".to_string()]
         );
     }
 
@@ -3059,6 +3205,28 @@ mod b162_cli_tests {
     #[test]
     fn env_adopt_requires_env() {
         assert!(parse(&["thegn", "env", "adopt", "foo", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn env_up_shell_ready_is_optional() {
+        for (args, shell_ready) in [
+            (&["thegn", "env", "up", "--shell-ready"][..], true),
+            (&["thegn", "env", "up"][..], false),
+        ] {
+            let Ok(cli) = parse(args) else {
+                panic!("{args:?} must parse");
+            };
+            match cli.command {
+                Some(crate::Command::Env {
+                    action:
+                        super::Action::Up {
+                            shell_ready: actual,
+                            ..
+                        },
+                }) => assert_eq!(actual, shell_ready, "{args:?}"),
+                _ => panic!("expected env up"),
+            }
+        }
     }
 
     #[test]

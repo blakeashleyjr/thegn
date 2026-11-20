@@ -101,28 +101,46 @@ pub(crate) fn paste_bytes(text: &str, bracketed: bool) -> Result<Vec<u8>> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScreenModes {
     pub(crate) cursor_row: u16,
     pub(crate) cursor_col: u16,
     pub(crate) alt_screen: bool,
     pub(crate) app_cursor: bool,
     pub(crate) bracketed_paste: bool,
+    pub(crate) mouse: &'static str,
+    pub(crate) sgr_mouse: bool,
+    pub(crate) title: Option<String>,
+}
+
+fn strip_title_controls(title: String) -> String {
+    title.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Replay the snapshot's ANSI repaint into an emulator and read back its modes.
 pub(crate) fn screen_modes(rows: u16, cols: u16, ansi: &[u8]) -> ScreenModes {
-    use crate::emulator::PaneEmulator;
+    use crate::emulator::{MouseMode, PaneEmulator};
 
     let mut emulator = crate::emulator::AlacrittyEmulator::new(rows.max(1), cols.max(1), 0);
     emulator.advance(ansi);
     let (cursor_row, cursor_col) = emulator.cursor();
+    let (mouse_mode, sgr_mouse) = emulator.mouse_mode();
+    let mouse = match mouse_mode {
+        MouseMode::None => "none",
+        MouseMode::Press => "press",
+        MouseMode::PressRelease => "press_release",
+        MouseMode::ButtonMotion => "button_motion",
+        MouseMode::AnyMotion => "any_motion",
+    };
     ScreenModes {
         cursor_row,
         cursor_col,
         alt_screen: emulator.alt_screen(),
         app_cursor: emulator.application_cursor(),
         bracketed_paste: emulator.bracketed_paste(),
+        mouse,
+        sgr_mouse,
+        title: emulator.title().map(strip_title_controls),
     }
 }
 
@@ -299,6 +317,9 @@ mod tests {
             alt_screen: true,
             app_cursor: true,
             bracketed_paste: true,
+            mouse: 1002,
+            sgr_mouse: true,
+            title: "test title".into(),
             history_tail: String::new(),
             cells: vec![SnapCell::default(); rows as usize * cols as usize],
             seq: 0,
@@ -312,6 +333,9 @@ mod tests {
                 alt_screen: true,
                 app_cursor: true,
                 bracketed_paste: true,
+                mouse: "button_motion",
+                sgr_mouse: true,
+                title: Some("test title".into()),
             }
         );
     }

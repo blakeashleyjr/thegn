@@ -265,7 +265,8 @@ an array of at most 64 key names, in the syntax of `thegn session send --key`
 (see [[daemon-and-sessions]]). `paste: true` goes with `text` only and sends it
 as a (bracketed, when the pane enabled it) paste. Authorisation is unchanged:
 `write` scope **and** `--allow-session-input`. `sessions_snapshot` also returns
-`seq`, `cursor`, `alt_screen`, `app_cursor` and `bracketed_paste`, and refuses a
+`seq`, `cursor`, `alt_screen`, `app_cursor`, `bracketed_paste`, `mouse`,
+`sgr_mouse` and `title`, and refuses a
 session id containing `/ ? # %` or equal to `.` or `..`. `sessions_wait` takes
 `screen:<regex>` and `stable:<ms>` as well.
 
