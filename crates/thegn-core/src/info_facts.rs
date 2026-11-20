@@ -915,11 +915,18 @@ pub fn sessions_for(
 mod tests {
     use super::*;
 
-    #[expect(clippy::disallowed_methods, reason = "test fixture invokes git")]
     fn git(dir: &Path, args: &[&str]) {
         let output = crate::util::git_cmd(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(["-c", "commit.gpgsign=false"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=thegn-test",
+                "-c",
+                "user.email=thegn-test@example.invalid",
+            ])
             .args(args)
             .output()
             .expect("git fixture command starts");
