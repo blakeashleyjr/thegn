@@ -13,6 +13,16 @@ Homebrew metadata targets Darwin, AUR targets musl, and nfpm deb/rpm packages
 target Linux GNU. Windows/Scoop/winget remain disabled until their artifact leg
 is enabled and proven.
 
+Each selected release asset remains subject to the 512 MiB archive cap and
+64 KiB text-asset cap. The aggregate selected-download cap is 1 GiB, twice the
+archive cap. The three enabled target archives in v0.1.0-alpha.103 were
+46,161,052, 55,302,039, and 55,513,949 bytes (156,977,040 bytes total); all
+listed release assets in that candidate totaled 156,981,077 bytes. This leaves
+about 6.8x headroom over the observed target archives while bounding the
+unfiltered manifest download. The aggregate cap was previously an owner-number
+question; 1 GiB is the conservative implementation default pending owner
+confirmation of the operational budget.
+
 ## Build and provenance pipeline
 
 Tagged builds produce the stable archive/checksum contract. A downstream

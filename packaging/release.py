@@ -39,6 +39,11 @@ FORBIDDEN_OUTPUT = ("REPLACE_WITH_", "thegn-dev", ".SRCINFO")
 WINDOWS_ERROR = "Windows release lane is not enabled"
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_TRUSTED_DIGESTS_BYTES = 64 * 1024
+# Bound all assets selected by one release download. The current three enabled
+# target archives total about 150 MiB in v0.1.0-alpha.103; twice the existing
+# per-archive ceiling leaves headroom for package growth while bounding a full
+# draft download to 1 GiB. The owner still needs to confirm this operational cap.
+MAX_SELECTED_DOWNLOAD_BYTES = 2 * MAX_ARCHIVE_BYTES
 TEXT_ASSET_SUFFIXES = (".sha256", "-release.json", "-manifest.json")
 RELEASE_MANIFEST_NAME = "thegn-{tag}-manifest.json"
 MAX_MEMBERS = 64
@@ -1930,6 +1935,7 @@ def check_release_asset_sizes(document: Any, patterns: Sequence[str]) -> list[st
     )
     if not selected:
         raise ReleaseError("no release assets match the download patterns")
+    total = 0
     for name in selected:
         limit = (
             MAX_TRUSTED_DIGESTS_BYTES
@@ -1938,6 +1944,12 @@ def check_release_asset_sizes(document: Any, patterns: Sequence[str]) -> list[st
         )
         if sizes[name] > limit:
             raise ReleaseError(f"release asset {name} exceeds the {limit} byte download limit")
+        size = sizes[name]
+        if size > MAX_SELECTED_DOWNLOAD_BYTES - total:
+            raise ReleaseError(
+                f"selected release assets exceed the {MAX_SELECTED_DOWNLOAD_BYTES} byte aggregate download limit"
+            )
+        total += size
     return selected
 
 
