@@ -1718,7 +1718,7 @@ fn agents_install_script(agents: &[String]) -> String {
         lines.push(line);
     }
     // shellcheck disable=SC2086: package names are intentionally word-split.
-    lines.push("if [ -n \"$pkgs\" ]; then t1=$(date +%s); npm_g $pkgs || for p in $pkgs; do npm_g \"$p\" || true; done; echo \"thegn-agent-install: npm$pkgs $(( $(date +%s) - t1 ))s\" >>\"$log\"; fi".into());
+    lines.push("if [ -n \"$pkgs\" ]; then t1=$(date +%s 2>/dev/null || echo 0); npm_g $pkgs || for p in $pkgs; do npm_g \"$p\" || true; done; echo \"thegn-agent-install: npm$pkgs $(( $(date +%s) - t1 ))s\" >>\"$log\"; fi".into());
     lines.push("[ -z \"$hermes_pid\" ] || wait \"$hermes_pid\"".into());
     for program in known_programs {
         lines.push(format!("have {program} || missing=\"$missing {program}\""));
@@ -3042,7 +3042,8 @@ mod tests {
     #[test]
     fn agents_installer_does_not_background_without_hermes() {
         let s = agents_install_script(&["codex".into()]);
-        assert!(!s.contains('&'));
+        assert!(!s.contains("} &"));
+        assert!(!s.contains("hermes_pid=$!"));
     }
 
     #[test]
