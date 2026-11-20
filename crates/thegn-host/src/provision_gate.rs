@@ -407,10 +407,54 @@ pub(crate) fn guard_unprovisioned_attach(
     if !has_provider_location || choice == "clean-shell" {
         return Ok(());
     }
-    match unprovisioned_provider_env(cfg, worktree)? {
-        Some(env_name) => Err(unprovisioned_halt(env_name, worktree).into()),
-        None => Ok(()),
+    let Some((env_name, id)) = provider_target(cfg, worktree)? else {
+        return Ok(());
+    };
+    if !crate::provider_workdir::is_provisioned_locally(&id) {
+        return Err(unprovisioned_halt(env_name, worktree).into());
     }
+    if let Some(text) = deferred_attach_refusal(
+        cfg,
+        choice,
+        worktree,
+        thegn_core::provision_journal::read(&id).as_ref(),
+    ) {
+        anyhow::bail!(text);
+    }
+    Ok(())
+}
+
+pub(crate) fn deferred_attach_refusal(
+    cfg: &thegn_core::config::Config,
+    choice: &str,
+    worktree: &str,
+    journal: Option<&thegn_core::provision_journal::Journal>,
+) -> Option<String> {
+    use thegn_core::provision_journal::{AgentGate, agent_gate, is_agent_choice};
+
+    if !is_agent_choice(cfg, choice) || agent_gate(journal) != AgentGate::Wait {
+        return None;
+    }
+    let step = journal
+        .map(|journal| journal.step.as_str())
+        .filter(|step| !step.is_empty())
+        .unwrap_or("background setup")
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    Some(format!(
+        "{choice} is not started yet: its CLI and login are still being set up in the background ({step}); it opens once setup finishes. Run `thegn env up --worktree {worktree}` to wait for it"
+    ))
+}
+
+pub(crate) fn deferred_pending_env(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some((env_name, id)) = provider_target(cfg, worktree)? else {
+        return Ok(None);
+    };
+    Ok(thegn_core::provision_journal::read(&id).map(|_| env_name))
 }
 
 /// The env name when `worktree` resolves to a provider env whose sandbox has NOT
@@ -1814,6 +1858,52 @@ mod tests {
             guard_unprovisioned_attach(&thegn_core::config::Config::default(), &wt, "shell", true);
         assert!(
             matches!(result, Err(error) if error.to_string().contains("provider attach refused"))
+        );
+    }
+
+    #[test]
+    fn deferred_attach_refusal_only_blocks_pending_agents() {
+        use thegn_core::config::NamedCommand;
+        use thegn_core::provision_journal::{DeferredState, Journal};
+
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.agents.push(NamedCommand {
+            name: "codex".into(),
+            command: "codex".into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: None,
+            drawer_cwd: None,
+        });
+        let mut pending = Journal::pending("/wt", "cloud");
+        pending.step = "agents\ninstall".into();
+        let mut failed = pending.clone();
+        failed.state = DeferredState::Failed;
+        assert!(deferred_attach_refusal(&cfg, "shell", "/wt", Some(&pending)).is_none());
+        assert!(deferred_attach_refusal(&cfg, "tool", "/wt", Some(&pending)).is_none());
+        assert!(deferred_attach_refusal(&cfg, "codex", "/wt", None).is_none());
+        let refusal = deferred_attach_refusal(&cfg, "codex", "/wt", Some(&pending))
+            .expect("pending agent is held");
+        assert!(refusal.contains("thegn env up --worktree /wt"));
+        assert!(refusal.contains("agentsinstall"));
+        assert!(!refusal.contains('\n'));
+        assert!(deferred_attach_refusal(&cfg, "codex", "/wt", Some(&failed)).is_none());
+    }
+
+    #[test]
+    fn deferred_pending_env_is_none_for_a_local_worktree() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().to_string_lossy().into_owned();
+        assert_eq!(
+            deferred_pending_env(&thegn_core::config::Config::default(), &wt).unwrap(),
+            None
         );
     }
 
