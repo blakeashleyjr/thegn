@@ -470,7 +470,7 @@ pub fn scrub_url(url: &str) -> String {
     };
     let authority_start = scheme_end + 3;
     let authority_end = url[authority_start..]
-        .find(|character| matches!(character, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .map(|offset| authority_start + offset)
         .unwrap_or(url.len());
     let authority = &url[authority_start..authority_end];
