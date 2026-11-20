@@ -16,6 +16,13 @@ pub enum IoClass {
     RealTime(u8),
     BestEffort(u8),
     Idle,
+    #[cfg_attr(
+        all(not(target_os = "linux"), not(test)),
+        expect(
+            dead_code,
+            reason = "constructed only by non-Linux tests; Linux production uses it"
+        )
+    )]
     None,
 }
 

@@ -2489,6 +2489,7 @@ fn disk_health_drives_report(drives: Vec<crate::platform::DiskHealth>) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn optional_metric(value: Option<u64>) -> String {
     value.map_or_else(|| "n/a".to_string(), |value| value.to_string())
 }
