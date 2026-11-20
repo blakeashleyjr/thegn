@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Vercel: streamed commands, interactive shells and file transfers refused because the session had stopped are retried once after resume, like one-shot commands.
+
 ## [0.1.0-alpha.108] — 2026-11-19
 
 ## [0.1.0-alpha.107] — 2026-11-19
