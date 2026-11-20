@@ -2945,22 +2945,6 @@ pub(crate) fn provision_step_timeout(step_id: &str) -> std::time::Duration {
     }
 }
 
-pub fn provision_provider_env(
-    cfg: &Config,
-    worktree: &str,
-    env_name: &str,
-    mut progress: impl FnMut(&[ProvisionStepView]),
-) -> anyhow::Result<bool> {
-    provision_provider_env_inner(
-        cfg,
-        worktree,
-        env_name,
-        None,
-        ProvisionMode::All,
-        &mut progress,
-    )
-    .map(|o| o.provisioned)
-}
 
 /// Provision a provider env into a sandbox. `name_override` forces the sandbox
 /// name (used for warm-pool SPARES, which aren't bound to a worktree); `None`
@@ -4053,14 +4037,13 @@ fn provision_provider_env_inner(
             }
         }
         journal::JournalAction::MarkFailed => {
-            if let Some((label, detail)) = deferred_failure {
-                if !journal::read(&id)
+            if let Some((label, detail)) = deferred_failure
+                && !journal::read(&id)
                     .is_some_and(|entry| entry.state == journal::DeferredState::Cancelled)
-                {
-                    let failed = journal::Journal::failed(worktree, env_name, &label, &detail);
-                    if let Err(error) = journal::write(&id, &failed) {
-                        tracing::warn!(target: "thegn::provider", %id, %error, "could not record failed deferred provision");
-                    }
+            {
+                let failed = journal::Journal::failed(worktree, env_name, &label, &detail);
+                if let Err(error) = journal::write(&id, &failed) {
+                    tracing::warn!(target: "thegn::provider", %id, %error, "could not record failed deferred provision");
                 }
             }
         }
