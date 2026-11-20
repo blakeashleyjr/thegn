@@ -148,7 +148,15 @@ pub fn read_in(dir: &Path, id: &str) -> Option<Journal> {
     match open_existing(dir) {
         Ok(Some(private)) => read_private(&private, id),
         Ok(None) => None,
-        Err(_) => Some(unreadable_journal()),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::provision",
+                path = %dir.display(),
+                %error,
+                "ignoring deferred provisioning journals in non-private directory"
+            );
+            None
+        }
     }
 }
 
@@ -367,7 +375,9 @@ mod tests {
     use std::time::Duration;
 
     fn journal_dir() -> tempfile::TempDir {
-        tempfile::tempdir().expect("journal test directory")
+        let dir = tempfile::tempdir().expect("journal test directory");
+        crate::fsperm::ensure_private_dir(dir.path()).expect("private journal test directory");
+        dir
     }
 
     fn pending() -> Journal {
@@ -397,6 +407,7 @@ mod tests {
     #[test]
     fn cancel_flips_pending_and_failed_and_absent_is_false() {
         let dir = journal_dir();
+        assert!(read_in(dir.path(), "sandbox-1").is_none());
         assert!(!cancel_in(dir.path(), "sandbox-1").unwrap());
         write_in(dir.path(), "sandbox-1", &pending()).unwrap();
         assert!(cancel_in(dir.path(), "sandbox-1").unwrap());
@@ -416,11 +427,19 @@ mod tests {
     #[test]
     fn corrupt_journal_reads_as_pending() {
         let dir = journal_dir();
-        crate::fsperm::ensure_private_dir(dir.path()).unwrap();
         std::fs::write(dir.path().join("sandbox-1.json"), b"not json").unwrap();
         let journal = read_in(dir.path(), "sandbox-1").unwrap();
         assert_eq!(journal.state, DeferredState::Pending);
         assert_eq!(journal.detail, "unreadable journal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_private_directory_reads_as_absent_and_cancel_is_false() {
+        let dir = journal_dir();
+        crate::fsperm::set_mode_for_test(dir.path(), 0o755).unwrap();
+        assert!(read_in(dir.path(), "sandbox-1").is_none());
+        assert!(!cancel_in(dir.path(), "sandbox-1").unwrap());
     }
 
     #[test]
