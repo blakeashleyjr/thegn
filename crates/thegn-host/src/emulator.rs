@@ -205,17 +205,18 @@ pub trait PaneEmulator: Send {
     fn scrollback_text(&self, _max_lines: usize, _include_screen: bool) -> Option<Vec<String>> {
         None
     }
+    /// As `locate_line`, plus the logical line's top absolute grid line and its
+    /// row count (wrapped rows included): `(offset, top_line, rows)`.
+    fn locate_line_span(&self, _text: &str, _hint_from_bottom: usize) -> Option<(usize, i32, u16)> {
+        None
+    }
     /// Display offset (rows scrolled up from the live bottom) that brings the
     /// newest-nearest logical line equal to `text` (trailing spaces trimmed,
     /// soft wraps joined) into view, picking the occurrence whose logical
     /// distance from the bottom is closest to `hint_from_bottom`.
     /// None when the alt screen is active or the line is not in the grid. One
     /// lock.
-    /// As `locate_line`, plus the logical line's top absolute grid line and its
-    /// row count (wrapped rows included): `(offset, top_line, rows)`.
-    fn locate_line_span(&self, _text: &str, _hint_from_bottom: usize) -> Option<(usize, i32, u16)> {
-        None
-    }
+    #[cfg(test)]
     fn locate_line(&self, text: &str, hint_from_bottom: usize) -> Option<usize> {
         self.locate_line_span(text, hint_from_bottom)
             .map(|(offset, _, _)| offset)

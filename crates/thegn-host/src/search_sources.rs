@@ -101,8 +101,7 @@ pub(crate) fn build_search_sources<'a>(
     out
 }
 
-/// Jump to the matched line: switch tab if needed, scroll the pane so the
-/// matched line is visible, and focus the center terminal.
+/// What a search jump did: the line to select and whether it switched worktree group.
 pub(crate) struct SearchJump {
     /// The found line as a selection in absolute lines (copymode::Selection).
     pub(crate) highlight: Option<(u32, crate::copymode::Selection)>,
@@ -110,6 +109,8 @@ pub(crate) struct SearchJump {
     pub(crate) switched_group: bool,
 }
 
+/// Jump to the matched line: switch tab if needed, scroll the pane so the
+/// matched line is visible, and focus the center terminal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_search_jump(
     m: thegn_core::search::SearchMatch,
