@@ -3297,7 +3297,7 @@ pub enum ExecFrame {
 }
 
 /// A Sprites exec WebSocket message that breaks the documented frame
-/// protocol (AsyncAPI exec, THE-533). Never treated as output or success.
+/// protocol (AsyncAPI exec, THE-533); unknown well-formed control types are tolerated and ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecProtocolError {
     EmptyFrame,
@@ -3305,8 +3305,6 @@ pub enum ExecProtocolError {
     MalformedExit,
     DuplicateExit,
     OutputAfterExit,
-    /// Sanitized: only [a-z0-9_], at most 32 chars, else "<invalid>".
-    UnknownControl(String),
     MalformedControl,
 }
 
@@ -3318,7 +3316,6 @@ impl std::fmt::Display for ExecProtocolError {
             Self::MalformedExit => "the exit frame is malformed".to_string(),
             Self::DuplicateExit => "a second exit arrived".to_string(),
             Self::OutputAfterExit => "output arrived after the exit".to_string(),
-            Self::UnknownControl(t) => format!("unknown control message type {t}"),
             Self::MalformedControl => "a control message is malformed".to_string(),
         };
         write!(f, "sprites exec: protocol error: {message}")
@@ -3809,7 +3806,7 @@ fn sanitize_control_type(t: &str) -> String {
 }
 
 /// Classify a Sprites exec text frame according to the documented control
-/// protocol. Non-JSON text is output only for TTY sessions.
+/// protocol; unknown well-formed control types are tolerated and ignored. Non-JSON text is output only for TTY sessions.
 fn parse_sprite_ctrl(text: &str, tty: bool) -> std::result::Result<SpriteCtrl, ExecProtocolError> {
     if text.len() > EXEC_CONTROL_TEXT_MAX {
         return if tty {
@@ -3855,7 +3852,17 @@ fn parse_sprite_ctrl(text: &str, tty: bool) -> std::result::Result<SpriteCtrl, E
             Ok(SpriteCtrl::Session(session_id.to_string()))
         }
         "port_opened" | "port_closed" => Ok(SpriteCtrl::Notice),
-        _ => Err(ExecProtocolError::UnknownControl(sanitize_control_type(t))),
+        _ => {
+            // The server sends control types the AsyncAPI exec document does not list
+            // (seen live: "debug"). A well-formed control message of an unknown type
+            // is tolerated so a new server message cannot break every command.
+            tracing::debug!(
+                target: "thegn::provider",
+                control = %sanitize_control_type(t),
+                "sprites exec: ignoring an unknown control message type"
+            );
+            Ok(SpriteCtrl::Notice)
+        }
     }
 }
 
@@ -7294,11 +7301,11 @@ mod tests {
             );
             assert_eq!(
                 parse_sprite_ctrl(r#"{"type":"Debug!x"}"#, tty),
-                Err(ExecProtocolError::UnknownControl("<invalid>".into()))
+                Ok(SpriteCtrl::Notice)
             );
             assert_eq!(
                 parse_sprite_ctrl(r#"{"type":"debug"}"#, tty),
-                Err(ExecProtocolError::UnknownControl("debug".into()))
+                Ok(SpriteCtrl::Notice)
             );
             assert_eq!(
                 parse_sprite_ctrl("not json", tty),
@@ -7533,6 +7540,26 @@ mod tests {
         )
         .await;
         assert_eq!(frames, vec![ExecFrame::Exit(0)]);
+        assert_eq!(fault, None);
+    }
+
+    #[tokio::test]
+    async fn drive_exec_ignores_an_unknown_control_type() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (frames, fault) = drive_exec_messages(
+            false,
+            vec![
+                Message::Text(r#"{"type":"debug","message":"x"}"#.into()),
+                Message::Binary(vec![1, b'o', b'k'].into()),
+                Message::Binary(vec![3, 0].into()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            frames,
+            vec![ExecFrame::Stdout(b"ok".to_vec()), ExecFrame::Exit(0)]
+        );
         assert_eq!(fault, None);
     }
 
