@@ -506,7 +506,7 @@ fn listed_state(report: &thegn_svc::provider::InventoryReport, id: &str) -> Opti
         thegn_svc::provider::InventoryReport::Complete(rows)
         | thegn_svc::provider::InventoryReport::Partial { rows, .. } => rows
             .iter()
-            .find(matches)
+            .find(|info| matches(info))
             .and_then(|info| info.state.clone()),
     }
 }
