@@ -9,7 +9,7 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Added
 
-- Info screen: `thegn info` (with `--workspace`, `--worktree`, `--json`), the sidebar key `I` and `Alt I` show what is in force for a workspace or worktree, which layer set each value, and which sandbox backend would launch, using the same rule as a real launch. Remote and provider placements are never probed.
+- Info screen: `thegn info` (with `--workspace`, `--worktree`, `--json`), the sidebar key `I` and the palette action "Info screen" show what is in force for a workspace or worktree, which layer set each value, and which sandbox backend would launch, using the same rule as a real launch. Remote and provider placements are never probed.
 
 ## [0.1.0-alpha.106] — 2026-11-19
 

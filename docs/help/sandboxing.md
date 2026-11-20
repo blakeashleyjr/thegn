@@ -429,7 +429,7 @@ a red gate or conflict to the fixer agent.
 ## Inspecting
 
 To see which backend would launch for a worktree, and which layer chose each
-setting, run `thegn info` or press `Alt I` (see the Info screen section of
+setting, run `thegn info` or press `I` on its sidebar row (see the Info screen section of
 Workspaces and worktrees).
 
 The panel's **system → sandbox** section shows the live state for the

@@ -269,7 +269,7 @@ sandbox settings, which backend would launch, and any per-worktree overrides.
 | Surface     | How                                                              |
 | ----------- | ---------------------------------------------------------------- |
 | Sidebar     | `I` on a row (workspace or worktree)                             |
-| Anywhere    | `Alt I`, or the palette action "Info screen" (`open-info`)       |
+| Anywhere | the palette action "Info screen" (`open-info`); no chord is bound by default |
 | CLI         | `thegn info [--workspace SLUG\|PATH] [--worktree PATH\|BRANCH]`  |
 | CLI, JSON   | `thegn info --json`                                              |
 
