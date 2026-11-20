@@ -1237,9 +1237,11 @@ mod tests {
         let assert_unknown_warned = |fields: &[Field], key: &str| {
             let field = fields.iter().find(|field| field.key == key).unwrap();
             assert!(
-                matches!(field.shown, crate::info_model::Shown::Unknown(ref why) if why.starts_with("state db read failed: "))
+                matches!(field.shown, crate::info_model::Shown::Unknown(ref why) if why.starts_with("state db read failed: ")),
+                "{key}: expected unknown state db read failure, got {:?}",
+                field.shown
             );
-            assert!(field.warn, "{key} should be warned");
+            assert!(field.warn, "{key}: should be warned, got {:?}", field.shown);
         };
 
         let db = crate::db::Db::open_memory().unwrap();
