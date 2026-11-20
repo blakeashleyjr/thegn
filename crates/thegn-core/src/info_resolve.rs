@@ -3,7 +3,7 @@
 use crate::config::{Config, ProcessEnv, SandboxConfig};
 use crate::config_resolve::Approvals;
 use crate::info_model::{Field, Source, clean, config_value_text, origin_of};
-use crate::store::{RepoTrustStore, WorkspaceStore};
+use crate::store::{RepoTrustStore, WorkspaceStore, ZoneStore};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -39,15 +39,20 @@ fn sandbox_value(sandbox: &SandboxConfig, key: &str) -> Value {
     }
 }
 
+struct Stages<'a> {
+    repo_sandbox: &'a SandboxConfig,
+    repo_source: &'a str,
+    profile_selection: Option<crate::config::SandboxProfile>,
+    zone_floor: Option<(String, crate::config::SandboxProfile)>,
+}
+
 fn sandbox_field(
     cfg: &Config,
     config_path: Option<&PathBuf>,
     environment: &crate::env::Environment,
     key: &str,
     label: &str,
-    repo_sandbox: &SandboxConfig,
-    repo_source: &str,
-    profile_selection: Option<crate::config::SandboxProfile>,
+    stages: &Stages<'_>,
 ) -> Result<Field, String> {
     let loaded = sandbox_value(&cfg.sandbox, key);
     let base = explain_source(config_path, &format!("sandbox.{key}"), loaded.clone())?;
@@ -57,22 +62,25 @@ fn sandbox_field(
         profile.sandbox.clone().apply(&mut profile_sandbox);
     }
 
-    let repo_value = sandbox_value(repo_sandbox, key);
+    let repo_value = sandbox_value(stages.repo_sandbox, key);
     let environment_value = sandbox_value(&environment.sandbox, key);
-    let stages = vec![
+    let candidates = vec![
         (base, loaded),
         (
             Source::ProfileTable(cfg.profile.clone()),
             sandbox_value(&profile_sandbox, key),
         ),
-        (Source::Repo(repo_source.to_string()), repo_value.clone()),
+        (
+            Source::Repo(stages.repo_source.to_string()),
+            repo_value.clone(),
+        ),
         (
             Source::Env(environment.name.clone()),
             environment_value.clone(),
         ),
     ];
 
-    let mut source = origin_of(&stages).unwrap_or(Source::Builtin);
+    let mut source = origin_of(&candidates).unwrap_or(Source::Builtin);
     if key == "backend"
         && cfg
             .env
@@ -83,9 +91,18 @@ fn sandbox_field(
         source = Source::Placement;
     }
     if key == "profile"
-        && profile_selection.is_some_and(|profile| json_value(&profile) == environment_value)
+        && stages
+            .profile_selection
+            .is_some_and(|profile| json_value(&profile) == environment_value)
     {
         source = Source::WorktreeDb;
+    }
+    if key == "profile"
+        && let Some((zone_name, floor)) = &stages.zone_floor
+        && json_value(floor) == environment_value
+        && stages.profile_selection != Some(*floor)
+    {
+        source = Source::Zone(zone_name.clone());
     }
 
     Ok(Field::value(
@@ -169,6 +186,18 @@ pub fn settings(
             None
         }
     };
+    let zone_floor = match db.zone_of_worktree(&wt) {
+        Ok(Some(zone)) => cfg
+            .zone
+            .get(&zone.name)
+            .and_then(|ceiling| ceiling.sandbox_floor)
+            .map(|floor| (zone.name.clone(), floor)),
+        Ok(None) => None,
+        Err(error) => {
+            notes.push(format!("could not read the worktree's zone: {error}"));
+            None
+        }
+    };
 
     let base_path = config_path.as_ref();
     let worktree_env = match db.worktree_env(&wt) {
@@ -195,27 +224,27 @@ pub fn settings(
         && workspace_env.as_deref() != Some(environment.name.as_str())
         && repo_env == environment.name;
     let env_name_source = if worktree_env.as_deref() == Some(environment.name.as_str()) {
-        Source::WorktreeDb
+        Some(Source::WorktreeDb)
     } else if workspace_env.as_deref() == Some(environment.name.as_str()) {
-        Source::WorkspaceDb
+        Some(Source::WorkspaceDb)
     } else if repo_env_won {
-        Source::Repo(repo_source.clone())
+        Some(Source::Repo(repo_source.clone()))
     } else if worktree == repo_root && !cfg.sandbox.main_env.is_empty() {
         explain_source(
             base_path,
             "sandbox.main_env",
             json_value(&cfg.sandbox.main_env),
         )
-        .unwrap_or(Source::Builtin)
+        .ok()
     } else if !cfg.sandbox.default_env.is_empty() || environment.name == "default" {
         explain_source(
             base_path,
             "sandbox.default_env",
             json_value(&cfg.sandbox.default_env),
         )
-        .unwrap_or(Source::Builtin)
+        .ok()
     } else {
-        Source::Builtin
+        Some(Source::Builtin)
     };
     let env_name = if environment.unresolved_selection {
         format!(
@@ -225,7 +254,8 @@ pub fn settings(
     } else {
         environment.name.clone()
     };
-    let env_name_field = Field::value(ENV_NAME, "Environment", env_name, env_name_source);
+    let mut env_name_field = Field::value(ENV_NAME, "Environment", env_name, Source::Builtin);
+    env_name_field.source = env_name_source;
     fields.push(if environment.unresolved_selection {
         env_name_field.warned()
     } else {
@@ -255,22 +285,19 @@ pub fn settings(
         Source::Env(environment.name.clone()),
     ));
 
+    let stages = Stages {
+        repo_sandbox: &repo_sandbox,
+        repo_source: &repo_source,
+        profile_selection,
+        zone_floor,
+    };
     for (key, label) in [
         ("enabled", "Sandbox enabled"),
         ("backend", "Sandbox backend"),
         ("profile", "Sandbox profile"),
         ("network", "Sandbox network"),
     ] {
-        match sandbox_field(
-            cfg,
-            base_path,
-            environment,
-            key,
-            label,
-            &repo_sandbox,
-            &repo_source,
-            profile_selection,
-        ) {
+        match sandbox_field(cfg, base_path, environment, key, label, &stages) {
             Ok(field) => fields.push(field),
             Err(error) => fields.push(Field::unknown(&format!("sandbox.{key}"), label, error)),
         }
@@ -302,7 +329,11 @@ pub fn settings(
             "new worktrees resolve default_env; main_env applies to the root checkout".into(),
         );
     }
-    if !repo_env.is_empty() && !repo_env_won {
+    if !repo_env.is_empty()
+        && worktree_env.is_none()
+        && workspace_env.is_none()
+        && repo_env != environment.name
+    {
         notes.push(format!(
             "repo env `{repo_env}` was not applied (it would weaken the sandbox; see `thegn config explain sandbox --repo`)"
         ));
@@ -428,4 +459,5 @@ pub fn settings(
 }
 
 #[cfg(test)]
-mod info_resolve_tests;
+#[path = "info_resolve_tests.rs"]
+mod tests;
