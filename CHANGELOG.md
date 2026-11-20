@@ -23,6 +23,11 @@ All notable changes to **thegn** are documented here. The format follows
 - Sprites lifetime reapers keep sandboxes bound to a registered worktree; background passes never wake a sandbox, and the hibernator never execs a sleeping sandbox unless a listing shows it awake.
 - Non-tty `sprite-exec` streams without a cap, sends remote stderr to stderr and forwards a non-terminal stdin.
 - `test/remote-parity.sh` prints a `RUN SUMMARY` (THE-2477).
+- Native local interactive sandboxes on NixOS now get host Nix-daemon access when safety checks pass. Agent, SSH, provider, and OCI launches stay off by default; explicit `nix_daemon = false` opts out (THE-2478).
+
+### Fixed
+
+- Native macOS builds no longer fail on the per-process activity test or dead-code lints for Linux-only media and process-sampling helpers (THE-2479, THE-2482, THE-2483).
 
 ## [0.1.0-alpha.118] — 2026-11-20
 
@@ -4150,7 +4155,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.118...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.119...HEAD
+[0.1.0-alpha.119]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.118...v0.1.0-alpha.119
 [0.1.0-alpha.118]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.117...v0.1.0-alpha.118
 [0.1.0-alpha.117]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.116...v0.1.0-alpha.117
 [0.1.0-alpha.116]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.115...v0.1.0-alpha.116
