@@ -17,11 +17,17 @@ pub(crate) use linux::proc_backend;
 pub(crate) mod proc_backend;
 
 pub(crate) struct ProcSampleRequest<'a> {
+    // The non-Linux backend intentionally ignores this Linux sampling contract.
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub rows: usize,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub self_pid: u32,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub daemon_pid: Option<u32>,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub pane_pids: &'a [(u32, u32)],
     /// Whether a previous pass exists (set by the sampler before projecting).
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub primed: bool,
 }
 pub mod model;
