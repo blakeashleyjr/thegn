@@ -2167,6 +2167,13 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
             format!("access-tokens = github.com={tok}"),
         ));
     }
+    let host_locale = crate::remote_term::host_locale(&|k| std::env::var(k).ok());
+    crate::remote_term::apply(
+        &mut env,
+        crate::remote_term::PANE_TERM,
+        Some(crate::remote_term::PANE_COLORTERM),
+        host_locale.as_deref(),
+    );
     env.push(("THEGN_WORKTREE".to_string(), worktree.to_string()));
     env.push(("THEGN_BRANCH".to_string(), String::new()));
     // A claimed warm-pool spare overrides the derived id (same rule as

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use thegn_svc::provider::{ExecFrame, ExecSpec, SpritesProvider};
+use thegn_svc::provider::{ExecFrame, ExecProtocolError, ExecSpec, SpritesProvider};
 
 #[derive(Clone, Copy)]
 enum Hs {
@@ -282,6 +282,102 @@ async fn non_tty_nonzero_exit_appends_the_stderr_tail() {
     assert_eq!(code, 7);
     assert!(output.contains("[stderr, last 4 bytes]"));
     assert!(output.contains("boom"));
+}
+
+#[tokio::test]
+async fn non_tty_duplicate_exit_is_a_typed_protocol_error() {
+    let mock = start_mock(vec![script(vec![
+        Out::Bin(vec![3, 0]),
+        Out::Bin(vec![3, 1]),
+        Out::Close,
+    ])]);
+
+    let error = provider(&mock)
+        .run_exec("tgtest1", &["sh".into()], None, &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ExecProtocolError>(),
+        Some(&ExecProtocolError::DuplicateExit)
+    );
+}
+
+#[tokio::test]
+async fn non_tty_exit_repeated_in_both_forms_is_accepted() {
+    let mock = start_mock(vec![script(vec![
+        Out::Bin(vec![1, b'o', b'k']),
+        Out::Bin(vec![3, 0]),
+        Out::Text(r#"{"type":"exit","exit_code":0}"#),
+        Out::Close,
+    ])]);
+
+    let result = provider(&mock)
+        .run_exec("tgtest1", &["sh".into()], None, &[])
+        .await
+        .unwrap();
+    assert_eq!(result, (0, "ok".to_string()));
+}
+
+#[tokio::test]
+async fn non_tty_output_after_exit_is_a_typed_protocol_error() {
+    let mock = start_mock(vec![script(vec![
+        Out::Bin(vec![3, 0]),
+        Out::Bin(vec![1, b'x']),
+        Out::Close,
+    ])]);
+
+    let error = provider(&mock)
+        .run_exec("tgtest1", &["sh".into()], None, &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ExecProtocolError>(),
+        Some(&ExecProtocolError::OutputAfterExit)
+    );
+}
+
+#[tokio::test]
+async fn non_tty_unknown_stream_is_a_typed_protocol_error() {
+    let mock = start_mock(vec![script(vec![Out::Bin(vec![5, b'x']), Out::Close])]);
+
+    let error = provider(&mock)
+        .run_exec("tgtest1", &["sh".into()], None, &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ExecProtocolError>(),
+        Some(&ExecProtocolError::UnknownStream(5))
+    );
+}
+
+#[tokio::test]
+async fn non_tty_malformed_exit_is_a_typed_protocol_error() {
+    let mock = start_mock(vec![script(vec![Out::Bin(vec![3]), Out::Close])]);
+
+    let error = provider(&mock)
+        .run_exec("tgtest1", &["sh".into()], None, &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ExecProtocolError>(),
+        Some(&ExecProtocolError::MalformedExit)
+    );
+}
+
+#[tokio::test]
+async fn non_tty_coalesced_output_is_kept_whole() {
+    let mock = start_mock(vec![script(vec![
+        Out::Bin([vec![1], b"a\nb".to_vec()].concat()),
+        Out::Bin([vec![1], b"c".to_vec()].concat()),
+        Out::Bin(vec![3, 0]),
+        Out::Close,
+    ])]);
+
+    let result = provider(&mock)
+        .run_exec("tgtest1", &["sh".into()], None, &[])
+        .await
+        .unwrap();
+    assert_eq!(result, (0, "a\nbc".to_string()));
 }
 
 #[tokio::test]
