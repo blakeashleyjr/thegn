@@ -20,7 +20,7 @@ while the process is contained.
 - [[sandbox-devcontainers]] — running a worktree in the repository's devcontainer
 - [[sandbox-resources]] — CPU, memory and process limits, and caches
 - [[sandbox-network]] — network modes and the allow and block lists
-- [[environments]] — named environments, worktree toolchains, lifecycle hooks and remote worktrees
+- [[environments]] — named environments, worktree toolchains, lifecycle hooks, remote worktrees and how a remote pane behaves (terminal identity, close versus quit, background setup)
 - [[sandbox-profiles]] — pinning a profile per worktree
 
 ## Hardening profiles
@@ -425,6 +425,12 @@ If the sandbox cannot start or is refused, the gate is an infrastructure hold
 that asks for approval; it is never run on the host and never blamed on the
 branch. The fold itself stays thegn's own git. An unattended drain never hands
 a red gate or conflict to the fixer agent.
+
+## Remote panes
+
+A pane in a provider sandbox is a thegn terminal like any other. Its terminal
+identity, what closing it does and what runs after its prompt are the same for
+every remote provider; see "Interactive remote panes" in [[environments]].
 
 ## Inspecting
 
