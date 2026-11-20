@@ -179,6 +179,81 @@ if run_make_app --dest "$tmp/symlink-dest" >"$tmp/symlink-dest.out" 2>"$tmp/syml
 fi
 [[ -z "$(find "$tmp/target-dest" -mindepth 1 -print -quit)" ]] || fail "symlink destination target received files"
 
+if THEGN_MAKE_APP_PINNED=0 run_make_app --dest "$tmp/unpinned-bypass" >"$tmp/unpinned.out" 2>"$tmp/unpinned.err"; then
+  fail "caller-controlled pin marker bypassed destination pinning"
+fi
+grep -Fq "invalid pinned destination descriptor" "$tmp/unpinned.err" || fail "invalid pin marker had no fail-closed diagnostic"
+[[ ! -e "$tmp/unpinned-bypass" ]] || fail "invalid pin marker created a destination"
+
+# The generator keeps operating on its opened destination if the path is
+# replaced after pinning; later relative writes must not follow the new symlink.
+real_mktemp="$(command -v mktemp)"
+race_bin="$tmp/pin-race-bin"
+race_dest="$tmp/pin-race-dest"
+race_moved="$tmp/pin-race-moved"
+race_foreign="$tmp/pin-race-foreign"
+mkdir -p "$race_bin" "$race_foreign"
+printf foreign >"$race_foreign/sentinel"
+cat >"$race_bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+made="$("$REAL_MKTEMP" "$@")"
+case "$*" in
+  *pin-race.app.staging.*)
+    mv -- "$RACE_DEST" "$RACE_MOVED"
+    ln -s -- "$RACE_FOREIGN" "$RACE_DEST"
+    ;;
+esac
+printf '%s\n' "$made"
+EOF
+chmod 0755 "$race_bin/mktemp"
+REAL_MKTEMP="$real_mktemp" RACE_DEST="$race_dest" RACE_MOVED="$race_moved" RACE_FOREIGN="$race_foreign" \
+  PATH="$race_bin:$mac_bin:$PATH" HOME="$tmp/home" \
+  "$repo/packaging/macos/make-app.sh" --bin "$mac_bin/thegn" --dest "$race_dest" --name pin-race >/dev/null ||
+  fail "destination path swap prevented generation in pinned directory"
+[[ -d "$race_moved/pin-race.app" ]] || fail "path swap redirected bundle away from pinned destination"
+[[ "$(cat "$race_foreign/sentinel")" == foreign ]] || fail "path swap modified the foreign destination"
+[[ -z "$(find "$race_foreign" -mindepth 1 -maxdepth 1 -name '*.app*' -print -quit)" ]] || fail "path swap created bundle artifacts in the foreign destination"
+
+# Recheck installer ownership immediately before exchange, after a competing
+# process swaps the original app path for a symlink to a foreign bundle.
+owner_race="$tmp/owner-race"
+owner_displaced="$tmp/owner-displaced.app"
+owner_foreign="$tmp/owner-foreign.app"
+mkdir -p "$owner_race" "$owner_foreign/Contents"
+run_make_app --dest "$owner_race" >/dev/null || fail "owner-race seed bundle failed"
+printf original >"$owner_race/thegn.app/Contents/Resources/keep"
+printf foreign >"$owner_foreign/Contents/sentinel"
+# The native runner may put Apple's /usr/bin shims before the Nix PATH. Pin the
+# helper to the interpreter selected by the test environment before HOME/PATH
+# changes below make those shims unusable. The override is intentionally scoped
+# to this fixture; normal runs still use python3 from PATH.
+real_python="${THEGN_TEST_PYTHON:-$(command -v python3)}"
+[[ -x $real_python ]] || fail "owner-race helper Python is not executable: $real_python"
+cat >"$race_bin/python3" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1-} == */app_bundle_fs.py && ${2-} == promote ]]; then
+  mv -- "$OWNER_RACE/thegn.app" "$OWNER_DISPLACED"
+  ln -s -- "$OWNER_FOREIGN" "$OWNER_RACE/thegn.app"
+fi
+exec "$REAL_PYTHON" "$@"
+EOF
+chmod 0755 "$race_bin/python3"
+if REAL_PYTHON="$real_python" REAL_MKTEMP="$real_mktemp" OWNER_RACE="$owner_race" OWNER_DISPLACED="$owner_displaced" OWNER_FOREIGN="$owner_foreign" \
+  PATH="$race_bin:$mac_bin:$PATH" HOME="$tmp/home" \
+  "$repo/packaging/macos/make-app.sh" --bin "$mac_bin/thegn" --dest "$owner_race" >"$tmp/owner-race.out" 2>"$tmp/owner-race.err"; then
+  fail "promotion accepted an app path swapped to a foreign symlink"
+fi
+if [[ ! -L "$owner_race/thegn.app" ]]; then
+  cat "$tmp/owner-race.err" >&2
+  ls -ld "$owner_race/thegn.app" >&2 || true
+  fail "ownership-race refusal replaced the foreign symlink"
+fi
+[[ "$(cat "$owner_foreign/Contents/sentinel")" == foreign ]] || fail "ownership-race refusal modified foreign bundle bytes"
+[[ "$(cat "$owner_displaced/Contents/Resources/keep")" == original ]] || fail "ownership-race refusal damaged displaced owned bundle"
+assert_no_workdirs "$owner_race" || fail "ownership-race refusal left staging directories"
+
 # bundle identifier grammar
 run_make_app --dest "$tmp/id-ok" --name my_app >/dev/null || fail "underscore name was refused"
 grep -Fq '<key>CFBundleIdentifier</key><string>com.github.blakeashleyjr.my-app</string>' "$tmp/id-ok/my_app.app/Contents/Info.plist" ||
@@ -247,22 +322,62 @@ if [[ $command_text == *TG_PROBE* || $command_text == *pwned* ]]; then
   fail "terminal command contains an environment value"
 fi
 
+# Negative launcher tests must not open a GUI dialog on macOS. Replace the
+# absolute osascript path only in these copied test bundles; generated app
+# bundles and their normal user-facing alerts remain unchanged.
+alert_stub="$tmp/osascript-alert-stub"
+alert_log="$tmp/osascript-alerts.log"
+cat >"$alert_stub" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "${2-}" >>"$THEGN_TEST_ALERT_LOG"
+EOF
+chmod 0755 "$alert_stub"
+install_headless_alert_stub() {
+  local common="$1" quoted
+  printf -v quoted '%q' "$alert_stub"
+  python3 - "$common" "$quoted" <<'PY'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+contents = path.read_bytes()
+needle = b"/usr/bin/osascript"
+if contents.count(needle) != 1:
+    raise SystemExit("expected exactly one GUI-alert command in common.sh")
+path.write_bytes(contents.replace(needle, sys.argv[2].encode(), 1))
+PY
+}
+assert_malformed_refusal() {
+  local bundle="$1" stderr="$2" expected_message expected_alert
+  expected_message="invalid launcher environment entry in $bundle/Contents/Resources/env"
+  expected_alert="display alert \"thegn\" message \"$expected_message\" as critical"
+  grep -Fxq "thegn: $expected_message" "$stderr" || fail "malformed environment refusal diagnostic changed"
+  [[ "$(cat "$alert_log")" == "$expected_alert" ]] || fail "malformed environment refusal did not issue exactly the expected alert"
+}
+
 # A tampered key record refuses before the target process can run.
 tampered_bundle="$tmp/tampered.app"
 cp -R "$probe_bundle" "$tampered_bundle"
+install_headless_alert_stub "$tampered_bundle/Contents/Resources/common.sh"
 printf 'BAD;KEY=x\0' >>"$tampered_bundle/Contents/Resources/env"
-if ENVDUMP_OUT="$tmp/tampered.out" USER="$test_user" bash "$tampered_bundle/Contents/Resources/thegn.command" >"$tmp/tampered.stdout" 2>"$tmp/tampered.stderr"; then
+if THEGN_TEST_ALERT_LOG="$alert_log" ENVDUMP_OUT="$tmp/tampered.out" USER="$test_user" bash "$tampered_bundle/Contents/Resources/thegn.command" >"$tmp/tampered.stdout" 2>"$tmp/tampered.stderr"; then
   fail "tampered environment key was accepted"
 fi
 [[ ! -e "$tmp/tampered.out" ]] || fail "tampered environment reached the target process"
+assert_malformed_refusal "$tampered_bundle" "$tmp/tampered.stderr"
 
 # A record without '=' is malformed even though its text resembles a valid key.
 no_value_bundle="$tmp/no-value.app"
 cp -R "$probe_bundle" "$no_value_bundle"
+install_headless_alert_stub "$no_value_bundle/Contents/Resources/common.sh"
+: >"$alert_log"
 printf 'FOO\0' >>"$no_value_bundle/Contents/Resources/env"
-if ENVDUMP_OUT="$tmp/no-value.out" USER="$test_user" bash "$no_value_bundle/Contents/Resources/thegn.command" >"$tmp/no-value.stdout" 2>"$tmp/no-value.stderr"; then
+if THEGN_TEST_ALERT_LOG="$alert_log" ENVDUMP_OUT="$tmp/no-value.out" USER="$test_user" bash "$no_value_bundle/Contents/Resources/thegn.command" >"$tmp/no-value.stdout" 2>"$tmp/no-value.stderr"; then
   fail "environment record without '=' was accepted"
 fi
 [[ ! -e "$tmp/no-value.out" ]] || fail "malformed environment record reached the target process"
+assert_malformed_refusal "$no_value_bundle" "$tmp/no-value.stderr"
+
+python3 -B "$repo/test/app_bundle_fs_test.py" || fail "bundle filesystem race tests failed"
 
 echo "make-app tests passed"
