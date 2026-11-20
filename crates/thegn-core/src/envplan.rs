@@ -1606,6 +1606,11 @@ pub fn agent_auth_critical_files(agent: &str) -> Vec<String> {
             ".config/codex/config.json".into(),
         ],
         "pi" => vec![".pi.json".into()],
+        "hermes" => vec![
+            ".hermes/auth.json".into(),
+            ".hermes/config.yaml".into(),
+            ".hermes/.env".into(),
+        ],
         other => vec![
             format!(".{other}.json"),
             format!(".{other}/config.json"),
@@ -3606,6 +3611,14 @@ mod tests {
                 ".codex/config.json",
                 ".config/codex/config.json",
             ]
+        );
+    }
+
+    #[test]
+    fn hermes_auth_critical_files_carry_credentials_and_config() {
+        assert_eq!(
+            agent_auth_critical_files("hermes"),
+            [".hermes/auth.json", ".hermes/config.yaml", ".hermes/.env"]
         );
     }
 
