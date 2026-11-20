@@ -565,6 +565,12 @@ fn deprovision(
     Ok(())
 }
 
+/// The worktree's sandbox binding before an env switch; `None` when it cannot
+/// be resolved (not fatal for the switch itself).
+fn binding_before_switch(cfg: &Config, wt: &str) -> Option<crate::provider_git::OfflineBinding> {
+    crate::provider_git::bound_offline(cfg, wt).ok()
+}
+
 fn worktree_bindings(cfg: &Config) -> Result<Vec<(String, crate::provider_git::OfflineBinding)>> {
     Ok(Db::open()?
         .worktrees()?
@@ -2098,10 +2104,7 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
         // The env the worktree resolved to before the switch, for the id of a
         // provider sandbox it may leave behind. Unresolvable is not fatal here.
         let old_env = resolve_for(cfg, Some(wt.clone()));
-        let old = match crate::provider_git::bound_offline(cfg, &wt) {
-            Ok(binding) => Some(binding),
-            Err(_) => None,
-        };
+        let old = binding_before_switch(cfg, &wt);
         let stored_is_provider = is_provider_location(
             &wt,
             db.location_for(&wt)
