@@ -93,6 +93,7 @@ pub struct Predictor {
 /// Latency floor (ms) below which local echo is imperceptible, so we don't
 /// bother predicting (avoids any glitch risk on a fast/local link).
 pub const PREDICT_MIN_SRTT_MS: f64 = 50.0;
+pub const PREDICT_STALE_MS: u64 = 2000;
 
 impl Predictor {
     pub fn new() -> Self {
@@ -162,31 +163,72 @@ impl Predictor {
         self.clear();
     }
 
-    /// Real server output arrived: it's authoritative (and carries the echoed
-    /// text), so drop the overlay. Also folds a round-trip sample into the srtt
-    /// when this output plausibly echoes the pending burst.
-    pub fn on_server_output(&mut self, now_ms: u64, cursor: (usize, usize), echoed: Option<&str>) {
-        if let Some(start) = self.last_key_ms.take() {
-            self.srtt.observe(now_ms.saturating_sub(start) as f64);
-        }
-        self.confirmed_row = match self.key_cursor {
-            Some((row, col))
-                if self.key_char.is_some()
-                    && cursor.0 == row
-                    && cursor.1 > col
-                    && echoed.and_then(|text| text.chars().next()) == self.key_char =>
-            {
-                Some(row)
+    /// Real server output arrived: reconcile the overlay against the cells the
+    /// authoritative emulator now contains. A cursor that did not move is not
+    /// evidence that the server rejected the input, so keep the overlay until
+    /// it either advances, mismatches, or goes stale.
+    pub fn on_server_output(
+        &mut self,
+        now_ms: u64,
+        cursor: (usize, usize),
+        cell: &dyn Fn(usize, usize) -> Option<String>,
+    ) {
+        let Some((row, col)) = self.key_cursor else {
+            if let Some(start) = self.last_key_ms.take() {
+                self.srtt.observe(now_ms.saturating_sub(start) as f64);
             }
-            _ => None,
+            self.confirmed_row = None;
+            self.pending.clear();
+            self.key_char = None;
+            return;
         };
-        self.pending.clear();
-        self.key_cursor = None;
-        self.key_char = None;
-    }
 
-    pub fn echo_cell(&self) -> Option<(usize, usize)> {
-        self.key_cursor
+        if cursor == (row, col) {
+            if self
+                .last_key_ms
+                .is_some_and(|start| now_ms.saturating_sub(start) > PREDICT_STALE_MS)
+            {
+                self.clear();
+            }
+            return;
+        }
+
+        let advanced_same_row = cursor.0 == row && cursor.1 > col;
+        let pending_is_ascii = self.pending.iter().all(|c| c.is_ascii());
+        let n = advanced_same_row
+            .then(|| (cursor.1 - col).min(self.pending.len().max(1)))
+            .unwrap_or(0);
+        let all_match = advanced_same_row
+            && pending_is_ascii
+            && (0..n).all(|i| {
+                let expected = self.pending.get(i).copied().or(self.key_char);
+                let actual = cell(row, col + i).and_then(|text| text.chars().next());
+                expected.is_some_and(|expected| actual == Some(expected))
+            });
+
+        if all_match {
+            if let Some(start) = self.last_key_ms.take() {
+                self.srtt.observe(now_ms.saturating_sub(start) as f64);
+            }
+            self.confirmed_row = Some(row);
+            self.pending.drain(..n.min(self.pending.len()));
+            if self.pending.is_empty() {
+                self.key_cursor = None;
+                self.key_char = None;
+            } else {
+                self.key_cursor = Some((row, col + n));
+                self.key_char = self.pending.first().copied();
+                self.last_key_ms = Some(now_ms);
+            }
+        } else {
+            if let Some(start) = self.last_key_ms.take() {
+                self.srtt.observe(now_ms.saturating_sub(start) as f64);
+            }
+            self.confirmed_row = None;
+            self.pending.clear();
+            self.key_cursor = None;
+            self.key_char = None;
+        }
     }
 
     /// Drop predictions without taking an srtt sample (resize, focus loss, …).
@@ -242,7 +284,7 @@ mod tests {
         assert!(p.is_empty());
         // A fresh burst, then server output clears it + records the rtt.
         p.on_key('x', 100, (0, 0));
-        p.on_server_output(420, (0, 1), None); // 320 ms round-trip
+        p.on_server_output(420, (0, 1), &|_, _| None); // 320 ms round-trip
         assert!(p.is_empty());
         assert_eq!(p.srtt_ms(), Some(320.0));
     }
@@ -254,7 +296,7 @@ mod tests {
         assert!(!p.should_predict(&prompt(23, 0, 80)));
         // Seed a slow link.
         p.on_key('a', 0, (23, 0));
-        p.on_server_output(320, (23, 1), Some("a"));
+        p.on_server_output(320, (23, 1), &|_, _| Some("a".into()));
         assert!(
             p.should_predict(&prompt(23, 1, 80)),
             "slow link, prompt row ⇒ predict"
@@ -270,7 +312,7 @@ mod tests {
         }));
         // A server response that did not advance the cursor is not echo.
         p.on_key('p', 400, (10, 4));
-        p.on_server_output(720, (10, 4), None);
+        p.on_server_output(720, (10, 4), &|_, _| None);
         assert!(!p.should_predict(&prompt(10, 4, 80)));
     }
 
@@ -278,7 +320,7 @@ mod tests {
     fn fast_link_does_not_predict() {
         let mut p = Predictor::new();
         p.on_key('a', 0, (23, 0));
-        p.on_server_output(8, (23, 1), None); // 8 ms — local/fast
+        p.on_server_output(8, (23, 1), &|_, _| None); // 8 ms — local/fast
         assert!(!p.should_predict(&prompt(23, 1, 80)));
     }
 
@@ -286,7 +328,7 @@ mod tests {
     fn confirmed_row_predicts_mid_screen() {
         let mut p = Predictor::new();
         p.on_key('a', 0, (10, 4));
-        p.on_server_output(320, (10, 5), Some("a"));
+        p.on_server_output(320, (10, 5), &|_, _| Some("a".into()));
         assert!(p.should_predict(&prompt(10, 5, 80)));
     }
 
@@ -294,7 +336,7 @@ mod tests {
     fn right_edge_guard_accounts_for_pending_chars() {
         let mut p = Predictor::new();
         p.on_key('a', 0, (10, 4));
-        p.on_server_output(320, (10, 5), Some("a"));
+        p.on_server_output(320, (10, 5), &|_, _| Some("a".into()));
         p.on_key('b', 321, (10, 5));
         assert!(!p.should_predict(&prompt(10, 78, 80)));
     }
@@ -303,17 +345,86 @@ mod tests {
     fn enter_resets_confirmation() {
         let mut p = Predictor::new();
         p.on_key('a', 0, (10, 4));
-        p.on_server_output(320, (10, 5), Some("a"));
+        p.on_server_output(320, (10, 5), &|_, _| Some("a".into()));
         assert!(p.should_predict(&prompt(10, 5, 80)));
         p.on_enter();
         assert!(!p.should_predict(&prompt(10, 5, 80)));
     }
 
     #[test]
+    fn partial_echo_retires_one_key_and_keeps_predicting() {
+        let mut p = Predictor::new();
+        p.on_key('a', 0, (10, 4));
+        p.on_server_output(320, (10, 5), &|_, _| Some("a".into()));
+        p.on_key('b', 321, (10, 5));
+        p.on_key('c', 322, (10, 6));
+        p.on_server_output(640, (10, 6), &|row, col| {
+            ((row, col) == (10, 5)).then(|| "b".into())
+        });
+        assert_eq!(p.pending(), &['c']);
+        assert!(p.should_predict(&prompt(10, 6, 80)));
+    }
+
+    #[test]
+    fn mismatched_echo_clears_all_predictions() {
+        let mut p = Predictor::new();
+        p.on_key('a', 0, (10, 4));
+        p.on_key('b', 1, (10, 5));
+        p.on_server_output(320, (10, 6), &|_, _| Some("x".into()));
+        assert!(p.is_empty());
+        assert_eq!(p.confirmed_row, None);
+    }
+
+    #[test]
+    fn no_op_output_keeps_overlay() {
+        let mut p = Predictor::new();
+        p.on_key('a', 0, (10, 4));
+        p.on_server_output(320, (10, 5), &|_, _| Some("a".into()));
+        p.on_key('b', 400, (10, 5));
+        p.on_server_output(500, (10, 5), &|_, _| None);
+        assert_eq!(p.pending(), &['b']);
+        assert_eq!(p.confirmed_row, Some(10));
+        assert_eq!(p.srtt_ms(), Some(320.0));
+    }
+
+    #[test]
+    fn stale_no_op_output_clears_overlay() {
+        let mut p = Predictor::new();
+        p.on_key('a', 0, (10, 4));
+        p.on_server_output(PREDICT_STALE_MS + 1, (10, 4), &|_, _| None);
+        assert!(p.is_empty());
+        assert_eq!(p.key_cursor, None);
+        assert_eq!(p.srtt_ms(), None);
+    }
+
+    #[test]
+    fn non_ascii_pending_char_clears_overlay() {
+        let mut p = Predictor::new();
+        p.on_key('é', 0, (10, 4));
+        p.on_server_output(320, (10, 5), &|_, _| Some("é".into()));
+        assert!(p.is_empty());
+        assert_eq!(p.confirmed_row, None);
+    }
+
+    #[test]
+    fn full_echo_leaves_confirmed_row_after_emptying_overlay() {
+        let mut p = Predictor::new();
+        p.on_key('a', 0, (10, 4));
+        p.on_key('b', 1, (10, 5));
+        p.on_server_output(320, (10, 6), &|row, col| match (row, col) {
+            (10, 4) => Some("a".into()),
+            (10, 5) => Some("b".into()),
+            _ => None,
+        });
+        assert!(p.is_empty());
+        assert_eq!(p.confirmed_row, Some(10));
+    }
+
+    #[test]
     fn mask_echo_never_confirms() {
         let mut p = Predictor::new();
         p.on_key('p', 0, (5, 10));
-        p.on_server_output(320, (5, 11), Some("*"));
+        p.on_server_output(320, (5, 11), &|_, _| Some("*".into()));
         assert!(!p.should_predict(&prompt(5, 11, 80)));
     }
 }
