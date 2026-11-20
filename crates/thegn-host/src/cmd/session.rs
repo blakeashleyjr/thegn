@@ -882,6 +882,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     "alt_screen": modes.alt_screen,
                     "app_cursor": modes.app_cursor,
                     "bracketed_paste": modes.bracketed_paste,
+                    "mouse": modes.mouse,
+                    "sgr_mouse": modes.sgr_mouse,
+                    "title": modes.title,
                 });
                 if let Some(t) = plain {
                     doc["text"] = serde_json::Value::String(t);
