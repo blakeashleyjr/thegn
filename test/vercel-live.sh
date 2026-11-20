@@ -290,7 +290,10 @@ sys.exit(1)
 
 wait_state() { # wait_state <tries> <state>: poll every 5 s
   local _
-  for _ in $(seq 1 "$1"); do fleet_state_is "$2" && return 0; sleep 5; done
+  for _ in $(seq 1 "$1"); do
+    fleet_state_is "$2" && return 0
+    sleep 5
+  done
   return 1
 }
 
