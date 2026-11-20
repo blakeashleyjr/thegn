@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.105] — 2026-11-19
+
 ### Changed
 
 - New worktree checkout directories end in a 16-character digest instead of 64. Existing checkouts are not moved.
@@ -3985,7 +3987,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.104...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.105...HEAD
+[0.1.0-alpha.105]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.104...v0.1.0-alpha.105
 [0.1.0-alpha.104]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.103...v0.1.0-alpha.104
 [0.1.0-alpha.103]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.102...v0.1.0-alpha.103
 [0.1.0-alpha.102]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.101...v0.1.0-alpha.102
