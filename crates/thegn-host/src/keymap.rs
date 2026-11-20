@@ -159,6 +159,8 @@ pub enum Action {
     /// Raise / lower the warm-spare-pool target for the active workspace's env.
     PoolIncrement,
     PoolDecrement,
+    /// Retry failed provider pull-backs without destroying their sandboxes.
+    RetryPullbacks,
     TogglePanel,
     ToggleRecorder,
     /// Fork the focused live daemon session into a fresh process.
@@ -626,6 +628,7 @@ impl Action {
             Action::SidebarWider => "sidebar-wider",
             Action::PoolIncrement => "warm-pool-increment",
             Action::PoolDecrement => "warm-pool-decrement",
+            Action::RetryPullbacks => "retry-pullbacks",
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
             Action::ForkSession => "fork-session",
@@ -786,6 +789,7 @@ impl Action {
             "sidebar-wider" => Action::SidebarWider,
             "warm-pool-increment" => Action::PoolIncrement,
             "warm-pool-decrement" => Action::PoolDecrement,
+            "retry-pullbacks" | "sync-retry" => Action::RetryPullbacks,
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
             "fork-session" => Action::ForkSession,
@@ -2424,6 +2428,14 @@ mod tests {
                 spec.id
             );
         }
+    }
+
+    #[test]
+    fn retry_pullbacks_action_round_trips() {
+        let action = Action::from_key("retry-pullbacks").expect("retry-pullbacks action");
+        assert_eq!(action, Action::RetryPullbacks);
+        assert_eq!(action.key(), "retry-pullbacks");
+        assert_eq!(Action::from_key("sync-retry"), Some(Action::RetryPullbacks));
     }
 
     #[test]
