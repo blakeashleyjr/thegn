@@ -121,6 +121,7 @@ Steps:
   8f  env restore of it exits 0 (ledger proof, health check, stream completion)
   7g  (only with --with-agent <name>) agent run --wait --pull --json spends model usage;
       poll /v1/tasks every 15 s while it runs
+      (on failure prints the agent's status, exit code and error, never secrets)
   7h  (only with --with-agent <name>) agent JSON is exited 0 and pull.ok is true
   7i  (only with --with-agent <name>) /v1/tasks includes thegn-hold- during the run
       (7g first starts this run's own pane daemon on the fresh state; teardown stops it)
@@ -130,6 +131,7 @@ Steps:
       or zero usage (partial or not) warns and passes; reported false warns
   10b fleet list --env remains in the pre-cost warm/cold class (wait up to 90 s
       first if the pre-cost row is running; timeout warns; usage did not wake it)
+      (reads the state up to 4 times, 10 s apart: fails only if it stays running; warns on provider noise)
   10w wake from cold: sprite-exec -- true completes within 150 s; print wake time
   10x wake row is running or warm (a lagging cold state warns and passes)
   11  env down                         11b fleet list puts this sprite in view.down,
@@ -231,6 +233,8 @@ INTERACTIVE_OUT=""
 PULL_SHA=""
 CHECKPOINT_ID=""
 AGENT_JSON=""
+AGENT_RUN_RC=0
+AGENT_STDERR_FILE=""
 AGENT_RUN_SECONDS=0
 COST_PRE_STATE=""
 COST_PRE_WAIT_TIMED_OUT=0
@@ -304,7 +308,14 @@ teardown() {
     for n in $names; do
       case "$n" in *[!a-z0-9-]*) continue ;; esac
       echo "-- teardown: env deprovision $n"
-      "$THEGN_BIN" "${MIN_RAM_SET[@]}" env deprovision "$n" --env "$env_name" # destroy proves ownership via this run's ledger
+      if ! "$THEGN_BIN" "${MIN_RAM_SET[@]}" env deprovision "$n" --env "$env_name"; then
+        if ! listing_lacks_name "$n"; then
+          (cd "$REPO" && "$THEGN_BIN" "${MIN_RAM_SET[@]}" env down --worktree "$REPO" --force)
+          if case "$(live_listing "$env_name" "$n")" in present\ *) true ;; *) false ;; esac then
+            echo "-- teardown: sandbox $n still exists; remove it with thegn env reap"
+          fi
+        fi
+      fi
     done
     echo "-- teardown: env reap"
     "$THEGN_BIN" env reap --provider sprites --apply --yes
@@ -378,13 +389,22 @@ head_matches() { # the sprite workspace HEAD equals the local lane HEAD
 }
 
 exec_exit_and_stderr() {
-  local out rc
+  local out err rc
+  err="$TMP/4b.stderr"
   set +e
-  out="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'echo boom >&2; exit 3')"
+  out="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'echo boom >&2; exit 3' 2>"$err")"
   rc=$?
   set -e
   printf '%s\n' "$out"
-  [ "$rc" -eq 3 ] && [[ $out == *boom* ]]
+  if [[ $out == *boom* ]]; then
+    echo "   stderr marker arrived on stdout"
+  elif grep -Fq boom "$err"; then
+    sed 's/^/   /' "$err"
+    echo "   stderr marker arrived on stderr"
+  else
+    return 1
+  fi
+  [ "$rc" -eq 3 ]
 }
 
 memory_reported() { # INFO only: the guest's MemTotal; the Sprites policy is not a guest cgroup
@@ -871,20 +891,102 @@ agent_run() {
   agent_tasks_poll &
   AGENT_POLL_PID=$!
   set +e
-  AGENT_JSON="$(in_repo "$THEGN_BIN" agent run --worktree "$REPO" --agent "$agent_name" --prompt "create sx-agent.txt containing ok and commit it" --wait --pull --json)"
+  AGENT_STDERR_FILE="$TMP/agent-run.stderr"
+  AGENT_JSON="$(in_repo "$THEGN_BIN" agent run --worktree "$REPO" --agent "$agent_name" --prompt "create sx-agent.txt containing ok and commit it" --wait --pull --json 2>"$AGENT_STDERR_FILE")"
   rc=$?
   kill "$AGENT_POLL_PID" 2>/dev/null
   wait "$AGENT_POLL_PID" 2>/dev/null
   AGENT_POLL_PID=""
   set -e
+  AGENT_RUN_RC=$rc
   ended="$(date +%s)" || return 1
   AGENT_RUN_SECONDS=$((ended - started))
-  [ "$rc" -eq 0 ] || return "$rc"
+  if [ "$rc" -ne 0 ]; then
+    agent_failure_summary "$rc"
+    return "$rc"
+  fi
   [ -n "$AGENT_JSON" ]
 }
 
+agent_failure_summary() {
+  local status="${1:-$AGENT_RUN_RC}" stderr_file="${AGENT_STDERR_FILE:-$TMP/agent-run.stderr}"
+  AGENT_SUMMARY_JSON="$AGENT_JSON" AGENT_SUMMARY_STATUS="$status" AGENT_SUMMARY_STDERR="$stderr_file" python3 -I -c '
+import json, os, sys
+
+def clean(value):
+    if isinstance(value, str):
+        text = value
+    elif value is None or isinstance(value, (bool, int, float)):
+        text = json.dumps(value)
+    else:
+        text = type(value).__name__
+    text = "".join(ch for ch in text if ord(ch) >= 32 and not (127 <= ord(ch) <= 159))
+    return text[:200]
+
+def emit(label, value):
+    print("   agent " + label + ": " + clean(value))
+
+emit("command exit status", os.environ.get("AGENT_SUMMARY_STATUS", "unknown"))
+raw = os.environ.get("AGENT_SUMMARY_JSON", "")
+try:
+    result = json.loads(raw)
+except Exception:
+    if raw:
+        emit("JSON", "invalid")
+else:
+    if isinstance(result, dict):
+        for key in ("status", "exit_code", "error"):
+            if key in result:
+                emit(key, result[key])
+        if "provision" in result:
+            provision = result["provision"]
+            if isinstance(provision, (dict, list)):
+                provision = type(provision).__name__
+            emit("provision", provision)
+        pull = result.get("pull")
+        if isinstance(pull, dict):
+            if "ok" in pull:
+                emit("pull.ok", pull["ok"])
+            if "error" in pull:
+                emit("pull.error", pull["error"])
+        for key in ("stderr", "output"):
+            value = result.get(key)
+            if isinstance(value, str):
+                lines = value.splitlines()[-20:]
+                for line in lines:
+                    emit(key, line)
+        if isinstance(result.get("sandbox"), str):
+            emit("sandbox", result["sandbox"])
+        if "output_tail" in result:
+            tail = result["output_tail"]
+            if isinstance(tail, str):
+                lines = tail.splitlines()[-20:]
+                print("   agent output tail:")
+                for line in lines:
+                    print("      " + clean(line))
+            elif isinstance(tail, list) and all(isinstance(line, str) for line in tail):
+                lines = "\n".join(tail).splitlines()[-20:]
+                print("   agent output tail:")
+                for line in lines:
+                    print("      " + clean(line))
+            else:
+                print("   agent output tail: " + type(tail).__name__)
+
+path = os.environ.get("AGENT_SUMMARY_STDERR", "")
+if path:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            lines = stream.read().splitlines()[-20:]
+    except OSError:
+        lines = []
+    for line in lines:
+        emit("stderr", line)
+'
+  return 0
+}
+
 agent_result_ok() {
-  AGENT_RESULT_JSON="$AGENT_JSON" python3 -I -c '
+  if AGENT_RESULT_JSON="$AGENT_JSON" python3 -I -c '
 import json, os, sys
 try:
     result = json.loads(os.environ["AGENT_RESULT_JSON"])
@@ -901,7 +1003,11 @@ pull = result.get("pull")
 if not isinstance(pull, dict) or pull.get("ok") is not True:
     print("agent run pull.ok is not true", file=sys.stderr)
     sys.exit(1)
-'
+'; then
+    return 0
+  fi
+  agent_failure_summary
+  return 1
 }
 
 agent_task_log_ok() {
@@ -992,22 +1098,48 @@ if not_reported:
 }
 
 cost_state_ok() {
-  local after
-  after="$(fleet_row_state)" || return 1
-  echo "   sprite state after fleet cost: $after"
-  if [ "$COST_PRE_WAIT_TIMED_OUT" = 1 ]; then
-    echo "WARN 10b: comparing after-cost state against timed-out pre-cost state $COST_PRE_STATE"
-    return 0
-  fi
-  case "$COST_PRE_STATE:$after" in
-  warm:warm | warm:cold | cold:warm | cold:cold)
-    return 0
-    ;;
-  *)
-    echo "sprite row state changed from $COST_PRE_STATE to $after (fleet cost may have woken it)" >&2
+  local after err="$TMP/10b.err" rc reads=0 running_reads=0 first_success=0
+  while [ "$reads" -lt 4 ]; do
+    : >"$err"
+    after="$(fleet_row_state 2>"$err")" && rc=0 || rc=$?
+    reads=$((reads + 1))
+    if [ "$rc" -eq 0 ]; then
+      if [ "$first_success" -eq 0 ]; then
+        echo "   sprite state after fleet cost: $after"
+        first_success=1
+      fi
+      if [ "$COST_PRE_WAIT_TIMED_OUT" = 1 ]; then
+        echo "WARN 10b: comparing after-cost state against timed-out pre-cost state $COST_PRE_STATE"
+        return 0
+      fi
+      case "$after" in
+      warm | cold)
+        if [ "$running_reads" -gt 0 ]; then
+          echo "WARN 10b: the sprite read running $running_reads time(s) after fleet cost before settling to $after"
+        fi
+        return 0
+        ;;
+      running)
+        running_reads=$((running_reads + 1))
+        ;;
+      *)
+        printf '%s\n' "sprite row state is not warm, cold, or running: $after" >"$err"
+        ;;
+      esac
+    fi
+    if [ "$reads" -lt 4 ]; then
+      sleep 10
+    fi
+  done
+  if [ "$running_reads" -gt 0 ]; then
+    echo "the sprite stayed running after fleet cost (a read woke it); it read running $running_reads of $reads time(s) and never warm or cold" >&2
     return 1
-    ;;
-  esac
+  fi
+  echo "WARN 10b: the provider listing could not be read after fleet cost; the wake check is unproven"
+  if [ -s "$err" ]; then
+    sed 's/^/   /' "$err"
+  fi
+  return 0
 }
 
 fleet_down_not_missing() {
