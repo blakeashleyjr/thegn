@@ -1220,7 +1220,7 @@ fn teardown_runtime(
     loc: &thegn_core::remote::GitLoc,
     db: Option<&Db>,
     mode: HookExecutionMode,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     #[cfg(test)]
     teardown_fixture::refuse_observed_path(worktree)?;
     let selected = teardown_selection(match db {

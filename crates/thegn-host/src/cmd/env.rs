@@ -565,6 +565,12 @@ fn deprovision(
     Ok(())
 }
 
+/// The worktree's sandbox binding before an env switch; `None` when it cannot
+/// be resolved (not fatal for the switch itself).
+fn binding_before_switch(cfg: &Config, wt: &str) -> Option<crate::provider_git::OfflineBinding> {
+    crate::provider_git::bound_offline(cfg, wt).ok()
+}
+
 fn worktree_bindings(cfg: &Config) -> Result<Vec<(String, crate::provider_git::OfflineBinding)>> {
     Ok(Db::open()?
         .worktrees()?
@@ -2098,7 +2104,7 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
         // The env the worktree resolved to before the switch, for the id of a
         // provider sandbox it may leave behind. Unresolvable is not fatal here.
         let old_env = resolve_for(cfg, Some(wt.clone()));
-        let old = crate::provider_git::bound_offline(cfg, &wt).ok();
+        let old = binding_before_switch(cfg, &wt);
         let stored_is_provider = is_provider_location(
             &wt,
             db.location_for(&wt)
@@ -2972,26 +2978,42 @@ mod down_tests {
     }
 
     #[test]
-    fn a_diverged_pull_keeps_the_ref_and_destroys() {
-        let outcome = PullOutcome::Diverged {
+    fn a_diverged_pull_refuses_without_force_and_destroys_with_it() {
+        let outcome = || PullOutcome::Diverged {
             kept_ref: "refs/thegn/pull/lane-abc".into(),
             vm_head: "c".repeat(40),
         };
-        assert_eq!(kept_ref(&outcome), Some("refs/thegn/pull/lane-abc"));
-        let (result, calls) = run_down(Ok(report(outcome)), destroy());
-        result.expect("nothing is lost: env down continues");
+        assert_eq!(kept_ref(&outcome()), Some("refs/thegn/pull/lane-abc"));
+        let (result, calls) = run_down(Ok(report(outcome())), destroy());
+        let error = format!("{:#}", result.expect_err("a diverged pull refuses"));
+        assert_eq!(calls, ["list", "pull"]);
+        assert!(error.contains("nothing was destroyed"), "{error}");
+        let forced = DownOpts {
+            mode: DownMode::Destroy,
+            force: true,
+        };
+        let (result, calls) = run_down(Ok(report(outcome())), forced);
+        result.expect("a forced env down destroys");
         assert_eq!(calls, DESTROYED);
     }
 
     #[test]
-    fn a_locally_dirty_pull_keeps_the_ref_and_destroys() {
-        let outcome = PullOutcome::LocalDirty {
+    fn a_locally_dirty_pull_refuses_without_force_and_destroys_with_it() {
+        let outcome = || PullOutcome::LocalDirty {
             kept_ref: "refs/thegn/pull/lane-abc".into(),
         };
-        assert_eq!(kept_ref(&outcome), Some("refs/thegn/pull/lane-abc"));
+        assert_eq!(kept_ref(&outcome()), Some("refs/thegn/pull/lane-abc"));
         assert_eq!(kept_ref(&PullOutcome::UpToDate), None);
-        let (result, calls) = run_down(Ok(report(outcome)), destroy());
-        result.expect("env down continues");
+        let (result, calls) = run_down(Ok(report(outcome())), destroy());
+        let error = format!("{:#}", result.expect_err("a locally dirty pull refuses"));
+        assert_eq!(calls, ["list", "pull"]);
+        assert!(error.contains("nothing was destroyed"), "{error}");
+        let forced = DownOpts {
+            mode: DownMode::Destroy,
+            force: true,
+        };
+        let (result, calls) = run_down(Ok(report(outcome())), forced);
+        result.expect("a forced env down destroys");
         assert_eq!(calls, DESTROYED);
     }
 
