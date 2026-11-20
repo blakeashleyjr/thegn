@@ -111,6 +111,9 @@ Steps:
   8   env pull after an empty commit inside the sprite; output is fast-forwarded
   8b  local HEAD equals the commit made inside the sprite
   8c  refs/thegn/pull is empty after the clean fast-forward
+  8d  env snapshot creates a checkpoint
+  8e  env snapshots lists it
+  8f  env restore of it exits 0 (ledger proof, health check, stream completion)
   7g  (only with --with-agent <name>) agent run --wait --pull --json spends model usage;
       poll /v1/tasks every 15 s while it runs
   7h  (only with --with-agent <name>) agent JSON is exited 0 and pull.ok is true
@@ -234,6 +237,7 @@ STEP_11_PASSED=0
 FAILED_STEPS=()
 INTERACTIVE_OUT=""
 PULL_SHA=""
+CHECKPOINT_ID=""
 AGENT_JSON=""
 AGENT_RUN_SECONDS=0
 COST_PRE_STATE=""
@@ -574,6 +578,79 @@ pull_head_matches() {
 }
 
 pull_refs_empty() { [ -z "$(git -C "$REPO" for-each-ref refs/thegn/pull)" ]; }
+
+checkpoint_create() {
+  local line candidate
+  if ! in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env snapshot --label sx-live >"$TMP/8d.out" 2>"$TMP/8d.err"; then
+    echo "env snapshot stderr:" >&2
+    sed 's/^/  /' "$TMP/8d.err" >&2
+    return 1
+  fi
+  CHECKPOINT_ID=""
+  while IFS= read -r line; do
+    case "$line" in
+    "created checkpoint: "*)
+      candidate="${line#created checkpoint: }"
+      case "$candidate" in
+      '' | *[!A-Za-z0-9_.-]*) ;;
+      *) CHECKPOINT_ID="$candidate"; break ;;
+      esac
+      ;;
+    esac
+  done <"$TMP/8d.out"
+  if [ -z "$CHECKPOINT_ID" ]; then
+    echo "env snapshot did not print a valid checkpoint id:" >&2
+    sed 's/^/  /' "$TMP/8d.err" >&2
+    return 1
+  fi
+  echo "   checkpoint: $CHECKPOINT_ID"
+}
+
+checkpoint_listed() {
+  local line err="$TMP/8e.err" out
+  if [ -z "$CHECKPOINT_ID" ]; then
+    echo "checkpoint id is empty:" >&2
+    if [ -f "$err" ]; then sed 's/^/  /' "$err" >&2; fi
+    return 1
+  fi
+  if ! out="$(in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env snapshots 2>"$err")"; then
+    echo "env snapshots stderr:" >&2
+    sed 's/^/  /' "$err" >&2
+    return 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+    "$CHECKPOINT_ID"*)
+      echo "   listed checkpoint: $CHECKPOINT_ID"
+      return 0
+      ;;
+    esac
+  done <<<"$out"
+  echo "env snapshots did not list checkpoint $CHECKPOINT_ID:" >&2
+  sed 's/^/  /' "$err" >&2
+  return 1
+}
+
+checkpoint_restored() {
+  local err="$TMP/8f.err" out
+  if [ -z "$CHECKPOINT_ID" ]; then
+    echo "checkpoint id is empty:" >&2
+    if [ -f "$err" ]; then sed 's/^/  /' "$err" >&2; fi
+    return 1
+  fi
+  if ! out="$(in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env restore "$CHECKPOINT_ID" 2>"$err")"; then
+    echo "env restore stderr:" >&2
+    sed 's/^/  /' "$err" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+  case "$out" in
+  *restored*) return 0 ;;
+  esac
+  echo "env restore did not print restored:" >&2
+  sed 's/^/  /' "$err" >&2
+  return 1
+}
 
 warm_or_cold() {
   local state
@@ -920,6 +997,9 @@ step 7e "the hold had keep-awake (no 'keep-awake unavailable' on stderr)" hold_w
 step 8 "env pull fast-forwards the commit made inside the sprite" pull_fast_forwarded
 step 8b "local HEAD equals the commit made inside the sprite" pull_head_matches
 step 8c "refs/thegn/pull is empty after the clean fast-forward" pull_refs_empty
+step 8d "env snapshot creates a checkpoint" checkpoint_create
+step 8e "env snapshots lists it" checkpoint_listed
+step 8f "env restore of it exits 0 (ledger proof, health check, stream completion)" checkpoint_restored
 if [ -n "$agent_name" ]; then
   step 7g "agent run --wait --pull --json (spends model usage)" agent_run
   step 7h "agent JSON is exited 0 with pull.ok true" agent_result_ok
