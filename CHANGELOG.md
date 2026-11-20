@@ -7,6 +7,22 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.114] — 2026-11-20
+
+### Added
+
+- The shared provider conformance suite gains four opt-in cases any remote provider can back: a command stream without an exit status fails; a call refused because the session stopped is retried exactly once; an unfinished listing is never reported complete; an egress allow list never widens to allow-all (THE-2351).
+- A contributor page, "Add a remote sandbox provider", lists each rule with the test or live step that enforces it.
+
+### Changed
+
+- The live checks for Sprites, Vercel and the daily remote run share one step runner and print per-step times and start-up times (THE-2351, THE-2223).
+- The Sprites memory step reports the guest's available memory and gives a clear verdict on whether the limit is enforced.
+
+### Fixed
+
+- The Sprites live check's agent step starts its own pane daemon (it failed at once before).
+
 ## [0.1.0-alpha.113] — 2026-11-20
 
 ### Added
@@ -4070,7 +4086,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.113...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.114...HEAD
+[0.1.0-alpha.114]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.113...v0.1.0-alpha.114
 [0.1.0-alpha.113]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.112...v0.1.0-alpha.113
 [0.1.0-alpha.112]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.111...v0.1.0-alpha.112
 [0.1.0-alpha.111]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.110...v0.1.0-alpha.111
