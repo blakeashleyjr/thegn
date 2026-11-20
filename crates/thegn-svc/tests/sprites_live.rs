@@ -153,6 +153,94 @@ async fn collect_until_end(
     }
 }
 
+struct WireStats {
+    bytes: usize,
+    elapsed: Duration,
+    frames: usize,
+    max_frame: usize,
+    output: Vec<u8>,
+}
+
+async fn collect_wire_stats(
+    session: &mut ExecSession,
+    started: Instant,
+    budget: Duration,
+    marker: Option<&[u8]>,
+    capture_output: bool,
+) -> anyhow::Result<WireStats> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut bytes = 0;
+    let mut frames = 0;
+    let mut max_frame = 0;
+    let mut output = Vec::new();
+    let mut tail = Vec::new();
+
+    loop {
+        let frame = tokio::time::timeout_at(deadline, session.frames.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out collecting exec wire stats"))?;
+        let Some(frame) = frame else {
+            if marker.is_none() {
+                return Ok(WireStats {
+                    bytes,
+                    elapsed: started.elapsed(),
+                    frames,
+                    max_frame,
+                    output,
+                });
+            }
+            bail!("exec stream closed before wire marker");
+        };
+        match frame {
+            ExecFrame::Stdout(chunk) => {
+                frames += 1;
+                max_frame = max_frame.max(chunk.len());
+                let prior_tail_len = tail.len();
+                let mut probe = tail;
+                probe.extend_from_slice(&chunk);
+                let marker_end = marker.and_then(|needle| {
+                    probe
+                        .windows(needle.len())
+                        .position(|window| window == needle)
+                        .map(|start| start + needle.len())
+                });
+                let consumed = marker_end
+                    .map(|end| end.saturating_sub(prior_tail_len).min(chunk.len()))
+                    .unwrap_or(chunk.len());
+                bytes += consumed;
+                if capture_output {
+                    output.extend_from_slice(&chunk[..consumed]);
+                }
+                if marker_end.is_some() {
+                    return Ok(WireStats {
+                        bytes,
+                        elapsed: started.elapsed(),
+                        frames,
+                        max_frame,
+                        output,
+                    });
+                }
+                if probe.len() > 16 {
+                    probe.drain(..probe.len() - 16);
+                }
+                tail = probe;
+            }
+            ExecFrame::Exit(code) => {
+                if marker.is_some() {
+                    bail!("exec exited with {code} before wire marker");
+                }
+                return Ok(WireStats {
+                    bytes,
+                    elapsed: started.elapsed(),
+                    frames,
+                    max_frame,
+                    output,
+                });
+            }
+        }
+    }
+}
+
 async fn session_absent_within(
     provider: &Provider,
     name: &str,
@@ -904,4 +992,226 @@ fn live_exec_session_semantics() {
     });
 
     result.expect("live exec session semantics");
+}
+
+#[test]
+#[ignore = "live: needs SPRITES_TOKEN, network, creates a real sprite"]
+fn live_exec_wire_throughput() {
+    let Ok(token) = std::env::var("SPRITES_TOKEN") else {
+        println!("INFO SPRITES_TOKEN unset — skipping");
+        return;
+    };
+    let name = format!("tgwire-{}", std::process::id());
+    let (sprites, _ledger) = scoped(&token, &name, "tgwire-live");
+    let provider = Provider::Sprites(sprites);
+    let _leak_note = LeakNote(name.clone());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let result: anyhow::Result<()> = rt.block_on(async {
+        let result = async {
+            provider.ensure_exists(&name).await?;
+            provider.wait_ready(&name, Duration::from_secs(120)).await?;
+
+            let print_stats = |label: &str, stats: &WireStats| {
+                let seconds = stats.elapsed.as_secs_f64().max(f64::EPSILON);
+                let kb_per_second = stats.bytes as f64 / 1024.0 / seconds;
+                let average_frame = if stats.frames == 0 {
+                    0.0
+                } else {
+                    stats.bytes as f64 / stats.frames as f64
+                };
+                println!(
+                    "INFO {label}: bytes={}, ms={}, KB/s={kb_per_second:.1}, frames={}, avg={average_frame:.1}, max={}",
+                    stats.bytes,
+                    stats.elapsed.as_millis(),
+                    stats.frames,
+                    stats.max_frame,
+                );
+            };
+            let sh = |script: &str| {
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                ]
+            };
+
+            let mut tty_session = provider
+                .open_exec(
+                    &name,
+                    &ExecSpec {
+                        argv: vec![
+                            "/bin/bash".into(),
+                            "--norc".into(),
+                            "--noprofile".into(),
+                            "-i".into(),
+                        ],
+                        tty: true,
+                        cols: 120,
+                        rows: 40,
+                        env: vec![("TERM".into(), "xterm-256color".into())],
+                        cwd: None,
+                    },
+                )
+                .await?;
+            tty_session
+                .control
+                .send(ExecControl::Stdin(b"stty size\r".to_vec()))
+                .await?;
+            let initial_size =
+                recv_until(&mut tty_session, b"40 120", Duration::from_secs(10)).await?;
+            println!(
+                "INFO initial size: {}",
+                String::from_utf8_lossy(&initial_size).trim()
+            );
+
+            let tty_started = Instant::now();
+            tty_session
+                .control
+                .send(ExecControl::Stdin(
+                    b"yes 0123456789 | head -n 400000; printf '%s%s\n' __RP END__\r".to_vec(),
+                ))
+                .await?;
+            let tty_stats = collect_wire_stats(
+                &mut tty_session,
+                tty_started,
+                Duration::from_secs(60),
+                Some(b"__RPEND__"),
+                false,
+            )
+            .await?;
+            print_stats("tty flood", &tty_stats);
+            anyhow::ensure!(
+                tty_stats.bytes >= 4_400_000,
+                "tty flood byte count was {}, expected at least 4400000",
+                tty_stats.bytes
+            );
+            tty_session.control.send(ExecControl::Close).await?;
+            drop(tty_session);
+
+            let mut non_tty_session = provider
+                .open_exec(
+                    &name,
+                    &ExecSpec {
+                        argv: sh("yes 0123456789 | head -n 400000"),
+                        tty: false,
+                        cols: 0,
+                        rows: 0,
+                        env: Vec::new(),
+                        cwd: None,
+                    },
+                )
+                .await?;
+            let non_tty_started = Instant::now();
+            let non_tty_stats = collect_wire_stats(
+                &mut non_tty_session,
+                non_tty_started,
+                Duration::from_secs(60),
+                None,
+                false,
+            )
+            .await?;
+            print_stats("non-tty flood", &non_tty_stats);
+            anyhow::ensure!(
+                non_tty_stats.bytes == 4_400_000,
+                "non-tty flood byte count was {}, expected 4400000",
+                non_tty_stats.bytes
+            );
+            non_tty_session.control.send(ExecControl::Close).await?;
+            drop(non_tty_session);
+
+            let baseline_started = Instant::now();
+            let (_, baseline_output) = provider
+                .run_exec(
+                    &name,
+                    &sh("yes 0123456789 | head -n 400000 | wc -c"),
+                    None,
+                    &[],
+                )
+                .await?;
+            let baseline_bytes = baseline_output.trim().parse::<usize>()?;
+            println!(
+                "INFO server baseline: bytes={baseline_bytes}, ms={}",
+                baseline_started.elapsed().as_millis()
+            );
+            anyhow::ensure!(
+                baseline_bytes == 4_400_000,
+                "server baseline byte count was {baseline_bytes}, expected 4400000"
+            );
+
+            let bulk_spec = ExecSpec {
+                argv: sh("wc -c"),
+                tty: false,
+                cols: 0,
+                rows: 0,
+                env: Vec::new(),
+                cwd: None,
+            };
+            let mut bulk_session = provider.open_exec(&name, &bulk_spec).await?;
+            let bulk_started = Instant::now();
+            for _ in 0..32 {
+                bulk_session
+                    .control
+                    .send(ExecControl::Stdin(vec![b'x'; 32 * 1024]))
+                    .await?;
+            }
+            bulk_session.control.send(ExecControl::Close).await?;
+            let bulk_stats = collect_wire_stats(
+                &mut bulk_session,
+                bulk_started,
+                Duration::from_secs(30),
+                None,
+                true,
+            )
+            .await?;
+            let bulk_output = String::from_utf8_lossy(&bulk_stats.output);
+            println!(
+                "INFO stdin bulk: bytes=1048576, ms={}, output={bulk_output:?}",
+                bulk_stats.elapsed.as_millis()
+            );
+            anyhow::ensure!(
+                bulk_output.contains("1048576"),
+                "bulk stdin output did not contain 1048576: {bulk_output:?}"
+            );
+            drop(bulk_session);
+
+            let mut byte_session = provider.open_exec(&name, &bulk_spec).await?;
+            let byte_started = Instant::now();
+            for _ in 0..65_536 {
+                byte_session
+                    .control
+                    .send(ExecControl::Stdin(vec![b'x']))
+                    .await?;
+            }
+            byte_session.control.send(ExecControl::Close).await?;
+            let byte_stats = collect_wire_stats(
+                &mut byte_session,
+                byte_started,
+                Duration::from_secs(60),
+                None,
+                true,
+            )
+            .await?;
+            let byte_output = String::from_utf8_lossy(&byte_stats.output);
+            let messages_per_second = 65_536.0 / byte_stats.elapsed.as_secs_f64().max(f64::EPSILON);
+            println!(
+                "INFO stdin per byte: bytes=65536, ms={}, messages/s={messages_per_second:.1}, output={byte_output:?}",
+                byte_stats.elapsed.as_millis()
+            );
+            anyhow::ensure!(
+                byte_output.contains("65536"),
+                "per-byte stdin output did not contain 65536: {byte_output:?}"
+            );
+            drop(byte_session);
+
+            anyhow::Ok(())
+        }
+        .await;
+
+        let destroy = provider.destroy(&name).await;
+        destroy.expect("destroy live wire probe sprite");
+        result
+    });
+
+    result.expect("live exec wire throughput");
 }
