@@ -7449,7 +7449,7 @@ mod tests {
         let mut server =
             tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
                 .await;
-        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
@@ -7754,7 +7754,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn drive_exec_non_tty_never_arms_probe() {
-        use futures_util::{SinkExt, StreamExt};
+        use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
