@@ -97,34 +97,34 @@ impl VercelProvider {
                     }
                 },
             };
-            if status == GONE {
-                rows.push(UsageRow {
-                    name,
-                    status,
-                    session: None,
-                    snapshots_usd_month: 0.0,
-                    snapshot_bytes: 0,
-                });
-                continue;
-            }
-            let session = match self.api().usage(&name).await {
-                Ok(Some(usage)) => core_usage::session_accrual(&usage, now, &PRO_IAD1),
-                Ok(None) => None,
-                Err(error) => {
-                    complete = false;
-                    tracing::debug!(sandbox = %name, "vercel usage: session read failed: {error:#}");
-                    None
+            let session = if status == GONE {
+                // a gone sandbox can leave snapshots that still bill
+                None
+            } else {
+                match self.api().usage(&name).await {
+                    Ok(Some(usage)) => core_usage::session_accrual(&usage, now, &PRO_IAD1),
+                    Ok(None) => None,
+                    Err(error) => {
+                        complete = false;
+                        tracing::debug!(sandbox = %name, "vercel usage: session read failed: {error:#}");
+                        None
+                    }
                 }
             };
             let (snapshots_usd_month, snapshot_bytes) = match self.api().snapshot_usage(&name).await
             {
-                Ok(snapshots) => (
-                    core_usage::snapshot_month_usd(&snapshots, &PRO_IAD1),
-                    snapshots
-                        .iter()
-                        .filter(|s| s.status.trim().eq_ignore_ascii_case("created"))
-                        .fold(0u64, |sum, s| sum.saturating_add(s.size_bytes)),
-                ),
+                Ok((snapshots, snapshots_complete)) => {
+                    if !snapshots_complete {
+                        complete = false;
+                    }
+                    (
+                        core_usage::snapshot_month_usd(&snapshots, &PRO_IAD1),
+                        snapshots
+                            .iter()
+                            .filter(|s| s.status.trim().eq_ignore_ascii_case("created"))
+                            .fold(0u64, |sum, s| sum.saturating_add(s.size_bytes)),
+                    )
+                }
                 Err(error) => {
                     complete = false;
                     tracing::debug!(sandbox = %name, "vercel usage: snapshot read failed: {error:#}");

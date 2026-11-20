@@ -395,6 +395,36 @@ fn create_get_list_encode_method_path_scope_and_auth() {
 }
 
 #[test]
+fn get_with_an_expired_snapshot_is_snapshot_expired() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mock = Mock::start(move |_| {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::json(
+                "410 Gone",
+                serde_json::json!({"error": {"code": "snapshot_not_found"}}),
+            )
+        } else {
+            Reply::json(
+                "410 Gone",
+                serde_json::json!({"error": {"code": "other_code"}}),
+            )
+        }
+    });
+    let client = mock.client();
+    let rt = rt();
+    let expired = rt.block_on(client.get("tg-a", true)).unwrap_err();
+    let typed = expired
+        .downcast_ref::<thegn_svc::vercel::client::SnapshotExpired>()
+        .expect("expired snapshot error");
+    assert_eq!(typed.name, "tg-a");
+    assert!(format!("{expired:#}").contains("tg-a"));
+    let plain = rt.block_on(client.get("tg-a", true)).unwrap_err();
+    assert!(format!("{plain:#}").contains("HTTP 410"), "{plain:#}");
+    mock.assert_custody(&[&expired, &plain]);
+}
+
+#[test]
 fn list_without_a_prefix_does_not_send_sort_by() {
     let mock = Mock::start(|_| {
         Reply::json(
@@ -484,6 +514,53 @@ fn delete_and_stop_treat_404_as_success_and_use_their_paths() {
     assert_eq!(reqs[2].method, "DELETE");
     assert_eq!(reqs[2].path(), "/v2/sandboxes/snapshots/snap_1");
     mock.assert_custody(&[]);
+}
+
+#[test]
+fn stop_and_kill_treat_410_as_already_stopped() {
+    let mock = Mock::start(|_| {
+        Reply::json(
+            "410 Gone",
+            serde_json::json!({"error": {"code": "sandbox_stopped"}}),
+        )
+    });
+    let client = mock.client();
+    let rt = rt();
+    rt.block_on(client.stop("sess_1")).expect("stopped session");
+    rt.block_on(client.kill("sess_1", "cmd_1", 9))
+        .expect("stopped command");
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn delete_still_refuses_a_410() {
+    let mock = Mock::start(|_| {
+        Reply::json(
+            "410 Gone",
+            serde_json::json!({"error": {"code": "sandbox_stopped"}}),
+        )
+    });
+    let err = rt().block_on(mock.client().delete("tg-a")).unwrap_err();
+    assert!(format!("{err:#}").contains("HTTP 410"), "{err:#}");
+    mock.assert_custody(&[&err]);
+}
+
+#[test]
+fn an_error_code_that_echoes_the_token_is_never_shown() {
+    let mock = Mock::start(|_| {
+        Reply::json(
+            "422 Unprocessable Entity",
+            serde_json::json!({"error": {"code": TOKEN}}),
+        )
+    });
+    let err = rt()
+        .block_on(mock.client().run_detached("sess_1", &serde_json::json!({})))
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+            .is_none()
+    );
+    mock.assert_custody(&[&err]);
 }
 
 #[test]
@@ -777,6 +854,94 @@ fn run_detached_returns_the_command_id() {
 }
 
 #[test]
+fn run_wait_on_a_stopped_session_is_session_stopped() {
+    let mock = Mock::start(|r| {
+        let (status, code) = if r.target.contains("sess_gone") {
+            ("410 Gone", "sandbox_stopped")
+        } else if r.target.contains("sess_stopping") {
+            ("422 Unprocessable Entity", "sandbox_stopping")
+        } else if r.target.contains("sess_snapshotting") {
+            ("422 Unprocessable Entity", "sandbox_snapshotting")
+        } else {
+            ("422 Unprocessable Entity", "bad_request")
+        };
+        Reply::json(status, serde_json::json!({"error": {"code": code}}))
+    });
+    let client = mock.client();
+    let rt = rt();
+    let mut errors = Vec::new();
+    for (session, status, stopped) in [
+        ("sess_gone", 410, true),
+        ("sess_stopping", 422, true),
+        ("sess_snapshotting", 422, true),
+        ("sess_bad", 422, false),
+    ] {
+        let err = rt
+            .block_on(client.run_wait(session, &serde_json::json!({"command": "true"}), 64))
+            .unwrap_err();
+        if stopped {
+            let typed = err
+                .downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+                .expect("stopped session error");
+            assert_eq!(typed.status, status);
+        } else {
+            assert!(
+                err.downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+                    .is_none()
+            );
+            assert!(format!("{err:#}").contains("HTTP 422"), "{err:#}");
+        }
+        errors.push(err);
+    }
+    let refs: Vec<&anyhow::Error> = errors.iter().collect();
+    mock.assert_custody(&refs);
+}
+
+#[test]
+fn run_detached_on_a_stopped_session_is_session_stopped() {
+    let mock = Mock::start(|r| {
+        let (status, code) = if r.target.contains("sess_gone") {
+            ("410 Gone", "sandbox_stopped")
+        } else if r.target.contains("sess_stopping") {
+            ("422 Unprocessable Entity", "sandbox_stopping")
+        } else if r.target.contains("sess_snapshotting") {
+            ("422 Unprocessable Entity", "sandbox_snapshotting")
+        } else {
+            ("422 Unprocessable Entity", "bad_request")
+        };
+        Reply::json(status, serde_json::json!({"error": {"code": code}}))
+    });
+    let client = mock.client();
+    let rt = rt();
+    let mut errors = Vec::new();
+    for (session, status, stopped) in [
+        ("sess_gone", 410, true),
+        ("sess_stopping", 422, true),
+        ("sess_snapshotting", 422, true),
+        ("sess_bad", 422, false),
+    ] {
+        let err = rt
+            .block_on(client.run_detached(session, &serde_json::json!({"command": "true"})))
+            .unwrap_err();
+        if stopped {
+            let typed = err
+                .downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+                .expect("stopped session error");
+            assert_eq!(typed.status, status);
+        } else {
+            assert!(
+                err.downcast_ref::<thegn_svc::vercel::client::SessionStopped>()
+                    .is_none()
+            );
+            assert!(format!("{err:#}").contains("HTTP 422"), "{err:#}");
+        }
+        errors.push(err);
+    }
+    let refs: Vec<&anyhow::Error> = errors.iter().collect();
+    mock.assert_custody(&refs);
+}
+
+#[test]
 fn logs_streams_lines_then_ends_on_eof() {
     let mock = Mock::start(|_| {
         let mut reply = Reply::ndjson(&[out("a"), err_line("b"), exit(0)]);
@@ -964,6 +1129,12 @@ fn interactive_ticket_is_wss_and_its_token_is_redacted() {
         mock.requests()[0].path(),
         "/v2/sandboxes/sessions/sess_1/interactive"
     );
+    assert_eq!(mock.requests()[0].json(), serde_json::json!({}));
+    assert!(
+        mock.requests()[0]
+            .header("content-type")
+            .starts_with("application/json")
+    );
     mock.assert_custody(&[]);
 }
 
@@ -1040,7 +1211,7 @@ fn snapshots_for_lists_ids_scoped_by_name() {
             _ => Reply::json("500 Internal Server Error", serde_json::json!({})),
         }
     });
-    let ids = rt()
+    let (ids, complete) = rt()
         .block_on(mock.client().snapshots_for("tg-a"))
         .expect("snapshots");
     assert_eq!(
@@ -1051,6 +1222,7 @@ fn snapshots_for_lists_ids_scoped_by_name() {
             "snap_3".to_string()
         ]
     );
+    assert!(!complete);
     let reqs = mock.requests();
     assert_eq!(reqs[0].path(), "/v2/sandboxes/snapshots");
     assert_eq!(
@@ -1061,6 +1233,7 @@ fn snapshots_for_lists_ids_scoped_by_name() {
         reqs[0].query().get("project").map(String::as_str),
         Some(PROJECT)
     );
+    assert_eq!(reqs[0].query().get("limit").map(String::as_str), Some("50"));
     assert_eq!(reqs.len(), 3);
     assert_eq!(
         reqs[1].query().get("cursor").map(String::as_str),
@@ -1070,6 +1243,56 @@ fn snapshots_for_lists_ids_scoped_by_name() {
         reqs[2].query().get("cursor").map(String::as_str),
         Some("page-3")
     );
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn snapshots_for_is_complete_when_every_id_is_valid_and_the_last_page_ends() {
+    let mock = Mock::start(|r| {
+        if r.query().contains_key("cursor") {
+            Reply::json(
+                "200 OK",
+                serde_json::json!({
+                    "snapshots": [{"id": "snap_2"}],
+                    "pagination": {"next": null}
+                }),
+            )
+        } else {
+            Reply::json(
+                "200 OK",
+                serde_json::json!({
+                    "snapshots": [{"id": "snap_1"}],
+                    "pagination": {"next": "page-2"}
+                }),
+            )
+        }
+    });
+    let (ids, complete) = rt()
+        .block_on(mock.client().snapshots_for("tg-a"))
+        .expect("snapshots");
+    assert_eq!(ids, vec!["snap_1", "snap_2"]);
+    assert!(complete);
+    assert_eq!(mock.requests().len(), 2);
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn snapshot_listing_with_a_repeated_cursor_is_incomplete() {
+    let mock = Mock::start(|_| {
+        Reply::json(
+            "200 OK",
+            serde_json::json!({
+                "snapshots": [{"id": "snap_1"}],
+                "pagination": {"next": "same"}
+            }),
+        )
+    });
+    let (ids, complete) = rt()
+        .block_on(mock.client().snapshots_for("tg-a"))
+        .expect("snapshots");
+    assert_eq!(ids, vec!["snap_1", "snap_1"]);
+    assert!(!complete);
+    assert_eq!(mock.requests().len(), 2);
     mock.assert_custody(&[]);
 }
 
@@ -1668,9 +1891,10 @@ fn snapshot_usage_pages_and_stops_at_the_cap() {
             }),
         )
     });
-    let snaps = rt()
+    let (snaps, complete) = rt()
         .block_on(mock.client().snapshot_usage("tg-a"))
         .expect("snapshots");
+    assert!(!complete);
     assert_eq!(snaps.len(), 20);
     assert_eq!(snaps[0].id, "snap_0");
     assert_eq!(snaps[19].id, "snap_19");
@@ -1681,6 +1905,10 @@ fn snapshot_usage_pages_and_stops_at_the_cap() {
     assert_eq!(
         reqs[0].query().get("name").map(String::as_str),
         Some("tg-a")
+    );
+    assert!(
+        reqs.iter()
+            .all(|req| { req.query().get("limit").map(String::as_str) == Some("50") })
     );
     assert!(!reqs[0].query().contains_key("cursor"));
     assert_eq!(reqs[1].query().get("cursor").map(String::as_str), Some("1"));
@@ -1698,9 +1926,10 @@ fn snapshot_usage_stops_on_the_last_page() {
             }),
         )
     });
-    let snaps = rt()
+    let (snaps, complete) = rt()
         .block_on(mock.client().snapshot_usage("tg-a"))
         .expect("snapshots");
+    assert!(complete);
     assert_eq!(snaps.len(), 1);
     assert_eq!(snaps[0].size_bytes, 42);
     assert_eq!(mock.requests().len(), 1);
