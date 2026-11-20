@@ -158,7 +158,7 @@ for want in "11b " "view.down" "view.missing" "binary predates batch 170" "13 " 
     fail "sprites-live plan lacks '$want'"
   fi
 done
-for want in "5b " "6b " "7e " "10b "; do
+for want in "5b " "6b " "7e " "8d " "8f " "10b "; do
   if has "$T/plan-sprites-live.out" "$want"; then pass "sprites-live plan names step $want"; else fail "sprites-live plan lacks step $want"; fi
 done
 for want in " 11 " "11b " "11c " "wt rm <rd-y path> --force"; do
