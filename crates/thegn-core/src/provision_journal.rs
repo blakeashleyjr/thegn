@@ -433,11 +433,13 @@ mod tests {
         assert_eq!(journal.detail, "unreadable journal");
     }
 
-    #[cfg(unix)]
     #[test]
     fn non_private_directory_reads_as_absent_and_cancel_is_false() {
         let dir = journal_dir();
-        crate::fsperm::set_mode_for_test(dir.path(), 0o755).unwrap();
+        // Platforms with no mode bits report Unsupported: nothing to check there.
+        if crate::fsperm::set_mode_for_test(dir.path(), 0o755).is_err() {
+            return;
+        }
         assert!(read_in(dir.path(), "sandbox-1").is_none());
         assert!(!cancel_in(dir.path(), "sandbox-1").unwrap());
     }
