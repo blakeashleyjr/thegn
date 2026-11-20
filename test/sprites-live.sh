@@ -98,6 +98,9 @@ Steps:
   5b  (only with --min-ram-gb N) INFO: the guest's MemTotal from /proc/meminfo
       (never FAIL; the policy is not a guest cgroup)
   5c  (only with --min-ram-gb N) fleet inspect --policy reads back N*1024 MiB
+  5d  (only with --min-ram-gb N; runs after 10x) a guest process allocates N*1024+512 MiB
+      under a 120 s timeout: PASS when it is stopped at the limit; WARN (not FAIL) when it
+      succeeds: the limit is accepted by the API but not enforced in the guest
   6   interactive exec under script(1): /dev/pts/<n> and ok; print the trace
       log path and the last 40 "sprites exec frame" lines
   6c  interactive output line breaks: WARN (not FAIL) when /dev/pts/<n> and ok
@@ -206,6 +209,37 @@ if not isinstance(unbound, list):
 if unbound:
     print("WARN 0: unbound ledger sandboxes: " + ", ".join(show(n) for n in unbound) + ": pre-existing sandboxes this run will not touch")
 print("PASS 0")
+'
+MEMPROBE_PY='
+import sys
+target = int(sys.argv[2])
+try:
+    with open("/proc/self/oom_score_adj", "w") as f:
+        f.write("1000")
+except OSError:
+    pass
+avail = None
+try:
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) // 1024
+except (OSError, ValueError):
+    pass
+if avail is not None and target + 256 > avail:
+    print("headroom", avail, flush=True)
+    sys.exit(0)
+held = []
+reached = 0
+try:
+    while reached < target:
+        held.append(b"\x01" * (64 << 20))
+        reached += 64
+        print("reached", reached, flush=True)
+except MemoryError:
+    print("memoryerror", reached, flush=True)
+    sys.exit(3)
+print("done", reached, flush=True)
 '
 DOCTOR_JSON=""
 preflight_capture() { # doctor may exit non-zero on unrelated checks; parse what it printed
@@ -427,6 +461,86 @@ print("   fleet inspect memory policy: " + str(got) + " MiB")
     sed 's/^/  /' "$err" >&2
     return 1
   fi
+}
+
+memory_enforced() {
+  local out rc limit target verdict verdict_rc cgroup
+  if ! no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'command -v python3 && command -v timeout'; then
+    echo "WARN 5d: python3 or timeout is missing in the guest; memory enforcement unproven"
+    return 0
+  fi
+  if cgroup="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'cat /sys/fs/cgroup/memory.max 2>/dev/null || echo absent')"; then
+    printf '%s\n' "$cgroup" | tr -d '\r' | sed 's/^/INFO 5d: guest cgroup memory.max: /'
+  else
+    echo "INFO 5d: could not read the guest cgroup memory.max"
+  fi
+  limit=$((min_ram * 1024))
+  target=$((limit + 512))
+  out="$(timeout 300 "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- timeout 120 python3 -I -c "$MEMPROBE_PY" thegn-memprobe "$target" "$target" </dev/null 2>"$TMP/5d.stderr")" && rc=0 || rc=$?
+  verdict=""
+  verdict_rc=0
+  if ! verdict="$({
+    MEMPROBE_OUT="$out" MEMPROBE_RC="$rc" MEMPROBE_LIMIT="$limit" MEMPROBE_TARGET="$target" \
+      python3 -I -c '
+import os
+import re
+
+out = os.environ["MEMPROBE_OUT"]
+rc = int(os.environ["MEMPROBE_RC"])
+limit = int(os.environ["MEMPROBE_LIMIT"])
+target = int(os.environ["MEMPROBE_TARGET"])
+lines = out.replace("\r", "").splitlines()
+if rc == 124:
+    print("timeout 0")
+else:
+    headroom = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"headroom (\d+)", line))]
+    done = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"done (\d+)", line))]
+    reached = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"reached (\d+)", line))]
+    errors = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"memoryerror (\d+)", line))]
+    if headroom:
+        print("headroom " + str(headroom[-1]))
+    elif rc == 0 and done:
+        print("unenforced " + str(done[-1]))
+    else:
+        stopped = reached[-1] if reached else (errors[-1] if errors else 0)
+        if (rc in (137, 3) or errors) and stopped >= limit // 2:
+            print("enforced " + str(stopped))
+        elif reached or errors:
+            print("early " + str(stopped))
+        else:
+            print("noout 0")
+';
+  })"; then
+    verdict="noout 0"
+    verdict_rc=1
+  fi
+  case "$verdict" in
+  timeout\ *)
+    echo "WARN 5d: the memory probe timed out after 120 s; memory enforcement unproven"
+    ;;
+  headroom\ *)
+    echo "WARN 5d: the guest has only ${verdict#headroom } MiB available, so a probe past the limit cannot tell the limit from the guest size; memory enforcement unproven"
+    ;;
+  unenforced\ *)
+    echo "WARN 5d: limit accepted by the API but not enforced in the guest: one process held ${verdict#unenforced } MiB under a ${limit} MiB limit (Sprites provider behaviour, not a thegn failure)"
+    ;;
+  enforced\ *)
+    echo "   memory limit enforced: the probe was stopped at ${verdict#enforced } MiB (limit ${limit} MiB, rc ${rc})"
+    ;;
+  early\ *)
+    echo "WARN 5d: the probe was stopped early at ${verdict#early } MiB (limit ${limit} MiB); inconclusive"
+    ;;
+  noout\ *)
+    printf '%s\n' "$out" | sed 's/^/  /'
+    sed 's/^/  /' "$TMP/5d.stderr"
+    verdict_rc=1
+    ;;
+  esac
+  if ! no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- true; then
+    echo "the sprite did not answer after the memory probe" >&2
+    return 1
+  fi
+  return "$verdict_rc"
 }
 
 curl_present() { # the keep-awake hold needs curl inside the sprite
@@ -987,7 +1101,7 @@ if [ -n "$min_ram" ]; then
   step 5b "guest MemTotal (INFO only)" memory_reported
   step 5c "memory policy reads back $((min_ram * 1024)) MiB (fleet inspect --policy)" policy_read_back
 else
-  echo "SKIP 5, 5b, 5c (needs --min-ram-gb N)"
+  echo "SKIP 5, 5b, 5c, 5d (needs --min-ram-gb N)"
 fi
 step 6 "interactive exec has /dev/pts/<n> and ok" interactive_tty
 step 6c "interactive output keeps its line breaks" interactive_line_breaks
@@ -1016,6 +1130,9 @@ step 10 "fleet cost reports sprites_usage CPU hours or zero usage (partial or no
 step 10b "fleet list remains in the pre-cost warm/cold class after fleet cost" cost_state_ok
 step 10w "wake from cold (sprite-exec -- true within 150 s)" wake_from_cold
 step 10x "wake row is running or warm" wake_state
+if [ -n "$min_ram" ]; then
+  step 5d "a guest allocation past $((min_ram * 1024)) MiB is stopped (WARN when the limit is not enforced)" memory_enforced
+fi
 step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env down
 step 11b "ledger record gone; fleet list classifies the sprite as down, not missing" fleet_down_not_missing
 step 12 "reap dry-run: 0 recorded orphans" reap_dry_clean
