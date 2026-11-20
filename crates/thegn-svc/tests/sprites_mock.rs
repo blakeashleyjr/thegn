@@ -365,6 +365,16 @@ fn route(method: &str, target: &str, restore_error: bool) -> (&'static str, &'st
             br#"[{"id":"Current","create_time":"2026-06-27T05:08:24Z","is_auto":false},{"id":"v1","create_time":"2026-06-27T05:19:29Z","is_auto":false}]"#
                 .to_vec(),
         ),
+        ("GET", "/v1/sprites/tgtest1/checkpoints/bad") => (
+            "200 OK",
+            json,
+            br#"{"id":"bad","create_time":"t","health":"mount_failed"}"#.to_vec(),
+        ),
+        ("GET", "/v1/sprites/tgtest1/checkpoints/v1") => (
+            "200 OK",
+            json,
+            br#"{"id":"v1","create_time":"t"}"#.to_vec(),
+        ),
         ("POST", "/v1/sprites/tgtest1/checkpoints/v1/restore") if restore_error => (
             "200 OK",
             "application/x-ndjson",
@@ -914,6 +924,42 @@ fn restore_reports_a_stream_error() {
     let (p, _ledger) = recorded(&mock.base_url, "tgtest1");
     let err = rt().block_on(p.restore("tgtest1", "v1")).unwrap_err();
     assert!(err.to_string().contains("boom"), "{err:#}");
+}
+
+#[test]
+fn restore_refuses_an_unhealthy_checkpoint() {
+    let mock = start_mock();
+    let (p, _ledger) = recorded(&mock.base_url, "tgtest1");
+    let err = rt().block_on(p.restore("tgtest1", "bad")).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "sprites: checkpoint bad is unhealthy (mount_failed); not restoring it"
+    );
+    let requests = mock.recorded.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method != "POST" || !request.path.ends_with("/restore")),
+        "unhealthy checkpoint must not be restored: {requests:?}"
+    );
+}
+
+#[test]
+fn restore_refuses_a_missing_checkpoint() {
+    let mock = start_mock();
+    let (p, _ledger) = recorded(&mock.base_url, "tgtest1");
+    let err = rt().block_on(p.restore("tgtest1", "missing")).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "sprites: no checkpoint missing on tgtest1; not restoring"
+    );
+    let requests = mock.recorded.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method != "POST" || !request.path.ends_with("/restore")),
+        "missing checkpoint must not be restored: {requests:?}"
+    );
 }
 
 #[test]
