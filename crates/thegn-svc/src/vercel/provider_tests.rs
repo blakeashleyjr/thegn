@@ -38,6 +38,8 @@ pub(super) struct FakeApi {
     pub(super) resume_expired: bool,
     /// Every create and run body sent, in order.
     pub(super) bodies: Mutex<Vec<serde_json::Value>>,
+    /// The last network policy body sent per sandbox name.
+    pub(super) policies: Mutex<BTreeMap<String, serde_json::Value>>,
     /// Delay before a one-shot command answers.
     pub(super) run_delay: Mutex<Option<std::time::Duration>>,
     /// Fail keep-alive GETs after the initial session lookup.
@@ -202,10 +204,14 @@ impl Api for FakeApi {
     fn set_network_policy<'a>(
         &'a self,
         name: &'a str,
-        _body: &'a serde_json::Value,
+        body: &'a serde_json::Value,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.record(format!("policy {name}"));
+            self.policies
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), body.clone());
             Ok(())
         })
     }

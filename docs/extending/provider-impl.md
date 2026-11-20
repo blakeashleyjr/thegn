@@ -77,3 +77,5 @@ A remote sandbox kind (sprites, fly, machine0, vercel) follows one checklist:
   `vps::registry` so a crash cannot leak a paid instance.
 - Add a lifetime reaper whose `tick` early-returns when no env uses the kind.
 - Refuse unsupported options (`host_cache`, `connect = "ssh"`) in admission.
+- See [remote-provider.md](remote-provider.md) for the rules every remote
+  provider must obey and the test that enforces each.
