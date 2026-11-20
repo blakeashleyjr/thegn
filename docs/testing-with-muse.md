@@ -240,6 +240,12 @@ change is settled, not after every small edit. `just e2e-update` is likewise an
 intentional baseline update followed by review; run `just e2e` again afterward
 to verify the reviewed baselines.
 
+To run the same gate with an already-built binary (for example, one produced
+by a remote native build runner), set `THEGN_E2E_BINARY` to its executable path:
+`THEGN_E2E_BINARY=/absolute/path/to/thegn just e2e`. This skips `just build`;
+the path must name an executable file called `thegn`. Without the variable, the
+recipe runs `just build` and uses `${CARGO_TARGET_DIR:-target}/debug/thegn`.
+
 Masks and normalizers in a spec's `snapshot_defaults` apply to every
 snapshot in it; per-step `masks:`/`normalize:` add to them. A `content` mask
 blanks whatever the regex matches; a `rect` mask blanks an area.

@@ -68,6 +68,33 @@ export E2E_RESULTS="$(pwd)/e2e-results"
 rm -rf "$E2E_RESULTS"
 '''
 
+# Resolve the binary once for every Muse recipe. By default, build and use the
+# active Cargo target directory; a native gate can pass an existing binary with
+# THEGN_E2E_BINARY and avoid a second build.
+_e2e_binary := '''
+set -e
+if [ -n "${THEGN_E2E_BINARY:-}" ]; then
+    E2E_BINARY="$THEGN_E2E_BINARY"
+else
+    just build
+    E2E_BINARY="${CARGO_TARGET_DIR:-target}/debug/thegn"
+fi
+case "$E2E_BINARY" in
+    /*) ;;
+    *) E2E_BINARY="$(pwd)/$E2E_BINARY" ;;
+esac
+[ "$(basename "$E2E_BINARY")" = thegn ] || {
+    echo "Muse binary must be named thegn: $E2E_BINARY" >&2
+    exit 2
+}
+[ -f "$E2E_BINARY" ] && [ -x "$E2E_BINARY" ] || {
+    echo "Muse binary is not a regular executable: $E2E_BINARY" >&2
+    exit 2
+}
+E2E_BINARY="$(cd "$(dirname "$E2E_BINARY")" && pwd -P)/$(basename "$E2E_BINARY")"
+E2E_BIN_DIR="$(dirname "$E2E_BINARY")"
+'''
+
 # Show available recipes (default).
 default:
     @just --list
@@ -662,31 +689,34 @@ deps-audit:
 # HOME, the XDG dirs, and git config into a throwaway temp dir (cleaned on exit),
 # so warm/shared envs can neither change behavior nor leak test state. Each spec
 # additionally isolates XDG_STATE_HOME per case via `case_tmp_env`.
-e2e: build
+e2e:
     #!/usr/bin/env bash
+    {{_e2e_binary}}
     {{_e2e_env}}
     # muse takes spec FILES (a bare directory is "Is a directory" — os error 21).
     # One worker: the stress specs fire resize/chord storms whose timing is
     # the point; a second compositor competing for the CPU turned those into
     # load-dependent flakes (and masked a real race, tasks.md 748). ~8 min.
-    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
+    PATH="$E2E_BIN_DIR:$PATH" muse run test/muse/specs/*.yaml \
         --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # Re-record the snapshot baselines (after an intentional UI change). Review the
 # diff under test/muse/snapshots/ before committing it.
-e2e-update: build
+e2e-update:
     #!/usr/bin/env bash
+    {{_e2e_binary}}
     {{_e2e_env}}
-    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
+    PATH="$E2E_BIN_DIR:$PATH" muse run test/muse/specs/*.yaml \
         --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --update-snapshots --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # Run only the glitch-hunt specs (18–28) — the boundary/stress subset.
-e2e-glitch: build
+e2e-glitch:
     #!/usr/bin/env bash
+    {{_e2e_binary}}
     {{_e2e_env}}
-    PATH="$(pwd)/target/debug:$PATH" muse run \
+    PATH="$E2E_BIN_DIR:$PATH" muse run \
         test/muse/specs/1[89]-*.yaml test/muse/specs/2[0-8]-*.yaml \
         --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
