@@ -159,14 +159,24 @@ mod tests {
             ("/wt/a", Some("code"), Some("code.md")),
             ("/wt/./a", Some("review"), Some("review.md")),
             ("/wt/b", Some("code"), Some("other.md")),
+            // Imported legacy-held stages have no artifact but still establish
+            // durable pipeline ownership.
+            ("/wt/legacy", Some("review"), None),
             ("/wt/a", None, None),
         ] {
-            db.put_agent_dispatch(NewDispatch {
-                stage,
-                artifact_path: artifact,
-                ..NewDispatch::new("linear:THE-1204", path, "fixture")
-            })
-            .unwrap();
+            let id = db
+                .put_agent_dispatch(NewDispatch {
+                    stage,
+                    artifact_path: artifact,
+                    ..NewDispatch::new("linear:THE-1204", path, "fixture")
+                })
+                .unwrap();
+            if path == "/wt/legacy" {
+                assert_eq!(
+                    db.dispatch_kind(id).unwrap().as_deref(),
+                    Some("legacy_held")
+                );
+            }
         }
         let rows = db
             .pipeline_rows_for_worktree_paths(&["/wt/a", "/wt/./a", "/wt/a"])
@@ -194,7 +204,7 @@ mod tests {
         }
         assert_eq!(
             db.pipeline_worktree_paths().unwrap(),
-            ["/wt/./a", "/wt/a", "/wt/b"]
+            ["/wt/./a", "/wt/a", "/wt/b", "/wt/legacy"]
         );
     }
 

@@ -84,6 +84,13 @@ pub enum RowKind {
 }
 
 impl RowKind {
+    /// Whether this row is the actionable row for a worktree. Pipeline-owned
+    /// worktrees retain the same activation and navigation behavior as the
+    /// ordinary worktree rows they replace.
+    pub(crate) fn is_worktree(self) -> bool {
+        matches!(self, RowKind::Worktree | RowKind::PipelineWorktree)
+    }
+
     /// Whether rows of this kind head a collapsible subtree (drive a caret and
     /// respond to the collapse/expand keys). Workspaces, 📂 folder sub-groups,
     /// terminal-host groups and the derived pipeline group/lane folders
@@ -1097,6 +1104,20 @@ pub fn build_rows(
                 .map(|worktree| crate::sidebar_pipeline::path_identity(&worktree.path))
         }))
         .collect();
+    // Native pipeline dispatches persist their reserved environment on the
+    // worktree before their first dispatch row exists. That exact binding is
+    // the ownership witness until durable stage metadata appears.
+    let environment_paths: Vec<String> = db_worktrees
+        .iter()
+        .filter(|worktree| worktree.env_name.as_deref() == Some("pipeline"))
+        .map(|worktree| worktree.path.clone())
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+    pipeline_paths.extend(
+        environment_paths
+            .iter()
+            .map(|path| crate::sidebar_pipeline::path_identity(path)),
+    );
     // An explicit user folder is an override to the default Pipelines filing.
     // Keep that worktree in its chosen folder while leaving all other rows and
     // folder state untouched.
@@ -1186,7 +1207,9 @@ pub fn build_rows(
     let mut lanes_by_ws: std::collections::BTreeMap<String, Vec<crate::sidebar_pipeline::Lane>> =
         std::collections::BTreeMap::new();
     let mut assigned_pipeline_paths = std::collections::HashSet::new();
-    for lane in &status.pipeline_lanes {
+    let environment_lanes =
+        crate::sidebar_pipeline::lanes_with_persisted_paths(&[], &environment_paths);
+    for lane in status.pipeline_lanes.iter().chain(&environment_lanes) {
         let worktrees: Vec<_> = lane
             .worktrees
             .iter()
@@ -5239,7 +5262,7 @@ mod tests {
             .expect("the Pipelines group sits inside the workspace");
         // Workspace first, then its own worktree rows, then the group chain.
         assert_eq!(kinds[0], RowKind::Workspace);
-        assert!(group > 1, "the group is not the workspace itself");
+        assert!(group > 0, "the group is nested after the workspace header");
         assert_eq!(
             &kinds[group..group + 3],
             &[
@@ -5250,6 +5273,7 @@ mod tests {
         );
         assert_eq!(rows[group].label, "Pipelines");
         assert_eq!(rows[group].depth, 1);
+        assert_eq!(rows[group].workspace_slug, rows[0].workspace_slug);
         assert_eq!(rows[group].child_count, 1, "the group counts its lanes");
         assert_eq!(rows[group + 1].label, "THE-74", "named from the issue id");
         assert_eq!(rows[group + 1].depth, 2);
@@ -5260,6 +5284,14 @@ mod tests {
         );
         assert_eq!(rows[group + 2].depth, 3);
         assert_eq!(rows[group + 2].label, "home");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.worktree_path.as_deref() == Some("/wt/home"))
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            vec![RowKind::PipelineWorktree],
+            "the pipeline leaf is the only actionable row for its worktree"
+        );
         // Everything is visible BY DEFAULT.
         for r in &rows[group..group + 3] {
             assert!(r.visible, "{:?} must be visible by default", r.kind);
@@ -5578,8 +5610,82 @@ mod tests {
     }
 
     #[test]
+    fn reserved_pipeline_environment_files_native_stage_less_worktree_without_roster() {
+        // Native dispatches initially carry no stage or artifact metadata. The
+        // persisted reserved environment is enough to place their one real
+        // worktree row in Pipelines until roster metadata arrives.
+        let s = session(vec![tab("app/feature", "/wt/feature")], 0);
+        let dbw = vec![DbWorktree {
+            slug: "app".into(),
+            branch: "feature".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/feature".into(),
+            path: "/wt/feature".into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: Some("pipeline".into()),
+            sandbox_profile: None,
+            env_degraded: false,
+            external: false,
+        }];
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|row| row.worktree_path.as_deref() == Some("/wt/feature"))
+            .collect();
+        assert_eq!(matching.len(), 1, "no duplicate ordinary row is emitted");
+        assert_eq!(matching[0].kind, RowKind::PipelineWorktree);
+        assert_eq!(matching[0].depth, 3);
+        assert_eq!(matching[0].tab_target, Some(RowTarget::Tab(0, 0)));
+        assert!(rows.iter().any(|row| row.kind == RowKind::PipelineGroup));
+    }
+
+    #[test]
+    fn other_persisted_environments_remain_ordinary_worktrees() {
+        let s = session(vec![tab("app/feature", "/wt/feature")], 0);
+        let dbw = DbWorktree {
+            slug: "app".into(),
+            branch: "feature".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/feature".into(),
+            path: "/wt/feature".into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: Some("company-k8s".into()),
+            sandbox_profile: None,
+            env_degraded: false,
+            external: false,
+        };
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &no_activity(),
+            &[dbw],
+            &[],
+            &[],
+        );
+        assert!(rows.iter().any(|row| {
+            row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/feature")
+        }));
+        assert!(!rows.iter().any(|row| {
+            row.kind == RowKind::PipelineWorktree
+                && row.worktree_path.as_deref() == Some("/wt/feature")
+        }));
+    }
+
+    #[test]
     fn explicit_user_folder_filing_overrides_pipeline_default() {
-        let (session, workspaces, db_worktrees, folders) = folder_fixture();
+        let (session, workspaces, mut db_worktrees, folders) = folder_fixture();
+        db_worktrees[0].env_name = Some("pipeline".into());
         let persisted = vec!["/wt/feat".to_string()];
         let mut status = lane_status(crate::sidebar_pipeline::lanes_with_persisted_paths(
             &[],
@@ -5808,7 +5914,17 @@ mod tests {
             1,
             "the stale pin hoisted nothing"
         );
-        assert!(group > 1, "the group still sits inside its workspace");
+        assert!(group > 0, "the group still follows its workspace header");
+        assert_eq!(rows[group].depth, 1);
+        assert_eq!(rows[group].workspace_slug, rows[0].workspace_slug);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.worktree_path.as_deref() == Some("/wt/home"))
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            vec![RowKind::PipelineWorktree],
+            "a stale lane pin does not duplicate or move the actionable row"
+        );
     }
 
     #[test]
@@ -5883,12 +5999,25 @@ mod tests {
             flat: true,
             ..ViewState::default()
         };
+        let dbw = vec![DbWorktree {
+            slug: "app".into(),
+            branch: "home".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/home".into(),
+            path: "/wt/home".into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: Some("pipeline".into()),
+            sandbox_profile: None,
+            env_degraded: false,
+            external: false,
+        }];
         let rows = build_rows(
             &s,
             &app_workspace(),
             &view,
             &lane_status(vec![lane("THE-74", &["/wt/home"])]),
-            &[],
+            &dbw,
             &[],
             &[],
         );
@@ -5899,6 +6028,9 @@ mod tests {
             )),
             "the flat layout has nowhere to nest a lane"
         );
+        assert!(rows.iter().any(|row| {
+            row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/home")
+        }));
     }
 
     #[test]

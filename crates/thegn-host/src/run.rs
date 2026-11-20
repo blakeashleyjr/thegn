@@ -1815,7 +1815,7 @@ pub(crate) fn sidebar_worktree_order(model: &FrameModel) -> Vec<usize> {
     model
         .sidebar_rows
         .iter()
-        .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Worktree)
+        .filter(|r| r.visible && r.kind.is_worktree())
         .filter_map(|r| match r.tab_target {
             Some(crate::sidebar::RowTarget::Tab(g, _)) => Some(g),
             _ => None,

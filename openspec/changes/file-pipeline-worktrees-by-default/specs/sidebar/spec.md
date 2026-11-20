@@ -11,10 +11,14 @@ roster rollup — SHALL be emitted at the root of the tree.
 In grouped layout, each pipeline-owned worktree SHALL appear once under its
 owning project's `Pipelines` folder by default, rather than also appearing in
 ordinary loose, filed, or Other rows. Ownership SHALL use durable persisted
-staged-dispatch paths independently of the bounded live roster. Roster stage
-references to one normalized path SHALL produce one leaf with stable path
-identity. An explicit user folder assignment MAY override the default
-Pipelines filing.
+nonblank stage paths independently of the bounded live roster, including
+legacy-held stage rows without artifacts. A worktree whose persisted selected
+environment is exactly the reserved `pipeline` environment SHALL also be filed
+under Pipelines while no stage row exists. Other environment names SHALL NOT
+establish pipeline ownership. Roster stage references and environment
+ownership for one normalized path SHALL produce one actionable leaf with
+stable path identity. An explicit user folder assignment MAY override the
+default Pipelines filing.
 
 A lane's project SHALL be resolved from the first of its worktrees that
 resolves through live session groups or DB-registered worktrees; when none does,
@@ -47,6 +51,25 @@ via `Action::OpenPipelineBoard`.
   appears in the sidebar roster window
 - **THEN** its open worktree still appears under Pipelines with a stable
   path-keyed lane and can be activated
+
+#### Scenario: Legacy-held stage ownership survives without an artifact
+
+- **WHEN** a worktree has a persisted nonblank legacy-held stage row without an
+  artifact and no longer appears in the sidebar roster window
+- **THEN** its open worktree still appears under Pipelines with a stable
+  path-keyed lane and can be activated
+
+#### Scenario: Native pipeline environment precedes stage metadata
+
+- **WHEN** a worktree has the persisted reserved `pipeline` environment but its
+  native dispatch has no stage or artifact metadata yet
+- **THEN** its open worktree appears once under Pipelines and remains
+  activatable
+
+#### Scenario: Other persisted environments remain ordinary
+
+- **WHEN** a worktree's persisted environment has a name other than `pipeline`
+- **THEN** that environment alone does not move it under Pipelines
 
 #### Scenario: Repeated stage references are deduplicated
 

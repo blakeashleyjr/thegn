@@ -1088,7 +1088,6 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT worktree_path FROM agent_dispatches \
              WHERE stage IS NOT NULL AND TRIM(stage) <> '' \
-             AND artifact_path IS NOT NULL AND TRIM(artifact_path) <> '' \
              ORDER BY worktree_path",
         )?;
         Ok(stmt
