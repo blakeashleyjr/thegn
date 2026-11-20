@@ -112,6 +112,8 @@ Steps:
   6   commit in sandbox               6b  in-sandbox curl must fail (egress)
   6b-m..6e upload mode (only --with-model-login)
   7   env pull (fast-forward)         8   stop (env down --stop), 8a resume
+  8s  fleet list shows the sandbox stopped (the stop really ended compute)
+  8r  fleet list shows it running again after 8a
   7s  Vercel usage response shapes parsed (fleet cost --json)
   8b  tmpfs login dir is gone after stop/resume
   7h  (--with-headless) agent run --wait --pull with model_credentials =
@@ -259,6 +261,40 @@ if not isinstance(rows, list):
 name = os.environ["LISTED_NAME"]
 sys.exit(1 if any(isinstance(row, dict) and row.get("id") == name for row in rows) else 0)
 '
+}
+
+fleet_state_is() { # fleet_state_is <state>: this run's sandbox row in a complete fleet listing has that state
+  local state="$1" out
+  out="$("$THEGN_BIN" fleet list --env "$ENV_NAME" --json 2>/dev/null)" || return 1
+  printf '%s' "$out" | FLEET_SANDBOX="$SANDBOX_NAME" FLEET_STATE="$state" python3 -I -c '
+import json, os, sys
+
+try:
+    listing = json.load(sys.stdin)
+    view = listing["view"]
+    rows = view["rows"]
+except (AttributeError, KeyError, TypeError, ValueError):
+    sys.exit(1)
+if not isinstance(view, dict) or view.get("partial"):
+    sys.exit(1)
+if not isinstance(rows, list):
+    sys.exit(1)
+name = os.environ["FLEET_SANDBOX"]
+state = os.environ["FLEET_STATE"]
+for row in rows:
+    if isinstance(row, dict) and row.get("id") == name:
+        sys.exit(0 if row.get("state") == state else 1)
+sys.exit(1)
+'
+}
+
+wait_state() { # wait_state <tries> <state>: poll every 5 s
+  local _
+  for _ in $(seq 1 "$1"); do
+    fleet_state_is "$2" && return 0
+    sleep 5
+  done
+  return 1
 }
 
 teardown() {
@@ -481,9 +517,9 @@ scratch_repo() {
     git -C "$REPO" switch -q -c vx/live-lane
 }
 
-step 1 "write temp config + scratch repo" bash -c "true"
-write_config
-scratch_repo
+setup_run() { write_config && scratch_repo; }
+
+step 1 "write temp config + scratch repo" setup_run
 # The env exists only in the temp config written above, so doctor runs here.
 preflight_capture
 preflight_check "$ENV_NAME"
@@ -521,7 +557,9 @@ if [ "$headless" = 1 ]; then
   step 7r "release check: land released the headless sandbox" released_headless
 fi
 step 8 "stop (env down --stop)" in_repo "$THEGN_BIN" env down --stop
+step 8s "stop reached Vercel (fleet list shows the sandbox stopped)" wait_state 12 stopped
 step 8a "resume (env up)" in_repo "$THEGN_BIN" env up
+step 8r "resume reached Vercel (fleet list shows it running)" wait_state 12 running
 step 8b "tmpfs login dir is gone after stop/resume" ask "/dev/shm/thegn-login-* absent after resume? "
 step 9 "env down destroys the sandbox" in_repo "$THEGN_BIN" env down
 step 9b "no ledger record for this run's sandbox" sandbox_record_gone
