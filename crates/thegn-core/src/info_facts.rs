@@ -15,7 +15,19 @@ use crate::remote::GitLoc;
 use crate::store::{CacheStore, NotificationStore, WorkspaceStore, WorktreeAuxStore, ZoneStore};
 
 fn same_path(a: &Path, b: &Path) -> bool {
-    a == b || a.canonicalize().ok().as_deref() == b.canonicalize().ok().as_deref()
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn redacted_text(text: &str, max: usize) -> String {
+    let line = crate::log_redact::redact_text_line(text);
+    let scrubbed = line.split(' ').map(scrub_url).collect::<Vec<_>>().join(" ");
+    clean(&scrubbed, max)
 }
 
 fn contains_path(root: &Path, path: &Path) -> bool {
@@ -149,10 +161,18 @@ pub fn resolve_target(
 /// Identity facts for the workspace root.
 pub fn workspace_identity(cfg: &Config, db: &crate::db::Db, repo_root: &Path) -> Vec<Field> {
     let root = path_string(repo_root);
-    let row = db.workspaces().ok().and_then(|rows| {
-        rows.into_iter()
-            .find(|row| same_path(Path::new(&row.repo_path), repo_root))
-    });
+    let row = match db.workspaces() {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|row| same_path(Path::new(&row.repo_path), repo_root)),
+        Err(error) => {
+            return vec![Field::unknown(
+                keys::WORKSPACE_NAME,
+                "Name",
+                error.to_string(),
+            )];
+        }
+    };
     let Some(row) = row else {
         return vec![Field::unknown(
             keys::WORKSPACE_NAME,
@@ -208,11 +228,9 @@ pub fn workspace_identity(cfg: &Config, db: &crate::db::Db, repo_root: &Path) ->
         crate::workspace_overlay::WorkspaceOverlay::Refused(reason) => {
             fields.push(Field::unknown(keys::WORKSPACE_BLOCK, "Block", reason.to_string()).warned())
         }
-        crate::workspace_overlay::WorkspaceOverlay::Unconfigured => fields.push(Field::unset(
-            keys::WORKSPACE_BLOCK,
-            "Block",
-            Source::WorkspaceDb,
-        )),
+        crate::workspace_overlay::WorkspaceOverlay::Unconfigured => {
+            fields.push(Field::unset(keys::WORKSPACE_BLOCK, "Block", Source::Global))
+        }
     }
     let discovery = crate::config_repo::discover_repo_overlay(repo_root);
     match discovery.selected() {
@@ -221,7 +239,7 @@ pub fn workspace_identity(cfg: &Config, db: &crate::db::Db, repo_root: &Path) ->
                 keys::WORKSPACE_REPO_OVERLAY,
                 "Repo overlay",
                 candidate.path.display().to_string(),
-                Source::Repo(root.clone()),
+                Source::Repo(candidate.path.display().to_string()),
             );
             if discovery.shadow_warning().is_some() {
                 field = field.warned();
@@ -258,17 +276,31 @@ pub fn workspace_stats(
     now: i64,
 ) -> Vec<Field> {
     let root = path_string(repo_root);
-    let rows = db.worktrees().unwrap_or_default();
-    let workspace_rows: Vec<_> = rows
-        .iter()
-        .filter(|row| same_path(Path::new(&row.repo_root), repo_root))
-        .collect();
-    let mut fields = vec![Field::value(
-        keys::STATS_WORKTREES,
-        "Worktrees",
-        workspace_rows.len().to_string(),
-        Source::Database,
-    )];
+    let (workspace_rows, mut fields) = match db.worktrees() {
+        Ok(rows) => {
+            let workspace_rows: Vec<_> = rows
+                .iter()
+                .filter(|row| same_path(Path::new(&row.repo_root), repo_root))
+                .collect();
+            (
+                workspace_rows.clone(),
+                vec![Field::value(
+                    keys::STATS_WORKTREES,
+                    "Worktrees",
+                    workspace_rows.len().to_string(),
+                    Source::Database,
+                )],
+            )
+        }
+        Err(error) => (
+            Vec::new(),
+            vec![Field::unknown(
+                keys::STATS_WORKTREES,
+                "Worktrees",
+                error.to_string(),
+            )],
+        ),
+    };
     match &live.sessions {
         Some(all) => {
             let paths = workspace_rows
@@ -285,34 +317,39 @@ pub fn workspace_stats(
         }
         None => fields.push(Field::not_measured(keys::STATS_SESSIONS, "Sessions")),
     }
-    let disk = db.all_worktree_disk().unwrap_or_default();
-    let stamps = db.all_worktree_disk_stamps().unwrap_or_default();
-    let measured = workspace_rows
-        .iter()
-        .filter_map(|row| disk.get(&row.worktree).map(|(size, _)| (row, *size)))
-        .collect::<Vec<_>>();
-    if measured.is_empty() {
-        fields.push(Field::not_measured(keys::STATS_DISK, "Disk"));
-    } else {
-        let total: i64 = measured.iter().map(|(_, size)| *size).sum();
-        let oldest = workspace_rows
-            .iter()
-            .filter_map(|row| stamps.get(&row.worktree).copied())
-            .min();
-        fields.push(Field::value(
-            keys::STATS_DISK,
-            "Disk",
-            format!(
-                "{} ({} of {} measured)",
-                crate::sandbox_manage::human_bytes(total.max(0) as u64),
-                measured.len(),
-                workspace_rows.len()
-            ),
-            Source::Cache {
-                name: "worktree_disk".into(),
-                at: oldest,
-            },
-        ));
+    match (db.all_worktree_disk(), db.all_worktree_disk_stamps()) {
+        (Err(error), _) | (_, Err(error)) => {
+            fields.push(Field::unknown(keys::STATS_DISK, "Disk", error.to_string()))
+        }
+        (Ok(disk), Ok(stamps)) => {
+            let measured = workspace_rows
+                .iter()
+                .filter_map(|row| disk.get(&row.worktree).map(|(size, _)| (row, *size)))
+                .collect::<Vec<_>>();
+            if measured.is_empty() {
+                fields.push(Field::not_measured(keys::STATS_DISK, "Disk"));
+            } else {
+                let total: i64 = measured.iter().map(|(_, size)| *size).sum();
+                let oldest = workspace_rows
+                    .iter()
+                    .filter_map(|row| stamps.get(&row.worktree).copied())
+                    .min();
+                fields.push(Field::value(
+                    keys::STATS_DISK,
+                    "Disk",
+                    format!(
+                        "{} ({} of {} measured)",
+                        crate::sandbox_manage::human_bytes(total.max(0) as u64),
+                        measured.len(),
+                        workspace_rows.len()
+                    ),
+                    Source::Cache {
+                        name: "worktree_disk".into(),
+                        at: oldest,
+                    },
+                ));
+            }
+        }
     }
     match live.workspace_ahead {
         Some((ahead, total)) => fields.push(Field::value(
@@ -323,22 +360,31 @@ pub fn workspace_stats(
         )),
         None => fields.push(Field::not_measured(keys::STATS_AHEAD, "Ahead")),
     }
-    if let Some(row) = db.workspaces().ok().and_then(|rows| {
-        rows.into_iter()
-            .find(|row| same_path(Path::new(&row.repo_path), repo_root))
-    }) {
-        fields.push(Field::value(
+    match db.workspaces() {
+        Ok(rows) => {
+            if let Some(row) = rows
+                .into_iter()
+                .find(|row| same_path(Path::new(&row.repo_path), repo_root))
+            {
+                fields.push(Field::value(
+                    keys::STATS_LAST_ACTIVE,
+                    "Last active",
+                    age(now, row.last_active),
+                    Source::Database,
+                ));
+            } else {
+                fields.push(Field::unknown(
+                    keys::STATS_LAST_ACTIVE,
+                    "Last active",
+                    format!("workspace {root} is not registered"),
+                ));
+            }
+        }
+        Err(error) => fields.push(Field::unknown(
             keys::STATS_LAST_ACTIVE,
             "Last active",
-            age(now, row.last_active),
-            Source::Database,
-        ));
-    } else {
-        fields.push(Field::unknown(
-            keys::STATS_LAST_ACTIVE,
-            "Last active",
-            format!("workspace {root} is not registered"),
-        ));
+            error.to_string(),
+        )),
     }
     fields
 }
@@ -371,14 +417,14 @@ fn git_facts(base: &str, wt: &Path) -> std::result::Result<GitFacts, String> {
             "--count",
             &format!("{base}...HEAD"),
         ])
-        .and_then(|text| parse_count(&text))
-        .map_err(|e| e.to_string());
+        .map_err(|e| e.to_string())
+        .and_then(|text| parse_count(&text));
     let upstream = loc.git_text(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
     let upstream_counts = if upstream.is_ok() {
         Some(
             loc.git_text(&["rev-list", "--left-right", "--count", "@{u}...HEAD"])
-                .and_then(|text| parse_count(&text))
-                .map_err(|e| e.to_string()),
+                .map_err(|e| e.to_string())
+                .and_then(|text| parse_count(&text)),
         )
     } else {
         None
@@ -591,7 +637,11 @@ pub fn worktree_fields(
                             at: Some(panel.fetched_at),
                         },
                     ),
-                    other => Field::unknown(keys::WORKTREE_PR, "PR", format!("{other:?}")),
+                    other => Field::unknown(
+                        keys::WORKTREE_PR,
+                        "PR",
+                        redacted_text(&format!("{other:?}"), 120),
+                    ),
                 };
                 fields.push(field);
             }
@@ -687,7 +737,7 @@ pub fn worktree_fields(
                 "{} → {}: {}",
                 queue.status,
                 queue.target_branch,
-                clean(&error, 120)
+                redacted_text(error, 120)
             ),
             None => format!("{} → {}", queue.status, queue.target_branch),
         };
@@ -774,7 +824,7 @@ pub fn overrides(
         .and_then(|path| db.worktree_sandbox(path).ok().flatten())
         .filter(|value| {
             let value = value.trim();
-            !value.is_empty() && !value.eq_ignore_ascii_case("auto")
+            !value.is_empty() && value != "auto"
         })
     {
         fields.push(Field::value(
@@ -795,12 +845,17 @@ pub fn overrides(
     if let crate::workspace_overlay::WorkspaceOverlay::Selected { key, overlay } =
         cfg.workspace_overlay(repo_root)
     {
+        let default =
+            serde_json::to_value(crate::config::WorkspaceConfig::default()).unwrap_or_default();
         let mut value = serde_json::to_value(overlay).unwrap_or_default();
         crate::redact::redact_json(&mut value);
         if let serde_json::Value::Object(map) = value {
             let mut names = map
-                .keys()
-                .filter(|key| key.as_str() != "repo_path")
+                .iter()
+                .filter(|(key, value)| {
+                    key.as_str() != "repo_path" && default.get(key.as_str()) != Some(value)
+                })
+                .map(|(key, _)| key)
                 .cloned()
                 .collect::<Vec<_>>();
             names.sort();
@@ -819,7 +874,7 @@ pub fn overrides(
             keys::OVERRIDE_REPO_OVERLAY,
             "Repo overlay",
             candidate.path.display().to_string(),
-            Source::Repo(path_string(repo_root)),
+            Source::Repo(candidate.path.display().to_string()),
         ));
     }
     if let Some(path) = wt
@@ -859,6 +914,28 @@ pub fn sessions_for(
 mod tests {
     use super::*;
 
+    #[expect(clippy::disallowed_methods, reason = "test fixture invokes git")]
+    fn git(dir: &Path, args: &[&str]) {
+        let output = crate::util::git_cmd(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git fixture command starts");
+        assert!(
+            output.status.success(),
+            "git fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn committed_repo(dir: &Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("fixture"), "first\n").expect("write fixture");
+        git(dir, &["add", "fixture"]);
+        git(dir, &["commit", "-q", "-m", "initial"]);
+    }
+
     #[test]
     fn resolve_target_prefers_registered_path_and_unique_branch() {
         let db = crate::db::Db::open_memory().unwrap();
@@ -882,6 +959,18 @@ mod tests {
             .unwrap();
         assert!(resolve_target(&db, None, Some("same"), Path::new("/tmp")).is_err());
         assert!(resolve_target(&db, Some("/repo"), Some("/other/a"), Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn resolve_target_rejects_here_outside_registered_workspaces() {
+        let db = crate::db::Db::open_memory().unwrap();
+        db.put_workspace("/repo", "Repo", "repo").unwrap();
+        db.put_worktree("repo/a", "/repo", "/deleted/a", "a", None, None)
+            .unwrap();
+        let here = tempfile::tempdir().unwrap();
+
+        let error = resolve_target(&db, None, None, here.path()).unwrap_err();
+        assert!(error.to_string().contains("not inside a thegn workspace"));
     }
 
     #[test]
@@ -937,6 +1026,146 @@ mod tests {
             .find(|field| field.key == keys::WORKTREE_PR)
             .unwrap();
         assert!(matches!(pr.shown, crate::info_model::Shown::Unknown(_)));
+    }
+
+    #[test]
+    fn worktree_git_facts_are_not_measured_when_git_read_is_disabled() {
+        let db = crate::db::Db::open_memory().unwrap();
+        db.put_worktree("repo/a", "/repo", "/repo/a", "a", None, None)
+            .unwrap();
+        let fields = worktree_fields(
+            &db,
+            Path::new("/repo"),
+            Path::new("/repo/a"),
+            &LiveFacts {
+                read_git: false,
+                ..LiveFacts::default()
+            },
+            0,
+        );
+
+        for key in [keys::WORKTREE_DIRTY, keys::WORKTREE_AHEAD_BASE] {
+            let field = fields.iter().find(|field| field.key == key).unwrap();
+            assert_eq!(field.shown, crate::info_model::Shown::NotMeasured);
+        }
+    }
+
+    #[test]
+    fn worktree_git_facts_report_one_commit_ahead_of_base() {
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path());
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.path().join("fixture"), "second\n").expect("write fixture");
+        git(dir.path(), &["add", "fixture"]);
+        git(dir.path(), &["commit", "-q", "-m", "feature"]);
+
+        let db = crate::db::Db::open_memory().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        db.put_worktree(&path, &path, &path, "feature", None, None)
+            .unwrap();
+        let fields = worktree_fields(
+            &db,
+            dir.path(),
+            dir.path(),
+            &LiveFacts {
+                read_git: true,
+                ..LiveFacts::default()
+            },
+            0,
+        );
+
+        let ahead = fields
+            .iter()
+            .find(|field| field.key == keys::WORKTREE_AHEAD_BASE)
+            .unwrap();
+        assert_eq!(
+            ahead.shown,
+            crate::info_model::Shown::Value("1".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_identity_scrubs_origin_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "https://u:t@github.com/a/b"],
+        );
+        let db = crate::db::Db::open_memory().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        db.put_workspace(&path, "Repo", "repo").unwrap();
+
+        let origin = workspace_identity(&Config::default(), &db, dir.path())
+            .into_iter()
+            .find(|field| field.key == keys::WORKSPACE_ORIGIN)
+            .unwrap();
+        assert_eq!(
+            origin.shown,
+            crate::info_model::Shown::Value("https://github.com/a/b".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_queue_error_detail_is_redacted() {
+        let db = crate::db::Db::open_memory().unwrap();
+        db.put_worktree("repo/a", "/repo", "/repo/a", "a", None, None)
+            .unwrap();
+        db.enqueue_merge("/repo/a", "a", "main").unwrap();
+        db.update_merge_status(
+            "/repo/a",
+            "gate_error",
+            None,
+            None,
+            Some("fatal: unable to access 'https://u:tok@github.com/a/b/'"),
+        )
+        .unwrap();
+
+        let merge_queue = worktree_fields(
+            &db,
+            Path::new("/repo"),
+            Path::new("/repo/a"),
+            &LiveFacts::default(),
+            0,
+        )
+        .into_iter()
+        .find(|field| field.key == keys::WORKTREE_MERGE_QUEUE)
+        .unwrap();
+        match merge_queue.shown {
+            crate::info_model::Shown::Value(value) => assert!(!value.contains("tok")),
+            shown => panic!("expected merge queue value, got {shown:?}"),
+        }
+    }
+
+    #[test]
+    fn overrides_reports_worktree_env_backend_pick_and_zone() {
+        let db = crate::db::Db::open_memory().unwrap();
+        db.put_workspace("/repo", "Repo", "repo").unwrap();
+        db.put_worktree("repo/a", "/repo", "/repo/a", "a", None, None)
+            .unwrap();
+        db.set_worktree_env("/repo/a", "dev").unwrap();
+        db.set_worktree_sandbox("/repo/a", "bwrap").unwrap();
+        let zone = db.create_zone("client", 1).unwrap();
+        db.assign_workspace_zone("/repo", Some(zone)).unwrap();
+
+        let fields = overrides(
+            &Config::default(),
+            &db,
+            Path::new("/repo"),
+            Some(Path::new("/repo/a")),
+        );
+        assert!(fields.iter().any(|field| {
+            field.key == keys::OVERRIDE_WORKTREE_ENV
+                && field.shown == crate::info_model::Shown::Value("dev".to_string())
+        }));
+        assert!(fields.iter().any(|field| {
+            field.key == keys::OVERRIDE_BACKEND_PICK
+                && field.shown == crate::info_model::Shown::Value("bwrap".to_string())
+        }));
+        assert!(fields.iter().any(|field| {
+            field.key == keys::OVERRIDE_ZONE
+                && field.shown == crate::info_model::Shown::Value("client".to_string())
+        }));
     }
 
     #[test]
