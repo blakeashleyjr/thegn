@@ -13,6 +13,7 @@ actions:
     toggle-region,
     sidebar-narrower,
     sidebar-wider,
+    open-info,
   ]
 ---
 
@@ -73,6 +74,10 @@ queues stay quiet. The token is a shortcut to Work ▸ Merge queue; click it, or
 choose **Open merge queue** from the project's `m` menu. Narrow headers drop
 the count before hiding the marker, and the token is never painted in rail
 mode.
+
+A worktree deleted outside the running TUI (`wt rm`, `wt prune`, a landing or
+plain git) leaves the bar without a restart. A leftover directory with no
+checkout in it is not a live worktree, so it gets no row.
 
 ## Navigate
 
@@ -416,6 +421,10 @@ reading, it shows an amber `?`.
   sidebar focus is controlled separately by `sidebar_detail_when`; `i` cycles
   only `sidebar_focus_detail`. Both settings are in [[config-reference]] `[ui]`
   and the `sidebar_focus_detail` runtime choice persists.
+- `I` — Info screen for the row under the cursor (also "Info screen"
+  in the palette): identity, the effective settings with the layer that set
+  each one (env, sandbox backend and what would launch here, profile, network,
+  agent, merge gate), overrides, sessions and stats. Esc closes it.
 
 ### Row detail
 

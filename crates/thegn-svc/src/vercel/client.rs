@@ -739,7 +739,7 @@ impl VercelClient {
 
     /// Wait for a command's exit code: `GET …/cmd/{id}?wait=true` until the
     /// command reports `exitCode`. `Ok(None)` when `deadline` (a hard bound on
-    /// the whole wait, retries and backoff included) or [`WAIT_MAX_POLLS`]
+    /// the whole wait, retries and backoff included) or `WAIT_MAX_POLLS`
     /// runs out first. An exit code outside `i32` is
     /// [`EXEC_EXIT_STATUS_UNKNOWN`]; a response naming another command is an
     /// error.

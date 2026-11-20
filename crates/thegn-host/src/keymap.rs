@@ -159,6 +159,8 @@ pub enum Action {
     /// Raise / lower the warm-spare-pool target for the active workspace's env.
     PoolIncrement,
     PoolDecrement,
+    /// Retry failed provider pull-backs without destroying their sandboxes.
+    RetryPullbacks,
     TogglePanel,
     ToggleRecorder,
     /// Fork the focused live daemon session into a fresh process.
@@ -202,6 +204,8 @@ pub enum Action {
     PrReviewTaskHandle,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
+    /// Open the Info screen for the sidebar row under the cursor, else the active worktree.
+    OpenInfo,
     /// Open the tabbed system monitor.
     OpenMonitor,
     /// Open the system monitor straight onto the agent-pipeline board.
@@ -626,6 +630,7 @@ impl Action {
             Action::SidebarWider => "sidebar-wider",
             Action::PoolIncrement => "warm-pool-increment",
             Action::PoolDecrement => "warm-pool-decrement",
+            Action::RetryPullbacks => "retry-pullbacks",
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
             Action::ForkSession => "fork-session",
@@ -646,6 +651,7 @@ impl Action {
             Action::PrQueueRefresh => "pr-queue-refresh",
             Action::PrReviewTaskHandle => "pr-review-task-handle",
             Action::OpenUsage => "open-usage",
+            Action::OpenInfo => "open-info",
             Action::OpenMonitor => "open-monitor",
             Action::OpenPipelineBoard => "open-pipeline-board",
             Action::OpenCalendar => "open-calendar",
@@ -786,6 +792,7 @@ impl Action {
             "sidebar-wider" => Action::SidebarWider,
             "warm-pool-increment" => Action::PoolIncrement,
             "warm-pool-decrement" => Action::PoolDecrement,
+            "retry-pullbacks" | "sync-retry" => Action::RetryPullbacks,
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
             "fork-session" => Action::ForkSession,
@@ -806,6 +813,7 @@ impl Action {
             "pr-queue-refresh" => Action::PrQueueRefresh,
             "pr-review-task-handle" | "review-task-handle" => Action::PrReviewTaskHandle,
             "open-usage" => Action::OpenUsage,
+            "open-info" | "info" => Action::OpenInfo,
             "open-monitor" => Action::OpenMonitor,
             "open-pipeline-board" | "pipeline-board" => Action::OpenPipelineBoard,
             "open-calendar" => Action::OpenCalendar,
@@ -2366,6 +2374,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn open_info_key_round_trips() {
+        assert_eq!(Action::from_key("open-info"), Some(Action::OpenInfo));
+        assert_eq!(Action::OpenInfo.key(), "open-info");
+    }
+
     /// The registry is complete: every `Action::key()` id that `from_key`
     /// can parse back is an `ACTION_SPECS` entry, so every action has a label,
     /// keywords, a palette row and a help-page obligation. Parametric
@@ -2424,6 +2438,14 @@ mod tests {
                 spec.id
             );
         }
+    }
+
+    #[test]
+    fn retry_pullbacks_action_round_trips() {
+        let action = Action::from_key("retry-pullbacks").expect("retry-pullbacks action");
+        assert_eq!(action, Action::RetryPullbacks);
+        assert_eq!(action.key(), "retry-pullbacks");
+        assert_eq!(Action::from_key("sync-retry"), Some(Action::RetryPullbacks));
     }
 
     #[test]

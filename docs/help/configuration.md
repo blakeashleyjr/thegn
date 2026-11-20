@@ -35,6 +35,8 @@ including `[project.<slug>.merge_queue]` and
 `[project.<slug>.pr_queue]`, which is where a repo whose gate,
 integration branch, or review rules differ from your defaults belongs. `thegn
 config explain <key>`, run inside the repo, names the layer that won.
+`thegn info` shows the per-workspace and per-worktree answer, including the
+backend that would launch.
 The `<slug>` must be the normalized repo directory name (`My_Repo` →
 `my-repo`). A differently spelled key, or two keys that normalize to the same
 slug, fails `thegn config validate` and the block is refused rather than

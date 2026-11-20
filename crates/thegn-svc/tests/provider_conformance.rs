@@ -10,12 +10,13 @@
 //!
 //! Run: `cargo test -p thegn-svc --test provider_conformance`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use thegn_svc::provider::{Provider, SpritesProvider};
 use thegn_svc::provider_conformance::{Fixture, suite};
@@ -327,14 +328,20 @@ fn delete_counter(
     })
 }
 
-fn fly_fake() -> (String, Requests) {
+fn fly_fake() -> (String, Requests, Arc<Mutex<bool>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    let deleted = Arc::new(Mutex::new(HashSet::new()));
+    let hold_after_delete = Arc::new(Mutex::new(false));
     let shared = requests.clone();
+    let deleted_server = deleted.clone();
+    let hold_server = hold_after_delete.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let shared = shared.clone();
+            let deleted = deleted_server.clone();
+            let hold_after_delete = hold_server.clone();
             thread::spawn(move || {
                 let Some((method, path, body)) = read_request(&stream) else {
                     return;
@@ -354,12 +361,19 @@ fn fly_fake() -> (String, Requests) {
                     && path.starts_with("/v1/apps/")
                     && !path.contains("/machines")
                 {
-                    Some(r#"{"name":"tg-app","status":"deployed"}"#.to_string())
+                    if deleted.lock().unwrap().contains(&path)
+                        && !*hold_after_delete.lock().unwrap()
+                    {
+                        None
+                    } else {
+                        Some(r#"{"name":"tg-app","status":"deployed"}"#.to_string())
+                    }
                 } else if method == "POST" && path.ends_with("/machines") {
                     Some(format!(
                         r#"{{"id":"90810","name":"tg-fly-1","state":"created","config":{{"metadata":{managed}}}}}"#
                     ))
                 } else if method == "DELETE" && path.starts_with("/v1/apps/") {
+                    deleted.lock().unwrap().insert(path.clone());
                     Some(r#"{"ok":true}"#.to_string())
                 } else {
                     None
@@ -368,7 +382,11 @@ fn fly_fake() -> (String, Requests) {
             });
         }
     });
-    (format!("http://127.0.0.1:{port}"), requests)
+    (
+        format!("http://127.0.0.1:{port}"),
+        requests,
+        hold_after_delete,
+    )
 }
 
 #[tokio::test]
@@ -376,8 +394,8 @@ async fn fly_passes_the_conformance_suite() {
     use thegn_svc::fly::{FlyProvider, FlySpec};
     let _state = thegn_core::testenv::IsolatedState::new();
     let tmp = tempfile::tempdir().unwrap();
-    let (base, _requests) = fly_fake();
-    let p = Provider::Fly(FlyProvider::new(FlySpec {
+    let (base, _requests, hold_after_delete) = fly_fake();
+    let fly = FlyProvider::new(FlySpec {
         api_base: format!("{base}/v1"),
         graphql_url: format!("{base}/graphql"),
         token: "mock-token".into(),
@@ -392,7 +410,9 @@ async fn fly_passes_the_conformance_suite() {
         pubkey: TEST_PUBKEY.into(),
         iroh: None,
         skip_ready_wait: true,
-    }));
+    })
+    .with_destroy_confirm(Duration::from_millis(200), Duration::from_millis(20));
+    let p = Provider::Fly(fly);
     // The suite's sandbox must exist (and be in the ledger) up front.
     p.create().await.expect("fly create");
     let fx = Fixture {
@@ -408,14 +428,17 @@ async fn fly_passes_the_conformance_suite() {
         cap: None,
         // The minimal fake serves no machine list/stop routes.
         supports_stop: false,
-        // UNVERIFIED: whether Fly/VPS keep the record until absent is queued.
-        hold_after_delete: None,
-        recorded: None,
+        hold_after_delete: Some(Box::new(move |_name, held| {
+            *hold_after_delete.lock().unwrap() = held;
+        })),
+        recorded: Some(Box::new(|name| {
+            thegn_svc::vps::registry::read(name).is_some()
+        })),
     };
     let report = suite(&p, &fx).await;
     report.assert_green();
     assert!(
-        report.skipped.contains(&"destroy_keeps_record_until_gone"),
+        report.passed.contains(&"destroy_keeps_record_until_gone"),
         "{report:?}"
     );
 }
@@ -493,7 +516,7 @@ async fn vps_passes_the_conformance_suite() {
         cap: None,
         // A powered-off VPS still bills: no stop by construction.
         supports_stop: false,
-        // UNVERIFIED: whether Fly/VPS keep the record until absent is queued.
+        // UNVERIFIED: whether VPS keeps the record until absent is queued.
         hold_after_delete: None,
         recorded: None,
     };
