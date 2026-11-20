@@ -110,6 +110,11 @@ const AGENT_STATE_SKIP_DIRS: &[&str] = &[
     "logs",            // any: log spool
     "cache",
     ".cache",
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
 ];
 
 /// Skip an individual config file larger than this — real agent config/auth is
@@ -514,7 +519,10 @@ async fn ship_archive(
 /// "`agentmemory-*.sh`: not found" hook errors). `entry.file_type()` reports the
 /// link itself (neither file nor dir), so we resolve the target via
 /// `fs::metadata`; a `seen` set of canonical dirs guards against symlink cycles.
-pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String, bool)> {
+fn collect_agent_config_files_for(
+    dir: &Path,
+    allow_plugins: bool,
+) -> Vec<(std::path::PathBuf, String, bool)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
@@ -539,7 +547,9 @@ pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf,
             if md.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if AGENT_STATE_SKIP_DIRS.iter().any(|s| *s == name) {
+                if AGENT_STATE_SKIP_DIRS.iter().any(|s| *s == name)
+                    && !(allow_plugins && name == "plugins")
+                {
                     continue;
                 }
                 stack.push(path);
@@ -560,19 +570,31 @@ pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf,
     out
 }
 
+pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String, bool)> {
+    collect_agent_config_files_for(dir, false)
+}
+
 /// [`collect_agent_config_files`] filtered through [`phase2_allowed`]; returns
 /// `(allowed, total_walked)`.
 fn collect_allowed_agent_files(
     agent: &str,
     dir: &Path,
 ) -> (Vec<(std::path::PathBuf, String, bool)>, usize) {
-    let all = collect_agent_config_files(dir);
+    let all = collect_agent_config_files_for(dir, agent.trim() == "hermes");
     let total = all.len();
     let kept = all
         .into_iter()
         .filter(|(_, rel, _)| phase2_allowed(agent, rel))
         .collect();
     (kept, total)
+}
+
+/// Whether [`phase2_allowed`] has an explicit arm for this agent.
+pub(crate) fn phase2_is_known(agent: &str) -> bool {
+    matches!(
+        agent.trim(),
+        "claude" | "claude-code" | "codex" | "pi" | "hermes"
+    )
 }
 
 /// Phase 2 allowlist: is `rel` (relative to the agent's config dir) a file the
@@ -582,6 +604,11 @@ fn collect_allowed_agent_files(
 /// behaviour ([`AGENT_STATE_SKIP_DIRS`] still applies on top in the walk).
 fn phase2_allowed(agent: &str, rel: &str) -> bool {
     let rel = rel.trim_start_matches("./");
+    if agent.trim() == "hermes"
+        && (rel.ends_with(".db") || rel.split('/').any(|part| part == "cache"))
+    {
+        return false;
+    }
     let mut parts = rel.split('/');
     let top = parts.next().unwrap_or("");
     let nested = rel.contains('/');
@@ -599,11 +626,64 @@ fn phase2_allowed(agent: &str, rel: &str) -> bool {
         },
         "pi" => match top {
             "settings.json" => !nested,
-            "agent" => nested,
+            "agent" => {
+                let mut rest = rel.strip_prefix("agent/").unwrap_or("").split('/');
+                let Some(second) = rest.next() else {
+                    return false;
+                };
+                if matches!(
+                    second,
+                    "extensions"
+                        | "skills"
+                        | "agents"
+                        | "prompts"
+                        | "themes"
+                        | "compound-engineering"
+                ) {
+                    return true;
+                }
+                rest.next().is_none()
+            }
+            _ => false,
+        },
+        "hermes" => match top {
+            "config.yaml"
+            | "auth.json"
+            | ".env"
+            | "SOUL.md"
+            | "AGENTS.md"
+            | "delegation-override.yaml" => !nested,
+            "skills" | "hooks" | "prompts" | "memories" | "scripts" => nested,
+            "plugins" => nested && !parts.any(|part| part == "cache"),
             _ => false,
         },
         _ => true,
     }
+}
+
+fn cap_unknown_agent_files(
+    agent: &str,
+    files: &mut Vec<(std::path::PathBuf, String, bool)>,
+    warn: &mut dyn FnMut(&str),
+) {
+    if phase2_is_known(agent) || files.len() <= 2_000 {
+        return;
+    }
+    let count = files.len();
+    files.retain(|(_, rel, _)| !rel.contains('/'));
+    let agent = agent
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    warn(&format!(
+        "agent-login sync: {agent}'s config tree has {count} files; only its top-level files were synced"
+    ));
 }
 
 /// Where an agent's login files are read from on this host.
@@ -833,27 +913,62 @@ fn sync_agent_auth_critical(
     let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let mut ok = 0usize;
     let mut failed = 0usize;
-    for (f, data, exec) in collect_auth_critical(sources, &host_home, &mut read_host_file) {
-        let dest = format!("{base}/{f}");
-        match block_on_provider(|| async {
-            let write = async {
-                if exec {
-                    provider.write_exec(id, &dest, &data).await
-                } else {
-                    provider.write_private(id, &dest, &data).await
+    let critical = collect_auth_critical(sources, &host_home, &mut read_host_file);
+    let critical_dests = critical
+        .iter()
+        .map(|(f, _, _)| format!("{base}/{f}"))
+        .collect::<Vec<_>>();
+    let results = block_on_provider(move || async move {
+        use futures::future::join_all;
+
+        let uploads = critical
+            .into_iter()
+            .map(|(f, data, exec)| {
+                let dest = format!("{base}/{f}");
+                async move {
+                    let write = async {
+                        if exec {
+                            provider.write_exec(id, &dest, &data).await
+                        } else {
+                            provider.write_private(id, &dest, &data).await
+                        }
+                    };
+                    let result =
+                        match tokio::time::timeout(AGENT_CONFIG_UPLOAD_TIMEOUT, write).await {
+                            Ok(r) => r,
+                            Err(_) => Err(anyhow::anyhow!(
+                                "upload timed out after {}s",
+                                AGENT_CONFIG_UPLOAD_TIMEOUT.as_secs()
+                            )),
+                        };
+                    (dest, result)
                 }
-            };
-            match tokio::time::timeout(AGENT_CONFIG_UPLOAD_TIMEOUT, write).await {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!(
-                    "upload timed out after {}s",
-                    AGENT_CONFIG_UPLOAD_TIMEOUT.as_secs()
-                )),
+            })
+            .collect::<Vec<_>>();
+        Ok(join_all(uploads).await)
+    });
+    match results {
+        Ok(results) => {
+            for (dest, result) in results {
+                match result {
+                    Ok(()) => ok += 1,
+                    Err(e) => {
+                        failed += 1;
+                        tracing::warn!(
+                            target: "thegn::startup",
+                            dest = %dest,
+                            error = %e,
+                            "agent-config auth-critical upload failed (best-effort)"
+                        );
+                    }
+                }
             }
-        }) {
-            Ok(()) => ok += 1,
-            Err(e) => {
-                failed += 1;
+        }
+        Err(e) => {
+            // Keep the aggregate counts/log shape if the provider runtime itself
+            // cannot be created: every collected upload failed to run.
+            failed = critical_dests.len();
+            for dest in critical_dests {
                 tracing::warn!(
                     target: "thegn::startup",
                     dest = %dest,
@@ -933,24 +1048,27 @@ pub(crate) fn resync_agent_auth(
     }
     // Resolve the sandbox `$HOME` (where the auth files must land) the same way
     // `run_provisioning` does — a tiny non-tty exec.
-    let sprite_home = block_on_provider(|| async {
-        provider
-            .run_exec(
-                id,
-                &[
-                    "/bin/sh".to_string(),
-                    "-lc".to_string(),
-                    "printf %s \"$HOME\"".to_string(),
-                ],
-                None,
-                &[],
-            )
-            .await
-    })
-    .ok()
-    .filter(|(code, out)| *code == 0 && !out.trim().is_empty())
-    .map(|(_, out)| out.trim().to_string())
-    .unwrap_or_else(|| "/root".to_string());
+    let sprite_home = match crate::provider_workdir::cached_home(id) {
+        Some(home) => home,
+        None => block_on_provider(|| async {
+            provider
+                .run_exec(
+                    id,
+                    &[
+                        "/bin/sh".to_string(),
+                        "-lc".to_string(),
+                        "printf %s \"$HOME\"".to_string(),
+                    ],
+                    None,
+                    &[],
+                )
+                .await
+        })
+        .ok()
+        .filter(|(code, out)| *code == 0 && !out.trim().is_empty())
+        .map(|(_, out)| out.trim().to_string())
+        .unwrap_or_else(|| "/root".to_string()),
+    };
     let (ok, failed) =
         sync_agent_auth_critical(provider, id, sprite_home.trim_end_matches('/'), &sources);
     tracing::debug!(
@@ -1008,8 +1126,10 @@ pub(crate) fn upload_agent_configs(
     // `rel` is relative to the sandbox `$HOME` (`base`): packing and the
     // per-file fallback both join it to `base` themselves.
     let mut all_uploads: Vec<PackEntry> = Vec::new();
+    let mut unknown_cap_warnings = std::collections::HashSet::new();
     for (agent, source) in &sources {
         let (files, dirs) = thegn_core::envplan::agent_config_paths(agent);
+        let mut agent_uploads = Vec::new();
         for f in files {
             if already_uploaded.contains(&f) {
                 continue;
@@ -1021,7 +1141,7 @@ pub(crate) fn upload_agent_configs(
                 continue;
             };
             let data = strip_sandbox_hooks(&f, data);
-            all_uploads.push((f, data, exec));
+            agent_uploads.push((f, data, exec));
         }
         for d in dirs {
             let Some(src) = agent_source_path(&host_home, &d, source) else {
@@ -1030,7 +1150,13 @@ pub(crate) fn upload_agent_configs(
             if !src.is_dir() {
                 continue;
             }
-            let (collected, walked) = collect_allowed_agent_files(agent, &src);
+            let (mut collected, walked) = collect_allowed_agent_files(agent, &src);
+            let warning_key = agent.trim().to_owned();
+            cap_unknown_agent_files(agent, &mut collected, &mut |message| {
+                if unknown_cap_warnings.insert(warning_key.clone()) {
+                    thegn_core::msg::warn(message);
+                }
+            });
             tracing::info!(
                 target: "thegn::startup",
                 agent = %agent,
@@ -1048,9 +1174,10 @@ pub(crate) fn upload_agent_configs(
                     continue;
                 };
                 let data = strip_sandbox_hooks(&host_rel, data);
-                all_uploads.push((host_rel, data, exec));
+                agent_uploads.push((host_rel, data, exec));
             }
         }
+        all_uploads.extend(agent_uploads);
     }
 
     let total_phase2 = all_uploads.len();
@@ -1824,38 +1951,107 @@ mod tests {
 
     #[test]
     fn phase2_codex_pi_and_unknown_tables() {
-        assert!(phase2_allowed("codex", "config.toml"));
-        assert!(phase2_allowed("codex", "prompts/a.md"));
-        assert!(phase2_allowed("codex", "AGENTS.md"));
-        assert!(phase2_allowed("codex", "auth.json"));
-        assert!(!phase2_allowed("codex", "sessions/a.jsonl"));
-        assert!(!phase2_allowed("codex", "log/x"));
-        assert!(phase2_allowed("pi", "agent/skills/a/SKILL.md"));
-        assert!(phase2_allowed("pi", "settings.json"));
-        assert!(!phase2_allowed("pi", "history/x"));
-        assert!(!phase2_allowed("pi", "telemetry.json"));
-        assert!(phase2_allowed("claude", "plugins/a/b.json"));
-        assert!(!phase2_allowed("claude", "plugins/cache/b.json"));
-        assert!(!phase2_allowed("claude", "plugins/a/repos/b.json"));
-        assert!(!phase2_allowed("claude", "telemetry/a"));
+        let cases = [
+            ("codex", "config.toml", true),
+            ("codex", "prompts/a.md", true),
+            ("codex", "AGENTS.md", true),
+            ("codex", "auth.json", true),
+            ("pi", "agent/npm/x", false),
+            ("pi", "agent/git/x", false),
+            ("pi", "agent/sessions/x", false),
+            ("pi", "agent/settings.json", true),
+            ("pi", "agent/auth.json", true),
+            ("pi", "agent/skills/a/SKILL.md", true),
+            ("pi", "settings.json", true),
+            ("pi", "settings.json/nested", false),
+            ("pi", "history/x", false),
+            ("pi", "telemetry.json", false),
+            ("hermes", "profiles/x", false),
+            ("hermes", "config.yaml", true),
+            ("hermes", "skills/x", true),
+            ("hermes", "skills/x.db", false),
+            ("hermes", "cache/x", false),
+            ("hermes", "plugins/cache/x", false),
+            ("claude", "plugins/a/b.json", true),
+            ("claude", "plugins/cache/b.json", false),
+            ("claude", "plugins/a/repos/b.json", false),
+            ("claude", "telemetry/a", false),
+        ];
+        for (agent, rel, expected) in cases {
+            assert_eq!(phase2_allowed(agent, rel), expected, "{agent}/{rel}");
+        }
     }
 
     #[test]
-    fn phase2_unknown_agent_unchanged() {
+    fn phase2_hermes_allowlist_collects_only_config() {
         let root = std::env::temp_dir().join(format!("tg-allow-unk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root); // best-effort: scratch dir may not exist
-        for f in ["conf.toml", "telemetry/e.json", "cache/x"] {
+        for f in [
+            "config.yaml",
+            "auth.json",
+            ".env",
+            "SOUL.md",
+            "AGENTS.md",
+            "delegation-override.yaml",
+            "profiles/x",
+            "skills/x",
+            "plugins/x",
+            "cache/x",
+        ] {
             touch(&root, f);
         }
         let allowed = allowed_rels("hermes", &root);
-        let mut plain: Vec<String> = collect_agent_config_files(&root)
-            .into_iter()
-            .map(|(_, r, _)| r)
-            .collect();
-        plain.sort();
-        assert_eq!(allowed, plain);
-        assert!(allowed.contains(&"telemetry/e.json".to_string()));
+        assert_eq!(
+            allowed,
+            vec![
+                ".env",
+                "AGENTS.md",
+                "SOUL.md",
+                "auth.json",
+                "config.yaml",
+                "delegation-override.yaml",
+                "plugins/x",
+                "skills/x",
+            ]
+        );
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup
+    }
+
+    #[test]
+    fn phase2_skip_dirs_drop_dependency_and_repository_state() {
+        let root = tempfile::tempdir().unwrap();
+        for f in [
+            "node_modules/pkg/index.js",
+            ".git/config",
+            "__pycache__/x.pyc",
+        ] {
+            touch(root.path(), f);
+        }
+        touch(root.path(), "config.json");
+        assert_eq!(allowed_rels("unknown", root.path()), vec!["config.json"]);
+    }
+
+    #[test]
+    fn phase2_unknown_agent_cap_keeps_top_level_and_warns_once() {
+        let root = tempfile::tempdir().unwrap();
+        for n in 0..2_001 {
+            touch(root.path(), &format!("nested/{n}.json"));
+        }
+        touch(root.path(), "auth.json");
+        touch(root.path(), "config.json");
+        let (mut files, walked) = collect_allowed_agent_files("custom", root.path());
+        assert_eq!(walked, 2_003);
+        let mut warnings = Vec::new();
+        cap_unknown_agent_files("custom", &mut files, &mut |message| {
+            warnings.push(message.to_string())
+        });
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            warnings,
+            [
+                "agent-login sync: custom's config tree has 2003 files; only its top-level files were synced"
+            ]
+        );
     }
 
     #[test]
