@@ -245,6 +245,9 @@ by a remote native build runner), set `THEGN_E2E_BINARY` to its executable path:
 `THEGN_E2E_BINARY=/absolute/path/to/thegn just e2e`. This skips `just build`;
 the path must name an executable file called `thegn`. Without the variable, the
 recipe runs `just build` and uses `${CARGO_TARGET_DIR:-target}/debug/thegn`.
+For a single spec, use `just e2e-spec test/muse/specs/33-app-tabs.yaml` with the
+same override. This keeps the isolated Muse environment while avoiding unrelated
+platform baselines; the app-tab regression has assertions but no snapshots.
 
 Masks and normalizers in a spec's `snapshot_defaults` apply to every
 snapshot in it; per-step `masks:`/`normalize:` add to them. A `content` mask

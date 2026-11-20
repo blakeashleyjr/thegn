@@ -701,6 +701,22 @@ e2e:
         --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
+# Run one assertion-only Muse spec with the same isolated environment. This is
+# useful for platform checks whose new spec intentionally has no snapshots.
+e2e-spec spec:
+    #!/usr/bin/env bash
+    {{_e2e_binary}}
+    {{_e2e_env}}
+    spec="{{spec}}"
+    case "$spec" in
+        test/muse/specs/*.yaml) ;;
+        *) echo "expected a spec under test/muse/specs/: $spec" >&2; exit 2 ;;
+    esac
+    [ -f "$spec" ] || { echo "Muse spec not found: $spec" >&2; exit 2; }
+    PATH="$E2E_BIN_DIR:$PATH" muse run "$spec" \
+        --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
+        --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
+
 # Re-record the snapshot baselines (after an intentional UI change). Review the
 # diff under test/muse/snapshots/ before committing it.
 e2e-update:
