@@ -56,9 +56,7 @@ impl SpritesProvider {
             .push("exec")
             .push(session)
             .push("kill");
-        url.query_pairs_mut()
-            .append_pair("signal", "SIGHUP")
-            .append_pair("timeout", "5s");
+        url.query_pairs_mut().append_pair("signal", "SIGHUP");
 
         let mut response = self
             .client
@@ -267,7 +265,6 @@ mod tests {
                 .into_owned()
                 .collect::<Vec<_>>();
             assert!(query.contains(&("signal".into(), "SIGHUP".into())));
-            assert!(query.contains(&("timeout".into(), "5s".into())));
             assert_eq!(authorization.as_deref(), Some("Bearer test-token"));
             drop(requests);
             server.abort();
