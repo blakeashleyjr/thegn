@@ -25,6 +25,8 @@ verified on the selected runtime.
   and evidence files
 - **THEN** each runtime resource uses a per-run random name and cleanup is
   limited to those names
+- **AND** generated Apple network and container names use lowercase portable
+  characters while retaining a unique per-run suffix
 - **AND** the listener serves only a random canary body on one chosen interface
   and an ephemeral port
 - **AND** output is stored in a private directory, does not overwrite an earlier
@@ -39,3 +41,10 @@ verified on the selected runtime.
   process-limit, or label-based lifecycle enforcement
 - **AND** any later behavior change SHALL be covered by the reviewed evidence
   and runtime-specific tests
+
+#### Scenario: Process-limit output remains observational without a user control
+
+- **WHEN** V-AC-03 reports a process count under the image's default user
+- **THEN** the runner records the count as observed evidence
+- **AND** it does not infer that `nproc` enforcement is disabled or approved
+  without a suitable user/control comparison

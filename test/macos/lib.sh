@@ -11,6 +11,13 @@ MACOS_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck disable=SC1091 # source path is resolved from the checkout root
 . "$MACOS_TEST_ROOT/scripts/spikes/lib-cases.sh"
 
+# Convert the random suffix returned by mktemp into a portable Apple resource
+# component. The source remains the collision-safe private directory name;
+# lowercasing handles mktemp's mixed-case alphabet without dropping entropy.
+macos_ws05_resource_id() {
+  LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cd 'a-z0-9'
+}
+
 # The older spike helpers also serve unrelated procedures and stay Python-free.
 # Override redaction only in this Mac case library, where Python is already a
 # declared prerequisite and host addresses/image refs must be hidden.
