@@ -591,6 +591,11 @@ pub const CATALOG: &[Slot] = &[
     ),
     slot("session record", "session", SourceKind::Session),
     slot("session send", "session", SourceKind::Session),
+    slot(
+        "session send",
+        "key",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("session snapshot", "session", SourceKind::Session),
     slot("session snapshot", "session_pos", SourceKind::Session),
     slot("session split", "session", SourceKind::Session),
