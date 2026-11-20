@@ -139,6 +139,7 @@ fn resolve(cfg: &Config, group: String, worktree: &str, req: LaunchRequest) -> L
 /// Compose one launch spec for a single picker choice (records the remembered
 /// agent for agent choices, exactly like the wizard picker).
 fn compose_choice(cfg: &Config, worktree: &str, choice: &str) -> anyhow::Result<LaunchSpec> {
+    crate::provision_bg::ensure_agents_ready(cfg, worktree, choice)?;
     let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
     launch_spec_full(
         cfg,
@@ -166,6 +167,7 @@ fn compose_preset_command(
         PresetCommand::Shell => ("shell", None),
         PresetCommand::ShellCommand(c) => ("shell", Some(c.clone())),
     };
+    crate::provision_bg::ensure_agents_ready(cfg, worktree, choice)?;
     let mut spec = launch_spec_full(
         cfg,
         worktree,

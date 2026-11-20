@@ -249,6 +249,7 @@ mod profile;
 mod provider_factory;
 mod provider_git;
 mod provider_workdir;
+mod provision_bg;
 mod provision_gate;
 mod provision_recover;
 mod pty_drain;
