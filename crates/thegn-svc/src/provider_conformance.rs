@@ -3,14 +3,18 @@
 //! server, the Vercel `FakeApi`, and Fly and VPS fakes. The cases are
 //! `create_records_before_request`, `destroy_missing_is_ok`,
 //! `destroy_unrecorded_refused`, `inventory_contains_created`,
-//! `run_captures_exit_and_output`, `reads_never_resume`,
-//! `inventory_partial_keeps_created`, `create_respects_cap`,
-//! `stop_resume_round_trip`, `destroy_keeps_record_until_gone`,
-//! `destroy_is_idempotent`, and `probe_report_shape`. WS08-P1-08 extends this
-//! file rather than replacing it: add cases to `suite`, keep the names stable.
+//! `run_captures_exit_and_output`, `exec_without_exit_fails`,
+//! `stopped_run_is_retried_once`, `reads_never_resume`,
+//! `inventory_partial_keeps_created`, `unfinished_listing_is_never_complete`,
+//! `create_respects_cap`, `egress_never_widens`, `stop_resume_round_trip`,
+//! `destroy_keeps_record_until_gone`, `destroy_is_idempotent`, and
+//! `probe_report_shape`. WS08-P1-08 extends this file rather than replacing it:
+//! add cases to `suite`, keep the names stable.
 //!
 //! A case is *skipped* (never failed) only when the [`Fixture`] says the op is
 //! unbacked (no probe, no `foreign`, `supports_run == false`).
+//! A new `Fixture` field is optional; each fixture test pins its `report.skipped`
+//! list so a skip is always visible.
 
 use std::future::Future;
 
@@ -26,10 +30,22 @@ pub type DeleteCounter = Box<dyn Fn(&str) -> usize + Send + Sync>;
 /// while the sandbox stays present on every later read.
 pub type HoldSwitch = Box<dyn Fn(&str, bool) + Send + Sync>;
 
+/// Arms (`true`) or disarms (`false`) a fake-wide behaviour.
+pub type Switch = Box<dyn Fn(bool) + Send + Sync>;
+
+/// Makes the fake refuse the next `n` one-shot runs as "the session stopped"
+/// (refused in the response head: nothing started); `0` disarms.
+pub type RunRefusal = Box<dyn Fn(u32) + Send + Sync>;
+
+/// Whether the network policy the fake last accepted for a name lets every
+/// domain through; `None` when the fake accepted none.
+pub type EgressProbe = Box<dyn Fn(&str) -> Option<bool> + Send + Sync>;
+
 /// Whether this host's ownership record for a name is on disk.
 pub type RecordProbe = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What one provider run of the suite works against.
+#[derive(Default)]
 pub struct Fixture {
     /// The sandbox the provider's `create` yields (and the provider owns).
     pub created: String,
@@ -46,7 +62,8 @@ pub struct Fixture {
     pub ledger_at_create: Option<Probe<Option<bool>>>,
     /// How many DELETE requests the fake has seen for a name.
     pub deletes_for: Option<Probe<DeleteCounter>>,
-    /// How many resume requests the fake has seen (none for sprites).
+    /// How many wakes the fake has seen (Vercel resume requests, Sprites exec
+    /// upgrades); `None` skips `reads_never_resume`.
     pub resumes: Option<Probe<usize>>,
     /// The provider's instance cap (`max_instances`) when the fixture is
     /// configured with one the suite can fill; `None` skips `create_respects_cap`.
@@ -58,6 +75,17 @@ pub struct Fixture {
     pub hold_after_delete: Option<HoldSwitch>,
     /// `None` skips `destroy_keeps_record_until_gone`.
     pub recorded: Option<RecordProbe>,
+    /// Backs `exec_without_exit_fails`; `None` skips it.
+    pub drop_exit: Option<Switch>,
+    /// Backs `stopped_run_is_retried_once`; `None` skips it.
+    pub refuse_runs_stopped: Option<RunRefusal>,
+    /// One-shot run requests the fake saw, refused or not; `None` skips
+    /// `stopped_run_is_retried_once`.
+    pub runs: Option<Probe<usize>>,
+    /// Backs `unfinished_listing_is_never_complete`; `None` skips it.
+    pub unfinished_listing: Option<Switch>,
+    /// Backs `egress_never_widens`; `None` skips it.
+    pub egress_allows_all: Option<EgressProbe>,
 }
 
 /// The outcome of one suite run, case by case.
@@ -84,6 +112,10 @@ impl Report {
 
 fn ensure(cond: bool, why: impl FnOnce() -> String) -> Result<(), String> {
     if cond { Ok(()) } else { Err(why()) }
+}
+
+fn conformance_argv() -> [String; 3] {
+    ["sh".into(), "-c".into(), "echo conformance".into()]
 }
 
 async fn case<F: Future<Output = Result<(), String>>>(
@@ -168,11 +200,7 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
         &mut report,
         "run_captures_exit_and_output",
         fx.supports_run.then_some(async {
-            let argv = [
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo conformance".into(),
-            ];
+            let argv = conformance_argv();
             let (code, out) = p
                 .run_exec(&fx.created, &argv, None, &[])
                 .await
@@ -182,6 +210,58 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
                 format!("got ({code}, {out:?}), want ({want_code}, ..{want_out:?}..)")
             })
         }),
+    )
+    .await;
+
+    case(
+        &mut report,
+        "exec_without_exit_fails",
+        fx.drop_exit.as_ref().map(|arm| async move {
+            arm(true);
+            let result = p
+                .run_exec(&fx.created, &conformance_argv(), None, &[])
+                .await;
+            arm(false);
+            match result {
+                Ok((code, out)) => Err(format!(
+                    "an exec stream with no exit status returned ({code}, {out:?})"
+                )),
+                Err(_) => Ok(()),
+            }
+        }),
+    )
+    .await;
+
+    case(
+        &mut report,
+        "stopped_run_is_retried_once",
+        fx.refuse_runs_stopped
+            .as_ref()
+            .zip(fx.runs.as_ref())
+            .map(|(refuse, runs)| async move {
+                refuse(1);
+                let before = runs();
+                let first_result = p
+                    .run_exec(&fx.created, &conformance_argv(), None, &[])
+                    .await;
+                let first = runs().saturating_sub(before);
+
+                refuse(2);
+                let before = runs();
+                let second_result = p
+                    .run_exec(&fx.created, &conformance_argv(), None, &[])
+                    .await;
+                let second = runs().saturating_sub(before);
+
+                refuse(0);
+                ensure(first_result.is_ok() && first == 2, || {
+                    "a run refused once because the session stopped was not retried exactly once"
+                        .into()
+                })?;
+                ensure(second_result.is_err() && second == 2, || {
+                    "a second stop refusal was retried past the one allowed retry".into()
+                })
+            }),
     )
     .await;
 
@@ -223,6 +303,32 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
 
     case(
         &mut report,
+        "unfinished_listing_is_never_complete",
+        fx.unfinished_listing.as_ref().map(|arm| async move {
+            arm(true);
+            let inventory = p.inventory().await;
+            arm(true);
+            let list = p.list().await;
+            arm(false);
+
+            ensure(
+                !matches!(&inventory, Ok(InventoryReport::Complete(_))),
+                || "an unfinished listing was reported Complete".into(),
+            )?;
+            if let Ok(InventoryReport::Partial { rows, .. }) = &inventory {
+                ensure(rows.iter().any(|row| row.id == fx.created), || {
+                    format!("partial inventory dropped {}: {rows:?}", fx.created)
+                })?;
+            }
+            ensure(list.is_err(), || {
+                "list() accepted an unfinished listing".into()
+            })
+        }),
+    )
+    .await;
+
+    case(
+        &mut report,
         "create_respects_cap",
         fx.cap.map(|cap| async move {
             // Fill the cap, then the cap+1 create must be refused. Creates the
@@ -236,6 +342,28 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
             }
             ensure(refused, || {
                 format!("create {} succeeded past the cap of {cap}", cap + 1)
+            })
+        }),
+    )
+    .await;
+
+    case(
+        &mut report,
+        "egress_never_widens",
+        fx.egress_allows_all.as_ref().map(|probe| async move {
+            let allow = ["a.example".to_string()];
+            let shadowed = p.set_network_policy(&fx.created, &allow, &allow).await;
+            if shadowed.is_ok() {
+                ensure(probe(&fx.created) == Some(false), || {
+                    "an allow list emptied by blocks was applied as allow-all".into()
+                })?;
+            }
+            let applied = p.set_network_policy(&fx.created, &allow, &[]).await;
+            ensure(applied.is_ok(), || {
+                "a non-empty allow list was refused".into()
+            })?;
+            ensure(probe(&fx.created) == Some(false), || {
+                "an allow list was applied as allow-all".into()
             })
         }),
     )
