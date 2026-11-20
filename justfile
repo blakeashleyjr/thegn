@@ -992,6 +992,15 @@ test-remote host *args:
 test-remote-selftest:
     bash test/remote-runner-selftest.sh
 
+# Hermetic evidence-runner checks and the opt-in macOS OCI runtime capture.
+# The latter requires an interactive owner-provided output path and runs only
+# on the Apple-silicon Mac; see test/macos/README.md.
+macos-ondevice-selftest:
+    bash test/macos/selftest.sh
+
+macos-ondevice outdir:
+    bash test/macos/on-device.sh "{{outdir}}"
+
 # Opt-in local Windows 11 VM (KVM + quickemu from the flake's nixpkgs, state
 # under $XDG_DATA_HOME/thegn-dev/windows-vm, never in the repo). `setup`
 # downloads Microsoft's ISO and prepares an unattended install that comes up

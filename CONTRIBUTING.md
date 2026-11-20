@@ -308,6 +308,13 @@ Mac when touching anything platform-sensitive; it covers what neither
    `auto` picks it; without it, `auto` falls through to `host`.
 9. The media badge, `osascript` notifications, the `afplay` chime, `pbcopy`
    copy-mode yank, and a Keychain secret round-trip all fire.
+10. For the Apple OCI runtime decision, run `just macos-ondevice-selftest`,
+    then `just macos-ondevice "$HOME/spike-evidence/WS05-P0-01-<unique-run>"`
+    from a private evidence directory. This checks `container` network none,
+    internal-network internet/host reachability with positive controls,
+    `--ulimit nproc`, labels, version output, and read-only Podman/Docker
+    machine metadata. Review inconclusive rows as inconclusive; startup errors
+    and timeouts do not count as isolation evidence. See [test/macos](test/macos/README.md).
 
 ## Windows (native) notes
 
