@@ -203,10 +203,7 @@ fn sample_inputs(session: &crate::session::Session) -> SampleInputs {
 fn sample_vanished_tabs(
     groups: &[VanishedGroup],
     path_state: impl Fn(&str) -> PathState,
-    load_registry: impl FnOnce() -> anyhow::Result<(
-        Vec<thegn_core::models::WorktreeRow>,
-        Vec<thegn_core::models::WorkspaceRow>,
-    )>,
+    load_registry: impl FnOnce() -> anyhow::Result<RegistrySample>,
     mut git_unlisted: impl FnMut(&str, Option<&str>) -> bool,
     settled_groups: &Mutex<HashMap<String, (u64, Option<std::time::Instant>)>>,
     now: std::time::Instant,
@@ -241,7 +238,12 @@ fn sample_vanished_tabs(
     if missing.is_empty() {
         return Ok(Vec::new());
     }
-    let (rows, workspaces) = load_registry()?;
+    let registry = load_registry()?;
+    let RegistrySample {
+        rows,
+        workspaces,
+        remote,
+    } = registry;
     let mut gone = Vec::new();
     let mut unregistered_reaped = 0;
     let mut unregistered_kept = 0;
@@ -252,7 +254,7 @@ fn sample_vanished_tabs(
             .iter()
             .any(|workspace| workspace.repo_path == *path);
         match rows.iter().find(|row| row.worktree == *path) {
-            Some(row) if row.location.is_empty() || row.location == "local" => match state {
+            Some(row) if !remote.contains(&row.worktree) => match state {
                 PathState::Missing => gone.push(path.clone()),
                 PathState::Remnant => {
                     if git_unlisted(path, Some(row.repo_root.as_str())) {
@@ -301,6 +303,72 @@ fn sample_vanished_tabs(
         );
     }
     Ok(gone)
+}
+
+/// THE-2472: the one "is this registry row remote" answer the automatic
+/// reapers share. Remote = a stored non-local `location`, OR an effective env
+/// (the row's own, else the repo's ambient one) whose placement is ssh, k8s or
+/// provider. ssh and k8s rows never store a `location`.
+pub(crate) fn registry_row_is_remote(
+    db: &Db,
+    cfg: &thegn_core::config::Config,
+    row: &thegn_core::models::WorktreeRow,
+    ambient_cache: &mut HashMap<String, String>,
+) -> bool {
+    let stored_local = row.location.is_empty() || row.location == "local";
+    !stored_local
+        || crate::hydrate::row_is_remote_effective(
+            db,
+            cfg,
+            "",
+            row.env_name.as_deref(),
+            &row.repo_root,
+            ambient_cache,
+        )
+}
+
+/// What the sampler reads from the state DB on the reap branch.
+struct RegistrySample {
+    rows: Vec<thegn_core::models::WorktreeRow>,
+    workspaces: Vec<thegn_core::models::WorkspaceRow>,
+    /// Paths of rows `registry_row_is_remote` calls remote.
+    remote: HashSet<String>,
+}
+
+impl RegistrySample {
+    #[cfg(test)]
+    fn from_location(
+        rows: Vec<thegn_core::models::WorktreeRow>,
+        workspaces: Vec<thegn_core::models::WorkspaceRow>,
+    ) -> Self {
+        let remote = rows
+            .iter()
+            .filter(|row| !(row.location.is_empty() || row.location == "local"))
+            .map(|row| row.worktree.clone())
+            .collect();
+        Self {
+            rows,
+            workspaces,
+            remote,
+        }
+    }
+}
+
+/// Read the registry and classify every row once (one ambient-env cache).
+fn registry_sample(db: &Db, cfg: &thegn_core::config::Config) -> anyhow::Result<RegistrySample> {
+    let rows = db.worktrees()?;
+    let workspaces = db.workspaces()?;
+    let mut ambient_cache = HashMap::new();
+    let remote = rows
+        .iter()
+        .filter(|row| registry_row_is_remote(db, cfg, row, &mut ambient_cache))
+        .map(|row| row.worktree.clone())
+        .collect();
+    Ok(RegistrySample {
+        rows,
+        workspaces,
+        remote,
+    })
 }
 
 fn git_confirms_unlisted(
@@ -916,7 +984,7 @@ fn remove_landed_with_config_unaudited(
     let row_is_local = (expected_queue.location.is_empty() || expected_queue.location == "local")
         && match db.worktree_record(worktree) {
             Ok(None) => true,
-            Ok(Some(row)) => row.location.is_empty() || row.location == "local",
+            Ok(Some(row)) => !registry_row_is_remote(db, cfg, &row, &mut HashMap::new()),
             Err(_) => false, // unknown is never "gone"
         };
     if row_is_local
@@ -1229,11 +1297,13 @@ pub(crate) fn spawn_reconcile_removed_tabs(
                 }
             },
             || {
+                let admitted = crate::config_startup::display().ok_or_else(|| {
+                    anyhow::anyhow!("no admitted config yet; remote rows cannot be told apart, so nothing is reaped")
+                })?;
                 let db = Db::open()?;
-                let rows = db.worktrees()?;
-                let workspaces = db.workspaces()?;
+                let sample = registry_sample(&db, admitted.config())?;
                 sampled_db = Some(db);
-                Ok((rows, workspaces))
+                Ok(sample)
             },
             |path, row_root| {
                 git_confirms_unlisted(
@@ -1352,7 +1422,7 @@ mod cleanup_tests;
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use thegn_core::config::OnLanded;
+    use thegn_core::config::{Config, EnvConfig, OnLanded, PlacementMode};
     use thegn_core::store::NotificationStore;
     use thegn_core::util;
 
@@ -1406,7 +1476,7 @@ mod tests {
                 |_| PathState::Missing,
                 || {
                     loads.set(loads.get() + 1);
-                    Ok((Vec::new(), Vec::new()))
+                    Ok(RegistrySample::from_location(Vec::new(), Vec::new()))
                 },
                 |_, _| false,
                 &remote,
@@ -1433,13 +1503,203 @@ mod tests {
         let gone = sample_vanished_tabs(
             &groups,
             |_| PathState::Missing,
-            || Ok((db.worktrees()?, db.workspaces()?)),
+            || {
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
+            },
             |_, _| false,
             &remote,
             std::time::Instant::now(),
         )
         .unwrap();
         assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn ssh_row_with_missing_path_is_kept_and_settled() {
+        let db = Db::open_memory().unwrap();
+        db.put_workspace("/repo", "repo", "git").unwrap();
+        db.put_worktree("repo/a", "/repo", "/gone/a", "a", None, None)
+            .unwrap();
+        db.set_worktree_env("/gone/a", "build").unwrap();
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "build".into(),
+            EnvConfig {
+                placement: PlacementMode::Ssh,
+                ..Default::default()
+            },
+        );
+        let sample = registry_sample(&db, &cfg).unwrap();
+        let settled = Mutex::new(HashMap::new());
+        let gone = sample_vanished_tabs(
+            &[VanishedGroup {
+                path: "/gone/a".into(),
+                epoch: 1,
+            }],
+            |_| PathState::Missing,
+            || Ok(sample),
+            |_, _| panic!("remote rows do not need git confirmation"),
+            &settled,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(gone.is_empty());
+        assert!(matches!(
+            settled.lock().unwrap().get("/gone/a"),
+            Some((1, None))
+        ));
+    }
+
+    #[test]
+    fn k8s_row_inheriting_the_ambient_env_is_kept() {
+        let db = Db::open_memory().unwrap();
+        db.put_workspace("/repo", "repo", "git").unwrap();
+        db.put_worktree("repo/a", "/repo", "/gone/a", "a", None, None)
+            .unwrap();
+        db.set_workspace_env("/repo", "kube").unwrap();
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "kube".into(),
+            EnvConfig {
+                placement: PlacementMode::K8s,
+                ..Default::default()
+            },
+        );
+        let sample = registry_sample(&db, &cfg).unwrap();
+        let settled = Mutex::new(HashMap::new());
+        let gone = sample_vanished_tabs(
+            &[VanishedGroup {
+                path: "/gone/a".into(),
+                epoch: 1,
+            }],
+            |_| PathState::Missing,
+            || Ok(sample),
+            |_, _| panic!("remote rows do not need git confirmation"),
+            &settled,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn local_row_with_missing_path_is_still_gone() {
+        let db = Db::open_memory().unwrap();
+        db.put_workspace("/repo", "repo", "git").unwrap();
+        db.put_worktree("repo/a", "/repo", "/gone/a", "a", None, None)
+            .unwrap();
+        db.set_workspace_env("/repo", "host").unwrap();
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "host".into(),
+            EnvConfig {
+                placement: PlacementMode::Local,
+                ..Default::default()
+            },
+        );
+        let sample = registry_sample(&db, &cfg).unwrap();
+        let gone = sample_vanished_tabs(
+            &[VanishedGroup {
+                path: "/gone/a".into(),
+                epoch: 1,
+            }],
+            |_| PathState::Missing,
+            || Ok(sample),
+            |_, _| panic!("missing registered rows do not need git confirmation"),
+            &Mutex::new(HashMap::new()),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(gone, ["/gone/a"]);
+    }
+
+    #[test]
+    fn registry_row_is_remote_reads_location_and_env() {
+        let db = Db::open_memory().unwrap();
+        for (root, name) in [
+            ("/location-repo", "location"),
+            ("/local-repo", "local"),
+            ("/pinned-repo", "pinned"),
+            ("/ambient-repo", "ambient"),
+            ("/local-ambient-repo", "local-ambient"),
+        ] {
+            db.put_workspace(root, name, "git").unwrap();
+        }
+        db.put_worktree(
+            "location",
+            "/location-repo",
+            "/location",
+            "location",
+            Some("remote"),
+            None,
+        )
+        .unwrap();
+        db.put_worktree(
+            "local",
+            "/local-repo",
+            "/local",
+            "local",
+            Some("local"),
+            None,
+        )
+        .unwrap();
+        db.put_worktree("pinned", "/pinned-repo", "/pinned", "pinned", None, None)
+            .unwrap();
+        db.set_worktree_env("/pinned", "build").unwrap();
+        db.put_worktree(
+            "ambient",
+            "/ambient-repo",
+            "/ambient",
+            "ambient",
+            None,
+            None,
+        )
+        .unwrap();
+        db.set_workspace_env("/ambient-repo", "kube").unwrap();
+        db.put_worktree(
+            "local-ambient",
+            "/local-ambient-repo",
+            "/local-ambient",
+            "local-ambient",
+            None,
+            None,
+        )
+        .unwrap();
+        db.set_workspace_env("/local-ambient-repo", "host").unwrap();
+
+        let mut cfg = Config::default();
+        for (name, placement) in [
+            ("build", PlacementMode::Ssh),
+            ("kube", PlacementMode::K8s),
+            ("host", PlacementMode::Local),
+        ] {
+            cfg.env.insert(
+                name.into(),
+                EnvConfig {
+                    placement,
+                    ..Default::default()
+                },
+            );
+        }
+        let rows = db.worktrees().unwrap();
+        let mut ambient_cache = HashMap::new();
+        for (path, expected) in [
+            ("/location", true),
+            ("/local", false),
+            ("/pinned", true),
+            ("/ambient", true),
+            ("/local-ambient", false),
+        ] {
+            let row = rows.iter().find(|row| row.worktree == path).unwrap();
+            assert_eq!(
+                registry_row_is_remote(&db, &cfg, row, &mut ambient_cache),
+                expected,
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -1459,7 +1719,7 @@ mod tests {
             |_| PathState::Checkout,
             || {
                 loads.set(loads.get() + 1);
-                Ok((Vec::new(), Vec::new()))
+                Ok(RegistrySample::from_location(Vec::new(), Vec::new()))
             },
             |_, _| false,
             &remote,
@@ -1490,7 +1750,10 @@ mod tests {
             |_| PathState::Missing,
             || {
                 loads.set(loads.get() + 1);
-                Ok((db.worktrees()?, db.workspaces()?))
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
             },
             |_, _| false,
             &remote,
@@ -1506,7 +1769,10 @@ mod tests {
             |_| PathState::Missing,
             || {
                 loads.set(loads.get() + 1);
-                Ok((db.worktrees()?, db.workspaces()?))
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
             },
             |_, _| false,
             &remote,
@@ -1522,7 +1788,10 @@ mod tests {
             |_| PathState::Missing,
             || {
                 loads.set(loads.get() + 1);
-                Ok((db.worktrees()?, db.workspaces()?))
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
             },
             |_, _| false,
             &remote,
@@ -1568,7 +1837,12 @@ mod tests {
         let gone = sample_vanished_tabs(
             &groups,
             dir_path_state,
-            || Ok((db.worktrees()?, db.workspaces()?)),
+            || {
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
+            },
             |_, _| false,
             &remote,
             std::time::Instant::now(),
@@ -1612,7 +1886,12 @@ mod tests {
         let gone = sample_vanished_tabs(
             &groups,
             dir_path_state,
-            || Ok((db.worktrees()?, db.workspaces()?)),
+            || {
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
+            },
             |_, _| false,
             &remote,
             std::time::Instant::now(),
@@ -1631,7 +1910,7 @@ mod tests {
         let gone = sample_vanished_tabs(
             &groups,
             |_| PathState::Missing,
-            || Ok((Vec::new(), Vec::new())),
+            || Ok(RegistrySample::from_location(Vec::new(), Vec::new())),
             |_, _| true,
             &settled,
             std::time::Instant::now(),
@@ -1656,7 +1935,7 @@ mod tests {
                 |_| PathState::Missing,
                 || {
                     loads.set(loads.get() + 1);
-                    Ok((Vec::new(), Vec::new()))
+                    Ok(RegistrySample::from_location(Vec::new(), Vec::new()))
                 },
                 |_, _| {
                     git_calls.set(git_calls.get() + 1);
@@ -1696,7 +1975,7 @@ mod tests {
                 |_| PathState::Missing,
                 || {
                     loads.set(loads.get() + 1);
-                    Ok((Vec::new(), Vec::new()))
+                    Ok(RegistrySample::from_location(Vec::new(), Vec::new()))
                 },
                 |_, _| {
                     git_calls.set(git_calls.get() + 1);
@@ -1736,7 +2015,12 @@ mod tests {
                 epoch: 1,
             }],
             |_| PathState::Remnant,
-            || Ok((db.worktrees()?, db.workspaces()?)),
+            || {
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
+            },
             |_, _| false,
             &settled,
             std::time::Instant::now(),
@@ -1750,7 +2034,12 @@ mod tests {
                 epoch: 2,
             }],
             |_| PathState::Remnant,
-            || Ok((db.worktrees()?, db.workspaces()?)),
+            || {
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
+            },
             |_, _| true,
             &settled,
             std::time::Instant::now(),
@@ -1777,7 +2066,12 @@ mod tests {
                     epoch: 1,
                 }],
                 |_| PathState::Remnant,
-                || Ok((db.worktrees()?, db.workspaces()?)),
+                || {
+                    Ok(RegistrySample::from_location(
+                        db.worktrees()?,
+                        db.workspaces()?,
+                    ))
+                },
                 |_, _| {
                     git_calls.set(git_calls.get() + 1);
                     false
@@ -1809,7 +2103,12 @@ mod tests {
                 epoch: 1,
             }],
             |_| PathState::Missing,
-            || Ok((db.worktrees()?, db.workspaces()?)),
+            || {
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
+            },
             |_, _| panic!("missing registered rows do not need git confirmation"),
             &Mutex::new(HashMap::new()),
             std::time::Instant::now(),
@@ -1896,7 +2195,12 @@ mod tests {
                     dir_path_state(path)
                 }
             },
-            || Ok((db.worktrees()?, db.workspaces()?)),
+            || {
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
+            },
             |path, row_root| {
                 git_confirms_unlisted(
                     &branch_paths,
@@ -1939,7 +2243,12 @@ mod tests {
                     dir_path_state(path)
                 }
             },
-            || Ok((db.worktrees()?, db.workspaces()?)),
+            || {
+                Ok(RegistrySample::from_location(
+                    db.worktrees()?,
+                    db.workspaces()?,
+                ))
+            },
             |path, row_root| {
                 git_confirms_unlisted(
                     &branch_paths,
