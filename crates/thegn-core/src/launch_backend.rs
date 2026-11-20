@@ -294,6 +294,9 @@ fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A saved backend pick as stored in the database (a name, never an argv).
+    const PODMAN_PICK: &str = "podman";
     use crate::capabilities::IsolationClass;
     use crate::config::{DataMode, OnFloorMiss, SandboxBackend};
     use crate::info_model::Shown;
@@ -319,7 +322,7 @@ mod tests {
             (
                 true,
                 SandboxBackend::Bwrap,
-                vec!["podman"],
+                vec![PODMAN_PICK],
                 vec![SandboxBackend::Bwrap],
             ),
             (

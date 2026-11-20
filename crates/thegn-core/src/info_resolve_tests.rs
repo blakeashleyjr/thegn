@@ -52,7 +52,7 @@ fn field<'a>(fields: &'a [Field], key: &str) -> &'a Field {
     fields.iter().find(|field| field.key == key).unwrap()
 }
 
-fn source(fields: &[Field], key: &str) -> &Source {
+fn source<'a>(fields: &'a [Field], key: &str) -> &'a Source {
     field(fields, key).source.as_ref().unwrap()
 }
 
