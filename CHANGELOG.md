@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Info screen: `thegn info` (with `--workspace`, `--worktree`, `--json`), the sidebar key `I` and `Alt I` show what is in force for a workspace or worktree, which layer set each value, and which sandbox backend would launch, using the same rule as a real launch. Remote and provider placements are never probed.
+
 ## [0.1.0-alpha.106] — 2026-11-19
 
 - Docs: help pages for Sprites checkpoint and restore ledger proof, URL auth pinning, the create-time memory policy, `fleet inspect`, the `provision` field of `agent run --json`, the drain warning, the Fly destroy check, `sandbox warm-devshell`, the masthead instance tag and the "Retry failed pull-backs" action. `env snapshot` and `env restore` now refuse a sprite another instance made for the same worktree path.
