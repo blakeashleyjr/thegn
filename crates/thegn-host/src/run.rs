@@ -7873,6 +7873,7 @@ async fn event_loop<T: Terminal>(
         std::collections::VecDeque::new();
     let mut mouse_selecting = false;
     let mut mouse_sel: Option<(u32, crate::copymode::Selection)> = None;
+    let mut search_sel_after_switch: Option<(u32, crate::copymode::Selection)> = None;
     // A destructive delete awaiting its y/N confirmation: (question, targets).
     // A delete worktree action from menu awaiting the user choice
     // Stable group NAMES (not indices): a background reap can shift worktree
@@ -9644,7 +9645,7 @@ async fn event_loop<T: Terminal>(
             let _switch_prep = crate::perf::measure(crate::perf::Subsys::SwitchPrep);
             let prev_worktree = last_active_worktree.replace(current_key.clone());
             // A selection anchored in the previous worktree's pane is stale.
-            mouse_sel = None;
+            mouse_sel = search_sel_after_switch.take();
             // For a remote/provider worktree, connect its resident bridge (off
             // the loop) so git routes through the persistent agent and in-env
             // file edits stream back as refreshes. No-op for local worktrees.
@@ -10607,6 +10608,19 @@ async fn event_loop<T: Terminal>(
                                 }
                             };
                             pending_switch.clear_spinner_if_matches(seq, &mut model.status);
+                            if sb
+                                .create_preview
+                                .as_ref()
+                                .is_some_and(|(preview_seq, _)| *preview_seq == seq)
+                            {
+                                if let Some((_, root)) = sb.create_preview.take() {
+                                    crate::workspace_switch_prep::remove_preview_entry(
+                                        &mut model.sidebar_workspaces,
+                                        &root,
+                                    );
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                }
+                            }
                             match route {
                                 crate::workspace_switch_prep::CreatedRoute::AlreadyOpen {
                                     status,
@@ -10641,6 +10655,20 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                 }
+                crate::workspace_switch_prep::SwitchResult::CreatePreview { seq, entry } => {
+                    if pending_switch.current(seq) {
+                        let root = entry.3.clone();
+                        if crate::workspace_switch_prep::preview_sidebar_entry(
+                            &mut model.sidebar_workspaces,
+                            entry,
+                        ) {
+                            sb.create_preview = Some((seq, root));
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 other => other,
             };
             if let crate::workspace_switch_prep::SwitchResult::Cold { request, result } = &result {
@@ -10664,6 +10692,7 @@ async fn event_loop<T: Terminal>(
                     }
                     continue;
                 }
+                sb.create_preview = None;
                 match result {
                     Err(_) => {
                         model.status = format!(
@@ -12550,6 +12579,7 @@ async fn event_loop<T: Terminal>(
                         .and_then(|old| old.submodule.clone());
                 }
             }
+            sb.filter_deleted(generation, &mut next_model.sidebar_db_worktrees);
             // Idle guard: the 2s safety tick re-hydrates identical git/db data.
             // Compute up front (before `model` is mutated) whether this result
             // carries any render-affecting change; if not, we still apply it
@@ -14688,6 +14718,7 @@ async fn event_loop<T: Terminal>(
             &mut model,
             &mut sb,
         );
+        sb.stamp_deleted(hydration_gen);
         dirty |= applied.changed;
         if drawer_runtime.drain_evictions(&mut panes) {
             sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home);
@@ -21624,6 +21655,18 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                             continue;
                         }
+                        crate::search::SearchOutcome::Rescope(scope) => {
+                            let srcs = crate::search_sources::build_search_sources(
+                                scope, &session, &panes, focused,
+                            );
+                            let srcs_ref: Vec<(u32, &str, &thegn_core::history::HistoryBuffer)> =
+                                srcs.iter()
+                                    .map(|(id, label, buf)| (*id, label.as_str(), *buf))
+                                    .collect();
+                            ov.apply_scope(scope, &srcs_ref);
+                            dirty = true;
+                            continue;
+                        }
                         crate::search::SearchOutcome::Dismiss => {
                             search = None;
                             dirty = true;
@@ -21631,7 +21674,7 @@ async fn event_loop<T: Terminal>(
                         }
                         crate::search::SearchOutcome::Jump(m) => {
                             search = None;
-                            crate::search_sources::apply_search_jump(
+                            let jump = crate::search_sources::apply_search_jump(
                                 m,
                                 &mut session,
                                 &mut panes,
@@ -21640,6 +21683,11 @@ async fn event_loop<T: Terminal>(
                                 &mut sb,
                                 &mut need_relayout,
                             );
+                            if jump.switched_group {
+                                search_sel_after_switch = jump.highlight;
+                            } else {
+                                mouse_sel = jump.highlight;
+                            }
                             dirty = true;
                             continue;
                         }

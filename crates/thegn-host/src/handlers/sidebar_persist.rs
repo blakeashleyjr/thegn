@@ -129,9 +129,38 @@ pub(crate) struct SidebarState {
     /// a config simply doesn't freeze — the conservative direction: a test
     /// fixture gets today's unheld behaviour rather than a silent hold.
     pub(crate) freeze_sort: bool,
+    /// THE-2470: worktree paths whose delete completed, with the hydration
+    /// generation current when the completion was applied (`None` until stamped).
+    pub(crate) recently_deleted: std::collections::HashMap<String, Option<u64>>,
+    /// THE-2463 Q1: the preview project row a pending create added: (seq, repo path).
+    pub(crate) create_preview: Option<(u64, String)>,
 }
 
 impl SidebarState {
+    pub(crate) fn note_deleted(&mut self, path: &str) {
+        self.recently_deleted.insert(path.to_string(), None);
+    }
+
+    pub(crate) fn stamp_deleted(&mut self, hydration_gen: u64) {
+        for generation in self.recently_deleted.values_mut() {
+            if generation.is_none() {
+                *generation = Some(hydration_gen);
+            }
+        }
+    }
+
+    /// Drop entries a newer hydration supersedes (stamped gen < generation),
+    /// then remove rows whose path is still recorded.
+    pub(crate) fn filter_deleted(
+        &mut self,
+        generation: u64,
+        rows: &mut Vec<crate::sidebar::DbWorktree>,
+    ) {
+        self.recently_deleted
+            .retain(|_, stamped| stamped.is_none_or(|stamp| stamp >= generation));
+        rows.retain(|row| !self.recently_deleted.contains_key(&row.path));
+    }
+
     /// Load persisted collapse/sort/pins/width from `ui_state` for this session.
     /// Legacy tombstone rows (`"0"` for the boolean `collapse:`/`pin:` keys,
     /// written before deletes replaced tombstones) are swept as they're read.
@@ -316,6 +345,61 @@ pub(crate) fn read_sidebar_state_from_writer() -> anyhow::Result<Vec<(String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn db_worktree(path: &str) -> crate::sidebar::DbWorktree {
+        crate::sidebar::DbWorktree {
+            path: path.into(),
+            slug: String::new(),
+            branch: String::new(),
+            repo_path: String::new(),
+            tab_name: String::new(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: None,
+            sandbox_profile: None,
+            env_degraded: false,
+            external: false,
+        }
+    }
+
+    #[test]
+    fn filter_deleted_hides_a_row_from_an_older_hydration() {
+        let mut sb = SidebarState::default();
+        sb.note_deleted("/gone");
+        sb.stamp_deleted(7);
+        let mut rows = vec![db_worktree("/gone"), db_worktree("/kept")];
+
+        sb.filter_deleted(7, &mut rows);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/kept");
+        assert_eq!(sb.recently_deleted.get("/gone"), Some(&Some(7)));
+    }
+
+    #[test]
+    fn filter_deleted_forgets_the_path_once_a_newer_hydration_arrives() {
+        let mut sb = SidebarState::default();
+        sb.note_deleted("/gone");
+        sb.stamp_deleted(7);
+        let mut rows = vec![db_worktree("/gone")];
+
+        sb.filter_deleted(8, &mut rows);
+
+        assert_eq!(rows.len(), 1);
+        assert!(sb.recently_deleted.is_empty());
+    }
+
+    #[test]
+    fn unstamped_deletes_are_filtered() {
+        let mut sb = SidebarState::default();
+        sb.note_deleted("/gone");
+        let mut rows = vec![db_worktree("/gone")];
+
+        sb.filter_deleted(8, &mut rows);
+
+        assert!(rows.is_empty());
+        assert_eq!(sb.recently_deleted.get("/gone"), Some(&None));
+    }
 
     #[test]
     fn persist_does_not_block_on_a_held_write_lock() {
