@@ -37,7 +37,7 @@ export THEGN_E2E=1
 # row label) would make every pane-bearing snapshot machine-specific. A wrapper
 # rather than $ENV because thegn's curated pane env doesn't carry ENV/PS1.
 mkdir -p "$_tmp/bin"
-printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND=\nexec /bin/sh --norc --noprofile -i\n' > "$_tmp/bin/e2esh"
+printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND= ENV=/dev/null\nexec /bin/sh -i\n' > "$_tmp/bin/e2esh"
 chmod +x "$_tmp/bin/e2esh"
 export SHELL="$_tmp/bin/e2esh"
 # Cut the session D-Bus: otherwise the developer's live media player leaks
