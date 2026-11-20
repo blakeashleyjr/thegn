@@ -4,7 +4,9 @@ name: work_observe_app_tabs
 # asserts stable center content without changing platform baselines.
 case_tmp_env: XDG_STATE_HOME
 matrix:
-  profiles: [xterm]
+  # Alt+[ and Alt+] need an unambiguous modified-key encoding: their legacy
+  # ESC-prefixed forms alias CSI and OSC. The kitty Muse profile supplies CSI-u.
+  profiles: [kitty]
   sizes: ["120x36"]
 spawn:
   - sh
