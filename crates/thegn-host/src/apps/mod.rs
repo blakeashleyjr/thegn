@@ -33,6 +33,55 @@ use tg_kit::ratatui::buffer::Buffer;
 use tg_kit::{AppTile, Theme};
 use thegn_core::theme::Palette;
 
+static OBSERVE_HOST_FEED: std::sync::OnceLock<gtui_embed::embed::HostFeed> =
+    std::sync::OnceLock::new();
+static OBSERVE_FEED_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The process-wide Observe host feed: filled by the stats ticker from startup
+/// while `[observe]` is enabled, read by every Observe tile built since.
+pub(crate) fn observe_host_feed() -> &'static gtui_embed::embed::HostFeed {
+    OBSERVE_HOST_FEED.get_or_init(gtui_embed::embed::HostFeed::new)
+}
+
+/// Push one masthead sample (called by the stats ticker for every sample).
+pub(crate) fn feed_observe_sample(
+    at_ms: u64,
+    snap: &thegn_metrics::StatsSnapshot,
+    cadence_secs: f64,
+) {
+    feed_if_armed(&OBSERVE_FEED_ARMED, observe_host_feed(), at_ms, snap, cadence_secs);
+}
+
+fn feed_if_armed(
+    armed: &std::sync::atomic::AtomicBool,
+    feed: &gtui_embed::embed::HostFeed,
+    at_ms: u64,
+    snap: &thegn_metrics::StatsSnapshot,
+    cadence_secs: f64,
+) {
+    if !armed.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if crate::e2e_freeze::active() {
+        let frozen = crate::e2e_freeze::stats();
+        feed.push(at_ms as f64 / 1000.0, &frozen, cadence_secs);
+    } else {
+        feed.push(at_ms as f64 / 1000.0, snap, cadence_secs);
+    }
+}
+
+fn arm_feed(
+    armed: &std::sync::atomic::AtomicBool,
+    feed: &gtui_embed::embed::HostFeed,
+    enabled: bool,
+) {
+    let was = armed.swap(enabled, std::sync::atomic::Ordering::AcqRel);
+    if was && !enabled {
+        feed.clear();
+    }
+}
+
 /// Which top-level tab is active. `Work` is the existing worktree IDE chrome;
 /// `Tile(i)` is the app in slot `i`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +239,7 @@ impl AppHost {
     /// When the configured default changes, it takes effect immediately. If
     /// the active tile is removed or disabled, the configured default wins.
     pub fn reconcile(&mut self, cfg: &thegn_core::config::Config) {
+        arm_feed(&OBSERVE_FEED_ARMED, observe_host_feed(), cfg.observe.enabled);
         if self.observe_config_snapshot != cfg.observe {
             if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == "observe") {
                 *slot = AppSlot::new(slot.id.clone(), slot.label.clone());
@@ -861,10 +911,16 @@ pub fn build_observe_tile(
     cfg: &thegn_core::config_observe::ObserveConfig,
     rt: tokio::runtime::Handle,
     theme: Theme,
-    sampler_thread_start: impl FnOnce() + Send + 'static,
+    host_feed: gtui_embed::embed::HostFeed,
 ) -> Result<Box<dyn AppTile>, String> {
-    let tile = gtui_embed::embed::ObserveTile::new(hook, cfg, rt, theme, sampler_thread_start)
-        .map_err(|error| error.to_string())?;
+    let tile = gtui_embed::embed::ObserveTile::new(
+        hook,
+        cfg,
+        rt,
+        theme,
+        gtui_embed::embed::HostSourceInit::Fed(host_feed),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(Box::new(tile))
 }
 
@@ -957,6 +1013,23 @@ pub fn tab_chord(
 mod tests {
     use super::*;
     use termwiz::input::{KeyCode, Modifiers};
+
+    #[test]
+    fn observe_feed_fills_only_while_armed() {
+        let armed = std::sync::atomic::AtomicBool::new(false);
+        let feed = gtui_embed::embed::HostFeed::new();
+        let snap = thegn_metrics::StatsSnapshot::default();
+
+        feed_if_armed(&armed, &feed, 1_000, &snap, 2.0);
+        assert!(feed.is_empty());
+
+        arm_feed(&armed, &feed, true);
+        feed_if_armed(&armed, &feed, 1_000, &snap, 2.0);
+        assert_eq!(feed.len(), 1);
+
+        arm_feed(&armed, &feed, false);
+        assert!(feed.is_empty());
+    }
 
     /// THE-70 root cause B. The intercept must claim plain `Alt+<digit>` and
     /// `Alt+]`/`[` — and nothing else.
