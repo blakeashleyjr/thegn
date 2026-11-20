@@ -23,6 +23,9 @@ use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 // only carries the stage name through `AgentLaunch.stage` and refuses, before
 // any roster row exists, a grant the harness cannot take (`policy_admission`).
 
+#[path = "session_keys.rs"]
+pub(crate) mod keys;
+
 #[derive(clap::Subcommand, Clone)]
 #[expect(
     clippy::large_enum_variant,
@@ -250,8 +253,15 @@ pub enum SessionAction {
         /// Target session id (see `session list`).
         #[arg(long)]
         session: String,
-        /// The text to type.
-        text: String,
+        /// The text to type (omit with --key).
+        #[arg(required_unless_present = "key")]
+        text: Option<String>,
+        /// A named key (repeatable): up, esc, enter, tab, f5, ctrl+c, alt+x, shift+tab…
+        #[arg(long = "key", value_name = "KEY", conflicts_with = "text")]
+        key: Vec<String>,
+        /// Paste the text (bracketed when the pane enabled bracketed paste).
+        #[arg(long, requires = "text")]
+        paste: bool,
         /// Append a carriage return (send-and-run).
         #[arg(long)]
         enter: bool,
@@ -304,7 +314,7 @@ pub enum SessionAction {
             required_unless_present = "session"
         )]
         session_pos: Option<String>,
-        /// Condition: `exited` | `idle` | `blocked` | `done` | `match:<regex>`.
+        /// Condition: `exited` | `idle` | `blocked` | `done` | `match:<regex>` | `screen:<regex>` | `stable:<ms>`.
         #[arg(long, default_value = "exited")]
         until: String,
         /// Milliseconds before giving up (exit 2). Omit to wait forever.
@@ -493,7 +503,7 @@ pub(crate) fn parse_wait_condition(s: &str) -> Result<serde_json::Value> {
             Some(rx) => serde_json::json!({ "kind": "output_matches", "regex": rx }),
             None => anyhow::bail!(
                 "unknown wait condition '{other}' \
-                 (expected exited|idle|blocked|done|match:<regex>)"
+                 (expected exited|idle|blocked|done|match:<regex>|screen:<regex>|stable:<ms>)"
             ),
         },
     };
@@ -816,12 +826,39 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         SessionAction::Send {
             session,
             text,
+            key,
+            paste,
             enter,
         } => {
-            client.send_input(&session, text.as_bytes(), enter).await?;
+            let bytes = if !key.is_empty() {
+                anyhow::ensure!(
+                    key.len() <= keys::MAX_KEYS,
+                    "too many keys (maximum is {})",
+                    keys::MAX_KEYS
+                );
+                let (_, rows, cols, ansi) = client.snapshot(&session).await?;
+                let modes = keys::screen_modes(rows, cols, &ansi);
+                let parsed = key
+                    .iter()
+                    .map(|spec| keys::parse_key(spec))
+                    .collect::<Result<Vec<_>>>()?;
+                keys::encode_keys(&parsed, modes.app_cursor)?
+            } else {
+                let text = text
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("text is required unless --key is present"))?;
+                if paste {
+                    let (_, rows, cols, ansi) = client.snapshot(&session).await?;
+                    let modes = keys::screen_modes(rows, cols, &ansi);
+                    keys::paste_bytes(text, modes.bracketed_paste)?
+                } else {
+                    text.as_bytes().to_vec()
+                }
+            };
+            client.send_input(&session, &bytes, enter).await?;
             outln!(
                 "sent {} byte(s) to {}",
-                text.len() + usize::from(enter),
+                bytes.len() + usize::from(enter),
                 display_cell(&session)
             );
         }
@@ -837,9 +874,14 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             // to plain rows through the same emulator the panes use.
             let plain = text.then(|| snapshot_text(rows, cols, &ansi));
             if json {
+                let modes = keys::screen_modes(rows, cols, &ansi);
                 let mut doc = serde_json::json!({
                     "session": session, "seq": seq, "rows": rows, "cols": cols,
                     "ansi_b64": base64::engine::general_purpose::STANDARD.encode(&ansi),
+                    "cursor": { "row": modes.cursor_row, "col": modes.cursor_col },
+                    "alt_screen": modes.alt_screen,
+                    "app_cursor": modes.app_cursor,
+                    "bracketed_paste": modes.bracketed_paste,
                 });
                 if let Some(t) = plain {
                     doc["text"] = serde_json::Value::String(t);
@@ -895,8 +937,12 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             json,
         } => {
             let session = session_target(session, session_pos)?;
-            let condition = parse_wait_condition(&until)?;
-            let outcome = client.wait(&session, condition, timeout).await?;
+            let outcome = if let Some(wait) = keys::parse_screen_wait(&until)? {
+                keys::wait_screen(&client, &session, &wait, timeout).await?
+            } else {
+                let condition = parse_wait_condition(&until)?;
+                client.wait(&session, condition, timeout).await?
+            };
             let matched = outcome
                 .get("matched")
                 .and_then(|v| v.as_bool())
@@ -2517,6 +2563,54 @@ mod session_target_tests {
             error
                 .to_string()
                 .contains("Usage: thegn session snapshot [OPTIONS] [SESSION]")
+        );
+    }
+
+    #[test]
+    fn send_accepts_repeatable_keys() {
+        let action = parse(&[
+            "thegn",
+            "session",
+            "send",
+            "--session",
+            "s",
+            "--key",
+            "up",
+            "--key",
+            "ctrl+c",
+        ])
+        .unwrap();
+        match action {
+            SessionAction::Send {
+                text, key, paste, ..
+            } => {
+                assert_eq!(text, None);
+                assert_eq!(key, vec!["up".to_string(), "ctrl+c".to_string()]);
+                assert!(!paste);
+            }
+            _ => panic!("expected send"),
+        }
+    }
+
+    #[test]
+    fn send_requires_text_or_key() {
+        assert!(parse(&["thegn", "session", "send", "--session", "s"]).is_err());
+    }
+
+    #[test]
+    fn send_paste_requires_text() {
+        assert!(
+            parse(&[
+                "thegn",
+                "session",
+                "send",
+                "--session",
+                "s",
+                "--key",
+                "up",
+                "--paste",
+            ])
+            .is_err()
         );
     }
 }
