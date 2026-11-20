@@ -17,6 +17,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         "Projects & worktrees",
         &[
             "wt",
+            "info",
             "repo",
             "program",
             "open",
