@@ -5661,6 +5661,11 @@ pub(crate) fn set_config_source(overrides: Vec<String>, config: Option<std::path
     let _ = CONFIG_SOURCE.set((overrides, config)); // best-effort: first-set-wins: the first config source serves for the process
 }
 
+/// The `--config` path this process started with (`None` = the default path).
+pub(crate) fn config_source_path() -> Option<std::path::PathBuf> {
+    CONFIG_SOURCE.get().and_then(|(_, path)| path.clone())
+}
+
 /// The one config every off-loop hydration path uses. In a process that ran
 /// startup admission this is the latest **admitted** generation — the exact
 /// snapshot the loop published (hosts included), with no reparse and no

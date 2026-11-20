@@ -2385,8 +2385,7 @@ impl WorktreeAuxStore for Db {
     // --- per-worktree disk usage cache (v20) -------------------------------
     /// `(size_bytes, target_bytes, fetched_at)` for one worktree, or `None`.
     fn get_worktree_disk(&self, worktree: &str) -> Result<Option<(i64, i64, i64)>> {
-        let r = self
-            .conn()
+        self.conn()
             .query_row(
                 "SELECT size_bytes, target_bytes, fetched_at FROM worktree_disk WHERE worktree=?1",
                 params![worktree],
@@ -2398,8 +2397,8 @@ impl WorktreeAuxStore for Db {
                     ))
                 },
             )
-            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
-        Ok(r)
+            .optional()
+            .map_err(Into::into)
     }
 
     fn put_worktree_disk(&self, worktree: &str, size_bytes: i64, target_bytes: i64) -> Result<()> {
