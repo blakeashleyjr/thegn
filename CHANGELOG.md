@@ -7,6 +7,22 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn session send --key` presses named keys (`up`, `esc`, `f5`, `ctrl+c`…) and `--paste` sends bracketed paste; `session wait --until` takes `screen:<regex>` and `stable:<ms>`; MCP `sessions_input` takes `keys` and `paste`, and `sessions_snapshot` reports the cursor and screen modes. Who may type is unchanged (THE-2475).
+- Sidebar row menu: "Info…" opens the Info screen for the row.
+
+### Changed
+
+- Sprites restore reads the checkpoint first and refuses a missing or unhealthy one. `fleet cost` marks a sprite younger than an hour `recent`, as its usage may not be reported yet (THE-2451).
+- Observe: a partial window says how much it covers, e.g. `partial: last 3m of 15m`.
+
+### Fixed
+
+- The reaper no longer retires worktrees whose location is remote or whose effective environment is ssh, k8s or a provider (THE-2472).
+- A deleted worktree no longer reappears in the sidebar from an older refresh (THE-2470).
+- Info explains against the `--config` path the TUI started with, and shows a failed state-database read as "unknown" instead of unset.
+
 ## [0.1.0-alpha.107] — 2026-11-19
 
 ### Added
