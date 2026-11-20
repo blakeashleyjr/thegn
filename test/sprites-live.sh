@@ -593,7 +593,10 @@ checkpoint_create() {
       candidate="${line#created checkpoint: }"
       case "$candidate" in
       '' | *[!A-Za-z0-9_.-]*) ;;
-      *) CHECKPOINT_ID="$candidate"; break ;;
+      *)
+        CHECKPOINT_ID="$candidate"
+        break
+        ;;
       esac
       ;;
     esac
