@@ -5,7 +5,6 @@ use crate::env::Environment;
 use crate::info_model::{BackendRow, Field, Source, keys};
 use crate::placement::Placement;
 use crate::sandbox::Backend;
-use crate::seam::Kind as _;
 
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -113,6 +112,17 @@ pub fn candidates(sb: &SandboxConfig) -> Vec<SandboxConfig> {
     out
 }
 
+/// Whether an enabled `auto` sandbox's configured `backend_chain` explicitly
+/// lists the host (`host`/`none`). Only the user's own chain counts — the
+/// implicit host tail `candidates` appends is not consent.
+pub fn auto_chain_names_host(sandbox: &SandboxConfig) -> bool {
+    sandbox.enabled
+        && sandbox.backend == SandboxBackend::Auto
+        && sandbox.backend_chain.iter().any(|name| {
+            SandboxBackend::from_str_validated(name).is_ok_and(|b| b == SandboxBackend::None)
+        })
+}
+
 /// Predict the backend and isolation fields shown by the Info screen.
 pub fn predict(
     environment: &Environment,
@@ -134,31 +144,34 @@ pub fn predict(
         .iter()
         .map(|c| c.backend.as_str().to_string())
         .collect();
-    let floors: Vec<IsolationFloor> = cands
-        .iter()
-        .map(|c| crate::sandbox_floor::floor_in_force(c, false))
-        .collect();
+    let floor = crate::sandbox_floor::floor_in_force(&req.sandbox, false);
+    let policy = crate::sandbox_floor::miss_policy_in_force(&req.sandbox);
+    let floors = vec![floor; cands.len()];
+    let host_allowed = environment.placement.is_local()
+        && (!req.sandbox.enabled
+            || req.sandbox.backend == SandboxBackend::None
+            || auto_chain_names_host(&req.sandbox));
     let local = exec.is_local();
     let (rows, chosen) = if local {
         let oci = (!req.sandbox.oci_runtime.trim().is_empty())
             .then_some(req.sandbox.oci_runtime.as_str());
         let support = crate::sandbox_support::support_report(&names, &exec, oci);
-        let chosen = choose(&support, &floors);
-        let rows =
-            support
-                .iter()
-                .enumerate()
-                .map(|(index, row)| BackendRow {
-                    name: row.name.clone(),
-                    state: format!("{:?}", row.state).to_lowercase(),
-                    isolation: row.isolation.map(|c| c.as_str().to_string()),
-                    meets_floor: Some(row.isolation.is_none_or(|class| {
-                        crate::sandbox_floor::class_meets(class, floors[index])
-                    })),
-                    chosen: chosen == Some(index),
-                    remedy: row.remedy.clone(),
-                })
-                .collect();
+        let chosen = choose(&support, &floors, policy, host_allowed);
+        let rows = support
+            .iter()
+            .enumerate()
+            .map(|(index, row)| BackendRow {
+                name: row.name.clone(),
+                state: format!("{:?}", row.state).to_lowercase(),
+                isolation: row.isolation.map(|c| c.as_str().to_string()),
+                meets_floor: Some(
+                    row.isolation
+                        .is_none_or(|class| crate::sandbox_floor::class_meets(class, floor)),
+                ),
+                chosen: chosen == Some(index),
+                remedy: row.remedy.clone(),
+            })
+            .collect();
         (rows, chosen)
     } else {
         (
@@ -197,6 +210,13 @@ pub fn predict(
             "none (sandbox disabled)",
             Source::Env(environment.name.clone()),
         )
+    } else if environment.unresolved_selection && req.sandbox.backend != SandboxBackend::None {
+        Field::unknown(
+            keys::SANDBOX_SELECTED_BACKEND,
+            "Selected backend",
+            format!("env `{}` is not defined; launch halts", environment.name),
+        )
+        .warned()
     } else if local {
         if let Some(index) = chosen {
             Field::value(
@@ -206,14 +226,13 @@ pub fn predict(
                 Source::Probe,
             )
         } else {
-            let floor = crate::sandbox_floor::floor_in_force(&req.sandbox, false);
             Field::unknown(
                 keys::SANDBOX_SELECTED_BACKEND,
                 "Selected backend",
                 format!(
-                    "no candidate is usable at floor {}; launch follows on_floor_miss = {}",
+                    "no candidate is ready and admitted at floor {} (on_floor_miss = {}); launch refuses, see `thegn doctor`",
                     floor.as_str(),
-                    crate::sandbox_floor::miss_policy_in_force(&req.sandbox).as_str()
+                    policy.as_str()
                 ),
             )
             .warned()
@@ -229,7 +248,6 @@ pub fn predict(
         )
     };
     fields.push(selected);
-    let floor = crate::sandbox_floor::floor_in_force(&req.sandbox, false);
     fields.push(Field::value(
         keys::SANDBOX_ISOLATION_FLOOR,
         "Isolation floor",
@@ -243,8 +261,12 @@ pub fn predict(
     fields.push(Field::value(
         keys::SANDBOX_ON_FLOOR_MISS,
         "On floor miss",
-        crate::sandbox_floor::miss_policy_in_force(&req.sandbox).as_str(),
-        Source::Env(environment.name.clone()),
+        policy.as_str(),
+        if req.sandbox.isolation_floor.is_some() {
+            Source::Env(environment.name.clone())
+        } else {
+            Source::Builtin
+        },
     ));
     (fields, rows)
 }
@@ -252,13 +274,19 @@ pub fn predict(
 fn choose(
     rows: &[crate::sandbox_support::BackendSupport],
     floors: &[IsolationFloor],
+    policy: crate::config::OnFloorMiss,
+    host_allowed: bool,
 ) -> Option<usize> {
     rows.iter().enumerate().find_map(|(index, row)| {
         let floor = floors.get(index).copied()?;
         (row.state.usable()
-            && row
-                .isolation
-                .is_none_or(|class| crate::sandbox_floor::class_meets(class, floor)))
+            && (row.backend != Backend::None || host_allowed)
+            && row.isolation.is_none_or(|class| {
+                !matches!(
+                    crate::sandbox_floor::decide(floor, policy, class, class),
+                    crate::sandbox_floor::FloorDecision::Fail(_)
+                )
+            }))
         .then_some(index)
     })
 }
@@ -267,7 +295,8 @@ fn choose(
 mod tests {
     use super::*;
     use crate::capabilities::IsolationClass;
-    use crate::config::{DataMode, SandboxBackend};
+    use crate::config::{DataMode, OnFloorMiss, SandboxBackend};
+    use crate::info_model::Shown;
     use crate::placement::{ProviderPlacement, SshPlacement, TransportKind};
     use crate::sandbox_support::{BackendState, BackendSupport};
 
@@ -409,20 +438,29 @@ mod tests {
             ),
         ];
         assert_eq!(
-            choose(&rows, &[IsolationFloor::Off, IsolationFloor::Off]),
+            choose(
+                &rows,
+                &[IsolationFloor::Off, IsolationFloor::Off],
+                OnFloorMiss::Fail,
+                true,
+            ),
             Some(0)
         );
         assert_eq!(
             choose(
                 &rows,
-                &[IsolationFloor::GuestKernel, IsolationFloor::GuestKernel]
+                &[IsolationFloor::GuestKernel, IsolationFloor::GuestKernel],
+                OnFloorMiss::Fail,
+                true,
             ),
             Some(1)
         );
         assert_eq!(
             choose(
                 &rows,
-                &[IsolationFloor::GuestKernel, IsolationFloor::UserspaceKernel]
+                &[IsolationFloor::GuestKernel, IsolationFloor::UserspaceKernel],
+                OnFloorMiss::Fail,
+                true,
             ),
             Some(1)
         );
@@ -432,7 +470,108 @@ mod tests {
             BackendState::NotInstalled,
             IsolationClass::SharedKernel,
         )];
-        assert_eq!(choose(&none, &[IsolationFloor::Off]), None);
+        assert_eq!(
+            choose(&none, &[IsolationFloor::Off], OnFloorMiss::Fail, true),
+            None
+        );
+    }
+
+    #[test]
+    fn choose_degrades_below_floor_and_rejects_implicit_host() {
+        let rows = vec![
+            support(
+                Backend::Bwrap,
+                "bwrap",
+                BackendState::Ready,
+                IsolationClass::SharedKernel,
+            ),
+            support(
+                Backend::Docker,
+                "docker",
+                BackendState::Ready,
+                IsolationClass::GuestKernel,
+            ),
+        ];
+        assert_eq!(
+            choose(
+                &rows,
+                &[IsolationFloor::GuestKernel, IsolationFloor::GuestKernel],
+                OnFloorMiss::Degrade,
+                true,
+            ),
+            Some(0)
+        );
+
+        let host = vec![support(
+            Backend::None,
+            "none",
+            BackendState::Ready,
+            IsolationClass::HostProcess,
+        )];
+        assert_eq!(
+            choose(&host, &[IsolationFloor::Off], OnFloorMiss::Fail, false),
+            None
+        );
+    }
+
+    fn local_environment(sandbox: SandboxConfig) -> Environment {
+        Environment {
+            name: "local".into(),
+            placement: Placement::Local,
+            sandbox,
+            data: DataMode::InEnv,
+            unresolved_selection: false,
+        }
+    }
+
+    fn selected_backend_field(fields: &[Field]) -> &Field {
+        fields
+            .iter()
+            .find(|field| field.key == keys::SANDBOX_SELECTED_BACKEND)
+            .expect("selected backend field")
+    }
+
+    #[test]
+    fn predict_local_auto_without_host_refuses_implicit_none() {
+        let mut sb = sandbox(SandboxBackend::Auto);
+        sb.enabled = true;
+        sb.backend_chain = vec![];
+        let (fields, rows) = predict(&local_environment(sb), None);
+        let field = selected_backend_field(&fields);
+        assert!(matches!(
+            &field.shown,
+            Shown::Unknown(why)
+                if why == "no candidate is ready and admitted at floor shared-kernel (on_floor_miss = fail); launch refuses, see `thegn doctor`"
+        ));
+        assert!(field.warn);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].chosen);
+    }
+
+    #[test]
+    fn predict_local_auto_with_host_in_chain_shows_none_ready() {
+        let mut sb = sandbox(SandboxBackend::Auto);
+        sb.enabled = true;
+        sb.backend_chain = vec!["host".into()];
+        sb.isolation_floor = Some(IsolationFloor::Off);
+        let (fields, rows) = predict(&local_environment(sb), None);
+        assert_eq!(
+            &selected_backend_field(&fields).shown,
+            &Shown::Value("none (ready)".into())
+        );
+        assert!(rows[0].chosen);
+    }
+
+    #[test]
+    fn predict_local_disabled_sandbox_shows_none_disabled() {
+        let mut sb = sandbox(SandboxBackend::Auto);
+        sb.enabled = false;
+        let (fields, rows) = predict(&local_environment(sb), None);
+        assert_eq!(
+            &selected_backend_field(&fields).shown,
+            &Shown::Value("none (sandbox disabled)".into())
+        );
+        assert!(rows[0].chosen);
     }
 
     #[test]
