@@ -259,3 +259,68 @@ untracked files, has a process running inside it (Linux only). Live sessions and
 rows are not checked. Each worktree is re-checked just before its removal and
 skipped if it changed meanwhile. A removal that fails is reported and the rest continue; the exit
 status is non-zero if any failed.
+
+## Info screen
+
+The Info screen answers "what is actually in force here, and who set it" for a
+workspace or one worktree: identity, git facts, live sessions, the effective
+sandbox settings, which backend would launch, and any per-worktree overrides.
+
+| Surface     | How                                                              |
+| ----------- | ---------------------------------------------------------------- |
+| Sidebar     | `I` on a row (workspace or worktree)                             |
+| Anywhere    | `Alt I`, or the palette action "Info screen" (`open-info`)       |
+| CLI         | `thegn info [--workspace SLUG\|PATH] [--worktree PATH\|BRANCH]`  |
+| CLI, JSON   | `thegn info --json`                                              |
+
+The target is the row under the sidebar cursor when the sidebar is focused,
+otherwise the active worktree. The CLI defaults to the worktree you are in. The
+screen opens at once and fills in when the report is gathered; it reads the
+database, so it is not available while the schema is being refused.
+
+`--json` prints the same report the screen renders, with `"schema": 1`. The
+shape is a stable API: changes are additive only.
+
+### Source labels
+
+Every value names the layer that set it, or says why it has none.
+
+| Label                | Meaning                                                              |
+| -------------------- | -------------------------------------------------------------------- |
+| builtin              | the compiled-in default                                              |
+| global, profile file | your global or profile config file                                   |
+| runtime              | a runtime override                                                   |
+| loaded (differs)     | the file on disk no longer matches what thegn loaded; restart or reload |
+| profile table, workspace, repo, zone | the named layer or table in your own config     |
+| env NAME             | the environment definition that supplied it                          |
+| placement            | forced by where the worktree runs                                    |
+| worktree pick, worktree db | a choice saved for this worktree                               |
+| probed now           | checked while building the report                                    |
+| recorded             | the last value thegn saw, not a fresh check                          |
+| cache NAME, 3m ago   | a cached value and its age                                           |
+| git, daemon, database, sidebar | where a live fact was read from                            |
+| not measured         | nothing was read; the TUI only shows ahead/behind/dirty from the sidebar cache |
+
+Secrets and credential-bearing URLs are never shown, and error text from the
+merge queue and pull requests is redacted.
+
+### Which backend would launch
+
+The backend candidates list shows each candidate's state, isolation class and
+whether it meets the isolation floor. "Selected backend" is the first candidate
+that is ready and meets the floor, using the same rule as a real launch. The
+settings use the same trust resolution as launch, including the zone ceiling.
+
+Limits:
+
+- Remote placements (ssh, Kubernetes, provider sandboxes) are never probed:
+  waking a sprite could start billing. The screen shows "decided inside
+  <placement> at launch; not probed" and the last recorded backend.
+- The workspace view resolves for the repository's root checkout, as launch
+  does. When `sandbox.main_env` is set, a note says new worktrees resolve
+  `default_env` instead.
+- `devcontainer.json`, the sealed-home gate and the compose gate are applied at
+  launch and are not reflected; a note on the screen says so.
+- Ahead/behind and dirty come from the sidebar cache in the TUI ("not
+  measured" when absent). The CLI reads them from git for the one worktree it
+  describes.

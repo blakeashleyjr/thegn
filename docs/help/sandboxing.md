@@ -428,6 +428,10 @@ a red gate or conflict to the fixer agent.
 
 ## Inspecting
 
+To see which backend would launch for a worktree, and which layer chose each
+setting, run `thegn info` or press `Alt I` (see the Info screen section of
+Workspaces and worktrees).
+
 The panel's **system → sandbox** section shows the live state for the
 focused worktree: the backend, image, mounts, DNS filtering, and the
 container's status and cpu/mem/net when one exists; the wider views add
