@@ -474,7 +474,7 @@ impl DaytonaProvider {
             .collect())
     }
 
-    /// The typed sibling of [`Self::parse_list`] (same envelope and id
+    /// The typed sibling of the test-only `parse_list` (same envelope and id
     /// refusals): optional `status|state`, `created_at|createdAt`,
     /// `class|size` and `region|target` are read tolerantly (absent or
     /// wrong-typed ⇒ `None`).

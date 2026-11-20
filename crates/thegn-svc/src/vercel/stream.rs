@@ -4,7 +4,7 @@
 //!
 //! stdout and stderr are merged into [`ExecFrame::Stdout`] in log order.
 //! `Close` (or the caller dropping the control sender) kills the command with
-//! SIGTERM, then SIGKILL after [`KILL_GRACE`]. The driver calls the control
+//! SIGTERM, then SIGKILL after `KILL_GRACE`. The driver calls the control
 //! plane after `open_stream` returns, so it needs an owned provider: the
 //! receiver is `Arc<Self>`.
 
@@ -204,7 +204,7 @@ pub(super) async fn drive_stream<O: StreamOps, L>(
     }
 }
 
-/// SIGTERM, wait up to [`KILL_GRACE`] for the command to end (forwarding its
+/// SIGTERM, wait up to `KILL_GRACE` for the command to end (forwarding its
 /// last output and exit), then SIGKILL.
 async fn terminate<O: StreamOps>(
     ops: &O,
