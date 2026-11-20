@@ -152,6 +152,20 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState, restor
             Some(b) => ("200 OK", "application/octet-stream", b),
             None => ("404 Not Found", "text/plain", b"missing".to_vec()),
         }
+    } else if method == "POST" && path.split('?').next() == Some("/v1/sprites") {
+        // Echo the requested name, as the real API does: create refuses any other.
+        let name = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("name").and_then(|name| name.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "tgtest1".to_owned());
+        (
+            "200 OK",
+            "application/json",
+            format!(
+                r#"{{"id":"sprite-abc","name":"{name}","status":"cold","url":"https://x.sprites.app"}}"#
+            )
+            .into_bytes(),
+        )
     } else {
         route(&method, &path, restore_error)
     };
