@@ -3170,6 +3170,18 @@ mod tests {
             assert_eq!(actual.origin, expected.origin, "{key}");
             assert_eq!(actual.trace, expected.trace, "{key}");
         }
+        let backend = layers.origin("sandbox.backend");
+        assert_eq!(backend.trace[1].1, serde_json::json!("auto"));
+        assert_eq!(backend.trace[2].0, TrustLevel::Profile);
+        assert_eq!(backend.trace[2].1, serde_json::json!("podman"));
+        let network = layers.origin("sandbox.network");
+        assert_eq!(network.origin, TrustLevel::Runtime);
+        assert_eq!(network.value, serde_json::json!("none"));
+        assert_eq!(
+            layers.origin("sandbox.default_env").trace[1].1,
+            serde_json::json!("local")
+        );
+        assert_eq!(layers.origin("no.such.key").value, serde_json::Value::Null);
     }
 
     #[test]
