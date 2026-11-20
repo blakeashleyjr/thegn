@@ -62,16 +62,43 @@ if [ "${STUB_MODE:-}" = continue ]; then
     ;;
   "env pull") echo 'fast-forwarded sp-live'; exit 0 ;;
   "env down") rm -f "$XDG_STATE_HOME/thegn/vps/sp-live.json"; touch "$XDG_STATE_HOME/down"; exit 0 ;;
+  "env down --worktree "*)
+    rm -f "$XDG_STATE_HOME/thegn/vps/sp-live.json"
+    touch "$XDG_STATE_HOME/down"
+    touch "$STUB_LOG.fallback-down"
+    exit 0
+    ;;
   "env reap --provider sprites --unrecorded --json") echo '{"apply":false,"results":[],"accounts":[{"entries":[{"name":"sx-foreign","class":"unrecorded"}]}]}'; exit 0 ;;
   "env reap"*) echo '{"orphans":[]}'; exit 0 ;;
-  "env deprovision"*) exit 0 ;;
+  "env deprovision"*)
+    if [ "${STUB_DEPROVISION_REFUSED:-}" = 1 ]; then exit 1; fi
+    exit 0
+    ;;
   "fleet list"*)
     if [ -e "$XDG_STATE_HOME/down" ]; then
-      echo '{"view":{"rows":[],"down":[{"id":"sp-live"}],"missing":[],"partial":false}}'
+      if [ "${STUB_DEPROVISION_REFUSED:-}" = 1 ] &&
+        [ -e "$STUB_LOG.deprov-list-seen" ] &&
+        [ ! -e "$STUB_LOG.fallback-down" ]; then
+        echo '{"view":{"rows":[{"id":"sp-live","state":"warm"}],"partial":false}}'
+      else
+        echo '{"view":{"rows":[],"down":[{"id":"sp-live"}],"missing":[],"partial":false}}'
+        if [ "${STUB_DEPROVISION_REFUSED:-}" = 1 ] && [ ! -e "$STUB_LOG.deprov-list-seen" ]; then
+          touch "$STUB_LOG.deprov-list-seen"
+          mkdir -p "$XDG_STATE_HOME/thegn/vps"
+          printf '%s\n' '{"provider":"sprites","state":"ready"}' >"$XDG_STATE_HOME/thegn/vps/sp-live.json"
+        fi
+      fi
     elif [ "${STUB_FLEET_OTHER_COLD:-}" = 1 ]; then
       echo '{"view":{"rows":[{"id":"sx-foreign","state":"cold"}],"partial":false}}'
     elif [ -e "$STUB_LOG.fleet-cost" ] && [ "${STUB_FLEET_PARTIAL_AFTER_COST:-}" = 1 ] && [ "${STUB_FLEET_PARTIAL:-}" = 1 ]; then
       echo '{"view":{"rows":[],"partial":true}}'
+    elif [ -e "$STUB_LOG.fleet-cost" ] && [ "${STUB_FLEET_RUNNING_THEN_PARTIAL:-}" = 1 ]; then
+      if [ -s "$STUB_LOG.fleet-running-reads" ]; then
+        echo '{"view":{"rows":[],"partial":true}}'
+      else
+        echo 1 >"$STUB_LOG.fleet-running-reads"
+        echo '{"view":{"rows":[{"id":"sp-live","state":"running"}],"partial":false}}'
+      fi
     elif [ -e "$STUB_LOG.fleet-cost" ] && [ "${STUB_FLEET_RUNNING_READS:-0}" -gt 0 ]; then
       running_reads=0
       if [ -f "$STUB_LOG.fleet-running-reads" ]; then
@@ -101,7 +128,10 @@ if [ "${STUB_MODE:-}" = continue ]; then
     exit 0
     ;;
   "fleet inspect"*) echo '{"memory_limit_mb":2048}'; exit 0 ;;
-  *"exit 3"*) echo boom; exit 3 ;;
+  *"exit 3"*)
+    if [ "${STUB_EXEC_STDERR:-}" = 1 ]; then echo boom >&2; else echo boom; fi
+    exit 3
+    ;;
   "sprite-exec sp-live -- true") exit 0 ;;
   *"--hold"*) /usr/bin/sleep 2; exit 0 ;;
   *"git -c user.name=live"*) echo '1111111111111111111111111111111111111111'; exit 0 ;;
@@ -145,6 +175,7 @@ run() {
   done
   [ $# -gt 0 ] && shift
   : >"$LOG"
+  rm -f "$LOG.fleet-cost" "$LOG.fleet-running-reads"
   env -u THEGN_BIN -u THEGN_CHANNEL -u STUB_DOCTOR -u THEGN_LOG PATH="$T/bin:$PATH" STUB_LOG="$LOG" TMPDIR="$T/tmp" \
     "${envs[@]}" bash "$ROOT/test/$script" "$@" >"$T/$name.out" 2>&1 </dev/null || rc=$?
   echo "$rc" >"$T/$name.rc"
@@ -306,6 +337,7 @@ run keep-going-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB
   "${SX[@]}" --keep-going
 if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
   has "$T/keep-going-sprites.out" "PASS 4b" &&
+  has "$T/keep-going-sprites.out" "arrived on stdout" &&
   has "$T/keep-going-sprites.out" "TIME 4b " &&
   has "$T/keep-going-sprites.out" "STARTUP cold create (env up): " &&
   has "$T/keep-going-sprites.out" "STARTUP wake from cold (sprite-exec -- true): " &&
@@ -324,6 +356,15 @@ if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
   pass "sprites-live: --keep-going records a failure, continues, and avoids repeat force-down"
 else
   fail "sprites-live: --keep-going acting run ($(cat "$T/keep-going-sprites.out"))"
+fi
+
+run exec-stderr-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_EXEC_STDERR=1 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if has "$T/exec-stderr-sprites.out" "PASS 4b" &&
+  has "$T/exec-stderr-sprites.out" "arrived on stderr"; then
+  pass "sprites-live: sprite-exec stderr marker is accepted on stderr"
+else
+  fail "sprites-live: sprite-exec stderr marker ($(cat "$T/exec-stderr-sprites.out"))"
 fi
 
 run memprobe-enforced sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_MEMPROBE=enforced STUB_DOCTOR="$T/tok-true.json" -- \
@@ -394,11 +435,32 @@ fi
 
 run cost-list-partial-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_FLEET_PARTIAL=1 STUB_FLEET_PARTIAL_AFTER_COST=1 STUB_DOCTOR="$T/tok-true.json" -- \
   "${SX[@]}" --keep-going
-if has "$T/cost-list-partial-sprites.out" "WARN 10b: the provider listing could not be read after fleet cost; the wake check is unproven" &&
+if ! has "$T/cost-list-partial-sprites.out" "FAIL 10:" &&
+  has "$T/cost-list-partial-sprites.out" "WARN 10b: the provider listing could not be read after fleet cost; the wake check is unproven" &&
   has "$T/cost-list-partial-sprites.out" "PASS 10b"; then
   pass "sprites-live: an unreadable post-cost listing warns and passes"
 else
   fail "sprites-live: partial post-cost listing ($(cat "$T/cost-list-partial-sprites.out"))"
+fi
+
+run cost-running-partial-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_FLEET_RUNNING_THEN_PARTIAL=1 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if has "$T/cost-running-partial-sprites.out" "FAIL 10b" &&
+  has "$T/cost-running-partial-sprites.out" "stayed running" &&
+  ! has "$T/cost-running-partial-sprites.out" "wake check is unproven"; then
+  pass "sprites-live: a running read followed by partial listings fails the wake gate"
+else
+  fail "sprites-live: running then partial post-cost listing ($(cat "$T/cost-running-partial-sprites.out"))"
+fi
+
+run deprovision-refused-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_DEPROVISION_REFUSED=1 STUB_DOCTOR="$T/tok-true.json" -- \
+  "${SX[@]}" --keep-going
+if has "$T/deprovision-refused-sprites.log" "thegn env down --worktree" &&
+  has "$T/deprovision-refused-sprites.out" "FAILED STEPS: 1b" &&
+  ! has "$T/deprovision-refused-sprites.out" "FAILED STEPS: 1b, 11"; then
+  pass "sprites-live: refused deprovision falls back to worktree down without changing the result"
+else
+  fail "sprites-live: refused deprovision fallback ($(cat "$T/deprovision-refused-sprites.out"))"
 fi
 
 rm -f "$LOG.daemon-pid"

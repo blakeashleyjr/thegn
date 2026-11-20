@@ -121,7 +121,7 @@ Steps:
   8f  env restore of it exits 0 (ledger proof, health check, stream completion)
   7g  (only with --with-agent <name>) agent run --wait --pull --json spends model usage;
       poll /v1/tasks every 15 s while it runs
-      (on failure prints the agent's status, exit code and error, never secrets).
+      (on failure prints the agent's status, exit code and error, never secrets)
   7h  (only with --with-agent <name>) agent JSON is exited 0 and pull.ok is true
   7i  (only with --with-agent <name>) /v1/tasks includes thegn-hold- during the run
       (7g first starts this run's own pane daemon on the fresh state; teardown stops it)
@@ -308,7 +308,14 @@ teardown() {
     for n in $names; do
       case "$n" in *[!a-z0-9-]*) continue ;; esac
       echo "-- teardown: env deprovision $n"
-      "$THEGN_BIN" "${MIN_RAM_SET[@]}" env deprovision "$n" --env "$env_name" # destroy proves ownership via this run's ledger
+      if ! "$THEGN_BIN" "${MIN_RAM_SET[@]}" env deprovision "$n" --env "$env_name"; then
+        if ! listing_lacks_name "$n"; then
+          (cd "$REPO" && "$THEGN_BIN" "${MIN_RAM_SET[@]}" env down --worktree "$REPO" --force)
+          if case "$(live_listing "$env_name" "$n")" in present\ *) true ;; *) false ;; esac; then
+            echo "-- teardown: sandbox $n still exists; remove it with thegn env reap"
+          fi
+        fi
+      fi
     done
     echo "-- teardown: env reap"
     "$THEGN_BIN" env reap --provider sprites --apply --yes
@@ -382,13 +389,22 @@ head_matches() { # the sprite workspace HEAD equals the local lane HEAD
 }
 
 exec_exit_and_stderr() {
-  local out rc
+  local out err rc
+  err="$TMP/4b.stderr"
   set +e
-  out="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'echo boom >&2; exit 3')"
+  out="$(no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'echo boom >&2; exit 3' 2>"$err")"
   rc=$?
   set -e
   printf '%s\n' "$out"
-  [ "$rc" -eq 3 ] && [[ $out == *boom* ]]
+  if [[ $out == *boom* ]]; then
+    echo "   stderr marker arrived on stdout"
+  elif grep -Fq boom "$err"; then
+    sed 's/^/   /' "$err"
+    echo "   stderr marker arrived on stderr"
+  else
+    return 1
+  fi
+  [ "$rc" -eq 3 ]
 }
 
 memory_reported() { # INFO only: the guest's MemTotal; the Sprites policy is not a guest cgroup
@@ -900,12 +916,11 @@ import json, os, sys
 def clean(value):
     if isinstance(value, str):
         text = value
+    elif value is None or isinstance(value, (bool, int, float)):
+        text = json.dumps(value)
     else:
-        try:
-            text = json.dumps(value, sort_keys=True, separators=(",", ":"))
-        except (TypeError, ValueError):
-            text = str(value)
-    text = "".join(ch for ch in text if ord(ch) >= 32 and ord(ch) != 127)
+        text = type(value).__name__
+    text = "".join(ch for ch in text if ord(ch) >= 32 and not (127 <= ord(ch) <= 159))
     return text[:200]
 
 def emit(label, value):
@@ -915,7 +930,7 @@ emit("command exit status", os.environ.get("AGENT_SUMMARY_STATUS", "unknown"))
 raw = os.environ.get("AGENT_SUMMARY_JSON", "")
 try:
     result = json.loads(raw)
-except (TypeError, ValueError):
+except Exception:
     if raw:
         emit("JSON", "invalid")
 else:
@@ -1101,12 +1116,8 @@ cost_state_ok() {
       sleep 10
     fi
   done
-  if [ "$COST_PRE_WAIT_TIMED_OUT" = 1 ]; then
-    echo "WARN 10b: comparing after-cost state against timed-out pre-cost state $COST_PRE_STATE"
-    return 0
-  fi
-  if [ "$running_reads" -eq 4 ]; then
-    echo "the sprite stayed running after fleet cost (a read woke it)" >&2
+  if [ "$running_reads" -gt 0 ]; then
+    echo "the sprite stayed running after fleet cost (a read woke it); it read running $running_reads of $reads time(s) and never warm or cold" >&2
     return 1
   fi
   echo "WARN 10b: the provider listing could not be read after fleet cost; the wake check is unproven"
