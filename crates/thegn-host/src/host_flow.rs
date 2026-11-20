@@ -284,7 +284,7 @@ pub(crate) fn provision_worktree(
     policy: ConsentPolicy,
     mut progress: impl FnMut(&[ProvisionStepView]),
     ui: Option<&HostUiTx>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<crate::agent::ProvisionOutcome> {
     match ensure_ready(cfg, worktree, policy, &mut progress, ui) {
         Ok(HostOutcome::Ready(_)) => {
             // The host is Ready: run the per-worktree pipeline (repo toolchain
@@ -306,7 +306,16 @@ pub(crate) fn provision_worktree(
             // An ssh `in_env` worktree is seeded onto its host first (a no-op
             // otherwise); its failure fails the provision like any other step.
             let out = crate::ssh_seed::seed_if_needed(cfg, worktree).and_then(|seeded| {
-                crate::agent::provision_worktree(cfg, worktree, progress).map(|p| p || seeded)
+                crate::agent::provision_worktree_mode(
+                    cfg,
+                    worktree,
+                    crate::agent::ProvisionMode::Foreground,
+                    progress,
+                )
+                .map(|mut outcome| {
+                    outcome.provisioned |= seeded;
+                    outcome
+                })
             });
             match &out {
                 Ok(_) => crate::placement_flow::mark_active(worktree),
@@ -319,7 +328,16 @@ pub(crate) fn provision_worktree(
         }
         Ok(_) => {
             let out = crate::ssh_seed::seed_if_needed(cfg, worktree).and_then(|seeded| {
-                crate::agent::provision_worktree(cfg, worktree, progress).map(|p| p || seeded)
+                crate::agent::provision_worktree_mode(
+                    cfg,
+                    worktree,
+                    crate::agent::ProvisionMode::Foreground,
+                    progress,
+                )
+                .map(|mut outcome| {
+                    outcome.provisioned |= seeded;
+                    outcome
+                })
             });
             if let Err(e) = &out {
                 // A spilled-over worktree's provider failure cools its lane.

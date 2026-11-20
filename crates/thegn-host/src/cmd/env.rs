@@ -1074,7 +1074,7 @@ fn down_provider(
     let mut list = || crate::agent::block_on_provider(|| async { provider.inventory().await });
     let mut sleep = std::thread::sleep;
     let mut forget = || forget_destroyed_sandbox(id, wt);
-    destroy_provider_sandbox(
+    let result = destroy_provider_sandbox(
         env_name,
         id,
         opts,
@@ -1088,7 +1088,11 @@ fn down_provider(
             sleep: &mut sleep,
             forget: &mut forget,
         },
-    )
+    );
+    if result.is_err() {
+        crate::provision_bg::resume_cancelled(id, wt, env_name);
+    }
+    result
 }
 
 fn reset_deferred_journal(id: &str, worktree: &str, env_name: &str) {
@@ -1104,6 +1108,9 @@ fn reset_deferred_journal(id: &str, worktree: &str, env_name: &str) {
 /// already gone.
 fn forget_destroyed_sandbox(id: &str, wt: &str) {
     crate::provider_workdir::clear_provisioned(id);
+    if let Err(error) = thegn_core::provision_journal::clear(id) {
+        tracing::debug!(target: "thegn::provider", %id, %error, "could not clear deferred provision journal");
+    }
     crate::lifecycle::forget_destroyed_spare(id);
     match Db::open() {
         Ok(db) => {
@@ -1802,6 +1809,12 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
         &home,
     );
     for line in show_lines(&env, &location, provisioned, &env.sandbox.git, &warnings) {
+        outln!("{line}");
+    }
+    if let thegn_core::placement::Placement::Provider(p) = &env.placement
+        && !p.id.trim().is_empty()
+        && let Some(line) = crate::provision_bg::show_line(&p.id)
+    {
         outln!("{line}");
     }
     Ok(())
