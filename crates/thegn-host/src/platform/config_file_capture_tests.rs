@@ -3,6 +3,7 @@
 
 use super::*;
 use std::ffi::CString;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 
@@ -119,6 +120,52 @@ fn equal_length_mutation_changes_observed_descriptor_time_identity() {
             Ok(readable)
         }),
         Err(Error::Changed)
+    );
+}
+
+#[test]
+fn same_length_rewrite_between_passes_is_changed_without_a_clock_tick() {
+    let dir = fixture();
+    let path = dir.path().join("same-length");
+    std::fs::write(&path, b"one").unwrap();
+    let metadata = metadata_target(&path).unwrap().unwrap();
+    assert_eq!(
+        read_target_with(metadata, 64, readable, || {
+            std::fs::write(&path, b"two").unwrap();
+            Ok(())
+        }),
+        Err(Error::Changed)
+    );
+}
+
+#[test]
+fn growth_between_passes_is_changed() {
+    let dir = fixture();
+    let path = dir.path().join("growing");
+    std::fs::write(&path, b"one").unwrap();
+    let metadata = metadata_target(&path).unwrap().unwrap();
+    assert_eq!(
+        read_target_with(metadata, 64, readable, || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"x").unwrap();
+            Ok(())
+        }),
+        Err(Error::Changed)
+    );
+}
+
+#[test]
+fn unchanged_file_survives_the_second_pass() {
+    let dir = fixture();
+    let path = dir.path().join("unchanged");
+    std::fs::write(&path, b"one").unwrap();
+    let metadata = metadata_target(&path).unwrap().unwrap();
+    assert_eq!(
+        read_target_with(metadata, 64, readable, || Ok(())),
+        Ok(b"one".to_vec())
     );
 }
 
