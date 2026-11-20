@@ -65,6 +65,8 @@ while [ $# -gt 0 ]; do
     ;;
   esac
 done
+# shellcheck disable=SC2034 # read by test/lib/live.sh
+LIVE_KEEP_GOING="$keep_going"
 
 print_plan() {
   cat <<PLAN
@@ -121,6 +123,7 @@ Steps:
       poll /v1/tasks every 15 s while it runs
   7h  (only with --with-agent <name>) agent JSON is exited 0 and pull.ok is true
   7i  (only with --with-agent <name>) /v1/tasks includes thegn-hold- during the run
+      (7g first starts this run's own pane daemon on the fresh state; teardown stops it)
   9   after 120 s idle, fleet list --env shows warm or cold
   9b  /v1/tasks is empty
   10  fleet cost --json: print sprites_usage; error fails, cpu_hours > 0 passes,
@@ -139,9 +142,12 @@ Each step prints PASS/FAIL; the first FAIL tears down and exits non-zero.
 With --keep-going, failed steps print FAIL <id>, the run continues, and the
 end prints FAILED STEPS: <ids> before exiting non-zero. ALL STEPS PASS prints
 only when no step failed.
+Each step also prints TIME <id> <seconds> s; the end prints STARTUP lines (start-up numbers).
 PLAN
 }
 
+# shellcheck source=test/lib/live.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib/live.sh"
 # ---- flag gate: nothing above this line touches the network or thegn ----
 if [ -z "$env_name" ] && [ "$accept" = 0 ]; then
   print_plan
@@ -164,52 +170,10 @@ MIN_RAM_SET=()
 if [ -n "$min_ram" ]; then
   MIN_RAM_SET=(--set "env.$env_name.provider.min_ram_gb=$min_ram")
 fi
+# shellcheck disable=SC2034 # read by test/lib/live.sh
+LIVE_THEGN_ARGS=("${MIN_RAM_SET[@]+"${MIN_RAM_SET[@]}"}")
 
 # ---- step 0: preflight (doctor's "Remote live readiness" block) ----
-# doctor --json lists names only, never values: whether the token resolves,
-# which env var names, git token and agent logins enter the sandbox, and ledger
-# sandboxes nothing is bound to. The token itself is never read or printed.
-PREFLIGHT_PY='
-import json, os, sys
-env = os.environ["PRE_ENV"]
-required = os.environ.get("PRE_REQUIRED", "1") == "1"
-try:
-    doc = json.loads(sys.stdin.read())
-except ValueError:
-    print("FAIL 0: doctor --json did not print JSON", file=sys.stderr)
-    sys.exit(1)
-rows = doc.get("remote_live") if isinstance(doc, dict) else None
-if rows is None:
-    print("SKIP 0: doctor --json has no remote_live key (older binary): no credential statement")
-    sys.exit(0)
-row = next((r for r in rows if isinstance(r, dict) and r.get("env") == env), None)
-if row is None:
-    if required:
-        print("FAIL 0: doctor remote_live has no row for env " + env, file=sys.stderr)
-        sys.exit(1)
-    print("SKIP 0: doctor remote_live has no row for env " + env + " (it covers sprites and vercel envs)")
-    sys.exit(0)
-def show(v):
-    if isinstance(v, bool):
-        return "yes" if v else "no"
-    if isinstance(v, list):
-        return ",".join(show(x) for x in v) or "none"
-    if isinstance(v, dict):
-        return ",".join(k + "=" + show(x) for k, x in sorted(v.items())) or "none"
-    if v is None or v == "":
-        return "none"
-    return str(v)
-if row.get("token_resolves") is not True:
-    print("FAIL 0: the token for env " + env + " does not resolve (remote_live.token_resolves = " + show(row.get("token_resolves")) + ")", file=sys.stderr)
-    sys.exit(1)
-print("INFO 0: credentials entering the sandbox: forwarded_env=" + show(row.get("forwarded_env")) + "; git_token=" + show(row.get("git_token")) + "; login_upload=" + show(row.get("login_upload")))
-unbound = row.get("unbound") or []
-if not isinstance(unbound, list):
-    unbound = [unbound]
-if unbound:
-    print("WARN 0: unbound ledger sandboxes: " + ", ".join(show(n) for n in unbound) + ": pre-existing sandboxes this run will not touch")
-print("PASS 0")
-'
 MEMPROBE_PY='
 import sys
 target = int(sys.argv[2])
@@ -226,9 +190,10 @@ try:
                 avail = int(line.split()[1]) // 1024
 except (OSError, ValueError):
     pass
-if avail is not None and target + 256 > avail:
-    print("headroom", avail, flush=True)
-    sys.exit(0)
+if avail is None:
+    print("avail unknown", flush=True)
+else:
+    print("avail", avail, flush=True)
 held = []
 reached = 0
 try:
@@ -241,17 +206,8 @@ except MemoryError:
     sys.exit(3)
 print("done", reached, flush=True)
 '
-DOCTOR_JSON=""
-preflight_capture() { # doctor may exit non-zero on unrelated checks; parse what it printed
-  DOCTOR_JSON="$("$THEGN_BIN" "${MIN_RAM_SET[@]}" doctor --json 2>/dev/null)" || true
-}
-preflight_check() { # preflight_check <env> [required: 1|0]
-  echo "== step 0: preflight (doctor --json remote_live for env '$1')"
-  printf '%s' "$DOCTOR_JSON" | PRE_ENV="$1" PRE_REQUIRED="${2:-1}" python3 -I -c "$PREFLIGHT_PY" || {
-    echo "FAIL 0: preflight" >&2
-    exit 1
-  }
-}
+preflight_capture() { live_preflight_capture; }
+preflight_check() { live_preflight_check "$@"; }
 # Run against the owner's real state, before the fresh dirs below, so
 # pre-existing unbound sandboxes are listed.
 preflight_capture
@@ -266,8 +222,10 @@ SPRITE_NAME="(unknown)"
 CREATED=0
 HOLD_PID=""
 AGENT_POLL_PID=""
+DAEMON_PID=""
 HOLD_ERR="$TMP/hold.err"
 STEP_11_PASSED=0
+# shellcheck disable=SC2034 # appended to and read by test/lib/live.sh
 FAILED_STEPS=()
 INTERACTIVE_OUT=""
 PULL_SHA=""
@@ -276,6 +234,10 @@ AGENT_JSON=""
 AGENT_RUN_SECONDS=0
 COST_PRE_STATE=""
 COST_PRE_WAIT_TIMED_OUT=0
+# shellcheck disable=SC2034 # read by test/lib/live.sh
+LIVE_STARTUP=("3=cold create (env up)" "6=first interactive output (sprite-exec under script)" "10w=wake from cold (sprite-exec -- true)")
+
+live_on_pass() { if [ "$1" = 11 ]; then STEP_11_PASSED=1; fi; }
 
 print_plan
 echo
@@ -354,6 +316,22 @@ teardown() {
       fi
     done
   fi
+  if [ -n "$DAEMON_PID" ]; then
+    echo "-- teardown: daemon stop (this run's pane daemon, pid $DAEMON_PID)"
+    "$THEGN_BIN" daemon stop
+    kill "$DAEMON_PID" 2>/dev/null
+    local daemon_tries=0
+    while [ "$daemon_tries" -lt 10 ] && kill -0 "$DAEMON_PID" 2>/dev/null; do
+      sleep 1
+      daemon_tries=$((daemon_tries + 1))
+    done
+    if kill -0 "$DAEMON_PID" 2>/dev/null; then
+      echo "-- teardown: pane daemon $DAEMON_PID ignored TERM; sending KILL" >&2
+      kill -KILL "$DAEMON_PID" 2>/dev/null
+    fi
+    wait "$DAEMON_PID" 2>/dev/null
+    DAEMON_PID=""
+  fi
   if [ "$left" = 1 ]; then
     echo "-- keeping $TMP (ledger needed for a later reap); ledger records:" >&2
     ls "$(ledger_dir)" >&2
@@ -365,22 +343,7 @@ teardown() {
 trap teardown EXIT INT TERM
 
 step() { # step <id> <description> <command...>
-  local id="$1" desc="$2"
-  shift 2
-  echo "== step $id: $desc"
-  if "$@"; then
-    echo "PASS $id"
-    if [ "$id" = 11 ]; then
-      STEP_11_PASSED=1
-    fi
-  else
-    echo "FAIL $id: $desc" >&2
-    FAILED_STEPS+=("$id")
-    if [ "$keep_going" != 1 ]; then
-      exit 1
-    fi
-  fi
-  return 0
+  live_step "$@"
 }
 
 in_repo() { (cd "$REPO" && "$@"); }
@@ -464,7 +427,7 @@ print("   fleet inspect memory policy: " + str(got) + " MiB")
 }
 
 memory_enforced() {
-  local out rc limit target verdict verdict_rc cgroup
+  local out rc limit target verdict verdict_rc cgroup probe_info
   if ! no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- sh -c 'command -v python3 && command -v timeout'; then
     echo "WARN 5d: python3 or timeout is missing in the guest; memory enforcement unproven"
     return 0
@@ -490,36 +453,54 @@ rc = int(os.environ["MEMPROBE_RC"])
 limit = int(os.environ["MEMPROBE_LIMIT"])
 target = int(os.environ["MEMPROBE_TARGET"])
 lines = out.replace("\r", "").splitlines()
+avail = [line for line in lines if re.fullmatch(r"avail (?:unknown|\d+)", line)]
+if avail:
+    print(avail[-1])
+else:
+    print("avail unknown")
 if rc == 124:
     print("timeout 0")
 else:
-    headroom = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"headroom (\d+)", line))]
     done = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"done (\d+)", line))]
     reached = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"reached (\d+)", line))]
     errors = [int(m.group(1)) for line in lines if (m := re.fullmatch(r"memoryerror (\d+)", line))]
-    if headroom:
-        print("headroom " + str(headroom[-1]))
-    elif rc == 0 and done:
+    stopped = reached[-1] if reached else (errors[-1] if errors else 0)
+    was_stopped = rc in (137, 3) or bool(errors)
+    if rc == 0 and done:
         print("unenforced " + str(done[-1]))
+    elif was_stopped and stopped < limit // 2:
+        print("early " + str(stopped))
+    elif was_stopped and stopped <= limit + 256:
+        print("enforced " + str(stopped))
+    elif was_stopped and stopped > limit + 256:
+        print("overshoot " + str(stopped))
     else:
-        stopped = reached[-1] if reached else (errors[-1] if errors else 0)
-        if (rc in (137, 3) or errors) and stopped >= limit // 2:
-            print("enforced " + str(stopped))
-        elif reached or errors:
-            print("early " + str(stopped))
-        else:
-            print("noout 0")
+        print("noout 0")
 '
   })"; then
     verdict="noout 0"
     verdict_rc=1
   fi
+  probe_info="${verdict%%$'\n'*}"
+  case "$probe_info" in
+  "avail unknown")
+    echo "INFO 5d: guest MemAvailable: unknown"
+    ;;
+  "avail "*)
+    echo "INFO 5d: guest MemAvailable: ${probe_info#avail } MiB (policy ${limit} MiB)"
+    ;;
+  *)
+    echo "INFO 5d: guest MemAvailable: unknown"
+    ;;
+  esac
+  if [ "$probe_info" != "$verdict" ]; then
+    verdict="${verdict#*$'\n'}"
+  else
+    verdict="noout 0"
+  fi
   case "$verdict" in
   timeout\ *)
     echo "WARN 5d: the memory probe timed out after 120 s; memory enforcement unproven"
-    ;;
-  headroom\ *)
-    echo "WARN 5d: the guest has only ${verdict#headroom } MiB available, so a probe past the limit cannot tell the limit from the guest size; memory enforcement unproven"
     ;;
   unenforced\ *)
     echo "WARN 5d: limit accepted by the API but not enforced in the guest: one process held ${verdict#unenforced } MiB under a ${limit} MiB limit (Sprites provider behaviour, not a thegn failure)"
@@ -529,6 +510,9 @@ else:
     ;;
   early\ *)
     echo "WARN 5d: the probe was stopped early at ${verdict#early } MiB (limit ${limit} MiB); inconclusive"
+    ;;
+  overshoot\ *)
+    echo "WARN 5d: the probe was stopped at ${verdict#overshoot } MiB, above the ${limit} MiB limit; the limit is not enforced at its stated value"
     ;;
   noout\ *)
     printf '%s\n' "$out" | sed 's/^/  /'
@@ -784,29 +768,21 @@ warm_or_cold() {
 }
 
 fleet_row_state() {
-  local out
-  out="$("$THEGN_BIN" "${MIN_RAM_SET[@]}" fleet list --env "$env_name" --json)" || return 1
-  FLEET_JSON="$out" FLEET_SPRITE="$SPRITE_NAME" python3 -I -c '
-import json, os, sys
-try:
-    listing = json.loads(os.environ["FLEET_JSON"])
-    rows = listing["view"]["rows"]
-except (KeyError, TypeError, ValueError) as exc:
-    print("fleet list JSON is invalid: " + str(exc), file=sys.stderr)
-    sys.exit(1)
-if not isinstance(rows, list):
-    print("fleet list JSON view.rows is not an array", file=sys.stderr)
-    sys.exit(1)
-row = next((r for r in rows if isinstance(r, dict) and r.get("id") == os.environ["FLEET_SPRITE"]), None)
-if row is None:
-    print("sprite row absent from the listing", file=sys.stderr)
-    sys.exit(1)
-state = row.get("state")
-if not isinstance(state, str):
-    print("sprite row has no state", file=sys.stderr)
-    sys.exit(1)
-print(state)
-'
+  local answer
+  answer="$(live_listing "$env_name" "$SPRITE_NAME")" || return 1
+  case "$answer" in
+  "present -")
+    echo "sprite row has no state" >&2
+    return 1
+    ;;
+  "present "*)
+    printf '%s\n' "${answer#present }"
+    ;;
+  *)
+    echo "sprite row is not in the listing ($answer)" >&2
+    return 1
+    ;;
+  esac
 }
 idle_warm_or_cold() {
   echo "   idling 120 s"
@@ -861,8 +837,36 @@ agent_tasks_poll() {
   done
 }
 
+# agent run connects to a pane daemon and never spawns one, and this run's
+# state is fresh: start this run's own daemon (same binary, same state) in
+# the background; teardown stops it. THEGN_CONTROL_ADDR is unset so neither
+# the probe nor agent run can reach another instance's daemon.
+agent_daemon_start() {
+  local tries=0
+  [ -z "$DAEMON_PID" ] || return 0
+  unset THEGN_CONTROL_ADDR
+  "$THEGN_BIN" "${MIN_RAM_SET[@]}" daemon </dev/null >"$TMP/daemon.log" 2>&1 &
+  DAEMON_PID=$!
+  while [ "$tries" -lt 30 ]; do
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+      echo "pane daemon exited at start; log: $TMP/daemon.log" >&2
+      tail -n 20 "$TMP/daemon.log" >&2
+      return 1
+    fi
+    if "$THEGN_BIN" session list --json >/dev/null 2>&1; then
+      echo "   pane daemon up (pid $DAEMON_PID)"
+      return 0
+    fi
+    sleep 1
+    tries=$((tries + 1))
+  done
+  echo "pane daemon did not answer session list within 30 s; log: $TMP/daemon.log" >&2
+  return 1
+}
+
 agent_run() {
   local started ended rc
+  agent_daemon_start || return 1
   started="$(date +%s)" || return 1
   agent_tasks_poll &
   AGENT_POLL_PID=$!
@@ -1137,8 +1141,4 @@ step 11 "env down destroys the sprite" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" 
 step 11b "ledger record gone; fleet list classifies the sprite as down, not missing" fleet_down_not_missing
 step 12 "reap dry-run: 0 recorded orphans" reap_dry_clean
 step 13 "unrecorded reap is read-only and empty" reap_unrecorded_read_only
-if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
-  echo "FAILED STEPS: ${FAILED_STEPS[*]}"
-  exit 1
-fi
-echo "ALL STEPS PASS"
+live_finish
