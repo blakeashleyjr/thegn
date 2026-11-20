@@ -49,7 +49,7 @@ if [ "${STUB_MODE:-}" = continue ]; then
   "session list --json") echo '[]'; exit 0 ;;
   *"agent run"*)
     if [ "${STUB_AGENT_FAILURE:-}" = 1 ]; then
-      printf '%s\n' '{"status":"failed","exit_code":7,"error":"agent boom","token":"SECRET"}'
+      printf '%s\n' '{"status":"failed","exit_code":7,"error":"agent boom","token":"SECRET","output_tail":"line one\nboom from agent"}'
       exit 3
     fi
     ;;
@@ -138,7 +138,8 @@ if [ "${STUB_MODE:-}" = continue ]; then
   *"rev-parse HEAD"*) echo '1111111111111111111111111111111111111111'; exit 0 ;;
   *"command -v curl"*) echo /usr/bin/curl; exit 0 ;;
   *"tty && echo ok"*) printf '/dev/pts/1\nok\n'; exit 0 ;;
-  *curl*) echo '[]'; exit 0 ;;
+  *"curl"*"/v1/tasks"*) echo '[]'; exit 0 ;;
+  *"curl"*"/v1/usage"*) printf '200'; exit 0 ;;
   esac
 fi
 echo "stub thegn: refusing '$*'" >&2
@@ -227,7 +228,7 @@ for want in "11b " "view.down" "view.missing" "binary predates batch 170" "13 " 
     fail "sprites-live plan lacks '$want'"
   fi
 done
-for want in "5b " "5d " "6b " "7e " "8d " "8f " "10b "; do
+for want in "5b " "5d " "6b " "7e " "8d " "8f " "10b " "10u (INFO) direct usage reads"; do
   if has "$T/plan-sprites-live.out" "$want"; then pass "sprites-live plan names step $want"; else fail "sprites-live plan lacks step $want"; fi
 done
 if has "$T/plan-sprites-live.out" "fails only if it stays running"; then
@@ -347,6 +348,8 @@ if ! rc_is keep-going-sprites 0 && has "$T/keep-going-sprites.out" "FAIL 1b:" &&
   has "$T/keep-going-sprites.out" "last 40 sprites exec frame lines:" &&
   has "$T/keep-going-sprites.out" "TRACE sprites exec frame" &&
   has "$T/keep-going-sprites.out" "WARN 10: usage not reported yet for a sprite this young" &&
+  has "$T/keep-going-sprites.out" "INFO 10u: no usage read changed the reported state" &&
+  has "$T/keep-going-sprites.out" "PASS 10u" &&
   has "$T/keep-going-sprites.out" "PASS 10w" &&
   has "$T/keep-going-sprites.out" "SKIP 5, 5b, 5c, 5d" &&
   has "$T/keep-going-sprites.out" "unrecorded entries: 1" &&
@@ -485,6 +488,7 @@ rm -f "$LOG.daemon-pid"
 run agent-failure-sprites sprites-live.sh THEGN_CHANNEL=dev STUB_MODE=continue STUB_AGENT_FAILURE=1 STUB_DOCTOR="$T/tok-true.json" -- \
   "${SX[@]}" --keep-going --with-agent stubagent
 if has "$T/agent-failure-sprites.out" "agent boom" &&
+  has "$T/agent-failure-sprites.out" "boom from agent" &&
   has "$T/agent-failure-sprites.out" "exit_code" &&
   ! has "$T/agent-failure-sprites.out" "SECRET"; then
   pass "sprites-live: agent failure summary is bounded and sanitized"
