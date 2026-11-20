@@ -86,6 +86,9 @@ const EXIT_LOCAL_CLOSED: i32 = 1;
 /// How long to wait for the remote exit frame after the local tty went away.
 const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
 
+/// Largest stdin message built from queued input (pane.rs STREAM_STDIN_CHUNK).
+const STDIN_COALESCE_MAX: usize = 32 << 10;
+
 /// Run `cmd` inside sprite `id` over the native exec API. A tty on stdin gets
 /// the streaming PTY bridge; anything else the one-shot capture used by the
 /// control reads. `cmd` arrives already shaped by `GitLoc::provider_command`
@@ -452,6 +455,30 @@ pub(crate) fn encode_input(ev: &FromTty, modes: &mut RemoteModes) -> Option<Vec<
     }
 }
 
+/// Encode `first` plus every input event already queued behind it as ONE
+/// stdin write, up to STDIN_COALESCE_MAX bytes (a single larger event, e.g.
+/// a bracketed paste, is sent whole). Stops at a resize and returns it so the
+/// caller sends it AFTER the bytes; events after the resize stay queued.
+pub(crate) fn coalesce_input(
+    first: &FromTty,
+    rx: &mut tokio::sync::mpsc::Receiver<FromTty>,
+    modes: &mut RemoteModes,
+) -> (Vec<u8>, Option<(u16, u16)>) {
+    let mut bytes = encode_input(first, modes).unwrap_or_default();
+    while bytes.len() < STDIN_COALESCE_MAX {
+        match rx.try_recv() {
+            Ok(FromTty::Resize { cols, rows }) => return (bytes, Some((cols, rows))),
+            Ok(ev) => {
+                if let Some(b) = encode_input(&ev, modes) {
+                    bytes.extend_from_slice(&b);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (bytes, None)
+}
+
 // ---------------------------------------------------------------------------
 // Streaming seam (cov_ignore): a live tty + a network exec stream. Every
 // decision above is pure and unit-tested; this only moves bytes.
@@ -524,7 +551,8 @@ fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
     ))?;
 
     term.set_raw_mode().context("raw mode")?;
-    let (tty_tx, tty_rx) = tokio::sync::mpsc::channel::<FromTty>(256);
+    // A burst of per-key events can then coalesce into one message of up to about 4 KiB.
+    let (tty_tx, tty_rx) = tokio::sync::mpsc::channel::<FromTty>(4096);
     let done = Arc::new(AtomicBool::new(false));
     let waker = term.waker();
     let thread = {
@@ -643,8 +671,26 @@ async fn pump(
                     let _ = session.control.send(ExecControl::Resize { cols, rows }).await; // best-effort: send: a closed driver surfaces as the frame stream ending
                 }
                 Some(ev) => {
-                    if let Some(bytes) = encode_input(&ev, modes) {
-                        let _ = session.control.send(ExecControl::Stdin(bytes)).await; // best-effort: send: a closed driver surfaces as the frame stream ending
+                    let (bytes, resize) = coalesce_input(&ev, tty_rx, modes);
+                    if !bytes.is_empty()
+                        && session
+                            .control
+                            .send(ExecControl::Stdin(bytes))
+                            .await
+                            .is_err()
+                    {
+                        tracing::debug!(target: "thegn::provider", "sprite-exec: stdin not delivered; the stream is ending");
+                    }
+                    if let Some((cols, rows)) = resize {
+                        *size = (cols, rows);
+                        if session
+                            .control
+                            .send(ExecControl::Resize { cols, rows })
+                            .await
+                            .is_err()
+                        {
+                            tracing::debug!(target: "thegn::provider", "sprite-exec: resize not delivered; the stream is ending");
+                        }
                     }
                 }
                 None => return StreamEnd::LocalGone,
@@ -686,8 +732,9 @@ fn tty_loop<T: Terminal>(
 mod tests {
     use super::{
         EXIT_REMOTE_LOST, FromTty, REATTACH_BUDGET_RESET, RemoteModes, WAKE_NOTICE_AFTER,
-        attempts_after_stream, encode_input, hold_ceiling, hold_task_from, lost_line,
-        pick_sprites_env, pty_size, reconnect_delays, should_reattach, tty_env, with_slow_notice,
+        attempts_after_stream, coalesce_input, encode_input, hold_ceiling, hold_task_from,
+        lost_line, pick_sprites_env, pty_size, reconnect_delays, should_reattach, tty_env,
+        with_slow_notice,
     };
     use std::cell::Cell;
     use std::time::Duration;
@@ -881,6 +928,107 @@ mod tests {
             mouse_buttons,
             modifiers: Modifiers::NONE,
         })
+    }
+
+    #[tokio::test]
+    async fn coalesce_input_combines_keys_and_unbracketed_paste() {
+        let first = FromTty::Key(KeyEvent {
+            key: KeyCode::Char('a'),
+            modifiers: Modifiers::NONE,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tx.send(FromTty::Key(KeyEvent {
+            key: KeyCode::Char('b'),
+            modifiers: Modifiers::NONE,
+        }))
+        .await
+        .unwrap();
+        tx.send(FromTty::Paste("cd".into())).await.unwrap();
+
+        let (bytes, resize) = coalesce_input(&first, &mut rx, &mut RemoteModes::default());
+        assert_eq!(bytes, b"abcd");
+        assert_eq!(resize, None);
+    }
+
+    #[tokio::test]
+    async fn coalesce_input_stops_at_resize_and_leaves_following_input_queued() {
+        let first = FromTty::Key(KeyEvent {
+            key: KeyCode::Char('x'),
+            modifiers: Modifiers::NONE,
+        });
+        let third = FromTty::Key(KeyEvent {
+            key: KeyCode::Char('z'),
+            modifiers: Modifiers::NONE,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tx.send(FromTty::Resize {
+            cols: 100,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+        tx.send(third.clone()).await.unwrap();
+
+        let (bytes, resize) = coalesce_input(&first, &mut rx, &mut RemoteModes::default());
+        assert_eq!(bytes, b"x");
+        assert_eq!(resize, Some((100, 30)));
+        assert_eq!(rx.try_recv().unwrap(), third);
+    }
+
+    #[tokio::test]
+    async fn coalesce_input_caps_queued_pastes_but_sends_one_large_paste_whole() {
+        let paste = || FromTty::Paste("x".repeat(8 * 1024));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        for _ in 0..5 {
+            tx.send(paste()).await.unwrap();
+        }
+
+        let (bytes, resize) = coalesce_input(&paste(), &mut rx, &mut RemoteModes::default());
+        assert_eq!(bytes.len(), 32 * 1024);
+        assert_eq!(resize, None);
+        assert!(matches!(rx.try_recv(), Ok(FromTty::Paste(text)) if text.len() == 8 * 1024));
+        assert!(matches!(rx.try_recv(), Ok(FromTty::Paste(text)) if text.len() == 8 * 1024));
+        assert!(rx.try_recv().is_err());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        drop(tx);
+        let mut modes = RemoteModes::default();
+        modes.observe(b"\x1b[?2004h");
+        let (bytes, resize) =
+            coalesce_input(&FromTty::Paste("x".repeat(64 * 1024)), &mut rx, &mut modes);
+        assert_eq!(bytes.len(), 64 * 1024 + b"\x1b[200~\x1b[201~".len());
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        assert_eq!(resize, None);
+    }
+
+    #[tokio::test]
+    async fn coalesce_input_ignores_mouse_when_mouse_mode_is_disabled() {
+        let first = mouse(1, 1, MouseButtons::LEFT);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tx.send(FromTty::Key(KeyEvent {
+            key: KeyCode::Char('x'),
+            modifiers: Modifiers::NONE,
+        }))
+        .await
+        .unwrap();
+
+        let (bytes, resize) = coalesce_input(&first, &mut rx, &mut RemoteModes::default());
+        assert_eq!(bytes, b"x");
+        assert_eq!(resize, None);
+    }
+
+    #[tokio::test]
+    async fn coalesce_input_with_an_empty_queue_returns_the_first_event_only() {
+        let first = FromTty::Key(KeyEvent {
+            key: KeyCode::Char('q'),
+            modifiers: Modifiers::NONE,
+        });
+        let (_tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+        let (bytes, resize) = coalesce_input(&first, &mut rx, &mut RemoteModes::default());
+        assert_eq!(bytes, b"q");
+        assert_eq!(resize, None);
     }
 
     #[test]
