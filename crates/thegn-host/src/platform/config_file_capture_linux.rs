@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 
 use nix::libc;
@@ -231,10 +231,41 @@ fn readable(metadata: &File) -> Result<File, Error> {
     .map_err(|_| Error::Unavailable)
 }
 
+/// Re-read `file` from offset 0 and compare with `expected`; false on any
+/// difference or on a byte past `expected.len()`.
+fn same_bytes_again(file: &File, expected: &[u8]) -> Result<bool, Error> {
+    let mut offset = 0usize;
+    let mut chunk = [0u8; 8192];
+    while offset < expected.len() {
+        let size = (expected.len() - offset).min(chunk.len());
+        let count = file
+            .read_at(&mut chunk[..size], offset as u64)
+            .map_err(|_| Error::Unavailable)?;
+        if count == 0 || chunk[..count] != expected[offset..offset + count] {
+            return Ok(false);
+        }
+        offset += count;
+    }
+    let mut probe = [0u8; 1];
+    let count = file
+        .read_at(&mut probe, expected.len() as u64)
+        .map_err(|_| Error::Unavailable)?;
+    Ok(count == 0)
+}
+
 fn read_target(
     metadata: File,
     limit: usize,
     open: impl FnOnce(&File) -> Result<File, Error>,
+) -> Result<Vec<u8>, Error> {
+    read_target_with(metadata, limit, open, || Ok(()))
+}
+
+fn read_target_with(
+    metadata: File,
+    limit: usize,
+    open: impl FnOnce(&File) -> Result<File, Error>,
+    between: impl FnOnce() -> Result<(), Error>,
 ) -> Result<Vec<u8>, Error> {
     if limit > thegn_core::config_budget::MAX_SOURCE_BYTES {
         return Err(Error::TooLarge);
@@ -261,6 +292,10 @@ fn read_target(
             return Err(Error::TooLarge);
         }
         bytes.extend_from_slice(&chunk[..count]);
+    }
+    between()?;
+    if !same_bytes_again(read.get_ref(), &bytes)? {
+        return Err(Error::Changed);
     }
     if identity(read.get_ref())? != expected {
         return Err(Error::Changed);
