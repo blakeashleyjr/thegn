@@ -132,6 +132,8 @@ Steps:
   10b fleet list --env remains in the pre-cost warm/cold class (wait up to 90 s
       first if the pre-cost row is running; timeout warns; usage did not wake it)
       (reads the state up to 4 times, 10 s apart: fails only if it stays running; warns on provider noise)
+  10u (INFO) direct usage reads: state, account usage GET, state, per-sprite usage GET, state, 10 s, state;
+      shows whether a Sprites usage read is followed by a "running" reading (THE-2476)
   10w wake from cold: sprite-exec -- true completes within 150 s; print wake time
   10x wake row is running or warm (a lagging cold state warns and passes)
   11  env down                         11b fleet list puts this sprite in view.down,
@@ -632,9 +634,24 @@ else:
   esac
 }
 
+sprites_api_get() { # the sprite's in-VM API; the second arg selects body or status output
+  local path="$1" mode="${2:-body}"
+  case "$mode" in
+  body)
+    no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- \
+      sh -c 'curl -sS --unix-socket /.sprite/api.sock "http://sprite$1"' sh "$path"
+    ;;
+  status)
+    no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- \
+      sh -c 'curl -sS -o /dev/null -w "%{http_code}" --unix-socket /.sprite/api.sock "http://sprite$1"' sh "$path"
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
 list_tasks() { # the sprite's in-VM Tasks API
-  no_stdin "$THEGN_BIN" sprite-exec "$SPRITE_NAME" -- \
-    sh -c 'curl -sS --unix-socket /.sprite/api.sock http://sprite/v1/tasks'
+  sprites_api_get /v1/tasks
 }
 hold_task_present() {
   local out
@@ -955,6 +972,22 @@ else:
                 lines = value.splitlines()[-20:]
                 for line in lines:
                     emit(key, line)
+        if isinstance(result.get("sandbox"), str):
+            emit("sandbox", result["sandbox"])
+        if "output_tail" in result:
+            tail = result["output_tail"]
+            if isinstance(tail, str):
+                lines = tail.splitlines()[-20:]
+                print("   agent output tail:")
+                for line in lines:
+                    print("      " + clean(line))
+            elif isinstance(tail, list) and all(isinstance(line, str) for line in tail):
+                lines = "\n".join(tail).splitlines()[-20:]
+                print("   agent output tail:")
+                for line in lines:
+                    print("      " + clean(line))
+            else:
+                print("   agent output tail: " + type(tail).__name__)
 
 path = os.environ.get("AGENT_SUMMARY_STDERR", "")
 if path:
@@ -1127,6 +1160,59 @@ cost_state_ok() {
   return 0
 }
 
+usage_probe_state() {
+  local state rc
+  state="$(fleet_row_state 2>/dev/null)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$state" ]; then
+    state=unknown
+  fi
+  printf '%s\n' "$state"
+}
+
+usage_probe_code() {
+  local path="$1" code rc
+  code="$(sprites_api_get "$path" status)" && rc=0 || rc=$?
+  case "$rc:$code" in
+  0:[0-9][0-9][0-9]) printf '%s\n' "$code" ;;
+  *) printf '%s\n' unknown ;;
+  esac
+}
+
+usage_state_probe() {
+  local start state_a state_b state_c state_d account_code sprite_code rc
+  start="$(date -u '+%Y-%m-01T00:00:00Z')" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$start" ]; then
+    echo "INFO 10u: state before usage reads: unknown"
+    echo "INFO 10u: after the account usage read (HTTP unknown): unknown"
+    echo "INFO 10u: after the per-sprite usage read (HTTP unknown): unknown"
+    echo "INFO 10u: 10 s later: unknown"
+    echo "INFO 10u: no usage read changed the reported state"
+    return 0
+  fi
+  start="${start//:/%3A}"
+  state_a="$(usage_probe_state)"
+  echo "INFO 10u: state before usage reads: $state_a"
+  account_code="$(usage_probe_code "/v1/usage?start=$start")"
+  sleep 3
+  state_b="$(usage_probe_state)"
+  echo "INFO 10u: after the account usage read (HTTP $account_code): $state_b"
+  sprite_code="$(usage_probe_code "/v1/usage/$SPRITE_NAME?start=$start")"
+  sleep 3
+  state_c="$(usage_probe_state)"
+  echo "INFO 10u: after the per-sprite usage read (HTTP $sprite_code): $state_c"
+  sleep 10
+  state_d="$(usage_probe_state)"
+  echo "INFO 10u: 10 s later: $state_d"
+  if [ "$state_c" = running ] && [ "$state_b" != running ] && [ "$state_b" != unknown ]; then
+    echo "INFO 10u: the per-sprite usage read is followed by a running reading"
+  elif [ "$state_b" = running ] && [ "$state_a" != running ] && [ "$state_a" != unknown ]; then
+    echo "INFO 10u: the account usage read is followed by a running reading"
+  else
+    echo "INFO 10u: no usage read changed the reported state"
+  fi
+  return 0
+}
+
 fleet_down_not_missing() {
   local out
   [ ! -f "$(ledger_dir)/$SPRITE_NAME.json" ] || {
@@ -1249,6 +1335,7 @@ step 9 "after 120 s idle the sprite is warm or cold" idle_warm_or_cold
 step 9b "/v1/tasks is empty" tasks_empty
 step 10 "fleet cost reports sprites_usage CPU hours or zero usage (partial or not)" cost_has_cpu
 step 10b "fleet list remains in the pre-cost warm/cold class after fleet cost" cost_state_ok
+step 10u "direct usage reads report whether a usage read is followed by running" usage_state_probe
 step 10w "wake from cold (sprite-exec -- true within 150 s)" wake_from_cold
 step 10x "wake row is running or warm" wake_state
 if [ -n "$min_ram" ]; then
