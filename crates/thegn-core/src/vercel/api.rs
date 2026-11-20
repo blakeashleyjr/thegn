@@ -155,7 +155,9 @@ pub fn parse_sandbox(v: &serde_json::Value) -> Result<SandboxView, ApiParseError
         .get("session")
         .or_else(|| v.get("session"))
         .filter(|s| s.is_object());
-    let status_text = str_of(o, "status").or_else(|| session.and_then(|s| str_of(s, "status")));
+    let status_text = session
+        .and_then(|s| str_of(s, "status"))
+        .or_else(|| str_of(o, "status"));
     let session_id = str_of(o, "currentSessionId")
         .or_else(|| str_of(o, "sessionId"))
         .or_else(|| session.and_then(|s| str_of(s, "id")));
@@ -308,7 +310,19 @@ pub fn command_body(
 ) -> Result<serde_json::Value, ApiParseError> {
     let mut m = command_parts(argv, cwd, env)?;
     m.insert("wait".into(), wait.into());
+    if wait {
+        m.insert("logs".into(), true.into());
+    }
     Ok(m.into())
+}
+
+/// Mark a REST command body for stdin attachment. Non-object values are
+/// returned unchanged.
+pub fn with_attach_stdin(mut body: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(ref mut object) = body {
+        object.insert("attachStdin".into(), true.into());
+    }
+    body
 }
 
 /// The `/interactive` start frame.
@@ -320,6 +334,18 @@ pub fn interactive_start_frame(
     rows: u16,
 ) -> Result<String, ApiParseError> {
     let mut m = command_parts(argv, cwd, env)?;
+    if !env.is_empty() {
+        let mut sorted_env = env.iter().collect::<Vec<_>>();
+        sorted_env.sort_by(|(left, _), (right, _)| left.cmp(right));
+        m.insert(
+            "env".into(),
+            sorted_env
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
     m.insert("type".into(), "start".into());
     m.insert("cols".into(), cols.into());
     m.insert("rows".into(), rows.into());
@@ -345,12 +371,14 @@ pub fn parse_ws_control(text: &str) -> WsControl {
     WsControl::Output(text.to_string())
 }
 
-/// The user-defined network policy body (`allow` list; empty ⇒ `allow-all`).
+/// The network policy body. An empty allow list fails closed as `deny-all`.
 pub fn network_policy_body(domains: &[String]) -> serde_json::Value {
     if domains.is_empty() {
-        serde_json::json!({"type": "allow-all"})
+        serde_json::json!({"mode": "deny-all"})
+    } else if domains.len() == 1 && domains[0] == "*" {
+        serde_json::json!({"mode": "allow-all"})
     } else {
-        serde_json::json!({"type": "user-defined", "allow": domains})
+        serde_json::json!({"mode": "custom", "allowedDomains": domains})
     }
 }
 
@@ -475,8 +503,8 @@ pub fn interactive_host_allowed(host: &str, suffixes: &[String]) -> bool {
 /// response (`{"sandbox": …, "session": …}`, or a bare sandbox carrying its
 /// own `session`). `Ok(None)` when there is no `session` object. Each field is
 /// read from the session, falling back to the sandbox (and its `resources`
-/// for `vcpus`/`memory`); every field is optional. A non-object response is
-/// an error.
+/// for `vcpus`/`memory`); every field is optional. The sandbox CPU figure is
+/// cumulative across sessions. A non-object response is an error.
 pub fn parse_session_usage(
     v: &serde_json::Value,
 ) -> Result<Option<crate::vercel::usage::SessionUsage>, ApiParseError> {
@@ -505,8 +533,14 @@ pub fn parse_session_usage(
                 .filter(|x| !x.is_null())
         })
     };
+    let active_cpu_ms = match session.get("activeCpuDurationMs") {
+        Some(value) if !value.is_null() => value.as_u64(),
+        _ => sandbox
+            .get("totalActiveCpuDurationMs")
+            .and_then(|x| x.as_u64()),
+    };
     Ok(Some(crate::vercel::usage::SessionUsage {
-        active_cpu_ms: field("activeCpuDurationMs").and_then(|x| x.as_u64()),
+        active_cpu_ms,
         memory_mb: resource("memory").and_then(|x| x.as_u64()),
         vcpus: resource("vcpus")
             .and_then(|x| x.as_u64())
@@ -514,6 +548,14 @@ pub fn parse_session_usage(
         started_at_ms: field("startedAt").and_then(|x| x.as_i64()),
         stopped_at_ms: field("stoppedAt").and_then(|x| x.as_i64()),
     }))
+}
+
+/// Parse usage from a complete sandbox response. The sandbox CPU figure is
+/// cumulative across sessions and fills a missing session figure.
+pub fn parse_usage_with_sandbox_fallback(
+    response: &serde_json::Value,
+) -> Result<Option<crate::vercel::usage::SessionUsage>, ApiParseError> {
+    parse_session_usage(response)
 }
 
 /// Snapshot ids: `[A-Za-z0-9_-]{1,128}` (they become URL path segments).
@@ -614,7 +656,7 @@ mod tests {
                 "resources": {"vcpus": 2}, "persistent": true,
                 "image": "node24", "region": "iad1",
                 "tags": {"thegn-owner": "x"},
-                "networkPolicy": {"type": "user-defined", "allow": ["github.com"]}
+                "networkPolicy": {"mode": "custom", "allowedDomains": ["github.com"]}
             })
         );
         for k in ["source", "credentials", "env", "ports"] {
@@ -624,10 +666,14 @@ mod tests {
 
     #[test]
     fn network_policy_golden() {
-        assert_eq!(network_policy_body(&[]), json!({"type": "allow-all"}));
+        assert_eq!(network_policy_body(&[]), json!({"mode": "deny-all"}));
+        assert_eq!(
+            network_policy_body(&s(&["*"])),
+            json!({"mode": "allow-all"})
+        );
         assert_eq!(
             network_policy_body(&s(&["a.com", "b.com"])),
-            json!({"type": "user-defined", "allow": ["a.com", "b.com"]})
+            json!({"mode": "custom", "allowedDomains": ["a.com", "b.com"]})
         );
     }
 
@@ -643,12 +689,28 @@ mod tests {
         assert_eq!(
             v,
             json!({"command": "git", "args": ["status"], "cwd": "/work",
-                   "env": {"FOO_1": "bar"}, "wait": true})
+                   "env": {"FOO_1": "bar"}, "wait": true, "logs": true})
         );
         let v = command_body(&s(&["ls"]), None, &[], false).unwrap();
         assert_eq!(v, json!({"command": "ls", "args": [], "wait": false}));
+        assert!(v.get("logs").is_none());
         let v = command_body(&s(&["ls"]), Some(""), &[], false).unwrap();
         assert!(v.get("cwd").is_none());
+    }
+
+    #[test]
+    fn command_body_attach_stdin() {
+        assert_eq!(
+            with_attach_stdin(json!({"command": "cat"})),
+            json!({"command": "cat", "attachStdin": true})
+        );
+        let detached = with_attach_stdin(command_body(&s(&["cat"]), None, &[], false).unwrap());
+        assert_eq!(detached.get("attachStdin"), Some(&json!(true)));
+        assert!(detached.get("logs").is_none());
+        assert_eq!(
+            with_attach_stdin(json!("not an object")),
+            json!("not an object")
+        );
     }
 
     #[test]
@@ -674,6 +736,33 @@ mod tests {
             v,
             json!({"type": "start", "command": "bash", "args": ["-l"], "cwd": "/w",
                    "cols": 80, "rows": 24})
+        );
+        let f = interactive_start_frame(
+            &s(&["env"]),
+            None,
+            &[
+                ("Z_LAST".into(), "z".into()),
+                ("A_FIRST".into(), "a".into()),
+            ],
+            80,
+            24,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+        assert_eq!(v.get("env"), Some(&json!(["A_FIRST=a", "Z_LAST=z"])));
+        let rest = command_body(
+            &s(&["env"]),
+            None,
+            &[
+                ("Z_LAST".into(), "z".into()),
+                ("A_FIRST".into(), "a".into()),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rest.get("env"),
+            Some(&json!({"Z_LAST": "z", "A_FIRST": "a"}))
         );
         assert!(interactive_start_frame(&[], None, &[], 1, 1).is_err());
         let r: serde_json::Value = serde_json::from_str(&resize_frame(100, 30)).unwrap();
@@ -784,6 +873,30 @@ mod tests {
         let sb = parse_sandbox(&json!({"name": "m"})).unwrap();
         assert_eq!(sb.status, SessionStatus::Unknown);
         assert!(sb.tags.is_empty() && sb.session_id.is_none());
+    }
+
+    #[test]
+    fn session_status_takes_precedence_over_sandbox_status() {
+        let pending = parse_sandbox(&json!({
+            "sandbox": {"name": "n", "status": "running"},
+            "session": {"status": "pending"}
+        }))
+        .unwrap();
+        assert_eq!(pending.status, SessionStatus::Pending);
+        let failed = parse_sandbox(&json!({
+            "sandbox": {"name": "n", "status": "running"},
+            "session": {"status": "failed"}
+        }))
+        .unwrap();
+        assert_eq!(failed.status, SessionStatus::Failed);
+        let stopped = parse_sandbox(&json!({"name": "n", "status": "stopped"})).unwrap();
+        assert_eq!(stopped.status, SessionStatus::Stopped);
+        let capitalized = parse_sandbox(&json!({
+            "sandbox": {"name": "n", "status": "RUNNING"},
+            "session": {"status": "PeNdInG"}
+        }))
+        .unwrap();
+        assert_eq!(capitalized.status, SessionStatus::Pending);
     }
 
     #[test]
@@ -942,7 +1055,11 @@ mod tests {
     #[test]
     fn session_usage_reads_session_then_sandbox_fields() {
         let v = json!({
-            "sandbox": {"name": "tg-a", "resources": {"vcpus": 2, "memory": 4096}},
+            "sandbox": {
+                "name": "tg-a",
+                "resources": {"vcpus": 2, "memory": 4096},
+                "totalActiveCpuDurationMs": 9000
+            },
             "session": {"activeCpuDurationMs": 1500, "startedAt": 10, "stoppedAt": null}
         });
         let u = parse_session_usage(&v).unwrap().expect("a session");
@@ -954,6 +1071,19 @@ mod tests {
         let nested = json!({"sandbox": {"vcpus": 4, "session": {"startedAt": 1}}});
         let u = parse_session_usage(&nested).unwrap().expect("a session");
         assert_eq!((u.vcpus, u.started_at_ms), (Some(4), Some(1)));
+        let fallback = json!({
+            "sandbox": {"name": "tg-a", "totalActiveCpuDurationMs": 9000},
+            "session": {"activeCpuDurationMs": null}
+        });
+        let u = parse_usage_with_sandbox_fallback(&fallback)
+            .unwrap()
+            .expect("a session");
+        assert_eq!(u.active_cpu_ms, Some(9000));
+        let none = json!({"sandbox": {"name": "tg-a"}, "session": {}});
+        assert_eq!(
+            parse_session_usage(&none).unwrap().unwrap().active_cpu_ms,
+            None
+        );
         assert_eq!(
             parse_session_usage(&json!({"sandbox": {"name": "tg-a"}})).unwrap(),
             None
