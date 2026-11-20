@@ -326,6 +326,7 @@ pub mod project;
 pub mod projection;
 pub mod provider_admission;
 pub mod provider_credentials;
+pub mod provision_journal;
 pub mod proxy;
 pub mod pull_progress;
 pub mod rebase_todo;
