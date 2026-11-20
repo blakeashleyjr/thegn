@@ -44,6 +44,7 @@ pub mod fleet_inspect;
 pub mod forward;
 pub mod host;
 pub mod inbox;
+pub mod info;
 pub mod integrate;
 pub(crate) mod integrate_order;
 pub mod issue;

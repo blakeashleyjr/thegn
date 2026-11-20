@@ -52,6 +52,7 @@ pub enum SidebarKeyId {
     ToggleWide,
     ToggleFlat,
     CycleDetail,
+    Info,
     TogglePin,
     Mark,
     RowMenu,
@@ -100,6 +101,7 @@ impl SidebarKeyId {
                 | I::Fork
                 | I::Folder
                 | I::CopyPath
+                | I::Info
                 | I::ReorderUp
                 | I::ReorderDown
         )
@@ -210,6 +212,13 @@ pub const SIDEBAR_KEYS: &[SidebarKey] = &[
         &[KeyCode::Char('i')],
         "i",
         "row detail",
+        HintTier::Common,
+    ),
+    k(
+        SidebarKeyId::Info,
+        &[KeyCode::Char('I')],
+        "I",
+        "info",
         HintTier::Common,
     ),
     k(
@@ -607,6 +616,7 @@ mod tests {
     fn chord_of_reads_the_table() {
         assert_eq!(chord_of(SidebarKeyId::ToggleFlat), "g");
         assert_eq!(chord_of(SidebarKeyId::CycleDetail), "i");
+        assert_eq!(chord_of(SidebarKeyId::Info), "I");
         assert_eq!(chord_of(SidebarKeyId::Activate), "\u{21b5}");
     }
 
