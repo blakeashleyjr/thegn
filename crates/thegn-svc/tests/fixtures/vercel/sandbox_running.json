@@ -3,10 +3,8 @@
     "name": "tg-fixture-1",
     "status": "running",
     "currentSessionId": "sess_abc123",
-    "resources": {
-      "vcpus": 2,
-      "memory": 4096
-    },
+    "vcpus": 2,
+    "memory": 4096,
     "region": "iad1",
     "createdAt": 1763500000000,
     "cwd": "/vercel/sandbox",
@@ -19,8 +17,9 @@
   "session": {
     "id": "sess_abc123",
     "status": "running",
-    "activeCpuDurationMs": 12000,
     "startedAt": 1763500001000,
     "stoppedAt": null
-  }
+  },
+  "routes": [],
+  "resumed": false
 }
