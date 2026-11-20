@@ -159,18 +159,23 @@ pub fn destroy_provider_sandbox_with(
     let Some(name) = name.filter(|s| !s.is_empty()) else {
         return Ok(Teardown::NoSandbox);
     };
-    // Revoke before recycle/destroy. If SQLite is unavailable, fail closed and
-    // leave the sandbox intact so the lifecycle can retry rather than orphaning
-    // an unrevoked return credential with no remaining owner metadata.
     if let Err(error) = thegn_core::provision_journal::cancel(&name) {
         tracing::debug!(target: "thegn::provider", sandbox = %name, %error, "could not cancel deferred provision journal");
     }
-    crate::remote_enqueue_auth::revoke_for_sandbox(pc, &name, Some(worktree))
-        .map_err(|error| format!("revoke route-to-host credential: {error:#}"))?;
+    // Revoke before recycle/destroy. If SQLite is unavailable, fail closed and
+    // leave the sandbox intact so the lifecycle can retry rather than orphaning
+    // an unrevoked return credential with no remaining owner metadata.
+    if let Err(error) = crate::remote_enqueue_auth::revoke_for_sandbox(pc, &name, Some(worktree)) {
+        crate::provision_bg::resume_cancelled(&name, worktree, env_name);
+        return Err(format!("revoke route-to-host credential: {error:#}"));
+    }
     // A CLAIMED pool spare with a fresh provisioned-base checkpoint is RECYCLED
     // back into the pool (restore-in-place, row → `ready`) instead of destroyed.
     let disposition = crate::lifecycle::recycle_claimed_on_delete(cfg, env_name, &name);
     if disposition == crate::lifecycle::DeleteRecycle::Recycled {
+        if let Err(error) = thegn_core::provision_journal::clear(&name) {
+            tracing::debug!(target: "thegn::provider", sandbox = %name, %error, "could not clear deferred provision journal");
+        }
         thegn_core::msg::info(&format!("recycled spare {name} into the pool on delete"));
         return Ok(Teardown::Recycled { name });
     }
@@ -183,9 +188,12 @@ pub fn destroy_provider_sandbox_with(
         &mut || Instant::now() + DESTROY_VERIFY_TIMEOUT,
         &mut std::thread::sleep,
     );
-    after_destroy(outcome, disposition, || {
+    if let Err(error) = after_destroy(outcome, disposition, || {
         crate::lifecycle::forget_destroyed_spare(&name)
-    })?;
+    }) {
+        crate::provision_bg::resume_cancelled(&name, worktree, env_name);
+        return Err(error);
+    }
     thegn_core::msg::info(&format!("destroyed sandbox {name} on worktree delete"));
     // Drop the local provisioned marker so a later sandbox reusing this id isn't
     // treated as provisioned (the attach gate would skip re-provisioning).

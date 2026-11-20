@@ -229,17 +229,7 @@ fn report_relaunch_refusal(refusal: RelaunchRefusal, worktree: &str) {
     );
 }
 
-/// When the THE-85 attach probe found NO live daemon session for `worktree`,
-/// a fresh (re)bring-up relaunches the worktree's remembered agent as
-/// `leaf`'s process — resuming its last harness session when the
-/// `[[agents]]` entry opted in (`resume = true`) and the harness advertises
-/// the RESUME capability. `Ok(None)` ⇒ keep the resolved shell spec; `Err` is
-/// only the final launch-spec refusal that the caller reports before keeping
-/// that same shell.
-///
-/// Every lookup gate fails open to `Ok(None)` (today's shell): an unremembered
-/// / `"shell"` / `"clean-shell"` / tool-drawer record, or an entry that has
-/// left the config, all remain silent and degrade honestly.
+/// Return the remembered agent name when it is configured for this worktree.
 fn remembered_agent_with(db: &Db, cfg: &Config, worktree: &str) -> Option<String> {
     let name = match db.worktree_agent(worktree) {
         Ok(Some(name)) => name,
@@ -261,11 +251,23 @@ fn remembered_agent_with(db: &Db, cfg: &Config, worktree: &str) -> Option<String
     Some(name)
 }
 
+/// Return the remembered agent name, if the worktree database is available.
 pub(crate) fn remembered_agent(cfg: &Config, worktree: &str) -> Option<String> {
     let db = Db::open().ok()?;
     remembered_agent_with(&db, cfg, worktree)
 }
 
+/// When the THE-85 attach probe found NO live daemon session for `worktree`,
+/// a fresh (re)bring-up relaunches the worktree's remembered agent as
+/// `leaf`'s process — resuming its last harness session when the
+/// `[[agents]]` entry opted in (`resume = true`) and the harness advertises
+/// the RESUME capability. `Ok(None)` ⇒ keep the resolved shell spec; `Err` is
+/// only the final launch-spec refusal that the caller reports before keeping
+/// that same shell.
+///
+/// Every lookup gate fails open to `Ok(None)` (today's shell): an unremembered
+/// / `"shell"` / `"clean-shell"` / tool-drawer record, or an entry that has
+/// left the config, all remain silent and degrade honestly.
 pub(crate) fn remembered_agent_relaunch(
     cfg: &Config,
     worktree: &str,

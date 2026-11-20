@@ -258,7 +258,11 @@ pub(crate) fn maybe_materialize(
                     Ok(outcome) => {
                         handoff = outcome.deferred;
                         if !quiet
-                            && handoff.is_some()
+                            && handoff.as_ref().is_some_and(|h| {
+                                thegn_core::provision_journal::agent_gate(
+                                    thegn_core::provision_journal::read(&h.sandbox).as_ref(),
+                                ) == thegn_core::provision_journal::AgentGate::Wait
+                            })
                             && crate::handlers::worktree_launch::remembered_agent(&cfg, &wt)
                                 .is_some()
                         {
@@ -366,10 +370,9 @@ pub(crate) fn maybe_materialize(
                 attach,
             })
             .is_ok()
+            && wk.wake().is_err()
         {
-            if wk.wake().is_err() {
-                tracing::debug!(target: "thegn::loading", "materialize spec wake failed");
-            }
+            tracing::debug!(target: "thegn::loading", "materialize spec wake failed");
         }
         if let Some(handoff) = handoff {
             crate::provision_bg::finish_in_background(&cfg, &wt, handoff);
