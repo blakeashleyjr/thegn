@@ -278,14 +278,16 @@ impl DaemonService {
     async fn shutdown_sessions_within(&self, drain_deadline: std::time::Duration) {
         self.accepting
             .store(false, std::sync::atomic::Ordering::Release);
-        let deadline = tokio::time::Instant::now() + drain_deadline;
-        let senders = self
-            .sessions
-            .lock()
-            .await
+        let sessions = self.sessions.lock().await;
+        let ids = sessions.keys().cloned().collect::<Vec<_>>();
+        let n = ids.len();
+        tracing::info!(target: "thegn::daemon", live = n, ids = ?ids, "daemon stopping; these session ids become unknown to the next daemon");
+        let senders = sessions
             .values()
             .map(|entry| entry.msg_tx.clone())
             .collect::<Vec<_>>();
+        drop(sessions);
+        let deadline = tokio::time::Instant::now() + drain_deadline;
         let mut tasks = Vec::new();
         let drain = tokio::time::timeout_at(deadline, async {
             for tx in senders {
@@ -1506,7 +1508,26 @@ impl DaemonService {
                         super::stage_launch::LaunchAdmit::Fresh => {
                             Some(super::stage_launch::LaunchGuard::new(&self.launches, &id))
                         }
-                        super::stage_launch::LaunchAdmit::Replay(info) => return Ok(info),
+                        super::stage_launch::LaunchAdmit::Replay(info) => {
+                            if matches!(self.lookup(&info.id).await, Lookup::Unknown) {
+                                let safe_session_id = info
+                                    .id
+                                    .chars()
+                                    .filter(|character| !character.is_control())
+                                    .collect::<String>();
+                                tracing::info!(
+                                    target: "thegn::daemon",
+                                    launch = %id,
+                                    session = %safe_session_id,
+                                    "stage launch replay names a session this daemon no longer knows"
+                                );
+                                return Err(ControlError::Conflict(format!(
+                                    "stage launch {id} already opened session {}, which this daemon no longer knows (it ended and was evicted, or the daemon restarted); dispatch again with a new launch id",
+                                    safe_session_id
+                                )));
+                            }
+                            return Ok(info);
+                        }
                         super::stage_launch::LaunchAdmit::Refused(message) => {
                             return Err(ControlError::Conflict(message));
                         }
@@ -6585,6 +6606,95 @@ mod tests {
             "reused launch id must not spawn another worker"
         );
         svc.kill(&first.id).await.expect("stop worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_replay_of_a_vanished_session_is_refused() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
+            .await
+            .expect("prepare pipeline row");
+        let mut spec = dispatch_open_spec(row);
+        spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "d".repeat(32),
+        ));
+
+        let first = svc.open(spec.clone()).await.expect("first launch");
+        svc.kill(&first.id).await.expect("stop worker");
+        for _ in 0..200 {
+            if matches!(svc.lookup(&first.id).await, Lookup::Dead(_)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            matches!(svc.lookup(&first.id).await, Lookup::Dead(_)),
+            "killed session must reach the graveyard before eviction"
+        );
+
+        for i in 0..super::super::tombstone::MAX_TOMBSTONES {
+            let id = format!("fresh-{i}");
+            svc.tombs.lock().await.insert(
+                id.clone(),
+                super::super::tombstone::tests::tomb(&id, Some(0)),
+                now_ms(),
+            );
+        }
+        assert!(
+            matches!(svc.lookup(&first.id).await, Lookup::Unknown),
+            "the original tombstone must be evicted"
+        );
+
+        let error = svc
+            .open(spec)
+            .await
+            .expect_err("a replay of an unknown session must be refused");
+        match error {
+            ControlError::Conflict(message) => assert!(message.contains("no longer knows")),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert!(
+            svc.list_sessions()
+                .await
+                .expect("list sessions")
+                .iter()
+                .all(|session| session.exited_at_ms.is_some()),
+            "a vanished replay must not create a live session"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_replay_of_a_graveyard_session_succeeds() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
+            .await
+            .expect("prepare pipeline row");
+        let mut spec = dispatch_open_spec(row);
+        spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "e".repeat(32),
+        ));
+
+        let first = svc.open(spec.clone()).await.expect("first launch");
+        svc.kill(&first.id).await.expect("stop worker");
+        for _ in 0..200 {
+            if matches!(svc.lookup(&first.id).await, Lookup::Dead(_)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            matches!(svc.lookup(&first.id).await, Lookup::Dead(_)),
+            "killed session must remain in the graveyard"
+        );
+
+        let replay = svc.open(spec).await.expect("graveyard replay");
+        assert_eq!(replay.id, first.id);
     }
 
     #[tokio::test(flavor = "multi_thread")]

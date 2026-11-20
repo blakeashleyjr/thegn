@@ -912,6 +912,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             // the session lives on (that's the point).
             use std::io::Write;
             let mut out = std::io::stdout();
+            let mut saw_exit = false;
             while let Some(frame) = stream.frames.recv().await {
                 use thegn_core::control_wire::EventFrame;
                 match frame {
@@ -921,6 +922,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         out.flush()?;
                     }
                     EventFrame::SessionExit { code, .. } => {
+                        saw_exit = true;
                         let _ = stream.control.send(AttachControl::Close).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                         outln!(
                             "\n[session exited: {}]",
@@ -929,6 +931,26 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         break;
                     }
                     _ => {}
+                }
+            }
+            if !saw_exit {
+                let listed = client.sessions().await?;
+                match attach_end_verdict(listed.iter().find(|info| info.id == session)) {
+                    AttachEnd::Exited(code) => {
+                        outln!(
+                            "\n[session exited: {}]",
+                            code.map_or("?".into(), |c| c.to_string())
+                        );
+                        return Ok(());
+                    }
+                    AttachEnd::StillRunning => anyhow::bail!(
+                        "attach stream for {} ended while the session is still running (the daemon dropped this observer)",
+                        display_cell(&session)
+                    ),
+                    AttachEnd::Gone => anyhow::bail!(
+                        "session {} is gone: this daemon does not know it (it may have restarted)",
+                        display_cell(&session)
+                    ),
                 }
             }
         }
@@ -1248,6 +1270,7 @@ pub(crate) async fn open_plain(
         already_capped: false,
     };
     let info = client.open(&spec).await?;
+    confirm_opened(client, &info.id).await?;
     let tracked_row = match track {
         Some(track_issue) => Some(
             crate::cmd::session_track::track_opened(client, track_issue, &wt, &agent, &info.id)
@@ -1878,7 +1901,9 @@ pub(crate) async fn open_stage_dispatch(
             adopt: d.adopt,
             already_capped: false,
         };
-        crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await
+        let info = crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await?;
+        confirm_opened(client, &info.id).await?;
+        Ok(info)
     }
     .await;
     match opened {
@@ -2355,7 +2380,9 @@ async fn resume_work(
             adopt,
             already_capped: false,
         };
-        crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await
+        let info = crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await?;
+        confirm_opened(client, &info.id).await?;
+        Ok(info)
     }
     .await;
     match opened {
@@ -2407,6 +2434,33 @@ async fn resume_work(
     }
 }
 
+/// Refuse an id the daemon does not list (live or tombstone).
+async fn confirm_opened(client: &ControlClient, id: &str) -> Result<()> {
+    if client.sessions().await?.iter().any(|info| info.id == id) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the daemon returned session {} but does not list it; nothing to attach to (run `thegn session list`)",
+        display_cell(id)
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttachEnd {
+    Exited(Option<i32>),
+    StillRunning,
+    Gone,
+}
+
+/// Pure: what a frame stream that ended WITHOUT SessionExit means.
+fn attach_end_verdict(listed: Option<&thegn_svc::control::SessionInfo>) -> AttachEnd {
+    match listed {
+        Some(info) if info.exited_at_ms.is_some() => AttachEnd::Exited(info.exit_code),
+        Some(_) => AttachEnd::StillRunning,
+        None => AttachEnd::Gone,
+    }
+}
+
 /// Render an ANSI screen repaint to plain rows: feed it to a fresh emulator
 /// of the session's geometry and copy the whole pane out, row by row.
 pub(crate) fn snapshot_text(rows: u16, cols: u16, ansi: &[u8]) -> String {
@@ -2421,6 +2475,50 @@ fn session_target(flag: Option<String>, pos: Option<String>) -> Result<String> {
         (Some(_), Some(_)) => anyhow::bail!("give only one session id (positional or --session)"),
         (Some(session), None) | (None, Some(session)) => Ok(session),
         (None, None) => anyhow::bail!("give a session id (positional or --session)"),
+    }
+}
+
+#[cfg(test)]
+mod attach_end_tests {
+    use super::{AttachEnd, attach_end_verdict};
+    use thegn_svc::control::SessionInfo;
+
+    fn session(exited_at_ms: Option<i64>, exit_code: Option<i32>) -> SessionInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": "session-1",
+            "worktree": null,
+            "program": "sh",
+            "cwd": null,
+            "rows": 24,
+            "cols": 80,
+            "created_at_ms": 1,
+            "attached_clients": 0,
+            "error_active": false,
+            "lease_expires_at": null,
+            "pid": null,
+            "exited_at_ms": exited_at_ms,
+            "exit_code": exit_code,
+            "final_state": null,
+            "recording": null,
+            "forked_from": null,
+            "last_output_unix_secs": null,
+            "honoured": [],
+        }))
+        .expect("session wire shape")
+    }
+
+    #[test]
+    fn attach_end_verdict_table() {
+        let cases = [
+            (None, AttachEnd::Gone),
+            (Some(session(None, None)), AttachEnd::StillRunning),
+            (Some(session(Some(2), Some(3))), AttachEnd::Exited(Some(3))),
+            (Some(session(Some(2), None)), AttachEnd::Exited(None)),
+        ];
+
+        for (listed, expected) in cases {
+            assert_eq!(attach_end_verdict(listed.as_ref()), expected);
+        }
     }
 }
 
