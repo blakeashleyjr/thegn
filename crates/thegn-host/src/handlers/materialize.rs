@@ -275,10 +275,7 @@ pub(crate) fn maybe_materialize(
                                 &wt,
                                 deferred,
                                 &mut |views| {
-                                    if ptx_p
-                                        .send((gname_p.clone(), ti, provision_load_steps(views)))
-                                        .is_err()
-                                    {
+                                    if !ptx_p.send((gname_p.clone(), ti, provision_load_steps(views))) {
                                         tracing::debug!(
                                             target: "thegn::loading",
                                             worktree = %wt,
