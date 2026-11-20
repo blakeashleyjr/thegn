@@ -1992,8 +1992,31 @@ mod tests {
             })
             .await
             .unwrap();
-        // The child keeps writing while detached (marker2 after 300ms).
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        // The child keeps writing while detached (marker2 after 300ms). Poll
+        // through observer snapshots so this remains a load proof without a
+        // fixed wait that needlessly extends the test.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut probe_number = 0;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "marker2 did not reach a detached observer snapshot"
+            );
+            let probe_id = format!("probe-{probe_number}");
+            let probe = attach(&h, &probe_id, AttachKind::Observer, 24, 80).await;
+            let (_, screen) = snapshot_parts(&probe.snapshot);
+            h.msg_tx
+                .send(SessionMsg::Detach {
+                    client_id: probe_id,
+                })
+                .await
+                .unwrap();
+            if screen.contains("marker2") {
+                break;
+            }
+            probe_number += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         let mut second = attach(&h, "c2", AttachKind::Interactive, 24, 80).await;
         let (seq1, screen) = snapshot_parts(&second.snapshot);
