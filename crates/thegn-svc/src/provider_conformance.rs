@@ -62,7 +62,8 @@ pub struct Fixture {
     pub ledger_at_create: Option<Probe<Option<bool>>>,
     /// How many DELETE requests the fake has seen for a name.
     pub deletes_for: Option<Probe<DeleteCounter>>,
-    /// How many resume requests the fake has seen (none for sprites).
+    /// How many wakes the fake has seen (Vercel resume requests, Sprites exec
+    /// upgrades); `None` skips `reads_never_resume`.
     pub resumes: Option<Probe<usize>>,
     /// The provider's instance cap (`max_instances`) when the fixture is
     /// configured with one the suite can fill; `None` skips `create_respects_cap`.
@@ -350,7 +351,7 @@ pub async fn suite(p: &Provider, fx: &Fixture) -> Report {
         &mut report,
         "egress_never_widens",
         fx.egress_allows_all.as_ref().map(|probe| async move {
-            let allow = vec!["a.example".to_string()];
+            let allow = ["a.example".to_string()];
             let shadowed = p.set_network_policy(&fx.created, &allow, &allow).await;
             if shadowed.is_ok() {
                 ensure(probe(&fx.created) == Some(false), || {
