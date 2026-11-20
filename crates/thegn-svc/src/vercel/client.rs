@@ -382,6 +382,9 @@ impl VercelClient {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
+        // A row the parser refused (an id that is not a valid snapshot id) is
+        // a snapshot this listing cannot name, so the listing is not complete.
+        let mut dropped = false;
         for _page in 0..SNAPSHOT_PAGE_CAP {
             let mut extra: Vec<(&str, &str)> = vec![
                 ("project", self.scope.project_id.as_str()),
@@ -397,9 +400,16 @@ impl VercelClient {
             let v = response_json(resp, PROVIDER, p.op).await?;
             let (items, next) =
                 parse_snapshots(&v).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+            let listed = v
+                .get("snapshots")
+                .and_then(|rows| rows.as_array())
+                .map_or(0, Vec::len);
+            if items.len() != listed {
+                dropped = true;
+            }
             out.extend(items);
             match next {
-                None => return Ok((out, true)),
+                None => return Ok((out, !dropped)),
                 Some(next) if seen.insert(next.clone()) => cursor = Some(next),
                 Some(_) => return Ok((out, false)),
             }
