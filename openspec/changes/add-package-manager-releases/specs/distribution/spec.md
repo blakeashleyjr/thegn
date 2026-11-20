@@ -34,6 +34,22 @@ resolve only assets produced for the same release contract.
 - **THEN** the attestation identifies this repository's release workflow and
   its checksum matches the published checksum asset
 
+### Requirement: Release downloads have a selected aggregate byte budget
+
+Before downloading release assets, the workflow SHALL validate each selected
+asset against its existing per-asset limit and validate the selected total
+against a 1 GiB aggregate limit. Pattern-filtered downloads SHALL count only
+assets selected by those patterns; an unfiltered manifest download SHALL count
+all listed release assets. The aggregate check MUST reject excess before the
+download command runs.
+
+#### Scenario: Selected assets exceed the aggregate budget
+
+- **WHEN** each selected release asset is within its per-asset limit but their
+  combined size exceeds 1 GiB
+- **THEN** the workflow refuses the download before creating the package input
+  set
+
 ### Requirement: Homebrew and AUR publication is protected and idempotent
 
 Homebrew/AUR publication SHALL run only through the protected publication

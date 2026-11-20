@@ -1763,6 +1763,37 @@ class ReleaseAssetSizePrecheckTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.check_release_asset_sizes(self.listing(("x.sha256", cap + 1)), [])
 
+    def test_aggregate_selected_download_cap_boundary_and_overflow(self) -> None:
+        with (
+            mock.patch.object(release, "MAX_ARCHIVE_BYTES", 1000),
+            mock.patch.object(release, "MAX_SELECTED_DOWNLOAD_BYTES", 1500),
+        ):
+            at_limit = self.listing(("a.tar.gz", 750), ("b.tar.gz", 750))
+            self.assertEqual(
+                ["a.tar.gz", "b.tar.gz"],
+                release.check_release_asset_sizes(at_limit, []),
+            )
+            one_over = self.listing(("a.tar.gz", 751), ("b.tar.gz", 750))
+            with self.assertRaisesRegex(release.ReleaseError, "aggregate download limit"):
+                release.check_release_asset_sizes(one_over, [])
+
+    def test_aggregate_budget_applies_only_to_pattern_selected_assets(self) -> None:
+        document = self.listing(
+            ("linux.tar.gz", 700),
+            ("darwin.tar.gz", 700),
+            ("unselected.tar.gz", 1000),
+        )
+        with (
+            mock.patch.object(release, "MAX_ARCHIVE_BYTES", 1000),
+            mock.patch.object(release, "MAX_SELECTED_DOWNLOAD_BYTES", 1400),
+        ):
+            self.assertEqual(
+                ["darwin.tar.gz", "linux.tar.gz"],
+                release.check_release_asset_sizes(document, ["*.tar.gz"]),
+            )
+            with self.assertRaisesRegex(release.ReleaseError, "aggregate download limit"):
+                release.check_release_asset_sizes(document, [])
+
     def test_rejects_bad_shapes(self) -> None:
         bad = [
             [],
