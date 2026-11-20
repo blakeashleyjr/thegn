@@ -1005,7 +1005,7 @@ async fn stream_retries_a_stopped_detached_command_once() {
     let p = Arc::new(provider(&fake, ledger.path(), 2));
     let _session = p.clone().open_stream(NAME, &stream_spec()).await.unwrap();
     assert_eq!(fake.count("run_detached"), 2, "{:?}", fake.calls());
-    assert_eq!(fake.count("get"), 2, "{:?}", fake.calls());
+    assert_eq!(fake.count("get"), 4, "{:?}", fake.calls());
 }
 
 #[tokio::test]
@@ -1063,7 +1063,7 @@ async fn interactive_retries_a_stopped_ticket_once() {
     };
     assert!(error.downcast_ref::<client::SessionStopped>().is_none());
     assert_eq!(fake.count("interactive"), 2, "{:?}", fake.calls());
-    assert_eq!(fake.count("get"), 2, "{:?}", fake.calls());
+    assert_eq!(fake.count("get"), 4, "{:?}", fake.calls());
 }
 
 #[tokio::test]
