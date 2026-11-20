@@ -311,7 +311,7 @@ teardown() {
       if ! "$THEGN_BIN" "${MIN_RAM_SET[@]}" env deprovision "$n" --env "$env_name"; then
         if ! listing_lacks_name "$n"; then
           (cd "$REPO" && "$THEGN_BIN" "${MIN_RAM_SET[@]}" env down --worktree "$REPO" --force)
-          if case "$(live_listing "$env_name" "$n")" in present\ *) true ;; *) false ;; esac; then
+          if case "$(live_listing "$env_name" "$n")" in present\ *) true ;; *) false ;; esac then
             echo "-- teardown: sandbox $n still exists; remove it with thegn env reap"
           fi
         fi
@@ -1003,8 +1003,7 @@ pull = result.get("pull")
 if not isinstance(pull, dict) or pull.get("ok") is not True:
     print("agent run pull.ok is not true", file=sys.stderr)
     sys.exit(1)
-'
-  then
+'; then
     return 0
   fi
   agent_failure_summary
