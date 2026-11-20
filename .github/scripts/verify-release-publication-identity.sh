@@ -51,3 +51,6 @@ python3 "$GITHUB_WORKSPACE/packaging/release.py" verify-publication-identity \
   --commit "$peeled" \
   --repository "$GITHUB_REPOSITORY" \
   --server-url "$GITHUB_SERVER_URL"
+jq -cn --arg tag_object "$tag_object" --arg commit "$peeled" \
+  '{tag_object: $tag_object, commit: $commit}' \
+  >"$RUNNER_TEMP/release-tag-identity.json"

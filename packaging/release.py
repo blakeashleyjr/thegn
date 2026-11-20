@@ -1186,7 +1186,7 @@ def build_release_manifest(
     for name in expected:
         path = found[name]
         result_assets.append({"name": name, "sha256": _sha256(path), "size": path.stat().st_size})
-    return {
+    value = {
         "schema_version": 1,
         "tag": tag,
         "commit": commit,
@@ -1598,6 +1598,314 @@ def check_publication_identity(
     return run_id
 
 
+def _aur_metadata_digests(files_dir: Path) -> dict[str, str]:
+    return {
+        name: _hash_payload_file(files_dir / name)
+        for name in ("PKGBUILD", ".SRCINFO")
+    }
+
+
+def write_aur_metadata_digest_sidecar(
+    *,
+    output: Path,
+    files_dir: Path,
+    tag: str,
+    repository: str,
+    run_id: str,
+    run_attempt: int,
+    source_sha: str,
+) -> dict[str, Any]:
+    if RELEASE_TAG_RE.fullmatch(tag) is None:
+        raise ReleaseError(f"invalid release tag {tag!r}")
+    if not isinstance(repository, str) or re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
+    ) is None:
+        raise ReleaseError("invalid repository for AUR metadata sidecar")
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9]{1,20}", run_id) is None:
+        raise ReleaseError("invalid workflow run id for AUR metadata sidecar")
+    if isinstance(run_attempt, bool) or not isinstance(run_attempt, int) or run_attempt < 1:
+        raise ReleaseError("invalid workflow run attempt for AUR metadata sidecar")
+    if not isinstance(source_sha, str) or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", source_sha) is None:
+        raise ReleaseError("invalid workflow source SHA for AUR metadata sidecar")
+    value = {
+        "schema_version": 1,
+        "tag": tag,
+        "workflow_run": {
+            "repository": repository,
+            "id": run_id,
+            "attempt": run_attempt,
+            "source_sha": source_sha,
+        },
+        "files": _aur_metadata_digests(files_dir),
+    }
+    try:
+        if output.is_symlink():
+            raise ReleaseError(f"refusing to write AUR metadata sidecar through symlink: {output}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as error:
+        raise ReleaseError(f"cannot write AUR metadata sidecar {output}: {error}") from error
+    return value
+
+
+def _load_aur_metadata_digest_sidecar(
+    path: Path,
+    *,
+    tag: str,
+    repository: str,
+    run_id: str,
+    run_attempt: int,
+    source_sha: str,
+) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ReleaseError(f"AUR metadata digest sidecar must not be a symlink: {path}")
+    try:
+        if path.stat().st_size > 65536:
+            raise ReleaseError(f"AUR metadata digest sidecar {path} exceeds 64 KiB")
+
+        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for name, value in pairs:
+                if name in result:
+                    raise ReleaseError(f"AUR metadata digest sidecar {path} has duplicate keys")
+                result[name] = value
+            return result
+
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ReleaseError(f"cannot read AUR metadata digest sidecar {path}: {error}") from error
+    if not isinstance(value, dict) or set(value) != {"schema_version", "tag", "workflow_run", "files"}:
+        raise ReleaseError("AUR metadata digest sidecar has an invalid shape")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise ReleaseError("AUR metadata digest sidecar schema_version must be integer 1")
+    if value["tag"] != tag:
+        raise ReleaseError("AUR metadata digest sidecar names the wrong release tag")
+    workflow_run = value["workflow_run"]
+    if not isinstance(workflow_run, dict) or workflow_run != {
+        "repository": repository,
+        "id": run_id,
+        "attempt": run_attempt,
+        "source_sha": source_sha,
+    }:
+        raise ReleaseError("AUR metadata digest sidecar belongs to a different workflow run")
+    files = value["files"]
+    if not isinstance(files, dict) or set(files) != {"PKGBUILD", ".SRCINFO"}:
+        raise ReleaseError("AUR metadata digest sidecar must cover PKGBUILD and .SRCINFO exactly")
+    if any(not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None for digest in files.values()):
+        raise ReleaseError("AUR metadata digest sidecar contains an invalid SHA-256")
+    return value
+
+
+def verify_aur_metadata_digest_sidecar(
+    *,
+    files_dir: Path,
+    sidecar_path: Path,
+    tag: str,
+    repository: str,
+    run_id: str,
+    run_attempt: int,
+    source_sha: str,
+) -> dict[str, str]:
+    sidecar = _load_aur_metadata_digest_sidecar(
+        sidecar_path,
+        tag=tag,
+        repository=repository,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        source_sha=source_sha,
+    )
+    actual = _aur_metadata_digests(files_dir)
+    if actual != sidecar["files"]:
+        raise ReleaseError("AUR metadata does not match its workflow digest sidecar")
+    return actual
+
+
+def build_publication_receipt(
+    *,
+    manifest_path: Path,
+    verification: Any,
+    workflow_run: Any,
+    tag: str,
+    tag_object: str,
+    commit: str,
+    target: str,
+    target_repository: str,
+    branch: str,
+    outcome: str,
+    old_oid: str | None,
+    new_oid: str,
+    observed_oid: str,
+    published_blobs: Mapping[str, str],
+    aur_metadata_digests: Mapping[str, str] | None,
+    repository: str,
+    server_url: str,
+    publication_run_id: str,
+    publication_run_attempt: int,
+    publication_source_sha: str,
+    aur_metadata_sidecar_sha256: str | None,
+    aur_metadata_artifact_id: str | None,
+    aur_metadata_producer_attempt: int | None,
+    aur_metadata_producer_source_sha: str | None,
+) -> dict[str, Any]:
+    """Build a credential-free receipt for a verified external publication."""
+    release_run_id = check_publication_identity(
+        manifest_path=manifest_path,
+        verification=verification,
+        workflow_run=workflow_run,
+        tag=tag,
+        tag_object=tag_object,
+        commit=commit,
+        repository=repository,
+        server_url=server_url,
+    )
+    record = load_release_manifest_record(manifest_path, tag)
+    oid_pattern = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+    if target not in {"homebrew", "aur"}:
+        raise ReleaseError(f"invalid publication target: {target!r}")
+    target_repository_is_valid = (
+        isinstance(target_repository, str)
+        and len(target_repository) <= 200
+        and (
+            re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target_repository) is not None
+            if target == "homebrew"
+            else target_repository == "thegn-bin"
+        )
+    )
+    if not target_repository_is_valid:
+        raise ReleaseError("invalid publication target repository")
+    expected_branch = "main" if target == "homebrew" else "master"
+    if branch != expected_branch:
+        raise ReleaseError(f"invalid {target} publication branch: {branch!r}")
+    if outcome not in {"committed", "unchanged"}:
+        raise ReleaseError(f"invalid publication outcome: {outcome!r}")
+    for name, value in (("new", new_oid), ("observed", observed_oid)):
+        if not isinstance(value, str) or oid_pattern.fullmatch(value) is None:
+            raise ReleaseError(f"invalid publication {name} OID")
+    if old_oid is not None and (
+        not isinstance(old_oid, str) or oid_pattern.fullmatch(old_oid) is None
+    ):
+        raise ReleaseError("invalid publication old OID")
+    if observed_oid != new_oid:
+        raise ReleaseError("observed publication OID does not match new OID")
+    if outcome == "unchanged" and (old_oid is None or new_oid != old_oid):
+        raise ReleaseError("unchanged publication must retain its old OID")
+    if outcome == "committed" and old_oid == new_oid:
+        raise ReleaseError("committed publication must change its OID")
+    expected_paths = (
+        {"Formula/thegn.rb"}
+        if target == "homebrew"
+        else {"PKGBUILD", ".SRCINFO"}
+    )
+    if set(published_blobs) != expected_paths:
+        raise ReleaseError("publication receipt blob paths do not match the target contract")
+    if any(
+        not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None
+        for digest in published_blobs.values()
+    ):
+        raise ReleaseError("publication receipt contains an invalid blob SHA-256")
+    signed_asset = f"thegn-{tag}-homebrew.rb" if target == "homebrew" else f"thegn-{tag}-PKGBUILD"
+    signed_assets = {asset["name"]: asset["sha256"] for asset in record["assets"]}
+    signed_blob_path = "Formula/thegn.rb" if target == "homebrew" else "PKGBUILD"
+    if signed_assets.get(signed_asset) != published_blobs[signed_blob_path]:
+        raise ReleaseError("published metadata blob does not match the signed release manifest")
+    if target == "aur":
+        if (
+            not isinstance(aur_metadata_digests, Mapping)
+            or set(aur_metadata_digests) != {"PKGBUILD", ".SRCINFO"}
+            or aur_metadata_digests["PKGBUILD"] != published_blobs["PKGBUILD"]
+            or aur_metadata_digests[".SRCINFO"] != published_blobs[".SRCINFO"]
+            or not isinstance(aur_metadata_sidecar_sha256, str)
+            or SHA256_RE.fullmatch(aur_metadata_sidecar_sha256) is None
+            or not isinstance(aur_metadata_artifact_id, str)
+            or re.fullmatch(r"[0-9]{1,20}", aur_metadata_artifact_id) is None
+            or isinstance(aur_metadata_producer_attempt, bool)
+            or not isinstance(aur_metadata_producer_attempt, int)
+            or aur_metadata_producer_attempt < 1
+            or aur_metadata_producer_attempt > publication_run_attempt
+            or not isinstance(aur_metadata_producer_source_sha, str)
+            or oid_pattern.fullmatch(aur_metadata_producer_source_sha) is None
+            or aur_metadata_producer_source_sha != publication_source_sha
+        ):
+            raise ReleaseError("published AUR blobs do not match the verified metadata sidecar")
+    elif any(
+        value is not None
+        for value in (
+            aur_metadata_digests,
+            aur_metadata_sidecar_sha256,
+            aur_metadata_artifact_id,
+            aur_metadata_producer_attempt,
+            aur_metadata_producer_source_sha,
+        )
+    ):
+        raise ReleaseError("Homebrew receipt cannot include AUR metadata digests")
+    run_attempt = workflow_run["run_attempt"]
+    source_sha = workflow_run["head_sha"]
+    if (
+        not isinstance(publication_run_id, str)
+        or re.fullmatch(r"[0-9]{1,20}", publication_run_id) is None
+    ):
+        raise ReleaseError("invalid publication workflow run id")
+    if (
+        isinstance(publication_run_attempt, bool)
+        or not isinstance(publication_run_attempt, int)
+        or publication_run_attempt < 1
+    ):
+        raise ReleaseError("invalid publication workflow run attempt")
+    if not isinstance(publication_source_sha, str) or oid_pattern.fullmatch(publication_source_sha) is None:
+        raise ReleaseError("invalid publication workflow source SHA")
+    return {
+        "schema_version": 1,
+        "target": target,
+        "target_repository": target_repository,
+        "branch": branch,
+        "outcome": outcome,
+        "old_oid": old_oid,
+        "new_oid": new_oid,
+        "observed_oid": observed_oid,
+        "published_blobs": [
+            {"path": path, "sha256": published_blobs[path]}
+            for path in sorted(published_blobs)
+        ],
+        "metadata_sidecar_sha256": aur_metadata_sidecar_sha256,
+        "metadata_artifact_id": aur_metadata_artifact_id,
+        "metadata_producer": (
+            {
+                "run_id": publication_run_id,
+                "attempt": aur_metadata_producer_attempt,
+                "source_sha": aur_metadata_producer_source_sha,
+            }
+            if target == "aur"
+            else None
+        ),
+        "release": {
+            "tag": tag,
+            "tag_object": record["tag_object"],
+            "source_commit": record["commit"],
+            "workflow_sha": record["workflow_sha"],
+            "run_id": release_run_id,
+            "run_attempt": run_attempt,
+            "run_source_sha": source_sha,
+            "repository": repository,
+            "manifest_sha256": _sha256(manifest_path),
+        },
+        "publication_run": {
+            "id": publication_run_id,
+            "attempt": publication_run_attempt,
+            "source_sha": publication_source_sha,
+        },
+    }
+
+
+def write_publication_receipt(output: Path, value: Mapping[str, Any]) -> None:
+    try:
+        if output.is_symlink():
+            raise ReleaseError(f"refusing to write publication receipt through symlink: {output}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as error:
+        raise ReleaseError(f"cannot write publication receipt {output}: {error}") from error
+
+
 def check_release_asset_sizes(document: Any, patterns: Sequence[str]) -> list[str]:
     if not isinstance(document, dict) or not isinstance(document.get("assets"), list):
         raise ReleaseError("malformed release asset listing: expected an assets list")
@@ -1712,6 +2020,92 @@ def _run(args: argparse.Namespace) -> None:
             server_url=args.server_url,
         )
         print(f"{args.tag}: signed release manifest is bound to run {run_id} and current tag")
+        return
+    if args.command == "write-aur-metadata-digests":
+        write_aur_metadata_digest_sidecar(
+            output=args.output,
+            files_dir=args.files_dir,
+            tag=args.tag,
+            repository=args.repository,
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+            source_sha=args.source_sha,
+        )
+        print(f"{args.tag}: wrote AUR metadata digest sidecar")
+        return
+    if args.command == "verify-aur-metadata-digests":
+        verified = verify_aur_metadata_digest_sidecar(
+            files_dir=args.files_dir,
+            sidecar_path=args.sidecar,
+            tag=args.tag,
+            repository=args.repository,
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+            source_sha=args.source_sha,
+        )
+        for name in sorted(verified):
+            print(f"{name}: {verified[name]}")
+        return
+    if args.command == "write-publication-receipt":
+        try:
+            workflow_run = json.loads(args.workflow_run.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ReleaseError(f"cannot read workflow run metadata {args.workflow_run}: {error}") from error
+        try:
+            tag_identity = json.loads(args.tag_identity.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ReleaseError(f"cannot read live tag identity {args.tag_identity}: {error}") from error
+        if not isinstance(tag_identity, dict):
+            raise ReleaseError("malformed live tag identity")
+        aur_metadata_digests: Mapping[str, str] | None = None
+        aur_metadata_sidecar_sha256: str | None = None
+        if args.metadata_sidecar is not None:
+            sidecar_record = _load_aur_metadata_digest_sidecar(
+                args.metadata_sidecar,
+                tag=args.tag,
+                repository=args.repository,
+                run_id=args.publication_run_id,
+                run_attempt=args.metadata_producer_attempt,
+                source_sha=args.metadata_producer_source_sha,
+            )
+            aur_metadata_digests = sidecar_record["files"]
+            aur_metadata_sidecar_sha256 = _hash_payload_file(args.metadata_sidecar)
+        published_blobs: dict[str, str] = {}
+        for item in args.published_blob:
+            if "=" not in item:
+                raise ReleaseError("published blob must use PATH=SHA256 syntax")
+            path, digest = item.split("=", 1)
+            if path in published_blobs:
+                raise ReleaseError(f"duplicate published blob path {path!r}")
+            published_blobs[path] = digest
+        receipt = build_publication_receipt(
+            manifest_path=args.release_manifest,
+            verification=load_attestation_verification(args.verification),
+            workflow_run=workflow_run,
+            tag=args.tag,
+            tag_object=tag_identity.get("tag_object"),
+            commit=tag_identity.get("commit"),
+            target=args.target,
+            target_repository=args.target_repository,
+            branch=args.branch,
+            outcome=args.outcome,
+            old_oid=args.old_oid or None,
+            new_oid=args.new_oid,
+            observed_oid=args.observed_oid,
+            repository=args.repository,
+            server_url=args.server_url,
+            publication_run_id=args.publication_run_id,
+            publication_run_attempt=args.publication_run_attempt,
+            publication_source_sha=args.publication_source_sha,
+            aur_metadata_sidecar_sha256=aur_metadata_sidecar_sha256,
+            aur_metadata_artifact_id=args.metadata_artifact_id,
+            aur_metadata_producer_attempt=args.metadata_producer_attempt,
+            aur_metadata_producer_source_sha=args.metadata_producer_source_sha,
+            published_blobs=published_blobs,
+            aur_metadata_digests=aur_metadata_digests,
+        )
+        write_publication_receipt(args.output, receipt)
+        print(f"{args.target}: wrote publication receipt for {args.tag}")
         return
     if args.command == "check-asset-sizes":
         selected = check_release_asset_sizes(
@@ -1884,6 +2278,54 @@ def build_parser() -> argparse.ArgumentParser:
     publication_identity_parser.add_argument("--commit", required=True)
     publication_identity_parser.add_argument("--repository", required=True)
     publication_identity_parser.add_argument("--server-url", required=True)
+    aur_metadata_write_parser = subparsers.add_parser(
+        "write-aur-metadata-digests", help="write a run-bound sidecar for generated AUR metadata"
+    )
+    aur_metadata_write_parser.add_argument("--files-dir", required=True, type=Path)
+    aur_metadata_write_parser.add_argument("--output", required=True, type=Path)
+    aur_metadata_write_parser.add_argument("--tag", required=True)
+    aur_metadata_write_parser.add_argument("--repository", required=True)
+    aur_metadata_write_parser.add_argument("--run-id", required=True)
+    aur_metadata_write_parser.add_argument("--run-attempt", required=True, type=int)
+    aur_metadata_write_parser.add_argument("--source-sha", required=True)
+    aur_metadata_verify_parser = subparsers.add_parser(
+        "verify-aur-metadata-digests", help="verify generated AUR metadata against its run-bound sidecar"
+    )
+    aur_metadata_verify_parser.add_argument("--files-dir", required=True, type=Path)
+    aur_metadata_verify_parser.add_argument("--sidecar", required=True, type=Path)
+    aur_metadata_verify_parser.add_argument("--tag", required=True)
+    aur_metadata_verify_parser.add_argument("--repository", required=True)
+    aur_metadata_verify_parser.add_argument("--run-id", required=True)
+    aur_metadata_verify_parser.add_argument("--run-attempt", required=True, type=int)
+    aur_metadata_verify_parser.add_argument("--source-sha", required=True)
+    publication_receipt_parser = subparsers.add_parser(
+        "write-publication-receipt", help="write a machine-readable external publication receipt"
+    )
+    publication_receipt_parser.add_argument("--release-manifest", required=True, type=Path)
+    publication_receipt_parser.add_argument("--verification", required=True, type=Path)
+    publication_receipt_parser.add_argument("--workflow-run", required=True, type=Path)
+    publication_receipt_parser.add_argument("--tag-identity", required=True, type=Path)
+    publication_receipt_parser.add_argument("--tag", required=True)
+    publication_receipt_parser.add_argument("--target", required=True, choices=("homebrew", "aur"))
+    publication_receipt_parser.add_argument("--target-repository", required=True)
+    publication_receipt_parser.add_argument("--branch", required=True)
+    publication_receipt_parser.add_argument(
+        "--outcome", required=True, choices=("committed", "unchanged")
+    )
+    publication_receipt_parser.add_argument("--old-oid", default="")
+    publication_receipt_parser.add_argument("--new-oid", required=True)
+    publication_receipt_parser.add_argument("--observed-oid", required=True)
+    publication_receipt_parser.add_argument("--repository", required=True)
+    publication_receipt_parser.add_argument("--server-url", required=True)
+    publication_receipt_parser.add_argument("--publication-run-id", required=True)
+    publication_receipt_parser.add_argument("--publication-run-attempt", required=True, type=int)
+    publication_receipt_parser.add_argument("--publication-source-sha", required=True)
+    publication_receipt_parser.add_argument("--metadata-sidecar", type=Path)
+    publication_receipt_parser.add_argument("--metadata-artifact-id")
+    publication_receipt_parser.add_argument("--metadata-producer-attempt", type=int)
+    publication_receipt_parser.add_argument("--metadata-producer-source-sha")
+    publication_receipt_parser.add_argument("--published-blob", action="append", default=[])
+    publication_receipt_parser.add_argument("--output", required=True, type=Path)
     check_sizes_parser = subparsers.add_parser("check-asset-sizes")
     check_sizes_parser.add_argument("--assets-json", required=True, type=Path)
     check_sizes_parser.add_argument("--pattern", action="append")

@@ -128,7 +128,7 @@ class WorkflowPolicyTests(unittest.TestCase):
 
     def test_committed_known_hosts_match_published_fingerprints(self) -> None:
         known_hosts = ROOT / ".github" / "known_hosts"
-        entries = []
+        fingerprints: dict[str, list[str]] = {}
         for line in known_hosts.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -138,19 +138,18 @@ class WorkflowPolicyTests(unittest.TestCase):
             host, key_type, blob = fields
             self.assertEqual("ssh-ed25519", key_type)
             self.assertIn(host, {"github.com", "aur.archlinux.org"})
-            entries.append((host, key_type, blob))
-        github_keys = [
-            entry
-            for entry in entries
-            if entry[:2] == ("github.com", "ssh-ed25519")
-        ]
-        self.assertTrue(github_keys, "github.com ed25519 host key must be committed")
-        for _, _, blob in github_keys:
             fingerprint = base64.b64encode(hashlib.sha256(base64.b64decode(blob)).digest())
-            self.assertEqual(
-                "+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
-                fingerprint.decode("ascii").rstrip("="),
-            )
+            fingerprints.setdefault(host, []).append(fingerprint.decode("ascii").rstrip("="))
+        self.assertEqual({"github.com", "aur.archlinux.org"}, set(fingerprints))
+        self.assertEqual(1, len(fingerprints["github.com"]))
+        self.assertEqual(1, len(fingerprints["aur.archlinux.org"]))
+        self.assertEqual(
+            {
+                "github.com": "+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
+                "aur.archlinux.org": "RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4",
+            },
+            {host: values[0] for host, values in fingerprints.items()},
+        )
 
     def test_create_release_never_deletes(self) -> None:
         workflow_path = ROOT / ".github" / "workflows" / "release.yml"
@@ -607,14 +606,32 @@ class WorkflowPolicyTests(unittest.TestCase):
             if step.get("uses", "").startswith("actions/download-artifact@")
         ]
         self.assertEqual(1, len(downloads))
-        self.assertEqual("aur-metadata", downloads[0].get("with", {}).get("name"))
+        self.assertEqual(
+            "${{ needs.aur-srcinfo.outputs.metadata_artifact_id }}",
+            downloads[0].get("with", {}).get("artifact-ids"),
+        )
         srcinfo_job = read_workflow("release.yml")["jobs"]["aur-srcinfo"]
+        self.assertEqual(
+            "${{ steps.upload-metadata.outputs.artifact-id }}",
+            srcinfo_job.get("outputs", {}).get("metadata_artifact_id"),
+        )
+        self.assertEqual(
+            "${{ steps.metadata-digests.outputs.producer_attempt }}",
+            srcinfo_job.get("outputs", {}).get("producer_attempt"),
+        )
+        self.assertEqual(
+            "${{ steps.metadata-digests.outputs.producer_source_sha }}",
+            srcinfo_job.get("outputs", {}).get("producer_source_sha"),
+        )
         uploads = [
             step for step in srcinfo_job.get("steps", [])
             if step.get("uses", "").startswith("actions/upload-artifact@")
         ]
         self.assertEqual(1, len(uploads))
-        self.assertEqual("aur-metadata", uploads[0].get("with", {}).get("name"))
+        self.assertEqual("upload-metadata", uploads[0].get("id"))
+        self.assertIn(
+            "${{ github.run_attempt }}", uploads[0].get("with", {}).get("name", "")
+        )
         self.assertIs(uploads[0].get("with", {}).get("include-hidden-files"), True)
         job_text = yaml.safe_dump(job)
         self.assertNotIn("makepkg", job_text)
@@ -625,8 +642,25 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         validation_script = validation.get("run", "")
         self.assertIn("LC_ALL=C sort", validation_script)
+        self.assertIn('[ "${#artifact_files[@]}" -ne 3 ]', validation_script)
+        self.assertIn('[ "${artifact_files[2]:-}" != metadata-digests.json ]', validation_script)
         self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/.SRCINFO" ]', validation_script)
         self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/PKGBUILD" ]', validation_script)
+        self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/metadata-digests.json" ]', validation_script)
+        self.assertIn("verify-aur-metadata-digests", validation_script)
+        self.assertIn(
+            '"${{ needs.aur-srcinfo.outputs.producer_attempt }}"',
+            validation_script,
+        )
+        self.assertIn(
+            '"${{ needs.aur-srcinfo.outputs.producer_source_sha }}"',
+            validation_script,
+        )
+        srcinfo_generation = next(
+            step for step in srcinfo_job["steps"]
+            if step.get("name") == "Generate and bound AUR source metadata"
+        )
+        self.assertIn("write-aur-metadata-digests", srcinfo_generation.get("run", ""))
 
     def test_publish_roots_live_under_runner_temp(self) -> None:
         jobs = read_workflow("release.yml")["jobs"]
@@ -670,6 +704,93 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertIn(
                     "before the target was cloned; remote state unknown", summary_script
                 )
+
+    def test_external_publication_receipts_are_pinned_credential_free_artifacts(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        for job_name, target, receipt_name, artifact_path in (
+            (
+                "publish-homebrew",
+                "homebrew",
+                "Write Homebrew publication receipt",
+                "${{ runner.temp }}/release-publication-homebrew.json",
+            ),
+            (
+                "publish-aur",
+                "aur",
+                "Write AUR publication receipt",
+                "${{ runner.temp }}/release-publication-aur.json",
+            ),
+        ):
+            job = jobs[job_name]
+            steps = job["steps"]
+            names = [step.get("name") for step in steps]
+            write_index = names.index(receipt_name)
+            key_cleanup_index = names.index(
+                "Remove temporary Homebrew deploy key"
+                if target == "homebrew"
+                else "Remove temporary AUR deploy key"
+            )
+            workspace_cleanup_index = names.index(
+                "Remove Homebrew publication workspace"
+                if target == "homebrew"
+                else "Remove AUR publication workspace"
+            )
+            upload = steps[workspace_cleanup_index + 1]
+            write_script = steps[write_index].get("run", "")
+            with self.subTest(target=target):
+                self.assertEqual("read", job["permissions"]["actions"])
+                self.assertEqual(
+                    "steps.publish.outcome == 'success'", steps[write_index].get("if")
+                )
+                self.assertLess(key_cleanup_index, write_index)
+                self.assertLess(write_index, workspace_cleanup_index)
+                upload_action = upload.get("uses", "").split(" #", maxsplit=1)[0]
+                self.assertEqual(
+                    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                    upload_action,
+                )
+                self.assertEqual("steps.receipt.outcome == 'success'", upload.get("if"))
+                self.assertLess(workspace_cleanup_index, steps.index(upload))
+                self.assertEqual(artifact_path, upload.get("with", {}).get("path"))
+                self.assertEqual(90, upload.get("with", {}).get("retention-days"))
+                artifact_prefix = (
+                    f"release-publication-{target}-"
+                    "${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}"
+                )
+                self.assertIn(artifact_prefix, upload["with"]["name"])
+                for required in (
+                    "write-publication-receipt",
+                    "release-workflow-run.json",
+                    "release-manifest-attestation.json",
+                    "release-tag-identity.json",
+                    "--release-manifest",
+                    "--verification",
+                    "--tag-identity",
+                    "--old-oid",
+                    "--new-oid",
+                    "--observed-oid",
+                    "--publication-run-id",
+                    "--publication-run-attempt",
+                    "--server-url",
+                    "--published-blob",
+                    "--publication-source-sha",
+                ):
+                    self.assertIn(required, write_script)
+                self.assertFalse(
+                    any("DEPLOY_KEY" in name for name in steps[write_index].get("env", {}))
+                )
+                self.assertIn("rm -f", steps[key_cleanup_index].get("run", ""))
+                self.assertEqual("always()", steps[key_cleanup_index].get("if"))
+                self.assertNotIn("DEPLOY_KEY", write_script)
+                self.assertNotIn("$PUBLISH_ROOT/keys/", write_script)
+                if target == "aur":
+                    for required in (
+                        "--metadata-sidecar",
+                        "--metadata-artifact-id",
+                        "--metadata-producer-attempt",
+                        "--metadata-producer-source-sha",
+                    ):
+                        self.assertIn(required, write_script)
 
     def test_publish_cas_rehearsal(self) -> None:
         if shutil.which("git") is None or shutil.which("bash") is None:

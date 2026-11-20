@@ -40,8 +40,21 @@ Homebrew/AUR publication SHALL run only through the protected publication
 environment after validating public-repository and narrowly scoped deploy-key
 configuration. It SHALL publish the exact rendered metadata, regenerate AUR
 `.SRCINFO`, avoid exposing credentials through argv/logs/artifacts, and push
-only when content differs. Failure MUST NOT alter/retract release assets and a
-same-tag rerun MUST be idempotent.
+only when content differs. SSH endpoints SHALL match committed, reviewed
+`known_hosts` keys. Failure MUST NOT alter/retract release assets and a same-tag
+rerun MUST be idempotent.
+
+Each successful target publication SHALL upload a credential-free,
+machine-readable receipt artifact. The receipt SHALL bind the signed release
+manifest digest, admitted tag/source identity, release workflow run and
+attempt, publication workflow run and attempt, target, outcome, and exact old,
+new, and observed external commit OIDs. It SHALL record each published
+repository-relative path and the SHA-256 of its exact blob. Homebrew formula
+and AUR PKGBUILD digests SHALL match signed manifest entries. The generated AUR
+`.SRCINFO` digest SHALL match a workflow-run-bound sidecar from the exact
+immutable artifact ID. Deploy keys MUST be removed before receipt generation,
+and only the receipt may be uploaded after workspace cleanup. Receipt artifacts
+are retained for 90 days; longer-term archival requires a separate policy.
 
 Before either publisher materializes a deploy key, it SHALL reverify the signed
 release manifest against the live approved annotated tag object and peeled
@@ -65,6 +78,20 @@ source commit recorded by the attestation. A mismatch MUST refuse publication.
 
 - **WHEN** published metadata already equals the rendered release output
 - **THEN** the job performs no new commit and succeeds without changing assets
+
+#### Scenario: A verified external publication leaves a durable receipt
+
+- **WHEN** Homebrew or AUR publication succeeds after its remote branch is
+  verified
+- **THEN** the publisher uploads a per-target receipt tied to the signed
+  manifest and both workflow run identities, recording the target outcome and
+  exact old/new/observed commit OIDs and each published path/blob digest
+  without deploy credentials
+
+#### Scenario: An external SSH host identity changes
+
+- **WHEN** a publication endpoint presents an unknown or changed SSH host key
+- **THEN** publication fails closed before modifying the external repository
 
 ### Requirement: A channel is advertised only after real rehearsal
 
