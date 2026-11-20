@@ -25,6 +25,16 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.108] — 2026-11-19
 
+### Changed
+
+- The Vercel live check proves that a stop and a resume reached the provider.
+
+### Fixed
+
+- Vercel: a one-shot command refused because its session had stopped is retried once after resume.
+- Vercel: stopping or killing something already stopped is success; an expired saved snapshot gives a clear refusal with the remedy, and nothing is deleted automatically.
+- Vercel: a snapshot listing that does not finish is never treated as complete: destroy keeps its record and can be retried, and cost reports are marked incomplete; snapshots of a sandbox that is gone are priced.
+
 ## [0.1.0-alpha.107] — 2026-11-19
 
 ### Added
@@ -36,16 +46,6 @@ All notable changes to **thegn** are documented here. The format follows
 - Docs: help pages for Sprites checkpoint and restore ledger proof, URL auth pinning, the create-time memory policy, `fleet inspect`, the `provision` field of `agent run --json`, the drain warning, the Fly destroy check, `sandbox warm-devshell`, the masthead instance tag and the "Retry failed pull-backs" action. `env snapshot` and `env restore` now refuse a sprite another instance made for the same worktree path.
 - Sidebar: a worktree deleted from outside the running TUI (wt rm, wt prune, a landing, plain git) no longer stays in the left bar; a leftover directory with no checkout in it is no longer treated as a live worktree.
 - Observe: the host dashboard now uses the masthead's samples, so it has history from launch and no gaps while the tab is hidden, and no longer runs a second sampler.
-
-### Changed
-
-- The Vercel live check proves that a stop and a resume reached the provider.
-
-### Fixed
-
-- Vercel: a one-shot command refused because its session had stopped is retried once after resume.
-- Vercel: stopping or killing something already stopped is success; an expired saved snapshot gives a clear refusal with the remedy, and nothing is deleted automatically.
-- Vercel: a snapshot listing that does not finish is never treated as complete: destroy keeps its record and can be retried, and cost reports are marked incomplete; snapshots of a sandbox that is gone are priced.
 
 ## [0.1.0-alpha.105] — 2026-11-19
 
