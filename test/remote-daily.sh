@@ -18,7 +18,8 @@ set -euo pipefail
 
 THEGN_BIN="${THEGN_BIN:-thegn}"
 # The scratch repository has no build: the owner's merge gate command must not decide these lands.
-LAND_SET=(--set merge_queue.gate_command=true)
+# The value is TOML: a bare true is a boolean and is refused, so the string is quoted.
+LAND_SET=(--set 'merge_queue.gate_command="true"')
 
 env_name="" accept=0 provider="sprites" with_model=0 adopt_name="" with_reaper=0 with_pool=0 keep_going=0
 while [ $# -gt 0 ]; do
@@ -128,7 +129,7 @@ Steps:
       otherwise no model login entered the sandbox (model_credentials default)
   7   local git log has the commits
   8   land --worktree <rd-x path> --release-sandbox
-       (both lands pass --set merge_queue.gate_command=true: the scratch repository has no build)
+       (both lands pass --set merge_queue.gate_command="true": the scratch repository has no build)
   9   ledger record gone, sandbox absent from the org listing
  10   env reap --provider <p> --json is clean
  11   wt new rd-y --env <S>
