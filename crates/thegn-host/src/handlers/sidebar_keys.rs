@@ -2060,16 +2060,41 @@ mod tests {
         use crate::sidebar::{RowKind, RowTarget, SidebarRow};
 
         let model = FrameModel {
-            sidebar_rows: vec![SidebarRow {
-                worktree_path: Some("/repos/app-pipeline".into()),
-                pin_key: "app/app-pipeline".into(),
-                branch: Some("feature".into()),
-                tab_target: Some(RowTarget::Tab(0, 0)),
-                ..SidebarRow::base(RowKind::PipelineWorktree, 3, "app-pipeline", "app")
-            }],
+            sidebar_workspaces: vec![(
+                "app".into(),
+                "app".into(),
+                "repo".into(),
+                "/repos/app".into(),
+            )],
+            sidebar_rows: vec![
+                SidebarRow {
+                    worktree_path: Some("/repos/app".into()),
+                    pin_key: "app".into(),
+                    ..SidebarRow::base(RowKind::Workspace, 0, "app", "app")
+                },
+                SidebarRow {
+                    worktree_path: Some("/repos/app-pipeline".into()),
+                    pin_key: "app/app-pipeline".into(),
+                    branch: Some("feature".into()),
+                    tab_target: Some(RowTarget::Tab(0, 0)),
+                    ..SidebarRow::base(RowKind::PipelineWorktree, 3, "app-pipeline", "app")
+                },
+            ],
             ..Default::default()
         };
-        let sb = SidebarState::default();
+        let mut sb = SidebarState::default();
+        sb.cursor = model
+            .sidebar_rows
+            .iter()
+            .filter(|row| row.visible)
+            .position(|row| {
+                row.kind == RowKind::PipelineWorktree && row.pin_key == "app/app-pipeline"
+            })
+            .expect("pipeline leaf is visible");
+        assert_eq!(
+            sb.selected_row(&model).map(|row| row.pin_key.as_str()),
+            Some("app/app-pipeline")
+        );
         let menu = sb
             .menu_for_cursor(&model, &crate::session::Session::default())
             .expect("pipeline worktree menu");
@@ -2089,8 +2114,10 @@ mod tests {
         assert!(menu.entries.iter().any(|entry| entry.id == "pin"));
         assert!(matches!(
             sb.folder_outcome(&model),
-            Some(SidebarOutcome::MoveToFolder { worktree_path, .. })
-                if worktree_path == "/repos/app-pipeline"
+            Some(SidebarOutcome::MoveToFolder {
+                worktree_path,
+                repo_path,
+            }) if worktree_path == "/repos/app-pipeline" && repo_path == "/repos/app"
         ));
     }
 

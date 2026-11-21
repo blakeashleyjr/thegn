@@ -178,14 +178,26 @@ mod tests {
 
     #[test]
     fn pipeline_worktree_paths_lists_distinct_pipeline_paths_only() {
-        let db = Db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v109.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE agent_dispatches DROP COLUMN dispatch_kind;
+                     PRAGMA user_version=109;
+                     INSERT INTO agent_dispatches (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,artifact_path)
+                       VALUES ('linear:THE-1204-legacy','/wt/legacy','fixture',1,'running','review',NULL);",
+                )
+                .unwrap();
+        }
+        // This row predates dispatch_kind and becomes legacy_held through the
+        // production v110 migration, rather than through current write rules.
+        let db = Db::open_at(&path).unwrap();
         for (path, stage, artifact) in [
             ("/wt/a", Some("code"), Some("code.md")),
             ("/wt/./a", Some("review"), Some("review.md")),
             ("/wt/b", Some("code"), Some("other.md")),
-            // Imported legacy-held stages have no artifact but still establish
-            // durable pipeline ownership.
-            ("/wt/legacy", Some("review"), None),
             ("/wt/a", None, None),
             // A plain dispatch has a path, but it does not establish pipeline
             // worktree ownership and must stay out of this list.
@@ -198,15 +210,22 @@ mod tests {
                     ..NewDispatch::new("linear:THE-1204", path, "fixture")
                 })
                 .unwrap();
-            if path == "/wt/legacy" {
-                assert_eq!(
-                    db.dispatch_kind(id).unwrap().as_deref(),
-                    Some("legacy_held")
-                );
-            } else if path == "/wt/plain" {
+            if path == "/wt/plain" {
                 assert_eq!(db.dispatch_kind(id).unwrap().as_deref(), Some("plain"));
             }
         }
+        let legacy_id: i64 = db
+            .conn()
+            .query_row(
+                "SELECT id FROM agent_dispatches WHERE worktree_path='/wt/legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            db.dispatch_kind(legacy_id).unwrap().as_deref(),
+            Some("legacy_held")
+        );
         assert_eq!(
             db.pipeline_worktree_paths().unwrap(),
             ["/wt/./a", "/wt/a", "/wt/b", "/wt/legacy"]
