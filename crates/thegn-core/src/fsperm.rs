@@ -2242,7 +2242,6 @@ fn pinned_directory_entries(
 ) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>> {
     use nix::fcntl::{openat, OFlag};
     use nix::sys::stat::Mode;
-    use std::os::unix::ffi::OsStringExt;
 
     let fd = openat(
         std::os::fd::AsFd::as_fd(directory),
@@ -3502,9 +3501,13 @@ mod tests {
         let raw_fd = fd.as_raw_fd();
 
         assert!(OwnedDirectoryStream::from_fd(fd).is_err());
+        // SAFETY: `F_GETFD` accepts the raw descriptor integer and takes no
+        // third argument; a closed descriptor is valid input for this check.
+        let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+        assert_eq!(result, -1);
         assert_eq!(
-            nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFD),
-            Err(nix::errno::Errno::EBADF)
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
         );
     }
 
