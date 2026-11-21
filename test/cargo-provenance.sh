@@ -58,15 +58,11 @@ else
   fi
 fi
 
-if [[ $checkout == /* ]]; then
-  checkout_abs=$(cd "$checkout" 2>/dev/null && pwd -P)
-else
-  checkout_abs=$(cd "$PWD/$checkout" 2>/dev/null && pwd -P)
-fi
-if [[ -n $checkout_abs ]]; then
+checkout_resolved=1
+if checkout_abs=$(cd -P "$checkout" 2>/dev/null && pwd -P); then
   checkout=$checkout_abs
-elif [[ $checkout != /* ]]; then
-  checkout=$PWD/$checkout
+else
+  checkout_resolved=0
 fi
 
 if ((target_dir_set)); then
@@ -171,7 +167,18 @@ else
     foreign_source=0
     listed_source_count=0
     depinfo_source_identities=()
-    depinfo_tokens=$(tr ' ' '\n' <"$core_depinfo")
+    depinfo_data=
+    if ! depinfo_data=$(cat "$core_depinfo" 2>/dev/null); then
+      depinfo_supported=0
+    else
+      depinfo_supported=1
+    fi
+    # Rustc's make-style dep-info escapes whitespace and line continuations.
+    # This diagnostic intentionally refuses those path forms instead of
+    # splitting a pathname and accidentally counting its prefix as coverage.
+    case "$depinfo_data" in
+      *\\*|*$'\t'*|*$'\r'* ) depinfo_supported=0 ;;
+    esac
 
     # Compare source identities using the physical parent directory on both
     # sides. macOS can expose one checkout through spellings such as /tmp and
@@ -182,21 +189,26 @@ else
       if [[ $source_path != /* ]]; then
         source_path=$checkout/$source_path
       fi
+      case "$source_path" in *[[:space:]]* ) return 1 ;; esac
       source_dir=${source_path%/*}
       source_base=${source_path##*/}
-      if source_dir_abs=$(cd "$source_dir" 2>/dev/null && pwd -P); then
+      if source_dir_abs=$(cd -P "$source_dir" 2>/dev/null && pwd -P); then
         printf '%s/%s\n' "$source_dir_abs" "$source_base"
       else
-        printf '%s\n' "$source_path"
+        return 1
       fi
     }
 
-    for depinfo_token in $depinfo_tokens; do
+    set -f
+    for depinfo_token in $depinfo_data; do
       depinfo_token=${depinfo_token%:}
       case "$depinfo_token" in
       */crates/thegn-core/src/*.rs | crates/thegn-core/src/*.rs)
         listed_source_count=$((listed_source_count + 1))
-        token_identity=$(source_identity "$depinfo_token")
+        if ((checkout_resolved == 0)) || ! token_identity=$(source_identity "$depinfo_token"); then
+          depinfo_supported=0
+          continue
+        fi
         depinfo_source_identities+=("$token_identity")
         case "$token_identity" in
         "$checkout"/crates/thegn-core/src/*.rs) ;;
@@ -209,20 +221,43 @@ else
         ;;
       esac
     done
+    set +f
 
-    missing_sources=0
+    missing_sources=unknown
     core_src_dir=$checkout/crates/thegn-core/src
-    if [[ -d $core_src_dir ]]; then
+    if ((checkout_resolved == 0)) || [[ ! -d $core_src_dir ]]; then
+      depinfo_supported=0
+    fi
+    if ((depinfo_supported)) && ((checkout_resolved)) && [[ -d $core_src_dir ]]; then
+      comparison_dir=$(mktemp -d "${TMPDIR:-/tmp}/cargo-provenance.XXXXXX" 2>/dev/null) || comparison_dir=
+      if [[ -z $comparison_dir ]]; then
+        depinfo_supported=0
+      else
+        trap 'rm -rf "$comparison_dir"' EXIT HUP INT TERM
+      fi
+    fi
+    if ((depinfo_supported)) && ((checkout_resolved)) && [[ -d $core_src_dir && -n ${comparison_dir:-} ]]; then
       required_source_identities=()
-      while IFS= read -r source_file; do
-        required_source_identities+=("$(source_identity "$source_file")")
-      done < <(find "$core_src_dir" -type f -name '*.rs' 2>/dev/null)
+      if ! find "$core_src_dir" -type f -name '*.rs' -print0 >"$comparison_dir/required.nul" 2>/dev/null; then
+        depinfo_supported=0
+      else
+        required_source_count=0
+        while IFS= read -r -d '' source_file; do
+          if ! source_identity_resolved=$(source_identity "$source_file"); then
+            depinfo_supported=0
+            break
+          fi
+          required_source_identities+=("$source_identity_resolved")
+          required_source_count=$((required_source_count + 1))
+        done <"$comparison_dir/required.nul"
+        ((required_source_count > 0)) || depinfo_supported=0
+      fi
 
       # Normalize each side once, then compare the sets in one awk pass. In
       # particular, do not resolve source paths from inside a nested pair loop:
       # real crates contain hundreds of source files.
-      missing_sources=$(
-        {
+      if ((depinfo_supported)); then
+        if ! {
           if ((${#depinfo_source_identities[@]})); then
             for identity in "${depinfo_source_identities[@]}"; do
               printf 'D\t%s\n' "$identity"
@@ -233,11 +268,21 @@ else
               printf 'R\t%s\n' "$identity"
             done
           fi
-        } |
-          awk -F '\t' '$1 == "D" { listed[$2] = 1; next }
-            $1 == "R" && !listed[$2] { missing++ }
-            END { print missing + 0 }'
-      )
+        } >"$comparison_dir/records"; then
+          depinfo_supported=0
+        elif ! missing_sources=$(awk 'substr($0, 1, 2) == "D\t" { listed[substr($0, 3)] = 1; next }
+            substr($0, 1, 2) == "R\t" && !listed[substr($0, 3)] { missing++ }
+            END { print missing + 0 }' "$comparison_dir/records" 2>/dev/null); then
+          depinfo_supported=0
+        elif [[ ! $missing_sources =~ ^[0-9]+$ ]]; then
+          depinfo_supported=0
+        fi
+      fi
+    fi
+    if ((depinfo_supported == 0)); then
+      missing_sources=unknown
+      foreign_source=1
+      printf '%s\n' 'cargo-provenance: refusing unsupported dep-info paths or unresolved/failed source comparison' >&2
     fi
     printf 'provenance.core_depinfo_missing_sources: %s\n' "$missing_sources"
     if [[ -n $depinfo_lib ]]; then
@@ -249,7 +294,11 @@ else
       fi
     else
       printf '%s\n' 'provenance.core_depinfo_lib: none'
-      match=unknown
+      if ((depinfo_supported == 0)); then
+        match=no
+      else
+        match=unknown
+      fi
     fi
   else
     printf '%s\n' 'provenance.core_depinfo: none'

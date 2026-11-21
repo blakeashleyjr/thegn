@@ -175,6 +175,94 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "0")
         self.assertEqual(facts["provenance.verdict"], "ok")
 
+    def test_unresolved_checkout_cannot_be_counted_as_coverage(self):
+        fixture = self.fixture()
+        missing_checkout = fixture["checkout"].parent / "missing-checkout"
+        result = run(
+            ["--checkout", str(missing_checkout), "--target-dir", str(fixture["target"]), "--strict"],
+            fixture["bin_dir"],
+        )
+        facts = parse_output(result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+        self.assertNotEqual(facts["provenance.core_depinfo_missing_sources"], "0")
+        self.assertEqual(facts["provenance.verdict"], "foreign-depinfo")
+
+    def test_escaped_depinfo_path_form_is_refused(self):
+        fixture = self.fixture()
+        depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+        lib_path = fixture["checkout"] / "crates/thegn-core/src/lib.rs"
+        depinfo.write_text(
+            f"{lib_path}: {lib_path} crates/thegn-core/src/a\\ file.rs\n",
+            encoding="utf-8",
+        )
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+        self.assertEqual(facts["provenance.verdict"], "foreign-depinfo")
+
+    def test_source_enumeration_failure_cannot_be_zero_missing(self):
+        fixture = self.fixture()
+        real_find = shutil.which("find")
+        if real_find is None:
+            self.skipTest("find is unavailable")
+        find = fixture["bin_dir"] / "find"
+        find.write_text(
+            "#!/bin/sh\n"
+            "case \" $* \" in *' -print0 '*) exit 9 ;; esac\n"
+            f"exec {real_find} \"$@\"\n",
+            encoding="utf-8",
+        )
+        find.chmod(0o700)
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotEqual(facts["provenance.core_depinfo_missing_sources"], "0")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+
+    def test_comparison_failure_cannot_be_accepted_as_success(self):
+        fixture = self.fixture()
+        real_awk = shutil.which("awk")
+        if real_awk is None:
+            self.skipTest("awk is unavailable")
+        awk = fixture["bin_dir"] / "awk"
+        awk.write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in *records*) exit 8 ;; esac\n"
+            f"exec {real_awk} \"$@\"\n",
+            encoding="utf-8",
+        )
+        awk.chmod(0o700)
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotEqual(facts["provenance.core_depinfo_missing_sources"], "0")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+
+    def test_non_numeric_comparison_output_cannot_be_accepted(self):
+        fixture = self.fixture()
+        real_awk = shutil.which("awk")
+        if real_awk is None:
+            self.skipTest("awk is unavailable")
+        awk = fixture["bin_dir"] / "awk"
+        awk.write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in *records*) printf 'not-a-count\\n'; exit 0 ;; esac\n"
+            f"exec {real_awk} \"$@\"\n",
+            encoding="utf-8",
+        )
+        awk.chmod(0o700)
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotEqual(facts["provenance.core_depinfo_missing_sources"], "0")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+
     def test_relative_cargo_depinfo_with_all_checkout_sources_is_ok(self):
         fixture = self.fixture()
         (fixture["deps"] / "thegn_core-aaaa.d").write_text(
