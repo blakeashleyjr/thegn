@@ -124,7 +124,12 @@ impl IrohControlListener {
                                 endpoint: format!("iroh:{peer}"),
                                 peer: PeerIdentity::IrohEndpointId(peer),
                             };
-                            let _ = tx.send((io, info)).await;
+                            if tx.send((io, info)).await.is_err() {
+                                tracing::debug!(
+                                    target: "thegn::control",
+                                    "Iroh control listener receiver shut down; dropping direct connection"
+                                );
+                            }
                         });
                     }
                     Some(_) = pending.join_next(), if !pending.is_empty() => {}
