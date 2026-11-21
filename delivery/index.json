@@ -916,6 +916,42 @@
       "summary": "Complete runtime TUI localization and define plugin-visible string participation."
     },
     {
+      "change": "file-pipeline-worktrees-by-default",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2491",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "THE-2491 owns pipeline worktree filing; implementation landed, with coordinator Mac sidebar proof and rendered evidence still unchecked."
+    },
+    {
+      "change": "fix-macos-oci-runtimes",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2099",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "THE-2099 owns the macOS OCI evidence runner; owner Mac capture and review of runtime decisions remain unchecked before enforcement changes."
+    },
+    {
+      "change": "fix-macos-process-group-drain",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2490",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "THE-2490 owns the Darwin process-group drain repair; coordinator native tests and exact B192 fixture proof remain unchecked."
+    },
+    {
       "change": "fix-static-cli-startup",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1157,6 +1193,18 @@
         "openspec/changes/archive/2026-10-12-rework-shell-completions/"
       ],
       "archive_path": "openspec/changes/archive/2026-10-12-package-shell-completions/"
+    },
+    {
+      "change": "pair-directly-over-iroh",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2486",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "THE-2486 owns direct Iroh control pairing; all proposal tasks remain unchecked, so delivery and protocol acceptance stay active."
     },
     {
       "change": "pane-zoom-stack",
@@ -1457,6 +1505,18 @@
         }
       ],
       "summary": "Compile repository data into bounded inert argv or explicitly admitted shell templates."
+    },
+    {
+      "change": "secure-macos-app-generation",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-416",
+          "project": "Distribution & Release Readiness"
+        }
+      ],
+      "summary": "THE-416 owns secure macOS app generation; the recorded native run did not exercise the ownership-race swap, so focused rerun evidence remains pending."
     },
     {
       "change": "secure-merge-bundle-custody",

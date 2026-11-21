@@ -327,6 +327,13 @@
       ]
     },
     {
+      "issue": "THE-416",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "secure-macos-app-generation"
+      ]
+    },
+    {
       "issue": "THE-516",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [],
@@ -500,6 +507,13 @@
       ]
     },
     {
+      "issue": "THE-2099",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "fix-macos-oci-runtimes"
+      ]
+    },
+    {
       "issue": "THE-2142",
       "project": "Client API & Remote Access",
       "changes": [
@@ -626,6 +640,27 @@
       "project": "Client API & Remote Access",
       "changes": [],
       "no_spec_rationale": "Bug fix with no OpenSpec change: it corrects behaviour to match an existing contract, recorded in the changelog."
+    },
+    {
+      "issue": "THE-2486",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "pair-directly-over-iroh"
+      ]
+    },
+    {
+      "issue": "THE-2490",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "fix-macos-process-group-drain"
+      ]
+    },
+    {
+      "issue": "THE-2491",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "file-pipeline-worktrees-by-default"
+      ]
     }
   ]
 }
