@@ -386,8 +386,9 @@ pub(crate) mod test_support {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
         successful_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        reader_exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
         reader: Option<std::thread::JoinHandle<()>>,
+        #[cfg(test)]
+        join_ack: Option<std::sync::mpsc::Sender<()>>,
     }
 
     #[cfg(target_os = "macos")]
@@ -400,7 +401,12 @@ pub(crate) mod test_support {
                 // The reader uses a finite poll timeout, so this join is
                 // bounded even while the slave stays open and reads return
                 // EAGAIN. It does not depend on EOF or EIO.
-                let _ = reader.join();
+                if reader.join().is_ok() {
+                    #[cfg(test)]
+                    if let Some(join_ack) = self.join_ack.take() {
+                        let _ = join_ack.send(());
+                    }
+                }
             }
         }
     }
@@ -439,8 +445,6 @@ pub(crate) mod test_support {
         let reader_idle = idle.clone();
         let successful_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let reader_successful_reads = successful_reads.clone();
-        let reader_exited = Arc::new(AtomicBool::new(false));
-        let reader_reader_exited = reader_exited.clone();
         let reader = std::thread::Builder::new()
             .name("thegn-test-pty-drain".into())
             .spawn(move || {
@@ -448,7 +452,6 @@ pub(crate) mod test_support {
                 let mut bytes = [0_u8; 4096];
                 #[cfg(test)]
                 let mut pause_after_first_read = first_read_gate;
-                let _reader_exit = ReaderExit(&reader_reader_exited);
                 loop {
                     if reader_stop.load(Ordering::Acquire) {
                         return;
@@ -471,7 +474,9 @@ pub(crate) mod test_support {
                                     // the test fails before releasing the reader,
                                     // dropping its sender wakes this rendezvous.
                                     if entered.send(()).is_err()
-                                        || release.recv_timeout(Duration::from_secs(5)).is_err()
+                                        || release
+                                            .recv_timeout(std::time::Duration::from_secs(5))
+                                            .is_err()
                                     {
                                         return;
                                     }
@@ -527,18 +532,9 @@ pub(crate) mod test_support {
             stop,
             idle,
             successful_reads,
-            reader_exited,
             reader: Some(reader),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    struct ReaderExit<'a>(&'a std::sync::atomic::AtomicBool);
-
-    #[cfg(target_os = "macos")]
-    impl Drop for ReaderExit<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::Release);
+            #[cfg(test)]
+            join_ack: None,
         }
     }
 
@@ -556,8 +552,7 @@ pub(crate) mod test_support {
             slave: Option<std::fs::File>,
             drainer: Option<PtyDrainer>,
             release: Option<Sender<()>>,
-            teardown_started: Option<Receiver<()>>,
-            teardown_done: Option<Receiver<(bool, usize)>>,
+            join_ack: Option<Receiver<()>>,
             teardown: Option<std::thread::JoinHandle<()>>,
         }
 
@@ -567,8 +562,7 @@ pub(crate) mod test_support {
                     slave: Some(slave),
                     drainer: Some(drainer),
                     release: None,
-                    teardown_started: None,
-                    teardown_done: None,
+                    join_ack: None,
                     teardown: None,
                 }
             }
@@ -580,28 +574,18 @@ pub(crate) mod test_support {
             }
 
             fn start_teardown(&mut self) {
-                let drainer = self.drainer.take().expect("drainer is still owned");
-                let reader_exited = drainer.reader_exited.clone();
-                let successful_reads = drainer.successful_reads.clone();
-                let (started_tx, started_rx) = std::sync::mpsc::channel();
-                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let mut drainer = self.drainer.take().expect("drainer is still owned");
+                let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+                drainer.join_ack = Some(joined_tx);
                 self.teardown = Some(std::thread::spawn(move || {
-                    let _ = started_tx.send(());
                     drop(drainer);
-                    let _ = done_tx.send((
-                        reader_exited.load(Ordering::Acquire),
-                        successful_reads.load(Ordering::Acquire),
-                    ));
                 }));
-                self.teardown_started = Some(started_rx);
-                self.teardown_done = Some(done_rx);
+                self.join_ack = Some(joined_rx);
             }
 
-            fn wait_for_teardown(
-                &mut self,
-            ) -> Result<(bool, usize), std::sync::mpsc::RecvTimeoutError> {
+            fn wait_for_join(&mut self) -> Result<(), std::sync::mpsc::RecvTimeoutError> {
                 let result = self
-                    .teardown_done
+                    .join_ack
                     .as_ref()
                     .expect("teardown has started")
                     .recv_timeout(Duration::from_secs(1));
@@ -619,12 +603,23 @@ pub(crate) mod test_support {
                 self.release_reader();
                 drop(self.slave.take());
                 drop(self.drainer.take());
-                if let Some(done) = self.teardown_done.take()
-                    && done.recv_timeout(Duration::from_secs(1)).is_ok()
+                if let Some(joined) = self.join_ack.take()
+                    && joined.recv_timeout(Duration::from_secs(1)).is_ok()
                     && let Some(teardown) = self.teardown.take()
                 {
                     let _ = teardown.join();
                 }
+            }
+        }
+
+        fn wait_for_stop(stop: &std::sync::atomic::AtomicBool) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !stop.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY drainer did not observe teardown"
+                );
+                std::thread::yield_now();
             }
         }
 
@@ -665,17 +660,20 @@ pub(crate) mod test_support {
                 std::thread::yield_now();
             }
 
+            let stop = cleanup.drainer.as_ref().unwrap().stop.clone();
+            let successful_reads = cleanup.drainer.as_ref().unwrap().successful_reads.clone();
             cleanup.start_teardown();
-            assert!(
-                cleanup
-                    .teardown_started
-                    .as_ref()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(1))
-                    .is_ok()
+            wait_for_stop(&stop);
+            assert_eq!(
+                cleanup.wait_for_join(),
+                Ok(()),
+                "drop must join the idle reader"
             );
-            let result = cleanup.wait_for_teardown();
-            assert_eq!(result, Ok((true, 0)), "drop must join the idle reader");
+            assert_eq!(
+                successful_reads.load(Ordering::Acquire),
+                0,
+                "idle PTY reader must not consume data"
+            );
         }
 
         #[test]
@@ -732,32 +730,31 @@ pub(crate) mod test_support {
                 .load(Ordering::Acquire);
             assert_eq!(reads_before_stop, 1);
 
-            // Keep the reader paused while drop starts and blocks joining it.
+            // Observe the exact stop flag while the reader is still held after
+            // its first real read. The join acknowledgment can only follow a
+            // successful join inside PtyDrainer::drop.
+            let stop = cleanup.drainer.as_ref().unwrap().stop.clone();
+            let successful_reads = cleanup.drainer.as_ref().unwrap().successful_reads.clone();
             cleanup.start_teardown();
-            assert!(
-                cleanup
-                    .teardown_started
-                    .as_ref()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(1))
-                    .is_ok(),
-                "teardown did not start"
-            );
-            assert!(
-                matches!(
-                    cleanup.teardown_done.as_ref().unwrap().try_recv(),
-                    Err(std::sync::mpsc::TryRecvError::Empty)
-                ),
-                "teardown must remain pending while the live reader is held"
-            );
+            wait_for_stop(&stop);
 
-            let _ = cleanup.release.as_ref().unwrap().send(());
+            cleanup
+                .release
+                .as_ref()
+                .unwrap()
+                .send(())
+                .expect("held reader must accept release");
             cleanup.release_reader();
-            let result = cleanup.wait_for_teardown();
+            let result = cleanup.wait_for_join();
             assert_eq!(
                 result,
-                Ok((true, reads_before_stop)),
-                "drop must join the reader before returning, without another read"
+                Ok(()),
+                "drop must successfully join the reader before returning"
+            );
+            assert_eq!(
+                successful_reads.load(Ordering::Acquire),
+                reads_before_stop,
+                "continuous PTY reader must perform exactly one successful read"
             );
         }
     }
