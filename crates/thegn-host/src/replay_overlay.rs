@@ -961,8 +961,7 @@ mod tests {
         }
         let rec = recording_with(&[(b"alpha\r\n", 10), (b"beta\r\n", 20)]);
         let mut ov = ReplayOverlay::new(1, &rec, 1000);
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         ov.set_search_waker(waker);
         // Start at the tail; reverse-search for alpha via / then n? Use forward
         // from start: jump to start first.
@@ -991,8 +990,7 @@ mod tests {
         }
         let rec = recording_with(&[(b"alpha\r\n", 10), (b"beta\r\n", 20)]);
         let mut ov = ReplayOverlay::new(1, &rec, 1000);
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         ov.set_search_waker(waker);
         ov.handle_key(&KeyCode::Char('g'), Modifiers::NONE, &rec);
 
@@ -1042,8 +1040,7 @@ mod tests {
         rec.push_bytes(b"old", epoch);
         rec.push_bytes(b"\r\nnew", epoch + std::time::Duration::from_millis(10));
         let mut ov = ReplayOverlay::new(1, &rec, 1000);
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         ov.set_search_waker(waker);
         ov.last_query = "old".into();
         ov.run_search(&rec, true);
@@ -1085,8 +1082,7 @@ mod tests {
         }
         let rec = recording_with(&[(b"alpha", 10)]);
         let mut ov = ReplayOverlay::new(1, &rec, 1000);
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         ov.set_search_waker(waker);
         ov.handle_key(&KeyCode::Char('/'), Modifiers::NONE, &rec);
         ov.handle_key(&KeyCode::Char('a'), Modifiers::NONE, &rec);

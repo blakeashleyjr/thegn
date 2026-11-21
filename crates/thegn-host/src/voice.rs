@@ -1580,7 +1580,7 @@ mod tests {
             ],
             ..VoiceConfig::default()
         };
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker = spawn_capture(config, 1, 1, stop.clone(), tx, waker).unwrap();
@@ -1673,7 +1673,7 @@ mod tests {
         if !UNIX {
             return;
         }
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let mut controller = VoiceController::new(VoiceConfig::default());
         controller.transcription_worker = Some(thread::spawn(|| {
             thread::sleep(Duration::from_millis(150));
@@ -1718,7 +1718,7 @@ mod tests {
             ],
             ..VoiceConfig::default()
         };
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let (tx, rx) = mpsc::channel();
         let worker =
             spawn_capture(config, 1, 1, Arc::new(AtomicBool::new(false)), tx, waker).unwrap();
