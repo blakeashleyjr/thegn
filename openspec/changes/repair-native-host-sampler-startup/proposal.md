@@ -3,11 +3,14 @@
 ## Summary
 
 Defer constructing Observe's native host sampler until its worker observes an
-active source. Sampler construction performs platform probes, including the
-Apple HID temperature probe, so a source hidden immediately after creation
-must be able to park without first completing hardware discovery. Keep real
-sampling on its dedicated worker, preserve the discarded CPU priming read on
-resume, and retain wakeable bounded stop behavior.
+active source. The public constructor starts active. If the worker observes
+the source parked at its state check before entering the sampler factory, it
+parks without beginning hardware discovery; a park request after that check
+is cooperative and construction may finish before the worker observes it.
+Sampler construction performs platform probes, including the Apple HID
+temperature probe. Keep real sampling on its dedicated worker, preserve the
+discarded CPU priming read on resume, and retain wakeable bounded stop
+behavior.
 
 ## Impact
 

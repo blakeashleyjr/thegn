@@ -1381,18 +1381,41 @@ mod tests {
 
     #[test]
     fn stop_during_sampler_initialization_prevents_first_sample() {
-        let (source, entered, release, factories, samples) = gated_sampler_source(false);
+        let (source, entered, release, factories, samples) = gated_sampler_source(true);
+        wait_for("initial park", || source.in_park.load(Ordering::Acquire));
+        source.set_active(true);
         entered
             .recv_timeout(Duration::from_secs(5))
-            .expect("factory did not start");
+            .expect("factory did not start after activation");
         let exited = Arc::clone(&source.exited);
-        drop(source);
+
+        // Drop requests stop before joining. Keep the factory gate under this
+        // thread's control so an accidental inline join is bounded and can be
+        // released before the test fails.
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
+        let drop_thread = std::thread::spawn(move || {
+            drop(source);
+            let _ = drop_done_tx.send(());
+        });
+        if drop_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .is_err()
+        {
+            release.send(()).unwrap();
+            drop_thread.join().unwrap();
+            panic!("drop blocked while sampler factory was held");
+        }
+        drop_thread.join().unwrap();
         release.send(()).unwrap();
         wait_for("worker exit after stop during factory", || {
             exited.load(Ordering::Acquire)
         });
         assert_eq!(factories.load(Ordering::SeqCst), 1);
-        assert_eq!(samples.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            samples.load(Ordering::SeqCst),
+            0,
+            "stop allowed a priming or first read"
+        );
     }
 
     #[test]
