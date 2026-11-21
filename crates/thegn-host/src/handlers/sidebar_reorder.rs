@@ -49,9 +49,7 @@ fn visible_index_of_worktree_path(model: &FrameModel, path: &str) -> Option<usiz
         .sidebar_rows
         .iter()
         .filter(|r| r.visible)
-        .position(|r| {
-            r.kind == crate::sidebar::RowKind::Worktree && r.worktree_path.as_deref() == Some(path)
-        })
+        .position(|r| r.kind.is_worktree() && r.worktree_path.as_deref() == Some(path))
 }
 
 /// The workspace slug owning the worktree row at `path`.
@@ -59,9 +57,7 @@ fn workspace_slug_of_path(model: &FrameModel, path: &str) -> Option<String> {
     model
         .sidebar_rows
         .iter()
-        .find(|r| {
-            r.kind == crate::sidebar::RowKind::Worktree && r.worktree_path.as_deref() == Some(path)
-        })
+        .find(|r| r.kind.is_worktree() && r.worktree_path.as_deref() == Some(path))
         .map(|r| r.workspace_slug.clone())
 }
 

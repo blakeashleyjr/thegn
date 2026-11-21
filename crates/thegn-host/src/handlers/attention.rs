@@ -19,7 +19,7 @@ pub(crate) fn active_worktree_path(model: &FrameModel) -> Option<&str> {
     model
         .sidebar_rows
         .iter()
-        .find(|r| r.active && r.kind == crate::sidebar::RowKind::Worktree)
+        .find(|r| r.active && r.kind.is_worktree())
         .and_then(|r| r.worktree_path.as_deref())
 }
 
@@ -232,7 +232,7 @@ pub(crate) fn next_target(
         .filter(|(p, _)| Some(p.as_str()) != active_path.as_deref())
         .find_map(|(next, score)| {
             let row = model.sidebar_rows.iter().find(|r| {
-                r.kind == crate::sidebar::RowKind::Worktree
+                r.kind.is_worktree()
                     && r.worktree_path.as_deref() == Some(next.as_str())
                     && r.tab_target.is_some()
             })?;

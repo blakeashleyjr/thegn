@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use thegn_core::plugin_api::RowFieldSlot;
 
 use crate::handlers::plugins::RowFieldSnapshot;
-use crate::sidebar::{PluginFieldValue, RowKind, SidebarRow};
+use crate::sidebar::{PluginFieldValue, SidebarRow};
 
 /// `(plugin, field)` to the slot its `WorktreeField` contribution declared.
 pub(crate) type FieldSlots = BTreeMap<(String, String), RowFieldSlot>;
@@ -40,7 +40,7 @@ pub(crate) fn project_plugin_fields(
     slots: &FieldSlots,
 ) -> BTreeMap<String, Vec<PluginFieldValue>> {
     let mut projected = BTreeMap::new();
-    for row in rows.iter().filter(|row| row.kind == RowKind::Worktree) {
+    for row in rows.iter().filter(|row| row.kind.is_worktree()) {
         let Some(path) = row.worktree_path.as_deref() else {
             continue;
         };
@@ -85,6 +85,7 @@ pub(crate) fn project_plugin_fields(
 mod tests {
     use super::*;
     use crate::handlers::plugins::RowValue;
+    use crate::sidebar::RowKind;
     use thegn_core::plugin_api::RowRole;
 
     fn row(path: Option<&str>, branch: &str) -> SidebarRow {
@@ -144,6 +145,20 @@ mod tests {
         }];
         assert_eq!(projected["/wt/a"], expected);
         assert_eq!(rows[0].plugin_fields, expected);
+    }
+
+    #[test]
+    fn projects_values_onto_pipeline_worktree_rows() {
+        let mut pipeline = row(Some("/wt/pipeline"), "feat/pipeline");
+        pipeline.kind = RowKind::PipelineWorktree;
+        let mut rows = vec![pipeline];
+        let snap = snapshot(&[("ci", "status", "/wt/pipeline", "passing")]);
+        let slots = slots(&[("ci", "status", RowFieldSlot::Badge)]);
+
+        let projected = project_plugin_fields(&mut rows, &snap, &slots);
+
+        assert_eq!(texts(&rows[0].plugin_fields), ["passing"]);
+        assert_eq!(texts(&projected["/wt/pipeline"]), ["passing"]);
     }
 
     #[test]

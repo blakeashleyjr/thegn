@@ -403,6 +403,11 @@ fn collect_attention_inner(
     );
     let roster_read_succeeded = roster_read.is_ok();
     let (roster, truncated) = roster_read.unwrap_or_default();
+    // Sidebar ownership cannot come from the bounded display roster: a live
+    // pipeline worktree may have old/finished stage rows beyond its window.
+    // This distinct DB read is unbounded and only returns durable pipeline
+    // worktree paths; lane names still come from the roster when available.
+    let pipeline_worktree_paths = db.pipeline_worktree_paths().unwrap_or_default();
     static TRUNCATION_WARNED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     if truncated && !TRUNCATION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -420,10 +425,15 @@ fn collect_attention_inner(
     // over rows already in memory; no extra I/O, no wake source.
     crate::monitor_pipeline::note_roster(&roster);
     status.pipeline_stages = crate::monitor_pipeline::stage_badges(&roster);
-    // Third derivation, same rows, same thread: the sidebar's derived
-    // pipeline folders. Pure — no DB open, nothing spawned, no new wake
-    // source.
-    status.pipeline_lanes = crate::sidebar_pipeline::lanes(&roster);
+    // Third derivation on this hydration thread: roster rows provide lane
+    // labels and the unbounded path read above keeps durable owners visible.
+    // No extra DB open, spawned work, or wake source is introduced.
+    status.pipeline_worktree_paths = pipeline_worktree_paths
+        .iter()
+        .map(|path| crate::sidebar_pipeline::path_identity(path))
+        .collect();
+    status.pipeline_lanes =
+        crate::sidebar_pipeline::lanes_with_persisted_paths(&roster, &pipeline_worktree_paths);
     let stage_blocked = crate::monitor_pipeline::stage_blocked(&roster);
 
     // Live raised hands (OSC 9 / OSC 777), one small table read like the two

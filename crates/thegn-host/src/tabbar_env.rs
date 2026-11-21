@@ -20,7 +20,7 @@ pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
     let devcontainer_status = model
         .sidebar_rows
         .iter()
-        .find(|row| row.active && matches!(row.kind, crate::sidebar::RowKind::Worktree))
+        .find(|row| row.active && row.kind.is_worktree())
         .and_then(|row| row.devcontainer_status.as_deref());
     let mut chips = runtime_sandbox_chips(backend, devcontainer_status);
     if let Some(profile) = model.active_sandbox_profile_pin.as_deref()
@@ -141,5 +141,26 @@ mod tests {
             env_chips(&model).is_empty(),
             "a pin does not create a backend chip"
         );
+    }
+
+    #[test]
+    fn active_pipeline_worktree_contributes_devcontainer_status() {
+        let status = "dc:.devcontainer.json [ready]";
+        let model = FrameModel {
+            active_sandbox_backend: "devcontainer".into(),
+            sidebar_rows: vec![crate::sidebar::SidebarRow {
+                active: true,
+                devcontainer_status: Some(status.into()),
+                ..crate::sidebar::SidebarRow::base(
+                    crate::sidebar::RowKind::PipelineWorktree,
+                    3,
+                    "feature",
+                    "repo",
+                )
+            }],
+            ..FrameModel::default()
+        };
+
+        assert_eq!(env_chips(&model), [status]);
     }
 }

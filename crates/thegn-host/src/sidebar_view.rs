@@ -822,7 +822,6 @@ fn sidebar_geom_from(
     rect: Rect,
     visible: &[&crate::sidebar::SidebarRow],
 ) -> SidebarGeom {
-    use crate::sidebar::RowKind;
     let rail = model.sidebar_rail;
     // The full panel reserves a header + blank row at the top and a metrics
     // section at the bottom; the rail reserves only row 0, for its mode glyph.
@@ -877,7 +876,7 @@ fn sidebar_geom_from(
                 return 1;
             }
             let mut h = 1;
-            if row.kind == RowKind::Worktree
+            if row.kind.is_worktree()
                 && model
                     .sidebar_display
                     .show_detail(detail_focused, i == detail_cursor)
@@ -966,7 +965,7 @@ fn quick_jump_slots(
                 ws += 1;
                 s
             }
-            RowKind::Worktree
+            RowKind::Worktree | RowKind::PipelineWorktree
                 if matches!(r.tab_target, Some(crate::sidebar::RowTarget::Tab(..))) =>
             {
                 let s = (wt <= 9 && (wt as usize) > claimed_by_app_tabs).then_some(wt);
@@ -1045,7 +1044,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     // the active worktree row. (Workspace rows themselves carry `active = false`.)
     let active_ws_slug: Option<String> = visible
         .iter()
-        .find(|r| r.active && r.kind == RowKind::Worktree)
+        .find(|r| r.active && r.kind.is_worktree())
         .map(|r| r.workspace_slug.clone());
 
     // Compose ONLY the rows that land inside the list window.
@@ -2250,23 +2249,6 @@ fn compose_row_lines(
                 seg(Tok::Slot(S::Text), label),
             ])]
         }
-        // A worktree the lane's roster rows reference, as a leaf. Dim when it
-        // resolved a target, faint when it did not — a worktree thegn can't
-        // open still shows, because hiding it would make the lane look like it
-        // references less than the roster says.
-        RowKind::PipelineWorktree => {
-            // `tree_lead` indents by depth, landing the connector under its
-            // lane row's caret.
-            let mut l = vec![sp(1), sp(2)];
-            l.extend(tree_lead(row.depth, is_last, 0));
-            let tok = if row.tab_target.is_some() {
-                Tok::Slot(S::Dim)
-            } else {
-                Tok::Slot(S::Faint)
-            };
-            l.push(seg(tok, display_cell(&row.label)));
-            vec![Line::Segs(l)]
-        }
         // The derived "Other" group of external worktrees: folder-shaped
         // (caret + label + count) but toned one step quieter than a real
         // folder and without the folder glyph — it is a holding area for
@@ -2361,7 +2343,7 @@ fn compose_row_lines(
             l.push(seg(Tok::Slot(S::Dim), display_cell(&row.label)));
             vec![Line::Segs(l)]
         }
-        RowKind::Worktree => {
+        RowKind::Worktree | RowKind::PipelineWorktree => {
             // Left cluster: gutter, Alt+1..9 jump digit, tree connector,
             // activity dot, the dynamic name, then the agent glyph.
             let mut left = vec![sp(1)];
@@ -2632,7 +2614,7 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
             .unwrap_or_default()
     };
     match row.kind {
-        RowKind::Worktree | RowKind::Terminal => {
+        RowKind::Worktree | RowKind::PipelineWorktree | RowKind::Terminal => {
             let dot = if matches!(row.activity, ActivityState::None) {
                 seg(Tok::Slot(S::Ghost2), gl.middot) // · placeholder keeps the column
             } else {
@@ -4046,7 +4028,7 @@ mod tests {
         };
         let mut dead_ws = SidebarRow::base(RowKind::Workspace, 0, "no-path", "no-path");
         dead_ws.worktree_path = None;
-        vec![
+        let mut rows = vec![
             ws("a"),
             wt("a1", 0),
             ws("b"),
@@ -4055,7 +4037,9 @@ mod tests {
             dead_ws,
             ws("c"),
             wt("c1", 2),
-        ]
+        ];
+        rows[3].kind = RowKind::PipelineWorktree;
+        rows
     }
 
     fn slots_for(model: &FrameModel) -> Vec<Option<u8>> {
@@ -5351,6 +5335,34 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn pipeline_worktree_keeps_worktree_identity_in_rail_mode() {
+        use crate::sidebar::SidebarRow;
+
+        let mut row = SidebarRow::base(RowKind::PipelineWorktree, 3, "feature", "app");
+        row.active = true;
+        row.activity = crate::sidebar::ActivityState::Active;
+
+        let line = compose_rail_line(&row);
+        let text = match line {
+            crate::seg::Line::Segs(segments) => segments
+                .into_iter()
+                .map(|segment| segment.text)
+                .collect::<String>(),
+            other => panic!("expected worktree rail line, got {other:?}"),
+        };
+
+        assert!(
+            text.contains(&crate::caps::active_glyphs().dot_filled),
+            "{text:?}"
+        );
+        assert!(text.contains('f'), "{text:?}");
+        assert!(
+            !text.contains(&crate::caps::active_glyphs().box_h),
+            "{text:?}"
+        );
     }
 
     #[test]

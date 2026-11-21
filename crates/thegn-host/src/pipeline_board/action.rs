@@ -102,7 +102,7 @@ pub fn pipeline_target(
         .sidebar_rows
         .iter()
         .find(|r| {
-            r.kind == crate::sidebar::RowKind::Worktree
+            r.kind.is_worktree()
                 && r.worktree_path.as_deref() == Some(jump.worktree.as_str())
                 && r.tab_target.is_some()
         })
@@ -161,6 +161,20 @@ mod tests {
         assert_eq!(
             pipeline_target(&jump("/wt/a"), &model),
             Some(RowTarget::Tab(2, 1))
+        );
+    }
+
+    #[test]
+    fn tier_one_resolves_a_live_pipeline_leaf_to_its_tab_target() {
+        let mut model = FrameModel::default();
+        model.sidebar_rows.push(SidebarRow {
+            worktree_path: Some("/wt/pipeline".into()),
+            tab_target: Some(RowTarget::Tab(4, 2)),
+            ..SidebarRow::base(RowKind::PipelineWorktree, 3, "pipeline", "app")
+        });
+        assert_eq!(
+            pipeline_target(&jump("/wt/pipeline"), &model),
+            Some(RowTarget::Tab(4, 2))
         );
     }
 

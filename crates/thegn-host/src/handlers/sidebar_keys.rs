@@ -199,7 +199,7 @@ impl SidebarState {
             // lock would freeze the whole UI (event-loop-blocking invariant).
             // Fall back to `main_worktree` only when the model has no workspace
             // row for this slug (a live worktree with no persisted workspace).
-            crate::sidebar::RowKind::Worktree => {
+            crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::PipelineWorktree => {
                 Self::workspace_repo_path(model, &row.workspace_slug).or_else(|| {
                     row.worktree_path.as_deref().and_then(|p| {
                         thegn_core::repo::main_worktree(std::path::Path::new(p))
@@ -223,7 +223,7 @@ impl SidebarState {
         let row = self.selected_row(model)?;
         let folder_id = match row.kind {
             RowKind::Folder => row.folder_id,
-            RowKind::Worktree => {
+            RowKind::Worktree | RowKind::PipelineWorktree => {
                 let path = row.worktree_path.as_deref()?;
                 model
                     .sidebar_db_worktrees
@@ -370,7 +370,7 @@ impl SidebarState {
             RowKind::Terminal => Some(SidebarOutcome::CloseTerminal {
                 name: row.label.clone(),
             }),
-            RowKind::Worktree => {
+            RowKind::Worktree | RowKind::PipelineWorktree => {
                 if self.cursor_is_home(model, session) && self.marked.is_empty() {
                     model.status = "The home worktree can't be closed or deleted".into();
                     return Some(SidebarOutcome::Redraw);
@@ -414,7 +414,7 @@ impl SidebarState {
         let sep = RowMenuEntry::separator;
         let mut entries: Vec<RowMenuEntry> = Vec::new();
         match row.kind {
-            RowKind::Worktree => {
+            RowKind::Worktree | RowKind::PipelineWorktree => {
                 if row.tab_target.is_some() {
                     entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
                 }
@@ -446,7 +446,7 @@ impl SidebarState {
                         Some(chord_of(Id::Folder)),
                     ));
                 }
-                if !row.pin_key.is_empty() {
+                if row.is_pinnable() {
                     entries.push(e("pin", "Pin / unpin", Some(chord_of(Id::TogglePin))));
                 }
                 if row.worktree_path.is_some() {
@@ -607,14 +607,6 @@ impl SidebarState {
                     Some(chord_of(Id::Activate)),
                 ));
             }
-            // The lane's worktree mirror opens its worktree — the same door,
-            // the same target as the primary row. Nothing identity-shaped
-            // (pin, rename, close, delete) is offered on a mirror.
-            RowKind::PipelineWorktree => {
-                if row.tab_target.is_some() {
-                    entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
-                }
-            }
             // The "show more"/"show fewer" toggle does one thing (Enter,
             // Space or a click); a menu would only repeat it.
             RowKind::SectionHeading | RowKind::EmptyHint | RowKind::ShowMore => {
@@ -686,7 +678,9 @@ impl SidebarState {
                     .position(|r| {
                         matches!(
                             r.kind,
-                            crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::Terminal
+                            crate::sidebar::RowKind::Worktree
+                                | crate::sidebar::RowKind::PipelineWorktree
+                                | crate::sidebar::RowKind::Terminal
                         )
                     })
             {
@@ -863,7 +857,9 @@ impl SidebarState {
                 if self.selected_row(model).is_some_and(|r| {
                     matches!(
                         r.kind,
-                        crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::Workspace
+                        crate::sidebar::RowKind::Worktree
+                            | crate::sidebar::RowKind::PipelineWorktree
+                            | crate::sidebar::RowKind::Workspace
                     )
                 }) {
                     return SidebarOutcome::Synthetic(crate::keymap::Action::OpenInfo);
@@ -992,7 +988,7 @@ impl SidebarState {
                 folder_id: row.folder_id?,
                 name: row.label.clone(),
             }),
-            RowKind::Worktree => {
+            RowKind::Worktree | RowKind::PipelineWorktree => {
                 if self.cursor_is_home(model, session) {
                     model.status = "The home worktree can't be renamed".into();
                     return Some(SidebarOutcome::Redraw);
@@ -1047,7 +1043,7 @@ impl SidebarState {
         use crate::sidebar::RowKind;
         let row = self.selected_row(model)?;
         match row.kind {
-            RowKind::Worktree => {
+            RowKind::Worktree | RowKind::PipelineWorktree => {
                 let worktree_path = row.worktree_path.clone()?;
                 let repo_path = Self::workspace_repo_path(model, &row.workspace_slug)?;
                 Some(SidebarOutcome::MoveToFolder {
@@ -1202,10 +1198,9 @@ impl SidebarState {
             .collect();
         if keys.is_empty()
             && let Some(row) = self.selected_row(model)
-            // A derived pipeline group/lane carries a `pin_key` only so its
-            // collapse state has a home, and the worktree mirror's key is
-            // anchor-only (its menu offers no pin); none of the three may be
-            // floated into a tree the user arranged.
+            // Derived pipeline group/lane keys hold collapse state. Pipeline
+            // worktree leaves are real worktree actions and may be pinned
+            // within their lane using the path-stable key.
             && row.is_pinnable()
         {
             keys.push(row.pin_key.clone());
@@ -2057,6 +2052,72 @@ mod tests {
             SidebarOutcome::OpenInIde { target, workspace_slug }
                 if target.worktree() == std::path::Path::new("/repos/app-feature")
                     && workspace_slug == "app"
+        ));
+    }
+
+    #[test]
+    fn pipeline_worktree_menu_keeps_regular_worktree_actions() {
+        use crate::sidebar::{RowKind, RowTarget, SidebarRow};
+
+        let model = FrameModel {
+            sidebar_workspaces: vec![(
+                "app".into(),
+                "app".into(),
+                "repo".into(),
+                "/repos/app".into(),
+            )],
+            sidebar_rows: vec![
+                SidebarRow {
+                    worktree_path: Some("/repos/app".into()),
+                    pin_key: "app".into(),
+                    ..SidebarRow::base(RowKind::Workspace, 0, "app", "app")
+                },
+                SidebarRow {
+                    worktree_path: Some("/repos/app-pipeline".into()),
+                    pin_key: "app/app-pipeline".into(),
+                    branch: Some("feature".into()),
+                    tab_target: Some(RowTarget::Tab(0, 0)),
+                    ..SidebarRow::base(RowKind::PipelineWorktree, 3, "app-pipeline", "app")
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sb = SidebarState::default();
+        sb.cursor = model
+            .sidebar_rows
+            .iter()
+            .filter(|row| row.visible)
+            .position(|row| {
+                row.kind == RowKind::PipelineWorktree && row.pin_key == "app/app-pipeline"
+            })
+            .expect("pipeline leaf is visible");
+        assert_eq!(
+            sb.selected_row(&model).map(|row| row.pin_key.as_str()),
+            Some("app/app-pipeline")
+        );
+        let menu = sb
+            .menu_for_cursor(&model, &crate::session::Session::default())
+            .expect("pipeline worktree menu");
+        for id in [
+            "open",
+            "open-in-ide",
+            "fork",
+            "move-to-folder",
+            "copy-path",
+            "info",
+        ] {
+            assert!(
+                menu.entries.iter().any(|entry| entry.id == id),
+                "missing {id}"
+            );
+        }
+        assert!(menu.entries.iter().any(|entry| entry.id == "pin"));
+        assert!(matches!(
+            sb.folder_outcome(&model),
+            Some(SidebarOutcome::MoveToFolder {
+                worktree_path,
+                repo_path,
+            }) if worktree_path == "/repos/app-pipeline" && repo_path == "/repos/app"
         ));
     }
 

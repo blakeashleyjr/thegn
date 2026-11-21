@@ -898,6 +898,38 @@ fn needs_you(model: &mut FrameModel, path: &str) {
 }
 
 #[test]
+fn needs_you_enter_activates_a_dormant_pipeline_worktree_target() {
+    let path = "/wt/pipeline";
+    let mut model = FrameModel::default();
+    needs_you(&mut model, path);
+    let target = crate::sidebar::RowTarget::Workspace {
+        repo_path: "/repo".into(),
+        group: Some("feat/pipeline".into()),
+    };
+    model.sidebar_rows.push(crate::sidebar::SidebarRow {
+        worktree_path: Some(path.into()),
+        tab_target: Some(target.clone()),
+        ..crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::PipelineWorktree,
+            3,
+            "feat/pipeline",
+            "repo",
+        )
+    });
+
+    let ov = open_notifications(&model);
+    let DetailContent::List(list) = &ov.content else {
+        panic!("expected a list");
+    };
+    let row = list
+        .rows
+        .iter()
+        .find(|row| row.text.contains("process failed"))
+        .unwrap();
+    assert_eq!(row.enter, Some(DetailAction::ActivateTarget(target)));
+}
+
+#[test]
 fn unified_surface_groups_by_section_and_dedups_worktree_alerts() {
     // A per-worktree failure that already shows under "Needs you" must NOT be
     // repeated in "Alerts"; a host-global alert (no worktree) still shows there.

@@ -288,7 +288,7 @@ pub(crate) fn known_worktrees(
     let mut known: Vec<(PathBuf, String)> = model
         .sidebar_rows
         .iter()
-        .filter(|row| row.kind == crate::sidebar::RowKind::Worktree)
+        .filter(|row| row.kind.is_worktree())
         .filter_map(|row| {
             row.worktree_path
                 .as_deref()

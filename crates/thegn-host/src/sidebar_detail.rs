@@ -10,7 +10,7 @@ use thegn_svc::git::{DiffCount, META_COUNT_CAP};
 
 use crate::chrome::S;
 use crate::seg::{Line, Seg, Tok, seg, seg_width, sp};
-use crate::sidebar::{CiBadge, PluginFieldValue, RowKind, SidebarRow};
+use crate::sidebar::{CiBadge, PluginFieldValue, SidebarRow};
 use crate::sidebar_view::SidebarDisplay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,8 +151,7 @@ fn detail_branch(row: &SidebarRow) -> &str {
 /// the heights pass and the compose pass agree.
 pub(crate) fn title_echo(row: &SidebarRow, disp: &SidebarDisplay, title: &str) -> TitleEcho {
     TitleEcho {
-        branch: row.kind == RowKind::Worktree
-            && display_cell(title) == display_cell(detail_branch(row)),
+        branch: row.kind.is_worktree() && display_cell(title) == display_cell(detail_branch(row)),
         commits: disp.show_commits || disp.show_behind_base,
         pr: disp.show_pr_chip && row.pr_number.is_some(),
         upstream: disp.show_ahead_behind && row.git.is_some(),
@@ -165,7 +164,7 @@ fn detail_fields(
     now_unix: i64,
     echo: TitleEcho,
 ) -> Vec<Field> {
-    if row.kind != RowKind::Worktree {
+    if !row.kind.is_worktree() {
         return Vec::new();
     }
     let branch = detail_branch(row);
@@ -225,7 +224,7 @@ fn plugin_fields(row: &SidebarRow, plugin: &str, field: &str) -> Vec<Field> {
 }
 
 fn branch_field(row: &SidebarRow, branch: &str, id: FieldId) -> Option<Field> {
-    (row.kind == RowKind::Worktree && !branch.is_empty())
+    (row.kind.is_worktree() && !branch.is_empty())
         .then(|| Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(branch))], 1))
 }
 
@@ -788,6 +787,7 @@ pub(crate) fn compose_detail_line(row: &SidebarRow, disp: &SidebarDisplay) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::RowKind;
     use thegn_svc::git::BranchMeta;
 
     fn row() -> SidebarRow {
