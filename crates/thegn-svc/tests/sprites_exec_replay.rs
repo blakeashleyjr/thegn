@@ -250,21 +250,23 @@ async fn tty_forwards_plain_text_frames_as_output() {
 }
 
 #[tokio::test]
-async fn non_tty_replay_separates_stdout_stderr_and_exit() {
+async fn non_tty_replay_preserves_exit_after_stdout_stderr_and_normal_close() {
     let mock = start_mock(vec![script(vec![
         session_info(),
         Out::Bin([vec![1], b"out\n".to_vec()].concat()),
         Out::Bin([vec![2], b"warn\n".to_vec()].concat()),
-        Out::Bin(vec![3, 0]),
+        Out::Bin(vec![3, 7]),
+        Out::Close,
     ])]);
 
     let (code, output) = provider(&mock)
         .run_exec("tgtest1", &["sh".into()], None, &[])
         .await
         .unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(output, "out\n");
-    assert!(!output.contains("warn"));
+    assert_eq!(code, 7);
+    assert!(output.starts_with("out\n[stderr, last 5 bytes]\n"), "{output:?}");
+    assert!(output.ends_with("warn\n"), "{output:?}");
+    assert_eq!(requests(&mock).len(), 1, "replay must not retry the command");
 }
 
 #[tokio::test]

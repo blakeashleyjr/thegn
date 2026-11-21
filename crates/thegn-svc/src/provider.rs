@@ -7913,11 +7913,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_exec_non_tty_closes_after_exit_when_stdin_is_closed() {
+    async fn drive_exec_non_tty_half_closes_stdin_then_drains_exact_exit() {
         use tokio_tungstenite::tungstenite::Message;
 
-        let (_, fault, client_close) =
-            drive_exec_messages(false, vec![Message::Binary(vec![3, 0].into())], true).await;
+        let (frames, fault, client_close) = drive_exec_messages(
+            false,
+            vec![
+                Message::Binary([vec![1], b"recorded output".to_vec()].concat().into()),
+                Message::Binary(vec![3, 7].into()),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(
+            frames,
+            vec![
+                ExecFrame::Stdout(b"recorded output".to_vec()),
+                ExecFrame::Exit(7),
+            ]
+        );
         assert_eq!(fault, None);
         assert_eq!(client_close, Some(Message::Close(None)));
     }
