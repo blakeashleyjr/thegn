@@ -1071,6 +1071,16 @@ fn apply_write_result(q: &mut Q, result: std::io::Result<()>, oob_kind: Option<O
 mod tests {
     use super::*;
 
+    // Failure-path cleanup must release a blocked sink when it is still
+    // listening, but a retired receiver is expected after a failed worker
+    // start or while the original watchdog failure is unwinding.
+    fn release_after_fixture_failure(release: &std::sync::mpsc::Sender<()>) {
+        match release.send(()) {
+            Ok(()) => {}
+            Err(_receiver_retired) => {}
+        }
+    }
+
     /// Harness-only liveness limit; deliberately far beyond the 30 ms sync
     /// and shutdown test bounds so scheduling jitter is not timed.
     const TEST_LIVENESS_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1214,13 +1224,13 @@ mod tests {
             returned_tx.send((writer, submitted)).unwrap();
         });
         if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             panic!("writer worker did not enter the blocked sink");
         }
         let (writer, submitted) = match returned_rx.recv_timeout(TEST_LIVENESS_WATCHDOG) {
             Ok(result) => result,
             Err(_) => {
-                let _ = release_tx.send(());
+                release_after_fixture_failure(&release_tx);
                 panic!(
                     "synchronous frame submission did not return before the harness liveness watchdog"
                 );
@@ -1306,13 +1316,13 @@ mod tests {
             returned_tx.send(accepted).unwrap();
         });
         if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             panic!("writer worker did not enter the blocked sink");
         }
         let accepted = match returned_rx.recv_timeout(TEST_LIVENESS_WATCHDOG) {
             Ok(accepted) => accepted,
             Err(_) => {
-                let _ = release_tx.send(());
+                release_after_fixture_failure(&release_tx);
                 panic!(
                     "synchronous termwiz submission did not return before the harness liveness watchdog"
                 );
@@ -1383,7 +1393,7 @@ mod tests {
         let first_writer = Arc::clone(&writer);
         let first = std::thread::spawn(move || first_writer.submit_frame(vec![1], None));
         if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             panic!("writer worker did not enter the blocked sink");
         }
         {
@@ -1401,7 +1411,7 @@ mod tests {
             dropped_tx.send(()).unwrap();
         });
         if dropped_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             dropper.join().unwrap();
             panic!("FrameWriter::drop did not return before the harness liveness watchdog");
         }
@@ -2316,7 +2326,7 @@ mod tests {
             sync: false,
         };
         if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             panic!("writer worker did not enter the blocked sink");
         }
         let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
@@ -2325,7 +2335,7 @@ mod tests {
             dropped_tx.send(()).unwrap();
         });
         if dropped_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             dropper.join().unwrap();
             panic!("FrameWriter::drop did not return before the harness liveness watchdog");
         }
@@ -2699,16 +2709,21 @@ mod tests {
 
             let caller = std::thread::spawn(move || {
                 let submitted = writer.submit_frame(vec![1], None);
-                let _ = returned_tx.send((writer, submitted));
+                match returned_tx.send((writer, submitted)) {
+                    Ok(()) => {}
+                    // A watchdog timeout retires this receiver while the
+                    // caller is returning; still dispose of its writer.
+                    Err(std::sync::mpsc::SendError((writer, _submitted))) => drop(writer),
+                }
             });
             if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
-                let _ = release_tx.send(());
+                release_after_fixture_failure(&release_tx);
                 panic!("writer worker did not enter the blocked sink");
             }
             let (writer, submitted) = match returned_rx.recv_timeout(TEST_LIVENESS_WATCHDOG) {
                 Ok(result) => result,
                 Err(_) => {
-                    let _ = release_tx.send(());
+                    release_after_fixture_failure(&release_tx);
                     panic!(
                         "synchronous frame submission did not return before the harness liveness watchdog"
                     );
@@ -2779,27 +2794,32 @@ mod tests {
         );
 
         if !writer.submit_frame(vec![1], None) {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             panic!("initial frame was not admitted");
         }
         if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             panic!("writer worker did not enter the sink before the harness liveness watchdog");
         }
         if !writer.submit_frame(vec![2], None) {
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             panic!("second frame was not queued behind the blocked sink");
         }
 
         let dropper = std::thread::spawn(move || {
             drop(writer);
-            let _ = dropped_tx.send(());
+            match dropped_tx.send(()) {
+                Ok(()) => {}
+                // If the watchdog failed, its panic may already have retired
+                // this receiver while the dropper is completing.
+                Err(_receiver_retired) => {}
+            }
         });
         let returned_with_sink_held = dropped_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_ok();
         if !returned_with_sink_held {
             // Release the fixture before failing so a broken bound does not
             // strand its worker while the test process unwinds.
-            let _ = release_tx.send(());
+            release_after_fixture_failure(&release_tx);
             panic!(
                 "FrameWriter::drop did not return with the sink held behind its shutdown deadline"
             );
