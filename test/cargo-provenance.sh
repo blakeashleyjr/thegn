@@ -170,6 +170,7 @@ else
     depinfo_lib=
     foreign_source=0
     listed_source_count=0
+    depinfo_source_identities=()
     depinfo_tokens=$(tr ' ' '\n' <"$core_depinfo")
 
     # Compare source identities using the physical parent directory on both
@@ -181,8 +182,8 @@ else
       if [[ $source_path != /* ]]; then
         source_path=$checkout/$source_path
       fi
-      source_dir=$(dirname "$source_path")
-      source_base=$(basename "$source_path")
+      source_dir=${source_path%/*}
+      source_base=${source_path##*/}
       if source_dir_abs=$(cd "$source_dir" 2>/dev/null && pwd -P); then
         printf '%s/%s\n' "$source_dir_abs" "$source_base"
       else
@@ -196,6 +197,7 @@ else
       */crates/thegn-core/src/*.rs | crates/thegn-core/src/*.rs)
         listed_source_count=$((listed_source_count + 1))
         token_identity=$(source_identity "$depinfo_token")
+        depinfo_source_identities+=("$token_identity")
         case "$token_identity" in
         "$checkout"/crates/thegn-core/src/*.rs) ;;
         *) foreign_source=1 ;;
@@ -211,19 +213,31 @@ else
     missing_sources=0
     core_src_dir=$checkout/crates/thegn-core/src
     if [[ -d $core_src_dir ]]; then
+      required_source_identities=()
       while IFS= read -r source_file; do
-        source_listed=0
-        for depinfo_token in $depinfo_tokens; do
-          depinfo_token=${depinfo_token%:}
-          if [[ $(source_identity "$depinfo_token") == "$(source_identity "$source_file")" ]]; then
-            source_listed=1
-            break
-          fi
-        done
-        if ((source_listed == 0)); then
-          missing_sources=$((missing_sources + 1))
-        fi
+        required_source_identities+=("$(source_identity "$source_file")")
       done < <(find "$core_src_dir" -type f -name '*.rs' 2>/dev/null)
+
+      # Normalize each side once, then compare the sets in one awk pass. In
+      # particular, do not resolve source paths from inside a nested pair loop:
+      # real crates contain hundreds of source files.
+      missing_sources=$(
+        {
+          if ((${#depinfo_source_identities[@]})); then
+            for identity in "${depinfo_source_identities[@]}"; do
+              printf 'D\t%s\n' "$identity"
+            done
+          fi
+          if ((${#required_source_identities[@]})); then
+            for identity in "${required_source_identities[@]}"; do
+              printf 'R\t%s\n' "$identity"
+            done
+          fi
+        } |
+          awk -F '\t' '$1 == "D" { listed[$2] = 1; next }
+            $1 == "R" && !listed[$2] { missing++ }
+            END { print missing + 0 }'
+      )
     fi
     printf 'provenance.core_depinfo_missing_sources: %s\n' "$missing_sources"
     if [[ -n $depinfo_lib ]]; then
