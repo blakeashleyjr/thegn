@@ -628,7 +628,7 @@ impl Landing {
         sb: &crate::run::SidebarState,
         removed: &[&str],
     ) -> Self {
-        use crate::sidebar::{RowKind, RowTarget, SidebarRow};
+        use crate::sidebar::{RowTarget, SidebarRow};
         let rows: Vec<&SidebarRow> = model.sidebar_rows.iter().filter(|r| r.visible).collect();
         let gone = |r: &SidebarRow| {
             r.worktree_path

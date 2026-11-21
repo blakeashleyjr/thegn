@@ -2355,6 +2355,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 last_workspace = Some(i);
                 last_folder = None; // folders don't span workspaces
                 last_group = None;
+                last_lane = None;
             }
             // The derived "Other" group nests its rows at depth 2 exactly like
             // a folder, so the filter surfaces and reveals it the same way.
@@ -2387,7 +2388,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     }
                 }
             }
-            RowKind::Worktree | RowKind::PipelineWorktree => {
+            RowKind::Worktree => {
                 if keep[i] {
                     if let Some(w) = last_workspace {
                         keep[w] = true; // surface the parent repo header
@@ -2399,6 +2400,19 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                         && let Some(f) = last_folder
                     {
                         keep[f] = true;
+                    }
+                }
+            }
+            RowKind::PipelineWorktree => {
+                if keep[i] {
+                    if let Some(w) = last_workspace {
+                        keep[w] = true;
+                    }
+                    if let Some(g) = last_group {
+                        keep[g] = true;
+                    }
+                    if let Some(l) = last_lane {
+                        keep[l] = true;
                     }
                 }
             }
@@ -2438,6 +2452,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 reveal_ws = self_match[i];
                 reveal_folder = false; // folders don't span workspaces
                 reveal_group = false;
+                reveal_lane = false;
             }
             RowKind::Folder | RowKind::OtherGroup | RowKind::BatchGroup => {
                 // A folder that matched on its own label reveals its children,
@@ -2459,10 +2474,15 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     keep[i] = true;
                 }
             }
-            RowKind::Worktree | RowKind::PipelineWorktree => {
+            RowKind::Worktree => {
                 // Loose worktrees (depth 1) follow the workspace's reveal;
                 // filed worktrees (depth 2) also reveal when their folder did.
                 if reveal_ws || (rows[i].depth >= 2 && reveal_folder) {
+                    keep[i] = true;
+                }
+            }
+            RowKind::PipelineWorktree => {
+                if reveal_ws || reveal_group || reveal_lane {
                     keep[i] = true;
                 }
             }
@@ -6022,6 +6042,42 @@ mod tests {
             .find(|r| r.kind == RowKind::PipelineWorktree)
             .unwrap();
         assert!(wt.visible, "its worktrees reveal with it");
+    }
+
+    #[test]
+    fn a_pipeline_group_match_reveals_its_lanes_and_worktrees() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let view = ViewState {
+            filter: "Pipelines".into(),
+            ..ViewState::default()
+        };
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.kind == RowKind::PipelineGroup)
+                .unwrap()
+                .visible
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.kind == RowKind::PipelineLane)
+                .unwrap()
+                .visible
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.kind == RowKind::PipelineWorktree)
+                .unwrap()
+                .visible
+        );
     }
 
     #[test]

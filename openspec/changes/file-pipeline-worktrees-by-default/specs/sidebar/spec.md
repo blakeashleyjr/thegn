@@ -33,7 +33,11 @@ of the roster.
 
 The leaf SHALL retain the ordinary worktree's target and complete status
 rendering so activation, worktree actions, filtering, and cursor anchoring
-continue to work. If that
+continue to work. The leaf's context-menu **Move to Folder** action and a drag
+onto a folder SHALL file that selected worktree through the existing folder
+assignment path. The manual sibling reorder shortcuts SHALL NOT rewrite the
+workspace's worktree order for a derived pipeline leaf; pipeline leaves retain
+their deterministic lane order (earliest dispatch reference, then name). If that
 worktree is the active session worktree, its Pipelines and lane ancestors SHALL
 be rendered open for that frame even when their persisted collapsed keys are
 set; the collapsed state itself MUST NOT be changed. The flat layout has no
@@ -103,8 +107,22 @@ via `Action::OpenPipelineBoard`.
 
 - **WHEN** a pipeline-owned worktree appears under a lane
 - **THEN** it shows the ordinary activity, Git, PR, environment, and detail
-  fields, supports Info and attention navigation, receives its Alt-number
-  slot, and move actions target that selected leaf
+  fields, supports Info and attention navigation, and receives its Alt-number
+  slot
+
+#### Scenario: Pipeline leaf folder actions target the selected worktree
+
+- **WHEN** the user chooses **Move to Folder** on a pipeline leaf or drags that
+  leaf onto a folder
+- **THEN** the folder assignment applies to that leaf's worktree, which then
+  appears in the explicit folder
+
+#### Scenario: Manual reorder does not change derived pipeline order
+
+- **WHEN** the user invokes a manual sibling reorder shortcut while a derived
+  pipeline leaf is selected
+- **THEN** the action does not rewrite manual workspace or folder worktree
+  positions, and the leaf remains in deterministic dispatch order
 
 #### Scenario: Existing pins survive layout and ownership changes
 

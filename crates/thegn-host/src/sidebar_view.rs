@@ -5339,6 +5339,8 @@ mod tests {
 
     #[test]
     fn pipeline_worktree_keeps_worktree_identity_in_rail_mode() {
+        use crate::sidebar::SidebarRow;
+
         let mut row = SidebarRow::base(RowKind::PipelineWorktree, 3, "feature", "app");
         row.active = true;
         row.activity = crate::sidebar::ActivityState::Active;

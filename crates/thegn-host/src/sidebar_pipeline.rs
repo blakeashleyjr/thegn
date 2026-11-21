@@ -92,6 +92,7 @@ pub(crate) struct LaneWorktree {
 /// - **Lane order**: earliest `dispatched_at_ms` of the lane's rows first
 ///   (the order work started — the same reading
 ///   `monitor_pipeline::ordered_rows` uses), tie-broken by key.
+#[cfg(test)]
 pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
     lanes_with_persisted_paths(dispatches, &[])
 }

@@ -1695,7 +1695,7 @@ mod tests {
         row.worktree_path = Some(repo.to_string_lossy().into_owned());
         model.sidebar_rows = vec![row];
 
-        let sb = SidebarState::default();
+        let mut sb = SidebarState::default();
         assert_eq!(
             sb.cursor_repo_root(&model),
             Some("/hydrated/root".to_string()),
@@ -2036,7 +2036,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut sb = SidebarState::default();
+        let sb = SidebarState::default();
         let menu = sb
             .menu_for_cursor(&model, &crate::session::Session::default())
             .expect("worktree menu");
@@ -2069,7 +2069,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut sb = SidebarState::default();
+        let sb = SidebarState::default();
         let menu = sb
             .menu_for_cursor(&model, &crate::session::Session::default())
             .expect("pipeline worktree menu");
