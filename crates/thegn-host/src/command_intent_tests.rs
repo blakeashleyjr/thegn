@@ -152,7 +152,7 @@ fn direct_iroh_serve_and_pair_actions_parse_as_dev_channel_controls() {
     assert!(matches!(
         parse(&["pair", "direct", "redeem", "laptop"])
             .command
-            .as_deref(),
+            .as_ref(),
         Some(Command::Pair {
             action: cmd::pair::PairAction::Direct {
                 action: cmd::pair::DirectAction::Redeem { .. }
@@ -162,7 +162,7 @@ fn direct_iroh_serve_and_pair_actions_parse_as_dev_channel_controls() {
     assert!(matches!(
         parse(&["pair", "direct", "me", "laptop"])
             .command
-            .as_deref(),
+            .as_ref(),
         Some(Command::Pair {
             action: cmd::pair::PairAction::Direct {
                 action: cmd::pair::DirectAction::Me { .. }
