@@ -333,6 +333,75 @@ pub(crate) fn disk_health(_deadline: std::time::Duration) -> DiskHealthReport {
     DiskHealthReport::Unavailable("unsupported on this platform".to_string())
 }
 
+/// Render the platform-specific disk health result for `doctor` without
+/// exposing Linux-only report variants or drive fields at the command surface.
+pub(crate) fn disk_health_report_lines(report: DiskHealthReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    match report {
+        DiskHealthReport::Unavailable(reason) => {
+            lines.push(format!("  health: n/a (udisks2 unavailable): {reason}"));
+        }
+        #[cfg(target_os = "linux")]
+        DiskHealthReport::Degraded { drives, reason } => {
+            lines.push(format!("  health: partial ({reason})"));
+            append_disk_health_lines(&mut lines, drives);
+        }
+        #[cfg(target_os = "linux")]
+        DiskHealthReport::Available(drives) if drives.is_empty() => {
+            lines.push("  health: n/a (udisks2 unavailable): no drives reported".to_string());
+        }
+        #[cfg(target_os = "linux")]
+        DiskHealthReport::Available(drives) => append_disk_health_lines(&mut lines, drives),
+    }
+    lines
+}
+
+#[cfg(target_os = "linux")]
+fn append_disk_health_lines(lines: &mut Vec<String>, drives: Vec<DiskHealth>) {
+    for drive in drives {
+        let serial = drive.serial_last4.as_deref().unwrap_or("n/a");
+        let health = drive.health.as_deref().unwrap_or("n/a");
+        let warning = drive.critical_warning.as_ref().map_or_else(
+            || "n/a".to_string(),
+            |warnings| {
+                if warnings.is_empty() {
+                    "none".to_string()
+                } else {
+                    warnings.join(", ")
+                }
+            },
+        );
+        lines.push(format!(
+            "  {} serial …{} health {health} critical-warning {warning}",
+            drive.name, serial
+        ));
+        lines.push(format!(
+            "    wear {}% spare {}/{} read {} B written {} B",
+            optional_metric(drive.percent_used),
+            optional_metric(drive.available_spare),
+            optional_metric(drive.spare_threshold),
+            optional_metric(drive.data_read_bytes),
+            optional_metric(drive.data_written_bytes),
+        ));
+        lines.push(format!(
+            "    power {} h cycles {} unsafe-shutdowns {} media-errors {} ATA-bad-sectors {} temperature {} °C",
+            optional_metric(drive.power_on_hours),
+            optional_metric(drive.power_cycles),
+            optional_metric(drive.unsafe_shutdowns),
+            optional_metric(drive.media_errors),
+            optional_metric(drive.ata_bad_sectors),
+            drive
+                .temperature_c
+                .map_or_else(|| "n/a".to_string(), |value| value.to_string()),
+        ));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn optional_metric(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| value.to_string())
+}
+
 /// Live per-process introspection (pane cwd / foreground job / argv). Unlike the
 /// rest of this module the split is Linux-vs-macOS-vs-other rather than
 /// unix-vs-windows, because `/proc` is a Linux facility, not a POSIX one.
