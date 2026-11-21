@@ -10,6 +10,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1515,7 +1516,8 @@ mod tests {
             exited.load(Ordering::Acquire)
         });
         let exit_ms = started.elapsed().as_millis();
-        eprintln!(
+        let _write_result = writeln!(
+            std::io::stderr().lock(),
             "native HostSource witness: initial={initial} parked={parked} resumed={resumed} initial_mem_gib={initial_memory:.3} resumed_mem_gib={resumed_memory:.3} drop_ms={drop_ms} worker_exit_ms={exit_ms}"
         );
     }
