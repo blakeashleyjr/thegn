@@ -5,7 +5,8 @@
 - [x] 2. Defer sampler initialization until the worker observes active state;
       preserve first-sample and resume priming behavior.
 - [x] 3. Make host lifecycle tests use a deterministic injected sampler and add
-      proof that initialization waits for activation.
+      gated-factory coverage for stop and hide during active startup and
+      initially parked activation, including reactivation with one collector.
 - [ ] 4. Run the four affected `gtui-query` tests repeatedly in serial and
       concurrently on build-mac at baseline and repair; capture a native sample
       witness and verify bounded park/drop.

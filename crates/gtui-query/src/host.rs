@@ -210,6 +210,11 @@ impl HostSource {
                 }
                 if sampler.is_none() {
                     sampler = Some(make_sampler.take().expect("sampler factory used once")());
+                    // Construction may block while activation, parking, or
+                    // shutdown changes the worker flags. Re-enter the state
+                    // checks before either the first read or resume priming.
+                    // Keep the sampler in this worker across that wakeup.
+                    continue;
                 }
                 let sampler = sampler.as_mut().expect("sampler initialized");
                 if was_parked {
@@ -1332,6 +1337,165 @@ mod tests {
         assert!(!initialized.load(Ordering::Acquire));
 
         source.set_active(true);
-        wait_for("sampler initialization", || initialized.load(Ordering::Acquire));
+        wait_for("sampler initialization", || {
+            initialized.load(Ordering::Acquire)
+        });
+    }
+
+    fn gated_sampler_source(
+        initially_parked: bool,
+    ) -> (
+        HostSource,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factories_bg = Arc::clone(&factories);
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let samples_bg = Arc::clone(&samples);
+        let source = HostSource::try_new_with_sampler(
+            || {},
+            move || {
+                factories_bg.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Box::new(move || {
+                    samples_bg.fetch_add(1, Ordering::SeqCst);
+                    StatsSnapshot::default()
+                })
+            },
+            initially_parked,
+            |worker| {
+                std::thread::Builder::new()
+                    .name("gtui-host-metrics-test".into())
+                    .spawn(worker)
+            },
+        )
+        .unwrap();
+        (source, entered_rx, release_tx, factories, samples)
+    }
+
+    #[test]
+    fn stop_during_sampler_initialization_prevents_first_sample() {
+        let (source, entered, release, factories, samples) = gated_sampler_source(false);
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("factory did not start");
+        let exited = Arc::clone(&source.exited);
+        drop(source);
+        release.send(()).unwrap();
+        wait_for("worker exit after stop during factory", || {
+            exited.load(Ordering::Acquire)
+        });
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+        assert_eq!(samples.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn hide_during_active_startup_parks_before_first_sample() {
+        let (source, entered, release, factories, samples) = gated_sampler_source(false);
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("factory did not start");
+        source.set_active(false);
+        release.send(()).unwrap();
+        wait_for("worker park after hide during factory", || {
+            source.in_park.load(Ordering::Acquire)
+        });
+        assert_eq!(samples.load(Ordering::SeqCst), 0);
+
+        source.set_active(true);
+        wait_for("first sample after activation", || {
+            samples.load(Ordering::SeqCst) > 0
+        });
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hide_during_initially_parked_activation_keeps_factory_for_next_wakeup() {
+        let (source, entered, release, factories, samples) = gated_sampler_source(true);
+        wait_for("initial park", || source.in_park.load(Ordering::Acquire));
+        source.set_active(true);
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("factory did not start after activation");
+        source.set_active(false);
+        release.send(()).unwrap();
+        wait_for("worker re-park after hide during factory", || {
+            source.in_park.load(Ordering::Acquire)
+        });
+        assert_eq!(samples.load(Ordering::SeqCst), 0);
+
+        source.set_active(true);
+        wait_for("first sample after second activation", || {
+            samples.load(Ordering::SeqCst) > 0
+        });
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "native coordinator witness; exercises the real platform collector"]
+    async fn public_native_host_source_memory_witness() {
+        let source = HostSource::try_new().expect("native host sampler should start");
+        source.set_active(true);
+        wait_for("two initial native samples", || {
+            source.ring.lock().unwrap().len() >= 2
+        });
+        let initial_values = native_memory_values(&source).await;
+        assert!(
+            initial_values.len() >= 2,
+            "native query should return memory"
+        );
+        let initial = initial_values.len();
+        let initial_memory = initial_values[0];
+
+        source.set_active(false);
+        wait_for("native sampler park", || {
+            source.in_park.load(Ordering::Acquire)
+        });
+        let parked = native_memory_values(&source).await.len();
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(native_memory_values(&source).await.len(), parked);
+
+        source.set_active(true);
+        let mut resumed_values = native_memory_values(&source).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while resumed_values.len() <= parked && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            resumed_values = native_memory_values(&source).await;
+        }
+        assert!(resumed_values.len() > parked, "native query did not resume");
+        let resumed = resumed_values.len();
+        let resumed_memory = *resumed_values.last().unwrap();
+
+        let exited = Arc::clone(&source.exited);
+        let started = std::time::Instant::now();
+        drop(source);
+        let drop_ms = started.elapsed().as_millis();
+        wait_for("native worker exit after drop", || {
+            exited.load(Ordering::Acquire)
+        });
+        let exit_ms = started.elapsed().as_millis();
+        println!(
+            "native HostSource witness: initial={initial} parked={parked} resumed={resumed} initial_mem_gib={initial_memory:.3} resumed_mem_gib={resumed_memory:.3} drop_ms={drop_ms} worker_exit_ms={exit_ms}"
+        );
+    }
+
+    async fn native_memory_values(source: &HostSource) -> Vec<f64> {
+        let query = Query {
+            ref_id: "native-witness".into(),
+            expr: "host_mem_used".into(),
+            time_range: TimeRange {
+                from: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                to: Utc::now(),
+            },
+        };
+        source.query(vec![query]).await.unwrap().remove(0).fields[1]
+            .floats()
+            .to_vec()
     }
 }

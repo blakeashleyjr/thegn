@@ -1339,7 +1339,7 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "THE-2566 defers native host collector initialization until activation and replaces hardware-dependent lifecycle fixtures; repeated native macOS and real sample evidence remain pending."
+      "summary": "THE-2566 defers native host collector initialization until activation, rechecks stop and park after the blocking factory, and tests held-factory lifecycle races; external Linear project is unassigned, grouped here under Workspace Product & Observability; repeated native macOS and real sample evidence remain pending."
     },
     {
       "change": "repair-performance-evidence-and-log-tail",
