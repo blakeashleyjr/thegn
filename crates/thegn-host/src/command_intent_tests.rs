@@ -116,7 +116,7 @@ fn direct_iroh_serve_and_pair_actions_parse_as_dev_channel_controls() {
         })
     ));
     assert_eq!(
-        experimental_command(serve.command.as_deref().unwrap()),
+        crate::experimental_command(serve.command.as_ref().unwrap()),
         Some(("serve --iroh-direct", Feature::Remote))
     );
 
@@ -143,7 +143,7 @@ fn direct_iroh_serve_and_pair_actions_parse_as_dev_channel_controls() {
         })
     ));
     assert_eq!(
-        experimental_command(invite.command.as_deref().unwrap()),
+        crate::experimental_command(invite.command.as_ref().unwrap()),
         Some(("pair direct", Feature::Remote))
     );
     assert!(!Feature::Remote.allowed_in(Channel::Stable));
