@@ -661,6 +661,13 @@
       "changes": [
         "file-pipeline-worktrees-by-default"
       ]
+    },
+    {
+      "issue": "THE-2566",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "repair-native-host-sampler-startup"
+      ]
     }
   ]
 }

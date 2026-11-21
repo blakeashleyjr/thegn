@@ -1330,6 +1330,18 @@
       "summary": "Bound Kitty APC parsing and emit text without repeated retained-prefix copies."
     },
     {
+      "change": "repair-native-host-sampler-startup",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2566",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "THE-2566 defers native host collector initialization until activation and replaces hardware-dependent lifecycle fixtures; repeated native macOS and real sample evidence remain pending."
+    },
+    {
       "change": "repair-performance-evidence-and-log-tail",
       "archive_path": "openspec/changes/archive/2026-10-22-repair-performance-evidence-and-log-tail/",
       "lifecycle": "archived",
