@@ -1379,14 +1379,16 @@ mod tests {
         (source, entered_rx, release_tx, factories, samples)
     }
 
-    #[test]
-    fn stop_during_sampler_initialization_prevents_first_sample() {
-        let (source, entered, release, factories, samples) = gated_sampler_source(true);
-        wait_for("initial park", || source.in_park.load(Ordering::Acquire));
-        source.set_active(true);
+    fn assert_stop_during_sampler_initialization(initially_parked: bool) {
+        let (source, entered, release, factories, samples) =
+            gated_sampler_source(initially_parked);
+        if initially_parked {
+            wait_for("initial park", || source.in_park.load(Ordering::Acquire));
+            source.set_active(true);
+        }
         entered
             .recv_timeout(Duration::from_secs(5))
-            .expect("factory did not start after activation");
+            .expect("factory did not start");
         let exited = Arc::clone(&source.exited);
 
         // Drop requests stop before joining. Keep the factory gate under this
@@ -1416,6 +1418,16 @@ mod tests {
             0,
             "stop allowed a priming or first read"
         );
+    }
+
+    #[test]
+    fn stop_during_active_sampler_initialization_prevents_first_sample() {
+        assert_stop_during_sampler_initialization(false);
+    }
+
+    #[test]
+    fn stop_during_parked_activation_initialization_prevents_first_sample() {
+        assert_stop_during_sampler_initialization(true);
     }
 
     #[test]
