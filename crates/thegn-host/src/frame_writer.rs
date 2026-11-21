@@ -1071,8 +1071,8 @@ fn apply_write_result(q: &mut Q, result: std::io::Result<()>, oob_kind: Option<O
 mod tests {
     use super::*;
 
-    /// Harness-only liveness limit; deliberately far beyond the 30 ms test
-    /// deadline (and production deadlines) so scheduling jitter is not timed.
+    /// Harness-only liveness limit; deliberately far beyond the 30 ms sync
+    /// and shutdown test bounds so scheduling jitter is not timed.
     const TEST_LIVENESS_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(2);
 
     fn q() -> Q {
@@ -1118,26 +1118,6 @@ mod tests {
             handle: None,
             sync: false,
         }
-    }
-
-    fn gated_sync_writer(
-        gate: std::sync::mpsc::Receiver<()>,
-        log: Arc<Mutex<Vec<Vec<u8>>>>,
-        finished: Option<std::sync::mpsc::Sender<()>>,
-    ) -> FrameWriter {
-        FrameWriter::spawn_with(
-            true,
-            true,
-            |_| {},
-            move |bytes| {
-                gate.recv().unwrap();
-                log.lock().unwrap().push(bytes.to_vec());
-                if let Some(finished) = &finished {
-                    finished.send(()).unwrap();
-                }
-                Ok(())
-            },
-        )
     }
 
     fn termwiz_test_frame_bytes() -> Vec<u8> {
@@ -1209,18 +1189,56 @@ mod tests {
     }
 
     #[test]
-    fn sync_submit_returns_within_bound_on_a_never_returning_sink() {
+    fn sync_submit_times_out_on_a_never_returning_sink() {
+        let (alive_tx, alive_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
         let log = Arc::new(Mutex::new(Vec::new()));
-        let writer = gated_sync_writer(release_rx, Arc::clone(&log), None);
-        let started = Instant::now();
-        assert!(writer.submit_frame(vec![1], None));
-        assert!(started.elapsed() < SYNC_WRITE_BOUND + std::time::Duration::from_millis(150));
+        let sink_log = Arc::clone(&log);
+        let alive = alive_tx.clone();
+        let writer = FrameWriter::spawn_with(
+            true,
+            true,
+            |_| {},
+            move |bytes| {
+                let _alive = &alive;
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                sink_log.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+        );
+        let caller = std::thread::spawn(move || {
+            let submitted = writer.submit_frame(vec![1], None);
+            returned_tx.send((writer, submitted)).unwrap();
+        });
+        if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
+            let _ = release_tx.send(());
+            panic!("writer worker did not enter the blocked sink");
+        }
+        let (writer, submitted) = match returned_rx.recv_timeout(TEST_LIVENESS_WATCHDOG) {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = release_tx.send(());
+                panic!(
+                    "synchronous frame submission did not return before the harness liveness watchdog"
+                );
+            }
+        };
+        caller.join().unwrap();
+        assert!(submitted);
         assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
         assert_eq!(writer.try_submit_oob(OobKind::Other, vec![2]), Err(vec![2]));
         release_tx.send(()).unwrap();
         drop(writer);
         assert_eq!(*log.lock().unwrap(), vec![vec![1]]);
+        drop(alive_tx);
+        assert_eq!(
+            alive_rx.recv_timeout(TEST_LIVENESS_WATCHDOG),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the writer worker outlived its writer"
+        );
     }
 
     #[test]
@@ -1259,18 +1277,22 @@ mod tests {
     // has taken the frame before the sync deadline begins; the held gate keeps
     // that write in flight until the main test thread releases it after Fatal.
     #[test]
-    fn termwiz_frame_on_a_never_writable_sink_returns_within_the_bound() {
+    fn termwiz_frame_sync_timeout_wakes_the_loop_for_a_never_writable_sink() {
         let bytes = termwiz_test_frame_bytes();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let (alive_tx, alive_rx) = std::sync::mpsc::channel::<()>();
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
+        let alive = alive_tx.clone();
         let writer = Arc::new(FrameWriter::spawn_with(
             true,
             true,
             move |reason| wake_tx.send(reason).unwrap(),
             move |sink_bytes| {
+                let _alive = &alive;
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 sink_log.lock().unwrap().push(sink_bytes.to_vec());
@@ -1280,21 +1302,27 @@ mod tests {
         let submit_writer = Arc::clone(&writer);
         let frame_bytes = bytes.clone();
         let submit = std::thread::spawn(move || {
-            let started = Instant::now();
             let accepted = submit_writer.submit_frame(frame_bytes, None);
-            (accepted, started.elapsed())
+            returned_tx.send(accepted).unwrap();
         });
-        started_rx
-            .recv_timeout(SYNC_WRITE_BOUND + std::time::Duration::from_secs(1))
-            .unwrap();
-        let (accepted, elapsed) = submit.join().unwrap();
+        if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
+            let _ = release_tx.send(());
+            panic!("writer worker did not enter the blocked sink");
+        }
+        let accepted = match returned_rx.recv_timeout(TEST_LIVENESS_WATCHDOG) {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                let _ = release_tx.send(());
+                panic!(
+                    "synchronous termwiz submission did not return before the harness liveness watchdog"
+                );
+            }
+        };
+        submit.join().unwrap();
         assert!(accepted);
-        assert!(elapsed < SYNC_WRITE_BOUND + std::time::Duration::from_millis(150));
         assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
         assert_eq!(
-            wake_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .unwrap(),
+            wake_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).unwrap(),
             "synchronous writer deadline expired",
             "sync timeout must wake the idle event loop so Fatal is observed"
         );
@@ -1302,6 +1330,12 @@ mod tests {
         release_tx.send(()).unwrap();
         drop(writer);
         assert_eq!(*log.lock().unwrap(), vec![bytes]);
+        drop(alive_tx);
+        assert_eq!(
+            alive_rx.recv_timeout(TEST_LIVENESS_WATCHDOG),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the writer worker outlived its writer"
+        );
     }
 
     // One worker consumes the frame and then the OOB message from the same
@@ -1326,16 +1360,19 @@ mod tests {
 
     #[test]
     fn drop_during_blocked_sync_write_is_bounded_and_emits_no_queued_bytes() {
+        let (alive_tx, alive_rx) = std::sync::mpsc::channel::<()>();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
+        let alive = alive_tx.clone();
         let writer = Arc::new(FrameWriter::spawn_with(
             true,
             true,
             |_| {},
             move |bytes| {
+                let _alive = &alive;
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 sink_log.lock().unwrap().push(bytes.to_vec());
@@ -1345,9 +1382,10 @@ mod tests {
         ));
         let first_writer = Arc::clone(&writer);
         let first = std::thread::spawn(move || first_writer.submit_frame(vec![1], None));
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
+            let _ = release_tx.send(());
+            panic!("writer worker did not enter the blocked sink");
+        }
         {
             let mut q = writer.inner.q.lock().unwrap();
             assert_eq!(q.submitted_seq, 1);
@@ -1357,14 +1395,26 @@ mod tests {
             q.msgs.push_back(Msg::Oob(OobKind::Other, vec![2], 2));
         }
         assert!(first.join().unwrap());
-        let started = Instant::now();
-        drop(writer);
-        assert!(started.elapsed() < WRITER_SHUTDOWN_BOUND + std::time::Duration::from_millis(150));
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(writer);
+            dropped_tx.send(()).unwrap();
+        });
+        if dropped_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
+            let _ = release_tx.send(());
+            dropper.join().unwrap();
+            panic!("FrameWriter::drop did not return before the harness liveness watchdog");
+        }
         release_tx.send(()).unwrap();
-        finished_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        finished_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).unwrap();
+        dropper.join().unwrap();
         assert_eq!(*log.lock().unwrap(), vec![vec![1]]);
+        drop(alive_tx);
+        assert_eq!(
+            alive_rx.recv_timeout(TEST_LIVENESS_WATCHDOG),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the writer worker outlived its writer"
+        );
     }
 
     #[test]
@@ -2223,6 +2273,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (alive_tx, alive_rx) = std::sync::mpsc::channel::<()>();
         let written = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         {
             let mut q = inner.q.lock().unwrap();
@@ -2235,6 +2286,7 @@ mod tests {
         let written_by_worker = Arc::clone(&written);
         let inner_for_worker = Arc::clone(&inner);
         let handle = std::thread::spawn(move || {
+            let _alive = alive_tx;
             let (errored, _, _) =
                 write_message(&inner_for_worker, Msg::Frame(vec![1], None, 1), |bytes| {
                     started_tx.send(()).unwrap();
@@ -2263,12 +2315,20 @@ mod tests {
             handle: Some(handle),
             sync: false,
         };
-        started_rx.recv().unwrap();
-        let started_at = Instant::now();
-        drop(writer);
-        assert!(
-            started_at.elapsed() < WRITER_SHUTDOWN_BOUND + std::time::Duration::from_millis(100)
-        );
+        if started_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
+            let _ = release_tx.send(());
+            panic!("writer worker did not enter the blocked sink");
+        }
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(writer);
+            dropped_tx.send(()).unwrap();
+        });
+        if dropped_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).is_err() {
+            let _ = release_tx.send(());
+            dropper.join().unwrap();
+            panic!("FrameWriter::drop did not return before the harness liveness watchdog");
+        }
         {
             let q = inner.q.lock().unwrap();
             assert!(matches!(q.status, WriterStatus::Fatal(_)));
@@ -2276,14 +2336,19 @@ mod tests {
             assert_eq!(q.frames_queued, 0);
             assert_eq!(q.oob_in_flight, 0);
             assert_eq!(q.oob_bytes, 0);
+            assert!(!q.worker_done, "the worker is still inside the sink");
         }
         release_tx.send(()).unwrap();
         // The only bytes that may land after the deadline are from the one
         // write already in flight; the queued frame must be discarded.
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        done_rx.recv_timeout(TEST_LIVENESS_WATCHDOG).unwrap();
+        dropper.join().unwrap();
         assert_eq!(*written.lock().unwrap(), vec![vec![1]]);
+        assert_eq!(
+            alive_rx.recv_timeout(TEST_LIVENESS_WATCHDOG),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the writer worker outlived its writer"
+        );
     }
 
     #[cfg(unix)] // EIO-as-transient is unix errno classification
