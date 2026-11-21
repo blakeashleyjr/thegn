@@ -5,14 +5,20 @@
 The opt-in direct Iroh control listener SHALL use a dedicated control ALPN,
 explicit direct UDP IP socket addresses, and an endpoint ID authenticated by
 the Iroh handshake. It SHALL disable relay and address lookup and SHALL serve
-the existing control router with implicit local administration disabled.
-Pairing SHALL redeem the existing expiring single-use code through
-`POST /v1/pair`;
-`GET /health` and `GET /pair` remain public. Every later request to a
-protected route SHALL present a bearer token with the required scope, including
-requests after reconnect, and SHALL verify that token against the existing
-revocation store. The direct control transport SHALL remain separate from
-sandbox `ExecReq` transport and existing SSH/dumbpipe host behavior.
+the existing control router with implicit local administration disabled,
+and SHALL pass the Iroh-authenticated remote peer endpoint ID as request
+metadata to that router. This peer identity metadata SHALL remain distinct
+from authorization, which SHALL continue to use the scoped bearer token and
+existing approval policy. Pairing SHALL redeem the existing expiring
+single-use code through `POST /v1/pair`; `GET /health` and `GET /pair` remain
+public. A code MAY be redeemed and a scoped bearer token issued before
+approval, but a pending or otherwise unapproved token SHALL NOT authorize
+protected routes until the peer is accepted under the existing policy. Every
+request to a protected route SHALL present a bearer token with the required
+scope, including requests after reconnect, and SHALL verify that token against
+the existing revocation store. The direct control transport SHALL remain
+separate from sandbox `ExecReq` transport and existing SSH/dumbpipe host
+behavior.
 
 With the `iroh` feature and dev release channel, `thegn serve --iroh-direct`
 SHALL start the direct listener and print its Peer ID, concrete IP socket
@@ -33,10 +39,17 @@ pairing code. The redemption store does not bind a code to an endpoint ID.
 
 #### Scenario: A direct invitation is redeemed and reused
 
-- **WHEN** a peer redeems a valid invitation and then reconnects to the
-  invited endpoint ID using its explicit direct addresses
+- **WHEN** a peer redeems a valid invitation, is accepted under any required
+  approval policy, and then reconnects to the invited endpoint ID using its
+  explicit direct addresses
 - **THEN** the peer receives only the code's scopes and can make an authorized
   control request over the separate Iroh control ALPN
+
+#### Scenario: A pending pairing cannot authorize protected routes
+
+- **WHEN** a peer redeems a valid code while its required approval is pending
+- **THEN** the scoped token MAY be issued, but it cannot authorize protected
+  routes until the peer is accepted under the existing policy
 
 #### Scenario: Direct control has no implicit local administrator
 
