@@ -2274,7 +2274,7 @@ fn pinned_directory_entries(
 /// An owned `fdopendir` stream. The `OwnedFd` stays live until `fdopendir`
 /// succeeds, so a failed conversion closes it when the local value drops.
 #[cfg(unix)]
-struct OwnedDirectoryStream(std::ptr::NonNull<libc::DIR>);
+struct OwnedDirectoryStream(std::ptr::NonNull<nix::libc::DIR>);
 
 #[cfg(unix)]
 impl OwnedDirectoryStream {
@@ -2284,7 +2284,7 @@ impl OwnedDirectoryStream {
         // SAFETY: `fd` is an owned, open descriptor. POSIX `fdopendir` takes
         // ownership only on success; on failure `fd` remains owned here and
         // is closed by its `OwnedFd` drop.
-        let raw_stream = unsafe { libc::fdopendir(fd.as_raw_fd()) };
+        let raw_stream = unsafe { nix::libc::fdopendir(fd.as_raw_fd()) };
         let Some(stream) = std::ptr::NonNull::new(raw_stream) else {
             return Err(std::io::Error::last_os_error());
         };
@@ -2301,13 +2301,13 @@ impl OwnedDirectoryStream {
         // SAFETY: the stream remains live for `self`; `readdir` returns either
         // null or a pointer to an entry valid until the next call on this
         // stream. The name is copied before that next call.
-        let entry = unsafe { libc::readdir(self.0.as_ptr()) };
+        let entry = unsafe { nix::libc::readdir(self.0.as_ptr()) };
         if entry.is_null() {
             let error = nix::errno::Errno::last_raw();
             return if error == 0 {
                 Ok(None)
             } else {
-                Err(nix_io_error(nix::errno::Errno::from_raw(error)))
+                Err(std::io::Error::from_raw_os_error(error))
             };
         }
 
@@ -2326,7 +2326,7 @@ impl Drop for OwnedDirectoryStream {
         // SAFETY: this wrapper uniquely owns the stream returned by
         // `fdopendir`; it is closed exactly once here.
         unsafe {
-            libc::closedir(self.0.as_ptr());
+            nix::libc::closedir(self.0.as_ptr());
         }
     }
 }
@@ -3503,11 +3503,11 @@ mod tests {
         assert!(OwnedDirectoryStream::from_fd(fd).is_err());
         // SAFETY: `F_GETFD` accepts the raw descriptor integer and takes no
         // third argument; a closed descriptor is valid input for this check.
-        let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+        let result = unsafe { nix::libc::fcntl(raw_fd, nix::libc::F_GETFD) };
         assert_eq!(result, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+            Some(nix::libc::EBADF)
         );
     }
 
