@@ -10,6 +10,13 @@
 # Usage: test/smoke.sh [path-to-thegn]   (defaults to ./target/debug/thegn)
 set -euo pipefail
 
+# The gate history guard requires its fixture repo and Git metadata to be
+# private. Nix shells may launch smoke with umask 0002, which makes Git's
+# directories group-writable and exercises the unsafe-history refusal instead
+# of the missing-command verdict. Any intentional unsafe-mode fixtures below
+# set their unsafe permissions explicitly with chmod.
+umask 077
+
 SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/thegn}"
 # Resolve to an absolute path — the test cd's into a temp repo before running it.
 SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
@@ -1240,7 +1247,7 @@ GATE_DRAIN_OUTPUT="$("$SZ" --set merge_queue.gate_on=true \
 check "an unrunnable gate is reported as gate_error, not a build verdict" \
   gate_drain_output_is_error
 check "the queue row records gate_error with the real spawn reason" \
-  "'$SZ' merge list --json | python3 -c 'import json,sys; rows=json.load(sys.stdin); row=next(r for r in rows if r[\"branch\"] == \"$GB\"); assert row[\"status\"] == \"gate_error\"; assert row[\"error_detail\"] and \"gate command could not be started with process containment:\" in row[\"error_detail\"]'"
+  "'$SZ' merge list --json | python3 -c 'import json,sys; rows=json.load(sys.stdin); row=next(r for r in rows if r[\"branch\"] == \"$GB\"); detail=row[\"error_detail\"] or \"\"; headline=detail.splitlines()[0] if detail else \"\"; assert row[\"status\"] == \"gate_error\"; assert headline == \"gate command not found (exit 127)\" or headline == \"gate command could not be started with process containment: No such file or directory (os error 2)\", repr(headline)'"
 check "an unrunnable gate never dispatches the fixing agent" \
   "[[ ! -e '$AGENT_MARK' ]]"
 # The row must show the target the run actually folded into, not the one frozen
