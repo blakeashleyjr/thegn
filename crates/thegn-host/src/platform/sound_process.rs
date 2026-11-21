@@ -595,10 +595,8 @@ pub(crate) mod test_support {
                     .as_ref()
                     .expect("teardown has started")
                     .recv_timeout(Duration::from_secs(1));
-                if result.is_ok() {
-                    if let Some(teardown) = self.teardown.take() {
-                        teardown.join().expect("teardown thread panicked");
-                    }
+                if result.is_ok() && let Some(teardown) = self.teardown.take() {
+                    teardown.join().expect("teardown thread panicked");
                 }
                 result
             }
