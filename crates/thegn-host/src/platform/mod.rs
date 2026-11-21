@@ -32,6 +32,22 @@ pub(crate) fn set_owner_executable(_path: &std::path::Path) -> std::io::Result<(
     }
 }
 
+/// Prepare the Unix-only world-readable invitation fixture. Returns `false`
+/// on platforms where Unix permission bits do not apply.
+#[cfg(test)]
+pub(crate) fn make_world_readable_for_test(path: &std::path::Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        unix::make_world_readable_for_test(path)?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
 /// Bind a PTY child's process-tree identity before its reaper starts. Failure
 /// is represented as `None`; callers then use the child's own killer handle.
 #[cfg(unix)]
