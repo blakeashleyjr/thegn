@@ -16,12 +16,17 @@ class UnsupportedDepInfo(Exception):
     pass
 
 
-def physical_identity(path: str) -> str:
-    """Resolve every existing parent component, preserving the final name."""
-    parent, name = os.path.split(path)
-    if not name or any(char.isspace() for char in path) or "\\" in path:
+def validated_source_identity(path: str) -> str:
+    """Validate the original path before resolving aliases to a physical file."""
+    if not path or any(char.isspace() for char in path) or "\\" in path:
         raise UnsupportedDepInfo("unsupported source path")
-    return os.path.join(os.path.realpath(parent or ".", strict=True), name)
+    # Check the exact spelling first. realpath can simplify an existing but
+    # unsearchable (or non-directory) component before `..` without asking the
+    # kernel to traverse it, while stat must resolve the original pathname.
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise UnsupportedDepInfo("source path is not a regular file")
+    return os.path.realpath(path, strict=True)
 
 
 def source_paths(root: str) -> set[str]:
@@ -39,7 +44,7 @@ def source_paths(root: str) -> set[str]:
             if name.endswith(".rs"):
                 info = os.lstat(path)
                 if stat.S_ISREG(info.st_mode):
-                    required.add(physical_identity(path))
+                    required.add(validated_source_identity(path))
                     if len(required) > MAX_SOURCE_FILES:
                         raise UnsupportedDepInfo("source tree exceeds parser bound")
     if not required:
@@ -100,7 +105,7 @@ def source_dependencies(root: str, prerequisites: set[str]) -> tuple[set[str], b
         if not match:
             continue
         path = token if os.path.isabs(token) else os.path.join(checkout, token)
-        identity = physical_identity(path)
+        identity = validated_source_identity(path)
         dependencies.add(identity)
         if not (identity.startswith(checkout_sources + os.sep) and os.path.isfile(identity)):
             foreign = True

@@ -195,6 +195,44 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
         self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "unknown")
 
+    def test_untraversable_component_before_parent_traversal_is_refused(self):
+        fixture = self.fixture()
+        blocker = fixture["checkout"].parent / "blocked"
+        blocker.mkdir()
+        blocker.chmod(0)
+        try:
+            injected = blocker / "../checkout/crates/thegn-core/src/lib.rs"
+            try:
+                os.stat(injected)
+            except PermissionError:
+                # This branch exercises the DAC failure that real users see.
+                pass
+            else:
+                # Root and processes with DAC-bypass capabilities can traverse
+                # mode-000 directories. A regular file gives the kernel a
+                # deterministic ENOTDIR check on the same `component/../` path.
+                blocker.chmod(0o700)
+                blocker.rmdir()
+                blocker.write_text("not a directory", encoding="utf-8")
+                injected = blocker / "../checkout/crates/thegn-core/src/lib.rs"
+                with self.assertRaises(NotADirectoryError):
+                    os.stat(injected)
+
+            depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+            source = fixture["checkout"] / "crates/thegn-core/src/a.rs"
+            valid_lib = fixture["checkout"] / "crates/thegn-core/src/lib.rs"
+            depinfo.write_text(
+                f"{valid_lib}: {injected} {source}\n", encoding="utf-8"
+            )
+            result, facts = self.facts_for(
+                fixture, "--target-dir", str(fixture["target"]), "--strict"
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+            self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "unknown")
+        finally:
+            blocker.chmod(0o700)
+
     def test_unresolved_checkout_cannot_be_counted_as_coverage(self):
         fixture = self.fixture()
         missing_checkout = fixture["checkout"].parent / "missing-checkout"
@@ -252,6 +290,7 @@ class CargoProvenanceTests(unittest.TestCase):
     def run_parser_with_injected_error(self, fixture, boundary):
         driver = (
             "import importlib.util, os, sys\n"
+            "sys.dont_write_bytecode = True\n"
             "from unittest import mock\n"
             "spec = importlib.util.spec_from_file_location('parser', sys.argv[1])\n"
             "module = importlib.util.module_from_spec(spec)\n"
