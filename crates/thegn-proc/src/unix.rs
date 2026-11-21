@@ -3,10 +3,11 @@ use crate::{
     POLL_INTERVAL, Run, StdinHandoff, Stream, StreamConsumer, Which, aggregate_fit,
 };
 use nix::{
-    errno::Errno,
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
+#[cfg(any(test, not(target_os = "macos")))]
+use nix::errno::Errno;
 use std::{
     fs::File,
     io,
