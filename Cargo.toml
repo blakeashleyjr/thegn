@@ -108,6 +108,7 @@ iana-time-zone = "0.1"
 libc = "0.2"
 nix = { version = "0.31", default-features = false, features = [
   "fs",
+  "dir",
   "time",
   "signal",
   "user",

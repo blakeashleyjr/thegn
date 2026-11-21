@@ -1,0 +1,4 @@
+- [x] Replace `/dev/fd` listings with a shared descriptor-relative stream helper.
+- [x] Preserve independent listing positions and non-Unix behavior.
+- [x] Add focused repeated-listing coverage.
+- [x] Record native proof still required from the coordinator.

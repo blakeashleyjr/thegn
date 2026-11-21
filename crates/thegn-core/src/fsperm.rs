@@ -1265,12 +1265,12 @@ impl PrivateDir {
     /// iteration errors are returned to the caller.
     pub fn file_names(&self) -> std::io::Result<Vec<std::ffi::OsString>> {
         #[cfg(unix)]
-        let entries = {
-            use std::os::fd::AsRawFd;
-            std::fs::read_dir(format!("/dev/fd/{}", self.fd.as_raw_fd()))?
-        };
+        let entries = pinned_directory_entries(&self.fd)?;
         #[cfg(not(unix))]
         let entries = std::fs::read_dir(&self.path)?;
+        #[cfg(unix)]
+        return entries.into_iter().collect();
+        #[cfg(not(unix))]
         entries
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect()
@@ -1300,11 +1300,7 @@ impl PrivateDir {
         max_age: std::time::Duration,
     ) -> usize {
         #[cfg(unix)]
-        let entries = {
-            use std::os::fd::AsRawFd;
-
-            std::fs::read_dir(format!("/dev/fd/{}", self.fd.as_raw_fd()))
-        };
+        let entries = pinned_directory_entries(&self.fd).map(|names| names.into_iter());
         #[cfg(not(unix))]
         let entries = std::fs::read_dir(&self.path);
         let entries = match entries {
@@ -2144,10 +2140,7 @@ impl RootedDir {
     /// List entry names through the held directory handle.
     #[cfg(unix)]
     fn file_names(&self) -> std::io::Result<Vec<std::ffi::OsString>> {
-        use std::os::fd::AsRawFd;
-        std::fs::read_dir(format!("/dev/fd/{}", self.fd.as_raw_fd()))?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect()
+        pinned_directory_entries(&self.fd)?.into_iter().collect()
     }
 
     #[cfg(unix)]
@@ -2236,6 +2229,42 @@ fn validate_relative_directory(rel: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn nix_io_error(error: nix::errno::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error as i32)
+}
+
+/// List names through a fresh directory stream opened relative to a pinned
+/// descriptor. Opening `.` creates an independent read position for each
+/// listing, while `fdopendir` avoids the platform-specific `/dev/fd` path
+/// boundary (which is not a directory on Darwin).
+#[cfg(unix)]
+fn pinned_directory_entries(
+    directory: &impl std::os::fd::AsRawFd,
+) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>> {
+    use nix::dir::Dir;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut stream = Dir::openat(
+        directory.as_raw_fd(),
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(nix_io_error)?;
+    stream
+        .iter()
+        .filter_map(|entry| match entry {
+            Ok(entry) => {
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    None
+                } else {
+                    Some(Ok(Ok(std::ffi::OsString::from_vec(name.to_vec()))))
+                }
+            }
+            Err(error) => Some(Ok(Err(nix_io_error(error)))),
+        })
+        .collect()
 }
 
 /// Owner and mode policy for a child opened by [`PrivateDir::open_child_nofollow`]:
@@ -3374,6 +3403,23 @@ mod tests {
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o750)).unwrap();
         let error = open_private_dir(&private).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn pinned_directory_listings_have_independent_positions() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        let pinned = open_private_dir(&private).unwrap();
+        std::fs::write(private.join("first"), b"1").unwrap();
+        std::fs::write(private.join("second"), b"2").unwrap();
+
+        let mut first = pinned.file_names().unwrap();
+        let mut second = pinned.file_names().unwrap();
+        first.sort();
+        second.sort();
+        assert_eq!(first, ["first".into(), "second".into()]);
+        assert_eq!(second, first);
     }
 
     #[test]
