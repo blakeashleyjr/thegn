@@ -1171,6 +1171,7 @@ mod tests {
             pin_key: row.pin_key.clone(),
             caret_x: None,
             lead_gap: 0,
+            mq_span: None,
         };
         let src = drag_src_for(&SidebarState::default(), &model, &session, &hit)
             .expect("pipeline worktree is a drag source");
