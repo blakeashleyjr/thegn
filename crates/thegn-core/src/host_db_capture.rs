@@ -108,9 +108,18 @@ mod tests {
         // they do not claim to have exercised positive WAL capture there.
         let absent = unsafe { rusqlite::ffi::sqlite3_vfs_find(c"unix".as_ptr()).is_null() };
         if absent {
-            let (dir, root) = canonical_tempdir();
+            // Keep this ordinary tempfile spelling: Windows canonicalize can
+            // add an extended-length prefix that the path guard rejects
+            // before the missing-VFS behavior is reached.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            let writer = database(&path);
+            writer
+                .execute("INSERT INTO hosts VALUES ('a','default-vfs-host','{}')", [])
+                .unwrap();
+            writer.close().unwrap();
             assert!(matches!(
-                capture_host_definitions_wal_at(&root.join("state.db")),
+                capture_host_definitions_wal_at(&path),
                 Err(HostCaptureReadError::Open)
             ));
             dir.close().expect("owned unsupported-VFS fixture cleanup");
@@ -272,15 +281,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn query_like_literal_filenames_are_explicitly_unsupported() {
         let (dir, root) = canonical_tempdir();
         for name in ["state.db?immutable=1", "state.db#fragment"] {
             let path = root.join(name);
+            let writer = database(&path);
+            writer
+                .execute("INSERT INTO hosts VALUES ('a','literal-name-host','{}')", [])
+                .unwrap();
+            writer.close().unwrap();
+            assert!(
+                path.is_file(),
+                "literal database fixture must exist: {name}"
+            );
             assert!(matches!(
                 capture_host_definitions_wal_at(&path),
                 Err(HostCaptureReadError::Open)
             ));
-            assert!(!path.exists());
         }
         dir.close().expect("owned URI refusal fixture cleanup");
     }
