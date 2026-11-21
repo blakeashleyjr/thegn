@@ -417,7 +417,7 @@ pub(crate) mod test_support {
         #[cfg(test)] first_read_gate: Option<(
             std::sync::mpsc::Sender<()>,
             std::sync::mpsc::Receiver<()>,
-            Arc<AtomicBool>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
         )>,
     ) -> PtyDrainer {
         use std::io::Read;
