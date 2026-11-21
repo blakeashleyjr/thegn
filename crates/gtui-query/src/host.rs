@@ -1323,7 +1323,7 @@ mod tests {
             || {},
             move || {
                 initialized_bg.store(true, Ordering::Release);
-                Box::new(|| StatsSnapshot::default())
+                Box::new(StatsSnapshot::default)
             },
             true,
             |worker| {
@@ -1515,7 +1515,7 @@ mod tests {
             exited.load(Ordering::Acquire)
         });
         let exit_ms = started.elapsed().as_millis();
-        println!(
+        eprintln!(
             "native HostSource witness: initial={initial} parked={parked} resumed={resumed} initial_mem_gib={initial_memory:.3} resumed_mem_gib={resumed_memory:.3} drop_ms={drop_ms} worker_exit_ms={exit_ms}"
         );
     }
