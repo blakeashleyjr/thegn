@@ -34,7 +34,7 @@ pub(crate) fn set_owner_executable(_path: &std::path::Path) -> std::io::Result<(
 
 /// Prepare the Unix-only world-readable invitation fixture. Returns `false`
 /// on platforms where Unix permission bits do not apply.
-#[cfg(test)]
+#[cfg(all(test, feature = "iroh"))]
 pub(crate) fn make_world_readable_for_test(path: &std::path::Path) -> std::io::Result<bool> {
     #[cfg(unix)]
     {

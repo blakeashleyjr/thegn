@@ -5,7 +5,7 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "iroh"))]
 pub(crate) fn make_world_readable_for_test(path: &std::path::Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
