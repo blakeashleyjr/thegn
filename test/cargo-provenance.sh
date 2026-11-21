@@ -183,7 +183,7 @@ else
     if ((checkout_resolved)) && command -v python3 >/dev/null 2>&1 && [[ ! $checkout =~ [[:space:]] ]]; then
       if parser_result=$(python3 "$script_dir/cargo-provenance-parse.py" "$checkout" "$core_depinfo" 2>/dev/null); then
         IFS=$'\t' read -r missing_sources foreign_source depinfo_lib <<<"$parser_result"
-        if [[ $missing_sources =~ ^[0-9]+$ && ( $foreign_source == 0 || $foreign_source == 1 ) && -n $depinfo_lib ]]; then
+        if [[ $missing_sources =~ ^[0-9]+$ && ($foreign_source == 0 || $foreign_source == 1) && -n $depinfo_lib ]]; then
           depinfo_supported=1
         fi
       fi
