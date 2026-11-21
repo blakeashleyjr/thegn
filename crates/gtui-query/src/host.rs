@@ -10,7 +10,6 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -503,6 +502,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use gtui_core::datasource::TimeRange;
+    use std::io::Write;
 
     fn test_source() -> HostSource {
         HostSource::try_new_with_sampler(
@@ -1398,7 +1398,9 @@ mod tests {
         let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
         let drop_thread = std::thread::spawn(move || {
             drop(source);
-            let _ = drop_done_tx.send(());
+            drop_done_tx
+                .send(())
+                .expect("drop completion receiver should remain available");
         });
         if drop_done_rx
             .recv_timeout(Duration::from_secs(2))
@@ -1516,10 +1518,11 @@ mod tests {
             exited.load(Ordering::Acquire)
         });
         let exit_ms = started.elapsed().as_millis();
-        let _write_result = writeln!(
+        writeln!(
             std::io::stderr().lock(),
             "native HostSource witness: initial={initial} parked={parked} resumed={resumed} initial_mem_gib={initial_memory:.3} resumed_mem_gib={resumed_memory:.3} drop_ms={drop_ms} worker_exit_ms={exit_ms}"
-        );
+        )
+        .expect("failed to write native HostSource witness diagnostic");
     }
 
     async fn native_memory_values(source: &HostSource) -> Vec<f64> {
