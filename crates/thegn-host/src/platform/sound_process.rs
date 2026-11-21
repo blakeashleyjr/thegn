@@ -388,7 +388,7 @@ pub(crate) mod test_support {
         successful_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         reader: Option<std::thread::JoinHandle<()>>,
         #[cfg(test)]
-        join_ack: Option<std::sync::mpsc::Sender<()>>,
+        join_ack: Option<std::sync::mpsc::Sender<Result<(), &'static str>>>,
     }
 
     #[cfg(target_os = "macos")]
