@@ -281,14 +281,19 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn query_like_literal_filenames_are_explicitly_unsupported() {
+        if unsupported_vfs() {
+            return;
+        }
         let (dir, root) = canonical_tempdir();
         for name in ["state.db?immutable=1", "state.db#fragment"] {
             let path = root.join(name);
             let writer = database(&path);
             writer
-                .execute("INSERT INTO hosts VALUES ('a','literal-name-host','{}')", [])
+                .execute(
+                    "INSERT INTO hosts VALUES ('a','literal-name-host','{}')",
+                    [],
+                )
                 .unwrap();
             writer.close().unwrap();
             assert!(
@@ -303,11 +308,8 @@ mod tests {
         dir.close().expect("owned URI refusal fixture cleanup");
     }
 
-    #[cfg(unix)]
     #[test]
     fn database_symlink_is_refused_by_nofollow() {
-        use std::os::unix::fs::symlink;
-
         if unsupported_vfs() {
             return;
         }
@@ -316,7 +318,7 @@ mod tests {
         let writer = database(&target);
         drop(writer);
         let link = root.join("linked.db");
-        symlink(&target, &link).unwrap();
+        crate::fsperm::create_symlink(&target, &link, false).unwrap();
         assert!(matches!(
             capture_host_definitions_wal_at(&link),
             Err(HostCaptureReadError::Open)
