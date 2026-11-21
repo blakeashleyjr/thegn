@@ -18,6 +18,7 @@ enum Hs {
 enum Out {
     Text(&'static str),
     Bin(Vec<u8>),
+    WaitForStdinEof,
     Close,
 }
 
@@ -167,9 +168,20 @@ fn handle_connection(mut stream: TcpStream, script: Script, requests: Arc<Mutex<
 
     let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
     for output in script.out {
+        if matches!(&output, Out::WaitForStdinEof) {
+            loop {
+                match socket.read() {
+                    Ok(Message::Binary(bytes)) if bytes.as_ref() == [4] => break,
+                    Ok(Message::Close(_)) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+            continue;
+        }
         let message = match output {
             Out::Text(text) => Message::Text(text.into()),
             Out::Bin(bytes) => Message::Binary(bytes.into()),
+            Out::WaitForStdinEof => unreachable!("handled before message construction"),
             Out::Close => Message::Close(None),
         };
         if socket.send(message).is_err() {
@@ -267,6 +279,98 @@ async fn non_tty_replay_preserves_exit_after_stdout_stderr_and_normal_close() {
     assert!(output.starts_with("out\n[stderr, last 5 bytes]\n"), "{output:?}");
     assert!(output.ends_with("warn\n"), "{output:?}");
     assert_eq!(requests(&mock).len(), 1, "replay must not retry the command");
+}
+
+#[tokio::test]
+async fn non_tty_streaming_owner_drop_half_closes_and_preserves_report() {
+    let mock = start_mock(vec![script(vec![
+        Out::Text(
+            r#"{"type":"session_info","session_id":"1847","command":"sh","created":1767609000,"cols":0,"rows":0,"is_owner":true,"tty":false}"#,
+        ),
+        Out::WaitForStdinEof,
+        Out::Bin([vec![1], b"out\n".to_vec()].concat()),
+        Out::Bin([vec![2], b"warn\n".to_vec()].concat()),
+        Out::Bin(vec![3, 7]),
+        Out::Close,
+    ])]);
+
+    let spec = ExecSpec {
+        argv: vec!["sh".into()],
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    };
+    let streaming = provider(&mock)
+        .open_exec_streaming("tgtest1", &spec)
+        .await
+        .unwrap();
+    let thegn_svc::provider::StreamingExec {
+        session,
+        stderr,
+        verdict,
+    } = streaming;
+    let thegn_svc::provider::ExecSession {
+        mut frames,
+        control,
+        session_id,
+    } = session;
+    drop(control);
+    drop(session_id);
+
+    let mut received = Vec::new();
+    while let Some(frame) = frames.recv().await {
+        received.push(frame);
+    }
+    assert_eq!(
+        received,
+        vec![ExecFrame::Stdout(b"out\n".to_vec()), ExecFrame::Exit(7)]
+    );
+    assert_eq!(stderr.total(), 5);
+    assert_eq!(stderr.render(), "warn\n");
+    assert_eq!(verdict.await.unwrap(), None);
+    assert_eq!(requests(&mock).len(), 1, "streaming must not retry the command");
+}
+
+#[tokio::test]
+async fn non_tty_streaming_owner_drop_preserves_typed_protocol_report() {
+    let mock = start_mock(vec![script(vec![
+        Out::WaitForStdinEof,
+        Out::Bin(vec![3, 7]),
+        Out::Bin(vec![3, 8]),
+        Out::Close,
+    ])]);
+    let spec = ExecSpec {
+        argv: vec!["sh".into()],
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    };
+    let streaming = provider(&mock)
+        .open_exec_streaming("tgtest1", &spec)
+        .await
+        .unwrap();
+    let thegn_svc::provider::StreamingExec {
+        session,
+        verdict,
+        ..
+    } = streaming;
+    let thegn_svc::provider::ExecSession {
+        mut frames,
+        control,
+        ..
+    } = session;
+    drop(control);
+
+    assert_eq!(frames.recv().await, Some(ExecFrame::Exit(7)));
+    assert_eq!(frames.recv().await, None);
+    assert_eq!(
+        verdict.await.unwrap(),
+        Some(ExecProtocolError::DuplicateExit)
+    );
 }
 
 #[tokio::test]
