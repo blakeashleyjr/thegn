@@ -5,7 +5,9 @@
 
 use thegn_cas::Digest;
 
-use crate::{JobSpec, Recipe, Snapshot};
+use crate::{
+    Diagnostic, JobResult, JobSpec, JobStatus, Recipe, Snapshot, TestSummary, Timings, Truncation,
+};
 
 /// Maximum retained output from a selected build/test recipe.
 pub const MAX_SELECTED_LOG_BYTES: usize = 16 * 1024;
@@ -16,9 +18,17 @@ pub struct SelectedJobResult {
     pub runner: String,
     pub recipe: Recipe,
     pub source: Digest,
-    /// A missing exit code means the runner could not prove completion.
-    pub exit_code: Option<i32>,
+    pub completion: SelectedCompletion,
     pub log_tail: String,
+}
+
+/// Terminal state reported by the selected runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedCompletion {
+    Exited(i32),
+    Cancelled,
+    /// The runner returned without proving a terminal state.
+    Indeterminate,
 }
 
 /// Typed refusal before any runner call.
@@ -103,10 +113,138 @@ pub fn submit_selected(
     if result.recipe != recipe {
         return Err(RunnerRefusal::WrongRecipe);
     }
-    if result.exit_code.is_none() {
+    if result.completion == SelectedCompletion::Indeterminate {
         return Err(RunnerRefusal::Indeterminate);
     }
     Ok(bound_log_tail(result))
+}
+
+/// Adapt a selected-runner receipt or refusal to the established user-facing
+/// job result shape. This keeps selected jobs readable by the same consumers
+/// as ordinary jobs without inventing provider placement or run identifiers.
+pub fn selected_job_readback(
+    job_id: impl Into<String>,
+    outcome: Result<SelectedJobResult, RunnerRefusal>,
+) -> JobResult {
+    let (status, log_tail, diagnostic) = match outcome {
+        Ok(result) => {
+            let result = bound_log_tail(result);
+            match result.completion {
+                SelectedCompletion::Exited(0) => (JobStatus::Succeeded, result.log_tail, None),
+                SelectedCompletion::Exited(code) => {
+                    let reason = format!("selected runner exited with status {code}");
+                    (
+                        JobStatus::Failed {
+                            reason: reason.clone(),
+                        },
+                        result.log_tail,
+                        Some(reason),
+                    )
+                }
+                SelectedCompletion::Cancelled => (
+                    JobStatus::Cancelled,
+                    result.log_tail,
+                    Some("selected runner cancelled the job".into()),
+                ),
+                SelectedCompletion::Indeterminate => {
+                    let reason = "selected runner did not prove a terminal result".to_owned();
+                    (
+                        JobStatus::Indeterminate {
+                            reason: reason.clone(),
+                        },
+                        result.log_tail,
+                        Some(reason),
+                    )
+                }
+            }
+        }
+        Err(refusal @ RunnerRefusal::RunnerUnavailable(_)) => {
+            let reason = refusal.to_string();
+            (
+                JobStatus::Rejected {
+                    reason: reason.clone(),
+                    missing_capabilities: vec![],
+                },
+                String::new(),
+                Some(reason),
+            )
+        }
+        Err(RunnerRefusal::Indeterminate) => {
+            let reason = RunnerRefusal::Indeterminate.to_string();
+            (
+                JobStatus::Indeterminate {
+                    reason: reason.clone(),
+                },
+                String::new(),
+                Some(reason),
+            )
+        }
+        Err(
+            refusal @ (RunnerRefusal::WrongRunner
+            | RunnerRefusal::WrongSource
+            | RunnerRefusal::WrongRecipe),
+        ) => {
+            let reason = refusal.to_string();
+            (
+                JobStatus::Indeterminate {
+                    reason: reason.clone(),
+                },
+                String::new(),
+                Some(reason),
+            )
+        }
+        Err(refusal) => {
+            let reason = refusal.to_string();
+            (
+                JobStatus::Rejected {
+                    reason: reason.clone(),
+                    missing_capabilities: vec![],
+                },
+                String::new(),
+                Some(reason),
+            )
+        }
+    };
+    let diagnostics = diagnostic
+        .map(|message| {
+            vec![Diagnostic {
+                level: "error".into(),
+                code: None,
+                message,
+                file: None,
+                line: None,
+            }]
+        })
+        .unwrap_or_default();
+    let incomplete = matches!(
+        &status,
+        JobStatus::Cancelled | JobStatus::TimedOut | JobStatus::Indeterminate { .. }
+    );
+    JobResult {
+        job_id: job_id.into(),
+        status,
+        shards: vec![],
+        summary: TestSummary {
+            incomplete,
+            ..TestSummary::default()
+        },
+        failures: vec![],
+        diagnostics,
+        truncated: Truncation::default(),
+        log_tail,
+        logs: vec![],
+        artifacts: vec![],
+        timings: Timings::default(),
+        cache: Default::default(),
+        placement: vec![],
+        cost: crate::result::Cost {
+            currency: "USD".into(),
+            compute_micros: None,
+            storage_micros: None,
+            egress_micros: None,
+            estimate_source: None,
+        },
+    }
 }
 
 fn bound_log_tail(mut result: SelectedJobResult) -> SelectedJobResult {

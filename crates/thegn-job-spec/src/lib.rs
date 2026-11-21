@@ -12,7 +12,10 @@ use thegn_cas::Digest;
 pub mod result;
 pub use result::JobResult;
 pub mod selected;
-pub use selected::{RunnerDirectory, RunnerRefusal, SelectedJobResult, submit_selected};
+pub use selected::{
+    RunnerDirectory, RunnerRefusal, SelectedCompletion, SelectedJobResult, selected_job_readback,
+    submit_selected,
+};
 mod validation;
 pub use validation::{byte_quantity, duration_ms};
 
