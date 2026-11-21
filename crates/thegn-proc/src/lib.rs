@@ -206,8 +206,9 @@ fn aggregate_fit(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Containment {
-    /// Own process group (unix). Emptiness is proved by reaping the leader and probing
-    /// `killpg(pgid, 0)`; a /proc scan is only the fallback for a leader we cannot reap.
+    /// Own process group (unix). The supervisor proves emptiness using platform process state
+    /// while retaining a safe group identity for signalling; Linux uses reap-then-probe plus a
+    /// `/proc` fallback, while macOS excludes zombie-only members through libproc.
     ProcessGroup,
     /// Direct child only (non-unix until THE-274 Job Objects).
     DirectChildOnly,

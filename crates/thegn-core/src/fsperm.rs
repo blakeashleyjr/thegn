@@ -812,6 +812,83 @@ impl PrivateDir {
         &self.path
     }
 
+    /// Read an existing owner-owned regular child file without following a
+    /// symlink, up to `limit` bytes. A missing child is reported as `None`.
+    pub fn read_regular(&self, name: &str, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        let file = {
+            use nix::fcntl::{OFlag, openat};
+            use nix::sys::stat::{Mode, SFlag, fstat};
+            use nix::unistd::geteuid;
+
+            let fd = match openat(
+                &self.fd,
+                name_path,
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::ENOENT) => return Ok(None),
+                Err(nix::errno::Errno::ELOOP) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "private directory entry is a symlink",
+                    ));
+                }
+                Err(error) => return Err(nix_io_error(error)),
+            };
+            let stat = fstat(&fd).map_err(nix_io_error)?;
+            if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "private directory entry is not a regular file",
+                ));
+            }
+            if stat.st_uid != geteuid().as_raw() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "private directory entry is owned by another user",
+                ));
+            }
+            std::fs::File::from(fd)
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let path = self.path.join(name_path);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "private directory entry is a symlink",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let file = open_regular_file_nofollow(&path)?;
+            if !owned_by_current_user(&file.metadata()?) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "private directory entry is owned by another user",
+                ));
+            }
+            file
+        };
+
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "private directory entry exceeds the read limit",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
     /// Exclusively create an owner-only file relative to this held directory.
     /// The returned handle is the reservation; an existing entry, including a
     /// symlink, is never replaced.

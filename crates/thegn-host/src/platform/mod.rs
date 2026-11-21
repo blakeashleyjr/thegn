@@ -275,6 +275,7 @@ pub(crate) mod thread_census;
 #[cfg(target_os = "linux")]
 mod udisks_smart_linux;
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiskHealth {
     pub(crate) name: String,
@@ -296,8 +297,10 @@ pub(crate) struct DiskHealth {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DiskHealthReport {
+    #[cfg(target_os = "linux")]
     Available(Vec<DiskHealth>),
     Unavailable(String),
+    #[cfg(target_os = "linux")]
     Degraded {
         drives: Vec<DiskHealth>,
         reason: String,

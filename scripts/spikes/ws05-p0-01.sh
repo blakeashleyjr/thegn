@@ -23,7 +23,7 @@ export SC_SUMMARY_PRIVATE
 img="${SPIKE_IMAGE:-docker.io/library/alpine:3}"
 run_dir="$(mktemp -d "${TMPDIR:-/tmp}/thegn-ws05.XXXXXX")"
 sp_on_exit "rm -rf '$run_dir'"
-run_id="$(basename "$run_dir" | tr -cd 'A-Za-z0-9' | tail -c 9)"
+run_id="$(basename "$run_dir" | tail -c 10 | macos_ws05_resource_id)"
 [ -n "$run_id" ] || sp_die "could not generate a per-run resource id"
 net="thegn-ws05-$run_id"
 label_container="thegn-ws05-$run_id-label"
@@ -46,47 +46,6 @@ export SP_REDACT_EXTRA_2="$host_ip"
 
 # shellcheck disable=SC2016 # variables expand in the container's sh, not here
 probe_script='tmp=$(mktemp); err=$(mktemp); wget -T 5 -O "$tmp" "$1" 2>"$err"; rc=$?; if [ "$rc" -eq 0 ] && [ -n "$2" ]; then if [ "$(cat "$tmp")" = "$2" ]; then body=expected; else body=unexpected; fi; else body=none; fi; if grep -Eiq "network is unreachable|no route to host|operation not permitted|network is down" "$err"; then kind=denied; elif [ "$rc" -eq 0 ]; then kind=connected; elif grep -Eiq "server returned error|HTTP/[0-9.]+ [45][0-9][0-9]" "$err"; then kind=reachable; elif grep -Eiq "timed out|timeout" "$err"; then kind=timeout; else kind=failed; fi; printf "__THEGN_SPIKE_RC=%s\n__THEGN_SPIKE_KIND=%s\n__THEGN_SPIKE_BODY=%s\n" "$rc" "$kind" "$body"; rm -f "$tmp" "$err"; exit 0'
-
-label_list_probe='import json, subprocess, sys
-name, marker = sys.argv[1:]
-proc = subprocess.run(["container", "ls", "-a", "--format", "json"], capture_output=True, text=True)
-print("__THEGN_LIST_RC=%d" % proc.returncode)
-if proc.returncode:
-    print("__THEGN_LIST_PARSEABLE=false")
-    print("__THEGN_LIST_NAME=false")
-    print("__THEGN_LIST_LABEL=false")
-    raise SystemExit(0)
-try:
-    data = json.loads(proc.stdout)
-except Exception:
-    print("__THEGN_LIST_PARSEABLE=false")
-    print("__THEGN_LIST_NAME=false")
-    print("__THEGN_LIST_LABEL=false")
-    raise SystemExit(0)
-rows = data if isinstance(data, list) else next((data[k] for k in ("containers", "Containers", "items") if isinstance(data, dict) and isinstance(data.get(k), list)), [])
-def names(row):
-    result = []
-    for key in ("name", "Name", "names", "Names"):
-        value = row.get(key)
-        result.extend(value if isinstance(value, list) else [value])
-    return [str(value).lstrip("/") for value in result if value is not None]
-def has_label(value):
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if str(key).lower() == "labels":
-                if isinstance(item, dict) and item.get("thegn.spike") == marker:
-                    return True
-                if isinstance(item, list) and "thegn.spike=" + marker in item:
-                    return True
-            if has_label(item):
-                return True
-    elif isinstance(value, list):
-        return any(has_label(item) for item in value)
-    return False
-matched = [row for row in rows if isinstance(row, dict) and name in names(row)]
-print("__THEGN_LIST_PARSEABLE=true")
-print("__THEGN_LIST_NAME=" + str(bool(matched)).lower())
-print("__THEGN_LIST_LABEL=" + str(any(has_label(row) for row in matched)).lower())'
 
 probe_row() { # ID [network-name|default] URL [expected body]
   local id="$1" network="$2" url="$3" body="${4:-}"
@@ -216,7 +175,7 @@ PY
   ulimit_rc="$SC_LAST_RC"
   procs="$(sed -n 's/^procs=//p' "$SP_OUT/$SP_ITEM/V-AC-03.out" | head -1)"
   if [ "$ulimit_rc" -eq 0 ] && [ -n "$procs" ]; then
-    if [ "$procs" -le 80 ]; then ulimit_verdict="recorded: accepted; observed process count $procs"; else ulimit_verdict="not effective: observed process count $procs"; fi
+    ulimit_verdict="recorded: accepted; observed process count $procs under the image default user; policy effect unverified"
   else
     ulimit_verdict="inconclusive: container start or process probe failed"
   fi
@@ -228,7 +187,7 @@ PY
   if [ "$label_run_rc" -eq 0 ]; then
     sp_on_exit "container rm -f '$label_container'"
   fi
-  sc_case V-AC-04-ls any python3 -c "$label_list_probe" "$label_container" "$run_id"
+  sc_case V-AC-04-ls any python3 "$here/../../test/macos/apple-container-list-probe.py" "$label_container" "$run_id"
   label_list_rc="$(probe_value V-AC-04-ls LIST_RC)"
   label_list_parseable="$(probe_value V-AC-04-ls LIST_PARSEABLE)"
   label_list_name="$(probe_value V-AC-04-ls LIST_NAME)"

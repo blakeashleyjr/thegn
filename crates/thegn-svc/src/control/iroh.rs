@@ -174,15 +174,15 @@ impl AsyncWrite for QuicControlIo {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.send).poll_write(cx, buf)
+        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.send).poll_flush(cx)
+        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.send).poll_shutdown(cx)
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
     }
 }
 
