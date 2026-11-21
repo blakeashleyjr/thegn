@@ -401,10 +401,19 @@ pub(crate) mod test_support {
                 // The reader uses a finite poll timeout, so this join is
                 // bounded even while the slave stays open and reads return
                 // EAGAIN. It does not depend on EOF or EIO.
-                if reader.join().is_ok() {
-                    #[cfg(test)]
-                    if let Some(join_ack) = self.join_ack.take() {
-                        let _ = join_ack.send(());
+                #[cfg(test)]
+                let reader_join = reader.join();
+                #[cfg(not(test))]
+                match reader.join() {
+                    Ok(()) | Err(_) => {}
+                }
+                #[cfg(test)]
+                if let Some(join_ack) = self.join_ack.take() {
+                    let outcome = reader_join.map_err(|_| "PTY reader thread panicked");
+                    // The test may already be unwinding and have dropped its
+                    // receiver. A failed notification must not panic in Drop.
+                    match join_ack.send(outcome) {
+                        Ok(()) | Err(_) => {}
                     }
                 }
             }
@@ -558,7 +567,7 @@ pub(crate) mod test_support {
             slave: Option<std::fs::File>,
             drainer: Option<PtyDrainer>,
             release: Option<Sender<()>>,
-            join_ack: Option<Receiver<()>>,
+            join_ack: Option<Receiver<Result<(), &'static str>>>,
             teardown: Option<std::thread::JoinHandle<()>>,
         }
 
@@ -589,18 +598,44 @@ pub(crate) mod test_support {
                 self.join_ack = Some(joined_rx);
             }
 
-            fn wait_for_join(&mut self) -> Result<(), std::sync::mpsc::RecvTimeoutError> {
-                let result = self
+            fn wait_for_join(&mut self) -> Result<(), String> {
+                let ack = self
                     .join_ack
                     .as_ref()
                     .expect("teardown has started")
                     .recv_timeout(Duration::from_secs(1));
-                if result.is_ok()
-                    && let Some(teardown) = self.teardown.take()
-                {
-                    teardown.join().expect("teardown thread panicked");
+                match ack {
+                    Ok(reader_result) => {
+                        let teardown_result = match self.teardown.take() {
+                            Some(teardown) => teardown.join(),
+                            None => return Err("PTY teardown handle was missing".into()),
+                        };
+                        if teardown_result.is_err() {
+                            return Err("PTY teardown thread panicked".into());
+                        }
+                        reader_result.map_err(str::to_owned)
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        Err("timed out waiting for PTY reader join acknowledgment".into())
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // A closed channel proves only that no acknowledgment
+                        // arrived, never that the reader joined successfully.
+                        match self.teardown.take() {
+                            Some(teardown) => match teardown.join() {
+                                Ok(()) => {
+                                    Err("PTY reader join acknowledgment was disconnected".into())
+                                }
+                                Err(_) => {
+                                    Err("PTY teardown thread panicked before acknowledgment".into())
+                                }
+                            },
+                            None => {
+                                Err("PTY teardown handle was missing before acknowledgment".into())
+                            }
+                        }
+                    }
                 }
-                result
             }
         }
 
@@ -609,11 +644,24 @@ pub(crate) mod test_support {
                 self.release_reader();
                 drop(self.slave.take());
                 drop(self.drainer.take());
-                if let Some(joined) = self.join_ack.take()
-                    && joined.recv_timeout(Duration::from_secs(1)).is_ok()
-                    && let Some(teardown) = self.teardown.take()
-                {
-                    let _ = teardown.join();
+                if let Some(joined) = self.join_ack.take() {
+                    match joined.recv_timeout(Duration::from_secs(1)) {
+                        Ok(_reader_result) => {
+                            if let Some(teardown) = self.teardown.take() {
+                                // Cleanup is already in Drop (possibly during
+                                // unwind), so reap without introducing a panic.
+                                match teardown.join() {
+                                    Ok(()) | Err(_) => {}
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            // Keep cleanup bounded; dropping the handle detaches
+                            // a teardown that has not acknowledged completion.
+                            drop(self.teardown.take());
+                        }
+                    }
                 }
             }
         }
