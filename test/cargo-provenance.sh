@@ -58,7 +58,6 @@ else
   fi
 fi
 
-checkout_given=$checkout
 if [[ $checkout == /* ]]; then
   checkout_abs=$(cd "$checkout" 2>/dev/null && pwd -P)
 else
@@ -172,27 +171,36 @@ else
     foreign_source=0
     listed_source_count=0
     depinfo_tokens=$(tr ' ' '\n' <"$core_depinfo")
+
+    # Compare source identities using the physical parent directory on both
+    # sides. macOS can expose one checkout through spellings such as /tmp and
+    # /private/tmp, and dep-info preserves whichever spelling Cargo observed.
+    source_identity() {
+      local source_path source_dir source_base source_dir_abs
+      source_path=$1
+      if [[ $source_path != /* ]]; then
+        source_path=$checkout/$source_path
+      fi
+      source_dir=$(dirname "$source_path")
+      source_base=$(basename "$source_path")
+      if source_dir_abs=$(cd "$source_dir" 2>/dev/null && pwd -P); then
+        printf '%s/%s\n' "$source_dir_abs" "$source_base"
+      else
+        printf '%s\n' "$source_path"
+      fi
+    }
+
     for depinfo_token in $depinfo_tokens; do
       depinfo_token=${depinfo_token%:}
       case "$depinfo_token" in
       */crates/thegn-core/src/*.rs | crates/thegn-core/src/*.rs)
         listed_source_count=$((listed_source_count + 1))
-        if [[ $depinfo_token == /* ]]; then
-          token_dir=$(dirname "$depinfo_token")
-          token_base=$(basename "$depinfo_token")
-          if token_dir_abs=$(cd "$token_dir" 2>/dev/null && pwd -P); then
-            token_abs=$token_dir_abs/$token_base
-          else
-            token_abs=$depinfo_token
-          fi
-          case "$token_abs" in
-          "$checkout"/crates/thegn-core/src/*.rs | "$checkout_given"/crates/thegn-core/src/*.rs) ;;
-          *) foreign_source=1 ;;
-          esac
-          [[ -f $token_abs ]] || foreign_source=1
-        else
-          [[ -f $checkout/$depinfo_token ]] || foreign_source=1
-        fi
+        token_identity=$(source_identity "$depinfo_token")
+        case "$token_identity" in
+        "$checkout"/crates/thegn-core/src/*.rs) ;;
+        *) foreign_source=1 ;;
+        esac
+        [[ -f $token_identity ]] || foreign_source=1
         if [[ $depinfo_token == */crates/thegn-core/src/lib.rs || $depinfo_token == crates/thegn-core/src/lib.rs ]]; then
           depinfo_lib=$depinfo_token
         fi
@@ -207,7 +215,7 @@ else
         source_listed=0
         for depinfo_token in $depinfo_tokens; do
           depinfo_token=${depinfo_token%:}
-          if [[ $depinfo_token == "$source_file" || $depinfo_token == "${source_file#"$checkout"/}" ]]; then
+          if [[ $(source_identity "$depinfo_token") == "$(source_identity "$source_file")" ]]; then
             source_listed=1
             break
           fi

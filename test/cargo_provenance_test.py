@@ -156,6 +156,25 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "yes")
         self.assertEqual(facts["provenance.verdict"], "ok")
 
+    def test_matching_depinfo_via_temporary_checkout_alias_is_ok(self):
+        fixture = self.fixture()
+        alias = fixture["checkout"].parent / "checkout-alias"
+        alias.symlink_to(fixture["checkout"], target_is_directory=True)
+        depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+        lib_path = alias / "crates" / "thegn-core" / "src" / "lib.rs"
+        other_path = alias / "crates" / "thegn-core" / "src" / "a.rs"
+        depinfo.write_text(
+            f"{lib_path}: {lib_path} {other_path} /x/other.rs\n", encoding="utf-8"
+        )
+
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "yes")
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "0")
+        self.assertEqual(facts["provenance.verdict"], "ok")
+
     def test_relative_cargo_depinfo_with_all_checkout_sources_is_ok(self):
         fixture = self.fixture()
         (fixture["deps"] / "thegn_core-aaaa.d").write_text(
