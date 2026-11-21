@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "test" / "cargo-provenance.sh"
 
 
-def run(args, bin_dir=None, env_extra=None):
+def run(args, bin_dir=None, env_extra=None, cwd=None, input_text=""):
     env = os.environ.copy()
     for key in (
         "RUSTC_WRAPPER",
@@ -33,6 +33,8 @@ def run(args, bin_dir=None, env_extra=None):
         return subprocess.run(
             ["bash", str(SCRIPT), *args],
             env=env,
+            cwd=cwd,
+            input=input_text,
             capture_output=True,
             text=True,
             timeout=10,
@@ -291,6 +293,123 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "1")
         self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
         self.assertEqual(facts["provenance.verdict"], "foreign-depinfo")
+
+    def test_rustc_rules_count_prerequisites_and_ignore_dummy_targets(self):
+        fixture = self.fixture()
+        lib = fixture["checkout"] / "crates/thegn-core/src/lib.rs"
+        source = fixture["checkout"] / "crates/thegn-core/src/a.rs"
+        depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+        depinfo.write_text(
+            f"{fixture['target']}/debug/deps/libthegn_core-aaaa.rlib: "
+            f"{lib} {source} /rustc/library/core/src/lib.rs\n"
+            f"{fixture['target']}/debug/deps/thegn_core-aaaa.d: "
+            f"{lib} {source} /rustc/library/core/src/lib.rs\n"
+            f"{lib}:\n{source}:\n",
+            encoding="utf-8",
+        )
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "0")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "yes")
+
+    def test_dummy_targets_without_prerequisite_rule_are_refused(self):
+        fixture = self.fixture()
+        lib = fixture["checkout"] / "crates/thegn-core/src/lib.rs"
+        source = fixture["checkout"] / "crates/thegn-core/src/a.rs"
+        (fixture["deps"] / "thegn_core-aaaa.d").write_text(
+            f"{lib}:\n{source}:\n", encoding="utf-8"
+        )
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "unknown")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+
+    def test_nul_depinfo_is_refused_before_text_parsing(self):
+        fixture = self.fixture()
+        lib = fixture["checkout"] / "crates/thegn-core/src/lib.rs"
+        source = fixture["checkout"] / "crates/thegn-core/src/a.rs"
+        (fixture["deps"] / "thegn_core-aaaa.d").write_bytes(
+            f"{lib}: {lib} {str(source)[:-1]}\0.rs\n".encode()
+        )
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "unknown")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+
+    def test_relative_tmpdir_with_equals_and_empty_stdin_keeps_omission(self):
+        fixture = self.fixture()
+        depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+        depinfo.write_text(
+            f"{depinfo}: crates/thegn-core/src/lib.rs\n", encoding="utf-8"
+        )
+        relative_tmpdir = fixture["checkout"].parent / "cache=tmp"
+        relative_tmpdir.mkdir()
+        result = run(
+            ["--checkout", "checkout", "--target-dir", str(fixture["target"]), "--strict"],
+            fixture["bin_dir"],
+            {"TMPDIR": "cache=tmp"},
+            cwd=fixture["checkout"].parent,
+            input_text="",
+        )
+        facts = parse_output(result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "1")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+
+    def test_cdpath_cannot_resolve_missing_relative_checkout(self):
+        fixture = self.fixture()
+        matching = run(
+            ["--checkout", "checkout", "--target-dir", str(fixture["target"]), "--strict"],
+            fixture["bin_dir"],
+            {"CDPATH": "."},
+            cwd=fixture["checkout"].parent,
+        )
+        matching_facts = parse_output(matching.stdout)
+        self.assertEqual(matching.returncode, 0, matching.stderr)
+        self.assertEqual(matching_facts["provenance.core_depinfo_matches_checkout"], "yes")
+
+        search = fixture["checkout"].parent / "search"
+        search.mkdir()
+        searched_checkout = search / "checkout"
+        shutil.copytree(fixture["checkout"], searched_checkout)
+        lib = searched_checkout / "crates/thegn-core/src/lib.rs"
+        source = searched_checkout / "crates/thegn-core/src/a.rs"
+        (fixture["deps"] / "thegn_core-aaaa.d").write_text(
+            f"{lib}: {lib} {source}\n", encoding="utf-8"
+        )
+        invocation = fixture["checkout"].parent / "invocation"
+        invocation.mkdir()
+        result = run(
+            ["--checkout", "checkout", "--target-dir", str(fixture["target"]), "--strict"],
+            fixture["bin_dir"],
+            {"CDPATH": str(search)},
+            cwd=invocation,
+        )
+        facts = parse_output(result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+
+    def test_newline_ending_checkout_is_not_confused_with_sibling(self):
+        fixture = self.fixture()
+        plain = fixture["checkout"]
+        newline_checkout = plain.with_name(plain.name + "\n")
+        shutil.copytree(plain, newline_checkout)
+        depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+        lib = newline_checkout / "crates/thegn-core/src/lib.rs"
+        source = newline_checkout / "crates/thegn-core/src/a.rs"
+        depinfo.write_text(f"{lib}: {lib} {source}\n", encoding="utf-8")
+        result, facts = self.facts_for(
+            {**fixture, "checkout": newline_checkout},
+            "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
 
     def test_foreign_depinfo_is_flagged_and_strict_fails(self):
         fixture = self.fixture(foreign=True)
