@@ -355,11 +355,85 @@ mod tests {
 pub(crate) mod test_support {
     pub(crate) const UNIX: bool = cfg!(unix);
 
-    /// A real terminal waker (backed by a pty); the other ends must outlive it.
+    /// On macOS, keep consuming PTY output until the terminal is dropped.
+    /// Darwin's `tcdrain` waits for the peer to read queued output, including
+    /// the cleanup escape sequences written by `UnixTerminal::drop`.
+    #[cfg(target_os = "macos")]
+    pub(crate) struct TestPtyMaster {
+        reader: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for TestPtyMaster {
+        fn drop(&mut self) {
+            if let Some(reader) = self.reader.take() {
+                // Usually UnixTerminal has already closed the slave and the
+                // reader has observed EOF/EIO. Do not wait here if a caller
+                // drops the master before the terminal; in that case the
+                // reader owns the master and exits when the terminal closes.
+                if reader.is_finished() {
+                    let _ = reader.join();
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(crate) type TestPtyMaster = std::fs::File;
+
+    #[cfg(target_os = "macos")]
+    fn keep_master_drained(master: std::fs::File) -> TestPtyMaster {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::time::Duration;
+
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "read PTY master flags: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "make PTY master nonblocking: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let reader = std::thread::Builder::new()
+            .name("thegn-test-pty-drain".into())
+            .spawn(move || {
+                let mut master = master;
+                let mut bytes = [0_u8; 4096];
+                loop {
+                    loop {
+                        match master.read(&mut bytes) {
+                            Ok(0) => return,
+                            Ok(_) => continue,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1));
+                                break;
+                            }
+                            // A closed PTY can report EIO; no more output can
+                            // be drained, and the fixture is being torn down.
+                            Err(_) => return,
+                        }
+                    }
+                }
+            })
+            .expect("spawn PTY master drainer");
+        TestPtyMaster {
+            reader: Some(reader),
+        }
+    }
+
+    /// A real terminal waker (backed by a pty); keep both PTY ends alive as
+    /// long as the terminal is in use. On macOS, the master drains output
+    /// until it is dropped after the terminal.
     #[cfg(unix)]
     pub(crate) fn test_waker() -> (
         termwiz::terminal::TerminalWaker,
-        std::fs::File,
+        TestPtyMaster,
         termwiz::terminal::UnixTerminal,
     ) {
         use std::os::fd::FromRawFd;
@@ -386,6 +460,8 @@ pub(crate) mod test_support {
             termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
                 .unwrap();
         let terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
+        #[cfg(target_os = "macos")]
+        let master = keep_master_drained(master);
         (terminal.waker(), master, terminal)
     }
 
