@@ -13,7 +13,8 @@
     "Cross-Platform Support & Verification",
     "Proposal Retirement & Cleanup",
     "Sandbox & Remote 00: Shared contracts",
-    "Sandbox & Remote 01: Truth and fixes"
+    "Sandbox & Remote 01: Truth and fixes",
+    "Sandbox & Remote 05: macOS"
   ],
   "entries": [
     {
@@ -934,7 +935,7 @@
       "owners": [
         {
           "issue": "THE-2099",
-          "project": "Runtime Security & Host Architecture"
+          "project": "Sandbox & Remote 05: macOS"
         }
       ],
       "summary": "THE-2099 owns the macOS OCI evidence runner; owner Mac capture and review of runtime decisions remain unchecked before enforcement changes."
@@ -1508,7 +1509,8 @@
     },
     {
       "change": "secure-macos-app-generation",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
+      "delivered_at": "2026-11-20",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1516,7 +1518,7 @@
           "project": "Distribution & Release Readiness"
         }
       ],
-      "summary": "THE-416 owns secure macOS app generation; the recorded native run did not exercise the ownership-race swap, so focused rerun evidence remains pending."
+      "summary": "THE-416 owns secure macOS app generation. The native focused fixture passed at 13f00217a with identical generator and fixture files. Archive reconciliation remains."
     },
     {
       "change": "secure-merge-bundle-custody",

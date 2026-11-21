@@ -254,6 +254,68 @@ fi
 [[ "$(cat "$owner_displaced/Contents/Resources/keep")" == original ]] || fail "ownership-race refusal damaged displaced owned bundle"
 assert_no_workdirs "$owner_race" || fail "ownership-race refusal left staging directories"
 
+# A retirement failure happens after the atomic exchange has committed. Exercise
+# the complete shell transaction (including its EXIT trap) with inert bundles
+# in a private destination: the new app must stay active and the partially
+# retired old generation must remain available for recovery.
+retire_dest="$tmp/retire-failure"
+run_make_app --dest "$retire_dest" --name retire-failure --env RETIRE_GENERATION=old >/dev/null ||
+  fail "retirement-failure seed bundle failed"
+cat >"$tmp/inject-retirement-failure.py" <<'PY'
+import errno
+import os
+import sys
+
+helper_path = sys.argv[1]
+sys.path.insert(0, os.path.dirname(helper_path))
+import app_bundle_fs
+
+def fail_after_partial_retirement(directory_fd):
+    contents_fd = os.open("Contents", os.O_RDONLY | app_bundle_fs.O_DIRECTORY, dir_fd=directory_fd)
+    try:
+        os.unlink("Info.plist", dir_fd=contents_fd)
+    finally:
+        os.close(contents_fd)
+    raise OSError(errno.EIO, "injected shell-level retirement failure")
+
+app_bundle_fs.remove_tree_contents = fail_after_partial_retirement
+sys.argv = [helper_path, *sys.argv[2:]]
+app_bundle_fs.main()
+PY
+cat >"$race_bin/python3" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1-} == */app_bundle_fs.py && ${2-} == promote && ${THEGN_TEST_RETIRE_FAILURE-} == 1 ]]; then
+  exec "$REAL_PYTHON" "$RETIRE_FAILURE_SCRIPT" "$@"
+fi
+exec "$REAL_PYTHON" "$@"
+EOF
+chmod 0755 "$race_bin/python3"
+retire_python="${THEGN_TEST_PYTHON:-$(command -v python3)}"
+if REAL_PYTHON="$retire_python" REAL_MKTEMP="$real_mktemp" RETIRE_FAILURE_SCRIPT="$tmp/inject-retirement-failure.py" \
+  THEGN_TEST_RETIRE_FAILURE=1 PATH="$race_bin:$mac_bin:$PATH" HOME="$tmp/home" \
+  "$repo/packaging/macos/make-app.sh" --bin "$mac_bin/thegn" --dest "$retire_dest" \
+  --name retire-failure --env RETIRE_GENERATION=new >"$tmp/retire.out" 2>"$tmp/retire.err"; then
+  fail "injected retirement failure was reported as success"
+else
+  retire_status=$?
+  if [[ $retire_status -ne 75 ]]; then
+    cat "$tmp/retire.err" >&2
+    fail "retirement failure returned status $retire_status instead of 75"
+  fi
+fi
+python3 - "$retire_dest/retire-failure.app/Contents/Resources/env" <<'PY' || fail "new complete bundle was not left active after retirement failure"
+import pathlib, sys
+if pathlib.Path(sys.argv[1]).read_bytes() != b"RETIRE_GENERATION=new\0":
+    raise SystemExit(1)
+PY
+grep -Fq "cleanup incomplete" "$tmp/retire.err" || fail "retirement failure was not reported"
+retire_residue="$(find "$retire_dest" -mindepth 1 -maxdepth 1 -type d -name '.retire-failure.app.staging.*' -print -quit)"
+[[ -n $retire_residue ]] || fail "EXIT cleanup removed the recovery residue"
+[[ ! -e "$retire_residue/Contents/Info.plist" ]] || fail "retirement injection did not leave a partial old bundle"
+[[ -f "$retire_residue/Contents/Resources/common.sh" ]] || fail "recovery residue lost its remaining old launcher files"
+[[ ! -e "$retire_dest/.retire-failure.app.lock" ]] || fail "retirement failure left the generation lock behind"
+
 # bundle identifier grammar
 run_make_app --dest "$tmp/id-ok" --name my_app >/dev/null || fail "underscore name was refused"
 grep -Fq '<key>CFBundleIdentifier</key><string>com.github.blakeashleyjr.my-app</string>' "$tmp/id-ok/my_app.app/Contents/Info.plist" ||

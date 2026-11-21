@@ -508,7 +508,7 @@
     },
     {
       "issue": "THE-2099",
-      "project": "Runtime Security & Host Architecture",
+      "project": "Sandbox & Remote 05: macOS",
       "changes": [
         "fix-macos-oci-runtimes"
       ]
