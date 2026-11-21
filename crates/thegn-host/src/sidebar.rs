@@ -1473,14 +1473,15 @@ pub fn build_rows(
             push_pipeline_group(
                 &mut rows,
                 ws_lanes,
-                &format!("pipeline/group:{repo_slug}"),
-                repo_slug,
-                collapsed,
-                view,
-                &lane_targets,
-                active_path,
-                &pipeline_groups,
-                status,
+                PipelineGroupContext {
+                    group_slug: repo_slug,
+                    parent_collapsed: collapsed,
+                    view,
+                    lane_targets: &lane_targets,
+                    active_path,
+                    pipeline_groups: &pipeline_groups,
+                    status,
+                },
             );
         }
     }
@@ -1732,6 +1733,17 @@ fn push_other_group(
     }
 }
 
+/// Borrowed per-workspace state used to emit the derived Pipelines folder.
+struct PipelineGroupContext<'a> {
+    group_slug: &'a str,
+    parent_collapsed: bool,
+    view: &'a ViewState,
+    lane_targets: &'a std::collections::HashMap<String, (String, RowTarget)>,
+    active_path: Option<&'a str>,
+    pipeline_groups: &'a std::collections::HashMap<String, Group>,
+    status: &'a SidebarStatus,
+}
+
 /// Emit one derived `Pipelines` group: the folder head, each lane folder
 /// named from the roster's issue id, and each lane's referenced worktrees as
 /// leaves. These leaves are the primary sidebar rows for pipeline-owned
@@ -1747,19 +1759,13 @@ fn push_other_group(
 fn push_pipeline_group(
     rows: &mut Vec<SidebarRow>,
     lanes: &[crate::sidebar_pipeline::Lane],
-    group_key: &str,
-    group_slug: &str,
-    parent_collapsed: bool,
-    view: &ViewState,
-    lane_targets: &std::collections::HashMap<String, (String, RowTarget)>,
-    active_path: Option<&str>,
-    pipeline_groups: &std::collections::HashMap<String, Group>,
-    status: &SidebarStatus,
+    context: PipelineGroupContext<'_>,
 ) {
     if lanes.is_empty() {
         return;
     }
-    let holds_active = active_path.is_some_and(|path| {
+    let group_key = format!("pipeline/group:{}", context.group_slug);
+    let holds_active = context.active_path.is_some_and(|path| {
         let active = crate::sidebar_pipeline::path_identity(path);
         lanes.iter().any(|lane| {
             lane.worktrees
@@ -1767,53 +1773,66 @@ fn push_pipeline_group(
                 .any(|worktree| crate::sidebar_pipeline::path_identity(&worktree.path) == active)
         })
     });
-    let group_collapsed = view.collapsed.contains(group_key) && !holds_active;
+    let group_collapsed = context.view.collapsed.contains(&group_key) && !holds_active;
     rows.push(SidebarRow {
-        pin_key: group_key.to_string(),
+        pin_key: group_key,
         collapsed: group_collapsed,
-        visible: !parent_collapsed,
+        visible: !context.parent_collapsed,
         child_count: lanes.len(),
-        ..SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", group_slug)
+        ..SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", context.group_slug)
     });
     for lane in lanes {
         let lane_key = format!("pipeline/lane:{}", lane.key);
-        let lane_holds_active = active_path.is_some_and(|path| {
+        let lane_holds_active = context.active_path.is_some_and(|path| {
             let active = crate::sidebar_pipeline::path_identity(path);
             lane.worktrees
                 .iter()
                 .any(|worktree| crate::sidebar_pipeline::path_identity(&worktree.path) == active)
         });
-        let lane_collapsed = view.collapsed.contains(&lane_key) && !lane_holds_active;
+        let lane_collapsed = context.view.collapsed.contains(&lane_key) && !lane_holds_active;
         rows.push(SidebarRow {
             pin_key: lane_key,
             collapsed: lane_collapsed,
-            visible: !parent_collapsed && !group_collapsed,
+            visible: !context.parent_collapsed && !group_collapsed,
             child_count: lane.worktrees.len(),
-            ..SidebarRow::base(RowKind::PipelineLane, 2, lane.label.clone(), group_slug)
+            ..SidebarRow::base(
+                RowKind::PipelineLane,
+                2,
+                lane.label.clone(),
+                context.group_slug,
+            )
         });
         for wt in &lane.worktrees {
-            let hit = lane_targets.get(&crate::sidebar_pipeline::path_identity(&wt.path));
+            let hit = context
+                .lane_targets
+                .get(&crate::sidebar_pipeline::path_identity(&wt.path));
             let identity = crate::sidebar_pipeline::path_identity(&wt.path);
-            let mut row = pipeline_groups
+            let mut row = context
+                .pipeline_groups
                 .get(&identity)
                 .map(|group| {
                     worktree_row(
                         group,
-                        status,
-                        group_slug,
+                        context.status,
+                        context.group_slug,
                         3,
                         format!("pipeline/worktree:{identity}"),
-                        !parent_collapsed && !group_collapsed && !lane_collapsed,
+                        !context.parent_collapsed && !group_collapsed && !lane_collapsed,
                         None,
                     )
                 })
                 .unwrap_or_else(|| {
-                    SidebarRow::base(RowKind::PipelineWorktree, 3, wt.name.clone(), group_slug)
+                    SidebarRow::base(
+                        RowKind::PipelineWorktree,
+                        3,
+                        wt.name.clone(),
+                        context.group_slug,
+                    )
                 });
             row.kind = RowKind::PipelineWorktree;
-            row.pin_key = format!("{group_slug}/{}", row.label);
+            row.pin_key = format!("{}/{}", context.group_slug, row.label);
             row.label = wt.name.clone();
-            row.visible = !parent_collapsed && !group_collapsed && !lane_collapsed;
+            row.visible = !context.parent_collapsed && !group_collapsed && !lane_collapsed;
             row.worktree_path = Some(wt.path.clone());
             row.tab_target = hit.map(|(_, target)| target.clone());
             rows.push(row);
