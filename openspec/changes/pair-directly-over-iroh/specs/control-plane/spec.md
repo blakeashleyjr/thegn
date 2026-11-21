@@ -1,51 +1,66 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
-### Requirement: Direct Iroh control pairing
+### Requirement: Direct Iroh pairing uses the existing scoped control authority
 
-The control service SHALL offer an opt-in direct Iroh transport for its
-existing scoped control API. The server SHALL accept direct control connections
-only on its separate control ALPN. A client SHALL authenticate the server's
-invited Iroh endpoint identity, and the listener SHALL expose the authenticated
-remote peer identity to the control API. Direct pairing SHALL redeem the
-existing expiring, single-use pairing code and authorize each subsequent
-control operation with the resulting scoped bearer token. The direct listener
-SHALL require that token and SHALL NOT grant implicit local administrator
-authority. This experimental CLI surface SHALL require the dev release
-channel. Pairing and bearer credentials SHALL NOT be logged.
+The opt-in direct Iroh control listener SHALL use a dedicated control ALPN,
+explicit direct UDP IP socket addresses, and an endpoint ID authenticated by
+the Iroh handshake. It SHALL disable relay and address lookup and SHALL serve
+the existing control router with implicit local administration disabled.
+Pairing SHALL redeem the existing expiring single-use code through
+`POST /v1/pair`;
+`GET /health` and `GET /pair` remain public. Every later request to a
+protected route SHALL present a bearer token with the required scope, including
+requests after reconnect, and SHALL verify that token against the existing
+revocation store. The direct control transport SHALL remain separate from
+sandbox `ExecReq` transport and existing SSH/dumbpipe host behavior.
 
-#### Scenario: Server explicitly enables direct pairing
+With the `iroh` feature and dev release channel, `thegn serve --iroh-direct`
+SHALL start the direct listener and print its Peer ID, concrete IP socket
+addresses, and the command for creating an invitation. It SHALL NOT print the
+invitation or its code. `--no-pair-url` is accepted with direct mode but is
+redundant because direct mode does not print a pairing URL. An ordinary pane
+daemon SHALL NOT start this listener.
 
-- **WHEN** the operator starts `thegn serve` with direct Iroh enabled
-- **THEN** the control service exposes its separate direct Iroh listener and
-  its direct invitation contains the server peer ID and concrete IP socket
-  addresses
-- **AND** an ordinary pane daemon does not start this listener
+`thegn pair direct new --endpoint-id <peer-id> --address <ip:port> --out
+<path>` SHALL create an owner-only invitation file; `--address` MAY be
+repeated, and `--scope` and `--ttl-mins` are optional. `thegn pair direct
+redeem <name> --invitation-file <path>` SHALL redeem that file and save a
+reconnectable profile; when `--invitation-file` is absent, it SHALL read the
+invitation from stdin. `thegn pair direct me <name>` SHALL use the saved
+profile. If the server endpoint ID reached by the client does not match the
+invited ID, the client SHALL abort the Iroh handshake before transmitting the
+pairing code. The redemption store does not bind a code to an endpoint ID.
 
-#### Scenario: Peer redeems an invitation
+#### Scenario: A direct invitation is redeemed and reused
 
-- **WHEN** a peer connects using the invited peer ID and explicit IP socket
-  addresses and redeems a valid pairing code
-- **THEN** the server identity matches the invited endpoint and the listener
-  preserves the authenticated remote peer identity in connection metadata
-- **AND** the existing pairing flow returns a token with the granted
-  scopes
-- **AND** an expired, previously redeemed, or invalid code grants no access
+- **WHEN** a peer redeems a valid invitation and then reconnects to the
+  invited endpoint ID using its explicit direct addresses
+- **THEN** the peer receives only the code's scopes and can make an authorized
+  control request over the separate Iroh control ALPN
 
-#### Scenario: Scoped authorization and revocation apply to direct requests
+#### Scenario: Direct control has no implicit local administrator
 
-- **WHEN** a paired peer makes a direct control request
-- **THEN** the control API checks its bearer token and required scope for that
-  request without treating Iroh peer identity as authorization
-- **AND** requests using a revoked or expired pairing are refused, including
-  after reconnecting with a saved pairing profile
+- **WHEN** a QUIC peer connects to the direct control listener without a
+  bearer token
+- **THEN** protected routes reject the request even if the listener process
+  also owns a local Unix socket that grants same-UID administrator access
 
-#### Scenario: Direct mode has no relay or implicit network path
+#### Scenario: Direct pairing is revoked or cannot be redeemed
 
-- **WHEN** an operator or client configures direct Iroh pairing
-- **THEN** it uses an explicit server peer ID and one or more concrete IP
-  socket addresses, with relay use and address lookup disabled
-- **AND** the peers need a working direct IP path, including any required UDP
-  traffic
-- **AND** this mode does not use Tailscale, a relay server, the sandbox
-  `ExecReq` listener, or local Unix-socket administration
-- **AND** existing HTTP pairing and `host add dumbpipe:` remain available
+- **WHEN** a code is expired, already redeemed, invalid, or a redeemed token
+  is revoked
+- **THEN** the normal pairing/authentication path refuses it and does not grant
+  broader local administrator authority
+
+#### Scenario: The invited server identity does not match
+
+- **WHEN** the client reaches an endpoint whose Iroh identity differs from the
+  endpoint ID in the invitation
+- **THEN** the client aborts the Iroh handshake before transmitting the code
+
+#### Scenario: No direct IP path exists
+
+- **WHEN** the invited peer cannot reach an explicit IP socket address
+- **THEN** connection fails with a direct-connect error; the client does not
+  query an address lookup service or fall back to a relay, and this mode has
+  no Tailscale dependency
