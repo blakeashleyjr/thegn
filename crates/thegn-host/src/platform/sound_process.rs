@@ -417,6 +417,7 @@ pub(crate) mod test_support {
         #[cfg(test)] first_read_gate: Option<(
             std::sync::mpsc::Sender<()>,
             std::sync::mpsc::Receiver<()>,
+            Arc<AtomicBool>,
         )>,
     ) -> PtyDrainer {
         use std::io::Read;
@@ -469,17 +470,22 @@ pub(crate) mod test_support {
                                 reader_successful_reads.fetch_add(1, Ordering::AcqRel);
                                 reader_idle.store(false, Ordering::Release);
                                 #[cfg(test)]
-                                if let Some((entered, release)) = pause_after_first_read.take() {
+                                if let Some((entered, release, release_received)) =
+                                    pause_after_first_read.take()
+                                {
                                     // Both sides use finite channel operations. If
                                     // the test fails before releasing the reader,
                                     // dropping its sender wakes this rendezvous.
-                                    if entered.send(()).is_err()
-                                        || release
-                                            .recv_timeout(std::time::Duration::from_secs(5))
-                                            .is_err()
+                                    if entered.send(()).is_err() {
+                                        return;
+                                    }
+                                    if release
+                                        .recv_timeout(std::time::Duration::from_secs(5))
+                                        .is_err()
                                     {
                                         return;
                                     }
+                                    release_received.store(true, Ordering::Release);
                                 }
                                 continue;
                             }
@@ -700,10 +706,11 @@ pub(crate) mod test_support {
             let slave = unsafe { std::fs::File::from_raw_fd(slave) };
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             // SAFETY: the master descriptor is transferred to the reader.
             let drainer = keep_master_drained(
                 unsafe { std::fs::File::from_raw_fd(master) },
-                Some((entered_tx, release_rx)),
+                Some((entered_tx, release_rx, release_received.clone())),
             );
             let mut cleanup = TestCleanup::new(slave, drainer);
             cleanup.release = Some(release_tx);
@@ -750,6 +757,10 @@ pub(crate) mod test_support {
                 result,
                 Ok(()),
                 "drop must successfully join the reader before returning"
+            );
+            assert!(
+                release_received.load(Ordering::Acquire),
+                "reader must receive the release signal before join acknowledgment"
             );
             assert_eq!(
                 successful_reads.load(Ordering::Acquire),
