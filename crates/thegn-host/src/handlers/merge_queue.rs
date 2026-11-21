@@ -1990,8 +1990,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let cfg = Config::default();
         let notify = crate::notify::NotifyState::new(
             cfg.notifications.clone(),
@@ -2034,8 +2033,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let cfg = Config::default();
         let notify = crate::notify::NotifyState::new(
             cfg.notifications.clone(),
@@ -2107,8 +2105,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let cfg = Config::default();
         let notify = crate::notify::NotifyState::new(
             cfg.notifications.clone(),

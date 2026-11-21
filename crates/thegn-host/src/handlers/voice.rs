@@ -433,7 +433,7 @@ mod tests {
         }
         let mut voice = voice();
         voice.hold_transcript("spoken words".into());
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         assert_eq!(
             cancel(&mut voice, &waker),
             "Held voice transcript discarded"
@@ -452,7 +452,7 @@ mod tests {
             pane_id: 1,
             request_id: 4,
         };
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         assert!(voice.is_active());
         assert_eq!(cancel(&mut voice, &waker), "Voice cancelled");
         assert!(!voice.is_active());
@@ -521,7 +521,7 @@ mod tests {
         if !UNIX {
             return;
         }
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let mut voice = voice();
         voice.set_capture_generation_for_test(2);
         voice.next_request_id = 4;
@@ -580,7 +580,7 @@ mod tests {
         if !UNIX {
             return;
         }
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let mut voice = voice();
         voice.set_capture_generation_for_test(1);
         voice.next_request_id = 1;

@@ -331,10 +331,8 @@ mod tests {
 
     fn setup() -> Setup {
         let isolated = crate::testenv::IsolatedState::new();
-        let (waker, keepalive_a, keepalive_b) =
-            crate::platform::sound_process::test_support::test_waker();
-        let keepalive: Vec<Box<dyn std::any::Any>> =
-            vec![Box::new(keepalive_a), Box::new(keepalive_b)];
+        let (waker, fixture) = crate::platform::sound_process::test_support::test_waker();
+        let keepalive: Vec<Box<dyn std::any::Any>> = vec![Box::new(fixture)];
         let state =
             crate::notify::NotifyState::new(Config::default().notifications, String::new(), waker);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

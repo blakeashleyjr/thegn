@@ -157,8 +157,7 @@ mod tests {
         }
         let _isolated = crate::testenv::IsolatedState::new();
         let db = thegn_core::db::Db::open_memory().unwrap();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let state = crate::notify::NotifyState::new(
             thegn_core::config::Config::default().notifications,
             String::new(),
@@ -485,8 +484,7 @@ mod tests {
         let lock = rusqlite::Connection::open(state.state_home().join("thegn/thegn.db")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let notify_state = crate::notify::NotifyState::new(
             thegn_core::config::Config::default().notifications,
             String::new(),

@@ -1068,8 +1068,7 @@ mod tests {
         let lock = rusqlite::Connection::open(state.state_home().join("thegn/thegn.db")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let started = std::time::Instant::now();
         let status = crate::handlers::host::queue_host_add_from_input(
             "alice@host.example",
@@ -1112,8 +1111,7 @@ mod tests {
             return;
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (name, hc) =
             thegn_core::host_config::parse_host_target("alice@host.example", None).unwrap();
         let request = HostAddRequest {
@@ -1163,8 +1161,7 @@ mod tests {
             return;
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
 
         drop(pool_target_job(
             &tx,
@@ -1208,8 +1205,7 @@ mod tests {
             return;
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (name, hc) =
             thegn_core::host_config::parse_host_target("alice@host.example", None).unwrap();
 
