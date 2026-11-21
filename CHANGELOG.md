@@ -7,6 +7,27 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.120] — 2026-11-20
+
+### Added
+
+- Development builds support direct Iroh pairing using explicit peer addresses
+  and scoped invitations.
+
+### Changed
+
+- Pipeline-owned worktrees appear once under Pipelines by default. Explicit
+  folder assignments take precedence, and the flat layout remains available.
+
+### Fixed
+
+- Work and Observe tabs respond to mouse clicks and keyboard navigation.
+- Native macOS checkout-hook inspection handles an exited process-group leader
+  while preserving checks for live descendants.
+- Native CI shells include the packaging and release smoke test dependencies.
+  Linux-only process diagnostics and feature-only helpers are compiled where
+  they are used.
+
 ## [0.1.0-alpha.119] — 2026-11-20
 
 ### Changed
@@ -4155,7 +4176,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.119...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.120...HEAD
+[0.1.0-alpha.120]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.119...v0.1.0-alpha.120
 [0.1.0-alpha.119]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.118...v0.1.0-alpha.119
 [0.1.0-alpha.118]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.117...v0.1.0-alpha.118
 [0.1.0-alpha.117]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.116...v0.1.0-alpha.117
