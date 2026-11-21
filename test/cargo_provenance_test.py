@@ -4,10 +4,13 @@
 import hashlib
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "test" / "cargo-provenance.sh"
@@ -177,6 +180,21 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "0")
         self.assertEqual(facts["provenance.verdict"], "ok")
 
+    def test_missing_component_before_parent_traversal_is_refused(self):
+        fixture = self.fixture()
+        depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+        lib = fixture["checkout"] / "crates/thegn-core/src/lib.rs"
+        source = fixture["checkout"] / "crates/thegn-core/src/a.rs"
+        injected = fixture["checkout"] / "missing-prefix/../crates/thegn-core/src/lib.rs"
+        depinfo.write_text(f"{lib}: {injected} {source}\n", encoding="utf-8")
+
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "unknown")
+
     def test_unresolved_checkout_cannot_be_counted_as_coverage(self):
         fixture = self.fixture()
         missing_checkout = fixture["checkout"].parent / "missing-checkout"
@@ -207,37 +225,23 @@ class CargoProvenanceTests(unittest.TestCase):
 
     def test_source_enumeration_failure_cannot_be_zero_missing(self):
         fixture = self.fixture()
-        real_find = shutil.which("find")
-        if real_find is None:
-            self.skipTest("find is unavailable")
-        find = fixture["bin_dir"] / "find"
-        find.write_text(
-            "#!/bin/sh\n"
-            "case \" $* \" in *' -print0 '*) exit 9 ;; esac\n"
-            f"exec {real_find} \"$@\"\n",
-            encoding="utf-8",
-        )
-        find.chmod(0o700)
-        result, facts = self.facts_for(
-            fixture, "--target-dir", str(fixture["target"]), "--strict"
-        )
+        result, facts = self.run_parser_with_injected_error(fixture, "walk")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertNotEqual(facts["provenance.core_depinfo_missing_sources"], "0")
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "unknown")
         self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
 
     def test_comparison_failure_cannot_be_accepted_as_success(self):
         fixture = self.fixture()
-        real_awk = shutil.which("awk")
-        if real_awk is None:
-            self.skipTest("awk is unavailable")
-        awk = fixture["bin_dir"] / "awk"
-        awk.write_text(
-            "#!/bin/sh\n"
-            "case \"$*\" in *records*) exit 8 ;; esac\n"
-            f"exec {real_awk} \"$@\"\n",
-            encoding="utf-8",
-        )
-        awk.chmod(0o700)
+        result, facts = self.run_parser_with_injected_error(fixture, "compare")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "unknown")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+
+    def test_non_numeric_comparison_output_cannot_be_accepted(self):
+        fixture = self.fixture()
+        python = fixture["bin_dir"] / "python3"
+        python.write_text("#!/bin/sh\nprintf 'not-a-count\\t0\\tlib.rs\\n'\n", encoding="utf-8")
+        python.chmod(0o700)
         result, facts = self.facts_for(
             fixture, "--target-dir", str(fixture["target"]), "--strict"
         )
@@ -245,25 +249,35 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertNotEqual(facts["provenance.core_depinfo_missing_sources"], "0")
         self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
 
-    def test_non_numeric_comparison_output_cannot_be_accepted(self):
-        fixture = self.fixture()
-        real_awk = shutil.which("awk")
-        if real_awk is None:
-            self.skipTest("awk is unavailable")
-        awk = fixture["bin_dir"] / "awk"
-        awk.write_text(
-            "#!/bin/sh\n"
-            "case \"$*\" in *records*) printf 'not-a-count\\n'; exit 0 ;; esac\n"
-            f"exec {real_awk} \"$@\"\n",
+    def run_parser_with_injected_error(self, fixture, boundary):
+        driver = (
+            "import importlib.util, os, sys\n"
+            "from unittest import mock\n"
+            "spec = importlib.util.spec_from_file_location('parser', sys.argv[1])\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "sys.argv = [sys.argv[1], *sys.argv[2:]]\n"
+            "if os.environ['CARGO_PROVENANCE_INJECT'] == 'walk':\n"
+            "    patch = mock.patch.object(module.os, 'walk', side_effect=OSError('controlled walk failure'))\n"
+            "else:\n"
+            "    patch = mock.patch.object(module, 'source_dependencies', side_effect=OSError('controlled comparison failure'))\n"
+            "with patch:\n"
+            "    raise SystemExit(module.main())\n"
+        )
+        python = fixture["bin_dir"] / "python3"
+        python.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(driver)} \"$@\"\n",
             encoding="utf-8",
         )
-        awk.chmod(0o700)
+        python.chmod(0o700)
         result, facts = self.facts_for(
-            fixture, "--target-dir", str(fixture["target"]), "--strict"
+            fixture,
+            "--target-dir",
+            str(fixture["target"]),
+            "--strict",
+            env_extra={"CARGO_PROVENANCE_INJECT": boundary},
         )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertNotEqual(facts["provenance.core_depinfo_missing_sources"], "0")
-        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+        return result, facts
 
     def test_relative_cargo_depinfo_with_all_checkout_sources_is_ok(self):
         fixture = self.fixture()

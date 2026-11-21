@@ -17,11 +17,11 @@ class UnsupportedDepInfo(Exception):
 
 
 def physical_identity(path: str) -> str:
-    """Resolve the parent physically, preserving the final filename bytes."""
+    """Resolve every existing parent component, preserving the final name."""
     parent, name = os.path.split(path)
     if not name or any(char.isspace() for char in path) or "\\" in path:
         raise UnsupportedDepInfo("unsupported source path")
-    return os.path.join(os.path.realpath(parent or "."), name)
+    return os.path.join(os.path.realpath(parent or ".", strict=True), name)
 
 
 def source_paths(root: str) -> set[str]:
