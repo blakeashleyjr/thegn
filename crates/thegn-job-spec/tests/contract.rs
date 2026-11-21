@@ -1,7 +1,70 @@
-use thegn_job_spec::{Feature, JobSpec, RetryLimit, byte_quantity, duration_ms};
+use thegn_cas::Digest;
+use thegn_job_spec::{
+    Feature, JobSpec, Recipe, RetryLimit, RunnerDirectory, RunnerRefusal, SelectedJobResult,
+    SelectedRunner, byte_quantity, duration_ms, submit_selected,
+};
 
 const EXAMPLE: &str = include_str!("fixtures/web-e2e.yaml");
 const MINIMAL: &str = "apiVersion: thegn.dev/jobs/v0\nkind: Job\nmetadata: {name: build}\nenvironment: {image: ci}\nsteps: [{name: build, argv: [cargo, build]}]\n";
+const SELECTED: &str = include_str!("fixtures/selected-cargo-test.yaml");
+
+struct FixtureRunner;
+impl SelectedRunner for FixtureRunner {
+    fn submit(
+        &self,
+        runner_alias: &str,
+        recipe: Recipe,
+        source: &Digest,
+    ) -> Result<SelectedJobResult, RunnerRefusal> {
+        assert_eq!(runner_alias, "fixture-linux");
+        assert_eq!(recipe.argv(), ["cargo", "test"]);
+        Ok(SelectedJobResult {
+            runner: runner_alias.to_owned(),
+            recipe,
+            source: source.clone(),
+            exit_code: Some(0),
+            log_tail: "fixture passed".into(),
+        })
+    }
+}
+
+struct FixtureDirectory;
+impl RunnerDirectory for FixtureDirectory {
+    fn resolve(&self, alias: &str) -> Option<&dyn SelectedRunner> {
+        (alias == "fixture-linux").then_some(&FixtureRunner)
+    }
+}
+
+#[test]
+fn typed_selected_recipe_routes_only_to_owner_named_fixture_runner() {
+    let spec = JobSpec::parse_yaml(SELECTED).unwrap();
+    let source = Digest::of(b"");
+    let result = submit_selected(&spec, &source, &FixtureDirectory).unwrap();
+    assert_eq!(result.runner, "fixture-linux");
+    assert_eq!(result.recipe, Recipe::CargoTest);
+    assert_eq!(result.source, source);
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.log_tail, "fixture passed");
+}
+
+#[test]
+fn typed_selected_recipe_refuses_source_mismatch_and_missing_runner_without_fallback() {
+    let spec = JobSpec::parse_yaml(SELECTED).unwrap();
+    assert!(matches!(
+        submit_selected(&spec, &Digest::of(b"changed"), &FixtureDirectory),
+        Err(RunnerRefusal::SourceMismatch { .. })
+    ));
+    struct Empty;
+    impl RunnerDirectory for Empty {
+        fn resolve(&self, _: &str) -> Option<&dyn SelectedRunner> {
+            None
+        }
+    }
+    assert_eq!(
+        submit_selected(&spec, &Digest::of(b""), &Empty),
+        Err(RunnerRefusal::RunnerUnavailable("fixture-linux".into()))
+    );
+}
 
 #[test]
 fn portable_example_requires_one_offering_to_support_every_feature() {
@@ -100,7 +163,11 @@ fn schemas_and_a_terminal_result_are_available_without_a_daemon() {
         input["definitions"]["Digest"]["properties"]["hash"]["pattern"],
         "^[0-9a-f]{64}$"
     );
-    assert_eq!(input["properties"]["steps"]["minItems"], 1);
+    assert!(input["properties"]["steps"]["minItems"].is_null());
+    assert_eq!(
+        input["definitions"]["Recipe"]["enum"],
+        serde_json::json!(["cargo-build", "cargo-test"])
+    );
     let output = serde_json::to_value(result_schema()).unwrap();
     assert!(output["properties"]["artifacts"].is_object());
     let published_job: serde_json::Value =

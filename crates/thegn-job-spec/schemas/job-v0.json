@@ -6,8 +6,7 @@
     "apiVersion",
     "environment",
     "kind",
-    "metadata",
-    "steps"
+    "metadata"
   ],
   "properties": {
     "apiVersion": {
@@ -66,6 +65,13 @@
         }
       ]
     },
+    "recipe": {
+      "default": null,
+      "anyOf": [
+        { "$ref": "#/definitions/Recipe" },
+        { "type": "null" }
+      ]
+    },
     "resources": {
       "default": {
         "arch": "any",
@@ -107,6 +113,10 @@
         }
       ]
     },
+    "runner": {
+      "default": null,
+      "type": ["string", "null"]
+    },
     "secrets": {
       "default": [],
       "type": "array",
@@ -139,11 +149,11 @@
       ]
     },
     "steps": {
+      "default": [],
       "type": "array",
       "items": {
         "$ref": "#/definitions/Step"
-      },
-      "minItems": 1
+      }
     },
     "timeout": {
       "default": "60m",
@@ -433,6 +443,10 @@
         }
       },
       "additionalProperties": false
+    },
+    "Recipe": {
+      "type": "string",
+      "enum": ["cargo-build", "cargo-test"]
     },
     "Retry": {
       "type": "object",

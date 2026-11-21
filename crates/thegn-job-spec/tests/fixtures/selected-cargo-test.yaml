@@ -1,0 +1,9 @@
+apiVersion: thegn.dev/jobs/v0
+kind: Job
+metadata: {name: selected-cargo-test}
+runner: fixture-linux
+recipe: cargo-test
+source:
+  snapshot: {hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855, sizeBytes: 0}
+environment: {image: ghcr.io/acme/rust-ci:stable}
+steps: []

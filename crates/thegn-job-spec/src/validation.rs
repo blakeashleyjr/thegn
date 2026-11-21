@@ -18,6 +18,28 @@ impl JobSpec {
             !self.metadata.name.trim().is_empty(),
             "metadata.name is empty"
         );
+        if self.recipe.is_some() {
+            ensure!(
+                self.runner
+                    .as_ref()
+                    .is_some_and(|runner| valid_runner_alias(runner)),
+                "typed recipe requires a valid explicitly selected runner"
+            );
+            ensure!(
+                self.steps.is_empty(),
+                "typed recipes cannot be combined with command steps"
+            );
+            ensure!(
+                matches!(&self.source.snapshot, crate::Snapshot::Pinned(_)),
+                "typed recipe requires a pinned source digest"
+            );
+        } else {
+            ensure!(
+                self.runner.is_none(),
+                "runner selection requires a typed recipe"
+            );
+            ensure!(!self.steps.is_empty(), "steps must contain a command");
+        }
         match &self.environment {
             Environment::Image { image } => {
                 ensure!(!image.trim().is_empty(), "environment.image is empty")
@@ -37,7 +59,6 @@ impl JobSpec {
             }
         }
         duration_ms(&self.timeout).context("timeout")?;
-        ensure!(!self.steps.is_empty(), "steps must contain a command");
         for (i, step) in self.steps.iter().enumerate() {
             ensure!(!step.name.trim().is_empty(), "steps[{i}].name is empty");
             let valid = match (&step.run, &step.argv) {
@@ -171,6 +192,16 @@ fn valid_env_name(s: &str) -> bool {
         .next()
         .is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
         && s.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
+}
+
+fn valid_runner_alias(runner: &str) -> bool {
+    !runner.is_empty()
+        && runner.len() <= 128
+        && runner
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && runner.as_bytes()[0].is_ascii_alphanumeric()
+        && runner.as_bytes()[runner.len() - 1].is_ascii_alphanumeric()
 }
 
 fn check_env(env: &Env) -> Result<()> {

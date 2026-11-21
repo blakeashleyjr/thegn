@@ -11,6 +11,8 @@ use thegn_cas::Digest;
 
 pub mod result;
 pub use result::JobResult;
+pub mod selected;
+pub use selected::{RunnerDirectory, RunnerRefusal, SelectedJobResult, submit_selected};
 mod validation;
 pub use validation::{byte_quantity, duration_ms};
 
@@ -22,6 +24,13 @@ pub struct JobSpec {
     pub api_version: Version,
     pub kind: Kind,
     pub metadata: Metadata,
+    /// Explicit owner-selected runner alias. Used only by typed recipes; it is
+    /// independent of the worktree's interactive placement.
+    #[serde(default)]
+    pub runner: Option<String>,
+    /// A small, closed set of build/test operations with fixed argv.
+    #[serde(default)]
+    pub recipe: Option<Recipe>,
     #[serde(default)]
     pub source: Source,
     pub environment: Environment,
@@ -38,7 +47,7 @@ pub struct JobSpec {
     pub env: Env,
     #[serde(default)]
     pub secrets: Vec<String>,
-    #[schemars(length(min = 1))]
+    #[serde(default)]
     pub steps: Vec<Step>,
     #[serde(default = "one")]
     pub shards: NonZeroU32,
@@ -50,6 +59,25 @@ pub struct JobSpec {
     pub retry: Retry,
     #[serde(default = "default_timeout")]
     pub timeout: String,
+}
+
+/// Build/test commands admitted for explicit project-runner dispatch. These
+/// values never contain command text or shell fragments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum Recipe {
+    CargoBuild,
+    CargoTest,
+}
+
+impl Recipe {
+    /// Fixed argument vector for the allowlisted operation.
+    pub fn argv(self) -> &'static [&'static str] {
+        match self {
+            Self::CargoBuild => &["cargo", "build"],
+            Self::CargoTest => &["cargo", "test"],
+        }
+    }
 }
 
 /// Structural JSON Schemas. Validate cross-field constraints with JobSpec::validate.
