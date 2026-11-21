@@ -69,7 +69,7 @@ else
 fi
 
 checkout_resolved=1
-if checkout_abs=$(CDPATH= cd -P "$checkout" >/dev/null 2>&1 && pwd -P && printf '\001'); then
+if checkout_abs=$(CDPATH='' cd -P "$checkout" >/dev/null 2>&1 && pwd -P && printf '\001'); then
   checkout_abs=${checkout_abs%$'\001'}
   checkout_abs=${checkout_abs%$'\n'}
   checkout=$checkout_abs
