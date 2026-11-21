@@ -2254,7 +2254,9 @@ fn pinned_directory_entries(
     let mut entries = Vec::new();
     loop {
         match stream.next_name() {
-            Ok(Some(name)) if name != std::ffi::OsStr::new(".") && name != std::ffi::OsStr::new("..") => {
+            Ok(Some(name))
+                if name != std::ffi::OsStr::new(".") && name != std::ffi::OsStr::new("..") =>
+            {
                 entries.push(Ok(name));
             }
             Ok(Some(_)) => {}
