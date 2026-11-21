@@ -147,6 +147,9 @@ done
 # would let the socket probe cross-connect these checks to a live daemon.
 export XDG_RUNTIME_DIR="$SMOKE_RUNTIME_DIR"
 mkdir -p "$XDG_RUNTIME_DIR"
+# Match the native/CI headless isolation seam: a contained MCP upstream must
+# not discover or depend on the caller's session bus.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus"
 # Isolate the `[database]` migration policy. These are ambient in any shell
 # started from inside a live thegn (it exports the pin so a stale binary can
 # never migrate the user's real state DB), and inheriting them here pinned
