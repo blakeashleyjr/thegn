@@ -2240,7 +2240,7 @@ fn nix_io_error(error: nix::errno::Errno) -> std::io::Error {
 fn pinned_directory_entries(
     directory: &impl std::os::fd::AsFd,
 ) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>> {
-    use nix::fcntl::{openat, OFlag};
+    use nix::fcntl::{OFlag, openat};
     use nix::sys::stat::Mode;
 
     let fd = openat(
@@ -2254,10 +2254,7 @@ fn pinned_directory_entries(
     let mut entries = Vec::new();
     loop {
         match stream.next_name() {
-            Ok(Some(name))
-                if name != std::ffi::OsStr::new(".")
-                    && name != std::ffi::OsStr::new("..") =>
-            {
+            Ok(Some(name)) if name != std::ffi::OsStr::new(".") && name != std::ffi::OsStr::new("..") => {
                 entries.push(Ok(name));
             }
             Ok(Some(_)) => {}
@@ -2314,9 +2311,7 @@ impl OwnedDirectoryStream {
         // SAFETY: `readdir` returned a live `dirent`, whose `d_name` is a
         // NUL-terminated byte string for the lifetime documented above.
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        Ok(Some(std::ffi::OsString::from_vec(
-            name.to_bytes().to_vec(),
-        )))
+        Ok(Some(std::ffi::OsString::from_vec(name.to_bytes().to_vec())))
     }
 }
 
