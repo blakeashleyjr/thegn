@@ -1265,15 +1265,15 @@ impl PrivateDir {
     /// iteration errors are returned to the caller.
     pub fn file_names(&self) -> std::io::Result<Vec<std::ffi::OsString>> {
         #[cfg(unix)]
-        let entries = pinned_directory_entries(&self.fd)?;
+        {
+            pinned_directory_entries(&self.fd)?.into_iter().collect()
+        }
         #[cfg(not(unix))]
-        let entries = std::fs::read_dir(&self.path)?;
-        #[cfg(unix)]
-        return entries.into_iter().collect();
-        #[cfg(not(unix))]
-        entries
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect()
+        {
+            std::fs::read_dir(&self.path)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect()
+        }
     }
 
     /// Sync directory metadata through the held handle.
@@ -2237,15 +2237,17 @@ fn nix_io_error(error: nix::errno::Errno) -> std::io::Error {
 /// boundary (which is not a directory on Darwin).
 #[cfg(unix)]
 fn pinned_directory_entries(
-    directory: &impl std::os::fd::AsRawFd,
+    directory: &impl std::os::fd::AsFd,
 ) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>> {
     use nix::dir::Dir;
     use nix::fcntl::OFlag;
     use nix::sys::stat::Mode;
+    use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStringExt;
 
+    let dirfd = directory.as_fd();
     let mut stream = Dir::openat(
-        directory.as_raw_fd(),
+        dirfd,
         ".",
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
@@ -3406,7 +3408,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_directory_listings_have_independent_positions() {
+    fn pinned_directory_listings_start_at_independent_positions() {
         let root = tempfile::tempdir().unwrap();
         let private = root.path().join("private");
         ensure_private_dir(&private).unwrap();
@@ -3418,7 +3420,13 @@ mod tests {
         let mut second = pinned.file_names().unwrap();
         first.sort();
         second.sort();
-        assert_eq!(first, ["first".into(), "second".into()]);
+        assert_eq!(
+            first,
+            vec![
+                std::ffi::OsString::from("first"),
+                std::ffi::OsString::from("second"),
+            ]
+        );
         assert_eq!(second, first);
     }
 

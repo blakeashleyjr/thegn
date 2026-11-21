@@ -668,6 +668,13 @@
       "changes": [
         "repair-native-host-sampler-startup"
       ]
+    },
+    {
+      "issue": "THE-2583",
+      "project": "Sandbox & Remote 05: macOS",
+      "changes": [
+        "restore-darwin-pinned-directory-listing"
+      ]
     }
   ]
 }

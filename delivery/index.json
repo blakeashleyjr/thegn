@@ -1427,6 +1427,18 @@
       "summary": "Resolve checkout Git identity and keep unchanged linked builds fresh."
     },
     {
+      "change": "restore-darwin-pinned-directory-listing",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2583",
+          "project": "Sandbox & Remote 05: macOS"
+        }
+      ],
+      "summary": "Restore descriptor-relative pinned directory listings for managed-home rollback on Darwin; strict native and ARM proof remains pending."
+    },
+    {
       "change": "resurrect-model-proxy",
       "archive_path": "openspec/changes/archive/2026-11-16-resurrect-model-proxy/",
       "lifecycle": "archived",
