@@ -744,7 +744,6 @@ mod tests {
     #[test]
     fn reminder_delivery_default_route_records_one_row_and_rings_once() {
         use std::collections::BTreeMap;
-        use termwiz::terminal::Terminal;
         use thegn_core::calendar::DueReminder;
         use thegn_core::store::NotificationStore;
 
@@ -835,7 +834,6 @@ mod tests {
     #[test]
     fn reminder_delivery_route_without_inbox_rings_once_and_writes_no_row() {
         use std::collections::BTreeMap;
-        use termwiz::terminal::Terminal;
         use thegn_core::calendar::DueReminder;
         use thegn_core::config::NotificationRule;
         use thegn_core::store::NotificationStore;
@@ -924,7 +922,6 @@ mod tests {
     #[test]
     fn reminder_delivery_drop_rule_consumes_the_claim_and_delivers_nothing() {
         use std::collections::BTreeMap;
-        use termwiz::terminal::Terminal;
         use thegn_core::calendar::DueReminder;
         use thegn_core::config::NotificationRule;
         use thegn_core::store::NotificationStore;

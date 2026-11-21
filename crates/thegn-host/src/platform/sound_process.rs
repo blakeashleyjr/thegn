@@ -385,6 +385,8 @@ pub(crate) mod test_support {
     struct PtyDrainer {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        successful_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        reader_exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
         reader: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -404,7 +406,13 @@ pub(crate) mod test_support {
     }
 
     #[cfg(target_os = "macos")]
-    fn keep_master_drained(master: std::fs::File) -> PtyDrainer {
+    fn keep_master_drained(
+        master: std::fs::File,
+        #[cfg(test)] first_read_barriers: Option<(
+            std::sync::Arc<std::sync::Barrier>,
+            std::sync::Arc<std::sync::Barrier>,
+        )>,
+    ) -> PtyDrainer {
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::sync::{
@@ -429,20 +437,39 @@ pub(crate) mod test_support {
         let reader_stop = stop.clone();
         let idle = Arc::new(AtomicBool::new(false));
         let reader_idle = idle.clone();
+        let successful_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader_successful_reads = successful_reads.clone();
+        let reader_exited = Arc::new(AtomicBool::new(false));
+        let reader_reader_exited = reader_exited.clone();
         let reader = std::thread::Builder::new()
             .name("thegn-test-pty-drain".into())
             .spawn(move || {
                 let mut master = master;
                 let mut bytes = [0_u8; 4096];
+                #[cfg(test)]
+                let mut pause_after_first_read = first_read_barriers;
+                let _reader_exit = ReaderExit(&reader_reader_exited);
                 loop {
                     if reader_stop.load(Ordering::Acquire) {
                         return;
                     }
                     loop {
+                        // A successful read can keep this inner loop busy
+                        // forever under continuous PTY output. Observe stop
+                        // before every read, not only after reaching EAGAIN.
+                        if reader_stop.load(Ordering::Acquire) {
+                            return;
+                        }
                         match master.read(&mut bytes) {
                             Ok(0) => return,
                             Ok(_) => {
+                                reader_successful_reads.fetch_add(1, Ordering::AcqRel);
                                 reader_idle.store(false, Ordering::Release);
+                                #[cfg(test)]
+                                if let Some((entered, resume)) = pause_after_first_read.take() {
+                                    entered.wait();
+                                    resume.wait();
+                                }
                                 continue;
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
@@ -493,7 +520,19 @@ pub(crate) mod test_support {
         PtyDrainer {
             stop,
             idle,
+            successful_reads,
+            reader_exited,
             reader: Some(reader),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct ReaderExit<'a>(&'a std::sync::atomic::AtomicBool);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ReaderExit<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -526,7 +565,7 @@ pub(crate) mod test_support {
             let _slave = unsafe { std::fs::File::from_raw_fd(slave) };
             // SAFETY: openpty returned a fresh master descriptor transferred
             // to the reader thread by keep_master_drained.
-            let drainer = keep_master_drained(unsafe { std::fs::File::from_raw_fd(master) });
+            let drainer = keep_master_drained(unsafe { std::fs::File::from_raw_fd(master) }, None);
 
             let ready_by = Instant::now() + Duration::from_secs(1);
             while !drainer.idle.load(Ordering::Acquire) {
@@ -534,12 +573,84 @@ pub(crate) mod test_support {
                 std::thread::yield_now();
             }
 
-            let started = Instant::now();
-            drop(drainer);
-            assert!(
-                started.elapsed() < Duration::from_secs(1),
-                "PTY reader did not stop after its bounded poll interval"
+            let reader_exited = drainer.reader_exited.clone();
+            let (drop_returned_tx, drop_returned_rx) = std::sync::mpsc::channel();
+            let teardown = std::thread::spawn(move || {
+                drop(drainer);
+                drop_returned_tx
+                    .send(reader_exited.load(Ordering::Acquire))
+                    .unwrap();
+            });
+            assert_eq!(
+                drop_returned_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(true),
+                "PTY drainer drop must return only after its reader exits"
             );
+            teardown.join().unwrap();
+        }
+
+        #[test]
+        fn pty_drainer_observes_stop_during_continuous_reads() {
+            use std::io::Write;
+
+            let mut master = -1;
+            let mut slave = -1;
+            assert_eq!(
+                // SAFETY: out-pointers are valid; null optional attributes are allowed.
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            // Keep a real PTY slave open and writable throughout teardown.
+            // SAFETY: openpty returned fresh descriptors owned here.
+            let mut slave = unsafe { std::fs::File::from_raw_fd(slave) };
+            let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+            // SAFETY: the master descriptor is transferred to the reader.
+            let drainer = keep_master_drained(
+                unsafe { std::fs::File::from_raw_fd(master) },
+                Some((entered.clone(), resume.clone())),
+            );
+
+            // Gate the reader after its first real PTY read. Queue another
+            // byte before releasing it, so the next read succeeds regardless
+            // of OS thread scheduling once stop is set.
+            slave.write_all(b"first").unwrap();
+            entered.wait();
+            slave.write_all(b"still-readable").unwrap();
+            let reads_before_stop = drainer.successful_reads.load(Ordering::Acquire);
+            assert_eq!(reads_before_stop, 1);
+
+            let reader_exited = drainer.reader_exited.clone();
+            let successful_reads = drainer.successful_reads.clone();
+            // Set stop while the reader is paused after its first successful
+            // read, then let it resume with more PTY data already queued.
+            drainer.stop.store(true, Ordering::Release);
+            resume.wait();
+            let (drop_returned_tx, drop_returned_rx) = std::sync::mpsc::channel();
+            let teardown = std::thread::spawn(move || {
+                drop(drainer);
+                drop_returned_tx
+                    .send((
+                        reader_exited.load(Ordering::Acquire),
+                        successful_reads.load(Ordering::Acquire),
+                    ))
+                    .unwrap();
+            });
+            let result = drop_returned_rx.recv_timeout(Duration::from_secs(1));
+            assert_eq!(
+                result,
+                Ok((true, reads_before_stop)),
+                "drop must join the reader before returning, without another read"
+            );
+            teardown.join().unwrap();
         }
     }
 
@@ -574,7 +685,7 @@ pub(crate) mod test_support {
         #[cfg(target_os = "macos")]
         let fixture = TestPtyFixture {
             terminal: Some(terminal),
-            drainer: Some(keep_master_drained(master)),
+            drainer: Some(keep_master_drained(master, None)),
         };
         #[cfg(all(unix, not(target_os = "macos")))]
         let fixture = TestPtyFixture {
