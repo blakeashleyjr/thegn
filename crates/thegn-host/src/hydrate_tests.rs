@@ -1535,6 +1535,13 @@ fn remote_placement_worktrees_survive_missing_local_dir() {
         },
     );
     cfg.env.insert(
+        "kube".into(),
+        EnvConfig {
+            placement: PlacementMode::K8s,
+            ..Default::default()
+        },
+    );
+    cfg.env.insert(
         "host".into(),
         EnvConfig {
             placement: PlacementMode::Local,
@@ -1548,6 +1555,7 @@ fn remote_placement_worktrees_survive_missing_local_dir() {
     // (`ageless`) + provider (`machine0`) worktrees vanished on create.
     assert!(row_is_remote("", Some("ageless"), &cfg));
     assert!(row_is_remote("", Some("machine0"), &cfg));
+    assert!(row_is_remote("", Some("kube"), &cfg));
 
     // A local env whose dir is gone IS reapable; so is an unknown/absent env.
     assert!(!row_is_remote("", Some("host"), &cfg));
@@ -1557,6 +1565,78 @@ fn remote_placement_worktrees_survive_missing_local_dir() {
     // A persisted location always wins, regardless of placement.
     assert!(row_is_remote("{\"path\":\"/x\"}", Some("host"), &cfg));
     assert!(row_is_remote("{\"path\":\"/x\"}", None, &cfg));
+}
+
+#[test]
+fn db_worktree_list_keeps_missing_ssh_and_kubernetes_rows_but_reaps_exact_local_pin() {
+    use thegn_core::config::{Config, EnvConfig, PlacementMode};
+    use thegn_core::store::WorkspaceStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _) = git_repo_with_linked_worktree(
+        &dir.path().join("repo"),
+        &dir.path().join("unused-linked-worktree"),
+    );
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    let ssh = dir.path().join("remote-ssh").to_string_lossy().into_owned();
+    let kubernetes = dir
+        .path()
+        .join("remote-kubernetes")
+        .to_string_lossy()
+        .into_owned();
+    let dormant_local = dir
+        .path()
+        .join("dormant-local")
+        .to_string_lossy()
+        .into_owned();
+    for (tab, path, env) in [
+        ("repo/ssh", ssh.as_str(), "ssh"),
+        ("repo/kubernetes", kubernetes.as_str(), "kubernetes"),
+        ("repo/dormant", dormant_local.as_str(), "local"),
+    ] {
+        db.put_worktree(tab, &root, path, tab, None, None).unwrap();
+        db.set_worktree_env(path, env).unwrap();
+    }
+
+    let mut cfg = Config::default();
+    cfg.env.insert(
+        "ssh".into(),
+        EnvConfig {
+            placement: PlacementMode::Ssh,
+            ..Default::default()
+        },
+    );
+    cfg.env.insert(
+        "kubernetes".into(),
+        EnvConfig {
+            placement: PlacementMode::K8s,
+            ..Default::default()
+        },
+    );
+    cfg.env.insert(
+        "local".into(),
+        EnvConfig {
+            placement: PlacementMode::Local,
+            ..Default::default()
+        },
+    );
+
+    // All three paths are absent and Git never listed them. The exact row
+    // placement keeps SSH/Kubernetes rows visible; the explicitly local pin
+    // remains eligible for dormant-local cleanup even beside remote envs.
+    assert!(!std::path::Path::new(&ssh).exists());
+    assert!(!std::path::Path::new(&kubernetes).exists());
+    assert!(!std::path::Path::new(&dormant_local).exists());
+    let listed = db_worktree_list(&db, &cfg);
+    let mut listed_paths: Vec<_> = listed.iter().map(|row| row.path.as_str()).collect();
+    listed_paths.sort_unstable();
+    let mut expected_paths = vec![ssh.as_str(), kubernetes.as_str()];
+    expected_paths.sort_unstable();
+    assert_eq!(listed_paths, expected_paths);
+    let rows = db.worktrees().unwrap();
+    assert!(rows.iter().any(|row| row.worktree == ssh));
+    assert!(rows.iter().any(|row| row.worktree == kubernetes));
+    assert!(!rows.iter().any(|row| row.worktree == dormant_local));
 }
 
 #[test]
