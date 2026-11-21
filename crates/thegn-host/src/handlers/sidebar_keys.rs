@@ -2082,15 +2082,17 @@ mod tests {
             ],
             ..Default::default()
         };
-        let mut sb = SidebarState::default();
-        sb.cursor = model
-            .sidebar_rows
-            .iter()
-            .filter(|row| row.visible)
-            .position(|row| {
-                row.kind == RowKind::PipelineWorktree && row.pin_key == "app/app-pipeline"
-            })
-            .expect("pipeline leaf is visible");
+        let sb = SidebarState {
+            cursor: model
+                .sidebar_rows
+                .iter()
+                .filter(|row| row.visible)
+                .position(|row| {
+                    row.kind == RowKind::PipelineWorktree && row.pin_key == "app/app-pipeline"
+                })
+                .expect("pipeline leaf is visible"),
+            ..SidebarState::default()
+        };
         assert_eq!(
             sb.selected_row(&model).map(|row| row.pin_key.as_str()),
             Some("app/app-pipeline")

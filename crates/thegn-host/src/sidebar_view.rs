@@ -5355,12 +5355,12 @@ mod tests {
         };
 
         assert!(
-            text.contains(&crate::caps::active_glyphs().dot_filled),
+            text.contains(crate::caps::active_glyphs().dot_filled),
             "{text:?}"
         );
         assert!(text.contains('f'), "{text:?}");
         assert!(
-            !text.contains(&crate::caps::active_glyphs().box_h),
+            !text.contains(crate::caps::active_glyphs().box_h),
             "{text:?}"
         );
     }
