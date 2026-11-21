@@ -180,6 +180,25 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "0")
         self.assertEqual(facts["provenance.verdict"], "ok")
 
+    def test_final_file_symlink_from_foreign_path_is_refused(self):
+        fixture = self.fixture()
+        foreign_src = fixture["checkout"].parent / "foreign" / "crates" / "thegn-core" / "src"
+        foreign_src.mkdir(parents=True)
+        foreign_lib = foreign_src / "lib.rs"
+        foreign_lib.symlink_to(fixture["checkout"] / "crates/thegn-core/src/lib.rs")
+        source = fixture["checkout"] / "crates/thegn-core/src/a.rs"
+        depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+        depinfo.write_text(
+            f"{foreign_lib}: {foreign_lib} {source}\n", encoding="utf-8"
+        )
+
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+        self.assertEqual(facts["provenance.verdict"], "foreign-depinfo")
+
     def test_missing_component_before_parent_traversal_is_refused(self):
         fixture = self.fixture()
         depinfo = fixture["deps"] / "thegn_core-aaaa.d"

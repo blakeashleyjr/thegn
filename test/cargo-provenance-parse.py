@@ -20,13 +20,15 @@ def validated_source_identity(path: str) -> str:
     """Validate the original path before resolving aliases to a physical file."""
     if not path or any(char.isspace() for char in path) or "\\" in path:
         raise UnsupportedDepInfo("unsupported source path")
-    # Check the exact spelling first. realpath can simplify an existing but
-    # unsearchable (or non-directory) component before `..` without asking the
-    # kernel to traverse it, while stat must resolve the original pathname.
-    info = os.stat(path)
+    # Check the exact spelling first. lstat follows every parent component but
+    # leaves the final entry intact, so a final-file symlink cannot borrow its
+    # target's identity. realpath can simplify an existing but unsearchable
+    # (or non-directory) component before `..` without kernel traversal.
+    info = os.lstat(path)
     if not stat.S_ISREG(info.st_mode):
         raise UnsupportedDepInfo("source path is not a regular file")
-    return os.path.realpath(path, strict=True)
+    parent = os.path.realpath(os.path.dirname(path) or ".", strict=True)
+    return os.path.join(parent, os.path.basename(path))
 
 
 def source_paths(root: str) -> set[str]:
