@@ -1,4 +1,4 @@
-## Added Requirements
+## ADDED Requirements
 
 ### Requirement: Pinned directory listings use descriptor-relative streams
 
@@ -8,6 +8,10 @@ without resolving a replacement path or following a symlink. Every listing
 SHALL have an independent read position. Other Unix platforms SHALL preserve
 the same pinned-directory behavior, and non-Unix listing behavior SHALL remain
 path-based.
+
+If reading a directory stream fails, enumeration SHALL stop at the first read
+error. Strict name listings SHALL return that error, while best-effort stale
+cleanup SHALL retain and process names successfully read before the error.
 
 #### Scenario: Managed-home rollback can list the newly created home
 
@@ -21,3 +25,10 @@ path-based.
 - **WHEN** a pinned directory is listed more than once
 - **THEN** each listing returns the current entries, even when the earlier
   listing consumed its stream
+
+#### Scenario: A directory stream read fails
+
+- **WHEN** reading a pinned directory stream fails after returning one or more
+  entry names
+- **THEN** strict name listing returns the read error, and best-effort stale
+  cleanup processes the names already returned before stopping enumeration

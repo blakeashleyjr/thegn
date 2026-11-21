@@ -1,4 +1,6 @@
 - [x] Replace `/dev/fd` listings with a shared descriptor-relative stream helper.
 - [x] Preserve independent listing positions and non-Unix behavior.
 - [x] Add focused repeated-listing coverage.
+- [x] Normalize cleanup entry names and preserve prior names on the first stream-read error.
+- [x] Keep fresh descriptor ownership through `fdopendir` failure.
 - [x] Record native proof still required from the coordinator.

@@ -1302,7 +1302,8 @@ impl PrivateDir {
         #[cfg(unix)]
         let entries = pinned_directory_entries(&self.fd).map(|names| names.into_iter());
         #[cfg(not(unix))]
-        let entries = std::fs::read_dir(&self.path);
+        let entries = std::fs::read_dir(&self.path)
+            .map(|entries| entries.map(|entry| entry.map(|entry| entry.file_name())));
         let entries = match entries {
             Ok(entries) => entries,
             Err(error) => {
@@ -1313,7 +1314,7 @@ impl PrivateDir {
         let mut removed = 0;
         for entry in entries {
             let name = match entry {
-                Ok(entry) => entry.file_name(),
+                Ok(name) => name,
                 Err(error) => {
                     tracing::debug!(%error, "unable to read private directory entry name");
                     continue;
@@ -2239,34 +2240,96 @@ fn nix_io_error(error: nix::errno::Errno) -> std::io::Error {
 fn pinned_directory_entries(
     directory: &impl std::os::fd::AsFd,
 ) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>> {
-    use nix::dir::Dir;
-    use nix::fcntl::OFlag;
+    use nix::fcntl::{openat, OFlag};
     use nix::sys::stat::Mode;
-    use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStringExt;
 
-    let dirfd = directory.as_fd();
-    let mut stream = Dir::openat(
-        dirfd,
+    let fd = openat(
+        std::os::fd::AsFd::as_fd(directory),
         ".",
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
     .map_err(nix_io_error)?;
-    stream
-        .iter()
-        .filter_map(|entry| match entry {
-            Ok(entry) => {
-                let name = entry.file_name().to_bytes();
-                if name == b"." || name == b".." {
-                    None
-                } else {
-                    Some(Ok(Ok(std::ffi::OsString::from_vec(name.to_vec()))))
-                }
+    let mut stream = OwnedDirectoryStream::from_fd(fd)?;
+    let mut entries = Vec::new();
+    loop {
+        match stream.next_name() {
+            Ok(Some(name))
+                if name != std::ffi::OsStr::new(".")
+                    && name != std::ffi::OsStr::new("..") =>
+            {
+                entries.push(Ok(name));
             }
-            Err(error) => Some(Ok(Err(nix_io_error(error)))),
-        })
-        .collect()
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) => {
+                entries.push(Err(error));
+                break;
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// An owned `fdopendir` stream. The `OwnedFd` stays live until `fdopendir`
+/// succeeds, so a failed conversion closes it when the local value drops.
+#[cfg(unix)]
+struct OwnedDirectoryStream(std::ptr::NonNull<libc::DIR>);
+
+#[cfg(unix)]
+impl OwnedDirectoryStream {
+    fn from_fd(fd: std::os::fd::OwnedFd) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        // SAFETY: `fd` is an owned, open descriptor. POSIX `fdopendir` takes
+        // ownership only on success; on failure `fd` remains owned here and
+        // is closed by its `OwnedFd` drop.
+        let raw_stream = unsafe { libc::fdopendir(fd.as_raw_fd()) };
+        let Some(stream) = std::ptr::NonNull::new(raw_stream) else {
+            return Err(std::io::Error::last_os_error());
+        };
+        // `fdopendir` owns the descriptor now. Prevent `OwnedFd` from closing
+        // it; `closedir` below owns its eventual close.
+        let _ = fd.into_raw_fd();
+        Ok(Self(stream))
+    }
+
+    fn next_name(&mut self) -> std::io::Result<Option<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStringExt;
+
+        nix::errno::Errno::clear();
+        // SAFETY: the stream remains live for `self`; `readdir` returns either
+        // null or a pointer to an entry valid until the next call on this
+        // stream. The name is copied before that next call.
+        let entry = unsafe { libc::readdir(self.0.as_ptr()) };
+        if entry.is_null() {
+            let error = nix::errno::Errno::last_raw();
+            return if error == 0 {
+                Ok(None)
+            } else {
+                Err(nix_io_error(nix::errno::Errno::from_raw(error)))
+            };
+        }
+
+        // SAFETY: `readdir` returned a live `dirent`, whose `d_name` is a
+        // NUL-terminated byte string for the lifetime documented above.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        Ok(Some(std::ffi::OsString::from_vec(
+            name.to_bytes().to_vec(),
+        )))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the stream returned by
+        // `fdopendir`; it is closed exactly once here.
+        unsafe {
+            libc::closedir(self.0.as_ptr());
+        }
+    }
 }
 
 /// Owner and mode policy for a child opened by [`PrivateDir::open_child_nofollow`]:
@@ -3428,6 +3491,21 @@ mod tests {
             ]
         );
         assert_eq!(second, first);
+    }
+
+    #[test]
+    fn failed_directory_stream_conversion_closes_the_fresh_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let file = tempfile::tempfile().unwrap();
+        let fd: std::os::fd::OwnedFd = file.into();
+        let raw_fd = fd.as_raw_fd();
+
+        assert!(OwnedDirectoryStream::from_fd(fd).is_err());
+        assert_eq!(
+            nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFD),
+            Err(nix::errno::Errno::EBADF)
+        );
     }
 
     #[test]
