@@ -1381,8 +1381,7 @@ mod tests {
     }
 
     fn assert_stop_during_sampler_initialization(initially_parked: bool) {
-        let (source, entered, release, factories, samples) =
-            gated_sampler_source(initially_parked);
+        let (source, entered, release, factories, samples) = gated_sampler_source(initially_parked);
         if initially_parked {
             wait_for("initial park", || source.in_park.load(Ordering::Acquire));
             source.set_active(true);
@@ -1402,10 +1401,7 @@ mod tests {
                 .send(())
                 .expect("drop completion receiver should remain available");
         });
-        if drop_done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .is_err()
-        {
+        if drop_done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
             release.send(()).unwrap();
             drop_thread.join().unwrap();
             panic!("drop blocked while sampler factory was held");
