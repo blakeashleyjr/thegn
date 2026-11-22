@@ -7,11 +7,15 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0-alpha.118] — 2026-11-20
+## [0.1.0-alpha.118] — 2026-11-22
 
 ### Fixed
 
 - The documentation build passes again: doc links that could not be resolved are plain code text (THE-2389).
+
+### Security
+
+- `url` is updated to 2.5.9, which closes a stack overflow in `Url::origin()` on nested `blob:` URLs (RUSTSEC-2026-0592).
 
 ## [0.1.0-alpha.117] — 2026-11-20
 
