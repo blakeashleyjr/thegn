@@ -295,6 +295,9 @@ fn an_unresolved_ref_spawns_nothing() {
     assert_eq!(RUNS.load(Ordering::SeqCst), 1);
 }
 
+// Unix-only: probes the killed child with `libc::kill(pid, 0)`, and `libc` is a
+// unix-only dependency of this crate.
+#[cfg(unix)]
 #[test]
 fn a_timeout_kills_the_process_group() {
     let dir = tempfile::tempdir().unwrap();
