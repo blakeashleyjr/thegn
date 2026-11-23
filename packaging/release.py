@@ -31,7 +31,10 @@ PACKAGING_DIR = Path(__file__).resolve().parent
 REPOSITORY_ROOT = PACKAGING_DIR.parent
 MANIFEST_PATH = PACKAGING_DIR / "release.json"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
-TRUSTED_NAME_RE = re.compile(r"thegn[A-Za-z0-9._+-]*")
+# Release assets are either thegn-prefixed or the aggregate sums file, which is a
+# fixed name in `expected_release_assets` and is bound by the manifest like every
+# other asset.
+TRUSTED_NAME_RE = re.compile(r"(?:thegn[A-Za-z0-9._+-]*|SHA256SUMS)")
 TARGET_RE = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,}")
 PLACEHOLDER_RE = re.compile(r"@@([A-Z][A-Z0-9_]*)@@")
 RELEASE_TAG_RE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?")

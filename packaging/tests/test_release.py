@@ -699,6 +699,13 @@ class TrustedDigestTests(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, "cannot read trusted digests"):
                 release.load_trusted_digests([malformed])
 
+        with self.subTest(case="aggregate-sums"):
+            # SHA256SUMS is a fixed-name release asset (not thegn-prefixed), so the
+            # loader must accept it; without this the whole manifest step rejects
+            # the package job's digest set.
+            sums = self.write_digest_file("sums.json", {"SHA256SUMS": digest})
+            self.assertEqual(release.load_trusted_digests([sums]), {"SHA256SUMS": digest})
+
         with self.subTest(case="duplicate"):
             first = self.write_digest_file("first.json", {"thegn-a.tar.gz": digest})
             second = self.write_digest_file("second.json", {"thegn-a.tar.gz": digest})
