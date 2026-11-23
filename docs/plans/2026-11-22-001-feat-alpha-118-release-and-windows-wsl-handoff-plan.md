@@ -289,7 +289,12 @@ release a user could scan; `cargo metadata` version still `0.1.0-alpha.118`.
 
 ---
 
-- [ ] U4. **Local release rehearsal**
+- [x] U4. **Local release rehearsal**
+
+> `nix-build-full` green; `result/bin/thegn --version` reports the workspace
+> version. Rehearsed twice: `v0.1.0-alpha.118` (sha256 `afc0e238…`) and, after
+> the `.119` bump, `v0.1.0-alpha.119` (sha256 `56b9850f…`). Both passed
+> `release-verify host_only=1` with the expected store-interpreter warning.
 
 **Goal:** Prove the archive this host would ship is well-formed before a tag
 exists.
@@ -321,7 +326,16 @@ warning; archive contains `thegn`, `LICENSE-MIT`, `LICENSE-APACHE`,
 
 ---
 
-- [ ] U5. **Push `main`, tag, and publish the release**
+- [x] U5. **Push `main`, tag, and publish the release**
+
+> `main` pushed at `ea2d63c13` with tag `v0.1.0-alpha.118`; the admission gate
+> was approved and the run built and uploaded every asset, then failed at
+> `verify-manifest`: `release.py` rejected the package job's `SHA256SUMS`
+> digest because only `thegn*` names were allowed. `verify-manifest` checks out
+> the admitted commit and the .118 tag is immutable, so the fix could not
+> repair it in place: `29f0fc67e` widens the name rule (with a regression
+> test), bumps the workspace to `0.1.0-alpha.119`, and re-tags. `main` and
+> `v0.1.0-alpha.119` are pushed; the .118 draft stays unpublished.
 
 **Goal:** Turn the local tip into the public download Pritam can use.
 
@@ -382,7 +396,15 @@ musl asset and ran `thegn doctor` without a Nix store or this repo present.
 
 ---
 
-- [ ] U7. **Windows-native evidence: opt-in CI run and artifact**
+- [x] U7. **Windows-native evidence: opt-in CI run and artifact**
+
+> Dispatching `ci.yml` with `extras: true` (run 45091904082) answered it: the
+> MSVC workspace check passed, then the `thegn-svc` lib test target failed to
+> compile (`calendar/command_tests.rs:110` and `inbox/command_tests.rs:324` use
+> `libc::kill` without a `cfg(unix)` guard). The IPC/Job-Object tests, the
+> `thegn.exe` build and the artifact smoke were skipped, so no candidate
+> artifact exists. Recorded in `CONTRIBUTING.md` and the
+> `add-windows-ci-distribution` task; no support claim changed.
 
 **Goal:** Either give Pritam a provenance-carrying `thegn.exe` candidate or a
 recorded "not yet" that closes the ambiguity.
@@ -417,7 +439,11 @@ artifact digest handed over, or the exact red step named.
 
 ---
 
-- [ ] U8. **Pritam's WSL2 + Windows handoff**
+- [x] U8. **Pritam's WSL2 + Windows handoff**
+
+> `docs/superpowers/guides/windows-wsl-test-handoff.md` written, plus a WSL
+> pointer in `KNOWN_ISSUES.md`. The Linear comment could not be posted from
+> this environment (no Linear credentials); its text is in the handoff reply.
 
 **Goal:** A tester can install, run and report without asking follow-up
 questions.
