@@ -47,16 +47,12 @@ pub enum RowKind {
     /// and no `tab_target`, and is deliberately NOT a [`RowKind::Folder`] for
     /// the same reason: there is no `folders` row behind it.
     PipelineLane,
-    /// A worktree the lane's roster rows reference, as a leaf inside its lane
-    /// folder. A **mirror**: it carries the same `tab_target` the primary
-    /// worktree row does, but its OWN `pin_key` (`pipeline/lane:{key}/wt:{path}`
-    /// — never the primary row's), and every pin/mark/bulk path skips it by
-    /// kind (`is_markable` / `is_pinnable` / the drag sources all gate on
-    /// `RowKind`). The key is for identity anchoring only: the context menu's
-    /// re-anchor, double-click detection and the rebuild's cursor re-seek all
-    /// resolve rows by `pin_key`, and an empty key would resolve to the first
-    /// keyless row instead. A mirrored [`RowKind::Worktree`] would also make
-    /// the board's "jump to this worktree" depend on emission order.
+    /// A pipeline-owned worktree's primary row, nested inside its lane folder.
+    /// It carries the same worktree target/status/action contract as an
+    /// ordinary row. Its `{workspace}/{label}` pin identity is shared with the
+    /// ordinary grouped and flat layouts, so pins survive ownership changes.
+    /// Drag reordering remains unavailable because lane order comes from the
+    /// dispatch roster.
     PipelineWorktree,
     /// A **derived** "Other (N)" group under a workspace holding its
     /// *external* worktrees — git worktrees thegn did not create (see
@@ -89,6 +85,13 @@ pub enum RowKind {
 }
 
 impl RowKind {
+    /// Whether this row is the actionable row for a worktree. Pipeline-owned
+    /// worktrees retain the same activation and navigation behavior as the
+    /// ordinary worktree rows they replace.
+    pub(crate) fn is_worktree(self) -> bool {
+        matches!(self, RowKind::Worktree | RowKind::PipelineWorktree)
+    }
+
     /// Whether rows of this kind head a collapsible subtree (drive a caret and
     /// respond to the collapse/expand keys). Workspaces, 📂 folder sub-groups,
     /// terminal-host groups and the derived pipeline group/lane folders
@@ -434,22 +437,18 @@ impl SidebarRow {
     /// with a stable identity. Excludes section headings / empty hints (no
     /// `pin_key`) and folders / terminals (no bulk or reorder action).
     pub fn is_markable(&self) -> bool {
-        !self.pin_key.is_empty() && matches!(self.kind, RowKind::Workspace | RowKind::Worktree)
+        !self.pin_key.is_empty() && (self.kind == RowKind::Workspace || self.kind.is_worktree())
     }
 
     /// Whether this row can be pinned (floated to the top of its sibling run).
-    /// Everything with a `pin_key` except the derived pipeline rows: a group
-    /// and a lane carry a key purely so their collapse state has somewhere to
-    /// live, and floating a row the roster invented would reorder a tree the
-    /// user never arranged (the worktree mirror's key is anchor-only; see
-    /// `RowKind::PipelineWorktree`).
+    /// Groups carry a key for collapse state. Worktree leaves share one
+    /// identity across ordinary and pipeline layouts.
     pub fn is_pinnable(&self) -> bool {
         !self.pin_key.is_empty()
             && !matches!(
                 self.kind,
                 RowKind::PipelineGroup
                     | RowKind::PipelineLane
-                    | RowKind::PipelineWorktree
                     | RowKind::OtherGroup
                     | RowKind::BatchGroup
                     | RowKind::ShowMore
@@ -588,12 +587,13 @@ pub struct SidebarStatus {
     pub linked_issues: std::collections::BTreeMap<String, (String, usize)>,
     /// Resident plugin row-field values keyed by worktree path.
     pub plugin_fields: std::collections::BTreeMap<String, Vec<PluginFieldValue>>,
-    /// The derived lane folders under the Pipeline row: one per issue/worktree
-    /// with **active** dispatch rows, each carrying its agents (see
-    /// [`crate::sidebar_pipeline::lanes`]). A fourth pure fold over the same
-    /// off-loop roster read — no DB open, no wake source. Empty ⇒ no lane rows,
-    /// which is how a finished lane disappears with nothing to reap.
+    /// The derived lane folders under each project's Pipelines group. The
+    /// bounded roster names issue lanes; persisted-only ownership paths get a
+    /// stable path lane. See [`crate::sidebar_pipeline::lanes_with_persisted_paths`].
     pub pipeline_lanes: Vec<crate::sidebar_pipeline::Lane>,
+    /// Durable ownership from every persisted staged dispatch row. This is
+    /// deliberately independent of the bounded roster used to name lanes.
+    pub pipeline_worktree_paths: std::collections::BTreeSet<String>,
     /// Worktree paths whose current attention signal the user has acknowledged
     /// (see `attention::AttentionScore::is_acked_by`). Suppressed from the nag
     /// surfaces — the `✋` badge count and the "Needs you" popup / jump ring —
@@ -1088,6 +1088,42 @@ pub fn build_rows(
         }
         db_by_slug.entry(w.slug.as_str()).or_default().push(w);
     }
+    // The persisted DB paths cover pipeline worktrees whose rows have aged out
+    // of the bounded sidebar roster. Roster paths are included as a fallback
+    // if the ownership query failed during hydration.
+    let mut pipeline_paths: std::collections::HashSet<String> = status
+        .pipeline_worktree_paths
+        .iter()
+        .cloned()
+        .chain(status.pipeline_lanes.iter().flat_map(|lane| {
+            lane.worktrees
+                .iter()
+                .map(|worktree| crate::sidebar_pipeline::path_identity(&worktree.path))
+        }))
+        .collect();
+    // Native pipeline dispatches persist their reserved environment on the
+    // worktree before their first dispatch row exists. That exact binding is
+    // the ownership witness until durable stage metadata appears.
+    let environment_paths: Vec<String> = db_worktrees
+        .iter()
+        .filter(|worktree| worktree.env_name.as_deref() == Some("pipeline"))
+        .map(|worktree| worktree.path.clone())
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+    pipeline_paths.extend(
+        environment_paths
+            .iter()
+            .map(|path| crate::sidebar_pipeline::path_identity(path)),
+    );
+    // An explicit user folder is an override to the default Pipelines filing.
+    // Keep that worktree in its chosen folder while leaving all other rows and
+    // folder state untouched.
+    for worktree in db_worktrees
+        .iter()
+        .filter(|worktree| worktree.folder_id.is_some())
+    {
+        pipeline_paths.remove(&crate::sidebar_pipeline::path_identity(&worktree.path));
+    }
 
     // Flat cross-workspace layout: emit one recency-ordered list of every
     // worktree (each tagged with its repo) under a single banner, and skip the
@@ -1123,25 +1159,27 @@ pub fn build_rows(
     // view of the roster, including lanes no workspace claims. For the same
     // reason the flat layout, which has no workspace rows to nest under, emits
     // no pipeline rows at all.
-    let mut lane_targets: std::collections::HashMap<&str, (String, RowTarget)> =
+    let mut lane_targets: std::collections::HashMap<String, (String, RowTarget)> =
         std::collections::HashMap::new();
     for (gi, g) in session.worktrees.iter().enumerate() {
         if let Some((repo, _)) = split_tab(&g.name) {
             lane_targets
-                .entry(g.path.as_str())
+                .entry(crate::sidebar_pipeline::path_identity(&g.path))
                 .or_insert_with(|| (repo, RowTarget::Tab(gi, g.active_tab)));
         }
     }
     for w in db_worktrees {
-        lane_targets.entry(w.path.as_str()).or_insert_with(|| {
-            (
-                w.slug.clone(),
-                RowTarget::Workspace {
-                    repo_path: w.repo_path.clone(),
-                    group: Some(w.tab_name.clone()),
-                },
-            )
-        });
+        lane_targets
+            .entry(crate::sidebar_pipeline::path_identity(&w.path))
+            .or_insert_with(|| {
+                (
+                    w.slug.clone(),
+                    RowTarget::Workspace {
+                        repo_path: w.repo_path.clone(),
+                        group: Some(w.tab_name.clone()),
+                    },
+                )
+            });
     }
     // Second-chance attribution, consulted only when the direct lookup fails.
     // A pipeline creates its worktree as a SIBLING of the workspace's existing
@@ -1149,12 +1187,12 @@ pub fn build_rows(
     // path itself is in neither the session nor the DB (the case that used to
     // dump a lane in the top-level tail group). A directory two workspaces
     // share is ambiguous, and is dropped rather than guessed.
-    let mut dir_owner: std::collections::HashMap<&std::path::Path, Option<&str>> =
+    let mut dir_owner: std::collections::HashMap<std::path::PathBuf, Option<&str>> =
         std::collections::HashMap::new();
     for (path, (slug, _)) in &lane_targets {
         if let Some(dir) = std::path::Path::new(path).parent() {
             dir_owner
-                .entry(dir)
+                .entry(dir.to_path_buf())
                 .and_modify(|owner| {
                     if *owner != Some(slug.as_str()) {
                         *owner = None;
@@ -1163,19 +1201,39 @@ pub fn build_rows(
                 .or_insert(Some(slug.as_str()));
         }
     }
-    let mut lanes_by_ws: std::collections::BTreeMap<String, Vec<&crate::sidebar_pipeline::Lane>> =
+    let mut lanes_by_ws: std::collections::BTreeMap<String, Vec<crate::sidebar_pipeline::Lane>> =
         std::collections::BTreeMap::new();
-    for lane in &status.pipeline_lanes {
+    let mut assigned_pipeline_paths = std::collections::HashSet::new();
+    let environment_lanes =
+        crate::sidebar_pipeline::lanes_with_persisted_paths(&[], &environment_paths);
+    for lane in status.pipeline_lanes.iter().chain(&environment_lanes) {
+        let worktrees: Vec<_> = lane
+            .worktrees
+            .iter()
+            .filter(|worktree| {
+                let identity = crate::sidebar_pipeline::path_identity(&worktree.path);
+                pipeline_paths.contains(&identity) && assigned_pipeline_paths.insert(identity)
+            })
+            .cloned()
+            .collect();
+        if worktrees.is_empty() {
+            continue;
+        }
+        let lane = crate::sidebar_pipeline::Lane {
+            worktrees,
+            ..(*lane).clone()
+        };
         let home = if view.flat {
             None
         } else {
             lane.worktrees
                 .iter()
-                .find_map(|w| lane_targets.get(w.path.as_str()))
+                .find_map(|w| lane_targets.get(&crate::sidebar_pipeline::path_identity(&w.path)))
                 .map(|(slug, _)| slug.clone())
                 .or_else(|| {
                     lane.worktrees.iter().find_map(|w| {
-                        std::path::Path::new(w.path.as_str())
+                        let identity = crate::sidebar_pipeline::path_identity(&w.path);
+                        std::path::Path::new(&identity)
                             .parent()
                             .and_then(|dir| dir_owner.get(dir).copied().flatten())
                             .map(str::to_string)
@@ -1214,6 +1272,26 @@ pub fn build_rows(
             &db_by_tab,
             &db_by_slug,
         );
+        let pipeline_groups: std::collections::HashMap<String, Group> = groups
+            .iter()
+            .filter(|group| {
+                pipeline_paths.contains(&crate::sidebar_pipeline::path_identity(&group.path))
+            })
+            .map(|group| {
+                (
+                    crate::sidebar_pipeline::path_identity(&group.path),
+                    group.clone(),
+                )
+            })
+            .collect();
+
+        // In the default project tree a pipeline-owned worktree has one home:
+        // its Pipelines leaf. Explicit flat layout remains a flat list.
+        if !view.flat {
+            groups.retain(|group| {
+                !pipeline_paths.contains(&crate::sidebar_pipeline::path_identity(&group.path))
+            });
+        }
 
         sort_groups(&mut groups, view.sort, &keys);
 
@@ -1331,6 +1409,11 @@ pub fn build_rows(
                 .map(Vec::as_slice)
                 .unwrap_or_default()
             {
+                if !view.flat
+                    && pipeline_paths.contains(&crate::sidebar_pipeline::path_identity(&w.path))
+                {
+                    continue;
+                }
                 let already_counted = filed_in_folders
                     .get(&folder.folder_id)
                     .map(|v| v.iter().any(|g| g.label == w.branch))
@@ -1386,14 +1469,19 @@ pub fn build_rows(
         // ancestors (the folder precedent), so the filter can reveal a row
         // inside a collapsed group.
         if let Some(ws_lanes) = lanes_by_ws.get(repo_slug) {
+            let active_path = session.active_group().map(|group| group.path.as_str());
             push_pipeline_group(
                 &mut rows,
                 ws_lanes,
-                &format!("pipeline/group:{repo_slug}"),
-                repo_slug,
-                collapsed,
-                view,
-                &lane_targets,
+                PipelineGroupContext {
+                    group_slug: repo_slug,
+                    parent_collapsed: collapsed,
+                    view,
+                    lane_targets: &lane_targets,
+                    active_path,
+                    pipeline_groups: &pipeline_groups,
+                    status,
+                },
             );
         }
     }
@@ -1521,7 +1609,7 @@ pub fn build_rows(
     // so a collapsed workspace still shows its most urgent child's glyph.
     for row in &mut rows {
         match row.kind {
-            RowKind::Worktree => {
+            RowKind::Worktree | RowKind::PipelineWorktree => {
                 row.attention = row
                     .worktree_path
                     .as_deref()
@@ -1565,9 +1653,7 @@ pub fn build_rows(
         let workspace_slug = &rows[index].workspace_slug;
         let mq_rollup = thegn_core::merge_queue_view::rollup(
             rows.iter()
-                .filter(|child| {
-                    child.kind == RowKind::Worktree && child.workspace_slug == *workspace_slug
-                })
+                .filter(|child| child.kind.is_worktree() && child.workspace_slug == *workspace_slug)
                 .filter_map(|child| child.mq_status),
         );
         rows[index].mq_rollup = mq_rollup;
@@ -1647,77 +1733,109 @@ fn push_other_group(
     }
 }
 
+/// Borrowed per-workspace state used to emit the derived Pipelines folder.
+struct PipelineGroupContext<'a> {
+    group_slug: &'a str,
+    parent_collapsed: bool,
+    view: &'a ViewState,
+    lane_targets: &'a std::collections::HashMap<String, (String, RowTarget)>,
+    active_path: Option<&'a str>,
+    pipeline_groups: &'a std::collections::HashMap<String, Group>,
+    status: &'a SidebarStatus,
+}
+
 /// Emit one derived `Pipelines` group: the folder head, each lane folder
 /// named from the roster's issue id, and each lane's referenced worktrees as
-/// mirror leaves.
+/// leaves. These leaves are the primary sidebar rows for pipeline-owned
+/// worktrees in the default grouped layout.
 ///
-/// Nothing here is state: the rows are a fold of `status.pipeline_lanes`,
-/// which is itself a fold of the roster's rows of ANY status — so the folders
-/// survive a restart and a finished lane stays until its rows go, with no
-/// reaper and no DB write. The worktree leaves mirror the `tab_target` of the
-/// primary row for the same path (resolved from the same `Group`/`DbWorktree`
-/// sources the primary rows build from), so activating one lands exactly
-/// where activating the primary row does; a path with no primary row keeps
-/// `tab_target: None` and renders faint rather than vanishing.
+/// Lane rows come from the bounded roster plus durable path ownership. The
+/// leaves resolve to the same targets as ordinary worktree rows, so opening
+/// one keeps the existing keyboard, mouse, and action behavior.
 ///
 /// Visibility follows the folder precedent: children are ALWAYS emitted and
 /// only their `visible` flag tracks a collapsed ancestor, so the sidebar
 /// filter can still find and reveal a row inside a collapsed group or lane.
 fn push_pipeline_group(
     rows: &mut Vec<SidebarRow>,
-    lanes: &[&crate::sidebar_pipeline::Lane],
-    group_key: &str,
-    group_slug: &str,
-    parent_collapsed: bool,
-    view: &ViewState,
-    lane_targets: &std::collections::HashMap<&str, (String, RowTarget)>,
+    lanes: &[crate::sidebar_pipeline::Lane],
+    context: PipelineGroupContext<'_>,
 ) {
     if lanes.is_empty() {
         return;
     }
-    let group_collapsed = view.collapsed.contains(group_key);
+    let group_key = format!("pipeline/group:{}", context.group_slug);
+    let holds_active = context.active_path.is_some_and(|path| {
+        let active = crate::sidebar_pipeline::path_identity(path);
+        lanes.iter().any(|lane| {
+            lane.worktrees
+                .iter()
+                .any(|worktree| crate::sidebar_pipeline::path_identity(&worktree.path) == active)
+        })
+    });
+    let group_collapsed = context.view.collapsed.contains(&group_key) && !holds_active;
     rows.push(SidebarRow {
-        pin_key: group_key.to_string(),
+        pin_key: group_key,
         collapsed: group_collapsed,
-        visible: !parent_collapsed,
+        visible: !context.parent_collapsed,
         child_count: lanes.len(),
-        ..SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", group_slug)
+        ..SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", context.group_slug)
     });
     for lane in lanes {
         let lane_key = format!("pipeline/lane:{}", lane.key);
-        let lane_collapsed = view.collapsed.contains(&lane_key);
+        let lane_holds_active = context.active_path.is_some_and(|path| {
+            let active = crate::sidebar_pipeline::path_identity(path);
+            lane.worktrees
+                .iter()
+                .any(|worktree| crate::sidebar_pipeline::path_identity(&worktree.path) == active)
+        });
+        let lane_collapsed = context.view.collapsed.contains(&lane_key) && !lane_holds_active;
         rows.push(SidebarRow {
             pin_key: lane_key,
             collapsed: lane_collapsed,
-            visible: !parent_collapsed && !group_collapsed,
+            visible: !context.parent_collapsed && !group_collapsed,
             child_count: lane.worktrees.len(),
-            ..SidebarRow::base(RowKind::PipelineLane, 2, lane.label.clone(), group_slug)
+            ..SidebarRow::base(
+                RowKind::PipelineLane,
+                2,
+                lane.label.clone(),
+                context.group_slug,
+            )
         });
         for wt in &lane.worktrees {
-            let hit = lane_targets.get(wt.path.as_str());
-            rows.push(SidebarRow {
-                // A MIRROR: its `pin_key` is its own (lane-scoped, path-qualified)
-                // identity, never the primary row's — pins/marks cannot reach it
-                // because those paths are kind-gated (`is_markable`,
-                // `is_pinnable`, the drag sources). The key exists for the
-                // ANCHOR paths that resolve a row by `pin_key`: the context-menu
-                // re-anchor (keyboard Enter and the mouse click both
-                // `.position(|r| r.pin_key == target)`), double-click detection
-                // and the rebuild's cursor re-seek. An empty key there would
-                // resolve to the FIRST keyless row — another mirror or the door
-                // row — and fire the menu entry at the wrong worktree.
-                pin_key: format!("pipeline/lane:{}/wt:{}", lane.key, wt.path),
-                visible: !parent_collapsed && !group_collapsed && !lane_collapsed,
-                worktree_path: Some(wt.path.clone()),
-                tab_target: hit.map(|(_, t)| t.clone()),
-                ..SidebarRow::base(
-                    RowKind::PipelineWorktree,
-                    3,
-                    wt.name.clone(),
-                    hit.map(|(slug, _)| slug.clone())
-                        .unwrap_or_else(|| group_slug.to_string()),
-                )
-            });
+            let hit = context
+                .lane_targets
+                .get(&crate::sidebar_pipeline::path_identity(&wt.path));
+            let identity = crate::sidebar_pipeline::path_identity(&wt.path);
+            let mut row = context
+                .pipeline_groups
+                .get(&identity)
+                .map(|group| {
+                    worktree_row(
+                        group,
+                        context.status,
+                        context.group_slug,
+                        3,
+                        format!("pipeline/worktree:{identity}"),
+                        !context.parent_collapsed && !group_collapsed && !lane_collapsed,
+                        None,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    SidebarRow::base(
+                        RowKind::PipelineWorktree,
+                        3,
+                        wt.name.clone(),
+                        context.group_slug,
+                    )
+                });
+            row.kind = RowKind::PipelineWorktree;
+            row.pin_key = format!("{}/{}", context.group_slug, row.label);
+            row.label = wt.name.clone();
+            row.visible = !context.parent_collapsed && !group_collapsed && !lane_collapsed;
+            row.worktree_path = Some(wt.path.clone());
+            row.tab_target = hit.map(|(_, target)| target.clone());
+            rows.push(row);
         }
     }
 }
@@ -2256,6 +2374,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 last_workspace = Some(i);
                 last_folder = None; // folders don't span workspaces
                 last_group = None;
+                last_lane = None;
             }
             // The derived "Other" group nests its rows at depth 2 exactly like
             // a folder, so the filter surfaces and reveals it the same way.
@@ -2303,6 +2422,19 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     }
                 }
             }
+            RowKind::PipelineWorktree => {
+                if keep[i] {
+                    if let Some(w) = last_workspace {
+                        keep[w] = true;
+                    }
+                    if let Some(g) = last_group {
+                        keep[g] = true;
+                    }
+                    if let Some(l) = last_lane {
+                        keep[l] = true;
+                    }
+                }
+            }
             RowKind::PipelineGroup => {
                 last_group = Some(i);
                 last_lane = None; // lanes don't span groups
@@ -2315,19 +2447,6 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
             RowKind::PipelineLane => {
                 last_lane = Some(i);
                 if keep[i] {
-                    if let Some(g) = last_group {
-                        keep[g] = true;
-                    }
-                    if let Some(w) = last_workspace {
-                        keep[w] = true;
-                    }
-                }
-            }
-            RowKind::PipelineWorktree => {
-                if keep[i] {
-                    if let Some(l) = last_lane {
-                        keep[l] = true;
-                    }
                     if let Some(g) = last_group {
                         keep[g] = true;
                     }
@@ -2352,6 +2471,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 reveal_ws = self_match[i];
                 reveal_folder = false; // folders don't span workspaces
                 reveal_group = false;
+                reveal_lane = false;
             }
             RowKind::Folder | RowKind::OtherGroup | RowKind::BatchGroup => {
                 // A folder that matched on its own label reveals its children,
@@ -2380,6 +2500,11 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     keep[i] = true;
                 }
             }
+            RowKind::PipelineWorktree => {
+                if reveal_ws || reveal_group || reveal_lane {
+                    keep[i] = true;
+                }
+            }
             // A group that matched on its own label (or a self-matched
             // workspace) reveals its lanes, and each revealed lane reveals its
             // worktrees — the folder rule, one level deeper.
@@ -2392,11 +2517,6 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
             }
             RowKind::PipelineLane => {
                 reveal_lane = self_match[i] || reveal_group;
-                if reveal_lane {
-                    keep[i] = true;
-                }
-            }
-            RowKind::PipelineWorktree => {
                 if reveal_lane {
                     keep[i] = true;
                 }
@@ -5157,7 +5277,7 @@ mod tests {
             .expect("the Pipelines group sits inside the workspace");
         // Workspace first, then its own worktree rows, then the group chain.
         assert_eq!(kinds[0], RowKind::Workspace);
-        assert!(group > 1, "the group is not the workspace itself");
+        assert!(group > 0, "the group is nested after the workspace header");
         assert_eq!(
             &kinds[group..group + 3],
             &[
@@ -5168,6 +5288,7 @@ mod tests {
         );
         assert_eq!(rows[group].label, "Pipelines");
         assert_eq!(rows[group].depth, 1);
+        assert_eq!(rows[group].workspace_slug, rows[0].workspace_slug);
         assert_eq!(rows[group].child_count, 1, "the group counts its lanes");
         assert_eq!(rows[group + 1].label, "THE-74", "named from the issue id");
         assert_eq!(rows[group + 1].depth, 2);
@@ -5178,6 +5299,14 @@ mod tests {
         );
         assert_eq!(rows[group + 2].depth, 3);
         assert_eq!(rows[group + 2].label, "home");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.worktree_path.as_deref() == Some("/wt/home"))
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            vec![RowKind::PipelineWorktree],
+            "the pipeline leaf is the only actionable row for its worktree"
+        );
         // Everything is visible BY DEFAULT.
         for r in &rows[group..group + 3] {
             assert!(r.visible, "{:?} must be visible by default", r.kind);
@@ -5309,7 +5438,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_worktree_mirrors_the_primary_rows_target_without_its_identity() {
+    fn a_pipeline_worktree_uses_the_existing_target_and_ordinary_pin_identity() {
         let s = session(vec![tab("app/home", "/wt/home")], 0);
         let rows = build_rows(
             &s,
@@ -5320,31 +5449,86 @@ mod tests {
             &[],
             &[],
         );
-        let primary = rows
-            .iter()
-            .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some("/wt/home"))
-            .expect("the primary worktree row");
         let mirror = rows
             .iter()
             .find(|r| r.kind == RowKind::PipelineWorktree)
             .expect("the lane's worktree row");
-        assert_eq!(mirror.tab_target, primary.tab_target, "same door");
-        // The mirror's `pin_key` is its OWN identity — lane-scoped and
-        // path-qualified — so the menu/double-click/cursor anchors resolve the
-        // mirror and never the primary row (or a sibling mirror).
-        assert_ne!(primary.pin_key, mirror.pin_key);
-        assert!(mirror.pin_key.starts_with("pipeline/lane:THE-74/wt:"));
-        assert_eq!(mirror.pin_key, "pipeline/lane:THE-74/wt:/wt/home");
-        // …while remaining unpinnable/unmarkable: the kind gates, not the
-        // empty key, are what keep it out of the pin and mark sets.
-        assert!(!mirror.is_markable());
-        assert!(!mirror.is_pinnable());
+        assert_eq!(mirror.tab_target, Some(RowTarget::Tab(0, 0)), "same door");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.kind == RowKind::Worktree
+                    && r.worktree_path.as_deref() == Some("/wt/home")),
+            "the pipeline leaf is the only default-layout row for this path"
+        );
+        // Existing pins use {workspace}/{label}; retaining that identity
+        // preserves them through flat/grouped layout and ownership changes.
+        assert_eq!(mirror.pin_key, "app/home");
+        assert!(mirror.is_markable());
+        assert!(mirror.is_pinnable());
     }
 
     #[test]
-    fn two_mirrors_of_one_worktree_in_different_lanes_never_share_a_pin_key() {
-        // The context menu re-anchors by `pin_key`; two mirrors sharing a key
-        // would fire one lane's menu entry at the other lane's worktree.
+    fn existing_worktree_pin_identity_survives_pipeline_layout_transitions() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let view = ViewState {
+            pins: vec!["app/home".into()],
+            ..ViewState::default()
+        };
+        let pipeline = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let pipeline_key = pipeline
+            .iter()
+            .find(|row| row.kind == RowKind::PipelineWorktree)
+            .unwrap()
+            .pin_key
+            .clone();
+
+        let mut flat_view = view.clone();
+        flat_view.flat = true;
+        let flat = build_rows(
+            &s,
+            &app_workspace(),
+            &flat_view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let flat_key = flat
+            .iter()
+            .find(|row| {
+                row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/home")
+            })
+            .unwrap()
+            .pin_key
+            .clone();
+
+        let ordinary = build_rows(&s, &app_workspace(), &view, &no_activity(), &[], &[], &[]);
+        let ordinary_key = ordinary
+            .iter()
+            .find(|row| {
+                row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/home")
+            })
+            .unwrap()
+            .pin_key
+            .clone();
+
+        assert_eq!(pipeline_key, "app/home");
+        assert_eq!(flat_key, pipeline_key);
+        assert_eq!(ordinary_key, pipeline_key);
+        assert!(view.pins.contains(&pipeline_key));
+    }
+
+    #[test]
+    fn one_worktree_referenced_by_multiple_lanes_emits_one_path_identity() {
         let s = session(vec![tab("app/home", "/wt/home")], 0);
         let rows = build_rows(
             &s,
@@ -5365,7 +5549,14 @@ mod tests {
             .collect();
         keys.sort_unstable();
         keys.dedup();
-        assert_eq!(keys.len(), 2, "one unique anchor per mirror: {keys:?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == RowKind::PipelineWorktree)
+                .count(),
+            1,
+            "one reference survives across lanes"
+        );
+        assert_eq!(keys.len(), 1, "one sidebar leaf per owned path: {keys:?}");
     }
 
     #[test]
@@ -5462,15 +5653,152 @@ mod tests {
     }
 
     #[test]
-    fn collapsing_a_lane_hides_its_worktrees_but_still_emits_them() {
+    fn persisted_pipeline_worktree_without_roster_uses_its_pipeline_leaf() {
         let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let persisted = vec!["/wt/home".to_string()];
+        let mut status = lane_status(crate::sidebar_pipeline::lanes_with_persisted_paths(
+            &[],
+            &persisted,
+        ));
+        status.pipeline_worktree_paths = persisted
+            .iter()
+            .map(|path| crate::sidebar_pipeline::path_identity(path))
+            .collect();
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &status,
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.worktree_path.as_deref() == Some("/wt/home"))
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            vec![RowKind::PipelineWorktree],
+            "durable ownership moves the open worktree without a live roster row"
+        );
+    }
+
+    #[test]
+    fn reserved_pipeline_environment_files_native_stage_less_worktree_without_roster() {
+        // Native dispatches initially carry no stage or artifact metadata. The
+        // persisted reserved environment is enough to place their one real
+        // worktree row in Pipelines until roster metadata arrives.
+        let s = session(vec![tab("app/feature", "/wt/feature")], 0);
+        let dbw = vec![DbWorktree {
+            slug: "app".into(),
+            branch: "feature".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/feature".into(),
+            path: "/wt/feature".into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: Some("pipeline".into()),
+            sandbox_profile: None,
+            env_degraded: false,
+            external: false,
+        }];
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|row| row.worktree_path.as_deref() == Some("/wt/feature"))
+            .collect();
+        assert_eq!(matching.len(), 1, "no duplicate ordinary row is emitted");
+        assert_eq!(matching[0].kind, RowKind::PipelineWorktree);
+        assert_eq!(matching[0].depth, 3);
+        assert_eq!(matching[0].tab_target, Some(RowTarget::Tab(0, 0)));
+        assert!(rows.iter().any(|row| row.kind == RowKind::PipelineGroup));
+    }
+
+    #[test]
+    fn other_persisted_environments_remain_ordinary_worktrees() {
+        let s = session(vec![tab("app/feature", "/wt/feature")], 0);
+        let dbw = DbWorktree {
+            slug: "app".into(),
+            branch: "feature".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/feature".into(),
+            path: "/wt/feature".into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: Some("company-k8s".into()),
+            sandbox_profile: None,
+            env_degraded: false,
+            external: false,
+        };
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &no_activity(),
+            &[dbw],
+            &[],
+            &[],
+        );
+        assert!(rows.iter().any(|row| {
+            row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/feature")
+        }));
+        assert!(!rows.iter().any(|row| {
+            row.kind == RowKind::PipelineWorktree
+                && row.worktree_path.as_deref() == Some("/wt/feature")
+        }));
+    }
+
+    #[test]
+    fn explicit_user_folder_filing_overrides_pipeline_default() {
+        let (session, workspaces, mut db_worktrees, folders) = folder_fixture();
+        db_worktrees[0].env_name = Some("pipeline".into());
+        let persisted = vec!["/wt/feat".to_string()];
+        let mut status = lane_status(crate::sidebar_pipeline::lanes_with_persisted_paths(
+            &[],
+            &persisted,
+        ));
+        status.pipeline_worktree_paths = persisted
+            .iter()
+            .map(|path| crate::sidebar_pipeline::path_identity(path))
+            .collect();
+        let rows = build_rows(
+            &session,
+            &workspaces,
+            &ViewState::default(),
+            &status,
+            &db_worktrees,
+            &folders,
+            &[],
+        );
+        assert!(rows.iter().any(|row| {
+            row.kind == RowKind::Worktree
+                && row.worktree_path.as_deref() == Some("/wt/feat")
+                && row.depth == 2
+        }));
+        assert!(!rows.iter().any(|row| row.kind == RowKind::PipelineWorktree));
+    }
+
+    #[test]
+    fn collapsing_a_lane_hides_its_worktrees_but_still_emits_them() {
+        let s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/other", "/wt/other")],
+            0,
+        );
         let mut view = ViewState::default();
         view.collapsed.insert("pipeline/lane:THE-74".into());
         let rows = build_rows(
             &s,
             &app_workspace(),
             &view,
-            &one_lane_status("/wt/home"),
+            &one_lane_status("/wt/other"),
             &[],
             &[],
             &[],
@@ -5490,14 +5818,17 @@ mod tests {
 
     #[test]
     fn collapsing_the_pipelines_group_hides_its_lanes_but_still_emits_them() {
-        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/other", "/wt/other")],
+            0,
+        );
         let mut view = ViewState::default();
         view.collapsed.insert("pipeline/group:app".into());
         let rows = build_rows(
             &s,
             &app_workspace(),
             &view,
-            &one_lane_status("/wt/home"),
+            &one_lane_status("/wt/other"),
             &[],
             &[],
             &[],
@@ -5517,15 +5848,58 @@ mod tests {
     }
 
     #[test]
+    fn an_open_pipeline_worktree_stays_visible_inside_collapsed_pipeline_folders() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let view = ViewState {
+            collapsed: [
+                "pipeline/group:app".to_string(),
+                "pipeline/lane:THE-74".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            ..ViewState::default()
+        };
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let group = rows
+            .iter()
+            .find(|row| row.kind == RowKind::PipelineGroup)
+            .unwrap();
+        let lane = rows
+            .iter()
+            .find(|row| row.kind == RowKind::PipelineLane)
+            .unwrap();
+        let worktree = rows
+            .iter()
+            .find(|row| row.kind == RowKind::PipelineWorktree)
+            .unwrap();
+        assert!(group.visible && !group.collapsed);
+        assert!(lane.visible && !lane.collapsed);
+        assert!(worktree.visible, "the active tab remains findable");
+        assert!(view.collapsed.contains("pipeline/group:app"));
+        assert!(view.collapsed.contains("pipeline/lane:THE-74"));
+    }
+
+    #[test]
     fn two_lanes_collapse_independently() {
         // They share one `workspace_slug`, so keying collapse on it would fold
         // every lane at once — the folder precedent (`pin_key`) is why not.
-        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/other", "/wt/other")],
+            0,
+        );
         let mut view = ViewState::default();
         view.collapsed.insert("pipeline/lane:THE-9".into());
         let status = lane_status(vec![
             lane("THE-74", &["/wt/home"]),
-            lane("THE-9", &["/wt/home"]),
+            lane("THE-9", &["/wt/other"]),
         ]);
         let rows = build_rows(&s, &app_workspace(), &view, &status, &[], &[], &[]);
         let lanes: Vec<(&str, bool)> = rows
@@ -5543,7 +5917,7 @@ mod tests {
     }
 
     #[test]
-    fn no_pipeline_row_is_markable_pinnable_or_reorderable() {
+    fn pipeline_worktree_leaf_keeps_worktree_mark_and_pin_actions() {
         let s = session(vec![tab("app/home", "/wt/home")], 0);
         let rows = build_rows(
             &s,
@@ -5564,7 +5938,10 @@ mod tests {
             })
             .collect();
         assert_eq!(derived.len(), 3);
-        for r in derived {
+        for r in derived
+            .iter()
+            .filter(|r| r.kind != RowKind::PipelineWorktree)
+        {
             assert!(
                 !r.is_markable(),
                 "{:?} must never join the mark set",
@@ -5573,6 +5950,12 @@ mod tests {
             assert!(!r.is_pinnable(), "{:?} must never be pinned", r.kind);
             assert!(r.folder_id.is_none(), "{:?} is not a real folder", r.kind);
         }
+        let worktree = derived
+            .iter()
+            .find(|row| row.kind == RowKind::PipelineWorktree)
+            .unwrap();
+        assert!(worktree.is_markable());
+        assert!(worktree.is_pinnable());
     }
 
     #[test]
@@ -5605,7 +5988,17 @@ mod tests {
             1,
             "the stale pin hoisted nothing"
         );
-        assert!(group > 1, "the group still sits inside its workspace");
+        assert!(group > 0, "the group still follows its workspace header");
+        assert_eq!(rows[group].depth, 1);
+        assert_eq!(rows[group].workspace_slug, rows[0].workspace_slug);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.worktree_path.as_deref() == Some("/wt/home"))
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            vec![RowKind::PipelineWorktree],
+            "a stale lane pin does not duplicate or move the actionable row"
+        );
     }
 
     #[test]
@@ -5671,6 +6064,42 @@ mod tests {
     }
 
     #[test]
+    fn a_pipeline_group_match_reveals_its_lanes_and_worktrees() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let view = ViewState {
+            filter: "Pipelines".into(),
+            ..ViewState::default()
+        };
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.kind == RowKind::PipelineGroup)
+                .unwrap()
+                .visible
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.kind == RowKind::PipelineLane)
+                .unwrap()
+                .visible
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.kind == RowKind::PipelineWorktree)
+                .unwrap()
+                .visible
+        );
+    }
+
+    #[test]
     fn the_flat_layout_emits_no_pipeline_rows() {
         // Flat mode has no workspace rows to nest under, and there is no
         // top-level group to fall back to — so it grows no pipeline rows at
@@ -5680,12 +6109,25 @@ mod tests {
             flat: true,
             ..ViewState::default()
         };
+        let dbw = vec![DbWorktree {
+            slug: "app".into(),
+            branch: "home".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/home".into(),
+            path: "/wt/home".into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: Some("pipeline".into()),
+            sandbox_profile: None,
+            env_degraded: false,
+            external: false,
+        }];
         let rows = build_rows(
             &s,
             &app_workspace(),
             &view,
             &lane_status(vec![lane("THE-74", &["/wt/home"])]),
-            &[],
+            &dbw,
             &[],
             &[],
         );
@@ -5696,6 +6138,9 @@ mod tests {
             )),
             "the flat layout has nowhere to nest a lane"
         );
+        assert!(rows.iter().any(|row| {
+            row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/home")
+        }));
     }
 
     #[test]

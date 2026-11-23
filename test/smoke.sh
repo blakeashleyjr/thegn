@@ -10,6 +10,13 @@
 # Usage: test/smoke.sh [path-to-thegn]   (defaults to ./target/debug/thegn)
 set -euo pipefail
 
+# The gate history guard requires its fixture repo and Git metadata to be
+# private. Nix shells may launch smoke with umask 0002, which makes Git's
+# directories group-writable and exercises the unsafe-history refusal instead
+# of the missing-command verdict. Any intentional unsafe-mode fixtures below
+# set their unsafe permissions explicitly with chmod.
+umask 077
+
 SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/thegn}"
 # Resolve to an absolute path — the test cd's into a temp repo before running it.
 SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
@@ -147,6 +154,9 @@ done
 # would let the socket probe cross-connect these checks to a live daemon.
 export XDG_RUNTIME_DIR="$SMOKE_RUNTIME_DIR"
 mkdir -p "$XDG_RUNTIME_DIR"
+# Match the native/CI headless isolation seam: a contained MCP upstream must
+# not discover or depend on the caller's session bus.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus"
 # Isolate the `[database]` migration policy. These are ambient in any shell
 # started from inside a live thegn (it exports the pin so a stale binary can
 # never migrate the user's real state DB), and inheriting them here pinned
@@ -263,6 +273,9 @@ bad() {
   fail=1
 }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+gate_drain_output_is_error() {
+  [[ $GATE_DRAIN_OUTPUT == *"was NOT gated"* && $GATE_DRAIN_OUTPUT != *"breaks the build"* ]]
+}
 
 # Two repos under the scan root, plus one outside it.
 mkdir -p "$TMP/code"
@@ -1226,14 +1239,15 @@ echo hi >"$GP/smoke-gate.txt"
 git -C "$GP" add -A && git -C "$GP" commit -q -m "smoke gate change"
 "$SZ" merge add "$GP" >/dev/null 2>&1
 AGENT_MARK="$XDG_STATE_HOME/agent-fired"
+GATE_DRAIN_OUTPUT="$("$SZ" --set merge_queue.gate_on=true \
+  --set merge_queue.gate_command=definitely-not-a-real-binary \
+  --set merge_queue.conflict_handoff=agent \
+  --set "merge_queue.agent_command=touch $AGENT_MARK" \
+  merge drain 2>&1)"
 check "an unrunnable gate is reported as gate_error, not a build verdict" \
-  "'$SZ' --set merge_queue.gate_on=true \
-     --set merge_queue.gate_command=definitely-not-a-real-binary \
-     --set merge_queue.conflict_handoff=agent \
-     --set merge_queue.agent_command=\"touch $AGENT_MARK\" \
-     merge drain 2>&1 | grep -q 'NOT gated'"
-check "the queue row records gate_error with the real reason" \
-  "'$SZ' merge list | grep -q 'gate_error'"
+  gate_drain_output_is_error
+check "the queue row records gate_error with the real spawn reason" \
+  "'$SZ' merge list --json | python3 -c 'import json,sys; rows=json.load(sys.stdin); row=next(r for r in rows if r[\"branch\"] == \"$GB\"); detail=row[\"error_detail\"] or \"\"; headline=detail.splitlines()[0] if detail else \"\"; assert row[\"status\"] == \"gate_error\"; assert headline == \"gate command not found (exit 127)\" or headline == \"gate command could not be started with process containment: No such file or directory (os error 2)\", repr(headline)'"
 check "an unrunnable gate never dispatches the fixing agent" \
   "[[ ! -e '$AGENT_MARK' ]]"
 # The row must show the target the run actually folded into, not the one frozen

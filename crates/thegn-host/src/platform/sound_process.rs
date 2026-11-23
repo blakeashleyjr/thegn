@@ -355,15 +355,475 @@ mod tests {
 pub(crate) mod test_support {
     pub(crate) const UNIX: bool = cfg!(unix);
 
-    /// A real terminal waker (backed by a pty); the other ends must outlive it.
+    /// Move-only owner of both ends of a real PTY fixture. Moving this value
+    /// transfers teardown responsibility as one unit. On macOS dropping it
+    /// destroys the terminal before stopping and joining its master drainer.
     #[cfg(unix)]
-    pub(crate) fn test_waker() -> (
-        termwiz::terminal::TerminalWaker,
-        std::fs::File,
-        termwiz::terminal::UnixTerminal,
-    ) {
+    pub(crate) struct TestPtyFixture {
+        terminal: Option<termwiz::terminal::UnixTerminal>,
+        #[cfg(target_os = "macos")]
+        drainer: Option<PtyDrainer>,
+        #[cfg(not(target_os = "macos"))]
+        master: Option<std::fs::File>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestPtyFixture {
+        fn drop(&mut self) {
+            // The terminal's drop can tcdrain, so its master reader stays live
+            // until this first step completes. The drainer's thread owns the
+            // master fd and drops it when the subsequent join returns.
+            drop(self.terminal.take());
+            #[cfg(target_os = "macos")]
+            drop(self.drainer.take());
+            #[cfg(not(target_os = "macos"))]
+            drop(self.master.take());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct PtyDrainer {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        successful_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        reader: Option<std::thread::JoinHandle<()>>,
+        #[cfg(test)]
+        join_ack: Option<std::sync::mpsc::Sender<Result<(), &'static str>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for PtyDrainer {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+
+            self.stop.store(true, Ordering::Release);
+            if let Some(reader) = self.reader.take() {
+                // The reader uses a finite poll timeout, so this join is
+                // bounded even while the slave stays open and reads return
+                // EAGAIN. It does not depend on EOF or EIO.
+                #[cfg(test)]
+                let reader_join = reader.join();
+                #[cfg(not(test))]
+                match reader.join() {
+                    Ok(()) | Err(_) => {}
+                }
+                #[cfg(test)]
+                if let Some(join_ack) = self.join_ack.take() {
+                    let outcome = reader_join.map_err(|_| "PTY reader thread panicked");
+                    // The test may already be unwinding and have dropped its
+                    // receiver. A failed notification must not panic in Drop.
+                    match join_ack.send(outcome) {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn keep_master_drained(
+        master: std::fs::File,
+        #[cfg(test)] first_read_gate: Option<(
+            std::sync::mpsc::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        )>,
+    ) -> PtyDrainer {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "read PTY master flags: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "make PTY master nonblocking: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let idle = Arc::new(AtomicBool::new(false));
+        let reader_idle = idle.clone();
+        let successful_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader_successful_reads = successful_reads.clone();
+        let reader = std::thread::Builder::new()
+            .name("thegn-test-pty-drain".into())
+            .spawn(move || {
+                let mut master = master;
+                let mut bytes = [0_u8; 4096];
+                #[cfg(test)]
+                let mut pause_after_first_read = first_read_gate;
+                loop {
+                    if reader_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    loop {
+                        // A successful read can keep this inner loop busy
+                        // forever under continuous PTY output. Observe stop
+                        // before every read, not only after reaching EAGAIN.
+                        if reader_stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        match master.read(&mut bytes) {
+                            Ok(0) => return,
+                            Ok(_) => {
+                                reader_successful_reads.fetch_add(1, Ordering::AcqRel);
+                                reader_idle.store(false, Ordering::Release);
+                                #[cfg(test)]
+                                if let Some((entered, release, release_received)) =
+                                    pause_after_first_read.take()
+                                {
+                                    // Both sides use finite channel operations. If
+                                    // the test fails before releasing the reader,
+                                    // dropping its sender wakes this rendezvous.
+                                    if entered.send(()).is_err() {
+                                        return;
+                                    }
+                                    if release
+                                        .recv_timeout(std::time::Duration::from_secs(5))
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    release_received.store(true, Ordering::Release);
+                                }
+                                continue;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                if reader_stop.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                continue;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                reader_idle.store(true, Ordering::Release);
+                                break;
+                            }
+                            // A closed PTY can report EIO; no more output can
+                            // be drained, and the fixture is being torn down.
+                            Err(_) => return,
+                        }
+                    }
+
+                    if reader_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let mut pollfd = libc::pollfd {
+                        fd: master.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // A finite timeout makes the stop flag observable without
+                    // relying on terminal close or an indefinitely sleeping
+                    // EAGAIN loop. Retry Interrupted without losing the stop.
+                    loop {
+                        // SAFETY: pollfd points to one initialized pollfd.
+                        let result = unsafe { libc::poll(&mut pollfd, 1, 10) };
+                        if result >= 0 {
+                            break;
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            if reader_stop.load(Ordering::Acquire) {
+                                return;
+                            }
+                            continue;
+                        }
+                        return;
+                    }
+                }
+            })
+            .expect("spawn PTY master drainer");
+        PtyDrainer {
+            stop,
+            idle,
+            successful_reads,
+            reader: Some(reader),
+            #[cfg(test)]
+            join_ack: None,
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod macos_tests {
+        use super::*;
         use std::os::fd::FromRawFd;
-        use termwiz::terminal::{Terminal, UnixTerminal};
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::{Receiver, Sender};
+        use std::time::{Duration, Instant};
+
+        /// Owns test resources in an error-safe order. On failure, releasing
+        /// the reader and closing the slave happen before any drainer join.
+        struct TestCleanup {
+            slave: Option<std::fs::File>,
+            drainer: Option<PtyDrainer>,
+            release: Option<Sender<()>>,
+            join_ack: Option<Receiver<Result<(), &'static str>>>,
+            teardown: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl TestCleanup {
+            fn new(slave: std::fs::File, drainer: PtyDrainer) -> Self {
+                Self {
+                    slave: Some(slave),
+                    drainer: Some(drainer),
+                    release: None,
+                    join_ack: None,
+                    teardown: None,
+                }
+            }
+
+            fn release_reader(&mut self) {
+                // Closing the channel wakes recv_timeout, even if the test
+                // failed before reaching the explicit release handshake.
+                drop(self.release.take());
+            }
+
+            fn start_teardown(&mut self) {
+                let mut drainer = self.drainer.take().expect("drainer is still owned");
+                let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+                drainer.join_ack = Some(joined_tx);
+                self.teardown = Some(std::thread::spawn(move || {
+                    drop(drainer);
+                }));
+                self.join_ack = Some(joined_rx);
+            }
+
+            fn wait_for_join(&mut self) -> Result<(), String> {
+                let ack = self
+                    .join_ack
+                    .as_ref()
+                    .expect("teardown has started")
+                    .recv_timeout(Duration::from_secs(1));
+                match ack {
+                    Ok(reader_result) => {
+                        let teardown_result = match self.teardown.take() {
+                            Some(teardown) => teardown.join(),
+                            None => return Err("PTY teardown handle was missing".into()),
+                        };
+                        if teardown_result.is_err() {
+                            return Err("PTY teardown thread panicked".into());
+                        }
+                        reader_result.map_err(str::to_owned)
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        Err("timed out waiting for PTY reader join acknowledgment".into())
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // A closed channel proves only that no acknowledgment
+                        // arrived, never that the reader joined successfully.
+                        match self.teardown.take() {
+                            Some(teardown) => match teardown.join() {
+                                Ok(()) => {
+                                    Err("PTY reader join acknowledgment was disconnected".into())
+                                }
+                                Err(_) => {
+                                    Err("PTY teardown thread panicked before acknowledgment".into())
+                                }
+                            },
+                            None => {
+                                Err("PTY teardown handle was missing before acknowledgment".into())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        impl Drop for TestCleanup {
+            fn drop(&mut self) {
+                self.release_reader();
+                drop(self.slave.take());
+                drop(self.drainer.take());
+                if let Some(joined) = self.join_ack.take() {
+                    match joined.recv_timeout(Duration::from_secs(1)) {
+                        Ok(_reader_result) => {
+                            if let Some(teardown) = self.teardown.take() {
+                                // Cleanup is already in Drop (possibly during
+                                // unwind), so reap without introducing a panic.
+                                match teardown.join() {
+                                    Ok(()) | Err(_) => {}
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            // Keep cleanup bounded; dropping the handle detaches
+                            // a teardown that has not acknowledged completion.
+                            drop(self.teardown.take());
+                        }
+                    }
+                }
+            }
+        }
+
+        fn wait_for_stop(stop: &std::sync::atomic::AtomicBool) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !stop.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY drainer did not observe teardown"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        #[test]
+        fn pty_drainer_stops_while_slave_is_open_and_master_is_idle() {
+            let mut master = -1;
+            let mut slave = -1;
+            assert_eq!(
+                // SAFETY: out-pointers are valid; null optional attributes are allowed.
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            // Keep the slave open so the master reader cannot finish via EOF/EIO.
+            // SAFETY: openpty returned a fresh slave descriptor owned here.
+            let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+            // SAFETY: openpty returned a fresh master descriptor transferred
+            // to the reader thread by keep_master_drained.
+            let drainer = keep_master_drained(unsafe { std::fs::File::from_raw_fd(master) }, None);
+            let mut cleanup = TestCleanup::new(slave, drainer);
+
+            let ready_by = Instant::now() + Duration::from_secs(1);
+            while !cleanup
+                .drainer
+                .as_ref()
+                .unwrap()
+                .idle
+                .load(Ordering::Acquire)
+            {
+                assert!(Instant::now() < ready_by, "PTY reader did not reach EAGAIN");
+                std::thread::yield_now();
+            }
+
+            let stop = cleanup.drainer.as_ref().unwrap().stop.clone();
+            let successful_reads = cleanup.drainer.as_ref().unwrap().successful_reads.clone();
+            cleanup.start_teardown();
+            wait_for_stop(&stop);
+            assert_eq!(
+                cleanup.wait_for_join(),
+                Ok(()),
+                "drop must join the idle reader"
+            );
+            assert_eq!(
+                successful_reads.load(Ordering::Acquire),
+                0,
+                "idle PTY reader must not consume data"
+            );
+        }
+
+        #[test]
+        fn pty_drainer_observes_stop_during_continuous_reads() {
+            use std::io::Write;
+
+            let mut master = -1;
+            let mut slave = -1;
+            assert_eq!(
+                // SAFETY: out-pointers are valid; null optional attributes are allowed.
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            // Keep a real PTY slave open and writable throughout teardown.
+            // SAFETY: openpty returned fresh descriptors owned here.
+            let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // SAFETY: the master descriptor is transferred to the reader.
+            let drainer = keep_master_drained(
+                unsafe { std::fs::File::from_raw_fd(master) },
+                Some((entered_tx, release_rx, release_received.clone())),
+            );
+            let mut cleanup = TestCleanup::new(slave, drainer);
+            cleanup.release = Some(release_tx);
+
+            // Gate the reader after its first real PTY read. Queue another
+            // byte before releasing it, so the next read succeeds regardless
+            // of OS thread scheduling once stop is set.
+            cleanup.slave.as_mut().unwrap().write_all(b"first").unwrap();
+            assert!(
+                entered_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+                "reader did not reach its first read"
+            );
+            cleanup
+                .slave
+                .as_mut()
+                .unwrap()
+                .write_all(b"still-readable")
+                .unwrap();
+            let reads_before_stop = cleanup
+                .drainer
+                .as_ref()
+                .unwrap()
+                .successful_reads
+                .load(Ordering::Acquire);
+            assert_eq!(reads_before_stop, 1);
+
+            // Observe the exact stop flag while the reader is still held after
+            // its first real read. The join acknowledgment can only follow a
+            // successful join inside PtyDrainer::drop.
+            let stop = cleanup.drainer.as_ref().unwrap().stop.clone();
+            let successful_reads = cleanup.drainer.as_ref().unwrap().successful_reads.clone();
+            cleanup.start_teardown();
+            wait_for_stop(&stop);
+
+            cleanup
+                .release
+                .as_ref()
+                .unwrap()
+                .send(())
+                .expect("held reader must accept release");
+            cleanup.release_reader();
+            let result = cleanup.wait_for_join();
+            assert_eq!(
+                result,
+                Ok(()),
+                "drop must successfully join the reader before returning"
+            );
+            assert!(
+                release_received.load(Ordering::Acquire),
+                "reader must receive the release signal before join acknowledgment"
+            );
+            assert_eq!(
+                successful_reads.load(Ordering::Acquire),
+                reads_before_stop,
+                "continuous PTY reader must perform exactly one successful read"
+            );
+        }
+    }
+
+    /// A real terminal waker backed by a PTY. Keep the returned fixture alive
+    /// as long as the waker is in use; it owns teardown ordering for both ends.
+    #[cfg(unix)]
+    pub(crate) fn test_waker() -> (termwiz::terminal::TerminalWaker, TestPtyFixture) {
+        use std::os::fd::FromRawFd;
+        use termwiz::terminal::UnixTerminal;
         let mut master = -1;
         let mut slave = -1;
         assert_eq!(
@@ -386,11 +846,31 @@ pub(crate) mod test_support {
             termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
                 .unwrap();
         let terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
-        (terminal.waker(), master, terminal)
+        #[cfg(target_os = "macos")]
+        let fixture = TestPtyFixture {
+            terminal: Some(terminal),
+            drainer: Some(keep_master_drained(master, None)),
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let fixture = TestPtyFixture {
+            terminal: Some(terminal),
+            master: Some(master),
+        };
+        (fixture_terminal_waker(&fixture), fixture)
+    }
+
+    #[cfg(unix)]
+    fn fixture_terminal_waker(fixture: &TestPtyFixture) -> termwiz::terminal::TerminalWaker {
+        use termwiz::terminal::Terminal;
+        fixture
+            .terminal
+            .as_ref()
+            .expect("live PTY terminal")
+            .waker()
     }
 
     #[cfg(not(unix))]
-    pub(crate) fn test_waker() -> (termwiz::terminal::TerminalWaker, (), ()) {
+    pub(crate) fn test_waker() -> (termwiz::terminal::TerminalWaker, ()) {
         unreachable!("callers return early when !UNIX")
     }
 

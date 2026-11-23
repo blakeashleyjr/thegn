@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Opt-in, read-only THE-609 diagnostic: show which toolchain, wrapper, and cached
 # artifact a build used, and whether its dep-info names this checkout. This is not
-# part of `just ci`.
+# part of `just ci`; Python 3 is required when a dep-info file is present.
 set -u
+
+script_dir=${BASH_SOURCE[0]%/*}
+if [[ $script_dir == "${BASH_SOURCE[0]}" ]]; then
+  script_dir=.
+fi
 
 usage() {
   printf '%s\n' 'Usage: test/cargo-provenance.sh [--target-dir DIR] [--checkout DIR] [--strict] [-h|--help]' >&2
@@ -52,22 +57,24 @@ done
 if ((checkout_set)); then
   checkout=$checkout_arg
 else
-  checkout=$(git rev-parse --show-toplevel 2>/dev/null)
+  if checkout=$(git rev-parse --show-toplevel 2>/dev/null && printf '\001'); then
+    checkout=${checkout%$'\001'}
+    checkout=${checkout%$'\n'}
+  else
+    checkout=
+  fi
   if [[ -z $checkout ]]; then
     checkout=$PWD
   fi
 fi
 
-checkout_given=$checkout
-if [[ $checkout == /* ]]; then
-  checkout_abs=$(cd "$checkout" 2>/dev/null && pwd -P)
-else
-  checkout_abs=$(cd "$PWD/$checkout" 2>/dev/null && pwd -P)
-fi
-if [[ -n $checkout_abs ]]; then
+checkout_resolved=1
+if checkout_abs=$(CDPATH='' cd -P "$checkout" >/dev/null 2>&1 && pwd -P && printf '\001'); then
+  checkout_abs=${checkout_abs%$'\001'}
+  checkout_abs=${checkout_abs%$'\n'}
   checkout=$checkout_abs
-elif [[ $checkout != /* ]]; then
-  checkout=$PWD/$checkout
+else
+  checkout_resolved=0
 fi
 
 if ((target_dir_set)); then
@@ -168,66 +175,39 @@ else
   core_depinfo=$(find "$deps_dir" -maxdepth 1 -type f -name 'thegn_core-*.d' -exec ls -t {} + 2>/dev/null | head -n 1)
   if [[ -n $core_depinfo ]]; then
     printf 'provenance.core_depinfo: %s\n' "$core_depinfo"
-    depinfo_lib=
+    missing_sources=unknown
+    depinfo_supported=0
     foreign_source=0
-    listed_source_count=0
-    depinfo_tokens=$(tr ' ' '\n' <"$core_depinfo")
-    for depinfo_token in $depinfo_tokens; do
-      depinfo_token=${depinfo_token%:}
-      case "$depinfo_token" in
-      */crates/thegn-core/src/*.rs | crates/thegn-core/src/*.rs)
-        listed_source_count=$((listed_source_count + 1))
-        if [[ $depinfo_token == /* ]]; then
-          token_dir=$(dirname "$depinfo_token")
-          token_base=$(basename "$depinfo_token")
-          if token_dir_abs=$(cd "$token_dir" 2>/dev/null && pwd -P); then
-            token_abs=$token_dir_abs/$token_base
-          else
-            token_abs=$depinfo_token
-          fi
-          case "$token_abs" in
-          "$checkout"/crates/thegn-core/src/*.rs | "$checkout_given"/crates/thegn-core/src/*.rs) ;;
-          *) foreign_source=1 ;;
-          esac
-          [[ -f $token_abs ]] || foreign_source=1
-        else
-          [[ -f $checkout/$depinfo_token ]] || foreign_source=1
+    depinfo_lib=
+    parser_result=
+    if ((checkout_resolved)) && command -v python3 >/dev/null 2>&1 && [[ ! $checkout =~ [[:space:]] ]]; then
+      if parser_result=$(python3 "$script_dir/cargo-provenance-parse.py" "$checkout" "$core_depinfo" 2>/dev/null); then
+        IFS=$'\t' read -r missing_sources foreign_source depinfo_lib <<<"$parser_result"
+        if [[ $missing_sources =~ ^[0-9]+$ && ($foreign_source == 0 || $foreign_source == 1) && -n $depinfo_lib ]]; then
+          depinfo_supported=1
         fi
-        if [[ $depinfo_token == */crates/thegn-core/src/lib.rs || $depinfo_token == crates/thegn-core/src/lib.rs ]]; then
-          depinfo_lib=$depinfo_token
-        fi
-        ;;
-      esac
-    done
-
-    missing_sources=0
-    core_src_dir=$checkout/crates/thegn-core/src
-    if [[ -d $core_src_dir ]]; then
-      while IFS= read -r source_file; do
-        source_listed=0
-        for depinfo_token in $depinfo_tokens; do
-          depinfo_token=${depinfo_token%:}
-          if [[ $depinfo_token == "$source_file" || $depinfo_token == "${source_file#"$checkout"/}" ]]; then
-            source_listed=1
-            break
-          fi
-        done
-        if ((source_listed == 0)); then
-          missing_sources=$((missing_sources + 1))
-        fi
-      done < <(find "$core_src_dir" -type f -name '*.rs' 2>/dev/null)
+      fi
+    fi
+    if ((depinfo_supported == 0)); then
+      missing_sources=unknown
+      foreign_source=1
+      printf '%s\n' 'cargo-provenance: refusing unsupported dep-info paths, unavailable Python 3, or unresolved source comparison' >&2
     fi
     printf 'provenance.core_depinfo_missing_sources: %s\n' "$missing_sources"
     if [[ -n $depinfo_lib ]]; then
       printf 'provenance.core_depinfo_lib: %s\n' "$depinfo_lib"
-      if ((foreign_source == 0 && missing_sources == 0 && listed_source_count > 0)); then
+      if ((foreign_source == 0 && missing_sources == 0)); then
         match=yes
       else
         match=no
       fi
     else
       printf '%s\n' 'provenance.core_depinfo_lib: none'
-      match=unknown
+      if ((depinfo_supported == 0)); then
+        match=no
+      else
+        match=unknown
+      fi
     fi
   else
     printf '%s\n' 'provenance.core_depinfo: none'

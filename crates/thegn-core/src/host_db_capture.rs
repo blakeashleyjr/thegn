@@ -91,15 +91,35 @@ pub fn capture_host_definitions_wal_at(
 mod tests {
     use super::*;
 
+    fn canonical_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        // macOS commonly spells the temp root as /tmp while the directory is
+        // actually below /private/tmp. SQLite's unix VFS NOFOLLOW admission
+        // can reject DB paths whose fixture-created ancestors retain that
+        // symlink spelling, so give every fixture its canonical path before
+        // creating any database or invoking capture.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, root)
+    }
+
     fn unsupported_vfs() -> bool {
         // This is a VFS capability check, not a target-name inference. On a
         // build without Unix VFS these tests assert the explicit refusal path;
         // they do not claim to have exercised positive WAL capture there.
         let absent = unsafe { rusqlite::ffi::sqlite3_vfs_find(c"unix".as_ptr()).is_null() };
         if absent {
+            // Keep this ordinary tempfile spelling: Windows canonicalize can
+            // add an extended-length prefix that the path guard rejects
+            // before the missing-VFS behavior is reached.
             let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            let writer = database(&path);
+            writer
+                .execute("INSERT INTO hosts VALUES ('a','default-vfs-host','{}')", [])
+                .unwrap();
+            writer.close().unwrap();
             assert!(matches!(
-                capture_host_definitions_wal_at(&dir.path().join("state.db")),
+                capture_host_definitions_wal_at(&path),
                 Err(HostCaptureReadError::Open)
             ));
             dir.close().expect("owned unsupported-VFS fixture cleanup");
@@ -121,14 +141,14 @@ mod tests {
         if unsupported_vfs() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
+        let (dir, root) = canonical_tempdir();
+        let path = root.join("state.db");
         let writer = database(&path);
         writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO hosts VALUES ('a','private-host','{}');").unwrap();
         writer.execute_batch("CREATE TABLE capture_canary (payload TEXT); INSERT INTO capture_canary VALUES ('expired-looking sentinel retained');").unwrap();
-        assert!(dir.path().join("state.db-wal").is_file());
+        assert!(root.join("state.db-wal").is_file());
         let base_before = std::fs::read(&path).unwrap();
-        let wal_before = std::fs::read(dir.path().join("state.db-wal")).unwrap();
+        let wal_before = std::fs::read(root.join("state.db-wal")).unwrap();
         let captured = capture_host_definitions_wal_at(&path).unwrap();
         assert_eq!(captured.definitions()[0].0, "private-host");
         assert_eq!(
@@ -158,10 +178,10 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), base_before);
         assert_eq!(
-            std::fs::read(dir.path().join("state.db-wal")).unwrap(),
+            std::fs::read(root.join("state.db-wal")).unwrap(),
             wal_before
         );
-        let mut files = std::fs::read_dir(dir.path())
+        let mut files = std::fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
@@ -181,14 +201,14 @@ mod tests {
         if unsupported_vfs() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.db");
+        let (dir, root) = canonical_tempdir();
+        let path = root.join("missing.db");
         assert!(matches!(
             capture_host_definitions_wal_at(&path),
             Err(HostCaptureReadError::Open)
         ));
         assert!(!path.exists());
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         assert!(matches!(
             capture_host_definitions_wal_at(Path::new(":memory:")),
             Err(HostCaptureReadError::Open)
@@ -208,7 +228,7 @@ mod tests {
             ))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"not a sqlite database");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         dir.close().expect("owned invalid-source fixture cleanup");
     }
 
@@ -217,8 +237,8 @@ mod tests {
         if unsupported_vfs() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
+        let (dir, root) = canonical_tempdir();
+        let path = root.join("state.db");
         let writer = database(&path);
         writer
             .execute("INSERT INTO hosts VALUES ('a','a','{')", [])
@@ -262,16 +282,48 @@ mod tests {
 
     #[test]
     fn query_like_literal_filenames_are_explicitly_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
+        if unsupported_vfs() {
+            return;
+        }
+        let (dir, root) = canonical_tempdir();
         for name in ["state.db?immutable=1", "state.db#fragment"] {
-            let path = dir.path().join(name);
+            let path = root.join(name);
+            let writer = database(&path);
+            writer
+                .execute(
+                    "INSERT INTO hosts VALUES ('a','literal-name-host','{}')",
+                    [],
+                )
+                .unwrap();
+            writer.close().unwrap();
+            assert!(
+                path.is_file(),
+                "literal database fixture must exist: {name}"
+            );
             assert!(matches!(
                 capture_host_definitions_wal_at(&path),
                 Err(HostCaptureReadError::Open)
             ));
-            assert!(!path.exists());
         }
         dir.close().expect("owned URI refusal fixture cleanup");
+    }
+
+    #[test]
+    fn database_symlink_is_refused_by_nofollow() {
+        if unsupported_vfs() {
+            return;
+        }
+        let (dir, root) = canonical_tempdir();
+        let target = root.join("target.db");
+        let writer = database(&target);
+        drop(writer);
+        let link = root.join("linked.db");
+        crate::fsperm::create_symlink(&target, &link, false).unwrap();
+        assert!(matches!(
+            capture_host_definitions_wal_at(&link),
+            Err(HostCaptureReadError::Open)
+        ));
+        dir.close().expect("owned symlink fixture cleanup");
     }
 
     #[test]
@@ -279,8 +331,8 @@ mod tests {
         if unsupported_vfs() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("secret-name.db");
+        let (dir, root) = canonical_tempdir();
+        let path = root.join("secret-name.db");
         let writer = database(&path);
         writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
         let started = std::time::Instant::now();

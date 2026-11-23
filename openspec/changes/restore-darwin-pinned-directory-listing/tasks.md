@@ -1,0 +1,7 @@
+- [x] Replace `/dev/fd` listings with a shared descriptor-relative stream helper.
+- [x] Preserve independent listing positions and non-Unix behavior.
+- [x] Add focused repeated-listing coverage.
+- [x] Normalize cleanup entry names and preserve prior names on the first stream-read error.
+- [x] Keep fresh descriptor ownership through `fdopendir` failure.
+- [x] Record native proof still required from the coordinator.
+- [ ] Coordinator: on the exact source and lock, run macOS locked strict all-targets lint, prove managed-account rollback and fsperm behavior, and complete full-batch qualification; record the native receipt. The existing ARM receipt may be bound when source and lock match exactly.

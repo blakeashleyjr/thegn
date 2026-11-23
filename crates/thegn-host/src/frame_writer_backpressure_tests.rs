@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     FRAME_QUEUE_DEPTH, FrameWriter, Msg, OOB_QUEUE_BYTES, OOB_QUEUE_COUNT, OobKind, PARSER_RESET,
-    WRITER_SHUTDOWN_BOUND, WriterStatus,
+    WriterStatus,
 };
 use crate::perf_timing::{FrameStamp, WriterMetrics};
 
@@ -437,20 +437,15 @@ fn shutdown_with_a_still_blocked_sink_returns_within_the_bound() {
 
     let (dropped_tx, dropped_rx) = mpsc::channel();
     let dropper = std::thread::spawn(move || {
-        let started = Instant::now();
         drop(writer);
         dropped_tx
-            .send(started.elapsed())
+            .send(())
             .expect("test stopped waiting for the drop");
     });
-    let elapsed = dropped_rx
+    dropped_rx
         .recv_timeout(FAILURE_BOUND)
         .expect("dropping the writer waited on the blocked sink instead of detaching");
     dropper.join().expect("dropper thread panicked");
-    assert!(
-        elapsed < FAILURE_BOUND,
-        "shutdown took {elapsed:?} (bound {WRITER_SHUTDOWN_BOUND:?})"
-    );
     {
         let q = inner.q.lock().expect("writer queue");
         assert!(matches!(q.status, WriterStatus::Fatal(_)));

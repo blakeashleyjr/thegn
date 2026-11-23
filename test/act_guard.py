@@ -739,21 +739,35 @@ def self_test() -> int:
                 passwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
             except (KeyError, OSError):
                 pass
+        native_config = (
+            Path("Library") / "Application Support"
+            if sys.platform == "darwin"
+            else Path(".config")
+        )
         cases.append(
             (
                 "user-actrc-absent-is-unchanged",
                 user_actrc_paths(user_env)
                 == [xdg / "act" / "actrc", home / ".actrc"]
                 and user_actrc_paths({"HOME": str(home)})
-                == [home / ".config" / "act" / "actrc", home / ".actrc"]
+                == [home / native_config / "act" / "actrc", home / ".actrc"]
                 and user_actrc_paths({})
                 == (
-                    [passwd_home / ".config" / "act" / "actrc", passwd_home / ".actrc"]
+                    [passwd_home / native_config / "act" / "actrc", passwd_home / ".actrc"]
                     if passwd_home is not None
                     else []
                 )
+                and not any(path.exists() for path in user_actrc_paths({"HOME": str(home)}))
                 and user_actrc_tokens(user_env) == []
                 and plan("push", [], None, None) == baseline,
+            )
+        )
+        linux_home = temp_root / "linux-home"
+        cases.append(
+            (
+                "user-actrc-linux-config-path",
+                user_actrc_paths({"HOME": str(linux_home)}, "linux")
+                == [linux_home / ".config" / "act" / "actrc", linux_home / ".actrc"],
             )
         )
         darwin_home = temp_root / "darwin-home"
@@ -780,6 +794,23 @@ def self_test() -> int:
                 user_tokens == ["--secret", "T=x"]
                 and argv is None
                 and ".github/workflows/ci.yml" in message,
+            )
+        )
+        identical_argv, identical_message = plan(
+            "push",
+            ["--secret", "T=x"],
+            [" M .github/workflows/ci.yml"],
+            "abc123",
+            False,
+            user_tokens,
+        )
+        cases.append(
+            (
+                "identical-user-and-cli-credential-flags-are-refused",
+                user_tokens == ["--secret", "T=x"]
+                and has_credentials([*user_tokens, "--secret", "T=x"])
+                and identical_argv is None
+                and ".github/workflows/ci.yml" in identical_message,
             )
         )
 

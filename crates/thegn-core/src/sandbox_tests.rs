@@ -2600,6 +2600,7 @@ fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_famil
         let alias = td.path().join("provider-cache-alias");
         std::fs::create_dir(&target).unwrap();
         symlink(&target, &alias).unwrap();
+        let canonical_target = std::fs::canonicalize(&target).unwrap();
         for backend in [Backend::Bwrap, Backend::Systemd, Backend::Docker] {
             let mut candidate = spec(backend);
             candidate.mounts.push(Mount {
@@ -2614,7 +2615,7 @@ fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_famil
                 .iter()
                 .find(|mount| mount.dest == "/work/cache-through-alias")
                 .unwrap();
-            assert_eq!(mount.host, target.to_string_lossy().as_ref());
+            assert_eq!(mount.host, canonical_target.to_string_lossy().as_ref());
             assert_eq!(mount.dest, "/work/cache-through-alias");
         }
         let mut remote = spec(Backend::Bwrap);

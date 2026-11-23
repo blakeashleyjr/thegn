@@ -628,7 +628,7 @@ impl Landing {
         sb: &crate::run::SidebarState,
         removed: &[&str],
     ) -> Self {
-        use crate::sidebar::{RowKind, RowTarget, SidebarRow};
+        use crate::sidebar::{RowTarget, SidebarRow};
         let rows: Vec<&SidebarRow> = model.sidebar_rows.iter().filter(|r| r.visible).collect();
         let gone = |r: &SidebarRow| {
             r.worktree_path
@@ -642,7 +642,7 @@ impl Landing {
             let order: Vec<usize> = (0..rows.len())
                 .filter(|&i| {
                     i == at
-                        || (rows[i].kind == RowKind::Worktree
+                        || (rows[i].kind.is_worktree()
                             && &rows[i].workspace_slug == slug
                             && keep(rows[i]))
                 })
@@ -662,7 +662,7 @@ impl Landing {
             .filter(|g| !g.path.is_empty() && removed.contains(&g.path.as_str()))
             .and_then(|g| {
                 rows.iter().position(|r| {
-                    r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some(&g.path)
+                    r.kind.is_worktree() && r.worktree_path.as_deref() == Some(&g.path)
                 })
             })
             .and_then(|at| neighbour(at, &|r| matches!(r.tab_target, Some(RowTarget::Tab(..)))))

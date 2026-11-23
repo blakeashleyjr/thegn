@@ -5,6 +5,13 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[cfg(all(test, feature = "iroh"))]
+pub(crate) fn make_world_readable_for_test(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+}
+
 impl<R: std::io::Read + std::os::fd::AsRawFd> super::GatePipe for R {
     fn set_nonblocking(&self) -> io::Result<()> {
         // SAFETY: fcntl changes only the status flags on our owned pipe descriptor.

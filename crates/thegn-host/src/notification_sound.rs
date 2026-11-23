@@ -573,7 +573,7 @@ mod tests {
             return;
         }
         use std::sync::atomic::AtomicUsize;
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let builds = Arc::new(AtomicUsize::new(0));
@@ -613,7 +613,7 @@ mod tests {
         if !UNIX {
             return;
         }
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let building = Arc::new(AtomicBool::new(false));
         // An uncooperative build (a hung `read_dir`): ignores `stopping`.
         let builder: Arc<SnapshotBuilder> = {
@@ -685,7 +685,7 @@ mod tests {
         if !UNIX {
             return;
         }
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let runtime = SoundRuntime::with_builder(waker, Arc::new(|_, _| None));
         assert!(!runtime.take_fallback_bell());
         runtime.enqueue(&SoundEmit::Command("exit 7".into()));
@@ -698,7 +698,7 @@ mod tests {
         if !UNIX {
             return;
         }
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let runtime = SoundRuntime::with_builder(waker, Arc::new(|_, _| None));
         // Wedge the worker, then overfill the bounded queue.
         for _ in 0..=(QUEUE_DEPTH + 2) {
@@ -716,7 +716,7 @@ mod tests {
         if !UNIX {
             return;
         }
-        let (waker, _master, _terminal) = test_waker();
+        let (waker, _fixture) = test_waker();
         let runtime = SoundRuntime::new(waker);
         assert!(!runtime.take_fallback_bell());
         runtime.latch_fallback_bell_for_test();

@@ -1657,8 +1657,11 @@ impl SidebarState {
                         .iter()
                         .filter(|r| r.visible)
                         .position(|r| {
-                            r.kind == crate::sidebar::RowKind::Worktree
-                                && r.worktree_path.as_ref() == Some(p)
+                            matches!(
+                                r.kind,
+                                crate::sidebar::RowKind::Worktree
+                                    | crate::sidebar::RowKind::PipelineWorktree
+                            ) && r.worktree_path.as_ref() == Some(p)
                         })
                 })
             };
@@ -1812,7 +1815,7 @@ pub(crate) fn sidebar_worktree_order(model: &FrameModel) -> Vec<usize> {
     model
         .sidebar_rows
         .iter()
-        .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Worktree)
+        .filter(|r| r.visible && r.kind.is_worktree())
         .filter_map(|r| match r.tab_target {
             Some(crate::sidebar::RowTarget::Tab(g, _)) => Some(g),
             _ => None,
@@ -8728,6 +8731,7 @@ async fn event_loop<T: Terminal>(
                             matches!(
                                 r.kind,
                                 crate::sidebar::RowKind::Worktree
+                                    | crate::sidebar::RowKind::PipelineWorktree
                                     | crate::sidebar::RowKind::Workspace
                             )
                         })
@@ -27546,7 +27550,8 @@ async fn event_loop<T: Terminal>(
                                     // cursor, matching the two arms above —
                                     // this used to move the *active* worktree
                                     // no matter where the cursor sat.
-                                    Some(crate::sidebar::RowKind::Worktree) => {
+                                    Some(crate::sidebar::RowKind::Worktree)
+                                    | Some(crate::sidebar::RowKind::PipelineWorktree) => {
                                         sb.move_cursor_worktree(&mut model, &mut session, up)
                                     }
                                     _ => sb.move_active_worktree(&mut model, &mut session, up),

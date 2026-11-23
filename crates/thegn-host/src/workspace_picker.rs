@@ -2124,8 +2124,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let mut p = picker(&["/r/a"]);
         p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
         let first = thegn_core::config::Config {
@@ -2160,8 +2159,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let mut p = picker(&["/r/a"]);
         p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
         let cfg = thegn_core::config::Config {
@@ -2197,8 +2195,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let mut p = picker(&["/r/a"]);
         p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
         let cfg = thegn_core::config::Config {
@@ -2218,8 +2215,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let mut p = picker(&["/r/a"]);
         p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
         let cfg = thegn_core::config::Config {

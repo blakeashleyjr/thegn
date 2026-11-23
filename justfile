@@ -1553,7 +1553,7 @@ clean-aux:
 cargo-provenance *args:
     bash test/cargo-provenance.sh {{args}}
 
-# Hermetic fixture test for the provenance script; pure Python + bash, no Cargo.
+# Hermetic fixture test for the provenance script; Python 3 + Bash, no Cargo.
 test-cargo-provenance:
     python3 -B test/cargo_provenance_test.py
 

@@ -506,10 +506,7 @@ mod direct_tests {
             "tgc1_single-use-code"
         );
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if crate::platform::make_world_readable_for_test(&path).unwrap() {
             let error = read_invitation(Some(path)).err().unwrap().to_string();
             assert!(error.contains("invitation file refused"));
             assert!(!error.contains("tgc1_single-use-code"));

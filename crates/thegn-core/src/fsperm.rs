@@ -1265,15 +1265,15 @@ impl PrivateDir {
     /// iteration errors are returned to the caller.
     pub fn file_names(&self) -> std::io::Result<Vec<std::ffi::OsString>> {
         #[cfg(unix)]
-        let entries = {
-            use std::os::fd::AsRawFd;
-            std::fs::read_dir(format!("/dev/fd/{}", self.fd.as_raw_fd()))?
-        };
+        {
+            pinned_directory_entries(&self.fd)?.into_iter().collect()
+        }
         #[cfg(not(unix))]
-        let entries = std::fs::read_dir(&self.path)?;
-        entries
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect()
+        {
+            std::fs::read_dir(&self.path)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect()
+        }
     }
 
     /// Sync directory metadata through the held handle.
@@ -1300,13 +1300,10 @@ impl PrivateDir {
         max_age: std::time::Duration,
     ) -> usize {
         #[cfg(unix)]
-        let entries = {
-            use std::os::fd::AsRawFd;
-
-            std::fs::read_dir(format!("/dev/fd/{}", self.fd.as_raw_fd()))
-        };
+        let entries = pinned_directory_entries(&self.fd).map(|names| names.into_iter());
         #[cfg(not(unix))]
-        let entries = std::fs::read_dir(&self.path);
+        let entries = std::fs::read_dir(&self.path)
+            .map(|entries| entries.map(|entry| entry.map(|entry| entry.file_name())));
         let entries = match entries {
             Ok(entries) => entries,
             Err(error) => {
@@ -1317,7 +1314,7 @@ impl PrivateDir {
         let mut removed = 0;
         for entry in entries {
             let name = match entry {
-                Ok(entry) => entry.file_name(),
+                Ok(name) => name,
                 Err(error) => {
                     tracing::debug!(%error, "unable to read private directory entry name");
                     continue;
@@ -2144,10 +2141,7 @@ impl RootedDir {
     /// List entry names through the held directory handle.
     #[cfg(unix)]
     fn file_names(&self) -> std::io::Result<Vec<std::ffi::OsString>> {
-        use std::os::fd::AsRawFd;
-        std::fs::read_dir(format!("/dev/fd/{}", self.fd.as_raw_fd()))?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect()
+        pinned_directory_entries(&self.fd)?.into_iter().collect()
     }
 
     #[cfg(unix)]
@@ -2236,6 +2230,102 @@ fn validate_relative_directory(rel: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn nix_io_error(error: nix::errno::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error as i32)
+}
+
+/// List names through a fresh directory stream opened relative to a pinned
+/// descriptor. Opening `.` creates an independent read position for each
+/// listing, while `fdopendir` avoids the platform-specific `/dev/fd` path
+/// boundary (which is not a directory on Darwin).
+#[cfg(unix)]
+fn pinned_directory_entries(
+    directory: &impl std::os::fd::AsFd,
+) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    let fd = openat(
+        std::os::fd::AsFd::as_fd(directory),
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(nix_io_error)?;
+    let mut stream = OwnedDirectoryStream::from_fd(fd)?;
+    let mut entries = Vec::new();
+    loop {
+        match stream.next_name() {
+            Ok(Some(name))
+                if name != std::ffi::OsStr::new(".") && name != std::ffi::OsStr::new("..") =>
+            {
+                entries.push(Ok(name));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) => {
+                entries.push(Err(error));
+                break;
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// An owned `fdopendir` stream. The `OwnedFd` stays live until `fdopendir`
+/// succeeds, so a failed conversion closes it when the local value drops.
+#[cfg(unix)]
+struct OwnedDirectoryStream(std::ptr::NonNull<nix::libc::DIR>);
+
+#[cfg(unix)]
+impl OwnedDirectoryStream {
+    fn from_fd(fd: std::os::fd::OwnedFd) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        // SAFETY: `fd` is an owned, open descriptor. POSIX `fdopendir` takes
+        // ownership only on success; on failure `fd` remains owned here and
+        // is closed by its `OwnedFd` drop.
+        let raw_stream = unsafe { nix::libc::fdopendir(fd.as_raw_fd()) };
+        let Some(stream) = std::ptr::NonNull::new(raw_stream) else {
+            return Err(std::io::Error::last_os_error());
+        };
+        // `fdopendir` owns the descriptor now. Prevent `OwnedFd` from closing
+        // it; `closedir` below owns its eventual close.
+        let _ = fd.into_raw_fd();
+        Ok(Self(stream))
+    }
+
+    fn next_name(&mut self) -> std::io::Result<Option<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStringExt;
+
+        nix::errno::Errno::clear();
+        // SAFETY: the stream remains live for `self`; `readdir` returns either
+        // null or a pointer to an entry valid until the next call on this
+        // stream. The name is copied before that next call.
+        let entry = unsafe { nix::libc::readdir(self.0.as_ptr()) };
+        if entry.is_null() {
+            let error = nix::errno::Errno::last_raw();
+            return if error == 0 {
+                Ok(None)
+            } else {
+                Err(std::io::Error::from_raw_os_error(error))
+            };
+        }
+
+        // SAFETY: `readdir` returned a live `dirent`, whose `d_name` is a
+        // NUL-terminated byte string for the lifetime documented above.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        Ok(Some(std::ffi::OsString::from_vec(name.to_bytes().to_vec())))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the stream returned by
+        // `fdopendir`; it is closed exactly once here.
+        unsafe {
+            nix::libc::closedir(self.0.as_ptr());
+        }
+    }
 }
 
 /// Owner and mode policy for a child opened by [`PrivateDir::open_child_nofollow`]:
@@ -3374,6 +3464,48 @@ mod tests {
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o750)).unwrap();
         let error = open_private_dir(&private).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn pinned_directory_listings_start_at_independent_positions() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        let pinned = open_private_dir(&private).unwrap();
+        std::fs::write(private.join("first"), b"1").unwrap();
+        std::fs::write(private.join("second"), b"2").unwrap();
+
+        let mut first = pinned.file_names().unwrap();
+        let mut second = pinned.file_names().unwrap();
+        first.sort();
+        second.sort();
+        assert_eq!(
+            first,
+            vec![
+                std::ffi::OsString::from("first"),
+                std::ffi::OsString::from("second"),
+            ]
+        );
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn failed_directory_stream_conversion_closes_the_fresh_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let file = tempfile::tempfile().unwrap();
+        let fd: std::os::fd::OwnedFd = file.into();
+        let raw_fd = fd.as_raw_fd();
+
+        assert!(OwnedDirectoryStream::from_fd(fd).is_err());
+        // SAFETY: `F_GETFD` accepts the raw descriptor integer and takes no
+        // third argument; a closed descriptor is valid input for this check.
+        let result = unsafe { nix::libc::fcntl(raw_fd, nix::libc::F_GETFD) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(nix::libc::EBADF)
+        );
     }
 
     #[test]
