@@ -7,6 +7,15 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.123] — 2026-11-23
+
+### Fixed
+
+- A text selection in a pane disappears when that pane is resized (a new
+  split, a closed pane, zoom, the drawer, or a window resize) or leaves the
+  screen. It used to stay highlighted over whatever text had reflowed under it.
+  The selected text is still copied when you release the mouse.
+
 ## [0.1.0-alpha.122] — 2026-11-23
 
 ### Fixed
@@ -4196,7 +4205,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.122...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.123...HEAD
+[0.1.0-alpha.123]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.122...v0.1.0-alpha.123
 [0.1.0-alpha.122]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.121...v0.1.0-alpha.122
 [0.1.0-alpha.121]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.120...v0.1.0-alpha.121
 [0.1.0-alpha.120]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.119...v0.1.0-alpha.120

@@ -10391,6 +10391,13 @@ async fn event_loop<T: Terminal>(
         }
 
         let tree = crate::handlers::pane_zoom::displayed_tree(&session);
+        // The selected pane's grid size before any layout pass this frame: a
+        // selection stores cells, so a resize (split, close, zoom, drawer,
+        // window) or the pane leaving the screen (tab switch, stack collapse)
+        // leaves its highlight over the wrong text. Checked after the pass.
+        let sel_size_before = mouse_sel
+            .as_ref()
+            .and_then(|(sp, _)| panes.table.get(sp).map(|p| p.emulator().size()));
         if need_relayout || crate::panes::size_drifted(&panes, &tree, chrome.center) {
             let _relayout_span = crate::perf::measure(crate::perf::Subsys::Relayout);
             relayout(&mut panes, &tree, chrome.center);
@@ -10428,6 +10435,17 @@ async fn event_loop<T: Terminal>(
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
             need_relayout = false;
+        }
+        if let Some((sp, _)) = mouse_sel.as_ref() {
+            let sp = *sp;
+            let size_after = panes.table.get(&sp).map(|p| p.emulator().size());
+            let visible =
+                drawer == Some(sp) || tree.layout(chrome.center).iter().any(|(id, _)| *id == sp);
+            if crate::copymode::selection_is_stale(sel_size_before, size_after, visible) {
+                mouse_sel = None;
+                mouse_selecting = false;
+                dirty = true;
+            }
         }
         let focused = session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
         // The drain below only needs the visible pane ids; the tree itself is
