@@ -7,7 +7,7 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0-alpha.120] — 2026-11-20
+## [0.1.0-alpha.120] — 2026-11-23
 
 ### Added
 
@@ -18,20 +18,6 @@ All notable changes to **thegn** are documented here. The format follows
 
 - Pipeline-owned worktrees appear once under Pipelines by default. Explicit
   folder assignments take precedence, and the flat layout remains available.
-
-### Fixed
-
-- Work and Observe tabs respond to mouse clicks and keyboard navigation.
-- Native macOS checkout-hook inspection handles an exited process-group leader
-  while preserving checks for live descendants.
-- Native CI shells include the packaging and release smoke test dependencies.
-  Linux-only process diagnostics and feature-only helpers are compiled where
-  they are used.
-
-## [0.1.0-alpha.119] — 2026-11-20
-
-### Changed
-
 - Commands that now refuse, and what to run instead:
   - `wt rm` and the TUI delete pull the sandbox's commits first and refuse on a failed pull or a dirty sandbox; use `--force` (or the TUI force delete) to destroy anyway.
   - `env down` refuses a dirty sandbox or failed pull; use `--force`, or `--stop` to park it.
@@ -48,13 +34,29 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Fixed
 
+- Work and Observe tabs respond to mouse clicks and keyboard navigation.
+- Native macOS checkout-hook inspection handles an exited process-group leader
+  while preserving checks for live descendants.
+- Native CI shells include the packaging and release smoke test dependencies.
+  Linux-only process diagnostics and feature-only helpers are compiled where
+  they are used.
 - Native macOS builds no longer fail on the per-process activity test or dead-code lints for Linux-only media and process-sampling helpers (THE-2479, THE-2482, THE-2483).
 
-## [0.1.0-alpha.118] — 2026-11-20
+## [0.1.0-alpha.119] — 2026-11-22
+
+### Fixed
+
+- A published release's manifest binds `SHA256SUMS` like every other asset, so verifying a download no longer fails at the manifest step.
+
+## [0.1.0-alpha.118] — 2026-11-22
 
 ### Fixed
 
 - The documentation build passes again: doc links that could not be resolved are plain code text (THE-2389).
+
+### Security
+
+- `url` is updated to 2.5.9, which closes a stack overflow in `Url::origin()` on nested `blob:` URLs (RUSTSEC-2026-0592).
 
 ## [0.1.0-alpha.117] — 2026-11-20
 

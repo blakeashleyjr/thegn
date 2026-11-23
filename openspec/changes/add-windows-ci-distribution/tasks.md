@@ -37,3 +37,8 @@
       core modules (shellinv, fsperm, termcaps/basename additions).
 - [ ] 4.3 First opt-in `windows` plus `windows-artifact-smoke` CI run green on
       GitHub; then remove the opt-in gates and record the first routine run.
+      First attempt intaken 2026-11-23
+      ([run 45091904082](https://github.com/blakeashleyjr/thegn/actions/runs/45091904082)):
+      the MSVC workspace check passed; `cargo test -p thegn-svc --lib --locked
+ipc` failed, so the Job-Object, `thegn.exe` build and artifact-smoke steps
+      were skipped. Fix the IPC tests before re-running.

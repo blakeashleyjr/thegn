@@ -22,7 +22,11 @@ reproducible problems that are not listed here.
 - **The `apple` sandbox backend cannot run offline.** `network = "none"`, and
   therefore the `sealed` profile, is refused with `network-unexpressible`; use
   podman or docker for offline or sealed worktrees.
-- **Windows is deferred.** No Windows binary is published.
+- **Windows is deferred.** No Windows binary is published. To run thegn on a
+  Windows host, use WSL2 with the supported Linux x86_64 archive; see the
+  [Windows and WSL test handoff](docs/superpowers/guides/windows-wsl-test-handoff.md).
+  The native port compiles for MSVC, but its first opt-in CI run failed in the
+  named-pipe IPC tests and no `thegn.exe` is published.
 - **Homebrew and AUR publication are pending owner setup.** They are not
   install channels yet; see [RELEASING.md](RELEASING.md#deferred-release-channels).
 - Standalone `.deb` and `.rpm` assets are attached to releases, but their clean

@@ -320,21 +320,28 @@ Mac when touching anything platform-sensitive; it covers what neither
 
 Native Windows is a build target **under development**, not a supported
 platform, and no Windows binaries ship in the current public alpha. Current
-repository state, pending the first recorded native CI run:
+repository state, from the first opt-in native run on 2026-11-23
+([run 45091904082](https://github.com/blakeashleyjr/thegn/actions/runs/45091904082)):
 
-- The Linux-side `x86_64-pc-windows-gnu` cross-check covers cfg/compile
-  regressions, but it is not evidence that the MSVC workspace check passes.
-- Native named-pipe daemon IPC tests exist. They used to fail on
+- The MSVC workspace check (`cargo check --workspace --locked`) **passes** on
+  windows-latest. The Linux-side `x86_64-pc-windows-gnu` cross-check still
+  covers cfg/compile regressions ahead of that run.
+- Native named-pipe daemon IPC tests exist and are the first gate after the
+  check; that run never ran them, because the `thegn-svc` lib test target does
+  not compile for Windows: `crates/thegn-svc/src/calendar/command_tests.rs:110`
+  and `crates/thegn-svc/src/inbox/command_tests.rs:324` call `libc::kill`
+  without a `cfg(unix)` guard, and `libc` is a unix-only dependency there.
+  `cargo check --workspace` does not build test targets, which is why the step
+  before it passed. The kernel tests after it (Job Objects, the `thegn.exe`
+  build and the artifact smoke) have not run yet. They used to fail on
   `pipe_bind_is_the_lock_and_round_trips`: Windows keeps a pipe _name_ reserved
   for a few milliseconds after the last handle of an instance that carried a
   connection closes, and `bind_exclusive` read that window as a rival daemon.
-  It now retries briefly (`crates/thegn-svc/src/ipc.rs`).
-- Native Job-Object process-scoping tests exist, but neither test group has a
-  recorded green run in the current CI configuration.
-- A successful opt-in job is configured to build and upload `thegn.exe`, then
-  a separate job downloads and smokes that artifact. No such run has completed,
-  and nobody has run thegn interactively on Windows. Those are remaining gaps
-  before the platform can be called supported — see
+  It now retries briefly (`crates/thegn-svc/src/ipc.rs`); the opt-in run has
+  not been green since.
+- No `thegn.exe` artifact exists yet, because the upload step follows the
+  tests, and nobody has run thegn interactively on Windows. Those are remaining
+  gaps before the platform can be called supported — see
   `openspec/changes/add-windows-compositor-validation`.
 - The MSVC and artifact-smoke jobs are opt-in: manually dispatch `ci.yml` with
   `extras: true`.
