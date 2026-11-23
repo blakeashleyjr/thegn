@@ -161,7 +161,11 @@ its opt-in CI job has never produced a recorded run
 
 ## Implementation Units
 
-- [ ] U1. **Land the RFC and board-audit content**
+- [x] U1. **Land the RFC and board-audit content**
+
+> Done in `2edfc0989` (RFCs), `c2fb6b084` (audit + register) and `f085ba9af`
+> (this plan). The cross-references resolve; `treefmt --ci` reported two
+> unformatted files that were then formatted.
 
 **Goal:** Commit the RFC rewrite and the 18 November board audit as an
 internally consistent, link-clean documentation change.
@@ -203,7 +207,17 @@ one or two commits with messages that say what changed for the reader.
 
 ---
 
-- [ ] U2. **Establish the release gate on local `main`**
+- [x] U2. **Establish the release gate on local `main`**
+
+> Run at `2edfc0989`. `lint`, `build`, `check-cross`, `check-features`,
+> `check-msrv`, `test-doc`, `doc-check`, `openspec-validate`, `smoke`,
+> `sandbox-e2e-db`, `term-check` and `nix-build` passed first time. Two stages
+> failed and were fixed: `deps-audit` on RUSTSEC-2026-0592 (`86bd5c94f`) and
+> `test`/`coverage` on the host instance's `THEGN_CONFIG_DIR` (`9c4a35f48`).
+> With those in, `test` ran 23,132 tests green and `coverage` met the core 95%
+> line gate. The two stages were re-run with the host's `THEGN_*` variables
+> cleared, which is what CI sees; the earlier failures were the ambient second
+> instance, not the code.
 
 **Goal:** Know whether the 803-commit tip is releasable before it becomes
 `origin/main`.
@@ -236,7 +250,13 @@ release can proceed (or the decision to stop).
 
 ---
 
-- [ ] U3. **Finalize `CHANGELOG.md` and the version for `0.1.0-alpha.118`**
+- [x] U3. **Finalize `CHANGELOG.md` and the version for `0.1.0-alpha.118`**
+
+> No rewrite was needed: `.104`–`.117` already document their own releases, and
+> nothing user-visible landed after the `.118` bump commit `06c776669`. The
+> section gained the `url` Security line and its date moved to the release day.
+> `[0.1.0-alpha.118]` and compare links were already present; the `[Unreleased]`
+> link resolves once the tag exists.
 
 **Goal:** A release section that describes 803 commits of user-visible change,
 with the tag/version invariant intact.
