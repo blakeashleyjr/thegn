@@ -41,6 +41,27 @@ impl Selection {
     }
 }
 
+/// Whether a live mouse selection no longer describes what is on screen and
+/// must be dropped. A selection stores grid cells, so it is only meaningful
+/// while its pane keeps the size it was made at and stays shown:
+///
+/// - `size_before` / `size_after` are the selected pane's emulator size
+///   `(rows, cols)` around a layout pass. A split, close, zoom, drawer toggle
+///   or window resize changes it, the text reflows, and the same cells now hold
+///   different text, so the highlight would sit over the wrong content.
+/// - `visible` is whether the pane is still composited (the active tab's
+///   displayed tree, or the drawer). A tab switch or a stack collapse hides it.
+///
+/// The text was already copied when the drag ended, so dropping the highlight
+/// loses nothing.
+pub fn selection_is_stale(
+    size_before: Option<(u16, u16)>,
+    size_after: Option<(u16, u16)>,
+    visible: bool,
+) -> bool {
+    !visible || size_after.is_none() || size_before != size_after
+}
+
 /// A full-grid selection (used by "copy whole pane") — the currently visible
 /// screen, expressed in absolute lines so it copies what's on screen even when
 /// scrolled into history.
@@ -145,6 +166,35 @@ mod tests {
     fn osc52_wraps_base64_in_the_escape() {
         let seq = String::from_utf8(osc52("hi")).unwrap();
         assert_eq!(seq, "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn a_selection_survives_only_an_unchanged_visible_pane() {
+        let size = Some((24, 80));
+        assert!(!selection_is_stale(size, size, true), "nothing moved");
+        // A split halves the width: the text reflows under the same cells.
+        assert!(selection_is_stale(size, Some((24, 40)), true));
+        // A bottom drawer or a window resize changes only the height.
+        assert!(selection_is_stale(size, Some((12, 80)), true));
+        // Tab switch / stack collapse: same size, but no longer on screen.
+        assert!(selection_is_stale(size, size, false));
+        // The pane closed: no emulator to measure.
+        assert!(selection_is_stale(size, None, true));
+    }
+
+    #[test]
+    fn a_reflow_moves_text_out_from_under_a_selection() {
+        // Why a resize must drop the selection: the same cells name different
+        // text after a split narrows the pane.
+        let mut e = AlacrittyEmulator::new(3, 20, 0);
+        e.advance(b"abcdefghij klmnopqrs");
+        let sel = Selection {
+            anchor: (0, 11),
+            cursor: (0, 15),
+        };
+        assert_eq!(extract(&e, &sel), "klmno");
+        e.resize(3, 10);
+        assert_ne!(extract(&e, &sel), "klmno");
     }
 
     #[test]
