@@ -1177,6 +1177,22 @@ class ReleaseAssetManifestTests(unittest.TestCase):
         path.write_bytes(self.content)
         self.assertEqual({self.asset: self.digest}, release.verify_release_asset_files({self.asset: (self.digest, len(self.content))}, [path]))
 
+    def test_verify_release_asset_files_exact_requires_every_manifest_entry(self) -> None:
+        path = self.temp / self.asset
+        path.write_bytes(self.content)
+        entries = {
+            self.asset: (self.digest, len(self.content)),
+            "thegn-extra.txt": (hashlib.sha256(b"x").hexdigest(), 1),
+        }
+        with self.assertRaisesRegex(release.ReleaseError, "do not exactly match"):
+            release.verify_release_asset_files(entries, [path], exact=True)
+        extra = self.temp / "thegn-extra.txt"
+        extra.write_bytes(b"x")
+        self.assertEqual(
+            {self.asset: self.digest, extra.name: hashlib.sha256(b"x").hexdigest()},
+            release.verify_release_asset_files(entries, [path, extra], exact=True),
+        )
+
     def test_verify_release_asset_files_rejects_digest_mismatch(self) -> None:
         path = self.temp / self.asset
         path.write_bytes(self.content)
@@ -1520,6 +1536,268 @@ class AttestationVerificationTests(unittest.TestCase):
             run_id=self.RUN,
         )
 
+    def publication_fixture(self):
+        manifest_path = self.temp / "thegn-v1.2.3-manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "tag": "v1.2.3",
+                    "commit": self.SHA,
+                    "tag_object": "a" * 40,
+                    "workflow_sha": self.SHA,
+                    "run_id": self.RUN,
+                    "assets": [
+                        {
+                            "name": "thegn-v1.2.3-x.tar.gz",
+                            "sha256": "b" * 64,
+                            "size": 10,
+                        },
+                        {
+                            "name": "thegn-v1.2.3-homebrew.rb",
+                            "sha256": "e" * 64,
+                            "size": 10,
+                        },
+                        {
+                            "name": "thegn-v1.2.3-PKGBUILD",
+                            "sha256": "f" * 64,
+                            "size": 10,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        verification = [
+            self.entry(
+                subject=[
+                    {
+                        "name": manifest_path.name,
+                        "digest": {"sha256": manifest_digest},
+                    }
+                ]
+            )
+        ]
+        workflow_run = {
+            "id": int(self.RUN),
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+            "path": ".github/workflows/release.yml",
+            "head_repository": {"full_name": self.REPO},
+            "head_sha": self.SHA,
+        }
+        return manifest_path, verification, workflow_run
+
+    def check_publication(self, manifest_path, verification, initial_workflow_run, **overrides):
+        values = {
+            "manifest_path": manifest_path,
+            "verification": verification,
+            "workflow_run": initial_workflow_run,
+            "tag": "v1.2.3",
+            "tag_object": "a" * 40,
+            "commit": self.SHA,
+            "repository": self.REPO,
+            "server_url": self.SERVER,
+        }
+        values.update(overrides)
+        return release.check_publication_identity(**values)
+
+    def test_publication_identity_binds_manifest_attestation_to_current_tag_and_run(self) -> None:
+        manifest, verification, workflow_run = self.publication_fixture()
+        self.assertEqual(
+            self.RUN,
+            self.check_publication(manifest, verification, workflow_run),
+        )
+
+    def test_publication_identity_refuses_moved_tag_or_wrong_run(self) -> None:
+        manifest, verification, workflow_run = self.publication_fixture()
+        cases = (
+            ({"tag_object": "c" * 40}, "tag identity"),
+            ({"commit": "d" * 40}, "tag identity"),
+            ({"workflow_run": {**workflow_run, "id": 54321}}, "run id"),
+            ({"workflow_run": {**workflow_run, "run_attempt": 2}}, "not bound to this workflow run"),
+            ({"workflow_run": {**workflow_run, "conclusion": "failure"}}, "successful release"),
+            ({"workflow_run": {**workflow_run, "head_repository": {"full_name": "fork/r"}}}, "wrong repository"),
+            ({"workflow_run": {**workflow_run, "head_sha": "e" * 40}}, "wrong source commit"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                release.ReleaseError, message
+            ):
+                self.check_publication(manifest, verification, workflow_run, **overrides)
+
+    def test_publication_receipt_binds_external_oids_to_release_and_publication_runs(self) -> None:
+        manifest, verification, workflow_run = self.publication_fixture()
+        receipt = release.build_publication_receipt(
+            manifest_path=manifest,
+            verification=verification,
+            workflow_run=workflow_run,
+            tag="v1.2.3",
+            tag_object="a" * 40,
+            commit=self.SHA,
+            target="homebrew",
+            target_repository="owner/homebrew-tap",
+            branch="main",
+            outcome="committed",
+            old_oid="c" * 40,
+            new_oid="d" * 40,
+            observed_oid="d" * 40,
+            published_blobs={"Formula/thegn.rb": "e" * 64},
+            aur_metadata_digests=None,
+            aur_metadata_artifact_id=None,
+            aur_metadata_producer_attempt=None,
+            aur_metadata_producer_source_sha=None,
+            repository=self.REPO,
+            server_url=self.SERVER,
+            publication_run_id="67890",
+            publication_run_attempt=2,
+            publication_source_sha=self.SHA,
+            aur_metadata_sidecar_sha256=None,
+        )
+        self.assertEqual(1, receipt["schema_version"])
+        self.assertEqual("committed", receipt["outcome"])
+        self.assertEqual("c" * 40, receipt["old_oid"])
+        self.assertEqual("d" * 40, receipt["new_oid"])
+        self.assertEqual("d" * 40, receipt["observed_oid"])
+        self.assertEqual(
+            [{"path": "Formula/thegn.rb", "sha256": "e" * 64}],
+            receipt["published_blobs"],
+        )
+        self.assertEqual("owner/homebrew-tap", receipt["target_repository"])
+        self.assertEqual(self.RUN, receipt["release"]["run_id"])
+        self.assertEqual(1, receipt["release"]["run_attempt"])
+        self.assertEqual(self.SHA, receipt["release"]["source_commit"])
+        self.assertEqual("67890", receipt["publication_run"]["id"])
+        self.assertEqual(2, receipt["publication_run"]["attempt"])
+        self.assertIsNone(receipt["metadata_artifact_id"])
+        self.assertEqual(
+            hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            receipt["release"]["manifest_sha256"],
+        )
+        self.assertNotIn("key", json.dumps(receipt).lower())
+        output = self.temp / "receipt.json"
+        release.write_publication_receipt(output, receipt)
+        self.assertEqual(receipt, json.loads(output.read_text(encoding="utf-8")))
+
+    def test_publication_receipt_rejects_unverified_or_inconsistent_oids(self) -> None:
+        manifest, verification, workflow_run = self.publication_fixture()
+        base = {
+            "manifest_path": manifest,
+            "verification": verification,
+            "workflow_run": workflow_run,
+            "tag": "v1.2.3",
+            "tag_object": "a" * 40,
+            "commit": self.SHA,
+            "target": "aur",
+            "target_repository": "thegn-bin",
+            "branch": "master",
+            "outcome": "unchanged",
+            "old_oid": "c" * 40,
+            "new_oid": "c" * 40,
+            "observed_oid": "c" * 40,
+            "published_blobs": {"PKGBUILD": "f" * 64, ".SRCINFO": "a" * 64},
+            "aur_metadata_digests": {"PKGBUILD": "f" * 64, ".SRCINFO": "a" * 64},
+            "aur_metadata_sidecar_sha256": "b" * 64,
+            "aur_metadata_artifact_id": "98765",
+            "aur_metadata_producer_attempt": 1,
+            "aur_metadata_producer_source_sha": self.SHA,
+            "repository": self.REPO,
+            "server_url": self.SERVER,
+            "publication_run_id": "67890",
+            "publication_run_attempt": 1,
+            "publication_source_sha": self.SHA,
+        }
+        self.assertEqual(
+            "unchanged", release.build_publication_receipt(**base)["outcome"]
+        )
+        aur_receipt = release.build_publication_receipt(**base)
+        self.assertEqual("98765", aur_receipt["metadata_artifact_id"])
+        self.assertEqual(
+            {"run_id": "67890", "attempt": 1, "source_sha": self.SHA},
+            aur_receipt["metadata_producer"],
+        )
+        rerun_receipt = release.build_publication_receipt(
+            **{**base, "publication_run_attempt": 2}
+        )
+        self.assertEqual(1, rerun_receipt["metadata_producer"]["attempt"])
+        self.assertEqual(2, rerun_receipt["publication_run"]["attempt"])
+        cases = (
+            ({"observed_oid": "d" * 40}, "does not match new OID"),
+            ({"new_oid": "d" * 40, "observed_oid": "d" * 40}, "must retain its old OID"),
+            (
+                {"workflow_run": {**workflow_run, "run_attempt": 2}},
+                "not bound to this workflow run",
+            ),
+            ({"branch": "main"}, "invalid aur publication branch"),
+            (
+                {"target_repository": "ssh://user:pass@example.invalid/repo"},
+                "invalid publication target repository",
+            ),
+            (
+                {"aur_metadata_digests": {"PKGBUILD": "f" * 64, ".SRCINFO": "0" * 64}},
+                "verified metadata sidecar",
+            ),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                release.ReleaseError, message
+            ):
+                release.build_publication_receipt(**{**base, **overrides})
+
+    def test_aur_metadata_digest_sidecar_binds_exact_files_to_workflow_run(self) -> None:
+        files = self.temp / "aur-files"
+        files.mkdir()
+        (files / "PKGBUILD").write_text("pkgname=thegn-bin\n", encoding="utf-8")
+        (files / ".SRCINFO").write_text("pkgbase = thegn-bin\n", encoding="utf-8")
+        sidecar_path = self.temp / "aur-metadata-digests.json"
+        sidecar = release.write_aur_metadata_digest_sidecar(
+            output=sidecar_path,
+            files_dir=files,
+            tag="v1.2.3",
+            repository=self.REPO,
+            run_id=self.RUN,
+            run_attempt=1,
+            source_sha=self.SHA,
+        )
+        self.assertEqual({"PKGBUILD", ".SRCINFO"}, set(sidecar["files"]))
+        self.assertEqual(
+            sidecar["files"],
+            release.verify_aur_metadata_digest_sidecar(
+                files_dir=files,
+                sidecar_path=sidecar_path,
+                tag="v1.2.3",
+                repository=self.REPO,
+                run_id=self.RUN,
+                run_attempt=1,
+                source_sha=self.SHA,
+            ),
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "different workflow run"):
+            release.verify_aur_metadata_digest_sidecar(
+                files_dir=files,
+                sidecar_path=sidecar_path,
+                tag="v1.2.3",
+                repository=self.REPO,
+                run_id=self.RUN,
+                run_attempt=2,
+                source_sha=self.SHA,
+            )
+        (files / ".SRCINFO").write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            release.ReleaseError, "does not match its workflow digest sidecar"
+        ):
+            release.verify_aur_metadata_digest_sidecar(
+                files_dir=files,
+                sidecar_path=sidecar_path,
+                tag="v1.2.3",
+                repository=self.REPO,
+                run_id=self.RUN,
+                run_attempt=1,
+                source_sha=self.SHA,
+            )
+
     def test_valid_attestations_are_accepted(self) -> None:
         self.assertEqual(1, self.check([self.entry()]))
         self.assertEqual(2, self.check([self.entry(), self.entry()]))
@@ -1662,6 +1940,167 @@ class AttestationVerificationTests(unittest.TestCase):
         self.assertEqual(2, raised.exception.code)
 
 
+class PublicationSagaTests(unittest.TestCase):
+    TAG = "v1.2.3"
+    REPOSITORY = "owner/thegn"
+    RUN_ID = "67890"
+    SOURCE_SHA = "a" * 40
+    MANIFEST_SHA = "b" * 64
+
+    def receipt(self, target: str, attempt: int) -> dict[str, object]:
+        homebrew = target == "homebrew"
+        return {
+            "schema_version": 1,
+            "target": target,
+            "target_repository": "owner/homebrew-tap" if homebrew else "thegn-bin",
+            "branch": "main" if homebrew else "master",
+            "outcome": "committed",
+            "old_oid": "c" * 40,
+            "new_oid": "d" * 40,
+            "observed_oid": "d" * 40,
+            "published_blobs": (
+                [{"path": "Formula/thegn.rb", "sha256": "3" * 64}]
+                if homebrew
+                else [
+                    {"path": "PKGBUILD", "sha256": "3" * 64},
+                    {"path": ".SRCINFO", "sha256": "4" * 64},
+                ]
+            ),
+            "metadata_sidecar_sha256": None if homebrew else "5" * 64,
+            "metadata_artifact_id": None if homebrew else "98765",
+            "metadata_producer": None
+            if homebrew
+            else {"run_id": self.RUN_ID, "attempt": attempt, "source_sha": self.SOURCE_SHA},
+            "release": {
+                "tag": self.TAG,
+                "tag_object": "e" * 40,
+                "source_commit": "f" * 40,
+                "workflow_sha": "1" * 40,
+                "run_id": "12345",
+                "run_attempt": 1,
+                "run_source_sha": "f" * 40,
+                "repository": self.REPOSITORY,
+                "manifest_sha256": self.MANIFEST_SHA,
+            },
+            "publication_run": {
+                "id": self.RUN_ID,
+                "attempt": attempt,
+                "source_sha": self.SOURCE_SHA,
+            },
+        }
+
+    def saga(self, **overrides):
+        values = {
+            "tag": self.TAG,
+            "repository": self.REPOSITORY,
+            "publication_run_id": self.RUN_ID,
+            "publication_run_attempt": 1,
+            "publication_source_sha": self.SOURCE_SHA,
+            "homebrew_job_result": "success",
+            "homebrew_ready": "false",
+            "homebrew_outcome_hint": "",
+            "homebrew_receipt_artifact_id": "",
+            "homebrew_receipt": None,
+            "homebrew_receipt_sha256": None,
+            "aur_job_result": "success",
+            "aur_ready": "false",
+            "aur_outcome_hint": "",
+            "aur_receipt_artifact_id": "",
+            "aur_receipt": None,
+            "aur_receipt_sha256": None,
+        }
+        values.update(overrides)
+        return release.build_publication_saga_ledger(**values)
+
+    def test_homebrew_only_receipt_is_partial_and_requires_reconciliation(self) -> None:
+        ledger = self.saga(
+            homebrew_ready="true",
+            homebrew_receipt_artifact_id="101",
+            homebrew_receipt=self.receipt("homebrew", 1),
+            homebrew_receipt_sha256="3" * 64,
+        )
+        self.assertEqual("partial", ledger["state"])
+        self.assertTrue(ledger["reconcile_required"])
+        self.assertEqual("verified", ledger["targets"]["homebrew"]["state"])
+        self.assertEqual("pending", ledger["targets"]["aur"]["state"])
+
+    def test_aur_only_receipt_is_partial_and_requires_reconciliation(self) -> None:
+        ledger = self.saga(
+            aur_ready="true",
+            aur_receipt_artifact_id="202",
+            aur_receipt=self.receipt("aur", 1),
+            aur_receipt_sha256="4" * 64,
+        )
+        self.assertEqual("partial", ledger["state"])
+        self.assertTrue(ledger["reconcile_required"])
+        self.assertEqual("pending", ledger["targets"]["homebrew"]["state"])
+        self.assertEqual("verified", ledger["targets"]["aur"]["state"])
+
+    def test_missing_receipt_after_a_possible_push_is_unknown_not_unchanged(self) -> None:
+        ledger = self.saga(
+            homebrew_job_result="failure",
+            homebrew_ready="true",
+            homebrew_outcome_hint="committed",
+        )
+        homebrew = ledger["targets"]["homebrew"]
+        self.assertEqual("unknown", homebrew["state"])
+        self.assertIsNone(homebrew.get("outcome"))
+        self.assertTrue(ledger["reconcile_required"])
+        self.assertIn("receipt is missing", homebrew["reason"])
+        self.assertIn("not evidence", release.publication_saga_summary(ledger))
+        self.assertIn("outcome hint: committed", release.publication_saga_summary(ledger))
+
+    def test_disabled_and_skipped_targets_remain_distinct_from_unknown(self) -> None:
+        ledger = self.saga(
+            homebrew_job_result="failure",
+            homebrew_ready="false",
+            aur_job_result="skipped",
+            aur_ready="unknown",
+        )
+        self.assertEqual("pending", ledger["state"])
+        self.assertEqual("pending", ledger["targets"]["homebrew"]["state"])
+        self.assertEqual("skipped", ledger["targets"]["aur"]["state"])
+        self.assertFalse(ledger["reconcile_required"])
+
+    def test_rerun_uses_prior_success_receipt_and_current_attempt_receipt(self) -> None:
+        homebrew = self.receipt("homebrew", 1)
+        aur = self.receipt("aur", 2)
+        ledger = self.saga(
+            publication_run_attempt=2,
+            homebrew_job_result="success",
+            homebrew_ready="true",
+            homebrew_receipt_artifact_id="303",
+            homebrew_receipt=homebrew,
+            homebrew_receipt_sha256="5" * 64,
+            aur_job_result="success",
+            aur_ready="true",
+            aur_receipt_artifact_id="404",
+            aur_receipt=aur,
+            aur_receipt_sha256="6" * 64,
+        )
+        self.assertEqual("complete", ledger["state"])
+        self.assertFalse(ledger["reconcile_required"])
+        self.assertEqual(1, ledger["targets"]["homebrew"]["receipt_publication_attempt"])
+        self.assertEqual(2, ledger["targets"]["aur"]["receipt_publication_attempt"])
+        self.assertEqual(self.MANIFEST_SHA, ledger["release_manifest_sha256"])
+
+    def test_mismatched_manifest_receipts_are_inconsistent(self) -> None:
+        aur = self.receipt("aur", 1)
+        aur["release"]["manifest_sha256"] = "9" * 64
+        ledger = self.saga(
+            homebrew_ready="true",
+            homebrew_receipt_artifact_id="501",
+            homebrew_receipt=self.receipt("homebrew", 1),
+            homebrew_receipt_sha256="7" * 64,
+            aur_ready="true",
+            aur_receipt_artifact_id="502",
+            aur_receipt=aur,
+            aur_receipt_sha256="8" * 64,
+        )
+        self.assertEqual("inconsistent", ledger["state"])
+        self.assertTrue(ledger["reconcile_required"])
+
+
 class ReleaseAssetSizePrecheckTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -1687,6 +2126,37 @@ class ReleaseAssetSizePrecheckTests(unittest.TestCase):
         )
         with self.assertRaises(release.ReleaseError):
             release.check_release_asset_sizes(self.listing(("x.sha256", cap + 1)), [])
+
+    def test_aggregate_selected_download_cap_boundary_and_overflow(self) -> None:
+        with (
+            mock.patch.object(release, "MAX_ARCHIVE_BYTES", 1000),
+            mock.patch.object(release, "MAX_SELECTED_DOWNLOAD_BYTES", 1500),
+        ):
+            at_limit = self.listing(("a.tar.gz", 750), ("b.tar.gz", 750))
+            self.assertEqual(
+                ["a.tar.gz", "b.tar.gz"],
+                release.check_release_asset_sizes(at_limit, []),
+            )
+            one_over = self.listing(("a.tar.gz", 751), ("b.tar.gz", 750))
+            with self.assertRaisesRegex(release.ReleaseError, "aggregate download limit"):
+                release.check_release_asset_sizes(one_over, [])
+
+    def test_aggregate_budget_applies_only_to_pattern_selected_assets(self) -> None:
+        document = self.listing(
+            ("linux.tar.gz", 700),
+            ("darwin.tar.gz", 700),
+            ("unselected.bin", 1000),
+        )
+        with (
+            mock.patch.object(release, "MAX_ARCHIVE_BYTES", 1000),
+            mock.patch.object(release, "MAX_SELECTED_DOWNLOAD_BYTES", 1400),
+        ):
+            self.assertEqual(
+                ["darwin.tar.gz", "linux.tar.gz"],
+                release.check_release_asset_sizes(document, ["*.tar.gz"]),
+            )
+            with self.assertRaisesRegex(release.ReleaseError, "aggregate download limit"):
+                release.check_release_asset_sizes(document, [])
 
     def test_rejects_bad_shapes(self) -> None:
         bad = [
@@ -1744,6 +2214,88 @@ class ReleaseAssetSizePrecheckTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 release.main(["check-asset-sizes", "--assets-json", str(path), "--pattern", "zzz"])
         self.assertEqual(2, raised.exception.code)
+
+
+class ReleaseAssetUploadPlanTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def asset(self, name: str, payload: bytes) -> Path:
+        path = self.root / name
+        path.write_bytes(payload)
+        return path
+
+    @staticmethod
+    def remote(path: Path) -> dict[str, str]:
+        return {
+            "name": path.name,
+            "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    def test_same_run_retry_reuses_exact_assets_and_selects_only_absent(self) -> None:
+        archive = self.asset("thegn-v1.2.3-x86_64-unknown-linux-gnu.tar.gz", b"archive")
+        checksum = self.asset("thegn-v1.2.3-x86_64-unknown-linux-gnu.sha256", b"sum")
+        missing = self.asset("thegn-v1.2.3-completions.tar.gz", b"completions")
+        inventory = [[self.remote(archive)], [self.remote(checksum)]]
+
+        self.assertEqual(
+            [missing], release.plan_release_asset_uploads(inventory, [archive, checksum, missing])
+        )
+
+    def test_fresh_run_release_record_conflict_fails_closed(self) -> None:
+        record = self.asset("thegn-v1.2.3-release.json", b'{"run_id":"old"}')
+        inventory = [self.remote(record)]
+        record.write_bytes(b'{"run_id":"new"}')
+
+        with self.assertRaisesRegex(release.ReleaseError, "conflicts with this generation"):
+            release.plan_release_asset_uploads(inventory, [record])
+
+    def test_generation_record_allows_same_run_retry_and_rejects_new_run(self) -> None:
+        record_path = self.asset(
+            "thegn-v1.2.3-release.json",
+            json.dumps(
+                {
+                    "tag": "v1.2.3",
+                    "commit": "a" * 40,
+                    "tag_object": "b" * 40,
+                    "workflow_sha": "c" * 40,
+                    "run_id": "12345",
+                    "assets": [],
+                }
+            ).encode(),
+        )
+        expected = {
+            "tag": "v1.2.3",
+            "commit": "a" * 40,
+            "tag_object": "b" * 40,
+            "workflow_sha": "c" * 40,
+            "run_id": "12345",
+        }
+        release.verify_release_generation(record_path, **expected)
+        with self.assertRaisesRegex(release.ReleaseError, "run_id does not match"):
+            release.verify_release_generation(record_path, **(expected | {"run_id": "67890"}))
+
+    def test_extra_and_malformed_inventory_fail_closed(self) -> None:
+        requested = self.asset("thegn-v1.2.3-release.json", b"record")
+        unrelated = {"name": "thegn-v1.2.3-extra.txt", "digest": "md5:bad"}
+        self.assertEqual(
+            [requested], release.plan_release_asset_uploads([unrelated], [requested])
+        )
+        malformed_existing = {"name": requested.name, "digest": "md5:bad"}
+        with self.assertRaisesRegex(release.ReleaseError, "unusable digest metadata"):
+            release.plan_release_asset_uploads([malformed_existing], [requested])
+
+        missing_digest = {"name": requested.name}
+        with self.assertRaisesRegex(release.ReleaseError, "no trusted SHA-256"):
+            release.plan_release_asset_uploads([missing_digest], [requested])
+
+        duplicate = [self.remote(requested), self.remote(requested)]
+        with self.assertRaisesRegex(release.ReleaseError, "repeats"):
+            release.plan_release_asset_uploads(duplicate, [requested])
 
 
 if __name__ == "__main__":

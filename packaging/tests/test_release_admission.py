@@ -199,7 +199,11 @@ class ReleaseAdmissionTests(unittest.TestCase):
         for job_name, job in self.jobs.items():
             permissions = job.get("permissions", {})
             has_write = any(str(permission).lower() == "write" for permission in permissions.values())
-            if "inputs.operation == 'build'" not in job.get("if", "") or not has_write:
+            condition = job.get("if", "")
+            if (
+                "inputs.operation == 'build'" not in condition
+                and "inputs.operation == 'publish-release'" not in condition
+            ) or not has_write:
                 continue
             pending = list(job.get("needs", []))
             if isinstance(job.get("needs"), str):
@@ -216,8 +220,19 @@ class ReleaseAdmissionTests(unittest.TestCase):
                 self.assertIn("admit", closure)
 
     def test_every_write_job_reverifies_the_admitted_tag(self) -> None:
-        for job_name in ("create-release", "upload", "package", "verify-manifest"):
+        for job_name in ("create-release", "upload", "package", "verify-manifest", "publish-release"):
             steps = self.jobs[job_name]["steps"]
+            if job_name == "publish-release":
+                names = [step.get("name") for step in steps]
+                identity_index = names.index("Reverify signed release identity and live tag")
+                publish_index = names.index("Publish or confirm the verified release")
+                self.assertLess(identity_index, publish_index)
+                self.assertIn(
+                    ".github/scripts/verify-release-publication-identity.sh",
+                    steps[identity_index]["run"],
+                )
+                self.assertIn(".github/scripts/finalize-release.sh", steps[publish_index]["run"])
+                continue
             checks = [
                 (index, step)
                 for index, step in enumerate(steps)
@@ -232,6 +247,8 @@ class ReleaseAdmissionTests(unittest.TestCase):
                     for index, step in enumerate(steps)
                     if "gh release create" in step.get("run", "")
                     or "gh release upload" in step.get("run", "")
+                    or ".github/scripts/upload-release-assets.sh" in step.get("run", "")
+                    or ".github/scripts/finalize-release.sh" in step.get("run", "")
                     or str(step.get("uses", "")).startswith("actions/attest-")
                 ),
                 None,
@@ -239,7 +256,10 @@ class ReleaseAdmissionTests(unittest.TestCase):
             self.assertIsNotNone(first_privileged_index, f"{job_name} must expose a write/attest step")
             if job_name == "package" and first_check_index == first_privileged_index:
                 script = check_step["run"]
-                self.assertLess(script.index("git ls-remote"), script.index("gh release upload"))
+                self.assertLess(
+                    script.index("git ls-remote"),
+                    script.index(".github/scripts/upload-release-assets.sh"),
+                )
             else:
                 self.assertLess(first_check_index, first_privileged_index, job_name)
 

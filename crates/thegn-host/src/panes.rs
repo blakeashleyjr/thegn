@@ -568,6 +568,13 @@ fn sandbox_wrap_shell(
             Ok(None)
         };
     };
+    if should_auto_enable_nix_daemon_for_local_terminal(
+        &sb,
+        &spec,
+        cfg!(target_os = "linux") && std::path::Path::new("/etc/NIXOS").exists(),
+    ) {
+        thegn_core::sandbox::add_nix_daemon_access(&mut spec);
+    }
     // Terminal-connection tabs are center panes routed through the pane daemon,
     // so a local bwrap terminal must drop `--die-with-parent` to survive UI
     // detach (see the daemon-persistent gate in `sandbox::enter_argv`).
@@ -591,6 +598,29 @@ fn sandbox_wrap_shell(
         isolation,
         network_note,
     }))
+}
+
+/// Grant Nix daemon access to a standalone interactive terminal only after the
+/// resolver proves the actual backend is local host-toolchain isolation. An OCI
+/// fallback may use a remote engine, so it never receives this automatic grant.
+/// Generic agent/automation sandboxes treat an omitted setting as off.
+fn should_auto_enable_nix_daemon_for_local_terminal(
+    sandbox: &thegn_core::config::SandboxConfig,
+    spec: &thegn_core::sandbox::SandboxSpec,
+    nixos_host: bool,
+) -> bool {
+    sandbox.nix_daemon.is_none()
+        && nixos_host
+        && !sandbox.profile.hides_home()
+        && spec.placement.is_local()
+        && spec.backend.is_host_toolchain()
+        && spec.network == thegn_core::config::Network::Nat
+        && sandbox.network_allow.is_empty()
+        && sandbox.network_block.is_empty()
+        && spec.network_allow.is_empty()
+        && spec.network_block.is_empty()
+        && !sandbox.network_audit
+        && spec.vpn.is_none()
 }
 
 /// Join a shell argv into a single command string for `sh -lc` execution,
@@ -1683,6 +1713,123 @@ mod tests {
     use super::*;
     use crate::layout;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn local_terminal_nix_daemon_auto_default_is_nixos_only_and_explicit_values_win() {
+        fn spec(backend: thegn_core::sandbox::Backend) -> thegn_core::sandbox::SandboxSpec {
+            thegn_core::sandbox::SandboxSpec {
+                backend,
+                placement: thegn_core::placement::Placement::Local,
+                network: thegn_core::config::Network::Nat,
+                ..Default::default()
+            }
+        }
+
+        let standard = thegn_core::config::SandboxConfig::default();
+        let local = spec(thegn_core::sandbox::Backend::Bwrap);
+        assert!(should_auto_enable_nix_daemon_for_local_terminal(
+            &standard, &local, true
+        ));
+
+        let non_nixos = spec(thegn_core::sandbox::Backend::Bwrap);
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &standard, &non_nixos, false
+        ));
+
+        let sealed = thegn_core::config::SandboxConfig {
+            profile: thegn_core::config::SandboxProfile::Sealed,
+            ..Default::default()
+        };
+        let sealed_spec = spec(thegn_core::sandbox::Backend::Bwrap);
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &sealed,
+            &sealed_spec,
+            true
+        ));
+
+        let explicitly_disabled = thegn_core::config::SandboxConfig {
+            nix_daemon: Some(false),
+            ..Default::default()
+        };
+        let disabled_spec = spec(thegn_core::sandbox::Backend::Bwrap);
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &explicitly_disabled,
+            &disabled_spec,
+            true,
+        ));
+
+        let explicitly_enabled = thegn_core::config::SandboxConfig {
+            nix_daemon: Some(true),
+            profile: thegn_core::config::SandboxProfile::Sealed,
+            ..Default::default()
+        };
+        let enabled_spec = spec(thegn_core::sandbox::Backend::Bwrap);
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &explicitly_enabled,
+            &enabled_spec,
+            false,
+        ));
+
+        // Actual backend after fallback controls auto eligibility: never grant
+        // the host daemon to an OCI backend or remote OCI engine.
+        let mut remote_oci = spec(thegn_core::sandbox::Backend::Podman);
+        remote_oci.oci_host = Some("ssh://builder".into());
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &standard,
+            &remote_oci,
+            true
+        ));
+
+        let mut no_network = spec(thegn_core::sandbox::Backend::Bwrap);
+        no_network.network = thegn_core::config::Network::None;
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &standard,
+            &no_network,
+            true
+        ));
+
+        let mut network_policy = spec(thegn_core::sandbox::Backend::Bwrap);
+        network_policy.network_block.push("*".into());
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &standard,
+            &network_policy,
+            true
+        ));
+
+        let mut network_allow = thegn_core::config::SandboxConfig::default();
+        network_allow.network_allow.push("example.com".into());
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &network_allow,
+            &local,
+            true
+        ));
+
+        let mut requested_block = thegn_core::config::SandboxConfig::default();
+        requested_block.network_block.push("example.com".into());
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &requested_block,
+            &local,
+            true
+        ));
+
+        let mut resolved_allow = spec(thegn_core::sandbox::Backend::Bwrap);
+        resolved_allow.network_allow.push("example.com".into());
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &standard,
+            &resolved_allow,
+            true
+        ));
+
+        let network_audit = thegn_core::config::SandboxConfig {
+            network_audit: true,
+            ..Default::default()
+        };
+        assert!(!should_auto_enable_nix_daemon_for_local_terminal(
+            &network_audit,
+            &local,
+            true
+        ));
+    }
 
     #[test]
     fn sealed_hint_terminal_refusals_name_standard() {

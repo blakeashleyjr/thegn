@@ -1,13 +1,13 @@
 //! `thegn sprite-exec <id> [--] cmd…` — the self-bridge that gives a sprites
 //! (WSS-native) env a CLI exec prefix with no vendor `sprite` CLI. Two modes,
-//! chosen by whether stdin is a terminal:
+//! chosen by whether both local streams are terminals:
 //!
-//! - **Capture** (stdin not a tty): the control-plane READ path — the chrome
-//!   git/gh/fs reads and the persisted worktree `GitLoc` shell out through it
-//!   (the role `vps-ssh` plays for VPS envs). Runs the command over the native
-//!   exec API, relays its captured stdout, and exits with its code, so a caller
-//!   like `git -C /workspace status` reads the output exactly as if local.
-//! - **TTY** (stdin is a tty): a long-running agent/session launched as
+//! - **Stream** (not both stdin and stdout are terminals): the control-plane
+//!   READ path — the chrome git/gh/fs reads and the persisted worktree `GitLoc`
+//!   shell out through it (the role `vps-ssh` plays for VPS envs). Runs the
+//!   command over the native exec API and relays stdout as it arrives, so a
+//!   caller like `git -C /workspace status` reads the output exactly as if local.
+//! - **TTY** (stdin and stdout are ttys): a long-running agent/session launched as
 //!   `thegn sprite-exec <id> -- agent…` (the create handle's exec prefix). Opens
 //!   a PTY exec, puts the local tty in raw mode, pumps keystrokes and resizes
 //!   up and output down, and exits with the remote code. When the stream drops
@@ -21,7 +21,7 @@
 //! Resolves the sprites provider from the WSS-native env whose account owns the
 //! sprite, built named with THIS id (exec takes the id as an argument).
 
-use std::io::{IsTerminal as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -33,7 +33,7 @@ use termwiz::terminal::{Terminal, new_terminal};
 use thegn_core::config::Config;
 use thegn_core::config_env_tables::wss_native_provider_kind;
 use thegn_core::sprite_hold::{HOLD_ENV, ceiling_secs, hold_name, wrap_argv};
-use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provider};
+use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provider, StreamingExec};
 
 /// Exit code when the remote exec stream was lost and could not be reattached
 /// (`EX_TEMPFAIL`): the remote process did not survive. `session list` keys
@@ -41,6 +41,12 @@ use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provide
 pub(crate) const EXIT_REMOTE_LOST: i32 = 75;
 
 pub(crate) const WAKE_NOTICE_AFTER: Duration = Duration::from_secs(3);
+
+const STDERR_TAIL_CAP: u64 = 8 * 1024;
+
+fn tty_mode(stdin_tty: bool, stdout_tty: bool) -> bool {
+    stdin_tty && stdout_tty
+}
 
 /// Await `fut`; if it is still pending after `after`, call `notice` once and
 /// keep awaiting.
@@ -89,9 +95,9 @@ const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Largest stdin message built from queued input (pane.rs STREAM_STDIN_CHUNK).
 const STDIN_COALESCE_MAX: usize = 32 << 10;
 
-/// Run `cmd` inside sprite `id` over the native exec API. A tty on stdin gets
-/// the streaming PTY bridge; anything else the one-shot capture used by the
-/// control reads. `cmd` arrives already shaped by `GitLoc::provider_command`
+/// Run `cmd` inside sprite `id` over the native exec API. When stdin and stdout
+/// are both terminals, use the streaming PTY bridge; anything else streams.
+/// `cmd` arrives already shaped by `GitLoc::provider_command`
 /// (`/bin/sh -lc <script>`) or the launch argv; empty falls back to a login
 /// shell.
 ///
@@ -151,17 +157,17 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
         .nth(selected)
         .flatten()
         .ok_or_else(|| anyhow!("sprite-exec: selected Sprites env has no resolvable API token"))?;
-    if std::io::stdin().is_terminal() {
+    if tty_mode(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
         let code = run_tty(&provider, id, argv)?;
         std::process::exit(code);
     }
     // Current-thread: one network call does not need a worker per core.
     // See `agent::provider_runtime`.
     let rt = crate::agent::provider_runtime()?;
-    let (code, out) = rt.block_on(async { provider.run_exec(id, &argv, None, &[]).await })?;
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(out.as_bytes()); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
-    let _ = stdout.flush(); // best-effort: flush: display-only
+    let code = rt.block_on(run_streaming(&provider, id, argv))?;
     std::process::exit(code);
 }
 
@@ -534,6 +540,119 @@ impl Drop for TtyGuard {
     }
 }
 
+/// Stream a non-tty exec: stdout as it arrives (no cap), remote stderr to
+/// stderr at the end, a non-terminal stdin forwarded then half-closed.
+async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
+    let spec = ExecSpec {
+        argv,
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    };
+    let StreamingExec {
+        session,
+        stderr,
+        verdict,
+    } = provider.open_exec_streaming(id, &spec).await?;
+    let ExecSession {
+        mut frames,
+        control,
+        ..
+    } = session;
+
+    if !std::io::stdin().is_terminal() {
+        let input_control = control.clone();
+        thegn_core::thread_name::spawn_named("thegn-sprite-in", move || {
+            let mut input = std::io::stdin().lock();
+            let mut chunk = [0u8; 32 * 1024];
+            loop {
+                match input.read(&mut chunk) {
+                    Ok(0) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "thegn::provider",
+                            error = %error,
+                            "sprite-exec: stdin read failed; sending EOF"
+                        );
+                        break;
+                    }
+                    Ok(len) => {
+                        if input_control
+                            .blocking_send(ExecControl::Stdin(chunk[..len].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(control);
+
+    let frame_result = {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        stream_frames(&mut frames, &mut stdout).await
+    };
+    let verdict_result = tokio::time::timeout(Duration::from_secs(3), verdict).await;
+    let result = match verdict_result {
+        Ok(Ok(Some(fault))) => Err(anyhow::Error::new(fault)),
+        _ => frame_result.map_err(anyhow::Error::msg),
+    };
+    let rendered = stderr.render();
+    let total = stderr.total();
+    if total > STDERR_TAIL_CAP || !rendered.is_empty() {
+        let mut output = std::io::stderr();
+        if total > STDERR_TAIL_CAP {
+            let marker = format!(
+                "[thegn: remote stderr, last {STDERR_TAIL_CAP} of {} bytes]\n",
+                total
+            );
+            if output.write_all(marker.as_bytes()).is_err() {
+                tracing::debug!(target: "thegn::provider", "sprite-exec: stderr gone");
+            }
+        }
+        if !rendered.is_empty() && output.write_all(rendered.as_bytes()).is_err() {
+            tracing::debug!(target: "thegn::provider", "sprite-exec: stderr gone");
+        }
+    }
+    result
+}
+
+async fn stream_frames(
+    frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
+    out: &mut dyn std::io::Write,
+) -> std::result::Result<i32, String> {
+    while let Some(frame) = frames.recv().await {
+        match frame {
+            ExecFrame::Stdout(bytes) => {
+                if let Err(error) = out.write_all(&bytes).and_then(|()| out.flush()) {
+                    return if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        Ok(141)
+                    } else {
+                        Err(error.to_string())
+                    };
+                }
+            }
+            ExecFrame::Exit(code) => {
+                if let Err(error) = out.flush() {
+                    return if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        Ok(141)
+                    } else {
+                        Err(error.to_string())
+                    };
+                }
+                return Ok(code);
+            }
+        }
+    }
+    Err("exec stream ended without an exit status".to_string())
+}
+
 /// Stream `argv` in sprite `id` over a PTY exec with the local tty in raw mode.
 /// Returns the code to exit with (the remote's, or [`EXIT_REMOTE_LOST`]); the
 /// tty is restored before this returns on every path. Subprocess/network seam
@@ -668,18 +787,55 @@ async fn pump(
     modes: &mut RemoteModes,
     size: &mut (u16, u16),
 ) -> StreamEnd {
+    struct PumpStats {
+        frames: u64,
+        bytes: u64,
+        write: Duration,
+        max_write: Duration,
+    }
+
+    let mut stats = PumpStats {
+        frames: 0,
+        bytes: 0,
+        write: Duration::ZERO,
+        max_write: Duration::ZERO,
+    };
+    let log_stats = |stats: &PumpStats| {
+        tracing::debug!(
+            target: "thegn::provider",
+            frames = stats.frames,
+            bytes = stats.bytes,
+            write_ms = stats.write.as_millis() as u64,
+            max_write_ms = stats.max_write.as_millis() as u64,
+            "sprite-exec output pump"
+        );
+    };
     let mut out = std::io::stdout();
     loop {
         tokio::select! {
             frame = session.frames.recv() => match frame {
                 Some(ExecFrame::Stdout(bytes)) => {
                     modes.observe(&bytes);
-                    if out.write_all(&bytes).and_then(|()| out.flush()).is_err() {
+                    let began = Instant::now();
+                    let result = out.write_all(&bytes).and_then(|()| out.flush());
+                    let elapsed = began.elapsed();
+                    stats.frames += 1;
+                    stats.bytes += bytes.len() as u64;
+                    stats.write += elapsed;
+                    stats.max_write = stats.max_write.max(elapsed);
+                    if result.is_err() {
+                        log_stats(&stats);
                         return StreamEnd::LocalGone;
                     }
                 }
-                Some(ExecFrame::Exit(code)) => return StreamEnd::Exit(code),
-                None => return StreamEnd::Dropped,
+                Some(ExecFrame::Exit(code)) => {
+                    log_stats(&stats);
+                    return StreamEnd::Exit(code);
+                }
+                None => {
+                    log_stats(&stats);
+                    return StreamEnd::Dropped;
+                }
             },
             ev = tty_rx.recv() => match ev {
                 Some(FromTty::Resize { cols, rows }) => {
@@ -718,7 +874,10 @@ async fn pump(
                         }
                     }
                 }
-                None => return StreamEnd::LocalGone,
+                None => {
+                    log_stats(&stats);
+                    return StreamEnd::LocalGone;
+                }
             },
         }
     }
@@ -756,10 +915,10 @@ fn tty_loop<T: Terminal>(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXIT_REMOTE_LOST, FromTty, REATTACH_BUDGET_RESET, RemoteModes, WAKE_NOTICE_AFTER,
-        attempts_after_stream, coalesce_input, encode_input, hold_ceiling, hold_task_from,
-        lost_line, pick_sprites_env, pty_size, reconnect_delays, should_reattach, tty_env,
-        with_slow_notice,
+        EXIT_REMOTE_LOST, ExecFrame, FromTty, REATTACH_BUDGET_RESET, RemoteModes,
+        WAKE_NOTICE_AFTER, attempts_after_stream, coalesce_input, encode_input, hold_ceiling,
+        hold_task_from, lost_line, pick_sprites_env, pty_size, reconnect_delays, should_reattach,
+        stream_frames, tty_env, tty_mode, with_slow_notice,
     };
     use std::cell::Cell;
     use std::time::Duration;
@@ -830,6 +989,110 @@ mod tests {
 
         assert_eq!(output, "done");
         assert_eq!(notices.get(), 0);
+    }
+
+    #[test]
+    fn tty_mode_needs_both_terminals() {
+        for (stdin_tty, stdout_tty, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            assert_eq!(tty_mode(stdin_tty, stdout_tty), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_frames_passes_three_mib_through_without_a_marker() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..3 {
+            tx.send(ExecFrame::Stdout(chunk.clone())).await.unwrap();
+        }
+        tx.send(ExecFrame::Exit(0)).await.unwrap();
+        drop(tx);
+
+        let mut output = Vec::new();
+        assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(0));
+        assert_eq!(output, vec![b'x'; 3 << 20]);
+        assert!(!output.starts_with(b"[thegn:"));
+    }
+
+    struct FlushCountingWriter {
+        flushes: usize,
+    }
+
+    impl std::io::Write for FlushCountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    struct BrokenPipeWriter;
+
+    impl std::io::Write for BrokenPipeWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_frames_flushes_each_frame() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        tx.send(ExecFrame::Stdout(b"one".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Stdout(b"two".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Exit(0)).await.unwrap();
+
+        let mut output = FlushCountingWriter { flushes: 0 };
+        assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(0));
+        assert!(output.flushes >= 2);
+    }
+
+    #[tokio::test]
+    async fn stream_frames_stops_on_a_closed_pipe() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        tx.send(ExecFrame::Stdout(b"first".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Stdout(b"second".to_vec()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut output = BrokenPipeWriter;
+        assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(141));
+    }
+
+    #[tokio::test]
+    async fn stream_frames_returns_the_remote_code() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(1);
+        tx.send(ExecFrame::Exit(3)).await.unwrap();
+
+        let mut output = Vec::new();
+        assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(3));
+    }
+
+    #[tokio::test]
+    async fn stream_frames_without_exit_is_an_error() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(1);
+        tx.send(ExecFrame::Stdout(b"partial".to_vec()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut output = Vec::new();
+        assert_eq!(
+            stream_frames(&mut frames, &mut output).await,
+            Err("exec stream ended without an exit status".to_string())
+        );
     }
 
     #[test]

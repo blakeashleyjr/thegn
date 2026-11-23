@@ -855,6 +855,8 @@
             pkgs.just
             # `just test` runs `cargo nextest run --workspace`.
             pkgs.cargo-nextest
+            # `just test-packaging` runs the pure release-policy Python suite.
+            (pkgs.python3.withPackages (ps: [ps.pyyaml]))
             # libgit2-sys → libz-sys wants pkg-config + zlib; sqlite is vendored.
             pkgs.pkg-config
             pkgs.zlib
@@ -897,6 +899,8 @@
             act
             # smoke.sh validates `--json` output with python's json module
             python3
+            # `just smoke` inspects merge-queue rows directly with sqlite3.
+            sqlite
             # a login shell for sandbox panes: thegn injects this devShell's PATH
             # into bwrap/OCI panes (which ship no zsh of their own), so the pane's
             # shell probe finds zsh instead of dropping to a bare `/bin/sh`.

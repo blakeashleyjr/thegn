@@ -160,11 +160,29 @@ impl HostSource {
         on_thread_start: impl FnOnce() + Send + 'static,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
     ) -> Result<Self, HostSourceSpawnError> {
+        Self::try_new_with_sampler(
+            on_thread_start,
+            || {
+                let disk_path = std::env::current_dir().unwrap_or_else(|_| "/".into());
+                let mut sampler = StatsSampler::new(disk_path);
+                Box::new(move || sampler.sample())
+            },
+            false,
+            spawn,
+        )
+    }
+
+    fn try_new_with_sampler(
+        on_thread_start: impl FnOnce() + Send + 'static,
+        make_sampler: impl FnOnce() -> Box<dyn FnMut() -> StatsSnapshot + Send> + Send + 'static,
+        initially_parked: bool,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
+    ) -> Result<Self, HostSourceSpawnError> {
         let ring: Ring = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let ring_bg = ring.clone();
         let stop_bg = stop.clone();
-        let parked = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(AtomicBool::new(initially_parked));
         let parked_bg = parked.clone();
         let in_park = Arc::new(AtomicBool::new(false));
         let in_park_bg = in_park.clone();
@@ -172,11 +190,13 @@ impl HostSource {
         let exited_bg = exited.clone();
         // Dedicated sampler thread: `StatsSampler::sample()` blocks (refreshes
         // sysinfo) and needs a warm-up read to prime the CPU delta, so it lives
-        // off the UI thread and off the tokio runtime entirely.
+        // off the UI thread and off the tokio runtime entirely. Initialization
+        // also probes hardware (including Apple HID sensors), so defer it until
+        // after the worker has observed that the source is active.
         let worker = spawn(Box::new(move || {
             on_thread_start();
-            let disk_path = std::env::current_dir().unwrap_or_else(|_| "/".into());
-            let mut sampler = StatsSampler::new(disk_path);
+            let mut sampler = None;
+            let mut make_sampler = Some(make_sampler);
             let mut was_parked = false;
             while !stop_bg.load(Ordering::Acquire) {
                 if parked_bg.load(Ordering::Acquire) {
@@ -188,17 +208,26 @@ impl HostSource {
                     in_park_bg.store(false, Ordering::Release);
                     continue;
                 }
+                if sampler.is_none() {
+                    sampler = Some(make_sampler.take().expect("sampler factory used once")());
+                    // Construction may block while activation, parking, or
+                    // shutdown changes the worker flags. Re-enter the state
+                    // checks before either the first read or resume priming.
+                    // Keep the sampler in this worker across that wakeup.
+                    continue;
+                }
+                let sampler = sampler.as_mut().expect("sampler initialized");
                 if was_parked {
                     was_parked = false;
                     // The CPU delta spans everything since the last read, so
                     // the first reading after a long park would be one bogus
                     // average. Take a discarded priming read, let the delta
                     // window open, then sample normally.
-                    let _priming = sampler.sample();
+                    let _priming = sampler();
                     std::thread::park_timeout(Duration::from_millis(300));
                     continue;
                 }
-                let snap = sampler.sample();
+                let snap = sampler();
                 let ts = now_secs();
                 // Cancellation can arrive during sample(); skip publishing a
                 // sample taken after shutdown began (one post-sample check;
@@ -473,6 +502,30 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use gtui_core::datasource::TimeRange;
+    use std::io::Write;
+
+    fn test_source() -> HostSource {
+        HostSource::try_new_with_sampler(
+            || {},
+            || {
+                let mut sample = 0_u8;
+                Box::new(move || {
+                    sample = sample.wrapping_add(1);
+                    StatsSnapshot {
+                        cpu_pct: Some(sample),
+                        ..StatsSnapshot::default()
+                    }
+                })
+            },
+            true,
+            |worker| {
+                std::thread::Builder::new()
+                    .name("gtui-host-metrics-test".into())
+                    .spawn(worker)
+            },
+        )
+        .unwrap()
+    }
 
     fn range(from: i64, to: i64) -> TimeRange {
         TimeRange {
@@ -530,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_returns_a_frame_per_query_with_two_fields() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         let res = source
             .query(vec![q("host_cpu_pct"), q("host_load1")])
             .await
@@ -546,14 +599,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_expr_yields_empty_value_series() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         let res = source.query(vec![q("nope")]).await.unwrap();
         assert_eq!(res[0].fields[1].len(), 0);
     }
 
     #[test]
     fn query_uses_inclusive_range_and_sorted_sample_order() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         source.set_active(false);
         wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
         let mut ring = source.ring.lock().unwrap();
@@ -580,7 +633,7 @@ mod tests {
 
     #[test]
     fn query_marks_a_window_starting_before_retention_as_partial() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         source.set_active(false);
         wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
         let mut ring = source.ring.lock().unwrap();
@@ -616,7 +669,7 @@ mod tests {
 
     #[test]
     fn query_marks_interior_and_straddling_ring_gaps_as_partial() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         admit_cpu_range(&source, &[100..=105, 200..=205]);
 
         assert_eq!(
@@ -639,7 +692,7 @@ mod tests {
 
     #[test]
     fn query_marks_a_gap_straddling_the_window_start_as_partial() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         admit_cpu_range(&source, &[100..=105, 300..=305]);
 
         assert_eq!(
@@ -652,7 +705,7 @@ mod tests {
 
     #[test]
     fn query_keeps_a_contiguous_window_complete() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         admit_cpu_range(&source, &[100..=110]);
 
         assert_eq!(
@@ -663,7 +716,7 @@ mod tests {
 
     #[test]
     fn trailing_hole_after_the_newest_sample_is_partial() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         admit_cpu_range_only(&source, &[100..=110]);
 
         assert_eq!(
@@ -678,7 +731,7 @@ mod tests {
 
     #[test]
     fn window_ending_at_the_newest_sample_stays_complete() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         admit_cpu_range_only(&source, &[100..=110]);
 
         assert_eq!(
@@ -705,7 +758,7 @@ mod tests {
 
     #[test]
     fn future_window_end_is_clamped_to_now() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         admit_cpu_range_only(&source, &[100..=110]);
 
         assert_eq!(
@@ -726,7 +779,7 @@ mod tests {
 
     #[test]
     fn window_after_all_samples_is_partial() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         admit_cpu_range_only(&source, &[100..=110]);
 
         assert_eq!(
@@ -741,7 +794,7 @@ mod tests {
 
     #[test]
     fn unknown_expression_stays_complete_with_a_trailing_hole() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         admit_cpu_range_only(&source, &[100..=110]);
 
         assert_eq!(
@@ -776,7 +829,7 @@ mod tests {
 
     #[test]
     fn empty_ring_is_reported_as_partial_retention() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         source.set_active(false);
         wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
         source.ring.lock().unwrap().clear();
@@ -1108,7 +1161,7 @@ mod tests {
             "seeded ring should exercise duplicate timestamps"
         );
 
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         source.set_active(false);
         wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
         *source.ring.lock().unwrap() = ring.clone();
@@ -1123,7 +1176,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_source_drop_does_not_invalidate_an_in_flight_query_future() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         let query = source.query(vec![q("host_cpu_pct")]);
         drop(source);
         let frames = query.await.unwrap();
@@ -1149,7 +1202,8 @@ mod tests {
 
     #[test]
     fn dropping_an_idle_sampler_wakes_and_joins_it_promptly() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
+        source.set_active(true);
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while source.ring.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -1202,7 +1256,7 @@ mod tests {
 
     #[test]
     fn poisoned_ring_is_reported_as_an_empty_frame() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         let ring = Arc::clone(&source.ring);
         let poisoner = std::thread::spawn(move || {
             let _guard = ring.lock().unwrap();
@@ -1237,7 +1291,8 @@ mod tests {
 
     #[test]
     fn a_parked_sampler_stops_sampling_and_resumes_on_activation() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
+        source.set_active(true);
         let len = || source.ring.lock().unwrap().len();
         wait_for("first sample", || len() > 0);
         source.set_active(false);
@@ -1253,11 +1308,230 @@ mod tests {
 
     #[test]
     fn dropping_a_parked_sampler_actually_exits_the_worker_promptly() {
-        let source = HostSource::try_new().unwrap();
+        let source = test_source();
         source.set_active(false);
         wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
         let exited = source.exited.clone();
         drop(source);
         wait_for("worker exit", || exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn sampler_initialization_waits_until_activation() {
+        let initialized = Arc::new(AtomicBool::new(false));
+        let initialized_bg = Arc::clone(&initialized);
+        let source = HostSource::try_new_with_sampler(
+            || {},
+            move || {
+                initialized_bg.store(true, Ordering::Release);
+                Box::new(StatsSnapshot::default)
+            },
+            true,
+            |worker| {
+                std::thread::Builder::new()
+                    .name("gtui-host-metrics-test".into())
+                    .spawn(worker)
+            },
+        )
+        .unwrap();
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        assert!(!initialized.load(Ordering::Acquire));
+
+        source.set_active(true);
+        wait_for("sampler initialization", || {
+            initialized.load(Ordering::Acquire)
+        });
+    }
+
+    fn gated_sampler_source(
+        initially_parked: bool,
+    ) -> (
+        HostSource,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factories_bg = Arc::clone(&factories);
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let samples_bg = Arc::clone(&samples);
+        let source = HostSource::try_new_with_sampler(
+            || {},
+            move || {
+                factories_bg.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Box::new(move || {
+                    samples_bg.fetch_add(1, Ordering::SeqCst);
+                    StatsSnapshot::default()
+                })
+            },
+            initially_parked,
+            |worker| {
+                std::thread::Builder::new()
+                    .name("gtui-host-metrics-test".into())
+                    .spawn(worker)
+            },
+        )
+        .unwrap();
+        (source, entered_rx, release_tx, factories, samples)
+    }
+
+    fn assert_stop_during_sampler_initialization(initially_parked: bool) {
+        let (source, entered, release, factories, samples) = gated_sampler_source(initially_parked);
+        if initially_parked {
+            wait_for("initial park", || source.in_park.load(Ordering::Acquire));
+            source.set_active(true);
+        }
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("factory did not start");
+        let exited = Arc::clone(&source.exited);
+
+        // Drop requests stop before joining. Keep the factory gate under this
+        // thread's control so an accidental inline join is bounded and can be
+        // released before the test fails.
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
+        let drop_thread = std::thread::spawn(move || {
+            drop(source);
+            drop_done_tx
+                .send(())
+                .expect("drop completion receiver should remain available");
+        });
+        if drop_done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+            release.send(()).unwrap();
+            drop_thread.join().unwrap();
+            panic!("drop blocked while sampler factory was held");
+        }
+        drop_thread.join().unwrap();
+        release.send(()).unwrap();
+        wait_for("worker exit after stop during factory", || {
+            exited.load(Ordering::Acquire)
+        });
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            samples.load(Ordering::SeqCst),
+            0,
+            "stop allowed a priming or first read"
+        );
+    }
+
+    #[test]
+    fn stop_during_active_sampler_initialization_prevents_first_sample() {
+        assert_stop_during_sampler_initialization(false);
+    }
+
+    #[test]
+    fn stop_during_parked_activation_initialization_prevents_first_sample() {
+        assert_stop_during_sampler_initialization(true);
+    }
+
+    #[test]
+    fn hide_during_active_startup_parks_before_first_sample() {
+        let (source, entered, release, factories, samples) = gated_sampler_source(false);
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("factory did not start");
+        source.set_active(false);
+        release.send(()).unwrap();
+        wait_for("worker park after hide during factory", || {
+            source.in_park.load(Ordering::Acquire)
+        });
+        assert_eq!(samples.load(Ordering::SeqCst), 0);
+
+        source.set_active(true);
+        wait_for("first sample after activation", || {
+            samples.load(Ordering::SeqCst) > 0
+        });
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hide_during_initially_parked_activation_keeps_factory_for_next_wakeup() {
+        let (source, entered, release, factories, samples) = gated_sampler_source(true);
+        wait_for("initial park", || source.in_park.load(Ordering::Acquire));
+        source.set_active(true);
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("factory did not start after activation");
+        source.set_active(false);
+        release.send(()).unwrap();
+        wait_for("worker re-park after hide during factory", || {
+            source.in_park.load(Ordering::Acquire)
+        });
+        assert_eq!(samples.load(Ordering::SeqCst), 0);
+
+        source.set_active(true);
+        wait_for("first sample after second activation", || {
+            samples.load(Ordering::SeqCst) > 0
+        });
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "native coordinator witness; exercises the real platform collector"]
+    async fn public_native_host_source_memory_witness() {
+        let source = HostSource::try_new().expect("native host sampler should start");
+        source.set_active(true);
+        wait_for("two initial native samples", || {
+            source.ring.lock().unwrap().len() >= 2
+        });
+        let initial_values = native_memory_values(&source).await;
+        assert!(
+            initial_values.len() >= 2,
+            "native query should return memory"
+        );
+        let initial = initial_values.len();
+        let initial_memory = initial_values[0];
+
+        source.set_active(false);
+        wait_for("native sampler park", || {
+            source.in_park.load(Ordering::Acquire)
+        });
+        let parked = native_memory_values(&source).await.len();
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(native_memory_values(&source).await.len(), parked);
+
+        source.set_active(true);
+        let mut resumed_values = native_memory_values(&source).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while resumed_values.len() <= parked && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            resumed_values = native_memory_values(&source).await;
+        }
+        assert!(resumed_values.len() > parked, "native query did not resume");
+        let resumed = resumed_values.len();
+        let resumed_memory = *resumed_values.last().unwrap();
+
+        let exited = Arc::clone(&source.exited);
+        let started = std::time::Instant::now();
+        drop(source);
+        let drop_ms = started.elapsed().as_millis();
+        wait_for("native worker exit after drop", || {
+            exited.load(Ordering::Acquire)
+        });
+        let exit_ms = started.elapsed().as_millis();
+        writeln!(
+            std::io::stderr().lock(),
+            "native HostSource witness: initial={initial} parked={parked} resumed={resumed} initial_mem_gib={initial_memory:.3} resumed_mem_gib={resumed_memory:.3} drop_ms={drop_ms} worker_exit_ms={exit_ms}"
+        )
+        .expect("failed to write native HostSource witness diagnostic");
+    }
+
+    async fn native_memory_values(source: &HostSource) -> Vec<f64> {
+        let query = Query {
+            ref_id: "native-witness".into(),
+            expr: "host_mem_used".into(),
+            time_range: TimeRange {
+                from: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                to: Utc::now(),
+            },
+        };
+        source.query(vec![query]).await.unwrap().remove(0).fields[1]
+            .floats()
+            .to_vec()
     }
 }

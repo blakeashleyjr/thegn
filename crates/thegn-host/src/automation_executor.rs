@@ -274,6 +274,8 @@ pub(crate) async fn client() -> Result<ControlClient> {
         ControlAddr::Unix(_) | ControlAddr::Tcp { .. } | ControlAddr::HttpOrigin { .. } => {
             Ok(ControlClient::new(addr))
         }
+        #[cfg(feature = "iroh")]
+        ControlAddr::Iroh { .. } => Ok(ControlClient::new(addr)),
     }
 }
 

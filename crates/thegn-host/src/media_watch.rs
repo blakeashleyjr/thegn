@@ -1824,8 +1824,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, _rx) = watch::channel(None);
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client_reads = reads.clone();
@@ -1857,8 +1856,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, _rx) = watch::channel(None);
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client_reads = reads.clone();
@@ -1891,8 +1889,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, _rx) = watch::channel(None);
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client_reads = reads.clone();
@@ -1917,8 +1914,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, _rx) = watch::channel(None);
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client_reads = reads.clone();
@@ -1962,8 +1958,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, _rx) = watch::channel(None);
         let resolves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let resolver_times = resolves.clone();
@@ -2015,8 +2010,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, _rx) = watch::channel(None);
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client_reads = reads.clone();
@@ -2055,8 +2049,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, mut rx) = watch::channel(None);
         let started = tokio::time::Instant::now();
         let deliveries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

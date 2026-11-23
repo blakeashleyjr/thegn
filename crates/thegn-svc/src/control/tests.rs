@@ -2038,6 +2038,81 @@ async fn unauthenticated_pair_redeem_mints_a_scoped_token() {
     );
 }
 
+#[cfg(feature = "iroh")]
+#[tokio::test]
+async fn direct_iroh_pairing_is_token_scoped_reconnectable_and_revocable() {
+    use super::client::{ControlAddr, ControlClient};
+    use thegn_core::store::ControlStore;
+
+    let r = rig(true); // direct serve must override this local-only admin setting.
+    let code = auth::mint(
+        TokenKind::PairingCode,
+        ScopeSet::parse("read"),
+        "",
+        None,
+        None,
+        1_000,
+    );
+    r.db.lock().unwrap().put_pairing(&code.row).unwrap();
+
+    let endpoint = super::iroh::bind_direct([9; 32]).await.unwrap();
+    let address = super::iroh::direct_address(&endpoint).unwrap();
+    let server = tokio::spawn(super::iroh::serve(endpoint, r.state));
+
+    let impostor = super::iroh::bind_direct([8; 32]).await.unwrap();
+    let wrong_peer = ControlClient::new(ControlAddr::Iroh {
+        endpoint: iroh::EndpointAddr::from_parts(impostor.id(), address.addrs.clone()),
+        token: String::new(),
+    });
+    assert!(
+        wrong_peer.me().await.is_err(),
+        "Iroh handshake must pin the invitation peer ID"
+    );
+    impostor.close().await;
+
+    let anonymous = ControlClient::new(ControlAddr::Iroh {
+        endpoint: address.clone(),
+        token: String::new(),
+    });
+    assert!(
+        anonymous.me().await.is_err(),
+        "Iroh peer identity must not imply local admin"
+    );
+
+    let pairing = anonymous
+        .pair(&code.token, "direct test peer")
+        .await
+        .unwrap();
+    let pairing_id = pairing["pairing_id"].as_str().unwrap().to_owned();
+    let token = pairing["token"].as_str().unwrap().to_owned();
+    assert_eq!(pairing["scopes"].as_str(), Some("read"));
+
+    // A fresh ControlClient/QUIC connection proves the saved peer address and
+    // minted bearer can reconnect through the existing scoped API.
+    let reconnect = ControlClient::new(ControlAddr::Iroh {
+        endpoint: address,
+        token,
+    });
+    assert_eq!(
+        reconnect.me().await.unwrap()["scopes"].as_str(),
+        Some("read")
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    r.db.lock()
+        .unwrap()
+        .revoke_pairing(&pairing_id, now)
+        .unwrap();
+    assert!(
+        reconnect.me().await.is_err(),
+        "revoked token must fail on a new connection"
+    );
+    server.abort();
+}
+
 /// The pairing lifecycle must be visible on the event feed: redeem announces
 /// `Requested` (the `require_approval` park that used to be silent), approve
 /// announces `Approved`, revoke announces `Revoked`.

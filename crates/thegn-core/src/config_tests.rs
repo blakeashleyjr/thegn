@@ -1906,7 +1906,7 @@ fn env_overlay_covers_every_knob() {
         crate::config_placement::OnDormant::Cancel
     );
     assert!(c.sandbox.inject_devshell);
-    assert!(c.sandbox.nix_daemon);
+    assert_eq!(c.sandbox.nix_daemon, Some(true));
     assert_eq!(c.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
     assert_eq!(
         c.sandbox.isolation_floor,
@@ -1952,6 +1952,17 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.preview.fetch_timeout_ms, 850);
     assert_eq!(c.preview.max_body_bytes, 8192);
     assert!(c.preview.allow_external_urls);
+}
+
+#[test]
+fn nix_daemon_config_distinguishes_auto_from_explicit_values() {
+    assert_eq!(Config::default().sandbox.nix_daemon, None);
+
+    let disabled: Config = toml::from_str("[sandbox]\nnix_daemon = false\n").unwrap();
+    assert_eq!(disabled.sandbox.nix_daemon, Some(false));
+
+    let enabled: Config = toml::from_str("[sandbox]\nnix_daemon = true\n").unwrap();
+    assert_eq!(enabled.sandbox.nix_daemon, Some(true));
 }
 
 #[test]
@@ -3323,7 +3334,7 @@ fn env_sandbox_overlay_survives_override_roundtrip() {
                     memory: Some("2g".into()),
                     ..Default::default()
                 }),
-                nix_daemon: Some(true),
+                nix_daemon: Some(false),
                 ..Default::default()
             },
             ..Default::default()
@@ -3341,7 +3352,7 @@ fn env_sandbox_overlay_survives_override_roundtrip() {
     );
     assert_eq!(
         sb.nix_daemon,
-        Some(true),
+        Some(false),
         "env sandbox nix_daemon must survive the round-trip"
     );
 }

@@ -76,7 +76,7 @@ pub fn implicit_local_admin(
         // Windows named pipes reject remote clients at creation time. Internal
         // dispatch is separately authenticated before entering the router.
         Some(PeerIdentity::LocalPipe | PeerIdentity::TrustedInternal) => true,
-        Some(PeerIdentity::Unavailable(_)) | None => false,
+        Some(PeerIdentity::IrohEndpointId(_) | PeerIdentity::Unavailable(_)) | None => false,
     }
 }
 
@@ -294,6 +294,11 @@ mod tests {
         assert!(!implicit_local_admin(false, Some(1000), Some(&same)));
         assert!(!implicit_local_admin(true, Some(1000), Some(&other)));
         assert!(!implicit_local_admin(true, Some(1000), Some(&unknown)));
+        assert!(!implicit_local_admin(
+            true,
+            Some(1000),
+            Some(&PeerIdentity::IrohEndpointId("authenticated-peer".into()))
+        ));
         assert!(!implicit_local_admin(true, Some(1000), None));
         assert!(implicit_local_admin(
             true,

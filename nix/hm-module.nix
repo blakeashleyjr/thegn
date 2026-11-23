@@ -109,6 +109,11 @@ self: {
         default = null;
         description = "Wrap the inner command in `devenv shell --`. Unset (null) = the binary's default.";
       };
+      nixDaemon = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Host Nix daemon access for local panes. Unset (null) = the binary's local NixOS default; false opts out, true explicitly enables.";
+      };
       onMissing = lib.mkOption {
         type = lib.types.nullOr (lib.types.enum ["warn" "prompt" "fail"]);
         default = null;
@@ -681,6 +686,7 @@ self: {
       backend_chain = cfg.sandbox.backendChain;
       env_passthrough = cfg.sandbox.envPassthrough;
       init_script = cfg.sandbox.initScript;
+      nix_daemon = cfg.sandbox.nixDaemon;
       on_missing = cfg.sandbox.onMissing;
       limits = {
         heavy_slots = cfg.limitsHeavySlots;
@@ -2249,6 +2255,7 @@ in {
         {
           backend = "podman";
           image = "ghcr.io/you/devbox:latest";
+          nixDaemon = false;
           remote = { host = "user@devbox"; transport = "mosh"; };
         }
       '';

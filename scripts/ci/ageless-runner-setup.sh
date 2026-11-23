@@ -15,6 +15,12 @@ RUNNER_UNIT_FILE="${RUNNER_UNIT_FILE:-/etc/systemd/system/thegn-ci-runner@.servi
 RUNNER_ARCHIVE_FILE="${RUNNER_ARCHIVE_FILE:-$RUNNER_BASE/actions-runner-linux-x64.tar.gz}"
 NIX_GITHUB_TOKEN="${NIX_GITHUB_TOKEN:-}"
 GH_PAT="${GH_PAT:-}"
+NIX_INSTALLER_VERSION="v3.24.2"
+NIX_INSTALLER_URL="https://github.com/DeterminateSystems/nix-installer/releases/download/${NIX_INSTALLER_VERSION}/nix-installer-x86_64-linux"
+# Reviewed official release asset identity; update version, size, and digest together.
+NIX_INSTALLER_SHA256="22ed14ee1b24d100d388f1fc245e3062bd5982433d159cffa6dec34c0eb15dab"
+NIX_INSTALLER_SIZE=78449072
+NIX_INSTALLER_MAX_BYTES=100663296
 
 log() { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
 die() {
@@ -345,11 +351,58 @@ install_runner_loop() {
 
 install_nix_if_missing() {
   if ! command -v nix >/dev/null && [ ! -e /nix/var/nix/profiles/default/bin/nix ]; then
-    log 'installing nix (Determinate Systems, multi-user)…'
-    curl -fsSL https://install.determinate.systems/nix | sh -s -- install --no-confirm
+    log "installing nix (Determinate Systems ${NIX_INSTALLER_VERSION}, multi-user)…"
+    run_verified_installer "$NIX_INSTALLER_URL" "$NIX_INSTALLER_SHA256" "$NIX_INSTALLER_SIZE" install --no-confirm
   else
     log 'nix already installed — leaving it in place'
   fi
+}
+
+download_verified_executable() {
+  local url="$1" expected_sha256="$2" expected_size="$3" destination="$4"
+  local actual_sha256 actual_size
+  [[ $expected_sha256 =~ ^[a-f0-9]{64}$ && $expected_size =~ ^[0-9]+$ && $expected_size -le $NIX_INSTALLER_MAX_BYTES ]] || {
+    die 'invalid pinned installer identity'
+    return 1
+  }
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --max-time 180 --max-filesize "$NIX_INSTALLER_MAX_BYTES" \
+    -o "$destination" "$url" || {
+    die 'could not download the pinned Nix installer'
+    return 1
+  }
+  actual_size="$(wc -c <"$destination")"
+  if [[ ! $actual_size =~ ^[0-9]+$ || $actual_size -gt $NIX_INSTALLER_MAX_BYTES || $actual_size != "$expected_size" ]]; then
+    die "pinned installer size mismatch: expected $expected_size bytes, got ${actual_size:-invalid}"
+    return 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_sha256="$(sha256sum "$destination")"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_sha256="$(shasum -a 256 "$destination")"
+  else
+    die 'sha256sum or shasum is required to verify the Nix installer'
+    return 1
+  fi
+  actual_sha256="${actual_sha256%% *}"
+  if [[ $actual_sha256 != "$expected_sha256" ]]; then
+    die "pinned installer SHA-256 mismatch: expected $expected_sha256, got $actual_sha256"
+    return 1
+  fi
+  chmod 0700 "$destination"
+}
+
+run_verified_installer() {
+  local url="$1" expected_sha256="$2" expected_size="$3" status=0 installer
+  shift 3
+  installer="$(mktemp)"
+  if ! download_verified_executable "$url" "$expected_sha256" "$expected_size" "$installer"; then
+    rm -f -- "$installer"
+    return 1
+  fi
+  "$installer" "$@" || status=$?
+  rm -f -- "$installer"
+  return "$status"
 }
 
 install_runner_payload() {

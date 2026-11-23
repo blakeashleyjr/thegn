@@ -27,5 +27,7 @@ thermal.rs
 cpu_freq.rs
 # vmstat.rs — Linux /proc/vmstat held-fd pread reader; the reader is absent elsewhere.
 vmstat.rs
-# collect/mod.rs — the only cfg in the collect/ tree: per-OS mod declarations (linux/ today).
+# collect/mod.rs — per-OS module declarations and Linux-only request fields.
 collect/mod.rs
+# collect/policy/container_scope.rs — Linux-only fixture test for proc cgroup paths.
+collect/policy/container_scope.rs

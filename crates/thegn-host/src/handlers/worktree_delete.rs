@@ -247,35 +247,33 @@ fn kept_sandbox_for_with(
     db: &thegn_core::db::Db,
     cfg: &thegn_core::config::Config,
     path: &str,
-    name_of: &mut dyn FnMut(&str, &str) -> anyhow::Result<Option<String>>,
+    bound: &mut dyn FnMut(&str) -> anyhow::Result<crate::provider_git::OfflineBinding>,
 ) -> Option<(String, String)> {
     use thegn_core::store::WorkspaceStore;
-    let location = db.location_for(path).ok().flatten();
-    if !matches!(
-        thegn_core::remote::GitLoc::from_db(path, location.as_deref()),
-        thegn_core::remote::GitLoc::Provider { .. }
-    ) {
-        return None;
-    }
+    let sandbox = match bound(path) {
+        Ok(crate::provider_git::OfflineBinding::Unbound) => return None,
+        Ok(crate::provider_git::OfflineBinding::Bound { sandbox }) => sandbox,
+        Ok(crate::provider_git::OfflineBinding::BoundUnknown) => "unknown".into(),
+        Err(error) => {
+            tracing::debug!(target: "thegn::worktree", %error, "kept-sandbox notice: offline binding lookup failed");
+            return None;
+        }
+    };
     let repo = db.repo_root_for(path).ok().flatten().unwrap_or_default();
-    let env = match db.effective_env_checked(path, &repo) {
-        Ok(Some(env)) => env,
-        Ok(None) => return None,
+    let provider = match db.effective_env_checked(path, &repo) {
+        Ok(Some(env)) => cfg
+            .env
+            .get(&env)
+            .map(|e| e.provider.provider.trim().to_string())
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or_else(|| "provider".into()),
+        Ok(None) => "provider".into(),
         Err(error) => {
             tracing::debug!(target: "thegn::worktree", %error, "kept-sandbox notice: env lookup failed");
-            return None;
+            "provider".into()
         }
     };
-    let name = match name_of(path, &env) {
-        Ok(Some(name)) => name,
-        Ok(None) => return None,
-        Err(error) => {
-            tracing::debug!(target: "thegn::worktree", %error, "kept-sandbox notice: sandbox name lookup failed");
-            return None;
-        }
-    };
-    let provider = cfg.env.get(&env)?.provider.provider.trim().to_string();
-    Some((provider, name))
+    Some((provider, sandbox))
 }
 
 fn kept_sandbox_for(
@@ -283,8 +281,8 @@ fn kept_sandbox_for(
     cfg: &thegn_core::config::Config,
     path: &str,
 ) -> Option<(String, String)> {
-    kept_sandbox_for_with(db, cfg, path, &mut |path, env| {
-        crate::provider_factory::provider_sandbox_name_checked(cfg, path, env)
+    kept_sandbox_for_with(db, cfg, path, &mut |path| {
+        crate::provider_git::bound_offline(cfg, path)
     })
 }
 
@@ -295,9 +293,15 @@ pub(crate) fn kept_sandbox_notice(kept: &[(String, String)]) -> Option<String> {
         [(provider, name)] => {
             let name = crate::merge_sweep::safe_display(name);
             let provider = crate::merge_sweep::safe_display(provider);
-            Some(format!(
-                "Closed. Sandbox {name} ({provider}) was kept and may still bill when awake; reopen the worktree to use it, or run `thegn env reap --provider {provider}` to remove it."
-            ))
+            if provider == "provider" {
+                Some(format!(
+                    "Closed. Sandbox {name} ({provider}) was kept and may still bill when awake; reopen the worktree to use it."
+                ))
+            } else {
+                Some(format!(
+                    "Closed. Sandbox {name} ({provider}) was kept and may still bill when awake; reopen the worktree to use it, or run `thegn env reap --provider {provider}` to remove it."
+                ))
+            }
         }
         many => {
             let names = many
@@ -624,7 +628,7 @@ impl Landing {
         sb: &crate::run::SidebarState,
         removed: &[&str],
     ) -> Self {
-        use crate::sidebar::{RowKind, RowTarget, SidebarRow};
+        use crate::sidebar::{RowTarget, SidebarRow};
         let rows: Vec<&SidebarRow> = model.sidebar_rows.iter().filter(|r| r.visible).collect();
         let gone = |r: &SidebarRow| {
             r.worktree_path
@@ -638,7 +642,7 @@ impl Landing {
             let order: Vec<usize> = (0..rows.len())
                 .filter(|&i| {
                     i == at
-                        || (rows[i].kind == RowKind::Worktree
+                        || (rows[i].kind.is_worktree()
                             && &rows[i].workspace_slug == slug
                             && keep(rows[i]))
                 })
@@ -658,7 +662,7 @@ impl Landing {
             .filter(|g| !g.path.is_empty() && removed.contains(&g.path.as_str()))
             .and_then(|g| {
                 rows.iter().position(|r| {
-                    r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some(&g.path)
+                    r.kind.is_worktree() && r.worktree_path.as_deref() == Some(&g.path)
                 })
             })
             .and_then(|at| neighbour(at, &|r| matches!(r.tab_target, Some(RowTarget::Tab(..)))))
@@ -1231,6 +1235,8 @@ mod tests {
         let one = kept_sandbox_notice(&[("sprites".into(), "wt-a".into())]).unwrap();
         assert!(one.contains("Sandbox wt-a (sprites) was kept"));
         assert!(one.contains("thegn env reap --provider sprites"));
+        let unknown = kept_sandbox_notice(&[("provider".into(), "wt-a".into())]).unwrap();
+        assert!(!unknown.contains("thegn env reap --provider provider"));
         let many = kept_sandbox_notice(&[
             ("sprites".into(), "a".into()),
             ("vercel".into(), "b".into()),
@@ -1250,12 +1256,12 @@ mod tests {
         let group = WorktreeGroup::new("repo/local".to_string(), GroupKind::Branch, path);
         let cfg = thegn_core::config::Config::default();
         let mut calls = 0;
-        let kept = kept_sandbox_for_with(&db, &cfg, &group.path, &mut |_, _| {
+        let kept = kept_sandbox_for_with(&db, &cfg, &group.path, &mut |_| {
             calls += 1;
-            Ok(Some("tg-box-1".into()))
+            Ok(crate::provider_git::OfflineBinding::Unbound)
         });
         assert_eq!(kept, None);
-        assert_eq!(calls, 0);
+        assert_eq!(calls, 1);
         let outcome = close_groups_durably(&db, "session", &[group], Some(&cfg));
         assert!(outcome.failures.is_empty());
         assert!(outcome.kept.is_empty());
@@ -1290,12 +1296,38 @@ mod tests {
         env.provider.provider = "sprites".into();
         cfg.env.insert("sp".into(), env);
         let mut calls = 0;
-        let kept = super::kept_sandbox_for_with(&db, &cfg, &path, &mut |_, _| {
+        let kept = super::kept_sandbox_for_with(&db, &cfg, &path, &mut |_| {
             calls += 1;
-            Ok(Some("tg-box-1".into()))
+            Ok(crate::provider_git::OfflineBinding::Bound {
+                sandbox: "tg-box-1".into(),
+            })
         });
         assert_eq!(kept, Some(("sprites".into(), "tg-box-1".into())));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn close_reports_the_kept_sandbox_of_a_headless_row() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        use thegn_core::store::WorkspaceStore;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("headless").to_string_lossy().into_owned();
+        db.put_worktree("repo/headless", "/repo", &path, "headless", None, None)
+            .unwrap();
+        db.set_worktree_env(&path, "sp").unwrap();
+        let mut cfg = thegn_core::config::Config::default();
+        let mut env = thegn_core::config::EnvConfig {
+            placement: thegn_core::config::PlacementMode::Provider,
+            ..Default::default()
+        };
+        env.provider.provider = "sprites".into();
+        cfg.env.insert("sp".into(), env);
+        let kept = super::kept_sandbox_for_with(&db, &cfg, &path, &mut |_| {
+            Ok(crate::provider_git::OfflineBinding::Bound {
+                sandbox: "tg-box-1".into(),
+            })
+        });
+        assert_eq!(kept, Some(("sprites".into(), "tg-box-1".into())));
     }
 
     #[test]

@@ -7,6 +7,41 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.120] — 2026-11-23
+
+### Added
+
+- Development builds support direct Iroh pairing using explicit peer addresses
+  and scoped invitations.
+
+### Changed
+
+- Pipeline-owned worktrees appear once under Pipelines by default. Explicit
+  folder assignments take precedence, and the flat layout remains available.
+- Commands that now refuse, and what to run instead:
+  - `wt rm` and the TUI delete pull the sandbox's commits first and refuse on a failed pull or a dirty sandbox; use `--force` (or the TUI force delete) to destroy anyway.
+  - `env down` refuses a dirty sandbox or failed pull; use `--force`, or `--stop` to park it.
+  - `env deprovision` refuses sandboxes bound to a registered worktree (`--all` skips them); run `env down --worktree <wt>` or `wt rm <wt>` first.
+  - `env rm` refuses while a registered worktree uses the env; tear the worktrees down or `env set <env> --worktree <wt>` first.
+  - `merge land` and the TUI land pull first and refuse a queued candidate the pull made stale; re-queue with `thegn merge add` or run `thegn land`.
+  - `wt prune` keeps worktrees bound to a provider sandbox.
+- `env set` and `env restore` pull first and name what they leave or discard; closing a worktree names the sandbox it leaves.
+- `land --release-sandbox` re-checks right before releasing and keeps a dirty sandbox.
+- Sprites lifetime reapers keep sandboxes bound to a registered worktree; background passes never wake a sandbox, and the hibernator never execs a sleeping sandbox unless a listing shows it awake.
+- Non-tty `sprite-exec` streams without a cap, sends remote stderr to stderr and forwards a non-terminal stdin.
+- `test/remote-parity.sh` prints a `RUN SUMMARY` (THE-2477).
+- Native local interactive sandboxes on NixOS now get host Nix-daemon access when safety checks pass. Agent, SSH, provider, and OCI launches stay off by default; explicit `nix_daemon = false` opts out (THE-2478).
+
+### Fixed
+
+- Work and Observe tabs respond to mouse clicks and keyboard navigation.
+- Native macOS checkout-hook inspection handles an exited process-group leader
+  while preserving checks for live descendants.
+- Native CI shells include the packaging and release smoke test dependencies.
+  Linux-only process diagnostics and feature-only helpers are compiled where
+  they are used.
+- Native macOS builds no longer fail on the per-process activity test or dead-code lints for Linux-only media and process-sampling helpers (THE-2479, THE-2482, THE-2483).
+
 ## [0.1.0-alpha.119] — 2026-11-22
 
 ### Fixed
@@ -4143,7 +4178,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.119...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.120...HEAD
+[0.1.0-alpha.120]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.119...v0.1.0-alpha.120
 [0.1.0-alpha.119]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.118...v0.1.0-alpha.119
 [0.1.0-alpha.118]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.117...v0.1.0-alpha.118
 [0.1.0-alpha.117]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.116...v0.1.0-alpha.117

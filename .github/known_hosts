@@ -1,4 +1,5 @@
-# Pinned SSH host keys from operators' published keys.
-# A maintainer adds aur.archlinux.org from the fingerprints published on the AUR home page,
-# then compares the key with `ssh-keygen -lf` before committing it.
+# Pinned SSH host keys from the providers' published identities.
+# Arch Linux announced the AUR ed25519 key and fingerprint at:
+# https://archlinux.org/news/aur-migration-new-ssh-hostkeys/
 github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN

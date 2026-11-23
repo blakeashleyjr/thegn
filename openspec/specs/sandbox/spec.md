@@ -115,8 +115,14 @@ and a mount whose host path is or contains a protected path SHALL refuse the
 launch. A sealed compose-backed spec SHALL be refused (compose volumes cannot be
 verified). A non-sealed local compose spec SHALL be refused before `up` when its
 effective config binds a protected host path; an uninspectable config SHALL
-launch with a warning and report host-process isolation. A kept OCI container
-SHALL be reused for a sealed spec only when it
+launch with a warning and report host-process isolation. Compose-backed OCI
+launches SHALL also be refused before Compose inspection or
+launch side effects whenever the resolved spec requests restrictions Compose
+does not apply: read-only root, no-new-privileges, PID or per-pane resource
+limits, dropped capabilities, sealed home, host or disabled networking,
+hostname filters, egress policy, a custom OCI runtime, or a VPN. A Compose
+recipe with none of those unsupported requests remains launchable. A kept OCI
+container SHALL be reused for a sealed spec only when it
 carries `thegn.seal_home=1` and binds exactly the required mounts, and a
 non-sealed spec SHALL NOT reuse a sealed container. The devenv `/nix` bind SHALL
 be tolerated only when the current spec would itself emit it. Apple containers
@@ -221,19 +227,36 @@ responsible for any later environment work.
 - **WHEN** the devShell cache is cold at pane spawn
 - **THEN** the pane spawns immediately and no host resolver proceeds in the background
 
-### Requirement: Opt-in nix daemon mount
+### Requirement: Scoped Nix daemon access for local developer panes
 
-`[sandbox] nix_daemon` (default false) SHALL bind-mount the nix daemon socket and set `NIX_REMOTE=daemon` so full `nix develop`/`build` work inside the sandbox, and MUST warn and stay off when the host has no daemon socket.
+`[sandbox] nix_daemon` SHALL mount the compatible host Nix daemon socket and set `NIX_REMOTE=daemon` when enabled. When the setting is omitted, thegn SHALL enable it only for a standalone local interactive terminal pane after a native local `bwrap` or `systemd` backend is resolved, on NixOS, when a compatible host daemon socket exists, the effective network mode is NAT, no network allow/block/audit or VPN policy is configured, and the profile is not sealed. Automatic enablement MUST NOT apply to agent or unattended execution, SSH worktrees, provider placements, or OCI backends (local or remotely addressed). An explicit `false` MUST opt out; an explicit `true` MUST preserve the existing explicit-enable behavior. If the host has no compatible daemon socket, thegn MUST leave the integration off (and warn for an explicit request) rather than half-wiring Nix.
 
-#### Scenario: Enabled with a host daemon
+The daemon socket grants sandbox processes authority to ask the host daemon to build arbitrary derivations and access paths in the host Nix store. It is a trust grant, not a sandbox security boundary.
 
-- **WHEN** `nix_daemon` is true and the host daemon socket exists
-- **THEN** the sandbox mounts the socket and nix operations work inside it
+#### Scenario: Omitted setting on a local NixOS developer pane
 
-#### Scenario: No host daemon
+- **WHEN** `nix_daemon` is omitted, a standalone local interactive terminal resolves to native local `bwrap` or `systemd`, the host is NixOS with a compatible daemon socket, the effective network mode is NAT with no allow/block/audit or VPN policy, and the profile is not sealed
+- **THEN** the sandbox mounts the socket and sets `NIX_REMOTE=daemon`
 
-- **WHEN** `nix_daemon` is true but no host daemon socket exists
-- **THEN** thegn warns and leaves the mount off rather than half-wiring nix
+#### Scenario: Omitted setting outside the local developer path
+
+- **WHEN** `nix_daemon` is omitted and execution is agent or unattended, sealed, SSH, provider-backed, uses an OCI backend, or has network mode `none` or configured network/VPN policy
+- **THEN** thegn does not automatically mount the host daemon socket
+
+#### Scenario: Explicit opt-out
+
+- **WHEN** `nix_daemon` is explicitly false
+- **THEN** the sandbox does not mount the host daemon socket, including on NixOS
+
+#### Scenario: Explicit enable with a host daemon
+
+- **WHEN** `nix_daemon` is explicitly true and the host daemon socket is compatible
+- **THEN** the sandbox mounts the socket and sets `NIX_REMOTE=daemon`
+
+#### Scenario: No compatible host daemon
+
+- **WHEN** the setting is omitted or explicitly true but no compatible host daemon socket exists
+- **THEN** the integration stays off; an explicit request emits a bounded warning
 
 ### Requirement: A commodity VPS can serve as a managed sandbox provider
 

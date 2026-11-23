@@ -37,7 +37,7 @@ export THEGN_E2E=1
 # row label) would make every pane-bearing snapshot machine-specific. A wrapper
 # rather than $ENV because thegn's curated pane env doesn't carry ENV/PS1.
 mkdir -p "$_tmp/bin"
-printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND=\nexec /bin/sh --norc --noprofile -i\n' > "$_tmp/bin/e2esh"
+printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND= ENV=/dev/null\nexec /bin/sh -i\n' > "$_tmp/bin/e2esh"
 chmod +x "$_tmp/bin/e2esh"
 export SHELL="$_tmp/bin/e2esh"
 # Cut the session D-Bus: otherwise the developer's live media player leaks
@@ -66,6 +66,33 @@ printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$XDG_CONFIG_
 export THEGN_SANDBOX_BACKEND=none
 export E2E_RESULTS="$(pwd)/e2e-results"
 rm -rf "$E2E_RESULTS"
+'''
+
+# Resolve the binary once for every Muse recipe. By default, build and use the
+# active Cargo target directory; a native gate can pass an existing binary with
+# THEGN_E2E_BINARY and avoid a second build.
+_e2e_binary := '''
+set -e
+if [ -n "${THEGN_E2E_BINARY:-}" ]; then
+    E2E_BINARY="$THEGN_E2E_BINARY"
+else
+    just build
+    E2E_BINARY="${CARGO_TARGET_DIR:-target}/debug/thegn"
+fi
+case "$E2E_BINARY" in
+    /*) ;;
+    *) E2E_BINARY="$(pwd)/$E2E_BINARY" ;;
+esac
+[ "$(basename "$E2E_BINARY")" = thegn ] || {
+    echo "Muse binary must be named thegn: $E2E_BINARY" >&2
+    exit 2
+}
+[ -f "$E2E_BINARY" ] && [ -x "$E2E_BINARY" ] || {
+    echo "Muse binary is not a regular executable: $E2E_BINARY" >&2
+    exit 2
+}
+E2E_BINARY="$(cd "$(dirname "$E2E_BINARY")" && pwd -P)/$(basename "$E2E_BINARY")"
+E2E_BIN_DIR="$(dirname "$E2E_BINARY")"
 '''
 
 # Show available recipes (default).
@@ -662,31 +689,50 @@ deps-audit:
 # HOME, the XDG dirs, and git config into a throwaway temp dir (cleaned on exit),
 # so warm/shared envs can neither change behavior nor leak test state. Each spec
 # additionally isolates XDG_STATE_HOME per case via `case_tmp_env`.
-e2e: build
+e2e:
     #!/usr/bin/env bash
+    {{_e2e_binary}}
     {{_e2e_env}}
     # muse takes spec FILES (a bare directory is "Is a directory" — os error 21).
     # One worker: the stress specs fire resize/chord storms whose timing is
     # the point; a second compositor competing for the CPU turned those into
     # load-dependent flakes (and masked a real race, tasks.md 748). ~8 min.
-    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
+    PATH="$E2E_BIN_DIR:$PATH" muse run test/muse/specs/*.yaml \
+        --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
+        --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
+
+# Run one assertion-only Muse spec with the same isolated environment. This is
+# useful for platform checks whose new spec intentionally has no snapshots.
+e2e-spec spec:
+    #!/usr/bin/env bash
+    {{_e2e_binary}}
+    {{_e2e_env}}
+    spec="{{spec}}"
+    case "$spec" in
+        test/muse/specs/*.yaml) ;;
+        *) echo "expected a spec under test/muse/specs/: $spec" >&2; exit 2 ;;
+    esac
+    [ -f "$spec" ] || { echo "Muse spec not found: $spec" >&2; exit 2; }
+    PATH="$E2E_BIN_DIR:$PATH" muse run "$spec" \
         --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # Re-record the snapshot baselines (after an intentional UI change). Review the
 # diff under test/muse/snapshots/ before committing it.
-e2e-update: build
+e2e-update:
     #!/usr/bin/env bash
+    {{_e2e_binary}}
     {{_e2e_env}}
-    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
+    PATH="$E2E_BIN_DIR:$PATH" muse run test/muse/specs/*.yaml \
         --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --update-snapshots --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # Run only the glitch-hunt specs (18–28) — the boundary/stress subset.
-e2e-glitch: build
+e2e-glitch:
     #!/usr/bin/env bash
+    {{_e2e_binary}}
     {{_e2e_env}}
-    PATH="$(pwd)/target/debug:$PATH" muse run \
+    PATH="$E2E_BIN_DIR:$PATH" muse run \
         test/muse/specs/1[89]-*.yaml test/muse/specs/2[0-8]-*.yaml \
         --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
@@ -991,6 +1037,15 @@ test-remote host *args:
 # network and no compile. Seconds; safe to run anywhere.
 test-remote-selftest:
     bash test/remote-runner-selftest.sh
+
+# Hermetic evidence-runner checks and the opt-in macOS OCI runtime capture.
+# The latter requires an interactive owner-provided output path and runs only
+# on the Apple-silicon Mac; see test/macos/README.md.
+macos-ondevice-selftest:
+    bash test/macos/selftest.sh
+
+macos-ondevice outdir:
+    bash test/macos/on-device.sh "{{outdir}}"
 
 # Opt-in local Windows 11 VM (KVM + quickemu from the flake's nixpkgs, state
 # under $XDG_DATA_HOME/thegn-dev/windows-vm, never in the repo). `setup`
@@ -1498,7 +1553,7 @@ clean-aux:
 cargo-provenance *args:
     bash test/cargo-provenance.sh {{args}}
 
-# Hermetic fixture test for the provenance script; pure Python + bash, no Cargo.
+# Hermetic fixture test for the provenance script; Python 3 + Bash, no Cargo.
 test-cargo-provenance:
     python3 -B test/cargo_provenance_test.py
 

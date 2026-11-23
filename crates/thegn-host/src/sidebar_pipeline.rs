@@ -20,6 +20,25 @@
 
 use thegn_core::issue::AgentDispatch;
 
+/// Stable lexical identity for absolute and relative worktree path spellings.
+/// No filesystem lookup is needed, so sidebar rebuilds stay cheap and path
+/// aliases containing redundant separators or dot components compare equal.
+pub(crate) fn path_identity(path: &str) -> String {
+    use std::path::{Component, PathBuf};
+
+    let mut normalized = PathBuf::new();
+    for component in std::path::Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.file_name().is_some() => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized.to_string_lossy().into_owned()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LaneId {
     Issue {
@@ -73,7 +92,18 @@ pub(crate) struct LaneWorktree {
 /// - **Lane order**: earliest `dispatched_at_ms` of the lane's rows first
 ///   (the order work started — the same reading
 ///   `monitor_pipeline::ordered_rows` uses), tie-broken by key.
+#[cfg(test)]
 pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
+    lanes_with_persisted_paths(dispatches, &[])
+}
+
+/// Fold roster lane names together with the DB's unbounded durable ownership
+/// paths. Paths no longer represented in the roster get a stable path-keyed
+/// lane, so the worktree stays findable without inventing persisted UI state.
+pub(crate) fn lanes_with_persisted_paths(
+    dispatches: &[AgentDispatch],
+    persisted_paths: &[String],
+) -> Vec<Lane> {
     use std::collections::{HashMap, HashSet};
 
     // Count distinct providers per canonical key before assigning unprefixed
@@ -150,7 +180,10 @@ pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
                 if path.is_empty() {
                     continue;
                 }
-                if let Some(w) = seen.iter_mut().find(|w| w.path == path) {
+                if let Some(w) = seen
+                    .iter_mut()
+                    .find(|w| path_identity(&w.path) == path_identity(path))
+                {
                     w.at_ms = w.at_ms.min(d.dispatched_at_ms);
                 } else {
                     seen.push(LaneWorktree {
@@ -176,7 +209,31 @@ pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
         .collect();
 
     lanes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.key.cmp(&b.1.key)));
-    lanes.into_iter().map(|(_, lane)| lane).collect()
+    let mut lanes: Vec<Lane> = lanes.into_iter().map(|(_, lane)| lane).collect();
+    let mut seen_paths: HashSet<String> = lanes
+        .iter()
+        .flat_map(|lane| {
+            lane.worktrees
+                .iter()
+                .map(|worktree| path_identity(&worktree.path))
+        })
+        .collect();
+    let mut durable_only: Vec<&str> = persisted_paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !path.trim().is_empty() && seen_paths.insert(path_identity(path)))
+        .collect();
+    durable_only.sort_unstable();
+    lanes.extend(durable_only.into_iter().map(|path| Lane {
+        key: format!("worktree:{path}"),
+        label: thegn_core::pipeline_report::display_cell(thegn_core::util::basename(path)),
+        worktrees: vec![LaneWorktree {
+            path: path.to_string(),
+            name: thegn_core::pipeline_report::display_cell(thegn_core::util::basename(path)),
+            at_ms: i64::MAX,
+        }],
+    }));
+    lanes
 }
 
 /// The grouping identity before unprefixed-provider ambiguity is resolved.
@@ -413,6 +470,43 @@ mod tests {
         assert_eq!(wt_names(&out[0]), vec!["tg-the-74"], "deduped by path");
         // The leaf keeps its EARLIEST reference, not its latest.
         assert_eq!(out[0].worktrees[0].at_ms, 1_000);
+    }
+
+    #[test]
+    fn repeated_stage_paths_and_path_aliases_make_one_leaf() {
+        let rows = vec![
+            dispatch(
+                1,
+                "THE-74",
+                "/wt/./pipeline",
+                AgentDispatchStatus::Running,
+                2_000,
+            ),
+            dispatch(
+                2,
+                "THE-74",
+                "/wt/pipeline",
+                AgentDispatchStatus::Done,
+                1_000,
+            ),
+        ];
+        let out = lanes(&rows);
+        assert_eq!(out[0].worktrees.len(), 1);
+        assert_eq!(out[0].worktrees[0].at_ms, 1_000);
+    }
+
+    #[test]
+    fn durable_paths_without_roster_rows_get_stable_path_lanes() {
+        let paths = vec![
+            "/repo/worktrees/old-pipeline".to_string(),
+            "/repo/worktrees/old-pipeline".to_string(),
+        ];
+        let first = lanes_with_persisted_paths(&[], &paths);
+        let second = lanes_with_persisted_paths(&[], &paths);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1, "duplicate durable paths collapse");
+        assert_eq!(first[0].key, "worktree:/repo/worktrees/old-pipeline");
+        assert_eq!(first[0].worktrees[0].path, paths[0]);
     }
 
     #[test]

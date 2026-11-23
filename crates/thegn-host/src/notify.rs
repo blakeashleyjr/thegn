@@ -618,7 +618,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn queue_hold_latch_tracks_state_and_clears_on_settled_progress() {
-        let (state, _master, _terminal) = test_state(NotificationsConfig::default());
+        let (state, _waker, _fixture) = test_state(NotificationsConfig::default());
         assert!(state.latch_queue_hold("row", Some("deferred")));
         assert!(!state.latch_queue_hold("row", Some("deferred")));
         assert!(state.latch_queue_hold("row", Some("gate_failed")));
@@ -633,7 +633,7 @@ mod tests {
             merge_queue_hold_desktop: true,
             ..NotificationsConfig::default()
         };
-        let (state, _master, _terminal) = test_state(cfg);
+        let (state, _waker, _fixture) = test_state(cfg);
         assert!(state.merge_queue_hold_desktop());
     }
 
@@ -642,34 +642,12 @@ mod tests {
         cfg: NotificationsConfig,
     ) -> (
         Arc<NotifyState>,
-        std::fs::File,
-        termwiz::terminal::UnixTerminal,
+        termwiz::terminal::TerminalWaker,
+        crate::platform::sound_process::test_support::TestPtyFixture,
     ) {
-        use std::os::fd::FromRawFd;
-        use termwiz::terminal::{Terminal, UnixTerminal};
-
-        let mut master = -1;
-        let mut slave = -1;
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            },
-            0
-        );
-        let master = unsafe { std::fs::File::from_raw_fd(master) };
-        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
-        let caps =
-            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
-                .unwrap();
-        let terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
-        let state = NotifyState::new(cfg, String::new(), terminal.waker());
-        (state, master, terminal)
+        let (waker, fixture) = crate::platform::sound_process::test_support::test_waker();
+        let state = NotifyState::new(cfg, String::new(), waker.clone());
+        (state, waker, fixture)
     }
 
     #[cfg(unix)]
@@ -685,7 +663,7 @@ mod tests {
             ("mentioned".into(), "bell".into()),
             ("overdue".into(), "bell".into()),
         ]);
-        let (state, _master, _terminal) = test_state(cfg.clone());
+        let (state, _waker, _fixture) = test_state(cfg.clone());
         let db = thegn_core::db::Db::open_memory().unwrap();
 
         for (kind, source_ref, message) in [
@@ -711,7 +689,7 @@ mod tests {
             drop: true,
             ..Default::default()
         });
-        let (drop_state, _master, _terminal) = test_state(drop_cfg);
+        let (drop_state, _waker, _fixture) = test_state(drop_cfg);
         let db = thegn_core::db::Db::open_memory().unwrap();
         let (decision, inserted) = record_once(
             &db,
@@ -726,7 +704,7 @@ mod tests {
         assert_eq!(decision.sound, None);
         assert!(!drop_state.take_bell());
 
-        let (dnd_state, _master, _terminal) = test_state(cfg.clone());
+        let (dnd_state, _waker, _fixture) = test_state(cfg.clone());
         assert!(dnd_state.toggle_dnd());
         let db = thegn_core::db::Db::open_memory().unwrap();
         let (decision, inserted) =
@@ -735,7 +713,7 @@ mod tests {
         assert_eq!(decision.sound, None);
         assert!(!dnd_state.take_bell());
 
-        let (focused_state, _master, _terminal) = test_state(cfg);
+        let (focused_state, _waker, _fixture) = test_state(cfg);
         focused_state.set_focused_worktree("/wt/app".into());
         let db = thegn_core::db::Db::open_memory().unwrap();
         let (decision, inserted) = record_once(
@@ -754,7 +732,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn take_bell_consumes_normal_and_fallback_latches_together() {
-        let (state, _master, _terminal) = test_state(NotificationsConfig::default());
+        let (state, _waker, _fixture) = test_state(NotificationsConfig::default());
         state.ring_bell();
         state.sound_runtime.latch_fallback_bell_for_test();
 
@@ -766,15 +744,13 @@ mod tests {
     #[test]
     fn reminder_delivery_default_route_records_one_row_and_rings_once() {
         use std::collections::BTreeMap;
-        use termwiz::terminal::Terminal;
         use thegn_core::calendar::DueReminder;
         use thegn_core::store::NotificationStore;
 
         let mut cfg = NotificationsConfig::default();
         cfg.sound.min_priority = "info".into();
         cfg.sound.per_kind = BTreeMap::from([("calendar_reminder".into(), "bell".into())]);
-        let (state, _master, terminal) = test_state(cfg);
-        let waker = terminal.waker();
+        let (state, waker, _fixture) = test_state(cfg);
         let db = thegn_core::db::Db::open_memory().unwrap();
         let r = DueReminder {
             event_id: "ics:work/e1".into(),
@@ -858,7 +834,6 @@ mod tests {
     #[test]
     fn reminder_delivery_route_without_inbox_rings_once_and_writes_no_row() {
         use std::collections::BTreeMap;
-        use termwiz::terminal::Terminal;
         use thegn_core::calendar::DueReminder;
         use thegn_core::config::NotificationRule;
         use thegn_core::store::NotificationStore;
@@ -871,8 +846,7 @@ mod tests {
             route: Some(vec!["sound".into()]),
             ..Default::default()
         });
-        let (state, _master, terminal) = test_state(cfg);
-        let waker = terminal.waker();
+        let (state, waker, _fixture) = test_state(cfg);
         let db = thegn_core::db::Db::open_memory().unwrap();
         let r = DueReminder {
             event_id: "ics:work/e1".into(),
@@ -948,7 +922,6 @@ mod tests {
     #[test]
     fn reminder_delivery_drop_rule_consumes_the_claim_and_delivers_nothing() {
         use std::collections::BTreeMap;
-        use termwiz::terminal::Terminal;
         use thegn_core::calendar::DueReminder;
         use thegn_core::config::NotificationRule;
         use thegn_core::store::NotificationStore;
@@ -961,8 +934,7 @@ mod tests {
             drop: true,
             ..Default::default()
         });
-        let (state, _master, terminal) = test_state(cfg);
-        let waker = terminal.waker();
+        let (state, waker, _fixture) = test_state(cfg);
         let db = thegn_core::db::Db::open_memory().unwrap();
         let r = DueReminder {
             event_id: "ics:work/e1".into(),

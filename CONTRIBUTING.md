@@ -308,6 +308,13 @@ Mac when touching anything platform-sensitive; it covers what neither
    `auto` picks it; without it, `auto` falls through to `host`.
 9. The media badge, `osascript` notifications, the `afplay` chime, `pbcopy`
    copy-mode yank, and a Keychain secret round-trip all fire.
+10. For the Apple OCI runtime decision, run `just macos-ondevice-selftest`,
+    then `just macos-ondevice "$HOME/spike-evidence/WS05-P0-01-<unique-run>"`
+    from a private evidence directory. This checks `container` network none,
+    internal-network internet/host reachability with positive controls,
+    `--ulimit nproc`, labels, version output, and read-only Podman/Docker
+    machine metadata. Review inconclusive rows as inconclusive; startup errors
+    and timeouts do not count as isolation evidence. See [test/macos](test/macos/README.md).
 
 ## Windows (native) notes
 
@@ -320,12 +327,14 @@ repository state, from the first opt-in native run on 2026-11-23
   windows-latest. The Linux-side `x86_64-pc-windows-gnu` cross-check still
   covers cfg/compile regressions ahead of that run.
 - Native named-pipe daemon IPC tests exist and are the first gate after the
-  check; that run never ran them, because the `thegn-svc` lib test target does
-  not compile for Windows: `crates/thegn-svc/src/calendar/command_tests.rs:110`
-  and `crates/thegn-svc/src/inbox/command_tests.rs:324` call `libc::kill`
-  without a `cfg(unix)` guard, and `libc` is a unix-only dependency there.
-  `cargo check --workspace` does not build test targets, which is why the step
-  before it passed. The kernel tests after it (Job Objects, the `thegn.exe`
+  check; that run never ran them, because the `thegn-svc` lib test target did
+  not compile for Windows: two process-group kill tests in
+  `crates/thegn-svc/src/calendar/command_tests.rs` and
+  `crates/thegn-svc/src/inbox/command_tests.rs` called `libc::kill`, and
+  `libc` is a unix-only dependency there. Both tests are now `cfg(unix)`; no
+  native run has confirmed the fix yet. `cargo check --workspace` does not
+  build test targets, which is why the step before it passed. The kernel tests
+  after it (Job Objects, the `thegn.exe`
   build and the artifact smoke) have not run yet. They used to fail on
   `pipe_bind_is_the_lock_and_round_trips`: Windows keeps a pipe _name_ reserved
   for a few milliseconds after the last handle of an instance that carried a

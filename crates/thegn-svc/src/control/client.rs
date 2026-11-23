@@ -33,6 +33,8 @@ use super::{
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
+#[cfg(feature = "iroh")]
+pub const IROH_CONTROL_ALPN: &[u8] = b"thegn/control/v1";
 
 /// A permanent failure while validating the control WebSocket greeting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +79,14 @@ pub enum ControlAddr {
     /// ordinary WebPKI certificate verification; WebSockets derive `ws`/`wss`
     /// from the same origin.
     HttpOrigin { origin: String, token: String },
+    /// Direct-only authenticated Iroh control endpoint. The address is
+    /// validated again at connect time: relay and custom transports are
+    /// refused even if a caller constructs this variant directly.
+    #[cfg(feature = "iroh")]
+    Iroh {
+        endpoint: iroh::EndpointAddr,
+        token: String,
+    },
 }
 
 impl std::fmt::Debug for ControlAddr {
@@ -91,6 +101,13 @@ impl std::fmt::Debug for ControlAddr {
             Self::HttpOrigin { origin, .. } => f
                 .debug_struct("HttpOrigin")
                 .field("origin", origin)
+                .field("token", &"[REDACTED]")
+                .finish(),
+            #[cfg(feature = "iroh")]
+            Self::Iroh { endpoint, .. } => f
+                .debug_struct("Iroh")
+                .field("endpoint_id", &endpoint.id)
+                .field("addresses", &endpoint.ip_addrs().collect::<Vec<_>>())
                 .field("token", &"[REDACTED]")
                 .finish(),
         }
@@ -669,6 +686,8 @@ impl ControlClient {
         match &self.addr {
             ControlAddr::Unix(_) => None,
             ControlAddr::Tcp { token, .. } | ControlAddr::HttpOrigin { token, .. } => Some(token),
+            #[cfg(feature = "iroh")]
+            ControlAddr::Iroh { token, .. } => (!token.is_empty()).then_some(token),
         }
     }
 
@@ -781,6 +800,11 @@ impl ControlClient {
                     .as_ref()
                     .map_err(|error| anyhow::Error::new(*error))?;
                 send_origin_request(client, origin, token, method, path, body, max).await
+            }
+            #[cfg(feature = "iroh")]
+            ControlAddr::Iroh { endpoint, .. } => {
+                let stream = iroh_control_stream(endpoint, connect).await?;
+                send_request(stream, method, path, self.token(), body, connect, max).await
             }
         }
     }
@@ -1376,6 +1400,12 @@ impl ControlClient {
                 Some(token.clone()),
                 websocket_url(origin, &path)?,
             ),
+            #[cfg(feature = "iroh")]
+            ControlAddr::Iroh { token, .. } => (
+                "thegn-iroh".to_string(),
+                Some(token.clone()),
+                format!("ws://thegn-iroh{path}"),
+            ),
         };
         let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
             .method("GET")
@@ -1453,6 +1483,22 @@ impl ControlClient {
                 .await?;
                 start_attach(ws, frame_tx, ctrl_rx, mode.clone(), liveness, end_tx).await?;
             }
+            #[cfg(feature = "iroh")]
+            ControlAddr::Iroh { endpoint, .. } => {
+                let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    let stream = iroh_control_stream(endpoint, connect).await?;
+                    let (ws, _) = tokio_tungstenite::client_async_with_config(
+                        req,
+                        stream,
+                        Some(control_ws_config()),
+                    )
+                    .await
+                    .context("Iroh events websocket handshake")?;
+                    Ok(ws)
+                })
+                .await?;
+                start_attach(ws, frame_tx, ctrl_rx, mode.clone(), liveness, end_tx).await?;
+            }
         }
         Ok(AttachStream {
             frames: frame_rx,
@@ -1515,6 +1561,12 @@ impl ControlClient {
                 origin_authority(origin)?,
                 Some(token.clone()),
                 websocket_url(origin, &path)?,
+            ),
+            #[cfg(feature = "iroh")]
+            ControlAddr::Iroh { token, .. } => (
+                "thegn-iroh".to_string(),
+                Some(token.clone()),
+                format!("ws://thegn-iroh{path}"),
             ),
         };
         let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
@@ -1589,6 +1641,22 @@ impl ControlClient {
                     )
                     .await
                     .context("attach websocket handshake")?;
+                    Ok(ws)
+                })
+                .await?;
+                start_attach(ws, frame_tx, ctrl_rx, mode, liveness, end_tx).await?;
+            }
+            #[cfg(feature = "iroh")]
+            ControlAddr::Iroh { endpoint, .. } => {
+                let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    let stream = iroh_control_stream(endpoint, connect).await?;
+                    let (ws, _) = tokio_tungstenite::client_async_with_config(
+                        req,
+                        stream,
+                        Some(control_ws_config()),
+                    )
+                    .await
+                    .context("Iroh attach websocket handshake")?;
                     Ok(ws)
                 })
                 .await?;
@@ -2125,6 +2193,68 @@ async fn send_origin_request(
     }
     let value = parse_response_body(status, content_type.as_deref(), &bytes)?;
     Ok((status, value))
+}
+
+/// Send one HTTP/1.1 request over `stream` and collect the JSON body.
+#[cfg(feature = "iroh")]
+async fn iroh_control_stream(
+    addr: &iroh::EndpointAddr,
+    connect_timeout: Duration,
+) -> Result<tokio::io::DuplexStream> {
+    use iroh::TransportAddr;
+    use iroh::endpoint::RelayMode;
+    use iroh::endpoint::presets::Minimal;
+
+    let mut direct = 0usize;
+    for address in &addr.addrs {
+        match address {
+            TransportAddr::Ip(socket) if !socket.ip().is_unspecified() && socket.port() != 0 => {
+                direct += 1
+            }
+            TransportAddr::Ip(_) => {
+                anyhow::bail!("Iroh direct address must have a concrete IP and port")
+            }
+            TransportAddr::Relay(_) => anyhow::bail!("Iroh direct control refuses relay addresses"),
+            TransportAddr::Custom(_) => {
+                anyhow::bail!("Iroh direct control refuses custom addresses")
+            }
+            _ => anyhow::bail!("Iroh direct control refuses unknown address transports"),
+        }
+    }
+    anyhow::ensure!(
+        direct > 0,
+        "Iroh direct control needs an explicit IP socket address"
+    );
+
+    let endpoint = iroh::Endpoint::builder(Minimal)
+        .alpns(vec![IROH_CONTROL_ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .clear_address_lookup()
+        .bind()
+        .await
+        .context("bind direct Iroh control endpoint")?;
+    let connection = tokio::time::timeout(
+        connect_timeout,
+        endpoint.connect(addr.clone(), IROH_CONTROL_ALPN),
+    )
+    .await
+    .context("direct Iroh control connect timed out")?
+    .context("connect to direct Iroh control endpoint")?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("open direct Iroh control stream")?;
+    let (client_io, bridge_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let (mut client_read, mut client_write) = tokio::io::split(bridge_io);
+        tokio::select! {
+            _ = tokio::io::copy(&mut client_read, &mut send) => {}
+            _ = tokio::io::copy(&mut recv, &mut client_write) => {}
+        }
+        connection.close(0u32.into(), b"request complete");
+        endpoint.close().await;
+    });
+    Ok(client_io)
 }
 
 /// Send one HTTP/1.1 request over `stream` and collect the JSON body.

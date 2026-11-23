@@ -334,8 +334,7 @@ mod tests {
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let started = std::time::Instant::now();
         persist(&choice("queued-terminal", "", "bwrap"), &tx, &waker);
         assert!(started.elapsed() < std::time::Duration::from_millis(500));

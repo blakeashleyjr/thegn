@@ -472,6 +472,8 @@ fn render(report: &ReapReport) -> String {
 ///   older than the env's `max_lifetime_secs` (age from the later of the API
 ///   `created_at` and the record's, so lifetime counts from adoption) → `--apply` destroys it through
 ///   `SpritesProvider::destroy`, which proves ownership again itself.
+/// - `over-lifetime-bound`: an over-lifetime sprite whose name is bound to a
+///   registered worktree → kept, never deleted by `--apply`.
 /// - `unrecorded`: in the account with no record of this host (including one
 ///   a worktree location row names, and every pre-ledger sprite) → reported,
 ///   **never** deleted.
@@ -555,6 +557,7 @@ mod sprites {
         OrphanRecord,
         StaleCreating,
         OverLifetime,
+        OverLifetimeBound,
         Unrecorded,
     }
 
@@ -564,6 +567,7 @@ mod sprites {
                 Class::OrphanRecord => "orphan-record",
                 Class::StaleCreating => "stale-creating",
                 Class::OverLifetime => "over-lifetime",
+                Class::OverLifetimeBound => "over-lifetime-bound",
                 Class::Unrecorded => "unrecorded",
             }
         }
@@ -573,7 +577,7 @@ mod sprites {
             match self {
                 Class::OrphanRecord | Class::StaleCreating => Some("remove record"),
                 Class::OverLifetime => Some("destroy sprite"),
-                Class::Unrecorded => None,
+                Class::OverLifetimeBound | Class::Unrecorded => None,
             }
         }
     }
@@ -678,6 +682,13 @@ mod sprites {
                 "no [env.<name>] with provider = \"sprites\" is configured (see `thegn env list`)"
             );
         }
+        let bound = match crate::sprites_reaper::bound_sandboxes(cfg) {
+            Ok(bound) => bound,
+            Err(error) if apply && !unrecorded => bail!(
+                "env reap: cannot read the worktree registry ({error:#}); refusing --apply so no sprite holding unpulled work is destroyed"
+            ),
+            Err(_) => crate::sprites_reaper::BoundSet::unresolved("registry unreadable"),
+        };
         let _lease = if apply && !unrecorded {
             match crate::reaper_policy::try_reaper_lease(KIND) {
                 Ok(Some(lease)) => Some(lease),
@@ -699,6 +710,7 @@ mod sprites {
                 Opts { apply, yes }
             },
             &mut ask,
+            &bound,
             thegn_core::util::now_ms(),
         )?;
         if unrecorded {
@@ -772,6 +784,7 @@ mod sprites {
         envs: &[SpritesEnv],
         opts: Opts,
         ask: Ask<'_>,
+        bound: &crate::sprites_reaper::BoundSet,
         now_ms: i64,
     ) -> Result<SpritesReport> {
         // 1. Group envs by account (an env with no scope is its own group).
@@ -875,14 +888,23 @@ mod sprites {
                     Some(row) => {
                         let created = lifetime_start_ms(row, record);
                         if over(created, lifetime, now_ms) {
+                            let (class, note) = match bound.holder(&record.name) {
+                                Some(holder) => (
+                                    Class::OverLifetimeBound,
+                                    Some(format!(
+                                        "bound to worktree {holder}: kept; `thegn env down --worktree <wt>` pulls its commits first"
+                                    )),
+                                ),
+                                None => (Class::OverLifetime, None),
+                            };
                             entries.push(Entry {
                                 name: record.name.clone(),
-                                class: Class::OverLifetime,
+                                class,
                                 status: row.state.clone().unwrap_or_else(|| "?".into()),
                                 created_ms: created,
                                 age: crate::cmd::fleet::age(created, now_ms),
                                 proof: "ledger",
-                                note: None,
+                                note,
                                 cpu_hours_30d: None,
                                 gb_hours_30d: None,
                                 usage_error: false,
@@ -1031,7 +1053,7 @@ mod sprites {
                 Class::OrphanRecord | Class::StaleCreating => {
                     remove_record(&name, scope.as_ref(), class)
                 }
-                Class::Unrecorded => Err("never deleted".into()),
+                Class::OverLifetimeBound | Class::Unrecorded => Err("never deleted".into()),
             };
             report.results.push(ActionResult {
                 name,
@@ -1189,8 +1211,14 @@ mod sprites {
             ));
         }
         if !report.apply {
+            let kept = report.count(Class::OverLifetimeBound);
+            let kept = if kept > 0 {
+                format!(", {kept} kept (bound to a worktree)")
+            } else {
+                String::new()
+            };
             out.push(format!(
-                "{} over-lifetime, {} orphan record(s), {} stale creating record(s)",
+                "{} over-lifetime{kept}, {} orphan record(s), {} stale creating record(s)",
                 report.count(Class::OverLifetime),
                 report.count(Class::OrphanRecord),
                 report.count(Class::StaleCreating)
@@ -1421,6 +1449,7 @@ mod sprites {
                 &envs(fake, 3600),
                 Opts { apply: false, yes },
                 &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
                 NOW_MS,
             )
             .unwrap();
@@ -1448,7 +1477,14 @@ mod sprites {
         fn sprites_reap_classifies_and_dry_run_deletes_nothing() {
             let _state = thegn_core::testenv::IsolatedState::new();
             let fake = seed();
-            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                DRY,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert!(fake.destroys.lock().unwrap().is_empty(), "dry run");
             assert_eq!(
                 classes(&report),
@@ -1488,7 +1524,14 @@ mod sprites {
                 row("sx-notime", None),
                 row("sx-old", Some(NOW_MS - 5 * HOUR_MS)),
             ]));
-            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                DRY,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert_eq!(
                 classes(&report),
                 [
@@ -1505,7 +1548,14 @@ mod sprites {
                 row("sx-notime", None),
                 row("sx-old", Some(NOW_MS - 5 * HOUR_MS)),
             ]));
-            let report = reap(&envs(&fake0, 0), DRY, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake0, 0),
+                DRY,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert!(report.accounts[0].entries.is_empty());
         }
 
@@ -1513,7 +1563,14 @@ mod sprites {
         fn sprites_reap_apply_never_deletes_unrecorded() {
             let _state = thegn_core::testenv::IsolatedState::new();
             let fake = seed();
-            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                APPLY_YES,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert_eq!(*fake.destroys.lock().unwrap(), ["sx-old"]);
             assert!(report.results.iter().all(|r| r.name != "owner-personal"));
             assert_eq!(report.failed(), 0, "{:?}", report.results);
@@ -1525,11 +1582,40 @@ mod sprites {
         }
 
         #[test]
+        fn sprites_reap_apply_keeps_a_bound_over_lifetime_sprite() {
+            let _state = thegn_core::testenv::IsolatedState::new();
+            let fake = seed();
+            let bound = crate::sprites_reaper::BoundSet::with(&[("sx-old", "/wt/sx")], &[]);
+            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, &bound, NOW_MS).unwrap();
+            assert!(fake.destroys.lock().unwrap().is_empty());
+            assert!(classes(&report).contains(&("sx-old".into(), Class::OverLifetimeBound)));
+            let entry = report.accounts[0]
+                .entries
+                .iter()
+                .find(|entry| entry.name == "sx-old")
+                .unwrap();
+            assert_eq!(
+                entry.note.as_deref(),
+                Some(
+                    "bound to worktree /wt/sx: kept; `thegn env down --worktree <wt>` pulls its commits first"
+                )
+            );
+            assert!(report.results.iter().all(|result| result.name != "sx-old"));
+        }
+
+        #[test]
         fn sprites_reap_spares_a_ready_record_committed_after_the_listing() {
             let _state = thegn_core::testenv::IsolatedState::new();
             write("sx-just-made", "ready", NOW_MS / 1000, "ctl-a");
             let fake = fake(Listing::Complete(Vec::new()));
-            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                APPLY_YES,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert!(report.accounts[0].entries.is_empty(), "{report:?}");
             assert!(report.results.is_empty());
             assert!(registry::read_checked("sx-just-made").unwrap().is_some());
@@ -1545,7 +1631,14 @@ mod sprites {
                 rows: vec![row("sx-old", Some(NOW_MS - 5 * HOUR_MS))],
                 reason: "inventory exceeds the page cap".into(),
             });
-            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                APPLY_YES,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert!(!report.complete);
             assert!(report.refused.as_deref().unwrap().contains("incomplete"));
             assert!(fake.destroys.lock().unwrap().is_empty());
@@ -1570,7 +1663,14 @@ mod sprites {
                 usage_calls: Mutex::new(Vec::new()),
                 destroys: Mutex::new(Vec::new()),
             });
-            let report = reap(&envs(&unscoped, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&unscoped, 3600),
+                APPLY_YES,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert_eq!(report.accounts[0].listing, "unknown");
             assert!(report.refused.is_some());
             assert!(unscoped.destroys.lock().unwrap().is_empty());
@@ -1598,7 +1698,14 @@ mod sprites {
                 row("sx-legacy", Some(NOW_MS - 5 * HOUR_MS)),
                 row("sx-theirs", Some(NOW_MS - 5 * HOUR_MS)),
             ]));
-            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                APPLY_YES,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert_eq!(
                 classes(&report),
                 [
@@ -1630,7 +1737,14 @@ mod sprites {
             })
             .unwrap();
             let fake = fake(Listing::Complete(Vec::new()));
-            let report = reap(&envs(&fake, 3600), APPLY_YES, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                APPLY_YES,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert!(report.accounts[0].entries.is_empty());
             assert!(registry::read_checked("vx-a").unwrap().is_some());
         }
@@ -1643,7 +1757,14 @@ mod sprites {
                 apply: true,
                 yes: false,
             };
-            let report = reap(&envs(&fake, 3600), opts, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                opts,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             assert!(report.refused.as_deref().unwrap().contains("--yes"));
             assert!(fake.destroys.lock().unwrap().is_empty());
             assert!(registry::read_checked("sx-gone").unwrap().is_some());
@@ -1653,7 +1774,14 @@ mod sprites {
         fn sprites_reap_json_shape() {
             let _state = thegn_core::testenv::IsolatedState::new();
             let fake = seed();
-            let report = reap(&envs(&fake, 3600), DRY, &mut no_tty, NOW_MS).unwrap();
+            let report = reap(
+                &envs(&fake, 3600),
+                DRY,
+                &mut no_tty,
+                &crate::sprites_reaper::BoundSet::default(),
+                NOW_MS,
+            )
+            .unwrap();
             let json = serde_json::to_value(&report).unwrap();
             assert_eq!(json["provider"], "sprites");
             assert_eq!(json["complete"], true);

@@ -2,8 +2,9 @@ use crate::{
     BACKOFF_CAP, Capture, Containment, End, GroupState, InputFeed, Leader, LeaderExit, Limits,
     POLL_INTERVAL, Run, StdinHandoff, Stream, StreamConsumer, Which, aggregate_fit,
 };
+#[cfg(any(test, not(target_os = "macos")))]
+use nix::errno::Errno;
 use nix::{
-    errno::Errno,
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
@@ -453,7 +454,7 @@ fn group_has_live_members_in(proc_root: &Path, pid: libc::pid_t) -> bool {
     group_live_with_scan(proc_root, pid, &mut scan)
 }
 
-#[cfg(any(test, not(target_os = "linux")))]
+#[cfg(any(test, all(not(target_os = "linux"), not(target_os = "macos"))))]
 fn group_live(pid: libc::pid_t) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -465,12 +466,84 @@ fn group_live(pid: libc::pid_t) -> bool {
     }
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn group_exists(pid: libc::pid_t) -> bool {
     match killpg(Pid::from_raw(pid), None) {
         Ok(()) => true,
         Err(Errno::ESRCH) => false,
         Err(_) => true,
     }
+}
+
+/// macOS `killpg(pgid, 0)` also sees an unreaped zombie leader, so it cannot
+/// prove that the group's pipes have drained while we keep that leader pinned
+/// for safe group signalling. libproc gives us the member pids and each
+/// process's BSD state; a group containing only zombies has no live work left.
+/// Any incomplete or denied observation fails closed as live.
+#[cfg(target_os = "macos")]
+fn macos_group_has_live_members(
+    pgid: libc::pid_t,
+    pinned_exited_leader: Option<libc::pid_t>,
+) -> bool {
+    const MAX_GROUP_MEMBERS: usize = 1024;
+
+    let mut pids = [0 as libc::pid_t; MAX_GROUP_MEMBERS];
+    // SAFETY: libproc writes no more than the byte length of the owned buffer.
+    // Its return value is a PID count; a full buffer may be truncated, so treat
+    // that observation as unknown/live rather than claiming the group drained.
+    let count = unsafe {
+        libc::proc_listpgrppids(
+            pgid,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as libc::c_int,
+        )
+    };
+    if count < 0 || count as usize >= pids.len() {
+        return true;
+    }
+
+    pids[..count as usize].iter().any(|&pid| {
+        if pid <= 0 {
+            return true;
+        }
+        // `waitid(WNOWAIT)` proves this exact owned child has exited while
+        // keeping its PID pinned for safe group signalling. libproc can list
+        // that zombie but cannot inspect it (`ESRCH`), so it is the only
+        // listed member that may be skipped without a state read.
+        if pinned_exited_leader == Some(pid) {
+            return false;
+        }
+        // SAFETY: zero is a valid initial value, and libproc is given the exact
+        // size of the caller-owned structure.
+        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let want = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        // SAFETY: `info` is writable for `want` bytes for the duration of call.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                want,
+            )
+        };
+        if got != want {
+            // The member may have raced with exit or may be unobservable. Either
+            // way, another bounded poll is safer than proving emptiness.
+            true
+        } else if info.pbsi_pgid != pgid as u32 {
+            // Membership changed between enumeration and inspection; keep the
+            // group owned for another bounded observation.
+            true
+        } else {
+            macos_process_status_is_live(info.pbsi_status)
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_status_is_live(status: u32) -> bool {
+    status != libc::SZOMB
 }
 
 fn wait_leader(child: &mut Child) -> Leader {
@@ -480,10 +553,10 @@ fn wait_leader(child: &mut Child) -> Leader {
     }
 }
 
-/// Whether the run's own process group still has a live member (THE-1996: reap-then-killpg).
+/// Whether the run's own process group still has a live member.
 ///
 /// - Leader alive: the group is live; no `/proc` read.
-/// - Leader exited: reap it now (its status is kept in `guard.reaped` and returned by
+/// - Linux leader exited: reap it now (its status is kept in `guard.reaped` and returned by
 ///   [`reap_after`] unchanged), then probe at once with `killpg(pgid, 0)`: `ESRCH` proves the group
 ///   empty, success means members remain. An unreaped zombie leader would keep that probe
 ///   succeeding, which is what forced the old global `/proc` walk.
@@ -493,8 +566,8 @@ fn wait_leader(child: &mut Child) -> Leader {
 /// - Reaping impossible (`waitid`/`waitpid` fails, i.e. the leader is not our waitable child): the
 ///   cached global `/proc` scan answers instead, as it does for [`group_has_live_members`].
 ///
-/// Non-Linux keeps the leader pinned and `killpg(pgid, 0)` alone (no `/proc` to confirm a
-/// destructive signal against after a reap).
+/// macOS keeps the leader pinned and uses libproc to ignore zombie-only membership; other
+/// non-Linux Unix targets keep the leader pinned and use `killpg(pgid, 0)` conservatively.
 fn own_group_live(
     guard: &mut Guard,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] child: &mut Child,
@@ -502,7 +575,18 @@ fn own_group_live(
 ) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
-        group_live(guard.pid)
+        #[cfg(target_os = "macos")]
+        {
+            match leader_exited(guard.pid) {
+                Ok(true) => macos_group_has_live_members(guard.pid, Some(guard.pid)),
+                Ok(false) => macos_group_has_live_members(guard.pid, None),
+                Err(_error) => true,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            group_live(guard.pid)
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -1439,6 +1523,32 @@ mod tests {
         );
         PROC_READS.with(|reads| assert_eq!(reads.get(), 0, "empty group read /proc"));
         GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 0, "empty group scanned /proc"));
+    }
+
+    #[test]
+    fn empty_group_after_leader_exit_is_drained_on_every_unix_target() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 3"]);
+        let result = run(
+            &mut cmd,
+            &limits(Duration::from_secs(5)),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(&result.end, End::LeaderExited), "{:?}", result.end);
+        assert_eq!(result.group, GroupState::Drained);
+        assert!(matches!(&result.leader, Leader::Reaped(status) if status.code() == Some(3)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_group_state_ignores_zombie_leader_but_keeps_live_members() {
+        assert!(!macos_process_status_is_live(libc::SZOMB));
+        assert!(macos_process_status_is_live(libc::SRUN), "SRUN is live");
+        assert!(macos_process_status_is_live(libc::SSLEEP), "SSLEEP is live");
+        assert!(
+            macos_process_status_is_live(u32::MAX),
+            "unknown states fail closed"
+        );
     }
 
     #[cfg(target_os = "linux")]

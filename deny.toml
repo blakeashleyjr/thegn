@@ -39,11 +39,6 @@ ignore = [
   "RUSTSEC-2026-0370", # zvariant unmaintained
   "RUSTSEC-2026-0371", # zbus_names unmaintained
   "RUSTSEC-2026-0372", # zvariant_derive unmaintained
-  # libz-sys 1.1.31 (via git2 -> libgit2-sys and fff-search). The fix, 1.1.33,
-  # was published 2026-11-10 and is inside the two-week publish rule.
-  # EXPIRES 2026-11-24: then `cargo update -p libz-sys --precise 1.1.33` and
-  # drop this entry (or THE-671 removes zlib).
-  "RUSTSEC-2026-0544", # libz-sys vulnerability, fix 1.1.33 not yet eligible
   # chrono, chrono-tz and chrono-tz-build are unmaintained notices, not vulnerabilities. Exit:
   # the THE-680 version sweep.
   "RUSTSEC-2026-0543", # chrono unmaintained

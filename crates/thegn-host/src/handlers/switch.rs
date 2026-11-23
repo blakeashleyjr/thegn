@@ -146,7 +146,7 @@ pub(crate) fn retarget_active(sb: &mut SidebarState, model: &mut FrameModel, ses
     for row in &mut model.sidebar_rows {
         if let Some(crate::sidebar::RowTarget::Tab(gi, ref mut ti)) = row.tab_target {
             row.active = gi == session.active;
-            if row.kind == crate::sidebar::RowKind::Worktree
+            if row.kind.is_worktree()
                 && let Some(g) = session.worktrees.get(gi)
             {
                 *ti = g.active_tab;
@@ -450,6 +450,90 @@ mod tests {
             sb.cursor,
             visible_index_of_active(&model),
             "unfocused sidebar follows the active row"
+        );
+    }
+
+    #[test]
+    fn pipeline_worktree_fast_refresh_tracks_active_group_and_tab() {
+        let mut session = session_two_workspaces();
+        session.worktrees[1].tabs.push(crate::session::Tab {
+            title: "second".into(),
+            center: crate::center::CenterTree::Leaf(99),
+            focused_pane: 99,
+            pane_cwds: Default::default(),
+            pane_cmds: Default::default(),
+            pane_sessions: Default::default(),
+            pane_scrollback: Default::default(),
+            grow: Default::default(),
+        });
+        let (mut model, mut sb) = built(&session, crate::sidebar::SortMode::Manual, &[]);
+        let row = model
+            .sidebar_rows
+            .iter_mut()
+            .find(|row| row.tab_target == Some(crate::sidebar::RowTarget::Tab(1, 0)))
+            .expect("feature worktree row");
+        row.kind = crate::sidebar::RowKind::PipelineWorktree;
+
+        session.switch_to(1);
+        session.next_tab();
+        retarget_active(&mut sb, &mut model, &session);
+
+        let row = model
+            .sidebar_rows
+            .iter()
+            .find(|row| row.kind == crate::sidebar::RowKind::PipelineWorktree)
+            .unwrap();
+        assert!(row.active, "the active pointer moves onto the pipeline row");
+        assert_eq!(row.tab_target, Some(crate::sidebar::RowTarget::Tab(1, 1)));
+    }
+
+    #[test]
+    fn pipeline_worktree_participates_in_sidebar_navigation_order() {
+        let mut session = session_two_workspaces();
+        session.switch_to(1);
+        let model = FrameModel {
+            sidebar_rows: vec![
+                crate::sidebar::SidebarRow {
+                    visible: true,
+                    tab_target: Some(crate::sidebar::RowTarget::Tab(0, 0)),
+                    ..crate::sidebar::SidebarRow::base(
+                        crate::sidebar::RowKind::Worktree,
+                        1,
+                        "home",
+                        "app",
+                    )
+                },
+                crate::sidebar::SidebarRow {
+                    visible: true,
+                    tab_target: Some(crate::sidebar::RowTarget::Tab(1, 0)),
+                    ..crate::sidebar::SidebarRow::base(
+                        crate::sidebar::RowKind::PipelineWorktree,
+                        3,
+                        "pipeline-feature",
+                        "app",
+                    )
+                },
+                crate::sidebar::SidebarRow {
+                    visible: true,
+                    tab_target: Some(crate::sidebar::RowTarget::Tab(2, 0)),
+                    ..crate::sidebar::SidebarRow::base(
+                        crate::sidebar::RowKind::Worktree,
+                        1,
+                        "fix",
+                        "app",
+                    )
+                },
+            ],
+            ..Default::default()
+        };
+        let order = sidebar_worktree_order(&model);
+        assert_eq!(order, [0, 1, 2]);
+        assert_eq!(
+            crate::hydrate::neighbor_worktree_paths(&session, &order),
+            [
+                std::path::PathBuf::from("/tmp/app"),
+                std::path::PathBuf::from("/tmp/app-fix")
+            ]
         );
     }
 }

@@ -2299,8 +2299,7 @@ mod tests {
             active: 0,
         };
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let started = std::time::Instant::now();
         assert_eq!(
             pool_target_adjust(

@@ -2,7 +2,7 @@
 
 **A terminal-native Git worktree IDE that is its own multiplexer.**
 
-> **Status: public alpha** (`0.1.0-alpha.119`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.120`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon is best-effort: use the flake or source
 > setup until a release archive is published. Pull requests run lean CI checks
 > (format, lint, test, smoke); the full gate runs nightly and on demand, and
@@ -398,7 +398,8 @@ thegn is a TUI, so on macOS the launcher entry is a generated `thegn.app` in
 `~/Applications` that opens a terminal emulator running thegn — Spotlight,
 Raycast, Alfred and the Dock all index it. `./install.sh` writes it
 automatically; for Nix installs, or Homebrew if published, generate it from a
-checkout:
+checkout. Safe staging requires Python 3.9 or newer (`python3`); the generator
+checks for it before changing the app destination:
 
 ```sh
 just macos-app                                  # points at `thegn` on PATH

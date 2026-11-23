@@ -1598,8 +1598,7 @@ mod tests {
     #[test]
     fn start_failure_host_thread_publishes_empty_load_then_refusal() {
         let (tx, mut rx) = plugin_channel();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
 
         report_host_start_failure(&tx, &waker, &std::io::Error::other("boom"));
 
@@ -1630,8 +1629,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
             generation: 0,
@@ -1698,8 +1696,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn start_failure_respawn_worker_retry_waits_for_backoff() {
         let runtime = tokio::runtime::Handle::current();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
             generation: 0,
@@ -1735,8 +1732,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn host_generation_stopped_retry_task_does_not_send() {
         let runtime = tokio::runtime::Handle::current();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
             generation: 0,
@@ -2025,8 +2021,7 @@ mod tests {
             .build()
             .unwrap();
         let disabled = Arc::new(Mutex::new(Default::default()));
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, _rx) = plugin_channel();
         let host = Arc::new(PluginsHost {
             generation: 0,
@@ -2356,8 +2351,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         thegn_core::fsperm::ensure_private_dir(tmp.path()).unwrap();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2405,8 +2399,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         thegn_core::fsperm::ensure_private_dir(tmp.path()).unwrap();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2602,8 +2595,7 @@ mod tests {
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
         let stop = Arc::new(StopSignal::default());
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, rx) = plugin_channel();
         drop(rx);
 
@@ -2651,8 +2643,7 @@ mod tests {
         let probe = supervisor.clone();
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let stop = Arc::new(StopSignal::default());
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, rx) = plugin_channel();
         drop(rx);
         let ctx = RespawnCtx {
@@ -2786,8 +2777,7 @@ mod tests {
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
         let stop = Arc::new(StopSignal::default());
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, mut rx) = plugin_channel();
 
         setup_and_schedule_with_waker(
@@ -2842,8 +2832,7 @@ mod tests {
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
         let stop = Arc::new(StopSignal::default());
         stop.stop();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let (tx, mut rx) = plugin_channel();
 
         setup_and_schedule_with_waker(
@@ -3408,8 +3397,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         thegn_core::fsperm::ensure_private_dir(tmp.path()).unwrap();
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

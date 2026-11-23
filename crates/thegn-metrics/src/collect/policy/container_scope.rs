@@ -71,6 +71,7 @@ mod tests {
         assert_eq!(scope_from_cgroup_line("0::/user.slice/some.service"), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolved_scope_accepts_proc_cgroup_path() {
         let path = scope_from_cgroup_line("0::/system.slice/docker-test.scope").unwrap();

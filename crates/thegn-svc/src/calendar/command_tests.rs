@@ -57,6 +57,8 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+// Unix-only: the process-group kill tests below are the only callers.
+#[cfg(unix)]
 async fn wait_for_file(path: &std::path::Path) -> u32 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
@@ -74,6 +76,9 @@ async fn wait_for_file(path: &std::path::Path) -> u32 {
     }
 }
 
+// Unix-only: probes the killed child with `libc::kill(pid, 0)`, and `libc` is a
+// unix-only dependency of this crate.
+#[cfg(unix)]
 #[test]
 fn an_abandoned_command_fetch_kills_the_plugin_process_group() {
     let dir = tempfile::tempdir().unwrap();

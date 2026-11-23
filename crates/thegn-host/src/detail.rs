@@ -2748,7 +2748,7 @@ fn attention_row(
         .sidebar_rows
         .iter()
         .find(|r| {
-            r.kind == crate::sidebar::RowKind::Worktree
+            r.kind.is_worktree()
                 && r.worktree_path.as_deref() == Some(path)
                 && r.tab_target.is_some()
         })

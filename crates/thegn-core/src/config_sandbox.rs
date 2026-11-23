@@ -307,7 +307,7 @@ impl SandboxOverlay {
             base.devshell = v;
         }
         if let Some(v) = self.nix_daemon {
-            base.nix_daemon = v;
+            base.nix_daemon = Some(v);
         }
         if let Some(v) = self.shell {
             base.shell = v;

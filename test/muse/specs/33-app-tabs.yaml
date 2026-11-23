@@ -1,0 +1,80 @@
+name: work_observe_app_tabs
+# Top-level Work/Observe navigation: click the masthead chips, then switch with
+# direct Alt+number selection and the Alt-bracket cycle. No snapshots: this
+# asserts stable center content without changing platform baselines.
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  # Alt+[ and Alt+] need an unambiguous modified-key encoding: their legacy
+  # ESC-prefixed forms alias CSI and OSC. The kitty Muse profile supplies CSI-u.
+  profiles: [kitty]
+  sizes: ["120x36"]
+spawn:
+  - sh
+  - -c
+  - |
+    set -e
+    export XDG_CONFIG_HOME="$XDG_STATE_HOME/config"
+    mkdir -p "$XDG_CONFIG_HOME/thegn"
+    cat > "$XDG_CONFIG_HOME/thegn/config.toml" <<'EOF'
+    [sandbox]
+    backend = "none"
+
+    [media]
+    enabled = false
+
+    [observe]
+    enabled = true
+
+    [apps]
+    default_tab = "work"
+    tab_order = ["work", "observe"]
+    EOF
+    repo="$XDG_STATE_HOME/repo"
+    mkdir -p "$repo"; cd "$repo"
+    git init -q -b main
+    git config user.email e2e@example.invalid
+    git config user.name e2e
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+    printf 'hello\n' > README.md
+    git add -A
+    git commit -q -m init
+    exec thegn
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  THEGN_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 12000
+steps:
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  # At 120 columns, the e2e-frozen masthead places Work and Observe at these
+  # stable cells. Press and release follow the normal terminal mouse path.
+  - mouse: {row: 0, col: 31}
+  - mouse: {row: 0, col: 31, action: release}
+  - expect_visible: {text: "CPU %", timeout_ms: 20000}
+  - expect_not_visible: {regex: "│\\$ ", timeout_ms: 5000}
+  - mouse: {row: 0, col: 22}
+  - mouse: {row: 0, col: 22, action: release}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 10000}
+  - expect_not_visible: {text: "CPU %", timeout_ms: 5000}
+  # Alt+2 focuses the lazily built Observe tile; its built-in host dashboard
+  # has stable panel headings even while metric queries are still loading.
+  - key: {key: "2", mods: [alt]}
+  - expect_visible: {text: "CPU %", timeout_ms: 20000}
+  - expect_not_visible: {regex: "│\\$ ", timeout_ms: 5000}
+  # Alt+1 restores Work and its existing shell.
+  - key: {key: "1", mods: [alt]}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 10000}
+  - expect_not_visible: {text: "CPU %", timeout_ms: 5000}
+  # The bracket chords cycle the same two top-level tabs in either direction.
+  - key: {key: "]", mods: [alt]}
+  - expect_visible: {text: "CPU %", timeout_ms: 10000}
+  - key: {key: "[", mods: [alt]}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 10000}
+  - expect_not_visible: {text: "CPU %", timeout_ms: 5000}
+  - check_file:
+      path: "{case_tmp}/thegn/logs/thegn.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

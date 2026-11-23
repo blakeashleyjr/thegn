@@ -101,6 +101,74 @@ fn every_configured_top_level_variant_parses_without_static_authority() {
     );
 }
 
+#[cfg(feature = "iroh")]
+#[test]
+fn direct_iroh_serve_and_pair_actions_parse_as_dev_channel_controls() {
+    use thegn_core::channel::{Channel, Feature};
+
+    let serve = parse(&["serve", "--iroh-direct", "--no-pair-url"]);
+    assert!(matches!(
+        serve.command.as_ref(),
+        Some(Command::Serve {
+            iroh_direct: true,
+            no_pair_url: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        crate::experimental_command(serve.command.as_ref().unwrap()),
+        Some(("serve --iroh-direct", Feature::Remote))
+    );
+
+    let invite = parse(&[
+        "--profile",
+        "work",
+        "pair",
+        "direct",
+        "new",
+        "--endpoint-id",
+        "peer",
+        "--address",
+        "192.0.2.1:1234",
+        "--out",
+        "invite.json",
+    ]);
+    assert_eq!(invite.profile.as_deref(), Some("work"));
+    assert!(matches!(
+        invite.command.as_ref(),
+        Some(Command::Pair {
+            action: cmd::pair::PairAction::Direct {
+                action: cmd::pair::DirectAction::New { .. }
+            }
+        })
+    ));
+    assert_eq!(
+        crate::experimental_command(invite.command.as_ref().unwrap()),
+        Some(("pair direct", Feature::Remote))
+    );
+    assert!(!Feature::Remote.allowed_in(Channel::Stable));
+    assert!(Feature::Remote.allowed_in(Channel::Dev));
+
+    assert!(matches!(
+        parse(&["pair", "direct", "redeem", "laptop"])
+            .command
+            .as_ref(),
+        Some(Command::Pair {
+            action: cmd::pair::PairAction::Direct {
+                action: cmd::pair::DirectAction::Redeem { .. }
+            }
+        })
+    ));
+    assert!(matches!(
+        parse(&["pair", "direct", "me", "laptop"]).command.as_ref(),
+        Some(Command::Pair {
+            action: cmd::pair::PairAction::Direct {
+                action: cmd::pair::DirectAction::Me { .. }
+            }
+        })
+    ));
+}
+
 #[test]
 fn every_config_api_and_automation_action_uses_its_exact_intent() {
     macro_rules! case {

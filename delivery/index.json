@@ -13,7 +13,8 @@
     "Cross-Platform Support & Verification",
     "Proposal Retirement & Cleanup",
     "Sandbox & Remote 00: Shared contracts",
-    "Sandbox & Remote 01: Truth and fixes"
+    "Sandbox & Remote 01: Truth and fixes",
+    "Sandbox & Remote 05: macOS"
   ],
   "entries": [
     {
@@ -916,6 +917,42 @@
       "summary": "Complete runtime TUI localization and define plugin-visible string participation."
     },
     {
+      "change": "file-pipeline-worktrees-by-default",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2491",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "THE-2491 owns pipeline worktree filing; implementation landed, with coordinator Mac sidebar proof and rendered evidence still unchecked."
+    },
+    {
+      "change": "fix-macos-oci-runtimes",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2099",
+          "project": "Sandbox & Remote 05: macOS"
+        }
+      ],
+      "summary": "THE-2099 owns the macOS OCI evidence runner; owner Mac capture and review of runtime decisions remain unchecked before enforcement changes."
+    },
+    {
+      "change": "fix-macos-process-group-drain",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2490",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "THE-2490 owns the Darwin process-group drain repair; coordinator native tests and exact B192 fixture proof remain unchecked."
+    },
+    {
       "change": "fix-static-cli-startup",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1159,6 +1196,18 @@
       "archive_path": "openspec/changes/archive/2026-10-12-package-shell-completions/"
     },
     {
+      "change": "pair-directly-over-iroh",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2486",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "THE-2486 owns direct Iroh control pairing; all proposal tasks remain unchecked, so delivery and protocol acceptance stay active."
+    },
+    {
       "change": "pane-zoom-stack",
       "archive_path": "openspec/changes/archive/2026-10-22-pane-zoom-stack/",
       "lifecycle": "archived",
@@ -1281,6 +1330,18 @@
       "summary": "Bound Kitty APC parsing and emit text without repeated retained-prefix copies."
     },
     {
+      "change": "repair-native-host-sampler-startup",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2566",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "THE-2566 defers native host collector initialization until activation, rechecks stop and park after the blocking factory, and tests held-factory lifecycle races; external Linear project is unassigned, grouped here under Workspace Product & Observability; repeated native macOS and real sample evidence remain pending."
+    },
+    {
       "change": "repair-performance-evidence-and-log-tail",
       "archive_path": "openspec/changes/archive/2026-10-22-repair-performance-evidence-and-log-tail/",
       "lifecycle": "archived",
@@ -1364,6 +1425,18 @@
         }
       ],
       "summary": "Resolve checkout Git identity and keep unchanged linked builds fresh."
+    },
+    {
+      "change": "restore-darwin-pinned-directory-listing",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2583",
+          "project": "Sandbox & Remote 05: macOS"
+        }
+      ],
+      "summary": "Restore descriptor-relative pinned directory listings for managed-home rollback on Darwin; strict native and ARM proof remains pending."
     },
     {
       "change": "resurrect-model-proxy",
@@ -1457,6 +1530,19 @@
         }
       ],
       "summary": "Compile repository data into bounded inert argv or explicitly admitted shell templates."
+    },
+    {
+      "change": "secure-macos-app-generation",
+      "lifecycle": "delivered-awaiting-archive",
+      "delivered_at": "2026-11-20",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-416",
+          "project": "Distribution & Release Readiness"
+        }
+      ],
+      "summary": "THE-416 owns secure macOS app generation. The native focused fixture passed at 13f00217a with identical generator and fixture files. Archive reconciliation remains."
     },
     {
       "change": "secure-merge-bundle-custody",

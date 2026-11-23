@@ -42,6 +42,11 @@ FORBIDDEN_OUTPUT = ("REPLACE_WITH_", "thegn-dev", ".SRCINFO")
 WINDOWS_ERROR = "Windows release lane is not enabled"
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_TRUSTED_DIGESTS_BYTES = 64 * 1024
+# Bound all assets selected by one release download. The current three enabled
+# target archives total about 150 MiB in v0.1.0-alpha.103; twice the existing
+# per-archive ceiling leaves headroom for package growth while bounding a full
+# draft download to 1 GiB. The owner still needs to confirm this operational cap.
+MAX_SELECTED_DOWNLOAD_BYTES = 2 * MAX_ARCHIVE_BYTES
 TEXT_ASSET_SUFFIXES = (".sha256", "-release.json", "-manifest.json")
 RELEASE_MANIFEST_NAME = "thegn-{tag}-manifest.json"
 MAX_MEMBERS = 64
@@ -69,7 +74,7 @@ POSIX_PAX_HEADERS = frozenset(
         "hdrcharset",
     }
 )
-DRAFT_RELEASE_ERROR = "release is already published; refusing to replace assets with --clobber"
+DRAFT_RELEASE_ERROR = "release is already published; refusing to upload or replace assets"
 MANAGER_PLACEHOLDERS = {
     "homebrew": {
         "VERSION",
@@ -699,7 +704,7 @@ def load_staged_digests(path: Path) -> dict[str, str]:
     return value
 
 
-def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
+def load_release_manifest_record(path: Path, tag: str) -> dict[str, Any]:
     descriptor: int | None = None
     try:
         path_metadata = path.lstat()
@@ -769,11 +774,19 @@ def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
         if name in entries:
             raise ReleaseError(f"release manifest {path} has duplicate asset name {name}")
         entries[name] = (digest, size)
-    return entries
+    return value
+
+
+def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
+    record = load_release_manifest_record(path, tag)
+    return {
+        item["name"]: (item["sha256"], item["size"])
+        for item in record["assets"]
+    }
 
 
 def verify_release_asset_files(
-    entries: Mapping[str, tuple[str, int]], paths: Sequence[Path]
+    entries: Mapping[str, tuple[str, int]], paths: Sequence[Path], *, exact: bool = False
 ) -> dict[str, str]:
     verified: dict[str, str] = {}
     for path in paths:
@@ -812,6 +825,12 @@ def verify_release_asset_files(
                 f"{name} does not match the release manifest: expected {expected_digest}, got {actual_digest}"
             )
         verified[name] = actual_digest
+    if exact and set(verified) != set(entries):
+        missing = sorted(set(entries) - set(verified))
+        raise ReleaseError(
+            "release asset files do not exactly match the manifest; missing: "
+            f"{', '.join(missing) or '(none)'}"
+        )
     return verified
 
 
@@ -1181,7 +1200,7 @@ def build_release_manifest(
     for name in expected:
         path = found[name]
         result_assets.append({"name": name, "sha256": _sha256(path), "size": path.stat().st_size})
-    return {
+    value = {
         "schema_version": 1,
         "tag": tag,
         "commit": commit,
@@ -1190,6 +1209,51 @@ def build_release_manifest(
         "run_id": run_id,
         "assets": result_assets,
     }
+    return value
+
+
+def verify_release_generation(
+    path: Path, *, tag: str, commit: str, tag_object: str, workflow_sha: str, run_id: str
+) -> None:
+    """Require the draft's producer record to name this admitted workflow run."""
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"release generation record is not a regular file: {path}")
+        if metadata.st_size > MAX_TRUSTED_DIGESTS_BYTES:
+            raise ReleaseError(
+                f"release generation record {path} exceeds {MAX_TRUSTED_DIGESTS_BYTES} bytes"
+            )
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ReleaseError(f"cannot inspect release generation record {path}: {error}") from error
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for field, item in pairs:
+            if field in value:
+                raise ReleaseError(f"release generation record {path} has duplicate field {field}")
+            value[field] = item
+        return value
+
+    try:
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            record = json.load(handle, object_pairs_hook=unique_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ReleaseError(f"cannot read release generation record {path}: {error}") from error
+    record = _object(record, "release generation record")
+    required_fields = {"tag", "commit", "tag_object", "workflow_sha", "run_id", "assets"}
+    if set(record) != required_fields or not isinstance(record.get("assets"), list):
+        raise ReleaseError("release generation record has an invalid field set")
+    expected = {
+        "tag": tag,
+        "commit": commit,
+        "tag_object": tag_object,
+        "workflow_sha": workflow_sha,
+        "run_id": run_id,
+    }
+    for field, value in expected.items():
+        if record.get(field) != value:
+            raise ReleaseError(f"release draft generation {field} does not match this workflow")
 
 
 def write_release_manifest(output: Path, assets_dir: Path, value: Mapping[str, Any]) -> None:
@@ -1386,6 +1450,7 @@ def check_attestation_verification(
     server_url: str,
     source_digest: str,
     run_id: str,
+    run_attempt: int | None = None,
 ) -> int:
     arguments = {
         "archive_sha256": (archive_sha256, SHA256_RE),
@@ -1397,6 +1462,10 @@ def check_attestation_verification(
             raise ReleaseError(f"invalid attestation check argument {name}: {shown}")
     if not isinstance(run_id, str) or re.fullmatch(r"[0-9]+", run_id) is None:
         raise ReleaseError(f"invalid attestation check argument run_id: {repr(run_id)[:200]}")
+    if run_attempt is not None and (
+        isinstance(run_attempt, bool) or not isinstance(run_attempt, int) or run_attempt < 1
+    ):
+        raise ReleaseError(f"invalid attestation check argument run_attempt: {run_attempt!r}")
     if (
         not isinstance(repository, str)
         or repository.count("/") != 1
@@ -1459,7 +1528,12 @@ def check_attestation_verification(
                 f"attestation was built by an untrusted runner: {_attestation_excerpt(runner)}"
             )
         invocation = _attestation_string(certificate, "runInvocationURI")
-        if not invocation.startswith(expected_run):
+        invocation_matches = (
+            invocation == f"{expected_run}attempts/{run_attempt}"
+            if run_attempt is not None
+            else invocation.startswith(expected_run)
+        )
+        if not invocation_matches:
             raise ReleaseError(
                 "attestation is not bound to this workflow run: "
                 f"{_attestation_excerpt(invocation)}"
@@ -1528,6 +1602,729 @@ def load_attestation_verification(path: Path) -> Any:
             os.close(descriptor)
 
 
+def check_publication_identity(
+    *,
+    manifest_path: Path,
+    verification: Any,
+    workflow_run: Any,
+    tag: str,
+    tag_object: str,
+    commit: str,
+    repository: str,
+    server_url: str,
+) -> str:
+    """Bind a published manifest to its successful release run and current tag."""
+    record = load_release_manifest_record(manifest_path, tag)
+    oid_pattern = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+    for name, value in (("tag object", tag_object), ("tag commit", commit)):
+        if not isinstance(value, str) or oid_pattern.fullmatch(value) is None:
+            raise ReleaseError(f"invalid publication {name}")
+    if record["tag_object"] != tag_object or record["commit"] != commit:
+        raise ReleaseError("published tag identity does not match the signed release manifest")
+    if not isinstance(record["workflow_sha"], str) or oid_pattern.fullmatch(record["workflow_sha"]) is None:
+        raise ReleaseError("release manifest workflow_sha is invalid")
+
+    run_id = record["run_id"]
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9]{1,20}", run_id) is None:
+        raise ReleaseError("release manifest run_id is invalid")
+    if not isinstance(workflow_run, dict):
+        raise ReleaseError("malformed workflow run metadata")
+    run_record_id = workflow_run.get("id")
+    if isinstance(run_record_id, bool) or str(run_record_id) != run_id:
+        raise ReleaseError("workflow run id does not match the signed release manifest")
+    if (
+        workflow_run.get("status") != "completed"
+        or workflow_run.get("conclusion") != "success"
+        or workflow_run.get("path") != ".github/workflows/release.yml"
+    ):
+        raise ReleaseError("manifest run is not a successful release workflow run")
+    head_repository = workflow_run.get("head_repository")
+    if not isinstance(head_repository, dict) or head_repository.get("full_name") != repository:
+        raise ReleaseError("manifest run belongs to the wrong repository")
+    source_digest = workflow_run.get("head_sha")
+    if not isinstance(source_digest, str) or oid_pattern.fullmatch(source_digest) is None:
+        raise ReleaseError("manifest run has an invalid source commit")
+    run_attempt = workflow_run.get("run_attempt")
+    check_attestation_verification(
+        verification,
+        archive_sha256=_sha256(manifest_path),
+        repository=repository,
+        server_url=server_url,
+        source_digest=source_digest,
+        run_id=run_id,
+        run_attempt=run_attempt,
+    )
+    return run_id
+
+
+def _aur_metadata_digests(files_dir: Path) -> dict[str, str]:
+    return {
+        name: _hash_payload_file(files_dir / name)
+        for name in ("PKGBUILD", ".SRCINFO")
+    }
+
+
+def write_aur_metadata_digest_sidecar(
+    *,
+    output: Path,
+    files_dir: Path,
+    tag: str,
+    repository: str,
+    run_id: str,
+    run_attempt: int,
+    source_sha: str,
+) -> dict[str, Any]:
+    if RELEASE_TAG_RE.fullmatch(tag) is None:
+        raise ReleaseError(f"invalid release tag {tag!r}")
+    if not isinstance(repository, str) or re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
+    ) is None:
+        raise ReleaseError("invalid repository for AUR metadata sidecar")
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9]{1,20}", run_id) is None:
+        raise ReleaseError("invalid workflow run id for AUR metadata sidecar")
+    if isinstance(run_attempt, bool) or not isinstance(run_attempt, int) or run_attempt < 1:
+        raise ReleaseError("invalid workflow run attempt for AUR metadata sidecar")
+    if not isinstance(source_sha, str) or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", source_sha) is None:
+        raise ReleaseError("invalid workflow source SHA for AUR metadata sidecar")
+    value = {
+        "schema_version": 1,
+        "tag": tag,
+        "workflow_run": {
+            "repository": repository,
+            "id": run_id,
+            "attempt": run_attempt,
+            "source_sha": source_sha,
+        },
+        "files": _aur_metadata_digests(files_dir),
+    }
+    try:
+        if output.is_symlink():
+            raise ReleaseError(f"refusing to write AUR metadata sidecar through symlink: {output}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as error:
+        raise ReleaseError(f"cannot write AUR metadata sidecar {output}: {error}") from error
+    return value
+
+
+def _load_aur_metadata_digest_sidecar(
+    path: Path,
+    *,
+    tag: str,
+    repository: str,
+    run_id: str,
+    run_attempt: int,
+    source_sha: str,
+) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ReleaseError(f"AUR metadata digest sidecar must not be a symlink: {path}")
+    try:
+        if path.stat().st_size > 65536:
+            raise ReleaseError(f"AUR metadata digest sidecar {path} exceeds 64 KiB")
+
+        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for name, value in pairs:
+                if name in result:
+                    raise ReleaseError(f"AUR metadata digest sidecar {path} has duplicate keys")
+                result[name] = value
+            return result
+
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ReleaseError(f"cannot read AUR metadata digest sidecar {path}: {error}") from error
+    if not isinstance(value, dict) or set(value) != {"schema_version", "tag", "workflow_run", "files"}:
+        raise ReleaseError("AUR metadata digest sidecar has an invalid shape")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise ReleaseError("AUR metadata digest sidecar schema_version must be integer 1")
+    if value["tag"] != tag:
+        raise ReleaseError("AUR metadata digest sidecar names the wrong release tag")
+    workflow_run = value["workflow_run"]
+    if not isinstance(workflow_run, dict) or workflow_run != {
+        "repository": repository,
+        "id": run_id,
+        "attempt": run_attempt,
+        "source_sha": source_sha,
+    }:
+        raise ReleaseError("AUR metadata digest sidecar belongs to a different workflow run")
+    files = value["files"]
+    if not isinstance(files, dict) or set(files) != {"PKGBUILD", ".SRCINFO"}:
+        raise ReleaseError("AUR metadata digest sidecar must cover PKGBUILD and .SRCINFO exactly")
+    if any(not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None for digest in files.values()):
+        raise ReleaseError("AUR metadata digest sidecar contains an invalid SHA-256")
+    return value
+
+
+def verify_aur_metadata_digest_sidecar(
+    *,
+    files_dir: Path,
+    sidecar_path: Path,
+    tag: str,
+    repository: str,
+    run_id: str,
+    run_attempt: int,
+    source_sha: str,
+) -> dict[str, str]:
+    sidecar = _load_aur_metadata_digest_sidecar(
+        sidecar_path,
+        tag=tag,
+        repository=repository,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        source_sha=source_sha,
+    )
+    actual = _aur_metadata_digests(files_dir)
+    if actual != sidecar["files"]:
+        raise ReleaseError("AUR metadata does not match its workflow digest sidecar")
+    return actual
+
+
+def build_publication_receipt(
+    *,
+    manifest_path: Path,
+    verification: Any,
+    workflow_run: Any,
+    tag: str,
+    tag_object: str,
+    commit: str,
+    target: str,
+    target_repository: str,
+    branch: str,
+    outcome: str,
+    old_oid: str | None,
+    new_oid: str,
+    observed_oid: str,
+    published_blobs: Mapping[str, str],
+    aur_metadata_digests: Mapping[str, str] | None,
+    repository: str,
+    server_url: str,
+    publication_run_id: str,
+    publication_run_attempt: int,
+    publication_source_sha: str,
+    aur_metadata_sidecar_sha256: str | None,
+    aur_metadata_artifact_id: str | None,
+    aur_metadata_producer_attempt: int | None,
+    aur_metadata_producer_source_sha: str | None,
+) -> dict[str, Any]:
+    """Build a credential-free receipt for a verified external publication."""
+    release_run_id = check_publication_identity(
+        manifest_path=manifest_path,
+        verification=verification,
+        workflow_run=workflow_run,
+        tag=tag,
+        tag_object=tag_object,
+        commit=commit,
+        repository=repository,
+        server_url=server_url,
+    )
+    record = load_release_manifest_record(manifest_path, tag)
+    oid_pattern = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+    if target not in {"homebrew", "aur"}:
+        raise ReleaseError(f"invalid publication target: {target!r}")
+    target_repository_is_valid = (
+        isinstance(target_repository, str)
+        and len(target_repository) <= 200
+        and (
+            re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target_repository) is not None
+            if target == "homebrew"
+            else target_repository == "thegn-bin"
+        )
+    )
+    if not target_repository_is_valid:
+        raise ReleaseError("invalid publication target repository")
+    expected_branch = "main" if target == "homebrew" else "master"
+    if branch != expected_branch:
+        raise ReleaseError(f"invalid {target} publication branch: {branch!r}")
+    if outcome not in {"committed", "unchanged"}:
+        raise ReleaseError(f"invalid publication outcome: {outcome!r}")
+    for name, value in (("new", new_oid), ("observed", observed_oid)):
+        if not isinstance(value, str) or oid_pattern.fullmatch(value) is None:
+            raise ReleaseError(f"invalid publication {name} OID")
+    if old_oid is not None and (
+        not isinstance(old_oid, str) or oid_pattern.fullmatch(old_oid) is None
+    ):
+        raise ReleaseError("invalid publication old OID")
+    if observed_oid != new_oid:
+        raise ReleaseError("observed publication OID does not match new OID")
+    if outcome == "unchanged" and (old_oid is None or new_oid != old_oid):
+        raise ReleaseError("unchanged publication must retain its old OID")
+    if outcome == "committed" and old_oid == new_oid:
+        raise ReleaseError("committed publication must change its OID")
+    expected_paths = (
+        {"Formula/thegn.rb"}
+        if target == "homebrew"
+        else {"PKGBUILD", ".SRCINFO"}
+    )
+    if set(published_blobs) != expected_paths:
+        raise ReleaseError("publication receipt blob paths do not match the target contract")
+    if any(
+        not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None
+        for digest in published_blobs.values()
+    ):
+        raise ReleaseError("publication receipt contains an invalid blob SHA-256")
+    signed_asset = f"thegn-{tag}-homebrew.rb" if target == "homebrew" else f"thegn-{tag}-PKGBUILD"
+    signed_assets = {asset["name"]: asset["sha256"] for asset in record["assets"]}
+    signed_blob_path = "Formula/thegn.rb" if target == "homebrew" else "PKGBUILD"
+    if signed_assets.get(signed_asset) != published_blobs[signed_blob_path]:
+        raise ReleaseError("published metadata blob does not match the signed release manifest")
+    if target == "aur":
+        if (
+            not isinstance(aur_metadata_digests, Mapping)
+            or set(aur_metadata_digests) != {"PKGBUILD", ".SRCINFO"}
+            or aur_metadata_digests["PKGBUILD"] != published_blobs["PKGBUILD"]
+            or aur_metadata_digests[".SRCINFO"] != published_blobs[".SRCINFO"]
+            or not isinstance(aur_metadata_sidecar_sha256, str)
+            or SHA256_RE.fullmatch(aur_metadata_sidecar_sha256) is None
+            or not isinstance(aur_metadata_artifact_id, str)
+            or re.fullmatch(r"[0-9]{1,20}", aur_metadata_artifact_id) is None
+            or isinstance(aur_metadata_producer_attempt, bool)
+            or not isinstance(aur_metadata_producer_attempt, int)
+            or aur_metadata_producer_attempt < 1
+            or aur_metadata_producer_attempt > publication_run_attempt
+            or not isinstance(aur_metadata_producer_source_sha, str)
+            or oid_pattern.fullmatch(aur_metadata_producer_source_sha) is None
+            or aur_metadata_producer_source_sha != publication_source_sha
+        ):
+            raise ReleaseError("published AUR blobs do not match the verified metadata sidecar")
+    elif any(
+        value is not None
+        for value in (
+            aur_metadata_digests,
+            aur_metadata_sidecar_sha256,
+            aur_metadata_artifact_id,
+            aur_metadata_producer_attempt,
+            aur_metadata_producer_source_sha,
+        )
+    ):
+        raise ReleaseError("Homebrew receipt cannot include AUR metadata digests")
+    run_attempt = workflow_run["run_attempt"]
+    source_sha = workflow_run["head_sha"]
+    if (
+        not isinstance(publication_run_id, str)
+        or re.fullmatch(r"[0-9]{1,20}", publication_run_id) is None
+    ):
+        raise ReleaseError("invalid publication workflow run id")
+    if (
+        isinstance(publication_run_attempt, bool)
+        or not isinstance(publication_run_attempt, int)
+        or publication_run_attempt < 1
+    ):
+        raise ReleaseError("invalid publication workflow run attempt")
+    if not isinstance(publication_source_sha, str) or oid_pattern.fullmatch(publication_source_sha) is None:
+        raise ReleaseError("invalid publication workflow source SHA")
+    return {
+        "schema_version": 1,
+        "target": target,
+        "target_repository": target_repository,
+        "branch": branch,
+        "outcome": outcome,
+        "old_oid": old_oid,
+        "new_oid": new_oid,
+        "observed_oid": observed_oid,
+        "published_blobs": [
+            {"path": path, "sha256": published_blobs[path]}
+            for path in sorted(published_blobs)
+        ],
+        "metadata_sidecar_sha256": aur_metadata_sidecar_sha256,
+        "metadata_artifact_id": aur_metadata_artifact_id,
+        "metadata_producer": (
+            {
+                "run_id": publication_run_id,
+                "attempt": aur_metadata_producer_attempt,
+                "source_sha": aur_metadata_producer_source_sha,
+            }
+            if target == "aur"
+            else None
+        ),
+        "release": {
+            "tag": tag,
+            "tag_object": record["tag_object"],
+            "source_commit": record["commit"],
+            "workflow_sha": record["workflow_sha"],
+            "run_id": release_run_id,
+            "run_attempt": run_attempt,
+            "run_source_sha": source_sha,
+            "repository": repository,
+            "manifest_sha256": _sha256(manifest_path),
+        },
+        "publication_run": {
+            "id": publication_run_id,
+            "attempt": publication_run_attempt,
+            "source_sha": publication_source_sha,
+        },
+    }
+
+
+def write_publication_receipt(output: Path, value: Mapping[str, Any]) -> None:
+    try:
+        if output.is_symlink():
+            raise ReleaseError(f"refusing to write publication receipt through symlink: {output}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as error:
+        raise ReleaseError(f"cannot write publication receipt {output}: {error}") from error
+
+
+def _read_publication_saga_receipt(path: Path | None) -> tuple[dict[str, Any] | None, str | None]:
+    if path is None:
+        return None, None
+    descriptor: int | None = None
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, item in pairs:
+            if name in value:
+                raise ValueError(f"duplicate JSON key {name}")
+            value[name] = item
+        return value
+
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_TRUSTED_DIGESTS_BYTES:
+            return None, None
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(MAX_TRUSTED_DIGESTS_BYTES + 1)
+        if len(raw) > MAX_TRUSTED_DIGESTS_BYTES:
+            return None, None
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+        if not isinstance(value, dict):
+            return None, hashlib.sha256(raw).hexdigest()
+        return value, hashlib.sha256(raw).hexdigest()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        return None, None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _publication_saga_target(
+    *,
+    target: str,
+    job_result: str,
+    ready: str,
+    outcome_hint: str,
+    receipt_artifact_id: str,
+    receipt: dict[str, Any] | None,
+    receipt_sha256: str | None,
+    tag: str,
+    repository: str,
+    publication_run_id: str,
+    publication_run_attempt: int,
+    publication_source_sha: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "job_result": job_result,
+        "ready": ready,
+        "outcome_hint": outcome_hint or None,
+        "receipt_artifact_id": receipt_artifact_id or None,
+        "receipt_sha256": receipt_sha256,
+    }
+    if job_result not in {"success", "failure", "cancelled", "skipped"}:
+        result.update(state="unknown", reason="invalid publisher job result")
+        return result
+    if receipt is None:
+        if ready == "false" and not receipt_artifact_id:
+            result.update(state="pending", reason="publisher was not configured; push steps were skipped")
+        elif job_result == "skipped" and not receipt_artifact_id:
+            result.update(state="skipped", reason="publisher job was skipped; no push step ran")
+        else:
+            result.update(
+                state="unknown",
+                reason="receipt is missing; remote target state must be reconciled",
+            )
+        return result
+
+    target_repository = receipt.get("target_repository")
+    branch = "main" if target == "homebrew" else "master"
+    release = receipt.get("release")
+    publication = receipt.get("publication_run")
+    new_oid = receipt.get("new_oid")
+    old_oid = receipt.get("old_oid")
+    observed_oid = receipt.get("observed_oid")
+    outcome = receipt.get("outcome")
+    oid_pattern = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+    publication_attempt = publication.get("attempt") if isinstance(publication, dict) else None
+    expected_blob_paths = (
+        {"Formula/thegn.rb"} if target == "homebrew" else {"PKGBUILD", ".SRCINFO"}
+    )
+    published_blobs = receipt.get("published_blobs")
+    blob_map: dict[str, str] = {}
+    if isinstance(published_blobs, list):
+        for item in published_blobs:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            digest = item.get("sha256")
+            if isinstance(path, str) and isinstance(digest, str) and path not in blob_map:
+                blob_map[path] = digest
+    target_repository_valid = (
+        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target_repository) is not None
+        if target == "homebrew" and isinstance(target_repository, str)
+        else target_repository == "thegn-bin"
+    )
+    aur_metadata = receipt.get("metadata_producer")
+    aur_metadata_valid = (
+        isinstance(receipt.get("metadata_sidecar_sha256"), str)
+        and SHA256_RE.fullmatch(receipt["metadata_sidecar_sha256"]) is not None
+        and isinstance(receipt.get("metadata_artifact_id"), str)
+        and re.fullmatch(r"[0-9]{1,20}", receipt["metadata_artifact_id"]) is not None
+        and isinstance(aur_metadata, dict)
+        and aur_metadata.get("run_id") == publication_run_id
+        and aur_metadata.get("source_sha") == publication_source_sha
+        and isinstance(aur_metadata.get("attempt"), int)
+        and not isinstance(aur_metadata.get("attempt"), bool)
+        and 1 <= aur_metadata["attempt"] <= publication_run_attempt
+    )
+    valid = (
+        receipt.get("schema_version") == 1
+        and receipt.get("target") == target
+        and isinstance(target_repository, str)
+        and bool(target_repository)
+        and target_repository_valid
+        and receipt.get("branch") == branch
+        and outcome in {"committed", "unchanged"}
+        and isinstance(new_oid, str)
+        and oid_pattern.fullmatch(new_oid) is not None
+        and isinstance(observed_oid, str)
+        and observed_oid == new_oid
+        and (old_oid is None or (isinstance(old_oid, str) and oid_pattern.fullmatch(old_oid) is not None))
+        and (
+            (outcome == "unchanged" and old_oid is not None and old_oid == new_oid)
+            or (outcome == "committed" and old_oid != new_oid)
+        )
+        and isinstance(release, dict)
+        and release.get("tag") == tag
+        and isinstance(release.get("tag_object"), str)
+        and oid_pattern.fullmatch(release["tag_object"]) is not None
+        and isinstance(release.get("source_commit"), str)
+        and oid_pattern.fullmatch(release["source_commit"]) is not None
+        and isinstance(release.get("workflow_sha"), str)
+        and oid_pattern.fullmatch(release["workflow_sha"]) is not None
+        and isinstance(release.get("run_source_sha"), str)
+        and oid_pattern.fullmatch(release["run_source_sha"]) is not None
+        and release["run_source_sha"] == release["source_commit"]
+        and release.get("repository") == repository
+        and isinstance(release.get("manifest_sha256"), str)
+        and SHA256_RE.fullmatch(release["manifest_sha256"]) is not None
+        and isinstance(release.get("run_id"), str)
+        and re.fullmatch(r"[0-9]{1,20}", release["run_id"]) is not None
+        and isinstance(release.get("run_attempt"), int)
+        and not isinstance(release["run_attempt"], bool)
+        and release["run_attempt"] > 0
+        and isinstance(publication, dict)
+        and publication.get("id") == publication_run_id
+        and isinstance(publication_attempt, int)
+        and not isinstance(publication_attempt, bool)
+        and 1 <= publication_attempt <= publication_run_attempt
+        and publication.get("source_sha") == publication_source_sha
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", publication_source_sha) is not None
+        and isinstance(receipt_artifact_id, str)
+        and re.fullmatch(r"[0-9]{1,20}", receipt_artifact_id) is not None
+        and isinstance(receipt_sha256, str)
+        and SHA256_RE.fullmatch(receipt_sha256) is not None
+        and set(blob_map) == expected_blob_paths
+        and all(SHA256_RE.fullmatch(digest) is not None for digest in blob_map.values())
+        and (aur_metadata_valid if target == "aur" else all(
+            receipt.get(field) is None
+            for field in ("metadata_sidecar_sha256", "metadata_artifact_id", "metadata_producer")
+        ))
+    )
+    if not valid:
+        result.update(state="unknown", reason="receipt does not match this target and workflow run")
+        return result
+
+    result.update(
+        state="verified",
+        outcome=receipt["outcome"],
+        target_repository=target_repository,
+        branch=branch,
+        old_oid=old_oid,
+        new_oid=new_oid,
+        observed_oid=observed_oid,
+        receipt_publication_attempt=publication_attempt,
+        release=release,
+    )
+    return result
+
+
+def build_publication_saga_ledger(
+    *,
+    tag: str,
+    repository: str,
+    publication_run_id: str,
+    publication_run_attempt: int,
+    publication_source_sha: str,
+    homebrew_job_result: str,
+    homebrew_ready: str,
+    homebrew_outcome_hint: str,
+    homebrew_receipt_artifact_id: str,
+    homebrew_receipt: dict[str, Any] | None,
+    homebrew_receipt_sha256: str | None,
+    aur_job_result: str,
+    aur_ready: str,
+    aur_outcome_hint: str,
+    aur_receipt_artifact_id: str,
+    aur_receipt: dict[str, Any] | None,
+    aur_receipt_sha256: str | None,
+) -> dict[str, Any]:
+    """Summarize per-target receipts without inferring state from a missing receipt."""
+    if RELEASE_TAG_RE.fullmatch(tag) is None:
+        raise ReleaseError(f"invalid release tag {tag!r}")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
+        raise ReleaseError("invalid publication saga repository")
+    if re.fullmatch(r"[0-9]{1,20}", publication_run_id) is None:
+        raise ReleaseError("invalid publication saga run id")
+    if (
+        isinstance(publication_run_attempt, bool)
+        or not isinstance(publication_run_attempt, int)
+        or publication_run_attempt < 1
+    ):
+        raise ReleaseError("invalid publication saga run attempt")
+    if not isinstance(publication_source_sha, str) or re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}", publication_source_sha
+    ) is None:
+        raise ReleaseError("invalid publication saga source SHA")
+    target_inputs = {
+        "homebrew": (
+            homebrew_job_result,
+            homebrew_ready,
+            homebrew_outcome_hint,
+            homebrew_receipt_artifact_id,
+            homebrew_receipt,
+            homebrew_receipt_sha256,
+        ),
+        "aur": (
+            aur_job_result,
+            aur_ready,
+            aur_outcome_hint,
+            aur_receipt_artifact_id,
+            aur_receipt,
+            aur_receipt_sha256,
+        ),
+    }
+    targets: dict[str, dict[str, Any]] = {}
+    for target, values in target_inputs.items():
+        job_result, ready, outcome_hint, artifact_id, receipt, receipt_sha256 = values
+        targets[target] = _publication_saga_target(
+            target=target,
+            job_result=job_result,
+            ready=ready,
+            outcome_hint=outcome_hint,
+            receipt_artifact_id=artifact_id,
+            receipt=receipt,
+            receipt_sha256=receipt_sha256,
+            tag=tag,
+            repository=repository,
+            publication_run_id=publication_run_id,
+            publication_run_attempt=publication_run_attempt,
+            publication_source_sha=publication_source_sha,
+        )
+
+    homebrew = targets["homebrew"]
+    aur = targets["aur"]
+    if homebrew["state"] == "verified" and aur["state"] == "verified":
+        homebrew_identity = homebrew["release"]
+        aur_identity = aur["release"]
+        identity_fields = (
+            "tag",
+            "tag_object",
+            "source_commit",
+            "workflow_sha",
+            "run_id",
+            "run_attempt",
+            "run_source_sha",
+            "repository",
+            "manifest_sha256",
+        )
+        if all(homebrew_identity.get(field) == aur_identity.get(field) for field in identity_fields):
+            state = "complete"
+        else:
+            state = "inconsistent"
+    elif homebrew["state"] in {"pending", "skipped"} and aur["state"] in {"pending", "skipped"}:
+        state = "pending"
+    elif homebrew["state"] == "verified" or aur["state"] == "verified":
+        state = "partial"
+    else:
+        state = "unknown"
+
+    ledger = {
+        "schema_version": 1,
+        "state": state,
+        "reconcile_required": state in {"partial", "unknown", "inconsistent"},
+        "tag": tag,
+        "repository": repository,
+        "publication_run": {
+            "id": publication_run_id,
+            "attempt": publication_run_attempt,
+            "source_sha": publication_source_sha,
+        },
+        "targets": targets,
+        "retention_days": 90,
+    }
+    manifest_digests = {
+        target["release"]["manifest_sha256"]
+        for target in targets.values()
+        if target["state"] == "verified"
+    }
+    if len(manifest_digests) == 1:
+        ledger["release_manifest_sha256"] = next(iter(manifest_digests))
+    return ledger
+
+
+def publication_saga_summary(ledger: Mapping[str, Any]) -> str:
+    state = ledger["state"]
+    lines = [
+        f"## External publication saga: {ledger['tag']}",
+        "",
+        f"State: **{state}**",
+    ]
+    for target_name in ("homebrew", "aur"):
+        target = ledger["targets"][target_name]
+        if target["state"] == "verified":
+            lines.append(
+                f"- {target_name}: {target['outcome']} at {target['observed_oid']} "
+                f"(receipt publication attempt {target['receipt_publication_attempt']})"
+            )
+        else:
+            hint = f"; publisher outcome hint: {target['outcome_hint']}" if target["outcome_hint"] else ""
+            lines.append(
+                f"- {target_name}: {target['state']} ({target['job_result']}, ready={target['ready']}) "
+                f"— {target['reason']}{hint}"
+            )
+    if ledger["reconcile_required"]:
+        lines.extend(
+            [
+                "",
+                "A missing receipt is not evidence that a push did not happen. Inspect both remote tips and "
+                "reconcile explicitly; this workflow does not infer unchanged or retry automatically.",
+            ]
+        )
+    elif state == "pending":
+        lines.extend(["", "No target has a verified publication; pending/skipped publisher jobs did not run their push steps."])
+    else:
+        lines.extend(["", f"Ledger artifact retention: {ledger['retention_days']} days."])
+    return "\n".join(lines) + "\n"
+
+
+def write_publication_saga_ledger(
+    *,
+    output: Path,
+    summary_path: Path,
+    ledger: Mapping[str, Any],
+) -> None:
+    try:
+        if output.is_symlink() or summary_path.is_symlink():
+            raise ReleaseError("refusing to write publication saga through a symlink")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        with summary_path.open("a", encoding="utf-8") as summary:
+            summary.write(publication_saga_summary(ledger))
+    except OSError as error:
+        raise ReleaseError(f"cannot write publication saga ledger: {error}") from error
+
+
 def check_release_asset_sizes(document: Any, patterns: Sequence[str]) -> list[str]:
     if not isinstance(document, dict) or not isinstance(document.get("assets"), list):
         raise ReleaseError("malformed release asset listing: expected an assets list")
@@ -1551,6 +2348,7 @@ def check_release_asset_sizes(document: Any, patterns: Sequence[str]) -> list[st
     )
     if not selected:
         raise ReleaseError("no release assets match the download patterns")
+    total = 0
     for name in selected:
         limit = (
             MAX_TRUSTED_DIGESTS_BYTES
@@ -1559,6 +2357,12 @@ def check_release_asset_sizes(document: Any, patterns: Sequence[str]) -> list[st
         )
         if sizes[name] > limit:
             raise ReleaseError(f"release asset {name} exceeds the {limit} byte download limit")
+        size = sizes[name]
+        if size > MAX_SELECTED_DOWNLOAD_BYTES - total:
+            raise ReleaseError(
+                f"selected release assets exceed the {MAX_SELECTED_DOWNLOAD_BYTES} byte aggregate download limit"
+            )
+        total += size
     return selected
 
 
@@ -1603,15 +2407,82 @@ def load_release_asset_listing(path: Path) -> Any:
             os.close(descriptor)
 
 
+def plan_release_asset_uploads(document: Any, assets: Sequence[Path]) -> list[Path]:
+    """Select absent draft assets; accept existing names only at the same SHA-256."""
+    requested_names = {path.name for path in assets}
+    pages: list[Any]
+    if isinstance(document, list) and document and all(isinstance(page, list) for page in document):
+        pages = document
+    elif isinstance(document, list):
+        pages = [document]
+    else:
+        raise ReleaseError("GitHub release asset inventory must be a JSON array")
+
+    existing: dict[str, str | None] = {}
+    for page in pages:
+        for entry in page:
+            item = _object(entry, "GitHub release asset")
+            name = item.get("name")
+            if not isinstance(name, str) or TRUSTED_NAME_RE.fullmatch(name) is None:
+                raise ReleaseError("GitHub release asset inventory has an invalid name")
+            if name in existing:
+                raise ReleaseError(f"GitHub release asset inventory repeats {name}")
+            digest = item.get("digest")
+            if name in requested_names and digest is not None and (
+                not isinstance(digest, str)
+                or not digest.startswith("sha256:")
+                or SHA256_RE.fullmatch(digest.removeprefix("sha256:")) is None
+            ):
+                raise ReleaseError(f"GitHub release asset {name} has unusable digest metadata")
+            existing[name] = digest
+
+    seen: set[str] = set()
+    upload: list[Path] = []
+    for path in assets:
+        name = path.name
+        if name in seen:
+            raise ReleaseError(f"local release upload repeats asset {name}")
+        seen.add(name)
+        if name in (".", "..") or TRUSTED_NAME_RE.fullmatch(name) is None:
+            raise ReleaseError(f"local release asset name is invalid: {name!r}")
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise ReleaseError(f"cannot inspect local release asset {path}: {error}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"local release asset is not a regular file: {path}")
+        remote_digest = existing.get(name)
+        if name not in existing:
+            upload.append(path)
+            continue
+        if remote_digest is None:
+            raise ReleaseError(f"existing release asset {name} has no trusted SHA-256 metadata")
+        local_digest = _sha256(path)
+        if remote_digest != f"sha256:{local_digest}":
+            raise ReleaseError(f"existing release asset {name} conflicts with this generation")
+    return upload
+
+
 def _run(args: argparse.Namespace) -> None:
     if args.command == "require-draft":
         require_draft(args.is_draft)
+        return
+    if args.command == "verify-generation":
+        verify_release_generation(
+            args.record,
+            tag=args.tag,
+            commit=args.commit,
+            tag_object=args.tag_object,
+            workflow_sha=args.workflow_sha,
+            run_id=args.run_id,
+        )
+        print(f"{args.tag}: draft is bound to workflow run {args.run_id}")
         return
     if args.command == "verify-assets":
         if RELEASE_TAG_RE.fullmatch(args.tag) is None:
             raise ReleaseError(f"invalid release tag {args.tag!r}")
         entries = load_release_manifest(args.release_manifest, args.tag)
-        verified = verify_release_asset_files(entries, args.asset)
+        verified = verify_release_asset_files(entries, args.asset, exact=args.exact)
         for name in verified:
             print(f"{name}: matches the release manifest")
         return
@@ -1626,11 +2497,151 @@ def _run(args: argparse.Namespace) -> None:
         )
         print(f"{args.archive.name}: {count} attestation(s) bound to this run")
         return
+    if args.command == "verify-publication-identity":
+        try:
+            workflow_run = json.loads(args.workflow_run.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ReleaseError(f"cannot read workflow run metadata {args.workflow_run}: {error}") from error
+        run_id = check_publication_identity(
+            manifest_path=args.release_manifest,
+            verification=load_attestation_verification(args.verification),
+            workflow_run=workflow_run,
+            tag=args.tag,
+            tag_object=args.tag_object,
+            commit=args.commit,
+            repository=args.repository,
+            server_url=args.server_url,
+        )
+        print(f"{args.tag}: signed release manifest is bound to run {run_id} and current tag")
+        return
+    if args.command == "write-aur-metadata-digests":
+        write_aur_metadata_digest_sidecar(
+            output=args.output,
+            files_dir=args.files_dir,
+            tag=args.tag,
+            repository=args.repository,
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+            source_sha=args.source_sha,
+        )
+        print(f"{args.tag}: wrote AUR metadata digest sidecar")
+        return
+    if args.command == "verify-aur-metadata-digests":
+        verified = verify_aur_metadata_digest_sidecar(
+            files_dir=args.files_dir,
+            sidecar_path=args.sidecar,
+            tag=args.tag,
+            repository=args.repository,
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+            source_sha=args.source_sha,
+        )
+        for name in sorted(verified):
+            print(f"{name}: {verified[name]}")
+        return
+    if args.command == "write-publication-receipt":
+        try:
+            workflow_run = json.loads(args.workflow_run.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ReleaseError(f"cannot read workflow run metadata {args.workflow_run}: {error}") from error
+        try:
+            tag_identity = json.loads(args.tag_identity.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ReleaseError(f"cannot read live tag identity {args.tag_identity}: {error}") from error
+        if not isinstance(tag_identity, dict):
+            raise ReleaseError("malformed live tag identity")
+        aur_metadata_digests: Mapping[str, str] | None = None
+        aur_metadata_sidecar_sha256: str | None = None
+        if args.metadata_sidecar is not None:
+            sidecar_record = _load_aur_metadata_digest_sidecar(
+                args.metadata_sidecar,
+                tag=args.tag,
+                repository=args.repository,
+                run_id=args.publication_run_id,
+                run_attempt=args.metadata_producer_attempt,
+                source_sha=args.metadata_producer_source_sha,
+            )
+            aur_metadata_digests = sidecar_record["files"]
+            aur_metadata_sidecar_sha256 = _hash_payload_file(args.metadata_sidecar)
+        published_blobs: dict[str, str] = {}
+        for item in args.published_blob:
+            if "=" not in item:
+                raise ReleaseError("published blob must use PATH=SHA256 syntax")
+            path, digest = item.split("=", 1)
+            if path in published_blobs:
+                raise ReleaseError(f"duplicate published blob path {path!r}")
+            published_blobs[path] = digest
+        receipt = build_publication_receipt(
+            manifest_path=args.release_manifest,
+            verification=load_attestation_verification(args.verification),
+            workflow_run=workflow_run,
+            tag=args.tag,
+            tag_object=tag_identity.get("tag_object"),
+            commit=tag_identity.get("commit"),
+            target=args.target,
+            target_repository=args.target_repository,
+            branch=args.branch,
+            outcome=args.outcome,
+            old_oid=args.old_oid or None,
+            new_oid=args.new_oid,
+            observed_oid=args.observed_oid,
+            repository=args.repository,
+            server_url=args.server_url,
+            publication_run_id=args.publication_run_id,
+            publication_run_attempt=args.publication_run_attempt,
+            publication_source_sha=args.publication_source_sha,
+            aur_metadata_sidecar_sha256=aur_metadata_sidecar_sha256,
+            aur_metadata_artifact_id=args.metadata_artifact_id,
+            aur_metadata_producer_attempt=args.metadata_producer_attempt,
+            aur_metadata_producer_source_sha=args.metadata_producer_source_sha,
+            published_blobs=published_blobs,
+            aur_metadata_digests=aur_metadata_digests,
+        )
+        write_publication_receipt(args.output, receipt)
+        print(f"{args.target}: wrote publication receipt for {args.tag}")
+        return
+    if args.command == "publication-saga":
+        homebrew_receipt, homebrew_sha256 = _read_publication_saga_receipt(
+            args.homebrew_receipt
+        )
+        aur_receipt, aur_sha256 = _read_publication_saga_receipt(args.aur_receipt)
+        ledger = build_publication_saga_ledger(
+            tag=args.tag,
+            repository=args.repository,
+            publication_run_id=args.publication_run_id,
+            publication_run_attempt=args.publication_run_attempt,
+            publication_source_sha=args.publication_source_sha,
+            homebrew_job_result=args.homebrew_result,
+            homebrew_ready=args.homebrew_ready,
+            homebrew_outcome_hint=args.homebrew_outcome,
+            homebrew_receipt_artifact_id=args.homebrew_artifact_id,
+            homebrew_receipt=homebrew_receipt,
+            homebrew_receipt_sha256=homebrew_sha256,
+            aur_job_result=args.aur_result,
+            aur_ready=args.aur_ready,
+            aur_outcome_hint=args.aur_outcome,
+            aur_receipt_artifact_id=args.aur_artifact_id,
+            aur_receipt=aur_receipt,
+            aur_receipt_sha256=aur_sha256,
+        )
+        write_publication_saga_ledger(
+            output=args.output,
+            summary_path=args.summary,
+            ledger=ledger,
+        )
+        print(f"{args.tag}: publication saga state {ledger['state']}")
+        return
     if args.command == "check-asset-sizes":
         selected = check_release_asset_sizes(
             load_release_asset_listing(args.assets_json), args.pattern or []
         )
         print(f"{len(selected)} release asset(s) within download limits")
+        return
+    if args.command == "plan-upload":
+        plan = plan_release_asset_uploads(
+            load_release_asset_listing(args.assets_json), args.asset
+        )
+        print(json.dumps([str(path) for path in plan]))
         return
     manifest_path = args.manifest.resolve()
     root = args.repo_root.resolve()
@@ -1724,9 +2735,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     draft_parser = subparsers.add_parser(
-        "require-draft", help="refuse asset replacement unless the release is a draft"
+        "require-draft", help="refuse release asset uploads unless the release is a draft"
     )
     draft_parser.add_argument("--is-draft", required=True)
+    generation_parser = subparsers.add_parser(
+        "verify-generation", help="bind a draft to the current admitted workflow run"
+    )
+    generation_parser.add_argument("--record", required=True, type=Path)
+    generation_parser.add_argument("--tag", required=True)
+    generation_parser.add_argument("--commit", required=True)
+    generation_parser.add_argument("--tag-object", required=True)
+    generation_parser.add_argument("--workflow-sha", required=True)
+    generation_parser.add_argument("--run-id", required=True)
     for command in ("validate", "render"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
@@ -1779,6 +2799,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_assets_parser.add_argument("--release-manifest", required=True, type=Path)
     verify_assets_parser.add_argument("--asset", required=True, type=Path, action="append")
+    verify_assets_parser.add_argument("--exact", action="store_true")
     verify_assets_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     verify_assets_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
     verify_attestation_parser = subparsers.add_parser("verify-attestation")
@@ -1788,9 +2809,91 @@ def build_parser() -> argparse.ArgumentParser:
     verify_attestation_parser.add_argument("--server-url", required=True)
     verify_attestation_parser.add_argument("--source-digest", required=True)
     verify_attestation_parser.add_argument("--run-id", required=True)
+    publication_identity_parser = subparsers.add_parser("verify-publication-identity")
+    publication_identity_parser.add_argument("--release-manifest", required=True, type=Path)
+    publication_identity_parser.add_argument("--verification", required=True, type=Path)
+    publication_identity_parser.add_argument("--workflow-run", required=True, type=Path)
+    publication_identity_parser.add_argument("--tag", required=True)
+    publication_identity_parser.add_argument("--tag-object", required=True)
+    publication_identity_parser.add_argument("--commit", required=True)
+    publication_identity_parser.add_argument("--repository", required=True)
+    publication_identity_parser.add_argument("--server-url", required=True)
+    aur_metadata_write_parser = subparsers.add_parser(
+        "write-aur-metadata-digests", help="write a run-bound sidecar for generated AUR metadata"
+    )
+    aur_metadata_write_parser.add_argument("--files-dir", required=True, type=Path)
+    aur_metadata_write_parser.add_argument("--output", required=True, type=Path)
+    aur_metadata_write_parser.add_argument("--tag", required=True)
+    aur_metadata_write_parser.add_argument("--repository", required=True)
+    aur_metadata_write_parser.add_argument("--run-id", required=True)
+    aur_metadata_write_parser.add_argument("--run-attempt", required=True, type=int)
+    aur_metadata_write_parser.add_argument("--source-sha", required=True)
+    aur_metadata_verify_parser = subparsers.add_parser(
+        "verify-aur-metadata-digests", help="verify generated AUR metadata against its run-bound sidecar"
+    )
+    aur_metadata_verify_parser.add_argument("--files-dir", required=True, type=Path)
+    aur_metadata_verify_parser.add_argument("--sidecar", required=True, type=Path)
+    aur_metadata_verify_parser.add_argument("--tag", required=True)
+    aur_metadata_verify_parser.add_argument("--repository", required=True)
+    aur_metadata_verify_parser.add_argument("--run-id", required=True)
+    aur_metadata_verify_parser.add_argument("--run-attempt", required=True, type=int)
+    aur_metadata_verify_parser.add_argument("--source-sha", required=True)
+    publication_receipt_parser = subparsers.add_parser(
+        "write-publication-receipt", help="write a machine-readable external publication receipt"
+    )
+    publication_receipt_parser.add_argument("--release-manifest", required=True, type=Path)
+    publication_receipt_parser.add_argument("--verification", required=True, type=Path)
+    publication_receipt_parser.add_argument("--workflow-run", required=True, type=Path)
+    publication_receipt_parser.add_argument("--tag-identity", required=True, type=Path)
+    publication_receipt_parser.add_argument("--tag", required=True)
+    publication_receipt_parser.add_argument("--target", required=True, choices=("homebrew", "aur"))
+    publication_receipt_parser.add_argument("--target-repository", required=True)
+    publication_receipt_parser.add_argument("--branch", required=True)
+    publication_receipt_parser.add_argument(
+        "--outcome", required=True, choices=("committed", "unchanged")
+    )
+    publication_receipt_parser.add_argument("--old-oid", default="")
+    publication_receipt_parser.add_argument("--new-oid", required=True)
+    publication_receipt_parser.add_argument("--observed-oid", required=True)
+    publication_receipt_parser.add_argument("--repository", required=True)
+    publication_receipt_parser.add_argument("--server-url", required=True)
+    publication_receipt_parser.add_argument("--publication-run-id", required=True)
+    publication_receipt_parser.add_argument("--publication-run-attempt", required=True, type=int)
+    publication_receipt_parser.add_argument("--publication-source-sha", required=True)
+    publication_receipt_parser.add_argument("--metadata-sidecar", type=Path)
+    publication_receipt_parser.add_argument("--metadata-artifact-id")
+    publication_receipt_parser.add_argument("--metadata-producer-attempt", type=int)
+    publication_receipt_parser.add_argument("--metadata-producer-source-sha")
+    publication_receipt_parser.add_argument("--published-blob", action="append", default=[])
+    publication_receipt_parser.add_argument("--output", required=True, type=Path)
+    publication_saga_parser = subparsers.add_parser(
+        "publication-saga", help="write a read-only ledger for external publication outcomes"
+    )
+    publication_saga_parser.add_argument("--tag", required=True)
+    publication_saga_parser.add_argument("--repository", required=True)
+    publication_saga_parser.add_argument("--publication-run-id", required=True)
+    publication_saga_parser.add_argument("--publication-run-attempt", required=True, type=int)
+    publication_saga_parser.add_argument("--publication-source-sha", required=True)
+    for target in ("homebrew", "aur"):
+        publication_saga_parser.add_argument(
+            f"--{target}-result", required=True, choices=("success", "failure", "cancelled", "skipped")
+        )
+        publication_saga_parser.add_argument(
+            f"--{target}-ready", required=True, choices=("true", "false", "unknown")
+        )
+        publication_saga_parser.add_argument(f"--{target}-outcome", default="")
+        publication_saga_parser.add_argument(f"--{target}-artifact-id", default="")
+        publication_saga_parser.add_argument(f"--{target}-receipt", required=True, type=Path)
+    publication_saga_parser.add_argument("--output", required=True, type=Path)
+    publication_saga_parser.add_argument("--summary", required=True, type=Path)
     check_sizes_parser = subparsers.add_parser("check-asset-sizes")
     check_sizes_parser.add_argument("--assets-json", required=True, type=Path)
     check_sizes_parser.add_argument("--pattern", action="append")
+    upload_plan_parser = subparsers.add_parser(
+        "plan-upload", help="select absent draft assets without replacing existing names"
+    )
+    upload_plan_parser.add_argument("--assets-json", required=True, type=Path)
+    upload_plan_parser.add_argument("--asset", required=True, action="append", type=Path)
     return parser
 
 

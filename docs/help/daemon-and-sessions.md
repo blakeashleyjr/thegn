@@ -80,6 +80,8 @@ daemon-backed; select it for the full session rollup. See [[bars]].
 
 ## Live sessions from any shell
 
+Scripts that use `api call sessions.open` should confirm the returned id with `thegn session list`.
+
 `thegn session list` shows what the daemon is holding. Each row has an id
 the other verbs take:
 

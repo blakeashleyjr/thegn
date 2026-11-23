@@ -63,7 +63,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             ]
             with self.subTest(job=job_name):
                 self.assertEqual(1, len(checkouts))
-                self.assertNotIn("ref", checkouts[0].get("with", {}))
+                self.assertEqual("${{ github.sha }}", checkouts[0].get("with", {}).get("ref"))
 
     def test_no_workflow_trusts_first_seen_host_keys(self) -> None:
         for path in sorted((ROOT / ".github" / "workflows").rglob("*.yml")):
@@ -93,9 +93,113 @@ class WorkflowPolicyTests(unittest.TestCase):
                         with self.subTest(required=required):
                             self.assertIn(required, script)
 
+    def test_external_publishers_reverify_signed_identity_before_keys(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        helper = (ROOT / ".github" / "scripts" / "verify-release-publication-identity.sh").read_text(
+            encoding="utf-8"
+        )
+        for job_name in ("publish-homebrew", "publish-aur"):
+            job = jobs[job_name]
+            steps = job.get("steps", [])
+            names = [step.get("name") for step in steps]
+            identity_index = names.index("Re-verify immutable release identity before publication")
+            key_index = names.index(
+                "Materialize Homebrew deploy key"
+                if job_name == "publish-homebrew"
+                else "Materialize AUR deploy key"
+            )
+            step_script = steps[identity_index].get("run", "")
+            with self.subTest(job=job_name):
+                self.assertLess(identity_index, key_index)
+                self.assertEqual("read", job.get("permissions", {}).get("actions"))
+                self.assertIn(".github/scripts/verify-release-publication-identity.sh", step_script)
+                for required in (
+                    "actions/runs/$run_id",
+                    'git -C "$GITHUB_WORKSPACE" ls-remote origin',
+                    "gh attestation verify",
+                    "--source-digest \"$run_head_sha\"",
+                    "verify-publication-identity",
+                    '[[ ${GITHUB_REF:-} == refs/heads/main ]]',
+                    'workflow_checkout_sha == "$expected_workflow_sha"',
+                    "--tag-object",
+                    "--commit",
+                ):
+                    self.assertIn(required, helper)
+
+    def test_publish_release_is_serialized_and_verifies_before_transition(self) -> None:
+        workflow = read_workflow("release.yml")
+        self.assertEqual("release-${{ inputs.tag || github.ref_name }}", workflow["concurrency"]["group"])
+        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertIn(
+            "publish-release",
+            triggers["workflow_dispatch"]["inputs"]["operation"]["options"],
+        )
+        job = workflow["jobs"]["publish-release"]
+        self.assertEqual("admit", job["needs"])
+        self.assertEqual({"contents": "write", "attestations": "read"}, job["permissions"])
+        steps = job["steps"]
+        names = [step.get("name", "") for step in steps]
+        inventory_index = names.index("Download and verify the exact release asset set")
+        identity_index = names.index("Reverify signed release identity and live tag")
+        publish_index = names.index("Publish or confirm the verified release")
+        self.assertLess(inventory_index, identity_index)
+        self.assertLess(identity_index, publish_index)
+        self.assertIn("--exact", steps[inventory_index]["run"])
+        self.assertIn("verify-release-publication-identity.sh", steps[identity_index]["run"])
+        self.assertIn("finalize-release.sh", steps[publish_index]["run"])
+        self.assertNotIn("gh release upload", "\n".join(step.get("run", "") for step in steps))
+        releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+        self.assertIn("Manual UI publication is break-glass only", releasing)
+        self.assertIn("stop every queued or running workflow for that tag first", releasing)
+
+    def test_release_publication_replay_is_read_only_after_verified_publish(self) -> None:
+        script = (ROOT / ".github/scripts/finalize-release.sh").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bindir = root / "bin"
+            bindir.mkdir()
+            state_path = root / "state"
+            log_path = root / "gh.log"
+            stub = bindir / "gh"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [[ "$1 $2" == "release view" ]]; then cat "$STATE_PATH"; exit 0; fi\n'
+                'if [[ "$1 $2" == "release edit" ]]; then echo edit >> "$LOG_PATH"; echo false > "$STATE_PATH"; exit 0; fi\n'
+                "exit 2\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{bindir}{os.pathsep}{environment.get('PATH', '')}",
+                    "TAG": "v1.2.3",
+                    "GITHUB_TOKEN": "fixture",
+                    "STATE_PATH": str(state_path),
+                    "LOG_PATH": str(log_path),
+                }
+            )
+            state_path.write_text("true\n", encoding="utf-8")
+            first = subprocess.run(["bash", str(ROOT / ".github/scripts/finalize-release.sh")], env=environment, check=False)
+            self.assertEqual(0, first.returncode)
+            self.assertEqual(["edit"], log_path.read_text(encoding="utf-8").splitlines())
+            second = subprocess.run(["bash", str(ROOT / ".github/scripts/finalize-release.sh")], env=environment, check=False)
+            self.assertEqual(0, second.returncode)
+            self.assertEqual(["edit"], log_path.read_text(encoding="utf-8").splitlines())
+            state_path.write_text("unknown\n", encoding="utf-8")
+            invalid = subprocess.run(["bash", str(ROOT / ".github/scripts/finalize-release.sh")], env=environment, check=False)
+            self.assertNotEqual(0, invalid.returncode)
+            self.assertEqual(["edit"], log_path.read_text(encoding="utf-8").splitlines())
+
+    def test_homebrew_publisher_does_not_receive_nix_setup_or_pat(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["publish-homebrew"]
+        self.assertFalse(any(step.get("uses") == "./.github/actions/ci-setup" for step in job["steps"]))
+        self.assertNotIn("NIX_GITHUB_TOKEN", yaml.safe_dump(job))
+
     def test_committed_known_hosts_match_published_fingerprints(self) -> None:
         known_hosts = ROOT / ".github" / "known_hosts"
-        entries = []
+        fingerprints: dict[str, list[str]] = {}
         for line in known_hosts.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -105,19 +209,18 @@ class WorkflowPolicyTests(unittest.TestCase):
             host, key_type, blob = fields
             self.assertEqual("ssh-ed25519", key_type)
             self.assertIn(host, {"github.com", "aur.archlinux.org"})
-            entries.append((host, key_type, blob))
-        github_keys = [
-            entry
-            for entry in entries
-            if entry[:2] == ("github.com", "ssh-ed25519")
-        ]
-        self.assertTrue(github_keys, "github.com ed25519 host key must be committed")
-        for _, _, blob in github_keys:
             fingerprint = base64.b64encode(hashlib.sha256(base64.b64decode(blob)).digest())
-            self.assertEqual(
-                "+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
-                fingerprint.decode("ascii").rstrip("="),
-            )
+            fingerprints.setdefault(host, []).append(fingerprint.decode("ascii").rstrip("="))
+        self.assertEqual({"github.com", "aur.archlinux.org"}, set(fingerprints))
+        self.assertEqual(1, len(fingerprints["github.com"]))
+        self.assertEqual(1, len(fingerprints["aur.archlinux.org"]))
+        self.assertEqual(
+            {
+                "github.com": "+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
+                "aur.archlinux.org": "RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4",
+            },
+            {host: values[0] for host, values in fingerprints.items()},
+        )
 
     def test_create_release_never_deletes(self) -> None:
         workflow_path = ROOT / ".github" / "workflows" / "release.yml"
@@ -272,97 +375,31 @@ class WorkflowPolicyTests(unittest.TestCase):
             any(step.get("uses", "").startswith("actions/attest-build-provenance@") for step in steps)
         )
         job_text = yaml.safe_dump(job)
-        self.assertIn("gh release upload", job_text)
+        self.assertIn("upload-release-assets.sh", job_text)
         self.assertIn("sha256sum", job_text)
 
-    def test_clobber_uploads_require_draft_rehearsal(self) -> None:
+    def test_producer_uploads_use_immutable_draft_planner(self) -> None:
         workflow = read_workflow("release.yml")
         upload_steps = (
-            ("upload", "Upload verified release assets"),
-            ("upload", "Write and publish release record"),
+            ("upload", "Bind generation and upload verified release assets"),
             ("package", "Upload packages and rendered metadata"),
             ("verify-manifest", "Upload release manifest"),
         )
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            temporary_path = Path(temporary_directory)
-            stub_dir = temporary_path / "bin"
-            stub_dir.mkdir()
-            log_path = temporary_path / "gh.log"
-            (stub_dir / "gh").write_text(
-                "#!/bin/sh\n"
-                'if [ "$1" = release ] && [ "$2" = view ]; then\n'
-                '  printf \'%s\\n\' "$GH_DRAFT"\n'
-                "  exit 0\n"
-                "fi\n"
-                'if [ "$1" = release ] && [ "$2" = upload ]; then\n'
-                '  printf \'upload\\n\' >> "$GH_LOG"\n'
-                "  exit 0\n"
-                "fi\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
-            (stub_dir / "gh").chmod(0o755)
-            for job_name, step_name in upload_steps:
-                with self.subTest(job=job_name, step=step_name):
-                    step = next(
-                        candidate
-                        for candidate in workflow["jobs"][job_name]["steps"]
-                        if candidate.get("name") == step_name
-                    )
-                    lines = step["run"].splitlines()
-                    guard_index = next(
-                        index
-                        for index, line in enumerate(lines)
-                        if "packaging/release.py require-draft" in line
-                    )
-                    guard = "\n".join(lines[guard_index : guard_index + 2])
-                    upload = next(line for line in lines if "gh release upload" in line)
-                    self.assertLess(guard_index, lines.index(upload))
-                    self.assertIn('gh release view "$TAG" --json isDraft --jq .isDraft', guard)
-                    self.assertIn("--clobber", upload)
-                    harness = "\n".join(
-                        (
-                            "set -euo pipefail",
-                            'release="$PWD/release"',
-                            'manifest="$PWD/manifest.json"',
-                            'PACKAGE_ROOT="$PWD"',
-                            'TAG="v1.2.3"',
-                            guard,
-                            upload,
-                        )
-                    )
-                    for draft, expected_status, expected_uploads in (
-                        ("true", 0, 1),
-                        ("false", 2, 0),
-                    ):
-                        log_path.write_text("", encoding="utf-8")
-                        environment = os.environ.copy()
-                        environment.update(
-                            {
-                                "PATH": f"{stub_dir}{os.pathsep}{environment.get('PATH', '')}",
-                                "GH_DRAFT": draft,
-                                "GH_LOG": str(log_path),
-                            }
-                        )
-                        result = subprocess.run(
-                            ["bash", "-c", harness],
-                            cwd=ROOT,
-                            env=environment,
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                        )
-                        message = (
-                            f"job={job_name} step={step_name} draft={draft} "
-                            f"returncode={result.returncode}\n"
-                            f"stdout={result.stdout}\nstderr={result.stderr}"
-                        )
-                        self.assertEqual(expected_status, result.returncode, message)
-                        self.assertEqual(
-                            expected_uploads,
-                            len(log_path.read_text(encoding="utf-8").splitlines()),
-                            message,
-                        )
+        helper = (ROOT / ".github/scripts/upload-release-assets.sh").read_text(encoding="utf-8")
+        self.assertIn("require-draft", helper)
+        self.assertIn("plan-upload", helper)
+        self.assertIn("--paginate --slurp", helper)
+        self.assertIn('gh release upload "$tag" "${upload_assets[@]}"', helper)
+        self.assertNotIn("--clobber", helper)
+        for job_name, step_name in upload_steps:
+            with self.subTest(job=job_name, step=step_name):
+                step = next(
+                    candidate
+                    for candidate in workflow["jobs"][job_name]["steps"]
+                    if candidate.get("name") == step_name
+                )
+                self.assertIn(".github/scripts/upload-release-assets.sh", step["run"])
+                self.assertNotIn("gh release upload", step["run"])
 
     def test_release_record_asset(self) -> None:
         job = read_workflow("release.yml")["jobs"]["upload"]
@@ -574,14 +611,32 @@ class WorkflowPolicyTests(unittest.TestCase):
             if step.get("uses", "").startswith("actions/download-artifact@")
         ]
         self.assertEqual(1, len(downloads))
-        self.assertEqual("aur-metadata", downloads[0].get("with", {}).get("name"))
+        self.assertEqual(
+            "${{ needs.aur-srcinfo.outputs.metadata_artifact_id }}",
+            downloads[0].get("with", {}).get("artifact-ids"),
+        )
         srcinfo_job = read_workflow("release.yml")["jobs"]["aur-srcinfo"]
+        self.assertEqual(
+            "${{ steps.upload-metadata.outputs.artifact-id }}",
+            srcinfo_job.get("outputs", {}).get("metadata_artifact_id"),
+        )
+        self.assertEqual(
+            "${{ steps.metadata-digests.outputs.producer_attempt }}",
+            srcinfo_job.get("outputs", {}).get("producer_attempt"),
+        )
+        self.assertEqual(
+            "${{ steps.metadata-digests.outputs.producer_source_sha }}",
+            srcinfo_job.get("outputs", {}).get("producer_source_sha"),
+        )
         uploads = [
             step for step in srcinfo_job.get("steps", [])
             if step.get("uses", "").startswith("actions/upload-artifact@")
         ]
         self.assertEqual(1, len(uploads))
-        self.assertEqual("aur-metadata", uploads[0].get("with", {}).get("name"))
+        self.assertEqual("upload-metadata", uploads[0].get("id"))
+        self.assertIn(
+            "${{ github.run_attempt }}", uploads[0].get("with", {}).get("name", "")
+        )
         self.assertIs(uploads[0].get("with", {}).get("include-hidden-files"), True)
         job_text = yaml.safe_dump(job)
         self.assertNotIn("makepkg", job_text)
@@ -592,8 +647,25 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         validation_script = validation.get("run", "")
         self.assertIn("LC_ALL=C sort", validation_script)
+        self.assertIn('[ "${#artifact_files[@]}" -ne 3 ]', validation_script)
+        self.assertIn('[ "${artifact_files[2]:-}" != metadata-digests.json ]', validation_script)
         self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/.SRCINFO" ]', validation_script)
         self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/PKGBUILD" ]', validation_script)
+        self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/metadata-digests.json" ]', validation_script)
+        self.assertIn("verify-aur-metadata-digests", validation_script)
+        self.assertIn(
+            '"${{ needs.aur-srcinfo.outputs.producer_attempt }}"',
+            validation_script,
+        )
+        self.assertIn(
+            '"${{ needs.aur-srcinfo.outputs.producer_source_sha }}"',
+            validation_script,
+        )
+        srcinfo_generation = next(
+            step for step in srcinfo_job["steps"]
+            if step.get("name") == "Generate and bound AUR source metadata"
+        )
+        self.assertIn("write-aur-metadata-digests", srcinfo_generation.get("run", ""))
 
     def test_publish_roots_live_under_runner_temp(self) -> None:
         jobs = read_workflow("release.yml")["jobs"]
@@ -637,6 +709,164 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertIn(
                     "before the target was cloned; remote state unknown", summary_script
                 )
+
+    def test_external_publication_receipts_are_pinned_credential_free_artifacts(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        for job_name, target, receipt_name, artifact_path in (
+            (
+                "publish-homebrew",
+                "homebrew",
+                "Write Homebrew publication receipt",
+                "${{ runner.temp }}/release-publication-homebrew.json",
+            ),
+            (
+                "publish-aur",
+                "aur",
+                "Write AUR publication receipt",
+                "${{ runner.temp }}/release-publication-aur.json",
+            ),
+        ):
+            job = jobs[job_name]
+            steps = job["steps"]
+            names = [step.get("name") for step in steps]
+            write_index = names.index(receipt_name)
+            key_cleanup_index = names.index(
+                "Remove temporary Homebrew deploy key"
+                if target == "homebrew"
+                else "Remove temporary AUR deploy key"
+            )
+            workspace_cleanup_index = names.index(
+                "Remove Homebrew publication workspace"
+                if target == "homebrew"
+                else "Remove AUR publication workspace"
+            )
+            upload = steps[workspace_cleanup_index + 1]
+            write_script = steps[write_index].get("run", "")
+            with self.subTest(target=target):
+                self.assertEqual("read", job["permissions"]["actions"])
+                self.assertEqual(
+                    "steps.publish.outcome == 'success'", steps[write_index].get("if")
+                )
+                self.assertLess(key_cleanup_index, write_index)
+                self.assertLess(write_index, workspace_cleanup_index)
+                upload_action = upload.get("uses", "").split(" #", maxsplit=1)[0]
+                self.assertEqual(
+                    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                    upload_action,
+                )
+                self.assertEqual("steps.receipt.outcome == 'success'", upload.get("if"))
+                self.assertLess(workspace_cleanup_index, steps.index(upload))
+                self.assertEqual(artifact_path, upload.get("with", {}).get("path"))
+                self.assertEqual(90, upload.get("with", {}).get("retention-days"))
+                artifact_prefix = (
+                    f"release-publication-{target}-"
+                    "${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}"
+                )
+                self.assertIn(artifact_prefix, upload["with"]["name"])
+                for required in (
+                    "write-publication-receipt",
+                    "release-workflow-run.json",
+                    "release-manifest-attestation.json",
+                    "release-tag-identity.json",
+                    "--release-manifest",
+                    "--verification",
+                    "--tag-identity",
+                    "--old-oid",
+                    "--new-oid",
+                    "--observed-oid",
+                    "--publication-run-id",
+                    "--publication-run-attempt",
+                    "--server-url",
+                    "--published-blob",
+                    "--publication-source-sha",
+                ):
+                    self.assertIn(required, write_script)
+                self.assertFalse(
+                    any("DEPLOY_KEY" in name for name in steps[write_index].get("env", {}))
+                )
+                self.assertIn("rm -f", steps[key_cleanup_index].get("run", ""))
+                self.assertEqual("always()", steps[key_cleanup_index].get("if"))
+                self.assertNotIn("DEPLOY_KEY", write_script)
+                self.assertNotIn("$PUBLISH_ROOT/keys/", write_script)
+                if target == "aur":
+                    for required in (
+                        "--metadata-sidecar",
+                        "--metadata-artifact-id",
+                        "--metadata-producer-attempt",
+                        "--metadata-producer-source-sha",
+                    ):
+                        self.assertIn(required, write_script)
+
+    def test_publication_saga_uses_exact_receipts_and_records_partial_state(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        saga = jobs["publication-saga"]
+        self.assertEqual(["publish-homebrew", "publish-aur"], saga["needs"])
+        self.assertIn("always()", saga["if"])
+        self.assertEqual(
+            {"actions": "read", "contents": "read"},
+            saga["permissions"],
+        )
+        for target, job_name in (("homebrew", "publish-homebrew"), ("aur", "publish-aur")):
+            display = "Homebrew" if target == "homebrew" else "AUR"
+            publisher = jobs[job_name]
+            steps = publisher["steps"]
+            upload = next(step for step in steps if step.get("name") == f"Upload {display} publication receipt")
+            self.assertEqual("upload-receipt", upload.get("id"))
+            self.assertEqual(
+                "${{ steps.upload-receipt.outputs.artifact-id }}",
+                publisher["outputs"]["receipt_artifact_id"],
+            )
+            download = next(
+                step
+                for step in saga["steps"]
+                if step.get("name") == f"Download {display} receipt by immutable artifact ID"
+            )
+            self.assertEqual(
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                upload["uses"],
+            )
+            self.assertEqual(
+                "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+                download["uses"],
+            )
+            self.assertEqual("${{ secrets.GITHUB_TOKEN }}", download["with"]["github-token"])
+            self.assertIn(
+                f"${{{{ needs.{job_name}.outputs.receipt_artifact_id }}}}",
+                download["with"]["artifact-ids"],
+            )
+            self.assertTrue(download["continue-on-error"])
+        writer = next(step for step in saga["steps"] if step.get("name") == "Write read-only cross-target saga ledger")
+        writer_script = writer["run"]
+        for required in (
+            "publication-saga",
+            "--homebrew-result",
+            "--homebrew-ready",
+            "--homebrew-outcome",
+            "--homebrew-artifact-id",
+            "--aur-result",
+            "--aur-ready",
+            "--aur-outcome",
+            "--aur-artifact-id",
+            "--output",
+            "--summary",
+        ):
+            self.assertIn(required, writer_script)
+        self.assertIn("needs.publish-homebrew.result", str(writer["env"]))
+        self.assertIn("needs.publish-aur.result", str(writer["env"]))
+        artifact = next(
+            step for step in saga["steps"]
+            if step.get("name") == "Upload durable cross-target saga ledger"
+        )
+        self.assertEqual(90, artifact["with"]["retention-days"])
+        self.assertIn("always()", artifact["if"])
+        fail_closed = next(
+            step for step in saga["steps"]
+            if step.get("name") == "Fail on incomplete or ambiguous publication state"
+        )
+        self.assertIn("$state" , fail_closed["run"])
+        self.assertIn("state" , fail_closed["run"])
+        self.assertNotIn("actions: write", str(saga["permissions"]))
+        self.assertNotIn("contents: write", str(saga["permissions"]))
 
     def test_publish_cas_rehearsal(self) -> None:
         if shutil.which("git") is None or shutil.which("bash") is None:
@@ -1336,6 +1566,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             name: names.index(name)
             for name in (
                 "Download every draft asset",
+                "Require this workflow's draft generation",
                 "Verify archive provenance",
                 "Build the release manifest",
                 "Verify tag still names the admitted commit",
@@ -1355,11 +1586,14 @@ class WorkflowPolicyTests(unittest.TestCase):
         download = steps[positions["Download every draft asset"]]["run"]
         self.assertIn('gh release download "$TAG" --dir "$root/assets"', download)
         self.assertNotIn("--pattern", download)
+        generation = steps[positions["Require this workflow's draft generation"]]["run"]
+        self.assertIn("release.py verify-generation", generation)
+        self.assertIn('--run-id "$RUN_ID"', generation)
         attest = steps[positions["Attest release manifest"]]
         self.assertTrue(attest["uses"].startswith("actions/attest-build-provenance@"))
         self.assertIn("manifest.json", attest["with"]["subject-path"])
         upload = steps[positions["Upload release manifest"]]["run"]
-        self.assertIn('gh release upload "$TAG" "$manifest" --clobber', upload)
+        self.assertIn("upload-release-assets.sh", upload)
         self.assertNotIn('release upload "$TAG" "$VERIFY_ROOT/assets/', upload)
 
     def test_publishers_require_the_release_manifest(self) -> None:
@@ -1534,7 +1768,11 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_upload_publishes_trusted_asset_digests(self) -> None:
         job = read_workflow("release.yml")["jobs"]["upload"]
         self.assertEqual("${{ steps.record.outputs.asset_digests }}", job["outputs"]["asset_digests"])
-        step = next(item for item in job["steps"] if item.get("name") == "Write and publish release record")
+        step = next(
+            item
+            for item in job["steps"]
+            if item.get("name") == "Bind generation and upload verified release assets"
+        )
         self.assertEqual("record", step["id"])
         self.assertIn('echo "asset_digests=$asset_digests" >> "$GITHUB_OUTPUT"', step["run"])
         self.assertIn('sha256sum "$asset"', step["run"])
@@ -1551,6 +1789,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertLess(
             names.index("Verify archive provenance"),
             names.index("Validate all active inputs and render metadata"),
+        )
+        self.assertLess(
+            names.index("Require this workflow's draft generation"),
+            names.index("Upload packages and rendered metadata"),
         )
         verify = job["steps"][verify_index]
         self.assertEqual(
@@ -1570,7 +1812,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn('[ -f "$asset" ] || {', packages["run"])
         self.assertLess(
             packages["run"].index('echo "package_digests='),
-            packages["run"].index('gh release upload'),
+            packages["run"].index("upload-release-assets.sh"),
         )
 
     def test_verify_manifest_binds_producer_digests(self) -> None:

@@ -3107,10 +3107,16 @@ inject_devshell = false
 # `[env.<name>.sandbox] devshell = "..."` (e.g. give sprites the lean "sprite-full"
 # while a bigger VPS env keeps the full default).
 # devshell = "sandbox"
-# Tier B: bind-mount the host Nix daemon socket into the sandbox so full
-# `nix develop`/`build`/`fmt` run INSIDE it. `true` is an explicit trusted
-# policy; `false` never auto-mounts it. Ignored if the host has no Nix daemon.
-nix_daemon = false
+# Host Nix daemon access is automatic only for standalone local interactive
+# terminal panes using native local bwrap/systemd on NixOS, with a compatible
+# socket, NAT networking without extra network/VPN policy, and a non-sealed
+# profile. It stays off for agents, unattended/SSH/provider runs, and OCI
+# backends (local or remotely addressed). The socket grants authority to request
+# arbitrary builds and access host Nix store paths.
+# Omit this key for the local NixOS default; true explicitly requests the
+# integration, false opts out for this sandbox configuration.
+# nix_daemon = true
+# nix_daemon = false
 
 # ── Missing backend behaviour ─────────────────────────────────────────────────
 # What to do when no sandbox backend in backend_chain is available and the

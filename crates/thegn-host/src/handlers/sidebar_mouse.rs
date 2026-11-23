@@ -575,7 +575,7 @@ fn drag_src_for(
         .filter(|r| r.visible)
         .nth(hit.visible_index)?;
     match row.kind {
-        RowKind::Worktree => {
+        RowKind::Worktree | RowKind::PipelineWorktree => {
             // Live, non-home worktrees only: the step-move machinery needs a
             // session group, and home is anchored first.
             let Some(RowTarget::Tab(gi, _)) = row.tab_target else {
@@ -971,7 +971,7 @@ fn move_to_end_of_run(
     let Some(slug) = model
         .sidebar_rows
         .iter()
-        .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some(path))
+        .find(|r| r.kind.is_worktree() && r.worktree_path.as_deref() == Some(path))
         .map(|r| r.workspace_slug.clone())
     else {
         return;
@@ -995,7 +995,7 @@ fn path_of_pin_key(model: &FrameModel, key: &str) -> Option<String> {
     model
         .sidebar_rows
         .iter()
-        .find(|r| r.kind == RowKind::Worktree && r.pin_key == key)
+        .find(|r| r.kind.is_worktree() && r.pin_key == key)
         .and_then(|r| r.worktree_path.clone())
 }
 
@@ -1020,6 +1020,16 @@ mod tests {
             pin_key: format!("{slug}/{branch}"),
             branch: Some(branch.into()),
             ..SidebarRow::base(RowKind::Worktree, 1, branch, slug)
+        }
+    }
+
+    fn pipeline_wt_row(slug: &str, branch: &str, gi: usize) -> SidebarRow {
+        SidebarRow {
+            tab_target: Some(RowTarget::Tab(gi, 0)),
+            worktree_path: Some(format!("/wt/{branch}")),
+            pin_key: format!("{slug}/{branch}"),
+            branch: Some(branch.into()),
+            ..SidebarRow::base(RowKind::PipelineWorktree, 3, branch, slug)
         }
     }
 
@@ -1134,6 +1144,40 @@ mod tests {
         assert!(matches!(
             spot_on(&model, rect, &src_feat(), "app"),
             Spot::Unfile { .. }
+        ));
+    }
+
+    #[test]
+    fn pipeline_leaf_drag_files_its_worktree_into_a_folder() {
+        let row = pipeline_wt_row("app", "feature", 0);
+        let folder = folder_row("app", 1, "Backend");
+        let model = crate::chrome::FrameModel {
+            sidebar_rows: vec![ws_row("app"), row.clone(), folder],
+            ..Default::default()
+        };
+        let session = crate::session::Session {
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "app/feature",
+                crate::session::GroupKind::Branch,
+                "/wt/feature",
+            )],
+            ..Default::default()
+        };
+        let hit = crate::sidebar_view::RowHit {
+            visible_index: 1,
+            y: 0,
+            height: 1,
+            kind: RowKind::PipelineWorktree,
+            pin_key: row.pin_key.clone(),
+            caret_x: None,
+            lead_gap: 0,
+            mq_span: None,
+        };
+        let src = drag_src_for(&SidebarState::default(), &model, &session, &hit)
+            .expect("pipeline worktree is a drag source");
+        assert!(matches!(
+            spot_for_hover(&model.sidebar_rows, 2, &src),
+            Spot::FileInto { folder_name, .. } if folder_name == "Backend"
         ));
     }
 

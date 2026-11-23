@@ -1143,7 +1143,7 @@ fn sealed_autopilot_sandbox(
     sandbox.auto_caches = false;
     sandbox.inject_devshell = false;
     sandbox.devshell.clear();
-    sandbox.nix_daemon = false;
+    sandbox.nix_daemon = Some(false);
     sandbox.devenv = false;
     sandbox.prepare.clear();
     sandbox.init_script.clear();

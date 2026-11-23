@@ -34,14 +34,124 @@ resolve only assets produced for the same release contract.
 - **THEN** the attestation identifies this repository's release workflow and
   its checksum matches the published checksum asset
 
+### Requirement: Draft producer uploads preserve one immutable workflow generation
+
+Every producer SHALL inspect the current GitHub Release asset inventory before
+upload. A missing name MAY be uploaded; an existing name MAY be reused only
+when GitHub's SHA-256 asset digest matches the local bytes. Missing or malformed
+digest metadata for an existing intended name, duplicate inventory names, or a
+digest conflict MUST fail closed. Uploads MUST NOT use replacement semantics;
+a same-name race MUST fail without replacing the existing asset.
+
+The release record SHALL bind the draft generation to the admitted tag object,
+commit, trusted workflow revision, and workflow run ID. Package and manifest
+producers MUST verify that identity before uploading. Re-running jobs in the
+same workflow run MAY reuse exact matching assets because the run ID is stable
+across attempts. A different workflow run MUST refuse a draft whose release
+record names another generation.
+
+#### Scenario: A same-run retry finds exact producer bytes
+
+- **WHEN** a rerun sees an existing intended asset with the exact SHA-256
+- **THEN** it skips that upload and uploads only absent names
+
+#### Scenario: A draft contains an asset from a conflicting generation
+
+- **WHEN** an existing intended asset's digest differs, or its release record
+  binds another workflow run
+- **THEN** the producer stops before replacing that asset or uploading later
+  producer outputs
+
+#### Scenario: GitHub reports an unusable asset inventory
+
+- **WHEN** an intended existing asset has no valid SHA-256 metadata or the
+  inventory contains duplicate names
+- **THEN** the producer refuses to upload
+
+### Requirement: Release publication is workflow-owned and serialized with producers
+
+Build, release-publication, and external-publication runs for the same tag SHALL
+share one concurrency group independent of operation and MUST NOT cancel an
+active run. The normal transition from draft to published SHALL be performed
+only by the protected `publish-release` workflow operation after it downloads
+and verifies the exact manifest asset set and rechecks the signed manifest
+against the successful release run and live annotated tag identity.
+
+A replay for an already-published release MAY succeed only after the same full
+verification and MUST make no release mutation. Missing, extra, mismatched, or
+unverifiable assets or identity MUST fail closed. The `publish-release` job
+MUST NOT upload, replace, or delete release assets. Manual GitHub UI publication
+is break-glass: an owner MUST first stop all workflow runs for the tag and MUST
+not resume or dispatch producers against the draft afterward.
+
+#### Scenario: Producer and publish operation target the same tag
+
+- **WHEN** a build and `publish-release` are dispatched for the same tag
+- **THEN** the shared tag concurrency group prevents them from executing at
+  the same time, and a producer that starts after publication refuses the
+  non-draft release
+
+#### Scenario: A verified publication is replayed
+
+- **WHEN** `publish-release` sees the exact release already published
+- **THEN** it verifies the complete asset set and release identity, then exits
+  successfully without changing the release
+
+#### Scenario: Release identity or assets fail verification
+
+- **WHEN** the signed manifest, live tag identity, or exact asset set is
+  missing or inconsistent
+- **THEN** the workflow refuses to publish
+
+### Requirement: Release downloads have a selected aggregate byte budget
+
+Before downloading release assets, the workflow SHALL validate each selected
+asset against its existing per-asset limit and validate the selected total
+against a 1 GiB aggregate limit. Pattern-filtered downloads SHALL count only
+assets selected by those patterns; an unfiltered manifest download SHALL count
+all listed release assets. The aggregate check MUST reject excess before the
+download command runs.
+
+#### Scenario: Selected assets exceed the aggregate budget
+
+- **WHEN** each selected release asset is within its per-asset limit but their
+  combined size exceeds 1 GiB
+- **THEN** the workflow refuses the download before creating the package input
+  set
+
 ### Requirement: Homebrew and AUR publication is protected and idempotent
 
 Homebrew/AUR publication SHALL run only through the protected publication
 environment after validating public-repository and narrowly scoped deploy-key
 configuration. It SHALL publish the exact rendered metadata, regenerate AUR
 `.SRCINFO`, avoid exposing credentials through argv/logs/artifacts, and push
-only when content differs. Failure MUST NOT alter/retract release assets and a
-same-tag rerun MUST be idempotent.
+only when content differs. SSH endpoints SHALL match committed, reviewed
+`known_hosts` keys. Failure MUST NOT alter/retract release assets and a same-tag
+rerun MUST be idempotent.
+
+Each successful target publication SHALL upload a credential-free,
+machine-readable receipt artifact. The receipt SHALL bind the signed release
+manifest digest, admitted tag/source identity, release workflow run and
+attempt, publication workflow run and attempt, target, outcome, and exact old,
+new, and observed external commit OIDs. It SHALL record each published
+repository-relative path and the SHA-256 of its exact blob. Homebrew formula
+and AUR PKGBUILD digests SHALL match signed manifest entries. The generated AUR
+`.SRCINFO` digest SHALL match a workflow-run-bound sidecar from the exact
+immutable artifact ID. Deploy keys MUST be removed before receipt generation,
+and only the receipt may be uploaded after workspace cleanup. Receipt artifacts
+are retained for 90 days; longer-term archival requires a separate policy.
+
+Before either publisher materializes a deploy key, it SHALL reverify the signed
+release manifest against the live approved annotated tag object and peeled
+commit, and against the exact successful release workflow run, attempt, and
+source commit recorded by the attestation. A mismatch MUST refuse publication.
+
+#### Scenario: Published release identity has changed or cannot be verified
+
+- **WHEN** the manifest signature, live annotated tag identity, or exact
+  successful workflow run/attempt/source identity does not match
+- **THEN** publication stops before deploy-key materialization and makes no
+  package-manager update
 
 #### Scenario: Missing setup blocks publication clearly
 
@@ -53,6 +163,52 @@ same-tag rerun MUST be idempotent.
 
 - **WHEN** published metadata already equals the rendered release output
 - **THEN** the job performs no new commit and succeeds without changing assets
+
+### Requirement: External publication outcomes are recorded as one resumable saga
+
+After both target publishers finish, the workflow SHALL write a read-only
+cross-target ledger from their exact receipt artifact IDs and explicit job
+outcomes. The ledger SHALL report `complete` only when both receipts verify for
+the same tag, release manifest, source, and publication workflow run. A
+successful publisher receipt from an earlier attempt of the same workflow run
+MAY be reused during a failed-job rerun; its original attempt SHALL remain
+recorded. A missing receipt when the target was ready SHALL be `unknown` and
+require reconciliation, even if the publisher reported a successful push.
+Missing receipt MUST NOT be treated as unchanged or as proof that retry is safe.
+The ledger SHALL remain credential-free and be retained as a workflow artifact
+for 90 days. It MUST NOT modify release assets or automatically retry a target.
+
+#### Scenario: Only Homebrew has a verified receipt
+
+- **WHEN** Homebrew has a valid receipt and AUR has no receipt
+- **THEN** the ledger reports partial publication and requires reconciliation
+
+#### Scenario: A receipt is lost after a possible push
+
+- **WHEN** a publisher was ready or reported a push but its receipt artifact is
+  absent or unreadable
+- **THEN** the ledger reports unknown remote state and does not infer unchanged
+
+#### Scenario: A failed-job rerun reuses the earlier successful target
+
+- **WHEN** Homebrew succeeded on an earlier attempt and AUR succeeds on the
+  current retry attempt for the same workflow run
+- **THEN** the ledger downloads both exact artifact IDs and records both receipt
+  attempts against the same release manifest
+
+#### Scenario: A verified external publication leaves a durable receipt
+
+- **WHEN** Homebrew or AUR publication succeeds after its remote branch is
+  verified
+- **THEN** the publisher uploads a per-target receipt tied to the signed
+  manifest and both workflow run identities, recording the target outcome and
+  exact old/new/observed commit OIDs and each published path/blob digest
+  without deploy credentials
+
+#### Scenario: An external SSH host identity changes
+
+- **WHEN** a publication endpoint presents an unknown or changed SSH host key
+- **THEN** publication fails closed before modifying the external repository
 
 ### Requirement: A channel is advertised only after real rehearsal
 

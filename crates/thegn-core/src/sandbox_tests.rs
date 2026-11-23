@@ -1751,6 +1751,27 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
             "network_block",
             Box::new(|s| s.network_block.push("example.com".into())),
         ),
+        ("network_host", Box::new(|s| s.network = Network::Host)),
+        (
+            "egress",
+            Box::new(|s| {
+                s.egress = Some(crate::egress::plan::EgressPlan {
+                    lease: crate::egress::plan::LeaseId([0; 16]),
+                    path: crate::egress::plan::EgressPath::External,
+                    endpoint: crate::egress::plan::ProxyEndpoint::Relay {
+                        host: "proxy.invalid".into(),
+                        port: 443,
+                    },
+                    auth: crate::egress::plan::ProxyAuth::Token {
+                        lease_user: "test".into(),
+                        token: crate::egress::plan::LeaseToken::new("synthetic".into()),
+                    },
+                    env: Vec::new(),
+                    binds: Vec::new(),
+                    policy_digest: [0; 32],
+                });
+            }),
+        ),
         (
             "oci_runtime",
             Box::new(|s| s.oci_runtime = Some("runsc".into())),
@@ -1790,7 +1811,6 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
             "add_capabilities",
             Box::new(|s| s.add_capabilities.push("NET_ADMIN".into())),
         ),
-        ("host_network", Box::new(|s| s.network = Network::Host)),
         (
             "cpu_total_off",
             Box::new(|s| s.limits.cpu_total = Some("off".into())),
@@ -2580,6 +2600,7 @@ fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_famil
         let alias = td.path().join("provider-cache-alias");
         std::fs::create_dir(&target).unwrap();
         symlink(&target, &alias).unwrap();
+        let canonical_target = std::fs::canonicalize(&target).unwrap();
         for backend in [Backend::Bwrap, Backend::Systemd, Backend::Docker] {
             let mut candidate = spec(backend);
             candidate.mounts.push(Mount {
@@ -2594,7 +2615,7 @@ fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_famil
                 .iter()
                 .find(|mount| mount.dest == "/work/cache-through-alias")
                 .unwrap();
-            assert_eq!(mount.host, target.to_string_lossy().as_ref());
+            assert_eq!(mount.host, canonical_target.to_string_lossy().as_ref());
             assert_eq!(mount.dest, "/work/cache-through-alias");
         }
         let mut remote = spec(Backend::Bwrap);

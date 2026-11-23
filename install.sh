@@ -587,6 +587,11 @@ if ((dry_run)); then
   exit 0
 fi
 
+if ((macos_app)) && { ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 9))'; }; then
+  echo "install.sh: Python 3.9 or newer is required for safe macOS app-bundle staging; install Python 3.9+ before retrying" >&2
+  exit 1
+fi
+
 acquire_install_lock
 
 preflight

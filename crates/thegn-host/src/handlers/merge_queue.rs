@@ -1351,7 +1351,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         Ok(admission) => admission,
         Err(error) => return DriveMsg::Failed(format!("land: {error}")),
     };
-    let (branch, target, outcome) = match crate::cmd::land::land_branch_pinned(
+    let pulled = match crate::cmd::land::land_branch_pinned_pulled(
         cfg,
         Path::new(wt),
         Some(&admission.candidate_oid),
@@ -1359,6 +1359,12 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         Ok(r) => r,
         Err(e) => return DriveMsg::Failed(format!("land: {e}")),
     };
+    let crate::cmd::land::PulledLand {
+        branch,
+        target,
+        outcome,
+        notes,
+    } = pulled;
     let record = |status: MqStatus,
                   oid: Option<&str>,
                   conflict_paths: Option<&str>,
@@ -1430,8 +1436,10 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 });
             let mut out = landed_outcome_after_record(write, &branch, &target, &old_oid, &commit);
             if !out.bookkeeping_failed.is_empty() {
+                out.warnings.extend(notes);
                 return DriveMsg::Done(out);
             }
+            out.warnings.extend(notes);
             if let (Ok(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
                 out.warnings.extend(
                     crate::merge_lifecycle::apply_landed_reported(
@@ -1465,14 +1473,13 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     )
                     .map_err(|error| error.to_string())
                 });
-            let notes = if write.is_ok() {
-                lifecycle(LifecycleEvent::Landed, &branch)
-            } else {
-                Vec::new()
-            };
+            let mut warnings = notes;
+            if write.is_ok() {
+                warnings.extend(lifecycle(LifecycleEvent::Landed, &branch));
+            }
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
-                warnings: notes,
+                warnings,
                 persistence_errors: write.err().into_iter().collect(),
                 ..DriveOutcome::default()
             })
@@ -1983,8 +1990,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let cfg = Config::default();
         let notify = crate::notify::NotifyState::new(
             cfg.notifications.clone(),
@@ -2027,8 +2033,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let cfg = Config::default();
         let notify = crate::notify::NotifyState::new(
             cfg.notifications.clone(),
@@ -2100,8 +2105,7 @@ mod tests {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
-        let (waker, _master, _terminal) =
-            crate::platform::sound_process::test_support::test_waker();
+        let (waker, _fixture) = crate::platform::sound_process::test_support::test_waker();
         let cfg = Config::default();
         let notify = crate::notify::NotifyState::new(
             cfg.notifications.clone(),
