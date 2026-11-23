@@ -7,6 +7,15 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.121] — 2026-11-23
+
+### Fixed
+
+- Release uploads resolve the draft release by listing releases instead of the
+  by-tag endpoint, which never returns a draft, so a release run no longer
+  stops at the upload step. alpha.120 was tagged but never published because
+  of this; alpha.121 carries the same changes.
+
 ## [0.1.0-alpha.120] — 2026-11-23
 
 ### Added
@@ -4178,7 +4187,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.120...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.121...HEAD
+[0.1.0-alpha.121]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.120...v0.1.0-alpha.121
 [0.1.0-alpha.120]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.119...v0.1.0-alpha.120
 [0.1.0-alpha.119]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.118...v0.1.0-alpha.119
 [0.1.0-alpha.118]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.117...v0.1.0-alpha.118

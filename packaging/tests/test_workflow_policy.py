@@ -391,6 +391,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--paginate --slurp", helper)
         self.assertIn('gh release upload "$tag" "${upload_assets[@]}"', helper)
         self.assertNotIn("--clobber", helper)
+        # The by-tag REST endpoint 404s for drafts; the helper only uploads to a
+        # draft, so it must resolve the release ID through `gh release view`.
+        self.assertNotIn("releases/tags/", helper)
+        self.assertIn('gh release view "$tag" --json databaseId', helper)
         for job_name, step_name in upload_steps:
             with self.subTest(job=job_name, step=step_name):
                 step = next(

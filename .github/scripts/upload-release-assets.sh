@@ -13,7 +13,10 @@ export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:?GITHUB_TOKEN is required}}"
 
 "$python" packaging/release.py require-draft \
   --is-draft "$(gh release view "$tag" --json isDraft --jq .isDraft)"
-release_id="$(gh api "repos/$repository/releases/tags/$tag" --jq .id)"
+# Resolve the ID through `gh release view`, never the by-tag REST endpoint: it
+# returns 404 for a draft, and this helper only ever uploads to a draft
+# (the alpha.120 release run 45238710959 failed here).
+release_id="$(gh release view "$tag" --json databaseId --jq .databaseId)"
 [[ $release_id =~ ^[0-9]+$ ]] || {
   echo "::error::could not resolve the draft release ID"
   exit 1
