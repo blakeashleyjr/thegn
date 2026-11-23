@@ -29,12 +29,19 @@
 # (THE-311/313 process-group kill, reap and close tests need `sh`, `sleep` and
 # /proc). No production bridge logic is cfg'd; per-OS kill/reap lives in
 # plugin/proc.rs.
+# calendar/command_tests.rs and inbox/command_tests.rs: only `#[cfg(unix)]` on
+# the process-group kill test (and the calendar test's pid-file helper). They
+# spawn `sh` with a backgrounded child and probe it with `libc::kill(pid, 0)`;
+# `libc` is a unix-only dependency here, so ungated they break the Windows
+# test-target build (CI run 45091904082). No production logic is cfg'd.
 bridge/mod.rs
+calendar/command_tests.rs
 calendar/tests.rs
 control/client.rs
 git/background_commit.rs
 git/commit.rs
 ipc.rs
+inbox/command_tests.rs
 issue/gh_run.rs
 issue/github.rs
 plugin/proc.rs
