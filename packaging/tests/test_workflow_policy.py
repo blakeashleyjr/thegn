@@ -1865,6 +1865,9 @@ class WorkflowPolicyTests(unittest.TestCase):
                     names.extend((f"{stem}.{extension}", f"{stem}{archive['checksum_suffix']}"))
             completions = f"thegn-{tag}-completions.tar.gz"
             names.extend((completions, f"{completions}.sha256"))
+            # The package job also downloads the upload broker's generation
+            # record (see "Download this tag's source assets").
+            names.append(f"thegn-{tag}-release.json")
             trusted: dict[str, str] = {}
             for name in names:
                 content = f"fixture:{name}".encode()

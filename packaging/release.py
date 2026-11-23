@@ -846,6 +846,10 @@ def verify_downloaded_assets(
             required.extend(_asset_names(manifest, tag, target))
     completions_name = f"thegn-{tag}-completions.tar.gz"
     required.extend((completions_name, f"{completions_name}.sha256"))
+    # The package job downloads the upload broker's generation record next to
+    # the archives (its draft-generation check reads it), and the broker's
+    # trusted digests cover it, so it is part of the exact downloaded set.
+    required.append(f"thegn-{tag}-release.json")
     required = sorted(required)
 
     found: set[str] = set()

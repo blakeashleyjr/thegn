@@ -7,6 +7,15 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.122] — 2026-11-23
+
+### Fixed
+
+- The release package step accepts the upload step's generation record among
+  the downloaded assets, so packaging no longer stops on an "unexpected" file.
+  alpha.120 and alpha.121 were tagged but never published; alpha.122 carries
+  their changes.
+
 ## [0.1.0-alpha.121] — 2026-11-23
 
 ### Fixed
@@ -4187,7 +4196,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.121...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.122...HEAD
+[0.1.0-alpha.122]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.121...v0.1.0-alpha.122
 [0.1.0-alpha.121]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.120...v0.1.0-alpha.121
 [0.1.0-alpha.120]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.119...v0.1.0-alpha.120
 [0.1.0-alpha.119]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.118...v0.1.0-alpha.119

@@ -622,6 +622,10 @@ class TrustedDigestTests(unittest.TestCase):
                 names.extend(release._asset_names(self.manifest, self.tag, target))
         completions = f"thegn-{self.tag}-completions.tar.gz"
         names.extend((completions, f"{completions}.sha256"))
+        # Mirror the package job's download patterns exactly: archives,
+        # checksums AND the upload broker's generation record. The alpha.121
+        # release failed because this set and the verifier's disagreed.
+        names.append(self.record_path.name)
         for name in names:
             (download / name).write_bytes((self.assets / name).read_bytes())
         return download, sorted(names)
