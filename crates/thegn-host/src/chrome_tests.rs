@@ -604,6 +604,48 @@ fn masthead_chip_hit_round_trips_through_chip_at() {
     }
 }
 
+/// THE-2480: the separator grab bands are column-only tests, and the sidebar's
+/// width puts its separator under the Work/Observe chips — the press armed a
+/// resize and swallowed the click. A chip cell must never be grabbable, at any
+/// width, and every chip cell must still resolve to its tab.
+#[test]
+fn masthead_chip_cells_never_arm_a_separator_grab_at_any_width() {
+    use crate::drag_hit::{SepSide, row_in_band, sep_grab};
+    let model = chip_model(&["work", "Observe"], 0);
+    for cols in [60usize, 80, 100, 120, 160, 200] {
+        let chrome = layout::compute(cols, 30, true, true);
+        let spans = crate::masthead::masthead_chip_spans(&model, &chrome);
+        assert!(!spans.is_empty(), "chips placed at cols={cols}");
+        for (idx, r) in &spans {
+            for x in r.x..r.x + r.cols {
+                assert_eq!(crate::masthead::chip_at(&spans, x, r.y), Some(*idx));
+                let left = sep_grab(chrome.sep_left, SepSide::Sidebar, x)
+                    && row_in_band(chrome.sidebar.map(|s| (s.y, s.rows)), r.y);
+                let right = sep_grab(chrome.sep_right, SepSide::Panel, x)
+                    && row_in_band(chrome.panel.map(|p| (p.y, p.rows)), r.y);
+                assert!(
+                    !left && !right,
+                    "chip {idx} cell x={x} grabbable at cols={cols}"
+                );
+            }
+        }
+        // The separators still grab inside the column band.
+        if let (Some(sep), Some(sb)) = (chrome.sep_left, chrome.sidebar) {
+            assert!(
+                sep_grab(Some(sep), SepSide::Sidebar, sep)
+                    && row_in_band(Some((sb.y, sb.rows)), sb.y)
+            );
+        }
+    }
+    // The exact collision: a sidebar whose separator sits under the first chip.
+    let chrome = layout::compute(160, 30, true, true);
+    let spans = crate::masthead::masthead_chip_spans(&model, &chrome);
+    let first = &spans[0].1;
+    let sep = Some(first.x + 1);
+    assert!(sep_grab(sep, SepSide::Sidebar, first.x + 1));
+    assert!(!row_in_band(chrome.sidebar.map(|s| (s.y, s.rows)), first.y));
+}
+
 #[test]
 fn masthead_sidebar_chip_appears_only_when_hidden() {
     use crate::layout::SidebarMode;
