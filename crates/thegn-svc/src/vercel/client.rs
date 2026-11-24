@@ -357,6 +357,7 @@ impl VercelClient {
 
     /// Pin the interactive WebSocket ticket host to `suffixes` (empty ⇒ the
     /// built-in defaults).
+    #[must_use]
     pub fn with_interactive_hosts(mut self, suffixes: Vec<String>) -> Self {
         self.interactive_hosts = suffixes;
         self

@@ -100,6 +100,7 @@ impl<'a> EgressInputs<'a> {
     }
 
     /// The launch's egress plan (`SandboxSpec.egress`), if any.
+    #[must_use]
     pub fn with_plan(self, plan: Option<&'a EgressPlan>) -> Self {
         EgressInputs { plan, ..self }
     }

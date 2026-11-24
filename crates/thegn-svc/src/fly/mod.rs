@@ -251,6 +251,7 @@ impl FlyProvider {
         &self.spec
     }
 
+    #[must_use]
     pub fn with_owner(mut self, owner: String) -> Self {
         self.owner = Some(owner);
         self
@@ -260,11 +261,13 @@ impl FlyProvider {
         self.owner.as_deref()
     }
 
+    #[must_use]
     pub fn with_credential_ref(mut self, credential_ref: &str) -> Self {
         self.credential_ref = Some(credential_ref.to_owned());
         self
     }
 
+    #[must_use]
     pub fn with_destroy_confirm(mut self, budget: Duration, poll: Duration) -> Self {
         self.destroy_budget = budget;
         self.destroy_poll = poll;
