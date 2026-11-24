@@ -4971,7 +4971,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 116);
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, issue_id TEXT);

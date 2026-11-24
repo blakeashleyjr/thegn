@@ -77,12 +77,7 @@ pub(crate) struct PrStep<'a> {
 /// outlives the notification that announced it. Best-effort: the refusal is
 /// diagnostic state, and the status write + `step` stand on their own.
 fn record_admission_refusal(db: &Db, item: &PrItem, head: &str, refusal: &AgentAdmissionRefusal) {
-    if let Err(error) = db.record_pr_agent_refusal(
-        &item.key,
-        item.last_head_oid.as_deref(),
-        Some(head),
-        refusal,
-    ) {
+    if let Err(error) = db.record_pr_agent_refusal(&item.key, Some(head), Some(head), refusal) {
         tracing::debug!(%error, "could not persist the PR-agent admission refusal");
     }
 }
@@ -816,10 +811,6 @@ pub(crate) fn drive_queue(
                     thegn_core::pr_queue::admit_prepared_dispatch(kind, true, &isolation)
                 {
                     let reason = refusal.to_string();
-                    // Record the refusal against the head the row still carries,
-                    // then let the status write below store the new head; the
-                    // refusal's own head column keeps it from being cleared.
-                    record_admission_refusal(db, &item, &head, &refusal);
                     // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     let _ = db.update_pr_status(
                         &item.key,
@@ -828,6 +819,9 @@ pub(crate) fn drive_queue(
                         Some(&reason),
                         Some(&head),
                     );
+                    // After the status write the row carries `head` (a CI rerun
+                    // reservation may already have moved it), so the fence matches.
+                    record_admission_refusal(db, &item, &head, &refusal);
                     step(PrqStatus::BlockedCi.as_str(), &reason, &mut progress);
                     out.blocked.push(item.number);
                     continue;
@@ -855,7 +849,6 @@ pub(crate) fn drive_queue(
                     &thegn_core::pr_queue::IsolationAdmission::Admitted,
                 ) {
                     let reason = refusal.to_string();
-                    record_admission_refusal(db, &item, &head, &refusal);
                     if let Err(error) = db.update_pr_status(
                         &item.key,
                         PrqStatus::for_blocker(&blocker).as_str(),
@@ -865,6 +858,7 @@ pub(crate) fn drive_queue(
                     ) {
                         tracing::debug!(%error, "could not persist invalid PR prompt refusal");
                     }
+                    record_admission_refusal(db, &item, &head, &refusal);
                     out.warnings.push(format!("PR #{}: {reason}", item.number));
                     out.blocked.push(item.number);
                     step(

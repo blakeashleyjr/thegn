@@ -369,6 +369,12 @@ fn consider_candidate_with_forge(
         }
         _ => item,
     };
+    // The head an early refusal is pinned to: the row's own, else the one this CI
+    // run failed on, so a later same-head status write keeps the refusal.
+    let early_head: Option<String> = item.last_head_oid.clone().or_else(|| {
+        let sha = entry.head_sha.trim();
+        (!sha.is_empty()).then(|| sha.to_owned())
+    });
     let row_status = match PrqStatus::parse(&item.status) {
         Some(status)
             if !status.is_settled()
@@ -377,19 +383,14 @@ fn consider_candidate_with_forge(
             status
         }
         Some(status) => {
-            let refusal = AgentAdmissionRefusal::RowState(status.as_str().to_owned());
+            // Not recorded as a typed refusal: the row's own status already says
+            // this, and recording would overwrite the row's actionable detail
+            // (merge refusal, authorship hold) with generic wording.
             notify(format!(
                 "CI autofix for PR #{} held: PR queue row is `{}`; agent dispatch refused",
                 item.number,
                 status.as_str()
             ));
-            record_refusal(
-                db,
-                &item.key,
-                item.last_head_oid.as_deref(),
-                item.last_head_oid.as_deref(),
-                &refusal,
-            );
             return;
         }
         None => {
@@ -402,7 +403,7 @@ fn consider_candidate_with_forge(
                 db,
                 &item.key,
                 item.last_head_oid.as_deref(),
-                item.last_head_oid.as_deref(),
+                early_head.as_deref(),
                 &refusal,
             );
             return;
@@ -439,7 +440,7 @@ fn consider_candidate_with_forge(
             db,
             &item.key,
             item.last_head_oid.as_deref(),
-            item.last_head_oid.as_deref(),
+            early_head.as_deref(),
             &refusal,
         );
         return;

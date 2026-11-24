@@ -221,6 +221,7 @@ repo other people push to:
   `admission_refusal` object (or null), and the section shows it beside the row.
   It is cleared when the branch's head changes (the reason described that head),
   when an agent is finally admitted, and when the row is re-queued or rebound.
+  Restart the daemon after upgrading (schema v117 adds the refusal columns).
 
 After each agent run thegn also compares the PR head with the head the agent
 started on and says what happened in the pass warnings: the agent changed
