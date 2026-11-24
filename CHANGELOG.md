@@ -9,19 +9,51 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.127] — 2026-11-24
 
+Restart the daemon after upgrading: schema v117 adds durable CI-autofix and
+PR-agent refusal reasons.
+
+### Added
+
+- Sprites selected-job attempts can be cancelled, interrupted attempts are
+  reconciled without ever re-running a command whose dispatch is unknown, and
+  a running attempt can be reattached.
+- A fixture-tested Vercel Sandbox selected-job executor for pinned build and
+  test attempts, with team/project identity checks, a lifetime ceiling and a
+  spend envelope.
+- The MCP server offers `agent_dispatch` for write-scoped native agent launches
+  with a redacted audit record. It is never offered to, or run for, a caller
+  using a scoped control token (the Lead).
+- `wt disk --lanes` reports build-lane sizes, owners and whether each lane can
+  be reclaimed; lanes with unresolvable ownership stay explicit.
+- Terminal search rows say which tab and program a line came from and how old
+  it is; Enter jumps to the matched line and `n`/`N` step through matches.
+- PR queue and CI-autofix refusals are stored with their reason.
+- Preview can open the selected development app with its own hot reload.
+- A Windows sandbox wire-protocol crate (`thegn-sandbox-proto`) and the
+  programme release-channel feature flags.
+
 ### Changed
 
 - Terminal history search scores matches on a worker thread, streams results
   as they are found, and keeps earlier results when you press Enter before the
   search finishes; the event loop no longer stalls on long histories.
-- macOS no longer offers the rootful podman sandbox backend, and the gate is
-  tested through the real resolver.
+- `oci_runtime` is passed as `--runtime` only to podman and docker; other OCI
+  engines say the value is ignored, and doctor still probes the runtime for an
+  `auto` backend.
+- The libkrun runtime probe checks read-write access to `/dev/kvm` on the host
+  that runs the engine, and only for local Linux placements.
+- Remote bwrap, systemd and provider OCI panes no longer put host-sourced
+  secrets on the command line; ssh and Kubernetes OCI creates send them over
+  stdin.
+- macOS no longer offers the rootful podman sandbox backend.
 - The seven crates without a package description now have one.
 
 ### Fixed
 
 - Closing the last pane of a nested stack removes the emptied stack from its
   parent split instead of leaving a blank region.
+- The GPU fallback sparkline keeps its selected interval.
+- Broken intra-doc links that failed the CI doc job.
 - Two load-sensitive host tests wait on observable conditions instead of
   fixed sleeps.
 - The Daytona config example no longer names an unverified CLI command, and
