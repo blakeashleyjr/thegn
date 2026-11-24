@@ -798,9 +798,13 @@ impl SearchOverlay {
             let count_str = if matches.is_empty() {
                 "no results".to_string()
             } else if engine.truncated() {
-                // The cap hid hits: say so and point at both ways to narrow,
-                // rather than showing a count that looks complete.
-                "too many results; narrow query or scope".to_string()
+                // The cap hid hits: keep the position but mark the count as a
+                // lower bound, so it never looks complete.
+                format!(
+                    "{} of {}+ · too many results",
+                    selected_idx + 1,
+                    matches.len()
+                )
             } else {
                 format!("{} of {}", selected_idx + 1, matches.len())
             };
@@ -811,8 +815,11 @@ impl SearchOverlay {
                 count_str
             };
             let mode_hint = "Alt+c Aa  Alt+w ab  Alt+r .*  Alt+f fuzzy  Ctrl+r recent";
-            let footer = Line::split(
-                vec![
+            // The navigation legend keeps its full width; the right cluster
+            // (count, then the toggle hint) truncates from its tail instead.
+            let footer = Line::SplitMinLeft {
+                min_l: 42,
+                l: vec![
                     seg(Tok::Slot(S::Ghost2), "↑↓"),
                     seg(Tok::Slot(S::Ghost), " move   "),
                     seg(Tok::Slot(S::Ghost2), "↵"),
@@ -822,12 +829,12 @@ impl SearchOverlay {
                     seg(Tok::Slot(S::Ghost2), "esc"),
                     seg(Tok::Slot(S::Ghost), " dismiss"),
                 ],
-                vec![
+                r: vec![
                     seg(Tok::Slot(S::Ghost3), count_str),
                     sp(2),
                     seg(Tok::Slot(S::Ghost2), mode_hint),
                 ],
-            );
+            };
             seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
         }
     }
@@ -1927,9 +1934,10 @@ mod tests {
         let mut ov = SearchOverlay::new(SearchScope::Pane(1), 1, 2);
         typed(&mut ov, "hit", &srcs);
         let out = draw(&ov, 100, 30);
+        assert!(out.contains("1 of 2+ · too many results"), "{out}");
         assert!(
-            out.contains("too many results; narrow query or scope"),
-            "{out}"
+            out.contains("Tab scope") && out.contains("esc dismiss"),
+            "the navigation keys stay visible: {out}"
         );
         assert!(
             out.contains("Alt+c Aa"),

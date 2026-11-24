@@ -73,8 +73,8 @@ output yet shows "no history yet".
 
 `[search] max_results` caps how many hits are collected — raise it for a
 big scrollback, lower it if searching feels heavy. When the cap is reached
-the footer says there are too many results and asks you to narrow the query
-or scope. See [[configuration]].
+the footer shows `N of M+ · too many results` — the count is a lower bound, so
+narrow the query or scope. See [[configuration]].
 
 ## File search
 
