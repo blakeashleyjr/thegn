@@ -854,7 +854,12 @@ pub fn parse_codex_rollup(bytes: &[u8], now: i64) -> Option<AccountUsage> {
         }
         match payload.get("rate_limits") {
             Some(rl) if !rl.is_null() => {
-                if let Ok(parsed) = serde_json::from_value::<CodexRateLimits>(rl.clone()) {
+                // Codex also emits snapshots for other buckets (e.g. `premium`)
+                // whose windows are all null; those must not displace the real
+                // `codex` snapshot, so only a snapshot with a window is kept.
+                if let Ok(parsed) = serde_json::from_value::<CodexRateLimits>(rl.clone())
+                    && (parsed.primary.is_some() || parsed.secondary.is_some())
+                {
                     latest = Some(parsed);
                 }
             }
@@ -865,6 +870,12 @@ pub fn parse_codex_rollup(bytes: &[u8], now: i64) -> Option<AccountUsage> {
     let mut windows = Vec::new();
     for (label, w) in [("session", &rl.primary), ("weekly", &rl.secondary)] {
         if let Some(w) = w {
+            // A lone primary window spanning a week is the weekly limit.
+            let label = if w.window_minutes.is_some_and(|m| m >= 7 * 24 * 60) {
+                "weekly"
+            } else {
+                label
+            };
             windows.push(UsageWindow::with_len(
                 label,
                 w.used_percent.unwrap_or(0.0) as f32,
@@ -1809,6 +1820,21 @@ mod tests {
         assert_eq!(u.windows[0].used_percent, 9.0); // last line won
         assert_eq!(u.windows[0].resets_at, Some(now + 1800));
         assert_eq!(u.windows[1].resets_at, Some(now + 275_281));
+    }
+
+    #[test]
+    fn codex_ignores_trailing_null_window_bucket_snapshot() {
+        let now = 1_000;
+        let blob = concat!(
+            r#"{"payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":100.0,"window_minutes":10080,"resets_at":1795642834},"secondary":null,"plan_type":"pro"}}}"#,
+            "\n",
+            r#"{"payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null,"credits":{"has_credits":false},"plan_type":"pro"}}}"#,
+            "\n"
+        );
+        let u = parse_codex_rollup(blob.as_bytes(), now).expect("parsed");
+        assert_eq!(u.windows.len(), 1);
+        assert_eq!(u.windows[0].label, "weekly");
+        assert_eq!(u.windows[0].used_percent, 100.0);
     }
 
     #[test]
