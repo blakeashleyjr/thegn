@@ -903,6 +903,28 @@ pub(crate) fn drain_specs(
                     ctx.loading_state
                         .advance_to_shell(tab_key.clone(), &backend);
                 }
+                // Spec resolution landed (THE-213): the pre-fork phase card
+                // moves past "resolving environment" — "starting sandbox"
+                // only for a real local sandbox wrapper (bwrap/systemd-run
+                // style); a host shell and every remote placement
+                // (ssh/provider/k8s) read "starting shell". The fork below
+                // then advances the tracker to the shell-wait phase,
+                // pane-keyed.
+                let sandboxed = specs.first().is_some_and(|(_, spec)| {
+                    !spec.remote && !matches!(spec.backend.as_str(), "host" | "none" | "")
+                });
+                let phase = if sandboxed {
+                    crate::spawn_progress::Phase::StartingSandbox
+                } else {
+                    crate::spawn_progress::Phase::StartingShell
+                };
+                for (leaf, _) in &specs {
+                    if let Some(tracker) =
+                        ctx.panes.spawn_pending.get_mut(&(name.clone(), ti, *leaf))
+                    {
+                        tracker.advance(phase, std::time::Instant::now());
+                    }
+                }
                 if is_active {
                     *ctx.dirty = true;
                 }
@@ -947,6 +969,16 @@ pub(crate) fn drain_specs(
                 // Mark the step that was actually running as failed (the live
                 // plan's rows stay intact) with the error as its sub-line.
                 ctx.loading_state.fail_active(tab_key.clone(), &err_detail);
+                // THE-213: the pre-fork phase cards carry the reason. The
+                // leaves stay missing until a retry re-kicks and overwrites
+                // the tracker, so the card is the only visible trace.
+                for leaf in &target_leaves {
+                    if let Some(tracker) =
+                        ctx.panes.spawn_pending.get_mut(&(name.clone(), ti, *leaf))
+                    {
+                        tracker.fail(err_detail.as_str(), std::time::Instant::now());
+                    }
+                }
                 match origin {
                     SpecOrigin::Materialize => {
                         if is_active {
@@ -1050,9 +1082,10 @@ pub(crate) fn drain_specs(
                 let overflow = fit.saturating_sub(plan.assignments.len() + plan.surplus.len());
                 (plan.assignments, plan.surplus, overflow)
             };
-        if let Err(e) = ctx.panes.materialize_with_specs(
+        if let Err(e) = ctx.panes.materialize_with_specs_keyed(
             ctx.current_config,
             tab,
+            Some(&tab_key),
             &wt,
             &specs,
             ctx.center,
@@ -1078,8 +1111,16 @@ pub(crate) fn drain_specs(
             ctx.model.status = format!("Pane spawn failed: {e}");
             ctx.loading_remote.insert(tab_key.clone(), tab_remote);
             // The shell step is the active one after `advance_to_shell`.
+            let spawn_detail = format!("{e}");
             ctx.loading_state
-                .fail_active(tab_key.clone(), &format!("{e}"));
+                .fail_active(tab_key.clone(), &spawn_detail);
+            // THE-213: the fork failed, so the leaves stay missing and their
+            // pending cards turn terminal with the spawn error.
+            for (leaf, _) in &specs {
+                if let Some(tracker) = ctx.panes.spawn_pending.get_mut(&(name.clone(), ti, *leaf)) {
+                    tracker.fail(spawn_detail.as_str(), std::time::Instant::now());
+                }
+            }
             // A spawn (openpty/fork) failure — EMFILE/ENOMEM, or a vanished
             // sandbox-wrapper binary — leaves the leaf missing and un-remapped.
             // Mark the tab failed (and dormant when active) exactly like the

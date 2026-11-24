@@ -21,6 +21,7 @@ use tokio::task;
 
 use crate::handlers::provision::{ProvisionTx, SpecBatch, SpecError, spec_err};
 use crate::loading::{SpecOrigin, provision_load_steps, seed_materialize_steps};
+use crate::spawn_progress::SpawnProgress;
 
 type Key = (String, usize);
 
@@ -32,6 +33,10 @@ pub(crate) struct MaterializeCtx<'a> {
     pub loading_retired: &'a mut HashSet<Key>,
     pub loading_remote: &'a mut HashMap<Key, bool>,
     pub loading_state: &'a mut crate::loading::track::LoadingTracker,
+    /// Per-leaf spawn-progress trackers (THE-213), keyed by `(group, tab,
+    /// still-missing leaf id)`: seeded here at the kick, re-keyed to the
+    /// pane id at the fork.
+    pub spawn_pending: &'a mut HashMap<crate::spawn_progress::PendingKey, SpawnProgress>,
     pub dirty: &'a mut bool,
 }
 
@@ -113,6 +118,19 @@ pub(crate) fn maybe_materialize(
         }
         *ctx.dirty = true;
     }
+    // Seed a spawn-progress tracker (THE-213) for each missing leaf: the
+    // pre-fork card (phase + elapsed). The fork (`materialize_with_specs`)
+    // moves these into `panes.spawn_progress` pane-keyed; the pane's first
+    // output retires them. A re-kick after a failure overwrites the tracker,
+    // so a retry never inherits the old phase. Seeded for quiet splits too —
+    // an empty new card is exactly the blank pane this card explains — and
+    // the kick dirties so the very next frame's derive can raise the ticker.
+    let kicked = std::time::Instant::now();
+    for leaf in &missing {
+        ctx.spawn_pending
+            .insert((name.to_string(), ti, *leaf), SpawnProgress::kicked(kicked));
+    }
+    *ctx.dirty = true;
     let cfg = cfg.clone();
     let tx = tx.clone();
     let wt = path.to_string();

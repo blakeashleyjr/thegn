@@ -520,6 +520,14 @@ pub(crate) enum RefreshKind {
     /// contract — and a straggler tick after the splash cleared leaves damage
     /// empty, so `render_plan` still Skips.
     SplashTick,
+    /// A spawn-progress tick ([`crate::spawn_progress::SpawnTicker`]): merge
+    /// the sampler's latest `/proc` payload into the per-pane trackers and
+    /// repaint the cards while any pane waits for its first shell prompt
+    /// (THE-213). The ticker thread exists ONLY while a pane is waiting —
+    /// the same 0%-idle contract — and a straggler tick after the last
+    /// tracker retired derives an unchanged hint map, so the frame is a
+    /// no-op.
+    SpawnProgressTick,
     /// The transient in-app projection of a routed notification — sent from an
     /// off-loop dispatch site ([`crate::notify::record`]) when the routing
     /// decision authorizes an in-app toast (`RouteDecision.toast`). The loop
