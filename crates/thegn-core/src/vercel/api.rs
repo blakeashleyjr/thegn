@@ -503,8 +503,9 @@ pub fn interactive_host_allowed(host: &str, suffixes: &[String]) -> bool {
 /// response (`{"sandbox": …, "session": …}`, or a bare sandbox carrying its
 /// own `session`). `Ok(None)` when there is no `session` object. Each field is
 /// read from the session, falling back to the sandbox (and its `resources`
-/// for `vcpus`/`memory`); every field is optional. The sandbox CPU figure is
-/// cumulative across sessions. A non-object response is an error.
+/// for `vcpus`/`memory`); every field is optional. CPU usage is session-scoped
+/// because the sandbox total is cumulative across sessions. A non-object
+/// response is an error.
 pub fn parse_session_usage(
     v: &serde_json::Value,
 ) -> Result<Option<crate::vercel::usage::SessionUsage>, ApiParseError> {
@@ -533,12 +534,7 @@ pub fn parse_session_usage(
                 .filter(|x| !x.is_null())
         })
     };
-    let active_cpu_ms = match session.get("activeCpuDurationMs") {
-        Some(value) if !value.is_null() => value.as_u64(),
-        _ => sandbox
-            .get("totalActiveCpuDurationMs")
-            .and_then(|x| x.as_u64()),
-    };
+    let active_cpu_ms = session.get("activeCpuDurationMs").and_then(|x| x.as_u64());
     Ok(Some(crate::vercel::usage::SessionUsage {
         active_cpu_ms,
         memory_mb: resource("memory").and_then(|x| x.as_u64()),
@@ -1078,7 +1074,7 @@ mod tests {
         let u = parse_usage_with_sandbox_fallback(&fallback)
             .unwrap()
             .expect("a session");
-        assert_eq!(u.active_cpu_ms, Some(9000));
+        assert_eq!(u.active_cpu_ms, None);
         let none = json!({"sandbox": {"name": "tg-a"}, "session": {}});
         assert_eq!(
             parse_session_usage(&none).unwrap().unwrap().active_cpu_ms,
