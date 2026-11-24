@@ -57,7 +57,7 @@ open panes"); `--yes` skips the question and `--no-launch` skips reopening
 thegn. Run non-interactively without `--yes` it restarts nothing and prints the
 commands. Re-running it also repairs an instance whose daemon still runs a
 replaced binary, and `just update` (status) lists such daemons. Only processes of
-that instance (same state dir and binary) are stopped. See [[just-recipes]].
+that instance (same state dir and binary) are stopped. See `docs/just-recipes.md`.
 
 ## Launching the dev instance from a desktop entry
 
