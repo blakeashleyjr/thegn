@@ -62,7 +62,6 @@
 //! own thread.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -966,7 +965,7 @@ impl AttemptStore {
         let Some(root) = self.open(false)? else {
             return Ok(Vec::new());
         };
-        let mut records = Vec::new();
+        let mut records: Vec<AttemptRecord> = Vec::new();
         for name in root
             .file_names()
             .context("sprites job ledger: cannot list")?
