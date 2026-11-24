@@ -1051,9 +1051,20 @@ async fn an_ambiguous_create_is_left_pending_and_never_dispatches() {
     assert_eq!(mock.count("POST", "/cmd"), 0, "nothing was dispatched");
     let record = store.read(1).unwrap().unwrap();
     assert_eq!(record.state, AttemptState::Rejected);
-    assert_eq!(record.cleanup, Cleanup::Pending, "the sandbox may exist");
-    assert_eq!(record.spent_micros, None, "its whole cap stays committed");
-    assert_eq!(record.committed_micros(), record.reserved_micros);
+    // The provider's failed-create cleanup deletes the possibly-created
+    // sandbox by name; the executor then confirms it is gone before calling
+    // cleanup unnecessary.
+    assert!(
+        mock.requests()
+            .iter()
+            .any(|req| req.method == "DELETE" && req.path().starts_with("/v2/sandboxes/")),
+        "the cleanup delete ran"
+    );
+    assert_eq!(
+        record.cleanup,
+        Cleanup::NotNeeded,
+        "the sandbox was confirmed gone"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
