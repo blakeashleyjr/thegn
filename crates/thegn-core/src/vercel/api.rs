@@ -501,11 +501,14 @@ pub fn interactive_host_allowed(host: &str, suffixes: &[String]) -> bool {
 
 /// Parse the current session's usage from a `GET /v2/sandboxes/{name}`
 /// response (`{"sandbox": …, "session": …}`, or a bare sandbox carrying its
-/// own `session`). `Ok(None)` when there is no `session` object. Each field is
-/// read from the session, falling back to the sandbox (and its `resources`
-/// for `vcpus`/`memory`); every field is optional. CPU usage is session-scoped
-/// because the sandbox total is cumulative across sessions. A non-object
-/// response is an error.
+/// own `session`). `Ok(None)` when there is no `session` object. The
+/// timestamps are read from the session and fall back to the sandbox;
+/// `vcpus`/`memory` fall back further to the sandbox's `resources`; every
+/// field is optional. CPU is session-only: it comes from
+/// `session.activeCpuDurationMs` and never from the sandbox, whose total is
+/// cumulative across sessions, so a missing session CPU figure reads as
+/// unavailable (`None`, which [`crate::vercel::usage::session_accrual`] prices
+/// at zero). A non-object response is an error.
 pub fn parse_session_usage(
     v: &serde_json::Value,
 ) -> Result<Option<crate::vercel::usage::SessionUsage>, ApiParseError> {
@@ -544,14 +547,6 @@ pub fn parse_session_usage(
         started_at_ms: field("startedAt").and_then(|x| x.as_i64()),
         stopped_at_ms: field("stoppedAt").and_then(|x| x.as_i64()),
     }))
-}
-
-/// Parse usage from a complete sandbox response. The sandbox CPU figure is
-/// cumulative across sessions and fills a missing session figure.
-pub fn parse_usage_with_sandbox_fallback(
-    response: &serde_json::Value,
-) -> Result<Option<crate::vercel::usage::SessionUsage>, ApiParseError> {
-    parse_session_usage(response)
 }
 
 /// Snapshot ids: `[A-Za-z0-9_-]{1,128}` (they become URL path segments).
@@ -1071,9 +1066,7 @@ mod tests {
             "sandbox": {"name": "tg-a", "totalActiveCpuDurationMs": 9000},
             "session": {"activeCpuDurationMs": null}
         });
-        let u = parse_usage_with_sandbox_fallback(&fallback)
-            .unwrap()
-            .expect("a session");
+        let u = parse_session_usage(&fallback).unwrap().expect("a session");
         assert_eq!(u.active_cpu_ms, None);
         let none = json!({"sandbox": {"name": "tg-a"}, "session": {}});
         assert_eq!(

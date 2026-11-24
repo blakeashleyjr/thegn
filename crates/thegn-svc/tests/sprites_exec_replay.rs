@@ -188,6 +188,21 @@ fn handle_connection(mut stream: TcpStream, script: Script, requests: Arc<Mutex<
             return;
         }
     }
+
+    // Drain what the client sends until it closes. Closing a socket that still
+    // holds unread received data makes Linux answer with an RST instead of a
+    // FIN and can discard the frames just written, so the scripted exit frame
+    // used to be lost to that race. Reading to the close handshake (the client
+    // answers our Close, or drops after an exit frame) settles it first; the
+    // read timeout bounds a client that keeps the stream open.
+    if socket
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return;
+    }
+    while socket.read().is_ok() {}
 }
 
 fn requests(mock: &Mock) -> Vec<Request> {
@@ -319,11 +334,7 @@ async fn non_tty_replay_preserves_exit_after_stdout_stderr_and_normal_close() {
         .await
         .unwrap();
     assert_eq!(code, 7);
-    assert!(
-        output.starts_with("out\n[stderr, last 5 bytes]\n"),
-        "{output:?}"
-    );
-    assert!(output.ends_with("warn\n"), "{output:?}");
+    assert_eq!(output, "out\n\n[stderr, last 5 bytes]\nwarn\n");
     assert_eq!(
         requests(&mock).len(),
         1,
