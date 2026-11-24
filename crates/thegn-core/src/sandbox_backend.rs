@@ -63,10 +63,23 @@ fn pick_backend_with_notice(
     cfg: &SandboxConfig,
     placement: &Placement,
     mode: Fallthrough,
-    mut missing: impl FnMut(&SandboxConfig, &str),
+    missing: impl FnMut(&SandboxConfig, &str),
 ) -> Option<Backend> {
-    let suitable = |b: Backend| backend_suitable(b, placement);
-    let unsuitable_reason = |b: Backend| unsuitable_reason_on(b, placement, host_os());
+    pick_backend_with_notice_on(cfg, placement, mode, missing, host_os(), available)
+}
+
+/// [`pick_backend_with_notice`] with the host OS and the runtime probe injected,
+/// so a test can resolve "as a Mac would" and count probes.
+fn pick_backend_with_notice_on(
+    cfg: &SandboxConfig,
+    placement: &Placement,
+    mode: Fallthrough,
+    mut missing: impl FnMut(&SandboxConfig, &str),
+    os: HostOs,
+    mut probe: impl FnMut(&Placement, Backend) -> RuntimeProbe,
+) -> Option<Backend> {
+    let suitable = |b: Backend| backend_suitable_on(b, placement, os);
+    let unsuitable_reason = |b: Backend| unsuitable_reason_on(b, placement, os);
 
     // Open the resolve phase so the splash's "sandbox" step names what the
     // resolver is probing (a wedged runtime probe otherwise freezes an opaque
@@ -91,7 +104,7 @@ fn pick_backend_with_notice(
                         crate::progress::emit(crate::progress::SandboxPhase::ResolveProbe {
                             backend: b.label().to_string(),
                         });
-                        match available(placement, b) {
+                        match probe(placement, b) {
                             RuntimeProbe::Present => return Some(b),
                             RuntimeProbe::Unreachable => saw_unreachable = true,
                             RuntimeProbe::Absent => {}
@@ -148,7 +161,7 @@ fn pick_backend_with_notice(
                 crate::progress::emit(crate::progress::SandboxPhase::ResolveProbe {
                     backend: b.label().to_string(),
                 });
-                match available(placement, b) {
+                match probe(placement, b) {
                     RuntimeProbe::Present => return Some(b),
                     RuntimeProbe::Unreachable => saw_unreachable = true,
                     RuntimeProbe::Absent => {}
@@ -280,9 +293,12 @@ pub(crate) fn backend_runs_on(b: Backend, os: HostOs) -> bool {
         // backend is a plausible future addition; until something actually
         // implements and verifies it, the row under-promises rather than
         // declaring a cell nothing enforces (same doctrine as smolmachines).
-        Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol => {
-            os != HostOs::Windows
-        }
+        Backend::Podman | Backend::Docker | Backend::Smol => os != HostOs::Windows,
+        // `sudo -n podman` needs a host root-owned podman. On macOS podman runs
+        // rootless inside a Linux VM (`podman machine`), so there is no host root
+        // daemon to sudo into: not a candidate there (and Windows, per the above).
+        // Linux-only, so BSD/other hosts lose it too.
+        Backend::PodmanRootful => os == HostOs::Linux,
         // Linux host-namespace primitives.
         Backend::Bwrap | Backend::Systemd => os == HostOs::Linux,
         // Apple's `container` is macOS-native (its per-container Linux VM is what
@@ -1085,6 +1101,10 @@ mod tests {
             (Backend::Docker, HostOs::Linux, true),
             (Backend::Docker, HostOs::MacOs, true),
             (Backend::Podman, HostOs::MacOs, true),
+            (Backend::PodmanRootful, HostOs::Linux, true),
+            (Backend::PodmanRootful, HostOs::MacOs, false),
+            (Backend::PodmanRootful, HostOs::Windows, false),
+            (Backend::PodmanRootful, HostOs::Other, false),
             (Backend::Podman, HostOs::Windows, false),
             (Backend::Docker, HostOs::Windows, false),
             (Backend::Smol, HostOs::Windows, false),
@@ -1096,6 +1116,63 @@ mod tests {
                 "backend_runs_on({b:?}, {os:?}) should be {want}"
             );
         }
+    }
+
+    #[test]
+    fn podman_rootful_not_runnable_on_macos() {
+        assert!(!backend_runs_on(Backend::PodmanRootful, HostOs::MacOs));
+        assert!(!backend_suitable_on(
+            Backend::PodmanRootful,
+            &Placement::Local,
+            HostOs::MacOs
+        ));
+        assert_eq!(
+            unsuitable_reason_on(Backend::PodmanRootful, &Placement::Local, HostOs::MacOs),
+            " on macOS"
+        );
+        // Rootless podman and docker stay offered on a Mac.
+        assert!(backend_runs_on(Backend::Podman, HostOs::MacOs));
+        assert!(backend_runs_on(Backend::Docker, HostOs::MacOs));
+    }
+
+    #[test]
+    fn default_chain_on_macos_skips_rootful_without_probe() {
+        // Drive the real resolver as a Mac would, with a fake probe that records
+        // what it is asked about: rootful must never be probed (never spawns
+        // `sudo -n podman`), while rootless podman is.
+        let cfg = SandboxConfig::default();
+        let mut probed = Vec::new();
+        let picked = pick_backend_with_notice_on(
+            &cfg,
+            &Placement::Local,
+            Fallthrough::Chain,
+            |_, _| {},
+            HostOs::MacOs,
+            |_, b| {
+                probed.push(b);
+                RuntimeProbe::Absent
+            },
+        );
+        assert_eq!(picked, Some(Backend::None));
+        assert!(
+            !probed.contains(&Backend::PodmanRootful),
+            "podman-rootful must not be probed on macOS: {probed:?}"
+        );
+        assert!(probed.contains(&Backend::Podman), "{probed:?}");
+        // Linux still probes it.
+        let mut probed = Vec::new();
+        pick_backend_with_notice_on(
+            &cfg,
+            &Placement::Local,
+            Fallthrough::Chain,
+            |_, _| {},
+            HostOs::Linux,
+            |_, b| {
+                probed.push(b);
+                RuntimeProbe::Absent
+            },
+        );
+        assert!(probed.contains(&Backend::PodmanRootful), "{probed:?}");
     }
 
     #[test]
