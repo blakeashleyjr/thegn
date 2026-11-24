@@ -448,11 +448,13 @@ mod tests {
             }
             // `Ok` is an explicit release, `Err` means the sender was dropped:
             // both unblock the worker, so the value carries nothing.
-            let released = release_rx
+            match release_rx
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .recv();
-            drop(released);
+                .recv()
+            {
+                Ok(()) | Err(mpsc::RecvError) => {}
+            }
         });
         (wake, entered_rx, release_tx)
     }
