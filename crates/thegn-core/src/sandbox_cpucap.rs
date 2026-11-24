@@ -602,6 +602,8 @@ pub(crate) fn systemd_cap_args(limits: &SandboxLimits) -> Vec<String> {
     }
     if let Some(m) = limits.memory.as_deref().and_then(systemd_mem_arg) {
         v.extend(["-p".into(), format!("MemoryMax={m}")]);
+        // Interactive pane: an OOM kill takes the offender, not the shell.
+        v.extend(["-p".into(), "OOMPolicy=continue".into()]);
     }
     v
 }
@@ -1211,6 +1213,11 @@ fn cap_prefix_named(
             }
             if let Some(m) = mem {
                 v.extend(["-p".into(), format!("MemoryMax={m}")]);
+                // Panes keep their shell when one process is OOM-killed;
+                // background/gate jobs keep systemd's default (stop the unit).
+                if role == CapRole::Pane {
+                    v.extend(["-p".into(), "OOMPolicy=continue".into()]);
+                }
             }
             v.push("--".into());
             v.extend(argv);
@@ -1847,6 +1854,10 @@ mod tests {
             joined.contains("MemoryMax=4G"),
             "lowercase is normalized for systemd"
         );
+        assert!(
+            joined.contains("OOMPolicy=continue"),
+            "pane keeps its shell"
+        );
         // The original argv survives, after the `--` separator.
         let sep = out.iter().position(|a| a == "--").unwrap();
         assert_eq!(&out[sep + 1..], ["bwrap", "--", "/bin/sh"]);
@@ -1974,6 +1985,10 @@ mod tests {
             joined.contains("MemoryMax=4G"),
             "lowercase is normalized for systemd"
         );
+        assert!(
+            joined.contains("OOMPolicy=continue"),
+            "pane keeps its shell"
+        );
         // Disabled aggregate + no per-pane ⇒ no args at all.
         assert!(systemd_cap_args(&limits(None, None, Some("off"))).is_empty());
     }
@@ -2012,6 +2027,10 @@ mod tests {
         assert!(bg.contains("--slice=thegn.slice"), "still joins the slice");
         assert!(bg.contains("MemoryMax=24G"), "memory is per-process, kept");
         assert!(
+            !bg.contains("OOMPolicy"),
+            "background keeps the default policy: {bg}"
+        );
+        assert!(
             !bg.contains("CPUQuota="),
             "the per-pane cpu quota must not bound a background job: {bg}"
         );
@@ -2028,6 +2047,7 @@ mod tests {
         .join(" ");
         assert!(pane.contains("CPUQuota=800%"));
         assert!(pane.contains("MemoryMax=24G"));
+        assert!(pane.contains("OOMPolicy=continue"));
         assert!(pane.contains("--slice=thegn.slice"));
     }
 

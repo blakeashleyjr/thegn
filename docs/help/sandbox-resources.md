@@ -23,6 +23,9 @@ cargo-registry = "/root/.cargo/registry"
 node-modules   = "/root/.npm"
 ```
 
+A process that exceeds the per-pane `memory` cap is killed and the pane stays
+open (the shell survives the out-of-memory kill).
+
 Named volumes survive container recreation, so a package cache does not
 cold-start on every build.
 

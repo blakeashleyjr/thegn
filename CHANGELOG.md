@@ -7,6 +7,14 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.130] — 2026-11-24
+
+### Fixed
+
+- A process that exceeds the per-pane memory cap (`[sandbox.limits] memory`)
+  is killed on its own; the pane and its shell stay open. Before, systemd
+  stopped the whole pane unit and the pane closed.
+
 ## [0.1.0-alpha.129] — 2026-11-24
 
 ### Added
