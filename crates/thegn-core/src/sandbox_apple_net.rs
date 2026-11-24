@@ -271,8 +271,10 @@ mod tests {
     fn apple_ensure_arm_is_a_noop_off_apple() {
         // No child is spawned for a non-Apple spec (the test would fail loudly
         // if `container` were invoked here: the binary is absent on Linux).
-        let mut spec = SandboxSpec::default();
-        spec.backend = Backend::Podman;
+        let spec = SandboxSpec {
+            backend: Backend::Podman,
+            ..SandboxSpec::default()
+        };
         assert!(ensure_apple_internal_network(&spec).is_ok());
     }
 }

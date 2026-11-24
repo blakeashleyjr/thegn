@@ -50,10 +50,11 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > `isolation_floor = "off"`, `backend = "none"`, `enabled = false`, or run on
 > host; `bwrap`/`systemd` are Linux-only.
 >
-> apple: `network = "host"` is refused with `network-unexpressible` — Apple's
-> `container` CLI has no host network at all; use `nat`. `network = "none"`
-> (and therefore `sealed`) is refused too: Apple can create an internal
-> network, but it still reaches services bound on your Mac, so it is not
+> apple: both `network = "host"` and `network = "none"` are refused with
+> `network-unexpressible`. Apple's `container` CLI has no host network at all;
+> use `nat`. `none` (and therefore `sealed`) is refused because Apple can
+> create an internal network, but it is expected to still reach services bound
+> on your Mac (not yet verified on a device), so it is not known to be
 > offline. Use podman or docker for offline or sealed worktrees on a Mac.
 
 > **Platform status:** the public alpha supports Linux on x86_64, where
