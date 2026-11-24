@@ -20,7 +20,7 @@ pub fn user_data(pubkey: &str, install_prereqs: bool) -> String {
     doc.push_str("ssh_pwauth: false\n");
     doc.push_str("disable_root: false\n");
     doc.push_str("ssh_authorized_keys:\n");
-    write!(doc, "  - {}\n", pubkey.trim()).expect("writing to String cannot fail");
+    writeln!(doc, "  - {}", pubkey.trim()).expect("writing to String cannot fail");
     if install_prereqs {
         doc.push_str("runcmd:\n");
         // Nix-installer prerequisites; `|| true` — a transient apt failure must

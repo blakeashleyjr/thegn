@@ -787,9 +787,9 @@ error: test run failed";
         // The real motivation: the control-schema snapshot prints ~120 KB.
         let mut out = String::new();
         for i in 0..500 {
-            write!(out, "    FAIL [   0.0{i}s] crate test_number_{i}\n")
+            writeln!(out, "    FAIL [   0.0{i}s] crate test_number_{i}")
                 .expect("writing to String cannot fail");
-            write!(out, "{}\n", "x".repeat(4_000)).expect("writing to String cannot fail");
+            writeln!(out, "{}", "x".repeat(4_000)).expect("writing to String cannot fail");
         }
         let d = digest(&out, ValidationClass::TestFailure, Some("nextest"));
         assert!(d.lines().count() <= DIGEST_MAX_LINES, "line count uncapped");

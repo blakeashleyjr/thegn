@@ -298,9 +298,9 @@ async fn healthz(State(state): State<SharedState>) -> Response {
 async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     let mut out = state.metrics.render();
     let now = now_ms();
-    write!(
+    writeln!(
         out,
-        "# HELP model_proxy_uptime_seconds Daemon uptime.\n# TYPE model_proxy_uptime_seconds gauge\nmodel_proxy_uptime_seconds {}\n",
+        "# HELP model_proxy_uptime_seconds Daemon uptime.\n# TYPE model_proxy_uptime_seconds gauge\nmodel_proxy_uptime_seconds {}",
         now.saturating_sub(state.started_ms).max(0) / 1000
     )
     .expect("writing to String cannot fail");
@@ -309,14 +309,14 @@ async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     );
     for (ident, _reason, next_probe_ms, healthy) in state.health.status(now) {
         if !healthy {
-            write!(
+            writeln!(
                 out,
-                "model_proxy_backend_exhausted{{backend=\"{ident}\"}} 1\n"
+                "model_proxy_backend_exhausted{{backend=\"{ident}\"}} 1"
             )
             .expect("writing to String cannot fail");
-            write!(
+            writeln!(
                 out,
-                "model_proxy_backend_next_probe_seconds{{backend=\"{ident}\"}} {}\n",
+                "model_proxy_backend_next_probe_seconds{{backend=\"{ident}\"}} {}",
                 (next_probe_ms - now).max(0) / 1000
             )
             .expect("writing to String cannot fail");

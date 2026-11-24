@@ -232,9 +232,9 @@ pub fn render_chunk(
     .expect("writing to String cannot fail");
     s.push_str("## Files to touch (exact paths)\n\n");
     for f in files {
-        write!(s, "- {:?}\n", f.path).expect("writing to String cannot fail");
+        writeln!(s, "- {:?}", f.path).expect("writing to String cannot fail");
     }
-    write!(
+    writeln!(
         s,
         "\n## State you are landing in\n\n\
          `git merge main` is ALREADY IN PROGRESS and left {} file(s) conflicted — \
@@ -242,7 +242,7 @@ pub fn render_chunk(
          the merge.\n\n\
          {concurrent_add} concurrent insertion(s) and {restructure} rewrite(s) need a decision, \
          and {unclassified} file(s) could not be classified automatically. \
-         **Do not apply a blanket \"keep both sides\" rule** — see below.\n",
+         **Do not apply a blanket \"keep both sides\" rule** — see below.",
         files.len()
     )
     .expect("writing to String cannot fail");
@@ -263,9 +263,9 @@ pub fn render_chunk(
             {
                 let key = format!("{}:{}", f.path, h.line);
                 let decision = decisions.get(&key).filter(|text| !text.trim().is_empty());
-                write!(
+                writeln!(
                     s,
-                    "- **line {}** — ours: {:?} / theirs: {:?}\n  - DECISION: {}\n",
+                    "- **line {}** — ours: {:?} / theirs: {:?}\n  - DECISION: {}",
                     h.line,
                     h.ours_hint,
                     h.theirs_hint,
@@ -288,9 +288,9 @@ pub fn render_chunk(
             let decision = decisions
                 .get(&f.path)
                 .filter(|text| !text.trim().is_empty());
-            write!(
+            writeln!(
                 s,
-                "- {:?} — {:?}\n  - DECISION: {}\n",
+                "- {:?} — {:?}\n  - DECISION: {}",
                 f.path,
                 f.inspection_error.as_deref().unwrap_or("inspection failed"),
                 decision.map_or_else(|| "_(state it)_".to_string(), |text| format!("{text:?}"))
@@ -312,9 +312,9 @@ pub fn render_chunk(
             for h in f.hunks.iter().filter(|h| h.class == HunkClass::Restructure) {
                 let key = format!("{}:{}", f.path, h.line);
                 let decision = decisions.get(&key).filter(|text| !text.trim().is_empty());
-                write!(
+                writeln!(
                     s,
-                    "- **line {}** — ours: {:?} / theirs: {:?}\n  - DECISION: {}\n",
+                    "- **line {}** — ours: {:?} / theirs: {:?}\n  - DECISION: {}",
                     h.line,
                     h.ours_hint,
                     h.theirs_hint,

@@ -156,7 +156,7 @@ fn scanner_rejects_line_depth_node_member_string_and_work_overages() {
 
     let mut nodes = String::new();
     for array in 0..4 {
-        write!(nodes, "values{array} = [\n").expect("writing to String cannot fail");
+        writeln!(nodes, "values{array} = [").expect("writing to String cannot fail");
         for index in 0..crate::config_budget::MAX_MEMBERS {
             nodes.push_str("1,");
             if index % 100 == 0 {
@@ -196,7 +196,7 @@ fn scanner_resets_statement_depth_and_counts_root_and_inline_members() {
 
     let mut root = String::new();
     for index in 0..=crate::config_budget::MAX_MEMBERS {
-        write!(root, "k{index} = 1\n").expect("writing to String cannot fail");
+        writeln!(root, "k{index} = 1").expect("writing to String cannot fail");
     }
     assert!(matches!(
         crate::config_budget::scan(root.as_bytes()),
@@ -205,7 +205,7 @@ fn scanner_resets_statement_depth_and_counts_root_and_inline_members() {
 
     let mut table = String::from("[members]\n");
     for index in 0..=crate::config_budget::MAX_MEMBERS {
-        write!(table, "k{index} = 1\n").expect("writing to String cannot fail");
+        writeln!(table, "k{index} = 1").expect("writing to String cannot fail");
     }
     assert!(matches!(
         crate::config_budget::scan(table.as_bytes()),
@@ -963,7 +963,7 @@ fn compatibility_diagnostics_are_bounded_by_bytes_as_well_as_count() {
     let slug = "s".repeat(900);
     let mut source = String::new();
     for index in 0..crate::config_budget::MAX_DIAGNOSTICS {
-        write!(source, "[workspace.\"{slug}{index:03}\"]\n")
+        writeln!(source, "[workspace.\"{slug}{index:03}\"]")
             .expect("writing to String cannot fail");
     }
     let normalized = crate::config_compat::normalize_admission(&source)

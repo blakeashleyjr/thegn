@@ -145,9 +145,9 @@ fn timezone_definition_without_observances_quarantines_its_event() {
 fn timezone_prescan_caps_bindings_and_oversized_metadata() {
     let mut input = String::from("BEGIN:VCALENDAR\n");
     for index in 0..65 {
-        write!(
+        writeln!(
             input,
-            "BEGIN:VTIMEZONE\nTZID:Vendor/Zone{index}\nBEGIN:STANDARD\nDTSTART:20250101T000000\nTZOFFSETFROM:+0000\nTZOFFSETTO:+0000\nEND:STANDARD\nEND:VTIMEZONE\n"
+            "BEGIN:VTIMEZONE\nTZID:Vendor/Zone{index}\nBEGIN:STANDARD\nDTSTART:20250101T000000\nTZOFFSETFROM:+0000\nTZOFFSETTO:+0000\nEND:STANDARD\nEND:VTIMEZONE"
         )
         .expect("writing to String cannot fail");
     }

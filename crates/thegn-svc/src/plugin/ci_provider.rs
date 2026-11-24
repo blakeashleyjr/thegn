@@ -640,7 +640,7 @@ done
     fn plugin_logs_redact_all_retained_lines_after_eviction() {
         let mut text = String::from("SYNTHETIC_EVICTED_BODY\n");
         for line in 0..PROVIDER_LOG_MAX_LINES {
-            write!(text, "ordinary {line}\n").expect("writing to String cannot fail");
+            writeln!(text, "ordinary {line}").expect("writing to String cannot fail");
         }
         text.push_str("-----END PRIVATE KEY-----\n");
         let log = bounded_log(serde_json::json!({"text": text, "truncated": false})).unwrap();

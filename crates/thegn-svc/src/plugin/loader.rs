@@ -1409,9 +1409,9 @@ cadence = { kind = "interval", millis = 250 }
         let spec_text = toml::to_string(&spec("limited", vec!["true".into()])).unwrap();
         let mut exact = format!("{spec_text}\n");
         assert!(exact.len() < MAX_MANIFEST_BYTES);
-        write!(
+        writeln!(
             exact,
-            "#{}\n",
+            "#{}",
             "x".repeat(MAX_MANIFEST_BYTES - exact.len() - 2)
         )
         .expect("writing to String cannot fail");

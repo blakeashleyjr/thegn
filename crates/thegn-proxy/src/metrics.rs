@@ -159,25 +159,25 @@ impl Metrics {
     fn render_duration_histogram(&self, out: &mut String) {
         let h = self.durations.lock().unwrap();
         let name = "model_proxy_request_duration_seconds";
-        write!(
+        writeln!(
             out,
-            "# HELP {name} Served request duration.\n# TYPE {name} histogram\n"
+            "# HELP {name} Served request duration.\n# TYPE {name} histogram"
         )
         .expect("writing to String cannot fail");
         for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
-            write!(
+            writeln!(
                 out,
-                "{name}_bucket{{le=\"{}\"}} {}\n",
+                "{name}_bucket{{le=\"{}\"}} {}",
                 *bound as f64 / 1000.0,
                 h.buckets[i]
             )
             .expect("writing to String cannot fail");
         }
-        write!(out, "{name}_bucket{{le=\"+Inf\"}} {}\n", h.count)
+        writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {}", h.count)
             .expect("writing to String cannot fail");
-        write!(out, "{name}_sum {}\n", h.sum_ms as f64 / 1000.0)
+        writeln!(out, "{name}_sum {}", h.sum_ms as f64 / 1000.0)
             .expect("writing to String cannot fail");
-        write!(out, "{name}_count {}\n", h.count).expect("writing to String cannot fail");
+        writeln!(out, "{name}_count {}", h.count).expect("writing to String cannot fail");
     }
 }
 
@@ -189,17 +189,17 @@ fn render_counter(
     scale: f64,
 ) {
     let map = map.lock().unwrap();
-    write!(out, "# HELP {name} {help}\n# TYPE {name} counter\n")
+    writeln!(out, "# HELP {name} {help}\n# TYPE {name} counter")
         .expect("writing to String cannot fail");
     if map.is_empty() {
-        write!(out, "{name} 0\n").expect("writing to String cannot fail");
+        writeln!(out, "{name} 0").expect("writing to String cannot fail");
         return;
     }
     for (labels, v) in map.iter() {
         if scale == 1.0 {
-            write!(out, "{name}{{{labels}}} {v}\n").expect("writing to String cannot fail");
+            writeln!(out, "{name}{{{labels}}} {v}").expect("writing to String cannot fail");
         } else {
-            write!(out, "{name}{{{labels}}} {}\n", *v as f64 * scale)
+            writeln!(out, "{name}{{{labels}}} {}", *v as f64 * scale)
                 .expect("writing to String cannot fail");
         }
     }

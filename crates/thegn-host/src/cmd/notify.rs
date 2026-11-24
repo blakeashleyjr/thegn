@@ -113,9 +113,9 @@ fn kind_help() -> String {
          other string is accepted as a custom kind:\n",
     );
     for k in NotificationKind::ALL {
-        write!(
+        writeln!(
             out,
-            "  {:<22} [{}]\n",
+            "  {:<22} [{}]",
             k.as_str(),
             k.default_priority().as_str()
         )

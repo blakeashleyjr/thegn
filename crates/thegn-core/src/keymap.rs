@@ -950,7 +950,7 @@ fn run_opt_lines(floating: bool, close_on_exit: bool, direction: Option<&str>) -
 fn render_block_bind(chord: &str, head: &str, children: &[String]) -> String {
     let mut s = format!("        bind \"{chord}\" {{\n            {head} {{\n");
     for c in children {
-        write!(s, "                {c}\n").expect("writing to String cannot fail");
+        writeln!(s, "                {c}").expect("writing to String cannot fail");
     }
     s.push_str("            }\n        }\n");
     s

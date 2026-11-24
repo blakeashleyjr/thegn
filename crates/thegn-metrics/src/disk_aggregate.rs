@@ -354,9 +354,9 @@ mod tests {
             } else {
                 format!("/btrfs/{i}")
             };
-            write!(
+            writeln!(
                 text,
-                "{i} 0 0:35 / {mount} rw - btrfs /dev/mapper/crypted rw\n"
+                "{i} 0 0:35 / {mount} rw - btrfs /dev/mapper/crypted rw"
             )
             .expect("writing to String cannot fail");
         }

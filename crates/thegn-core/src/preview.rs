@@ -1072,7 +1072,7 @@ mod tests {
     fn csv_row_cap_truncates() {
         let mut s = String::new();
         for i in 0..(MAX_ROWS + 50) {
-            write!(s, "{i}\n").expect("writing to String cannot fail");
+            writeln!(s, "{i}").expect("writing to String cannot fail");
         }
         let t = CsvTable::parse(&p("a.csv"), &s);
         assert!(t.truncated);

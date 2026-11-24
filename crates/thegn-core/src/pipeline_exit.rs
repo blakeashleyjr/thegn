@@ -306,7 +306,7 @@ mod tests {
         let d = ExitSignatures::defaults();
         let mut screen = String::from("connection reset in echoed issue body\n");
         for line in 0..CLASSIFY_TAIL_LINES {
-            write!(screen, "compile output {line}\n").expect("writing to String cannot fail");
+            writeln!(screen, "compile output {line}").expect("writing to String cannot fail");
         }
         assert_eq!(classify_tail(true, &screen, &d, CLASSIFY_TAIL_LINES), None);
         screen.push_str("connection reset\n");

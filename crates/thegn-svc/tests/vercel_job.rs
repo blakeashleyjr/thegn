@@ -237,7 +237,7 @@ fn handle(
         reply.status, reply.ctype
     );
     if !reply.no_length {
-        write!(head, "Content-Length: {}\r\n", reply.body.len())
+        writeln!(head, "Content-Length: {}\r", reply.body.len())
             .expect("writing to String cannot fail");
     }
     head.push_str("Connection: close\r\n\r\n");

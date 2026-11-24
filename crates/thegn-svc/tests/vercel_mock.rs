@@ -262,10 +262,10 @@ fn handle(mut stream: TcpStream, rec: &Mutex<Vec<Recorded>>, router: &Router) {
     };
     let mut head = format!("HTTP/1.1 {}\r\n", reply.status);
     for (name, value) in &reply.headers {
-        write!(head, "{name}: {value}\r\n").expect("writing to String cannot fail");
+        writeln!(head, "{name}: {value}\r").expect("writing to String cannot fail");
     }
     if !reply.no_length {
-        write!(head, "Content-Length: {}\r\n", reply.body.len())
+        writeln!(head, "Content-Length: {}\r", reply.body.len())
             .expect("writing to String cannot fail");
     }
     head.push_str("Connection: close\r\n\r\n");

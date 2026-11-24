@@ -139,14 +139,14 @@ async fn serve(listener: TcpListener, script: Script) -> Vec<String> {
                     } else {
                         format!("{{{}}}\r\n{header}", header.len())
                     };
-                    write!(
+                    writeln!(
                         out,
-                        "* {} FETCH (UID {uid} FLAGS () INTERNALDATE \"17-Jul-1996 02:44:25 +0000\" BODY[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID)] {literal})\r\n",
+                        "* {} FETCH (UID {uid} FLAGS () INTERNALDATE \"17-Jul-1996 02:44:25 +0000\" BODY[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID)] {literal})\r",
                         seq + 1
                     )
                     .expect("writing to String cannot fail");
                 }
-                write!(out, "{tag} OK done\r\n").expect("writing to String cannot fail");
+                writeln!(out, "{tag} OK done\r").expect("writing to String cannot fail");
                 out
             }
             ("LOGOUT", _) => {

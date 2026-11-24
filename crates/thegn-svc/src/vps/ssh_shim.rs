@@ -120,7 +120,7 @@ pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -
         // Keys are caller-controlled config (env_passthrough names); values are
         // quoted so arbitrary secret bytes survive.
         if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !k.is_empty() {
-            write!(out, "export {k}={}\n", thegn_core::util::sh_quote(v))
+            writeln!(out, "export {k}={}", thegn_core::util::sh_quote(v))
                 .expect("writing to String cannot fail");
         }
     }
@@ -133,9 +133,9 @@ pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -
         ));
     }
     if let Some(d) = cwd {
-        write!(
+        writeln!(
             out,
-            "cd -- {} || {{ printf '%s\\n' 'thegn: remote working directory is missing or not accessible' >&2; exit {}; }}\n",
+            "cd -- {} || {{ printf '%s\\n' 'thegn: remote working directory is missing or not accessible' >&2; exit {}; }}",
             thegn_core::util::sh_quote(d),
             crate::provider::EXEC_CWD_FAILED_STATUS
         )

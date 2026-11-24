@@ -454,9 +454,9 @@ mod tests {
             "name: \"Test Gogh\"\nvariant: dark\nbackground: \"#101820\"\nforeground: \"#f0f0f0\"\ncursor: \"#00ffcc\"\n",
         );
         for index in 1..=16 {
-            write!(
+            writeln!(
                 text,
-                "color_{index:02}: \"#{:02x}{:02x}{:02x}\"\n",
+                "color_{index:02}: \"#{:02x}{:02x}{:02x}\"",
                 index,
                 index + 1,
                 index + 2

@@ -250,19 +250,19 @@ impl CrashReport {
         let mut s = String::new();
         s.push_str("thegn crash report\n");
         s.push_str("==================\n");
-        write!(s, "version:   {}\n", id.version).expect("writing to String cannot fail");
-        write!(s, "channel:   {}\n", id.channel).expect("writing to String cannot fail");
-        write!(
+        writeln!(s, "version:   {}", id.version).expect("writing to String cannot fail");
+        writeln!(s, "channel:   {}", id.channel).expect("writing to String cannot fail");
+        writeln!(
             s,
-            "build:     {}\n",
+            "build:     {}",
             id.build.as_deref().unwrap_or("(unknown)")
         )
         .expect("writing to String cannot fail");
-        write!(s, "os/arch:   {}/{}\n", id.os, id.arch).expect("writing to String cannot fail");
-        write!(s, "process:   {}\n", self.proc_kind.as_str())
+        writeln!(s, "os/arch:   {}/{}", id.os, id.arch).expect("writing to String cannot fail");
+        writeln!(s, "process:   {}", self.proc_kind.as_str())
             .expect("writing to String cannot fail");
-        write!(s, "run:       {}\n", self.run_id).expect("writing to String cannot fail");
-        write!(s, "thread:    {}\n", self.thread).expect("writing to String cannot fail");
+        writeln!(s, "run:       {}", self.run_id).expect("writing to String cannot fail");
+        writeln!(s, "thread:    {}", self.thread).expect("writing to String cannot fail");
         s.push('\n');
         let panic_line = crate::log_redact::redact_text_line(&self.panic_line);
         s.push_str(&panic_line);
@@ -349,18 +349,18 @@ fn write_crash_report_to_dir(dir: &Path, report: &CrashReport, retain: usize) ->
     // layer that feeds this ring. The in-report note reaches the same reader
     // with none of that risk.
     if let Some(e) = &dir_err {
-        write!(
+        writeln!(
             body,
             "\n! degraded: could not restrict {} to owner-only ({e}) — \
-             this report may be readable by other users of this machine\n",
+             this report may be readable by other users of this machine",
             dir.display()
         )
         .expect("writing to String cannot fail");
     }
     if let Some(e) = &file_err {
-        write!(
+        writeln!(
             body,
-            "\n! degraded: could not restrict this report file to owner-only ({e})\n"
+            "\n! degraded: could not restrict this report file to owner-only ({e})"
         )
         .expect("writing to String cannot fail");
     }

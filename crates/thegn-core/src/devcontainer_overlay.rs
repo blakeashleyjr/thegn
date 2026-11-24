@@ -578,9 +578,9 @@ fn fold_env(
             tracing::warn!(key = %k, "devcontainer: dropping env with non-identifier name");
             continue;
         }
-        write!(
+        writeln!(
             exports,
-            "export {}={}\n",
+            "export {}={}",
             k,
             sh_quote(&ctx_subst(dc, v, ctx, local_env_allowed, report))
         )

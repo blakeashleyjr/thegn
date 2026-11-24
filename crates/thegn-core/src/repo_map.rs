@@ -169,7 +169,7 @@ impl RepoMap {
         for line in &lines {
             match line {
                 Line::Header(file) => {
-                    write!(out, "{file}\n").expect("writing to String cannot fail")
+                    writeln!(out, "{file}").expect("writing to String cannot fail")
                 }
                 Line::Ent(e) => {
                     let deg = if e.degree > 0 {
@@ -177,15 +177,15 @@ impl RepoMap {
                     } else {
                         String::new()
                     };
-                    write!(out, "  {} {}  L{}{}\n", e.kind.label(), e.name, e.line, deg)
+                    writeln!(out, "  {} {}  L{}{}", e.kind.label(), e.name, e.line, deg)
                         .expect("writing to String cannot fail");
                 }
             }
         }
         if elided > 0 {
-            write!(
+            writeln!(
                 out,
-                "… {elided} more entr{} elided (budget {} lines)\n",
+                "… {elided} more entr{} elided (budget {} lines)",
                 if elided == 1 { "y" } else { "ies" },
                 budget.max(1)
             )

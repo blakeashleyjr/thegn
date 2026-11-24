@@ -143,7 +143,7 @@ async fn write_json(
         bytes.len()
     );
     for (name, value) in headers {
-        write!(response, "{name}: {value}\r\n").expect("writing to String cannot fail");
+        writeln!(response, "{name}: {value}\r").expect("writing to String cannot fail");
     }
     response.push_str("\r\n");
     socket.write_all(response.as_bytes()).await.unwrap();

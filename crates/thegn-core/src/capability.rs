@@ -2137,7 +2137,7 @@ mod tests {
             .collect();
         rows.sort();
         for (id, s, why) in rows {
-            write!(out, "{id}\t{s}\t{why}\n").expect("writing to String cannot fail");
+            writeln!(out, "{id}\t{s}\t{why}").expect("writing to String cannot fail");
         }
         std::fs::write(path, out).expect("write surface-gaps-ratchet.txt");
         let doc_path = concat!(

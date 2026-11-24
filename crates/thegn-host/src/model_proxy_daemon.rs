@@ -328,7 +328,7 @@ fn probe_with(addr: SocketAddr, secret: &[u8]) -> ProbeState {
     if let Err(e) = stream.set_write_timeout(Some(Duration::from_millis(200))) {
         return ProbeState::Foreign(format!("set identity timeout: {e}"));
     }
-    if write!(stream, "GET /thegn/identity?challenge={challenge} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").is_err() { return ProbeState::Foreign("identity request failed".into()); }
+    if writeln!(stream, "GET /thegn/identity?challenge={challenge} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r").is_err() { return ProbeState::Foreign("identity request failed".into()); }
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     let mut response = Vec::new();
     let mut chunk = [0u8; 512];

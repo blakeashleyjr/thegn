@@ -18,7 +18,6 @@
 //! so the normal sweep lifecycle can collect the worktree.
 
 use anyhow::{Context, Result, bail};
-use std::fmt::Write as _;
 use std::path::Path;
 use thegn_core::config::Config;
 use thegn_core::db::{CompatibleDb, Db, SchemaOperation};
@@ -764,6 +763,7 @@ fn gate_failure_digest(log: &str) -> String {
 #[cfg(test)]
 mod land_digest_tests {
     use super::gate_failure_digest;
+    use std::fmt::Write as _;
 
     #[test]
     fn digest_names_failing_tests_and_skips_the_noise() {
@@ -792,7 +792,7 @@ error: test run failed
             log.push_str("        FAIL [ 0.01s] (1/1) same::test\n");
         }
         for i in 0..50 {
-            write!(log, "error[E0{i:03}]: distinct compile error {i}\n")
+            writeln!(log, "error[E0{i:03}]: distinct compile error {i}")
                 .expect("writing to String cannot fail");
         }
         let d = gate_failure_digest(&log);

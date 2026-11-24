@@ -49,7 +49,7 @@ pub fn run(
     let mut tar = TarBuilder::new();
     let mut manifest = String::from("thegn debug bundle\n===================\n");
     let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
-        write!(manifest, "  {:<28} {} bytes\n", name, data.len())
+        writeln!(manifest, "  {:<28} {} bytes", name, data.len())
             .expect("writing to String cannot fail");
         tar.append(name, &data);
     };
@@ -101,7 +101,7 @@ pub fn run(
     }
 
     // 6. the manifest itself (also printed below).
-    write!(manifest, "\nwritten: {}\n", out.display()).expect("writing to String cannot fail");
+    writeln!(manifest, "\nwritten: {}", out.display()).expect("writing to String cannot fail");
     tar.append("MANIFEST", manifest.as_bytes());
 
     // gzip the tar and write it out.
@@ -252,7 +252,7 @@ fn append_retained_report(
             let body = redacted_report_text(&body);
             add(tar, manifest, &format!("crash/{name}"), body.into_bytes());
         }
-        Err(e) => write!(manifest, "  crash/{name:<28} omitted: {e}\n")
+        Err(e) => writeln!(manifest, "  crash/{name:<28} omitted: {e}")
             .expect("writing to String cannot fail"),
     }
 }
@@ -470,7 +470,7 @@ mod tests {
         let mut tar = TarBuilder::new();
         let mut manifest = String::new();
         let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
-            write!(manifest, "  {name} {} bytes\n", data.len())
+            writeln!(manifest, "  {name} {} bytes", data.len())
                 .expect("writing to String cannot fail");
             tar.append(name, &data);
         };
@@ -496,7 +496,7 @@ mod tests {
         let mut tar = TarBuilder::new();
         let mut manifest = String::new();
         let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
-            write!(manifest, "  {name} {} bytes\n", data.len())
+            writeln!(manifest, "  {name} {} bytes", data.len())
                 .expect("writing to String cannot fail");
             tar.append(name, &data);
         };

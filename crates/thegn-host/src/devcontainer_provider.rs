@@ -1658,9 +1658,9 @@ mod tests {
         .unwrap();
         let mut compose = String::from("services:\n  app:\n    env_file:\n");
         for index in 0..257 {
-            write!(
+            writeln!(
                 compose,
-                "      - path: missing-{index}.env\n        required: false\n"
+                "      - path: missing-{index}.env\n        required: false"
             )
             .expect("writing to String cannot fail");
         }

@@ -111,7 +111,7 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
             continue;
         }
         let zone_local = rows.iter().any(|b| b.source == Source::ZoneTable);
-        write!(out, "\n## {}\n", zone_heading(&zone)).expect("writing to String cannot fail");
+        writeln!(out, "\n## {}", zone_heading(&zone)).expect("writing to String cannot fail");
         out.push_str(HEAD);
         for b in rows {
             out.push_str(&row(b));
@@ -136,7 +136,7 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
              | Action | Id |\n| --- | --- |\n",
         );
         for b in palette_only {
-            write!(out, "| {} | `{}` |\n", escape(&b.label), b.id)
+            writeln!(out, "| {} | `{}` |", escape(&b.label), b.id)
                 .expect("writing to String cannot fail");
         }
     }

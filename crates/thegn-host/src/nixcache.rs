@@ -267,21 +267,21 @@ fn narinfo_for(
         .unwrap_or_default();
 
     let mut s = String::new();
-    write!(s, "StorePath: {}\n", path.display()).expect("writing to String cannot fail");
-    write!(s, "URL: nar/{hash}.nar\n").expect("writing to String cannot fail");
+    writeln!(s, "StorePath: {}", path.display()).expect("writing to String cannot fail");
+    writeln!(s, "URL: nar/{hash}.nar").expect("writing to String cannot fail");
     s.push_str("Compression: none\n");
-    write!(s, "NarHash: {nar_hash}\n").expect("writing to String cannot fail");
-    write!(s, "NarSize: {nar_size}\n").expect("writing to String cannot fail");
-    write!(s, "References: {}\n", refs.join(" ")).expect("writing to String cannot fail");
+    writeln!(s, "NarHash: {nar_hash}").expect("writing to String cannot fail");
+    writeln!(s, "NarSize: {nar_size}").expect("writing to String cannot fail");
+    writeln!(s, "References: {}", refs.join(" ")).expect("writing to String cannot fail");
     if let Some(d) = rec
         .get("deriver")
         .and_then(|x| x.as_str())
         .filter(|d| !d.is_empty())
     {
-        write!(s, "Deriver: {}\n", basename(d)).expect("writing to String cannot fail");
+        writeln!(s, "Deriver: {}", basename(d)).expect("writing to String cannot fail");
     }
     for signature in signatures {
-        write!(s, "Sig: {signature}\n").expect("writing to String cannot fail");
+        writeln!(s, "Sig: {signature}").expect("writing to String cannot fail");
     }
     Ok(s)
 }

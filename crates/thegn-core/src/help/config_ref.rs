@@ -111,7 +111,7 @@ pub fn page(example: &str) -> String {
 
     let mut out = String::new();
     out.push_str("---\n");
-    write!(out, "id: {PAGE_ID}\n").expect("writing to String cannot fail");
+    writeln!(out, "id: {PAGE_ID}").expect("writing to String cannot fail");
     out.push_str("title: Config reference\n");
     out.push_str("parent: configuration\n");
     out.push_str("order: 99\n");

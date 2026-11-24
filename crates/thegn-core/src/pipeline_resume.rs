@@ -169,12 +169,12 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
     } else {
         format!("the handoff artifact at `{target_artifact}`")
     };
-    write!(
+    writeln!(
         p,
         "Finish the stage, do not merely exit: a zero exit code is not a done \
          stage — the `dispatch set-status done` gate refuses a handoff \
          artifact that git does not track. Leave {target} committed on the \
-         branch before you end your turn.\n"
+         branch before you end your turn."
     )
     .expect("writing to String cannot fail");
     p

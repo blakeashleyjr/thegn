@@ -51,9 +51,9 @@ fn peak_growth<T>(f: impl FnOnce() -> T) -> (T, usize) {
 fn feed(n: usize) -> String {
     let mut s = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..n {
-        write!(
+        writeln!(
             s,
-            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:Event number {i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
+            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:Event number {i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r"
         )
         .expect("writing to String cannot fail");
     }

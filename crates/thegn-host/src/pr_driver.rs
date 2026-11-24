@@ -1641,9 +1641,9 @@ fn check_urls(f: &FetchedPr) -> String {
         };
         match c.details_url.as_deref() {
             Some(u) if !u.is_empty() => {
-                write!(out, "  - {name}: {u}\n").expect("writing to String cannot fail")
+                writeln!(out, "  - {name}: {u}").expect("writing to String cannot fail")
             }
-            _ => write!(out, "  - {name}\n").expect("writing to String cannot fail"),
+            _ => writeln!(out, "  - {name}").expect("writing to String cannot fail"),
         }
     }
     if out.is_empty() {
@@ -1661,7 +1661,7 @@ fn format_threads(threads: &[ReviewThreadRow]) -> String {
             _ if !t.path.is_empty() => t.path.clone(),
             _ => "(general)".to_string(),
         };
-        write!(out, "  - {} on {where_}: {}\n", t.author, t.snippet)
+        writeln!(out, "  - {} on {where_}: {}", t.author, t.snippet)
             .expect("writing to String cannot fail");
     }
     if out.is_empty() {

@@ -1129,9 +1129,9 @@ fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
     );
     let mut feed = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..5 {
-        write!(
+        writeln!(
             feed,
-            "BEGIN:VEVENT\r\nUID:new{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
+            "BEGIN:VEVENT\r\nUID:new{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r"
         )
         .expect("writing to String cannot fail");
     }

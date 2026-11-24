@@ -137,7 +137,7 @@ fn preview_pane_output_spinner() {
     let mut prefill = String::from("ready http://localhost:5173/\n");
     let mut line = 0usize;
     while prefill.len() < thegn_core::preview::MAX_PORT_HINT_CHARS {
-        write!(prefill, "[build] compiled module {line:05} in 3ms\n")
+        writeln!(prefill, "[build] compiled module {line:05} in 3ms")
             .expect("writing to String cannot fail");
         line += 1;
     }

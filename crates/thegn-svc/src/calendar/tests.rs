@@ -3362,9 +3362,9 @@ fn budget_of(n: usize) -> AccountAdmission {
 fn ics_feed(n: usize) -> String {
     let mut s = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..n {
-        write!(
+        writeln!(
             s,
-            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:E{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
+            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:E{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r"
         )
         .expect("writing to String cannot fail");
     }
@@ -4279,9 +4279,9 @@ async fn a_long_history_feed_only_counts_the_sync_window() {
     // it must not now be refused just because the history is long.
     let mut feed = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..3_000 {
-        write!(
+        writeln!(
             feed,
-            "BEGIN:VEVENT\r\nUID:old{i}\r\nDTSTART:20190301T090000Z\r\nEND:VEVENT\r\n"
+            "BEGIN:VEVENT\r\nUID:old{i}\r\nDTSTART:20190301T090000Z\r\nEND:VEVENT\r"
         )
         .expect("writing to String cannot fail");
     }

@@ -287,7 +287,7 @@ fn flatten_ssh_config(content: &str, read: &dyn Fn(&str) -> Vec<String>, depth: 
             && t[7..].starts_with(char::is_whitespace);
         if is_include && depth < 16 {
             let args = t[7..].trim();
-            write!(out, "# thegn: inlined `Include {args}`\n")
+            writeln!(out, "# thegn: inlined `Include {args}`")
                 .expect("writing to String cannot fail");
             for token in args.split_whitespace() {
                 for body in read(token) {

@@ -402,7 +402,7 @@ fn explain_key(key: &str, path: PathBuf) -> String {
         origin.origin.as_str()
     );
     for (layer, val) in &origin.trace {
-        write!(s, "    {}: {val}\n", layer.as_str()).expect("writing to String cannot fail");
+        writeln!(s, "    {}: {val}", layer.as_str()).expect("writing to String cannot fail");
     }
     s
 }

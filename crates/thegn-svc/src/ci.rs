@@ -2784,7 +2784,7 @@ mod tests {
     fn log_collector_matches_collect_log_for_any_chunking() {
         let mut many_lines = String::new();
         for n in 0..2100 {
-            write!(many_lines, "line {n}\n").expect("writing to String cannot fail");
+            writeln!(many_lines, "line {n}").expect("writing to String cannot fail");
         }
         let inputs: [&[u8]; 3] = [
             b"before\n-----BEGIN PRIVATE KEY-----\nsecret-body\n-----END PRIVATE KEY-----\nafter\n",
@@ -3480,7 +3480,7 @@ mod tests {
     fn collector_redacts_all_retained_lines_after_prefix_eviction() {
         let mut input = String::from("SYNTHETIC_EVICTED_BODY\n");
         for line in 0..PROVIDER_LOG_MAX_LINES {
-            write!(input, "ordinary {line}\n").expect("writing to String cannot fail");
+            writeln!(input, "ordinary {line}").expect("writing to String cannot fail");
         }
         input.push_str("-----END PRIVATE KEY-----\n");
 

@@ -4070,7 +4070,7 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
     }
     // Unset blocked env keys (e.g. master API key when a scoped key replaces it).
     for key in &spec.env_block {
-        write!(s, "unset {key}\n").expect("writing to String cannot fail");
+        writeln!(s, "unset {key}").expect("writing to String cannot fail");
     }
     // Inject per-agent env overrides (e.g. scoped virtual API key from the proxy).
     // Sort for determinism in tests.
@@ -4079,7 +4079,7 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
     for (key, val) in overrides {
         // Single-quote the value to be safe with special characters.
         let safe = val.replace('\'', "'\\''");
-        write!(s, "export {key}='{safe}'\n").expect("writing to String cannot fail");
+        writeln!(s, "export {key}='{safe}'").expect("writing to String cannot fail");
     }
     if let Some(init) = &spec.init_script {
         s.push_str(init);

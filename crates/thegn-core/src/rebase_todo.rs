@@ -1058,14 +1058,14 @@ mod tests {
 
     fn todo_text() -> String {
         let mut text = String::new();
-        write!(text, "pick {} {LINE_HOSTILE}\n", full_sha(1))
+        writeln!(text, "pick {} {LINE_HOSTILE}", full_sha(1))
             .expect("writing to String cannot fail");
-        write!(text, "reword {} second \u{e9}\n", full_sha(2))
+        writeln!(text, "reword {} second \u{e9}", full_sha(2))
             .expect("writing to String cannot fail");
         text.push_str("# a comment line\n");
         text.push_str("exec make test\n");
         text.push_str("break\n");
-        write!(text, "drop {} last\n", full_sha(3)).expect("writing to String cannot fail");
+        writeln!(text, "drop {} last", full_sha(3)).expect("writing to String cannot fail");
         text
     }
 
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(parse_todo("pick abc\n").len(), 1);
         let mut text = String::new();
         for n in 0..5000 {
-            write!(text, "pick {} {LINE_HOSTILE}\n", full_sha(n))
+            writeln!(text, "pick {} {LINE_HOSTILE}", full_sha(n))
                 .expect("writing to String cannot fail");
         }
         let parsed = parse_todo(&text);

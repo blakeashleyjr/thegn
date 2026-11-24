@@ -235,7 +235,7 @@ impl<'a> DocsRouter<'a> {
         let mut out = String::new();
         for p in self.reg.pages() {
             let tag = if p.meta.generated { " (generated)" } else { "" };
-            write!(out, "{} — {}{}\n", p.meta.id, p.meta.title, tag)
+            writeln!(out, "{} — {}{}", p.meta.id, p.meta.title, tag)
                 .expect("writing to String cannot fail");
         }
         out

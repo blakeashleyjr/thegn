@@ -510,13 +510,10 @@ pub trait PlumbingOps: GitBackend {
         for (name, oid) in sources {
             let name = op::revision(name)?;
             let oid = op::revision(oid)?;
-            write!(transaction, "verify {name} {oid}\n").expect("writing to String cannot fail");
+            writeln!(transaction, "verify {name} {oid}").expect("writing to String cannot fail");
         }
-        write!(
-            transaction,
-            "update {target} {new} {old}\nprepare\ncommit\n"
-        )
-        .expect("writing to String cannot fail");
+        writeln!(transaction, "update {target} {new} {old}\nprepare\ncommit")
+            .expect("writing to String cannot fail");
         let args = fenced(loc, &["update-ref", "--stdin"]);
         match super::output_bounded_with_input(
             loc.git_command(&args),
