@@ -18,7 +18,7 @@ use super::{confirm, resolve_worktree};
 const CARGO_LOCK: &str = ".cargo-lock";
 
 /// One lane directory under `<checkout>/target/lanes`, measured and explained.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct LaneRow {
     /// Directory name under `target/lanes/`.
     lane: String,
@@ -39,10 +39,28 @@ struct LaneRow {
     /// `eligible`, `held` or `unknown`.
     eligibility: &'static str,
     reason: String,
+    /// The directory identity the row was measured from. `--apply` compares it
+    /// again before removing anything; it is evidence, not a report field.
+    #[serde(skip)]
+    identity: Option<LaneIdentity>,
+    /// Newest file mtime in the lane (`DiskUsage::newest_mtime`) at report
+    /// time, so an apply pass can notice a write the size could not.
+    #[serde(skip)]
+    newest_mtime: u64,
+}
+
+/// A lane directory's identity at report time. `--apply` takes it again right
+/// before removal so a lane replaced since the report (a rebuilt checkout, a
+/// different branch) is never mistaken for the one that was measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaneIdentity {
+    canonical: std::path::PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
 }
 
 /// The `--json` document: one object, totals in the same unit as the rows.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct LaneReport {
     root: String,
     unit: &'static str,
@@ -52,6 +70,38 @@ struct LaneReport {
     /// Build output of lanes classified `eligible` only.
     eligible_bytes: u64,
     lanes: Vec<LaneRow>,
+}
+
+/// The `--apply` document: the dry-run report plus what the apply pass actually
+/// removed and why everything else was left alone.
+#[derive(Debug, Serialize)]
+struct LaneApplyReport {
+    report: LaneReport,
+    /// Apparent bytes measured immediately before removal and confirmed gone.
+    reclaimed_bytes: u64,
+    removed: Vec<LaneRemoval>,
+    skipped: Vec<LaneSkip>,
+    apply_duration_ms: u64,
+}
+
+/// One lane whose build output was removed.
+#[derive(Debug, Serialize)]
+struct LaneRemoval {
+    lane: String,
+    /// What was actually removed: the lane's `target/` for a checkout copy, or
+    /// the lane itself when the lane is a bare Cargo target dir.
+    path: String,
+    bytes: u64,
+}
+
+/// One lane left untouched, with the evidence that kept it. `eligibility` is the
+/// report's class, or `retained` when the apply's own re-check kept a lane the
+/// report had called eligible.
+#[derive(Debug, Serialize)]
+struct LaneSkip {
+    lane: String,
+    eligibility: String,
+    reason: String,
 }
 
 /// What a lane directory is, from markers Cargo and git leave behind.
@@ -75,8 +125,9 @@ impl LaneKind {
     }
 }
 
-/// `thegn wt disk --lanes [--worktree P] [--json]` — read-only inventory of the
-/// build lanes beneath one checkout's `target/lanes/`.
+/// `thegn wt disk --lanes [--worktree P] [--json] [--apply]` — inventory of the
+/// build lanes beneath one checkout's `target/lanes/`, and (with `--apply`) the
+/// explicit reclaim of the build output the inventory can still prove is idle.
 ///
 /// The audit (`docs/audits/2026-11-18-repository-hygiene.md`) found 129 GiB in
 /// `target/lanes/` with no way to say which lane was large, whose it was, or
@@ -86,10 +137,13 @@ impl LaneKind {
 /// directory itself carries: its own git checkout, Cargo's build lock, and the
 /// newest write anywhere in the tree.
 ///
-/// Nothing is deleted or rewritten, no `worktree_disk` cache row is touched, and
-/// no other worktree is visited. The walk runs on this command's thread; it is
-/// never on the host event loop.
-pub fn lanes(worktree_arg: Option<String>, json: bool) -> Result<()> {
+/// The dry run deletes nothing. `--apply` re-checks each eligible candidate —
+/// identity, kind, owner and branch, Cargo lock, newest write, and measured
+/// bytes — immediately before removing only that lane's regenerable output, so
+/// a lane that became active or changed hands is retained. No `worktree_disk`
+/// cache row is touched, no other worktree is visited, and the walk runs on
+/// this command's thread; it is never on the host event loop.
+pub fn lanes(worktree_arg: Option<String>, json: bool, apply: bool) -> Result<()> {
     let started = std::time::Instant::now();
     let root = resolve_worktree(worktree_arg).join("target").join("lanes");
     let now = u64::try_from(thegn_core::util::now()).unwrap_or(0);
@@ -111,6 +165,10 @@ pub fn lanes(worktree_arg: Option<String>, json: bool) -> Result<()> {
         eligible_bytes,
         lanes,
     };
+
+    if apply {
+        return run_lane_apply(&root, &report, now, json);
+    }
 
     if json {
         return super::emit_json(&report);
@@ -145,6 +203,11 @@ pub fn lanes(worktree_arg: Option<String>, json: bool) -> Result<()> {
         disk::human(report.eligible_bytes),
         report.scan_duration_ms
     );
+    if report.eligible_bytes > 0 {
+        outln!(
+            "Dry run: `thegn wt disk --lanes --apply` reclaims the eligible build output after re-checking each lane."
+        );
+    }
     Ok(())
 }
 
@@ -179,6 +242,8 @@ fn lane_report(root: &std::path::Path, now: u64) -> Result<Vec<LaneRow>> {
                 activity_evidence: "symlink, not followed".to_string(),
                 eligibility: "unknown",
                 reason: "symlink, not followed; contents are not inspected".to_string(),
+                identity: None,
+                newest_mtime: 0,
             });
             continue;
         }
@@ -191,39 +256,15 @@ fn lane_report(root: &std::path::Path, now: u64) -> Result<Vec<LaneRow>> {
         let kind = lane_kind(&path);
         let (owner, branch) = lane_checkout(&path);
         let (activity, activity_evidence) = lane_activity(&path, kind, usage.newest_mtime, now);
-        let idle_secs = now.saturating_sub(usage.newest_mtime);
 
-        let (eligibility, reason) = if kind == LaneKind::Other {
-            (
-                "unknown",
-                "not a build lane: no target/, Cargo.toml or Cargo target marker".to_string(),
-            )
-        } else if activity == "building" {
-            (
-                "held",
-                format!("{activity_evidence}; a build may still own these artifacts"),
-            )
-        } else if activity == "active" {
-            (
-                "held",
-                format!("{activity_evidence}; a build may be running"),
-            )
-        } else if owner.is_none() {
-            (
-                "unknown",
-                "no git checkout to attribute the lane to; ownership unknown".to_string(),
-            )
-        } else if activity == "idle" {
-            (
-                "eligible",
-                format!(
-                    "verified checkout; nothing written for {} and no build lock held",
-                    human_age(idle_secs)
-                ),
-            )
-        } else {
-            ("unknown", "no activity evidence; retained".to_string())
-        };
+        let (eligibility, reason) = lane_verdict(
+            kind,
+            owner.as_deref(),
+            activity,
+            &activity_evidence,
+            usage.newest_mtime,
+            now,
+        );
 
         lanes.push(LaneRow {
             lane: entry.file_name().to_string_lossy().into_owned(),
@@ -237,6 +278,8 @@ fn lane_report(root: &std::path::Path, now: u64) -> Result<Vec<LaneRow>> {
             activity_evidence,
             eligibility,
             reason,
+            identity: lane_identity(&path).ok(),
+            newest_mtime: usage.newest_mtime,
         });
     }
     lanes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.lane.cmp(&b.lane)));
@@ -252,6 +295,277 @@ fn lane_build_bytes(kind: LaneKind, usage: &disk::DiskUsage) -> u64 {
         LaneKind::BuildDir => usage.total_bytes,
         LaneKind::Other => 0,
     }
+}
+
+/// Eligibility and its reason from measured evidence alone, shared by the dry
+/// run and the apply pass so the two can never disagree about what is eligible.
+fn lane_verdict(
+    kind: LaneKind,
+    owner: Option<&str>,
+    activity: &str,
+    activity_evidence: &str,
+    newest_mtime: u64,
+    now: u64,
+) -> (&'static str, String) {
+    if kind == LaneKind::Other {
+        (
+            "unknown",
+            "not a build lane: no target/, Cargo.toml or Cargo target marker".to_string(),
+        )
+    } else if activity == "building" {
+        (
+            "held",
+            format!("{activity_evidence}; a build may still own these artifacts"),
+        )
+    } else if activity == "active" {
+        (
+            "held",
+            format!("{activity_evidence}; a build may be running"),
+        )
+    } else if owner.is_none() {
+        (
+            "unknown",
+            "no git checkout to attribute the lane to; ownership unknown".to_string(),
+        )
+    } else if activity == "idle" {
+        let idle_secs = now.saturating_sub(newest_mtime);
+        (
+            "eligible",
+            format!(
+                "verified checkout; nothing written for {} and no build lock held",
+                human_age(idle_secs)
+            ),
+        )
+    } else {
+        ("unknown", "no activity evidence; retained".to_string())
+    }
+}
+
+/// Stat a lane directory so `--apply` can tell it apart from a directory that
+/// replaced it after the report. A symlinked lane is refused: the inventory
+/// never follows one and neither does removal.
+fn lane_identity(lane: &std::path::Path) -> Result<LaneIdentity> {
+    let metadata = std::fs::symlink_metadata(lane)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("not a regular directory");
+    }
+    Ok(LaneIdentity {
+        canonical: lane.canonicalize()?,
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+/// What `--apply` removes for a lane: the regenerable output only. A checkout
+/// copy keeps its sources, `.git` and `Cargo.toml`; a bare Cargo target dir is
+/// entirely output, so the lane directory itself goes.
+fn lane_reclaim_target(kind: LaneKind, lane: &std::path::Path) -> Option<std::path::PathBuf> {
+    match kind {
+        LaneKind::Checkout => Some(lane.join("target")),
+        LaneKind::BuildDir => Some(lane.to_path_buf()),
+        LaneKind::Other => None,
+    }
+}
+
+/// Re-prove one reported lane immediately before removing its build output.
+///
+/// Returns the directory to remove and the apparent bytes in it, or the reason
+/// the lane must be left alone. Everything is read again here rather than
+/// trusted from the report, so a lane that became active, changed hands, or
+/// changed shape between the dry run and the apply is retained.
+fn verified_reclaim_target(
+    row: &LaneRow,
+    root: &std::path::Path,
+    now: u64,
+) -> std::result::Result<(std::path::PathBuf, u64), String> {
+    let lane = std::path::Path::new(&row.path);
+    if lane.parent() != Some(root) {
+        return Err("lane is no longer a direct child of this target/lanes".into());
+    }
+    let identity = lane_identity(lane).map_err(|error| format!("lane is unreadable: {error}"))?;
+    let Some(reported) = row.identity.as_ref() else {
+        return Err("lane identity was unavailable at report time".into());
+    };
+    if reported != &identity {
+        return Err("lane directory identity changed after the report".into());
+    }
+    let kind = lane_kind(lane);
+    if kind.label() != row.kind {
+        return Err(format!(
+            "lane kind changed after the report ({} -> {})",
+            row.kind,
+            kind.label()
+        ));
+    }
+    let (owner, branch) = lane_checkout(lane);
+    if owner != row.owner || branch != row.branch {
+        return Err("lane ownership changed after the report".into());
+    }
+    let Some(target) = lane_reclaim_target(kind, lane) else {
+        return Err("not a build lane: no build output to reclaim".into());
+    };
+    // Activity last of the evidence checks, and immediately before the removal:
+    // the Cargo lock probe is the only guard that can see a build starting.
+    let usage = disk::measure_tree(lane);
+    let (activity, evidence) = lane_activity(lane, kind, usage.newest_mtime, now);
+    let (eligibility, reason) = lane_verdict(
+        kind,
+        owner.as_deref(),
+        activity,
+        &evidence,
+        usage.newest_mtime,
+        now,
+    );
+    if eligibility != "eligible" {
+        return Err(format!("lane is now {eligibility}: {reason}"));
+    }
+    let build_bytes = lane_build_bytes(kind, &usage);
+    if usage.total_bytes != row.bytes || build_bytes != row.build_bytes {
+        return Err("lane contents changed after the report".into());
+    }
+    if usage.newest_mtime != row.newest_mtime {
+        return Err("lane was written after the report".into());
+    }
+    Ok((target, build_bytes))
+}
+
+/// Remove the build output of every reported lane that still proves it is the
+/// same, inactive, unlocked, owned lane, one candidate at a time.
+///
+/// The plan is the dry-run report, and nothing here trusts it: each candidate
+/// is re-measured and re-probed immediately before its output is removed, and
+/// any change keeps the lane. Removal is per lane, so a partial pass is
+/// retryable — the lanes it could not remove stay eligible for a later apply.
+fn apply_lane_plan(root: &std::path::Path, report: &LaneReport, now: u64) -> LaneApplyReport {
+    let started = std::time::Instant::now();
+    let mut reclaimed_bytes = 0u64;
+    let mut removed: Vec<LaneRemoval> = Vec::new();
+    let mut skip_details: std::collections::BTreeMap<String, LaneSkip> =
+        std::collections::BTreeMap::new();
+
+    for row in &report.lanes {
+        if row.eligibility != "eligible" {
+            continue; // reported held/unknown: never a candidate
+        }
+        if row.build_bytes == 0 {
+            skip_details.insert(
+                row.lane.clone(),
+                LaneSkip {
+                    lane: row.lane.clone(),
+                    eligibility: row.eligibility.to_string(),
+                    reason: "no build output to reclaim".to_string(),
+                },
+            );
+            continue;
+        }
+        let (target, bytes) = match verified_reclaim_target(row, root, now) {
+            Ok(verified) => verified,
+            Err(reason) => {
+                skip_details.insert(
+                    row.lane.clone(),
+                    LaneSkip {
+                        lane: row.lane.clone(),
+                        // The lane was eligible at report time but the apply's
+                        // own re-check kept it, so it is no longer a candidate.
+                        eligibility: "retained".to_string(),
+                        reason,
+                    },
+                );
+                continue;
+            }
+        };
+        match std::fs::remove_dir_all(&target) {
+            Ok(()) => {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+                removed.push(LaneRemoval {
+                    lane: row.lane.clone(),
+                    path: target.to_string_lossy().into_owned(),
+                    bytes,
+                });
+            }
+            Err(error) => {
+                // A partial removal still freed bytes; measure what is left so
+                // the report states what was actually reclaimed, and leave the
+                // lane for a retry.
+                let remaining = disk::measure_tree(&target).total_bytes;
+                let reclaimed = bytes.saturating_sub(remaining);
+                reclaimed_bytes = reclaimed_bytes.saturating_add(reclaimed);
+                skip_details.insert(
+                    row.lane.clone(),
+                    LaneSkip {
+                        lane: row.lane.clone(),
+                        eligibility: "retained".to_string(),
+                        reason: format!(
+                            "removal failed after reclaiming {} apparent bytes: {error}",
+                            disk::human(reclaimed)
+                        ),
+                    },
+                );
+            }
+        }
+    }
+
+    // Every lane not removed is accounted for, including the ones the dry run
+    // already reported as held or unknown.
+    let mut skipped: Vec<LaneSkip> = Vec::new();
+    for row in &report.lanes {
+        if removed.iter().any(|done| done.lane == row.lane) {
+            continue;
+        }
+        if let Some(detail) = skip_details.remove(&row.lane) {
+            skipped.push(detail);
+        } else {
+            skipped.push(LaneSkip {
+                lane: row.lane.clone(),
+                eligibility: row.eligibility.to_string(),
+                reason: row.reason.clone(),
+            });
+        }
+    }
+    skipped.sort_by(|a, b| a.lane.cmp(&b.lane));
+
+    LaneApplyReport {
+        report: report.clone(),
+        reclaimed_bytes,
+        removed,
+        skipped,
+        apply_duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+/// Run the plan and print (or emit) the apply report.
+fn run_lane_apply(root: &std::path::Path, report: &LaneReport, now: u64, json: bool) -> Result<()> {
+    let applied = apply_lane_plan(root, report, now);
+    if json {
+        return super::emit_json(&applied);
+    }
+    if report.lanes.is_empty() {
+        outln!("No build lanes under {}.", report.root);
+        return Ok(());
+    }
+    outln!("Build lane cleanup in {}", report.root);
+    for removal in &applied.removed {
+        outln!(
+            "reclaimed {}  {} — {}",
+            disk::human(removal.bytes),
+            removal.lane,
+            removal.path
+        );
+    }
+    for skipped in &applied.skipped {
+        outln!("skipped   {} — {}", skipped.lane, skipped.reason);
+    }
+    outln!(
+        "Reclaimed {} apparent bytes across {} lane(s); {} lane(s) left untouched; apply {} ms.",
+        disk::human(applied.reclaimed_bytes),
+        applied.removed.len(),
+        applied.skipped.len(),
+        applied.apply_duration_ms
+    );
+    outln!(
+        "Only regenerable build output was removed; checkout sources, .git and Cargo.toml are kept. Cleanup is opt-in: do not pass --apply to stop it."
+    );
+    Ok(())
 }
 
 /// Classify a lane from markers Cargo leaves on disk. `target/` or `Cargo.toml`
@@ -682,6 +996,200 @@ mod lane_tests {
             .iter()
             .find(|lane| lane.lane == name)
             .unwrap_or_else(|| panic!("no lane {name}"))
+    }
+
+    /// The dry-run report for `root`, exactly as `lanes()` builds it before an
+    /// apply pass.
+    fn report_for(root: &std::path::Path, now: u64) -> LaneReport {
+        let lanes = lane_report(root, now).unwrap();
+        let total_bytes = lanes.iter().map(|lane| lane.bytes).sum();
+        let build_bytes = lanes.iter().map(|lane| lane.build_bytes).sum();
+        let eligible_bytes = lanes
+            .iter()
+            .filter(|lane| lane.eligibility == "eligible")
+            .map(|lane| lane.build_bytes)
+            .sum();
+        LaneReport {
+            root: root.to_string_lossy().into_owned(),
+            unit: "apparent file bytes",
+            scan_duration_ms: 1,
+            total_bytes,
+            build_bytes,
+            eligible_bytes,
+            lanes,
+        }
+    }
+
+    fn removed_names(applied: &LaneApplyReport) -> Vec<&str> {
+        applied
+            .removed
+            .iter()
+            .map(|removal| removal.lane.as_str())
+            .collect()
+    }
+
+    /// Two verified checkout lanes, each with a 17-byte artifact, both written
+    /// `old` so the report classifies them eligible. Returns the tempdir (kept
+    /// alive by the caller), the lanes root and the backdate instant.
+    fn two_idle_lanes() -> (tempfile::TempDir, std::path::PathBuf, std::time::SystemTime) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("target").join("lanes");
+        for (name, branch) in [("first", "first-branch"), ("second", "second-branch")] {
+            checkout_lane(&root.join(name), branch);
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+        backdate(&root, old);
+        (temp, root, old)
+    }
+
+    #[test]
+    fn apply_reclaims_eligible_lanes_and_keeps_checkout_sources() {
+        let (_temp, root, _old) = two_idle_lanes();
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+        let report = report_for(&root, now);
+        assert_eq!(
+            report.eligible_bytes, 34,
+            "both lanes are eligible build output"
+        );
+
+        let applied = apply_lane_plan(&root, &report, now);
+        let mut reclaimed_lanes = removed_names(&applied);
+        reclaimed_lanes.sort_unstable();
+        assert_eq!(reclaimed_lanes, ["first", "second"]);
+        assert_eq!(applied.reclaimed_bytes, 34);
+        assert!(applied.skipped.is_empty(), "{:?}", applied.skipped);
+
+        for name in ["first", "second"] {
+            assert!(
+                !root.join(name).join("target").exists(),
+                "{name} target gone"
+            );
+            assert!(
+                root.join(name).join("Cargo.toml").is_file(),
+                "{name} source kept"
+            );
+            assert!(
+                root.join(name).join(".git/HEAD").is_file(),
+                "{name} checkout evidence kept"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_skips_a_lane_that_became_active_after_the_report() {
+        let (_temp, root, _old) = two_idle_lanes();
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+        let report = report_for(&root, now);
+
+        // A build starts in `first` between the report and the apply.
+        fs::write(root.join("first/target/debug/fresh.bin"), [2u8; 5]).unwrap();
+        let applied = apply_lane_plan(&root, &report, now);
+
+        assert!(root.join("first/target/debug/artifact.bin").exists());
+        assert_eq!(removed_names(&applied), ["second"]);
+        let skipped = applied
+            .skipped
+            .iter()
+            .find(|skip| skip.lane == "first")
+            .expect("first is reported as skipped");
+        assert!(skipped.reason.contains("held"), "{}", skipped.reason);
+        assert!(
+            skipped.reason.contains("build may be running"),
+            "{}",
+            skipped.reason
+        );
+    }
+
+    #[test]
+    fn apply_skips_a_lane_whose_cargo_lock_is_held() {
+        let (_temp, root, _old) = two_idle_lanes();
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+        let report = report_for(&root, now);
+
+        let lock_path = root.join("first/target/debug/.cargo-lock");
+        fs::write(&lock_path, b"").unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.try_lock().unwrap();
+
+        let applied = apply_lane_plan(&root, &report, now);
+        assert!(root.join("first/target/debug/artifact.bin").exists());
+        assert_eq!(removed_names(&applied), ["second"]);
+        let skipped = applied
+            .skipped
+            .iter()
+            .find(|skip| skip.lane == "first")
+            .expect("first is reported as skipped");
+        assert!(
+            skipped.reason.contains("cargo build lock held"),
+            "{}",
+            skipped.reason
+        );
+    }
+
+    #[test]
+    fn apply_skips_a_lane_whose_ownership_changed() {
+        let (_temp, root, _old) = two_idle_lanes();
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+        let report = report_for(&root, now);
+
+        // The checkout now belongs to a different branch: the reported owner no
+        // longer describes what is on disk.
+        fs::write(root.join("first/.git/HEAD"), b"ref: refs/heads/other\n").unwrap();
+        let applied = apply_lane_plan(&root, &report, now);
+
+        assert!(root.join("first/target/debug/artifact.bin").exists());
+        assert_eq!(removed_names(&applied), ["second"]);
+        let skipped = applied
+            .skipped
+            .iter()
+            .find(|skip| skip.lane == "first")
+            .expect("first is reported as skipped");
+        assert!(
+            skipped.reason.contains("ownership changed"),
+            "{}",
+            skipped.reason
+        );
+    }
+
+    #[test]
+    fn apply_retries_the_remaining_lane_after_a_partial_cleanup() {
+        let (_temp, root, old) = two_idle_lanes();
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+        let report = report_for(&root, now);
+
+        // `second` becomes held after the report. Backdate the lock file so the
+        // lane still looks idle by mtime once the lock is released — only the
+        // lock, not recency, keeps it out of this pass.
+        let lock_path = root.join("second/target/debug/.cargo-lock");
+        fs::write(&lock_path, b"").unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.try_lock().unwrap();
+        backdate(&root.join("second"), old);
+
+        let first_pass = apply_lane_plan(&root, &report, now);
+        assert_eq!(removed_names(&first_pass), ["first"]);
+        assert_eq!(first_pass.reclaimed_bytes, 17);
+        assert!(!root.join("first/target").exists());
+        assert!(root.join("first/Cargo.toml").is_file());
+        assert!(root.join("second/target/debug/artifact.bin").exists());
+
+        // Once the lock is gone the still-reported lane is reclaimable without
+        // re-planning: removal is per lane and the first pass left no partial
+        // state behind.
+        drop(held);
+        let retry = apply_lane_plan(&root, &report, now);
+        assert_eq!(removed_names(&retry), ["second"]);
+        assert_eq!(retry.reclaimed_bytes, 17);
+        assert!(!root.join("second/target").exists());
+        assert!(root.join("second/Cargo.toml").is_file());
     }
 
     #[test]

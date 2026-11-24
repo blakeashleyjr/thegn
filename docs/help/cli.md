@@ -274,7 +274,15 @@ removes lane worktrees and branches already merged into the target; without
 directories under one checkout's `target/lanes/`: apparent bytes, the
 regenerable build output, the lane's own git owner and branch, Cargo-lock and
 mtime activity, and whether that output is safe to reclaim — with the reason
-printed beside each row. It changes nothing and scans no other worktree.
+printed beside each row. On its own it changes nothing and scans no other
+worktree.
+
+`thegn wt disk --lanes --apply` reclaims the build output of the lanes marked
+`eligible`, re-checking each lane's identity, owner, activity and lock
+immediately before removal. A lane that started building or changed hands in the
+meantime is kept and its reason printed. Only build output is removed: a
+checkout lane keeps its `.git`, `Cargo.toml` and sources. Review the dry run
+first. Cleanup only happens when you pass `--apply`.
 
 `thegn wt new --batch FILE` creates one lane for each non-comment, non-blank
 line in the file. Each line is `<name>` or `<name> <base>`; a per-line base

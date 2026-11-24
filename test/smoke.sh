@@ -739,8 +739,9 @@ check "host list --json includes the seeded host" \
   "'$SZ' host list --json | grep -q smoke-local"
 check "disk --json emits a JSON array" \
   "'$SZ' disk --json | head -c1 | grep -q '\['"
-# Build lanes (THE-2279): a read-only inventory of one checkout's
-# target/lanes/ — sized, attributed, and classified, with nothing removed.
+# Build lanes (THE-2279, THE-2284): a dry run inventories one checkout's
+# target/lanes/ without removing anything; --apply reclaims only a lane whose
+# own checkout, lock and recency still prove it idle, and keeps its sources.
 mkdir -p "$R/target/lanes/smoke-lane/target/debug"
 printf 'artifact' >"$R/target/lanes/smoke-lane/target/debug/artifact.bin"
 check "wt disk --lanes inventories a build lane" \
@@ -749,6 +750,25 @@ check "wt disk --lanes --json emits one object per lane" \
   "'$SZ' wt disk --lanes --worktree '$R' --json | grep -q '\"lane\":\"smoke-lane\"'"
 check "wt disk --lanes leaves lane contents alone" \
   "[[ -f '$R/target/lanes/smoke-lane/target/debug/artifact.bin' ]]"
+check "wt disk --lanes --apply keeps a lane with no verified owner" \
+  "'$SZ' wt disk --lanes --worktree '$R' --apply >/dev/null && [[ -f '$R/target/lanes/smoke-lane/target/debug/artifact.bin' ]]"
+# A lane with its own checkout, backdated past the activity window, is the one
+# shape --apply may reclaim.
+mkdir -p "$R/target/lanes/idle-lane/.git" "$R/target/lanes/idle-lane/target/debug"
+printf 'ref: refs/heads/smoke-lane\n' >"$R/target/lanes/idle-lane/.git/HEAD"
+printf '[package]\nname = "lane"\n' >"$R/target/lanes/idle-lane/Cargo.toml"
+printf 'artifact' >"$R/target/lanes/idle-lane/target/debug/artifact.bin"
+find "$R/target/lanes/idle-lane" -exec touch -t 200001010000 {} +
+check "wt disk --lanes --apply reclaims a verified idle lane" \
+  "'$SZ' wt disk --lanes --worktree '$R' --apply | grep -q 'reclaimed.*idle-lane'"
+check "wt disk --lanes --apply keeps the checkout sources" \
+  "[[ -f '$R/target/lanes/idle-lane/Cargo.toml' && -f '$R/target/lanes/idle-lane/.git/HEAD' ]]"
+check "wt disk --lanes --apply removed only the build output" \
+  "[[ ! -e '$R/target/lanes/idle-lane/target' ]]"
+check "wt disk --lanes --apply --json reports reclaimed bytes" \
+  "'$SZ' wt disk --lanes --worktree '$R' --apply --json | grep -q '\"reclaimed_bytes\"'"
+check "wt disk --apply without --lanes is a usage error" \
+  "! '$SZ' wt disk --worktree '$R' --apply >/dev/null 2>&1"
 rm -rf "$R/target"
 check "share list --json parses" \
   "'$SZ' share list --json | head -c1 | grep -q '\['"

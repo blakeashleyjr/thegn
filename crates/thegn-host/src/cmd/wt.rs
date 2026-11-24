@@ -50,9 +50,14 @@ pub struct DiskArgs {
     pub json: bool,
     /// Inventory this checkout's `target/lanes/` build lanes instead of
     /// worktrees: bytes, build output, verified owner, activity, and whether
-    /// each lane's output is safe to reclaim. Read-only.
+    /// each lane's output is safe to reclaim. Without `--apply` it is a dry run.
     #[arg(long)]
     pub lanes: bool,
+    /// Reclaim the build output of lanes the inventory still proves are
+    /// inactive, verified and unlocked. Requires `--lanes`; each candidate is
+    /// re-checked immediately before removal.
+    #[arg(long, requires = "lanes")]
+    pub apply: bool,
 }
 
 /// Args shared by `clean` and `wt clean`.
@@ -259,7 +264,7 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
         }
         Action::Disk(a) => {
             if a.lanes {
-                super::disk::lanes(a.worktree, a.json)
+                super::disk::lanes(a.worktree, a.json, a.apply)
             } else {
                 super::disk::disk(cfg, a.worktree, a.all, a.json)
             }

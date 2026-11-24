@@ -183,15 +183,16 @@ The batch form accepts the usual `--repo`, `--env`, `--isolation`,
 
 ```sh
 thegn wt disk --lanes [--worktree PATH] [--json]
+thegn wt disk --lanes [--worktree PATH] --apply [--json]
 ```
 
 Build lanes are the coordinator's per-lane build sandboxes: the immediate
 subdirectories of a checkout's `target/lanes/` — the 129 GiB the repository
 hygiene audit found with no owner attached. `--lanes` inventories exactly one
-checkout's lanes, largest first. It is a report: it removes nothing, rewrites
-nothing, does not touch the `worktree_disk` cache, and visits no other worktree.
-`--all` is a usage error here, because a lane inventory is scoped to one
-checkout.
+checkout's lanes, largest first. Without `--apply` it is a report: it removes
+nothing, rewrites nothing, does not touch the `worktree_disk` cache, and visits
+no other worktree. `--all` is a usage error here, because a lane inventory is
+scoped to one checkout.
 
 Each lane is measured with the same apparent-byte walk as `thegn disk`, so the
 two surfaces agree byte for byte. `BYTES` is the whole lane directory and
@@ -223,6 +224,40 @@ The report ends with lane count, total bytes, build output, eligible bytes and
 the scan duration. `--json` emits one object with the same fields; each `lanes`
 row carries `lane`, `path`, `bytes`, `build_bytes`, `kind`, `owner`, `branch`,
 `activity`, `activity_evidence`, `eligibility` and `reason`.
+
+### Reclaiming eligible lanes (`--apply`)
+
+`--apply` reclaims the build output of the lanes the inventory classified
+`eligible`. Review the dry run first: it lists every candidate, its estimated
+`BUILD` bytes, and the reason each other lane is held or unknown.
+
+Each candidate is re-inventoried immediately before anything is removed. The
+lane directory's identity, its kind, the verified owner and branch, Cargo's
+`.cargo-lock` probe, the newest write anywhere in the lane, and the measured
+bytes must all still match the dry run; if any of them changed — the lane
+started building, took another branch, or was replaced — the lane is left
+touched and the new reason is printed. Ambiguous lanes are never reclaimed.
+
+Removal takes only the regenerable output. A checkout lane keeps its `.git`,
+`Cargo.toml` and sources; only its `target/` subtree goes. A lane that is itself
+a bare Cargo target dir is removed whole, because all of it is build output.
+Nothing outside the selected lane's output is touched: the checkout being
+scanned, other lanes, ordinary `target/` output, and the lane's git evidence all
+stay.
+
+The apply report lists each removed lane with the apparent bytes removed, every
+lane left untouched with its reason, the total reclaimed, and the cleanup
+duration. `--json` emits the dry-run `report` object plus `reclaimed_bytes`,
+`removed` (`lane`, `path`, `bytes`), `skipped` (`lane`, `eligibility`, `reason`)
+and `apply_duration_ms`; a skipped lane's `eligibility` is its report class, or
+`retained` when the apply's re-check kept a lane the report had called eligible.
+Removal is per lane, so a partial run is retryable: the lanes it could not
+remove stay eligible for the next `--apply`.
+
+Cleanup is opt-in and never runs automatically; to stop future cleanup, stop
+passing `--apply`. After a real apply, record the `reclaimed_bytes` and skipped
+lanes from the report together with the elapsed time of the next comparable
+build in the issue handoff, so rebuild cost sits beside the recovered bytes.
 
 ## Vercel orphan reap (`env reap`)
 
