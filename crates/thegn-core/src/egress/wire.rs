@@ -65,7 +65,7 @@
 //! This item owns the shapes. The evaluator is WS04-P1-03, presets and
 //! `resolve_egress` are WS04-P1-05, the proxy and its persistence are
 //! WS04-P2-01a/P2-01b. [`EgressProxyLimits`] lives in
-//! [`crate::egress_nft`](crate::egress_nft) and is reused verbatim; its serde
+//! [`crate::egress_nft`] and is reused verbatim; its serde
 //! impls are here so that module is untouched.
 
 use std::io::{self, BufRead};

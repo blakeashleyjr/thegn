@@ -326,7 +326,7 @@ impl SearchEngine {
     }
 
     /// Score the current query/mode/options against `sources`, polling
-    /// `cancelled` every [`CANCEL_STRIDE`] lines.
+    /// `cancelled` every `CANCEL_STRIDE` lines.
     ///
     /// Returns `false` when `cancelled` fired mid-scan; the result list is then
     /// incomplete and the caller must discard it. The literal refine cache is
