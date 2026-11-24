@@ -280,9 +280,11 @@ pub(crate) fn backend_runs_on(b: Backend, os: HostOs) -> bool {
         // backend is a plausible future addition; until something actually
         // implements and verifies it, the row under-promises rather than
         // declaring a cell nothing enforces (same doctrine as smolmachines).
-        Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol => {
-            os != HostOs::Windows
-        }
+        Backend::Podman | Backend::Docker | Backend::Smol => os != HostOs::Windows,
+        // `sudo -n podman` needs a host root-owned podman. On macOS podman runs
+        // rootless inside a Linux VM (`podman machine`), so there is no host root
+        // daemon to sudo into: not a candidate there (and Windows, per the above).
+        Backend::PodmanRootful => os == HostOs::Linux,
         // Linux host-namespace primitives.
         Backend::Bwrap | Backend::Systemd => os == HostOs::Linux,
         // Apple's `container` is macOS-native (its per-container Linux VM is what
@@ -1085,6 +1087,9 @@ mod tests {
             (Backend::Docker, HostOs::Linux, true),
             (Backend::Docker, HostOs::MacOs, true),
             (Backend::Podman, HostOs::MacOs, true),
+            (Backend::PodmanRootful, HostOs::Linux, true),
+            (Backend::PodmanRootful, HostOs::MacOs, false),
+            (Backend::PodmanRootful, HostOs::Windows, false),
             (Backend::Podman, HostOs::Windows, false),
             (Backend::Docker, HostOs::Windows, false),
             (Backend::Smol, HostOs::Windows, false),
@@ -1096,6 +1101,45 @@ mod tests {
                 "backend_runs_on({b:?}, {os:?}) should be {want}"
             );
         }
+    }
+
+    #[test]
+    fn podman_rootful_not_runnable_on_macos() {
+        assert!(!backend_runs_on(Backend::PodmanRootful, HostOs::MacOs));
+        assert!(!backend_suitable_on(
+            Backend::PodmanRootful,
+            &Placement::Local,
+            HostOs::MacOs
+        ));
+        assert_eq!(
+            unsuitable_reason_on(Backend::PodmanRootful, &Placement::Local, HostOs::MacOs),
+            " on macOS"
+        );
+        // Rootless podman and docker stay offered on a Mac.
+        assert!(backend_runs_on(Backend::Podman, HostOs::MacOs));
+        assert!(backend_runs_on(Backend::Docker, HostOs::MacOs));
+    }
+
+    #[test]
+    fn default_chain_on_macos_skips_rootful_without_probe() {
+        // The resolver and `classify` both gate on `backend_suitable_on` before
+        // calling `available`, so an unsuitable backend is never probed (never
+        // spawns `sudo -n podman`). Walk the default chain as a Mac would.
+        let cfg = SandboxConfig::default();
+        let mut walked = Vec::new();
+        for name in &cfg.backend_chain {
+            let Some(b) = Backend::parse(name) else {
+                continue;
+            };
+            if backend_suitable_on(b, &Placement::Local, HostOs::MacOs) {
+                walked.push(b);
+            }
+        }
+        assert!(
+            !walked.contains(&Backend::PodmanRootful),
+            "podman-rootful must not be probed on macOS: {walked:?}"
+        );
+        assert!(walked.contains(&Backend::Podman));
     }
 
     #[test]

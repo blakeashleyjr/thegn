@@ -944,6 +944,10 @@
         {
           "issue": "THE-2099",
           "project": "Sandbox & Remote 05: macOS"
+        },
+        {
+          "issue": "THE-2131",
+          "project": "Sandbox & Remote 05: macOS"
         }
       ],
       "summary": "THE-2099 owns the macOS OCI evidence runner; owner Mac capture and review of runtime decisions remain unchecked before enforcement changes."

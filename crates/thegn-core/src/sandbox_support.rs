@@ -75,6 +75,12 @@ pub fn remedy(backend: Backend, state: BackendState) -> Option<String> {
 
 fn remedy_for(backend: Backend, state: BackendState) -> Option<String> {
     match (backend, state) {
+        // An explicit `podman-rootful` on a Mac: say where the right route is.
+        (Backend::PodmanRootful, BackendState::Unsupported) if host_os() == HostOs::MacOs => Some(
+            "podman-rootful is not available on macOS; use `podman machine set --rootful` \
+                 and the `podman-rootless` backend"
+                .into(),
+        ),
         (_, BackendState::Ready) | (_, BackendState::Unsupported) => None,
         (Backend::Apple, BackendState::NotRunning) => {
             Some("start it with `container system start`".into())
