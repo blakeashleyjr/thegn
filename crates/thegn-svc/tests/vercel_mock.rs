@@ -973,7 +973,7 @@ fn logs_streams_lines_then_ends_on_eof() {
     let lines = rt.block_on(async {
         let mut stream = mock.client().logs("sess_1", "cmd_1").await.expect("logs");
         let mut lines = Vec::new();
-        while let Some(line) = stream.recv().await {
+        while let Some(line) = stream.receiver_mut().recv().await {
             lines.push(line);
         }
         lines
@@ -1001,7 +1001,7 @@ fn dropping_a_live_log_stream_aborts_its_reader() {
     let rt = rt();
     rt.block_on(async {
         let mut stream = mock.client().logs("sess_1", "cmd_1").await.expect("logs");
-        let first = stream.recv().await.expect("first line");
+        let first = stream.receiver_mut().recv().await.expect("first line");
         assert_eq!(first, LogLine::Stdout(b"first".to_vec()));
         // The body is still open: the reader is parked on it, not finished.
         assert!(!stream.reader_finished());

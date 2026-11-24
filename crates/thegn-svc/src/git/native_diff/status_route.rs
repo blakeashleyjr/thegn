@@ -86,14 +86,14 @@ impl StatusRoute {
             &self.workdir,
             rela_path.as_ref(),
             path,
-            &mut cache.0,
+            cache.platform_mut(),
         )? {
             filter_route::StatusClean::Cleaned(bytes) => bytes,
             filter_route::StatusClean::NotRouted => return Ok(true),
             filter_route::StatusClean::Unavailable => {
                 let raw = std::fs::read(&pathname)
                     .with_context(|| format!("read status filter input {}", pathname.display()))?;
-                let platform = &mut cache.0;
+                let platform = cache.platform_mut();
                 filter_route::ProcessDrivers::convert_pipeline(
                     &self.repo,
                     &mut platform.filter.worktree_filter,
