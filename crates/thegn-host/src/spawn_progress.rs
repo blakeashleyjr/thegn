@@ -22,9 +22,11 @@
 //! exists while something is waiting — the same 0%-idle contract the splash
 //! ticker keeps (`thegn//spec/loading`).
 //!
-//! Redaction: pane argv flows through [`thegn_core::log_redact::redact_argv`]
-//! before it is drawn, exactly as the spawn-logging policy demands; nothing
-//! else from the environment is ever read.
+//! Redaction: pane argv flows through URL-userinfo masking,
+//! [`thegn_core::log_redact::redact_argv`] and
+//! [`thegn_core::log_redact::redact_text_line`] (URL query tokens) before it
+//! is drawn; nothing else from the environment is ever read. Redaction is
+//! best-effort: a bare positional secret cannot be recognised by shape.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,9 +36,9 @@ use std::time::{Duration, Instant};
 use crate::panes::Panes;
 use crate::platform::proc::{ProcSample, descendants_under};
 
-/// A card appears only once the *current* phase has run this long — instant
-/// spawns (fast resolution, immediate prompt) never flash one, even right
-/// after a slow phase advanced.
+/// A card first appears only once the current phase has run this long —
+/// instant spawns never flash one. Once a card has been shown it stays
+/// visible through later phase changes (no blink on a slow spawn).
 pub(crate) const GRACE: Duration = Duration::from_millis(150);
 /// A tracker is dropped this long after its kick (or fork), even with no
 /// output: the pane is then assumed live-but-quiet, and the startup
@@ -47,6 +49,11 @@ pub(crate) const BOUND: Duration = Duration::from_secs(30);
 pub(crate) const MAX_PROC_LINES: usize = 3;
 /// Args shown per descendant line, then clipped with `…`.
 const ARGS_BUDGET: usize = 40;
+
+/// Key of a pre-fork tracker: `(group name, tab index, missing leaf id)`.
+/// Leaf ids collide across tabs (shared fallback ids), so the tab is part of
+/// the identity; pane ids (global) key `Panes::spawn_progress` instead.
+pub(crate) type PendingKey = (String, usize, u32);
 
 /// Lifecycle phases, in order. A tracker only ever advances forward
 /// (`rank`); a stale advance after a phase moved on is ignored, and `Failed`
@@ -88,8 +95,9 @@ impl Phase {
 }
 
 /// What a card renders for one pane: `lines` top-down, then `hint` in the
-/// faint style. Equality drives the per-frame `dirty` gate, so it must not
-/// embed wall-clock-now (the elapsed values are re-derived each frame).
+/// faint style. Equality drives the per-frame `dirty` gate: the elapsed
+/// values embedded in `lines` are quantized to 0.5 s (see [`elapsed_text`]),
+/// so a card repaints at most twice a second.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpawnBlock {
     /// Phase line first, then at most [`MAX_PROC_LINES`] descendant lines.
@@ -113,6 +121,8 @@ pub struct SpawnProgress {
     procs: Vec<ProcSample>,
     /// Why a `Failed` tracker failed (already short; drawing clips further).
     failure: Option<String>,
+    /// A card has been drawn for this tracker: keep it across phase changes.
+    shown: bool,
 }
 
 impl SpawnProgress {
@@ -124,6 +134,7 @@ impl SpawnProgress {
             started: now,
             procs: Vec::new(),
             failure: None,
+            shown: false,
         }
     }
 
@@ -164,10 +175,11 @@ impl SpawnProgress {
     /// The card for this tracker right now, or `None` while the current
     /// phase is younger than [`GRACE`] (instant spawns never flash a card).
     /// `program` is the pane's own program name, when the pane exists.
-    pub(crate) fn block(&self, program: Option<&str>, now: Instant) -> Option<SpawnBlock> {
-        if now.saturating_duration_since(self.since) < GRACE {
+    pub(crate) fn block(&mut self, program: Option<&str>, now: Instant) -> Option<SpawnBlock> {
+        if !self.shown && now.saturating_duration_since(self.since) < GRACE {
             return None;
         }
+        self.shown = true;
         let mut lines = Vec::with_capacity(1 + self.procs.len());
         lines.push(match &self.failure {
             Some(failure) => format!("{}: {}", Phase::Failed.label(), failure),
@@ -187,10 +199,12 @@ impl SpawnProgress {
     }
 }
 
-/// Elapsed seconds as `0.4 s` / `2.4 s` under ten, whole above.
+/// Elapsed seconds as `0.5 s` / `2.5 s` under ten (quantized down to half
+/// seconds, so a card repaints at most 2 Hz), whole above.
 fn elapsed_text(elapsed: Duration) -> String {
     if elapsed.as_secs_f32() < 10.0 {
-        format!("{:.1} s", elapsed.as_secs_f32())
+        let halves = (elapsed.as_secs_f32() * 2.0).floor() / 2.0;
+        format!("{halves:.1} s")
     } else {
         format!("{} s", elapsed.as_secs())
     }
@@ -198,18 +212,23 @@ fn elapsed_text(elapsed: Duration) -> String {
 
 /// One descendant line: `direnv export bash 0.6 s` — argv[0] basename, up to
 /// [`ARGS_BUDGET`] chars of the rest (redacted first: this is pane argv, and
-/// pane argv never reaches a surface unredacted), then the descendant's age.
+/// pane argv never reaches a surface unredacted — URL userinfo masked, flag
+/// and assignment values redacted, URL query tokens redacted), then the
+/// descendant's age.
 fn proc_line(proc: &ProcSample, now: Instant) -> String {
-    let argv = thegn_core::log_redact::redact_argv(&proc.argv);
+    let masked: Vec<String> = proc.argv.iter().map(|a| mask_url_userinfo(a)).collect();
+    let argv = thegn_core::log_redact::redact_argv(&masked);
     let name = argv
         .first()
         .map(|first| thegn_core::util::basename(first))
         .unwrap_or_default()
         .to_string();
-    let args = if argv.is_empty() {
-        String::new()
+    let args = if argv.len() > 1 {
+        clip_args(&[thegn_core::log_redact::redact_text_line(
+            &argv[1..].join(" "),
+        )])
     } else {
-        clip_args(&argv[1..])
+        String::new()
     };
     let age = elapsed_text(now.saturating_duration_since(proc.started));
     if args.is_empty() {
@@ -217,6 +236,50 @@ fn proc_line(proc: &ProcSample, now: Instant) -> String {
     } else {
         format!("{name} {args} {age}")
     }
+}
+
+/// Replace the `user:pass@` of every `scheme://user:pass@host` with `***@`.
+fn mask_url_userinfo(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(pos) = rest.find("://") {
+        let auth_start = pos + 3;
+        out.push_str(&rest[..auth_start]);
+        rest = &rest[auth_start..];
+        let auth_end = rest
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(rest.len());
+        if let Some(at) = rest[..auth_end].rfind('@') {
+            out.push_str("***");
+            rest = &rest[at..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether a launch argv runs an interactive shell (directly, or as the
+/// payload of a sandbox/remote wrapper): any token whose basename is a known
+/// shell. Program panes (agents, `cat`, ...) get no shell-prompt card.
+pub(crate) fn is_shell_launch(argv: &[String]) -> bool {
+    const SHELLS: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "fish",
+        "ksh",
+        "mksh",
+        "tcsh",
+        "csh",
+        "nu",
+        "xonsh",
+        "elvish",
+        "pwsh",
+        "powershell",
+    ];
+    argv.iter()
+        .any(|a| SHELLS.contains(&thegn_core::util::basename(a)))
 }
 
 /// `argv[1..]` joined, clipped to [`ARGS_BUDGET`] chars with a `…` marker.
@@ -256,24 +319,30 @@ pub(crate) const CULPRITS: &[(&[&str], &str)] = &[
     (&["sudo", "passwd", "askpass"], "waiting for input"),
 ];
 
+/// Rows that make sense for a pane whose *own* program is the culprit: a pane
+/// running `git clone` or `nix develop` is not "prompt git status".
+const PROGRAM_ROWS: &[&str] = &["connecting", "waiting for input"];
+
 /// First matching row's hint for this pane, or `None` when nothing on the
-/// table applies. Two passes: the pane's *own* program is the strongest
-/// signal (an `ssh` pane answers `connecting` even while a descendant `git`
-/// runs), then the sampled descendants with row priority — `direnv` outranks
-/// a coincidental `git`. Candidates are argv[0] basenames.
+/// table applies. Two passes: the pane's own program against the connection
+/// and input rows only (an `ssh` pane answers `connecting` even while a
+/// descendant runs), then the sampled descendants with row priority —
+/// `direnv` outranks a coincidental `git`. A descendant that *is* the pane's
+/// own program is never a startup culprit. Candidates are argv[0] basenames.
 pub(crate) fn culprit_hint(program: Option<&str>, procs: &[ProcSample]) -> Option<&'static str> {
     if let Some(program) = program {
         for (keys, hint) in CULPRITS {
-            if keys.contains(&thegn_core::util::basename(program)) {
+            if PROGRAM_ROWS.contains(hint) && keys.contains(&thegn_core::util::basename(program)) {
                 return Some(hint);
             }
         }
     }
     for (keys, hint) in CULPRITS {
         if procs.iter().any(|proc| {
-            proc.argv
-                .first()
-                .is_some_and(|first| keys.contains(&thegn_core::util::basename(first)))
+            proc.argv.first().is_some_and(|first| {
+                let name = thegn_core::util::basename(first);
+                keys.contains(&name) && Some(name) != program
+            })
         }) {
             return Some(hint);
         }
@@ -287,17 +356,18 @@ pub(crate) fn culprit_hint(program: Option<&str>, procs: &[ProcSample]) -> Optio
 /// * `panes.spawn_progress` — keyed by *pane id* after the fork. Retired by
 ///   the drain on first output; pruned here when the pane is gone, already
 ///   printed (belt against a raced retire), or past the hard bound.
-/// * `panes.spawn_pending` — keyed by *missing leaf id* between the kick and
-///   the fork. Pruned here once the leaf went live through any other path
-///   (a raced direct spawn, a restore) or past the bound.
+/// * `panes.spawn_pending` — keyed by `(group, tab, missing leaf id)` between
+///   the kick and the fork. Pruned here once the leaf went live through any
+///   other path (a raced direct spawn, a restore) or past the bound.
 ///
 /// Only ids in `leaves` — the displayed tab's pane ids, missing leaves and
-/// live panes alike — get a card, so the result is display-tab scoped and
-/// background tabs can never collide on shared fallback leaf ids. The
-/// returned map's identity drives the frame `dirty` gate; the caller owns
-/// `model.spawn_hints` because the model owns everything the renderer reads.
+/// live panes alike — get a card, and pending trackers must also belong to
+/// `tab_key` (the displayed tab), so cards never cross tabs even on shared
+/// fallback leaf ids. The returned map's identity drives the frame `dirty`
+/// gate; the caller owns `model.spawn_hints`.
 pub(crate) fn derive_hints(
     panes: &mut Panes,
+    tab_key: Option<&(String, usize)>,
     leaves: &std::collections::HashSet<u32>,
     now: Instant,
 ) -> HashMap<u32, SpawnBlock> {
@@ -321,18 +391,19 @@ pub(crate) fn derive_hints(
         }
         true
     });
-    panes.spawn_pending.retain(|&leaf, tracker| {
+    panes.spawn_pending.retain(|(group, tab, leaf), tracker| {
         if tracker.is_past_bound(now) {
             return false;
         }
         // The leaf went live through another path (a raced direct spawn, a
         // restore): that pane is not waiting on this materialize anymore.
-        if panes.table.contains_key(&leaf) {
+        if panes.table.contains_key(leaf) {
             return false;
         }
-        if leaves.contains(&leaf) {
+        let displayed = tab_key.is_some_and(|(g, t)| g == group && t == tab);
+        if displayed && leaves.contains(leaf) {
             if let Some(block) = tracker.block(None, now) {
-                hints.insert(leaf, block);
+                hints.insert(*leaf, block);
             }
         }
         true
@@ -340,13 +411,18 @@ pub(crate) fn derive_hints(
     hints
 }
 
-/// Live sampler targets for every waiting pane: `pane id → (shell) pid`.
-/// Panes with no host pid are kept (sampling skips them) so the hub's
-/// payload map stays pane-keyed for the loop-side merge.
-pub(crate) fn sampler_targets(panes: &Panes) -> HashMap<u32, Option<u32>> {
+/// Live sampler targets for the *displayed* waiting panes (`leaves`):
+/// `pane id → (shell) pid`. Background-tab panes are never drawn, so they
+/// are never sampled. Panes with no host pid are kept (sampling skips them)
+/// so the hub's payload map stays pane-keyed for the loop-side merge.
+pub(crate) fn sampler_targets(
+    panes: &Panes,
+    leaves: &std::collections::HashSet<u32>,
+) -> HashMap<u32, Option<u32>> {
     panes
         .spawn_progress
         .keys()
+        .filter(|pane_id| leaves.contains(pane_id))
         .filter_map(|&pane_id| {
             let pid = panes.table.get(&pane_id)?.live_pid();
             Some((pane_id, pid))
@@ -371,8 +447,9 @@ pub(crate) struct SpawnSamplerHub {
 }
 
 impl SpawnSamplerHub {
-    /// Replace the target set. Called once per frame while anything waits:
-    /// cheap — one short mutex hold on a pane-count-sized map.
+    /// Replace the target set. Called once per frame while anything waits
+    /// (and once more with an empty map when the last tracker retires, which
+    /// clears the stale target): cheap — one short mutex hold.
     pub(crate) fn set_targets(&self, targets: &HashMap<u32, Option<u32>>) {
         let mut guard = self
             .targets
@@ -491,6 +568,7 @@ impl SpawnTicker {
             let tick = self.tick.clone();
             let period = self.period;
             thegn_core::thread_name::try_spawn_named("thegn-spawn", move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 loop {
                     std::thread::sleep(period);
                     if !active.load(Ordering::Relaxed) {

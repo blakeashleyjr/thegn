@@ -165,8 +165,7 @@ pub(crate) fn cmdline(pid: u32) -> Option<Vec<String>> {
 
 /// One descendant process sampled under a pane's shell, for the
 /// spawn-progress card: the kernel-recorded argv (nothing from the
-/// environment is ever read), how many levels below the root pid it sits
-/// (1 = direct child), and when it started. Exists on every platform so the
+/// environment is ever read) and when it started. Exists on every platform so the
 /// tracker can hold samples unconditionally; only `descendants_under` is
 /// platform-gated below.
 // Off Linux (and off `test`) nothing constructs or reads a sample — the
@@ -175,8 +174,6 @@ pub(crate) fn cmdline(pid: u32) -> Option<Vec<String>> {
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProcSample {
-    pub(crate) pid: u32,
-    pub(crate) depth: u32,
     pub(crate) argv: Vec<String>,
     pub(crate) started: std::time::Instant,
 }
@@ -229,25 +226,35 @@ pub(crate) fn descendants_under(pid: u32) -> Option<Vec<ProcSample>> {
     // lowest pid, so the `MAX_PROC_LINES` truncation drops wrappers, not
     // workers, and successive samples read stable.
     found.sort_by_key(|&(pid, depth)| (std::cmp::Reverse(depth), pid));
+    // Uptime and the tick rate are read once per walk, and resolution stops
+    // as soon as the card's line budget is full (the sort already ordered
+    // the candidates), so a wide tree costs a few procfs reads, not 24.
     let now = std::time::Instant::now();
-    found
-        .into_iter()
-        .filter_map(|(pid, depth)| {
-            let argv = cmdline(pid)?;
-            let first = argv.first()?;
-            if thegn_core::util::basename(first).is_empty() {
-                return None;
-            }
-            let started = proc_started_at(pid, now)?;
-            Some(ProcSample {
-                pid,
-                depth,
-                argv,
-                started,
-            })
-        })
-        .collect::<Vec<_>>()
-        .into()
+    let uptime = uptime_secs()?;
+    let ticks_per_sec = clock_ticks_per_sec()?;
+    let mut out = Vec::new();
+    for (pid, _depth) in found {
+        if out.len() >= crate::spawn_progress::MAX_PROC_LINES {
+            break;
+        }
+        let Some(argv) = cmdline(pid) else { continue };
+        let Some(first) = argv.first() else { continue };
+        if thegn_core::util::basename(first).is_empty() {
+            continue;
+        }
+        let Some(ticks) = stat_starttime(pid) else {
+            continue;
+        };
+        let age_secs = uptime - ticks as f64 / ticks_per_sec;
+        if age_secs < 0.0 {
+            continue;
+        }
+        let Some(started) = now.checked_sub(std::time::Duration::from_secs_f64(age_secs)) else {
+            continue;
+        };
+        out.push(ProcSample { argv, started });
+    }
+    Some(out)
 }
 
 /// `starttime` (field 22 of `/proc/<pid>/stat`, ticks since boot), parsed
@@ -283,19 +290,6 @@ fn clock_ticks_per_sec() -> Option<f64> {
     // contract beyond returning -1 on the unknown option.
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     (ticks > 0).then_some(ticks as f64)
-}
-
-/// When `pid` started, as an `Instant`: `starttime` against the live uptime,
-/// converted at sample time (so the card can print "0.6 s" next to each
-/// descendant without re-reading procfs while drawing).
-#[cfg(target_os = "linux")]
-fn proc_started_at(pid: u32, now: std::time::Instant) -> Option<std::time::Instant> {
-    let ticks = stat_starttime(pid)?;
-    let age_secs = uptime_secs()? - ticks as f64 / clock_ticks_per_sec()?;
-    if age_secs < 0.0 {
-        return None;
-    }
-    now.checked_sub(std::time::Duration::from_secs_f64(age_secs))
 }
 
 // ── macOS ───────────────────────────────────────────────────────────────────
@@ -1000,63 +994,63 @@ mod tests {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         assert!(pids_with_cwd_under(dir.path()).is_empty());
     }
-}
 
-#[test]
-fn walk_descendants_shapes_the_sample_tree() {
-    // 1 -> 10, 11; 10 -> 100 -> 1000 -> 10000 (1000's child would sit at
-    // depth 5, past the cap, so the walk never even asks for it).
-    let children = |pid: u32| match pid {
-        1 => Some(vec![10, 11]),
-        10 => Some(vec![100]),
-        11 => Some(vec![110, 111]),
-        100 => Some(vec![1000]),
-        1000 => Some(vec![10000]),
-        10000 => Some(vec![100000]),
-        _ => None,
-    };
-    let found = walk_descendants(children(1).unwrap(), children);
-    // Breadth-first order: shallower levels fully before deeper ones.
-    assert_eq!(
-        found,
-        vec![
-            (10, 1),
-            (11, 1),
-            (100, 2),
-            (110, 2),
-            (111, 2),
-            (1000, 3),
-            (10000, 4),
-            // (100000, 5) is cut off by DESCENDANT_MAX_DEPTH.
-        ]
-    );
-}
+    #[test]
+    fn walk_descendants_shapes_the_sample_tree() {
+        // 1 -> 10, 11; 10 -> 100 -> 1000 -> 10000 (1000's child would sit at
+        // depth 5, past the cap, so the walk never even asks for it).
+        let children = |pid: u32| match pid {
+            1 => Some(vec![10, 11]),
+            10 => Some(vec![100]),
+            11 => Some(vec![110, 111]),
+            100 => Some(vec![1000]),
+            1000 => Some(vec![10000]),
+            10000 => Some(vec![100000]),
+            _ => None,
+        };
+        let found = walk_descendants(children(1).unwrap(), children);
+        // Breadth-first order: shallower levels fully before deeper ones.
+        assert_eq!(
+            found,
+            vec![
+                (10, 1),
+                (11, 1),
+                (100, 2),
+                (110, 2),
+                (111, 2),
+                (1000, 3),
+                (10000, 4),
+                // (100000, 5) is cut off by DESCENDANT_MAX_DEPTH.
+            ]
+        );
+    }
 
-#[test]
-fn walk_descendants_keeps_going_when_a_child_vanishes() {
-    // A pid that died mid-walk yields `None` — it drops out, the rest of
-    // the tree still samples.
-    let children = |pid: u32| match pid {
-        1 => Some(vec![10, 11]),
-        10 => None,
-        11 => Some(vec![110]),
-        _ => None,
-    };
-    let found = walk_descendants(children(1).unwrap(), children);
-    assert_eq!(found, vec![(10, 1), (11, 1), (110, 2)]);
-}
+    #[test]
+    fn walk_descendants_keeps_going_when_a_child_vanishes() {
+        // A pid that died mid-walk yields `None` — it drops out, the rest of
+        // the tree still samples.
+        let children = |pid: u32| match pid {
+            1 => Some(vec![10, 11]),
+            10 => None,
+            11 => Some(vec![110]),
+            _ => None,
+        };
+        let found = walk_descendants(children(1).unwrap(), children);
+        assert_eq!(found, vec![(10, 1), (11, 1), (110, 2)]);
+    }
 
-#[test]
-fn parse_stat_starttime_reads_field_22_after_the_comm_parens() {
-    // comm contains spaces and a paren; the numeric fields start after the
-    // FINAL ')' (field 3 = state is the first token, so field 22 is token
-    // index 19).
-    let stat = "1234 (foo (bar) baz) S 1 1234 1234 34816 1234 4194624 ...";
-    assert_eq!(parse_stat_starttime(stat), None, "too short must be None");
-    let tokens: Vec<&str> = "S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 42"
-        .split(' ')
-        .collect();
-    assert_eq!(tokens.len(), 20);
-    let stat = format!("1234 (foo (bar)) {}", tokens.join(" "));
-    assert_eq!(parse_stat_starttime(&stat), Some(42));
+    #[test]
+    fn parse_stat_starttime_reads_field_22_after_the_comm_parens() {
+        // comm contains spaces and a paren; the numeric fields start after the
+        // FINAL ')' (field 3 = state is the first token, so field 22 is token
+        // index 19).
+        let stat = "1234 (foo (bar) baz) S 1 1234 1234 34816 1234 4194624 ...";
+        assert_eq!(parse_stat_starttime(stat), None, "too short must be None");
+        let tokens: Vec<&str> = "S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 42"
+            .split(' ')
+            .collect();
+        assert_eq!(tokens.len(), 20);
+        let stat = format!("1234 (foo (bar)) {}", tokens.join(" "));
+        assert_eq!(parse_stat_starttime(&stat), Some(42));
+    }
 }

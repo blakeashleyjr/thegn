@@ -9,8 +9,6 @@ use std::time::Duration;
 
 fn sample(argv: &[&str], started: Instant) -> ProcSample {
     ProcSample {
-        pid: 42,
-        depth: 1,
         argv: argv.iter().map(|a| a.to_string()).collect(),
         started,
     }
@@ -24,21 +22,27 @@ fn grace_hides_instant_spawns_and_bound_prunes() {
     assert_eq!(tracker.block(None, t0 + GRACE / 2), None);
     // Past the grace: the resolving phase shows with its own elapsed time.
     let card = tracker
-        .block(None, t0 + Duration::from_millis(300))
+        .block(None, t0 + Duration::from_millis(600))
         .expect("past the grace");
-    assert_eq!(card.lines[0], "resolving environment · 0.3 s");
+    assert_eq!(card.lines[0], "resolving environment · 0.5 s");
     assert!(card.hint.is_none());
-    // The grace resets on every phase change (a slow resolve must not make a
-    // fast prompt flash the waiting card).
+    // A card that has been shown stays through phase changes (no blink).
     tracker.advance(Phase::WaitingForShellPrompt, t0 + Duration::from_secs(1));
-    assert_eq!(
-        tracker.block(None, t0 + Duration::from_secs(1) + GRACE / 2),
-        None
-    );
+    let card = tracker
+        .block(None, t0 + Duration::from_secs(1) + GRACE / 2)
+        .expect("a shown card survives a phase change");
+    assert_eq!(card.lines[0], "waiting for shell prompt · 0.0 s");
     let card = tracker
         .block(None, t0 + Duration::from_secs(3))
-        .expect("past the grace again");
+        .expect("still shown");
     assert_eq!(card.lines[0], "waiting for shell prompt · 2.0 s");
+    // A tracker that never showed a card keeps the per-phase grace.
+    let mut fresh = SpawnProgress::kicked(t0);
+    fresh.advance(Phase::StartingShell, t0 + Duration::from_secs(1));
+    assert_eq!(
+        fresh.block(None, t0 + Duration::from_secs(1) + GRACE / 2),
+        None
+    );
     // Hard bound: 30 s after the kick the tracker is spent.
     assert!(!tracker.is_past_bound(t0 + BOUND));
     assert!(tracker.is_past_bound(t0 + BOUND + Duration::from_millis(1)));
@@ -77,7 +81,7 @@ fn descendant_lines_carry_a_redacted_argv_basename_and_age() {
         .block(None, t0 + Duration::from_secs(1))
         .expect("card");
     assert_eq!(card.lines[0], "resolving environment · 1.0 s");
-    assert_eq!(card.lines[1], "direnv export bash 0.6 s");
+    assert_eq!(card.lines[1], "direnv export bash 0.5 s");
     // The hint comes from the sampled basename, not just the pane program.
     assert_eq!(card.hint.as_deref(), Some("direnv is loading .envrc"));
     // More than three descendants: only the first three lines are kept.
@@ -108,6 +112,45 @@ fn argv_values_are_redacted_before_drawing() {
 }
 
 #[test]
+fn url_userinfo_and_query_tokens_are_redacted_before_drawing() {
+    let t0 = Instant::now();
+    let mut tracker = SpawnProgress::kicked(t0);
+    tracker.set_procs(vec![sample(
+        &["git", "fetch", "https://user:tok@host/x?token=abc"],
+        t0,
+    )]);
+    let card = tracker.block(None, t0 + Duration::from_secs(1)).unwrap();
+    let line = &card.lines[1];
+    assert!(!line.contains("tok@"), "{line}");
+    assert!(!line.contains("user:"), "{line}");
+    assert!(!line.contains("token=abc"), "{line}");
+    assert!(line.contains("https://***@host/x"), "{line}");
+}
+
+#[test]
+fn userinfo_mask_leaves_plain_urls_alone() {
+    assert_eq!(mask_url_userinfo("https://host/a@b"), "https://host/a@b");
+    assert_eq!(mask_url_userinfo("ssh://git@host/r"), "ssh://***@host/r");
+    assert_eq!(mask_url_userinfo("plain"), "plain");
+}
+
+#[test]
+fn shell_launch_detection_sees_through_wrappers() {
+    let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert!(is_shell_launch(&argv(&[
+        "/run/current-system/sw/bin/zsh",
+        "-l"
+    ])));
+    assert!(is_shell_launch(&argv(&[
+        "bwrap",
+        "--unshare-all",
+        "/bin/bash"
+    ])));
+    assert!(!is_shell_launch(&argv(&["claude"])));
+    assert!(!is_shell_launch(&argv(&["tail", "-f", "log"])));
+}
+
+#[test]
 fn culprit_rows_match_the_pane_program_first() {
     // An ssh pane answers `connecting` before any descendant is sampled.
     assert_eq!(culprit_hint(Some("ssh"), &[]), Some("connecting"));
@@ -126,6 +169,12 @@ fn culprit_rows_match_the_pane_program_first() {
         None
     );
     assert_eq!(culprit_hint(Some("zsh"), &[]), None);
+    // A pane running git/nix itself is not "prompt git status" / direnv.
+    assert_eq!(culprit_hint(Some("git"), &[]), None);
+    assert_eq!(culprit_hint(Some("nix"), &[]), None);
+    // A descendant that is the pane's own program is not a startup culprit.
+    let own = [sample(&["git", "clone"], Instant::now())];
+    assert_eq!(culprit_hint(Some("git"), &own), None);
 }
 
 #[test]
@@ -140,9 +189,13 @@ fn args_are_clipped_to_the_budget() {
 
 #[test]
 fn elapsed_text_fits_the_card() {
-    assert_eq!(elapsed_text(Duration::from_millis(412)), "0.4 s");
-    assert_eq!(elapsed_text(Duration::from_millis(2400)), "2.4 s");
+    assert_eq!(elapsed_text(Duration::from_millis(412)), "0.0 s");
+    assert_eq!(elapsed_text(Duration::from_millis(2600)), "2.5 s");
     assert_eq!(elapsed_text(Duration::from_secs(12)), "12 s");
+}
+
+fn key(group: &str, tab: usize, leaf: u32) -> PendingKey {
+    (group.to_string(), tab, leaf)
 }
 
 #[test]
@@ -150,31 +203,34 @@ fn derive_scopes_cards_to_the_displayed_tab_and_prunes() {
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let mut panes = Panes::new(tx);
     let t0 = Instant::now();
+    let shown = ("g".to_string(), 0usize);
     panes.insert_test_pane(1);
     panes.spawn_progress.insert(1, SpawnProgress::kicked(t0));
-    panes.spawn_pending.insert(7, SpawnProgress::kicked(t0));
+    panes
+        .spawn_pending
+        .insert(key("g", 0, 7), SpawnProgress::kicked(t0));
 
     let mut leaves = std::collections::HashSet::new();
     leaves.insert(1);
     leaves.insert(7);
     let now = t0 + BOUND + Duration::from_millis(1);
-    let hints = derive_hints(&mut panes, &leaves, now);
+    let hints = derive_hints(&mut panes, Some(&shown), &leaves, now);
     // Past the hard bound, every tracker prunes — nothing waits forever.
     assert!(hints.is_empty());
     assert!(panes.spawn_progress.is_empty());
     assert!(panes.spawn_pending.is_empty());
 
-    // Back inside the bound. A tracker for a pane that only exists in
-    // another tab (id 9, not in `leaves`): KEPT — its pane is still silent
-    // and it may become the displayed tab's card — but it never renders on
-    // the displayed tab. Displayed leaves get cards, others do not.
+    // Back inside the bound. A pane tracker outside `leaves` (id 9) is kept
+    // but never renders on the displayed tab.
     panes.insert_test_pane(1);
     panes.insert_test_pane(9);
     panes.spawn_progress.insert(1, SpawnProgress::kicked(t0));
     panes.spawn_progress.insert(9, SpawnProgress::kicked(t0));
-    panes.spawn_pending.insert(7, SpawnProgress::kicked(t0));
+    panes
+        .spawn_pending
+        .insert(key("g", 0, 7), SpawnProgress::kicked(t0));
     let now = t0 + GRACE * 2;
-    let hints = derive_hints(&mut panes, &leaves, now);
+    let hints = derive_hints(&mut panes, Some(&shown), &leaves, now);
     assert!(hints.contains_key(&1), "the pane tracker renders");
     assert!(hints.contains_key(&7), "the pending leaf renders");
     assert!(!hints.contains_key(&9), "cards are display-tab scoped");
@@ -187,32 +243,153 @@ fn derive_scopes_cards_to_the_displayed_tab_and_prunes() {
     // First output retires the pane's tracker (the drain owns the retire;
     // the derive must agree if the retire raced a render).
     panes.table.get_mut(&1).unwrap().feed(b"prompt$ ");
-    let hints = derive_hints(&mut panes, &leaves, now + GRACE);
+    let hints = derive_hints(&mut panes, Some(&shown), &leaves, now + GRACE);
     assert!(!hints.contains_key(&1), "output kills the pane card");
-    assert!(panes.spawn_progress.get(&1).is_none(), "tracker pruned");
+    assert!(!panes.spawn_progress.contains_key(&1), "tracker pruned");
     assert!(hints.contains_key(&7));
 
     // A leaf that went live through another path drops its pending tracker.
     panes.insert_test_pane(7);
-    let hints = derive_hints(&mut panes, &leaves, now + GRACE * 2);
+    let hints = derive_hints(&mut panes, Some(&shown), &leaves, now + GRACE * 2);
     assert!(!hints.contains_key(&7));
     assert!(panes.spawn_pending.is_empty());
 }
 
 #[test]
-fn sampler_targets_track_live_panes_only() {
+fn pending_cards_never_cross_tabs_on_shared_leaf_ids() {
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let mut panes = Panes::new(tx);
+    let t0 = Instant::now();
+    // Two tabs kicked the same fallback leaf id: two independent trackers.
+    panes
+        .spawn_pending
+        .insert(key("g", 0, 0), SpawnProgress::kicked(t0));
+    let mut other = SpawnProgress::kicked(t0);
+    other.fail("tab b failed", t0);
+    panes.spawn_pending.insert(key("g", 1, 0), other);
+    let leaves: std::collections::HashSet<u32> = [0].into_iter().collect();
+    let now = t0 + GRACE * 2;
+
+    let tab_a = ("g".to_string(), 0usize);
+    let hints = derive_hints(&mut panes, Some(&tab_a), &leaves, now);
+    assert_eq!(hints[&0].lines[0], "resolving environment · 0.0 s");
+    let tab_b = ("g".to_string(), 1usize);
+    let hints = derive_hints(&mut panes, Some(&tab_b), &leaves, now);
+    assert_eq!(hints[&0].lines[0], "failed: tab b failed");
+    // Neither tab displayed: both kept, nothing drawn.
+    assert!(derive_hints(&mut panes, None, &leaves, now).is_empty());
+    assert_eq!(panes.spawn_pending.len(), 2);
+}
+
+#[cfg(unix)]
+fn fork_one(
+    panes: &mut Panes,
+    tab: &mut crate::session::Tab,
+    tab_key: &(String, usize),
+    argv: &[&str],
+) {
+    let spec = crate::agent::LaunchSpec {
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        cwd: None,
+        env: Vec::new(),
+        backend: "host".into(),
+        warnings: Vec::new(),
+        degraded: false,
+        remote: false,
+    };
+    let center = crate::layout::compute(120, 30, true, true).center;
+    panes
+        .materialize_with_specs_keyed(
+            &thegn_core::config::Config::default(),
+            tab,
+            Some(tab_key),
+            "/tmp",
+            &[(3, spec)],
+            center,
+            &[],
+        )
+        .expect("fork");
+}
+
+#[cfg(unix)]
+fn one_tab() -> crate::session::WorktreeGroup {
+    let mut group = crate::session::WorktreeGroup::new(
+        "g",
+        crate::session::GroupKind::Home,
+        "/tmp".to_string(),
+    );
+    group.tabs[0].center = crate::center::CenterTree::Leaf(3);
+    group.tabs[0].focused_pane = 3;
+    group
+}
+
+#[cfg(unix)]
+#[test]
+fn fork_rekeys_only_this_tabs_pending_tracker_to_the_pane() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let mut panes = Panes::new(tx);
+    let mut group = one_tab();
+    let t0 = Instant::now();
+    panes
+        .spawn_pending
+        .insert(key("g", 0, 3), SpawnProgress::kicked(t0));
+    panes
+        .spawn_pending
+        .insert(key("other", 0, 3), SpawnProgress::kicked(t0));
+    fork_one(
+        &mut panes,
+        &mut group.tabs[0],
+        &("g".to_string(), 0),
+        &["/bin/sh", "-c", "sleep 1"],
+    );
+    let fresh = group.tabs[0].center.pane_ids()[0];
+    assert!(
+        panes.spawn_progress.contains_key(&fresh),
+        "re-keyed to pane"
+    );
+    assert!(!panes.spawn_pending.contains_key(&key("g", 0, 3)));
+    assert!(
+        panes.spawn_pending.contains_key(&key("other", 0, 3)),
+        "another tab's tracker is untouched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fork_gives_program_panes_no_shell_prompt_card() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let mut panes = Panes::new(tx);
+    let mut group = one_tab();
+    panes
+        .spawn_pending
+        .insert(key("g", 0, 3), SpawnProgress::kicked(Instant::now()));
+    fork_one(
+        &mut panes,
+        &mut group.tabs[0],
+        &("g".to_string(), 0),
+        &["sleep", "1"],
+    );
+    assert!(panes.spawn_progress.is_empty(), "program pane: no card");
+    assert!(panes.spawn_pending.is_empty(), "pending tracker dropped");
+}
+
+#[test]
+fn sampler_targets_track_displayed_live_panes_only() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let mut panes = Panes::new(tx);
+    let leaves: std::collections::HashSet<u32> = [3].into_iter().collect();
     panes
         .spawn_progress
         .insert(3, SpawnProgress::kicked(Instant::now()));
     // Tracker without a pane (departed): not a target.
-    assert!(sampler_targets(&panes).is_empty());
+    assert!(sampler_targets(&panes, &leaves).is_empty());
     panes.insert_test_pane(3);
     // Test panes have no host pid: kept as a None target so the payload map
     // stays pane-keyed.
-    let targets = sampler_targets(&panes);
+    let targets = sampler_targets(&panes, &leaves);
     assert_eq!(targets, HashMap::from([(3, None)]));
+    // A background-tab pane (not displayed) is never sampled.
+    assert!(sampler_targets(&panes, &std::collections::HashSet::new()).is_empty());
 }
 
 #[test]

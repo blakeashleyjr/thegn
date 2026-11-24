@@ -698,7 +698,8 @@ pub(crate) struct Panes {
     /// keyed by the still-missing leaf id. The fork moves them into
     /// [`Panes::spawn_progress`]; a raced direct spawn, restore, or the
     /// 30 s bound prunes them in the derive.
-    pub(crate) spawn_pending: std::collections::HashMap<u32, SpawnProgress>,
+    pub(crate) spawn_pending:
+        std::collections::HashMap<crate::spawn_progress::PendingKey, SpawnProgress>,
 }
 
 enum NativeRestoreAction {
@@ -1242,6 +1243,24 @@ impl Panes {
         center: Rect,
         attach: &[(u32, crate::handlers::worktree_attach::AttachTarget)],
     ) -> Result<()> {
+        self.materialize_with_specs_keyed(cfg, tab, None, worktree, specs, center, attach)
+    }
+
+    /// [`Self::materialize_with_specs`] for a tab whose `(group, tab index)`
+    /// key is known: the spawn-progress trackers the materialize kick seeded
+    /// under that key are re-keyed to the forked panes. Without a key (tests,
+    /// direct spawns) only fresh shell panes get a tracker born at the fork.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn materialize_with_specs_keyed(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        tab: &mut crate::session::Tab,
+        tab_key: Option<&(String, usize)>,
+        worktree: &str,
+        specs: &[(u32, crate::agent::LaunchSpec)],
+        center: Rect,
+        attach: &[(u32, crate::handlers::worktree_attach::AttachTarget)],
+    ) -> Result<()> {
         let worktree_missing = !worktree.is_empty() && !std::path::Path::new(worktree).is_dir();
         if worktree_missing {
             tracing::warn!(
@@ -1542,28 +1561,33 @@ impl Panes {
         // by the missing leaf id) into the pane-keyed map, so the card
         // follows the pane — the leaf id becomes the pane id on remap below.
         // `started` is kept, so the 30 s bound still counts from the kick.
-        // A fresh pane WITHOUT a pending tracker (a prewarm fork skipped the
-        // kick, or the leaf raced a direct spawn) still waits for its first
-        // prompt as far as the user can tell, so its tracker is born here,
-        // kicked at the fork. Reattached sessions are excluded: the prompt is
-        // already alive inside them, and instant spawns never show the card
-        // anyway (the 150 ms grace).
+        // A fresh SHELL pane without a pending tracker (a prewarm fork skipped
+        // the kick) still waits for its first prompt as far as the user can
+        // tell, so its tracker is born here, kicked at the fork. Reattached
+        // sessions never get a card (the prompt is already alive inside
+        // them) and program panes (agents, `cat`, ...) never wait for a shell
+        // prompt, so both drop any pending tracker. Instant spawns never show
+        // the card anyway (the 150 ms grace).
         let fork_now = std::time::Instant::now();
         for (old, fresh) in &map {
-            match self.spawn_pending.remove(old) {
-                Some(mut tracker) => {
-                    tracker.advance(
-                        crate::spawn_progress::Phase::WaitingForShellPrompt,
-                        fork_now,
-                    );
-                    self.spawn_progress.insert(*fresh, tracker);
-                }
-                None if !reattached.contains(fresh) => {
-                    self.spawn_progress
-                        .insert(*fresh, SpawnProgress::kicked(fork_now));
-                }
-                None => {}
+            let pending = tab_key
+                .and_then(|(group, ti)| self.spawn_pending.remove(&(group.clone(), *ti, *old)));
+            if reattached.contains(fresh) {
+                continue;
             }
+            let shell = specs
+                .iter()
+                .find(|(leaf, _)| leaf == old)
+                .is_none_or(|(_, spec)| crate::spawn_progress::is_shell_launch(&spec.argv));
+            if !shell {
+                continue;
+            }
+            let mut tracker = pending.unwrap_or_else(|| SpawnProgress::kicked(fork_now));
+            tracker.advance(
+                crate::spawn_progress::Phase::WaitingForShellPrompt,
+                fork_now,
+            );
+            self.spawn_progress.insert(*fresh, tracker);
         }
         let old_focus = tab.focused_pane;
         tab.center

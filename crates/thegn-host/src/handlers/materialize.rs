@@ -33,9 +33,10 @@ pub(crate) struct MaterializeCtx<'a> {
     pub loading_retired: &'a mut HashSet<Key>,
     pub loading_remote: &'a mut HashMap<Key, bool>,
     pub loading_state: &'a mut crate::loading::track::LoadingTracker,
-    /// Per-leaf spawn-progress trackers (THE-213), keyed by the still-missing
-    /// leaf id: seeded here at the kick, re-keyed to the pane id at the fork.
-    pub spawn_pending: &'a mut HashMap<u32, SpawnProgress>,
+    /// Per-leaf spawn-progress trackers (THE-213), keyed by `(group, tab,
+    /// still-missing leaf id)`: seeded here at the kick, re-keyed to the
+    /// pane id at the fork.
+    pub spawn_pending: &'a mut HashMap<crate::spawn_progress::PendingKey, SpawnProgress>,
     pub dirty: &'a mut bool,
 }
 
@@ -127,7 +128,7 @@ pub(crate) fn maybe_materialize(
     let kicked = std::time::Instant::now();
     for leaf in &missing {
         ctx.spawn_pending
-            .insert(*leaf, SpawnProgress::kicked(kicked));
+            .insert((name.to_string(), ti, *leaf), SpawnProgress::kicked(kicked));
     }
     *ctx.dirty = true;
     let cfg = cfg.clone();

@@ -15556,21 +15556,35 @@ async fn event_loop<T: Terminal>(
         // missing leaves alike), so a background tab's tracker never renders
         // a card over this tab's frames.
         {
-            let leaves: std::collections::HashSet<u32> = tree.pane_ids().into_iter().collect();
-            let derived =
-                crate::spawn_progress::derive_hints(&mut panes, &leaves, std::time::Instant::now());
-            if model.spawn_hints != derived {
-                model.spawn_hints = derived;
-                dirty = true;
-            }
             let waiting = !panes.spawn_progress.is_empty() || !panes.spawn_pending.is_empty();
-            // Same 0%-idle contract as the splash ticker: the thread exists
-            // only while some pane is waiting for its first prompt, and
-            // self-retires within one period after the last tracker retires.
-            spawn_ticker.set_visible(waiting);
-            if waiting {
-                let targets = crate::spawn_progress::sampler_targets(&panes);
-                spawn_sampler.set_targets(&targets);
+            // Nothing waiting and nothing drawn: no allocation, no repaint.
+            if waiting || !model.spawn_hints.is_empty() {
+                let leaves: std::collections::HashSet<u32> = tree.pane_ids().into_iter().collect();
+                let tab_key = session
+                    .worktrees
+                    .get(session.active)
+                    .map(|g| (g.name.clone(), g.active_tab));
+                let derived = crate::spawn_progress::derive_hints(
+                    &mut panes,
+                    tab_key.as_ref(),
+                    &leaves,
+                    std::time::Instant::now(),
+                );
+                if model.spawn_hints != derived {
+                    model.spawn_hints = derived;
+                    dirty = true;
+                }
+                let waiting = !panes.spawn_progress.is_empty() || !panes.spawn_pending.is_empty();
+                // Same 0%-idle contract as the splash ticker: the thread
+                // exists only while some pane is waiting for its first
+                // prompt, and self-retires within one period after the last
+                // tracker retires. Targets are updated unconditionally (an
+                // empty map clears a stale target) and only cover displayed
+                // panes: background-tab cards are never drawn.
+                spawn_ticker.set_visible(waiting);
+                spawn_sampler.set_targets(&crate::spawn_progress::sampler_targets(&panes, &leaves));
+            } else {
+                spawn_ticker.set_visible(false);
             }
         }
 

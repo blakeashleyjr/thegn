@@ -217,7 +217,12 @@ age). The card MUST appear only after a short grace so instantly-ready panes
 never flash one, MUST disappear on the pane's first output, and MUST retire
 itself after a bounded time. Descendant sampling MUST stay off the event
 loop, MUST stop as soon as output arrives, and MUST NOT run at all while no
-pane is starting. Sampled argv MUST be redacted before it is drawn.
+pane is starting, and only for displayed panes. Once shown, a card MUST stay
+visible across phase changes. Reattached sessions and program (non-shell)
+panes MUST NOT show the shell-prompt card; pre-fork state MUST be keyed by
+group, tab and leaf so a card never appears on another tab. Sampled argv
+MUST be redacted (URL userinfo, query tokens, sensitive flag values) before
+it is drawn.
 
 #### Scenario: An instant spawn never flashes the card
 
