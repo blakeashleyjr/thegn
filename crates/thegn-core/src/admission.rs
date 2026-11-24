@@ -126,6 +126,7 @@ impl EnforcedControls {
     }
 
     /// Record `control` as enforced and return the updated set.
+    #[must_use]
     pub fn with(mut self, control: EnforcedControl) -> Self {
         self.bits |= control.bit();
         self
