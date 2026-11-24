@@ -700,7 +700,10 @@ THE-2450 is reported as a WARN.
 - `--fill-spare` (needs `--startup-only`) also measures a warm-spare claim and
   spends one more sandbox; without it that row is skipped.
 - `--tui-probe` turns on the full-screen-program probe
-  (`test/remote_parity_tui.py`) for the run.
+  (`test/remote_parity_tui.py`) for the run. The probe gives the TUI a
+  throwaway home and config, keeps the run's own state dir so the TUI still
+  finds its daemon, and types the ready marker only once the pane shows a
+  shell prompt. It refuses to drive a TUI whose config resolves to yours.
 
 Latency and throughput are measured and printed, not held to fixed budgets.
 
