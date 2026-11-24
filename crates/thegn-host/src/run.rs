@@ -17898,12 +17898,13 @@ async fn event_loop<T: Terminal>(
                 if left
                     && !mouse_left_down
                     && !model.sidebar_rail
-                    && crate::drag_hit::sep_grab(
+                    && crate::drag_hit::grabs_separator(
                         chrome.sep_left,
                         crate::drag_hit::SepSide::Sidebar,
+                        chrome.sidebar.map(|r| (r.y, r.rows)),
                         mx,
+                        my,
                     )
-                    && crate::drag_hit::row_in_band(chrome.sidebar.map(|r| (r.y, r.rows)), my)
                     && (crate::drag_hit::sep_is_exact(chrome.sep_left, mx) || hit_pane.is_none())
                 {
                     // `sep_grab` matched ⇒ the separator exists.
@@ -17917,12 +17918,13 @@ async fn event_loop<T: Terminal>(
                 if left
                     && !mouse_left_down
                     && panel_ui.width == layout::PanelWidth::Normal
-                    && crate::drag_hit::sep_grab(
+                    && crate::drag_hit::grabs_separator(
                         chrome.sep_right,
                         crate::drag_hit::SepSide::Panel,
+                        chrome.panel.map(|r| (r.y, r.rows)),
                         mx,
+                        my,
                     )
-                    && crate::drag_hit::row_in_band(chrome.panel.map(|r| (r.y, r.rows)), my)
                     && (crate::drag_hit::sep_is_exact(chrome.sep_right, mx) || hit_pane.is_none())
                 {
                     let sep = chrome.sep_right.expect("sep_grab matched a separator");

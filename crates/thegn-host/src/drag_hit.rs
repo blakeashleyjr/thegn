@@ -41,6 +41,19 @@ pub fn row_in_band(band: Option<(usize, usize)>, my: usize) -> bool {
     band.is_some_and(|(y, rows)| my >= y && my < y + rows)
 }
 
+/// The full press decision for a separator grab: the pointer is on the
+/// separator's column cells (`sep_grab`) AND inside the column band's rows
+/// (`row_in_band`). `band` is the sidebar's or panel's `(y, rows)`.
+pub fn grabs_separator(
+    sep: Option<usize>,
+    side: SepSide,
+    band: Option<(usize, usize)>,
+    mx: usize,
+    my: usize,
+) -> bool {
+    sep_grab(sep, side, mx) && row_in_band(band, my)
+}
+
 /// Whether `mx` is the separator column ITSELF (as opposed to the band's extra
 /// furniture cell). Callers gate the extra cell on it not being pane/drawer
 /// content; the separator column always grabs.

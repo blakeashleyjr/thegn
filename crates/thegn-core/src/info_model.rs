@@ -139,6 +139,7 @@ impl Field {
         }
     }
 
+    #[must_use]
     pub fn warned(mut self) -> Field {
         self.warn = true;
         self

@@ -25,6 +25,7 @@ impl EnvSelection {
         }
     }
 
+    #[must_use]
     pub const fn with_profile(mut self, profile: SandboxProfile) -> Self {
         self.profile = Some(profile);
         self

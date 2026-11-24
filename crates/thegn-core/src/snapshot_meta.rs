@@ -30,6 +30,7 @@ impl SnapshotKey {
     }
 
     /// The pre-encoder key used by snapshots created before lossless prefixes.
+    #[must_use]
     pub fn legacy(&self) -> SnapshotKey {
         SnapshotKey {
             repo_slug: legacy_segment(&self.repo_slug),

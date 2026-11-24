@@ -51,6 +51,7 @@ impl TrustClass {
     }
 
     /// One step weaker; T0 is the fixpoint.
+    #[must_use]
     pub fn one_notch_down(self) -> TrustClass {
         match self {
             TrustClass::T0HostShell | TrustClass::T1Container => TrustClass::T0HostShell,
