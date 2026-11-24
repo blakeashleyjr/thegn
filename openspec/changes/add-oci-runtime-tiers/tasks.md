@@ -35,3 +35,11 @@
 
 - [ ] 6.1 `just quick thegn-core` + `just quick thegn-host`
 - [ ] 6.2 `just ci` (fmt + lint + build + test + openspec-validate + coverage + smoke)
+
+## 7. WS07-P0-02: Probe the runtime host
+
+- [x] 7.1 Keep remote and macOS-local OCI runtime requests untouched; probe only local Linux placements
+- [x] 7.2 Centralize the `/dev/kvm` read/write capability probe in `thegn_core::util::kvm_accessible`
+- [x] 7.3 Report the requested runtime and placement when an unprobed create rejects it
+- [x] 7.4 Correct the gVisor default-platform note (`systrap`, not `ptrace`)
+- [ ] 7.5 Coordinator verifies a `krun` pane on a Linux host with `/dev/kvm` access

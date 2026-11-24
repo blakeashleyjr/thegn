@@ -3185,7 +3185,8 @@ oci_host = ""
 #   "runsc" — gVisor: a userspace application kernel services the container's syscalls
 #             (no /dev/kvm needed). Reported as isolation class `userspace-kernel`.
 #   "krun"  — libkrun: the container runs inside a hardware-virtualized microVM
-#             (needs /dev/kvm). Reported as isolation class `guest-kernel`.
+#             (needs read/write access to /dev/kvm). Reported as isolation class
+#             `guest-kernel`.
 # The worktree bind stays path-preserving either way, so host-side git keeps working.
 # `thegn doctor` reports the resolved isolation class. Only a local Linux
 # placement is probed; remote and macOS placements keep the requested runtime.

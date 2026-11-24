@@ -157,7 +157,9 @@ Only a local placement on a Linux host probes the runtime binary and
 the runtime you requested, because the local machine cannot tell whether it
 exists there. On a local Linux host, `oci_runtime = "krun"` needs `/dev/kvm`
 to open read-write; otherwise it degrades and `thegn doctor` reports the
-resulting isolation class.
+resulting isolation class. When an unprobed engine still rejects the runtime at
+create, the failure names the runtime and the placement instead of a generic
+container error.
 
 ## Isolation floor
 

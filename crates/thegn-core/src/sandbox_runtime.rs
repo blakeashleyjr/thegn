@@ -2,11 +2,13 @@
 //! keep-or-degrade decision. Split out of the (ratchet-capped) `sandbox.rs`.
 //!
 //! A non-default runtime (`runsc`, `krun`) only works if its pieces are present:
-//! the runtime binary on `PATH`, and — for libkrun's microVM — `/dev/kvm`. When
-//! they're missing, `podman/docker create --runtime <x>` would fail; rather than
-//! hard-fail the pane we degrade to the daemon default and surface a note. This
-//! module owns only the *decision*; the host does the fs/`PATH` probe and applies
-//! it (so the subprocess/fs seam stays out of the coverage-gated core).
+//! the runtime binary on `PATH`, and — for libkrun's microVM — read-write access
+//! to `/dev/kvm`. When they're missing on a probed local Linux host,
+//! `podman/docker create --runtime <x>` would fail; thegn degrades to the daemon
+//! default and surfaces a note. An unprobed placement (remote, or a macOS host
+//! whose engine runs in a VM) keeps the request instead, and a create failure
+//! names the runtime and the placement. This module owns only the pure decisions
+//! and messages; the host performs the fs/`PATH` probe.
 
 /// What a non-default OCI runtime needs on the host to actually run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,7 +16,7 @@ pub struct RuntimeReq {
     /// The runtime binary podman/docker invokes (looked up on `PATH`).
     pub binary: &'static str,
     /// libkrun boots a hardware-virtualized microVM, so it needs `/dev/kvm`.
-    /// gVisor's `runsc` does not (its default platform is `ptrace`).
+    /// gVisor's `runsc` does not (its default platform is `systrap`).
     pub needs_kvm: bool,
 }
 
@@ -67,6 +69,24 @@ pub fn decide(runtime: Option<&str>, binary_present: bool, kvm_present: bool) ->
         ));
     }
     RuntimeDecision::Keep
+}
+
+/// Name the requested runtime and its placement when the engine rejects the
+/// create. On an unprobed placement (remote, or a macOS-local engine in a VM)
+/// this is the only honest feedback available: this host cannot check that
+/// engine's `PATH` or `/dev/kvm`, so thegn keeps the request and reports why it
+/// failed rather than silently substituting a weaker runtime.
+pub fn create_failure_message(runtime: &str, placement: &str, engine_error: &str) -> String {
+    // Refusals are one line on every surface, so fold the engine's stderr.
+    let detail = engine_error
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if detail.is_empty() {
+        format!("could not create OCI runtime {runtime:?} on placement {placement}")
+    } else {
+        format!("could not create OCI runtime {runtime:?} on placement {placement}: {detail}")
+    }
 }
 
 #[cfg(test)]
@@ -126,5 +146,25 @@ mod tests {
             RuntimeDecision::Degrade(m) => assert!(m.contains("/dev/kvm"), "{m}"),
             d => panic!("expected degrade, got {d:?}"),
         }
+    }
+
+    #[test]
+    fn decide_krun_without_kvm_access_degrades() {
+        assert!(matches!(
+            decide(Some("krun"), true, false),
+            RuntimeDecision::Degrade(reason) if reason.contains("/dev/kvm")
+        ));
+    }
+
+    #[test]
+    fn engine_rejection_names_runtime() {
+        let message = create_failure_message("krun", "ssh:u@host", "unknown runtime");
+        assert!(message.contains("krun"), "{message}");
+        assert!(message.contains("ssh:u@host"), "{message}");
+        assert!(message.contains("unknown runtime"), "{message}");
+        // Multi-line engine stderr is folded, not pasted into the refusal.
+        let folded = create_failure_message("krun", "local", "line one\nline two");
+        assert!(!folded.contains('\n'), "{folded}");
+        assert!(folded.contains("line one line two"), "{folded}");
     }
 }
