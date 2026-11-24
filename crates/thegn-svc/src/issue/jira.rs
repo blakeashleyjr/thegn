@@ -222,9 +222,8 @@ struct JiraTransitionState {
     name: String,
 }
 
-fn map_jira_status(status: &Option<JiraStatus>) -> IssueStatus {
+fn map_jira_status(status: Option<&JiraStatus>) -> IssueStatus {
     let cat = status
-        .as_ref()
         .and_then(|s| s.status_category.as_ref())
         .map(|c| c.key.as_str());
     match cat {
@@ -243,9 +242,8 @@ fn target_status_category(status: IssueStatus) -> &'static str {
     }
 }
 
-fn jira_status_category(status: &Option<JiraStatus>) -> Option<&str> {
+fn jira_status_category(status: Option<&JiraStatus>) -> Option<&str> {
     status
-        .as_ref()
         .and_then(|status| status.status_category.as_ref())
         .map(|category| category.key.as_str())
 }
@@ -285,8 +283,8 @@ fn jira_http_status(message: &str) -> Option<u16> {
         .and_then(|status| status.parse::<u16>().ok())
 }
 
-fn map_jira_priority(p: &Option<JiraPriority>) -> IssuePriority {
-    match p.as_ref().map(|p| p.name.as_str()) {
+fn map_jira_priority(p: Option<&JiraPriority>) -> IssuePriority {
+    match p.map(|p| p.name.as_str()) {
         Some("Highest") => IssuePriority::Urgent,
         Some("High") => IssuePriority::High,
         Some("Medium") => IssuePriority::Medium,
@@ -340,8 +338,8 @@ fn jira_issue_to_domain(ji: JiraIssue, configured_base_url: &str) -> Issue {
         provider: "jira".into(),
         title: ji.fields.summary,
         body,
-        status: map_jira_status(&ji.fields.status),
-        priority: map_jira_priority(&ji.fields.priority),
+        status: map_jira_status(ji.fields.status.as_ref()),
+        priority: map_jira_priority(ji.fields.priority.as_ref()),
         assignees: ji
             .fields
             .assignee
@@ -914,7 +912,7 @@ impl IssueBackend for JiraBackend {
             let mut status_mismatch = false;
             if let Some(status) = patch.status {
                 let target_cat = target_status_category(status);
-                if jira_status_category(&ji.fields.status) != Some(target_cat) {
+                if jira_status_category(ji.fields.status.as_ref()) != Some(target_cat) {
                     status_mismatch = true;
                 }
             }
@@ -1062,15 +1060,18 @@ mod tests {
 
     #[test]
     fn map_status_by_category_and_fallback() {
-        assert_eq!(map_jira_status(&status("new")), IssueStatus::Todo);
+        assert_eq!(map_jira_status(status("new").as_ref()), IssueStatus::Todo);
         assert_eq!(
-            map_jira_status(&status("indeterminate")),
+            map_jira_status(status("indeterminate").as_ref()),
             IssueStatus::InProgress
         );
-        assert_eq!(map_jira_status(&status("done")), IssueStatus::Done);
+        assert_eq!(map_jira_status(status("done").as_ref()), IssueStatus::Done);
         // Unknown category and a status with no category both fall back to Backlog.
-        assert_eq!(map_jira_status(&status("mystery")), IssueStatus::Backlog);
-        assert_eq!(map_jira_status(&None), IssueStatus::Backlog);
+        assert_eq!(
+            map_jira_status(status("mystery").as_ref()),
+            IssueStatus::Backlog
+        );
+        assert_eq!(map_jira_status(None), IssueStatus::Backlog);
     }
 
     #[test]
@@ -1078,13 +1079,22 @@ mod tests {
         let p = |name: &str| -> Option<JiraPriority> {
             serde_json::from_value(json!({ "name": name })).unwrap()
         };
-        assert_eq!(map_jira_priority(&p("Highest")), IssuePriority::Urgent);
-        assert_eq!(map_jira_priority(&p("High")), IssuePriority::High);
-        assert_eq!(map_jira_priority(&p("Medium")), IssuePriority::Medium);
-        assert_eq!(map_jira_priority(&p("Low")), IssuePriority::Low);
-        assert_eq!(map_jira_priority(&p("Lowest")), IssuePriority::Low);
-        assert_eq!(map_jira_priority(&p("Trivial")), IssuePriority::None);
-        assert_eq!(map_jira_priority(&None), IssuePriority::None);
+        assert_eq!(
+            map_jira_priority(p("Highest").as_ref()),
+            IssuePriority::Urgent
+        );
+        assert_eq!(map_jira_priority(p("High").as_ref()), IssuePriority::High);
+        assert_eq!(
+            map_jira_priority(p("Medium").as_ref()),
+            IssuePriority::Medium
+        );
+        assert_eq!(map_jira_priority(p("Low").as_ref()), IssuePriority::Low);
+        assert_eq!(map_jira_priority(p("Lowest").as_ref()), IssuePriority::Low);
+        assert_eq!(
+            map_jira_priority(p("Trivial").as_ref()),
+            IssuePriority::None
+        );
+        assert_eq!(map_jira_priority(None), IssuePriority::None);
     }
 
     #[test]

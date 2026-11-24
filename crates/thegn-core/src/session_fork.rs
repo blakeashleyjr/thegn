@@ -255,9 +255,9 @@ pub fn plan(source: &ForkSource, options: &ForkOptions) -> Result<ForkPlan, Fork
                     id,
                     harness,
                     native_session_id.as_deref(),
-                    agent,
-                    cwd,
-                    worktree,
+                    agent.as_ref(),
+                    cwd.as_ref(),
+                    worktree.as_ref(),
                     options,
                 ),
             }
@@ -267,7 +267,15 @@ pub fn plan(source: &ForkSource, options: &ForkOptions) -> Result<ForkPlan, Fork
             id,
             agent,
             worktree,
-        } => plan_harness(id, harness, Some(id), agent, &None, worktree, options),
+        } => plan_harness(
+            id,
+            harness,
+            Some(id),
+            agent.as_ref(),
+            None,
+            worktree.as_ref(),
+            options,
+        ),
     }
 }
 
@@ -275,9 +283,9 @@ fn plan_harness(
     source_id: &str,
     harness_id: &str,
     native_session_id: Option<&str>,
-    agent: &Option<String>,
-    cwd: &Option<String>,
-    worktree: &Option<String>,
+    agent: Option<&String>,
+    cwd: Option<&String>,
+    worktree: Option<&String>,
     options: &ForkOptions,
 ) -> Result<ForkPlan, ForkError> {
     checked_session_id(source_id)?;
@@ -294,10 +302,10 @@ fn plan_harness(
         lineage,
         harness: harness_id.into(),
         native_session_id: native_session_id.into(),
-        agent: agent.clone(),
+        agent: agent.cloned(),
         command,
-        cwd: options.cwd.clone().or_else(|| cwd.clone()),
-        worktree: options.worktree.clone().or_else(|| worktree.clone()),
+        cwd: options.cwd.clone().or_else(|| cwd.cloned()),
+        worktree: options.worktree.clone().or_else(|| worktree.cloned()),
     })
 }
 

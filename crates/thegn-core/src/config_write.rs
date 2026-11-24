@@ -369,13 +369,13 @@ pub fn upsert_env(config_path: &Path, spec: &EnvSpec) -> Result<()> {
     match spec.placement.as_str() {
         "provider" => {
             let p = subtable(et, "provider");
-            put_str(p, "provider", &spec.provider);
-            put_str(p, "api_key_env", &spec.api_key_env);
-            put_str(p, "region", &spec.region);
-            put_str(p, "size", &spec.size);
-            put_str(p, "team_id", &spec.team_id);
-            put_str(p, "project_id", &spec.project_id);
-            put_str(p, "template", &spec.template);
+            put_str(p, "provider", spec.provider.as_ref());
+            put_str(p, "api_key_env", spec.api_key_env.as_ref());
+            put_str(p, "region", spec.region.as_ref());
+            put_str(p, "size", spec.size.as_ref());
+            put_str(p, "team_id", spec.team_id.as_ref());
+            put_str(p, "project_id", spec.project_id.as_ref());
+            put_str(p, "template", spec.template.as_ref());
             if let Some(n) = spec.max_instances {
                 p.insert("max_instances", value(n));
             }
@@ -388,12 +388,12 @@ pub fn upsert_env(config_path: &Path, spec: &EnvSpec) -> Result<()> {
         }
         "ssh" => {
             let s = subtable(et, "ssh");
-            put_str(s, "host", &spec.ssh_host);
+            put_str(s, "host", spec.ssh_host.as_ref());
         }
         "local" => {
             if spec.sandbox_backend.is_some() {
                 let sb = subtable(et, "sandbox");
-                put_str(sb, "backend", &spec.sandbox_backend);
+                put_str(sb, "backend", spec.sandbox_backend.as_ref());
             }
         }
         other => anyhow::bail!("unknown placement {other:?} (expected local|ssh|provider)"),
@@ -401,8 +401,8 @@ pub fn upsert_env(config_path: &Path, spec: &EnvSpec) -> Result<()> {
     write_doc(config_path, &doc, expected.as_deref())
 }
 
-fn put_str(tbl: &mut Table, key: &str, v: &Option<String>) {
-    if let Some(s) = v.as_ref().filter(|s| !s.trim().is_empty()) {
+fn put_str(tbl: &mut Table, key: &str, v: Option<&String>) {
+    if let Some(s) = v.filter(|s| !s.trim().is_empty()) {
         tbl.insert(key, value(s.as_str()));
     }
 }

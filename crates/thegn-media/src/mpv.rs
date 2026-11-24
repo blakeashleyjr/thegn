@@ -298,10 +298,10 @@ impl MediaBackend for MpvIpc {
                 .get("media-title")
                 .await?
                 .and_then(|v| v.as_str().map(str::to_string))
-                .or_else(|| meta_field(&meta, &["title", "TITLE"]))
+                .or_else(|| meta_field(meta.as_ref(), &["title", "TITLE"]))
                 .unwrap_or_default();
-            let artist = meta_field(&meta, &["artist", "ARTIST"]).unwrap_or_default();
-            let album = meta_field(&meta, &["album", "ALBUM"]).unwrap_or_default();
+            let artist = meta_field(meta.as_ref(), &["artist", "ARTIST"]).unwrap_or_default();
+            let album = meta_field(meta.as_ref(), &["album", "ALBUM"]).unwrap_or_default();
 
             let length = self.get("duration").await?.and_then(secs);
             let position = self.get("time-pos").await?.and_then(secs);
@@ -533,8 +533,8 @@ impl MediaBackend for MpvIpc {
 }
 
 /// Read a metadata field, trying each candidate key (mpv casing varies).
-fn meta_field(meta: &Option<Value>, keys: &[&str]) -> Option<String> {
-    let obj = meta.as_ref()?.as_object()?;
+fn meta_field(meta: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let obj = meta?.as_object()?;
     for k in keys {
         if let Some(v) = obj.get(*k).and_then(|v| v.as_str())
             && !v.is_empty()
@@ -564,15 +564,15 @@ mod tests {
     fn meta_field_tries_casings() {
         let m = Some(json!({"ARTIST": "Boards of Canada", "title": "Roygbiv"}));
         assert_eq!(
-            meta_field(&m, &["artist", "ARTIST"]).as_deref(),
+            meta_field(m.as_ref(), &["artist", "ARTIST"]).as_deref(),
             Some("Boards of Canada")
         );
         assert_eq!(
-            meta_field(&m, &["title", "TITLE"]).as_deref(),
+            meta_field(m.as_ref(), &["title", "TITLE"]).as_deref(),
             Some("Roygbiv")
         );
-        assert_eq!(meta_field(&m, &["album"]), None);
-        assert_eq!(meta_field(&None, &["artist"]), None);
+        assert_eq!(meta_field(m.as_ref(), &["album"]), None);
+        assert_eq!(meta_field(None, &["artist"]), None);
     }
 
     #[test]

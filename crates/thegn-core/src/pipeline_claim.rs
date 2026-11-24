@@ -141,12 +141,18 @@ fn exited(row: &AgentDispatch) -> bool {
 /// dominate: two chunk descriptions must never claim the same handoff file
 /// concurrently.
 fn same_work(row: &AgentDispatch, req: &ClaimRequest) -> bool {
-    fn norm(value: &Option<String>) -> Option<&str> {
-        value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    fn norm(value: Option<&String>) -> Option<&str> {
+        value
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
     }
-    let same_assignment = match (norm(&row.artifact_path), norm(&req.artifact_path)) {
+    let same_assignment = match (
+        norm(row.artifact_path.as_ref()),
+        norm(req.artifact_path.as_ref()),
+    ) {
         (Some(row_artifact), Some(request_artifact)) => row_artifact == request_artifact,
-        _ => norm(&row.chunk_path) == norm(&req.chunk_path),
+        _ => norm(row.chunk_path.as_ref()) == norm(req.chunk_path.as_ref()),
     };
     crate::pipeline_identity::same_issue(&row.issue_id, &req.issue_id)
         && row.stage.as_deref().map(str::trim) == Some(req.stage.trim())

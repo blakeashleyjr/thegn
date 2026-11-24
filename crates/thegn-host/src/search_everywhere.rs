@@ -1509,7 +1509,7 @@ fn test_state_str(s: &crate::panel::TestState) -> &'static str {
 pub fn kick_palette_search(
     session: &mut PaletteSession,
     mode: PaletteMode,
-    file_index: &Option<FileIndex>,
+    file_index: Option<&FileIndex>,
     worktree_root: PathBuf,
     cfg: &thegn_core::config::Config,
     lsp: std::sync::Arc<crate::lsp::LspInner>,

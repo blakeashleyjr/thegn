@@ -172,8 +172,8 @@ fn row_acts(row: &fleet_cost::FleetRow) -> RowActs {
 }
 
 /// Whether the open overlay (if any) is this popup.
-pub(crate) fn is_open(slot: &Option<DetailOverlay>) -> bool {
-    slot.as_ref().is_some_and(|ov| ov.title == TITLE)
+pub(crate) fn is_open(slot: Option<&DetailOverlay>) -> bool {
+    slot.is_some_and(|ov| ov.title == TITLE)
 }
 
 fn usd(value: f64, decimals: usize) -> String {

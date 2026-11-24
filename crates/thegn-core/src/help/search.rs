@@ -55,7 +55,7 @@ pub const MAX_SNIPPETS_PER_PAGE: usize = 4;
 fn body_snippets(page: &HelpPage, query: &str, cap: usize) -> Vec<Snippet> {
     let mut out: Vec<Snippet> = Vec::new();
     let mut section: Option<String> = None;
-    let check = |text: String, section: &Option<String>, out: &mut Vec<Snippet>| {
+    let check = |text: String, section: Option<&String>, out: &mut Vec<Snippet>| {
         if out.len() < cap
             && let Some((hl_start, hl_len)) = find_ci(&text, query)
         {
@@ -63,7 +63,7 @@ fn body_snippets(page: &HelpPage, query: &str, cap: usize) -> Vec<Snippet> {
                 text,
                 hl_start,
                 hl_len,
-                section: section.clone(),
+                section: section.cloned(),
             });
         }
     };
@@ -74,18 +74,20 @@ fn body_snippets(page: &HelpPage, query: &str, cap: usize) -> Vec<Snippet> {
         match block {
             Block::Heading { spans, .. } => {
                 let text = plain(spans);
-                check(text.clone(), &section, &mut out);
+                check(text.clone(), section.as_ref(), &mut out);
                 section = Some(text);
             }
-            Block::Para(spans) | Block::Quote(spans) => check(plain(spans), &section, &mut out),
+            Block::Para(spans) | Block::Quote(spans) => {
+                check(plain(spans), section.as_ref(), &mut out)
+            }
             Block::List(items) => {
                 for item in items {
-                    check(plain(&item.spans), &section, &mut out);
+                    check(plain(&item.spans), section.as_ref(), &mut out);
                 }
             }
             Block::Code { text, .. } => {
                 for line in text.lines() {
-                    check(line.to_string(), &section, &mut out);
+                    check(line.to_string(), section.as_ref(), &mut out);
                 }
             }
             // Each row is one snippet line — a table row reads as a unit
@@ -93,7 +95,7 @@ fn body_snippets(page: &HelpPage, query: &str, cap: usize) -> Vec<Snippet> {
             Block::Table { header, rows } => {
                 for row in std::iter::once(header).chain(rows.iter()) {
                     let line = row.iter().map(|c| plain(c)).collect::<Vec<_>>().join(" — ");
-                    check(line, &section, &mut out);
+                    check(line, section.as_ref(), &mut out);
                 }
             }
             Block::Rule => {}

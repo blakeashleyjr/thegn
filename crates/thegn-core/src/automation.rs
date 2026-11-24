@@ -434,11 +434,11 @@ pub struct AutomationPredicate {
 
 impl AutomationPredicate {
     pub fn matches(&self, event: &AutomationEvent) -> bool {
-        glob_field(&self.workspace, &event.workspace)
-            && glob_field(&self.repo, &event.repo)
-            && glob_field(&self.worktree, &event.worktree)
-            && glob_field(&self.branch, &event.branch)
-            && exact_field(&self.agent_role, &event.agent_role)
+        glob_field(self.workspace.as_ref(), event.workspace.as_ref())
+            && glob_field(self.repo.as_ref(), event.repo.as_ref())
+            && glob_field(self.worktree.as_ref(), event.worktree.as_ref())
+            && glob_field(self.branch.as_ref(), event.branch.as_ref())
+            && exact_field(self.agent_role.as_ref(), event.agent_role.as_ref())
             && self
                 .notification_kind
                 .is_none_or(|kind| event.notification_kind == Some(kind))
@@ -456,7 +456,7 @@ impl AutomationPredicate {
                     regex::Regex::new(pattern).is_ok_and(|re| re.is_match(message))
                 })
             })
-            && exact_field(&self.session_id, &event.session_id)
+            && exact_field(self.session_id.as_ref(), event.session_id.as_ref())
             && bool_field(self.pr_checks_passed, event.pr_checks_passed)
             && bool_field(self.pr_review_requested, event.pr_review_requested)
             && bool_field(self.pr_merged, event.pr_merged)
@@ -465,14 +465,13 @@ impl AutomationPredicate {
     }
 
     fn matches_inbox(&self, inbox: Option<&InboxFacts>) -> bool {
-        let has = |selector: &Option<String>, test: &dyn Fn(&InboxFacts, &str) -> bool| {
-            selector
-                .as_deref()
-                .is_none_or(|want| inbox.is_some_and(|facts| test(facts, want)))
+        let has = |selector: Option<&String>, test: &dyn Fn(&InboxFacts, &str) -> bool| {
+            selector.is_none_or(|want| inbox.is_some_and(|facts| test(facts, want)))
         };
-        has(&self.inbox_account, &|facts, want| facts.account == want)
-            && has(&self.inbox_kind, &|facts, want| facts.kind == want)
-            && has(&self.inbox_label, &|facts, want| {
+        has(self.inbox_account.as_ref(), &|facts, want| {
+            facts.account == want
+        }) && has(self.inbox_kind.as_ref(), &|facts, want| facts.kind == want)
+            && has(self.inbox_label.as_ref(), &|facts, want| {
                 facts
                     .labels
                     .iter()
@@ -481,45 +480,40 @@ impl AutomationPredicate {
     }
 
     fn matches_issue(&self, issue: Option<&IssueFacts>) -> bool {
-        let has = |selector: &Option<String>, test: &dyn Fn(&IssueFacts, &str) -> bool| {
-            selector
-                .as_deref()
-                .is_none_or(|want| issue.is_some_and(|facts| test(facts, want)))
+        let has = |selector: Option<&String>, test: &dyn Fn(&IssueFacts, &str) -> bool| {
+            selector.is_none_or(|want| issue.is_some_and(|facts| test(facts, want)))
         };
-        has(&self.account, &|facts, want| facts.account == want)
-            && has(&self.project, &|facts, want| {
+        has(self.account.as_ref(), &|facts, want| facts.account == want)
+            && has(self.project.as_ref(), &|facts, want| {
                 facts.project_ids.iter().any(|id| id == want)
             })
-            && has(&self.label, &|facts, want| {
+            && has(self.label.as_ref(), &|facts, want| {
                 facts
                     .labels
                     .iter()
                     .any(|label| label.eq_ignore_ascii_case(want))
             })
-            && has(&self.assignee, &|facts, want| {
+            && has(self.assignee.as_ref(), &|facts, want| {
                 if want == "me" {
                     facts.assigned_to_me
                 } else {
                     facts.assignees.iter().any(|who| who == want)
                 }
             })
-            && has(&self.status, &|facts, want| {
+            && has(self.status.as_ref(), &|facts, want| {
                 facts.status.eq_ignore_ascii_case(want)
             })
     }
 }
 
-fn glob_field(pattern: &Option<String>, value: &Option<String>) -> bool {
-    pattern.as_ref().is_none_or(|pattern| {
-        value
-            .as_ref()
-            .is_some_and(|value| crate::notification_route::glob_match(pattern, value))
+fn glob_field(pattern: Option<&String>, value: Option<&String>) -> bool {
+    pattern.is_none_or(|pattern| {
+        value.is_some_and(|value| crate::notification_route::glob_match(pattern, value))
     })
 }
 
-fn exact_field(want: &Option<String>, actual: &Option<String>) -> bool {
-    want.as_ref()
-        .is_none_or(|want| actual.as_ref().is_some_and(|actual| actual == want))
+fn exact_field(want: Option<&String>, actual: Option<&String>) -> bool {
+    want.is_none_or(|want| actual.is_some_and(|actual| actual == want))
 }
 
 fn bool_field(want: Option<bool>, actual: Option<bool>) -> bool {

@@ -908,8 +908,8 @@ impl Instant {
     }
 }
 
-fn epoch_of(v: &Option<Instant>) -> Option<i64> {
-    v.as_ref().and_then(Instant::to_epoch)
+fn epoch_of(v: Option<&Instant>) -> Option<i64> {
+    v.and_then(Instant::to_epoch)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1026,7 +1026,7 @@ pub fn parse_claude_usage(bytes: &[u8], plan: Option<String>) -> Option<AccountU
             UsageWindow::with_len(
                 &l.label(),
                 l.percent.unwrap_or(0.0) as f32,
-                epoch_of(&l.resets_at),
+                epoch_of(l.resets_at.as_ref()),
                 l.window_minutes(),
             )
         })
@@ -1044,7 +1044,7 @@ pub fn parse_claude_usage(bytes: &[u8], plan: Option<String>) -> Option<AccountU
                 windows.push(UsageWindow::with_len(
                     label,
                     w.utilization.unwrap_or(0.0) as f32,
-                    epoch_of(&w.resets_at),
+                    epoch_of(w.resets_at.as_ref()),
                     Some(minutes),
                 ));
             }

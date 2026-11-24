@@ -1672,11 +1672,11 @@ const HINT_FIELDS: &[(&str, HintRule)] = &[
 ];
 
 fn limit_is_not_raised(
-    base: &Option<String>,
-    hinted: &Option<String>,
+    base: Option<&String>,
+    hinted: Option<&String>,
     parse: fn(&str) -> Option<u64>,
 ) -> bool {
-    match (base.as_deref(), hinted.as_deref()) {
+    match (base.map(String::as_str), hinted.map(String::as_str)) {
         (None, None) => true,
         (None, Some(hinted)) => parse(hinted).is_some(),
         (Some(_), None) => false,
@@ -1812,17 +1812,22 @@ fn repo_hint_weakens(
                 _ => false,
             },
             HintRule::Limits => {
-                !limit_is_not_raised(&base.limits.cpu, &hinted.limits.cpu, parse_cpu_millis)
-                    || !limit_is_not_raised(&base.limits.memory, &hinted.limits.memory, parse_bytes)
+                !limit_is_not_raised(
+                    base.limits.cpu.as_ref(),
+                    hinted.limits.cpu.as_ref(),
+                    parse_cpu_millis,
+                ) || !limit_is_not_raised(
+                    base.limits.memory.as_ref(),
+                    hinted.limits.memory.as_ref(),
+                    parse_bytes,
+                ) || !limit_is_not_raised(
+                    base.limits.cpu_total.as_ref(),
+                    hinted.limits.cpu_total.as_ref(),
+                    parse_cpu_millis,
+                ) || (base.limits.cpu_total.is_none() && hinted.limits.cpu_total.is_some())
                     || !limit_is_not_raised(
-                        &base.limits.cpu_total,
-                        &hinted.limits.cpu_total,
-                        parse_cpu_millis,
-                    )
-                    || (base.limits.cpu_total.is_none() && hinted.limits.cpu_total.is_some())
-                    || !limit_is_not_raised(
-                        &base.limits.memory_total,
-                        &hinted.limits.memory_total,
+                        base.limits.memory_total.as_ref(),
+                        hinted.limits.memory_total.as_ref(),
                         parse_bytes,
                     )
             }
