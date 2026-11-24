@@ -13,6 +13,17 @@
 
 use serde::Deserialize;
 
+/// The metadata table at the top of a recipe TOML file.
+///
+/// Payload tables (for example `[sandbox]`) are intentionally left to the
+/// recipe-kind owner. Unknown keys inside `[recipe]` remain rejected by
+/// [`RecipeHeader`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RecipeDocumentHeader {
+    /// The `[recipe]` table.
+    pub recipe: RecipeHeader,
+}
+
 /// Which seam a recipe configures. Stub (WS00-P1-08); owner WS08-P6-00.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -75,7 +86,7 @@ pub struct RecipeHeader {
     pub register: RecipeRegister,
 }
 
-/// `YYYY-MM-DD` with a plausible month and day.
+/// A valid Gregorian `YYYY-MM-DD` date.
 fn is_date(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
@@ -85,9 +96,20 @@ fn is_date(s: &str) -> bool {
     if !(digits(0..4) && digits(5..7) && digits(8..10)) {
         return false;
     }
+    let year = u16::from(b[0] - b'0') * 1000
+        + u16::from(b[1] - b'0') * 100
+        + u16::from(b[2] - b'0') * 10
+        + u16::from(b[3] - b'0');
     let month = (b[5] - b'0') * 10 + (b[6] - b'0');
     let day = (b[8] - b'0') * 10 + (b[9] - b'0');
-    (1..=12).contains(&month) && (1..=31).contains(&day)
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=max_day).contains(&day)
 }
 
 /// `YYYY-MM-DD.N` with `N` a positive decimal number.
@@ -112,6 +134,13 @@ impl RecipeHeader {
         if self.tier == RecipeTier::LiveTested && self.live_tested_on.is_empty() {
             return Err("tier = \"live-tested\" needs at least one live_tested_on entry".into());
         }
+        if self
+            .last_verified
+            .as_deref()
+            .is_some_and(|date| !is_date(date))
+        {
+            return Err("last_verified is not a valid YYYY-MM-DD date".into());
+        }
         if !is_revision(&self.revision) {
             return Err(format!("revision {:?} is not YYYY-MM-DD.N", self.revision));
         }
@@ -123,77 +152,88 @@ impl RecipeHeader {
 mod tests {
     use super::*;
 
-    fn parse(text: &str) -> Result<RecipeHeader, toml::de::Error> {
+    fn parse(text: &str) -> Result<RecipeDocumentHeader, toml::de::Error> {
         toml::from_str(text)
     }
 
     #[test]
     fn header_parses_minimal() {
         let header =
-            parse("kind = \"provider\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n")
+            parse("[recipe]\nkind = \"provider\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n")
                 .unwrap();
-        assert_eq!(header.kind, RecipeKind::Provider);
-        assert_eq!(header.tier, RecipeTier::DocumentedOnly);
-        assert_eq!(header.register, RecipeRegister::Template);
-        assert!(header.live_tested_on.is_empty());
-        assert!(header.spikes.is_empty() && header.platforms.is_empty());
-        assert_eq!(header.last_verified, None);
-        assert_eq!(header.validate(), Ok(()));
+        assert_eq!(header.recipe.kind, RecipeKind::Provider);
+        assert_eq!(header.recipe.tier, RecipeTier::DocumentedOnly);
+        assert_eq!(header.recipe.register, RecipeRegister::Template);
+        assert!(header.recipe.live_tested_on.is_empty());
+        assert!(header.recipe.spikes.is_empty() && header.recipe.platforms.is_empty());
+        assert_eq!(header.recipe.last_verified, None);
+        assert_eq!(header.recipe.validate(), Ok(()));
 
         let full = parse(
-            "kind = \"sandbox\"\ntier = \"live-tested\"\n\
+            "[recipe]\nkind = \"sandbox\"\ntier = \"live-tested\"\n\
              live_tested_on = [\"linux/x86_64@2026-11-20\"]\nrevision = \"2026-11-20.2\"\n\
              last_verified = \"2026-11-20\"\nspikes = [\"S3\"]\nplatforms = [\"linux\"]\n\
              register = \"shipped\"\n",
         )
         .unwrap();
-        assert_eq!(full.register, RecipeRegister::Shipped);
-        assert_eq!(full.tier, RecipeTier::LiveTested);
-        assert_eq!(full.validate(), Ok(()));
-        let connector = parse(
-            "kind = \"connector\"\ntier = \"fixture-tested\"\nrevision = \"2026-01-31.10\"\n",
+        assert_eq!(full.recipe.register, RecipeRegister::Shipped);
+        assert_eq!(full.recipe.tier, RecipeTier::LiveTested);
+        assert_eq!(full.recipe.validate(), Ok(()));
+        let file_with_payload = parse(
+            "[recipe]\nkind = \"sandbox\"\ntier = \"fixture-tested\"\nrevision = \"2026-11-20.1\"\n\
+             [sandbox]\nimage = \"example.invalid/inert\"\n",
         )
         .unwrap();
-        assert_eq!(connector.kind, RecipeKind::Connector);
-        assert_eq!(connector.tier, RecipeTier::FixtureTested);
-        assert_eq!(connector.validate(), Ok(()));
+        assert_eq!(file_with_payload.recipe.validate(), Ok(()));
+        let connector = parse(
+            "[recipe]\nkind = \"connector\"\ntier = \"fixture-tested\"\nrevision = \"2026-01-31.10\"\n",
+        )
+        .unwrap();
+        assert_eq!(connector.recipe.kind, RecipeKind::Connector);
+        assert_eq!(connector.recipe.tier, RecipeTier::FixtureTested);
+        assert_eq!(connector.recipe.validate(), Ok(()));
     }
 
     #[test]
     fn header_rejects_unknown_key() {
         assert!(
             parse(
-                "kind = \"sandbox\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n\
+                "[recipe]\nkind = \"sandbox\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n\
                  trusted = true\n"
             )
             .is_err()
         );
         assert!(
-            parse("kind = \"vm\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n")
-                .is_err()
+            parse(
+                "[recipe]\nkind = \"vm\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n"
+            )
+            .is_err()
         );
-        assert!(parse("kind = \"sandbox\"\nrevision = \"2026-11-17.1\"\n").is_err());
+        assert!(parse("[recipe]\nkind = \"sandbox\"\nrevision = \"2026-11-17.1\"\n").is_err());
+        // A header key outside `[recipe]` is not part of the document.
+        assert!(parse("kind = \"sandbox\"\n").is_err());
     }
 
     #[test]
     fn shipped_only_for_sandbox() {
         for kind in ["provider", "connector"] {
             let header = parse(&format!(
-                "kind = \"{kind}\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n\
+                "[recipe]\nkind = \"{kind}\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n\
                  register = \"shipped\"\n"
             ))
             .unwrap();
-            let err = header.validate().unwrap_err();
+            let err = header.recipe.validate().unwrap_err();
             assert!(err.contains("shipped"), "{err}");
         }
     }
 
     #[test]
     fn live_tested_needs_evidence() {
-        let header =
-            parse("kind = \"sandbox\"\ntier = \"live-tested\"\nrevision = \"2026-11-17.1\"\n")
-                .unwrap();
-        let err = header.validate().unwrap_err();
+        let header = parse(
+            "[recipe]\nkind = \"sandbox\"\ntier = \"live-tested\"\nrevision = \"2026-11-17.1\"\n",
+        )
+        .unwrap();
+        let err = header.recipe.validate().unwrap_err();
         assert!(err.contains("live_tested_on"), "{err}");
     }
 
@@ -206,6 +246,7 @@ mod tests {
             "2026-11-17.x",
             "2026-13-01.1",
             "2026-00-10.1",
+            "2026-02-29.1",
             "2026-11-32.1",
             "2026-11-00.1",
             "26-11-17.1",
@@ -227,5 +268,22 @@ mod tests {
             assert!(err.contains("YYYY-MM-DD.N"), "{bad}: {err}");
         }
         assert!(is_revision("2026-11-17.12"));
+        assert!(is_revision("2024-02-29.1"));
+        assert!(!is_date("2026-02-29"));
+        assert!(is_date("2024-02-29"));
+        assert!(is_date("2000-02-29"));
+        assert!(!is_date("1900-02-29"));
+        let header = parse(
+            "[recipe]\nkind = \"sandbox\"\ntier = \"documented-only\"\nrevision = \"2026-11-17.1\"\n\
+             last_verified = \"2026-02-30\"\n",
+        )
+        .unwrap();
+        assert!(
+            header
+                .recipe
+                .validate()
+                .unwrap_err()
+                .contains("last_verified")
+        );
     }
 }

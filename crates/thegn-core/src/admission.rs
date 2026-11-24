@@ -26,19 +26,22 @@ use crate::launch_class::LaunchClass;
 /// by WS02-P5-08.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceTrust {
-    /// The user: typed at a host terminal or written in the user's own config.
-    User,
-    /// Repo content: overlays, lifecycle scripts, agent-written code.
+    /// The user at the TUI or a host terminal (may carry a recorded per-run
+    /// override, T15).
+    HostUser,
+    /// Repo content: overlays, lifecycle scripts, agent-written code; it can
+    /// only narrow a class default (B31).
     Repo,
 }
 
-/// The workspace a launch runs in, by identity. Stub (WS00-P1-13); owned by
-/// WS02-P5-07 (the generation is an input of [`EffectivePolicyId`]).
+/// The workspace a launch runs in, by identity, with no path. Stub
+/// (WS00-P1-13); final owner WS11-P3-06a (private workspaces), read by
+/// WS02-P5-07 for the [`EffectivePolicyId`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkspaceRef {
-    /// The workspace's stable id.
-    pub id: String,
-    /// Bumped whenever the workspace's content baseline changes.
+    /// The workspace's stable worktree key.
+    pub worktree_key: String,
+    /// The workspace generation (an input to [`EffectivePolicyId`]).
     pub generation: u64,
 }
 
@@ -117,18 +120,19 @@ pub struct EnforcedControls {
 }
 
 impl EnforcedControls {
-    /// No control enforced.
-    pub fn none() -> Self {
+    /// No control is recorded as enforced.
+    pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record `control` as enforced.
-    pub fn insert(&mut self, control: EnforcedControl) {
+    /// Record `control` as enforced and return the updated set.
+    pub fn with(mut self, control: EnforcedControl) -> Self {
         self.bits |= control.bit();
+        self
     }
 
     /// Whether `control` is enforced.
-    pub fn contains(&self, control: EnforcedControl) -> bool {
+    pub fn has(&self, control: EnforcedControl) -> bool {
         self.bits & control.bit() != 0
     }
 }
@@ -195,14 +199,19 @@ mod tests {
 
     #[test]
     fn enforced_controls_bitset_and_verdicts_construct() {
-        let mut controls = EnforcedControls::none();
-        assert!(EnforcedControl::ALL.iter().all(|c| !controls.contains(*c)));
-        controls.insert(EnforcedControl::FsScope);
-        controls.insert(EnforcedControl::NoHostFallback);
+        assert!(
+            EnforcedControl::ALL
+                .iter()
+                .all(|c| !EnforcedControls::new().has(*c)),
+            "a fresh set enforces nothing"
+        );
+        let mut controls = EnforcedControls::new()
+            .with(EnforcedControl::FsScope)
+            .with(EnforcedControl::NoHostFallback);
         controls.evidence.push("manifest: bwrap".into());
         for control in EnforcedControl::ALL {
             assert_eq!(
-                controls.contains(control),
+                controls.has(control),
                 matches!(
                     control,
                     EnforcedControl::FsScope | EnforcedControl::NoHostFallback
@@ -221,13 +230,13 @@ mod tests {
             source_trust: SourceTrust::Repo,
             ceiling_digest: [0; 32],
             workspace: Some(WorkspaceRef {
-                id: "ws-1".into(),
+                worktree_key: "ws-1".into(),
                 generation: 3,
             }),
             command_digest: [1; 32],
         };
         assert_eq!(request.clone(), request);
-        assert_ne!(SourceTrust::User, SourceTrust::Repo);
+        assert_ne!(SourceTrust::HostUser, SourceTrust::Repo);
         let verdicts = [
             AdmissionVerdict::Admit,
             AdmissionVerdict::Refuse(RefusalReason::UnsupportedControl(

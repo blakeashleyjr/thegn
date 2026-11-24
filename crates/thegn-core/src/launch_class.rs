@@ -131,11 +131,14 @@ impl HostTrustKind {
 /// The credentials an untrusted class gets by default (T2). Stub (WS00-P1-13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialDefault {
-    /// No credential of any kind (batch kinds).
-    None,
+    /// Pass through the user's interactive credentials (`InteractiveOwner`;
+    /// not in [`CLASS_DEFAULTS`]).
+    Passthrough,
     /// Credential-free apart from model access, which comes only from a
     /// dedicated task account or brokering (agent kinds).
     ModelAccessOnly,
+    /// No credential of any kind (batch kinds).
+    None,
 }
 
 /// One untrusted kind's T2 defaults, as canonical config strings. Stub
@@ -170,7 +173,7 @@ const BATCH_DEFAULTS: ClassDefaults = ClassDefaults {
 /// home (implied by `sealed`), `agent@1` for agent kinds and `offline` for batch
 /// kinds, credential-free. `InteractiveOwner` keeps `standard` and has no row.
 /// Stub (WS00-P1-13): data only, read by WS02-P5-08.
-pub const CLASS_DEFAULTS: &[(UntrustedKind, ClassDefaults)] = &[
+pub static CLASS_DEFAULTS: &[(UntrustedKind, ClassDefaults)] = &[
     (UntrustedKind::QueueAgent, AGENT_DEFAULTS),
     (UntrustedKind::Autopilot, AGENT_DEFAULTS),
     (UntrustedKind::AgentRun, AGENT_DEFAULTS),
@@ -235,6 +238,12 @@ mod tests {
     #[test]
     fn class_defaults_cover_every_untrusted_kind() {
         assert_eq!(CLASS_DEFAULTS.len(), UntrustedKind::ALL.len());
+        assert!(
+            CLASS_DEFAULTS
+                .iter()
+                .all(|(_, d)| d.credentials != CredentialDefault::Passthrough),
+            "Passthrough belongs to InteractiveOwner, which has no row"
+        );
         for kind in UntrustedKind::ALL {
             let rows: Vec<&ClassDefaults> = CLASS_DEFAULTS
                 .iter()
