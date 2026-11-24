@@ -205,7 +205,11 @@ Classification is evidence-based, and every row prints its reason:
   directory or a linked worktree's `gitdir:` file. A directory with no checkout
   of its own is reported as `owner unknown`; it is never attributed to the
   checkout that happens to contain it, because ownership is what makes a lane
-  reclaimable.
+  reclaimable. The owner field is the lane's own checkout path (the same as
+  `path`), not a coordinating job: no job attribution is recorded. The checkout
+  must resolve: a `gitdir:` file pointing at a missing directory, or a git dir
+  with no readable `HEAD`, is an orphan and reports `owner unknown`. Symlinked
+  lane entries are listed as unknown and never followed.
 - **Activity** — Cargo's per-profile `.cargo-lock` first (a `try_lock` that
   fails means a build is running; the probe never waits and releases
   immediately), then the newest write anywhere in the lane, compared against the

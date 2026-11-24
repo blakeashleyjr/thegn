@@ -749,6 +749,7 @@ check "wt disk --lanes --json emits one object per lane" \
   "'$SZ' wt disk --lanes --worktree '$R' --json | grep -q '\"lane\":\"smoke-lane\"'"
 check "wt disk --lanes leaves lane contents alone" \
   "[[ -f '$R/target/lanes/smoke-lane/target/debug/artifact.bin' ]]"
+rm -rf "$R/target"
 check "share list --json parses" \
   "'$SZ' share list --json | head -c1 | grep -q '\['"
 check "forward list --json parses" \

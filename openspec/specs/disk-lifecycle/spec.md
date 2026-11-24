@@ -118,6 +118,8 @@ sizes MUST use the same apparent-byte accounting as `thegn disk`, so a lane's
 Ownership MUST come from the lane's own git checkout. A lane with no checkout of
 its own SHALL be reported with unknown ownership rather than attributed to the
 checkout that contains it, because ownership is what makes a lane reclaimable.
+A checkout whose git dir does not resolve or has no readable `HEAD` SHALL also be
+unknown. The owner is the lane's own checkout path, not a job.
 Activity MUST be Cargo's own per-profile `.cargo-lock` — held, never waited on —
 or the newest write anywhere in the lane, using the same recent-activity window
 as low-disk eviction. A lane SHALL be eligible only when it is a build lane, has

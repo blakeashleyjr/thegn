@@ -166,6 +166,22 @@ fn lane_report(root: &std::path::Path, now: u64) -> Result<Vec<LaneRow>> {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        if file_type.is_symlink() {
+            lanes.push(LaneRow {
+                lane: entry.file_name().to_string_lossy().into_owned(),
+                path: entry.path().to_string_lossy().into_owned(),
+                bytes: 0,
+                build_bytes: 0,
+                kind: LaneKind::Other.label(),
+                owner: None,
+                branch: None,
+                activity: "unknown",
+                activity_evidence: "symlink, not followed".to_string(),
+                eligibility: "unknown",
+                reason: "symlink, not followed; contents are not inspected".to_string(),
+            });
+            continue;
+        }
         if !file_type.is_dir() {
             continue;
         }
@@ -272,6 +288,12 @@ fn lane_checkout(lane: &std::path::Path) -> (Option<String>, Option<String>) {
     let Some(git_dir) = lane_git_dir(lane) else {
         return (None, None);
     };
+    // A `.git` entry alone proves nothing: a pruned linked worktree leaves a
+    // `gitdir:` file pointing nowhere. Ownership needs a git dir that resolves
+    // and a readable `HEAD`.
+    if !real_file(&git_dir.join("HEAD")) || std::fs::read_to_string(git_dir.join("HEAD")).is_err() {
+        return (None, None);
+    }
     (
         Some(lane.to_string_lossy().into_owned()),
         head_branch(&git_dir),
@@ -415,7 +437,7 @@ fn lock_is_held(path: &std::path::Path) -> bool {
     else {
         return true;
     };
-    let held = !matches!(file.try_lock(), Ok(()));
+    let held = file.try_lock().is_err();
     // The probe's lock (if any) is released here, before the report is printed.
     drop(file);
     held
@@ -744,6 +766,30 @@ mod lane_tests {
                 [1u8; 17],
                 "{lane} contents are intact"
             );
+        }
+    }
+
+    #[test]
+    fn orphaned_gitdir_leaves_owner_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("lanes");
+        let lane = root.join("orphan");
+        checkout_lane(&lane, "tg/the-1");
+        fs::remove_dir_all(lane.join(".git")).unwrap();
+        fs::write(lane.join(".git"), b"gitdir: ../gone\n").unwrap();
+        // A `.git` directory with no HEAD is no checkout either.
+        let headless = root.join("headless");
+        checkout_lane(&headless, "tg/the-2");
+        fs::remove_file(headless.join(".git/HEAD")).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        backdate(&root, old);
+
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+        let lanes = lane_report(&root, now).unwrap();
+        for name in ["orphan", "headless"] {
+            let lane = row(&lanes, name);
+            assert!(lane.owner.is_none(), "{name} has no resolvable checkout");
+            assert_eq!(lane.eligibility, "unknown");
         }
     }
 
