@@ -71,6 +71,14 @@
       compare-and-swap and fences when it loses; reconcile, reattach and
       cancel treat a live lease (fresh heartbeat, or same boot and live pid on
       Linux) as not stale. Recovery writes are already compare-and-swap.
+      The heartbeat checks ownership (stored row non-terminal and carrying this
+      run's lease) and rewrites only the lease, never the whole row; reattach
+      leaves a live-leased row alone before any provider call; a heartbeat more
+      than 5 s in the future is not fresh. Known limits: `OwnerLease` and
+      `AttemptRecord` use `deny_unknown_fields`, so an older binary sharing the
+      ledger cannot read an in-flight (non-terminal) row written by a newer one
+      (terminal rows clear the lease); and a row whose owning task panicked in a
+      still-running process stays unrecovered until that process exits.
 - [ ] 4.7 Run the new cancel, reconcile and reattach tests in
       `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
 - [ ] 4.8 Not in this slice: the credential broker, the CLI verb and a budgeted

@@ -529,21 +529,34 @@ impl AttemptStore {
     }
 
     /// Move the owner's heartbeat to `now_ms` by compare-and-swap against
-    /// `record`, the row the owning run last wrote. False means the stored row
-    /// changed (a recovery settled it) and nothing was written: the owner must
-    /// stop trusting its own state. `record` is updated only on success.
+    /// `record`, under the ledger lock: the stored row must be non-terminal and
+    /// carry this run's lease; only the lease is rewritten. False means a
+    /// recovery took the row and nothing was written: the owner must stop
+    /// trusting its own state. `record.lease` is updated only on success.
     pub fn refresh_lease(&self, record: &mut AttemptRecord, now_ms: i64) -> Result<bool> {
-        let Some(lease) = record.lease.as_ref() else {
+        let Some(lease) = record.lease.clone() else {
             return Ok(true);
         };
-        let mut next = record.clone();
-        next.lease = Some(lease.refreshed(now_ms));
-        if self.mark_if_unchanged(record, &next)? {
-            *record = next;
-            Ok(true)
-        } else {
-            Ok(false)
+        let Some(root) = self.open(false)? else {
+            return Ok(false);
+        };
+        let _lock = lock_ledger(&root)?;
+        let Some(mut current) =
+            self.read_record::<AttemptRecord>(&root, &attempt_file(record.attempt))?
+        else {
+            return Ok(false);
+        };
+        // Ownership, not equality: the run changes other fields locally between
+        // persists. Recovery always clears or replaces the lease when it settles
+        // a row, so a changed lease or a terminal row means the run lost it.
+        if current.is_terminal() || current.lease.as_ref() != Some(&lease) {
+            return Ok(false);
         }
+        let refreshed = lease.refreshed(now_ms);
+        current.lease = Some(refreshed.clone());
+        self.mark(&current)?;
+        record.lease = Some(refreshed);
+        Ok(true)
     }
 
     /// Publish `record` only when the stored row still equals `expected` (the
@@ -725,6 +738,9 @@ pub struct AttemptOptions {
     /// ([`PLAN_MAX_SANDBOX_TIMEOUT`] by default); the effective ceiling is the
     /// smaller of this and the env's `max_lifetime_secs`.
     pub max_sandbox_timeout: Duration,
+    /// How often the running owner refreshes its lease heartbeat
+    /// ([`LEASE_HEARTBEAT`] by default); injectable so a test can use a short one.
+    pub lease_heartbeat: Duration,
 }
 
 impl Default for AttemptOptions {
@@ -738,6 +754,7 @@ impl Default for AttemptOptions {
             outputs: Vec::new(),
             checkout_root: DEFAULT_CHECKOUT_ROOT.to_owned(),
             max_sandbox_timeout: PLAN_MAX_SANDBOX_TIMEOUT,
+            lease_heartbeat: LEASE_HEARTBEAT,
         }
     }
 }
@@ -745,6 +762,10 @@ impl Default for AttemptOptions {
 impl AttemptOptions {
     fn validate(&self) -> Result<()> {
         ensure!(!self.deadline.is_zero(), "attempt deadline must be nonzero");
+        ensure!(
+            !self.lease_heartbeat.is_zero(),
+            "lease heartbeat must be nonzero"
+        );
         ensure!(
             !self.transfer_budget.is_zero(),
             "transfer budget must be nonzero"
@@ -1193,8 +1214,8 @@ impl VercelSelectedRunner {
         match self.provider.api().logs(&session, &command).await {
             Ok(mut logs) => {
                 let mut beat = tokio::time::interval_at(
-                    tokio::time::Instant::now() + LEASE_HEARTBEAT,
-                    LEASE_HEARTBEAT,
+                    tokio::time::Instant::now() + self.options.lease_heartbeat,
+                    self.options.lease_heartbeat,
                 );
                 beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -1257,7 +1278,8 @@ impl VercelSelectedRunner {
                     .wait_command_exact(
                         &session,
                         &command,
-                        left.min(WAIT_COMMAND_DEADLINE).min(LEASE_HEARTBEAT),
+                        left.min(WAIT_COMMAND_DEADLINE)
+                            .min(self.options.lease_heartbeat),
                     )
                     .await
                 {

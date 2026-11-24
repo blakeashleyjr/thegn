@@ -2394,8 +2394,9 @@ async fn a_row_with_a_live_owner_lease_is_never_reconciled_even_past_the_stalene
     store.mark(&record).unwrap();
     let runner = runner(&mock, store.clone(), AttemptOptions::default());
 
+    // A realistic clock: ten seconds after the heartbeat, inside the window.
     let touched = runner
-        .reconcile_pending_at(1_000_000_000_000)
+        .reconcile_pending_at(thegn_core::util::now_ms() + 10_000)
         .await
         .unwrap();
 
@@ -2477,6 +2478,165 @@ fn a_lease_is_live_on_a_fresh_heartbeat_and_dead_with_a_gone_owner() {
     assert!(OwnerLease::current(now).is_live(now));
     assert!(OwnerLease::current(now).is_live(now + 29_000));
     assert!(!dead_lease().is_live(now));
+    // A little skew ahead is tolerated; a heartbeat far in the future is not
+    // proof of anything (the dead owner's pid fallback decides).
+    assert!(OwnerLease::current(now + 2_000).is_live(now));
+    let far = OwnerLease {
+        heartbeat_ms: now + 3_600_000,
+        ..dead_lease()
+    };
+    assert!(!far.is_live(now));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reattach_leaves_a_live_leased_row_untouched_before_any_provider_call() {
+    let mock = start_mock(vec![
+        script(vec![
+            session_info(),
+            Out::Info(r#"{"type":"exit","exit_code":0}"#),
+        ]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let mut record = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
+    store.mark(&record).unwrap();
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    let report = runner.reattach(1).await.unwrap();
+
+    assert!(!report.reattached);
+    assert!(report.note.is_some());
+    assert_eq!(store.read(1).unwrap().unwrap(), record);
+    assert!(
+        mock.execs.lock().unwrap().is_empty(),
+        "no attach and no kill"
+    );
+}
+
+/// Once the owner's heartbeat has advanced the stored lease, play a recovery
+/// pass that settles the row (a terminal row with no lease) and return it.
+async fn recover_after_heartbeat(store: AttemptStore) -> AttemptRecord {
+    for _ in 0..500 {
+        let beaten = store.read(1).ok().flatten().is_some_and(|record| {
+            record.state == AttemptState::Running
+                && record
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.heartbeat_ms > lease.started_at_ms)
+        });
+        if beaten {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut row = store.read(1).unwrap().unwrap();
+    row.state = AttemptState::Indeterminate;
+    row.cleanup = Cleanup::Done;
+    row.lease = None;
+    store.mark(&row).unwrap();
+    row
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_heartbeats_then_fences_when_a_recovery_settles_its_row() {
+    let mock = start_mock(vec![
+        script(vec![session_info(), Out::Silence]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(
+        &mock,
+        store.clone(),
+        AttemptOptions {
+            lease_heartbeat: Duration::from_millis(50),
+            ..outputs_options(DEADLINE)
+        },
+    );
+    let content = content();
+    let pin = pinned();
+
+    let (receipt, settled) = tokio::join!(
+        runner.run(Recipe::CargoBuild, &pin, &content, DEADLINE),
+        recover_after_heartbeat(store.clone()),
+    );
+    let receipt = receipt.unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Indeterminate);
+    assert!(receipt.outputs_fenced);
+    // The fenced owner never overwrote what the recovery settled.
+    assert_eq!(store.read(1).unwrap().unwrap(), settled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_selected_cancel_through_submit_reads_back_cancelled_and_sends_nothing() {
+    let mock = start_mock(Vec::new());
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let source = pinned();
+    let cancel = SelectedCancel::new();
+    cancel.cancel();
+
+    let worker = std::thread::spawn(move || {
+        runner.submit(
+            "sprites-tgtest1",
+            Recipe::CargoBuild,
+            &source,
+            Duration::from_secs(30),
+            &cancel,
+        )
+    });
+    let result = worker.join().unwrap().unwrap();
+
+    assert_eq!(result.completion, SelectedCompletion::Cancelled);
+    assert!(mock.execs.lock().unwrap().is_empty());
+    // The route short-circuits before reserving, so no attempt row exists.
+    assert!(store.read(1).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_selected_cancel_from_another_thread_kills_the_running_command_through_submit() {
+    let mock = start_mock(vec![
+        script(vec![session_info(), Out::Silence]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let source = pinned();
+    let cancel = SelectedCancel::new();
+
+    let submitted = cancel.clone();
+    let worker = std::thread::spawn(move || {
+        runner.submit(
+            "sprites-tgtest1",
+            Recipe::CargoBuild,
+            &source,
+            Duration::from_secs(30),
+            &submitted,
+        )
+    });
+    for _ in 0..500 {
+        let running = store
+            .read(1)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.state == AttemptState::Running);
+        if running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    let result = worker.join().unwrap().unwrap();
+
+    assert_eq!(result.completion, SelectedCompletion::Cancelled);
+    let (jobs, kills) = execs_of(&mock);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(kills.len(), 1);
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Cancelled
+    );
 }
 
 #[test]

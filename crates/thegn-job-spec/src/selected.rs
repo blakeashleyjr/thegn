@@ -209,9 +209,6 @@ pub fn submit_selected(
             observed: captured_source.clone(),
         }));
     }
-    let runner = directory.resolve(runner_alias).ok_or_else(|| {
-        SelectedFailure::Refused(RunnerRefusal::RunnerUnavailable(runner_alias.to_string()))
-    })?;
     if cancel.is_cancelled() {
         // Nothing was sent: a cancel before dispatch is a cancelled receipt.
         return Ok(SelectedJobResult {
@@ -223,6 +220,9 @@ pub fn submit_selected(
             truncated: false,
         });
     }
+    let runner = directory.resolve(runner_alias).ok_or_else(|| {
+        SelectedFailure::Refused(RunnerRefusal::RunnerUnavailable(runner_alias.to_string()))
+    })?;
     // The runner call itself may have started work, so nothing it returns is a
     // pre-submission refusal. A lost or mismatched receipt stays indeterminate.
     let result = runner

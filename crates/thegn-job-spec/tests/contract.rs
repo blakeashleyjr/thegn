@@ -493,10 +493,15 @@ fn a_cancel_before_dispatch_reads_back_as_cancelled_without_calling_the_runner()
 
 #[test]
 fn a_cancel_during_the_runner_call_reaches_its_hook_and_reads_back_as_cancelled() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Sender, channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
-    struct Hooked(Arc<AtomicBool>);
+    struct Hooked {
+        hooked: Arc<AtomicBool>,
+        started: Mutex<Sender<()>>,
+    }
     impl SelectedRunner for Hooked {
         fn submit(
             &self,
@@ -506,10 +511,15 @@ fn a_cancel_during_the_runner_call_reaches_its_hook_and_reads_back_as_cancelled(
             _: Duration,
             cancel: &SelectedCancel,
         ) -> Result<SelectedJobResult, RunnerRefusal> {
-            let seen = self.0.clone();
+            let seen = self.hooked.clone();
             cancel.on_cancel(move || seen.store(true, Ordering::SeqCst));
-            cancel.cancel();
-            let completion = if self.0.load(Ordering::SeqCst) {
+            self.started.lock().unwrap().send(()).unwrap();
+            // The cancel comes from outside this call; wait for its hook.
+            let limit = Instant::now() + Duration::from_secs(10);
+            while !self.hooked.load(Ordering::SeqCst) && Instant::now() < limit {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let completion = if self.hooked.load(Ordering::SeqCst) {
                 SelectedCompletion::Cancelled
             } else {
                 SelectedCompletion::Exited(0)
@@ -532,8 +542,21 @@ fn a_cancel_during_the_runner_call_reaches_its_hook_and_reads_back_as_cancelled(
     }
     let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
     let source = Digest::of(b"");
-    let directory = Directory(Hooked(Arc::new(AtomicBool::new(false))));
-    let result = submit_selected(&spec, &source, &directory, &SelectedCancel::new()).unwrap();
+    let (started_tx, started_rx) = channel();
+    let directory = Directory(Hooked {
+        hooked: Arc::new(AtomicBool::new(false)),
+        started: Mutex::new(started_tx),
+    });
+    let cancel = SelectedCancel::new();
+    let result = std::thread::scope(|scope| {
+        let run = scope.spawn(|| submit_selected(&spec, &source, &directory, &cancel));
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the runner started");
+        cancel.cancel();
+        run.join().unwrap()
+    })
+    .unwrap();
     assert_eq!(result.completion, SelectedCompletion::Cancelled);
 
     // A hook registered after the cancel runs immediately.

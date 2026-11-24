@@ -1297,3 +1297,51 @@ fn a_lease_heartbeat_loses_to_a_concurrent_recovery_write_and_the_owner_fences()
     assert_eq!(owner, held);
     assert_eq!(store.read(1).unwrap().unwrap(), recovery);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_exit_poll_after_an_unfinished_log_stream_keeps_the_owner_and_reads_exited() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let fs = Arc::new(Mutex::new(State::default()));
+    // The log stream ends with no exit line, so the exit is polled; the first
+    // poll fails and the next answers.
+    let base = router(fs, script(vec![stdout_line("compiling\n")]), b"built");
+    let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock = Mock::start(move |req| {
+        if req.method == "GET" && req.path().ends_with("/cmd/cmd_1") {
+            if waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Reply::not_found();
+            }
+            return Reply::json(
+                "200 OK",
+                serde_json::json!({"command": {"id": "cmd_1", "exitCode": 0}}),
+            );
+        }
+        base(req)
+    });
+    let (_dir, store) = store();
+    let runner = runner_with(
+        &mock,
+        store.clone(),
+        AttemptOptions {
+            lease_heartbeat: Duration::from_millis(100),
+            ..options()
+        },
+    );
+    let content = content();
+
+    let receipt = runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Exited(0));
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Finished);
+    assert_eq!(record.exit, Some(0));
+    assert!(record.lease.is_none(), "a terminal row carries no lease");
+}

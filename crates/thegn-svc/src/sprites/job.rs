@@ -724,6 +724,10 @@ struct SpriteClaim {
 /// heartbeat younger than twice this as proof of a live owner.
 pub(crate) const LEASE_HEARTBEAT: Duration = Duration::from_secs(15);
 
+/// How far ahead of the reader's clock a heartbeat may sit and still count as
+/// fresh.
+const LEASE_CLOCK_SKEW_MS: i64 = 5_000;
+
 /// The ownership lease a running attempt keeps in its non-terminal row, shared
 /// by the Sprites and Vercel executors.
 ///
@@ -815,7 +819,10 @@ impl OwnerLease {
     /// or the same process (same boot, same start time, not a zombie) is alive.
     pub fn is_live(&self, now_ms: i64) -> bool {
         let window = millis_i64(LEASE_HEARTBEAT * 2);
-        if now_ms.saturating_sub(self.heartbeat_ms) <= window {
+        // A heartbeat a little in the future is clock skew; one far in the future
+        // is a wrong clock or a corrupt row and proves nothing.
+        let age = now_ms.saturating_sub(self.heartbeat_ms);
+        if (-LEASE_CLOCK_SKEW_MS..=window).contains(&age) {
             return true;
         }
         let Some(recorded) = self.boot_id.as_deref() else {
@@ -1160,21 +1167,34 @@ impl AttemptStore {
     }
 
     /// Move the owner's heartbeat to `now_ms` by compare-and-swap against
-    /// `record`, the row the owning run last wrote. False means the stored row
-    /// changed (a recovery settled it) and nothing was written: the owner must
-    /// stop trusting its own state. `record` is updated only on success.
+    /// `record`, under the ledger lock: the stored row must be non-terminal and
+    /// carry this run's lease; only the lease is rewritten. False means a
+    /// recovery took the row and nothing was written: the owner must stop
+    /// trusting its own state. `record.lease` is updated only on success.
     pub fn refresh_lease(&self, record: &mut AttemptRecord, now_ms: i64) -> Result<bool> {
-        let Some(lease) = record.lease.as_ref() else {
+        let Some(lease) = record.lease.clone() else {
             return Ok(true);
         };
-        let mut next = record.clone();
-        next.lease = Some(lease.refreshed(now_ms));
-        if self.mark_if_unchanged(record, &next)? {
-            *record = next;
-            Ok(true)
-        } else {
-            Ok(false)
+        let Some(root) = self.open(false)? else {
+            return Ok(false);
+        };
+        let _lock = lock_ledger(&root)?;
+        let Some(mut current) =
+            self.read_record::<AttemptRecord>(&root, &attempt_file(record.attempt))?
+        else {
+            return Ok(false);
+        };
+        // Ownership, not equality: the run changes other fields locally between
+        // persists. Recovery always clears or replaces the lease when it settles
+        // a row, so a changed lease or a terminal row means the run lost it.
+        if current.is_terminal() || current.lease.as_ref() != Some(&lease) {
+            return Ok(false);
         }
+        let refreshed = lease.refreshed(now_ms);
+        current.lease = Some(refreshed.clone());
+        self.mark(&current)?;
+        record.lease = Some(refreshed);
+        Ok(true)
     }
 
     /// Publish `record` only when the stored row still equals `expected` (the
@@ -1487,6 +1507,9 @@ pub struct AttemptOptions {
     pub outputs: Vec<String>,
     /// Where per-attempt checkouts live on the sprite.
     pub checkout_root: String,
+    /// How often the running owner refreshes its lease heartbeat
+    /// ([`LEASE_HEARTBEAT`] by default); injectable so a test can use a short one.
+    pub lease_heartbeat: Duration,
 }
 
 impl Default for AttemptOptions {
@@ -1500,6 +1523,7 @@ impl Default for AttemptOptions {
             hold_ceiling_secs: 0,
             outputs: Vec::new(),
             checkout_root: DEFAULT_CHECKOUT_ROOT.to_owned(),
+            lease_heartbeat: LEASE_HEARTBEAT,
         }
     }
 }
@@ -1507,6 +1531,10 @@ impl Default for AttemptOptions {
 impl AttemptOptions {
     fn validate(&self) -> Result<()> {
         ensure!(!self.deadline.is_zero(), "attempt deadline must be nonzero");
+        ensure!(
+            !self.lease_heartbeat.is_zero(),
+            "lease heartbeat must be nonzero"
+        );
         ensure!(
             !self.transfer_budget.is_zero(),
             "transfer budget must be nonzero"
@@ -2316,8 +2344,8 @@ impl SpritesSelectedRunner {
         let mut cancelled = false;
         let mut fenced = false;
         let mut beat = tokio::time::interval_at(
-            tokio::time::Instant::now() + LEASE_HEARTBEAT,
-            LEASE_HEARTBEAT,
+            tokio::time::Instant::now() + self.options.lease_heartbeat,
+            self.options.lease_heartbeat,
         );
         beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -3002,7 +3030,20 @@ impl SpritesSelectedRunner {
                 && record.account == self.binding.account(),
             "attempt {attempt} belongs to another project, account or sprite"
         );
-        let stale = self.is_stale(&record, thegn_core::util::now_ms());
+        let now = thegn_core::util::now_ms();
+        if !record.is_terminal()
+            && record
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.is_live(now))
+        {
+            return Ok(Self::left_alone(
+                &record,
+                false,
+                "the attempt is owned by a live run (lease); nothing was touched",
+            ));
+        }
+        let stale = self.is_stale(&record, now);
         match record.resume(epoch) {
             Resume::Rejected => {
                 bail!("attempt {attempt} was rejected before any command ran; submit a new attempt")
