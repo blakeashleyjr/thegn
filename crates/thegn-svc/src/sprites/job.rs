@@ -78,6 +78,7 @@
 //! own thread.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -240,7 +241,7 @@ pub(crate) fn hex(bytes: impl AsRef<[u8]>) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
-            hex.push_str(&format!("{byte:02x}"));
+            write!(hex, "{byte:02x}").expect("writing to String cannot fail");
             hex
         })
 }
@@ -3075,10 +3076,8 @@ fn compose_log(stdout: &str, stderr: Option<&ExecStderr>, exit: Option<i32>) -> 
     if seen == 0 {
         return (log, false);
     }
-    log.push_str(&format!(
-        "\n[stderr, last {seen} bytes]\n{}",
-        stderr.render()
-    ));
+    write!(log, "\n[stderr, last {seen} bytes]\n{}", stderr.render())
+        .expect("writing to String cannot fail");
     (log, stderr.total() > STDERR_TAIL_CAP as u64)
 }
 

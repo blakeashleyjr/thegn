@@ -11,6 +11,7 @@
 //! on the same `[share]` config + `thegn_svc::share` seam this CLI uses.
 
 use anyhow::{Context, Result, bail};
+use std::fmt::Write as _;
 use thegn_core::config::{Config, ShareProviderKind};
 use thegn_core::db::{Db, ShareRow};
 use thegn_core::models::ShareOwner;
@@ -205,9 +206,11 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                             "share: serve start failed ({error:#}); teardown could not be verified ({teardown_error:#}); the share may still be reachable; run `thegn share stop {port}` to retry the teardown"
                         );
                         if let Err(record_error) = failed_record {
-                            message.push_str(&format!(
+                            write!(
+                                message,
                                 "; could not persist failed state: {record_error:#}"
-                            ));
+                            )
+                            .expect("writing to String cannot fail");
                         }
                         return Err(anyhow::anyhow!(message));
                     }
@@ -236,9 +239,11 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                             "share: could not record the started provider ({error:#}); teardown could not be verified ({teardown_error:#}); the share may still be reachable; run `thegn share stop {port}` to retry the teardown"
                         );
                         if let Err(record_error) = failed_record {
-                            message.push_str(&format!(
+                            write!(
+                                message,
                                 "; could not persist failed state: {record_error:#}"
-                            ));
+                            )
+                            .expect("writing to String cannot fail");
                         }
                         Err(anyhow::anyhow!(message))
                     }

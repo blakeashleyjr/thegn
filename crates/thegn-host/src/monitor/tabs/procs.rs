@@ -1,6 +1,6 @@
 //! Procs tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, TabBuild, heading, plain, row_ys};
 use super::super::procs_columns::{
     self, Availability, ColId, FitFlags, Preset, availability, format_bytes, format_cpu,
     proc_row_caps,
@@ -10,6 +10,7 @@ use super::super::{Confirm, MonitorOutcome, MonitorOverlay, ProcSort};
 use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection};
 use crate::seg::Tok;
+use std::fmt::Write as _;
 use thegn_core::numfmt::{NumFmt, Reading, Unit};
 use thegn_core::theme::Hue;
 
@@ -333,16 +334,18 @@ pub(in crate::monitor) fn procs(
         // CPU is a delta; the first sample has nothing to diff against.
         format!("{} of {} · cpu warming up", rows.len(), snap.total)
     };
-    note.push_str(&format!(
+    write!(
+        note,
         " · {}{}",
         display.sort.label(),
         if display.desc { "↓" } else { "↑" }
-    ));
+    )
+    .expect("writing to String cannot fail");
     if display.tree {
         note.push_str(" · tree");
     }
     if !display.filter.trim().is_empty() || display.filtering {
-        note.push_str(&format!(" · /{}", display.filter));
+        write!(note, " · /{}", display.filter).expect("writing to String cannot fail");
     }
     let mut out = vec![heading("processes", Some(note))];
 
@@ -1092,7 +1095,7 @@ mod tests {
             let cx = Ctx {
                 model: &model,
                 hist: &hist,
-                prefs: super::super::TabPrefs::default(),
+                prefs: crate::monitor::TabPrefs::default(),
                 cols,
                 now_ms: 0,
             };
@@ -1127,7 +1130,7 @@ mod tests {
         let cx = Ctx {
             model: &model,
             hist: &hist,
-            prefs: super::super::TabPrefs::default(),
+            prefs: crate::monitor::TabPrefs::default(),
             cols: 119,
             now_ms: 0,
         };

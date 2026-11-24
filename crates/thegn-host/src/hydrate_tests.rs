@@ -1,6 +1,7 @@
 use super::*;
 use crate::hydrate_tuning::DEFAULT_MODEL_REFRESH_MS;
 use crate::session::{GroupKind, Session, WorktreeGroup};
+use std::fmt::Write as _;
 
 #[test]
 fn config_source_path_is_none_until_set() {
@@ -1496,7 +1497,8 @@ fn read_log_tail_lines_is_bounded_and_snaps_to_line() {
     // Build a file larger than the tail window so the read must be bounded.
     let mut content = String::new();
     for i in 0..2000 {
-        content.push_str(&format!("2026-06-05T12:00:00  INFO  thegn::x  line {i}\n"));
+        writeln!(content, "2026-06-05T12:00:00  INFO  thegn::x  line {i}")
+            .expect("writing to String cannot fail");
     }
     std::fs::write(&path, content.as_bytes()).unwrap();
     let len = std::fs::metadata(&path).unwrap().len();

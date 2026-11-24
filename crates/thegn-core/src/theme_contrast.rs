@@ -258,6 +258,7 @@ fn hue_name(h: Hue) -> &'static str {
 mod tests {
     use super::*;
     use crate::theme::{Hues, PRESETS, extend_palette, preset};
+    use std::fmt::Write as _;
 
     /// Resolve a preset the way chrome does: table values + `extend_palette`.
     fn resolved(name: &str) -> Palette {
@@ -385,10 +386,12 @@ mod tests {
         for name in PRESETS {
             let findings = audit(&resolved(name), bar_for(name));
             for f in &findings {
-                failures.push_str(&format!(
+                write!(
+                    failures,
                     "\n  {name}: [{}] {} on {} = {:.2}:1 (want >= {})",
                     f.rule, f.fg, f.bg, f.ratio, f.min
-                ));
+                )
+                .expect("writing to String cannot fail");
             }
         }
         assert!(

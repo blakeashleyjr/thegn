@@ -15,6 +15,7 @@
 //! run) still maps stably, and the same input always renders identically.
 
 use serde::Serialize;
+use std::fmt::Write as _;
 
 use crate::semantic::EntityKind;
 
@@ -167,29 +168,28 @@ impl RepoMap {
         let (lines, elided) = self.shown(budget);
         for line in &lines {
             match line {
-                Line::Header(file) => out.push_str(&format!("{file}\n")),
+                Line::Header(file) => {
+                    writeln!(out, "{file}").expect("writing to String cannot fail")
+                }
                 Line::Ent(e) => {
                     let deg = if e.degree > 0 {
                         format!("  ×{}", e.degree)
                     } else {
                         String::new()
                     };
-                    out.push_str(&format!(
-                        "  {} {}  L{}{}\n",
-                        e.kind.label(),
-                        e.name,
-                        e.line,
-                        deg
-                    ));
+                    writeln!(out, "  {} {}  L{}{}", e.kind.label(), e.name, e.line, deg)
+                        .expect("writing to String cannot fail");
                 }
             }
         }
         if elided > 0 {
-            out.push_str(&format!(
-                "… {elided} more entr{} elided (budget {} lines)\n",
+            writeln!(
+                out,
+                "… {elided} more entr{} elided (budget {} lines)",
                 if elided == 1 { "y" } else { "ies" },
                 budget.max(1)
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         // Trim the trailing newline for a clean single/multi-line body.
         while out.ends_with('\n') {

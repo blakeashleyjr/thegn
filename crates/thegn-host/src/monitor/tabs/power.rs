@@ -6,7 +6,7 @@ pub(in crate::monitor) mod view;
 #[path = "power/power_wire_tests.rs"]
 mod wire_tests;
 
-use super::super::build::*;
+use super::super::build::{Ctx, MAIN_H, heading, kv};
 use crate::chrome::S;
 use crate::sections::{Section, spacer};
 use crate::seg::Tok;

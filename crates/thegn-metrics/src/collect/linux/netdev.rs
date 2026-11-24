@@ -225,6 +225,7 @@ mod tests {
         health::Health,
         policy::net_scope::{IfaceKind, Scope},
     };
+    use std::fmt::Write as _;
     use std::fs::{self, File};
     use std::os::unix::fs::FileExt;
 
@@ -436,7 +437,8 @@ mod tests {
             "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n",
         );
         for iface in 0..33 {
-            input.push_str(&format!("if{iface}: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n"));
+            writeln!(input, "if{iface}: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0")
+                .expect("writing to String cannot fail");
         }
         fs::write(&proc_path, input).unwrap();
         let mut collector = NetdevCollector::at(&proc_path, dir.path().join("sys"));

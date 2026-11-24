@@ -1,5 +1,6 @@
 use super::*;
 use axum::serve::Listener;
+use std::fmt::Write as _;
 use thegn_core::config_calendar::{CalendarAccount, CalendarConfig, CalendarProviderKind};
 
 struct CountingListener {
@@ -3361,9 +3362,11 @@ fn budget_of(n: usize) -> AccountAdmission {
 fn ics_feed(n: usize) -> String {
     let mut s = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..n {
-        s.push_str(&format!(
-            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:E{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
-        ));
+        writeln!(
+            s,
+            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:E{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r"
+        )
+        .expect("writing to String cannot fail");
     }
     s.push_str("END:VCALENDAR\r\n");
     s
@@ -3913,15 +3916,19 @@ fn multistatus(events: usize, deletions: usize) -> String {
     let mut s =
         String::from("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">");
     for i in 0..events {
-        s.push_str(&format!(
+        write!(
+            s,
             "<d:response><d:href>/cal/e{i}.ics</d:href><d:propstat><d:prop><c:calendar-data>{}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
             ics_feed(1).replace("e0", &format!("e{i}"))
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     for i in 0..deletions {
-        s.push_str(&format!(
+        write!(
+            s,
             "<d:response><d:href>/cal/gone{i}.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>"
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     s.push_str("<d:sync-token>tok-next</d:sync-token></d:multistatus>");
     s
@@ -4272,9 +4279,11 @@ async fn a_long_history_feed_only_counts_the_sync_window() {
     // it must not now be refused just because the history is long.
     let mut feed = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..3_000 {
-        feed.push_str(&format!(
-            "BEGIN:VEVENT\r\nUID:old{i}\r\nDTSTART:20190301T090000Z\r\nEND:VEVENT\r\n"
-        ));
+        writeln!(
+            feed,
+            "BEGIN:VEVENT\r\nUID:old{i}\r\nDTSTART:20190301T090000Z\r\nEND:VEVENT\r"
+        )
+        .expect("writing to String cannot fail");
     }
     feed.push_str(
         "BEGIN:VEVENT\r\nUID:now\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",

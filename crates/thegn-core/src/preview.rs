@@ -863,6 +863,7 @@ pub fn validate_preview_redirect(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     #[test]
     fn route_for_archive_table() {
         use std::path::Path;
@@ -1071,7 +1072,7 @@ mod tests {
     fn csv_row_cap_truncates() {
         let mut s = String::new();
         for i in 0..(MAX_ROWS + 50) {
-            s.push_str(&format!("{i}\n"));
+            writeln!(s, "{i}").expect("writing to String cannot fail");
         }
         let t = CsvTable::parse(&p("a.csv"), &s);
         assert!(t.truncated);

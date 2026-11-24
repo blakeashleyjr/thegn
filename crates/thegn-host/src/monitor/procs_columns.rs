@@ -185,7 +185,12 @@ impl Preset {
     ];
 
     fn columns(self) -> &'static [ColId] {
-        use ColId::*;
+        use ColId::{
+            Age, Average, Command, Container, ContextSwitches, Cpu, CpuBar, CpuHistory, CpuNumber,
+            Delay, Fds, IoTotal, MajorFaults, MemHistory, MemPercent, MinorFaults, Nice, Oom,
+            Owner, Pid, Policy, Priority, ReadRate, Rss, Shared, State, Swap, Threads, Time, Unit,
+            User, Virt, Worktree, WriteRate,
+        };
         match self {
             Preset::Default => &[
                 Pid, User, Owner, State, Nice, Threads, Cpu, CpuBar, CpuHistory, MemPercent, Rss,
@@ -319,7 +324,12 @@ pub(crate) fn fit_columns(preset: Preset, width: usize, flags: FitFlags) -> Vec<
 /// The collapse list is ordered from the first column to remove to the last.
 /// Within a priority bucket, retain later entries first.
 fn collapse_rank(id: ColId) -> usize {
-    use ColId::*;
+    use ColId::{
+        Age, Average, Command, Container, ContextSwitches, Cpu, CpuBar, CpuHistory, CpuNumber,
+        Delay, Fds, Gpu, IoTotal, MajorFaults, MemHistory, MemPercent, MinorFaults, Nice, Oom,
+        Owner, Pid, Policy, Ppid, Priority, ReadRate, Rss, Shared, State, Swap, Threads, Time, Tty,
+        Unit, User, Virt, Worktree, WriteRate,
+    };
     match id {
         Virt => 0,
         Shared => 1,

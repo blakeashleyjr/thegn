@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn error_classes() {
-        use InboxErrorClass::*;
+        use InboxErrorClass::{Auth, Config, Permanent, Transient};
         for (error, class) in [
             (InboxError::NotConfigured, Config),
             (InboxError::Unsupported("mark_read"), Config),

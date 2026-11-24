@@ -1973,7 +1973,7 @@ fn batch_right_cluster(
 /// The activity dot glyph (item 20): filled while active/waiting, hollow once
 /// read-but-stuck, `↻` while building; `None` = nothing. ASCII-safe glyph set.
 fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
-    use crate::sidebar::ActivityState::*;
+    use crate::sidebar::ActivityState::{Active, Failed, Loading, None, Read, Waiting};
     let g = crate::caps::active_glyphs();
     match state {
         Active | Waiting => g.dot_filled, // ● / *
@@ -1997,7 +1997,7 @@ fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
 /// Both used to be the same red, which made a finished turn shout as loudly as a
 /// stuck one. Seen-vs-unread stays the filled/hollow glyph distinction.
 fn activity_dot_tok(state: crate::sidebar::ActivityState, blocked: bool) -> crate::seg::Tok {
-    use crate::sidebar::ActivityState::*;
+    use crate::sidebar::ActivityState::{Active, Failed, Loading, Read, Waiting};
     // Failed reads as an error, so it takes a red hue rather than an activity
     // slot; every other state maps to its activity/accent slot.
     match state {

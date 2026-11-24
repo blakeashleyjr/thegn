@@ -29,6 +29,7 @@ use crate::sandbox_mounts::{
     parse_mount_checked,
 };
 use crate::{msg, util};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -4069,7 +4070,7 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
     }
     // Unset blocked env keys (e.g. master API key when a scoped key replaces it).
     for key in &spec.env_block {
-        s.push_str(&format!("unset {key}\n"));
+        writeln!(s, "unset {key}").expect("writing to String cannot fail");
     }
     // Inject per-agent env overrides (e.g. scoped virtual API key from the proxy).
     // Sort for determinism in tests.
@@ -4078,7 +4079,7 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
     for (key, val) in overrides {
         // Single-quote the value to be safe with special characters.
         let safe = val.replace('\'', "'\\''");
-        s.push_str(&format!("export {key}='{safe}'\n"));
+        writeln!(s, "export {key}='{safe}'").expect("writing to String cannot fail");
     }
     if let Some(init) = &spec.init_script {
         s.push_str(init);
@@ -4094,7 +4095,7 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         // (which don't inherit the host PATH) can exec devenv without it being on
         // their default PATH.
         let devenv = spec.devenv_path.as_deref().unwrap_or("devenv");
-        s.push_str(&format!("exec {devenv} shell -- {bare}"));
+        write!(s, "exec {devenv} shell -- {bare}").expect("writing to String cannot fail");
     } else if inner.contains("&&")
         || inner.contains("||")
         || inner.contains('|')
@@ -4111,7 +4112,7 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         // `|` check, but either substring is enough to skip the prefix.)
         s.push_str(inner);
     } else {
-        s.push_str(&format!("exec {bare}"));
+        write!(s, "exec {bare}").expect("writing to String cannot fail");
     }
     s
 }

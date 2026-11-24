@@ -394,6 +394,7 @@ mod tests {
     use crate::plugin::session::tests::FixtureSupervisor;
     use crate::plugin::session::{ResidentSession, SessionEvent};
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -639,7 +640,7 @@ done
     fn plugin_logs_redact_all_retained_lines_after_eviction() {
         let mut text = String::from("SYNTHETIC_EVICTED_BODY\n");
         for line in 0..PROVIDER_LOG_MAX_LINES {
-            text.push_str(&format!("ordinary {line}\n"));
+            writeln!(text, "ordinary {line}").expect("writing to String cannot fail");
         }
         text.push_str("-----END PRIVATE KEY-----\n");
         let log = bounded_log(serde_json::json!({"text": text, "truncated": false})).unwrap();

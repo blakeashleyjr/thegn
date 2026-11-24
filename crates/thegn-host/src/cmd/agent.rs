@@ -21,6 +21,7 @@
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use thegn_core::config::Config;
 use thegn_core::outln;
 
@@ -255,10 +256,10 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
             r.model.as_deref().unwrap_or("-")
         );
         if !r.env_keys.is_empty() {
-            s.push_str(&format!("  env:{}", r.env_keys.join(",")));
+            write!(s, "  env:{}", r.env_keys.join(",")).expect("writing to String cannot fail");
         }
         if r.permissions > 0 {
-            s.push_str(&format!("  perms:{}", r.permissions));
+            write!(s, "  perms:{}", r.permissions).expect("writing to String cannot fail");
         }
         s
     };

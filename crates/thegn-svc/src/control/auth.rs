@@ -8,6 +8,7 @@
 //! leak useless (argon2 would add per-request latency + a dependency to
 //! defend low-entropy inputs we never store). Comparison is constant-time.
 
+use std::fmt::Write as _;
 use thegn_core::control::{
     ScopeSet, TOKEN_ID_HEX, TOKEN_SECRET_HEX, TokenKind, format_token, parse_token,
 };
@@ -83,7 +84,7 @@ pub fn implicit_local_admin(
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        write!(s, "{b:02x}").expect("writing to String cannot fail");
     }
     s
 }

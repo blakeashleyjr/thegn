@@ -18,6 +18,7 @@
 //!   deleted with the instance.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -119,7 +120,8 @@ pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -
         // Keys are caller-controlled config (env_passthrough names); values are
         // quoted so arbitrary secret bytes survive.
         if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !k.is_empty() {
-            out.push_str(&format!("export {k}={}\n", thegn_core::util::sh_quote(v)));
+            writeln!(out, "export {k}={}", thegn_core::util::sh_quote(v))
+                .expect("writing to String cannot fail");
         }
     }
     let cwd = cwd.map(str::trim).filter(|d| !d.is_empty());
@@ -131,11 +133,13 @@ pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -
         ));
     }
     if let Some(d) = cwd {
-        out.push_str(&format!(
-            "cd -- {} || {{ printf '%s\\n' 'thegn: remote working directory is missing or not accessible' >&2; exit {}; }}\n",
+        writeln!(
+            out,
+            "cd -- {} || {{ printf '%s\\n' 'thegn: remote working directory is missing or not accessible' >&2; exit {}; }}",
             thegn_core::util::sh_quote(d),
             crate::provider::EXEC_CWD_FAILED_STATUS
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     out.push_str(script);
     out.push('\n');

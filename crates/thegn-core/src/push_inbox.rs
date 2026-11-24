@@ -27,6 +27,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 
 use crate::control::{Scope, ScopeSet};
 
@@ -83,7 +84,7 @@ pub fn verify_mac(secret: &[u8], env: &Envelope) -> bool {
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        write!(s, "{b:02x}").expect("writing to String cannot fail");
     }
     s
 }

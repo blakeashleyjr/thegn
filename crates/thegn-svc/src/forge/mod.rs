@@ -15,7 +15,10 @@ pub use thegn_core::forge::{
 use crate::seam::Ladder;
 use thegn_core::config::Config;
 use thegn_core::config_forge::ForgeKind;
-use thegn_core::forge::model::*;
+use thegn_core::forge::model::{
+    CreateOpts, IssueRow, MergeMethod, PrConversation, PrDiff, PrHeader, PrSearchRow, PrStatus,
+    ReviewState, ReviewThreadRow,
+};
 use thegn_core::github::GithubCli;
 use thegn_core::remote::GitLoc;
 use thegn_core::seam::{Availability, Kind, Probe, ProbeReport};

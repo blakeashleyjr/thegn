@@ -10,6 +10,7 @@
 //! host paints from; other branches and the all-branch listing never overwrite it.
 
 use anyhow::{Result, bail};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -703,11 +704,14 @@ fn render_log_output(text: &str, truncated: bool, tail_lines: usize) -> String {
     let mut output = String::new();
     if truncated {
         if thegn_core::ci_log::is_failure_window(text) {
-            output.push_str(&format!(
-                "… (showing a window around the first failure, at most {tail_lines} lines)\n"
-            ));
+            writeln!(
+                output,
+                "… (showing a window around the first failure, at most {tail_lines} lines)"
+            )
+            .expect("writing to String cannot fail");
         } else {
-            output.push_str(&format!("… (showing last {tail_lines} lines)\n"));
+            writeln!(output, "… (showing last {tail_lines} lines)")
+                .expect("writing to String cannot fail");
         }
     }
     let log = thegn_core::ci::CiLog {
@@ -715,7 +719,8 @@ fn render_log_output(text: &str, truncated: bool, tail_lines: usize) -> String {
         truncated,
     };
     if let Some(line) = log.first_failure_line() {
-        output.push_str(&format!(">> first failure at line {}\n", line + 1));
+        writeln!(output, ">> first failure at line {}", line + 1)
+            .expect("writing to String cannot fail");
     }
     output.push_str(&sanitized);
     output

@@ -958,7 +958,9 @@ fn live_exec_session_semantics() {
                 cwd: None,
             };
             let mut big_session = provider.open_exec(&name, &big_spec).await?;
-            let big_input = ("x".repeat(63) + "\n").repeat(16_384).into_bytes();
+            let mut chunk = "x".repeat(63);
+            chunk.push('\n');
+            let big_input = chunk.repeat(16_384).into_bytes();
             let big_send = big_session
                 .control
                 .send(ExecControl::Stdin(big_input))

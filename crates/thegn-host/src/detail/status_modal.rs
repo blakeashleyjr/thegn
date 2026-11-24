@@ -147,7 +147,7 @@ fn tail_only(samples: u64, p95: u64, p99: u64) -> String {
 
 /// One-word summary of the chip state for the modal's role line.
 pub(crate) fn role_word(state: crate::chrome::DaemonChipState) -> &'static str {
-    use crate::chrome::DaemonChipState::*;
+    use crate::chrome::DaemonChipState::{Client, Error, NonPersist, Persist, Server};
     match state {
         NonPersist => "non-persistent (inline pane)",
         Persist => "persistent (daemon-backed)",

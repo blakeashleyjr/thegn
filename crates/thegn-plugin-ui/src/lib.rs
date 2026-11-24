@@ -5,7 +5,11 @@ pub use editor::{Editor, FIELD_BYTES};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tg_kit::ratatui::{buffer::Buffer, layout::Rect};
 use tg_kit::{InputEvent, InputResult, Key, Modifiers, Theme};
-use thegn_core::plugin_app::*;
+use thegn_core::plugin_app::{
+    Action, AppEvent, AppEventResult, AppView, Field, FieldKind, FormEdit, FormIdentity,
+    Interaction, InteractionBinding, KeyInput, KeyModifiers, NamedKey, Selection, Submission,
+    Widget,
+};
 
 pub type UiIntent = AppEvent;
 pub const EVENT_BYTES: usize = 1024 * 1024;

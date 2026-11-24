@@ -12,6 +12,7 @@
 use base64::Engine as _;
 use base64::engine::DecodePaddingMode;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
+use std::fmt::Write as _;
 use zeroize::Zeroizing;
 
 /// The longest response line segment (text between CRLFs, literals excluded).
@@ -796,7 +797,7 @@ pub fn percent_encode(s: &str) -> String {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'@') {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            write!(out, "%{b:02X}").expect("writing to String cannot fail");
         }
     }
     out

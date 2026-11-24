@@ -8,6 +8,7 @@
 //! stops it gracefully. Process and network operations MUST run off the event
 //! loop; publishing desired configuration is a non-blocking mutex update.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -217,7 +218,8 @@ fn tgproxy_report_in(
 ) -> String {
     let mut report = tgproxy_status_line(find_tgproxy_in(self_dir, path_var).as_deref());
     if let Some(sibling) = skipped_tgproxy_sibling(self_dir) {
-        report.push_str(&format!("; skipped non-executable {}", sibling.display()));
+        write!(report, "; skipped non-executable {}", sibling.display())
+            .expect("writing to String cannot fail");
     }
     report
 }
@@ -326,7 +328,7 @@ fn probe_with(addr: SocketAddr, secret: &[u8]) -> ProbeState {
     if let Err(e) = stream.set_write_timeout(Some(Duration::from_millis(200))) {
         return ProbeState::Foreign(format!("set identity timeout: {e}"));
     }
-    if write!(stream, "GET /thegn/identity?challenge={challenge} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").is_err() { return ProbeState::Foreign("identity request failed".into()); }
+    if writeln!(stream, "GET /thegn/identity?challenge={challenge} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r").is_err() { return ProbeState::Foreign("identity request failed".into()); }
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     let mut response = Vec::new();
     let mut chunk = [0u8; 512];

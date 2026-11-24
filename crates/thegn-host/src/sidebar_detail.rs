@@ -1,5 +1,6 @@
 //! Pure composition and width fitting for worktree detail lines.
 
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thegn_core::config::{DetailEntry, DetailField};
@@ -420,7 +421,7 @@ fn issue_field(issue: &str, count: usize, id: FieldId) -> Option<Field> {
         clipped
     };
     if count > 1 {
-        text.push_str(&format!(" +{}", count - 1));
+        write!(text, " +{}", count - 1).expect("writing to String cannot fail");
     }
     Some(Field::new(id, vec![seg(Tok::Slot(S::Dim), text)], 1))
 }

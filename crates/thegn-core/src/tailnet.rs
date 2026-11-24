@@ -507,6 +507,7 @@ pub fn probe_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     // A logged-in Tailscale (SaaS control plane) capture: an SSH-advertising
     // server, an offline phone that explicitly advertises none, and an old-client
@@ -917,9 +918,11 @@ mod tests {
             if i > 0 {
                 peers.push(',');
             }
-            peers.push_str(&format!(
+            write!(
+                peers,
                 r#""k{i}":{{"HostName":"h{i}","DNSName":"h{i}.ts.net."}}"#
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         let json = format!(r#"{{"BackendState":"Running","Peer":{{{peers}}}}}"#);
         let st = parse_status_json(&json).unwrap();

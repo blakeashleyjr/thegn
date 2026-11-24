@@ -15,6 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -1171,7 +1172,7 @@ impl ControlClient {
     pub async fn ci_runs(&self, worktree: &str, limit: Option<usize>) -> Result<CiRunsReply> {
         let mut path = format!("/v1/ci/runs?worktree={}", query_escape(worktree));
         if let Some(limit) = limit {
-            path.push_str(&format!("&limit={limit}"));
+            write!(path, "&limit={limit}").expect("writing to String cannot fail");
         }
         let value = self.request_long("GET", &path, None).await?;
         Ok(serde_json::from_value(value)?)
@@ -1198,7 +1199,7 @@ impl ControlClient {
             query_escape(job_id),
         );
         if let Some(tail_lines) = tail_lines {
-            path.push_str(&format!("&tail_lines={tail_lines}"));
+            write!(path, "&tail_lines={tail_lines}").expect("writing to String cannot fail");
         }
         let value = self.request_large("GET", &path, None).await?;
         Ok(serde_json::from_value(value)?)
@@ -1547,12 +1548,12 @@ impl ControlClient {
         let mut separator = '?';
         if let Some(limit) = limit {
             path.push(separator);
-            path.push_str(&format!("limit={limit}"));
+            write!(path, "limit={limit}").expect("writing to String cannot fail");
             separator = '&';
         }
         if let Some(before) = before {
             path.push(separator);
-            path.push_str(&format!("before={before}"));
+            write!(path, "before={before}").expect("writing to String cannot fail");
         }
         path
     }
@@ -1991,7 +1992,7 @@ fn query_escape(value: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'~') {
             out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            write!(out, "%{byte:02X}").expect("writing to String cannot fail");
         }
     }
     out

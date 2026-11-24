@@ -417,6 +417,7 @@ pub fn digest(output: &str, class: ValidationClass, matcher: Option<&str>) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     // --- the environment/code split, inherited from `gate` -------------------
 
@@ -786,8 +787,9 @@ error: test run failed";
         // The real motivation: the control-schema snapshot prints ~120 KB.
         let mut out = String::new();
         for i in 0..500 {
-            out.push_str(&format!("    FAIL [   0.0{i}s] crate test_number_{i}\n"));
-            out.push_str(&format!("{}\n", "x".repeat(4_000)));
+            writeln!(out, "    FAIL [   0.0{i}s] crate test_number_{i}")
+                .expect("writing to String cannot fail");
+            writeln!(out, "{}", "x".repeat(4_000)).expect("writing to String cannot fail");
         }
         let d = digest(&out, ValidationClass::TestFailure, Some("nextest"));
         assert!(d.lines().count() <= DIGEST_MAX_LINES, "line count uncapped");

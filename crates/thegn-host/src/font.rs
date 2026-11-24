@@ -1,6 +1,7 @@
 use crate::palette::PaletteItem;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1156,7 +1157,7 @@ fn random_staging_suffix() -> Result<String, String> {
         .map_err(|error| format!("no randomness for a staging name: {error}"))?;
     let mut suffix = String::with_capacity(32);
     for byte in bytes {
-        suffix.push_str(&format!("{byte:02x}"));
+        write!(suffix, "{byte:02x}").expect("writing to String cannot fail");
     }
     Ok(suffix)
 }
@@ -1338,7 +1339,7 @@ mod tests {
 
     #[test]
     fn terminal_detection_prefers_the_running_terminal() {
-        use TerminalKind::*;
+        use TerminalKind::{Alacritty, Ghostty, Kitty, Unknown, Unsupported};
         // TERM_PROGRAM is the first-hand answer…
         assert_eq!(
             detect_terminal(Some("ghostty"), Some("xterm-256color")),

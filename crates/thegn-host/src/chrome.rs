@@ -3,6 +3,7 @@
 //! WASM, no plugin hop, no broadcast — widgets read state directly and draw cells.
 //! This replaces the four zellij plugins.
 
+use std::fmt::Write as _;
 use termwiz::cell::AttributeChange;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::surface::{Change, Position, Surface};
@@ -1709,10 +1710,11 @@ pub(crate) fn fleet_widget(snap: &crate::fleet_read::FleetSnapshot) -> Option<(S
         format!("${:.2}/h", cost.total_hourly.max(0.0))
     };
     if cost.unpriced > 0 {
-        text.push_str(&format!(" +{}", cost.unpriced));
+        write!(text, " +{}", cost.unpriced).expect("writing to String cannot fail");
     }
     if warn {
-        text.push_str(&format!(" {}", crate::caps::active_glyphs().warn));
+        write!(text, " {}", crate::caps::active_glyphs().warn)
+            .expect("writing to String cannot fail");
     }
     Some((text, warn))
 }

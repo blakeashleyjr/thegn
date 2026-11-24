@@ -2,7 +2,10 @@ use super::native::GhCircuit;
 use super::{CreateIssueOpts, Forge, ForgeCaps, ForgeError, ForgeIssue, LineComment, Mention};
 use std::sync::Arc;
 use thegn_core::forge::authorship::PrAuthorship;
-use thegn_core::forge::model::*;
+use thegn_core::forge::model::{
+    CreateOpts, IssueRow, MergeMethod, PrConversation, PrDiff, PrHeader, PrSearchRow, PrStatus,
+    ReviewState, ReviewThreadRow,
+};
 use thegn_core::forge::{PrRef, PrRole, RepoRef};
 use thegn_core::remote::GitLoc;
 use thegn_core::seam::{Probe, ProbeReport};

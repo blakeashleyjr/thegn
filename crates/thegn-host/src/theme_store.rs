@@ -1147,6 +1147,7 @@ fn atomic_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn temp_dir(label: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1209,7 +1210,7 @@ mod tests {
             "name: imported\nbackground: '#101010'\nforeground: '#f0f0f0'\ncursor: '#00ff00'\n",
         );
         for index in 1..=16 {
-            gogh.push_str(&format!("color_{index:02}: '#010101'\n"));
+            writeln!(gogh, "color_{index:02}: '#010101'").expect("writing to String cannot fail");
         }
         std::fs::write(&import_path, gogh).unwrap();
         let config_path = dir.join("config.toml");

@@ -1,5 +1,6 @@
 //! Opt-in bounded workloads for candidate hot paths. No terminal or live DB.
 
+use std::fmt::Write as _;
 use std::time::Instant;
 use termwiz::surface::{Change, Position, Surface};
 
@@ -136,7 +137,8 @@ fn preview_pane_output_spinner() {
     let mut prefill = String::from("ready http://localhost:5173/\n");
     let mut line = 0usize;
     while prefill.len() < thegn_core::preview::MAX_PORT_HINT_CHARS {
-        prefill.push_str(&format!("[build] compiled module {line:05} in 3ms\n"));
+        writeln!(prefill, "[build] compiled module {line:05} in 3ms")
+            .expect("writing to String cannot fail");
         line += 1;
     }
     sup.pane_output(1, "/bench", None, prefill.as_bytes(), Some(120));

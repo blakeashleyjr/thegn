@@ -9,6 +9,7 @@
 //! - baked snapshot (`template = "snapshot:<id>"`): keys only — the tools are
 //!   already in the image, so first boot stays fast.
 
+use std::fmt::Write as _;
 /// Build the `#cloud-config` user-data. `pubkey` is the managed OpenSSH public
 /// key line; `install_prereqs` is false for baked snapshot images.
 pub fn user_data(pubkey: &str, install_prereqs: bool) -> String {
@@ -19,7 +20,7 @@ pub fn user_data(pubkey: &str, install_prereqs: bool) -> String {
     doc.push_str("ssh_pwauth: false\n");
     doc.push_str("disable_root: false\n");
     doc.push_str("ssh_authorized_keys:\n");
-    doc.push_str(&format!("  - {}\n", pubkey.trim()));
+    writeln!(doc, "  - {}", pubkey.trim()).expect("writing to String cannot fail");
     if install_prereqs {
         doc.push_str("runcmd:\n");
         // Nix-installer prerequisites; `|| true` — a transient apt failure must

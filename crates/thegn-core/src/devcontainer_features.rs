@@ -18,6 +18,7 @@
 //! other Bearer-token registries).
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde_json::Value;
 
@@ -177,19 +178,19 @@ pub fn install_script(f: &Feature, remote_user: &str) -> String {
     // pull (ghcr-style Bearer auth); the feature tarball is the blob layer.
     let mut s = String::new();
     s.push_str("set -e\n");
-    s.push_str(&format!("_tg_ref={}\n", sh_quote(&ref_full)));
-    s.push_str(&format!("_tg_reg={}\n", sh_quote(&r.registry)));
-    s.push_str(&format!("_tg_repo={}\n", sh_quote(&r.repository)));
-    s.push_str(&format!("_tg_tag={}\n", sh_quote(&r.tag)));
-    s.push_str(&format!("_tg_name={}\n", sh_quote(r.short_name())));
+    writeln!(s, "_tg_ref={}", sh_quote(&ref_full)).expect("writing to String cannot fail");
+    writeln!(s, "_tg_reg={}", sh_quote(&r.registry)).expect("writing to String cannot fail");
+    writeln!(s, "_tg_repo={}", sh_quote(&r.repository)).expect("writing to String cannot fail");
+    writeln!(s, "_tg_tag={}", sh_quote(&r.tag)).expect("writing to String cannot fail");
+    writeln!(s, "_tg_name={}", sh_quote(r.short_name())).expect("writing to String cannot fail");
     for (k, v) in &f.options {
-        s.push_str(&format!("export {}={}\n", option_env_name(k), sh_quote(v)));
+        writeln!(s, "export {}={}", option_env_name(k), sh_quote(v))
+            .expect("writing to String cannot fail");
     }
-    s.push_str(&format!("export _REMOTE_USER={}\n", sh_quote(remote_user)));
-    s.push_str(&format!(
-        "export _CONTAINER_USER={}\n",
-        sh_quote(remote_user)
-    ));
+    writeln!(s, "export _REMOTE_USER={}", sh_quote(remote_user))
+        .expect("writing to String cannot fail");
+    writeln!(s, "export _CONTAINER_USER={}", sh_quote(remote_user))
+        .expect("writing to String cannot fail");
     s.push_str(FEATURE_INSTALL_BODY);
     s
 }

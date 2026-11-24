@@ -292,13 +292,14 @@ fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: std::fmt::Argument
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn admission_encoding_bound_counts_repeated_ancestor_paths() {
         let parent = "p".repeat(5_500);
         let mut source = format!("[{parent}]\n");
         for index in 0..1_500 {
-            source.push_str(&format!("k{index} = {{}}\n"));
+            writeln!(source, "k{index} = {{}}").expect("writing to String cannot fail");
         }
         assert!(crate::config_budget::scan(source.as_bytes()).is_ok());
         assert!(matches!(

@@ -447,18 +447,21 @@ fn average(colors: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::theme_contrast::{Bar, audit};
+    use std::fmt::Write as _;
 
     fn yaml() -> String {
         let mut text = String::from(
             "name: \"Test Gogh\"\nvariant: dark\nbackground: \"#101820\"\nforeground: \"#f0f0f0\"\ncursor: \"#00ffcc\"\n",
         );
         for index in 1..=16 {
-            text.push_str(&format!(
-                "color_{index:02}: \"#{:02x}{:02x}{:02x}\"\n",
+            writeln!(
+                text,
+                "color_{index:02}: \"#{:02x}{:02x}{:02x}\"",
                 index,
                 index + 1,
                 index + 2
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         text
     }

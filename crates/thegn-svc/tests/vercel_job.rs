@@ -13,6 +13,7 @@
 //! Run: `cargo test -p thegn-svc --test vercel_job`.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -236,7 +237,8 @@ fn handle(
         reply.status, reply.ctype
     );
     if !reply.no_length {
-        head.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
+        writeln!(head, "Content-Length: {}\r", reply.body.len())
+            .expect("writing to String cannot fail");
     }
     head.push_str("Connection: close\r\n\r\n");
     if stream.write_all(head.as_bytes()).is_err()

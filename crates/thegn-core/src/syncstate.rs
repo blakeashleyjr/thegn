@@ -18,6 +18,7 @@
 use crate::snapshot_meta::ArtifactMeta;
 use crate::util::sh_quote;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 /// The artifact short-names, in capture/replay order. These are the `<name>`
 /// in `<staging dir>/<name>` (or the legacy `/tmp/<stem>.<name>`) on the
@@ -273,10 +274,12 @@ pub fn replay_script_verified(
         }
         valid_names.push(artifact.name.as_str());
         let path = sh_quote(&staged_artifact_path(dir, &artifact.name));
-        validation.push_str(&format!(
+        write!(
+            validation,
             "printf '%s  %s\\n' {} {path} | sha256sum -c - >/dev/null 2>&1 || fail artifact_validation; ",
             sh_quote(&artifact.sha256)
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     for (name, carried) in [
         ("bundle", reset_head.is_some()),

@@ -124,7 +124,8 @@ fn snapshot_path() -> std::path::PathBuf {
 fn wire_schema_matches_the_committed_snapshot() {
     let current = wire_schema();
     let path = snapshot_path();
-    let pretty = serde_json::to_string_pretty(&current).unwrap() + "\n";
+    let mut pretty = serde_json::to_string_pretty(&current).unwrap();
+    pretty.push('\n');
     if std::env::var_os("THEGN_UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(&path, &pretty).unwrap();
         return;

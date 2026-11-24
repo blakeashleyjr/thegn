@@ -16,6 +16,7 @@
 //! auto-resets transient rows because a concurrent CLI `merge drain`
 //! legitimately owns them.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -1320,11 +1321,13 @@ fn add_all(cfg: &Config, any_path: &Path) -> String {
         )
     };
     if !pipeline_refusals.is_empty() {
-        message.push_str(&format!(
+        write!(
+            message,
             "; {} refused (pipeline gate): {}",
             pipeline_refusals.len(),
             pipeline_refusals.join("; ")
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     message
 }
@@ -2225,7 +2228,7 @@ mod tests {
 
     #[test]
     fn key_matrix_resolves_by_row_status() {
-        use MqAction::*;
+        use MqAction::{AddAll, AddCurrent, ClearLanded, Drain, Land, Remove, Retry};
         // Row-independent keys.
         for (k, want) in [
             ('a', AddCurrent),

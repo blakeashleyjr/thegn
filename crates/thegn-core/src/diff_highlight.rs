@@ -5,6 +5,7 @@
 //! source file's language, preserving diff prefixes so the structural diff
 //! information remains visible.
 
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color, FontStyle, Style, Theme};
@@ -252,12 +253,12 @@ fn style_ansi(style: &Style, bg: Option<Color>) -> String {
 
     // Background (from diff, added over what syntect might set).
     if let Some(c) = bg {
-        ansi.push_str(&format!("\x1b[48;2;{};{};{}m", c.r, c.g, c.b));
+        write!(ansi, "\x1b[48;2;{};{};{}m", c.r, c.g, c.b).expect("writing to String cannot fail");
     }
 
     // Foreground (from syntax highlighting).
     let fg = style.foreground;
-    ansi.push_str(&format!("\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b));
+    write!(ansi, "\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b).expect("writing to String cannot fail");
 
     // Font style.
     if style.font_style.contains(FontStyle::BOLD) {

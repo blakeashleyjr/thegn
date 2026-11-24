@@ -199,7 +199,7 @@ fn pad_column(mut labels: Vec<String>) -> Vec<String> {
     let w = labels.iter().map(|s| s.chars().count()).max().unwrap_or(0);
     for s in &mut labels {
         let pad = w - s.chars().count();
-        *s = " ".repeat(pad) + s;
+        s.insert_str(0, &" ".repeat(pad));
     }
     labels
 }

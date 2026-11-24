@@ -7,7 +7,7 @@ pub(in crate::monitor) mod view;
 #[path = "containers/containers_wire_tests.rs"]
 mod wire_tests;
 
-use super::super::build::*;
+use super::super::build::{Ctx, TabBuild, heading, plain, row_ys, trunc};
 use super::super::{
     ContainerReqKind, ContainerRequest, ContainerRowMeta, MonitorAction, MonitorOutcome,
     MonitorOverlay,

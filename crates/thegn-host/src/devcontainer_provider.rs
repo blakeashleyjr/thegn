@@ -912,6 +912,7 @@ fn provider_env(allowlisted: &[(String, String)]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn cli_exec_argv_keeps_provider_flags_inside_the_seam_for_verified_config() {
@@ -1657,9 +1658,11 @@ mod tests {
         .unwrap();
         let mut compose = String::from("services:\n  app:\n    env_file:\n");
         for index in 0..257 {
-            compose.push_str(&format!(
-                "      - path: missing-{index}.env\n        required: false\n"
-            ));
+            writeln!(
+                compose,
+                "      - path: missing-{index}.env\n        required: false"
+            )
+            .expect("writing to String cannot fail");
         }
         std::fs::write(config_dir.join("compose.yml"), compose).unwrap();
         let error = config_digest(&config_path).unwrap_err().to_string();

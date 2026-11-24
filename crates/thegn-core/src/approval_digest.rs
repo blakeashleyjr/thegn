@@ -13,6 +13,7 @@
 //! forged triple does nothing. Pure: no I/O.
 
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 use crate::automation_autonomy::Autonomy;
 use crate::db_approval_effects::ProposalRow;
@@ -36,7 +37,7 @@ pub fn digest(v: &serde_json::Value) -> String {
     let hash = Sha256::digest(canonical.as_bytes());
     let mut out = String::with_capacity(DIGEST_HEX);
     for byte in hash.iter() {
-        out.push_str(&format!("{byte:02x}"));
+        write!(out, "{byte:02x}").expect("writing to String cannot fail");
     }
     out.truncate(DIGEST_HEX);
     out

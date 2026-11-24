@@ -1623,6 +1623,7 @@ pub fn stubs() -> impl Iterator<Item = &'static HostCapability> {
 mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashSet};
+    use std::fmt::Write as _;
 
     #[test]
     fn every_verb_has_exactly_one_canonical_row() {
@@ -2136,7 +2137,7 @@ mod tests {
             .collect();
         rows.sort();
         for (id, s, why) in rows {
-            out.push_str(&format!("{id}\t{s}\t{why}\n"));
+            writeln!(out, "{id}\t{s}\t{why}").expect("writing to String cannot fail");
         }
         std::fs::write(path, out).expect("write surface-gaps-ratchet.txt");
         let doc_path = concat!(

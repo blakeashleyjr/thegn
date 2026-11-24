@@ -520,7 +520,7 @@ pub fn axis_labels(min: f32, max: f32, rows: usize, unit: Unit) -> Vec<String> {
     let w = out.iter().map(|s| s.chars().count()).max().unwrap_or(0);
     for s in &mut out {
         let pad = w - s.chars().count();
-        *s = " ".repeat(pad) + s;
+        s.insert_str(0, &" ".repeat(pad));
     }
     out
 }

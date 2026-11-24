@@ -1,6 +1,6 @@
 //! Disk tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, DiskWtRow, MAIN_H, TabBuild, heading, kv, row_ys, trunc};
 use super::super::{Confirm, MonitorOutcome, MonitorOverlay};
 use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection, spacer};

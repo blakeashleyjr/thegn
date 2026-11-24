@@ -2071,7 +2071,8 @@ mod tests {
         assert_eq!(fin.dropped_bytes, 0);
 
         let (output, events) = output_of(&captured);
-        let expected = "a".repeat(MAX_CHUNK_BYTES - 1) + "\u{20ac}";
+        let mut expected = "a".repeat(MAX_CHUNK_BYTES - 1);
+        expected.push('\u{20ac}');
         assert!(output == expected, "the straddling char did not rejoin");
         assert!(events.iter().all(|event| event[1] != "m"));
         assert_eq!(budget.load(Ordering::Acquire), 0);

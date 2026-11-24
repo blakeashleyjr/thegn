@@ -772,6 +772,7 @@ pub fn native_trust_refusal(plugin: &LoadedPlugin) -> Option<SpecProblem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use thegn_core::plugin_api::{ApiVersion, Contribution, ExtensionPoint, PluginManifest};
 
     fn spec(id: &str, command: Vec<String>) -> PluginSpec {
@@ -1408,10 +1409,12 @@ cadence = { kind = "interval", millis = 250 }
         let spec_text = toml::to_string(&spec("limited", vec!["true".into()])).unwrap();
         let mut exact = format!("{spec_text}\n");
         assert!(exact.len() < MAX_MANIFEST_BYTES);
-        exact.push_str(&format!(
-            "#{}\n",
+        writeln!(
+            exact,
+            "#{}",
             "x".repeat(MAX_MANIFEST_BYTES - exact.len() - 2)
-        ));
+        )
+        .expect("writing to String cannot fail");
         assert_eq!(exact.len(), MAX_MANIFEST_BYTES);
         std::fs::write(plugin_dir.join("plugin.toml"), &exact).unwrap();
         let (loaded, problems) = discover(&Config::default(), tmp.path());

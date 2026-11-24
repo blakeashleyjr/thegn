@@ -18,7 +18,10 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use thegn_core::forge::checkout::{ForgeCheckoutScope, checkout_scope};
-use thegn_core::forge::model::*;
+use thegn_core::forge::model::{
+    CheckRun, ForgeRepoIdentity, IssueRow, PrHeader, PrPanel, PrSearchRow, PrStatus,
+    owner_repo_from_url,
+};
 use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef, PrRole, RepoRef};
 use thegn_core::remote::GitLoc;
 use thegn_core::seam::{Availability, Probe, ProbeReport};
@@ -1310,6 +1313,9 @@ async fn token_command_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `PanelState` is only reached from assertions here, so the file-level import
+    // would be unused in the non-test build.
+    use thegn_core::forge::model::PanelState;
 
     #[test]
     fn token_precedence_prefers_gh_token_then_github_token_then_cli() {

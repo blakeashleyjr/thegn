@@ -228,10 +228,24 @@ fn exec_websocket(mut stream: TcpStream, headers: &HashMap<String, String>, drop
         return;
     }
     let exit = vec![0x03, 7];
-    // best-effort: the client may already have hung up.
-    socket
-        .send(Message::Binary(exit.into()))
-        .unwrap_or_default(); // best-effort: client may have gone
+    if socket.send(Message::Binary(exit.into())).is_err() {
+        return; // the client may already have hung up
+    }
+    // Do not drop the socket right after the exit frame: the client's unread
+    // Ping would turn the close into an RST that can discard the exit frame
+    // (seen in the pre-push run). Read until the client closes, bounded.
+    if socket
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(message) = socket.read() {
+        if matches!(message, Message::Close(_)) {
+            break;
+        }
+    }
 }
 
 #[tokio::test]
