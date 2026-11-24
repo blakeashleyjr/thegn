@@ -110,10 +110,12 @@ lifecycle are separate settings.
 `thegn wt disk --lanes` SHALL inventory the immediate subdirectories of one
 checkout's `target/lanes/` and report, per lane, its apparent-byte size, the
 regenerable build output inside it, the owning worktree it can verify, its
-activity evidence, an eligibility class, and a reason. Per-lane and aggregate
-sizes MUST use the same apparent-byte accounting as `thegn disk`, so a lane's
-`target/` and a worktree's `target/` are the same unit; only lanes classified
-`eligible` contribute to the eligible total.
+activity evidence, an eligibility class, and a reason. Without `--apply` it MUST
+NOT remove or modify lane contents, write the `worktree_disk` cache, or scan any
+other worktree. Per-lane and aggregate sizes MUST use the same apparent-byte
+accounting as `thegn disk`, so a lane's `target/` and a worktree's `target/` are
+the same unit; only lanes classified `eligible` contribute to the eligible
+total.
 
 Ownership MUST come from the lane's own git checkout. A lane with no checkout of
 its own SHALL be reported with unknown ownership rather than attributed to the
@@ -125,9 +127,6 @@ or the newest write anywhere in the lane, using the same recent-activity window
 as low-disk eviction. A lane SHALL be eligible only when it is a build lane, has
 a verifiable owner, holds no build lock, and has been idle longer than that
 window; every other lane MUST be reported `held` or `unknown` with its reason.
-
-The command MUST NOT remove or modify lane contents, write the `worktree_disk`
-cache, or scan any other worktree.
 
 #### Scenario: Active, idle, locked, and unowned lanes
 
@@ -141,3 +140,47 @@ cache, or scan any other worktree.
 
 - **WHEN** the selected checkout has no `target/lanes/` directory
 - **THEN** the inventory reports no lanes and exits successfully
+
+### Requirement: Verified inactive lanes can be reclaimed explicitly
+
+`thegn wt disk --lanes --apply` SHALL reclaim only the lanes the inventory
+classifies `eligible`: a build lane with a verifiable owner, no held Cargo lock,
+and no write inside the recent-activity window. It MUST re-read lane directory
+identity, kind, owner and branch, Cargo lock state, newest write, and measured
+bytes for each candidate immediately before removal. A candidate whose evidence
+changed, or is ambiguous, SHALL be retained and reported with the reason.
+
+Removal SHALL take only regenerable build output: a checkout lane's `target/`
+subtree, leaving its `.git`, `Cargo.toml` and sources. A lane directory SHALL never be
+removed whole, and a bare Cargo target dir SHALL be reported `unknown` until an
+ownership proof exists (follow-up). Cargo build locks SHALL be held across each
+removal, and a failed or partial removal SHALL make the command exit non-zero.
+Rebuild-cost measurement is a manual operator step. The selected checkout, other lanes, ordinary `target/` output, and lane
+evidence outside the removed output MUST remain untouched. The apply report
+SHALL include removed lane IDs and paths, apparent bytes actually removed,
+every lane left untouched with its reason, and cleanup duration. Removal SHALL
+be per lane so a partial run is retryable. Cleanup is opt-in and never runs
+automatically; omitting `--apply` stops future lane cleanup. The operator
+handoff SHALL record the bytes actually reclaimed, the skipped lanes, and the
+next comparable build's duration so rebuild cost can be compared with the
+recovered bytes.
+
+#### Scenario: A lane activates between report and apply
+
+- **WHEN** the dry run marks a lane eligible but a build lock is held or a file
+  in the lane is written before apply
+- **THEN** apply skips the lane, reports it as held with the fresh evidence, and
+  removes nothing from it
+
+#### Scenario: Ownership changes after report
+
+- **WHEN** the lane's own checkout is replaced or switched to another branch
+  after the dry run
+- **THEN** apply leaves the lane untouched and reports the changed ownership
+
+#### Scenario: Cleanup partially succeeds
+
+- **WHEN** one candidate is removed and another is held
+- **THEN** the report states the bytes actually removed and the reason the held
+  lane was skipped, and a later apply can reclaim the still-eligible lane
+  without relying on the earlier pass
