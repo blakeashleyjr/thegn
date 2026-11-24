@@ -112,10 +112,15 @@ fn cfg_oci_runtime(cfg: &Config) -> Option<&str> {
 /// A `" (…)"` availability suffix for the configured OCI runtime: whether its
 /// binary (and `/dev/kvm`, for libkrun) is present on THIS host, so the user
 /// learns a strong runtime would silently fall back before they rely on it.
-/// Engines without a `--runtime` flag never use the value, so probe nothing
-/// and say it is ignored — the same predicate [`Capabilities`] derives from.
-fn oci_runtime_status(backend: Backend, rt: &str) -> String {
-    if !backend.accepts_runtime_flag() {
+/// OCI engines without a `--runtime` flag never use the value, so probe
+/// nothing and say it is ignored — the same predicate [`Capabilities`] derives
+/// from. `None` (an `auto` chain) still probes: each chain row below states
+/// which engines ignore the runtime.
+fn oci_runtime_status(backend: Option<Backend>, rt: &str) -> String {
+    if let Some(backend) = backend
+        && backend.is_oci()
+        && !backend.accepts_runtime_flag()
+    {
         return format!(" (ignored: {} has no --runtime)", backend.label());
     }
     use thegn_core::sandbox_runtime::{RuntimeDecision, decide, runtime_req};
@@ -5649,9 +5654,7 @@ fn sandbox_report(cfg: &Config) {
         );
     }
     if let Some(rt) = cfg_oci_runtime(cfg) {
-        let status = Backend::from_config(cfg.sandbox.backend)
-            .map(|backend| oci_runtime_status(backend, rt))
-            .unwrap_or_default();
+        let status = oci_runtime_status(Backend::from_config(cfg.sandbox.backend), rt);
         outln!("  oci_runtime   {rt}{status}");
     }
     let chain = shell_chain(cfg);
@@ -5692,6 +5695,7 @@ fn sandbox_report(cfg: &Config) {
         // the concrete `backend` setting, not an `auto` chain).
         if cfg_oci_runtime(cfg).is_some()
             && let Some(backend) = Backend::parse(&row.name)
+            && backend.is_oci()
             && !backend.accepts_runtime_flag()
         {
             outln!(
@@ -8071,9 +8075,14 @@ agent = "plain-agent"
     #[test]
     fn doctor_marks_runtime_ignored_for_unsupported_engine() {
         assert_eq!(
-            oci_runtime_status(Backend::Apple, "runsc"),
+            oci_runtime_status(Some(Backend::Apple), "runsc"),
             " (ignored: apple has no --runtime)"
         );
+        // An `auto` chain (no concrete backend) keeps the availability probe
+        // instead of going silent; runc needs nothing, so it reports nothing.
+        assert_eq!(oci_runtime_status(None, "runc"), "");
+        // A non-OCI engine never had a runtime to ignore.
+        assert_eq!(oci_runtime_status(Some(Backend::Bwrap), "runc"), "");
     }
 
     #[test]

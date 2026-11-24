@@ -46,8 +46,8 @@ UserspaceKernel`, `krun → GuestKernel` only for those engines; every other
 - **No `--runtime`, no claim.** Engines without the flag (bwrap/systemd/none,
   and the OCI-family Apple `container`, Smol and WSL kinds) neither receive the
   flag nor raise their class; the flag and the class-raise are gated on
-  `Backend::accepts_runtime_flag()`. A configured value on such an engine
-  produces one `oci_runtime ignored: <label> has no --runtime` warning, so a
+  `Backend::accepts_runtime_flag()`. A configured value on such an OCI-family
+  engine produces one `oci_runtime ignored: <label> has no --runtime` warning, so a
   config string can never claim a boundary the engine did not deliver.
 - **Trust ladder.** `capabilities.rs` stays the source of truth the UI/doctor
   read; wiring a local guest-kernel sandbox into `trust_class` multi-host packing

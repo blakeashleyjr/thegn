@@ -5886,7 +5886,7 @@ pub fn warn_unsupported_oci_runtime(spec: &SandboxSpec, warnings: &mut Vec<Strin
         .oci_runtime
         .as_deref()
         .is_some_and(|rt| !rt.trim().is_empty());
-    if configured && !spec.backend.accepts_runtime_flag() {
+    if configured && spec.backend.is_oci() && !spec.backend.accepts_runtime_flag() {
         let warning = format!(
             "oci_runtime ignored: {} has no --runtime",
             spec.backend.label()
