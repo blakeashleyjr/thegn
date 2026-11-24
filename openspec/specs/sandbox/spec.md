@@ -1448,3 +1448,47 @@ runtime's verbs in order to clear the mark.
 
 - **WHEN** a backend whose runtime has been verified is reported
 - **THEN** no verification caveat appears and no warning is emitted
+
+### Requirement: Host-sourced secrets never ride a command line
+
+thegn SHALL treat an env pair whose value equals the launcher's own environment
+as a host-sourced secret and MUST NOT place its value in any argv, local or
+remote. Delivery SHALL use the strongest carrier the placement has: a 0600
+`EnvironmentFile` for local OCI and systemd launches, the control process's
+stdin for stdin-capable remote OCI placements (ssh and Kubernetes), and no
+delivery at all for a placement that has neither. Omission MUST be reported with
+the secret keys only; a value MUST NOT appear in a warning, error or log line,
+including runtime stderr.
+
+Before any stdin-delivered env payload is written, thegn SHALL validate every
+record as `NAME=value\n` with a shell identifier name and no CR/LF in the value,
+and SHALL refuse the launch when the payload exceeds 128 variables or 64 KiB.
+The refusal SHALL name no secret value. Captured stderr from the stdin
+carrier SHALL remain bounded and SHALL redact every delivered value. Synthetic
+pairs whose values are absent from the host environment (for example
+`THEGN_SANDBOX`) are not secrets and MAY stay inline.
+
+#### Scenario: Local launch keeps a passthrough token off argv
+
+- **WHEN** a local OCI or systemd pane inherits a host token through env passthrough
+- **THEN** the value is delivered through a private env-file and does not appear
+  in the launch argv
+
+#### Scenario: Remote stdin carrier is used when available
+
+- **WHEN** an ssh or Kubernetes OCI container is created with a host-sourced secret
+- **THEN** the env-file body is written to the control process's stdin and the
+  create argv names only `/dev/stdin`
+
+#### Scenario: A placement without a confidential carrier omits the secret
+
+- **WHEN** a provider placement, or a remote bwrap or systemd placement, receives
+  a host-sourced secret
+- **THEN** the value is omitted from the launch, argv contains no secret value,
+  and the warning names the omitted key but not its value
+
+#### Scenario: A malformed payload is refused without echoing it
+
+- **WHEN** a stdin-delivered env payload contains an invalid name, a CR/LF in a
+  value, too many variables, or too many bytes
+- **THEN** the launch is refused with an error that names no secret value
