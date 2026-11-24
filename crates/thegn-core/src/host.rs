@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(f.to_string(), "install: declined");
     }
 
-    /// A minimal spec for the injection tests (SandboxSpec has no Default).
+    /// A minimal spec for the injection tests, using the inert `SandboxSpec` default.
     fn blank_spec() -> crate::sandbox::SandboxSpec {
         crate::sandbox::SandboxSpec {
             backend: crate::sandbox::Backend::Podman,
