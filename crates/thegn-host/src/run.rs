@@ -23900,14 +23900,20 @@ async fn event_loop<T: Terminal>(
                                         }
                                         Section::Forward => {
                                             // Enter copies the focused preview/forward URL.
-                                            if panel_ui.cursor == 0
-                                                && let Some((worktree, port)) =
-                                                    model.preview.as_ref().map(|preview| {
-                                                        (preview.worktree.clone(), preview.port)
-                                                    })
-                                            {
-                                                preview_supervisor.rearm_port(&worktree, port);
-                                                model.preview = preview_supervisor.view(&worktree);
+                                            // Snapshot the preview before re-arming so the
+                                            // copied target keeps the status the user saw.
+                                            if panel_ui.cursor == 0 {
+                                                let worktree = model
+                                                    .preview
+                                                    .as_ref()
+                                                    .map(|preview| preview.worktree.clone());
+                                                if let Some(worktree) = worktree {
+                                                    // A missing supervisor target is
+                                                    // unavailable: do not leave a stale
+                                                    // preview that would open anyway.
+                                                    model.preview =
+                                                        preview_supervisor.open_view(&worktree);
+                                                }
                                             }
                                             if let Some(url) =
                                                 forward_url_at(&model, panel_ui.cursor)
@@ -23925,10 +23931,10 @@ async fn event_loop<T: Terminal>(
                                                 };
                                                 if panel_ui.cursor == 0
                                                     && let Some(preview) = &model.preview
-                                                    && preview.status
-                                                        != thegn_core::preview::PreviewStatus::Up
                                                 {
-                                                    model.status.push_str(" (not answering yet)");
+                                                    model.status.push_str(
+                                                        crate::preview::status_note(preview.status),
+                                                    );
                                                 }
                                             } else if model.preview.is_some()
                                                 && panel_ui.cursor == 0
@@ -24896,14 +24902,19 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- forward: open the focused preview in the browser --
                         (Section::Forward, KeyCode::Char('o')) => {
-                            if panel_ui.cursor == 0
-                                && let Some((worktree, port)) = model
+                            // Re-arm after snapshotting: the opened URL and its
+                            // feedback keep the source/status of the selected
+                            // target, while a fresh probe may update them later.
+                            if panel_ui.cursor == 0 {
+                                let worktree = model
                                     .preview
                                     .as_ref()
-                                    .map(|preview| (preview.worktree.clone(), preview.port))
-                            {
-                                preview_supervisor.rearm_port(&worktree, port);
-                                model.preview = preview_supervisor.view(&worktree);
+                                    .map(|preview| preview.worktree.clone());
+                                if let Some(worktree) = worktree {
+                                    // A missing supervisor target is unavailable: do
+                                    // not leave a stale preview that would open.
+                                    model.preview = preview_supervisor.open_view(&worktree);
+                                }
                             }
                             if let Some(url) =
                                 forward_url_at(&model, panel_ui.cursor).map(str::to_owned)
@@ -24917,9 +24928,10 @@ async fn event_loop<T: Terminal>(
                                 );
                                 if panel_ui.cursor == 0
                                     && let Some(preview) = &model.preview
-                                    && preview.status != thegn_core::preview::PreviewStatus::Up
                                 {
-                                    model.status.push_str(" (not answering yet)");
+                                    model
+                                        .status
+                                        .push_str(crate::preview::status_note(preview.status));
                                 }
                             } else {
                                 model.status = "No preview selected".into();
