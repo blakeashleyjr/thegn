@@ -598,7 +598,8 @@ fn run_in_sandbox(
         return SandboxedRun::Refused(format!("{NEEDS_SEALED} (unsupported on this platform)"));
     }
     // Keep a secret env-file alive until the bounded runner has reaped the child.
-    let (inner, _env_file) = match thegn_core::sandbox::enter_argv_guarded(spec, command) {
+    let (inner, _env_file) = match thegn_core::sandbox::enter_argv_guarded_background(spec, command)
+    {
         Ok(guarded) => guarded.into_parts(),
         Err(error) => return SandboxedRun::Refused(format!("{NEEDS_SEALED} ({error})")),
     };

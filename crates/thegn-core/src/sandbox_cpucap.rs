@@ -691,6 +691,53 @@ pub(crate) fn systemd_cap_args(limits: &SandboxLimits) -> Vec<String> {
 /// probed host mechanism. A no-op unless the backend is a local host-toolchain
 /// shell with something to enforce.
 pub(crate) fn wrap_pane_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<String> {
+    wrap_argv_role(spec, argv, false)
+}
+
+/// Like [`wrap_pane_argv`], for a sandboxed background job (sealed gate, stage
+/// executor, queue agent): background caps only, and any pane-only `-p`
+/// properties the Systemd backend wrote inline are peeled back off.
+pub(crate) fn wrap_background_entry_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<String> {
+    wrap_argv_role(spec, argv, true)
+}
+
+/// Remove the pane-only properties (`CPUQuota`, `OOMPolicy=continue`,
+/// `MemoryHigh`, `MemorySwapMax`) from an inline `systemd-run` property list.
+fn strip_pane_only_props(argv: Vec<String>) -> Vec<String> {
+    if argv.first().map(String::as_str) != Some("systemd-run") {
+        return argv;
+    }
+    let end = argv.iter().position(|w| w == "--").unwrap_or(argv.len());
+    let pane_only = |w: &str| {
+        ["CPUQuota=", "MemoryHigh=", "MemorySwapMax="]
+            .iter()
+            .any(|p| w.starts_with(p))
+            || w == "OOMPolicy=continue"
+    };
+    let mut out = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        if i < end && argv[i] == "-p" && argv.get(i + 1).is_some_and(|w| pane_only(w)) {
+            i += 2;
+            continue;
+        }
+        out.push(argv[i].clone());
+        i += 1;
+    }
+    out
+}
+
+fn wrap_argv_role(spec: &SandboxSpec, argv: Vec<String>, background: bool) -> Vec<String> {
+    let role = if background {
+        CapRole::Background
+    } else {
+        CapRole::Pane
+    };
+    let argv = if background {
+        strip_pane_only_props(argv)
+    } else {
+        argv
+    };
     let argv_original = argv.clone();
     let wrapped = cap_prefix(
         spec.backend,
@@ -698,7 +745,7 @@ pub(crate) fn wrap_pane_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<Strin
         &spec.limits,
         argv,
         detect_cpu_cap(),
-        CapRole::Pane,
+        role,
     );
     pane_wrap_or_plain(wrapped, argv_original, scope_known_unusable())
 }
@@ -2119,6 +2166,59 @@ mod tests {
             !bg.contains("MemoryHigh") && !bg.contains("MemorySwapMax"),
             "{bg}"
         );
+    }
+
+    #[test]
+    fn background_entry_argv_drops_pane_only_limits() {
+        let pane_only = |a: &str| {
+            a.contains("MemoryHigh") || a.contains("MemorySwapMax") || a.contains("OOMPolicy")
+        };
+        let l = limits(None, Some("24g"), Some("off"));
+        // Scope-wrapped (bwrap/none) path: background role never adds them.
+        let scope = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            vec!["sh".to_string()],
+            CpuCap::ScopeHard,
+            CapRole::Background,
+        )
+        .join(" ");
+        assert!(
+            scope.contains("MemoryMax=24G") && !pane_only(&scope),
+            "{scope}"
+        );
+        // Systemd-backend inline path: the pane props are peeled back off.
+        let inline: Vec<String> = [
+            "systemd-run",
+            "--user",
+            "--pty",
+            "-p",
+            "CPUQuota=200%",
+            "-p",
+            "MemoryMax=24G",
+            "-p",
+            "OOMPolicy=continue",
+            "-p",
+            "MemoryHigh=1",
+            "-p",
+            "MemorySwapMax=4G",
+            "--",
+            "sh",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let bg = strip_pane_only_props(inline.clone()).join(" ");
+        assert!(bg.contains("MemoryMax=24G") && !pane_only(&bg), "{bg}");
+        assert!(!bg.contains("CPUQuota") && bg.ends_with("-- sh"), "{bg}");
+        // A pane argv keeps them.
+        let pane = systemd_cap_args(&l).join(" ");
+        assert!(
+            pane.contains("MemoryHigh") && pane.contains("MemorySwapMax"),
+            "{pane}"
+        );
+        assert!(pane.contains("OOMPolicy=continue"), "{pane}");
     }
 
     #[test]

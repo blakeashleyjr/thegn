@@ -951,11 +951,9 @@ fn clamp_limits(
         memory: _,
         cpu_total,
         memory_total,
-        // Per-pane high-water/swap and aggregate swap are trusted-layer only: a repo
-        // overlay cannot set them (they stay at the base value).
-        memory_high: _,
-        memory_swap: _,
-        memory_swap_total: _,
+        memory_high,
+        memory_swap,
+        memory_swap_total,
         heavy_slots: _,
         max_load: _,
     } = req;
@@ -1062,6 +1060,38 @@ fn clamp_limits(
                 "a repo may not weaken the aggregate memory ceiling (off/unparseable)",
             )),
         }
+    }
+    // High-water mark and swap caps: a repo may only tighten a trusted value
+    // (at or below it). With no trusted value to compare against, or when the
+    // request is "off"/larger/unparseable, the request is denied and surfaced.
+    let mut tighten = |key: &'static str, requested: &Option<String>, trusted: &Option<String>| {
+        let req = requested.as_ref()?;
+        match (parse_bytes(req), trusted.as_deref().and_then(parse_bytes)) {
+            (Some(r), Some(b)) if r <= b => Some(req.clone()),
+            _ => {
+                events.push(ClampEvent::deny(
+                    layer,
+                    key,
+                    RepoFieldRule::CeilingIntersect,
+                    json!(req),
+                    "a repo may only tighten this limit below the trusted value",
+                ));
+                None
+            }
+        }
+    };
+    if let Some(v) = tighten("sandbox.limits.memory_high", memory_high, &base.memory_high) {
+        out.memory_high = Some(v);
+    }
+    if let Some(v) = tighten("sandbox.limits.memory_swap", memory_swap, &base.memory_swap) {
+        out.memory_swap = Some(v);
+    }
+    if let Some(v) = tighten(
+        "sandbox.limits.memory_swap_total",
+        memory_swap_total,
+        &base.memory_swap_total,
+    ) {
+        out.memory_swap_total = Some(v);
     }
     out
 }
@@ -1833,6 +1863,21 @@ fn repo_hint_weakens(
                     || !limit_is_not_raised(
                         base.limits.memory_total.as_ref(),
                         hinted.limits.memory_total.as_ref(),
+                        parse_bytes,
+                    )
+                    || !limit_is_not_raised(
+                        base.limits.memory_high.as_ref(),
+                        hinted.limits.memory_high.as_ref(),
+                        parse_bytes,
+                    )
+                    || !limit_is_not_raised(
+                        base.limits.memory_swap.as_ref(),
+                        hinted.limits.memory_swap.as_ref(),
+                        parse_bytes,
+                    )
+                    || !limit_is_not_raised(
+                        base.limits.memory_swap_total.as_ref(),
+                        hinted.limits.memory_swap_total.as_ref(),
                         parse_bytes,
                     )
             }
@@ -3028,6 +3073,40 @@ mod tests {
             r.sanctioned.limits.and_then(|l| l.cpu_total),
             Some("2".to_string()),
             "tightening the aggregate cap is granted"
+        );
+    }
+
+    #[test]
+    fn repo_may_tighten_but_not_weaken_swap_and_high_limits() {
+        let mut b = base();
+        b.limits = SandboxLimits {
+            memory_swap: Some("4g".into()),
+            memory_high: Some("20g".into()),
+            ..Default::default()
+        };
+        let mut o = overlay();
+        o.limits = Some(SandboxLimits {
+            memory_swap: Some("1g".into()),
+            memory_high: Some("off".into()),
+            ..Default::default()
+        });
+        let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
+        let lim = r.sanctioned.limits.unwrap();
+        assert_eq!(
+            lim.memory_swap,
+            Some("1g".to_string()),
+            "tightening granted"
+        );
+        assert_eq!(lim.memory_high, Some("20g".to_string()), "off keeps base");
+        assert!(
+            r.events
+                .iter()
+                .any(|e| e.key == "sandbox.limits.memory_high")
+        );
+        assert!(
+            !r.events
+                .iter()
+                .any(|e| e.key == "sandbox.limits.memory_swap")
         );
     }
 
