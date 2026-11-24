@@ -11,6 +11,7 @@
 //! 3. a "next event" bar widget wants one indexed row, not a whole calendar.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -80,7 +81,7 @@ impl CalendarStore for Db {
                     sql.push(',');
                 }
                 // Bound parameters start after the two span placeholders.
-                sql.push_str(&format!("?{}", i + 3));
+                write!(sql, "?{}", i + 3).expect("writing to String cannot fail");
             }
             sql.push(')');
         }

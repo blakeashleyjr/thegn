@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::ErrorCode;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use thegn_core::attention::MqStatus;
 use thegn_core::config::Config;
@@ -427,31 +428,37 @@ fn history_line(event: &MergeQueueEvent) -> String {
         .unwrap_or_else(|| "-".to_owned());
     let mut oids = String::new();
     if let Some(candidate) = &event.candidate_oid {
-        oids.push_str(&format!(
+        write!(
+            oids,
             "  candidate {}",
             crate::merge_sweep::safe_display(candidate)
                 .chars()
                 .take(12)
                 .collect::<String>()
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     if let Some(result) = &event.result_oid {
-        oids.push_str(&format!(
+        write!(
+            oids,
             "  result {}",
             crate::merge_sweep::safe_display(result)
                 .chars()
                 .take(12)
                 .collect::<String>()
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     if let Some(target_base) = &event.target_base_oid {
-        oids.push_str(&format!(
+        write!(
+            oids,
             "  base {}",
             crate::merge_sweep::safe_display(target_base)
                 .chars()
                 .take(12)
                 .collect::<String>()
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     format!(
         "{}  {} {}  {} -> {}  by {}{}",

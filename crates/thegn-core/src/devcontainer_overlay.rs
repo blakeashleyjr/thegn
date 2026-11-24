@@ -23,6 +23,7 @@
 //! (repo-committed) declaration may be applied at all is `repo_trust`'s job; the
 //! caller gates before calling here.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::SandboxConfig;
@@ -577,11 +578,13 @@ fn fold_env(
             tracing::warn!(key = %k, "devcontainer: dropping env with non-identifier name");
             continue;
         }
-        exports.push_str(&format!(
+        write!(
+            exports,
             "export {}={}\n",
             k,
             sh_quote(&ctx_subst(dc, v, ctx, local_env_allowed, report))
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     prepend_init(sb, exports);
 }

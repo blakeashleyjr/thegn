@@ -9,6 +9,7 @@ use crate::egress_admit::EgressSteps;
 use crate::egress_admit::admit_egress;
 use crate::provider_git::is_provider_location;
 use anyhow::{Context, Result};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thegn_core::config::Config;
@@ -638,10 +639,11 @@ impl DestroyAllOutcome {
             self.destroyed, self.skipped
         );
         if self.failed > 0 {
-            line.push_str(&format!(", failed {}", self.failed));
+            write!(line, ", failed {}", self.failed).expect("writing to String cannot fail");
         }
         if self.bound > 0 {
-            line.push_str(&format!(", kept {} (bound to a worktree)", self.bound));
+            write!(line, ", kept {} (bound to a worktree)", self.bound)
+                .expect("writing to String cannot fail");
         }
         line
     }

@@ -6,6 +6,7 @@
 //! The thegn sandbox id is the Vercel sandbox **name**; the session id changes
 //! on every resume and is resolved per call (cached in-process only).
 
+use std::fmt::Write as _;
 pub mod client;
 pub mod files;
 pub mod job;
@@ -53,11 +54,8 @@ fn append_vercel_stderr(mut out: String, code: i32, stderr: &str) -> String {
     if code == 0 || stderr.is_empty() {
         return out;
     }
-    out.push_str(&format!(
-        "\n[stderr, last {} bytes]\n{}",
-        stderr.len(),
-        stderr
-    ));
+    write!(out, "\n[stderr, last {} bytes]\n{}", stderr.len(), stderr)
+        .expect("writing to String cannot fail");
     out
 }
 

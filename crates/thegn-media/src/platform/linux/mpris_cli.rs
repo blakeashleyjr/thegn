@@ -4,6 +4,7 @@
 //! gates that off [`MediaCaps::playlists`].
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -512,7 +513,8 @@ mod tests {
                 '"' => escaped.push_str("&quot;"),
                 '\u{1f}' => escaped.push_str("&#x1f;"),
                 control if control.is_control() && !matches!(control, '\t' | '\n' | '\r') => {
-                    escaped.push_str(&format!("&#x{:x};", control as u32));
+                    write!(escaped, "&#x{:x};", control as u32)
+                        .expect("writing to String cannot fail");
                 }
                 other => escaped.push(other),
             }

@@ -9,6 +9,7 @@
 //! `sidebar_view::draw_sidebar`.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use crate::session::Session;
 use thegn_core::config_ui::ExternalWorktrees;
@@ -969,11 +970,13 @@ fn push_lead_section(
     if (live.is_some() || registered)
         && let Some(state) = state
     {
-        label.push_str(&format!(
+        write!(
+            label,
             " {} {}",
             crate::caps::active_glyphs().middot,
             state.word()
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     let active = live.is_some_and(|i| i == session.active);
     rows.push(SidebarRow {

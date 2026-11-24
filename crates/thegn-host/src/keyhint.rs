@@ -220,7 +220,11 @@ fn titlecase(s: &str) -> String {
     let mut cs = s.chars();
     match cs.next() {
         None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + &cs.as_str().to_lowercase(),
+        Some(f) => {
+            let mut out = f.to_uppercase().collect::<String>();
+            out.push_str(&cs.as_str().to_lowercase());
+            out
+        }
     }
 }
 

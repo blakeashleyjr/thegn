@@ -14,6 +14,7 @@ use crate::collect::{
     parse::diskstats,
     schedule::Cadence,
 };
+use std::fmt::Write as _;
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -728,9 +729,11 @@ mod tests {
             let device = sys.join(&name);
             fs::create_dir_all(device.join("device")).unwrap();
             fs::write(device.join("dev"), format!("8:{index}\n")).unwrap();
-            rows.push_str(&format!(
+            write!(
+                rows,
                 "8 {index} {name} 1 0 10 1 1 0 20 1 0 10 10 0 0 0 0 0 0\n"
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         fs::write(&proc, &rows).unwrap();
         let mut collector = DiskstatsCollector::at(&proc, &sys);

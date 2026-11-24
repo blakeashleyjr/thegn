@@ -16,6 +16,7 @@
 //! scope sets all answer to the same table.
 
 use crate::control::{Scope, Verb, required_scope};
+use std::fmt::Write as _;
 
 /// An external door through which a capability can be invoked.
 #[derive(
@@ -2136,7 +2137,7 @@ mod tests {
             .collect();
         rows.sort();
         for (id, s, why) in rows {
-            out.push_str(&format!("{id}\t{s}\t{why}\n"));
+            write!(out, "{id}\t{s}\t{why}\n").expect("writing to String cannot fail");
         }
         std::fs::write(path, out).expect("write surface-gaps-ratchet.txt");
         let doc_path = concat!(

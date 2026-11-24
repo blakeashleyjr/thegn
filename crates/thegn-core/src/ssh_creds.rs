@@ -27,6 +27,7 @@
 //!    resolve inside the sandbox without exposing any other secret.
 
 use crate::sandbox::Mount;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Materialize a flattened, user-owned copy of `~/.ssh/config` under the
@@ -286,7 +287,8 @@ fn flatten_ssh_config(content: &str, read: &dyn Fn(&str) -> Vec<String>, depth: 
             && t[7..].starts_with(char::is_whitespace);
         if is_include && depth < 16 {
             let args = t[7..].trim();
-            out.push_str(&format!("# thegn: inlined `Include {args}`\n"));
+            write!(out, "# thegn: inlined `Include {args}`\n")
+                .expect("writing to String cannot fail");
             for token in args.split_whitespace() {
                 for body in read(token) {
                     out.push_str(&flatten_ssh_config(&body, read, depth + 1));

@@ -14,6 +14,7 @@
 //! task's project (see `resolve_status_slug`).
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use thegn_core::issue::{
     Issue, IssueComment, IssueDetail, IssueDraft, IssueFilter, IssuePatch, IssuePriority,
     IssueStatus,
@@ -146,7 +147,7 @@ impl KaneoBackend {
         }
         let mut path = format!("task/tasks/{project_id}?limit={}", limit.clamp(1, 100));
         if let Some(uid) = assignee_id {
-            path.push_str(&format!("&assigneeId={uid}"));
+            write!(path, "&assigneeId={uid}").expect("writing to String cannot fail");
         }
         let board: BoardResp = Self::get(op, &path).await?;
         let mut out = Vec::new();

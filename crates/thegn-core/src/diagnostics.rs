@@ -16,6 +16,7 @@
 
 use crate::log::buffer::LogBuffer;
 use crate::log::parser::{LogLevel, ParsedLog};
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -249,16 +250,19 @@ impl CrashReport {
         let mut s = String::new();
         s.push_str("thegn crash report\n");
         s.push_str("==================\n");
-        s.push_str(&format!("version:   {}\n", id.version));
-        s.push_str(&format!("channel:   {}\n", id.channel));
-        s.push_str(&format!(
+        write!(s, "version:   {}\n", id.version).expect("writing to String cannot fail");
+        write!(s, "channel:   {}\n", id.channel).expect("writing to String cannot fail");
+        write!(
+            s,
             "build:     {}\n",
             id.build.as_deref().unwrap_or("(unknown)")
-        ));
-        s.push_str(&format!("os/arch:   {}/{}\n", id.os, id.arch));
-        s.push_str(&format!("process:   {}\n", self.proc_kind.as_str()));
-        s.push_str(&format!("run:       {}\n", self.run_id));
-        s.push_str(&format!("thread:    {}\n", self.thread));
+        )
+        .expect("writing to String cannot fail");
+        write!(s, "os/arch:   {}/{}\n", id.os, id.arch).expect("writing to String cannot fail");
+        write!(s, "process:   {}\n", self.proc_kind.as_str())
+            .expect("writing to String cannot fail");
+        write!(s, "run:       {}\n", self.run_id).expect("writing to String cannot fail");
+        write!(s, "thread:    {}\n", self.thread).expect("writing to String cannot fail");
         s.push('\n');
         let panic_line = crate::log_redact::redact_text_line(&self.panic_line);
         s.push_str(&panic_line);
@@ -345,16 +349,20 @@ fn write_crash_report_to_dir(dir: &Path, report: &CrashReport, retain: usize) ->
     // layer that feeds this ring. The in-report note reaches the same reader
     // with none of that risk.
     if let Some(e) = &dir_err {
-        body.push_str(&format!(
+        write!(
+            body,
             "\n! degraded: could not restrict {} to owner-only ({e}) — \
              this report may be readable by other users of this machine\n",
             dir.display()
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     if let Some(e) = &file_err {
-        body.push_str(&format!(
+        write!(
+            body,
             "\n! degraded: could not restrict this report file to owner-only ({e})\n"
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
 
     report_file.as_mut()?.write_all(body.as_bytes()).ok()?;

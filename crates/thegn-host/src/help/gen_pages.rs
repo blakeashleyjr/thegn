@@ -11,6 +11,7 @@
 //! could "never drift".
 
 use crate::keymap_merge::{Binding, Source, collect, zones};
+use std::fmt::Write as _;
 
 /// Expand authored `{{keys:<section>}}` lines from the tables the panel uses.
 pub fn expand_keys_directives(src: &str) -> String {
@@ -110,7 +111,7 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
             continue;
         }
         let zone_local = rows.iter().any(|b| b.source == Source::ZoneTable);
-        out.push_str(&format!("\n## {}\n", zone_heading(&zone)));
+        write!(out, "\n## {}\n", zone_heading(&zone)).expect("writing to String cannot fail");
         out.push_str(HEAD);
         for b in rows {
             out.push_str(&row(b));
@@ -135,7 +136,8 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
              | Action | Id |\n| --- | --- |\n",
         );
         for b in palette_only {
-            out.push_str(&format!("| {} | `{}` |\n", escape(&b.label), b.id));
+            write!(out, "| {} | `{}` |\n", escape(&b.label), b.id)
+                .expect("writing to String cannot fail");
         }
     }
 

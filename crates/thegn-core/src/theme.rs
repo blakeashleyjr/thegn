@@ -11,6 +11,7 @@
 //! 12 original slots; the extension tokens are derived via [`extend_palette`].
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
 mod roles;
 pub use roles::{Band, OwnerRole, RampId, SeriesRole, StateRole, band_of};
 
@@ -991,14 +992,16 @@ pub fn kbd(pairs: &[(&str, &str)], accent: &str) -> String {
     let mut out = String::new();
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 {
-            out.push_str(&format!(" {}·{RESET} ", fg(GHOST)));
+            write!(out, " {}·{RESET} ", fg(GHOST)).expect("writing to String cannot fail");
         }
-        out.push_str(&format!(
+        write!(
+            out,
             "{}{} {key} {RESET} {}{label}{RESET}",
             bg(PANEL),
             fg(accent),
             fg(DIM)
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     out
 }

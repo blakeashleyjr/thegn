@@ -48,6 +48,7 @@
 //! one and sharing its state, cleanup and resume types.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -802,10 +803,8 @@ fn compose_log(stdout: &str, stderr: &Tail, exit: Option<i32>) -> (String, bool)
         return (log, false);
     }
     let seen = stderr.total().min(STDERR_TAIL_CAP as u64);
-    log.push_str(&format!(
-        "\n[stderr, last {seen} bytes]\n{}",
-        stderr.render()
-    ));
+    write!(log, "\n[stderr, last {seen} bytes]\n{}", stderr.render())
+        .expect("writing to String cannot fail");
     (log, stderr.truncated())
 }
 

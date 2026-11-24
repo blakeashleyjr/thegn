@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use thegn_core::proxy::route_select::{RequestFeatures, route_select};
 use thegn_core::proxy::{transform, translate};
 use thegn_core::store::ModelProxyStore;
@@ -297,22 +298,28 @@ async fn healthz(State(state): State<SharedState>) -> Response {
 async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     let mut out = state.metrics.render();
     let now = now_ms();
-    out.push_str(&format!(
+    write!(
+        out,
         "# HELP model_proxy_uptime_seconds Daemon uptime.\n# TYPE model_proxy_uptime_seconds gauge\nmodel_proxy_uptime_seconds {}\n",
         now.saturating_sub(state.started_ms).max(0) / 1000
-    ));
+    )
+    .expect("writing to String cannot fail");
     out.push_str(
         "# HELP model_proxy_backend_exhausted Backend is cooling down.\n# TYPE model_proxy_backend_exhausted gauge\n",
     );
     for (ident, _reason, next_probe_ms, healthy) in state.health.status(now) {
         if !healthy {
-            out.push_str(&format!(
+            write!(
+                out,
                 "model_proxy_backend_exhausted{{backend=\"{ident}\"}} 1\n"
-            ));
-            out.push_str(&format!(
+            )
+            .expect("writing to String cannot fail");
+            write!(
+                out,
                 "model_proxy_backend_next_probe_seconds{{backend=\"{ident}\"}} {}\n",
                 (next_probe_ms - now).max(0) / 1000
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
     }
     (

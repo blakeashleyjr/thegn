@@ -11,6 +11,7 @@
 //! Run: `cargo test -p thegn-svc --test vercel_mock`.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -261,10 +262,11 @@ fn handle(mut stream: TcpStream, rec: &Mutex<Vec<Recorded>>, router: &Router) {
     };
     let mut head = format!("HTTP/1.1 {}\r\n", reply.status);
     for (name, value) in &reply.headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        write!(head, "{name}: {value}\r\n").expect("writing to String cannot fail");
     }
     if !reply.no_length {
-        head.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
+        write!(head, "Content-Length: {}\r\n", reply.body.len())
+            .expect("writing to String cannot fail");
     }
     head.push_str("Connection: close\r\n\r\n");
     if stream.write_all(head.as_bytes()).is_err()

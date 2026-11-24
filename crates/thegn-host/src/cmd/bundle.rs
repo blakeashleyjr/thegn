@@ -15,6 +15,7 @@
 #![allow(clippy::disallowed_macros)] // a CLI verb: println! is the user surface
 
 use anyhow::{Context, Result};
+use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use thegn_core::config::Config;
@@ -48,7 +49,8 @@ pub fn run(
     let mut tar = TarBuilder::new();
     let mut manifest = String::from("thegn debug bundle\n===================\n");
     let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
-        manifest.push_str(&format!("  {:<28} {} bytes\n", name, data.len()));
+        write!(manifest, "  {:<28} {} bytes\n", name, data.len())
+            .expect("writing to String cannot fail");
         tar.append(name, &data);
     };
 
@@ -99,7 +101,7 @@ pub fn run(
     }
 
     // 6. the manifest itself (also printed below).
-    manifest.push_str(&format!("\nwritten: {}\n", out.display()));
+    write!(manifest, "\nwritten: {}\n", out.display()).expect("writing to String cannot fail");
     tar.append("MANIFEST", manifest.as_bytes());
 
     // gzip the tar and write it out.
@@ -250,7 +252,8 @@ fn append_retained_report(
             let body = redacted_report_text(&body);
             add(tar, manifest, &format!("crash/{name}"), body.into_bytes());
         }
-        Err(e) => manifest.push_str(&format!("  crash/{name:<28} omitted: {e}\n")),
+        Err(e) => write!(manifest, "  crash/{name:<28} omitted: {e}\n")
+            .expect("writing to String cannot fail"),
     }
 }
 
@@ -467,7 +470,8 @@ mod tests {
         let mut tar = TarBuilder::new();
         let mut manifest = String::new();
         let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
-            manifest.push_str(&format!("  {name} {} bytes\n", data.len()));
+            write!(manifest, "  {name} {} bytes\n", data.len())
+                .expect("writing to String cannot fail");
             tar.append(name, &data);
         };
 
@@ -492,7 +496,8 @@ mod tests {
         let mut tar = TarBuilder::new();
         let mut manifest = String::new();
         let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
-            manifest.push_str(&format!("  {name} {} bytes\n", data.len()));
+            write!(manifest, "  {name} {} bytes\n", data.len())
+                .expect("writing to String cannot fail");
             tar.append(name, &data);
         };
         append_retained_report(&mut tar, &mut manifest, &path, &add);

@@ -2,6 +2,7 @@
 use crate::DiskInfo;
 #[cfg(any(target_os = "linux", test))]
 use crate::DiskKind;
+use std::fmt::Write as _;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
@@ -353,9 +354,11 @@ mod tests {
             } else {
                 format!("/btrfs/{i}")
             };
-            text.push_str(&format!(
+            write!(
+                text,
                 "{i} 0 0:35 / {mount} rw - btrfs /dev/mapper/crypted rw\n"
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         text.push_str("50 0 259:2 / / rw - ext4 /dev/nvme0n1p2 rw\n44 0 259:1 / /boot rw - vfat /dev/nvme0n1p1 rw\n45 0 8:1 / /mnt/data rw - ext4 /dev/sda1 rw\n46 0 0:99 / /proc rw - proc proc rw\n47 0 0:100 / /sys rw - sysfs sysfs rw\n48 0 0:101 / /run/user rw - tmpfs tmpfs rw\n49 0 0:102 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n");
         let groups = group_mounts(parse_mountinfo(&text));

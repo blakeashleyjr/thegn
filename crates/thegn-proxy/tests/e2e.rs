@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -142,7 +143,7 @@ async fn write_json(
         bytes.len()
     );
     for (name, value) in headers {
-        response.push_str(&format!("{name}: {value}\r\n"));
+        write!(response, "{name}: {value}\r\n").expect("writing to String cannot fail");
     }
     response.push_str("\r\n");
     socket.write_all(response.as_bytes()).await.unwrap();

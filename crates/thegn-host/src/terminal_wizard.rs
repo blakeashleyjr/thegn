@@ -26,6 +26,7 @@
 //! The whole struct is pure over its inputs; rendering + key handling run on the
 //! event loop, so an idle thegn still produces zero events.
 
+use std::fmt::Write as _;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
@@ -112,7 +113,7 @@ fn host_connection(name: &str, hc: &HostConfig) -> Option<String> {
             let target = if target.is_empty() { name } else { target };
             let mut conn = String::from("ssh ");
             if hc.ssh.port != 0 && hc.ssh.port != 22 {
-                conn.push_str(&format!("-p {} ", hc.ssh.port));
+                write!(conn, "-p {} ", hc.ssh.port).expect("writing to String cannot fail");
             }
             conn.push_str(target);
             Some(conn)

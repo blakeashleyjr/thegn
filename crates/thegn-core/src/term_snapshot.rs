@@ -20,6 +20,7 @@
 //! existing session-resurrect path has.
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 
 /// A color in terminal terms, mirroring the host emulator's `CellColor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -93,13 +94,21 @@ fn sgr(cell: &SnapCell) -> String {
     }
     match cell.fg {
         SnapColor::Default => {}
-        SnapColor::Indexed(n) => params.push_str(&format!(";38;5;{n}")),
-        SnapColor::Rgb(r, g, b) => params.push_str(&format!(";38;2;{r};{g};{b}")),
+        SnapColor::Indexed(n) => {
+            write!(params, ";38;5;{n}").expect("writing to String cannot fail")
+        }
+        SnapColor::Rgb(r, g, b) => {
+            write!(params, ";38;2;{r};{g};{b}").expect("writing to String cannot fail")
+        }
     }
     match cell.bg {
         SnapColor::Default => {}
-        SnapColor::Indexed(n) => params.push_str(&format!(";48;5;{n}")),
-        SnapColor::Rgb(r, g, b) => params.push_str(&format!(";48;2;{r};{g};{b}")),
+        SnapColor::Indexed(n) => {
+            write!(params, ";48;5;{n}").expect("writing to String cannot fail")
+        }
+        SnapColor::Rgb(r, g, b) => {
+            write!(params, ";48;2;{r};{g};{b}").expect("writing to String cannot fail")
+        }
     }
     format!("\x1b[{params}m")
 }

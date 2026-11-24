@@ -5,6 +5,7 @@
 //! mutation runs on `spawn_blocking` and reports back over a channel with a
 //! waker pulse, so the compositor loop never touches the network or the DB.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -401,7 +402,8 @@ fn pr_clear_message(outcome: &thegn_core::store::PrClearOutcome) -> String {
             .map(|number| format!("#{number}"))
             .collect::<Vec<_>>()
             .join(", ");
-        message.push_str(&format!(" kept PR {kept}: a PR agent is running for them"));
+        write!(message, " kept PR {kept}: a PR agent is running for them")
+            .expect("writing to String cannot fail");
     }
     message
 }

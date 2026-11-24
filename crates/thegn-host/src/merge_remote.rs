@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
@@ -958,7 +959,8 @@ fn stream_bundle(
             if !stderr_text.is_empty() {
                 stderr_text.push_str("; ");
             }
-            stderr_text.push_str(&format!("stderr read failed: {error}"));
+            write!(stderr_text, "stderr read failed: {error}")
+                .expect("writing to String cannot fail");
         }
         None => {
             if !stderr_text.is_empty() {

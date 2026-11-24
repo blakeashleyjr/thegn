@@ -18,6 +18,7 @@
 //!    cursor both survive, so a blip degrades to stale data, not no data.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -638,10 +639,12 @@ fn diagnostics_notice(
         now.total()
     );
     if now.unresolved_zones > 0 {
-        text.push_str(&format!(
+        write!(
+            text,
             " ({} with an unknown time zone)",
             now.unresolved_zones
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     let rejected = now
         .rejected

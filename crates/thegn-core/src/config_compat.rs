@@ -298,7 +298,7 @@ mod tests {
         let parent = "p".repeat(5_500);
         let mut source = format!("[{parent}]\n");
         for index in 0..1_500 {
-            source.push_str(&format!("k{index} = {{}}\n"));
+            write!(source, "k{index} = {{}}\n").expect("writing to String cannot fail");
         }
         assert!(crate::config_budget::scan(source.as_bytes()).is_ok());
         assert!(matches!(

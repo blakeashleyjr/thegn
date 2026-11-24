@@ -15,6 +15,7 @@
 //! boundary. A finisher retains only the capabilities and credentials granted
 //! by its ordinary agent launch and sandbox configuration.
 
+use std::fmt::Write as _;
 /// Per-field bound for recovery evidence included in a finisher prompt.
 pub const RECOVERY_FIELD_MAX_BYTES: usize = 2_048;
 /// Maximum lines retained from each recovery field.
@@ -105,9 +106,11 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
     p.push_str(task.trim_end());
     p.push_str("\n\n");
 
-    p.push_str(&format!(
+    write!(
+        p,
         "This finisher's required handoff artifact is `{target_artifact}`.\n\n"
-    ));
+    )
+    .expect("writing to String cannot fail");
 
     // JSON preserves field boundaries: newlines, fake headers, and delimiter
     // text in values cannot terminate this data container.
@@ -166,12 +169,14 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
     } else {
         format!("the handoff artifact at `{target_artifact}`")
     };
-    p.push_str(&format!(
+    write!(
+        p,
         "Finish the stage, do not merely exit: a zero exit code is not a done \
          stage — the `dispatch set-status done` gate refuses a handoff \
          artifact that git does not track. Leave {target} committed on the \
          branch before you end your turn.\n"
-    ));
+    )
+    .expect("writing to String cannot fail");
     p
 }
 

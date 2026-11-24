@@ -1,5 +1,6 @@
 //! Held-fd `/proc/net/dev` collector with bounded interface identities.
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -436,7 +437,8 @@ mod tests {
             "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n",
         );
         for iface in 0..33 {
-            input.push_str(&format!("if{iface}: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n"));
+            write!(input, "if{iface}: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n")
+                .expect("writing to String cannot fail");
         }
         fs::write(&proc_path, input).unwrap();
         let mut collector = NetdevCollector::at(&proc_path, dir.path().join("sys"));

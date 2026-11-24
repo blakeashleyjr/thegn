@@ -24,6 +24,7 @@
 //! inspection can see it. [`reconcile`] takes it at its word and says so here.
 
 use crate::sandbox::Backend;
+use std::fmt::Write as _;
 
 /// Words that keep the *next* word in command position (`sudo -n podman …`,
 /// `exec zsh`), rather than being the command themselves.
@@ -256,10 +257,12 @@ pub fn reconcile(requested: &str, argv: &[String]) -> Truth {
         )
     };
     if let Some(reserved) = want.filter(|backend| backend.is_reserved()) {
-        warning.push_str(&format!(
+        write!(
+            warning,
             " ({} is reserved and not implemented)",
             reserved.label()
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     Truth {
         label,

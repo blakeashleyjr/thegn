@@ -43,6 +43,7 @@
 //! concurrent additions, and the `pr_view.rs` / `diff_view.rs` /
 //! lifecycle-hook hunks classify as restructures. Both remain review items.
 
+use std::fmt::Write as _;
 use std::{collections::BTreeMap, fmt};
 
 /// What kind of decision a conflict hunk needs.
@@ -223,15 +224,18 @@ pub fn render_chunk(
         .filter(|f| f.inspection_error.is_some())
         .count();
     let mut s = String::new();
-    s.push_str(&format!(
+    write!(
+        s,
         "# {:?} reconcile — merge current main into the lane\n\n",
         issue
-    ));
+    )
+    .expect("writing to String cannot fail");
     s.push_str("## Files to touch (exact paths)\n\n");
     for f in files {
-        s.push_str(&format!("- {:?}\n", f.path));
+        write!(s, "- {:?}\n", f.path).expect("writing to String cannot fail");
     }
-    s.push_str(&format!(
+    write!(
+        s,
         "\n## State you are landing in\n\n\
          `git merge main` is ALREADY IN PROGRESS and left {} file(s) conflicted — \
          {total} hunk(s) total. Do not abort or restart it. Resolve, then `git commit` \
@@ -240,7 +244,8 @@ pub fn render_chunk(
          and {unclassified} file(s) could not be classified automatically. \
          **Do not apply a blanket \"keep both sides\" rule** — see below.\n",
         files.len()
-    ));
+    )
+    .expect("writing to String cannot fail");
 
     if concurrent_add > 0 {
         s.push_str(
@@ -250,7 +255,7 @@ pub fn render_chunk(
              hunk explicitly.\n\n",
         );
         for f in files.iter().filter(|f| f.concurrent_add() > 0) {
-            s.push_str(&format!("### {:?}\n\n", f.path));
+            write!(s, "### {:?}\n\n", f.path).expect("writing to String cannot fail");
             for h in f
                 .hunks
                 .iter()
@@ -258,13 +263,15 @@ pub fn render_chunk(
             {
                 let key = format!("{}:{}", f.path, h.line);
                 let decision = decisions.get(&key).filter(|text| !text.trim().is_empty());
-                s.push_str(&format!(
+                write!(
+                    s,
                     "- **line {}** — ours: {:?} / theirs: {:?}\n  - DECISION: {}\n",
                     h.line,
                     h.ours_hint,
                     h.theirs_hint,
                     decision.map_or_else(|| "_(state it)_".to_string(), |text| format!("{text:?}"))
-                ));
+                )
+                .expect("writing to String cannot fail");
             }
             s.push('\n');
         }
@@ -281,12 +288,14 @@ pub fn render_chunk(
             let decision = decisions
                 .get(&f.path)
                 .filter(|text| !text.trim().is_empty());
-            s.push_str(&format!(
+            write!(
+                s,
                 "- {:?} — {:?}\n  - DECISION: {}\n",
                 f.path,
                 f.inspection_error.as_deref().unwrap_or("inspection failed"),
                 decision.map_or_else(|| "_(state it)_".to_string(), |text| format!("{text:?}"))
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
     }
 
@@ -299,17 +308,19 @@ pub fn render_chunk(
              structure wins and which behaviour is ported onto it.\n\n",
         );
         for f in files.iter().filter(|f| f.restructure() > 0) {
-            s.push_str(&format!("### {:?}\n\n", f.path));
+            write!(s, "### {:?}\n\n", f.path).expect("writing to String cannot fail");
             for h in f.hunks.iter().filter(|h| h.class == HunkClass::Restructure) {
                 let key = format!("{}:{}", f.path, h.line);
                 let decision = decisions.get(&key).filter(|text| !text.trim().is_empty());
-                s.push_str(&format!(
+                write!(
+                    s,
                     "- **line {}** — ours: {:?} / theirs: {:?}\n  - DECISION: {}\n",
                     h.line,
                     h.ours_hint,
                     h.theirs_hint,
                     decision.map_or_else(|| "_(state it)_".to_string(), |text| format!("{text:?}"))
-                ));
+                )
+                .expect("writing to String cannot fail");
             }
             s.push('\n');
         }

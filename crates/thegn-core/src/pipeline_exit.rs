@@ -21,6 +21,7 @@
 //! cycling through attempts, not a fan-out; the human-driven resume mechanism
 //! (`session open --resume-work`) is what chains rows.
 
+use std::fmt::Write as _;
 /// What the final screen says about why the worker died.
 ///
 /// Transport failures are the daemon's to retry (a network hiccup is nobody's
@@ -305,7 +306,7 @@ mod tests {
         let d = ExitSignatures::defaults();
         let mut screen = String::from("connection reset in echoed issue body\n");
         for line in 0..CLASSIFY_TAIL_LINES {
-            screen.push_str(&format!("compile output {line}\n"));
+            write!(screen, "compile output {line}\n").expect("writing to String cannot fail");
         }
         assert_eq!(classify_tail(true, &screen, &d, CLASSIFY_TAIL_LINES), None);
         screen.push_str("connection reset\n");

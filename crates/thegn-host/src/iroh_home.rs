@@ -10,6 +10,7 @@
 //! Opt-in via `THEGN_IROH=1` until a config field lands (config.rs is at its
 //! god-file ratchet ceiling).
 
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,7 +37,7 @@ pub(crate) fn enabled() -> bool {
 fn encode_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        write!(s, "{b:02x}").expect("writing to String cannot fail");
     }
     s
 }

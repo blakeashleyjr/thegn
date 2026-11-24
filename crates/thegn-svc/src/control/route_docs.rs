@@ -5,6 +5,7 @@
 //! carries the output between [`BEGIN`] and [`END`]; a drift test regenerates
 //! it and fails when the committed text differs.
 
+use std::fmt::Write as _;
 use thegn_core::capability::{SURFACE_GAPS, lookup, scope_of};
 
 use super::route_types::route_types_for;
@@ -87,7 +88,7 @@ fn rows() -> Vec<(String, String, String)> {
                 .unwrap_or_else(|| panic!("ROUTE_TYPES has no row for capability {cap}"));
             let mut notes = capability.summary.to_owned();
             if let Some(replacement) = capability.deprecated {
-                notes.push_str(&format!(" (use {replacement})"));
+                write!(notes, " (use {replacement})").expect("writing to String cannot fail");
             }
             let row = format!(
                 "| `{method} {path}` | `{cap}` | `{}` | `{stability}` | `{surfaces}` | {} | {} | {} |",

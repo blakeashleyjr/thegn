@@ -21,6 +21,7 @@
 use crate::usage::{self, AccountUsage, UsageState, UsageTone, UsageWindow};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::path::{Component, Path};
 use unicode_width::UnicodeWidthStr;
 
@@ -149,7 +150,7 @@ pub fn metric_name(w: &UsageWindow) -> String {
     }
     let mut name = format!("{}-{unit} window", mins / div);
     if let Some(q) = qualifier(&w.label) {
-        name.push_str(&format!(" ({q})"));
+        write!(name, " ({q})").expect("writing to String cannot fail");
     }
     name
 }

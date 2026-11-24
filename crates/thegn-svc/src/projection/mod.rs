@@ -16,6 +16,7 @@
 //! in core.
 
 use anyhow::{Result, bail};
+use std::fmt::Write as _;
 use thegn_core::config::DataMode;
 use thegn_core::placement::{Placement, SshPlacement};
 use thegn_core::projection::ProjectionSpec;
@@ -526,15 +527,16 @@ fn run_mount_bounded_with(
     );
     append_stderr_tail(&mut message, stderr_tail(stderr_reader));
     if let Some(error) = kill_error {
-        message.push_str(&format!("; could not kill child: {error}"));
+        write!(message, "; could not kill child: {error}").expect("writing to String cannot fail");
     }
     if let Err(error) = wait_result {
-        message.push_str(&format!("; could not reap child: {error}"));
+        write!(message, "; could not reap child: {error}").expect("writing to String cannot fail");
     }
     if let Err(error) = rollback()
         && !rollback_means_not_mounted(&error)
     {
-        message.push_str(&format!("; rollback unmount also failed: {error}"));
+        write!(message, "; rollback unmount also failed: {error}")
+            .expect("writing to String cannot fail");
     }
     Err(anyhow::anyhow!(message))
 }
@@ -546,7 +548,8 @@ fn append_stderr_tail(message: &mut String, tail: Result<String>) {
             message.push_str(&tail);
         }
         Ok(_) => {}
-        Err(error) => message.push_str(&format!("; could not read stderr tail: {error}")),
+        Err(error) => write!(message, "; could not read stderr tail: {error}")
+            .expect("writing to String cannot fail"),
     }
 }
 

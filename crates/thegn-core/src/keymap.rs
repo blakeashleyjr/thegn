@@ -13,6 +13,7 @@
 //! default; the strict check is `thegn keys validate`.
 
 use crate::config::Config;
+use std::fmt::Write as _;
 
 /// Markers delimiting the generated keybind block inside the managed
 /// `zellij.kdl`. Everything outside them (theme, options, user edits) is left
@@ -949,7 +950,7 @@ fn run_opt_lines(floating: bool, close_on_exit: bool, direction: Option<&str>) -
 fn render_block_bind(chord: &str, head: &str, children: &[String]) -> String {
     let mut s = format!("        bind \"{chord}\" {{\n            {head} {{\n");
     for c in children {
-        s.push_str(&format!("                {c}\n"));
+        write!(s, "                {c}\n").expect("writing to String cannot fail");
     }
     s.push_str("            }\n        }\n");
     s

@@ -3,6 +3,7 @@
 //! headline counters; labelled per-backend families can be layered on later.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 /// Cumulative-histogram bucket upper bounds for request duration, in millis
@@ -158,19 +159,25 @@ impl Metrics {
     fn render_duration_histogram(&self, out: &mut String) {
         let h = self.durations.lock().unwrap();
         let name = "model_proxy_request_duration_seconds";
-        out.push_str(&format!(
+        write!(
+            out,
             "# HELP {name} Served request duration.\n# TYPE {name} histogram\n"
-        ));
+        )
+        .expect("writing to String cannot fail");
         for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
-            out.push_str(&format!(
+            write!(
+                out,
                 "{name}_bucket{{le=\"{}\"}} {}\n",
                 *bound as f64 / 1000.0,
                 h.buckets[i]
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
-        out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {}\n", h.count));
-        out.push_str(&format!("{name}_sum {}\n", h.sum_ms as f64 / 1000.0));
-        out.push_str(&format!("{name}_count {}\n", h.count));
+        write!(out, "{name}_bucket{{le=\"+Inf\"}} {}\n", h.count)
+            .expect("writing to String cannot fail");
+        write!(out, "{name}_sum {}\n", h.sum_ms as f64 / 1000.0)
+            .expect("writing to String cannot fail");
+        write!(out, "{name}_count {}\n", h.count).expect("writing to String cannot fail");
     }
 }
 
@@ -182,16 +189,18 @@ fn render_counter(
     scale: f64,
 ) {
     let map = map.lock().unwrap();
-    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+    write!(out, "# HELP {name} {help}\n# TYPE {name} counter\n")
+        .expect("writing to String cannot fail");
     if map.is_empty() {
-        out.push_str(&format!("{name} 0\n"));
+        write!(out, "{name} 0\n").expect("writing to String cannot fail");
         return;
     }
     for (labels, v) in map.iter() {
         if scale == 1.0 {
-            out.push_str(&format!("{name}{{{labels}}} {v}\n"));
+            write!(out, "{name}{{{labels}}} {v}\n").expect("writing to String cannot fail");
         } else {
-            out.push_str(&format!("{name}{{{labels}}} {}\n", *v as f64 * scale));
+            write!(out, "{name}{{{labels}}} {}\n", *v as f64 * scale)
+                .expect("writing to String cannot fail");
         }
     }
 }

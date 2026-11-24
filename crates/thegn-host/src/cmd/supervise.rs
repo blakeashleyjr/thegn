@@ -24,6 +24,7 @@
 
 use anyhow::{Context as _, Result};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use thegn_core::config::Config;
@@ -509,7 +510,7 @@ fn describe(lane: &Lane, action: &SuperviseAction) -> String {
             // An approval that exists but does not apply is the most confusing
             // state to be in, so say what IS on record.
             if why.wants_primary() && !matches!(lane.approval, ApprovalState::Absent) {
-                s.push_str(&format!(" [{}]", lane.approval.explain()));
+                write!(s, " [{}]", lane.approval.explain()).expect("writing to String cannot fail");
             }
             s
         }

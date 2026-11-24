@@ -6,6 +6,7 @@
 #![allow(clippy::disallowed_macros)]
 
 use clap::Subcommand;
+use std::fmt::Write as _;
 use thegn_core::store::NotificationStore;
 
 #[derive(Subcommand, Clone)]
@@ -112,11 +113,13 @@ fn kind_help() -> String {
          other string is accepted as a custom kind:\n",
     );
     for k in NotificationKind::ALL {
-        out.push_str(&format!(
+        write!(
+            out,
             "  {:<22} [{}]\n",
             k.as_str(),
             k.default_priority().as_str()
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     out
 }

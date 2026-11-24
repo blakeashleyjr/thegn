@@ -3,6 +3,7 @@
 //! captured command log that the client only ever read.
 
 use super::*;
+use std::fmt::Write as _;
 use thegn_core::config::InboxKind;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
@@ -138,12 +139,14 @@ async fn serve(listener: TcpListener, script: Script) -> Vec<String> {
                     } else {
                         format!("{{{}}}\r\n{header}", header.len())
                     };
-                    out.push_str(&format!(
+                    write!(
+                        out,
                         "* {} FETCH (UID {uid} FLAGS () INTERNALDATE \"17-Jul-1996 02:44:25 +0000\" BODY[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID)] {literal})\r\n",
                         seq + 1
-                    ));
+                    )
+                    .expect("writing to String cannot fail");
                 }
-                out.push_str(&format!("{tag} OK done\r\n"));
+                write!(out, "{tag} OK done\r\n").expect("writing to String cannot fail");
                 out
             }
             ("LOGOUT", _) => {

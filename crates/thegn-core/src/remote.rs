@@ -15,6 +15,7 @@
 use crate::store::WorkspaceStore;
 use crate::util;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1422,9 +1423,11 @@ pub fn provision_repo_script_with_submodules(
     s.push_str(" .");
     if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty()) {
         let bq = util::sh_quote(b);
-        s.push_str(&format!(
+        write!(
+            s,
             " && (git checkout {bq} 2>/dev/null || git checkout -b {bq})"
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     if direct_submodules {
         s.push_str(" && git -c submodule.recurse=false submodule update --init");

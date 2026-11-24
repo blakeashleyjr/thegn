@@ -13,6 +13,7 @@
 //! merely executed here. That split is what makes the safety rules testable
 //! without a forge.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use thegn_core::agent_task::{TaskKind, TaskVars};
@@ -1639,8 +1640,10 @@ fn check_urls(f: &FetchedPr) -> String {
             &c.name
         };
         match c.details_url.as_deref() {
-            Some(u) if !u.is_empty() => out.push_str(&format!("  - {name}: {u}\n")),
-            _ => out.push_str(&format!("  - {name}\n")),
+            Some(u) if !u.is_empty() => {
+                write!(out, "  - {name}: {u}\n").expect("writing to String cannot fail")
+            }
+            _ => write!(out, "  - {name}\n").expect("writing to String cannot fail"),
         }
     }
     if out.is_empty() {
@@ -1658,7 +1661,8 @@ fn format_threads(threads: &[ReviewThreadRow]) -> String {
             _ if !t.path.is_empty() => t.path.clone(),
             _ => "(general)".to_string(),
         };
-        out.push_str(&format!("  - {} on {where_}: {}\n", t.author, t.snippet));
+        write!(out, "  - {} on {where_}: {}\n", t.author, t.snippet)
+            .expect("writing to String cannot fail");
     }
     if out.is_empty() {
         out.push_str("  (no unresolved threads found)\n");
@@ -3800,7 +3804,8 @@ mod tests {
     fn classify_checkout_read_flattens_and_bounds_the_reason() {
         use thegn_core::git_run::{GitOutcome, GitTextError};
 
-        let stderr_tail = "a\nb\n".to_owned() + &"x".repeat(500);
+        let mut stderr_tail = "a\nb\n".to_owned();
+        stderr_tail.push_str(&"x".repeat(500));
         let read = classify_checkout_read(
             Err(GitTextError::Failed(GitOutcome::Exit {
                 code: Some(255),

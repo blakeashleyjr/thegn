@@ -23,6 +23,7 @@
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
+use std::fmt::Write as _;
 
 use crate::db::Db;
 
@@ -100,7 +101,7 @@ pub(crate) fn sha256_hex(input: &str) -> String {
     }
     let mut out = String::with_capacity(64);
     for word in h {
-        out.push_str(&format!("{word:08x}"));
+        write!(out, "{word:08x}").expect("writing to String cannot fail");
     }
     out
 }
