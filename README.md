@@ -95,9 +95,12 @@ More: press `F1`, or see [getting started](docs/help/getting-started.md).
 > default `standard` profile keeps files outside the worktree read-only, apart
 > from carved-back state directories, and leaves `$HOME` readable, including
 > credentials such as `~/.ssh`, `~/.aws` and `~/.config/gh`. The opt-in `sealed`
-> profile hides `$HOME` and disables network access.
+> profile hides `$HOME` and disables network access. `standard` is an accident
+> guard, not a boundary against a hostile agent: home is readable, network is
+> direct by default, and the kernel is shared. `sealed` is the hardened tier.
 > `[[plugins]]` extensions are native, unsandboxed processes. See the
-> [sandboxing help page](docs/help/sandboxing.md).
+> [sandboxing help page](docs/help/sandboxing.md) and the
+> [security model](docs/help/sandbox-security-model.md).
 
 ## Mental model
 

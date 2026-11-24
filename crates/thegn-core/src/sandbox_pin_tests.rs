@@ -103,7 +103,7 @@ fn sandbox_pin_explanations_cover_profile_capability_and_network_facts() {
     assert!(standard_text.contains("default capabilities"));
     assert!(standard_text.contains("SSH") && standard_text.contains("provider"));
     assert!(standard_text.contains("VPN attachments work"));
-    assert!(standard_text.contains("512 process limit"));
+    assert!(standard_text.contains("512-process limit on container and systemd backends"));
     assert!(
         standard_text
             .to_ascii_lowercase()
@@ -117,7 +117,7 @@ fn sandbox_pin_explanations_cover_profile_capability_and_network_facts() {
     assert!(sealed_text.contains("SSH agent socket"));
     assert!(sealed_text.contains("API-backed agent CLIs"));
     assert!(sealed_text.contains("git fetch/push"));
-    assert!(sealed_text.contains("offline builds"));
+    assert!(sealed_text.contains("package caches are private to this worktree and start cold"));
     assert!(sealed_text.contains("no network"));
     assert!(sealed_text.contains("VPN attachment"));
     assert!(sealed_text.contains("256 process limit"));
