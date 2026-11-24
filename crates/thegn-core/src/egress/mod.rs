@@ -5,8 +5,10 @@
 //! - [`plan`]: the egress plan a sandbox launch carries (`SandboxSpec.egress`);
 //!   owned by WS04-P2-08 after WS00.
 //!
-//! - [`pattern`]: host patterns with the DNS filter's semantics (`network_allow`,
-//!   `network_block`, zone/clamp); created by WS01-P2-01, extended by WS04-P1-01.
+//! - [`pattern`]: the one host-pattern grammar (`x`, `*.x`, `=x`, `*`, each with
+//!   an optional `:port` suffix), shared by `network_allow`, `network_block`, the
+//!   zone/clamp, the proxy, providers and credential hosts; created by
+//!   WS01-P2-01, extended to the full grammar by WS04-P1-01.
 //!
 //! Later items add their own submodules here: WS01-P2-01 added `pattern` (host
 //! patterns, today's semantics) and WS04 adds `policy`, `preset`, `resolve` and
