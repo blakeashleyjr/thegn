@@ -46,7 +46,11 @@ shared by reference rather than copied so the two cannot drift:
   material, and the absolute secret roots); and
 - the git-config entries of `SEALED_HOME_ALLOW` (`~/.gitconfig` and
   `~/.config/git/config`), which `sealed_home_allowlist` binds read-only, so a
-  git config write is already impossible in a sealed home.
+  git config write is already impossible in a sealed home; and
+- the repository's own git config: the shared `<common dir>/config` that the
+  git mounts in `crates/thegn-core/src/sandbox.rs` pin read-only over the
+  read-write common dir, plus the `[sandbox.git]` `ro_after` pins. For a
+  repository-scoped tool this is the git config a write could actually reach.
 
 Those constants are private today. WS02-P5-12 exposes them `pub(crate)` (or
 behind a `pub(crate)` accessor) instead of copying the entries, so a new

@@ -46,7 +46,8 @@ The operation policy SHALL evaluate its hard denies before any rule. The hard
 denies are writes to git configuration, SSH and GPG material, and the canonical
 secret paths, and they MUST be the same list the sandbox enforces rather than a
 copy (`SEALED_HOME_DENY`, `SEALED_ABS_DENY` and the read-only git-config entries
-of `SEALED_HOME_ALLOW` in `sandbox_mounts.rs`). A user allow rule, a profile, a
+of `SEALED_HOME_ALLOW` in `sandbox_mounts.rs`, plus the repository's shared git
+config and `[sandbox.git]` `ro_after` paths the sandbox pins read-only). A user allow rule, a profile, a
 repository overlay and a persisted always-choice MUST NOT lift a hard deny.
 
 #### Scenario: A repository overlay cannot lift a hard deny

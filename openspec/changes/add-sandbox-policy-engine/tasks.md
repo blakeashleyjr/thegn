@@ -10,7 +10,9 @@ Implemented by WS02-P5-12 (W4); nothing below is started.
       wins, default fall-through, empty policy is a no-op.
 - [ ] 1.2 Hard denies shared with the sandbox deny list — `SEALED_HOME_DENY`
       and `SEALED_ABS_DENY` in `sandbox_mounts.rs` plus the git-config entries
-      of `SEALED_HOME_ALLOW`, exposed `pub(crate)` rather than copied —
+      of `SEALED_HOME_ALLOW` and the repository git-config pins (shared
+      `<common>/config`, `[sandbox.git]` `ro_after`), exposed `pub(crate)`
+      rather than copied —
       evaluated first — **unit tests**: a user allow rule cannot lift a hard
       deny.
 - [ ] 1.3 `[[sandbox.policy]]` rules in user config; the rule action enum via
