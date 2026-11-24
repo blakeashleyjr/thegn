@@ -58,7 +58,16 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         if r.worktree.as_deref().is_none_or(str::is_empty) {
             left.push(seg(g(), " (no worktree)"));
         }
-        if let Some(detail) = r.detail.as_deref().filter(|s| !s.is_empty()) {
+        // The blocker detail is what the reader came for; a row that was never
+        // refreshed but *was* refused still owes them the reason, so fall back
+        // to the durable typed refusal rather than showing an empty row.
+        let detail = r
+            .detail
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| r.admission_refusal.as_ref().map(ToString::to_string));
+        if let Some(detail) = detail.as_deref() {
             let head = detail.lines().next().unwrap_or(detail);
             left.push(seg(g(), "  "));
             left.push(match r.status.as_str() {

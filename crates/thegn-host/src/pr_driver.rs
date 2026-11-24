@@ -21,7 +21,9 @@ use thegn_core::db::{Db, PrQueueRow};
 use thegn_core::forge::model::{MergeMethod, ReviewThreadRow, owner_repo_from_url};
 use thegn_core::forge::{FetchedPr, Forge, ForgeError, PrRef, RepoRef};
 use thegn_core::issue::AgentDispatchStatus;
-use thegn_core::pr_queue::{self, Blocker, PrQueueFacts, PrqStatus, QueueAction, QueueRowSnapshot};
+use thegn_core::pr_queue::{
+    self, AgentAdmissionRefusal, Blocker, PrQueueFacts, PrqStatus, QueueAction, QueueRowSnapshot,
+};
 use thegn_core::pr_review_tasks::{
     ExistingReviewTask, PrReviewTaskContext, ReviewTaskEvent, reconcile_review_tasks,
 };
@@ -69,6 +71,15 @@ pub(crate) struct PrStep<'a> {
     pub branch: &'a str,
     pub status: &'a str,
     pub detail: &'a str,
+}
+
+/// Persist the typed reason a PR-agent dispatch was refused, so the hold
+/// outlives the notification that announced it. Best-effort: the refusal is
+/// diagnostic state, and the status write + `step` stand on their own.
+fn record_admission_refusal(db: &Db, item: &PrItem, head: &str, refusal: &AgentAdmissionRefusal) {
+    if let Err(error) = db.record_pr_agent_refusal(&item.key, Some(head), Some(head), refusal) {
+        tracing::debug!(%error, "could not persist the PR-agent admission refusal");
+    }
 }
 
 /// Summary of one pass over the queue.
@@ -808,6 +819,9 @@ pub(crate) fn drive_queue(
                         Some(&reason),
                         Some(&head),
                     );
+                    // After the status write the row carries `head` (a CI rerun
+                    // reservation may already have moved it), so the fence matches.
+                    record_admission_refusal(db, &item, &head, &refusal);
                     step(PrqStatus::BlockedCi.as_str(), &reason, &mut progress);
                     out.blocked.push(item.number);
                     continue;
@@ -844,6 +858,7 @@ pub(crate) fn drive_queue(
                     ) {
                         tracing::debug!(%error, "could not persist invalid PR prompt refusal");
                     }
+                    record_admission_refusal(db, &item, &head, &refusal);
                     out.warnings.push(format!("PR #{}: {reason}", item.number));
                     out.blocked.push(item.number);
                     step(
@@ -3323,6 +3338,14 @@ mod tests {
         assert_eq!(row.status, "blocked_ci");
         assert!(row.detail.unwrap().contains("template"));
         assert_eq!(row.agent_attempts, 0);
+        // Durable, typed, and specific: an invalid template is a refusal a
+        // reader can act on, not just a warning in this pass's output.
+        assert_eq!(
+            row.admission_refusal,
+            Some(AgentAdmissionRefusal::PromptInvalid {
+                kind: TaskKind::PrCiFailure,
+            })
+        );
     }
 
     #[test]
@@ -3358,6 +3381,14 @@ mod tests {
         assert_eq!(row.status, "blocked_ci");
         assert_eq!(row.agent_attempts, 0);
         assert!(row.detail.unwrap().contains(".thegn.toml"));
+        assert!(
+            matches!(
+                row.admission_refusal,
+                Some(AgentAdmissionRefusal::IsolationRefused(_))
+            ),
+            "refusal={:?}",
+            row.admission_refusal
+        );
         assert!(!sentinel.exists());
     }
 

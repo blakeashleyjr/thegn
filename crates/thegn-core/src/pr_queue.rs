@@ -469,10 +469,10 @@ pub fn decide(blocker: &Blocker, facts: &PrQueueFacts, cfg: &PrQueueConfig) -> Q
 /// Callers still establish facts that require I/O (such as authorship proof and
 /// current checkout state); this function makes the policy decision from those
 /// facts and the persisted queue row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentAdmissionRefusal {
     UnknownStatus(String),
-    RowState(&'static str),
+    RowState(String),
     Disabled,
     Unwatched(PrWatchKind),
     ForeignPush,
@@ -840,7 +840,7 @@ pub fn admit_agent_dispatch(
     let status = PrqStatus::parse(row_status)
         .ok_or_else(|| AgentAdmissionRefusal::UnknownStatus(row_status.to_string()))?;
     if status.is_settled() || matches!(status, PrqStatus::AgentRunning | PrqStatus::Merging) {
-        return Err(AgentAdmissionRefusal::RowState(status.as_str()));
+        return Err(AgentAdmissionRefusal::RowState(status.as_str().to_owned()));
     }
     if !cfg.enabled {
         return Err(AgentAdmissionRefusal::Disabled);
@@ -1382,7 +1382,10 @@ mod tests {
                         status.as_str()
                     );
                     if !status_allows {
-                        assert_eq!(got, Err(AgentAdmissionRefusal::RowState(status.as_str())));
+                        assert_eq!(
+                            got,
+                            Err(AgentAdmissionRefusal::RowState(status.as_str().to_owned()))
+                        );
                     } else if !watched {
                         assert_eq!(got, Err(AgentAdmissionRefusal::Unwatched(PrWatchKind::Ci)));
                     }
@@ -1481,7 +1484,7 @@ mod tests {
                 "unknown PR queue status `mystery`; agent dispatch refused",
             ),
             (
-                AgentAdmissionRefusal::RowState("merged"),
+                AgentAdmissionRefusal::RowState("merged".into()),
                 "PR queue row is `merged`; agent dispatch refused",
             ),
             (
@@ -1541,6 +1544,38 @@ mod tests {
         ];
         for (refusal, expected) in cases {
             assert_eq!(refusal.to_string(), expected, "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn every_admission_refusal_round_trips_through_its_durable_encoding() {
+        // The DB stores the typed refusal as JSON, so a variant that loses a
+        // field on the way out would read back as a *different* reason. Every
+        // variant (and both payload shapes) must survive the round trip.
+        let cases = [
+            AgentAdmissionRefusal::UnknownStatus("mystery".into()),
+            AgentAdmissionRefusal::RowState("merged".into()),
+            AgentAdmissionRefusal::Disabled,
+            AgentAdmissionRefusal::Unwatched(PrWatchKind::Ci),
+            AgentAdmissionRefusal::Unwatched(PrWatchKind::Conflict),
+            AgentAdmissionRefusal::Unwatched(PrWatchKind::Review),
+            AgentAdmissionRefusal::ForeignPush,
+            AgentAdmissionRefusal::NoAgent,
+            AgentAdmissionRefusal::NotOwn,
+            AgentAdmissionRefusal::Policy,
+            AgentAdmissionRefusal::NeedsHuman("human review required".into()),
+            AgentAdmissionRefusal::Closed,
+            AgentAdmissionRefusal::Blocker,
+            AgentAdmissionRefusal::PromptInvalid {
+                kind: TaskKind::PrCiFailure,
+            },
+            AgentAdmissionRefusal::IsolationRefused("sandbox unavailable".into()),
+        ];
+        for refusal in cases {
+            let encoded = serde_json::to_string(&refusal).unwrap();
+            let decoded: AgentAdmissionRefusal = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, refusal, "encoded as {encoded}");
+            assert_eq!(decoded.to_string(), refusal.to_string());
         }
     }
 
@@ -1759,6 +1794,8 @@ mod tests {
             agent_attempts: 1,
             ci_rerun_head: None,
             last_head_oid: None,
+            admission_refusal: None,
+            admission_refusal_head: None,
             queued_at: 0,
             updated_at: 0,
         };

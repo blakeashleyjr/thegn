@@ -12,6 +12,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::Config;
 use thegn_core::db::{Db, PrQueueRow};
+use thegn_core::pr_queue::PrqStatus;
 use thegn_core::store::WorktreeAuxStore;
 
 use crate::hydrate::RefreshKind;
@@ -772,6 +773,14 @@ pub(crate) fn apply_step(
     if let Some(row) = panel.pr_queue.iter_mut().find(|r| r.key == key) {
         row.status = status.to_string();
         row.detail = (!detail.is_empty()).then(|| detail.to_string());
+        // A step into `agent_running` is the one transition that proves the
+        // refusal was resolved: the durable write clears it in the admission
+        // transaction, and this keeps the live row in step until the next model
+        // refresh re-reads it.
+        if status == PrqStatus::AgentRunning.as_str() {
+            row.admission_refusal = None;
+            row.admission_refusal_head = None;
+        }
     }
 }
 
@@ -1337,6 +1346,8 @@ mod tests {
             agent_attempts: 0,
             ci_rerun_head: None,
             last_head_oid: None,
+            admission_refusal: None,
+            admission_refusal_head: None,
             queued_at: 0,
             updated_at: 0,
         }
