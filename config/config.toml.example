@@ -3335,6 +3335,16 @@ on_floor_miss = "fail"
 #               cgroup reclaiming its own pages and the whole machine stalling
 #               in global direct reclaim. No "auto": unset = no aggregate
 #               memory cap. "off"/"" also disable.
+#   memory_high — per-pane high-water mark, set as `MemoryHigh` on the pane's
+#               scope: a size ("20g") or a percentage of `memory` ("85%").
+#               Past it the kernel throttles and reclaims inside the pane's
+#               cgroup BEFORE the hard `memory` cap OOM-kills. Default "85%"
+#               when `memory` is set; "off" disables.
+#   memory_swap — per-pane `MemorySwapMax` ("4g", "0" = no swap) so one pane
+#               cannot fill the machine's swap. Default "4g" when `memory` is
+#               set; "off" leaves swap unbounded.
+#   memory_swap_total — AGGREGATE swap cap on the shared slice (`MemorySwapMax`
+#               on thegn.slice). Opt-in: unset/"off" = no aggregate swap cap.
 #
 # NOTE: `cpu_total`/`memory_total` bound EVERYTHING thegn starts, not just the
 # panes you can see — the `[merge_queue]` fold gate and the queues' agent
@@ -3351,6 +3361,9 @@ on_floor_miss = "fail"
 # memory       = "4g"
 # cpu_total    = "auto"
 # memory_total = ""
+# memory_high  = "85%"
+# memory_swap  = "4g"
+# memory_swap_total = "off"
 # heavy_slots  = 2       # concurrent host-local heavyweight gates (0 = off)
 # max_load     = 0.0     # absolute 1-minute load average ceiling (0 = off)
 

@@ -251,7 +251,11 @@ fn set_aggregate_caps(cfg: &thegn_core::config::Config) {
         .and_then(sandbox::resolve_memory_total);
     // Nothing to enforce (both explicitly disabled) ⇒ don't create the slice at
     // all. The weights alone aren't worth a systemd round-trip.
-    if quota.is_none() && mem_high.is_none() {
+    let swap_max = limits
+        .memory_swap_total
+        .as_deref()
+        .and_then(sandbox::resolve_memory_swap_total);
+    if quota.is_none() && mem_high.is_none() && swap_max.is_none() {
         return;
     }
     let mut props = Vec::new();
@@ -260,6 +264,9 @@ fn set_aggregate_caps(cfg: &thegn_core::config::Config) {
     }
     if let Some(m) = &mem_high {
         props.push(format!("MemoryHigh={m}"));
+    }
+    if let Some(m) = &swap_max {
+        props.push(format!("MemorySwapMax={m}"));
     }
     props.push(format!("CPUWeight={SLICE_WEIGHT}"));
     props.push(format!("IOWeight={SLICE_WEIGHT}"));

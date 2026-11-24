@@ -951,6 +951,11 @@ fn clamp_limits(
         memory: _,
         cpu_total,
         memory_total,
+        // Per-pane high-water/swap and aggregate swap are trusted-layer only: a repo
+        // overlay cannot set them (they stay at the base value).
+        memory_high: _,
+        memory_swap: _,
+        memory_swap_total: _,
         heavy_slots: _,
         max_load: _,
     } = req;
@@ -2939,6 +2944,9 @@ mod tests {
             memory: Some("2g".into()),
             cpu_total: None,
             memory_total: None,
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
             heavy_slots: 0,
             max_load: 0.0,
         };
@@ -2948,6 +2956,9 @@ mod tests {
             memory: Some("512m".into()),
             cpu_total: None,
             memory_total: None,
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
             heavy_slots: 0,
             max_load: 0.0,
         });
@@ -2968,6 +2979,9 @@ mod tests {
             memory: None,
             cpu_total: Some("4".into()),
             memory_total: None,
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
             heavy_slots: 0,
             max_load: 0.0,
         };
@@ -3544,6 +3558,9 @@ mod tests {
             memory: Some("512m".into()),
             cpu_total: Some("2".into()),
             memory_total: Some("4g".into()),
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
             heavy_slots: 0,
             max_load: 0.0,
         };
@@ -3560,6 +3577,9 @@ mod tests {
             memory: Some("1g".into()),
             cpu_total: Some("4".into()),
             memory_total: Some("8g".into()),
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
             heavy_slots: 0,
             max_load: 0.0,
         };
@@ -3568,6 +3588,9 @@ mod tests {
             memory: Some("much".into()),
             cpu_total: Some("off".into()),
             memory_total: Some("off".into()),
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
             heavy_slots: 0,
             max_load: 0.0,
         };
@@ -3584,6 +3607,9 @@ mod tests {
             memory: Some("2g".into()),
             cpu_total: Some("8".into()),
             memory_total: Some("16g".into()),
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
             heavy_slots: 0,
             max_load: 0.0,
         };
@@ -3597,6 +3623,9 @@ mod tests {
             memory: None,
             cpu_total: None,
             memory_total: Some("2g".into()),
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
             heavy_slots: 0,
             max_load: 0.0,
         };

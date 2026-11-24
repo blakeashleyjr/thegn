@@ -511,6 +511,12 @@ pub struct SandboxLimits {
     /// (throttle + reclaim), not `MemoryMax` (OOM-kill) — see the config field.
     /// `None` = no aggregate memory cap.
     pub memory_total: Option<String>,
+    /// Per-pane `MemoryHigh` (size or `N%` of `memory`). `None` = default 85%.
+    pub memory_high: Option<String>,
+    /// Per-pane `MemorySwapMax` (size or `off`). `None` = default 4G.
+    pub memory_swap: Option<String>,
+    /// Aggregate `MemorySwapMax` on the shared slice. `None` = no cap.
+    pub memory_swap_total: Option<String>,
 }
 
 /// The config `[sandbox.limits]` table as resolved ceilings. A plain field copy
@@ -525,6 +531,9 @@ impl From<&crate::config::SandboxLimits> for SandboxLimits {
             memory: c.memory.clone(),
             cpu_total: c.cpu_total.clone(),
             memory_total: c.memory_total.clone(),
+            memory_high: c.memory_high.clone(),
+            memory_swap: c.memory_swap.clone(),
+            memory_swap_total: c.memory_swap_total.clone(),
         }
     }
 }

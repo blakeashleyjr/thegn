@@ -577,6 +577,84 @@ fn systemd_mem_arg(value: &str) -> Option<String> {
     systemd_bytes(v)
 }
 
+/// Default per-pane `MemoryHigh`, as a share of the pane's `MemoryMax`.
+const DEFAULT_MEMORY_HIGH: &str = "85%";
+/// Default per-pane `MemorySwapMax` when a per-pane `memory` cap is set.
+const DEFAULT_MEMORY_SWAP: &str = "4G";
+
+fn is_off(v: &str) -> bool {
+    v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none")
+}
+
+/// Resolve `[sandbox.limits] memory_high` for a pane: a size (`"20g"`, passed
+/// through normalized) or a percentage of the pane's `memory` (`"85%"`, rendered
+/// as a byte count). Unset defaults to 85% when `memory` is set; `"off"`/`""`
+/// disables. `None` for junk, a percentage with no resolvable `memory`, or a
+/// percentage outside `(0, 100]`, so one bad value omits one property instead
+/// of poisoning the whole `systemd-run` transaction.
+pub fn resolve_memory_high(limits: &SandboxLimits) -> Option<String> {
+    let memory = limits.memory.as_deref().and_then(systemd_mem_arg);
+    let raw = match limits.memory_high.as_deref() {
+        Some(v) => v.trim(),
+        None => {
+            memory.as_ref()?;
+            DEFAULT_MEMORY_HIGH
+        }
+    };
+    if is_off(raw) {
+        return None;
+    }
+    if let Some(pct) = raw.strip_suffix('%') {
+        let pct: f64 = pct.trim().parse().ok()?;
+        if !(pct > 0.0 && pct <= 100.0) {
+            return None;
+        }
+        let max = mem_bytes(&memory?)?;
+        let high = (max as f64 * pct / 100.0).floor() as u64;
+        return (high > 0).then(|| high.to_string());
+    }
+    systemd_mem_arg(raw)
+}
+
+/// Resolve `[sandbox.limits] memory_swap` for a pane. Unset defaults to `4G`
+/// when `memory` is set (and to nothing otherwise); `"off"`/`""`/`"none"`
+/// leaves swap unbounded; `"0"` forbids swap.
+pub fn resolve_memory_swap(limits: &SandboxLimits) -> Option<String> {
+    let raw = match limits.memory_swap.as_deref() {
+        Some(v) => v.trim(),
+        None => {
+            limits.memory.as_deref().and_then(systemd_mem_arg)?;
+            DEFAULT_MEMORY_SWAP
+        }
+    };
+    if is_off(raw) {
+        return None;
+    }
+    systemd_mem_arg(raw)
+}
+
+/// Resolve `[sandbox.limits] memory_swap_total` into an aggregate
+/// `MemorySwapMax` for [`CPU_SLICE`]. Opt-in: unset/`"off"`/`""` means none.
+pub fn resolve_memory_swap_total(value: &str) -> Option<String> {
+    let v = value.trim();
+    if is_off(v) {
+        return None;
+    }
+    systemd_mem_arg(v)
+}
+
+/// The pane-only `-p` properties for the high-water mark and swap cap.
+fn pane_memory_props(limits: &SandboxLimits) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(h) = resolve_memory_high(limits) {
+        v.extend(["-p".into(), format!("MemoryHigh={h}")]);
+    }
+    if let Some(s) = resolve_memory_swap(limits) {
+        v.extend(["-p".into(), format!("MemorySwapMax={s}")]);
+    }
+    v
+}
+
 /// Whether a pane should join the aggregate [`CPU_SLICE`]. Unset (`None`) means
 /// "auto" — on by default; only an explicit `"off"`/`"none"`/`""` disables it.
 fn slice_enabled(limits: &SandboxLimits) -> bool {
@@ -605,6 +683,7 @@ pub(crate) fn systemd_cap_args(limits: &SandboxLimits) -> Vec<String> {
         // Interactive pane: an OOM kill takes the offender, not the shell.
         v.extend(["-p".into(), "OOMPolicy=continue".into()]);
     }
+    v.extend(pane_memory_props(limits));
     v
 }
 
@@ -1190,7 +1269,8 @@ fn cap_prefix_named(
     };
     let use_slice = slice_enabled(limits);
     let mem = limits.memory.as_deref().and_then(systemd_mem_arg);
-    if per_pane.is_none() && !use_slice && mem.is_none() {
+    let pane_mem = role == CapRole::Pane && !pane_memory_props(limits).is_empty();
+    if per_pane.is_none() && !use_slice && mem.is_none() && !pane_mem {
         return argv; // nothing configured to enforce
     }
     match mech {
@@ -1218,6 +1298,12 @@ fn cap_prefix_named(
                 if role == CapRole::Pane {
                     v.extend(["-p".into(), "OOMPolicy=continue".into()]);
                 }
+            }
+            // High-water mark and swap cap are pane ergonomics: background/gate
+            // jobs keep only MemoryMax (build workloads there want the hard
+            // ceiling, not early throttling, and they share the slice's swap cap).
+            if role == CapRole::Pane {
+                v.extend(pane_memory_props(limits));
             }
             v.push("--".into());
             v.extend(argv);
@@ -1249,6 +1335,9 @@ mod tests {
             memory: mem.map(str::to_string),
             cpu_total: total.map(str::to_string),
             memory_total: None,
+            memory_high: None,
+            memory_swap: None,
+            memory_swap_total: None,
         }
     }
 
@@ -1972,6 +2061,95 @@ mod tests {
             ),
             sd
         );
+    }
+
+    #[test]
+    fn pane_memory_high_and_swap_defaults_and_overrides() {
+        let l = limits(Some("8"), Some("24g"), None);
+        let joined = systemd_cap_args(&l).join(" ");
+        // 85% of 24 GiB = 25769803776 * 85 / 100, floored.
+        assert!(joined.contains("MemoryHigh=21904333209"), "{joined}");
+        assert!(joined.contains("MemorySwapMax=4G"), "{joined}");
+
+        let mut l2 = l.clone();
+        l2.memory_high = Some("20g".into());
+        l2.memory_swap = Some("0".into());
+        let joined = systemd_cap_args(&l2).join(" ");
+        assert!(joined.contains("MemoryHigh=20G"), "{joined}");
+        assert!(joined.contains("MemorySwapMax=0"), "{joined}");
+
+        let mut off = l.clone();
+        off.memory_high = Some("off".into());
+        off.memory_swap = Some("off".into());
+        let joined = systemd_cap_args(&off).join(" ");
+        assert!(!joined.contains("MemoryHigh"), "{joined}");
+        assert!(!joined.contains("MemorySwapMax"), "{joined}");
+
+        // No per-pane memory: nothing defaulted.
+        let joined = systemd_cap_args(&limits(Some("8"), None, None)).join(" ");
+        assert!(!joined.contains("MemoryHigh") && !joined.contains("MemorySwapMax"));
+    }
+
+    #[test]
+    fn pane_scope_gets_high_and_swap_but_background_does_not() {
+        let l = limits(None, Some("24g"), Some("off"));
+        let argv = vec!["sh".to_string()];
+        let pane = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            argv.clone(),
+            CpuCap::ScopeHard,
+            CapRole::Pane,
+        )
+        .join(" ");
+        assert!(pane.contains("MemoryHigh=21904333209"), "{pane}");
+        assert!(pane.contains("MemorySwapMax=4G"), "{pane}");
+        let bg = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            argv,
+            CpuCap::ScopeHard,
+            CapRole::Background,
+        )
+        .join(" ");
+        assert!(bg.contains("MemoryMax=24G"));
+        assert!(
+            !bg.contains("MemoryHigh") && !bg.contains("MemorySwapMax"),
+            "{bg}"
+        );
+    }
+
+    #[test]
+    fn memory_high_and_swap_parse_and_validate() {
+        let mut l = limits(None, Some("10g"), None);
+        l.memory_high = Some("50%".into());
+        assert_eq!(resolve_memory_high(&l).as_deref(), Some("5368709120"));
+        l.memory_high = Some("100%".into());
+        assert_eq!(resolve_memory_high(&l).as_deref(), Some("10737418240"));
+        for bad in ["0%", "101%", "-5%", "x%", "lots", "%"] {
+            l.memory_high = Some(bad.into());
+            assert_eq!(resolve_memory_high(&l), None, "{bad}");
+        }
+        // A percentage needs a per-pane memory cap to be a percentage of.
+        let mut nomem = limits(None, None, None);
+        nomem.memory_high = Some("85%".into());
+        assert_eq!(resolve_memory_high(&nomem), None);
+        nomem.memory_high = Some("2gb".into());
+        assert_eq!(resolve_memory_high(&nomem).as_deref(), Some("2G"));
+
+        l.memory_swap = Some("2gb".into());
+        assert_eq!(resolve_memory_swap(&l).as_deref(), Some("2G"));
+        l.memory_swap = Some("junk".into());
+        assert_eq!(resolve_memory_swap(&l), None);
+        l.memory_swap = Some("".into());
+        assert_eq!(resolve_memory_swap(&l), None);
+
+        assert_eq!(resolve_memory_swap_total("8g").as_deref(), Some("8G"));
+        assert_eq!(resolve_memory_swap_total("off"), None);
+        assert_eq!(resolve_memory_swap_total(""), None);
+        assert_eq!(resolve_memory_swap_total("12%"), None);
     }
 
     #[test]
