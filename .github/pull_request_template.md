@@ -29,8 +29,9 @@ gh workflow run ci.yml --ref <ref> -f extras=true
 ```
 
 Dispatch is restricted to users with write access to this repository, so fork
-PR authors should ask a maintainer to run it. Find the resulting run in GitHub
-**Actions → CI**, listed for the selected ref.
+PR authors should ask a maintainer, who must push the branch to this repository
+and dispatch on that ref. Find the resulting run in GitHub **Actions → ci**,
+listed for the selected ref.
 
 ## Notes for reviewers
 
