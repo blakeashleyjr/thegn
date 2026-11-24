@@ -67,7 +67,7 @@ fn pick_backend_with_notice(
 ) -> Option<Backend> {
     let suitable = |b: Backend| backend_suitable(b, placement);
     let unsuitable_reason = |b: Backend| -> &'static str {
-        if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
+        if host_os() == HostOs::Windows && placement.is_local() && b.is_oci() && b != Backend::Wsl {
             " on native Windows (Linux containers can't bind-mount the worktree \
              at its real path — use WSL2 for container sandboxes)"
         } else if b.is_host_toolchain() && !placement.is_local() {
@@ -299,7 +299,9 @@ pub(crate) fn backend_suitable_on(b: Backend, placement: &Placement, os: HostOs)
     if placement.is_local() && !backend_runs_on(b, os) {
         return false;
     }
-    if os == HostOs::Windows && b.is_oci() && b != Backend::Wsl {
+    // Native Windows declines OCI for LOCAL placements only: a Linux container
+    // can't see the worktree at its real path. A remote host has no such limit.
+    if placement.is_local() && os == HostOs::Windows && b.is_oci() && b != Backend::Wsl {
         return false;
     }
     match b {
@@ -851,13 +853,34 @@ mod tests {
         // OCI runtimes DO nest in a placement (a container in the sprite/pod), so
         // they stay eligible remotely — on a non-local placement the OS gate does
         // not apply, because the remote may be a different OS entirely.
-        for os in [HostOs::Linux, HostOs::MacOs] {
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
             assert!(backend_suitable_on(Backend::Podman, &provider, os));
             assert!(backend_suitable_on(Backend::Docker, &provider, os));
         }
         // `none` (run natively in the placement) is always eligible.
         assert!(backend_suitable(Backend::None, &provider));
         assert!(backend_suitable(Backend::None, &Placement::Local));
+    }
+
+    #[test]
+    fn windows_local_oci_still_declined() {
+        for b in [Backend::Podman, Backend::Docker, Backend::Smol] {
+            assert!(!backend_suitable_on(b, &Placement::Local, HostOs::Windows));
+        }
+    }
+
+    #[test]
+    fn windows_ssh_placement_allows_remote_podman() {
+        use crate::placement::{Placement, SshPlacement, TransportKind};
+        let ssh = Placement::Ssh(SshPlacement::plain(
+            "dev@box".into(),
+            22,
+            true,
+            TransportKind::Ssh,
+        ));
+        for b in [Backend::Podman, Backend::Docker] {
+            assert!(backend_suitable_on(b, &ssh, HostOs::Windows));
+        }
     }
 
     #[test]
