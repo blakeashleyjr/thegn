@@ -588,8 +588,9 @@ mod tests {
         use std::os::windows::ffi::OsStringExt as _;
 
         // Windows folds case and verbatim prefixes at the filesystem layer; the
-        // identity deliberately keeps them distinct instead of normalizing to a
-        // display string, so two spellings can never cross-connect by accident.
+        // registry identity deliberately keeps them distinct instead of
+        // normalizing to a display string. The pipe name does fold them, so two
+        // spellings of one state dir can still share a pipe (a known gap).
         let upper = Path::new(r"C:\State\thegn");
         let lower = Path::new(r"c:\state\thegn");
         let plain = Path::new(r"C:\State\thegn");
