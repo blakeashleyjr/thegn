@@ -38,6 +38,46 @@ pub(crate) struct SpecBatch {
     /// ([`worktree_attach::live_for_worktree`]). Empty when the worker didn't
     /// probe (terminal groups, daemon route off, probe failure).
     pub attach: Vec<AttachTarget>,
+    /// Whether [`SpecBatch::worktree`] lives on a non-local placement, read
+    /// off-thread beside the specs ([`worktree_is_remote`]). Seeds
+    /// `loading_remote` (the startup-shell watchdog's 8s/300s window) so the
+    /// drain never opens SQLite on the compositor loop to find out.
+    pub remote: bool,
+    /// The worktree's `worktrees.agent` row, read off-thread beside the specs
+    /// ([`remembered_agent_row`]). The provider native-exec/ssh restore
+    /// relaunches it; absent/unreadable ⇒ the plain shell it has always fallen
+    /// back to. Carried because the spawn used to open the DB once PER LEAF.
+    pub remembered_agent: Option<String>,
+}
+
+/// Whether `worktree` is on a non-local placement, for a spec worker to carry
+/// in [`SpecBatch::remote`]. Opens the state DB, so it belongs on the worker
+/// thread — never the compositor loop.
+pub(crate) fn worktree_is_remote(worktree: &str) -> bool {
+    thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree)).is_remote()
+}
+
+/// The worktree's remembered agent (`worktrees.agent`), for a spec worker to
+/// carry in [`SpecBatch::remembered_agent`]. Opens the state DB, so it belongs
+/// on the worker thread — never the compositor loop.
+///
+/// Only a provider-configured host can take the native-exec/ssh restore branch
+/// that reads this, so a config without one reads nothing: the same gate the
+/// on-loop per-leaf read applied. The row is carried UNFILTERED — the `[tools]`
+/// and `shell` exclusions depend on the config live at spawn time, so the spawn
+/// keeps applying them.
+pub(crate) fn remembered_agent_row(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+) -> Option<String> {
+    use thegn_core::store::WorkspaceStore as _;
+
+    if !crate::agent::provider_envs_configured(cfg) || worktree.is_empty() {
+        return None;
+    }
+    thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.worktree_agent(worktree).ok().flatten())
 }
 
 /// Live env-provisioning progress for a tab's splash, keyed (group name, tab).
@@ -733,6 +773,8 @@ pub(crate) fn drain_specs(
             specs,
             relaunch,
             attach: batch_attach,
+            remote: tab_remote,
+            remembered_agent,
         } = batch;
         if relaunch == RelaunchOutcome::Refused {
             tracing::debug!(
@@ -826,12 +868,11 @@ pub(crate) fn drain_specs(
         ) {
             continue;
         }
-        // Remoteness of this worktree, resolved once from its path — seeds
-        // `loading_remote` alongside every `loading_state` write below so the
-        // startup-shell watchdog reads the correct 8s/300s deadline for THIS
-        // tab regardless of its (possibly identical) step Vec.
-        let tab_remote =
-            thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt)).is_remote();
+        // Remoteness of this worktree, carried by the worker that resolved the
+        // specs (it is a state-DB read, so the drain must not do it here) —
+        // seeds `loading_remote` alongside every `loading_state` write below so
+        // the startup-shell watchdog reads the correct 8s/300s deadline for
+        // THIS tab regardless of its (possibly identical) step Vec.
         // A remote materialize may have just CLAIMED a warm spare (ready →
         // claimed), so the chip's count is now stale. Force the pool
         // maintainer to re-read on the next loop (it's otherwise throttled to
@@ -1016,6 +1057,7 @@ pub(crate) fn drain_specs(
             &specs,
             ctx.center,
             &attach,
+            remembered_agent.as_deref(),
         ) {
             if !orphaned.is_empty() {
                 // The records were already consumed, but the batch aborted
@@ -1500,6 +1542,8 @@ mod tests {
                 specs: Ok(vec![(leaf, spec)]),
                 relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
+                remote: false,
+                remembered_agent: None,
             })
             .unwrap();
 
@@ -1549,6 +1593,103 @@ mod tests {
             model.status
         );
         assert!(dirty, "the drain leaves the frame dirty");
+    }
+
+    /// The spawn no longer reads the state DB on the loop: the drain's
+    /// remoteness seed (which picks the startup-shell watchdog's 8s/300s
+    /// window) is computed by the off-thread spec worker and carried in the
+    /// batch. Both halves are pinned here — the carried value lands in
+    /// `loading_remote`, and the drain opens nothing on the way. Reverting to
+    /// the old on-loop `GitLoc::for_worktree` read fails the open count.
+    #[test]
+    fn drain_specs_carries_remoteness_and_opens_no_state_db() {
+        let _state = crate::testenv::IsolatedState::new();
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        let leaf = 7u32;
+        session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(leaf);
+        session.worktrees[0].tabs[0].focused_pane = leaf;
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(tx);
+        let cfg = thegn_core::config::Config::default();
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::new();
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel::<SpecBatch>();
+        spec_tx
+            .send(SpecBatch {
+                group: "app/home".into(),
+                worktree: String::new(),
+                tab: 0,
+                target_leaves: vec![leaf],
+                origin: SpecOrigin::Materialize,
+                // A failed resolve keeps the drain off the spawn path, so the
+                // measurement covers the loop-side bookkeeping alone.
+                specs: Err(SpecError::Other("provider unavailable".into())),
+                relaunch: RelaunchOutcome::NotAttempted,
+                attach: Vec::new(),
+                remote: true,
+                remembered_agent: None,
+            })
+            .unwrap();
+
+        let opens_before = thegn_core::db_open_stats::total_opens();
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert_eq!(
+            thegn_core::db_open_stats::total_opens() - opens_before,
+            0,
+            "the drain must not open the state DB: the worker carried what the spawn needs"
+        );
+        assert_eq!(
+            loading_remote.get(&("app/home".to_string(), 0)),
+            Some(&true),
+            "the carried placement seeds the watchdog window"
+        );
+        assert!(
+            materialize_failed.contains(&("app/home".to_string(), 0)),
+            "the failed resolve is still marked"
+        );
+        assert!(panes.table.is_empty(), "a failed resolve spawns nothing");
     }
 
     #[test]
@@ -1605,6 +1746,8 @@ mod tests {
                     session: "live-session".into(),
                     program: "claude".into(),
                 }],
+                remote: false,
+                remembered_agent: None,
             })
             .unwrap();
 
@@ -1733,6 +1876,8 @@ mod tests {
                     session: "stale-session".into(),
                     program: "claude".into(),
                 }],
+                remote: false,
+                remembered_agent: None,
             })
             .unwrap();
 
@@ -1842,6 +1987,8 @@ mod tests {
                 specs: Ok(Vec::new()),
                 relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
+                remote: false,
+                remembered_agent: None,
             })
             .unwrap();
 
@@ -1940,6 +2087,8 @@ mod tests {
                 specs: Ok(vec![(99u32, spec)]),
                 relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
+                remote: false,
+                remembered_agent: None,
             })
             .unwrap();
 
@@ -2041,6 +2190,8 @@ mod tests {
                 specs: Err(SpecError::PrewarmSkipped),
                 relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
+                remote: false,
+                remembered_agent: None,
             })
             .unwrap();
 
@@ -2125,6 +2276,8 @@ mod tests {
                 specs: Err(SpecError::PrewarmSkipped),
                 relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
+                remote: false,
+                remembered_agent: None,
             })
             .unwrap();
 

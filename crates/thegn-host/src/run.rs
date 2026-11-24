@@ -10057,6 +10057,14 @@ async fn event_loop<T: Terminal>(
                             }
                         },
                     );
+                    // The spawn's per-worktree state reads ride back with the
+                    // specs, so the compositor loop never opens SQLite to open
+                    // a pane: its placement (the `loading_remote` watchdog
+                    // window) and the remembered agent the provider
+                    // native-exec/ssh restore relaunches.
+                    let remote = crate::handlers::provision::worktree_is_remote(&wt);
+                    let remembered_agent =
+                        crate::handlers::provision::remembered_agent_row(&cfg, &wt);
                     if tx
                         .send(SpecBatch {
                             group: name,
@@ -10067,6 +10075,8 @@ async fn event_loop<T: Terminal>(
                             specs,
                             relaunch,
                             attach,
+                            remote,
+                            remembered_agent,
                         })
                         .is_ok()
                     {

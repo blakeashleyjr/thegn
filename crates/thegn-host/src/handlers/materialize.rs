@@ -359,6 +359,12 @@ pub(crate) fn maybe_materialize(
             );
             (specs, attach, relaunch)
         };
+        // The spawn's per-worktree state reads ride back with the specs, so the
+        // compositor loop never opens SQLite to spawn a pane: its placement
+        // (the `loading_remote` watchdog window) and the remembered agent the
+        // provider native-exec/ssh restore relaunches.
+        let remote = crate::handlers::provision::worktree_is_remote(&wt);
+        let remembered_agent = crate::handlers::provision::remembered_agent_row(&cfg, &wt);
         if spec_tx
             .send(SpecBatch {
                 group: gname,
@@ -369,6 +375,8 @@ pub(crate) fn maybe_materialize(
                 specs,
                 relaunch,
                 attach,
+                remote,
+                remembered_agent,
             })
             .is_ok()
             && wk.wake().is_err()
