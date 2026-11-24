@@ -223,6 +223,7 @@ impl RowMenuEntry {
         }
     }
 
+    #[must_use]
     pub fn danger(mut self) -> Self {
         self.danger = true;
         self

@@ -1147,7 +1147,7 @@
     },
     {
       "change": "mark-unverified-backends",
-      "lifecycle": "active",
+      "lifecycle": "archived",
       "disposition": "verification-gated",
       "owners": [
         {
@@ -1155,7 +1155,8 @@
           "project": "Cross-Platform Support & Verification"
         }
       ],
-      "summary": "Truthful backend caveats shipped; smolvm and WSL remain unverified until real-host proof."
+      "summary": "Truthful backend caveats shipped; task 5.1 superseded by reserved smol, wsl and appcontainer (fix-truth-in-reporting); replacements owned by WS07-P2-04 and WS06.",
+      "archive_path": "openspec/changes/archive/2026-11-23-mark-unverified-backends/"
     },
     {
       "change": "monitor-framework",

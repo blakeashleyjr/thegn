@@ -79,7 +79,13 @@ reproducible problems that are not listed here.
   part of `just ci` or the default CI gate.
 - `sealed-tunnel` refuses to launch when a VPN is configured because thegn
   cannot yet enforce that the tunnel is the only network route. Docker Desktop
-  and WSL/WSL2 sandbox binds are best-effort and unverified.
+  sandbox binds are best-effort and unverified.
+- Allow/block lists (`network_allow`, `network_block`) are advisory everywhere
+  except Sprites, where they are translated to its own policy API. A VPN
+  sidecar routes traffic but is not an exclusive route and does not confine the
+  sandbox. `network_audit` is a podman `network` event feed (attach/detach),
+  not a DNS or connection log. `smol`, `wsl` and `appcontainer` are reserved:
+  accepted by config, not implemented, never selected.
 - Provider placements without an enforceable isolation request are reported as
   `provider-managed (unverified)`; their isolation is not verified by thegn.
 - The `remote`, `providers`, `placement`, and `voice` subsystems are

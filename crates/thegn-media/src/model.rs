@@ -330,6 +330,7 @@ impl LoopMode {
 
     /// The next mode when cycling (None → Playlist → Track → None), matching the
     /// usual player UX where the first press enables whole-list repeat.
+    #[must_use]
     pub fn cycle(self) -> LoopMode {
         match self {
             LoopMode::None => LoopMode::Playlist,
@@ -386,6 +387,7 @@ impl MediaState {
     /// Apply the shared provider-ingress bounds while preserving exact opaque
     /// identifiers. Invalid identifiers and oversized art references are
     /// omitted rather than truncated.
+    #[must_use]
     pub fn admitted(mut self) -> MediaState {
         self.player = bounded_field(self.player);
         self.title = bounded_field(self.title);

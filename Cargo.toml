@@ -281,6 +281,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # idiom itself.) The `let _ =` discipline is the file-level ratchet in
 # test/ignored-result-ratchet.txt.
 let_underscore_future = "deny"
+# Builder-style methods (`fn with_x(self, ..) -> Self`) are pure: dropping the
+# result silently discards the configuration. Public ones carry `#[must_use]`.
+return_self_not_must_use = "deny"
 
 [profile.dev]
 # Build-speed tuning for the inner loop. `line-tables-only` keeps backtraces

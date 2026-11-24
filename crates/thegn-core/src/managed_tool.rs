@@ -233,12 +233,14 @@ impl ManagedTool {
     }
 
     /// Builder: PATH fallback command names (tier 2).
+    #[must_use]
     pub fn with_path_fallbacks(mut self, names: &[&str]) -> ManagedTool {
         self.path_fallbacks = names.iter().map(|s| s.to_string()).collect();
         self
     }
 
     /// Builder: update policy (default [`UpdatePolicy::Once`]).
+    #[must_use]
     pub fn with_policy(mut self, policy: UpdatePolicy) -> ManagedTool {
         self.policy = policy;
         self
@@ -247,6 +249,7 @@ impl ManagedTool {
     /// Builder: pin an absolute managed dir, the binary path relative to it, and
     /// the version-marker filename — for tools with a legacy layout (the managed
     /// pi). New tools should use the defaults.
+    #[must_use]
     pub fn with_layout(mut self, dir: PathBuf, bin_rel: &str, marker_name: &str) -> ManagedTool {
         self.layout = Layout {
             dir: Some(dir),

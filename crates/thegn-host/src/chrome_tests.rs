@@ -604,6 +604,41 @@ fn masthead_chip_hit_round_trips_through_chip_at() {
     }
 }
 
+/// THE-2480: the separator grab bands are column-only tests, and the sidebar's
+/// width puts its separator under the Work/Observe chips — the press armed a
+/// resize and swallowed the click. Through the real press decision, a chip cell
+/// that coincides with the separator column must never grab, while the same
+/// column on a sidebar row still does.
+#[test]
+fn masthead_chip_cells_never_arm_a_separator_grab_at_any_width() {
+    use crate::drag_hit::{SepSide, grabs_separator};
+    let model = chip_model(&["work", "Observe"], 0);
+    let mut collisions = 0;
+    for sidebar_cols in 1..=80usize {
+        let chrome = layout::compute_with_width(160, 30, true, false, sidebar_cols);
+        let (Some(sep), Some(sb)) = (chrome.sep_left, chrome.sidebar) else {
+            continue;
+        };
+        let band = Some((sb.y, sb.rows));
+        let spans = crate::masthead::masthead_chip_spans(&model, &chrome);
+        for (idx, r) in &spans {
+            for x in r.x..r.x + r.cols {
+                assert_eq!(crate::masthead::chip_at(&spans, x, r.y), Some(*idx));
+                assert!(
+                    !grabs_separator(Some(sep), SepSide::Sidebar, band, x, r.y),
+                    "chip {idx} cell x={x} grabbable at sidebar_cols={sidebar_cols}"
+                );
+                if x == sep || x == sep + 1 {
+                    collisions += 1;
+                    // The same column, one row inside the sidebar band, grabs.
+                    assert!(grabs_separator(Some(sep), SepSide::Sidebar, band, x, sb.y));
+                }
+            }
+        }
+    }
+    assert!(collisions > 0, "no width put the separator under a chip");
+}
+
 #[test]
 fn masthead_sidebar_chip_appears_only_when_hidden() {
     use crate::layout::SidebarMode;

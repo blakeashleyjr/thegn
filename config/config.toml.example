@@ -3822,11 +3822,12 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 #                              #   ceiling = min(declared, probed) x overcommit
 #                              #   x independent_safety_pct.
 # trust_egress_enforced = false # ATTESTATION (taken on faith, never verified):
-#                              #   this box enforces the posture a thegn-built
-#                              #   image guarantees, restoring the one-notch
-#                              #   trust drop unattested user-owned hosts get
-#                              #   for packing (a probe proves PRESENCE of
-#                              #   podman/userns, never ENFORCEMENT).
+#                              #   the owner asserts this box's container
+#                              #   runtime/userns posture matches a thegn-built
+#                              #   host, restoring the one-notch trust drop for
+#                              #   packing. No thegn image enforces network
+#                              #   egress; this key does not imply egress
+#                              #   control.
 # [host.gpu-box.ssh]           # same knobs as [env.<name>.ssh]
 # host = "user@gpu-box"
 # port = 22

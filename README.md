@@ -95,9 +95,13 @@ More: press `F1`, or see [getting started](docs/help/getting-started.md).
 > default `standard` profile keeps files outside the worktree read-only, apart
 > from carved-back state directories, and leaves `$HOME` readable, including
 > credentials such as `~/.ssh`, `~/.aws` and `~/.config/gh`. The opt-in `sealed`
-> profile hides `$HOME` and disables network access.
+> profile hides `$HOME` and disables network access, but still shares the host's
+> read-write toolchain caches. `standard` is an accident
+> guard, not a boundary against a hostile agent: home is readable, network is
+> direct by default, and the kernel is shared. `sealed` is the hardened tier.
 > `[[plugins]]` extensions are native, unsandboxed processes. See the
-> [sandboxing help page](docs/help/sandboxing.md).
+> [sandboxing help page](docs/help/sandboxing.md) and the
+> [security model](docs/help/sandbox-security-model.md).
 
 ## Mental model
 
@@ -548,8 +552,9 @@ panel, PR) keep working.
   `podman-rootless` → `podman-rootful` → `docker` → `apple` (macOS `container`)
   → `bwrap` → `jobobject` (Windows Job Objects). `apple` and `jobobject` probe
   absent off their respective OSes. There is no host fallback; a launch with
-  no usable backend refuses. `systemd` and `wsl` are also selectable
-  explicitly. Hardening presets: `open`, `standard` (the default: read-only
+  no usable backend refuses. `systemd` is also selectable
+  explicitly; `wsl`, `smol` and `appcontainer` are reserved and never
+  selected. Hardening presets: `open`, `standard` (the default: read-only
   root, credentials readable), and `sealed` (opt-in: no network, read-only
   root, all caps dropped). Set `[sandbox] profile = "sealed"`,
   `[env.<name>.sandbox] profile = "sealed"`, or

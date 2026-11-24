@@ -1386,6 +1386,7 @@ impl<'a> StateRouter<'a> {
 
     /// Attach the audit-only caller label (see [`super::caller`]). Never
     /// consulted for authorization.
+    #[must_use]
     pub fn with_caller(mut self, caller: Option<String>) -> Self {
         self.caller = caller;
         self

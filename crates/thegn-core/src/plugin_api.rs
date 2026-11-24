@@ -662,6 +662,7 @@ impl HostContract {
         }
     }
 
+    #[must_use]
     pub fn with_extension_points(mut self, eps: impl IntoIterator<Item = ExtensionPoint>) -> Self {
         self.available_extension_points.extend(eps);
         self
@@ -670,6 +671,7 @@ impl HostContract {
     /// Install the complete support table for one host build. Only `wired`
     /// rows become negotiable; reserved and separately-owned vocabulary stays
     /// inspectable without accidentally becoming runtime support.
+    #[must_use]
     pub fn with_extension_support(
         mut self,
         rows: impl IntoIterator<Item = ExtensionPointSupport>,
@@ -684,6 +686,7 @@ impl HostContract {
         self
     }
 
+    #[must_use]
     pub fn with_grants(mut self, caps: impl IntoIterator<Item = Capability>) -> Self {
         self.granted_capabilities.extend(caps);
         self
@@ -1200,6 +1203,7 @@ impl PluginRuntime {
         }
     }
 
+    #[must_use]
     pub fn with_host_value(mut self, key: &str, val: serde_json::Value) -> Self {
         self.host_values.insert(key.to_string(), val);
         self

@@ -238,8 +238,8 @@ Credential Manager remains the primary store.
 
 ### Requirement: Container backends are declined on native Windows with the reason
 
-Backend selection SHALL NOT pick an OCI runtime (podman/docker/smol) on
-native Windows even when its CLI is installed and answering: Docker/Podman
+Backend selection SHALL NOT pick an OCI runtime (podman/docker/smol) for a
+local placement on native Windows even when its CLI is installed and answering: Docker/Podman
 Desktop containers are Linux VMs that cannot bind-mount the worktree at its
 real absolute path, which violates the sandbox contract. The decline warning
 MUST name that reason and point at WSL2; the chain then selects `jobobject`
@@ -250,6 +250,12 @@ MUST name that reason and point at WSL2; the chain then selects `jobobject`
 - **WHEN** backend `auto` resolves on native Windows with `docker` on PATH
 - **THEN** docker is skipped with the same-path/WSL2 warning and the
   `jobobject` backend is selected
+
+#### Scenario: Remote placement from a Windows host
+
+- **WHEN** backend `auto` resolves for an ssh placement from a Windows host
+  with podman available on the remote
+- **THEN** podman is selected and no native-Windows decline is reported
 
 ### Requirement: Desktop notifications deliver on Windows
 

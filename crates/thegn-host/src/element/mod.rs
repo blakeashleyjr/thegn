@@ -155,10 +155,12 @@ impl ElementRow {
             hit: None,
         }
     }
+    #[must_use]
     pub fn bg(mut self, bg: Tok) -> Self {
         self.bg = Some(bg);
         self
     }
+    #[must_use]
     pub fn hit(mut self, action: ElementAction) -> Self {
         self.hit = Some(action);
         self
