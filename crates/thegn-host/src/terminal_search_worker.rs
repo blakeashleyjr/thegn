@@ -442,12 +442,17 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
         let wake: WakeFn = Box::new(move || {
-            entered_tx.send(()).ok();
-            release_rx
+            // The test may have stopped listening; that ends the gate early.
+            if entered_tx.send(()).is_err() {
+                return;
+            }
+            // `Ok` is an explicit release, `Err` means the sender was dropped:
+            // both unblock the worker, so the value carries nothing.
+            let released = release_rx
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .recv()
-                .ok();
+                .recv();
+            drop(released);
         });
         (wake, entered_rx, release_tx)
     }
