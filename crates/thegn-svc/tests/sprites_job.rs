@@ -1826,6 +1826,13 @@ fn the_launcher_scrubs_the_environment_and_records_the_recipes_group() {
         "{seen}"
     );
     assert!(
+        seen.contains(&format!(
+            "{}=1\n",
+            thegn_svc::sprites::job::SELECTED_JOB_ENV
+        )),
+        "the recursion marker must reach the recipe: {seen}"
+    );
+    assert!(
         seen.trim_end().ends_with(&checkout.display().to_string()),
         "{seen}"
     );

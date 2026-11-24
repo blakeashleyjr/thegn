@@ -32,6 +32,35 @@ back to local execution.
 - **WHEN** the named runner is unavailable or the captured digest differs
 - **THEN** the route returns a typed refusal before submission
 
+### Requirement: Explicit CLI submission from a configured runner
+
+`thegn job run` SHALL submit one allowlisted recipe (`cargo-build` or
+`cargo-test`) to exactly one runner, named by `--runner` or else by
+`[jobs] runner`, which MUST be an `[env.<name>]` whose provider is `sprites` or
+`vercel`. The command MUST pin the digest of the current worktree's snapshot
+(the digest the executor verifies), MUST NOT accept a free-form command, and
+MUST NOT choose another runner when the named one cannot be built. The runner
+MUST be built from the env's own provider configuration; the provider token
+MUST stay on the submitting host and MUST NOT enter the recipe's environment.
+A missing token, project binding or supported provider MUST fail before any
+snapshot is sent and name what is missing. The command MUST refuse to run when
+`THEGN_SELECTED_JOB` is set, which the executors set in the recipe environment.
+An interrupt SHALL cancel the job through the route's cancel handle. The
+process SHALL exit with the recipe's exit code, `130` for a cancel, `124` for a
+deadline, `128 + n` for signal `n`, and `1` when no outcome was proven.
+
+#### Scenario: Runner cannot be built
+
+- **WHEN** the selected env has no resolvable token, no bound Sprite or Vercel
+  team and project, or an unsupported provider
+- **THEN** the command fails with an error naming the env and the missing
+  setting, and nothing is submitted
+
+#### Scenario: Started inside a selected job
+
+- **WHEN** `thegn job run` runs with `THEGN_SELECTED_JOB` set
+- **THEN** it refuses before reading any configuration or snapshot
+
 ### Requirement: Results identify the submitted operation
 
 The route MUST validate returned runner, recipe and source identity. A successful

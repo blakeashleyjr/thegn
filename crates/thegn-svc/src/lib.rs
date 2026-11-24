@@ -42,6 +42,7 @@ pub mod push;
 pub mod revtunnel;
 pub mod seam;
 pub mod secret;
+pub mod selected_job;
 pub mod sessions;
 pub mod share;
 pub mod snapshot;

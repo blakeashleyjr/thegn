@@ -110,6 +110,7 @@ const OMITTED: &[(&str, &str)] = &[
     ("merge_queue", "merge queue policy is not exposed"),
     ("pr_queue", "PR queue policy is not exposed"),
     ("autopilot", "autopilot policy is not exposed"),
+    ("jobs", "selected job runner is not exposed"),
     ("pipeline", "pipeline definitions are not exposed"),
     ("skills", "skill configuration is not exposed"),
     ("media.mpd.password", "credentials are not exposed"),

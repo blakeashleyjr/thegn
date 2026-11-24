@@ -4895,6 +4895,17 @@ organize_folders = true       # master switch for the folder automation
 queued_folder = "In review"   # file a worktree here when its PR is queued ("" ⇒ don't)
 failed_folder = "Needs attention"  # folder for a PR that needs a human ("" ⇒ leave it be)
 
+# ── Selected job runner ─────────────────────────────────────────────────────
+# `thegn job run <cargo-build|cargo-test>` snapshots the current worktree, pins
+# its digest, and runs the recipe on ONE explicitly selected runner: an
+# [env.<name>] whose provider is "sprites" or "vercel". It uses that env's own
+# token reference, region and project binding (sprites: `id` = the bound Sprite
+# name; vercel: `team_id` + `project_id`); there is no placement fallback and
+# no credential ever reaches the recipe. Empty = none selected (pass
+# `--runner <env>`). `config validate` refuses a name that is not such an env.
+# [jobs]
+# runner = ""
+
 # ── Issue autopilot (opt-in) ────────────────────────────────────────────────
 # Pick up issues returned by the provider's authenticated "my issues" query,
 # hand them to the configured generic coding agent, and bridge a verified

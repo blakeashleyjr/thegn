@@ -5322,6 +5322,7 @@ pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_host_discovery::{
     HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
 };
+pub use crate::config_jobs::JobsConfig;
 pub use crate::config_model_proxy::{
     BudgetBreach, BudgetConfig, BudgetLimit, ModelProviderKind, ModelProxyConfig, ProviderEntry,
     RouteBackend, RouteEntry, RoutingStrategy,
@@ -5512,6 +5513,9 @@ pub struct Config {
     /// Repo-specific values belong in the trusted `[workspace.<slug>.autopilot]`
     /// overlay; repo-root overlays cannot enable this supervisor.
     pub autopilot: AutopilotConfig,
+    /// `[jobs]` — the explicitly selected build/test runner (`thegn job run`):
+    /// an `[env.<name>]` whose provider is `sprites` or `vercel`.
+    pub jobs: JobsConfig,
     /// `[pipeline]` — the declarative `[[pipeline.stages]]` org chart a
     /// supervising agent reads (`thegn config get pipeline --json`) to run a
     /// multi-stage pipeline. **Structure, not judgment**: thegn validates and
@@ -5730,6 +5734,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
             autopilot: AutopilotConfig::default(),
+            jobs: JobsConfig::default(),
             pipeline: Pipeline::default(),
             skills: SkillsConfig::default(),
             replay: ReplayConfig::default(),

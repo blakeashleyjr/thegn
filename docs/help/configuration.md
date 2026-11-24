@@ -194,6 +194,20 @@ commit is opened as `ready` or `draft`; the existing PR queue remains the owner
 of review, CI, and merge. `done_on_merge` updates the matching issue only after
 that queue observes a real merge.
 
+### Selected job runner
+
+`[jobs] runner = "<env name>"` selects where `thegn job run` executes a typed
+build or test recipe. It must name an `[env.<name>]` whose provider is
+`sprites` or `vercel`; `thegn config validate` refuses any other name. It is
+empty by default, and `thegn job run --runner <env>` overrides it for one run.
+The choice is explicit: there is no placement fallback to another runner.
+
+The runner uses that env's own provider settings and token reference. A
+Sprites env needs `id` set to the one Sprite bound to the project (not a
+`{worktree}` template). A Vercel env needs `team_id` and `project_id`, and
+honors `template`, `region` and `size`. The token is resolved on this machine
+and never enters the recipe's environment. See [[cli]] for `thegn job run`.
+
 ## Database migration ownership
 
 The shared state database has a startup-only ownership policy. Its safe default
@@ -606,7 +620,7 @@ silently not applied: `[sandbox]` (and everything nested under it),
 `[forges]`, `[git]`, `[editor]`, `[lsp]`, `[metrics]`, `[notifications]`,
 `[clipboard]`, `[apps]`, `[skills]`, `[tasks]`, `[toolchain]`, `[limits]`,
 `[presets]`, `[profiles]`, `[worktree_templates]`, `[watch]`, `[ci]`,
-`[pr]`, `[issues]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
+`[pr]`, `[issues]`, `[jobs]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
 `[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[lead]`, `[pins]`,
 `[secrets]`, `[credentials]`, `[bundle]`, `[zone.*]`, `[observe]`,
 `[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, `[stats]`, and the

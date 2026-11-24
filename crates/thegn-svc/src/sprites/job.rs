@@ -162,6 +162,11 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(45);
 /// launcher failure is never confused with a recipe that exits 125.
 pub const LAUNCH_FAILED_MARKER: &str = "thegn-job-launch-failed";
 
+/// The marker the launcher sets (to `1`) in the recipe's scrubbed environment so
+/// a `thegn job run` started inside a selected job refuses to recurse. Both
+/// executors' launch scripts set it literally.
+pub const SELECTED_JOB_ENV: &str = "THEGN_SELECTED_JOB";
+
 /// Directory names a snapshot never carries, at any depth: version control,
 /// thegn's own state, and agent/provider/cloud credentials. A directory is
 /// pruned with its whole subtree.
@@ -1728,7 +1733,8 @@ for v in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_pro
     [ -z "$val" ] || set -- "$v=$val" "$@"
 done
 set -- PATH="$PATH" HOME="$home" TMPDIR="$home/tmp" CARGO_HOME="$cache/cargo" \
-    CARGO_TARGET_DIR="$cache/target" RUSTUP_HOME="$rustup_home" LANG=C.UTF-8 "$@"
+    CARGO_TARGET_DIR="$cache/target" RUSTUP_HOME="$rustup_home" LANG=C.UTF-8 \
+    THEGN_SELECTED_JOB=1 "$@"
 exec setsid sh -c 'pidfile=$1; shift
 st=
 getst() { set -- $1; shift 19; st=$1; }

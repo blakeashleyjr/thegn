@@ -27,9 +27,18 @@
 
 ## 3. Follow-up (not this change)
 
-- [ ] 3.1 Terminal and configured-runner adapter that invokes the route.
-      (Blocked on a factory that builds a `SelectedRunner` from provider config.)
-- [ ] 3.2 Config lookup for a project's selected runner and recursion guard.
+- [x] 3.1 Configured-runner adapter that invokes the route: a factory builds
+      the Sprites or Vercel executor from the env's provider config
+      (`thegn-host` `selected_runner`), and `thegn job run [--runner <env>]
+[--deadline <secs>] <cargo-build|cargo-test>` snapshots the worktree,
+      pins the digest, submits through `submit_selected` with Ctrl-C wired to
+      `SelectedCancel`, prints the receipt and exits with the job's exit code.
+      Interception of arbitrary terminal commands stays out of scope (a recipe
+      is chosen by name, never parsed from a command line).
+- [x] 3.2 Config lookup for the selected runner (`[jobs] runner`, validated to
+      name a sprites or vercel env) and the recursion guard (the launchers set
+      `THEGN_SELECTED_JOB=1` in the recipe environment; `job run` refuses when
+      it is set).
 - [ ] 3.3 Argv, cwd, stdio and per-step deadline forwarding.
 
 ## 4. Sprites executor (THE-2417)
@@ -60,10 +69,14 @@
       `reattach` on startup. 4.4-4.6 are runner-level only until this lands.
       Partly done: `SelectedRunner::submit` takes a std-only `SelectedCancel`
       (hooks bridge it to the Sprites `CancelToken`); a cancel before dispatch
-      reads back as `Cancelled` on both executors and mid-run on Sprites. Still
-      open: Vercel mid-run cancel (no `run_cancellable` yet), startup
-      `reconcile_pending`/`reattach` scheduling, and any code that builds the
-      executors from provider config (nothing constructs them outside tests).
+      reads back as `Cancelled` on both executors and mid-run on Sprites. The
+      executors are now built from provider config (task 3.1), and the daemon
+      runs one background `reconcile_pending` pass at start for the configured
+      `[jobs] runner` (Vercel gained a `reconcile_pending` wrapper over its
+      per-attempt `reconcile`; the pass scans only ledgers with unsettled rows,
+      so an idle ledger resolves no secret). Still open: Vercel mid-run cancel
+      (no `run_cancellable` yet), scheduling `reattach` on startup, and
+      reconciling ledgers of envs other than the configured runner.
 - [x] 4.10 Owner lease on non-terminal rows (pid, boot id from
       `/proc/sys/kernel/random/boot_id`, process start time, heartbeat) so
       recovery skips a live owner. Shared `OwnerLease` in `sprites::job`, used
@@ -81,5 +94,5 @@
       still-running process stays unrecovered until that process exits.
 - [ ] 4.7 Run the new cancel, reconcile and reattach tests in
       `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
-- [ ] 4.8 Not in this slice: the credential broker, the CLI verb and a budgeted
-      live run.
+- [ ] 4.8 Not in this slice: the credential broker and a budgeted live run. The
+      CLI verb landed with task 3.1; it has not yet run against a real provider.

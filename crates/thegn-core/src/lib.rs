@@ -72,6 +72,7 @@ pub mod config_git;
 pub mod config_host_discovery;
 pub mod config_inbox;
 pub mod config_issues;
+pub mod config_jobs;
 pub mod config_lead;
 pub mod config_loc;
 pub mod config_media;

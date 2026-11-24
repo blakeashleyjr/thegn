@@ -261,6 +261,8 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("pr_queue.enabled", Live, H::Schedule),
     ("pr_queue.poll_interval_secs", Live, H::Schedule),
     ("autopilot.*", Restart, H::None),
+    // Read when `thegn job run` starts and when the daemon reconciles at start.
+    ("jobs.*", NextUse, H::None),
     ("pipeline.*", NextUse, H::None),
     ("skills.*", NextUse, H::None),
     // Newly spawned panes pick up the reloaded replay settings.

@@ -78,8 +78,8 @@ use super::VercelProvider;
 use super::client::WAIT_COMMAND_DEADLINE;
 use crate::provider::{ProviderFiles, RemoteProvider, STDERR_TAIL_CAP, join_remote};
 pub use crate::sprites::job::{
-    AttemptState, Cleanup, DirSnapshot, OwnerLease, Resume, SnapshotContent, SnapshotSource,
-    root_digest,
+    AttemptState, Cleanup, DirSnapshot, OwnerLease, ReconcileOutcome, Reconciled, Resume,
+    SnapshotContent, SnapshotSource, root_digest,
 };
 use crate::sprites::job::{
     LEASE_HEARTBEAT, Tail, alias_is_valid, attempt_file, attempt_from_file, bound_log,
@@ -169,7 +169,8 @@ for v in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_pro
     [ -z "$val" ] || set -- "$v=$val" "$@"
 done
 exec env -i PATH="$PATH" HOME="$home" TMPDIR="$home/tmp" CARGO_HOME="$home/cargo" \
-    CARGO_TARGET_DIR="$home/target" RUSTUP_HOME="$rustup_home" LANG=C.UTF-8 "$@"
+    CARGO_TARGET_DIR="$home/target" RUSTUP_HOME="$rustup_home" LANG=C.UTF-8 \
+    THEGN_SELECTED_JOB=1 "$@"
 "#;
 
 /// Which project may use which Vercel team and project for selected Jobs.
@@ -1768,6 +1769,58 @@ impl VercelSelectedRunner {
         self.settle(attempt, false).await
     }
 
+    /// [`reconcile`](Self::reconcile) every attempt of this binding that a crash
+    /// left unsettled: terminal rows whose cleanup is still pending, and
+    /// non-terminal rows that are stale (a live owner lease or a younger row is
+    /// skipped here rather than refused). Never dispatches. A row whose
+    /// reconcile fails is logged and reported as still pending, so one broken
+    /// row never hides the others.
+    pub async fn reconcile_pending(&self) -> Result<Vec<Reconciled>> {
+        self.reconcile_pending_at(thegn_core::util::now_ms()).await
+    }
+
+    /// One [`reconcile_pending`](Self::reconcile_pending) pass at `now_ms`.
+    pub async fn reconcile_pending_at(&self, now_ms: i64) -> Result<Vec<Reconciled>> {
+        let store = self.store.clone();
+        let records = tokio::task::spawn_blocking(move || store.records())
+            .await
+            .map_err(|error| anyhow!("ledger task failed: {error}"))??;
+        let mut touched = Vec::new();
+        for record in records {
+            if record.project != self.binding.project()
+                || record.team_id != self.binding.team_id()
+                || record.project_id != self.binding.project_id()
+            {
+                continue;
+            }
+            if record.is_terminal() {
+                if record.cleanup != Cleanup::Pending {
+                    continue;
+                }
+            } else if record.state == AttemptState::Reserved || !self.is_stale(&record, now_ms) {
+                continue;
+            }
+            let attempt = record.attempt;
+            let outcome = match self.reconcile(attempt).await {
+                Ok(settled) if settled.cleanup == Cleanup::Pending => {
+                    ReconcileOutcome::StillPending
+                }
+                Ok(_) => ReconcileOutcome::Cleaned,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "thegn::vercel::job",
+                        attempt,
+                        %error,
+                        "cannot reconcile the pending attempt"
+                    );
+                    ReconcileOutcome::StillPending
+                }
+            };
+            touched.push(Reconciled { attempt, outcome });
+        }
+        Ok(touched)
+    }
+
     async fn settle(&self, attempt: u64, cancel: bool) -> Result<AttemptRecord> {
         let record = self
             .read_attempt(attempt)
@@ -1898,6 +1951,7 @@ mod tests {
         assert!(LAUNCH_SCRIPT.contains(LAUNCH_FAILED_MARKER));
         assert!(!LAUNCH_SCRIPT.contains("VERCEL"));
         assert!(!LAUNCH_SCRIPT.contains(".claude"));
+        assert!(LAUNCH_SCRIPT.contains(crate::sprites::job::SELECTED_JOB_ENV));
     }
 
     #[test]

@@ -124,6 +124,8 @@ const SECURITY_RELEVANT_ROOTS: &[&str] = &[
     // Inbox accounts run commands and carry credential refs (THE-2214).
     "inbox",
     "issues",
+    // Selects the env that executes `thegn job run` recipes remotely.
+    "jobs",
     "lead",
     "lifecycle",
     "limits",
@@ -612,6 +614,7 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     }
     batch!(crate::custom_cmd::validate_commands(&cfg.git_commands));
     batch!(cfg.autopilot.validate("autopilot"));
+    batch!(cfg.jobs.validate("jobs", &cfg.env));
     for (slug, ws) in &cfg.workspace {
         batch!(
             ws.autopilot

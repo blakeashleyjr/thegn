@@ -359,6 +359,14 @@ pub const CATALOG: &[Slot] = &[
         "name",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    // `job run --deadline` is a count of seconds: no enumerable source.
+    slot(
+        "job run",
+        "deadline",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // The recipe is a clap `ValueEnum` (`cargo-build`, `cargo-test`).
+    slot("job run", "recipe", SourceKind::Structural),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),
@@ -622,6 +630,7 @@ pub const CATALOG: &[Slot] = &[
     slot("env test", "name", SourceKind::Env),
     slot("fleet list", "env", SourceKind::Env),
     slot("fleet inspect", "env", SourceKind::Env),
+    slot("job run", "runner", SourceKind::Env),
     slot("wt new", "env", SourceKind::Env),
     // --- profile (`[profiles.<name>]`) -------------------------------------
     // A `global = true` arg: classified once at the root, and clap propagates
