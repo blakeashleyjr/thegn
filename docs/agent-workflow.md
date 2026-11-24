@@ -42,7 +42,7 @@ Save reusable decisions with a searchable `thegn` and issue or capability in the
 
 ## Measure accepted work
 
-The [baseline CSV](audits/agent-workflow-baseline.csv) contains ten issues with passing reviews on the main branch. It counts the available Codex sessions whose working directory belonged to the issue-named worktree. The ten rows cover 134 distinct sessions. Each contributes its final cumulative input count minus cached input. The sample covers those Codex worktrees only. Historical transcripts and review records do not consistently establish the first passing focused test time or combined-tree repair rounds. Those fields are blank.
+The baseline CSV (kept out of the public repository) contains ten issues with passing reviews on the main branch. It counts the available Codex sessions whose working directory belonged to the issue-named worktree. The ten rows cover 134 distinct sessions. Each contributes its final cumulative input count minus cached input. The sample covers those Codex worktrees only. Historical transcripts and review records do not consistently establish the first passing focused test time or combined-tree repair rounds. Those fields are blank.
 
 At the start of the next comparable pipeline issues, record the start timestamp and session IDs in the existing dispatch notes. At the first passing focused test, record the timestamp and command. At acceptance, record the evidence commit or review path and count combined-tree fix-and-retest rounds. Include every issue-attributed session using the same harness and worktree scope. For a dedicated set of Codex rollouts, calculate uncached input with:
 
