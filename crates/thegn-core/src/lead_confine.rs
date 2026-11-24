@@ -179,7 +179,11 @@ pub fn rule(verb: Verb) -> Rule {
 
         // Shape-checked. `sessions.input` is further held, in the daemon, to
         // sessions a Lead opened.
-        Verb::OpenSession | Verb::DispatchesPut | Verb::SendInput => Rule::AllowIf,
+        // `agent.dispatch` is MCP-local orchestration, but its launch still
+        // crosses the ordinary confined `sessions.open` boundary.
+        Verb::OpenSession | Verb::DispatchesPut | Verb::AgentDispatch | Verb::SendInput => {
+            Rule::AllowIf
+        }
         // b155 (6d): outward tracker writes go through the daemon's
         // `issues_*_confined` path, which needs an owner approval per call.
         // (THE-2222): a profile's env is returned only for the Lead's own
@@ -609,6 +613,7 @@ mod tests {
         (Verb::IssuesComment, AllowIf),
         (Verb::DispatchesList, Allow),
         (Verb::DispatchesPut, AllowIf),
+        (Verb::AgentDispatch, AllowIf),
         (Verb::DispatchesSetStatus, Allow),
         (Verb::DispatchesVerify, Allow),
         (Verb::DispatchesWait, Allow),

@@ -885,6 +885,62 @@ async fn fetch_state(
             let info = c.open(&spec).await.map_err(|e| e.to_string())?;
             serde_json::to_value(&info).map_err(|e| e.to_string())
         }
+        "agent.dispatch" => {
+            let agent = str_arg(args, "agent").ok_or("missing `agent`")?;
+            let worktree = str_arg(args, "worktree").ok_or("missing `worktree`")?;
+            let issue_id = str_arg(args, "issue_id").ok_or("missing `issue_id`")?;
+            let prompt = str_arg(args, "prompt").ok_or("missing `prompt`")?;
+            let stage = str_arg(args, "stage");
+
+            // Keep the MCP door on the CLI's offline admission and shared
+            // open path: a bad identity, an unknown stage or a blank task is
+            // not a daemon problem, so it is refused without consulting the
+            // daemon (and before any session or roster row exists). The daemon
+            // still resolves harness, model, env, permissions, credentials and
+            // isolation from trusted config.
+            super::session::open_preflight(
+                cfg,
+                stage,
+                None,
+                Some(issue_id),
+                Some(worktree),
+                prompt,
+                true,
+            )
+            .map_err(|e| e.to_string())?;
+            if let Some(stage) = stage {
+                super::session::policy_admission(cfg, agent, stage).map_err(|e| e.to_string())?;
+            }
+            let started = std::time::Instant::now();
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let (info, dispatch_id) = super::session::open_plain(
+                cfg,
+                &c,
+                super::session::PlainOpen {
+                    agent: Some(agent.to_string()),
+                    stage: stage.map(str::to_string),
+                    worktree: Some(worktree.to_string()),
+                    prompt: prompt.to_string(),
+                    headless: true,
+                    bind: false,
+                    adopt: false,
+                    track: Some(issue_id),
+                    permissions: Vec::new(),
+                    widen_permissions: false,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let elapsed_ms = started.elapsed().as_millis();
+            Ok(json!({
+                "status": "running",
+                "session_id": info.id,
+                "dispatch_id": dispatch_id,
+                "final_message": null,
+                "duration_ms": thegn_core::time_policy::saturating_i64(elapsed_ms),
+                "exit_status": null,
+            }))
+        }
         "sessions.fork" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let spec = thegn_svc::control::ForkSpec {
@@ -1957,5 +2013,26 @@ api_key = "mcp-token-sentinel-9e0"
         assert!(calendar.contains("khal-thegn"), "{calendar}");
         assert!(calendar.contains("KHAL_AUTH"), "{calendar}");
         assert!(token.contains(thegn_core::redact::PLACEHOLDER), "{token}");
+    }
+
+    #[tokio::test]
+    async fn agent_dispatch_refuses_a_malformed_identity_before_the_daemon() {
+        // The offline-admission contract: a bad dispatch identity is not a
+        // daemon problem, so the MCP door refuses it without consulting the
+        // daemon — and therefore before any session or roster row exists.
+        let err = super::fetch_state(
+            &thegn_core::config::Config::default(),
+            "agent.dispatch",
+            &serde_json::json!({
+                "agent": "worker",
+                "worktree": "/tmp/not-a-worktree",
+                "issue_id": "linear:THE 2586",
+                "prompt": "private task text"
+            }),
+        )
+        .await
+        .expect_err("a malformed identity must be refused");
+        assert!(err.contains("invalid pipeline issue id"), "got {err}");
+        assert!(!err.contains("private task text"), "got {err}");
     }
 }

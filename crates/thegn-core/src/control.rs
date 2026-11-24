@@ -426,6 +426,8 @@ pub enum Verb {
     DispatchesList,
     /// Record a new dispatch on the roster.
     DispatchesPut,
+    /// Launch and durably track one configured worker through the native agent path.
+    AgentDispatch,
     /// Advance a dispatch's status on the roster.
     DispatchesSetStatus,
     /// Report whether a roster row's handoff artifact is real — exists in the
@@ -610,6 +612,7 @@ impl Verb {
         Verb::IssuesComment,
         Verb::DispatchesList,
         Verb::DispatchesPut,
+        Verb::AgentDispatch,
         Verb::DispatchesSetStatus,
         Verb::DispatchesVerify,
         Verb::DispatchesWait,
@@ -747,6 +750,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::IssuesUpdate
         | Verb::IssuesComment
         | Verb::DispatchesPut
+        | Verb::AgentDispatch
         | Verb::DispatchesSetStatus
         | Verb::DispatchesReport
         | Verb::DispatchesNote
@@ -1243,6 +1247,7 @@ mod tests {
             IssuesUpdate,
             IssuesComment,
             DispatchesPut,
+            AgentDispatch,
             DispatchesSetStatus,
             DispatchesReport,
             DispatchesNote,

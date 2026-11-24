@@ -722,6 +722,42 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "agent.dispatch",
+        description: "Launch one configured agent headlessly in an existing isolated worktree and durably track it against a real issue identity. Uses the same native launch, sandbox, environment, credential and roster path as `thegn agent run --track`; no argv or caller environment. Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "agent",
+                kind: ArgKind::String,
+                required: true,
+                description: "Configured [[agents]] entry or registered harness id",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: true,
+                description: "Absolute path of the isolated worktree to launch in",
+            },
+            ArgSpec {
+                name: "issue_id",
+                kind: ArgKind::String,
+                required: true,
+                description: "Caller-supplied tracker identity such as linear:THE-123; thegn validates its canonical syntax and does not invent one",
+            },
+            ArgSpec {
+                name: "prompt",
+                kind: ArgKind::String,
+                required: true,
+                description: "Non-empty first-turn task",
+            },
+            ArgSpec {
+                name: "stage",
+                kind: ArgKind::String,
+                required: false,
+                description: "Name of a configured `[[pipeline.stages]]` entry supplying model, environment and permission policy",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "sessions.fork",
         description: "Fork a live daemon or recorded harness session into a new process. \
                       The source is never paused or cloned; a recorded source uses only \
@@ -1322,6 +1358,7 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "agent.sessions",
     "sessions.wait",
     "sessions.open",
+    "agent.dispatch",
     "sessions.fork",
     "sessions.input",
     "sessions.kill",
@@ -1662,10 +1699,11 @@ fn text_digest(text: &str) -> String {
 
 /// Redact a mutating tool call's arguments for the audit log: any value that
 /// can carry a secret (terminal input bytes, launch environment variables)
-/// becomes a non-reversible size descriptor rather than being omitted — the
-/// log still shows *that* a value was present and roughly how large it was,
-/// never its content. Every other field survives unredacted: they name what
-/// ran and where, not a secret.
+/// becomes a non-reversible size descriptor, and free text (an issue comment
+/// body, a dispatch task) becomes a length-and-digest marker, rather than
+/// being omitted — the log still shows *that* a value was present and roughly
+/// how large it was, never its content. Every other field survives unredacted:
+/// they name what ran and where, not a secret.
 pub fn redact_for_audit(cap: &str, args: &Value) -> Value {
     let Value::Object(obj) = args else {
         return args.clone();
@@ -1687,6 +1725,12 @@ pub fn redact_for_audit(cap: &str, args: &Value) -> Value {
             if let Some(v) = out.get("body").and_then(Value::as_str) {
                 let digest = text_digest(v);
                 out.insert("body".to_string(), json!(digest));
+            }
+        }
+        "agent.dispatch" => {
+            if let Some(v) = out.get("prompt").and_then(Value::as_str) {
+                let digest = text_digest(v);
+                out.insert("prompt".to_string(), json!(digest));
             }
         }
         "sessions.open" | "sessions.split" => {
@@ -2400,6 +2444,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_dispatch_is_write_scoped_and_redacts_the_task() {
+        let denied = StateRouter::new(vec!["issues.list"], |_, _| -> Result<Value, String> {
+            panic!("a denied dispatch must not reach fetch")
+        });
+        let args = json!({
+            "agent": "worker",
+            "worktree": "/w",
+            "issue_id": "linear:THE-123",
+            "prompt": "private task text",
+            "stage": "code"
+        });
+        let (code, message) = denied.call("agent_dispatch", &args).unwrap().unwrap_err();
+        assert_eq!(code, -32001);
+        assert!(message.contains("--scopes write"), "{message}");
+        assert_eq!(scope_of(lookup("agent.dispatch").unwrap()), Scope::Write);
+
+        let redacted = redact_for_audit("agent.dispatch", &args);
+        let task = redacted["prompt"].as_str().unwrap();
+        assert_eq!(task, text_digest("private task text"));
+        assert!(!task.contains("private task text"), "{task}");
+        assert_eq!(redacted["agent"], args["agent"]);
+        assert_eq!(redacted["stage"], args["stage"]);
+    }
+
+    #[test]
     fn issues_update_and_comment_are_write_scoped_and_advertised_only_when_allowed() {
         let r = StateRouter::new(vec!["issues.list"], |_, _| Ok(json!(null)));
         let names: Vec<String> = r
@@ -2733,6 +2802,7 @@ mod tests {
             "worktrees.open",
             "dispatches.put",
             "dispatches.set_status",
+            "agent.dispatch",
             "issues.update",
             "issues.comment",
             "notifications.ack",
