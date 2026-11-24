@@ -7953,6 +7953,10 @@ async fn event_loop<T: Terminal>(
     let _file_index_gen: u64 = 0;
     // Search overlay state: lives here so it survives across loop iterations.
     let mut search: Option<crate::search::SearchOverlay> = None;
+    // The hits of the search that was just activated: `n`/`N` step through them
+    // after the overlay closes, and the mark lasts only until the next key or
+    // scroll (THE-2242).
+    let mut search_walk: Option<crate::search::SearchWalk> = None;
     // Time-travel replay: a modal overlay (sibling of `search`) that scrubs the
     // focused pane's recording, plus the playback clock (a thread that pulses the
     // waker only while playing, otherwise parked — zero idle wakeups).
@@ -10472,6 +10476,7 @@ async fn event_loop<T: Terminal>(
                 drawer == Some(sp) || tree.layout(chrome.center).iter().any(|(id, _)| *id == sp);
             if crate::copymode::selection_is_stale(sel_size_before, size_after, visible) {
                 mouse_sel = None;
+                search_walk = None;
                 mouse_selecting = false;
                 dirty = true;
             }
@@ -12559,7 +12564,14 @@ async fn event_loop<T: Terminal>(
         // An Enter pressed before the first batch landed resolves here, once the
         // best hit (or an empty answer) is in.
         if let Some(outcome) = search.as_mut().and_then(|o| o.take_ready()) {
+            let walk = match &outcome {
+                crate::search::SearchOutcome::Jump(_) => search
+                    .as_ref()
+                    .and_then(|o| crate::search::SearchWalk::from_overlay(o)),
+                _ => None,
+            };
             search = None;
+            search_walk = walk;
             if let crate::search::SearchOutcome::Jump(m) = outcome {
                 let jump = crate::search_sources::apply_search_jump(
                     m,
@@ -18158,6 +18170,12 @@ async fn event_loop<T: Terminal>(
                 if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
                     let up = m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE);
                     if let Some((id, _)) = hit_pane {
+                        // A wheel scroll ends a search walk and its mark (the
+                        // next key would have done the same).
+                        if search_walk.take().is_some() {
+                            mouse_sel = None;
+                            search_sel_after_switch = None;
+                        }
                         // Coalesce all same-direction wheel ticks that are
                         // already queued: one render pass for the whole
                         // gesture, never one render per tick.
@@ -18416,6 +18434,7 @@ async fn event_loop<T: Terminal>(
                         need_relayout = true;
                     }
                     mouse_sel = None;
+                    search_walk = None;
                     if let Some((id, content)) = hit_pane {
                         // Interacting with the terminal clears selections
                         // everywhere else (sidebar marks included).
@@ -20099,10 +20118,50 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                // Typing clears any lingering mouse selection highlight.
+                // Typing clears any lingering selection highlight and ends the
+                // search walk. `n`/`N` are the exception: they step the walk to
+                // the next/previous hit and move the mark with it (THE-2242).
+                let search_step = search.is_none()
+                    && search_replace.is_none()
+                    && search_walk.is_some()
+                    && matches!(k.key, KeyCode::Char('n') | KeyCode::Char('N'))
+                    && (k.modifiers.is_empty() || k.modifiers == Modifiers::SHIFT);
                 if mouse_sel.take().is_some() {
                     dirty = true;
                 }
+                if search_sel_after_switch.take().is_some() {
+                    dirty = true;
+                }
+                if search_step {
+                    let forward = match k.key {
+                        KeyCode::Char('n') => !k.modifiers.contains(Modifiers::SHIFT),
+                        KeyCode::Char('N') => false,
+                        _ => true,
+                    };
+                    if let Some(walk) = search_walk.as_mut() {
+                        let (m, position, total) = walk.step(forward);
+                        let jump = crate::search_sources::apply_search_jump(
+                            m,
+                            &mut session,
+                            &mut panes,
+                            &mut focus,
+                            &mut model,
+                            &mut sb,
+                            &mut need_relayout,
+                        );
+                        if jump.switched_group {
+                            search_sel_after_switch = jump.highlight;
+                        } else {
+                            mouse_sel = jump.highlight;
+                        }
+                        if jump.highlight.is_some() {
+                            model.status = format!("search: match {position} of {total}");
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
+                search_walk = None;
                 // Top-level app tabs. Switch chords (Alt+1 = work, Alt+2.. =
                 // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
                 // focused it owns every other key (its own quit returns here).
@@ -21891,6 +21950,7 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         crate::search::SearchOutcome::Rescope(scope) => {
+                            search_walk = None;
                             let srcs = crate::search_sources::build_search_sources(
                                 scope, &session, &panes, focused,
                             );
@@ -21905,10 +21965,12 @@ async fn event_loop<T: Terminal>(
                         }
                         crate::search::SearchOutcome::Dismiss => {
                             search = None;
+                            search_walk = None;
                             dirty = true;
                             continue;
                         }
                         crate::search::SearchOutcome::Jump(m) => {
+                            search_walk = crate::search::SearchWalk::from_overlay(ov);
                             search = None;
                             let jump = crate::search_sources::apply_search_jump(
                                 m,

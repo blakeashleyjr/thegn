@@ -779,6 +779,47 @@ impl SearchOverlay {
     }
 }
 
+/// The hits of the search that was just activated, kept after the overlay closes
+/// so `n`/`N` can step through them. The mark lives only as long as the walk:
+/// the next key (or a scroll) ends it.
+#[derive(Debug)]
+pub(crate) struct SearchWalk {
+    matches: Vec<SearchMatch>,
+    index: usize,
+}
+
+impl SearchWalk {
+    /// Take the overlay's ranked hits, starting at the one Enter jumped to.
+    /// None when there is nothing to step through.
+    pub(crate) fn from_overlay(overlay: &SearchOverlay) -> Option<Self> {
+        let matches = overlay.engine.matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let index = overlay.engine.selected_idx().min(matches.len() - 1);
+        Some(Self {
+            matches: matches.to_vec(),
+            index,
+        })
+    }
+
+    /// Step to the next (`forward`) or previous hit, wrapping at either end.
+    /// Returns the hit to jump to and its 1-based position out of the total.
+    pub(crate) fn step(&mut self, forward: bool) -> (SearchMatch, usize, usize) {
+        let len = self.matches.len();
+        self.index = if forward {
+            (self.index + 1) % len
+        } else {
+            (self.index + len - 1) % len
+        };
+        (
+            self.matches[self.index].clone(),
+            self.index + 1,
+            self.matches.len(),
+        )
+    }
+}
+
 fn is_escape(key: &KeyCode, mods: Modifiers) -> bool {
     // `is_escape_key` matches both `KeyCode::Escape` and the
     // `KeyCode::Char('\x1b')` that CSI-u/fixterms terminals report for the
@@ -1050,6 +1091,42 @@ mod tests {
         if let SearchOutcome::Jump(m) = r {
             assert!(m.line.contains('c'));
         }
+    }
+
+    #[test]
+    fn search_walk_steps_forward_and_back_with_wrap() {
+        let buf = buf_from(&["hit one", "other", "hit two", "hit three"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "hit", &srcs);
+        assert_eq!(ov.engine().matches().len(), 3);
+
+        let first = ov.engine().selected().expect("selected hit").clone();
+        let mut walk = SearchWalk::from_overlay(&ov).expect("walkable results");
+
+        let (second, position, total) = walk.step(true);
+        assert_eq!((position, total), (2, 3));
+        let (third, position, _) = walk.step(true);
+        assert_eq!(position, 3);
+        let (wrapped, position, _) = walk.step(true);
+        assert_eq!(position, 1);
+        assert_eq!(wrapped, first, "forward step wraps to the first hit");
+
+        let (back, position, _) = walk.step(false);
+        assert_eq!(position, 3);
+        assert_eq!(back, third, "backward step wraps to the last hit");
+        assert_ne!(second, first);
+        assert_ne!(third, second);
+    }
+
+    #[test]
+    fn search_walk_is_none_without_hits() {
+        let buf = buf_from(&["cargo build"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "zzzz", &srcs);
+        assert!(ov.engine().matches().is_empty());
+        assert!(SearchWalk::from_overlay(&ov).is_none());
     }
 
     #[test]

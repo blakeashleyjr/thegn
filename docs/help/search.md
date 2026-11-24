@@ -35,9 +35,12 @@ Identical lines from one pane are grouped into a single row, and `↵` goes to
 the newest of them.
 
 `↵` scrolls the pane to the exact grid line when the terminal emulator still
-holds it. When the line has already scrolled out of the emulator's grid, the
-status line says so and points you to replay (`Alt r`), which has the full
-history.
+holds it and highlights the match. The mark stays until the next key or a
+scroll. `n` and `N` step to the next and previous hit without reopening the
+overlay; the status line shows which match you are on. When the line has
+already scrolled out of the emulator's grid, or came from a full-screen app,
+the status line says so and points you to replay (`Alt r`), which has the full
+history, instead of scrolling to an unrelated line.
 
 Matching is **literal** by default: the query is a substring, case-insensitive
 unless it contains an uppercase letter (smart case). Hits are ranked by match

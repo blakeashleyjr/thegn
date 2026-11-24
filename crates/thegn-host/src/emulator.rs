@@ -705,13 +705,17 @@ impl PaneEmulator for AlacrittyEmulator {
         let mut current_top = 0i32;
         let mut current_rows = 0u16;
         let mut best: Option<(usize, i32, u16, usize)> = None;
+        let mut logical_lines_from_bottom = 0usize;
 
-        let mut consider = |logical: String, top: i32, rows: u16| {
+        let mut consider = |logical: String, top: i32, rows: u16, from_bottom: usize| {
             if logical.trim_end_matches(' ') != target {
                 return;
             }
             let offset = if top < 0 { (-top) as usize } else { 0 };
-            let distance = offset.abs_diff(hint_from_bottom);
+            // SearchMatch::from_tail counts logical history lines. `offset`
+            // counts physical grid rows, which diverge when preceding output
+            // wraps; use the logical line ordinal to resolve duplicate text.
+            let distance = from_bottom.abs_diff(hint_from_bottom);
             if best.is_none_or(|(_, _, _, best_distance)| distance < best_distance) {
                 best = Some((offset, top, rows, distance));
             }
@@ -739,7 +743,13 @@ impl PaneEmulator for AlacrittyEmulator {
                     current_rows = current_rows.saturating_add(1);
                 }
                 Some(logical) => {
-                    consider(logical, current_top, current_rows);
+                    consider(
+                        logical,
+                        current_top,
+                        current_rows,
+                        logical_lines_from_bottom,
+                    );
+                    logical_lines_from_bottom = logical_lines_from_bottom.saturating_add(1);
                     current = Some(segment);
                     current_top = line_no;
                     current_rows = 1;
@@ -753,7 +763,12 @@ impl PaneEmulator for AlacrittyEmulator {
         }
 
         if let Some(logical) = current {
-            consider(logical, current_top, current_rows);
+            consider(
+                logical,
+                current_top,
+                current_rows,
+                logical_lines_from_bottom,
+            );
         }
 
         best.map(|(offset, top, rows, _)| {
@@ -1124,6 +1139,28 @@ mod tests {
             .locate_line("needle", usize::MAX)
             .expect("oldest occurrence");
         assert!(newest < oldest, "hint should select the nearer occurrence");
+    }
+
+    #[test]
+    fn locate_line_uses_logical_distance_when_duplicate_lines_cross_wrapped_output() {
+        let mut e = AlacrittyEmulator::new(5, 10, 100);
+        e.advance(b"needle\r\nbetween\r\n");
+        e.advance(format!("{}\r\n", "w".repeat(80)).as_bytes());
+        e.advance(b"needle\r\ntail-a\r\ntail-b\r\ntail-c\r\n");
+
+        let newest = e.locate_line_span("needle", 0).expect("newest occurrence");
+        let oldest = e
+            .locate_line_span("needle", usize::MAX)
+            .expect("oldest occurrence");
+        let selected = e
+            .locate_line_span("needle", 6)
+            .expect("occurrence at logical distance six");
+
+        assert_ne!(newest.1, oldest.1, "fixture has two distinct matches");
+        assert_eq!(
+            selected.1, oldest.1,
+            "the logical tail hint selects the older match despite wrapped rows"
+        );
     }
 
     #[test]
