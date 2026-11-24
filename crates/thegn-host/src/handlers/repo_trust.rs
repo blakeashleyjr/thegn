@@ -175,7 +175,7 @@ pub(crate) fn resolve_env_trusted(
     ) {
         pending.push(request);
     }
-    surface(&db, &root_s, worktree, &resolved.events, &pending);
+    surface(db, &root_s, worktree, &resolved.events, &pending);
     // Fold a repo `devcontainer.json` onto the resolved sandbox, trust-gated
     // exactly like the `.thegn.toml` overlay above. The worktree is bind-
     // mounted at its real path, so the devcontainer's workspace folder is that
@@ -185,7 +185,7 @@ pub(crate) fn resolve_env_trusted(
     } else {
         None
     };
-    apply_zone(&db, cfg, worktree, &mut env);
+    apply_zone(db, cfg, worktree, &mut env);
     Ok(TrustedEnvironment {
         environment: env,
         devcontainer,
@@ -268,7 +268,7 @@ fn overlay_devcontainer(
     for w in &outcome.warnings {
         tracing::warn!(target: "thegn::config_trust", "{w}");
     }
-    surface(&db, &root_s, worktree, &[], &outcome.pending);
+    surface(db, &root_s, worktree, &[], &outcome.pending);
     for key in &outcome.substitution.blocked_local_env {
         tracing::warn!(
             target: "thegn::config_trust",

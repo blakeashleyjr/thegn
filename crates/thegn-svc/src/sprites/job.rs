@@ -1086,7 +1086,9 @@ impl AttemptStore {
             // A hard link is the portable no-replace publish.
             let published =
                 std::fs::hard_link(registry.path().join(&temp), registry.path().join(&name));
-            let _ = registry.remove_file(&temp);
+            if let Err(error) = registry.remove_file(&temp) {
+                tracing::debug!(%error, "sprites job ledger: temp claim cleanup failed");
+            }
             match published {
                 Ok(()) => return Ok(None),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

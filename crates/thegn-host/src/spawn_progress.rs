@@ -384,10 +384,10 @@ pub(crate) fn derive_hints(
         if pane.output_stamps().0.is_some() {
             return false;
         }
-        if leaves.contains(&pane_id) {
-            if let Some(block) = tracker.block(Some(pane.program()), now) {
-                hints.insert(pane_id, block);
-            }
+        if leaves.contains(&pane_id)
+            && let Some(block) = tracker.block(Some(pane.program()), now)
+        {
+            hints.insert(pane_id, block);
         }
         true
     });
@@ -401,10 +401,11 @@ pub(crate) fn derive_hints(
             return false;
         }
         let displayed = tab_key.is_some_and(|(g, t)| g == group && t == tab);
-        if displayed && leaves.contains(leaf) {
-            if let Some(block) = tracker.block(None, now) {
-                hints.insert(*leaf, block);
-            }
+        if displayed
+            && leaves.contains(leaf)
+            && let Some(block) = tracker.block(None, now)
+        {
+            hints.insert(*leaf, block);
         }
         true
     });

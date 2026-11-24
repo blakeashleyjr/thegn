@@ -1236,6 +1236,7 @@ impl Panes {
     /// is that worktree's `worktrees.agent` row, read off-thread with the specs
     /// ([`crate::handlers::provision::remembered_agent_row`]): a state-DB read,
     /// so this loop must not make it — it used to open the DB once per leaf.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize_with_specs(
         &mut self,
@@ -1426,9 +1427,9 @@ impl Panes {
             let remembered_agent = if !provider_envs || worktree.is_empty() {
                 None
             } else {
-                remembered_agent.filter(|c| cfg.tool_command(*c).is_none())
+                remembered_agent.filter(|c| cfg.tool_command(c).is_none())
             };
-            let native_attempt = match remembered_agent.as_deref() {
+            let native_attempt = match remembered_agent {
                 Some(choice) => {
                     match crate::agent::native_agent_exec_for_pane(cfg, worktree, choice) {
                         ready @ crate::agent::PaneNativeExec::Ready(_) => ready,
@@ -1446,7 +1447,6 @@ impl Panes {
             let native = match native_restore_action(native_attempt) {
                 NativeRestoreAction::UseNative(n) => {
                     let program = remembered_agent
-                        .as_deref()
                         .and_then(|choice| {
                             cfg.agent_command(choice)
                                 .map(|cmd| crate::pane::agent_program_name(cmd, choice))

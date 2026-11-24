@@ -203,10 +203,10 @@ fn walk_descendants(
             break;
         }
         found.push((pid, depth));
-        if depth < DESCENDANT_MAX_DEPTH {
-            if let Some(kids) = children(pid) {
-                queue.extend(kids.into_iter().map(|kid| (kid, depth + 1)));
-            }
+        if depth < DESCENDANT_MAX_DEPTH
+            && let Some(kids) = children(pid)
+        {
+            queue.extend(kids.into_iter().map(|kid| (kid, depth + 1)));
         }
     }
     found
