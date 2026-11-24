@@ -1533,6 +1533,10 @@ impl VercelSelectedRunner {
     /// hashed, delete the sandbox, and build the receipt. Every exit from
     /// [`run`](Self::run) after the dispatch fence goes through here, so no path
     /// can forget the ledger.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the single terminal path takes the whole attempt context; bundling it would only rename these"
+    )]
     async fn conclude(
         &self,
         mut record: AttemptRecord,

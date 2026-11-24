@@ -808,6 +808,7 @@ impl OwnerLease {
     }
 
     /// The same lease with its heartbeat moved to `now_ms`.
+    #[must_use]
     pub fn refreshed(&self, now_ms: i64) -> Self {
         Self {
             heartbeat_ms: now_ms,
