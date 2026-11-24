@@ -12556,6 +12556,28 @@ async fn event_loop<T: Terminal>(
         {
             dirty = true;
         }
+        // An Enter pressed before the first batch landed resolves here, once the
+        // best hit (or an empty answer) is in.
+        if let Some(outcome) = search.as_mut().and_then(|o| o.take_ready()) {
+            search = None;
+            if let crate::search::SearchOutcome::Jump(m) = outcome {
+                let jump = crate::search_sources::apply_search_jump(
+                    m,
+                    &mut session,
+                    &mut panes,
+                    &mut focus,
+                    &mut model,
+                    &mut sb,
+                    &mut need_relayout,
+                );
+                if jump.switched_group {
+                    search_sel_after_switch = jump.highlight;
+                } else {
+                    mouse_sel = jump.highlight;
+                }
+            }
+            dirty = true;
+        }
 
         let mut pending_focus: Option<thegn_core::store::IntentRow> = None;
         // `open --preset` mailbox rows, applied right after the focus intent.

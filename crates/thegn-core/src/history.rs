@@ -12,6 +12,7 @@
 //! boundaries within a line).
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 // ── ANSI stripping ────────────────────────────────────────────────────────────
 
@@ -290,7 +291,9 @@ impl AnsiStripper {
 /// synchronously in the PTY-output drain path).
 #[derive(Clone)]
 pub struct HistoryBuffer {
-    lines: VecDeque<String>,
+    /// `Arc<str>` so cloning a buffer (the search snapshot) bumps one refcount
+    /// per line instead of copying every line's bytes.
+    lines: VecDeque<Arc<str>>,
     capacity: usize,
     /// Monotonically increasing count of all lines ever pushed (even after eviction).
     total: u64,
@@ -313,7 +316,7 @@ impl HistoryBuffer {
         if self.lines.len() >= self.capacity {
             self.lines.pop_front();
         }
-        self.lines.push_back(line);
+        self.lines.push_back(Arc::from(line));
         self.total += 1;
     }
 
@@ -325,14 +328,14 @@ impl HistoryBuffer {
             return false;
         }
         let index = self.lines.len() - k;
-        self.lines[index] = line;
+        self.lines[index] = Arc::from(line);
         self.total += 1;
         true
     }
 
     /// Iterate lines oldest-first.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.lines.iter().map(String::as_str)
+        self.lines.iter().map(|line| &**line)
     }
 
     /// Lines currently stored (≤ capacity).
@@ -353,7 +356,7 @@ impl HistoryBuffer {
     /// The `idx`-th stored line (0 = oldest surviving). Returns `None` if out
     /// of range.
     pub fn get(&self, idx: usize) -> Option<&str> {
-        self.lines.get(idx).map(String::as_str)
+        self.lines.get(idx).map(|line| &**line)
     }
 
     /// Capacity (max lines stored at once).

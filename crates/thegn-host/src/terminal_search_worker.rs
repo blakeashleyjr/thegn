@@ -8,31 +8,32 @@
 //! `TerminalSearchWorker` owns one parked thread that does the scoring. The loop
 //! hands it a *snapshot* of the in-scope histories plus the query, mode and
 //! options, and receives results back in bounded batches; each delivery pulses
-//! the loop through the terminal's [`TerminalWaker`], the same wake path every
-//! other off-loop producer uses (openspec `event-loop`).
+//! the loop through the wake callback (the terminal's `TerminalWaker`, the same
+//! wake path every other off-loop producer uses, openspec `event-loop`).
 //!
 //! The rules that keep the loop honest:
 //!
-//! - **Latest request wins.** Each submit bumps a generation. The worker drops a
-//!   request it has not started and abandons a scan in flight at its next
-//!   cancellation poll. Results carry their generation, so a batch produced just
-//!   before a newer keystroke is discarded on the loop side instead of landing
-//!   in the newer query's list.
+//! - **Latest request wins.** Each submit bumps a generation and stamps it into
+//!   the request under the same lock that queues it. The worker drops a request
+//!   it has not started and abandons a scan in flight at its next cancellation
+//!   poll. It tags results with the generation *of the request it scored*, never
+//!   with a freshly loaded one, so a batch produced just before a newer
+//!   keystroke can never be mistaken for the newer query's answer.
 //! - **The loop never waits on the worker.** `drain` only ever does a
 //!   `try_recv`; the bounded channel is backpressure for the *worker*.
 //! - **The loop touches no history.** Scoring reads the snapshot, never the
 //!   live buffers.
-//! - **Nothing is copied per keystroke.** A pane's history is snapshotted once
-//!   and reused, as the same `Arc`, until that pane's history changes.
+//! - **Snapshots are cheap.** A history buffer stores `Arc<str>` lines, so
+//!   snapshotting a changed pane bumps one refcount per line (no string copy),
+//!   and a pane whose history did not change is reused as the same `Arc`.
 //! - **Nothing runs while the overlay is closed.** The worker is parked in a
 //!   condvar wait when idle, and dropping it invalidates the generation and
 //!   wakes the thread so it exits.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-
-use termwiz::terminal::TerminalWaker;
 
 use thegn_core::history::HistoryBuffer;
 use thegn_core::search::{
@@ -55,59 +56,41 @@ pub(crate) struct SourceSnapshot {
     pub(crate) history: HistoryBuffer,
 }
 
+impl SourceSnapshot {
+    /// True when this snapshot still describes `history` exactly: same pane,
+    /// same label, same line count and same write count (a rewrite of a line
+    /// bumps the write count, so an in-place edit is not missed).
+    fn matches(&self, id: u32, label: &str, history: &HistoryBuffer) -> bool {
+        self.id == id
+            && self.label == label
+            && self.history.len() == history.len()
+            && self.history.total_pushed() == history.total_pushed()
+    }
+}
+
 /// The overlay's snapshot of every pane in scope. One `Arc` per pane, so an
 /// unchanged pane is shared across keystrokes instead of re-copied.
 pub(crate) type SnapshotSources = Vec<Arc<SourceSnapshot>>;
 
-/// Identity of one pane's history: a change means the snapshot must be rebuilt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SnapshotKey {
-    id: u32,
-    label: String,
-    lines: usize,
-    pushed: u64,
-}
-
-impl SnapshotKey {
-    fn of(id: u32, label: &str, history: &HistoryBuffer) -> Self {
-        SnapshotKey {
-            id,
-            label: label.to_owned(),
-            lines: history.len(),
-            pushed: history.total_pushed(),
-        }
-    }
-}
-
-/// The keys for `sources`, in order. Cheap: two integers and a label per pane.
-pub(crate) fn snapshot_keys(sources: &[SearchSource<'_>]) -> Vec<SnapshotKey> {
-    sources
-        .iter()
-        .map(|&(id, label, history)| SnapshotKey::of(id, label, history))
-        .collect()
-}
-
-/// Copy `sources` for the worker, reusing any `previous` entry whose history is
-/// unchanged (matched by [`SnapshotKey`]).
+/// Snapshot `sources` for the worker, reusing any `previous` entry whose pane
+/// is unchanged. A changed pane is re-cloned, which is one refcount bump per
+/// line (history lines are `Arc<str>`), never a string copy. Previous entries
+/// are indexed by pane id so this is linear in the pane count.
 pub(crate) fn take_snapshot(
     sources: &[SearchSource<'_>],
     previous: &[Arc<SourceSnapshot>],
 ) -> SnapshotSources {
+    let by_id: HashMap<u32, &Arc<SourceSnapshot>> =
+        previous.iter().map(|old| (old.id, old)).collect();
     sources
         .iter()
-        .map(|&(id, label, history)| {
-            let key = SnapshotKey::of(id, label, history);
-            previous
-                .iter()
-                .find(|old| SnapshotKey::of(old.id, &old.label, &old.history) == key)
-                .cloned()
-                .unwrap_or_else(|| {
-                    Arc::new(SourceSnapshot {
-                        id,
-                        label: label.to_owned(),
-                        history: history.clone(),
-                    })
-                })
+        .map(|&(id, label, history)| match by_id.get(&id) {
+            Some(old) if old.matches(id, label, history) => Arc::clone(old),
+            _ => Arc::new(SourceSnapshot {
+                id,
+                label: label.to_owned(),
+                history: history.clone(),
+            }),
         })
         .collect()
 }
@@ -123,6 +106,9 @@ pub(crate) fn source_refs(snapshot: &[Arc<SourceSnapshot>]) -> Vec<SearchSource<
 /// One search: everything the worker needs, owned, so the loop can get back to
 /// pumping input the moment it is submitted.
 pub(crate) struct SearchRequest {
+    /// Stamped by [`TerminalSearchWorker::submit`]; callers pass `0`. The worker
+    /// tags every message with this value and polls it for cancellation.
+    pub(crate) generation: u64,
     pub(crate) scope: SearchScope,
     pub(crate) max_results: usize,
     pub(crate) query: String,
@@ -138,11 +124,13 @@ pub(crate) struct Drained {
     pub(crate) batches: Vec<Vec<SearchMatch>>,
     /// `Some((total, error))` once the current generation finished.
     pub(crate) done: Option<(usize, Option<String>)>,
+    /// The worker thread is gone (it panicked) and nothing more will arrive.
+    pub(crate) disconnected: bool,
 }
 
 impl Drained {
     pub(crate) fn is_empty(&self) -> bool {
-        self.batches.is_empty() && self.done.is_none()
+        self.batches.is_empty() && self.done.is_none() && !self.disconnected
     }
 }
 
@@ -185,20 +173,25 @@ impl Shared {
     }
 }
 
+/// Callback that nudges the event loop awake after a delivery.
+pub(crate) type WakeFn = Box<dyn Fn() + Send>;
+
 pub(crate) struct TerminalSearchWorker {
     shared: Arc<Shared>,
     results: Receiver<Message>,
-    /// Generation of the most recent submit; the thread reads it to decide
+    /// Generation of the most recent submit; the thread polls it to decide
     /// whether its current scan is still wanted.
     current: Arc<AtomicU64>,
     /// Loop-side counter mirrored into `current`.
     generation: u64,
+    #[cfg(test)]
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TerminalSearchWorker {
-    /// Spawn the parked worker. `None` when the OS refuses the thread — the
+    /// Spawn the parked worker. `None` when the OS refuses the thread; the
     /// caller then scores on the loop instead of showing a stuck spinner.
-    pub(crate) fn new(waker: TerminalWaker) -> Option<Self> {
+    pub(crate) fn new(wake: WakeFn) -> Option<Self> {
         let shared = Arc::new(Shared::default());
         let current = Arc::new(AtomicU64::new(0));
         let (tx, results) = sync_channel(RESULT_QUEUE);
@@ -206,28 +199,29 @@ impl TerminalSearchWorker {
         let thread_current = Arc::clone(&current);
         let spawned = thegn_core::thread_name::try_spawn_named("thegn-term-srch", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            run_worker(&thread_shared, &thread_current, &tx, &waker);
+            run_worker(&thread_shared, &thread_current, &tx, wake.as_ref());
         });
-        if spawned.is_err() {
-            return None;
-        }
+        let _handle = spawned.ok()?;
         Some(TerminalSearchWorker {
             shared,
             results,
             current,
             generation: 0,
+            #[cfg(test)]
+            handle: Some(_handle),
         })
     }
 
     /// Hand `request` to the worker, superseding anything queued or running.
-    pub(crate) fn submit(&mut self, request: SearchRequest) {
+    pub(crate) fn submit(&mut self, mut request: SearchRequest) {
         self.generation += 1;
-        // Publish before queueing: the worker may observe the new generation
-        // while still finishing the old scan, and must not stream that scan's
-        // results as if they answered this request.
-        self.current.store(self.generation, Ordering::Release);
+        request.generation = self.generation;
         {
+            // Publish the new generation and queue the request under one lock,
+            // so the worker can never take a request and then observe a newer
+            // generation than the one stamped on it.
             let mut inner = self.shared.lock();
+            self.current.store(self.generation, Ordering::Release);
             inner.pending = Some(request);
         }
         self.shared.wait.notify_one();
@@ -255,7 +249,11 @@ impl TerminalSearchWorker {
                         drained.done = Some((total, error));
                     }
                 }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return drained,
+                Err(TryRecvError::Empty) => return drained,
+                Err(TryRecvError::Disconnected) => {
+                    drained.disconnected = true;
+                    return drained;
+                }
             }
         }
     }
@@ -278,12 +276,7 @@ impl Drop for TerminalSearchWorker {
 }
 
 /// The worker thread: park until a request arrives, score it, stream it.
-fn run_worker(
-    shared: &Shared,
-    current: &AtomicU64,
-    tx: &SyncSender<Message>,
-    waker: &TerminalWaker,
-) {
+fn run_worker(shared: &Shared, current: &AtomicU64, tx: &SyncSender<Message>, wake: &dyn Fn()) {
     // One engine across requests keeps the literal refine cache alive: a
     // growing query re-filters the previous hits instead of rescanning every
     // line of the corpus.
@@ -292,7 +285,9 @@ fn run_worker(
         let Some(request) = take_request(shared) else {
             return;
         };
-        let generation = current.load(Ordering::Acquire);
+        // The generation stamped on this request, never a fresh load of
+        // `current`: a newer submit must make this scan stale, not relabel it.
+        let generation = request.generation;
         let sources = source_refs(&request.sources);
         apply_request(&mut engine, &request);
         let cancelled = || current.load(Ordering::Acquire) != generation;
@@ -303,7 +298,7 @@ fn run_worker(
         }
         let total = engine.total();
         let error = engine.error().map(str::to_owned);
-        if !stream(tx, waker, current, generation, engine.matches()) {
+        if !stream(tx, wake, current, generation, engine.matches()) {
             continue;
         }
         let done = Message::Done {
@@ -311,9 +306,12 @@ fn run_worker(
             total,
             error,
         };
-        if tx.send(done).is_err() || !pulse(waker, current, generation) {
+        if tx.send(done).is_err() {
+            // The receiver is gone: the overlay closed.
             return;
         }
+        // A superseded generation just means a newer request is already queued.
+        pulse(wake, current, generation);
     }
 }
 
@@ -356,7 +354,7 @@ fn apply_request(engine: &mut SearchEngine, request: &SearchRequest) {
 /// the loop is gone; the caller then drops the rest.
 fn stream(
     tx: &SyncSender<Message>,
-    waker: &TerminalWaker,
+    wake: &dyn Fn(),
     current: &AtomicU64,
     generation: u64,
     matches: &[SearchMatch],
@@ -372,25 +370,224 @@ fn stream(
         if tx.send(message).is_err() {
             return false;
         }
-        if !pulse(waker, current, generation) {
+        if !pulse(wake, current, generation) {
             return false;
         }
     }
     current.load(Ordering::Acquire) == generation
 }
 
-/// Pulse the event loop out of its input poll. `false` when the scan was
+/// Pulse the event loop out of its input wait. `false` when the scan was
 /// superseded while the batch was in flight, so the caller stops streaming it.
 ///
-/// A pulse that cannot be written is *not* fatal: the loop's own poll timeout
-/// still picks the batch up (openspec `event-loop`), and stopping over a lost
-/// nudge would strand the overlay on `searching…` with no way to restart it.
-fn pulse(waker: &TerminalWaker, current: &AtomicU64, generation: u64) -> bool {
+/// Best-effort: a pulse that cannot be written is logged by the callback and not
+/// retried here. The loop blocks with no polling timeout (openspec
+/// `event-loop`), so a lost pulse leaves results undrawn until the next input
+/// event; stopping the scan over it would strand the overlay on `searching…`.
+fn pulse(wake: &dyn Fn(), current: &AtomicU64, generation: u64) -> bool {
     if current.load(Ordering::Acquire) != generation {
         return false;
     }
-    if let Err(error) = waker.wake() {
-        tracing::debug!(%error, "terminal search waker pulse failed");
-    }
+    wake();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn corpus(lines: usize) -> SnapshotSources {
+        let mut history = HistoryBuffer::new(lines.max(1));
+        for i in 0..lines {
+            if i % 3 == 0 {
+                history.push_line(format!("ssh zzz line {i}"));
+            } else {
+                history.push_line(format!("ssh line {i}"));
+            }
+        }
+        vec![Arc::new(SourceSnapshot {
+            id: 1,
+            label: "pane".into(),
+            history,
+        })]
+    }
+
+    fn request(
+        sources: &SnapshotSources,
+        query: &str,
+        mode: MatchMode,
+        max_results: usize,
+    ) -> SearchRequest {
+        SearchRequest {
+            generation: 0,
+            scope: SearchScope::Pane(1),
+            max_results,
+            query: query.into(),
+            mode,
+            options: MatchOptions::default(),
+            sources: sources.clone(),
+        }
+    }
+
+    fn noop_wake() -> WakeFn {
+        Box::new(|| {})
+    }
+
+    /// A wake callback whose calls block until `release` is dropped, plus a
+    /// receiver that fires each time the worker enters it.
+    fn gated_wake() -> (WakeFn, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let wake: WakeFn = Box::new(move || {
+            entered_tx.send(()).ok();
+            release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .ok();
+        });
+        (wake, entered_rx, release_tx)
+    }
+
+    /// Drain until the current generation's `Done`, returning what streamed.
+    fn collect(worker: &TerminalSearchWorker) -> (Vec<SearchMatch>, usize, Option<String>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut matches = Vec::new();
+        loop {
+            let drained = worker.drain();
+            assert!(!drained.disconnected, "the worker thread died");
+            for batch in drained.batches {
+                matches.extend(batch);
+            }
+            if let Some((total, error)) = drained.done {
+                return (matches, total, error);
+            }
+            assert!(Instant::now() < deadline, "no Done within the deadline");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn sync_ranking(
+        sources: &SnapshotSources,
+        query: &str,
+        mode: MatchMode,
+        max_results: usize,
+    ) -> (Vec<SearchMatch>, usize) {
+        let refs = source_refs(sources);
+        let mut engine = SearchEngine::new(SearchScope::Pane(1), max_results);
+        engine.set_mode(mode, &refs);
+        engine.set_query(query, &refs);
+        (engine.matches().to_vec(), engine.total())
+    }
+
+    #[test]
+    fn a_superseded_generation_is_dropped() {
+        let sources = corpus(300);
+        let (wake, entered, release) = gated_wake();
+        let mut worker = TerminalSearchWorker::new(wake).expect("spawn");
+
+        // "ssh" matches every line: several batches, so the worker is parked in
+        // its first wake with the rest of the stream still to send.
+        worker.submit(request(&sources, "ssh", MatchMode::Literal, 1000));
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker streamed its first batch");
+        worker.submit(request(&sources, "zzz", MatchMode::Literal, 1000));
+        drop(release);
+
+        let (matches, total, error) = collect(&worker);
+        let (expected, expected_total) = sync_ranking(&sources, "zzz", MatchMode::Literal, 1000);
+        assert_eq!(error, None);
+        assert_eq!(total, expected_total);
+        assert_eq!(matches, expected, "only the newer query's results arrive");
+        assert!(matches.iter().all(|m| m.line.contains("zzz")));
+    }
+
+    #[test]
+    fn closing_the_overlay_mid_scan_stops_the_thread() {
+        let sources = corpus(300);
+        let (wake, entered, release) = gated_wake();
+        let mut worker = TerminalSearchWorker::new(wake).expect("spawn");
+        let handle = worker.handle.take().expect("join handle");
+
+        worker.submit(request(&sources, "ssh", MatchMode::Literal, 1000));
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker streamed its first batch");
+        drop(worker);
+        drop(release);
+
+        handle.join().expect("worker thread exits cleanly");
+    }
+
+    #[test]
+    fn a_dropped_idle_worker_exits() {
+        let mut worker = TerminalSearchWorker::new(noop_wake()).expect("spawn");
+        let handle = worker.handle.take().expect("join handle");
+        drop(worker);
+        handle.join().expect("parked worker wakes and exits");
+    }
+
+    #[test]
+    fn streamed_results_equal_the_synchronous_ranking() {
+        let sources = corpus(700);
+        let cases = [
+            ("ssh", MatchMode::Literal, 1000),
+            ("zzz", MatchMode::Literal, 1000),
+            ("", MatchMode::Literal, 1000),
+            ("sshline", MatchMode::Fuzzy, 1000),
+            ("ssh", MatchMode::Literal, 50),
+        ];
+        let mut worker = TerminalSearchWorker::new(noop_wake()).expect("spawn");
+        for (query, mode, max) in cases {
+            worker.submit(request(&sources, query, mode, max));
+            let (matches, total, error) = collect(&worker);
+            let (expected, expected_total) = sync_ranking(&sources, query, mode, max);
+            assert_eq!(error, None, "query {query:?}");
+            assert_eq!(total, expected_total, "query {query:?}");
+            assert_eq!(matches, expected, "query {query:?} ({mode:?}, max {max})");
+        }
+    }
+
+    #[test]
+    fn a_panicking_worker_reports_disconnect() {
+        let sources = corpus(10);
+        let mut worker = TerminalSearchWorker::new(Box::new(|| {
+            panic!("boom");
+        }))
+        .expect("spawn");
+        worker.submit(request(&sources, "ssh", MatchMode::Literal, 1000));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if worker.drain().disconnected {
+                return;
+            }
+            assert!(Instant::now() < deadline, "disconnect never reported");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn snapshots_reuse_unchanged_panes_and_reclone_changed_ones() {
+        let mut quiet = HistoryBuffer::new(10);
+        let mut busy = HistoryBuffer::new(10);
+        quiet.push_line("one".into());
+        busy.push_line("two".into());
+        let first = take_snapshot(&[(1, "quiet", &quiet), (2, "busy", &busy)], &[]);
+
+        busy.push_line("three".into());
+        let second = take_snapshot(&[(1, "quiet", &quiet), (2, "busy", &busy)], &first);
+        assert!(Arc::ptr_eq(&first[0], &second[0]), "unchanged pane shared");
+        assert!(!Arc::ptr_eq(&first[1], &second[1]), "changed pane re-taken");
+        assert_eq!(second[1].history.len(), 2);
+
+        // A rewrite keeps the line count but bumps the write count.
+        assert!(busy.replace_from_end(1, "THREE".into()));
+        let third = take_snapshot(&[(1, "quiet", &quiet), (2, "busy", &busy)], &second);
+        assert!(!Arc::ptr_eq(&second[1], &third[1]));
+        assert_eq!(third[1].history.get(1), Some("THREE"));
+    }
 }

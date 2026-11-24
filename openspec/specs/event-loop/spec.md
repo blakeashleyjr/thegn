@@ -10,31 +10,6 @@ producers.
 
 ## Requirements
 
-### Requirement: Terminal history search runs off the event loop
-
-The terminal history search overlay SHALL perform matching on an overlay-owned
-worker, retain the existing scope filters and result ordering, stream results
-to the overlay in bounded batches, and discard work from superseded queries.
-Closing the overlay SHALL invalidate active and pending work so the worker
-stops at its next scan batch. No terminal history search worker SHALL run while
-the overlay is closed.
-
-#### Scenario: A newer query replaces an active search
-
-- **WHEN** the user enters another query while a history scan is active
-- **THEN** the earlier scan stops at its next batch and its results are ignored
-
-#### Scenario: Search results arrive in batches
-
-- **WHEN** the worker has results ready
-- **THEN** the overlay displays batches incrementally and shows a searching
-  status until the final batch arrives
-
-#### Scenario: The overlay closes during a scan
-
-- **WHEN** the user dismisses the overlay during a scan
-- **THEN** the active scan is invalidated and no further work is scheduled
-
 ### Requirement: Block with no polling timeout
 
 The event loop SHALL block on termwiz `poll_input(None)` with no tick and no timeout, and MUST NOT introduce a polling interval to detect background work.

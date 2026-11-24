@@ -36,7 +36,7 @@ use thegn_core::search::{
 };
 
 use crate::terminal_search_worker::{
-    SnapshotKey, SnapshotSources, TerminalSearchWorker, snapshot_keys, source_refs, take_snapshot,
+    SearchRequest, SnapshotSources, TerminalSearchWorker, WakeFn, source_refs, take_snapshot,
 };
 
 use crate::chrome::S;
@@ -100,9 +100,18 @@ pub struct SearchOverlay {
     search_pending: bool,
     /// The worker has not delivered its final batch for the current query yet.
     searching: bool,
-    /// Owned history snapshot, kept with the keys it was taken from so an
-    /// unchanged pane is never re-copied between keystrokes.
-    snapshot: Option<(Vec<SnapshotKey>, SnapshotSources)>,
+    /// Owned history snapshot the current results were scored against. Unchanged
+    /// panes are shared between keystrokes; previews read from it so they stay
+    /// consistent with the match indices.
+    snapshot: SnapshotSources,
+    /// Spawning or running the worker failed once: score on the loop from now on
+    /// instead of retrying a thread on every keystroke.
+    worker_failed: bool,
+    /// Enter was pressed before the first batch of the typed query arrived; jump
+    /// to its best hit as soon as it does.
+    pending_jump: bool,
+    /// An outcome produced while draining (a deferred Enter), for the loop to act on.
+    ready: Option<SearchOutcome>,
 }
 
 /// Where an edit is scored.
@@ -134,7 +143,10 @@ impl SearchOverlay {
             worker: None,
             search_pending: false,
             searching: false,
-            snapshot: None,
+            snapshot: Vec::new(),
+            worker_failed: false,
+            pending_jump: false,
+            ready: None,
         }
     }
 
@@ -213,6 +225,12 @@ impl SearchOverlay {
                     record_recent(self.engine.query());
                     return SearchOutcome::Jump(m.clone());
                 }
+                if self.searching {
+                    // The typed query has no batch yet: wait for its best hit
+                    // instead of dismissing (or jumping to a stale one).
+                    self.pending_jump = true;
+                    return SearchOutcome::Pending;
+                }
                 // Enter on empty results → dismiss.
                 record_recent(self.engine.query());
                 return SearchOutcome::Dismiss;
@@ -222,12 +240,12 @@ impl SearchOverlay {
                 self.engine.move_up();
                 // A selection move has no edit of its own: the preview follows
                 // the cursor without touching the result list.
-                self.refresh_preview(sources);
+                self.refresh_preview_for(sources);
             }
 
             KeyCode::DownArrow => {
                 self.engine.move_down();
-                self.refresh_preview(sources);
+                self.refresh_preview_for(sources);
             }
 
             KeyCode::Tab => {
@@ -308,39 +326,57 @@ impl SearchOverlay {
     /// Hand the pending edit to the worker. Cheap when nothing is pending, so
     /// the loop can call it unconditionally after a key.
     pub fn start_pending_search(&mut self, sources: &[SearchSource<'_>], waker: TerminalWaker) {
+        self.start_pending_search_with(
+            sources,
+            Box::new(move || {
+                if let Err(error) = waker.wake() {
+                    tracing::debug!(%error, "terminal search waker pulse failed");
+                }
+            }),
+        );
+    }
+
+    /// [`Self::start_pending_search`] with an explicit wake callback, used when
+    /// the worker is first spawned (and by tests, which have no terminal).
+    pub(crate) fn start_pending_search_with(&mut self, sources: &[SearchSource<'_>], wake: WakeFn) {
         if !self.search_pending {
             return;
         }
         self.search_pending = false;
-        let request = crate::terminal_search_worker::SearchRequest {
+        if self.worker.is_none() && !self.worker_failed {
+            self.worker = TerminalSearchWorker::new(wake);
+            self.worker_failed = self.worker.is_none();
+        }
+        if self.worker.is_none() {
+            self.score_on_loop(sources);
+            return;
+        }
+        // Cheap on the loop: unchanged panes are shared, changed ones cost one
+        // refcount bump per line.
+        self.snapshot = take_snapshot(sources, &self.snapshot);
+        let request = SearchRequest {
+            generation: 0,
             scope: self.engine.scope(),
             max_results: self.max_results,
             query: self.engine.query().to_string(),
             mode: self.engine.mode(),
             options: self.engine.options(),
-            sources: self.snapshot_for(sources),
+            sources: self.snapshot.clone(),
         };
-        if self.worker.is_none() {
-            self.worker = TerminalSearchWorker::new(waker);
-        }
-        // Move the request into the worker first, then touch the rest of `self`
-        // outside the borrow of the `worker` field.
-        let submitted = match self.worker.as_mut() {
-            Some(worker) => {
-                worker.submit(request);
-                true
-            }
-            None => false,
-        };
-        if submitted {
+        if let Some(worker) = self.worker.as_mut() {
+            worker.submit(request);
             self.searching = true;
-        } else {
-            // No thread available: score here rather than leave the panel
-            // claiming it is searching forever.
-            self.searching = false;
-            self.engine.rescore(sources);
-            self.refresh_preview(sources);
         }
+    }
+
+    /// No worker thread is available (it could not be spawned, or it died):
+    /// score here rather than leave the panel claiming it is searching forever.
+    fn score_on_loop(&mut self, sources: &[SearchSource<'_>]) {
+        self.searching = false;
+        self.snapshot.clear();
+        self.engine.rescore(sources);
+        self.refresh_preview(sources);
+        self.settle_pending_jump();
     }
 
     /// Apply what the worker has produced. Returns true when what is on screen
@@ -353,6 +389,7 @@ impl SearchOverlay {
         if drained.is_empty() {
             return false;
         }
+        let finished = drained.done.is_some() || drained.disconnected;
         for batch in drained.batches {
             self.engine.append_async_matches(batch);
         }
@@ -360,44 +397,54 @@ impl SearchOverlay {
             self.searching = false;
             self.engine.finish_async_results(total, error);
         }
-        // The preview's context lines come out of the snapshot, so take an owned
-        // handle on it (one refcount bump per pane) instead of holding a borrow
-        // of `self` across the mutable refresh below.
-        let snapshot = self
-            .snapshot
-            .as_ref()
-            .map(|(_, snapshot)| snapshot.clone())
-            .unwrap_or_default();
+        if drained.disconnected {
+            // The worker thread died (a panic while scoring). Say so, drop it,
+            // and stay on the loop-side path for the rest of this overlay.
+            self.worker = None;
+            self.worker_failed = true;
+            self.searching = false;
+            self.engine
+                .finish_async_results(0, Some("search worker stopped".to_string()));
+        }
+        // The preview's context lines come out of the snapshot the matches were
+        // scored against, not the live buffers.
+        let snapshot = self.snapshot.clone();
         let refs = source_refs(&snapshot);
         self.refresh_preview(&refs);
+        if finished || !self.engine.matches().is_empty() {
+            self.settle_pending_jump();
+        }
         true
     }
 
-    /// The worker's copy of `sources`, reusing the previous snapshot for every
-    /// pane whose history has not changed.
-    fn snapshot_for(&mut self, sources: &[SearchSource<'_>]) -> SnapshotSources {
-        let keys = snapshot_keys(sources);
-        let unchanged = self
-            .snapshot
-            .as_ref()
-            .is_some_and(|(previous, _)| *previous == keys);
-        if !unchanged {
-            let snapshot = match self.snapshot.as_ref() {
-                Some((_, previous)) => take_snapshot(sources, previous),
-                None => take_snapshot(sources, &[]),
-            };
-            self.snapshot = Some((keys, snapshot));
+    /// Take the outcome a deferred Enter produced while draining, if any.
+    pub fn take_ready(&mut self) -> Option<SearchOutcome> {
+        self.ready.take()
+    }
+
+    /// Resolve an Enter that arrived before any result: jump to the best hit
+    /// once there is one, dismiss if the finished query matched nothing.
+    fn settle_pending_jump(&mut self) {
+        if !self.pending_jump {
+            return;
         }
-        self.snapshot
-            .as_ref()
-            .map(|(_, snapshot)| snapshot.clone())
-            .unwrap_or_default()
+        if let Some(m) = self.engine.selected() {
+            self.pending_jump = false;
+            record_recent(self.engine.query());
+            self.ready = Some(SearchOutcome::Jump(m.clone()));
+        } else if !self.searching {
+            self.pending_jump = false;
+            record_recent(self.engine.query());
+            self.ready = Some(SearchOutcome::Dismiss);
+        }
     }
 
     /// A worker scan is now needed, and the preview's rows belong to the query
-    /// being replaced, so drop them instead of showing stale context.
+    /// being replaced, so drop them instead of showing stale context. A further
+    /// edit also withdraws a deferred Enter: the user is still typing.
     fn expect_scan(&mut self) {
         self.search_pending = true;
+        self.pending_jump = false;
         self.preview.clear();
     }
 
@@ -458,6 +505,17 @@ impl SearchOverlay {
                 self.engine.queue_options(options);
                 self.expect_scan();
             }
+        }
+    }
+
+    /// Refresh the preview from the snapshot the matches came from when there is
+    /// one (worker path), else from `sources`.
+    fn refresh_preview_for(&mut self, sources: &[SearchSource<'_>]) {
+        if self.snapshot.is_empty() {
+            self.refresh_preview(sources);
+        } else {
+            let snapshot = self.snapshot.clone();
+            self.refresh_preview(&source_refs(&snapshot));
         }
     }
 
@@ -1273,6 +1331,95 @@ mod tests {
 
         // Nothing to fold in before a worker exists.
         assert!(!ov.drain_search());
+    }
+
+    /// Fold worker output in until the deferred outcome (or the end of the
+    /// search) arrives.
+    fn pump(ov: &mut SearchOverlay) -> Option<SearchOutcome> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            ov.drain_search();
+            if let Some(outcome) = ov.take_ready() {
+                return Some(outcome);
+            }
+            if !ov.searching() {
+                return None;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn enter_before_the_first_batch_jumps_to_the_best_hit() {
+        let buf = buf_from(&["cargo build", "cargo test", "ninja"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        for c in "ninja".chars() {
+            ov.handle_key_async(&KeyCode::Char(c), Modifiers::NONE, &srcs);
+        }
+        ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        assert!(ov.searching());
+
+        // Nothing has been drained yet, so there is no hit to jump to.
+        let r = ov.handle_key_async(&KeyCode::Enter, Modifiers::NONE, &srcs);
+        assert!(
+            matches!(r, SearchOutcome::Pending),
+            "Enter waits, not dismisses"
+        );
+        match pump(&mut ov) {
+            Some(SearchOutcome::Jump(m)) => assert_eq!(m.line, "ninja"),
+            other => panic!("expected a jump to the best hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_before_results_dismisses_when_nothing_matches() {
+        let buf = buf_from(&["cargo build", "ninja"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        for c in "qqqq".chars() {
+            ov.handle_key_async(&KeyCode::Char(c), Modifiers::NONE, &srcs);
+        }
+        ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        let r = ov.handle_key_async(&KeyCode::Enter, Modifiers::NONE, &srcs);
+        assert!(matches!(r, SearchOutcome::Pending));
+        assert!(matches!(pump(&mut ov), Some(SearchOutcome::Dismiss)));
+    }
+
+    #[test]
+    fn typing_after_a_deferred_enter_withdraws_it() {
+        let buf = buf_from(&["cargo build", "ninja"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        ov.handle_key_async(&KeyCode::Char('n'), Modifiers::NONE, &srcs);
+        ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        ov.handle_key_async(&KeyCode::Enter, Modifiers::NONE, &srcs);
+        ov.handle_key_async(&KeyCode::Char('i'), Modifiers::NONE, &srcs);
+        ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        assert!(pump(&mut ov).is_none(), "the user kept typing: no jump");
+    }
+
+    #[test]
+    fn preview_reads_the_snapshot_not_the_live_buffer() {
+        let mut buf = buf_from(&["alpha", "beta needle", "gamma"]);
+        let mut ov = overlay(1);
+        {
+            let srcs = sources(1, &buf);
+            for c in "needle".chars() {
+                ov.handle_key_async(&KeyCode::Char(c), Modifiers::NONE, &srcs);
+            }
+            ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        }
+        assert!(pump(&mut ov).is_none());
+        // The live pane moves on (lines evicted/rewritten); the preview must
+        // still describe the lines the match index points into.
+        assert!(buf.replace_from_end(1, "REWRITTEN".into()));
+        ov.handle_key_async(&KeyCode::DownArrow, Modifiers::NONE, &sources(1, &buf));
+        assert_eq!(ov.preview, ["alpha", "gamma"]);
     }
 
     #[test]
