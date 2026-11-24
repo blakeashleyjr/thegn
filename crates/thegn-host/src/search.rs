@@ -668,25 +668,20 @@ impl SearchOverlay {
             let (bullet, label_tok) = if selected {
                 (
                     seg(Tok::Slot(S::Accent), "● ").bold(),
-                    seg(
-                        Tok::Slot(S::Text),
-                        truncate_label(&m.pane_label, label_cols),
-                    )
-                    .bold(),
+                    seg(Tok::Slot(S::Text), fit_label(&m.pane_label, label_cols)).bold(),
                 )
             } else {
                 (
                     seg(Tok::Slot(S::Ghost3), "  "),
-                    seg(
-                        Tok::Slot(S::Ghost2),
-                        truncate_label(&m.pane_label, label_cols),
-                    ),
+                    seg(Tok::Slot(S::Ghost2), fit_label(&m.pane_label, label_cols)),
                 )
             };
 
             // Content column: the matched line, windowed around the hit.
             let repeat_suffix = repeat_suffix(m.repeat);
-            let suffix_width = repeat_suffix.as_ref().map_or(0, String::len);
+            let suffix_width = repeat_suffix
+                .as_deref()
+                .map_or(0, unicode_width::UnicodeWidthStr::width);
             let line_avail = inner
                 .cols
                 .saturating_sub(prefix_cols)
@@ -868,7 +863,11 @@ fn relative_age(captured_at: SystemTime, now: SystemTime) -> String {
 }
 
 /// The result row's age cell: [`relative_age`], right-aligned in its column.
+/// A line with an unknown capture time (a replay) gets a blank cell, not a guess.
 fn age_cell(captured_at: SystemTime, now: SystemTime) -> String {
+    if captured_at == thegn_core::history::UNKNOWN_CAPTURE {
+        return " ".repeat(ROW_AGE_COLS);
+    }
     format!(
         "{:>width$}",
         relative_age(captured_at, now),
@@ -900,6 +899,51 @@ fn repeat_suffix(repeat: u32) -> Option<String> {
 /// scrollback, taking down the whole compositor).
 fn truncate_label(s: &str, max_cols: usize) -> String {
     crate::seg::clip_end(s, max_cols)
+}
+
+/// Separator `source_label` joins "worktree · tab · program" with.
+const LABEL_SEP: &str = " · ";
+
+/// Fit a "worktree · tab · program" label into `max_cols`, shortening the
+/// leading parts first so the program (the part that tells rows apart) stays
+/// visible. The worktree is middle-clipped; if not even a stub of it fits it is
+/// dropped, then the same is tried on the tab.
+fn fit_label(label: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    /// Cells below which a clipped leading part is not worth showing.
+    const MIN_HEAD_COLS: usize = 3;
+    if label.width() <= max_cols {
+        return label.to_string();
+    }
+    let Some((head, rest)) = label.split_once(LABEL_SEP) else {
+        return truncate_label(label, max_cols);
+    };
+    let tail_cols = LABEL_SEP.width() + rest.width();
+    if tail_cols + MIN_HEAD_COLS <= max_cols {
+        return format!(
+            "{}{LABEL_SEP}{rest}",
+            clip_middle(head, max_cols - tail_cols)
+        );
+    }
+    fit_label(rest, max_cols)
+}
+
+/// Clip `s` to `max_cols` cells keeping both ends: `theg…2241`.
+fn clip_middle(s: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    if max_cols <= 1 {
+        return seg::clip_end(s, max_cols);
+    }
+    let budget = max_cols - 1;
+    format!(
+        "{}{}{}",
+        take_prefix(s, budget.div_ceil(2)),
+        ellipsis(),
+        take_suffix(s, budget / 2)
+    )
 }
 
 /// The ellipsis glyph `seg::clip_end` draws (derived, not re-declared).
@@ -1080,7 +1124,7 @@ mod tests {
     fn result_rows_show_how_old_the_line_is() {
         use std::time::{Duration, SystemTime};
 
-        let now = SystemTime::now();
+        let now = crate::e2e_freeze::clock();
         let mut buf = HistoryBuffer::new(100);
         buf.push_line_at("needle fresh", now);
         buf.push_line_at("needle old", now - Duration::from_secs(3 * 3_600));
@@ -1094,11 +1138,67 @@ mod tests {
     }
 
     #[test]
+    fn replayed_lines_render_no_age() {
+        use std::time::SystemTime;
+
+        let mut buf = HistoryBuffer::new(100);
+        buf.push_line_at("needle replayed", thegn_core::history::UNKNOWN_CAPTURE);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "needle", &srcs);
+
+        let out = draw(&ov, 100, 30);
+        assert!(out.contains("needle replayed"), "{out}");
+        assert_eq!(
+            age_cell(thegn_core::history::UNKNOWN_CAPTURE, SystemTime::now()),
+            "    "
+        );
+    }
+
+    #[test]
+    fn long_worktree_name_keeps_tab_and_program_visible() {
+        for cols in [26, 22] {
+            let fitted = fit_label("thegn/tg/b223-the-2241 · tab 1 · claude", cols);
+            assert!(fitted.ends_with("tab 1 · claude"), "{fitted}");
+            assert!(
+                unicode_width::UnicodeWidthStr::width(fitted.as_str()) <= cols,
+                "{fitted}"
+            );
+        }
+        // 26 cells leaves a clipped worktree stub with both ends.
+        assert_eq!(
+            fit_label("thegn/tg/b223-the-2241 · tab 1 · claude", 26),
+            "theg…2241 · tab 1 · claude"
+        );
+        // Too narrow for any worktree stub: it is dropped before the program is.
+        assert_eq!(
+            fit_label("thegn/tg/b223-the-2241 · tab 1 · claude", 16),
+            "tab 1 · claude"
+        );
+        // A label that fits is untouched; a bare label falls back to clip_end.
+        assert_eq!(fit_label("app · dev · bash", 26), "app · dev · bash");
+        assert_eq!(fit_label("abcdefghij", 5), truncate_label("abcdefghij", 5));
+    }
+
+    #[test]
+    fn draw_keeps_the_program_for_a_long_worktree_name() {
+        let mut buf = HistoryBuffer::new(100);
+        buf.push_line("needle");
+        let srcs: Vec<SearchSource<'_>> =
+            vec![(1, "thegn/tg/b223-the-2241 · tab 1 · claude", &buf)];
+        let mut ov = overlay(1);
+        typed(&mut ov, "needle", &srcs);
+
+        let out = draw(&ov, 100, 30);
+        assert!(out.contains("tab 1 · claude"), "{out}");
+    }
+
+    #[test]
     fn narrow_panel_drops_the_age_column_first() {
         use std::time::{Duration, SystemTime};
 
         let mut buf = HistoryBuffer::new(100);
-        let old = SystemTime::now() - Duration::from_secs(3 * 3_600);
+        let old = crate::e2e_freeze::clock() - Duration::from_secs(3 * 3_600);
         buf.push_line_at("needle old", old);
         let srcs = sources(1, &buf);
         let mut ov = overlay(1);

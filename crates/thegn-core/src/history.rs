@@ -15,6 +15,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Capture time of a line whose real time is unknown (a replayed or restored
+/// scrollback line). Search renders no age for it rather than inventing one.
+pub const UNKNOWN_CAPTURE: SystemTime = SystemTime::UNIX_EPOCH;
+
 // ── ANSI stripping ────────────────────────────────────────────────────────────
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]

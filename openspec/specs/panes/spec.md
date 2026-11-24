@@ -16,7 +16,10 @@ available provenance from each result: pane- and tab-scoped rows carry the same
 worktree, tab and pane parts as wider scopes, and no row SHALL expose an
 internal pane id. History lines SHALL retain their capture time, stamped when
 the line was written, so rows can show relative age; search SHALL NOT derive
-timestamps from line order or invent time evidence. The selected result's
+timestamps from line order or invent time evidence: lines replayed by a daemon
+reattach have an unknown capture time and their rows show no age. A row label
+that does not fit SHALL shorten the worktree part before the tab or program.
+The selected result's
 preview SHALL show up to two surrounding lines before and after the match, with
 the matched line highlighted. Identical lines from one pane SHALL group into a
 single row that reports its occurrence count and resolves to the newest

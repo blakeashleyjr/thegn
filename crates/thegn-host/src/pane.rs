@@ -19,11 +19,14 @@ use std::sync::{Arc, Mutex};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history_at};
+use thegn_core::history::{AnsiStripper, HistoryBuffer, UNKNOWN_CAPTURE, feed_bytes_to_history_at};
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession};
 
 use crate::emulator::{AlacrittyEmulator, PaneEmulator};
 use crate::pane_writer::StdinSendError;
+
+/// How long after a daemon reattach fed output still counts as scrollback replay.
+const REPLAY_STAMP_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
 
 const STREAM_STDIN_CHUNK: usize = 32 << 10;
 const STREAM_STDIN_MAX_CHUNKS: usize = 64;
@@ -189,6 +192,10 @@ pub struct PtyPane {
     /// go through [`Self::write_reply`] and deliberately don't stamp, so an app's
     /// answer to a DA/DSR query isn't masked as echo.
     last_input_at: Option<std::time::Instant>,
+    /// End of the window in which fed output is a scrollback replay (set by a
+    /// daemon reattach). Lines completed inside it are stamped with
+    /// [`UNKNOWN_CAPTURE`] rather than the replay moment (THE-2241).
+    replay_until: Option<std::time::Instant>,
     /// A stream resize queued while its bounded control channel was full.
     pending_resize: Option<(u16, u16)>,
 }
@@ -429,6 +436,7 @@ impl PtyPane {
             loop_fed,
             last_output_at: None,
             last_input_at: None,
+            replay_until: None,
             pending_resize: None,
         })
     }
@@ -518,6 +526,7 @@ impl PtyPane {
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             last_output_at: None,
             last_input_at: None,
+            replay_until: None,
             pending_resize: None,
         }
     }
@@ -616,6 +625,18 @@ impl PtyPane {
     /// same inline for its SIGWINCH repaint.
     pub fn mark_output_solicited(&mut self) {
         self.last_input_at = Some(std::time::Instant::now());
+        // The replay carries no capture times of its own; stamping it `now`
+        // would make days-old lines read as fresh.
+        self.replay_until = Some(std::time::Instant::now() + REPLAY_STAMP_WINDOW);
+    }
+
+    /// Capture time for lines completed by a chunk fed right now: the freezable
+    /// clock, or [`UNKNOWN_CAPTURE`] while a reattach replay is arriving.
+    fn capture_stamp(&self) -> std::time::SystemTime {
+        match self.replay_until {
+            Some(end) if std::time::Instant::now() < end => UNKNOWN_CAPTURE,
+            _ => crate::e2e_freeze::clock(),
+        }
     }
 
     /// The command this pane is offering to relaunch, if any (drives the
@@ -693,12 +714,13 @@ impl PtyPane {
         };
         self.predictor
             .on_server_output(now, (cursor.0 as usize, cursor.1 as usize), &cell);
+        let stamp = self.capture_stamp();
         feed_bytes_to_history_at(
             bytes,
             &mut self.history,
             &mut self.history_partial,
             &mut self.history_stripper,
-            crate::e2e_freeze::clock(),
+            stamp,
         );
         // Time-travel recording tap: a third sink beside the emulator and the
         // history ring. `None` (replay disabled) ⇒ one null check, zero alloc.
@@ -1010,6 +1032,7 @@ impl PtyPane {
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             last_output_at: None,
             last_input_at: None,
+            replay_until: None,
             pending_resize: None,
         }
     }
