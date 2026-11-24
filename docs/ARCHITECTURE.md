@@ -52,9 +52,19 @@ The Jobs contract is a separately versioned group of workspace libraries.
 the bounded guest wire format. All four build independently of the daemon
 and UI. The [Jobs RFC](rfcs/jobs.md) describes their daemon and executor integrations.
 
+The Windows sandbox helper (`thegn-sandbox-win.exe`, WS06) has its own
+separately versioned library: `thegn-sandbox-proto` owns the request, probe and
+status wire types, the bounded numbered-environment request transport and the
+argv quoting that `thegn-core` (lowering) and the standalone helper must agree
+on. It is deliberately serde-only — no `cfg` code, no spawn, no threads, no OS
+calls — so the helper links it without the daemon and core lowers Windows
+sandbox policies into it without Win32 FFI. The helper, not this crate, owns the
+exit codes and the AppContainer/Job Object decisions.
+
 `thegn-core` may depend on the `thegn-proc` leaf for bounded process
-supervision; it has no core dependency. This is the one sanctioned core-to-leaf
-edge besides `thegn-media`, pinned in `crate_boundaries.rs`.
+supervision; it has no core dependency. This is one of the sanctioned
+core-to-leaf edges — `thegn-media` and the serde-only `thegn-sandbox-proto` are
+the others — pinned in `crate_boundaries.rs`.
 
 Native dictation is an optional host edge (`voice-native`, `voice-metal`), never
 a core dependency. The same binary's private worker owns microphone/Whisper;

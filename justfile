@@ -145,7 +145,7 @@ check-cross:
     # carry most of the per-OS code (sysinfo metrics; MPRIS/SMTC/AppleScript
     # media). thegn-core/-svc/-host + gtui-query are NOT here — ring, bundled
     # sqlite and libgit2 make them need a real cross cc.
-    leaves="thegn-metrics thegn-media thegn-proc thegn-cas thegn-job-spec thegn-lease thegn-guest-proto tg-kit gtui-core gtui-render gtui-app"
+    leaves="thegn-metrics thegn-media thegn-proc thegn-cas thegn-job-spec thegn-lease thegn-guest-proto thegn-sandbox-proto tg-kit gtui-core gtui-render gtui-app"
     if [ -d "$rustlib/aarch64-apple-darwin" ]; then
       for crate in $leaves; do
         cargo check -p "$crate" --target aarch64-apple-darwin
