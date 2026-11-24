@@ -7,6 +7,25 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.131] — 2026-11-24
+
+### Added
+
+- Each pane gets a memory high-water mark at 85% of its cap
+  (`[sandbox.limits] memory_high`) so the kernel reclaims before it kills, and
+  a 4G swap cap (`memory_swap`) so one pane cannot fill the machine's swap;
+  `memory_swap_total` optionally caps swap for all of thegn. Background and
+  gate jobs keep their own limits.
+- thegn watches each pane's memory: a `mem NN%` badge while it is near its cap,
+  inbox and desktop notices near the cap and when a process is OOM-killed, and
+  a pane whose shell or agent was killed for memory reopens in place, resuming
+  Claude or pi (at most once per 10 minutes, never after you typed).
+- `just update [stable|dev]` installs a verified release (or a Mac-built
+  branch) and restarts that instance's daemon so the new schema can migrate;
+  `docs/just-recipes.md` catalogs every recipe.
+- `thegn job run` can cancel a running Vercel job, and the daemon reattaches
+  Sprites job attempts whose owner died.
+
 ## [0.1.0-alpha.130] — 2026-11-24
 
 ### Fixed
