@@ -529,6 +529,15 @@ impl PreviewSupervisor {
         }
     }
 
+    /// Snapshot the selected target for an open/copy action, then re-arm its
+    /// probe. The returned source and status are what the user acted on; the
+    /// pending probe may update them on a later loop iteration.
+    pub(crate) fn open_view(&mut self, worktree: &str) -> Option<PreviewView> {
+        let view = self.view(worktree)?;
+        self.rearm_port(&view.worktree, view.port);
+        Some(view)
+    }
+
     pub(crate) fn apply_probe(&mut self, result: ProbeResult) -> bool {
         let worktree = result.request.worktree.clone();
         let before_view = self.view(&worktree);
@@ -693,6 +702,17 @@ impl From<&PreviewTarget> for PreviewView {
     }
 }
 
+/// Short suffix for copy/open feedback, naming the last known lifecycle state.
+/// `up` needs no qualifier; `down` is a stopped server; the remaining states
+/// have no reachability proof yet.
+pub(crate) fn status_note(status: PreviewStatus) -> &'static str {
+    match status {
+        PreviewStatus::Up => "",
+        PreviewStatus::Down => " (server stopped)",
+        PreviewStatus::Seen | PreviewStatus::Unknown => " (not answering yet)",
+    }
+}
+
 /// Whether this local worktree's pane can be reached through host loopback.
 /// An empty observed backend is the ordinary never-sandboxed host case when
 /// sandboxing is disabled; with sandboxing enabled it is trusted only after a
@@ -724,6 +744,7 @@ pub(crate) fn probe_allowed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
     fn pane_lifecycle_discovers_up_then_down_and_bounds_tail() {
@@ -945,6 +966,473 @@ mod tests {
             ok: false
         }));
         assert!(sup.probe_requests("/repo").is_empty());
+    }
+
+    #[test]
+    fn status_note_names_the_lifecycle_without_inventing_proof() {
+        assert_eq!(status_note(PreviewStatus::Up), "");
+        assert_eq!(status_note(PreviewStatus::Seen), " (not answering yet)");
+        assert_eq!(status_note(PreviewStatus::Unknown), " (not answering yet)");
+        assert_eq!(status_note(PreviewStatus::Down), " (server stopped)");
+    }
+
+    #[test]
+    fn open_view_preserves_the_acted_on_status_and_rearms_one_probe() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        sup.pane_output(30, "/repo", None, b"http://localhost:8765/\n", Some(80));
+        let request = sup.probe_requests("/repo").pop().unwrap();
+        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        let before = sup.view("/repo").unwrap();
+        assert_eq!(before.status, PreviewStatus::Up);
+
+        let opened = sup.open_view("/repo").expect("selected target");
+        assert_eq!(opened, before, "open feedback keeps the observed target");
+        assert_eq!(
+            opened.source,
+            thegn_core::preview::PortHintSource::PaneOutput
+        );
+
+        // The re-armed probe may downgrade the live projection later, but the
+        // view returned to the open/copy action is untouched.
+        assert_eq!(sup.view("/repo").unwrap().status, PreviewStatus::Seen);
+        let requests = sup.probe_requests("/repo");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].port, 8765);
+    }
+
+    #[test]
+    fn simultaneous_worktrees_keep_independent_targets_and_probe_state() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        assert!(sup.pane_output(
+            41,
+            "/alpha",
+            Some("alpha-session".into()),
+            b"  ready http://localhost:5173/\n",
+            Some(80)
+        ));
+        assert!(sup.pane_output(
+            42,
+            "/beta",
+            Some("beta-session".into()),
+            b"  Local: http://127.0.0.1:3000/\n",
+            Some(80)
+        ));
+
+        let alpha = sup.view("/alpha").unwrap();
+        let beta = sup.view("/beta").unwrap();
+        assert_eq!((alpha.port, alpha.status), (5173, PreviewStatus::Seen));
+        assert_eq!((beta.port, beta.status), (3000, PreviewStatus::Seen));
+        assert_eq!(alpha.url, "http://localhost:5173/");
+        assert_eq!(beta.url, "http://127.0.0.1:3000/");
+
+        let alpha_request = sup.probe_requests("/alpha");
+        assert_eq!(alpha_request.len(), 1);
+        assert_eq!(alpha_request[0].worktree, "/alpha");
+        assert_eq!(alpha_request[0].port, 5173);
+        assert!(sup.apply_probe(ProbeResult {
+            request: alpha_request[0].clone(),
+            ok: true,
+        }));
+
+        // Switching the active worktree rearms only that worktree's targets.
+        let beta_request = sup.probe_requests("/beta");
+        assert_eq!(beta_request.len(), 1);
+        assert_eq!(beta_request[0].worktree, "/beta");
+        assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Up);
+        assert_eq!(sup.view("/beta").unwrap().status, PreviewStatus::Seen);
+
+        // A beta pane exit stops beta; alpha's proof is untouched.
+        assert!(sup.pane_exit(42));
+        assert_eq!(sup.view("/beta").unwrap().status, PreviewStatus::Down);
+        assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Up);
+        assert_eq!(sup.view("/alpha").unwrap().port, 5173);
+    }
+
+    #[test]
+    fn restart_moves_the_selected_target_from_stopped_to_new_port() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        sup.pane_output(51, "/repo", None, b"http://localhost:5173/\n", Some(80));
+        let request = sup.probe_requests("/repo").pop().unwrap();
+        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        assert_eq!(sup.view("/repo").unwrap().status, PreviewStatus::Up);
+
+        assert!(sup.pane_exit(51));
+        let stopped = sup.view("/repo").unwrap();
+        assert_eq!((stopped.port, stopped.status), (5173, PreviewStatus::Down));
+
+        // The restarted dev server prints a different port in a new pane. The
+        // stopped target remains visible as history, but selection moves to
+        // the new live target.
+        assert!(sup.pane_output(52, "/repo", None, b"http://localhost:3000/\n", Some(80)));
+        let restarted = sup.view("/repo").unwrap();
+        assert_eq!(restarted.port, 3000);
+        assert_eq!(restarted.status, PreviewStatus::Seen);
+        assert_eq!(
+            restarted.source,
+            thegn_core::preview::PortHintSource::PaneOutput
+        );
+
+        let request = sup.probe_requests("/repo").pop().unwrap();
+        assert_eq!(request.port, 3000);
+        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        assert_eq!(sup.view("/repo").unwrap().status, PreviewStatus::Up);
+    }
+
+    async fn within<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .expect("fixture operation timed out")
+    }
+
+    /// A minimal unmasked server-to-client text frame. The fixture's HMR peer
+    /// only ever speaks this shape, which is enough to prove the browser keeps
+    /// its own socket without adding a WebSocket dependency to the host crate.
+    fn ws_text_frame(payload: &str) -> Vec<u8> {
+        let bytes = payload.as_bytes();
+        let mut frame = Vec::with_capacity(bytes.len() + 10);
+        frame.push(0x81);
+        match bytes.len() {
+            0..=125 => frame.push(bytes.len() as u8),
+            126..=65535 => {
+                frame.push(126);
+                frame.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            }
+            _ => {
+                frame.push(127);
+                frame.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(bytes);
+        frame
+    }
+
+    async fn read_http_response(
+        reader: &mut tokio::io::BufReader<tokio::net::TcpStream>,
+    ) -> String {
+        let mut response = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            let read = reader.read(&mut byte).await.expect("read handshake");
+            if read == 0 {
+                break;
+            }
+            response.push(byte[0]);
+        }
+        String::from_utf8(response).expect("utf8 handshake")
+    }
+
+    async fn ws_connect(addr: std::net::SocketAddr) -> tokio::io::BufReader<tokio::net::TcpStream> {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect hmr");
+        let request = format!(
+            "GET /hmr HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("hmr request");
+        let mut reader = tokio::io::BufReader::new(stream);
+        let response = read_http_response(&mut reader).await;
+        assert!(
+            response.starts_with("HTTP/1.1 101"),
+            "handshake: {response}"
+        );
+        reader
+    }
+
+    async fn read_ws_text(reader: &mut tokio::io::BufReader<tokio::net::TcpStream>) -> String {
+        let mut header = [0_u8; 2];
+        reader.read_exact(&mut header).await.expect("ws header");
+        assert_eq!(header[0] & 0x0f, 1, "expected a text frame");
+        assert_eq!(header[1] & 0x80, 0, "server frames are unmasked");
+        let len = match header[1] & 0x7f {
+            126 => {
+                let mut bytes = [0_u8; 2];
+                reader.read_exact(&mut bytes).await.expect("ws length");
+                u16::from_be_bytes(bytes) as usize
+            }
+            127 => {
+                let mut bytes = [0_u8; 8];
+                reader.read_exact(&mut bytes).await.expect("ws length");
+                usize::try_from(u64::from_be_bytes(bytes)).expect("ws length fits")
+            }
+            len => usize::from(len),
+        };
+        let mut payload = vec![0_u8; len];
+        reader.read_exact(&mut payload).await.expect("ws payload");
+        String::from_utf8(payload).expect("utf8 ws text")
+    }
+
+    /// A loopback dev-server fixture with a page, an independently served HMR
+    /// WebSocket, and an on-disk entry file. Editing the file updates both what
+    /// the app serves and the HMR payload, like a real dev server's transform
+    /// pipeline.
+    struct DevFixture {
+        _dir: tempfile::TempDir,
+        index: std::path::PathBuf,
+        app_addr: std::net::SocketAddr,
+        hmr_addr: std::net::SocketAddr,
+        content: Arc<Mutex<String>>,
+        updates: tokio::sync::broadcast::Sender<String>,
+        app_task: tokio::task::JoinHandle<()>,
+        hmr_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl DevFixture {
+        async fn start(initial: &str) -> Self {
+            let dir = tempfile::tempdir().expect("fixture dir");
+            let index = dir.path().join("index.html");
+            std::fs::write(&index, initial).expect("write fixture");
+            let content = Arc::new(Mutex::new(initial.to_string()));
+
+            let hmr_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind hmr");
+            let hmr_addr = hmr_listener.local_addr().expect("hmr addr");
+            let (updates, _) = tokio::sync::broadcast::channel::<String>(8);
+            let hmr_updates = updates.clone();
+            let hmr_task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = hmr_listener.accept().await else {
+                        break;
+                    };
+                    let updates = hmr_updates.clone();
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut buffer = [0_u8; 512];
+                        while !request
+                            .windows(4)
+                            .any(|window| window == b"\r\n\r\n".as_slice())
+                        {
+                            let Ok(read) = stream.read(&mut buffer).await else {
+                                return;
+                            };
+                            if read == 0 || request.len() > 8192 {
+                                return;
+                            }
+                            request.extend_from_slice(&buffer[..read]);
+                        }
+                        // Fixed RFC 6455 example key/accept pair; the fixture's
+                        // client sends this key and does not import a browser
+                        // identity.
+                        let handshake = concat!(
+                            "HTTP/1.1 101 Switching Protocols\r\n",
+                            "Upgrade: websocket\r\n",
+                            "Connection: Upgrade\r\n",
+                            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        );
+                        if stream.write_all(handshake.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        // Subscribe before announcing the connection so an edit
+                        // made immediately after the client sees `connected`
+                        // cannot race the receiver registration.
+                        let mut rx = updates.subscribe();
+                        if stream
+                            .write_all(&ws_text_frame("{\"type\":\"connected\"}"))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        while let Ok(payload) = rx.recv().await {
+                            if stream.write_all(&ws_text_frame(&payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+
+            let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind app");
+            let app_addr = app_listener.local_addr().expect("app addr");
+            let page = format!(
+                "<!doctype html><meta charset=\"utf-8\"><script>new WebSocket('ws://{hmr_addr}/')</script>"
+            );
+            let app_content = Arc::clone(&content);
+            let app_task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = app_listener.accept().await else {
+                        break;
+                    };
+                    let content = Arc::clone(&app_content);
+                    let page = page.clone();
+                    tokio::spawn(async move {
+                        let mut request = [0_u8; 4096];
+                        let _request = stream.read(&mut request).await;
+                        let body = content.lock().expect("fixture content").clone();
+                        let document = format!("{page}<main>{body}</main>");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{document}",
+                            document.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _shutdown = stream.shutdown().await;
+                    });
+                }
+            });
+
+            Self {
+                _dir: dir,
+                index,
+                app_addr,
+                hmr_addr,
+                content,
+                updates,
+                app_task,
+                hmr_task,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/", self.app_addr)
+        }
+
+        /// Edit the fixture's entry file and publish the transformed body to
+        /// connected HMR clients.
+        fn edit(&self, marker: &str) -> String {
+            let body = format!("<h1>{marker}</h1>");
+            std::fs::write(&self.index, &body).expect("edit fixture");
+            *self.content.lock().expect("fixture content") = body.clone();
+            let payload = serde_json::json!({
+                "type": "update",
+                "path": "index.html",
+                "body": body,
+            })
+            .to_string();
+            let _sent = self.updates.send(payload);
+            body
+        }
+
+        async fn served_page(&self) -> String {
+            within(async {
+                let mut stream = tokio::net::TcpStream::connect(self.app_addr)
+                    .await
+                    .expect("connect app");
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("request app");
+                let mut response = String::new();
+                stream
+                    .read_to_string(&mut response)
+                    .await
+                    .expect("read app");
+                response
+            })
+            .await
+        }
+    }
+
+    impl Drop for DevFixture {
+        fn drop(&mut self) {
+            self.app_task.abort();
+            self.hmr_task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_app_targets_keep_independent_hmr_and_reopen_after_restart() {
+        let alpha = DevFixture::start("<h1>alpha one</h1>").await;
+        let beta = DevFixture::start("<h1>beta one</h1>").await;
+
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        assert!(sup.pane_output(
+            101,
+            "/alpha",
+            Some("alpha-session".into()),
+            format!("  Local:   {}\n", alpha.url()).as_bytes(),
+            Some(80),
+        ));
+        assert!(sup.pane_output(
+            102,
+            "/beta",
+            Some("beta-session".into()),
+            format!("  Local:   {}\n", beta.url()).as_bytes(),
+            Some(80),
+        ));
+        assert_eq!(sup.view("/alpha").unwrap().url, alpha.url());
+        assert_eq!(sup.view("/beta").unwrap().url, beta.url());
+        assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Seen);
+        assert_eq!(sup.view("/beta").unwrap().status, PreviewStatus::Seen);
+
+        let request = sup.probe_requests("/alpha").pop().expect("alpha probe");
+        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        let request = sup.probe_requests("/beta").pop().expect("beta probe");
+        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Up);
+        assert_eq!(sup.view("/beta").unwrap().status, PreviewStatus::Up);
+
+        let mut alpha_ws = within(ws_connect(alpha.hmr_addr)).await;
+        let hello = within(read_ws_text(&mut alpha_ws)).await;
+        assert!(hello.contains("connected"));
+        let mut beta_ws = within(ws_connect(beta.hmr_addr)).await;
+        let hello = within(read_ws_text(&mut beta_ws)).await;
+        assert!(hello.contains("connected"));
+
+        // Editing alpha is visible over its HMR socket and on its app page;
+        // beta keeps serving its own content.
+        alpha.edit("alpha two");
+        let update = within(read_ws_text(&mut alpha_ws)).await;
+        assert!(update.contains("alpha two"));
+        assert!(update.contains("index.html"));
+        assert!(alpha.served_page().await.contains("alpha two"));
+        assert!(!alpha.served_page().await.contains("alpha one"));
+        assert!(beta.served_page().await.contains("beta one"));
+
+        beta.edit("beta two");
+        let update = within(read_ws_text(&mut beta_ws)).await;
+        assert!(update.contains("beta two"));
+        assert!(!update.contains("alpha two"));
+        assert_eq!(sup.view("/alpha").unwrap().url, alpha.url());
+
+        // Opening snapshots the current target (including its `up` status)
+        // before re-arming a fresh probe for later feedback.
+        let before_open = sup.view("/alpha").unwrap();
+        let opened = sup.open_view("/alpha").expect("open target");
+        assert_eq!(opened, before_open);
+        assert_eq!(
+            thegn_core::url_launch::normalize_url(&opened.url),
+            Ok(opened.url.clone())
+        );
+        assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Seen);
+        let request = sup.probe_requests("/alpha").pop().expect("re-probe");
+        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+
+        // Stop alpha, then bring a replacement dev server up on a new port.
+        let old_url = alpha.url();
+        drop(alpha);
+        assert!(sup.pane_exit(101));
+        assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Down);
+        assert_eq!(sup.view("/alpha").unwrap().url, old_url);
+
+        let restarted = DevFixture::start("<h1>alpha restarted</h1>").await;
+        assert!(sup.pane_output(
+            202,
+            "/alpha",
+            Some("alpha-restarted".into()),
+            format!("  Local:   {}\n", restarted.url()).as_bytes(),
+            Some(80),
+        ));
+        let view = sup.view("/alpha").unwrap();
+        assert_eq!(view.port, restarted.app_addr.port());
+        assert_eq!(view.status, PreviewStatus::Seen);
+        assert_ne!(view.url, old_url);
+        assert_eq!(sup.view("/beta").unwrap().url, beta.url());
+
+        let request = sup.probe_requests("/alpha").pop().expect("restarted probe");
+        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Up);
+        assert!(restarted.served_page().await.contains("alpha restarted"));
     }
 
     fn pane_ports(sup: &PreviewSupervisor) -> Vec<u16> {

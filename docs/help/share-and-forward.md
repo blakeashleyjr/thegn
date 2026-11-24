@@ -157,6 +157,24 @@ no shell; an explicit value is final, otherwise `$BROWSER`, then the OS opener;
 only http/https URLs are opened; also used by `open_on_detect`). The active
 worktree also gets a compact preview token in the sidebar.
 
+Opening a preview uses the selected URL unchanged as a top-level page in the
+configured external browser. The app keeps its own origin, navigation, forms,
+cookies, and hot-reload WebSocket, so a framework's normal HMR update appears
+without thegn proxying or re-rendering the app. thegn does not embed a browser
+engine, import a browser profile, or inject its own browser identity. If a
+future web surface offers an embedded view, it must also offer this ordinary
+tab; embedding is never the only way to open the app. Reopening with `o` (or
+copying with `↵`) snapshots the target's explicit source and last known state
+first: `up` needs no suffix, `seen`/`configured`/`unknown` say
+`(not answering yet)`, and `down` says `(server stopped)` while a fresh probe
+runs. An unavailable target reports that no preview is selected (or that the
+selected preview target is unavailable).
+
+Opening is only a browser hand-off: it never starts a dev server or package
+script, and never creates a public share. The bounded `preview.fetch`
+diagnostic is a separate credential-free GET for preview metadata; it does not
+carry app traffic, cookies, authorization, or a browser profile.
+
 An in-terminal browser is an optional drawer runtime occupant named `preview`.
 When the installed drawer tool registry provides that occupant, it receives the
 selected URL as ordinary argv/environment context and runs as a contained PTY;
