@@ -4,6 +4,14 @@
 //! need a flag-day API change. They perform no removed direnv warming,
 //! approval, or cache write; the normal launch resolver may still perform its
 //! ordinary sandbox/provider probes and provisioning.
+//!
+//! These are the seams a "skip the pane's per-spawn `.envrc` load" feature would
+//! be tempted to fill with a host `direnv export` (the callers live in
+//! `handlers/materialize.rs` and `handlers/tracker.rs`). They must not: the
+//! sandbox spec forbids evaluating a repository environment on the host during
+//! launch, and the launch-safety regressions in `agent_tests.rs` assert no
+//! `direnv` process is ever spawned from spec resolution. `thegn_core::direnv`
+//! documents the explicit-action alternative.
 
 use crate::agent::LaunchSpec;
 use thegn_core::config::Config;
