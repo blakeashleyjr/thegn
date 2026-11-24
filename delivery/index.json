@@ -67,6 +67,18 @@
       "summary": "Complete reproducible batteries-included platform bundles and clean-host proof."
     },
     {
+      "change": "add-bounded-argv-template-tokenizer",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2103",
+          "project": "Sandbox & Remote 00: Shared contracts"
+        }
+      ],
+      "summary": "One pure, bounded argv-element tokenizer is in thegn-core as the WS00-P1-07 stub; structural constructs and consumers remain with WS02-P4-02, so the change stays open until the first consumer lands."
+    },
+    {
       "change": "add-ci-logs-and-autofix",
       "archive_path": "openspec/changes/archive/2026-10-22-add-ci-logs-and-autofix/",
       "lifecycle": "archived",
