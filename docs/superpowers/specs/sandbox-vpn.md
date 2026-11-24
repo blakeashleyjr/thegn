@@ -1,7 +1,8 @@
 # Per-sandbox VPN / tunnel attachment
 
-Status: **landed (OCI sidecar v1)**, with bwrap/systemd proxy and DNS
-`filter-front` chaining explicitly deferred (see _Deferred_ below).
+Status: **landed (OCI sidecar v1)**, with bwrap/systemd proxy and host-prepared
+netns support deferred. VPN DNS `filter-front` is reserved; no hostname filter
+exists in any DNS mode.
 
 ## Goal
 
@@ -79,18 +80,19 @@ plain `sealed`.
 ## DNS
 
 - `tunnel` (default): the overlay owns resolution (MagicDNS / pushed DNS); for a
-  sidecar the sidecar's `/etc/resolv.conf` governs. `network_allow/block` bypassed.
-- `filter-only`: suppress the overlay's pushed DNS (Tailscale `TS_ACCEPT_DNS=false`).
-- `filter-front`: chain the allow/block filter in front of the tunnel's resolver.
-  `dns_filter::DnsPolicy.upstream` is the seam (configurable, tested). **Deferred**:
-  with a sidecar the loopback filter can't reach the sidecar's netns, so this
-  currently behaves like `tunnel`.
+  sidecar the sidecar's `/etc/resolv.conf` governs.
+- `filter-only`: drop the overlay's pushed DNS (for example, Tailscale
+  MagicDNS); the runtime's default resolver is used.
+- `filter-front`: reserved; lenient config load warns and behaves as `tunnel`,
+  while `thegn config validate --strict` rejects it.
+- No DNS mode filters hostnames or applies `network_allow`/`network_block`.
 
 ## Verification
 
-- Unit: `cargo test -p thegn-core --lib vpn`, `... dns_filter`,
+- Unit: `cargo test -p thegn-core --lib vpn`,
+  `cargo nextest run -p thegn-core filter_front`,
   `cargo test -p thegn-svc vpn` (provider plan builders, reconciliation
-  matrix, profile floors, sidecar-join/dns/ports suppression, upstream wiring).
+  matrix, profile floors, sidecar-join and DNS/ports suppression).
 - Manual (per provider, against a throwaway/ephemeral identity):
   `just start name=vpn-dev` with `[sandbox] enabled=true`, `[sandbox.vpn]
 provider="tailscale"`, `auth_key="env:TS_AUTHKEY"` (ephemeral key). Open a
@@ -107,10 +109,8 @@ provider="tailscale"`, `auth_key="env:TS_AUTHKEY"` (ephemeral key). Open a
    (not an OCI sidecar) on host loopback + `ALL_PROXY` in `wrap_script`; honestly
    non-isolating (shares the host netns). A separate bring-up path from the OCI
    sidecar runner.
-2. **DNS `filter-front` for sidecar tunnels** — run/forward the allow/block
-   filter inside or reachable-from the sidecar netns (the `upstream` seam exists).
-3. **CLI/status surfacing** — show tunnel state + node identity in the SANDBOXES
+2. **CLI/status surfacing** — show tunnel state + node identity in the SANDBOXES
    panel (events already map back to the worktree).
-4. **`[env.<name>.vpn]`** — when the named-environment / `Placement` layer lands,
+3. **`[env.<name>.vpn]`** — when the named-environment / `Placement` layer lands,
    a tunnel becomes a property of a named env for free (`VpnConfig` is whole-table
    in the overlay and identity-bearing).
