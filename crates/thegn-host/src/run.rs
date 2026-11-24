@@ -12547,6 +12547,16 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Terminal history search (THE-2244): the overlay's worker scores an
+        // owned snapshot off the loop, so all this pump does is fold in what it
+        // produced. Streamed batches land in rank order; a stale generation's
+        // batches are discarded inside `drain`; an idle wake touches nothing.
+        if let Some(o) = search.as_mut()
+            && o.drain_search()
+        {
+            dirty = true;
+        }
+
         let mut pending_focus: Option<thegn_core::store::IntentRow> = None;
         // `open --preset` mailbox rows, applied right after the focus intent.
         let mut pending_preset = crate::workspace_switch_prep::seed_deferred_preset(
@@ -21849,8 +21859,9 @@ async fn event_loop<T: Terminal>(
                         .iter()
                         .map(|(id, label, buf)| (*id, label.as_str(), *buf))
                         .collect();
-                    match ov.handle_key(&k.key, k.modifiers, &srcs_ref) {
+                    match ov.handle_key_async(&k.key, k.modifiers, &srcs_ref) {
                         crate::search::SearchOutcome::Pending => {
+                            ov.start_pending_search(&srcs_ref, waker.clone());
                             dirty = true;
                             continue;
                         }
@@ -21862,7 +21873,8 @@ async fn event_loop<T: Terminal>(
                                 srcs.iter()
                                     .map(|(id, label, buf)| (*id, label.as_str(), *buf))
                                     .collect();
-                            ov.apply_scope(scope, &srcs_ref);
+                            ov.apply_scope_async(scope);
+                            ov.start_pending_search(&srcs_ref, waker.clone());
                             dirty = true;
                             continue;
                         }
@@ -28758,7 +28770,8 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::SearchPane => {
                                 // Open an incremental search overlay scoped to
-                                // the focused pane's history.
+                                // the focused pane's history. The prime scan runs
+                                // on the search worker, not this loop.
                                 let max = keymap.config().search.max_results;
                                 let mut overlay = crate::search::SearchOverlay::new(
                                     thegn_core::search::SearchScope::Pane(focused),
@@ -28779,7 +28792,8 @@ async fn event_loop<T: Terminal>(
                                     .iter()
                                     .map(|(id, label, buf)| (*id, label.as_str(), *buf))
                                     .collect();
-                                overlay.prime(&srcs_ref);
+                                overlay.queue_prime();
+                                overlay.start_pending_search(&srcs_ref, waker.clone());
                                 search = Some(overlay);
                             }
                             Action::SearchGlobal => {
@@ -28805,7 +28819,8 @@ async fn event_loop<T: Terminal>(
                                     .iter()
                                     .map(|(id, label, buf)| (*id, label.as_str(), *buf))
                                     .collect();
-                                overlay.prime(&srcs_ref);
+                                overlay.queue_prime();
+                                overlay.start_pending_search(&srcs_ref, waker.clone());
                                 search = Some(overlay);
                             }
                             Action::SearchReplace => {

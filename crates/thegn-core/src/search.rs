@@ -4,12 +4,24 @@
 //! core) over one or more [`HistoryBuffer`]s, selected by [`SearchScope`]. The
 //! engine is pure data — it holds query + ranked matches; the host layer owns
 //! the overlay UI and feeds the engine sources on each keystroke.
+//!
+//! The query/option setters score synchronously. The host also drives the same
+//! engine from a worker thread: `queue_*` apply a control change without
+//! scanning, [`SearchEngine::recompute_cancellable`] runs the scan with a
+//! cancellation poll (so a superseded query stops mid-corpus), and
+//! [`SearchEngine::append_async_matches`] / [`SearchEngine::finish_async_results`]
+//! install the streamed results.
 
 use neo_frizbee::{Config, match_list};
 use regex::RegexBuilder;
 use std::collections::HashMap;
 
 use crate::history::HistoryBuffer;
+
+/// Lines between cancellation polls inside a scan. Small enough that a stale
+/// search stops within a frame, large enough that the atomic load disappears
+/// in the scoring cost.
+const CANCEL_STRIDE: usize = 256;
 
 // ── Scope ─────────────────────────────────────────────────────────────────────
 
@@ -225,7 +237,7 @@ impl SearchEngine {
         self.mode = m;
         self.refine = None;
         self.selected = 0;
-        self.recompute(sources);
+        self.recompute(sources, &|| false);
     }
 
     /// Change query options; re-scores against `sources`.
@@ -233,7 +245,91 @@ impl SearchEngine {
         self.options = o;
         self.refine = None;
         self.selected = 0;
-        self.recompute(sources);
+        self.recompute(sources, &|| false);
+    }
+
+    /// Change the result cap without scoring. Used by a worker that keeps one
+    /// engine across jobs, so the cap must be re-applied before each scan.
+    pub fn queue_max_results(&mut self, max_results: usize) {
+        self.max_results = max_results.max(1);
+        self.selected = 0;
+    }
+
+    /// Adopt a query without scoring it. The caller runs the scan elsewhere
+    /// (see [`SearchEngine::recompute_cancellable`]) and feeds the results back
+    /// through [`SearchEngine::append_async_matches`].
+    pub fn queue_query(&mut self, q: &str) {
+        self.query = q.to_string();
+        self.selected = 0;
+        self.matches.clear();
+        self.total = 0;
+        self.error = None;
+    }
+
+    /// Adopt a match mode without scoring it.
+    pub fn queue_mode(&mut self, mode: MatchMode) {
+        self.mode = mode;
+        self.refine = None;
+        self.selected = 0;
+        self.matches.clear();
+        self.total = 0;
+        self.error = None;
+    }
+
+    /// Adopt query options without scoring them.
+    pub fn queue_options(&mut self, options: MatchOptions) {
+        self.options = options;
+        self.refine = None;
+        self.selected = 0;
+        self.matches.clear();
+        self.total = 0;
+        self.error = None;
+    }
+
+    /// Adopt a scope without scoring against it.
+    pub fn queue_scope(&mut self, scope: SearchScope) {
+        self.scope = scope;
+        self.refine = None;
+        self.selected = 0;
+        self.matches.clear();
+        self.total = 0;
+        self.error = None;
+    }
+
+    /// Install a streamed batch of already-ranked matches.
+    pub fn append_async_matches(&mut self, matches: Vec<SearchMatch>) {
+        self.matches.extend(matches);
+        if self.selected >= self.matches.len() {
+            self.selected = self.matches.len().saturating_sub(1);
+        }
+    }
+
+    /// Install the final totals for a streamed search and clear the spinner.
+    pub fn finish_async_results(&mut self, total: usize, error: Option<String>) {
+        self.total = total;
+        self.error = error;
+    }
+
+    /// Score the current query, mode and options against `sources` on the
+    /// caller's thread. The fallback when no worker is available.
+    pub fn rescore(&mut self, sources: &[SearchSource<'_>]) {
+        self.recompute(sources, &|| false);
+    }
+
+    /// Score the current query/mode/options against `sources`, polling
+    /// `cancelled` every [`CANCEL_STRIDE`] lines.
+    ///
+    /// Returns `false` when `cancelled` fired mid-scan; the result list is then
+    /// incomplete and the caller must discard it. The literal refine cache is
+    /// kept across calls, so a growing query over an unchanged corpus re-filters
+    /// the previous hits instead of rescanning every line.
+    #[must_use]
+    pub fn recompute_cancellable(
+        &mut self,
+        sources: &[SearchSource<'_>],
+        cancelled: &dyn Fn() -> bool,
+    ) -> bool {
+        self.recompute(sources, cancelled)
     }
 
     pub fn query(&self) -> &str {
@@ -282,21 +378,21 @@ impl SearchEngine {
     pub fn set_query(&mut self, q: &str, sources: &[SearchSource<'_>]) {
         self.query = q.to_string();
         self.selected = 0;
-        self.recompute(sources);
+        self.recompute(sources, &|| false);
     }
 
     /// Append one character and re-score incrementally.
     pub fn push_char(&mut self, c: char, sources: &[SearchSource<'_>]) {
         self.query.push(c);
         self.selected = 0;
-        self.recompute(sources);
+        self.recompute(sources, &|| false);
     }
 
     /// Delete the last character and re-score.
     pub fn backspace(&mut self, sources: &[SearchSource<'_>]) {
         self.query.pop();
         self.selected = 0;
-        self.recompute(sources);
+        self.recompute(sources, &|| false);
     }
 
     /// Change scope without changing the query; re-score against new sources.
@@ -304,10 +400,12 @@ impl SearchEngine {
         self.scope = scope;
         self.refine = None;
         self.selected = 0;
-        self.recompute(sources);
+        self.recompute(sources, &|| false);
     }
 
-    fn recompute(&mut self, sources: &[SearchSource<'_>]) {
+    /// Fill `matches`/`total` from `sources`. Returns `false` when `cancelled`
+    /// fired mid-scan (the caller discards the partial result).
+    fn recompute(&mut self, sources: &[SearchSource<'_>], cancelled: &dyn Fn() -> bool) -> bool {
         self.matches.clear();
         self.total = 0;
         self.error = None;
@@ -351,7 +449,12 @@ impl SearchEngine {
         let mut hits: Vec<RankedSearchHit> = Vec::new();
         if empty {
             self.refine = None;
-            hits.extend(flat.iter().enumerate().map(|(i, _)| (i, 0, None)));
+            for (i, _) in flat.iter().enumerate() {
+                if i % CANCEL_STRIDE == 0 && cancelled() {
+                    return false;
+                }
+                hits.push((i, 0, None));
+            }
         } else {
             match mode {
                 MatchMode::Literal => {
@@ -364,7 +467,10 @@ impl SearchEngine {
                     });
                     match refine_hits {
                         Some(indices) => {
-                            for i in indices {
+                            for (n, i) in indices.into_iter().enumerate() {
+                                if n % CANCEL_STRIDE == 0 && cancelled() {
+                                    return false;
+                                }
                                 if let Some(f) = flat.get(i) {
                                     #[cfg(test)]
                                     {
@@ -389,6 +495,9 @@ impl SearchEngine {
                         }
                         None => {
                             for (i, f) in flat.iter().enumerate() {
+                                if i % CANCEL_STRIDE == 0 && cancelled() {
+                                    return false;
+                                }
                                 #[cfg(test)]
                                 {
                                     self.scanned += 1;
@@ -444,10 +553,13 @@ impl SearchEngine {
                                         line.chars().take(120).collect()
                                     }),
                             );
-                            return;
+                            return true;
                         }
                     };
                     for (i, f) in flat.iter().enumerate() {
+                        if i % CANCEL_STRIDE == 0 && cancelled() {
+                            return false;
+                        }
                         #[cfg(test)]
                         {
                             self.scanned += 1;
@@ -468,9 +580,17 @@ impl SearchEngine {
                     {
                         self.scanned = flat.len();
                     }
-                    let hay: Vec<&str> = flat.iter().map(|f| f.2).collect();
-                    for m in match_list(&trimmed, &hay, &Config::default()) {
-                        hits.push((m.index as usize, m.score as u32, None));
+                    // Score in cancellation-sized chunks so a superseded query
+                    // stops mid-corpus instead of after every line.
+                    for (chunk, lines) in flat.chunks(CANCEL_STRIDE).enumerate() {
+                        if cancelled() {
+                            return false;
+                        }
+                        let hay: Vec<&str> = lines.iter().map(|f| f.2).collect();
+                        let base = chunk * CANCEL_STRIDE;
+                        for m in match_list(&trimmed, &hay, &Config::default()) {
+                            hits.push((base + m.index as usize, m.score as u32, None));
+                        }
                     }
                 }
             }
@@ -506,6 +626,7 @@ impl SearchEngine {
             .into_iter()
             .map(|(i, score, span, repeat)| mk(&flat[i], score, span, repeat))
             .collect();
+        true
     }
 }
 
@@ -1187,6 +1308,118 @@ mod tests {
         let mut eng = SearchEngine::new(SearchScope::Pane(1), 2);
         eng.set_query("ssh", &sources);
         assert_eq!(lines_of(&eng), ["ssh latest", "ssh newest"]);
+    }
+
+    #[test]
+    fn queueing_state_scores_nothing() {
+        let buf = buf_from(&["ssh one", "ssh two"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_query("ssh", &sources);
+        assert_eq!(eng.total(), 2);
+        let scored = eng.scanned;
+        eng.queue_query("other");
+        assert_eq!(eng.query(), "other");
+        assert!(eng.matches().is_empty());
+        assert_eq!(eng.total(), 0);
+        assert_eq!(eng.selected_idx(), 0);
+        assert_eq!(eng.scanned, scored, "queueing a query scores nothing");
+    }
+
+    #[test]
+    fn streamed_matches_install_in_rank_order() {
+        let buf = buf_from(&["ssh one", "ssh two", "other"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut sync = engine(SearchScope::Pane(1));
+        sync.set_query("ssh", &sources);
+
+        let mut streamed = engine(SearchScope::Pane(1));
+        streamed.queue_query("ssh");
+        for batch in sync.matches().chunks(1) {
+            streamed.append_async_matches(batch.to_vec());
+        }
+        streamed.finish_async_results(sync.total(), None);
+
+        assert_eq!(streamed.matches(), sync.matches());
+        assert_eq!(streamed.total(), sync.total());
+        assert!(!streamed.truncated());
+        assert_eq!(streamed.selected_idx(), 0);
+    }
+
+    #[test]
+    fn completed_cancellable_scan_matches_the_synchronous_engine() {
+        let buf = buf_from(&["ssh host", "push changes", "status clean", "other"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut sync = engine(SearchScope::Pane(1));
+        sync.set_query("sh", &sources);
+
+        let mut async_eng = engine(SearchScope::Pane(1));
+        async_eng.queue_query("sh");
+        assert!(async_eng.recompute_cancellable(&sources, &|| false));
+
+        assert_eq!(async_eng.matches(), sync.matches());
+        assert_eq!(async_eng.total(), sync.total());
+        assert_eq!(async_eng.error(), sync.error());
+    }
+
+    #[test]
+    fn a_cancelled_scan_reports_incomplete_and_scores_nothing() {
+        let owned: Vec<String> = (0..2_000).map(|i| format!("line {i} ssh")).collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let buf = buf_from(&refs);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.queue_query("ssh");
+        assert!(!eng.recompute_cancellable(&sources, &|| true));
+        assert!(eng.matches().is_empty());
+    }
+
+    #[test]
+    fn cancellation_is_polled_every_stride_not_every_line() {
+        let owned: Vec<String> = (0..1_000).map(|i| format!("line {i} ssh")).collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let buf = buf_from(&refs);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let polls = std::cell::Cell::new(0_usize);
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.queue_query("ssh");
+        assert!(eng.recompute_cancellable(&sources, &|| {
+            polls.set(polls.get() + 1);
+            false
+        }));
+        // 1_000 lines / 256 ≈ 4 polls, not 1_000.
+        assert_eq!(polls.get(), 4, "one poll per 256 lines, not per line");
+    }
+
+    #[test]
+    fn fuzzy_scan_honours_cancellation() {
+        let buf = buf_from(&["shell prompt", "ssh host", "other"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.queue_mode(MatchMode::Fuzzy);
+        eng.queue_query("shp");
+        assert!(!eng.recompute_cancellable(&sources, &|| true));
+        assert!(eng.matches().is_empty());
+    }
+
+    #[test]
+    fn queued_growing_query_reuses_the_refine_cache() {
+        let buf = buf_from(&["s", "ss", "ssh", "other"]);
+        let sources: Vec<SearchSource<'_>> = vec![(1, "p", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.queue_max_results(1_000);
+        eng.queue_scope(SearchScope::Pane(1));
+        eng.queue_mode(MatchMode::Literal);
+        eng.queue_options(MatchOptions::default());
+        eng.queue_query("s");
+        assert!(eng.recompute_cancellable(&sources, &|| false));
+        assert_eq!(eng.scanned, buf.len());
+        assert_eq!(eng.total(), 3);
+
+        eng.queue_query("ss");
+        assert!(eng.recompute_cancellable(&sources, &|| false));
+        assert_eq!(eng.scanned, 3, "only the previous hits are re-filtered");
+        assert_eq!(eng.total(), 2);
     }
 
     fn next_random(state: &mut u64) -> u32 {
