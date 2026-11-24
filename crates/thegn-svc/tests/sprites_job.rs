@@ -391,6 +391,27 @@ fn exec_ws(mut stream: TcpStream, head: &Head, script: Script) {
             return;
         }
     }
+    // Do not drop the socket right after the last frame. The real client writes
+    // a Ping on connect (and a Pong/Close later) that this mock never reads;
+    // closing a TCP socket with unread inbound bytes sends RST instead of FIN,
+    // and an RST discards whatever the peer has not yet read, including the
+    // scripted `Exit` frame. Under load the client is slow enough to lose that
+    // race: it saw EOF without an exit, classed the attempt Indeterminate, and
+    // spent the 45 s kill-exec budget against a mock with no kill script left.
+    // Reading until the client closes (bounded) turns the close into a clean FIN
+    // that arrives after every frame.
+    if socket
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(message) = socket.read() {
+        if matches!(message, Message::Close(_)) {
+            break;
+        }
+    }
 }
 
 /// Percent-decode one query parameter value.
