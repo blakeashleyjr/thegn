@@ -661,6 +661,14 @@
       "summary": "Activity and attention parity require on-machine Windows validation."
     },
     {
+      "change": "add-windows-sandbox-helper-protocol",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2138 owns this crate, but its project (Sandbox & Remote 06: Windows) is outside the checked-in delivery inventory, so it is not mapped here.",
+      "summary": "The helper wire protocol and argv quoting still need Wine and Windows CI proof."
+    },
+    {
       "change": "add-workspace-search-replace",
       "lifecycle": "active",
       "disposition": "residual-split",

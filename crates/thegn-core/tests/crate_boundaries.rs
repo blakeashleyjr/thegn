@@ -158,6 +158,10 @@ fn core_is_substrate_free() {
     assert!(core.iter().any(|d| d == "thegn-media"));
     // Owner-approved for THE-368 (2026-10-20); the process leaf stays core-free.
     assert!(core.iter().any(|d| d == "thegn-proc"));
+    // The serde-only Windows sandbox wire crate (THE-2138): a leaf with no
+    // runtime and no OS calls, so core may lower Windows sandbox policies into
+    // it (WS06-P1-01) while staying substrate-free.
+    assert!(core.iter().any(|d| d == "thegn-sandbox-proto"));
 }
 
 /// `[workspace.lints]` (notably `let_underscore_future = "deny"`, the gate

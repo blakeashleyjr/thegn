@@ -15,7 +15,18 @@ test-utils = ["dep:tempfile"]
 [lints]
 workspace = true
 
+# The serde-only Windows sandbox wire crate (THE-2138). Core lowers Windows
+# sandbox policies into it in WS06-P1-01, so the dependency edge is recorded
+# ahead of its first use and machete must not report it as unused.
+[package.metadata.cargo-machete]
+ignored = ["thegn-sandbox-proto"]
+
 [dependencies]
+# Portable wire types shared with the standalone Windows sandbox helper. The
+# helper must not link core, and Win32 FFI must not enter core, so both sides
+# depend on this serde-only leaf (`crate_boundaries::core_is_substrate_free`
+# pins the edge).
+thegn-sandbox-proto.workspace = true
 # The media model lives in the C-dep-free `thegn-media` leaf (so its per-OS
 # control backends cross-check); core re-exports it via `media.rs` and lowers
 # `MediaConfig` into the leaf's `ResolveOpts`. Pure-Rust dep — does not affect

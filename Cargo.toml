@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/thegn-cas",
   "crates/thegn-guest-proto",
+  "crates/thegn-sandbox-proto",
   "crates/thegn-job-spec",
   "crates/thegn-lease",
   "crates/thegn-core",
@@ -265,6 +266,7 @@ tg-kit = { path = "crates/tg-kit" }
 thegn-svc = { path = "crates/thegn-svc" }
 thegn-metrics = { path = "crates/thegn-metrics" }
 thegn-media = { path = "crates/thegn-media" }
+thegn-sandbox-proto = { path = "crates/thegn-sandbox-proto" }
 thegn-proc = { path = "crates/thegn-proc" }
 # --- dev/bench tooling ---
 criterion = { version = "0.5", features = ["html_reports"] }
