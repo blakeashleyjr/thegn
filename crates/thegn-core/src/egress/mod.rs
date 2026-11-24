@@ -11,9 +11,11 @@
 //!   WS01-P2-01, extended to the full grammar by WS04-P1-01.
 //!
 //! Later items add their own submodules here: WS01-P2-01 added `pattern` (host
-//! patterns, today's semantics) and WS04 adds `policy`, `preset`, `resolve` and
-//! `wire`. The reporting enum [`EgressKind`](crate::capabilities::EgressKind)
-//! stays in `capabilities`; its semantics are owned by WS01-P1-02.
+//! patterns, extended to the full grammar by WS04-P1-01); WS04-P1-07 added `policy` (the frozen policy
+//! data shape, presets to follow) and `wire` (the control wire, the lease spec
+//! and the audit record v1); WS04 adds `preset` and `resolve`. The reporting enum
+//! [`EgressKind`](crate::capabilities::EgressKind) stays in `capabilities`; its
+//! semantics are owned by WS01-P1-02.
 //!
 //! - [`preset_names`]: the THE-791 network preset names (alignment T6); added
 //!   by WS00-P1-14, owned by WS04-P1-05.
@@ -23,6 +25,8 @@
 
 pub mod pattern;
 pub mod plan;
+pub mod policy;
+pub mod wire;
 
 /// The built-in network preset names of THE-791 (alignment T6). They replace
 /// `minimal@1`, `trusted@1` and `full@1` everywhere. Stub constants added by
