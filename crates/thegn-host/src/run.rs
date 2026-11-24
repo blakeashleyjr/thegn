@@ -12566,8 +12566,8 @@ async fn event_loop<T: Terminal>(
         if let Some(outcome) = search.as_mut().and_then(|o| o.take_ready()) {
             let walk = match &outcome {
                 crate::search::SearchOutcome::Jump(_) => search
-                    .as_ref()
-                    .and_then(|o| crate::search::SearchWalk::from_overlay(o)),
+                    .take()
+                    .and_then(crate::search::SearchWalk::from_overlay),
                 _ => None,
             };
             search = None;
@@ -21970,8 +21970,9 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         crate::search::SearchOutcome::Jump(m) => {
-                            search_walk = crate::search::SearchWalk::from_overlay(ov);
-                            search = None;
+                            search_walk = search
+                                .take()
+                                .and_then(crate::search::SearchWalk::from_overlay);
                             let jump = crate::search_sources::apply_search_jump(
                                 m,
                                 &mut session,

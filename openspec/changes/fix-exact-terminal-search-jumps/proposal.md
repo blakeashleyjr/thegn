@@ -22,7 +22,7 @@ left the user with no way to keep stepping through the ranked hits.
 
 ## Impact
 
-Affected specs: `search-jumps` (new capability).
+Affected specs: `panes` (history-search requirements added).
 
 Affected code: `thegn-host` emulator line lookup, search overlay walk state,
 host key/scroll/mouse handling, and the search help page.

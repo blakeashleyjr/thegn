@@ -1,4 +1,4 @@
-# Search jumps
+# Terminal history search
 
 ## ADDED Requirements
 

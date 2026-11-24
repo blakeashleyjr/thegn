@@ -701,13 +701,19 @@ impl PaneEmulator for AlacrittyEmulator {
         let target = text.trim_end_matches(' ');
         let first = -(history as i32);
         let last = screen as i32;
+        // Logical lines that END above the cursor row are the ones the history
+        // ring holds (`SearchMatch::from_tail` 0 is the first of them). The
+        // cursor row carries the unterminated partial line and the rows below
+        // it are blank; neither is in the ring, so they get no ordinal.
+        let cursor_line = grid.cursor.point.line.0;
         let mut current: Option<String> = None;
         let mut current_top = 0i32;
+        let mut current_bottom = 0i32;
         let mut current_rows = 0u16;
         let mut best: Option<(usize, i32, u16, usize)> = None;
-        let mut logical_lines_from_bottom = 0usize;
+        let mut next_ordinal = 0usize;
 
-        let mut consider = |logical: String, top: i32, rows: u16, from_bottom: usize| {
+        let mut consider = |logical: String, top: i32, rows: u16, ordinal: Option<usize>| {
             if logical.trim_end_matches(' ') != target {
                 return;
             }
@@ -715,10 +721,18 @@ impl PaneEmulator for AlacrittyEmulator {
             // SearchMatch::from_tail counts logical history lines. `offset`
             // counts physical grid rows, which diverge when preceding output
             // wraps; use the logical line ordinal to resolve duplicate text.
-            let distance = from_bottom.abs_diff(hint_from_bottom);
+            // A line outside the ring is only a last resort (never nearest).
+            let distance = ordinal.map_or(usize::MAX, |o| o.abs_diff(hint_from_bottom));
             if best.is_none_or(|(_, _, _, best_distance)| distance < best_distance) {
                 best = Some((offset, top, rows, distance));
             }
+        };
+        let mut ordinal_for = |bottom: i32| -> Option<usize> {
+            (bottom < cursor_line).then(|| {
+                let ordinal = next_ordinal;
+                next_ordinal = next_ordinal.saturating_add(1);
+                ordinal
+            })
         };
 
         for line_no in (first..last).rev() {
@@ -743,32 +757,25 @@ impl PaneEmulator for AlacrittyEmulator {
                     current_rows = current_rows.saturating_add(1);
                 }
                 Some(logical) => {
-                    consider(
-                        logical,
-                        current_top,
-                        current_rows,
-                        logical_lines_from_bottom,
-                    );
-                    logical_lines_from_bottom = logical_lines_from_bottom.saturating_add(1);
+                    let ordinal = ordinal_for(current_bottom);
+                    consider(logical, current_top, current_rows, ordinal);
                     current = Some(segment);
                     current_top = line_no;
+                    current_bottom = line_no;
                     current_rows = 1;
                 }
                 None => {
                     current = Some(segment);
                     current_top = line_no;
+                    current_bottom = line_no;
                     current_rows = 1;
                 }
             }
         }
 
         if let Some(logical) = current {
-            consider(
-                logical,
-                current_top,
-                current_rows,
-                logical_lines_from_bottom,
-            );
+            let ordinal = ordinal_for(current_bottom);
+            consider(logical, current_top, current_rows, ordinal);
         }
 
         best.map(|(offset, top, rows, _)| {
@@ -1141,25 +1148,76 @@ mod tests {
         assert!(newest < oldest, "hint should select the nearer occurrence");
     }
 
+    /// `SearchMatch::from_tail` of every line equal to `text`, oldest first,
+    /// from a history ring fed the same bytes (pins the cross-structure contract).
+    fn ring_from_tails(bytes: &[u8], text: &str) -> Vec<usize> {
+        use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
+
+        let mut buf = HistoryBuffer::new(1_000);
+        let mut partial = Vec::new();
+        let mut stripper = AnsiStripper::default();
+        feed_bytes_to_history(bytes, &mut buf, &mut partial, &mut stripper);
+        let n = buf.len();
+        (0..n)
+            .filter(|&i| buf.get(i) == Some(text))
+            .map(|i| n - 1 - i)
+            .collect()
+    }
+
     #[test]
     fn locate_line_uses_logical_distance_when_duplicate_lines_cross_wrapped_output() {
+        // Older copy, a 200-column line that wraps to 20 rows, the newer copy,
+        // six more lines, then an unterminated prompt on the cursor row.
+        let mut bytes = b"needle\r\n".to_vec();
+        bytes.extend_from_slice(format!("{}\r\n", "w".repeat(200)).as_bytes());
+        bytes.extend_from_slice(b"needle\r\n");
+        for i in 0..6 {
+            bytes.extend_from_slice(format!("x{i}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"$ ");
         let mut e = AlacrittyEmulator::new(5, 10, 100);
-        e.advance(b"needle\r\nbetween\r\n");
-        e.advance(format!("{}\r\n", "w".repeat(80)).as_bytes());
-        e.advance(b"needle\r\ntail-a\r\ntail-b\r\ntail-c\r\n");
+        e.advance(&bytes);
 
-        let newest = e.locate_line_span("needle", 0).expect("newest occurrence");
-        let oldest = e
-            .locate_line_span("needle", usize::MAX)
-            .expect("oldest occurrence");
-        let selected = e
-            .locate_line_span("needle", 6)
-            .expect("occurrence at logical distance six");
-
-        assert_ne!(newest.1, oldest.1, "fixture has two distinct matches");
+        let tails = ring_from_tails(&bytes, "needle");
         assert_eq!(
-            selected.1, oldest.1,
-            "the logical tail hint selects the older match despite wrapped rows"
+            tails,
+            vec![8, 6],
+            "fixture: older copy 8 lines back, newer 6"
+        );
+        let newer = e.locate_line_span("needle", 6).expect("newer copy");
+        let older = e.locate_line_span("needle", 8).expect("older copy");
+        assert_ne!(newer.1, older.1, "fixture has two distinct matches");
+        // Physical offsets are 3 (newer) and 24 (older): the old row-distance
+        // rule would send hint 8 to the newer copy (|3-8| < |24-8|).
+        assert_eq!(newer.1, -3);
+        assert_eq!(older.1, -24);
+        assert_eq!(e.locate_line_span("needle", 7).expect("tie").1, newer.1);
+    }
+
+    #[test]
+    fn locate_line_ignores_blank_rows_below_the_prompt_after_clear() {
+        let mut bytes = b"needle\r\n".to_vec();
+        for i in 0..30 {
+            bytes.extend_from_slice(format!("f{i}\r\n").as_bytes());
+        }
+        // `clear`: home + erase the screen, then the prompt lands on row 1 with
+        // three blank rows below it.
+        bytes.extend_from_slice(b"\x1b[H\x1b[2Jneedle\r\n$ ");
+        let mut e = AlacrittyEmulator::new(5, 40, 100);
+        e.advance(&bytes);
+
+        let tails = ring_from_tails(&bytes, "needle");
+        assert_eq!(
+            tails,
+            vec![31, 0],
+            "fixture: scrollback copy 31 back, screen copy 0"
+        );
+        let screen_copy = e.locate_line_span("needle", 0).expect("screen copy");
+        let old_copy = e.locate_line_span("needle", 17).expect("scrollback copy");
+        assert_eq!(screen_copy.1, 0, "the on-screen copy is the newest");
+        assert!(
+            old_copy.1 < 0,
+            "hint 17 is nearer the scrollback copy (|31-17| < 17)"
         );
     }
 
