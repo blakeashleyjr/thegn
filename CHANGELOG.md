@@ -7,6 +7,28 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.126] — 2026-11-23
+
+### Changed
+
+- Closing a pane focuses the pane you used most recently in that tab instead
+  of whichever pane the layout happened to leave. Closing a pane you are not
+  in leaves focus where it is.
+- Egress host patterns share one grammar: exact (`=host`), subdomain and
+  wildcard forms, ports, and IP literals, matched on label boundaries.
+  Percent-encoded or non-hostname characters are refused, and a block entry
+  without a port blocks every port.
+- The egress proxy control protocol and audit record shapes are frozen for
+  v1 (server challenge, lease reply, additive-only enums); credentials are
+  never serialised and audit paths drop query strings.
+
+### Fixed
+
+- Apple container sandboxes refuse `network = "host"` as well as
+  `network = "none"` instead of passing a keyword the runtime does not honour.
+- A Sprites job test no longer hangs for 45 s under load: the test server
+  reads the client's close before dropping the connection.
+
 ## [0.1.0-alpha.125] — 2026-11-23
 
 ### Added

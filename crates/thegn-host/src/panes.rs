@@ -1608,11 +1608,13 @@ impl Panes {
         let old_focus = tab.focused_pane;
         tab.center
             .remap(&mut |old| map.get(&old).copied().unwrap_or(old));
-        tab.focused_pane = map
+        tab.remap_focus_history(&mut |old| map.get(&old).copied());
+        let next = map
             .get(&old_focus)
             .copied()
             .or_else(|| tab.center.pane_ids().first().copied())
             .unwrap_or(0);
+        tab.focus_pane(next);
         Ok(())
     }
 }
@@ -1786,7 +1788,8 @@ pub(crate) fn replace_single_dead_center_pane(
     }
 
     tab.center = crate::center::CenterTree::Leaf(fresh_id);
-    tab.focused_pane = fresh_id;
+    tab.focus_history.retain(|id| *id != dead_id);
+    tab.focus_pane(fresh_id);
     true
 }
 

@@ -48,7 +48,7 @@ pub(crate) fn open_argv_tab(
         group.add_tab();
         if let Some(tab) = group.active_tab_mut() {
             tab.center = crate::center::CenterTree::Leaf(id);
-            tab.focused_pane = id;
+            tab.focus_pane(id);
             return true;
         }
     }
@@ -88,7 +88,7 @@ pub(crate) fn open_command_tab_id(
         g.add_tab();
         if let Some(tab) = g.active_tab_mut() {
             tab.center = crate::center::CenterTree::Leaf(id);
-            tab.focused_pane = id;
+            tab.focus_pane(id);
             return Some(id);
         }
     }
@@ -112,7 +112,7 @@ pub(crate) fn open_command_pane(
     if let Some(tab) = session.active_tab_mut()
         && tab.center.split(focused, crate::center::Dir::Row, id)
     {
-        tab.focused_pane = id;
+        tab.focus_pane(id);
         return;
     }
     panes.table.remove(&id);
@@ -133,7 +133,7 @@ pub(crate) fn open_argv_pane(
     if let Some(tab) = session.active_tab_mut()
         && tab.center.split(focused, crate::center::Dir::Row, id)
     {
-        tab.focused_pane = id;
+        tab.focus_pane(id);
         return true;
     }
     panes.table.remove(&id);

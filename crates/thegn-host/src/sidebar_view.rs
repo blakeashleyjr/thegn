@@ -4009,6 +4009,24 @@ mod tests {
         assert!(!d.other_group_collapsed);
     }
 
+    /// The row-limit and batch keys ride `from_ui`, so the documented defaults
+    /// (7 rows, batch once 2 share a token) and a config override both reach the
+    /// pure row passes.
+    #[test]
+    fn from_ui_carries_the_row_limit_and_batch_keys() {
+        let d = SidebarDisplay::from_ui(&thegn_core::config::UiConfig::default());
+        assert_eq!(d.group_row_limit, 7);
+        assert_eq!(d.batch_group_min, 2);
+        let ui = thegn_core::config::UiConfig {
+            sidebar_group_row_limit: 3,
+            sidebar_batch_group_min: 0,
+            ..Default::default()
+        };
+        let d = SidebarDisplay::from_ui(&ui);
+        assert_eq!(d.group_row_limit, 3);
+        assert_eq!(d.batch_group_min, 0);
+    }
+
     // ─── THE-70: honest quick-jump digits ──────────────────────────────────
 
     /// Three switchable workspaces interleaved with three Tab-target worktrees,

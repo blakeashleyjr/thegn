@@ -351,6 +351,7 @@ pub mod retry;
 pub mod review;
 pub mod revtunnel;
 pub mod sandbox;
+pub mod sandbox_apple_net;
 pub mod sandbox_backend;
 pub mod sandbox_build;
 pub mod sandbox_compose;

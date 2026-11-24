@@ -723,7 +723,7 @@ pub enum RefusalClass {
     /// A container with this lossy name belongs to another worktree or its owner could not be read.
     ContainerOwner,
     /// The backend has no verified way to express the requested network mode
-    /// (Apple `container` and `network = "none"`).
+    /// (Apple `container`, which has no `host` or `none` network keyword).
     NetworkUnexpressible,
 }
 
@@ -796,7 +796,7 @@ impl RefusalClass {
                 "another worktree's sandbox container has this container's name (worktree paths that differ only in punctuation or case share one): close that worktree's sandbox first, or rename one worktree directory"
             }
             Self::NetworkUnexpressible => {
-                "Apple `container` cannot express `network = \"none\"` yet: use podman or docker (they run in a VM on macOS) for offline or sealed worktrees, or set `network = \"nat\"`"
+                "apple `container` has no host network and cannot honour `network = \"none\"` (its internal network still reaches Mac services): use podman or docker for offline or sealed worktrees, or set `network = \"nat\"`"
             }
         }
     }
@@ -1070,16 +1070,29 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
     std::borrow::Cow::Owned(v)
 }
 
-/// The refusal message when the backend cannot express the spec's network
-/// mode: Apple `container` with `network = "none"` (which the `sealed`
-/// profile sets). WS05 removes this when Apple internal networks land.
+/// The refusal message when the backend cannot express the spec's network mode.
+///
+/// Apple `container` has neither a `host` nor a `none` network keyword: `none`
+/// is read as a network *name*, and there is no host-network mode at all. Apple
+/// `none` also stays refused while its internal network still reaches services
+/// bound on the Mac; only V-AC-02 evidence proving no internet **and** no host
+/// route lifts that (WS05-P0-02, owner decision O21).
 pub(crate) fn network_unexpressible_refusal(spec: &SandboxSpec) -> Option<String> {
-    (spec.backend == Backend::Apple && spec.network == Network::None).then(|| {
-        format!(
-            "the `{}` backend cannot express `network = \"none\"` (Apple `container run` has no offline network mode); refusing to launch with an unknown network",
+    if spec.backend != Backend::Apple {
+        return None;
+    }
+    let message = match spec.network {
+        Network::None => format!(
+            "the `{}` backend cannot express `network = \"none\"`: Apple's internal network still reaches your Mac's services, so thegn cannot honour `network = \"none\"` on apple; use podman or docker, whose `--network none` has no interface",
             spec.backend.label()
-        )
-    })
+        ),
+        Network::Host => format!(
+            "the `{}` backend cannot express `network = \"host\"`: apple `container` has no host network; use `nat`",
+            spec.backend.label()
+        ),
+        Network::Nat => return None,
+    };
+    Some(message)
 }
 
 /// Every launch gate in one place: volume admission, the sealed deny filter and
@@ -1105,9 +1118,10 @@ fn launchable_guarded<'a>(
         return Err(refusal(spec, RefusalClass::HostnamePolicy, None, message));
     }
     // Apple `container run` takes `--network <name>` only: `--network none`
-    // names a network rather than removing it. Refuse before any argv (and
-    // before the sealed strict gate, so a sealed Apple launch names the real
-    // reason) instead of launching with an unknown network.
+    // names a network rather than removing it, and there is no host-network
+    // mode at all. Refuse both before any argv (and before the sealed strict
+    // gate, so a sealed Apple launch names the real reason) instead of
+    // launching with an unknown network or inventing a `host` one.
     if let Some(message) = network_unexpressible_refusal(spec) {
         return Err(refusal(
             spec,
@@ -5493,17 +5507,14 @@ fn oci_create_opts_in(
         v.extend(["--network".into(), format!("container:{sidecar}")]);
     } else {
         match spec.network {
+            // Apple's `container` has neither keyword: `--network none` names a
+            // network, and there is no host-network mode at all. The launch
+            // gate refuses both (`network-unexpressible`) before argv is
+            // composed, so emit nothing here rather than attach to a network
+            // called `none` or invent a `host` network. A direct caller stays
+            // on Apple's default NAT network.
+            Network::Host | Network::None if spec.backend == Backend::Apple => {}
             Network::Host => v.extend(["--network".into(), "host".into()]),
-            // Apple reads `--network none` as a network NAME; the launch gate
-            // refuses this combination (`network-unexpressible`) before any
-            // argv, so emit nothing rather than attach to a network called
-            // `none`.
-            Network::None if spec.backend == Backend::Apple => {
-                debug_assert!(
-                    network_unexpressible_refusal(spec).is_none(),
-                    "apple + network=none is refused before argv (network-unexpressible)"
-                );
-            }
             Network::None => v.extend(["--network".into(), "none".into()]),
             Network::Nat => {}
         }

@@ -92,6 +92,15 @@
       "summary": "Crash core shipped; fallback notification and end-to-end evidence remain."
     },
     {
+      "change": "add-egress-policy-core",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2112 (Sandbox & Remote 04) owns the one host-pattern grammar requirement, but that project is outside the checked-in delivery inventory, so it is not mapped here.",
+      "summary": "One host-pattern grammar for egress allow/block/clamp entries is delivered; archive once the egress policy-core programme folds it.",
+      "delivered_at": "2026-11-23"
+    },
+    {
       "change": "add-fleet-view",
       "lifecycle": "archived",
       "disposition": "superseded-retire",

@@ -123,7 +123,7 @@ Process limits and privilege locking vary by backend:
 | bwrap                             | Shared kernel. No process-count cap yet.                                                                           |
 | OCI (podman, docker)              | Shared kernel.                                                                                                     |
 | systemd                           | Shared kernel.                                                                                                     |
-| Apple `container`                 | Refuses `network = "none"` with `network-unexpressible`.                                                           |
+| Apple `container`                 | Refuses `network = "none"` and `network = "host"` with `network-unexpressible`.                                    |
 
 Further tiers (Landlock, Seatbelt, MXC, microVMs, WSL) are not available yet. See
 [[sandbox-backends]] for the backends and the isolation floor.

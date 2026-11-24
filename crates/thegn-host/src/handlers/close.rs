@@ -40,16 +40,10 @@ pub(crate) fn close_pane(cx: &mut CloseCtx<'_>) {
         let removed = cx
             .session
             .active_tab_mut()
-            .map(|t| t.center.remove(focused))
+            .map(|t| t.remove_pane_and_refocus(focused))
             .unwrap_or(false);
         if removed {
             cx.panes.table.remove(&focused);
-            // Focus whatever is now the first pane.
-            if let Some(tab) = cx.session.active_tab_mut()
-                && let Some(first) = tab.center.pane_ids().first().copied()
-            {
-                tab.focused_pane = first;
-            }
             *cx.need_relayout = true;
             persist_session_layout_cached(cx.session);
         }

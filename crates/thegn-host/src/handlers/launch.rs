@@ -288,7 +288,7 @@ fn apply_launch_with(
         if let Some(tab) = g.tabs.get_mut(ti) {
             replaced = tab.center.pane_ids();
             tab.center = tree;
-            tab.focused_pane = focus;
+            tab.focus_pane(focus);
         }
         (Some(focus), replaced)
     } else {
@@ -303,7 +303,7 @@ fn apply_launch_with(
                     if let Some(tab) = g.tabs.get_mut(ti) {
                         replaced.extend(tab.center.pane_ids());
                         tab.center = CenterTree::Leaf(id);
-                        tab.focused_pane = id;
+                        tab.focus_pane(id);
                     }
                     last = Some(id);
                 }

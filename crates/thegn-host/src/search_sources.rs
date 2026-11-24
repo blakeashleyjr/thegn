@@ -151,7 +151,7 @@ pub(crate) fn apply_search_jump(
 
     focus.zone = Zone::Center;
     if let Some(tab) = session.active_tab_mut() {
-        tab.focused_pane = m.pane_id;
+        tab.focus_pane(m.pane_id);
     }
 
     let mut highlight = None;

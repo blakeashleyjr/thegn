@@ -846,4 +846,13 @@ sidebar_group_row_limits={Other=5,"agents wip"=0}"#;
         let cfg: UiConfig = toml::from_str("sidebar_external_worktrees = \"zzz\"").unwrap();
         assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Group);
     }
+
+    /// An `[ui]` table serialized before `sidebar_batch_group_min` existed keeps
+    /// the limit it wrote and takes the new key's default.
+    #[test]
+    fn an_old_config_without_the_batch_key_keeps_the_new_defaults() {
+        let cfg: UiConfig = toml::from_str("sidebar_group_row_limit = 15").unwrap();
+        assert_eq!(cfg.sidebar_group_row_limit, 15);
+        assert_eq!(cfg.sidebar_batch_group_min, 2);
+    }
 }

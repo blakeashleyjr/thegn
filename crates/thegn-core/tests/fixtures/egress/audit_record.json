@@ -1,0 +1,1 @@
+{"v":1,"ts":"2026-11-23T10:14:05.123Z","lease":"07070707070707070707070707070707","worktree":"/home/u/src/thegn-alpha","proto":"http","host":"crates.io","port":443,"ip":"198.51.100.7","sni":"crates.io","method":"GET","path":"/api/v1/crates","decision":"allow","reason":"none","rule":"allow:crates.io","bytes_up":1234,"bytes_down":5678,"dur_ms":321,"secret_id":null}
