@@ -3,6 +3,8 @@
 //! This route accepts only a pinned source identity and one closed recipe. It
 //! deliberately does not inspect or intercept arbitrary process commands.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thegn_cas::Digest;
@@ -87,9 +89,77 @@ impl std::fmt::Display for SelectedFailure {
     }
 }
 
+type CancelHook = Box<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    hooks: Mutex<Vec<CancelHook>>,
+}
+
+/// A user cancel handle for one selected submission. Clones share the state;
+/// [`cancel`](Self::cancel) is idempotent and may be called before, during or
+/// after the submission. It is std-only so this crate stays free of an async
+/// runtime: a runner bridges it to its own wake-up with
+/// [`on_cancel`](Self::on_cancel).
+#[derive(Clone, Default)]
+pub struct SelectedCancel {
+    state: Arc<CancelState>,
+}
+
+impl std::fmt::Debug for SelectedCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedCancel")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl SelectedCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation and run every registered hook once.
+    pub fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::SeqCst);
+        let hooks = {
+            let mut guard = self
+                .state
+                .hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for hook in hooks {
+            hook();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Run `hook` when the token is cancelled; immediately when it already is.
+    pub fn on_cancel(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let mut guard = self
+            .state
+            .hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_cancelled() {
+            drop(guard);
+            hook();
+        } else {
+            guard.push(Box::new(hook));
+        }
+    }
+}
+
 /// A runner that accepts only a fully typed, source-pinned request. `submit`
 /// may already have started work when it returns `Err`, so every error it
-/// returns is read back as unproven, never as a refusal.
+/// returns is read back as unproven, never as a refusal. A cancel before or
+/// during dispatch must come back as `Ok` with [`SelectedCompletion::Cancelled`].
 pub trait SelectedRunner: Send + Sync {
     fn submit(
         &self,
@@ -97,6 +167,7 @@ pub trait SelectedRunner: Send + Sync {
         recipe: Recipe,
         source: &Digest,
         deadline: Duration,
+        cancel: &SelectedCancel,
     ) -> Result<SelectedJobResult, RunnerRefusal>;
 }
 
@@ -112,6 +183,7 @@ pub fn submit_selected(
     spec: &JobSpec,
     captured_source: &Digest,
     directory: &dyn RunnerDirectory,
+    cancel: &SelectedCancel,
 ) -> Result<SelectedJobResult, SelectedFailure> {
     spec.validate()
         .map_err(|error| SelectedFailure::Refused(RunnerRefusal::InvalidSpec(error.to_string())))?;
@@ -140,10 +212,21 @@ pub fn submit_selected(
     let runner = directory.resolve(runner_alias).ok_or_else(|| {
         SelectedFailure::Refused(RunnerRefusal::RunnerUnavailable(runner_alias.to_string()))
     })?;
+    if cancel.is_cancelled() {
+        // Nothing was sent: a cancel before dispatch is a cancelled receipt.
+        return Ok(SelectedJobResult {
+            runner: runner_alias.to_string(),
+            recipe,
+            source: expected.clone(),
+            completion: SelectedCompletion::Cancelled,
+            log_tail: String::new(),
+            truncated: false,
+        });
+    }
     // The runner call itself may have started work, so nothing it returns is a
     // pre-submission refusal. A lost or mismatched receipt stays indeterminate.
     let result = runner
-        .submit(runner_alias, recipe, expected, deadline)
+        .submit(runner_alias, recipe, expected, deadline, cancel)
         .map_err(SelectedFailure::Unproven)?;
     if result.runner != runner_alias {
         return Err(SelectedFailure::Unproven(RunnerRefusal::WrongRunner));

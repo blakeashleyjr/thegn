@@ -13,8 +13,8 @@ pub mod result;
 pub use result::{JobResult, JobStatus};
 pub mod selected;
 pub use selected::{
-    MAX_SELECTED_LOG_BYTES, RunnerDirectory, RunnerRefusal, SelectedCompletion, SelectedFailure,
-    SelectedJobResult, SelectedRunner, selected_job_readback, submit_selected,
+    MAX_SELECTED_LOG_BYTES, RunnerDirectory, RunnerRefusal, SelectedCancel, SelectedCompletion,
+    SelectedFailure, SelectedJobResult, SelectedRunner, selected_job_readback, submit_selected,
 };
 mod validation;
 pub use validation::{byte_quantity, duration_ms};

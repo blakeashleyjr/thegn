@@ -3,8 +3,8 @@ use std::time::Duration;
 use thegn_cas::Digest;
 use thegn_job_spec::{
     Feature, JobSpec, JobStatus, MAX_SELECTED_LOG_BYTES, Recipe, RetryLimit, RunnerDirectory,
-    RunnerRefusal, SelectedCompletion, SelectedFailure, SelectedJobResult, SelectedRunner,
-    byte_quantity, duration_ms, selected_job_readback, submit_selected,
+    RunnerRefusal, SelectedCancel, SelectedCompletion, SelectedFailure, SelectedJobResult,
+    SelectedRunner, byte_quantity, duration_ms, selected_job_readback, submit_selected,
 };
 
 const EXAMPLE: &str = include_str!("fixtures/web-e2e.yaml");
@@ -20,6 +20,7 @@ impl SelectedRunner for FixtureRunner {
         recipe: Recipe,
         source: &Digest,
         deadline: Duration,
+        _cancel: &SelectedCancel,
     ) -> Result<SelectedJobResult, RunnerRefusal> {
         assert_eq!(runner_alias, "fixture-linux");
         assert_eq!(deadline, Duration::from_secs(60 * 60));
@@ -49,7 +50,8 @@ impl RunnerDirectory for FixtureDirectory {
 fn typed_selected_recipe_routes_only_to_owner_named_fixture_runner() {
     let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
     let source = Digest::of(b"");
-    let result = submit_selected(&spec, &source, &FixtureDirectory).unwrap();
+    let result =
+        submit_selected(&spec, &source, &FixtureDirectory, &SelectedCancel::new()).unwrap();
     assert_eq!(result.runner, "fixture-linux");
     assert_eq!(result.recipe, Recipe::CargoBuild);
     assert_eq!(result.source, source);
@@ -61,7 +63,8 @@ fn typed_selected_recipe_routes_only_to_owner_named_fixture_runner() {
 fn selected_runner_readback_distinguishes_accepted_unavailable_cancelled_and_failed() {
     let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
     let source = Digest::of(b"");
-    let accepted = submit_selected(&spec, &source, &FixtureDirectory).unwrap();
+    let accepted =
+        submit_selected(&spec, &source, &FixtureDirectory, &SelectedCancel::new()).unwrap();
     let accepted = selected_job_readback("job-accepted", Ok(accepted));
     assert!(matches!(accepted.status, JobStatus::Succeeded));
     assert_eq!(accepted.log_tail, "fixture passed");
@@ -75,7 +78,7 @@ fn selected_runner_readback_distinguishes_accepted_unavailable_cancelled_and_fai
             None
         }
     }
-    let unavailable = submit_selected(&spec, &source, &Empty).unwrap_err();
+    let unavailable = submit_selected(&spec, &source, &Empty, &SelectedCancel::new()).unwrap_err();
     assert_eq!(
         unavailable,
         SelectedFailure::Refused(RunnerRefusal::RunnerUnavailable("fixture-linux".into()))
@@ -90,6 +93,7 @@ fn selected_runner_readback_distinguishes_accepted_unavailable_cancelled_and_fai
             Recipe::CargoBuild,
             &source,
             Duration::from_secs(60 * 60),
+            &SelectedCancel::new(),
         )
         .unwrap();
     cancelled.completion = SelectedCompletion::Cancelled;
@@ -103,6 +107,7 @@ fn selected_runner_readback_distinguishes_accepted_unavailable_cancelled_and_fai
             Recipe::CargoBuild,
             &source,
             Duration::from_secs(60 * 60),
+            &SelectedCancel::new(),
         )
         .unwrap();
     timed_out.completion = SelectedCompletion::TimedOut;
@@ -117,6 +122,7 @@ fn selected_runner_readback_distinguishes_accepted_unavailable_cancelled_and_fai
             Recipe::CargoBuild,
             &source,
             Duration::from_secs(60 * 60),
+            &SelectedCancel::new(),
         )
         .unwrap();
     signalled.completion = SelectedCompletion::Signalled(9);
@@ -130,6 +136,7 @@ fn selected_runner_readback_distinguishes_accepted_unavailable_cancelled_and_fai
             Recipe::CargoBuild,
             &source,
             Duration::from_secs(60 * 60),
+            &SelectedCancel::new(),
         )
         .unwrap();
     failed.completion = SelectedCompletion::Exited(17);
@@ -151,7 +158,12 @@ fn selected_runner_readback_distinguishes_accepted_unavailable_cancelled_and_fai
 fn typed_selected_recipe_refuses_source_mismatch_and_missing_runner_without_fallback() {
     let spec = JobSpec::parse_yaml(SELECTED).unwrap();
     assert!(matches!(
-        submit_selected(&spec, &Digest::of(b"changed"), &FixtureDirectory),
+        submit_selected(
+            &spec,
+            &Digest::of(b"changed"),
+            &FixtureDirectory,
+            &SelectedCancel::new()
+        ),
         Err(SelectedFailure::Refused(
             RunnerRefusal::SourceMismatch { .. }
         ))
@@ -163,7 +175,7 @@ fn typed_selected_recipe_refuses_source_mismatch_and_missing_runner_without_fall
         }
     }
     assert_eq!(
-        submit_selected(&spec, &Digest::of(b""), &Empty),
+        submit_selected(&spec, &Digest::of(b""), &Empty, &SelectedCancel::new()),
         Err(SelectedFailure::Refused(RunnerRefusal::RunnerUnavailable(
             "fixture-linux".into()
         )))
@@ -322,6 +334,7 @@ fn typed_selected_recipe_forwards_the_deadline_and_refuses_unhonoured_fields() {
             _recipe: Recipe,
             source: &Digest,
             deadline: Duration,
+            _cancel: &SelectedCancel,
         ) -> Result<SelectedJobResult, RunnerRefusal> {
             assert_eq!(runner_alias, "fixture-linux");
             assert_eq!(deadline, Duration::from_secs(5 * 60));
@@ -344,7 +357,13 @@ fn typed_selected_recipe_forwards_the_deadline_and_refuses_unhonoured_fields() {
 
     let spec = JobSpec::parse_yaml(&SELECTED_BUILD.replace("steps: []", "steps: []\ntimeout: 5m"))
         .unwrap();
-    submit_selected(&spec, &Digest::of(b""), &DeadlineDirectory).unwrap();
+    submit_selected(
+        &spec,
+        &Digest::of(b""),
+        &DeadlineDirectory,
+        &SelectedCancel::new(),
+    )
+    .unwrap();
 
     for ignored in [
         "env: {CI: 'true'}",
@@ -380,6 +399,7 @@ fn selected_runner_failure_after_submission_reads_back_as_indeterminate() {
             _recipe: Recipe,
             _source: &Digest,
             _deadline: Duration,
+            _cancel: &SelectedCancel,
         ) -> Result<SelectedJobResult, RunnerRefusal> {
             Err(RunnerRefusal::RunnerUnavailable("transport dropped".into()))
         }
@@ -392,7 +412,13 @@ fn selected_runner_failure_after_submission_reads_back_as_indeterminate() {
     }
 
     let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
-    let failure = submit_selected(&spec, &Digest::of(b""), &LostDirectory).unwrap_err();
+    let failure = submit_selected(
+        &spec,
+        &Digest::of(b""),
+        &LostDirectory,
+        &SelectedCancel::new(),
+    )
+    .unwrap_err();
     assert_eq!(
         failure,
         SelectedFailure::Unproven(RunnerRefusal::RunnerUnavailable("transport dropped".into()))
@@ -432,4 +458,89 @@ fn selected_readback_reports_a_bounded_and_truncated_log_tail() {
     let complete = selected_job_readback("job-complete", Ok(complete));
     assert!(!complete.truncated.log_tail);
     assert_eq!(complete.log_tail, "short");
+}
+
+#[test]
+fn a_cancel_before_dispatch_reads_back_as_cancelled_without_calling_the_runner() {
+    struct Panicking;
+    impl SelectedRunner for Panicking {
+        fn submit(
+            &self,
+            _: &str,
+            _: Recipe,
+            _: &Digest,
+            _: Duration,
+            _: &SelectedCancel,
+        ) -> Result<SelectedJobResult, RunnerRefusal> {
+            panic!("a cancelled submission must not reach the runner");
+        }
+    }
+    struct Directory;
+    impl RunnerDirectory for Directory {
+        fn resolve(&self, alias: &str) -> Option<&dyn SelectedRunner> {
+            (alias == "fixture-linux").then_some(&Panicking)
+        }
+    }
+    let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
+    let source = Digest::of(b"");
+    let cancel = SelectedCancel::new();
+    cancel.cancel();
+    let result = submit_selected(&spec, &source, &Directory, &cancel).unwrap();
+    assert_eq!(result.completion, SelectedCompletion::Cancelled);
+    let readback = selected_job_readback("job-cancelled", Ok(result));
+    assert!(matches!(readback.status, JobStatus::Cancelled));
+}
+
+#[test]
+fn a_cancel_during_the_runner_call_reaches_its_hook_and_reads_back_as_cancelled() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Hooked(Arc<AtomicBool>);
+    impl SelectedRunner for Hooked {
+        fn submit(
+            &self,
+            runner_alias: &str,
+            recipe: Recipe,
+            source: &Digest,
+            _: Duration,
+            cancel: &SelectedCancel,
+        ) -> Result<SelectedJobResult, RunnerRefusal> {
+            let seen = self.0.clone();
+            cancel.on_cancel(move || seen.store(true, Ordering::SeqCst));
+            cancel.cancel();
+            let completion = if self.0.load(Ordering::SeqCst) {
+                SelectedCompletion::Cancelled
+            } else {
+                SelectedCompletion::Exited(0)
+            };
+            Ok(SelectedJobResult {
+                runner: runner_alias.to_owned(),
+                recipe,
+                source: source.clone(),
+                completion,
+                log_tail: String::new(),
+                truncated: false,
+            })
+        }
+    }
+    struct Directory(Hooked);
+    impl RunnerDirectory for Directory {
+        fn resolve(&self, alias: &str) -> Option<&dyn SelectedRunner> {
+            (alias == "fixture-linux").then_some(&self.0 as &dyn SelectedRunner)
+        }
+    }
+    let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
+    let source = Digest::of(b"");
+    let directory = Directory(Hooked(Arc::new(AtomicBool::new(false))));
+    let result = submit_selected(&spec, &source, &directory, &SelectedCancel::new()).unwrap();
+    assert_eq!(result.completion, SelectedCompletion::Cancelled);
+
+    // A hook registered after the cancel runs immediately.
+    let late = SelectedCancel::new();
+    late.cancel();
+    let fired = Arc::new(AtomicBool::new(false));
+    let flag = fired.clone();
+    late.on_cancel(move || flag.store(true, Ordering::SeqCst));
+    assert!(fired.load(Ordering::SeqCst));
 }

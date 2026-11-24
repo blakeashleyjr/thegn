@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use thegn_cas::{Digest, Entry, encode_directory};
 use thegn_core::sprite_hold::HOLD_SCRIPT;
-use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCompletion, SelectedRunner};
+use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCancel, SelectedCompletion, SelectedRunner};
 use thegn_svc::provider::SpritesProvider;
 use thegn_svc::sprites::job::{
     AttemptOptions, AttemptRecord, AttemptState, AttemptStore, CancelToken, Cleanup,
@@ -1364,6 +1364,7 @@ async fn the_sync_runner_contract_forwards_the_route_deadline_and_reaches_the_pr
                 Recipe::CargoBuild,
                 &submitted,
                 Duration::from_secs(30),
+                &SelectedCancel::new(),
             )
             .unwrap_err();
         assert!(matches!(wrong, RunnerRefusal::WrongRunner));
@@ -1372,12 +1373,14 @@ async fn the_sync_runner_contract_forwards_the_route_deadline_and_reaches_the_pr
             Recipe::CargoBuild,
             &submitted,
             Duration::from_secs(30),
+            &SelectedCancel::new(),
         );
         let timed_out = runner.submit(
             "sprites-tgtest1",
             Recipe::CargoTest,
             &submitted,
             Duration::from_millis(300),
+            &SelectedCancel::new(),
         );
         (ok, timed_out)
     });

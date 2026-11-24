@@ -28,6 +28,7 @@
 ## 3. Follow-up (not this change)
 
 - [ ] 3.1 Terminal and configured-runner adapter that invokes the route.
+      (Blocked on a factory that builds a `SelectedRunner` from provider config.)
 - [ ] 3.2 Config lookup for a project's selected runner and recursion guard.
 - [ ] 3.3 Argv, cwd, stdio and per-step deadline forwarding.
 
@@ -57,6 +58,12 @@
       runner and reads back as `Cancelled` on the route (today a pre-dispatch
       cancel surfaces as `RunnerUnavailable`); schedule `reconcile_pending` and
       `reattach` on startup. 4.4-4.6 are runner-level only until this lands.
+      Partly done: `SelectedRunner::submit` takes a std-only `SelectedCancel`
+      (hooks bridge it to the Sprites `CancelToken`); a cancel before dispatch
+      reads back as `Cancelled` on both executors and mid-run on Sprites. Still
+      open: Vercel mid-run cancel (no `run_cancellable` yet), startup
+      `reconcile_pending`/`reattach` scheduling, and any code that builds the
+      executors from provider config (nothing constructs them outside tests).
 - [ ] 4.10 Owner lease on non-terminal rows (pid, boot id from
       `/proc/sys/kernel/random/boot_id`, heartbeat) so recovery skips a live
       owner; until then a host suspended past the staleness margin can make a
