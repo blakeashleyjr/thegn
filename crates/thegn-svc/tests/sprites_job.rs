@@ -2,9 +2,9 @@
 //!
 //! Every test drives the real `SpritesSelectedRunner` against a loopback server
 //! that speaks the shapes the provider actually uses: `PUT
-//! /sprites/{name}/fs/write` and `GET /sprites/{name}/fs/read` for the
-//! materialized tree, and a `/sprites/{name}/exec` WebSocket for the attempt
-//! itself. Nothing is stubbed at the Rust boundary — the argv that leaves the
+//! /sprites/{name}/fs/write`, `GET /sprites/{name}/fs/read`, `GET .../fs/list`
+//! and `DELETE .../fs/delete` for the materialized tree, and a
+//! `/sprites/{name}/exec` WebSocket for the attempt (and its kill) itself. Nothing is stubbed at the Rust boundary — the argv that leaves the
 //! provider, the bytes that cross `fs/write`, the exit frame and the durable
 //! ledger record are all observed as the provider emits them.
 
@@ -15,12 +15,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use thegn_cas::{Digest, Entry, encode_directory};
 use thegn_core::sprite_hold::HOLD_SCRIPT;
 use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCompletion, SelectedRunner};
 use thegn_svc::provider::SpritesProvider;
 use thegn_svc::sprites::job::{
     AttemptOptions, AttemptState, AttemptStore, Cleanup, DEFAULT_CHECKOUT_ROOT, DirSnapshot,
-    ProjectBinding, ReserveRefusal, ReserveRequest, Resume, SnapshotContent, SnapshotSource,
+    KILL_SCRIPT, LAUNCH_FAILED_MARKER, LAUNCH_SCRIPT, ProjectBinding, ReserveRefusal,
+    ReserveRequest, Resume, SNAPSHOT_MAX_FILE_BYTES, SnapshotContent, SnapshotSource,
     SpritesSelectedRunner,
 };
 
@@ -32,6 +34,8 @@ type Fs = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 enum Hs {
     Accept,
     Status(u16),
+    /// Hold the upgrade for this many milliseconds, then accept it.
+    Delayed(u64),
 }
 
 enum Out {
@@ -47,6 +51,17 @@ enum Out {
 struct Script {
     handshake: Hs,
     out: Vec<Out>,
+    /// Files the "build" leaves in its checkout (relative path, bytes), made
+    /// visible as soon as the command starts.
+    produces: Vec<(&'static str, &'static [u8])>,
+}
+
+/// One accepted `fs/write`.
+#[derive(Debug, Clone)]
+struct Written {
+    path: String,
+    body: Vec<u8>,
+    mode: String,
 }
 
 #[derive(Debug, Clone)]
@@ -59,16 +74,22 @@ struct Mock {
     base: String,
     fs: Fs,
     execs: Arc<Mutex<Vec<Exec>>>,
-    writes: Arc<Mutex<Vec<String>>>,
+    writes: Arc<Mutex<Vec<Written>>>,
+    deletes: Arc<Mutex<Vec<String>>>,
     write_status: Arc<Mutex<Option<u16>>>,
+    stale: Arc<Mutex<bool>>,
+    write_delay_ms: Arc<Mutex<u64>>,
 }
 
 #[derive(Clone)]
 struct State {
     fs: Fs,
     execs: Arc<Mutex<Vec<Exec>>>,
-    writes: Arc<Mutex<Vec<String>>>,
+    writes: Arc<Mutex<Vec<Written>>>,
+    deletes: Arc<Mutex<Vec<String>>>,
     write_status: Arc<Mutex<Option<u16>>>,
+    stale: Arc<Mutex<bool>>,
+    write_delay_ms: Arc<Mutex<u64>>,
     scripts: Arc<Mutex<VecDeque<Script>>>,
 }
 
@@ -78,12 +99,18 @@ fn start_mock(scripts: Vec<Script>) -> Mock {
     let fs: Fs = Arc::new(Mutex::new(HashMap::new()));
     let execs = Arc::new(Mutex::new(Vec::new()));
     let writes = Arc::new(Mutex::new(Vec::new()));
+    let deletes = Arc::new(Mutex::new(Vec::new()));
     let write_status = Arc::new(Mutex::new(None));
+    let stale = Arc::new(Mutex::new(false));
+    let write_delay_ms = Arc::new(Mutex::new(0));
     let state = State {
         fs: Arc::clone(&fs),
         execs: Arc::clone(&execs),
         writes: Arc::clone(&writes),
+        deletes: Arc::clone(&deletes),
         write_status: Arc::clone(&write_status),
+        stale: Arc::clone(&stale),
+        write_delay_ms: Arc::clone(&write_delay_ms),
         scripts: Arc::new(Mutex::new(VecDeque::from(scripts))),
     };
     thread::spawn(move || {
@@ -97,8 +124,22 @@ fn start_mock(scripts: Vec<Script>) -> Mock {
         fs,
         execs,
         writes,
+        deletes,
         write_status,
+        stale,
+        write_delay_ms,
     }
+}
+
+/// Make every `fs/write` take this long, to model a slow transfer.
+fn slow_writes(mock: &Mock, millis: u64) {
+    *mock.write_delay_ms.lock().unwrap() = millis;
+}
+
+/// Make every written `Cargo.toml` leave a stray sibling behind, the way a stale
+/// checkout or a failed deletion would.
+fn plant_stale_files(mock: &Mock) {
+    *mock.stale.lock().unwrap() = true;
 }
 
 /// Refuse every `fs/write` with `status` — a denied transfer, not a denied exec.
@@ -110,7 +151,14 @@ fn script(out: Vec<Out>) -> Script {
     Script {
         handshake: Hs::Accept,
         out,
+        produces: Vec::new(),
     }
+}
+
+/// The scripted reply to the runner's kill exec: the group is confirmed gone
+/// (`0`), survived SIGKILL (`3`), or there is nothing to confirm (`4`).
+fn kill_reply(code: i32) -> Script {
+    script(vec![session_info(), Out::Exit(code)])
 }
 
 fn session_info() -> Out {
@@ -138,7 +186,19 @@ fn serve(mut stream: TcpStream, state: State) {
         state.execs.lock().unwrap().push(exec);
         let next = state.scripts.lock().unwrap().pop_front();
         match next {
-            Some(script) => exec_ws(stream, &head, script),
+            Some(script) => {
+                // The checkout is the launcher's second positional argument.
+                if let Some(checkout) = params(&head.target, "cmd").get(11) {
+                    for (rel, bytes) in &script.produces {
+                        state
+                            .fs
+                            .lock()
+                            .unwrap()
+                            .insert(format!("{checkout}/{rel}"), bytes.to_vec());
+                    }
+                }
+                exec_ws(stream, &head, script)
+            }
             None => respond(&mut stream, 500, b""),
         }
         return;
@@ -148,14 +208,61 @@ fn serve(mut stream: TcpStream, state: State) {
         return;
     };
     if head.method == "PUT" && head.target.contains("/fs/write?") {
+        let delay = *state.write_delay_ms.lock().unwrap();
+        if delay > 0 {
+            thread::sleep(Duration::from_millis(delay));
+        }
         let status = *state.write_status.lock().unwrap();
         if let Some(status) = status {
             respond(&mut stream, status, b"");
             return;
         }
-        state.writes.lock().unwrap().push(path.clone());
+        state.writes.lock().unwrap().push(Written {
+            path: path.clone(),
+            body: head.body.clone(),
+            mode: param(&head.target, "mode").unwrap_or_default(),
+        });
+        if *state.stale.lock().unwrap()
+            && let Some(dir) = path.strip_suffix("/Cargo.toml")
+        {
+            state
+                .fs
+                .lock()
+                .unwrap()
+                .insert(format!("{dir}/stale.txt"), b"left over".to_vec());
+        }
         state.fs.lock().unwrap().insert(path, head.body.clone());
         respond(&mut stream, 200, b"{}");
+        return;
+    }
+    if head.method == "DELETE" && head.target.contains("/fs/delete?") {
+        state.deletes.lock().unwrap().push(path.clone());
+        let below = format!("{path}/");
+        state
+            .fs
+            .lock()
+            .unwrap()
+            .retain(|key, _| key != &path && !key.starts_with(&below));
+        respond(&mut stream, 200, b"{}");
+        return;
+    }
+    if head.method == "GET" && head.target.contains("/fs/list?") {
+        let below = format!("{path}/");
+        let mut entries: std::collections::BTreeMap<String, bool> = Default::default();
+        for key in state.fs.lock().unwrap().keys() {
+            if let Some(rest) = key.strip_prefix(&below) {
+                let name = rest.split('/').next().unwrap_or(rest).to_owned();
+                let is_dir = rest.contains('/');
+                let entry = entries.entry(name).or_insert(is_dir);
+                *entry = *entry || is_dir;
+            }
+        }
+        let listed: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|(name, is_dir)| serde_json::json!({"name": name, "isDir": is_dir, "size": 0}))
+            .collect();
+        let body = serde_json::json!({ "entries": listed }).to_string();
+        respond(&mut stream, 200, body.as_bytes());
         return;
     }
     if head.method == "GET" && head.target.contains("/fs/read?") {
@@ -235,6 +342,9 @@ fn exec_ws(mut stream: TcpStream, head: &Head, script: Script) {
     if let Hs::Status(code) = script.handshake {
         respond(&mut stream, code, b"");
         return;
+    }
+    if let Hs::Delayed(millis) = script.handshake {
+        thread::sleep(Duration::from_millis(millis));
     }
     if head.websocket_key.is_empty() {
         return;
@@ -334,24 +444,76 @@ fn params(target: &str, key: &str) -> Vec<String> {
 // ------------------------------------------------------------------ the tests
 
 const OUTPUT: &str = "target/debug/app";
+const DEADLINE: Duration = Duration::from_secs(30);
 
 fn binding() -> ProjectBinding {
     ProjectBinding::new("proj-one", "acct", "tgtest1").unwrap()
 }
 
+/// The REAPI root `Directory` digest, built here with `thegn_cas` and no help
+/// from the module under test: this is what a real `Snapshot::Pinned` carries.
+fn reapi(files: &[(&str, &[u8], bool)]) -> Digest {
+    fn dir(files: &[(String, &[u8], bool)]) -> Digest {
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|(path, _, _)| path.split('/').next().unwrap().to_owned())
+            .collect();
+        names.dedup();
+        let mut entries = Vec::new();
+        for name in names {
+            let direct = files.iter().find(|(path, _, _)| path == &name);
+            if let Some((_, bytes, executable)) = direct {
+                entries.push((
+                    name,
+                    Entry::File {
+                        digest: Digest::of(bytes),
+                        executable: *executable,
+                    },
+                ));
+                continue;
+            }
+            let prefix = format!("{name}/");
+            let below: Vec<(String, &[u8], bool)> = files
+                .iter()
+                .filter_map(|(path, bytes, executable)| {
+                    path.strip_prefix(&prefix)
+                        .map(|rest| (rest.to_owned(), *bytes, *executable))
+                })
+                .collect();
+            entries.push((name, Entry::Directory(dir(&below))));
+        }
+        Digest::of(&encode_directory(entries).unwrap())
+    }
+    let mut sorted: Vec<(String, &[u8], bool)> = files
+        .iter()
+        .map(|(path, bytes, executable)| ((*path).to_owned(), *bytes, *executable))
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    dir(&sorted)
+}
+
+/// Pins a tuple's slice type at the call, so literals of different lengths
+/// can share one array.
+fn f<'a>(path: &'a str, bytes: &'a [u8], executable: bool) -> (&'a str, &'a [u8], bool) {
+    (path, bytes, executable)
+}
+
+const CARGO_TOML: &[u8] = b"[package]\nname = \"demo\"\n";
+const MAIN_RS: &[u8] = b"fn main() { println!(\"dirty\"); }\n";
+
 /// The pinned snapshot: two files, one of them dirty relative to `HEAD`.
 fn content() -> SnapshotContent {
     let mut content = SnapshotContent::new();
+    content.insert("Cargo.toml", CARGO_TOML.to_vec()).unwrap();
+    content.insert("src/main.rs", MAIN_RS.to_vec()).unwrap();
     content
-        .insert("Cargo.toml", b"[package]\nname = \"demo\"\n".to_vec())
-        .unwrap();
-    content
-        .insert(
-            "src/main.rs",
-            b"fn main() { println!(\"dirty\"); }\n".to_vec(),
-        )
-        .unwrap();
-    content
+}
+
+fn pinned() -> Digest {
+    reapi(&[
+        f("Cargo.toml", CARGO_TOML, false),
+        f("src/main.rs", MAIN_RS, false),
+    ])
 }
 
 struct Fixed(SnapshotContent);
@@ -368,16 +530,25 @@ fn store() -> (tempfile::TempDir, AttemptStore) {
     (dir, store)
 }
 
-fn runner(mock: &Mock, store: AttemptStore, options: AttemptOptions) -> SpritesSelectedRunner {
+fn runner_for(
+    mock: &Mock,
+    binding: ProjectBinding,
+    store: AttemptStore,
+    options: AttemptOptions,
+) -> SpritesSelectedRunner {
     SpritesSelectedRunner::with_options(
         SpritesProvider::new(&mock.base, "tok", "tgtest1"),
-        binding(),
+        binding,
         store,
         Box::new(Fixed(content())),
         tokio::runtime::Handle::current(),
         options,
     )
     .unwrap()
+}
+
+fn runner(mock: &Mock, store: AttemptStore, options: AttemptOptions) -> SpritesSelectedRunner {
+    runner_for(mock, binding(), store, options)
 }
 
 fn outputs_options(deadline: Duration) -> AttemptOptions {
@@ -388,30 +559,56 @@ fn outputs_options(deadline: Duration) -> AttemptOptions {
     }
 }
 
+/// The attempt's own writes, without the one-time sprite owner marker.
+fn attempt_writes(mock: &Mock) -> Vec<Written> {
+    mock.writes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|written| !written.path.ends_with("/.owner"))
+        .cloned()
+        .collect()
+}
+
+/// Every `/exec` the runner made, split into job dispatches and kill execs.
+fn execs_of(mock: &Mock) -> (Vec<Exec>, Vec<Exec>) {
+    mock.execs
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .partition(|exec| {
+            params(&exec.target, "cmd").get(3).map(String::as_str) == Some("thegn-hold")
+        })
+}
+
+fn fs_has_under(mock: &Mock, dir: &str) -> bool {
+    let below = format!("{dir}/");
+    mock.fs
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|key| key == dir || key.starts_with(&below))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_attempt_materializes_the_pinned_tree_and_reports_the_exit() {
-    let mock = start_mock(vec![script(vec![
+    let mut build = script(vec![
         session_info(),
         Out::Stdout("   Compiling demo v0.1.0\n"),
         Out::Stderr("warning: unused variable\n"),
         Out::Exit(0),
-    ])]);
-    let checked_out = binding().checkout(1, DEFAULT_CHECKOUT_ROOT);
-    // The declared output lives in the checkout the attempt is about to create.
-    mock.fs.lock().unwrap().insert(
-        format!("{checked_out}/{OUTPUT}"),
-        b"\x7fELF the built binary".to_vec(),
-    );
+    ]);
+    build.produces = vec![(OUTPUT, b"\x7fELF the built binary")];
+    let mock = start_mock(vec![build]);
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
     let content = content();
+    // The pinned identity is the REAPI root digest, not this module's own hash.
+    assert_eq!(content.digest().unwrap(), pinned());
 
     let receipt = runner
-        .run(Recipe::CargoBuild, &content.digest(), &content)
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
         .await
         .unwrap();
 
@@ -419,13 +616,21 @@ async fn cold_attempt_materializes_the_pinned_tree_and_reports_the_exit() {
     assert_eq!(receipt.project, "proj-one");
     assert_eq!(receipt.sprite, "tgtest1");
     assert_eq!(receipt.attempt, 1);
-    assert_eq!(receipt.checkout, checked_out);
-    assert_eq!(receipt.source, content.digest());
-    assert_eq!(receipt.materialized, content.digest());
+    assert!(
+        receipt
+            .checkout
+            .starts_with("/workspace/.thegn/jobs/proj-one/co/1-1-"),
+        "{}",
+        receipt.checkout
+    );
+    assert_eq!(receipt.source, pinned());
+    assert_eq!(receipt.materialized, pinned());
     assert_eq!(receipt.completion, SelectedCompletion::Exited(0));
     assert_eq!(receipt.exit, Some(0));
+    assert_eq!(receipt.signal, None);
     assert_eq!(receipt.cleanup, Cleanup::NotNeeded);
     assert!(!receipt.outputs_fenced);
+    assert!(!receipt.truncated);
     assert_eq!(receipt.session.as_deref(), Some("1847"));
     assert!(
         receipt
@@ -434,7 +639,6 @@ async fn cold_attempt_materializes_the_pinned_tree_and_reports_the_exit() {
             .is_some_and(|hold| hold.starts_with("thegn-hold-"))
     );
     assert_eq!(receipt.files_transferred, 2);
-    assert_eq!(receipt.files_reused, 0);
     assert_eq!(receipt.bytes_transferred, content.total_bytes());
     assert_eq!(receipt.outputs_missing, Vec::<String>::new());
     let hashed = receipt.outputs.get(OUTPUT).expect("output was hashed");
@@ -444,61 +648,67 @@ async fn cold_attempt_materializes_the_pinned_tree_and_reports_the_exit() {
     // No configured rate means no fabricated price.
     assert_eq!(receipt.cost_micros, None);
 
-    // The tree that crossed `fs/write` is exactly the pinned content.
-    let mut writes = mock.writes.lock().unwrap().clone();
-    writes.sort();
-    assert_eq!(
-        writes,
-        vec![
-            format!("{checked_out}/Cargo.toml"),
-            format!("{checked_out}/src/main.rs"),
-        ]
-    );
-    assert_eq!(
-        mock.fs
-            .lock()
-            .unwrap()
-            .get(&format!("{checked_out}/Cargo.toml"))
-            .map(Vec::as_slice),
-        Some(b"[package]\nname = \"demo\"\n".as_slice())
-    );
+    // The bytes that crossed `fs/write` are exactly the pinned content, with the
+    // directory modes the snapshot carries.
+    let mut writes = attempt_writes(&mock);
+    writes.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].path, format!("{}/Cargo.toml", receipt.checkout));
+    assert_eq!(writes[0].body, CARGO_TOML);
+    assert_eq!(writes[0].mode, "0644");
+    assert_eq!(writes[1].path, format!("{}/src/main.rs", receipt.checkout));
+    assert_eq!(writes[1].body, MAIN_RS);
 
-    // The argv is the hold-wrapped recipe behind the provider's own `cd`
-    // wrapper, and the warm cache is the project-scoped one.
-    let execs = mock.execs.lock().unwrap().clone();
-    assert_eq!(execs.len(), 1);
-    assert_eq!(execs[0].authorization, "Bearer tok");
-    let cmd = params(&execs[0].target, "cmd");
-    assert_eq!(cmd.len(), 13);
+    // The argv is the hold-wrapped launcher around the bare recipe. The cwd, the
+    // environment scrub and the kill handle live in the launcher, not in the
+    // provider's `cd` wrapper or the exec request's `env`.
+    let (jobs, kills) = execs_of(&mock);
+    assert_eq!(jobs.len(), 1);
+    assert!(kills.is_empty(), "an exited attempt needs no kill");
+    assert_eq!(jobs[0].authorization, "Bearer tok");
+    let cmd = params(&jobs[0].target, "cmd");
+    assert_eq!(cmd.len(), 16);
     assert_eq!(cmd[0], "/bin/sh");
     assert_eq!(cmd[1], "-c");
-    assert_eq!(cmd[3], "thegn-exec");
-    assert_eq!(cmd[4], checked_out);
-    assert_eq!(cmd[5], "/bin/sh");
-    assert_eq!(cmd[6], "-c");
-    assert_eq!(cmd[7], HOLD_SCRIPT);
-    assert_eq!(cmd[8], "thegn-hold");
-    assert_eq!(cmd[9], receipt.hold.clone().unwrap());
-    // The hold outlives the deadline: 30s deadline plus one hold expiry (300s),
-    // so a quiet build never loses its hold before its own deadline.
-    assert_eq!(cmd[10], "330");
-    assert_eq!(cmd[11], "cargo");
-    assert_eq!(cmd[12], "build");
-    assert_eq!(
-        params(&execs[0].target, "env"),
-        vec![format!(
-            "CARGO_TARGET_DIR={}",
-            binding().cache(DEFAULT_CHECKOUT_ROOT)
-        )]
+    assert_eq!(cmd[2], HOLD_SCRIPT);
+    assert_eq!(cmd[3], "thegn-hold");
+    assert_eq!(cmd[4], receipt.hold.clone().unwrap());
+    // The hold outlives the forwarded deadline by one hold expiry (300s).
+    assert_eq!(cmd[5], "330");
+    assert_eq!(cmd[6], "/bin/sh");
+    assert!(cmd[8].contains("env -i"));
+    assert_eq!(cmd[9], "thegn-job");
+    assert!(cmd[10].starts_with("/workspace/.thegn/jobs/proj-one/ctl/1-1-"));
+    assert_eq!(cmd[11], receipt.checkout);
+    assert!(cmd[12].starts_with("/workspace/.thegn/jobs/proj-one/home/1-1-"));
+    assert_eq!(cmd[13], binding().cache(DEFAULT_CHECKOUT_ROOT));
+    assert_eq!(cmd[14], "cargo");
+    assert_eq!(cmd[15], "build");
+    assert!(params(&jobs[0].target, "env").is_empty());
+    assert_eq!(params(&jobs[0].target, "tty"), vec!["false".to_owned()]);
+
+    // Only the project cache outlives the attempt: the checkout, the home and
+    // the control file were deleted once the outputs were hashed.
+    assert!(receipt.checkout_removed);
+    assert!(!fs_has_under(&mock, &receipt.checkout));
+    let deletes = mock.deletes.lock().unwrap().clone();
+    assert!(deletes.contains(&receipt.checkout));
+    assert!(deletes.iter().any(|path| path.contains("/proj-one/home/")));
+    assert!(deletes.iter().any(|path| path.contains("/proj-one/ctl/")));
+    assert!(
+        !deletes
+            .iter()
+            .any(|path| path.starts_with(&binding().cache(DEFAULT_CHECKOUT_ROOT)))
     );
-    assert_eq!(params(&execs[0].target, "tty"), vec!["false".to_owned()]);
 
     // The ledger agrees with the receipt and never reuses attempt 1.
     let record = store.read(1).unwrap().expect("attempt 1 is recorded");
     assert_eq!(record.state, AttemptState::Finished);
     assert_eq!(record.exit, Some(0));
     assert_eq!(record.cleanup, Cleanup::NotNeeded);
+    assert!(record.checkout_removed);
     assert_eq!(record.epoch, 1);
+    assert_eq!(record.materialized, Some(pinned()));
     assert_eq!(store.next_attempt().unwrap(), 2);
     assert_eq!(
         store.resume_attempt(1).unwrap(),
@@ -515,15 +725,11 @@ async fn a_failed_recipe_keeps_its_exit_code_and_adds_the_stderr_tail() {
         Out::Exit(101),
     ])]);
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
     let content = content();
 
     let receipt = runner
-        .run(Recipe::CargoTest, &content.digest(), &content)
+        .run(Recipe::CargoTest, &pinned(), &content, DEADLINE)
         .await
         .unwrap();
 
@@ -542,87 +748,198 @@ async fn a_failed_recipe_keeps_its_exit_code_and_adds_the_stderr_tail() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_missed_exit_is_indeterminate_with_cleanup_pending_and_no_outputs() {
-    let mock = start_mock(vec![script(vec![
-        session_info(),
-        Out::Stdout("   Compiling demo v0.1.0\n"),
-        Out::Silence,
-    ])]);
+async fn a_signal_exit_is_reported_as_signalled_with_no_exit_code() {
+    let mock = start_mock(vec![script(vec![session_info(), Out::Exit(137)])]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let content = content();
+
+    let receipt = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Signalled(9));
+    assert_eq!(receipt.exit, None);
+    assert_eq!(receipt.signal, Some(9));
+    // The tree ended by itself, so nothing is killed; the outputs of a build
+    // that did not finish are still fenced.
+    assert_eq!(receipt.cleanup, Cleanup::NotNeeded);
+    assert!(receipt.outputs_fenced);
+    assert!(execs_of(&mock).1.is_empty());
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Signalled);
+    assert_eq!(
+        store.resume_attempt(1).unwrap(),
+        Resume::Terminal(SelectedCompletion::Signalled(9))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_deadline_kills_the_owned_tree_and_reports_timed_out() {
+    let mock = start_mock(vec![
+        script(vec![
+            session_info(),
+            Out::Stdout("   Compiling demo v0.1.0\n"),
+            Out::Silence,
+        ]),
+        kill_reply(0),
+    ]);
     let (_dir, store) = store();
     let deadline = Duration::from_millis(300);
     let runner = runner(&mock, store.clone(), outputs_options(deadline));
     let content = content();
 
     let receipt = runner
-        .run(Recipe::CargoBuild, &content.digest(), &content)
+        .run(Recipe::CargoBuild, &pinned(), &content, deadline)
         .await
         .unwrap();
 
-    assert_eq!(receipt.completion, SelectedCompletion::Cancelled);
+    // A deadline stop is TimedOut, not a user cancellation.
+    assert_eq!(receipt.completion, SelectedCompletion::TimedOut);
     assert_eq!(receipt.exit, None);
-    assert_eq!(receipt.cleanup, Cleanup::Pending);
     assert!(receipt.outputs_fenced);
     assert!(receipt.outputs.is_empty());
     assert_eq!(receipt.stdout_tail, "   Compiling demo v0.1.0\n");
 
+    // The runner really issued the kill: a second exec, against this attempt's
+    // control file and hold, and the confirmed kill makes cleanup Done.
+    let (jobs, kills) = execs_of(&mock);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(kills.len(), 1);
+    let kill = params(&kills[0].target, "cmd");
+    assert_eq!(kill[3], "thegn-job-kill");
+    assert_eq!(kill[4], params(&jobs[0].target, "cmd")[10]);
+    assert_eq!(kill[5], receipt.hold.clone().unwrap());
+    assert_eq!(receipt.cleanup, Cleanup::Done);
+    // The hold was released by that kill, so the per-attempt paths are gone too.
+    assert!(receipt.checkout_removed);
+    assert!(!fs_has_under(&mock, &receipt.checkout));
+
     let record = store.read(1).unwrap().unwrap();
-    assert_eq!(record.state, AttemptState::Cancelled);
-    assert_eq!(record.cleanup, Cleanup::Pending);
+    assert_eq!(record.state, AttemptState::TimedOut);
+    assert_eq!(record.cleanup, Cleanup::Done);
     assert!(record.outputs_fenced);
     assert_eq!(
         store.resume_attempt(1).unwrap(),
-        Resume::Terminal(SelectedCompletion::Cancelled)
+        Resume::Terminal(SelectedCompletion::TimedOut)
     );
-    // A reconciler confirms the owned tree is gone, and the ledger says so.
+    // Already confirmed, so a reconciler has nothing left to mark.
+    assert!(!store.mark_cleaned(1).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unconfirmed_kill_leaves_cleanup_pending_and_keeps_the_control_state() {
+    let mock = start_mock(vec![
+        script(vec![session_info(), Out::Silence]),
+        // The group survived SIGKILL.
+        kill_reply(3),
+    ]);
+    let (_dir, store) = store();
+    let deadline = Duration::from_millis(300);
+    let runner = runner(&mock, store.clone(), outputs_options(deadline));
+    let content = content();
+
+    let receipt = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, deadline)
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::TimedOut);
+    assert_eq!(receipt.cleanup, Cleanup::Pending);
+    // The tree may still run, so its checkout and control file stay for the
+    // reconciler instead of being deleted underneath it.
+    assert!(!receipt.checkout_removed);
+    assert!(fs_has_under(&mock, &receipt.checkout));
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.cleanup, Cleanup::Pending);
     assert!(store.mark_cleaned(1).unwrap());
     assert_eq!(store.read(1).unwrap().unwrap().cleanup, Cleanup::Done);
     assert!(!store.mark_cleaned(1).unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_checkout_that_never_opened_is_indeterminate_and_keeps_the_code() {
-    let mock = start_mock(vec![script(vec![session_info(), Out::Exit(125)])]);
+async fn a_stream_that_ends_without_an_exit_is_indeterminate_and_fences_outputs() {
+    // The socket closes after some output and never carries an exit frame.
+    let mock = start_mock(vec![
+        script(vec![
+            session_info(),
+            Out::Stdout("   Compiling demo v0.1.0\n"),
+        ]),
+        kill_reply(0),
+    ]);
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
     let content = content();
 
     let receipt = runner
-        .run(Recipe::CargoBuild, &content.digest(), &content)
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
         .await
         .unwrap();
 
-    // 125 is the wrapper's `cd` failure: the recipe itself never ran.
     assert_eq!(receipt.completion, SelectedCompletion::Indeterminate);
     assert_eq!(receipt.exit, None);
-    assert_eq!(receipt.cleanup, Cleanup::Pending);
     assert!(receipt.outputs_fenced);
     assert!(receipt.outputs.is_empty());
     assert_eq!(
-        store.read(1).unwrap().unwrap().state,
-        AttemptState::Indeterminate
+        execs_of(&mock).1.len(),
+        1,
+        "a lost stream still gets a kill"
+    );
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Indeterminate);
+    assert_eq!(
+        store.resume_attempt(1).unwrap(),
+        Resume::Terminal(SelectedCompletion::Indeterminate)
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rejected_handshake_is_a_refusal_that_commits_no_spend() {
+async fn a_launcher_failure_is_indeterminate_but_a_recipe_exiting_125_is_not() {
+    // The launcher announces its own failure on stderr before exiting 125.
+    let mock = start_mock(vec![
+        script(vec![
+            session_info(),
+            Out::Stderr("thegn-job-launch-failed: cwd\n"),
+            Out::Exit(125),
+        ]),
+        script(vec![session_info(), Out::Exit(125)]),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let content = content();
+
+    let failed = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap();
+    assert_eq!(failed.completion, SelectedCompletion::Indeterminate);
+    assert_eq!(failed.exit, None);
+    assert!(failed.outputs_fenced);
+    assert!(failed.stderr_tail.contains("thegn-job-launch-failed"));
+
+    // The same code with no marker is the recipe's own exit, reported as such.
+    let genuine = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap();
+    assert_eq!(genuine.completion, SelectedCompletion::Exited(125));
+    assert_eq!(genuine.exit, Some(125));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_handshake_is_provably_never_run_and_commits_no_spend() {
     let mock = start_mock(vec![Script {
         handshake: Hs::Status(401),
         out: Vec::new(),
+        produces: Vec::new(),
     }]);
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
     let content = content();
 
     let refusal = runner
-        .run(Recipe::CargoBuild, &content.digest(), &content)
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
         .await
         .unwrap_err();
 
@@ -632,26 +949,86 @@ async fn a_rejected_handshake_is_a_refusal_that_commits_no_spend() {
     };
     assert!(why.contains("sprites-tgtest1"), "{why}");
     assert!(why.contains("401"), "{why}");
-    // Nothing ran, so the reservation is closed with no cleanup and no spend,
-    // and the caller may retry as a new attempt.
+    // A definite 4xx answered before anything was dispatched: exactly one try,
+    // and the ledger records the proof (state `rejected`), which is the only
+    // state that says "never ran".
+    let (jobs, kills) = execs_of(&mock);
+    assert_eq!(jobs.len(), 1);
+    assert!(kills.is_empty());
     let record = store.read(1).unwrap().expect("the reservation is closed");
-    assert_eq!(record.state, AttemptState::Indeterminate);
+    assert_eq!(record.state, AttemptState::Rejected);
     assert_eq!(record.cleanup, Cleanup::NotNeeded);
     assert_eq!(record.committed_micros(), 0);
     assert!(record.outputs_fenced);
     assert!(record.error.unwrap_or_default().contains("401"));
+    assert_eq!(store.resume_attempt(1).unwrap(), Resume::Rejected);
     assert_eq!(store.next_attempt().unwrap(), 2);
+    // The transferred checkout does not linger on the sprite.
+    assert!(
+        !mock
+            .fs
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|key| key.contains("/proj-one/co/"))
+    );
+    assert!(
+        mock.deletes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.contains("/proj-one/co/1-1-"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_upgrade_is_never_redispatched_and_reads_back_indeterminate() {
+    // The upgrade answers after the provider's single 8s try has given up. The
+    // old retrying open would have sent the request again; the job open must
+    // not, because the first request may already have started the build.
+    let mock = start_mock(vec![
+        Script {
+            handshake: Hs::Delayed(12_000),
+            out: vec![session_info(), Out::Exit(0)],
+            produces: Vec::new(),
+        },
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let content = content();
+
+    let receipt = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Indeterminate);
+    assert_eq!(receipt.exit, None);
+    assert!(receipt.outputs_fenced);
+    let (jobs, kills) = execs_of(&mock);
+    assert_eq!(jobs.len(), 1, "the build must be dispatched exactly once");
+    assert_eq!(kills.len(), 1, "whatever may have started gets a kill");
+    // The dispatch outcome is unknown, so the cap stays committed and the
+    // record says so.
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Indeterminate);
+    assert!(
+        record
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("outcome unknown")
+    );
+    assert_eq!(record.committed_micros(), record.reserved_micros);
+    assert_ne!(store.resume_attempt(1).unwrap(), Resume::Rejected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_digest_mismatch_is_refused_before_anything_leaves_the_host() {
     let mock = start_mock(Vec::new());
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
     let content = content();
     let mut other = SnapshotContent::new();
     other
@@ -659,14 +1036,19 @@ async fn a_digest_mismatch_is_refused_before_anything_leaves_the_host() {
         .unwrap();
 
     let refusal = runner
-        .run(Recipe::CargoBuild, &other.digest(), &content)
+        .run(
+            Recipe::CargoBuild,
+            &other.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
         .await
         .unwrap_err();
 
     match refusal {
         RunnerRefusal::SourceMismatch { expected, observed } => {
-            assert_eq!(expected, other.digest());
-            assert_eq!(observed, content.digest());
+            assert_eq!(expected, other.digest().unwrap());
+            assert_eq!(observed, content.digest().unwrap());
         }
         other => panic!("expected a source mismatch, got {other:?}"),
     }
@@ -679,15 +1061,16 @@ async fn a_digest_mismatch_is_refused_before_anything_leaves_the_host() {
 async fn an_empty_snapshot_is_refused_because_there_is_no_checkout_to_run_in() {
     let mock = start_mock(Vec::new());
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
     let empty = SnapshotContent::new();
 
     let refusal = runner
-        .run(Recipe::CargoBuild, &empty.digest(), &empty)
+        .run(
+            Recipe::CargoBuild,
+            &empty.digest().unwrap(),
+            &empty,
+            DEADLINE,
+        )
         .await
         .unwrap_err();
 
@@ -706,14 +1089,13 @@ async fn the_spend_envelope_stops_the_attempt_that_would_exceed_it() {
         AttemptOptions {
             spend_cap_micros: 600,
             spend_envelope_micros: 1_000,
-            ..outputs_options(Duration::from_secs(30))
+            ..outputs_options(DEADLINE)
         },
     );
     let content = content();
-    let source = content.digest();
 
     let first = runner
-        .run(Recipe::CargoBuild, &source, &content)
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
         .await
         .unwrap();
     assert_eq!(first.attempt, 1);
@@ -721,7 +1103,7 @@ async fn the_spend_envelope_stops_the_attempt_that_would_exceed_it() {
     assert_eq!(store.read(1).unwrap().unwrap().committed_micros(), 600);
 
     let refusal = runner
-        .run(Recipe::CargoBuild, &source, &content)
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
         .await
         .unwrap_err();
     let why = match refusal {
@@ -734,80 +1116,80 @@ async fn the_spend_envelope_stops_the_attempt_that_would_exceed_it() {
     assert_eq!(mock.execs.lock().unwrap().len(), 1);
 }
 
+fn reserve_request(attempt: Option<u64>, source: &Digest) -> ReserveRequest<'_> {
+    ReserveRequest {
+        attempt,
+        recipe: Recipe::CargoBuild,
+        source,
+        checkout_root: DEFAULT_CHECKOUT_ROOT,
+        deadline_ms: 0,
+        spend_cap_micros: 600,
+        spend_envelope_micros: 0,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_attempt_number_that_is_already_recorded_is_never_rerun() {
+async fn a_recorded_attempt_number_is_never_rerun_and_a_new_run_gets_a_fresh_checkout() {
     let one = script(vec![session_info(), Out::Exit(0)]);
     let two = script(vec![session_info(), Out::Exit(0)]);
     let mock = start_mock(vec![one, two]);
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
     let content = content();
-    let source = content.digest();
+    let source = pinned();
     let first = runner
-        .run(Recipe::CargoBuild, &source, &content)
+        .run(Recipe::CargoBuild, &source, &content, DEADLINE)
         .await
         .unwrap();
     assert_eq!(first.attempt, 1);
 
     // A second submission gets a fresh number rather than replaying attempt 1.
     let second = runner
-        .run(Recipe::CargoBuild, &source, &content)
+        .run(Recipe::CargoBuild, &source, &content, DEADLINE)
         .await
         .unwrap();
     assert_eq!(second.attempt, 2);
-    assert_eq!(
-        second.checkout,
-        binding().checkout(2, DEFAULT_CHECKOUT_ROOT)
-    );
     assert_ne!(second.checkout, first.checkout);
-    assert_eq!(mock.execs.lock().unwrap().len(), 2);
+    assert_eq!(execs_of(&mock).0.len(), 2);
 
     // Reserving a recorded number is a refusal, not a rerun.
     let refusal = store
-        .reserve(
-            &binding(),
-            ReserveRequest {
-                attempt: 1,
-                recipe: Recipe::CargoBuild,
-                source: &source,
-                checkout: binding().checkout(1, DEFAULT_CHECKOUT_ROOT),
-                deadline_ms: 0,
-                spend_cap_micros: 600,
-                spend_envelope_micros: 0,
-            },
-        )
+        .reserve(&binding(), reserve_request(Some(1), &source))
         .unwrap_err();
     assert!(matches!(
         refusal,
         ReserveRefusal::Duplicate(AttemptState::Finished)
     ));
-    assert_eq!(mock.execs.lock().unwrap().len(), 2);
+    assert_eq!(execs_of(&mock).0.len(), 2);
+}
+
+#[test]
+fn back_to_back_reservations_allocate_distinct_attempt_numbers() {
+    let (_dir, store) = store();
+    let source = pinned();
+    let first = store
+        .reserve(&binding(), reserve_request(None, &source))
+        .unwrap();
+    let second = store
+        .reserve(&binding(), reserve_request(None, &source))
+        .unwrap();
+    // The number is allocated inside the ledger lock (no separate
+    // read-then-reserve), so reservations advance it instead of colliding on
+    // `Duplicate`.
+    assert_eq!(first.attempt, 1);
+    assert_eq!(second.attempt, 2);
+    assert_ne!(first.key, second.key);
+    assert_ne!(first.checkout, second.checkout);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_interrupted_dispatch_reads_back_as_unknown_and_is_never_rerun() {
     let mock = start_mock(Vec::new());
     let (_dir, store) = store();
-    let content = content();
-    let source = content.digest();
+    let source = pinned();
     // Simulate a process that wrote the dispatch fence and then died.
     let mut record = store
-        .reserve(
-            &binding(),
-            ReserveRequest {
-                attempt: 1,
-                recipe: Recipe::CargoBuild,
-                source: &source,
-                checkout: binding().checkout(1, DEFAULT_CHECKOUT_ROOT),
-                deadline_ms: 0,
-                spend_cap_micros: 600,
-                spend_envelope_micros: 0,
-            },
-        )
+        .reserve(&binding(), reserve_request(Some(1), &source))
         .unwrap();
     record.state = AttemptState::Dispatching;
     store.mark(&record).unwrap();
@@ -817,18 +1199,7 @@ async fn an_interrupted_dispatch_reads_back_as_unknown_and_is_never_rerun() {
     assert_eq!(store.read(1).unwrap().unwrap().committed_micros(), 600);
     assert!(matches!(
         store
-            .reserve(
-                &binding(),
-                ReserveRequest {
-                    attempt: 1,
-                    recipe: Recipe::CargoBuild,
-                    source: &source,
-                    checkout: binding().checkout(1, DEFAULT_CHECKOUT_ROOT),
-                    deadline_ms: 0,
-                    spend_cap_micros: 600,
-                    spend_envelope_micros: 0,
-                },
-            )
+            .reserve(&binding(), reserve_request(Some(1), &source))
             .unwrap_err(),
         ReserveRefusal::Duplicate(AttemptState::Dispatching)
     ));
@@ -837,77 +1208,244 @@ async fn an_interrupted_dispatch_reads_back_as_unknown_and_is_never_rerun() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rebinding_a_project_marks_older_attempts_stale() {
-    let mock = start_mock(Vec::new());
+async fn rebinding_a_project_marks_older_attempts_stale_and_releases_the_old_sprite() {
     let (_dir, store) = store();
-    let content = content();
-    let source = content.digest();
+    let source = pinned();
     let first = store
-        .reserve(
-            &binding(),
-            ReserveRequest {
-                attempt: 1,
-                recipe: Recipe::CargoBuild,
-                source: &source,
-                checkout: binding().checkout(1, DEFAULT_CHECKOUT_ROOT),
-                deadline_ms: 0,
-                spend_cap_micros: 600,
-                spend_envelope_micros: 0,
-            },
-        )
+        .reserve(&binding(), reserve_request(Some(1), &source))
         .unwrap();
     assert_eq!(first.epoch, 1);
 
     // The same project, rebound to a different sprite.
     let rebound = ProjectBinding::new("proj-one", "acct", "tgtest2").unwrap();
     let second = store
-        .reserve(
-            &rebound,
-            ReserveRequest {
-                attempt: 2,
-                recipe: Recipe::CargoBuild,
-                source: &source,
-                checkout: rebound.checkout(2, DEFAULT_CHECKOUT_ROOT),
-                deadline_ms: 0,
-                spend_cap_micros: 600,
-                spend_envelope_micros: 0,
-            },
-        )
+        .reserve(&rebound, reserve_request(Some(2), &source))
         .unwrap();
     assert_eq!(second.epoch, 2);
     assert_eq!(store.resume_attempt(1).unwrap(), Resume::StaleEpoch);
-    assert!(mock.execs.lock().unwrap().is_empty());
+
+    // The first sprite is free again for another project.
+    let other_dir = store.dir().parent().unwrap().join("ledger-other");
+    let other = AttemptStore::at(other_dir);
+    let taken = ProjectBinding::new("proj-two", "acct", "tgtest1").unwrap();
+    other
+        .reserve(&taken, reserve_request(None, &source))
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_sync_runner_contract_reaches_the_sprites_provider() {
-    let mock = start_mock(vec![script(vec![
-        session_info(),
-        Out::Stdout("   Compiling demo v0.1.0\n"),
-        Out::Exit(0),
-    ])]);
-    let (_dir, store) = store();
-    let runner = runner(&mock, store, outputs_options(Duration::from_secs(30)));
+async fn a_second_project_cannot_bind_a_sprite_the_first_one_holds() {
+    let mock = start_mock(vec![
+        script(vec![session_info(), Out::Exit(0)]),
+        script(vec![session_info(), Out::Exit(0)]),
+    ]);
+    // Two projects, two ledgers beside each other (one host), one sprite.
+    let parent = tempfile::tempdir().unwrap();
+    let first_store = AttemptStore::at(parent.path().join("proj-one"));
+    let second_store = AttemptStore::at(parent.path().join("proj-two"));
+    let second_binding = ProjectBinding::new("proj-two", "acct", "tgtest1").unwrap();
+
+    let first = runner(&mock, first_store.clone(), outputs_options(DEADLINE));
     let content = content();
-    let source = content.digest();
+    first
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap();
+    let writes_before = mock.writes.lock().unwrap().len();
+    let execs_before = mock.execs.lock().unwrap().len();
+
+    // Refused by the local claim registry, before any ledger row or provider
+    // call exists.
+    let local = runner_for(
+        &mock,
+        second_binding.clone(),
+        second_store.clone(),
+        outputs_options(DEADLINE),
+    );
+    let refusal = local
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap_err();
+    let why = match refusal {
+        RunnerRefusal::RunnerUnavailable(why) => why,
+        other => panic!("expected an unavailable runner, got {other:?}"),
+    };
+    assert!(why.contains("already bound to project"), "{why}");
+    assert!(why.contains("proj-one"), "{why}");
+    assert!(second_store.records().unwrap().is_empty());
+
+    // A host with no claim registry in common still cannot use the sprite: the
+    // owner marker on the sprite itself names the first project.
+    let (_elsewhere, third_store) = store();
+    let remote = runner_for(
+        &mock,
+        second_binding,
+        third_store.clone(),
+        outputs_options(DEADLINE),
+    );
+    let refusal = remote
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap_err();
+    let why = match refusal {
+        RunnerRefusal::RunnerUnavailable(why) => why,
+        other => panic!("expected an unavailable runner, got {other:?}"),
+    };
+    assert!(why.contains("already bound to another project"), "{why}");
+    assert_eq!(
+        third_store.read(1).unwrap().unwrap().state,
+        AttemptState::Rejected
+    );
+
+    // Neither refused attempt wrote a byte or opened a socket on the sprite, so
+    // the first project's inputs and cache were never reachable.
+    assert_eq!(mock.writes.lock().unwrap().len(), writes_before);
+    assert_eq!(mock.execs.lock().unwrap().len(), execs_before);
+    assert!(
+        mock.fs
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|key| !key.contains("/proj-two/"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sync_runner_contract_forwards_the_route_deadline_and_reaches_the_provider() {
+    let mock = start_mock(vec![
+        script(vec![
+            session_info(),
+            Out::Stdout("   Compiling demo v0.1.0\n"),
+            Out::Exit(0),
+        ]),
+        // The second submission never finishes: only the forwarded deadline can
+        // stop it.
+        script(vec![session_info(), Out::Silence]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store, outputs_options(DEADLINE));
+    let source = pinned();
 
     // `submit` blocks on the runtime handle, so it must be called from a plain
-    // thread — exactly how the dispatcher calls it.
+    // thread, exactly how the dispatcher calls it.
     let submitted = source.clone();
     let worker = std::thread::spawn(move || {
         let wrong = runner
-            .submit("sprites-someone-else", Recipe::CargoBuild, &submitted)
+            .submit(
+                "sprites-someone-else",
+                Recipe::CargoBuild,
+                &submitted,
+                Duration::from_secs(30),
+            )
             .unwrap_err();
         assert!(matches!(wrong, RunnerRefusal::WrongRunner));
-        runner.submit("sprites-tgtest1", Recipe::CargoBuild, &submitted)
+        let ok = runner.submit(
+            "sprites-tgtest1",
+            Recipe::CargoBuild,
+            &submitted,
+            Duration::from_secs(30),
+        );
+        let timed_out = runner.submit(
+            "sprites-tgtest1",
+            Recipe::CargoTest,
+            &submitted,
+            Duration::from_millis(300),
+        );
+        (ok, timed_out)
     });
-    let result = worker.join().unwrap().unwrap();
+    let (ok, timed_out) = worker.join().unwrap();
+    let result = ok.unwrap();
 
     assert_eq!(result.runner, "sprites-tgtest1");
     assert_eq!(result.recipe, Recipe::CargoBuild);
     assert_eq!(result.source, source);
     assert_eq!(result.completion, SelectedCompletion::Exited(0));
     assert!(result.log_tail.contains("Compiling demo"));
+    assert!(!result.truncated);
+
+    let timed_out = timed_out.unwrap();
+    assert_eq!(timed_out.completion, SelectedCompletion::TimedOut);
+    // The hold ceiling followed the forwarded 300ms, not the binding's 30s:
+    // 0s (whole seconds) plus one hold expiry.
+    let (jobs, _) = execs_of(&mock);
+    assert_eq!(params(&jobs[1].target, "cmd")[5], "300");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_binding_clamps_a_longer_route_deadline() {
+    let mock = start_mock(vec![
+        script(vec![session_info(), Out::Silence]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store, outputs_options(Duration::from_millis(300)));
+    let content = content();
+
+    let receipt = runner
+        .run(
+            Recipe::CargoBuild,
+            &pinned(),
+            &content,
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::TimedOut);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_time_is_not_charged_to_the_build_deadline() {
+    // Every write takes 400ms, so the transfer outlasts the 200ms build
+    // deadline. The build itself exits at once: only a build clock that starts
+    // at dispatch, after the transfer, reports a clean exit.
+    let mock = start_mock(vec![script(vec![session_info(), Out::Exit(0)])]);
+    slow_writes(&mock, 400);
+    let (_dir, store) = store();
+    let deadline = Duration::from_millis(200);
+    let runner = runner(&mock, store, outputs_options(deadline));
+    let content = content();
+
+    let receipt = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, deadline)
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Exited(0));
+    assert!(receipt.elapsed_ms >= 400, "{}", receipt.elapsed_ms);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_over_its_own_budget_is_rejected_and_cleaned_up() {
+    let mock = start_mock(Vec::new());
+    slow_writes(&mock, 1_000);
+    let (_dir, store) = store();
+    let runner = runner(
+        &mock,
+        store.clone(),
+        AttemptOptions {
+            transfer_budget: Duration::from_millis(100),
+            ..outputs_options(DEADLINE)
+        },
+    );
+    let content = content();
+
+    let refusal = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap_err();
+
+    let why = match refusal {
+        RunnerRefusal::RunnerUnavailable(why) => why,
+        other => panic!("expected an unavailable runner, got {other:?}"),
+    };
+    assert!(why.contains("transfer exceeded"), "{why}");
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Rejected
+    );
+    assert!(mock.execs.lock().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -915,15 +1453,11 @@ async fn a_denied_transfer_is_refused_before_a_command_can_run() {
     let mock = start_mock(Vec::new());
     deny_writes(&mock, 403);
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
     let content = content();
 
     let refusal = runner
-        .run(Recipe::CargoBuild, &content.digest(), &content)
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
         .await
         .unwrap_err();
 
@@ -935,7 +1469,7 @@ async fn a_denied_transfer_is_refused_before_a_command_can_run() {
     // The checkout was never complete, so no command ran, nothing is pending
     // and nothing is spent: the caller may retry as a new attempt.
     let record = store.read(1).unwrap().expect("the reservation is closed");
-    assert_eq!(record.state, AttemptState::Indeterminate);
+    assert_eq!(record.state, AttemptState::Rejected);
     assert_eq!(record.cleanup, Cleanup::NotNeeded);
     assert_eq!(record.committed_micros(), 0);
     assert!(record.outputs_fenced);
@@ -945,28 +1479,86 @@ async fn a_denied_transfer_is_refused_before_a_command_can_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_warm_loop_retains_the_project_cache_but_never_the_checkout() {
+async fn a_checkout_holding_a_stray_file_is_never_run() {
+    let mock = start_mock(Vec::new());
+    plant_stale_files(&mock);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let content = content();
+
+    let refusal = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await
+        .unwrap_err();
+
+    let why = match refusal {
+        RunnerRefusal::RunnerUnavailable(why) => why,
+        other => panic!("expected an unavailable runner, got {other:?}"),
+    };
+    assert!(why.contains("does not hold exactly"), "{why}");
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Rejected
+    );
+    assert!(mock.execs.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_executable_bit_survives_the_transfer_and_is_part_of_the_pinned_identity() {
+    let mock = start_mock(vec![script(vec![session_info(), Out::Exit(0)])]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store, outputs_options(DEADLINE));
+    let mut content = SnapshotContent::new();
+    content.insert("Cargo.toml", CARGO_TOML.to_vec()).unwrap();
+    content
+        .insert_file("scripts/build.sh", b"#!/bin/sh\n".to_vec(), true)
+        .unwrap();
+    let pinned_exec = reapi(&[
+        f("Cargo.toml", CARGO_TOML, false),
+        f("scripts/build.sh", b"#!/bin/sh\n", true),
+    ]);
+    let pinned_plain = reapi(&[
+        f("Cargo.toml", CARGO_TOML, false),
+        f("scripts/build.sh", b"#!/bin/sh\n", false),
+    ]);
+    assert_eq!(content.digest().unwrap(), pinned_exec);
+    assert_ne!(pinned_exec, pinned_plain);
+
+    let receipt = runner
+        .run(Recipe::CargoBuild, &pinned_exec, &content, DEADLINE)
+        .await
+        .unwrap();
+    assert_eq!(receipt.materialized, pinned_exec);
+
+    let writes = attempt_writes(&mock);
+    let mode_of = |suffix: &str| {
+        writes
+            .iter()
+            .find(|written| written.path.ends_with(suffix))
+            .map(|written| written.mode.clone())
+    };
+    assert_eq!(mode_of("/scripts/build.sh").as_deref(), Some("0755"));
+    assert_eq!(mode_of("/Cargo.toml").as_deref(), Some("0644"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_warm_loop_retains_the_project_cache_but_never_a_checkout() {
     let mock = start_mock(vec![
         script(vec![session_info(), Out::Exit(0)]),
         script(vec![session_info(), Out::Exit(0)]),
     ]);
     let (_dir, store) = store();
-    let runner = runner(
-        &mock,
-        store.clone(),
-        outputs_options(Duration::from_secs(30)),
-    );
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
 
     // Cold: three files, one of which the warm loop deletes.
     let mut cold = SnapshotContent::new();
-    cold.insert("Cargo.toml", b"[package]\nname = \"demo\"\n".to_vec())
-        .unwrap();
+    cold.insert("Cargo.toml", CARGO_TOML.to_vec()).unwrap();
     cold.insert("src/main.rs", b"fn main() {}\n".to_vec())
         .unwrap();
     cold.insert("src/old.rs", b"pub fn old() {}\n".to_vec())
         .unwrap();
     let cold_receipt = runner
-        .run(Recipe::CargoBuild, &cold.digest(), &cold)
+        .run(Recipe::CargoBuild, &cold.digest().unwrap(), &cold, DEADLINE)
         .await
         .unwrap();
     assert_eq!(cold_receipt.files_transferred, 3);
@@ -974,8 +1566,7 @@ async fn a_warm_loop_retains_the_project_cache_but_never_the_checkout() {
     // Warm: the tracked entry point is dirty, one tracked file is deleted, and
     // an allowed untracked input appears beside them.
     let mut warm = SnapshotContent::new();
-    warm.insert("Cargo.toml", b"[package]\nname = \"demo\"\n".to_vec())
-        .unwrap();
+    warm.insert("Cargo.toml", CARGO_TOML.to_vec()).unwrap();
     warm.insert(
         "src/main.rs",
         b"fn main() { println!(\"warmer\"); }\n".to_vec(),
@@ -984,90 +1575,302 @@ async fn a_warm_loop_retains_the_project_cache_but_never_the_checkout() {
     warm.insert("notes.md", b"allowed untracked input\n".to_vec())
         .unwrap();
     let warm_receipt = runner
-        .run(Recipe::CargoTest, &warm.digest(), &warm)
+        .run(Recipe::CargoTest, &warm.digest().unwrap(), &warm, DEADLINE)
         .await
         .unwrap();
 
     assert_eq!(warm_receipt.attempt, 2);
-    assert_eq!(
-        warm_receipt.checkout,
-        binding().checkout(2, DEFAULT_CHECKOUT_ROOT)
-    );
     assert_ne!(warm_receipt.checkout, cold_receipt.checkout);
     // A per-attempt checkout holds nothing over, so the whole edited tree
-    // crosses again: the project cache is the one state attempt 2 inherits.
+    // crosses again and is verified against the pinned root digest.
     assert_eq!(warm_receipt.files_transferred, 3);
-    assert_eq!(warm_receipt.files_reused, 0);
-    assert_eq!(warm_receipt.materialized, warm.digest());
+    assert_eq!(warm_receipt.materialized, warm.digest().unwrap());
     assert_eq!(warm_receipt.completion, SelectedCompletion::Exited(0));
 
-    let cache = format!(
-        "CARGO_TARGET_DIR={}",
-        binding().cache(DEFAULT_CHECKOUT_ROOT)
-    );
-    let execs = mock.execs.lock().unwrap().clone();
-    assert_eq!(execs.len(), 2);
-    assert_eq!(params(&execs[0].target, "env"), vec![cache.clone()]);
-    assert_eq!(params(&execs[1].target, "env"), vec![cache]);
-    assert_eq!(params(&execs[0].target, "cmd")[4], cold_receipt.checkout);
-    assert_eq!(params(&execs[1].target, "cmd")[4], warm_receipt.checkout);
-    assert_eq!(
-        params(&execs[1].target, "cmd").last().map(String::as_str),
-        Some("test")
-    );
+    // The deleted file crossed only in the cold attempt, and the dirty edit only
+    // in the warm one.
+    let writes = attempt_writes(&mock);
+    let in_attempt = |checkout: &str, rel: &str| {
+        writes
+            .iter()
+            .any(|written| written.path == format!("{checkout}/{rel}"))
+    };
+    assert!(in_attempt(&cold_receipt.checkout, "src/old.rs"));
+    assert!(!in_attempt(&warm_receipt.checkout, "src/old.rs"));
+    assert!(in_attempt(&warm_receipt.checkout, "notes.md"));
 
-    // The deletion only ever applies to the warm checkout: the first attempt's
-    // tree is untouched, and the cache is the only shared path.
-    let fs = mock.fs.lock().unwrap();
-    assert!(fs.contains_key(&format!("{}/src/old.rs", cold_receipt.checkout)));
-    assert!(!fs.contains_key(&format!("{}/src/old.rs", warm_receipt.checkout)));
-    assert_eq!(
-        fs.get(&format!("{}/src/main.rs", warm_receipt.checkout))
-            .map(Vec::as_slice),
-        Some(b"fn main() { println!(\"warmer\"); }\n".as_slice())
+    // Both checkouts are gone; the project cache is the one shared path and is
+    // never written or deleted by the runner itself.
+    assert!(!fs_has_under(&mock, &cold_receipt.checkout));
+    assert!(!fs_has_under(&mock, &warm_receipt.checkout));
+    let cache = binding().cache(DEFAULT_CHECKOUT_ROOT);
+    assert!(
+        !mock
+            .deletes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.starts_with(&cache))
     );
-    assert!(!fs.contains_key(&binding().cache(DEFAULT_CHECKOUT_ROOT)));
+    let (jobs, _) = execs_of(&mock);
+    assert_eq!(params(&jobs[0].target, "cmd")[13], cache);
+    assert_eq!(params(&jobs[1].target, "cmd")[13], cache);
+    assert_eq!(params(&jobs[1].target, "cmd")[15], "test");
+}
+
+// -------------------------------------------------------------- the snapshot
+
+fn write_tree(root: &std::path::Path, rel: &str, bytes: &[u8]) {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, bytes).unwrap();
 }
 
 #[test]
 fn a_snapshot_carries_the_dirty_tree_and_its_allowed_untracked_input() {
     let root = tempfile::tempdir().unwrap();
-    let write = |rel: &str, bytes: &[u8]| {
-        let path = root.path().join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, bytes).unwrap();
-    };
+    let write = |rel: &str, bytes: &[u8]| write_tree(root.path(), rel, bytes);
     write("Cargo.toml", b"[package]\nname = \"demo\"\n");
     write("src/main.rs", b"fn main() {}\n");
     write("notes.md", b"an allowed untracked input\n");
+    write(".gitignore", b"target/\nnode_modules/\n.envrc.local\n");
+    // Ignored build output and local state never enter the runner.
+    write("target/debug/app", b"\x7fELF");
+    write("node_modules/dep/index.js", b"module.exports = 1;\n");
+    write(".envrc.local", b"export TOKEN=1\n");
+    // Credentials and VCS state are denied at the root and at every depth.
     write(".git/config", b"[core]\n");
     write(".env", b"SECRET=1\n");
     write(".env.local", b"SECRET=2\n");
     write(".ssh/id_ed25519", b"private\n");
     write(".thegn/state.json", b"{}\n");
+    write("services/api/.env", b"SECRET=3\n");
+    write("web/.npmrc", b"//registry:_authToken=x\n");
+    write("pkg/.claude/settings.json", b"{}\n");
+    write("sub/.git", b"gitdir: ../.git/modules/sub\n");
+    write("ci/.cargo/credentials.toml", b"[registry]\ntoken = \"x\"\n");
 
     let snapshot = DirSnapshot::new(root.path());
     let captured = snapshot.capture().unwrap();
     let paths: Vec<&str> = captured.files().map(|(path, _)| path).collect();
-    assert_eq!(paths, vec!["Cargo.toml", "notes.md", "src/main.rs"]);
-    // The credential trees are gone byte-for-byte, not just path-filtered.
-    assert!(captured.get(".env").is_none());
-    assert!(captured.get(".ssh/id_ed25519").is_none());
-    assert!(captured.get(".thegn/state.json").is_none());
+    assert_eq!(
+        paths,
+        vec![".gitignore", "Cargo.toml", "notes.md", "src/main.rs"]
+    );
+    // The identity is the REAPI root digest of exactly that tree.
+    assert_eq!(
+        captured.digest().unwrap(),
+        reapi(&[
+            f(
+                ".gitignore",
+                b"target/\nnode_modules/\n.envrc.local\n",
+                false
+            ),
+            f("Cargo.toml", b"[package]\nname = \"demo\"\n", false),
+            f("notes.md", b"an allowed untracked input\n", false),
+            f("src/main.rs", b"fn main() {}\n", false),
+        ])
+    );
 
     // Warm loop: a dirty edit, a deletion and an untracked addition all change
     // the digest, so the pinned identity cannot silently match a stale tree.
-    let baseline = captured.digest();
+    let baseline = captured.digest().unwrap();
     write("src/main.rs", b"fn main() { println!(\"edited\"); }\n");
     let edited = snapshot.capture().unwrap();
-    assert_ne!(edited.digest(), baseline);
+    assert_ne!(edited.digest().unwrap(), baseline);
 
     std::fs::remove_file(root.path().join("notes.md")).unwrap();
     let deleted = snapshot.capture().unwrap();
-    assert_ne!(deleted.digest(), edited.digest());
+    assert_ne!(deleted.digest().unwrap(), edited.digest().unwrap());
     assert!(deleted.get("notes.md").is_none());
     let unchanged = DirSnapshot::new(root.path()).capture().unwrap();
-    assert_eq!(unchanged.digest(), deleted.digest());
+    assert_eq!(unchanged.digest().unwrap(), deleted.digest().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_snapshot_preserves_the_executable_bit_and_refuses_symlinks() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), "Cargo.toml", b"[package]\n");
+    write_tree(root.path(), "scripts/build.sh", b"#!/bin/sh\n");
+    let script = root.path().join("scripts/build.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let captured = DirSnapshot::new(root.path()).capture().unwrap();
+    assert!(captured.is_executable("scripts/build.sh"));
+    assert!(!captured.is_executable("Cargo.toml"));
+    assert_eq!(
+        captured.digest().unwrap(),
+        reapi(&[
+            f("Cargo.toml", b"[package]\n", false),
+            f("scripts/build.sh", b"#!/bin/sh\n", true),
+        ])
+    );
+
+    // A symlink is refused outright rather than silently dropped.
+    std::os::unix::fs::symlink("Cargo.toml", root.path().join("link.toml")).unwrap();
+    let error = DirSnapshot::new(root.path()).capture().unwrap_err();
+    assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+}
+
+#[test]
+fn an_oversized_file_is_refused_from_its_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), "Cargo.toml", b"[package]\n");
+    // A sparse file: it costs no disk, and the cap trips on its length alone.
+    let big = std::fs::File::create(root.path().join("big.bin")).unwrap();
+    big.set_len(SNAPSHOT_MAX_FILE_BYTES + 1).unwrap();
+    let error = DirSnapshot::new(root.path()).capture().unwrap_err();
+    assert!(format!("{error:#}").contains("larger than"), "{error:#}");
+}
+
+// ---------------------------------------------------- the real launch scripts
+
+fn have(tool: &str) -> bool {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("command -v {tool} >/dev/null 2>&1")])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn launcher(
+    pidfile: &std::path::Path,
+    checkout: &std::path::Path,
+    home: &std::path::Path,
+    cache: &std::path::Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args(["-c", LAUNCH_SCRIPT, "thegn-job"])
+        .arg(pidfile)
+        .arg(checkout)
+        .arg(home)
+        .arg(cache);
+    command
+}
+
+/// The launcher the runner really sends, under a real `/bin/sh` with a hostile
+/// parent environment. Linux only: it needs `setsid`.
+#[test]
+fn the_launcher_scrubs_the_environment_and_records_the_recipes_group() {
+    if !cfg!(target_os = "linux") || !have("setsid") {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let checkout = work.path().join("co");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let pidfile = work.path().join("ctl/k.pid");
+    let home = work.path().join("home/k");
+    let cache = work.path().join("cache");
+    let dump = work.path().join("env.txt");
+
+    let output = launcher(&pidfile, &checkout, &home, &cache)
+        .args(["/bin/sh", "-c"])
+        .arg(format!("env > {0}; pwd >> {0}", dump.display()))
+        .env("CLAUDE_OAUTH_TOKEN", "sk-secret")
+        .env("AWS_SECRET_ACCESS_KEY", "aws-secret")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen = std::fs::read_to_string(&dump).unwrap();
+    assert!(!seen.contains("sk-secret"), "{seen}");
+    assert!(!seen.contains("aws-secret"), "{seen}");
+    assert!(
+        seen.contains(&format!("HOME={}\n", home.display())),
+        "{seen}"
+    );
+    assert!(
+        seen.contains(&format!("CARGO_TARGET_DIR={}/target\n", cache.display())),
+        "{seen}"
+    );
+    assert!(
+        seen.contains(&format!("CARGO_HOME={}/cargo\n", cache.display())),
+        "{seen}"
+    );
+    assert!(
+        seen.trim_end().ends_with(&checkout.display().to_string()),
+        "{seen}"
+    );
+    let recorded = std::fs::read_to_string(&pidfile).unwrap();
+    assert!(recorded.trim().parse::<u32>().is_ok(), "{recorded}");
+}
+
+#[test]
+fn the_launcher_reports_its_own_failure_with_the_marker() {
+    if !cfg!(target_os = "linux") || !have("setsid") {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let output = launcher(
+        &work.path().join("ctl/k.pid"),
+        &work.path().join("no-such-checkout"),
+        &work.path().join("home"),
+        &work.path().join("cache"),
+    )
+    .arg("/bin/true")
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(LAUNCH_FAILED_MARKER));
+}
+
+#[test]
+fn the_kill_script_stops_the_recorded_group_and_confirms_it() {
+    if !cfg!(target_os = "linux") || !have("setsid") || !std::path::Path::new("/bin/kill").exists()
+    {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let checkout = work.path().join("co");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let pidfile = work.path().join("ctl/k.pid");
+    let mut child = launcher(
+        &pidfile,
+        &checkout,
+        &work.path().join("home"),
+        &work.path().join("cache"),
+    )
+    // A quiet build: a shell that spawns a long sleeper of its own.
+    .args(["/bin/sh", "-c", "sleep 300 & wait"])
+    .spawn()
+    .unwrap();
+    let mut waited = 0;
+    while !pidfile.exists() && waited < 100 {
+        std::thread::sleep(Duration::from_millis(50));
+        waited += 1;
+    }
+    assert!(pidfile.exists(), "the launcher never recorded its group");
+
+    let killed = std::process::Command::new("/bin/sh")
+        .args(["-c", KILL_SCRIPT, "thegn-job-kill"])
+        .arg(&pidfile)
+        .arg("thegn-hold-0123456789abcdef")
+        .output()
+        .unwrap();
+    assert_eq!(
+        killed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    // The whole tree is gone, so the launcher's child is reaped by a signal.
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+
+    // With no usable control file nothing can be confirmed.
+    let nothing = std::process::Command::new("/bin/sh")
+        .args(["-c", KILL_SCRIPT, "thegn-job-kill"])
+        .arg(work.path().join("absent.pid"))
+        .arg("thegn-hold-0123456789abcdef")
+        .status()
+        .unwrap();
+    assert_eq!(nothing.code(), Some(4));
 }
