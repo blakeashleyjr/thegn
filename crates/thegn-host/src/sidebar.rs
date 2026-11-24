@@ -71,7 +71,6 @@ pub enum RowKind {
     /// `batch_open:{key}`). Like [`RowKind::OtherGroup`] it carries no
     /// `folder_id` and no `tab_target`, and is not markable, pinnable,
     /// fileable or draggable: there is no `folders` row behind it.
-    #[allow(dead_code)] // spine stub: lane 2 emits it; drop this allow then
     BatchGroup,
     /// A **derived** "… show N more" / "show fewer" toggle closing a group
     /// whose entries exceed `[ui] sidebar_group_row_limit` (or its
@@ -371,10 +370,8 @@ pub struct SidebarRow {
     /// installed plugin has published a value for the row.
     pub plugin_fields: Vec<PluginFieldValue>,
     /// Batch members: the leading part of the label hidden on screen (`tg/b161-b161-`).
-    #[allow(dead_code)] // spine stub: read once lanes 2-5 land; drop this allow then
     pub batch_prefix: Option<String>,
     /// BatchGroup rows: the members' rollup (filled by `fold::rollup_batch_stats`).
-    #[allow(dead_code)] // spine stub: read once lanes 2-5 land; drop this allow then
     pub group_stats: Option<fold::GroupStats>,
 }
 
@@ -660,11 +657,9 @@ pub struct ViewState {
     /// of hydration equality.
     pub freeze: Option<std::sync::Arc<crate::sidebar_freeze::SortFreeze>>,
     /// Batch groups the user opened (`batch_open:{key}` = "1"); absent = collapsed.
-    #[allow(dead_code)] // spine stub: read once lanes 2-5 land; drop this allow then
     pub batch_open: HashSet<String>,
     /// The focused cursor row's pin_key at rebuild time; the row limit never folds it.
     /// Loop-owned and transient, never persisted.
-    #[allow(dead_code)] // spine stub: read once lanes 2-5 land; drop this allow then
     pub cursor_key: Option<String>,
 }
 
