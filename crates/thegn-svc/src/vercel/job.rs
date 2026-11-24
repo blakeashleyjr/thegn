@@ -71,7 +71,7 @@ use thegn_core::vercel::admit;
 use thegn_core::vercel::api::LogLine;
 use thegn_job_spec::selected::MAX_SELECTED_LOG_BYTES;
 use thegn_job_spec::{
-    Recipe, RunnerRefusal, SelectedCompletion, SelectedJobResult, SelectedRunner,
+    Recipe, RunnerRefusal, SelectedCancel, SelectedCompletion, SelectedJobResult, SelectedRunner,
 };
 
 use super::VercelProvider;
@@ -1827,9 +1827,22 @@ impl SelectedRunner for VercelSelectedRunner {
         recipe: Recipe,
         source: &Digest,
         deadline: Duration,
+        cancel: &SelectedCancel,
     ) -> Result<SelectedJobResult, RunnerRefusal> {
         if runner_alias != self.alias {
             return Err(RunnerRefusal::WrongRunner);
+        }
+        // The Vercel attempt has no in-flight cancel handle yet (task 4.9): only
+        // a cancel before dispatch is honoured, and nothing has been sent then.
+        if cancel.is_cancelled() {
+            return Ok(SelectedJobResult {
+                runner: self.alias.clone(),
+                recipe,
+                source: source.clone(),
+                completion: SelectedCompletion::Cancelled,
+                log_tail: String::new(),
+                truncated: false,
+            });
         }
         let content = self
             .snapshot

@@ -100,7 +100,7 @@ use thegn_core::fsperm::{PrivateDir, ensure_private_dir, open_private_dir, owned
 use thegn_core::sprite_hold::{HOLD_EXPIRE_SECS, hold_name, wrap_argv};
 use thegn_job_spec::selected::MAX_SELECTED_LOG_BYTES;
 use thegn_job_spec::{
-    Recipe, RunnerRefusal, SelectedCompletion, SelectedJobResult, SelectedRunner,
+    Recipe, RunnerRefusal, SelectedCancel, SelectedCompletion, SelectedJobResult, SelectedRunner,
 };
 
 use crate::provider::{
@@ -3250,17 +3250,43 @@ impl SelectedRunner for SpritesSelectedRunner {
         recipe: Recipe,
         source: &Digest,
         deadline: Duration,
+        cancel: &SelectedCancel,
     ) -> Result<SelectedJobResult, RunnerRefusal> {
         if runner_alias != self.alias {
             return Err(RunnerRefusal::WrongRunner);
+        }
+        let cancelled = |this: &Self| SelectedJobResult {
+            runner: this.alias.clone(),
+            recipe,
+            source: source.clone(),
+            completion: SelectedCompletion::Cancelled,
+            log_tail: String::new(),
+            truncated: false,
+        };
+        if cancel.is_cancelled() {
+            return Ok(cancelled(self));
         }
         let content = self
             .snapshot
             .capture()
             .map_err(|error| self.unavailable(format!("cannot capture the snapshot: {error:#}")))?;
-        let receipt = self
+        // Bridge the route's std-only token to the executor's own cancel handle.
+        let token = CancelToken::new();
+        let bridge = token.clone();
+        cancel.on_cancel(move || bridge.cancel());
+        let receipt = match self
             .handle
-            .block_on(self.run(recipe, source, &content, deadline))?;
+            .block_on(self.run_cancellable(recipe, source, &content, deadline, &token))
+        {
+            Ok(receipt) => receipt,
+            // A cancel that closed the attempt before dispatch is recorded as
+            // rejected (nothing was sent, so no command ran); the route reads it
+            // back as a user cancel rather than an unavailable runner.
+            Err(RunnerRefusal::RunnerUnavailable(_)) if token.is_cancelled() => {
+                return Ok(cancelled(self));
+            }
+            Err(refusal) => return Err(refusal),
+        };
         Ok(SelectedJobResult {
             runner: self.alias.clone(),
             recipe,
