@@ -807,7 +807,7 @@ impl Panes {
     }
 
     /// Whether the daemon route is installed for new local panes — the exact
-    /// gate [`Self::materialize_with_specs`]' warm-reattach branch tests, so
+    /// gate `materialize_with_specs`' warm-reattach branch tests, so
     /// the drain's disabled-daemon claim (`handlers::provision::drain_specs`)
     /// agrees by construction with the fallback materialize will take.
     pub(crate) fn daemon_route_enabled(&self) -> bool {
@@ -1207,7 +1207,7 @@ impl Panes {
     }
 
     /// The leaves of `tab.center` not yet backed by live panes — the targets
-    /// a spec-resolution pass must cover before [`Self::materialize_with_specs`].
+    /// a spec-resolution pass must cover before `materialize_with_specs`.
     pub(crate) fn missing_leaves(&self, tab: &crate::session::Tab) -> Vec<u32> {
         tab.center
             .pane_ids()
@@ -1260,7 +1260,7 @@ impl Panes {
         )
     }
 
-    /// [`Self::materialize_with_specs`] for a tab whose `(group, tab index)`
+    /// `materialize_with_specs` for a tab whose `(group, tab index)`
     /// key is known: the spawn-progress trackers the materialize kick seeded
     /// under that key are re-keyed to the forked panes. Without a key (tests,
     /// direct spawns) only fresh shell panes get a tracker born at the fork.
