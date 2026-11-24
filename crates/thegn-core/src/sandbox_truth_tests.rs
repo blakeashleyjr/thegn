@@ -376,3 +376,29 @@ fn truth_observed_maps_smolvm_and_legacy_word() {
         assert_eq!(observed(&argv), Backend::Smol, "{word}");
     }
 }
+
+fn argv1(w: &str) -> Vec<String> {
+    vec![w.to_string()]
+}
+
+#[test]
+fn truth_windows_full_paths() {
+    for (w, want) in [
+        (r"C:\Program Files\Docker\docker.exe", Backend::Docker),
+        (r"DOCKER.EXE", Backend::Docker),
+        (r"C:\Tools\podman.exe", Backend::Podman),
+        (r"C:\Windows\System32\wsl.exe", Backend::Wsl),
+        (r"C:\Windows\System32\wslc.exe", Backend::Wsl),
+        (r"container.exe", Backend::None),
+        (r"C:\Users\x\docker\pwsh.exe", Backend::None),
+    ] {
+        assert_eq!(observed(&argv1(w)), want, "{w}");
+    }
+}
+
+#[test]
+fn truth_container_exe_not_apple_on_windows() {
+    assert_eq!(observed(&argv1(r"C:\bin\container.exe")), Backend::None);
+    assert_eq!(observed(&argv1("container.exe")), Backend::None);
+    assert_eq!(observed(&argv1("container")), Backend::Apple);
+}
