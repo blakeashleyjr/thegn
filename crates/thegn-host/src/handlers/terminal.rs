@@ -162,7 +162,7 @@ pub(crate) fn fresh_group(name: &str, panes: &mut Panes) -> crate::session::Work
     let mut group = crate::session::WorktreeGroup::terminal(name);
     let tab = &mut group.tabs[0];
     tab.center = crate::center::CenterTree::Leaf(placeholder);
-    tab.focused_pane = placeholder;
+    tab.focus_pane(placeholder);
     group
 }
 

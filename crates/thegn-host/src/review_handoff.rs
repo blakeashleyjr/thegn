@@ -176,7 +176,7 @@ pub(crate) fn dispatch(
                             .iter_mut()
                             .find(|tab| tab.center.pane_ids().contains(&id))
                     {
-                        tab.focused_pane = id;
+                        tab.focus_pane(id);
                     }
                     focus.zone = crate::focus::Zone::Center;
                     model.status = "review feedback pasted (not submitted)".into();
