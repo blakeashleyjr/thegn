@@ -52,7 +52,7 @@
       scrubbed per-attempt environment.
 - [ ] 4.3 Run `cargo nextest run -p thegn-svc --test sprites_job` and the
       `sprites::job` unit tests on the Mac builder.
-- [ ] 4.4 User cancel: a `CancelToken` on a running attempt issues the same
+- [x] 4.4 User cancel: a `CancelToken` on a running attempt issues the same
       owned-tree kill as the deadline, records `Cancelled` (distinct from
       `TimedOut`), fences outputs, releases the hold and marks cleanup `Done` on
       a confirmed kill or `Pending` otherwise.
@@ -69,13 +69,15 @@
       `reattach` on startup. 4.4-4.6 are runner-level only until this lands.
       Partly done: `SelectedRunner::submit` takes a std-only `SelectedCancel`
       (hooks bridge it to the Sprites `CancelToken`); a cancel before dispatch
-      reads back as `Cancelled` on both executors and mid-run on Sprites. The
+      reads back as `Cancelled` on both executors and mid-run on both (Vercel
+      kills the command and stops the sandbox through the deadline path). The
       executors are now built from provider config (task 3.1), and the daemon
       runs one background `reconcile_pending` pass at start for the configured
       `[jobs] runner` (Vercel gained a `reconcile_pending` wrapper over its
       per-attempt `reconcile`; the pass scans only ledgers with unsettled rows,
-      so an idle ledger resolves no secret). Still open: Vercel mid-run cancel
-      (no `run_cancellable` yet), scheduling `reattach` on startup, and
+      so an idle ledger resolves no secret). The same pass then calls Sprites
+      `reattach` for `Running` rows with a session handle and no live owner
+      lease (live leases are never touched), off the event loop. Still open:
       reconciling ledgers of envs other than the configured runner.
 - [x] 4.10 Owner lease on non-terminal rows (pid, boot id from
       `/proc/sys/kernel/random/boot_id`, process start time, heartbeat) so

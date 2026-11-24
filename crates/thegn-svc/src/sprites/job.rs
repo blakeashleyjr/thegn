@@ -1899,7 +1899,7 @@ impl CancelToken {
     }
 
     /// Resolves once [`cancel`](Self::cancel) was called.
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         while !self.is_cancelled() {
             self.inner.notify.notified().await;
         }

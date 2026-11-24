@@ -777,6 +777,7 @@ pub async fn main(
     crate::daemon::agent_error_cache::install_refresh(refresh_tx.clone(), waker.clone());
     crate::db_task::install_drop_notice(refresh_tx.clone(), waker.clone());
     crate::db_maintain::install_notice(refresh_tx.clone(), waker.clone());
+    crate::mem_watch::install_notice(refresh_tx.clone(), waker.clone());
     crate::mise_provider::install_refresh(refresh_tx.clone(), waker.clone());
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
@@ -16744,6 +16745,11 @@ async fn event_loop<T: Terminal>(
                             .title()
                             .filter(|t| !t.trim().is_empty())
                             .unwrap_or_else(|| p.program().to_string());
+                        // A pane near its memory cap carries a persistent badge.
+                        let name = match crate::mem_watch::badge(id) {
+                            Some(percent) => format!("{name} \u{26a0} mem {percent}%"),
+                            None => name,
+                        };
                         if title_leaf.is_empty() {
                             name
                         } else {

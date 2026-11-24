@@ -511,6 +511,12 @@ pub struct SandboxLimits {
     /// (throttle + reclaim), not `MemoryMax` (OOM-kill) — see the config field.
     /// `None` = no aggregate memory cap.
     pub memory_total: Option<String>,
+    /// Per-pane `MemoryHigh` (size or `N%` of `memory`). `None` = default 85%.
+    pub memory_high: Option<String>,
+    /// Per-pane `MemorySwapMax` (size or `off`). `None` = default 4G.
+    pub memory_swap: Option<String>,
+    /// Aggregate `MemorySwapMax` on the shared slice. `None` = no cap.
+    pub memory_swap_total: Option<String>,
 }
 
 /// The config `[sandbox.limits]` table as resolved ceilings. A plain field copy
@@ -525,6 +531,9 @@ impl From<&crate::config::SandboxLimits> for SandboxLimits {
             memory: c.memory.clone(),
             cpu_total: c.cpu_total.clone(),
             memory_total: c.memory_total.clone(),
+            memory_high: c.memory_high.clone(),
+            memory_swap: c.memory_swap.clone(),
+            memory_swap_total: c.memory_swap_total.clone(),
         }
     }
 }
@@ -4016,6 +4025,24 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterE
 /// secret env-file until the caller hands the argv to a spawned unit. Callers
 /// that may fail or decline to spawn after building should use this function.
 pub fn enter_argv_guarded(spec: &SandboxSpec, inner: &str) -> Result<EnterArgv, EnterError> {
+    enter_argv_guarded_role(spec, inner, false)
+}
+
+/// [`enter_argv_guarded`] for a sandboxed background job (sealed gate, stage
+/// executor, queue agent): background resource caps only, none of the
+/// pane-only limits (`CPUQuota`, `MemoryHigh`, `MemorySwapMax`, `OOMPolicy`).
+pub fn enter_argv_guarded_background(
+    spec: &SandboxSpec,
+    inner: &str,
+) -> Result<EnterArgv, EnterError> {
+    enter_argv_guarded_role(spec, inner, true)
+}
+
+fn enter_argv_guarded_role(
+    spec: &SandboxSpec,
+    inner: &str,
+    background: bool,
+) -> Result<EnterArgv, EnterError> {
     let spec = &*launchable(spec)?;
     let script = wrap_script(spec, inner);
     // A compose-backed spec with a named service attaches through
@@ -4055,7 +4082,11 @@ pub fn enter_argv_guarded(spec: &SandboxSpec, inner: &str) -> Result<EnterArgv, 
     };
     // Cap the pane's CPU on host-toolchain backends (no-op unless configured; see
     // [`crate::sandbox_cpucap`]). OCI/Systemd cap inline in their backend argv.
-    entered.argv = crate::sandbox_cpucap::wrap_pane_argv(spec, entered.argv);
+    entered.argv = if background {
+        crate::sandbox_cpucap::wrap_background_entry_argv(spec, entered.argv)
+    } else {
+        crate::sandbox_cpucap::wrap_pane_argv(spec, entered.argv)
+    };
     entered.argv = spec.placement.interactive_argv(&entered.argv);
     Ok(entered)
 }

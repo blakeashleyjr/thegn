@@ -1124,7 +1124,7 @@ pub(crate) fn run_outcome_cancellable(
     // (floor already cleared by `agent_floor_gate`), run the command INSIDE the
     // resolved sandbox first, then join the slice on top.
     let (inner_argv, _secret_env_file) = match &task.sandbox {
-        Some(spec) => match thegn_core::sandbox::enter_argv_guarded(spec, &command) {
+        Some(spec) => match thegn_core::sandbox::enter_argv_guarded_background(spec, &command) {
             Ok(guarded) => guarded.into_parts(),
             Err(error) => {
                 let reason = format!(

@@ -208,6 +208,20 @@ pub struct SandboxLimits {
     /// [`Self::memory`] stays a hard `MemoryMax`. `None` (the default) means no
     /// aggregate memory cap; `"off"`/`""` also disable it.
     pub memory_total: Option<String>,
+    /// Per-pane memory high-water mark, applied as systemd `MemoryHigh` on pane
+    /// scopes. A size (`"20g"`) or a percentage of [`Self::memory`] (`"85%"`).
+    /// Over this line the kernel throttles and reclaims inside the pane's cgroup
+    /// *before* the hard `MemoryMax` OOM-kill. `None` (the default) means `"85%"`
+    /// whenever `memory` is set; `"off"`/`""` disables it.
+    pub memory_high: Option<String>,
+    /// Per-pane swap ceiling, applied as systemd `MemorySwapMax` on pane scopes
+    /// so one pane cannot fill the machine's swap. A size (`"4g"`), `"0"` for no
+    /// swap, or `"off"`/`""` to leave swap unbounded. `None` (the default) means
+    /// `"4G"` whenever `memory` is set.
+    pub memory_swap: Option<String>,
+    /// Aggregate swap ceiling for the shared slice (`MemorySwapMax` on
+    /// `thegn.slice`). Opt-in: `None`/`"off"`/`""` means no aggregate swap cap.
+    pub memory_swap_total: Option<String>,
     /// Maximum number of concurrent host-local heavyweight gates. Zero leaves
     /// gate concurrency unlimited.
     pub heavy_slots: usize,

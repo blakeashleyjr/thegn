@@ -434,7 +434,7 @@ pub(crate) fn sealed_argv(
     extra_env: &[(String, String)],
 ) -> Result<(Vec<String>, Option<SecretEnvFile>), String> {
     let spec = gate_spec(spec, checkout, target, common_git, extra_env);
-    let (inner, env_file) = thegn_core::sandbox::enter_argv_guarded(&spec, command)
+    let (inner, env_file) = thegn_core::sandbox::enter_argv_guarded_background(&spec, command)
         .map_err(|error| format!("the sealed merge gate cannot start: {error}"))?
         .into_parts();
     let argv = thegn_core::sandbox_cpucap::wrap_background_argv_tagged(

@@ -24,9 +24,9 @@ use sha2::{Digest as _, Sha256};
 use thegn_core::vercel::api::Scope;
 use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCompletion};
 use thegn_svc::vercel::job::{
-    AttemptOptions, AttemptReceipt, AttemptRecord, AttemptState, AttemptStore, Cleanup,
-    DEFAULT_CHECKOUT_ROOT, JobBinding, OwnerLease, ReconcileOutcome, Reconciled, ReserveRefusal,
-    ReserveRequest, SnapshotContent, SnapshotSource, VercelSelectedRunner,
+    AttemptOptions, AttemptReceipt, AttemptRecord, AttemptState, AttemptStore, CancelToken,
+    Cleanup, DEFAULT_CHECKOUT_ROOT, JobBinding, OwnerLease, ReconcileOutcome, Reconciled,
+    ReserveRefusal, ReserveRequest, SnapshotContent, SnapshotSource, VercelSelectedRunner,
 };
 use thegn_svc::vercel::{VercelProvider, VercelSpec, VercelToken};
 
@@ -741,6 +741,131 @@ async fn the_deadline_kills_the_command_stops_the_sandbox_and_fences_outputs() {
     assert!(record.outputs_fenced);
     assert_eq!(record.command.as_deref(), Some("cmd_1"));
     mock.assert_custody();
+}
+
+/// Cancel `token` once the attempt's row says the command is running.
+async fn cancel_when_running(store: AttemptStore, token: CancelToken) {
+    for _ in 0..500 {
+        let running = store
+            .read(1)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.state == AttemptState::Running);
+        if running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    token.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_user_cancel_kills_the_command_stops_the_sandbox_and_reports_cancelled() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, _fs) = start(Script {
+        logs: vec![stdout_line("tick\n")],
+        hold: Duration::from_secs(8),
+        ..script(Vec::new())
+    });
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let content = content();
+    let token = CancelToken::new();
+    let source = content.digest().unwrap();
+
+    let (receipt, ()) = tokio::join!(
+        runner.run_cancellable(Recipe::CargoBuild, &source, &content, DEADLINE, &token),
+        cancel_when_running(store.clone(), token.clone()),
+    );
+    let receipt = receipt.unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Cancelled);
+    assert!(receipt.outputs_fenced);
+    assert!(receipt.outputs.is_empty());
+    assert_eq!(receipt.exit, None);
+    assert_eq!(receipt.cleanup, Cleanup::Done);
+    let kill = mock
+        .requests()
+        .into_iter()
+        .find(|req| req.method == "POST" && req.path().ends_with("/cmd/cmd_1/kill"))
+        .expect("the command was killed");
+    assert_eq!(kill.json()["signal"], serde_json::json!(9));
+    assert_eq!(mock.count("POST", "/stop"), 1, "the session was stopped");
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), 1);
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Cancelled);
+    assert_eq!(record.cleanup, Cleanup::Done);
+    assert!(record.outputs_fenced);
+    mock.assert_custody();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_that_lands_after_the_exit_reports_the_natural_exit() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let token = CancelToken::new();
+    let late = token.clone();
+    let (mock, _fs) = start(Script {
+        logs: vec![stdout_line("built\n"), exit_line(0)],
+        hold: Duration::from_secs(8),
+        // The exit is queued well before the cancel fires.
+        on_start: Some(Arc::new(move || {
+            let late = late.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(1500));
+                late.cancel();
+            });
+        })),
+        ..script(Vec::new())
+    });
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let content = content();
+
+    let receipt = runner
+        .run_cancellable(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+            &token,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Exited(0));
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Finished
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_cancelled_before_dispatch_never_starts_the_command() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, _fs) = start(script(Vec::new()));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let content = content();
+    let token = CancelToken::new();
+    token.cancel();
+
+    let refusal = runner
+        .run_cancellable(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+            &token,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert_eq!(mock.count("POST", "/cmd"), 0, "no command was started");
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Rejected
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
