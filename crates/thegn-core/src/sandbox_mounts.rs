@@ -31,7 +31,8 @@ pub fn host_toolchain_mounts() -> Vec<Mount> {
 }
 
 pub fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
-    host_toolchain_mounts_for_home(Some(ro_home))
+    let home = std::env::var("HOME").unwrap_or_default();
+    host_toolchain_mounts_at_home(&home, Some(ro_home))
 }
 
 /// The host-toolchain substrate with a sealed (private) `$HOME`: everything
@@ -40,8 +41,8 @@ pub fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
 /// tmpfs `$HOME` (bwrap `--tmpfs`, systemd `ProtectHome=tmpfs`; OCI never
 /// mounted it) so nothing outside the allowlist exists in the guest.
 pub fn host_toolchain_mounts_sealed_home() -> Vec<Mount> {
-    let mut mounts = host_toolchain_mounts_for_home(None);
     let home = std::env::var("HOME").unwrap_or_default();
+    let mut mounts = host_toolchain_mounts_at_home(&home, None);
     if !home.is_empty() {
         mounts.extend(sealed_home_allowlist(Path::new(&home)));
     }
@@ -50,9 +51,10 @@ pub fn host_toolchain_mounts_sealed_home() -> Vec<Mount> {
 
 /// `home_ro`: `Some(ro)` mounts the ambient `$HOME` (read-only or read-write);
 /// `None` withholds it entirely (sealed tiers).
-fn host_toolchain_mounts_for_home(home_ro: Option<bool>) -> Vec<Mount> {
+/// `home` is passed in (not read from the environment here) so tests can pin it.
+fn host_toolchain_mounts_at_home(home: &str, home_ro: Option<bool>) -> Vec<Mount> {
     let mut mounts = Vec::new();
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home.to_string();
 
     let ro = |path: &str| Mount {
         host: path.to_string(),
@@ -2239,12 +2241,13 @@ mod tests {
 
     #[test]
     fn ro_home_flag_controls_home_writability() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() || !std::path::Path::new(&home).exists() {
-            return;
-        }
-        let ro = host_toolchain_mounts_ro_home(true);
-        let rw = host_toolchain_mounts_ro_home(false);
+        // Hermetic: the home is passed explicitly. Reading `$HOME` here raced with other
+        // tests that mutate it in the shared-process libtest harness (llvm-cov), while
+        // nextest's process-per-test hid the race.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_string_lossy().into_owned();
+        let ro = host_toolchain_mounts_at_home(&home, Some(true));
+        let rw = host_toolchain_mounts_at_home(&home, Some(false));
         let home_mount = |ms: &[Mount]| ms.iter().find(|m| m.host == home).map(|m| m.ro);
         assert_eq!(
             home_mount(&ro),
