@@ -295,10 +295,13 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   GB-hours for all sprites in the account (`GET /v1/usage` from the start of the
   UTC month), deduplicated by account fingerprint (a second env on the same
   account says "same account as <env>") and marked `(partial)` when the API says
-  the figures are incomplete. A sprite younger than an hour (by its ledger `created_at`) is marked
-  `recent` (JSON `recent: true`) in the partial column, because the usage API may
-  not have reported it yet; read a low figure on it as "not yet". A failed account read shows "account usage
-  unavailable" and never hides the per-sprite rows.
+  the figures are incomplete. A sprite younger than an hour (by its ledger
+  `created_at`) is marked `recent` (JSON `recent: true`) in the partial column,
+  because the usage API may not have reported it yet. If that young sprite's
+  usage reads zero, the row shows `-` with `partial: true` (JSON `partial: true`,
+  `usd: null`) instead of a confident 0.00, and a note says the usage is not
+  recorded yet; run `thegn fleet cost` again later. A failed account read shows
+  "account usage unavailable" and never hides the per-sprite rows.
   On Sprites, reading costs calls the provider's usage endpoints, and a sprite
   has been seen to read `running` once right after such a read; thegn makes no
   command or wake call for a cost read.
