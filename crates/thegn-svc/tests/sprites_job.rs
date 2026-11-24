@@ -2229,3 +2229,141 @@ async fn reattaching_to_a_terminal_attempt_replays_the_ledger_without_a_socket()
     assert!(runner.reattach(9).await.is_err());
     assert!(mock.execs.lock().unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transient_attach_error_leaves_a_running_row_untouched() {
+    let flaky = Script {
+        handshake: Hs::Status(503),
+        out: Vec::new(),
+        produces: Vec::new(),
+    };
+    let mock = start_mock(vec![flaky, kill_reply(0)]);
+    let (_dir, store) = store();
+    let before = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    let report = runner.reattach(1).await.unwrap();
+
+    assert!(report.receipt.is_none());
+    assert!(!report.reattached);
+    assert!(report.note.is_some());
+    assert_eq!(store.read(1).unwrap().unwrap(), before);
+    assert_eq!(store.read(1).unwrap().unwrap().state, AttemptState::Running);
+    // Only the attach was tried: no kill and no job.
+    assert!(execs_of(&mock).0.is_empty());
+    assert_eq!(mock.execs.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_inside_its_staleness_age_is_never_killed_by_reattach() {
+    let mock = start_mock(vec![kill_reply(0)]);
+    let (_dir, store) = store();
+    let live_deadline = 4_000_000_000_000;
+    let before = seeded(
+        &store,
+        1,
+        AttemptState::Dispatching,
+        Cleanup::NotNeeded,
+        live_deadline,
+    );
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    let report = runner.reattach(1).await.unwrap();
+
+    assert!(report.note.is_some());
+    assert_eq!(store.read(1).unwrap().unwrap(), before);
+    assert!(mock.execs.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_dispatching_row_with_no_control_file_settles_done() {
+    // Kill exit 4: no pidfile, so the launcher never ran and nothing is left.
+    let mock = start_mock(vec![kill_reply(4)]);
+    let (_dir, store) = store();
+    seeded(&store, 1, AttemptState::Dispatching, Cleanup::NotNeeded, 0);
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    let touched = runner
+        .reconcile_pending_at(1_000_000_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        touched,
+        vec![Reconciled {
+            attempt: 1,
+            outcome: ReconcileOutcome::Cleaned
+        }]
+    );
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Indeterminate);
+    assert_eq!(record.cleanup, Cleanup::Done);
+}
+
+#[test]
+fn a_recovery_write_is_skipped_when_the_row_changed_since_the_scan() {
+    let (_dir, store) = store();
+    let scanned = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+
+    // The owner moves the row on after the recovery pass scanned it.
+    let mut owner = scanned.clone();
+    owner.state = AttemptState::Finished;
+    owner.exit = Some(0);
+    store.mark(&owner).unwrap();
+
+    let mut recovery = scanned.clone();
+    recovery.state = AttemptState::Indeterminate;
+    assert!(!store.mark_if_unchanged(&scanned, &recovery).unwrap());
+    assert_eq!(store.read(1).unwrap().unwrap(), owner);
+
+    // Against the row as it now stands, the write lands.
+    assert!(store.mark_if_unchanged(&owner, &recovery).unwrap());
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Indeterminate
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_racing_a_finished_exit_never_kills_a_proven_completion() {
+    // The exit is queued right behind the session handle; the cancel lands as
+    // soon as the attempt is dispatched. Whichever the loop sees first, a proven
+    // exit must not be reported as cancelled with a kill spent on it.
+    let mock = start_mock(vec![
+        script(vec![session_info(), Out::Stdout("done\n"), Out::Exit(0)]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let content = content();
+    let token = CancelToken::new();
+
+    let canceller = {
+        let store = store.clone();
+        let token = token.clone();
+        async move {
+            for _ in 0..5000 {
+                let seen = store.read(1).ok().flatten().is_some_and(|record| {
+                    matches!(record.state, AttemptState::Running | AttemptState::Finished)
+                });
+                if seen {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            token.cancel();
+        }
+    };
+    let (receipt, ()) = tokio::join!(
+        runner.run_cancellable(Recipe::CargoBuild, &pinned(), &content, DEADLINE, &token),
+        canceller,
+    );
+    let receipt = receipt.unwrap();
+
+    let (_, kills) = execs_of(&mock);
+    match receipt.completion {
+        SelectedCompletion::Exited(0) => assert!(kills.is_empty()),
+        SelectedCompletion::Cancelled => assert_eq!(kills.len(), 1),
+        other => panic!("unexpected completion {other:?}"),
+    }
+}
