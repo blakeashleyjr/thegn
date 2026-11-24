@@ -320,7 +320,21 @@ mod tests {
             assert!(f.allowed_in(Channel::Dev), "{f} must be allowed in dev");
             assert!(Feature::ALL.contains(&f), "{f} must be in ALL");
         }
-        // Display order: the seven pre-programme features come first.
+        // The seven pre-programme feature ids and their display order are part
+        // of doctor JSON compatibility. The programme appends to that surface.
+        let existing_ids: Vec<&str> = Feature::ALL[..7].iter().map(|f| f.id()).collect();
+        assert_eq!(
+            existing_ids,
+            [
+                "remote",
+                "providers",
+                "observe",
+                "placement",
+                "voice",
+                "plugin_apps",
+                "lead",
+            ]
+        );
         assert_eq!(&Feature::ALL[7..], &Feature::PROGRAMME[..]);
     }
 }
