@@ -147,7 +147,7 @@ const DENIED_DIRS: [&str; 10] = [
 ];
 
 /// File names a snapshot never carries, at any depth.
-const DENIED_NAMES: [&str; 12] = [
+const DENIED_NAMES: [&str; 8] = [
     ".env",
     ".netrc",
     ".npmrc",
@@ -156,11 +156,14 @@ const DENIED_NAMES: [&str; 12] = [
     ".dockercfg",
     ".git-credentials",
     "credentials.json",
-    "id_rsa",
-    "id_dsa",
-    "id_ecdsa",
-    "id_ed25519",
 ];
+
+/// SSH private keys by pattern: `id_rsa`, `id_ed25519_sk`, `id_ecdsa`, `id_dsa`
+/// and any other `id_*` file (case-insensitive) except a `.pub` public key.
+fn is_ssh_key_name(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    lower.starts_with("id_") && !lower.ends_with(".pub")
+}
 
 /// True when `rel` is content a job snapshot must never carry. Every component
 /// is checked, so `services/api/.env` and `pkg/.claude/x` are denied exactly
@@ -170,6 +173,7 @@ fn denied_path(rel: &str) -> bool {
     for (index, part) in parts.iter().enumerate() {
         if DENIED_DIRS.contains(part)
             || DENIED_NAMES.contains(part)
+            || is_ssh_key_name(part)
             || (part.starts_with(".env.") && part.len() > ".env.".len())
         {
             return true;
@@ -1073,13 +1077,19 @@ impl AttemptStore {
                 project: binding.project().to_owned(),
             })
             .context("sprites job ledger: encode")?;
-            match registry.create_owner_only_exclusive(&name) {
-                Ok(mut file) => {
-                    file.write_all(&bytes)
-                        .and_then(|()| file.sync_all())
-                        .context("sprites job ledger: cannot write the sprite claim")?;
-                    return Ok(None);
-                }
+            // Publish the complete claim in one step (temp file, then a
+            // no-replace link), so a crash or a concurrent reader never sees
+            // an empty claim.
+            let temp = format!("{name}.{}.claim", nonce());
+            registry
+                .write_owner_only_atomic(&temp, &bytes)
+                .context("sprites job ledger: cannot write the sprite claim")?;
+            // A hard link is the portable no-replace publish.
+            let published =
+                std::fs::hard_link(registry.path().join(&temp), registry.path().join(&name));
+            let _ = registry.remove_file(&temp);
+            match published {
+                Ok(()) => return Ok(None),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(error).context("sprites job ledger: cannot claim the sprite");
@@ -1481,8 +1491,10 @@ async fn session_handle(
 /// arguments: the control file, the checkout, the per-attempt `HOME`, the
 /// project cache, then the recipe argv.
 ///
-/// It records its own pid in the control file, then `exec`s the recipe under
-/// `setsid env -i`: the recipe leads a fresh process group whose id is the
+/// It `exec`s a fresh `setsid` shell that records its own pid and start time in
+/// the control file (so the file never exists before the group does) and then
+/// `exec`s the recipe under `env -i`, keeping only proxy and CA variables from
+/// the caller's environment: the recipe leads a fresh process group whose id is the
 /// recorded pid (so the whole tree can be killed by group), and it sees only a
 /// scrubbed environment with a per-attempt `HOME` and a project-scoped
 /// `CARGO_HOME`/`CARGO_TARGET_DIR`. Any failure to get that far prints
@@ -1496,36 +1508,71 @@ cache=$4
 shift 4
 rustup_home=${RUSTUP_HOME:-${HOME:-}/.rustup}
 command -v setsid >/dev/null 2>&1 || fail setsid
+[ -n "${PATH:-}" ] || fail path
 mkdir -p -- "${pidfile%/*}" "$home/tmp" "$cache/cargo" "$cache/target" || fail dirs
 cd -- "$cwd" || fail cwd
-echo $$ >"$pidfile" || fail pidfile
-exec setsid env -i PATH="$PATH" HOME="$home" TMPDIR="$home/tmp" CARGO_HOME="$cache/cargo" \
+for v in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy \
+    SSL_CERT_FILE SSL_CERT_DIR NIX_SSL_CERT_FILE; do
+    eval "val=\${$v:-}"
+    [ -z "$val" ] || set -- "$v=$val" "$@"
+done
+set -- PATH="$PATH" HOME="$home" TMPDIR="$home/tmp" CARGO_HOME="$cache/cargo" \
     CARGO_TARGET_DIR="$cache/target" RUSTUP_HOME="$rustup_home" LANG=C.UTF-8 "$@"
+exec setsid sh -c 'pidfile=$1; shift
+st=
+getst() { set -- $1; shift 19; st=$1; }
+if { read -r l </proc/$$/stat; } 2>/dev/null; then getst "${l##*) }"; fi
+echo "$$ $st" >"$pidfile" || { echo "thegn-job-launch-failed: pidfile" >&2; exit 125; }
+exec env -i "$@"' thegn-job-run "$pidfile" "$@"
 "#;
 
 /// Kills the owned process group recorded in the control file and releases the
 /// keep-awake hold. Positional arguments: the control file and the hold task.
 /// Exit 0 means the group is confirmed gone; 3 means it survived SIGKILL; 4
 /// means there is no usable control file, so nothing can be confirmed. It only
-/// ever signals the recorded group, never a process it did not start.
+/// ever signals the recorded group, never a process it did not start: the
+/// control file holds `<pid> <start time>` (written by the recipe's own
+/// process after `setsid`), and when `/proc` shows that pid with a different
+/// start time the pid was reused and the group is treated as gone. A group
+/// whose remaining members are all zombies also counts as gone.
 pub const KILL_SCRIPT: &str = r#"pidfile=$1
 hold=$2
 K=/bin/kill
 [ -x "$K" ] || K=kill
-pid=$(cat "$pidfile" 2>/dev/null)
+read -r pid start <"$pidfile" 2>/dev/null
 case $pid in '' | *[!0-9]*) exit 4 ;; esac
 [ "$pid" -gt 1 ] || exit 4
-if "$K" -0 -- "-$pid" 2>/dev/null; then
+start_of() {
+    { read -r l <"/proc/$1/stat"; } 2>/dev/null || return 1
+    r=${l##*) }
+    set -- $r
+    shift 19
+    echo "$1"
+}
+group_alive() {
+    "$K" -0 -- "-$pid" 2>/dev/null || return 1
+    [ -r /proc/self/stat ] || return 0
+    for s in /proc/[0-9]*/stat; do
+        { read -r l <"$s"; } 2>/dev/null || continue
+        r=${l##*) }
+        set -- $r
+        if [ "$3" = "$pid" ] && [ "$1" != Z ]; then return 0; fi
+    done
+    return 1
+}
+reused=0
+if [ -n "$start" ] && now=$(start_of "$pid") && [ "$now" != "$start" ]; then reused=1; fi
+if [ "$reused" = 0 ] && group_alive; then
     "$K" -s TERM -- "-$pid" 2>/dev/null
     n=0
-    while [ "$n" -lt 10 ] && "$K" -0 -- "-$pid" 2>/dev/null; do
+    while [ "$n" -lt 10 ] && group_alive; do
         sleep 1
         n=$((n + 1))
     done
-    if "$K" -0 -- "-$pid" 2>/dev/null; then
+    if group_alive; then
         "$K" -s KILL -- "-$pid" 2>/dev/null
         sleep 1
-        if "$K" -0 -- "-$pid" 2>/dev/null; then exit 3; fi
+        if group_alive; then exit 3; fi
     fi
 fi
 case $hold in '' | *[!a-z0-9-]*) ;; *)
@@ -1751,7 +1798,7 @@ impl SpritesSelectedRunner {
         // One project per sprite, verified on the sprite itself before anything
         // is written there.
         if let Err(error) = self.claim_remote().await {
-            return Err(self.reject(record, error).await);
+            return Err(self.reject(record, error, false).await);
         }
 
         let transferred = tokio::time::timeout(
@@ -1761,13 +1808,13 @@ impl SpritesSelectedRunner {
         .await;
         let transfer = match transferred {
             Ok(Ok(transfer)) => transfer,
-            Ok(Err(error)) => return Err(self.reject(record, error).await),
+            Ok(Err(error)) => return Err(self.reject(record, error, true).await),
             Err(_) => {
                 let error = anyhow!(
                     "the transfer exceeded its {}s budget",
                     self.options.transfer_budget.as_secs()
                 );
-                return Err(self.reject(record, error).await);
+                return Err(self.reject(record, error, true).await);
             }
         };
         if &transfer.digest != source {
@@ -1776,12 +1823,12 @@ impl SpritesSelectedRunner {
                 transfer.digest.hash(),
                 source.hash()
             );
-            return Err(self.reject(record, error).await);
+            return Err(self.reject(record, error, true).await);
         }
         record.materialized = Some(transfer.digest.clone());
         let Some(hold) = hold_task(&record.project, &record.sprite, &record.key) else {
             let error = anyhow!("cannot derive a hold task name");
-            return Err(self.reject(record, error).await);
+            return Err(self.reject(record, error, true).await);
         };
         record.hold = Some(hold.clone());
 
@@ -1789,7 +1836,7 @@ impl SpritesSelectedRunner {
         // back as an unknown dispatch and is never rerun blindly.
         record.state = AttemptState::Dispatching;
         if let Err(error) = self.persist(&record).await {
-            return Err(self.reject(record, error).await);
+            return Err(self.reject(record, error, true).await);
         }
 
         let root = &self.options.checkout_root;
@@ -1828,7 +1875,7 @@ impl SpritesSelectedRunner {
                     attempt = record.attempt,
                     "the provider rejected the exec upgrade; no command ran"
                 );
-                return Err(self.reject(record, error).await);
+                return Err(self.reject(record, error, true).await);
             }
             Err(error) => {
                 // A timeout or 5xx can follow an accepted upgrade, so the
@@ -1961,8 +2008,17 @@ impl SpritesSelectedRunner {
     /// dispatched (or the provider definitively rejected the dispatch), so no
     /// kill is needed and no spend is committed. Best effort: the partial
     /// checkout is removed, and cleanup stays pending if that fails.
-    async fn reject(&self, mut record: AttemptRecord, error: anyhow::Error) -> RunnerRefusal {
-        let removed = self.remove_attempt_dirs(&record).await;
+    ///
+    /// `touched` is false when nothing was written to the sprite (the project
+    /// claim refused): then no `DELETE` is sent, because the sprite may belong
+    /// to another project.
+    async fn reject(
+        &self,
+        mut record: AttemptRecord,
+        error: anyhow::Error,
+        touched: bool,
+    ) -> RunnerRefusal {
+        let removed = !touched || self.remove_attempt_dirs(&record).await;
         record.state = AttemptState::Rejected;
         record.cleanup = if removed {
             Cleanup::NotNeeded
@@ -2099,8 +2155,15 @@ impl SpritesSelectedRunner {
     async fn hash_outputs(&self, checkout: &str) -> (BTreeMap<String, String>, Vec<String>) {
         let mut outputs = BTreeMap::new();
         let mut missing = Vec::new();
+        let cache = self.binding.cache(&self.options.checkout_root);
         for path in &self.options.outputs {
-            let remote = join_remote(checkout, path);
+            // `CARGO_TARGET_DIR` is the project cache's `target`, so a declared
+            // `target/...` output lives there, not under the checkout.
+            let remote = if path.starts_with("target/") {
+                join_remote(&cache, path)
+            } else {
+                join_remote(checkout, path)
+            };
             match self.provider.read(self.binding.sprite(), &remote).await {
                 Ok(bytes) => {
                     outputs.insert(path.clone(), hex(Sha256::digest(&bytes)));
@@ -2459,6 +2522,9 @@ mod tests {
             "pkg/.claude/settings.json",
             "vendor/sub/.git/HEAD",
             "tools/id_rsa",
+            "tools/id_ed25519_sk",
+            "tools/ID_ECDSA",
+            "tools/id_dsa",
             "ci/.cargo/credentials.toml",
             "home/.config/gh/hosts.yml",
         ] {
@@ -2468,6 +2534,7 @@ mod tests {
                 "{denied} must be refused"
             );
         }
+        assert!(!denied_path("tools/id_rsa.pub"));
         assert!(!denied_path(".environment"));
         assert!(!denied_path("src/environment.rs"));
         assert!(!denied_path(".cargo/config.toml"));

@@ -189,12 +189,16 @@ fn serve(mut stream: TcpStream, state: State) {
             Some(script) => {
                 // The checkout is the launcher's second positional argument.
                 if let Some(checkout) = params(&head.target, "cmd").get(11) {
+                    // The recipe builds with `CARGO_TARGET_DIR=<cache>/target`
+                    // (the launcher's fourth argument), so `target/...` outputs
+                    // appear in the cache, not in the checkout.
+                    let cache = params(&head.target, "cmd").get(13).cloned();
                     for (rel, bytes) in &script.produces {
-                        state
-                            .fs
-                            .lock()
-                            .unwrap()
-                            .insert(format!("{checkout}/{rel}"), bytes.to_vec());
+                        let place = match (&cache, rel.strip_prefix("target/")) {
+                            (Some(cache), Some(_)) => format!("{cache}/{rel}"),
+                            _ => format!("{checkout}/{rel}"),
+                        };
+                        state.fs.lock().unwrap().insert(place, bytes.to_vec());
                     }
                 }
                 exec_ws(stream, &head, script)
@@ -1800,7 +1804,8 @@ fn the_launcher_scrubs_the_environment_and_records_the_recipes_group() {
         "{seen}"
     );
     let recorded = std::fs::read_to_string(&pidfile).unwrap();
-    assert!(recorded.trim().parse::<u32>().is_ok(), "{recorded}");
+    let pid = recorded.split_whitespace().next().unwrap_or_default();
+    assert!(pid.parse::<u32>().is_ok(), "{recorded}");
 }
 
 #[test]
@@ -1832,16 +1837,26 @@ fn the_kill_script_stops_the_recorded_group_and_confirms_it() {
     let checkout = work.path().join("co");
     std::fs::create_dir_all(&checkout).unwrap();
     let pidfile = work.path().join("ctl/k.pid");
-    let mut child = launcher(
-        &pidfile,
-        &checkout,
-        &work.path().join("home"),
-        &work.path().join("cache"),
-    )
-    // A quiet build: a shell that spawns a long sleeper of its own.
-    .args(["/bin/sh", "-c", "sleep 300 & wait"])
-    .spawn()
-    .unwrap();
+    // Run the launcher under a reaping parent, as the hold shell does in
+    // production, so a killed group leader never lingers as a zombie.
+    let mut child = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "\"$@\" & wait $!",
+            "reaper",
+            "/bin/sh",
+            "-c",
+            LAUNCH_SCRIPT,
+            "thegn-job",
+        ])
+        .arg(&pidfile)
+        .arg(&checkout)
+        .arg(work.path().join("home"))
+        .arg(work.path().join("cache"))
+        // A quiet build: a shell that spawns a long sleeper of its own.
+        .args(["/bin/sh", "-c", "sleep 300 & wait"])
+        .spawn()
+        .unwrap();
     let mut waited = 0;
     while !pidfile.exists() && waited < 100 {
         std::thread::sleep(Duration::from_millis(50));

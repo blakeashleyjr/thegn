@@ -81,7 +81,11 @@ project MUST be refused locally and by an owner marker on the Sprite before any
 file is written. The recipe MUST run under a scrubbed environment (`env -i`)
 with a per-attempt `HOME` and a project-scoped `CARGO_HOME` and
 `CARGO_TARGET_DIR`, so agent logins and cloud credentials in the Sprite user's
-home are not reachable through the environment.
+home are not reachable through the environment. Only proxy and CA variables
+(`HTTP(S)_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) pass through when
+set. A declared output under `target/` is read from the project cache's target
+directory, where `CARGO_TARGET_DIR` points. The snapshot never carries `id_*`
+SSH private keys (public `.pub` keys are allowed).
 
 #### Scenario: Second project reuses the Sprite
 
