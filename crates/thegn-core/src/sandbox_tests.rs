@@ -1738,6 +1738,9 @@ fn test_sandbox_all_oci_flags_applied() {
         memory: Some("4GB".into()),
         cpu_total: None,
         memory_total: None,
+        memory_high: None,
+        memory_swap: None,
+        memory_swap_total: None,
     };
     s.volumes = vec![("data-vol".into(), "/mnt/data".into())];
 

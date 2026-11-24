@@ -222,7 +222,9 @@ END;
         self.native(repo, "config", "validate")
         effective = json.loads(self.native(repo, "config", "show", "--json"))
         assert effective["sandbox"]["limits"] == {
-            "cpu": "", "cpu_total": "off", "memory": "", "memory_total": ""}
+            "cpu": "", "cpu_total": "off", "memory": "", "memory_total": "",
+            "memory_high": None, "memory_swap": None, "memory_swap_total": None,
+            "heavy_slots": 0, "max_load": 0.0}
         assert effective["merge_queue"]["gate_command"] == "sh ./gate.sh"
         (self.root / "evidence/effective-config.json").write_text(json.dumps(effective, indent=2))
         for parent, path in ((repo, historical), (foreign, unrelated), (repo, candidate)):
