@@ -69,13 +69,9 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   confine the sandbox.** See [[sandbox-network]].
 - **`network_audit` is a podman `network` event feed (attach/detach), not a
   DNS or connection log.** See [[sandbox-network]].
-- **Apple `container` cannot express `network = "none"`; the launch is refused
-  with `network-unexpressible`.** See [[sandbox-backends]].
-- **Windows ssh runs without ControlMaster (every call is a full
-  handshake).** See [[sandboxing]].
 - **`smol`, `wsl` and `appcontainer` are reserved: accepted by config, not
   implemented, never selected.** See [[sandbox-backends]].
-- **Docker Desktop and WSL sandbox binds are best-effort.** Treat those binds
+- **Docker Desktop sandbox binds are best-effort.** Treat those binds
   as unverified when relying on sandbox isolation; see [[sandboxing]].
 - **Provider placements without an enforceable isolation request are reported
   as `provider-managed (unverified)`.** Review the provider's isolation
