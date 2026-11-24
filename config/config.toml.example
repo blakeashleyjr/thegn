@@ -3180,8 +3180,9 @@ oci_host = ""
 
 # OCI runtime to run worktree containers under (`podman/docker --runtime <value>`).
 # Empty = the daemon default (runc/crun) — a shared-kernel container. Set a stronger
-# boundary when running untrusted code (only applies to OCI backends; non-OCI backends
-# ignore it, and an unavailable runtime warns + falls back to the default):
+# boundary when running untrusted code (only applies to engines that accept
+# `--runtime`: podman, podman-rootful and docker; other backends ignore it, and an
+# unavailable runtime warns + falls back to the default):
 #   "runsc" — gVisor: a userspace application kernel services the container's syscalls
 #             (no /dev/kvm needed). Reported as isolation class `userspace-kernel`.
 #   "krun"  — libkrun: the container runs inside a hardware-virtualized microVM

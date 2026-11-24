@@ -72,7 +72,8 @@ fn keyboard_remedy(in_tmux: bool) -> Vec<&'static str> {
 }
 
 /// The honest boundary class a named backend resolves to at `Local` placement,
-/// under the configured OCI runtime (`runsc`/`krun` raise it for OCI backends).
+/// under the configured OCI runtime (`runsc`/`krun` raise it only for engines
+/// that accept `--runtime`).
 fn isolation_of(backend_name: &str, oci_runtime: Option<&str>) -> Option<IsolationClass> {
     isolation_of_on(
         backend_name,
@@ -111,7 +112,12 @@ fn cfg_oci_runtime(cfg: &Config) -> Option<&str> {
 /// A `" (…)"` availability suffix for the configured OCI runtime: whether its
 /// binary (and `/dev/kvm`, for libkrun) is present on THIS host, so the user
 /// learns a strong runtime would silently fall back before they rely on it.
-fn oci_runtime_status(rt: &str) -> String {
+/// Engines without a `--runtime` flag never use the value, so probe nothing
+/// and say it is ignored — the same predicate [`Capabilities`] derives from.
+fn oci_runtime_status(backend: Backend, rt: &str) -> String {
+    if !backend.accepts_runtime_flag() {
+        return format!(" (ignored: {} has no --runtime)", backend.label());
+    }
     use thegn_core::sandbox_runtime::{RuntimeDecision, decide, runtime_req};
     let Some(req) = runtime_req(rt.trim()) else {
         return String::new(); // runc/crun/unknown: no extra requirement to report.
@@ -5643,7 +5649,10 @@ fn sandbox_report(cfg: &Config) {
         );
     }
     if let Some(rt) = cfg_oci_runtime(cfg) {
-        outln!("  oci_runtime   {rt}{}", oci_runtime_status(rt));
+        let status = Backend::from_config(cfg.sandbox.backend)
+            .map(|backend| oci_runtime_status(backend, rt))
+            .unwrap_or_default();
+        outln!("  oci_runtime   {rt}{status}");
     }
     let chain = shell_chain(cfg);
     // Actually PROBE, rather than listing the chain and calling it unknown. A
@@ -5678,6 +5687,20 @@ fn sandbox_report(cfg: &Config) {
             class,
             class.escape_note()
         );
+        // A configured runtime this engine cannot honor is stated in the
+        // engine's own row, not just the header line above (which only knows
+        // the concrete `backend` setting, not an `auto` chain).
+        if cfg_oci_runtime(cfg).is_some()
+            && let Some(backend) = Backend::parse(&row.name)
+            && !backend.accepts_runtime_flag()
+        {
+            outln!(
+                "    {:<16} {:<11} oci_runtime ignored: {} has no --runtime",
+                "",
+                "",
+                backend.label()
+            );
+        }
         if let Some(remedy) = &row.remedy {
             outln!("    {:<16} {:<11} \u{21b3} {remedy}", "", "");
         }
@@ -8028,6 +8051,12 @@ agent = "plain-agent"
             isolation_of("podman", Some("krun")),
             Some(IsolationClass::GuestKernel)
         );
+        // Apple's `container` has no `--runtime` flag, so a configured runtime
+        // must not change its real per-container VM class on macOS.
+        assert_eq!(
+            isolation_of_on("apple", Some("runsc"), HostOs::MacOs),
+            Some(IsolationClass::GuestKernel)
+        );
         // …but a non-OCI backend ignores it, and runc/crun stay shared-kernel.
         assert_eq!(
             isolation_of("bwrap", Some("krun")),
@@ -8036,6 +8065,14 @@ agent = "plain-agent"
         assert_eq!(
             isolation_of("podman", Some("crun")),
             Some(IsolationClass::SharedKernel)
+        );
+    }
+
+    #[test]
+    fn doctor_marks_runtime_ignored_for_unsupported_engine() {
+        assert_eq!(
+            oci_runtime_status(Backend::Apple, "runsc"),
+            " (ignored: apple has no --runtime)"
         );
     }
 

@@ -133,12 +133,15 @@ the same check.
 
 The honest **isolation class**, weakest to strongest:
 
-| Class              | Escape needs…                               | Backends                                             |
-| ------------------ | ------------------------------------------- | ---------------------------------------------------- |
-| `host-process`     | nothing — no boundary                       | `none`, and the Windows Job Object (scoping only)    |
-| `shared-kernel`    | a host-kernel exploit in an allowed syscall | podman/docker/bwrap/systemd                          |
-| `userspace-kernel` | a gVisor Sentry bug (`oci_runtime="runsc"`) | OCI + runsc                                          |
-| `guest-kernel`     | a VMM/KVM bug                               | `apple`, `oci_runtime="krun"`, macOS VM-mediated OCI |
+| Class              | Escape needs…                               | Backends                                                            |
+| ------------------ | ------------------------------------------- | ------------------------------------------------------------------- |
+| `host-process`     | nothing — no boundary                       | `none`, and the Windows Job Object (scoping only)                   |
+| `shared-kernel`    | a host-kernel exploit in an allowed syscall | podman/docker/bwrap/systemd                                         |
+| `userspace-kernel` | a gVisor Sentry bug (`oci_runtime="runsc"`) | podman/podman-rootful/docker + runsc                                |
+| `guest-kernel`     | a VMM/KVM bug                               | `apple`, podman/podman-rootful/docker + krun, macOS VM-mediated OCI |
+
+`oci_runtime` applies to podman, podman-rootful and docker only; other
+backends ignore it and say so.
 
 A Windows Job Object is process-tree lifetime + resource scoping with **no**
 filesystem or network boundary, so it is honestly `host-process`, never a

@@ -1421,7 +1421,7 @@ fn dropped_hardening_is_reported_not_swallowed() {
 }
 
 #[test]
-fn oci_runtime_injected_only_for_oci_backends_when_set() {
+fn oci_runtime_injected_only_for_engines_with_runtime_flag() {
     // Unset ⇒ no --runtime (daemon default).
     assert!(
         !oci_create_opts(&spec(Backend::Podman))
@@ -1430,7 +1430,7 @@ fn oci_runtime_injected_only_for_oci_backends_when_set() {
             .contains("--runtime")
     );
 
-    // Set on an OCI backend ⇒ `--runtime <value>` at create.
+    // Set on an engine that accepts the flag ⇒ `--runtime <value>` at create.
     let mut s = spec(Backend::Podman);
     s.oci_runtime = Some("runsc".into());
     assert!(
@@ -1449,6 +1449,16 @@ fn oci_runtime_injected_only_for_oci_backends_when_set() {
             .contains("--runtime krun")
     );
 
+    // Apple's `container` rejects unknown flags; the value is ignored.
+    let mut apple = spec(Backend::Apple);
+    apple.oci_runtime = Some("runsc".into());
+    assert!(
+        !oci_create_opts(&apple)
+            .expect("valid volume names")
+            .join(" ")
+            .contains("--runtime")
+    );
+
     // A blank/whitespace value is treated as unset.
     let mut blank = spec(Backend::Podman);
     blank.oci_runtime = Some("  ".into());
@@ -1458,6 +1468,82 @@ fn oci_runtime_injected_only_for_oci_backends_when_set() {
             .join(" ")
             .contains("--runtime")
     );
+}
+
+#[test]
+fn runtime_flag_absent_for_apple() {
+    // Apple's `container` exits 64 on an unknown flag, so `create` with a
+    // configured runtime would fail every pane.
+    let mut apple = spec(Backend::Apple);
+    apple.oci_runtime = Some("runsc".into());
+    let joined = oci_create_opts(&apple)
+        .expect("valid volume names")
+        .join(" ");
+    assert!(!joined.contains("--runtime"), "{joined}");
+}
+
+#[test]
+fn podman_runsc_emits_flag() {
+    let mut podman = spec(Backend::Podman);
+    podman.oci_runtime = Some("runsc".into());
+    let joined = oci_create_opts(&podman)
+        .expect("valid volume names")
+        .join(" ");
+    assert!(joined.contains("--runtime runsc"), "{joined}");
+    assert_eq!(
+        crate::capabilities::Capabilities::from_parts(
+            Backend::Podman,
+            &crate::placement::Placement::Local,
+            crate::config::Network::Nat,
+            false,
+            Some("runsc"),
+        )
+        .isolation,
+        crate::capabilities::IsolationClass::UserspaceKernel
+    );
+}
+
+#[test]
+fn docker_krun_emits_flag() {
+    let mut docker = spec(Backend::Docker);
+    docker.oci_runtime = Some("krun".into());
+    let joined = oci_create_opts(&docker)
+        .expect("valid volume names")
+        .join(" ");
+    assert!(joined.contains("--runtime krun"), "{joined}");
+    assert_eq!(
+        crate::capabilities::Capabilities::from_parts(
+            Backend::Docker,
+            &crate::placement::Placement::Local,
+            crate::config::Network::Nat,
+            false,
+            Some("krun"),
+        )
+        .isolation,
+        crate::capabilities::IsolationClass::GuestKernel
+    );
+}
+
+#[test]
+fn oci_runtime_on_apple_warns_once() {
+    let mut apple = spec(Backend::Apple);
+    apple.oci_runtime = Some("runsc".into());
+    let mut warnings = Vec::new();
+    warn_unsupported_oci_runtime(&apple, &mut warnings);
+    warn_unsupported_oci_runtime(&apple, &mut warnings);
+    assert_eq!(
+        warnings,
+        vec!["oci_runtime ignored: apple has no --runtime"]
+    );
+
+    // An engine that accepts the flag never warns, and a blank value is unset.
+    let mut podman = spec(Backend::Podman);
+    podman.oci_runtime = Some("runsc".into());
+    warn_unsupported_oci_runtime(&podman, &mut warnings);
+    let mut blank = spec(Backend::Apple);
+    blank.oci_runtime = Some("  ".into());
+    warn_unsupported_oci_runtime(&blank, &mut warnings);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
 }
 
 #[test]
