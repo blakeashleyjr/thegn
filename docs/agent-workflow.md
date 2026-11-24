@@ -8,6 +8,25 @@ Start with one issue and one question. For example, `just agent-context THE-21` 
 
 Use `codegraph_explore` for cross-crate navigation. Pass the absolute worktree path and a symbol, with two or three files initially. A query for `TerminalWaker poll_input` finds host call sites and the waker spike. Use `rg -n 'poll_input' crates/thegn-host` for the literal sites. Graph edges are candidates. Check trait dispatch, macro expansions and feature-gated code in source when correctness depends on completeness.
 
+For a current implementation question, search the symbol in the local CodeGraph index, then check its literal sites in the relevant source tree. Add the active OpenSpec paths when the behavior is in flight; `just agent-context` reports the issue's current contract and handoff directory:
+
+```sh
+just graph-find poll_input
+rg -n 'poll_input' crates/thegn-host
+just agent-context THE-21
+```
+
+For a past issue decision, use that issue's handoff directory and the specific OpenSpec change it cites. Search archived changes by adding their exact `openspec/changes/archive/<date>-<name>` path; keep the search scoped to the issue and cited contract:
+
+```sh
+rg -n '## Decision|RepoConfigFile|AutomationEvent' \
+  .thegn/pipeline/THE-21 openspec/changes/add-automation-rules
+```
+
+The handoff and OpenSpec files retain the decision and its evidence. `just agent-context` is the issue entry point, not a substitute for reading those sources.
+
+Tried at alpha.125: `rg -l 'poll_input' crates/thegn-host` matched 17 files and included the expected host input sites. The THE-21 `rg -l` above matched 7 files across the handoffs and `add-automation-rules`, and found the decision and the automation contract.
+
 ### Keep the code index current
 
 Use the CodeGraph CLI on the developer host (tested with 1.6.2). Run `just graph-sync` on the first use of a worktree. Select manual sync if the CLI offers Git hooks on a filesystem without watching. The checkout owns its ignored `.codegraph/` directory. The project MCP server watches while connected on supported filesystems. `just graph-find <symbol>` initializes or incrementally syncs before each CLI lookup, including changes since a branch switch. Use it when MCP or its watcher is unavailable.
