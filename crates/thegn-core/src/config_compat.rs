@@ -292,6 +292,7 @@ fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: std::fmt::Argument
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn admission_encoding_bound_counts_repeated_ancestor_paths() {

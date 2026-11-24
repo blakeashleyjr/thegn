@@ -18,7 +18,6 @@
 //! risky override is the builder's job (THE-7), not a config error.
 
 use crate::theme::{Hue, Palette, contrast_ratio};
-use std::fmt::Write as _;
 
 /// Which bar a palette is held to. The shipped default (prism) carries a
 /// stricter `text` floor (AAA 7.0); every other preset uses the AA 4.5 floor.
@@ -259,6 +258,7 @@ fn hue_name(h: Hue) -> &'static str {
 mod tests {
     use super::*;
     use crate::theme::{Hues, PRESETS, extend_palette, preset};
+    use std::fmt::Write as _;
 
     /// Resolve a preset the way chrome does: table values + `extend_palette`.
     fn resolved(name: &str) -> Palette {

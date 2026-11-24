@@ -3,7 +3,6 @@
 //! the host contract before anything runs.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -773,6 +772,7 @@ pub fn native_trust_refusal(plugin: &LoadedPlugin) -> Option<SpecProblem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use thegn_core::plugin_api::{ApiVersion, Contribution, ExtensionPoint, PluginManifest};
 
     fn spec(id: &str, command: Vec<String>) -> PluginSpec {

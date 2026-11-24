@@ -21,7 +21,6 @@
 //! cycling through attempts, not a fan-out; the human-driven resume mechanism
 //! (`session open --resume-work`) is what chains rows.
 
-use std::fmt::Write as _;
 /// What the final screen says about why the worker died.
 ///
 /// Transport failures are the daemon's to retry (a network hiccup is nobody's
@@ -242,6 +241,7 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn sig() -> ExitSignatures {
         ExitSignatures {

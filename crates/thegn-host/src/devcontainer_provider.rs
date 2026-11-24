@@ -5,7 +5,6 @@
 //! discovery, bounded version probing, `up`, and `exec` argv construction.
 //! Callers receive an opaque session and never need to know CLI-specific flags.
 
-use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -913,6 +912,7 @@ fn provider_env(allowlisted: &[(String, String)]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn cli_exec_argv_keeps_provider_flags_inside_the_seam_for_verified_config() {

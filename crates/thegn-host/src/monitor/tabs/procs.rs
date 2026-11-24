@@ -1095,7 +1095,7 @@ mod tests {
             let cx = Ctx {
                 model: &model,
                 hist: &hist,
-                prefs: super::super::TabPrefs::default(),
+                prefs: crate::monitor::TabPrefs::default(),
                 cols,
                 now_ms: 0,
             };
@@ -1130,7 +1130,7 @@ mod tests {
         let cx = Ctx {
             model: &model,
             hist: &hist,
-            prefs: super::super::TabPrefs::default(),
+            prefs: crate::monitor::TabPrefs::default(),
             cols: 119,
             now_ms: 0,
         };

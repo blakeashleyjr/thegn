@@ -1,7 +1,6 @@
 //! Off-loop provider for user themes.
 
 use std::collections::{BinaryHeap, HashMap};
-use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1148,6 +1147,7 @@ fn atomic_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn temp_dir(label: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);

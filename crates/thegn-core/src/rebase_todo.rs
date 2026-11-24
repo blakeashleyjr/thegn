@@ -19,7 +19,6 @@
 //! relative order encodes rebase-merges topology.
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 
 /// One sequencer instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +368,7 @@ pub fn place_fixup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn commit(action: TodoAction, sha: &str, subject: &str) -> TodoEntry {
         TodoEntry {

@@ -4,7 +4,6 @@
 //! gates that off [`MediaCaps::playlists`].
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -403,6 +402,7 @@ fn malformed_escape() -> MediaError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn parses_full_line() {

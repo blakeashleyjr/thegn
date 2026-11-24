@@ -52,7 +52,6 @@
 //! process.
 
 use crate::gate::{GateClass, classify_exit};
-use std::fmt::Write as _;
 
 /// What one validation run established.
 ///
@@ -418,6 +417,7 @@ pub fn digest(output: &str, class: ValidationClass, matcher: Option<&str>) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     // --- the environment/code split, inherited from `gate` -------------------
 

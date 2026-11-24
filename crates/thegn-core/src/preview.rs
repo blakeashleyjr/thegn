@@ -8,7 +8,6 @@
 //! document models are unit-tested in the core-coverage gate; the host owns the
 //! off-loop read/rasterize and the actual rendering.
 
-use std::fmt::Write as _;
 use std::path::Path;
 
 use once_cell::sync::Lazy;
@@ -864,6 +863,7 @@ pub fn validate_preview_redirect(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     #[test]
     fn route_for_archive_table() {
         use std::path::Path;

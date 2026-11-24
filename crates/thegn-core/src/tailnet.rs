@@ -21,7 +21,6 @@
 //! MagicDNS name, mitigating a control-plane MagicDNS spoof.
 
 use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
 
 use crate::host_config::{HostConfig, HostReach};
 use crate::remote::SshTarget;
@@ -508,6 +507,7 @@ pub fn probe_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     // A logged-in Tailscale (SaaS control plane) capture: an SSH-advertising
     // server, an offline phone that explicitly advertises none, and an old-client

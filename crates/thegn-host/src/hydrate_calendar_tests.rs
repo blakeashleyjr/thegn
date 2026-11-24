@@ -4,7 +4,6 @@
 //! worth testing at the seam that actually writes.
 
 use super::*;
-use std::fmt::Write as _;
 use thegn_core::calendar::{CalEvent, EventTime, TzRef};
 
 #[test]

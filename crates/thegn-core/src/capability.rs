@@ -16,7 +16,6 @@
 //! scope sets all answer to the same table.
 
 use crate::control::{Scope, Verb, required_scope};
-use std::fmt::Write as _;
 
 /// An external door through which a capability can be invoked.
 #[derive(
@@ -1624,6 +1623,7 @@ pub fn stubs() -> impl Iterator<Item = &'static HostCapability> {
 mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashSet};
+    use std::fmt::Write as _;
 
     #[test]
     fn every_verb_has_exactly_one_canonical_row() {

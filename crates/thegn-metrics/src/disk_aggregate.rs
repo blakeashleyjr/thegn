@@ -2,7 +2,6 @@
 use crate::DiskInfo;
 #[cfg(any(target_os = "linux", test))]
 use crate::DiskKind;
-use std::fmt::Write as _;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
@@ -269,6 +268,7 @@ impl DiskAggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn diskstats_parser_accepts_supported_shapes_and_rejects_bad_lines() {

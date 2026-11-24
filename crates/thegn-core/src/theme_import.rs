@@ -4,7 +4,6 @@
 //! and accepts a deliberately narrow flat YAML grammar or a strict JSON object.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 
 use crate::theme::{Hue, Palette, blend_over, contrast_ratio, extend_palette};
 use crate::theme_resolve::normalize_hex;
@@ -448,6 +447,7 @@ fn average(colors: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::theme_contrast::{Bar, audit};
+    use std::fmt::Write as _;
 
     fn yaml() -> String {
         let mut text = String::from(

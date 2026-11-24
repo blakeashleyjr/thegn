@@ -1,7 +1,6 @@
 //! CI provider adapter backed by a resident plugin's `provider.call` seam.
 
 use std::collections::VecDeque;
-use std::fmt::Write as _;
 use std::sync::{Arc, mpsc};
 
 use thegn_core::ci::{CiCaps, CiError, CiJob, CiLog, CiRun, CiSystem, CiWorkflow, RerunScope};
@@ -395,6 +394,7 @@ mod tests {
     use crate::plugin::session::tests::FixtureSupervisor;
     use crate::plugin::session::{ResidentSession, SessionEvent};
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
     use std::sync::Mutex;
     use std::time::Duration;
 
