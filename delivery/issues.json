@@ -626,6 +626,13 @@
       ]
     },
     {
+      "issue": "THE-2242",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "fix-exact-terminal-search-jumps"
+      ]
+    },
+    {
       "issue": "THE-2244",
       "project": "Workspace Product & Observability",
       "changes": [

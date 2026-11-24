@@ -967,6 +967,18 @@
       "summary": "THE-2491 owns pipeline worktree filing; implementation landed, with coordinator Mac sidebar proof and rendered evidence still unchecked."
     },
     {
+      "change": "fix-exact-terminal-search-jumps",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2242",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "THE-2242 resolves duplicate terminal matches by logical line distance, keeps the post-Enter mark steppable with n/N, and preserves the missing-line replay fallback; live wrapped-history proof remains unchecked."
+    },
+    {
       "change": "fix-macos-oci-runtimes",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

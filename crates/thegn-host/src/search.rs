@@ -439,6 +439,19 @@ impl SearchOverlay {
         true
     }
 
+    /// Stop waiting for the worker and rank the snapshot on this thread, so the
+    /// results are complete. Used when a search walk outlives the overlay.
+    fn finish_scan_now(&mut self) {
+        if !self.searching {
+            return;
+        }
+        self.worker = None;
+        self.searching = false;
+        let snapshot = self.snapshot.clone();
+        let refs = source_refs(&snapshot);
+        self.engine.rescore(&refs);
+    }
+
     /// Take the outcome a deferred Enter produced while draining, if any.
     pub fn take_ready(&mut self) -> Option<SearchOutcome> {
         self.ready.take()
@@ -820,6 +833,81 @@ impl SearchOverlay {
             );
             seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
         }
+    }
+}
+
+/// The hits of the search that was just activated, kept after the overlay closes
+/// so `n`/`N` can step through them. The mark lives only as long as the walk:
+/// the next key (or a scroll) ends it.
+pub(crate) struct SearchWalk {
+    matches: Vec<SearchMatch>,
+    index: usize,
+    /// The overlay, kept while its scan was still running at Enter so the first
+    /// step can finish ranking and walk every hit, not just the first batch.
+    scan: Option<Box<SearchOverlay>>,
+}
+
+impl std::fmt::Debug for SearchWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchWalk")
+            .field("matches", &self.matches.len())
+            .field("index", &self.index)
+            .field("scanning", &self.scan.is_some())
+            .finish()
+    }
+}
+
+impl SearchWalk {
+    /// Take the overlay's ranked hits, starting at the one Enter jumped to.
+    /// None when there is nothing to step through.
+    pub(crate) fn from_overlay(overlay: SearchOverlay) -> Option<Self> {
+        let matches = overlay.engine.matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let index = overlay.engine.selected_idx().min(matches.len() - 1);
+        let matches = matches.to_vec();
+        let scan = overlay.searching().then(|| Box::new(overlay));
+        Some(Self {
+            matches,
+            index,
+            scan,
+        })
+    }
+
+    /// Finish a scan that was still streaming at Enter: rank the overlay's own
+    /// snapshot here and keep the position on the hit that was jumped to.
+    fn complete_scan(&mut self) {
+        let Some(mut overlay) = self.scan.take() else {
+            return;
+        };
+        overlay.finish_scan_now();
+        let all = overlay.engine.matches();
+        if all.is_empty() {
+            return;
+        }
+        let current = self.matches.get(self.index);
+        self.index = current
+            .and_then(|c| all.iter().position(|m| m == c))
+            .unwrap_or_else(|| self.index.min(all.len() - 1));
+        self.matches = all.to_vec();
+    }
+
+    /// Step to the next (`forward`) or previous hit, wrapping at either end.
+    /// Returns the hit to jump to and its 1-based position out of the total.
+    pub(crate) fn step(&mut self, forward: bool) -> (SearchMatch, usize, usize) {
+        self.complete_scan();
+        let len = self.matches.len();
+        self.index = if forward {
+            (self.index + 1) % len
+        } else {
+            (self.index + len - 1) % len
+        };
+        (
+            self.matches[self.index].clone(),
+            self.index + 1,
+            self.matches.len(),
+        )
     }
 }
 
@@ -1342,6 +1430,58 @@ mod tests {
         if let SearchOutcome::Jump(m) = r {
             assert!(m.line.contains('c'));
         }
+    }
+
+    #[test]
+    fn search_walk_steps_forward_and_back_with_wrap() {
+        let buf = buf_from(&["hit one", "other", "hit two", "hit three"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "hit", &srcs);
+        assert_eq!(ov.engine().matches().len(), 3);
+
+        let first = ov.engine().selected().expect("selected hit").clone();
+        let mut walk = SearchWalk::from_overlay(ov).expect("walkable results");
+
+        let (second, position, total) = walk.step(true);
+        assert_eq!((position, total), (2, 3));
+        let (third, position, _) = walk.step(true);
+        assert_eq!(position, 3);
+        let (wrapped, position, _) = walk.step(true);
+        assert_eq!(position, 1);
+        assert_eq!(wrapped, first, "forward step wraps to the first hit");
+
+        let (back, position, _) = walk.step(false);
+        assert_eq!(position, 3);
+        assert_eq!(back, third, "backward step wraps to the last hit");
+        assert_ne!(second, first);
+        assert_ne!(third, second);
+    }
+
+    #[test]
+    fn search_walk_finishes_a_scan_that_was_still_running() {
+        let buf = buf_from(&["hit one", "hit two", "hit three"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "hit", &srcs);
+        // Enter landed while the worker still owed batches.
+        ov.searching = true;
+        let mut walk = SearchWalk::from_overlay(ov).expect("walkable results");
+        assert!(walk.scan.is_some(), "an unfinished scan keeps its overlay");
+
+        let (_, position, total) = walk.step(true);
+        assert!(walk.scan.is_none(), "the first step completes the scan");
+        assert!(position >= 1 && position <= total, "{position} of {total}");
+    }
+
+    #[test]
+    fn search_walk_is_none_without_hits() {
+        let buf = buf_from(&["cargo build"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "zzzz", &srcs);
+        assert!(ov.engine().matches().is_empty());
+        assert!(SearchWalk::from_overlay(ov).is_none());
     }
 
     #[test]
