@@ -7,12 +7,6 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- Sandbox panes no longer put host-sourced secrets on a remote command line:
-  ssh and Kubernetes OCI creates send the env-file over stdin, while provider
-  or remote bwrap/systemd panes omit those values with a keys-only warning.
-
 ## [0.1.0-alpha.127] — 2026-11-24
 
 ### Changed
