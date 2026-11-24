@@ -145,6 +145,7 @@ impl SandboxGitConfig {
 
     /// `self` with every key present in `overlay` replaced (lists replace
     /// wholesale, they do not append).
+    #[must_use]
     pub fn merged(&self, overlay: &SandboxGitOverlay) -> SandboxGitConfig {
         SandboxGitConfig {
             mode: overlay.mode.unwrap_or(self.mode),

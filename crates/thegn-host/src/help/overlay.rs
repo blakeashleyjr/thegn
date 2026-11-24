@@ -197,6 +197,7 @@ impl HelpOverlay {
         }
     }
 
+    #[must_use]
     pub fn with_close_chord(mut self, chord: Option<&str>) -> Self {
         self.close_key = chord.and_then(|chord| {
             let Ok(keys) = crate::keymap::parse_chord(chord) else {

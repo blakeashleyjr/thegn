@@ -409,6 +409,7 @@ pub fn prepare_sandbox_env(
         backend_choice,
         choice_is_explicit,
         &selection,
+        None,
     )
 }
 
@@ -421,11 +422,12 @@ pub fn prepare_sandbox_env_with_selection(
     backend_choice: Option<&str>,
     choice_is_explicit: bool,
     selection: &thegn_core::sandbox_pin::EnvSelection,
+    db: Option<&Db>,
 ) -> anyhow::Result<SandboxOutcome> {
     use crate::handlers::repo_trust::resolve_env_trusted;
     let generation =
         crate::config_startup::display().map_or(0, |admitted| admitted.revision().generation);
-    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selection)?;
+    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selection, db)?;
     let environment = trusted.environment;
     let devcontainer = trusted.devcontainer;
     // The MERGED pin (DB pin or an explicit caller profile): the sealed gate
@@ -6091,9 +6093,15 @@ pub fn launch_spec_full(
     daemon_persistent: bool,
     extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
-    let mut loc = match GitLoc::for_worktree_op(Path::new(worktree), "pane launch") {
-        Ok(loc) => loc,
-        Err(_) if !remote_placement_configured(cfg) => GitLoc::Local(PathBuf::from(worktree)),
+    // One state-DB handle for the whole resolution (each open re-runs the
+    // pragmas). The location read hands back the handle it opened, so the
+    // state reads below reuse it instead of opening SQLite a second time —
+    // this runs on the event loop for a drawer/menu launch.
+    let (mut loc, db) = match GitLoc::for_worktree_op_shared(Path::new(worktree), "pane launch") {
+        Ok((loc, db)) => (loc, db),
+        Err(_) if !remote_placement_configured(cfg) => {
+            (GitLoc::Local(PathBuf::from(worktree)), None)
+        }
         Err(error) => return Err(anyhow::anyhow!(error)),
     };
 
@@ -6112,19 +6120,24 @@ pub fn launch_spec_full(
     )
     .ok();
 
-    // One DB handle for the whole spec resolution (each open re-runs pragmas).
-    let db = match Db::open() {
-        Ok(db) => Some(db),
-        Err(error) => {
-            launch_state_gate(
-                cfg,
-                worktree,
-                choice,
-                "the state database could not be opened, so this worktree's saved sandbox override, selected environment and credential-overlay gate cannot be checked",
-                &worktree_isolation_read_failure(worktree, &error),
-            )?;
-            None
-        }
+    // No handle ⇒ the state DB did not exist yet (nothing recorded, so the
+    // worktree is local) or the tolerated location refusal above: open it, as
+    // the state reads below always did, creating it when absent.
+    let db = match db {
+        Some(db) => Some(db),
+        None => match Db::open() {
+            Ok(db) => Some(db),
+            Err(error) => {
+                launch_state_gate(
+                    cfg,
+                    worktree,
+                    choice,
+                    "the state database could not be opened, so this worktree's saved sandbox override, selected environment and credential-overlay gate cannot be checked",
+                    &worktree_isolation_read_failure(worktree, &error),
+                )?;
+                None
+            }
+        },
     }; // best-effort for shells: choice recording and repo-root lookups fall back to local git below
 
     // Record the choice for the dashboard / `--resume` (keyed by worktree path).
@@ -6235,6 +6248,7 @@ pub fn launch_spec_full(
             name: selected_env.clone(),
             profile: None,
         },
+        db.as_ref(),
     )?;
     if let Some(target) = outcome.route_ssh_target.as_ref() {
         crate::remote_enqueue_auth::reconcile_ssh_credential(cfg, target, &repo_root, worktree)?;

@@ -970,7 +970,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: test-dev-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro
+test: test-dev-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro test-remote-parity-tui
     #!/usr/bin/env bash
     set -euo pipefail
     if ! cargo nextest run --workspace; then
@@ -1455,6 +1455,11 @@ test-build-metadata:
 # Nix package identity and license metadata drift regression; pure Python.
 test-nix-metadata:
     python3 -B test/nix_metadata_test.py
+
+# The remote-parity TUI probe drives a real pty; every child gets a throwaway
+# HOME, config and state so the owner's thegn is never written. Pure Python.
+test-remote-parity-tui:
+    python3 -B test/remote_parity_tui_test.py
 
 # Backend overlay preservation regression; uses throwaway Git + HOME fixtures.
 test-apply-backend:

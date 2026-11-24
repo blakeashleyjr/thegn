@@ -66,27 +66,7 @@ fn pick_backend_with_notice(
     mut missing: impl FnMut(&SandboxConfig, &str),
 ) -> Option<Backend> {
     let suitable = |b: Backend| backend_suitable(b, placement);
-    let unsuitable_reason = |b: Backend| -> &'static str {
-        if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
-            " on native Windows (Linux containers can't bind-mount the worktree \
-             at its real path — use WSL2 for container sandboxes)"
-        } else if b.is_host_toolchain() && !placement.is_local() {
-            " on a non-local placement (a host-toolchain backend can't nest inside \
-             ssh/k8s/provider — the placement is already the isolation boundary)"
-        } else if placement.is_local() && !backend_runs_on(b, host_os()) {
-            // The OS gate. Without naming it, a Mac reported bwrap as unavailable
-            // "for this image mode", which sends the reader looking for a config
-            // problem that doesn't exist.
-            match host_os() {
-                HostOs::MacOs => " on macOS",
-                HostOs::Linux => " on Linux",
-                HostOs::Windows => " on Windows",
-                HostOs::Other => " on this OS",
-            }
-        } else {
-            " for this image mode"
-        }
-    };
+    let unsuitable_reason = |b: Backend| unsuitable_reason_on(b, placement, host_os());
 
     // Open the resolve phase so the splash's "sandbox" step names what the
     // resolver is probing (a wedged runtime probe otherwise freezes an opaque
@@ -241,6 +221,31 @@ impl HostOs {
     }
 }
 
+/// Why `b` is unsuitable for `placement` on `os`, phrased as a suffix for
+/// "sandbox backend '…' unavailable{…}". Pure, so every platform arm is testable
+/// on a single host.
+fn unsuitable_reason_on(b: Backend, placement: &Placement, os: HostOs) -> &'static str {
+    if os == HostOs::Windows && placement.is_local() && b.is_oci() && b != Backend::Wsl {
+        " on native Windows (Linux containers can't bind-mount the worktree \
+         at its real path — use WSL2 for container sandboxes)"
+    } else if b.is_host_toolchain() && !placement.is_local() {
+        " on a non-local placement (a host-toolchain backend can't nest inside \
+         ssh/k8s/provider — the placement is already the isolation boundary)"
+    } else if placement.is_local() && !backend_runs_on(b, os) {
+        // The OS gate. Without naming it, a Mac reported bwrap as unavailable
+        // "for this image mode", which sends the reader looking for a config
+        // problem that doesn't exist.
+        match os {
+            HostOs::MacOs => " on macOS",
+            HostOs::Linux => " on Linux",
+            HostOs::Windows => " on Windows",
+            HostOs::Other => " on this OS",
+        }
+    } else {
+        " for this image mode"
+    }
+}
+
 /// The OS this binary was built for.
 pub const fn host_os() -> HostOs {
     if cfg!(target_os = "linux") {
@@ -299,7 +304,9 @@ pub(crate) fn backend_suitable_on(b: Backend, placement: &Placement, os: HostOs)
     if placement.is_local() && !backend_runs_on(b, os) {
         return false;
     }
-    if os == HostOs::Windows && b.is_oci() && b != Backend::Wsl {
+    // Native Windows declines OCI for LOCAL placements only: a Linux container
+    // can't see the worktree at its real path. A remote host has no such limit.
+    if placement.is_local() && os == HostOs::Windows && b.is_oci() && b != Backend::Wsl {
         return false;
     }
     match b {
@@ -851,13 +858,58 @@ mod tests {
         // OCI runtimes DO nest in a placement (a container in the sprite/pod), so
         // they stay eligible remotely — on a non-local placement the OS gate does
         // not apply, because the remote may be a different OS entirely.
-        for os in [HostOs::Linux, HostOs::MacOs] {
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
             assert!(backend_suitable_on(Backend::Podman, &provider, os));
             assert!(backend_suitable_on(Backend::Docker, &provider, os));
         }
         // `none` (run natively in the placement) is always eligible.
         assert!(backend_suitable(Backend::None, &provider));
         assert!(backend_suitable(Backend::None, &Placement::Local));
+    }
+
+    #[test]
+    fn windows_local_oci_still_declined() {
+        // `backend_runs_on` rejects these first for local placements; the test pins
+        // the combined result (the placement clause in `backend_suitable_on` is
+        // defence in depth behind it).
+        for b in [
+            Backend::Podman,
+            Backend::PodmanRootful,
+            Backend::Docker,
+            Backend::Smol,
+        ] {
+            assert!(!backend_suitable_on(b, &Placement::Local, HostOs::Windows));
+        }
+    }
+
+    #[test]
+    fn unsuitable_reason_windows_remote_has_no_native_windows_text() {
+        use crate::placement::{Placement, SshPlacement, TransportKind};
+        let ssh = Placement::Ssh(SshPlacement::plain(
+            "dev@box".into(),
+            22,
+            true,
+            TransportKind::Ssh,
+        ));
+        let remote = unsuitable_reason_on(Backend::Podman, &ssh, HostOs::Windows);
+        assert_eq!(remote, " for this image mode");
+        assert!(!remote.contains("native Windows"));
+        let local = unsuitable_reason_on(Backend::Wsl, &Placement::Local, HostOs::Linux);
+        assert_eq!(local, " on Linux");
+    }
+
+    #[test]
+    fn windows_ssh_placement_allows_remote_podman() {
+        use crate::placement::{Placement, SshPlacement, TransportKind};
+        let ssh = Placement::Ssh(SshPlacement::plain(
+            "dev@box".into(),
+            22,
+            true,
+            TransportKind::Ssh,
+        ));
+        for b in [Backend::Podman, Backend::Docker] {
+            assert!(backend_suitable_on(b, &ssh, HostOs::Windows));
+        }
     }
 
     #[test]

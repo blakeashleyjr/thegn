@@ -136,6 +136,7 @@ pub enum PanelWidth {
 
 impl PanelWidth {
     /// Advance Normal → Half → Full → Normal.
+    #[must_use]
     pub fn cycle(self) -> Self {
         match self {
             PanelWidth::Normal => PanelWidth::Half,
@@ -146,6 +147,7 @@ impl PanelWidth {
 
     /// The reverse cycle (`E`): Full → Half → Normal → Full — so shrinking
     /// from Half never has to pass through Full first.
+    #[must_use]
     pub fn cycle_back(self) -> Self {
         match self {
             PanelWidth::Normal => PanelWidth::Full,
@@ -190,6 +192,7 @@ pub enum SidebarMode {
 
 impl SidebarMode {
     /// Advance Full → Rail → Hidden → Full.
+    #[must_use]
     pub fn cycle(self) -> Self {
         match self {
             SidebarMode::Full => SidebarMode::Rail,

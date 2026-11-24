@@ -188,6 +188,7 @@ impl AccountUsage {
     /// key from it. Used for rows that have no parsed identity (Codex, or a
     /// Claude home whose `.claude.json` is missing) so they still dedupe by
     /// where they came from rather than colliding on the bare provider id.
+    #[must_use]
     pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
         let home = home.into();
         self.key = format!("{}:{}", self.provider, home.display());
@@ -201,6 +202,7 @@ impl AccountUsage {
     ///
     /// The uuid pair — not `userID`, which is NOT unique: several of a user's
     /// profiles can share one while being genuinely different accounts.
+    #[must_use]
     pub fn with_identity(mut self, id: &ClaudeIdentity) -> Self {
         if let Some(k) = id.key() {
             self.key = format!("{}:{k}", self.provider);
@@ -216,6 +218,7 @@ impl AccountUsage {
     }
 
     /// Attach harness-reported cumulative token counters.
+    #[must_use]
     pub fn with_tokens(mut self, tokens: Option<TokenTotals>) -> Self {
         self.tokens = tokens;
         self

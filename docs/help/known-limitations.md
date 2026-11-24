@@ -65,7 +65,16 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 - **`sealed-tunnel` refuses to launch when a VPN is configured.** Use `sealed`
   without the tunnel requirement, or resolve the VPN configuration before
   retrying; see [[sandboxing]].
-- **Docker Desktop and WSL sandbox binds are best-effort.** Treat those binds
+- **Allow/block lists (`network_allow`, `network_block`) are advisory
+  everywhere, except Sprites, where they are translated to its own policy
+  API.** See [[sandbox-network]].
+- **A VPN sidecar routes traffic but is not an exclusive route; it does not
+  confine the sandbox.** See [[sandbox-network]].
+- **`network_audit` is a podman `network` event feed (attach/detach), not a
+  DNS or connection log.** See [[sandbox-network]].
+- **`smol`, `wsl` and `appcontainer` are reserved: accepted by config, not
+  implemented, never selected.** See [[sandbox-backends]].
+- **Docker Desktop sandbox binds are best-effort.** Treat those binds
   as unverified when relying on sandbox isolation; see [[sandboxing]].
 - **Provider placements without an enforceable isolation request are reported
   as `provider-managed (unverified)`.** Review the provider's isolation

@@ -40,8 +40,10 @@
 //!
 //! - `sprites_usage[]` (`fleet cost` only; absent when no `provider = "sprites"`
 //!   env is configured): `envs`, `error`, `rows[]` with `name`, `status`,
-//!   `cpu_hours`, `gb_hours`, `partial`, `recent`, `usd` (`null` = unpriced; priced only
-//!   when `[placement.price]` has a `sprites` entry), `reported`,
+//!   `cpu_hours`, `gb_hours`, `partial` (`true` when the API's window is
+//!   incomplete, or a sprite younger than the usage lag reports a zero),
+//!   `recent`, `usd` (`null` = unpriced or not yet recorded; priced only when
+//!   `[placement.price]` has a `sprites` entry), `reported`,
 //!   `last_recorded_at`, and per-row `error`. Only sprites this host proves it
 //!   owns (the ledger); usage comes from the Sprites API.
 //!
@@ -128,6 +130,8 @@ struct SpritesUsageRow {
     status: String,
     cpu_hours: f64,
     gb_hours: f64,
+    /// The figures are incomplete: the API said so, or the sprite is younger
+    /// than the usage lag and its usage reads zero.
     partial: bool,
     /// The sprite is younger than SPRITES_USAGE_LAG_SECS: the API may not have reported it yet.
     recent: bool,
@@ -136,7 +140,7 @@ struct SpritesUsageRow {
     last_recorded_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    /// `None` = unpriced.
+    /// `None` = unpriced, or usage not recorded yet.
     usd: Option<f64>,
     /// The API had no usage for this sprite (404).
     unavailable: bool,
@@ -150,6 +154,14 @@ fn unix_to_rfc3339(secs: i64) -> String {
 
 fn usage_is_recent(created_at: i64, now_secs: i64) -> bool {
     now_secs.saturating_sub(created_at) < SPRITES_USAGE_LAG_SECS
+}
+
+/// A sprite younger than the usage lag whose reading is a reported zero: the
+/// API has a bucket for it but recorded no usage yet, so the zero means "not
+/// yet available", not a measurement. Any nonzero figure, or a sprite older
+/// than the lag, is read as reported.
+fn usage_is_pending(recent: bool, reported: bool, cpu_hours: f64, gb_hours: f64) -> bool {
+    recent && reported && cpu_hours == 0.0 && gb_hours == 0.0
 }
 
 pub(crate) fn sanitize_text(value: &str, max_chars: usize) -> String {
@@ -323,12 +335,13 @@ fn sprites_row(
     let u = &reading.usage;
     let cpu_hours = finite_cpu_hours(u.cpu_seconds);
     let gb_hours = finite_gb_hours(u.reserved_gb_hours);
+    let pending = usage_is_pending(recent, reading.reported, cpu_hours, gb_hours);
     SpritesUsageRow {
         name: name.to_string(),
         status: status.to_string(),
         cpu_hours,
         gb_hours,
-        partial: u.partial,
+        partial: u.partial || pending,
         recent,
         reported: reading.reported,
         last_recorded_at: reading
@@ -336,7 +349,7 @@ fn sprites_row(
             .as_deref()
             .map(|value| sanitize_text(value, 40)),
         error: None,
-        usd: if reading.reported {
+        usd: if reading.reported && !pending {
             price.map(|p| cpu_hours * p).filter(|v| v.is_finite())
         } else {
             None
@@ -387,9 +400,10 @@ fn render_sprites(usage: &[SpritesUsage]) -> String {
                 .to_vec(),
         ];
         for row in &env.rows {
+            let pending = usage_is_pending(row.recent, row.reported, row.cpu_hours, row.gb_hours);
             let (cpu, gb) = if row.unavailable || row.error.is_some() {
                 ("?".to_string(), "?".to_string())
-            } else if !row.reported {
+            } else if !row.reported || pending {
                 ("-".to_string(), "-".to_string())
             } else {
                 (
@@ -426,6 +440,18 @@ fn render_sprites(usage: &[SpritesUsage]) -> String {
             out.push(format!(
                 "  no usage reported yet: {} (Sprites records usage with a delay; run thegn fleet cost again later)",
                 unreported.join(", ")
+            ));
+        }
+        let pending: Vec<&str> = env
+            .rows
+            .iter()
+            .filter(|row| usage_is_pending(row.recent, row.reported, row.cpu_hours, row.gb_hours))
+            .map(|row| row.name.as_str())
+            .collect();
+        if !pending.is_empty() {
+            out.push(format!(
+                "  usage not recorded yet: {} (the sprite is younger than the usage lag; run thegn fleet cost again later)",
+                pending.join(", ")
             ));
         }
         for row in &env.rows {
@@ -979,6 +1005,21 @@ mod tests {
     }
 
     #[test]
+    fn usage_is_pending_only_for_a_fresh_reported_zero() {
+        assert!(usage_is_pending(true, true, 0.0, 0.0));
+        assert!(
+            !usage_is_pending(false, true, 0.0, 0.0),
+            "an old zero is a measurement"
+        );
+        assert!(
+            !usage_is_pending(true, false, 0.0, 0.0),
+            "an unreported row is already marked unavailable"
+        );
+        assert!(!usage_is_pending(true, true, 1.5, 0.0));
+        assert!(!usage_is_pending(true, true, 0.0, 2.0));
+    }
+
+    #[test]
     fn list_table_aligns_marks_orphans_and_unpriced() {
         let view = view();
         let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
@@ -1337,6 +1378,73 @@ mod tests {
             Some("sp".to_string())
         );
         assert_eq!(account_shared_with(&mut first, "other", "acct-b"), None);
+    }
+
+    fn zero_reading(reported: bool) -> thegn_svc::sprites::usage::UsageReading {
+        thegn_svc::sprites::usage::UsageReading {
+            usage: thegn_svc::sprites::usage::SpriteUsage {
+                cpu_seconds: 0.0,
+                reserved_gb_hours: 0.0,
+                partial: false,
+            },
+            last_recorded_at: Some("2026-01-01T00:05:00Z".into()),
+            reported,
+        }
+    }
+
+    #[test]
+    fn a_fresh_reported_zero_reads_as_partial_not_zero() {
+        let row = sprites_row("tg-new", "ready", &zero_reading(true), Some(0.5), true);
+
+        assert!(row.partial, "a fresh zero is not a measurement");
+        assert_eq!(row.usd, None, "an unrecorded figure is not priced");
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["partial"], true);
+        assert_eq!(json["reported"], true);
+        assert_eq!(json["usd"], serde_json::Value::Null);
+
+        let usage = vec![SpritesUsage {
+            env: "sp".into(),
+            error: None,
+            account: None,
+            account_shared_with: None,
+            rows: vec![row],
+        }];
+        let text = render_sprites(&usage);
+        assert!(
+            text.lines()
+                .any(|line| line.contains("tg-new") && line.contains("yes")),
+            "the row is marked partial: {text}"
+        );
+        assert!(
+            text.contains(
+                "usage not recorded yet: tg-new (the sprite is younger than the usage lag; run thegn fleet cost again later)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("0.00"), "{text}");
+    }
+
+    #[test]
+    fn an_old_reported_zero_stays_a_real_zero() {
+        let row = sprites_row("tg-idle", "ready", &zero_reading(true), Some(0.5), false);
+
+        assert!(!row.partial);
+        assert_eq!(row.usd, Some(0.0));
+        let usage = vec![SpritesUsage {
+            env: "sp".into(),
+            error: None,
+            account: None,
+            account_shared_with: None,
+            rows: vec![row],
+        }];
+        let text = render_sprites(&usage);
+        assert!(
+            text.lines()
+                .any(|line| line.contains("tg-idle") && line.contains("0.00")),
+            "{text}"
+        );
+        assert!(!text.contains("usage not recorded yet"), "{text}");
     }
 
     #[test]

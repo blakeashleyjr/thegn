@@ -133,8 +133,19 @@ pub(crate) fn resolve_env_trusted(
     loc: &GitLoc,
     worktree: &str,
     selected_env: &EnvSelection,
+    db: Option<&Db>,
 ) -> anyhow::Result<TrustedEnvironment> {
-    let db = Db::open().map_err(|error| unreadable_worktree_isolation(worktree, &error))?;
+    // Share the caller's already-open handle when it has one (a launch resolves
+    // its whole spec through a single handle); only a caller without one pays
+    // for the open here.
+    let opened;
+    let db = match db {
+        Some(db) => db,
+        None => {
+            opened = Db::open().map_err(|error| unreadable_worktree_isolation(worktree, &error))?;
+            &opened
+        }
+    };
     let root_s = repo_root.to_string_lossy().to_string();
     let worktree_selection = db
         .effective_env_selection(worktree, &root_s)
@@ -164,7 +175,7 @@ pub(crate) fn resolve_env_trusted(
     ) {
         pending.push(request);
     }
-    surface(&db, &root_s, worktree, &resolved.events, &pending);
+    surface(db, &root_s, worktree, &resolved.events, &pending);
     // Fold a repo `devcontainer.json` onto the resolved sandbox, trust-gated
     // exactly like the `.thegn.toml` overlay above. The worktree is bind-
     // mounted at its real path, so the devcontainer's workspace folder is that
@@ -174,7 +185,7 @@ pub(crate) fn resolve_env_trusted(
     } else {
         None
     };
-    apply_zone(&db, cfg, worktree, &mut env);
+    apply_zone(db, cfg, worktree, &mut env);
     Ok(TrustedEnvironment {
         environment: env,
         devcontainer,

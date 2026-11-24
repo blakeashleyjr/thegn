@@ -61,6 +61,9 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > backend and macOS are best-effort; the Windows `jobobject` and `wsl` entries
 > are not supported in this alpha.
 
+Container backends (podman, docker) are declined on native Windows for local
+placements only; an ssh, connector or provider placement can still use them.
+
 `thegn doctor` reports which backends this machine actually has.
 
 ## Enforcement matrix

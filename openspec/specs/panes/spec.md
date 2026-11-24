@@ -205,3 +205,54 @@ gestures MUST use the same rects the renderer drew.
 
 - **WHEN** the user drag-selects inside a zoomed pane
 - **THEN** the selection starts at the cell under the pointer in that pane
+
+### Requirement: A starting pane shows what it is waiting on
+
+A pane that exists but has produced no output yet SHALL show its startup
+state instead of a blank cell: thegn's own lifecycle phase (`resolving
+environment` → `starting sandbox` → `starting shell` → `waiting for shell
+prompt`) with elapsed time, and while the prompt is pending the pane's live
+descendant processes (argv[0] basename plus clipped args, with the process
+age). The card MUST appear only after a short grace so instantly-ready panes
+never flash one, MUST disappear on the pane's first output, and MUST retire
+itself after a bounded time. Descendant sampling MUST stay off the event
+loop, MUST stop as soon as output arrives, and MUST NOT run at all while no
+pane is starting, and only for displayed panes. Once shown, a card MUST stay
+visible across phase changes. Reattached sessions and program (non-shell)
+panes MUST NOT show the shell-prompt card; pre-fork state MUST be keyed by
+group, tab and leaf so a card never appears on another tab. Sampled argv
+MUST be redacted (URL userinfo, query tokens, sensitive flag values) before
+it is drawn.
+
+#### Scenario: An instant spawn never flashes the card
+
+- **WHEN** a pane produces its prompt within the grace window
+- **THEN** no spawn-progress card is ever drawn for that pane
+
+#### Scenario: The card retires on first output and at the bound
+
+- **WHEN** the pane produces any output
+- **THEN** the card disappears and its sampler stops
+- **WHEN** the pane stays silent past the bound since its spawn was kicked
+- **THEN** the card retires itself and the pane renders as an ordinary pane
+
+#### Scenario: A recognized startup culprit gets a one-line hint
+
+- **WHEN** a descendant's argv[0] matches the culprit table (direnv, nix,
+  version managers, prompt frameworks, git, agents, ssh/mosh, sudo/askpass)
+- **THEN** the card shows the table's one-line hint for it
+
+#### Scenario: Sampled argv never leaks a secret
+
+- **WHEN** a sampled descendant's argv contains a token-shaped value
+- **THEN** the drawn line carries the redaction placeholder, never the value
+
+#### Scenario: Platforms without /proc keep the phases
+
+- **WHEN** the host does not expose a procfs descendant walk
+- **THEN** the card shows the lifecycle phase alone and samples nothing
+
+#### Scenario: Nothing waits, nothing polls
+
+- **WHEN** no pane is between its spawn and its first output
+- **THEN** no sampler thread exists and no descendant sampling occurs

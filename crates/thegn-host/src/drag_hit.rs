@@ -32,6 +32,28 @@ pub fn sep_grab(sep: Option<usize>, side: SepSide, mx: usize) -> bool {
     }
 }
 
+/// Whether pointer row `my` lies inside the column band `(y, rows)` the
+/// separator is drawn in. The band excludes the masthead, the divider, the
+/// statusbar and a full-width drawer: a grab must be vertically bounded or the
+/// columns under the masthead's app-tab chips (the sidebar width lands there)
+/// arm a resize and swallow the chip click. `None` (no such column) never hits.
+pub fn row_in_band(band: Option<(usize, usize)>, my: usize) -> bool {
+    band.is_some_and(|(y, rows)| my >= y && my < y + rows)
+}
+
+/// The full press decision for a separator grab: the pointer is on the
+/// separator's column cells (`sep_grab`) AND inside the column band's rows
+/// (`row_in_band`). `band` is the sidebar's or panel's `(y, rows)`.
+pub fn grabs_separator(
+    sep: Option<usize>,
+    side: SepSide,
+    band: Option<(usize, usize)>,
+    mx: usize,
+    my: usize,
+) -> bool {
+    sep_grab(sep, side, mx) && row_in_band(band, my)
+}
+
 /// Whether `mx` is the separator column ITSELF (as opposed to the band's extra
 /// furniture cell). Callers gate the extra cell on it not being pane/drawer
 /// content; the separator column always grabs.
@@ -79,6 +101,18 @@ mod tests {
             assert!(!sep_grab(None, SepSide::Sidebar, mx));
             assert!(!sep_grab(None, SepSide::Panel, mx));
         }
+    }
+
+    #[test]
+    fn row_band_excludes_masthead_and_statusbar_rows() {
+        // Masthead row 0, divider row 1, band rows 2..22, statusbar row 22.
+        let band = Some((2, 20));
+        assert!(!row_in_band(band, 0), "masthead row");
+        assert!(!row_in_band(band, 1), "divider row");
+        assert!(row_in_band(band, 2));
+        assert!(row_in_band(band, 21));
+        assert!(!row_in_band(band, 22), "statusbar row");
+        assert!(!row_in_band(None, 5));
     }
 
     #[test]

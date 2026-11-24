@@ -748,6 +748,7 @@ impl SpritesProvider {
     }
 
     /// The ownership scope create records under and destroy proves against.
+    #[must_use]
     pub fn with_scope(mut self, scope: crate::sprites::ledger::OwnerScope) -> Self {
         self.scope = Some(scope);
         self
@@ -773,36 +774,42 @@ impl SpritesProvider {
     }
 
     /// Provider ids of this host's worktree location rows (legacy proof).
+    #[must_use]
     pub fn with_legacy(mut self, ids: Vec<String>) -> Self {
         self.legacy_ids = ids;
         self
     }
 
     /// The memory policy limit applied after create (`0` = none).
+    #[must_use]
     pub fn with_memory_limit_mb(mut self, limit_mb: u32) -> Self {
         self.memory_limit_mb = limit_mb;
         self
     }
 
     /// Set the maximum number of sprites returned by each list request (clamped to the API's 1..=500).
+    #[must_use]
     pub fn with_list_page_size(mut self, n: u32) -> Self {
         self.list_page_size = Some(n.clamp(1, 500));
         self
     }
 
     /// The ledger reserve cap (`0` = no cap, today's behaviour for sprites).
+    #[must_use]
     pub fn with_max_instances(mut self, max_instances: u32) -> Self {
         self.max_instances = usize::try_from(max_instances).unwrap_or(usize::MAX);
         self
     }
 
     /// Use `dir` as the ownership ledger instead of the state directory.
+    #[must_use]
     pub fn with_ledger_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.ledger_dir = Some(dir);
         self
     }
 
     /// Override the post-DELETE confirmation budget and poll (tests; the default is 30 s / 2 s).
+    #[must_use]
     pub fn with_destroy_confirm(mut self, budget: Duration, poll: Duration) -> Self {
         self.destroy_budget = budget;
         self.destroy_poll = poll;
@@ -835,6 +842,7 @@ impl SpritesProvider {
         })
     }
 
+    #[must_use]
     pub fn with_custody_accounts(mut self, accounts: impl IntoIterator<Item = String>) -> Self {
         self.custody_accounts = accounts.into_iter().collect();
         self
@@ -3701,6 +3709,22 @@ impl std::error::Error for ProxyConnectTimeout {}
 /// The wrapper could not enter the requested directory; the command did not run.
 pub const EXEC_CWD_FAILED_STATUS: i32 = 125;
 
+/// True when a failed exec open is a definitive provider rejection of the
+/// upgrade (an HTTP 4xx other than 408/429): the server answered before it
+/// dispatched anything, so the command provably never ran. A timeout, a
+/// transport error or a 5xx proves nothing, because the server may have
+/// accepted the request first.
+pub fn is_definite_exec_rejection(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+            Some(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status().is_client_error()
+                    && !matches!(response.status().as_u16(), 408 | 429)
+        )
+    })
+}
+
 fn exec_argv(spec: &ExecSpec) -> Result<Vec<String>> {
     let Some(cwd) = spec.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) else {
         return Ok(spec.argv.clone());
@@ -4007,6 +4031,37 @@ impl SpritesProvider {
             session,
             stderr: ExecStderr(stderr),
             verdict,
+        })
+    }
+
+    /// Like [`open_exec_streaming`](Self::open_exec_streaming), but the WebSocket
+    /// upgrade is attempted **exactly once**. The Sprites exec API starts the
+    /// command from the upgrade request, so the retrying cold-open loop could
+    /// start a non-idempotent command twice (a slow `101`, or a 5xx after the
+    /// server accepted it). Callers that must never run a command twice use this
+    /// and classify a failure with [`is_definite_exec_rejection`]; any other
+    /// failure leaves the dispatch outcome unknown.
+    pub async fn open_exec_streaming_once(
+        &self,
+        id: &str,
+        spec: &ExecSpec,
+    ) -> Result<StreamingExec> {
+        anyhow::ensure!(!spec.tty, "sprites: a streaming exec is non-tty");
+        let url = exec_ws_url(self.base()?, id, spec)?;
+        let stderr = Arc::new(Mutex::new(StderrTail::default()));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let session = Box::pin(self.connect_exec(
+            url,
+            false,
+            false,
+            Some(Arc::clone(&stderr)),
+            Some(done_tx),
+        ))
+        .await?;
+        Ok(StreamingExec {
+            session,
+            stderr: ExecStderr(stderr),
+            verdict: done_rx,
         })
     }
 
@@ -7913,11 +7968,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_exec_non_tty_closes_after_exit_when_stdin_is_closed() {
+    async fn drive_exec_non_tty_half_closes_stdin_then_drains_exact_exit() {
         use tokio_tungstenite::tungstenite::Message;
 
-        let (_, fault, client_close) =
-            drive_exec_messages(false, vec![Message::Binary(vec![3, 0].into())], true).await;
+        let (frames, fault, client_close) = drive_exec_messages(
+            false,
+            vec![
+                Message::Binary([vec![1], b"recorded output".to_vec()].concat().into()),
+                Message::Binary(vec![3, 7].into()),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(
+            frames,
+            vec![
+                ExecFrame::Stdout(b"recorded output".to_vec()),
+                ExecFrame::Exit(7),
+            ]
+        );
         assert_eq!(fault, None);
         assert_eq!(client_close, Some(Message::Close(None)));
     }

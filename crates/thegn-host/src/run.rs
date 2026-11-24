@@ -7152,6 +7152,24 @@ async fn event_loop<T: Terminal>(
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         })
     };
+    // Spawn-progress (THE-213): the sampler hub shared with the spawn ticker
+    // thread. The loop publishes targets (waiting panes and their shell pids)
+    // and picks up the payloads each `SpawnProgressTick`; the ticker thread
+    // does the procfs walks off-loop.
+    let spawn_sampler = std::sync::Arc::new(crate::spawn_progress::SpawnSamplerHub::default());
+    // Spawn-progress repaint ticker: exists (as a thread) ONLY while some pane
+    // is waiting for its first shell prompt; `set_visible` is called after the
+    // spawn-progress derive each frame.
+    let spawn_ticker = {
+        let tx = refresh_tx.clone();
+        let wk = waker.clone();
+        let sampler = spawn_sampler.clone();
+        crate::spawn_progress::SpawnTicker::new(move || {
+            sampler.sample_all();
+            let _ = tx.send(RefreshKind::SpawnProgressTick); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        })
+    };
     // Keys (group name, tab) of worktrees whose tab is open for the loading
     // splash while the create worker finishes (`TabOpened` → `Done`/`Failed`).
     // The materialize path skips these so it never races the worker.
@@ -10057,6 +10075,14 @@ async fn event_loop<T: Terminal>(
                             }
                         },
                     );
+                    // The spawn's per-worktree state reads ride back with the
+                    // specs, so the compositor loop never opens SQLite to open
+                    // a pane: its placement (the `loading_remote` watchdog
+                    // window) and the remembered agent the provider
+                    // native-exec/ssh restore relaunches.
+                    let remote = crate::handlers::provision::worktree_is_remote(&wt);
+                    let remembered_agent =
+                        crate::handlers::provision::remembered_agent_row(&cfg, &wt);
                     if tx
                         .send(SpecBatch {
                             group: name,
@@ -10067,6 +10093,8 @@ async fn event_loop<T: Terminal>(
                             specs,
                             relaunch,
                             attach,
+                            remote,
+                            remembered_agent,
                         })
                         .is_ok()
                     {
@@ -10318,6 +10346,7 @@ async fn event_loop<T: Terminal>(
                     loading_retired: &mut loading_retired,
                     loading_remote: &mut loading_remote,
                     loading_state: &mut loading_state,
+                    spawn_pending: &mut panes.spawn_pending,
                     dirty: &mut dirty,
                 },
                 keymap.config(),
@@ -15239,6 +15268,19 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                     }
                 }
+                // Merge the sampler's latest /proc payloads into the waiting
+                // panes' trackers (THE-213). Repaint-only: the spawn-progress
+                // derive after the refresh drain decides whether the derived
+                // cards changed and only then flips `dirty`, so a straggler
+                // tick after the last tracker retired stays damage-free
+                // (render_plan Skips it).
+                RefreshKind::SpawnProgressTick => {
+                    for (pane_id, payload) in spawn_sampler.take_latest() {
+                        if let Some(tracker) = panes.spawn_progress.get_mut(&pane_id) {
+                            tracker.set_procs(payload.unwrap_or_default());
+                        }
+                    }
+                }
                 // The transient projection of a routed notification: push it onto
                 // the toast stack (colored by the same priority model the badges
                 // use) and schedule its one-shot expiry wake, so an off-loop
@@ -15514,6 +15556,46 @@ async fn event_loop<T: Terminal>(
             // but only a live step needs spinner/elapsed repaints. The ticker
             // self-retires within one period after the last live counter ends.
             splash_ticker.set_visible(ticker_visible);
+        }
+
+        // Derive the spawn-progress cards (THE-213) from the per-pane
+        // trackers: prune the dead ones, scope the cards to the displayed
+        // tab, and update the sampler's targets. `model.spawn_hints` is the
+        // model's copy of what `render_panes` draws; a changed map repaints.
+        // `tree` is the displayed tab's layout (pane ids of live panes and
+        // missing leaves alike), so a background tab's tracker never renders
+        // a card over this tab's frames.
+        {
+            let waiting = !panes.spawn_progress.is_empty() || !panes.spawn_pending.is_empty();
+            // Nothing waiting and nothing drawn: no allocation, no repaint.
+            if waiting || !model.spawn_hints.is_empty() {
+                let leaves: std::collections::HashSet<u32> = tree.pane_ids().into_iter().collect();
+                let tab_key = session
+                    .worktrees
+                    .get(session.active)
+                    .map(|g| (g.name.clone(), g.active_tab));
+                let derived = crate::spawn_progress::derive_hints(
+                    &mut panes,
+                    tab_key.as_ref(),
+                    &leaves,
+                    std::time::Instant::now(),
+                );
+                if model.spawn_hints != derived {
+                    model.spawn_hints = derived;
+                    dirty = true;
+                }
+                let waiting = !panes.spawn_progress.is_empty() || !panes.spawn_pending.is_empty();
+                // Same 0%-idle contract as the splash ticker: the thread
+                // exists only while some pane is waiting for its first
+                // prompt, and self-retires within one period after the last
+                // tracker retires. Targets are updated unconditionally (an
+                // empty map clears a stale target) and only cover displayed
+                // panes: background-tab cards are never drawn.
+                spawn_ticker.set_visible(waiting);
+                spawn_sampler.set_targets(&crate::spawn_progress::sampler_targets(&panes, &leaves));
+            } else {
+                spawn_ticker.set_visible(false);
+            }
         }
 
         // Startup-shell watchdog (extracted to keep run.rs capped): a shell alive
@@ -17898,10 +17980,12 @@ async fn event_loop<T: Terminal>(
                 if left
                     && !mouse_left_down
                     && !model.sidebar_rail
-                    && crate::drag_hit::sep_grab(
+                    && crate::drag_hit::grabs_separator(
                         chrome.sep_left,
                         crate::drag_hit::SepSide::Sidebar,
+                        chrome.sidebar.map(|r| (r.y, r.rows)),
                         mx,
+                        my,
                     )
                     && (crate::drag_hit::sep_is_exact(chrome.sep_left, mx) || hit_pane.is_none())
                 {
@@ -17916,10 +18000,12 @@ async fn event_loop<T: Terminal>(
                 if left
                     && !mouse_left_down
                     && panel_ui.width == layout::PanelWidth::Normal
-                    && crate::drag_hit::sep_grab(
+                    && crate::drag_hit::grabs_separator(
                         chrome.sep_right,
                         crate::drag_hit::SepSide::Panel,
+                        chrome.panel.map(|r| (r.y, r.rows)),
                         mx,
+                        my,
                     )
                     && (crate::drag_hit::sep_is_exact(chrome.sep_right, mx) || hit_pane.is_none())
                 {
