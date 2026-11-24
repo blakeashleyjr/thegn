@@ -332,10 +332,12 @@ impl std::error::Error for PatternError {}
 /// Whether `name` matches `pattern`, the DNS filter's `name_matches` bit for
 /// bit: a malformed pattern never matches.
 ///
-/// Name-only: a port suffix on `pattern` is ignored, because the caller has no
-/// port to check. A policy decision uses [`HostPattern::matches`] instead.
+/// Name-only, so a pattern that carries a port suffix never matches: the caller
+/// has no port to check, and ignoring the suffix would let a ceiling written
+/// `github.com:22` admit `github.com` on every port. A policy decision uses
+/// [`HostPattern::matches`] instead.
 pub fn name_matches(name: &str, pattern: &str) -> bool {
-    HostPattern::parse(pattern).is_ok_and(|pattern| pattern.matches_name(name))
+    HostPattern::parse(pattern).is_ok_and(|p| p.ports == PortSpec::Default && p.matches_name(name))
 }
 
 /// WS01-P2-01's `network_allow` / `network_block` rule set, now an alias over
@@ -356,10 +358,13 @@ impl HostRules {
     /// Whether `host` on `port` passes the rules. `default_ports` is the
     /// policy's own `ports` list, used by entries without a port suffix.
     pub fn allows(&self, host: &str, port: u16, default_ports: &[u16]) -> bool {
+        // A block entry without a port suffix blocks every port: the policy's
+        // default ports only narrow what an allow entry grants, never a deny.
+        // (The WS04-P1-03 evaluator must keep this rule.)
         if self
             .block
             .iter()
-            .any(|pattern| pattern.matches(host, port, default_ports))
+            .any(|pattern| pattern.matches(host, port, &[]))
         {
             return false;
         }
@@ -376,7 +381,9 @@ impl HostRules {
 /// literal by the grammar, so it is refused with the IP-literal error rather
 /// than being read as a name with a port.
 fn split_ports(raw: &str) -> Result<(&str, PortSpec), PatternError> {
-    if raw.starts_with('[') {
+    // Unbracketed IPv6 (`::1`, `2001:db8::1`) has two or more colons; a name
+    // with a port has at most one.
+    if raw.starts_with('[') || raw.matches(':').count() >= 2 {
         return Err(PatternError::IpLiteral);
     }
     match raw.rsplit_once(':') {
@@ -443,15 +450,19 @@ fn classify(host: &str, bare_is_exact: bool) -> Result<(PatternKind, &str), Patt
 /// `url` canonicalises to `Host::Ipv4`/`Host::Ipv6` for us, inet_aton forms
 /// included).
 fn canonical_name(name: &str) -> Result<String, PatternError> {
-    // The caller guarantees a non-empty name.
+    // A name can still be empty here (`=` or `=.`); `url` refuses it as
+    // `MalformedName`.
     if name.len() > MAX_NAME_BYTES {
         return Err(PatternError::TooLong);
     }
+    // `url` percent-decodes and UTS46-maps (`%2a`, fullwidth `＊`), so the
+    // checks that matter run on the canonical output below. A `%` is refused
+    // outright: no host name or pattern needs one.
+    if name.contains('%') {
+        return Err(PatternError::MalformedName);
+    }
     if name.contains(['*', '=']) {
         return Err(PatternError::StraySyntax);
-    }
-    if underscore_in_registrable(name) {
-        return Err(PatternError::UnderscoreInRegistrable);
     }
     let canonical = match url::Host::parse(name) {
         Ok(url::Host::Domain(domain)) => domain,
@@ -463,6 +474,19 @@ fn canonical_name(name: &str) -> Result<String, PatternError> {
     }
     if canonical.split('.').any(str::is_empty) {
         return Err(PatternError::EmptyLabel);
+    }
+    // Classify on what the pattern will actually be written and matched as.
+    if canonical.contains(['*', '=']) {
+        return Err(PatternError::StraySyntax);
+    }
+    if !canonical
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'_'))
+    {
+        return Err(PatternError::MalformedName);
+    }
+    if underscore_in_registrable(&canonical) {
+        return Err(PatternError::UnderscoreInRegistrable);
     }
     Ok(canonical)
 }
@@ -849,6 +873,54 @@ mod tests {
     }
 
     #[test]
+    fn decoded_or_mapped_markers_and_odd_characters_are_refused() {
+        for raw in [
+            "%2a.example.com",
+            "%2A.example.com",
+            "\u{ff0a}.example.com",
+            "%3dx.com",
+            "%5fexample.com",
+            "\u{ff3f}example.com",
+            "ex!ample.com",
+            "ex(ample.com",
+            "a%2eexample.com",
+        ] {
+            assert!(HostPattern::parse(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn write_then_parse_keeps_meaning() {
+        for raw in [
+            "example.com",
+            "*.example.com",
+            "=example.com",
+            "*",
+            "Bücher.de:443",
+            "_dmarc.example.com",
+            "=x.com:8000-8100",
+        ] {
+            let parsed = pattern(raw);
+            assert_eq!(pattern(&parsed.to_string()), parsed, "{raw}");
+        }
+    }
+
+    #[test]
+    fn block_without_port_blocks_every_port() {
+        let policy = rules(&["x.com:8080"], &["x.com"]);
+        assert!(!policy.allows("x.com", 8080, &[443]));
+        assert!(!policy.allows("x.com", 443, &[443]));
+        let policy = rules(&[], &["evil.com"]);
+        assert!(!policy.allows("evil.com", 80, &[443]));
+        assert!(policy.allows("good.com", 80, &[80]));
+    }
+
+    #[test]
+    fn name_matches_refuses_ported_ceiling() {
+        assert!(!name_matches("github.com", "github.com:22"));
+    }
+
+    #[test]
     fn inet_aton_forms_are_ip_literals() {
         // `0x7f.1` and friends are IPv4 to `url`, so they must be refused like
         // the dotted-quad spelling — otherwise an address could slip in as a
@@ -864,6 +936,8 @@ mod tests {
             "192.168.0.1:443",
             "[::1]",
             "[2001:db8::1]:443",
+            "::1",
+            "2001:db8::1",
         ] {
             assert_eq!(
                 HostPattern::parse(raw),
