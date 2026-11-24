@@ -13,7 +13,8 @@
 //! # The wire (NDJSON)
 //!
 //! One request or response per line, UTF-8, at most [`MAX_LINE`] bytes
-//! (excluding the newline). A longer line is an error: the connection is closed,
+//! (excluding the newline and an optional trailing `\r`). A longer line is an
+//! error: the connection is closed,
 //! never buffered.
 //!
 //! Requests carry an id: `{"id":3,"op":"list"}`. Responses echo it on success
@@ -21,24 +22,41 @@
 //! Events are server pushes with no id: `{"event":"dropped","n":12}`.
 //!
 //! ```text
+//! <- {"event":"challenge","proto":1,"nonce":"9c1e…"}
 //! -> {"id":1,"op":"hello","proto":1,"client":"thegn/0.1.0","mac":"5f2d…"}
 //! <- {"id":1,"ok":{"proto":1,"git_sha":"eefb04b29","features":["approvals"]}}
 //! -> {"id":2,"op":"lease", … }
-//! <- {"id":2,"ok":{"id":"0707…","lease_user":"lease-0707","endpoint":{…}}}
+//! <- {"id":2,"ok":{"id":"0707…","lease_user":"lease-0707","token":"…","endpoint":{…}}}
 //! <- {"event":"decision","v":1,"ts":"…","lease":"0707…", … }
 //! ```
+//!
+//! **Handshake.** The server speaks first: on accept it sends one
+//! [`ControlEvent::Challenge`] carrying a fresh random `nonce` (lowercase hex,
+//! at least 16 bytes of entropy) and its own [`PROTO_VERSION`]. The client's
+//! `hello` answers with `mac = lowercase-hex(HMAC-SHA256(secret, nonce ‖
+//! client))`, where `nonce` is the challenge's hex text as received (not
+//! decoded) and `client` is the `hello`'s `client` string, both as UTF-8 bytes.
+//! A nonce is single use: it is bound to its connection and never reissued.
+//!
+//! **The lease reply** is a [`LeaseGrantWire`] as the `ok` payload. It is the
+//! only message that carries the bearer token; only the authenticated socket
+//! carries it, and persistence stores the token's SHA-256, never the token.
 //!
 //! # Freeze rules
 //!
 //! 1. **Additive only within v1.** Unknown fields are ignored on read, so v1.1
 //!    may add a field; a field may not be renamed, removed or change meaning.
-//! 2. **Strings, not nested enums,** for closed vocabularies crossing the
-//!    socket: `proto`, `decision`, `reason`, `phase`, `approvals`. A reader of a
-//!    future version fails one line, not the whole document.
+//! 2. **Strings, with an `unknown` escape,** for the vocabularies a reader
+//!    consumes: `proto`, `decision`, `reason`, `why` and the `event` tag. Each is
+//!    a closed enum for the writer, but carries an `Unknown` arm (spelled
+//!    `unknown`) that any unrecognised value decodes to, so a v1 reader survives
+//!    a value a later v1.x writer adds. Request-side vocabularies (`op`,
+//!    `phase`, `approvals`, `verdict`) stay strict: a server must refuse a
+//!    request it does not understand.
 //! 3. **Secrets never enter a record.** [`LeaseToken`] and the value inside a
 //!    [`ResolvedCredential`] never appear in `Debug` (they are the `plan`
-//!    module's redacted types) and the audit record has no field for them
-//!    (B13).
+//!    module's redacted types), a [`ResolvedCredential`] never serialises its
+//!    value, and the audit record has no field for them (B13).
 //! 4. **The audit record (`v: 1`) is a published format.** Terminal width,
 //!    locale and theme never change a field's bytes.
 //!
@@ -51,7 +69,8 @@
 //! impls are here so that module is untouched.
 
 use std::io::{self, BufRead};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -86,9 +105,13 @@ pub const MAX_AUDIT_METHOD_LEN: usize = 16;
 /// path is recorded, never the query.
 pub const MAX_AUDIT_PATH_LEN: usize = 512;
 
+/// The longest `reason` carried by [`ControlEvent::ApprovalRequested`], in
+/// bytes. The host uses [`MAX_AUDIT_HOST_LEN`].
+pub const MAX_APPROVAL_REASON_LEN: usize = 512;
+
 /// A lease's approval policy (the plan's `ApprovalMode`): the same vocabulary as
-/// the policy's `approvals` key, spelled out on the lease so the proxy needs no
-/// cross-reference.
+/// the policy's `approvals` key. The lease carries it once, as
+/// [`EgressPolicy::approvals`]; [`LeaseSpec`] has no second copy.
 pub use crate::egress::policy::EgressApprovals as ApprovalMode;
 
 /// A lease's audit level (the plan's `AuditLevel`): the same vocabulary as the
@@ -115,7 +138,7 @@ const REDACTED: &str = "***";
 /// nothing left is [`io::ErrorKind::UnexpectedEof`].
 ///
 /// The cap includes neither `\n` nor a trailing `\r`, so a caller may pass
-/// [`MAX_LINE`].
+/// [`MAX_LINE`] and a CRLF line of exactly that many content bytes is accepted.
 pub fn read_line_bounded<R: BufRead>(reader: &mut R, max: usize) -> io::Result<String> {
     let mut line = Vec::new();
     loop {
@@ -138,7 +161,9 @@ pub fn read_line_bounded<R: BufRead>(reader: &mut R, max: usize) -> io::Result<S
             Some(index) => (&available[..index], index + 1),
             None => (available, available.len()),
         };
-        if line.len() + chunk.len() > max {
+        // One extra byte is tolerated while reading, for a trailing `\r`; the
+        // exact cap is enforced after it is stripped.
+        if line.len() + chunk.len() > max.saturating_add(1) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("egress wire: line exceeds {max} bytes"),
@@ -152,6 +177,12 @@ pub fn read_line_bounded<R: BufRead>(reader: &mut R, max: usize) -> io::Result<S
     }
     if line.last() == Some(&b'\r') {
         line.pop();
+    }
+    if line.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("egress wire: line exceeds {max} bytes"),
+        ));
     }
     String::from_utf8(line)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "egress wire: line is not UTF-8"))
@@ -262,10 +293,8 @@ pub struct LeaseSpec {
     pub owner: LeaseOwner,
     /// How the sandbox reaches the proxy.
     pub transport: Transport,
-    /// Deny an unmatched host or ask the user.
-    #[serde(default)]
-    pub approvals: ApprovalMode,
-    /// How much of the traffic is recorded.
+    /// How much of the traffic is recorded. Whether an unmatched host is denied
+    /// or asked about is [`EgressPolicy::approvals`], the one place it lives.
     #[serde(default)]
     pub audit: AuditLevel,
     /// The upstream HTTP/SOCKS5 proxy to chain to, when the sandbox cannot
@@ -277,8 +306,10 @@ pub struct LeaseSpec {
     /// The lifecycle phase the lease is in; `setup` refuses `agent` hosts.
     #[serde(default)]
     pub phase: LeasePhase,
-    /// Credentials the proxy injects for this lease. The value is present so a
-    /// lease can be materialised on another machine; it is never logged.
+    /// Credentials the proxy injects for this lease. Only the service and the
+    /// source name cross this message: a [`ResolvedCredential`] never serialises
+    /// its value, so persisting a `LeaseSpec` cannot write a secret. The value
+    /// reaches the proxy through the dedicated secret path (WS04-P5-02).
     #[serde(default)]
     pub credentials: Vec<ResolvedCredential>,
 }
@@ -341,7 +372,7 @@ pub enum LeasePhase {
 /// An upstream proxy a lease chains to (WS04-P2-05).
 ///
 /// The credentials are `SecretRef` names, never values: the value arrives as a
-/// lease-scoped [`ResolvedCredential`] on the same authenticated socket, so the
+/// lease-scoped [`ResolvedCredential`] on the secret path (WS04-P5-02), so the
 /// upstream's password is never stored in a lease record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upstream {
@@ -362,15 +393,20 @@ pub struct Upstream {
 ///
 /// `Debug` is redacted for the value (B13): the `secret_ref` is a scheme plus an
 /// operand (see [`SecretRef::audit_name`](crate::secretref::SecretRef::audit_name))
-/// and is safe to print, the value is not. The derived `Serialize` exists for
-/// lease materialisation on another machine and for nothing else.
+/// and is safe to print, the value is not.
+///
+/// **The value is never serialised** (`skip_serializing`): anything that
+/// persists or logs a [`LeaseSpec`] writes the service and the source name only.
+/// It still deserialises when present, so the dedicated secret frame of
+/// WS04-P5-02 can reuse the type; an absent value reads as the empty string.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedCredential {
     /// The service the credential belongs to (`github`, `registry.npmjs.org`).
     pub service: String,
     /// The source the credential came from, as `SecretRef::audit_name()`.
     pub secret_ref: String,
-    /// The value. Never logged, never audited.
+    /// The value. Never logged, never audited, never serialised.
+    #[serde(skip_serializing, default)]
     pub value: String,
 }
 
@@ -404,9 +440,9 @@ impl ResolvedCredential {
 /// its bearer token and where the sandbox reaches the proxy.
 ///
 /// Deliberately **not** `Serialize`: a lease record on disk stores only the
-/// token's SHA-256 (WS04-P2-01b), so the grant must be handed over through a
-/// path that is not a plain JSON document. `Debug` is redacted because it holds
-/// a [`LeaseToken`].
+/// token's SHA-256 (WS04-P2-01b). The socket reply uses [`LeaseGrantWire`],
+/// built with [`LeaseGrant::to_wire`]. `Debug` is redacted because it holds a
+/// [`LeaseToken`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseGrant {
     /// The lease id, also the proxy user name (`lease-<hex16>`).
@@ -417,6 +453,122 @@ pub struct LeaseGrant {
     pub token: LeaseToken,
     /// Where the sandbox reaches the proxy.
     pub endpoint: ProxyEndpoint,
+}
+
+impl LeaseGrant {
+    /// The frozen socket form of this grant. Only the authenticated control
+    /// socket may carry the result; never persist or log it.
+    #[must_use]
+    pub fn to_wire(&self) -> LeaseGrantWire {
+        LeaseGrantWire {
+            id: self.id,
+            lease_user: self.lease_user.clone(),
+            token: self.token.expose_secret().to_string(),
+            endpoint: EndpointWire::from(&self.endpoint),
+        }
+    }
+}
+
+/// The frozen wire shape of a [`LeaseGrant`]: the `ok` payload of a `lease`
+/// reply.
+///
+/// `token` is the bearer token's plain text, so this is the one type whose
+/// serialised form contains a secret: it may travel only over the authenticated
+/// control socket (persistence stores SHA-256 instead). `Debug` redacts it and
+/// the type has no `Display`; never log the serialised line.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseGrantWire {
+    /// The lease id.
+    pub id: LeaseId,
+    /// The proxy user name.
+    pub lease_user: String,
+    /// The bearer token's text. Never logged.
+    pub token: String,
+    /// Where the sandbox reaches the proxy.
+    pub endpoint: EndpointWire,
+}
+
+impl std::fmt::Debug for LeaseGrantWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseGrantWire")
+            .field("id", &self.id)
+            .field("lease_user", &self.lease_user)
+            .field("token", &REDACTED)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+impl From<LeaseGrantWire> for LeaseGrant {
+    fn from(wire: LeaseGrantWire) -> Self {
+        Self {
+            id: wire.id,
+            lease_user: wire.lease_user,
+            token: LeaseToken::new(wire.token),
+            endpoint: ProxyEndpoint::from(wire.endpoint),
+        }
+    }
+}
+
+/// The wire form of a [`ProxyEndpoint`], tagged by `kind`: `unix_dir`,
+/// `loopback` or `relay`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EndpointWire {
+    /// A unix-socket directory bound into the sandbox.
+    UnixDir {
+        /// The directory on the host.
+        host_dir: PathBuf,
+        /// Where it appears inside the sandbox.
+        in_sandbox: PathBuf,
+    },
+    /// A loopback address.
+    Loopback {
+        /// The proxy's listening address (`127.0.0.1:3128`).
+        addr: SocketAddr,
+    },
+    /// A relay reachable by host name and port.
+    Relay {
+        /// The relay host.
+        host: String,
+        /// The relay port.
+        port: u16,
+    },
+}
+
+impl From<&ProxyEndpoint> for EndpointWire {
+    fn from(endpoint: &ProxyEndpoint) -> Self {
+        match endpoint {
+            ProxyEndpoint::UnixDir {
+                host_dir,
+                in_sandbox,
+            } => Self::UnixDir {
+                host_dir: host_dir.clone(),
+                in_sandbox: in_sandbox.clone(),
+            },
+            ProxyEndpoint::Loopback { addr } => Self::Loopback { addr: *addr },
+            ProxyEndpoint::Relay { host, port } => Self::Relay {
+                host: host.clone(),
+                port: *port,
+            },
+        }
+    }
+}
+
+impl From<EndpointWire> for ProxyEndpoint {
+    fn from(wire: EndpointWire) -> Self {
+        match wire {
+            EndpointWire::UnixDir {
+                host_dir,
+                in_sandbox,
+            } => Self::UnixDir {
+                host_dir,
+                in_sandbox,
+            },
+            EndpointWire::Loopback { addr } => Self::Loopback { addr },
+            EndpointWire::Relay { host, port } => Self::Relay { host, port },
+        }
+    }
 }
 
 /// The answer to one [`ControlEvent::ApprovalRequested`].
@@ -441,6 +593,9 @@ pub enum Proto {
     Http,
     /// A SOCKS5 CONNECT.
     Socks5,
+    /// A protocol a newer writer added; readers must not fail on it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What was decided about a connection.
@@ -451,13 +606,17 @@ pub enum Action {
     Allow,
     /// Denied.
     Deny,
+    /// An action a newer writer added; readers must not fail on it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a connection was denied; [`Self::None`] on an allow.
 ///
 /// The first four names are the evaluator's own vocabulary (WS04 §3.3
 /// precedence: hard floor, deny rule, IP literal, no rule), so the audit record
-/// and `EgressDecision` never need a translation table.
+/// and `EgressDecision` never need a translation table. [`Self::Unknown`] is
+/// what any unrecognised value reads as, which is what keeps v1 additive-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DenyReason {
@@ -477,6 +636,15 @@ pub enum DenyReason {
     Guarded,
     /// The lease is in the `setup` phase and the host is not a bootstrap host.
     Setup,
+    /// `require_sni` is on and the TLS SNI did not equal the CONNECT host.
+    SniMismatch,
+    /// The proxy credentials were missing or wrong.
+    AuthFailed,
+    /// A lease limit (connections, bytes, lifetime) was exceeded.
+    LimitExceeded,
+    /// A reason a newer writer added; readers must not fail on it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One response line: the id echoed from the request, then either `ok` or
@@ -534,6 +702,14 @@ pub struct HelloReply {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ControlEvent {
+    /// The first line the server sends on a new connection: the single-use nonce
+    /// the client's `hello` MAC is computed over (see the module doc).
+    Challenge {
+        /// The server's [`PROTO_VERSION`].
+        proto: u32,
+        /// Lowercase hex, at least 16 random bytes, never reused.
+        nonce: String,
+    },
     /// A connection needs a human verdict; the proxy holds it without
     /// resolving DNS until [`ControlRequest::Approve`] or the timeout.
     ApprovalRequested {
@@ -577,6 +753,39 @@ pub enum ControlEvent {
         /// Why it went away.
         why: LeaseGoneReason,
     },
+    /// An event a newer writer added; a reader skips it.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ControlEvent {
+    /// Clamp the peer-chosen text of an event to its byte bounds (B16): the
+    /// host and reason of an approval request and the fields of a decision.
+    /// Consumers call this after reading an event from the socket.
+    #[must_use]
+    pub fn bounded(self) -> Self {
+        match self {
+            Self::ApprovalRequested {
+                request,
+                lease,
+                worktree,
+                host,
+                port,
+                proto,
+                reason,
+            } => Self::ApprovalRequested {
+                request,
+                lease,
+                worktree,
+                host: truncate_bytes(&host, MAX_AUDIT_HOST_LEN),
+                port,
+                proto,
+                reason: reason.map(|reason| truncate_bytes(&reason, MAX_APPROVAL_REASON_LEN)),
+            },
+            Self::Decision(record) => Self::Decision(record.bounded()),
+            other => other,
+        }
+    }
 }
 
 /// Why a lease is gone.
@@ -593,6 +802,9 @@ pub enum LeaseGoneReason {
     Shutdown,
     /// The lease expired on its own.
     Expired,
+    /// A reason a newer writer added; readers must not fail on it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One audit record, schema `v: 1` (WS04 §3.2, resolution B15).
@@ -666,7 +878,10 @@ pub struct AuditRecord {
 }
 
 impl AuditRecord {
-    /// Clamp the peer-chosen fields to their byte bounds (B16).
+    /// Clamp the peer-chosen fields to their byte bounds (B16) and cut the path
+    /// at the first `?` or `#`, so a query string never reaches a record.
+    ///
+    /// Consumers that read a record from a file or the socket call this too.
     ///
     /// Producers call this once, when the record is built; a renderer still
     /// escapes the stored text, so a host that is 253 bytes of control
@@ -679,9 +894,10 @@ impl AuditRecord {
         self.method = self
             .method
             .map(|method| truncate_bytes(&method, MAX_AUDIT_METHOD_LEN));
-        self.path = self
-            .path
-            .map(|path| truncate_bytes(&path, MAX_AUDIT_PATH_LEN));
+        self.path = self.path.map(|path| {
+            let end = path.find(['?', '#']).unwrap_or(path.len());
+            truncate_bytes(&path[..end], MAX_AUDIT_PATH_LEN)
+        });
         self
     }
 }
@@ -825,19 +1041,22 @@ impl<'de> Deserialize<'de> for EgressProxyLimits {
     where
         D: Deserializer<'de>,
     {
-        ProxyLimitsWire::deserialize(deserializer).map(EgressProxyLimits::from)
+        let limits = EgressProxyLimits::from(ProxyLimitsWire::deserialize(deserializer)?);
+        limits.validate().map_err(serde::de::Error::custom)?;
+        Ok(limits)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::net::SocketAddr;
 
     use super::*;
     use crate::egress::pattern::HostPattern;
     use crate::egress::policy::{EgressGuardClass, IpRule, LocalRule};
 
+    const CHALLENGE: &str = include_str!("../../tests/fixtures/egress/challenge.json");
+    const LEASE_GRANT: &str = include_str!("../../tests/fixtures/egress/lease_grant.json");
     const HELLO: &str = include_str!("../../tests/fixtures/egress/hello.json");
     const LEASE: &str = include_str!("../../tests/fixtures/egress/lease.json");
     const APPROVAL_REQUESTED: &str =
@@ -887,7 +1106,6 @@ mod tests {
                 name: "thegn-wt-0707".into(),
             },
             transport: Transport::LoopbackTcp { port: Some(3128) },
-            approvals: ApprovalMode::Prompt,
             audit: AuditLevel::Decisions,
             upstream: Some(Upstream {
                 scheme: "http".into(),
@@ -897,11 +1115,9 @@ mod tests {
             }),
             limits: EgressProxyLimits::default(),
             phase: LeasePhase::Agent,
-            credentials: vec![ResolvedCredential::new(
-                "github",
-                "keyring:gh-token",
-                "ghp_exampleValue",
-            )],
+            // The value never serialises, so the golden lease round-trips with
+            // an empty one.
+            credentials: vec![ResolvedCredential::new("github", "keyring:gh-token", "")],
         }
     }
 
@@ -960,6 +1176,152 @@ mod tests {
             fixture,
             "fixture is the canonical serde form"
         );
+    }
+
+    #[test]
+    fn challenge_fixture_is_stable() {
+        fixture_roundtrip(
+            CHALLENGE,
+            ControlEvent::Challenge {
+                proto: PROTO_VERSION,
+                nonce: "9c1e4f7a2b6d8035e1f4a7c9b2d6e803".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn lease_grant_fixture_is_stable() {
+        let grant = LeaseGrant {
+            id: LEASE_ID,
+            lease_user: "lease-0707".into(),
+            token: LeaseToken::new("lease-token-example".into()),
+            endpoint: ProxyEndpoint::Loopback {
+                addr: SocketAddr::from(([127, 0, 0, 1], 3128)),
+            },
+        };
+        fixture_roundtrip(LEASE_GRANT, grant.to_wire());
+        let wire: LeaseGrantWire = serde_json::from_str(LEASE_GRANT).expect("grant parses");
+        assert_eq!(LeaseGrant::from(wire.clone()), grant);
+        let rendered = format!("{wire:?}");
+        assert!(!rendered.contains("lease-token-example"), "{rendered}");
+
+        for endpoint in [
+            ProxyEndpoint::UnixDir {
+                host_dir: PathBuf::from("/run/thegn/egress/v1/0707"),
+                in_sandbox: PathBuf::from("/run/egress"),
+            },
+            ProxyEndpoint::Relay {
+                host: "relay.example".into(),
+                port: 8443,
+            },
+        ] {
+            let json = serde_json::to_string(&EndpointWire::from(&endpoint)).expect("serialises");
+            let back: EndpointWire = serde_json::from_str(&json).expect("parses");
+            assert_eq!(ProxyEndpoint::from(back), endpoint);
+        }
+    }
+
+    #[test]
+    fn unknown_vocabulary_values_decode_to_unknown() {
+        let mut record = serde_json::to_value(audit_record_value()).expect("record serialises");
+        let object = record.as_object_mut().expect("record is an object");
+        object.insert("reason".into(), serde_json::json!("quota_v1_1"));
+        object.insert("proto".into(), serde_json::json!("quic"));
+        object.insert("decision".into(), serde_json::json!("challenge"));
+        let parsed: AuditRecord = serde_json::from_value(record).expect("unknown values decode");
+        assert_eq!(parsed.reason, DenyReason::Unknown);
+        assert_eq!(parsed.proto, Proto::Unknown);
+        assert_eq!(parsed.decision, Action::Unknown);
+
+        let gone: ControlEvent = serde_json::from_str(
+            r#"{"event":"lease_gone","lease":"07070707070707070707070707070707","why":"evicted"}"#,
+        )
+        .expect("unknown why decodes");
+        assert_eq!(
+            gone,
+            ControlEvent::LeaseGone {
+                lease: LEASE_ID,
+                why: LeaseGoneReason::Unknown,
+            }
+        );
+
+        let future: ControlEvent =
+            serde_json::from_str(r#"{"event":"quota","n":3}"#).expect("unknown event decodes");
+        assert_eq!(future, ControlEvent::Unknown);
+
+        for (reason, wire) in [
+            (DenyReason::SniMismatch, "sni_mismatch"),
+            (DenyReason::AuthFailed, "auth_failed"),
+            (DenyReason::LimitExceeded, "limit_exceeded"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&reason).expect("serialises"),
+                format!("\"{wire}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_credential_never_serialises_its_value() {
+        let credential = ResolvedCredential::new("github", "keyring:gh-token", "ghp_secretValue");
+        let json = serde_json::to_string(&credential).expect("serialises");
+        assert!(!json.contains("ghp_secretValue"), "{json}");
+        assert_eq!(
+            json,
+            r#"{"service":"github","secret_ref":"keyring:gh-token"}"#
+        );
+        let back: ResolvedCredential = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.value, "");
+    }
+
+    #[test]
+    fn audit_path_drops_the_query_and_fragment() {
+        let mut record = audit_record_value();
+        record.path = Some("/api/v1/crates?token=abc#frag".into());
+        assert_eq!(record.bounded().path.as_deref(), Some("/api/v1/crates"));
+    }
+
+    #[test]
+    fn approval_request_peer_text_is_bounded() {
+        let event = ControlEvent::ApprovalRequested {
+            request: 1,
+            lease: LEASE_ID,
+            worktree: "/w".into(),
+            host: "h".repeat(MAX_AUDIT_HOST_LEN + 10),
+            port: 443,
+            proto: Proto::Connect,
+            reason: Some("r".repeat(MAX_APPROVAL_REASON_LEN + 10)),
+        };
+        let ControlEvent::ApprovalRequested { host, reason, .. } = event.bounded() else {
+            panic!("variant changed");
+        };
+        assert_eq!(host.len(), MAX_AUDIT_HOST_LEN);
+        assert_eq!(reason.map(|r| r.len()), Some(MAX_APPROVAL_REASON_LEN));
+    }
+
+    #[test]
+    fn invalid_limits_are_a_wire_error() {
+        let mut value = serde_json::to_value(EgressProxyLimits::default()).expect("limits");
+        value["max_connections"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<EgressProxyLimits>(value).is_err());
+        let mut value = serde_json::to_value(EgressProxyLimits::default()).expect("limits");
+        value["idle_timeout_ms"] = serde_json::json!(u64::MAX);
+        assert!(serde_json::from_value::<EgressProxyLimits>(value).is_err());
+    }
+
+    #[test]
+    fn crlf_line_at_the_cap_is_accepted() {
+        let mut ok = vec![b'a'; MAX_LINE];
+        ok.extend_from_slice(b"\r\n");
+        assert_eq!(
+            read_line_bounded(&mut Cursor::new(ok), MAX_LINE)
+                .expect("CRLF line at the cap")
+                .len(),
+            MAX_LINE
+        );
+        let mut over = vec![b'a'; MAX_LINE + 1];
+        over.extend_from_slice(b"\r\n");
+        assert!(read_line_bounded(&mut Cursor::new(over), MAX_LINE).is_err());
     }
 
     #[test]
@@ -1037,6 +1399,11 @@ mod tests {
     #[test]
     fn every_event_variant_roundtrips_without_an_id() {
         let events = [
+            ControlEvent::Challenge {
+                proto: PROTO_VERSION,
+                nonce: "00ff".into(),
+            },
+            ControlEvent::Unknown,
             approval_requested_event(),
             ControlEvent::ApprovalResolved {
                 request: 7,
@@ -1346,7 +1713,7 @@ mod tests {
             LeasePhase::Agent,
             "an absent phase is the plan's `agent` default"
         );
-        assert_eq!(spec.approvals, ApprovalMode::Off);
+        assert_eq!(spec.policy.approvals, ApprovalMode::Off);
         assert_eq!(spec.audit, AuditLevel::Off);
         assert_eq!(spec.upstream, None);
         assert!(spec.credentials.is_empty());

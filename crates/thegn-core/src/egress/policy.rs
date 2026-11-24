@@ -17,16 +17,16 @@
 //! these definitions move and this module re-exports the moved types, so no
 //! caller of `egress::policy` or of the wire changes.
 //!
-//! [`HostPattern`] serialises as its canonical config string: `*` for the
-//! machine-wide pattern, `*.example.com` for strict subdomains, `example.com`
-//! for the apex and every subdomain. A malformed pattern is a deserialisation
-//! error, never a silent widening: a malformed allow entry can never match.
+//! [`HostPattern`] is the one grammar type of [`crate::egress::pattern`], which
+//! also owns its serde: a pattern serialises as its canonical config string
+//! (`*`, `*.example.com`, `=example.com`, `example.com:443`, ...) and a
+//! malformed one is a deserialisation error, never a silent widening.
 //!
 //! Nothing here carries behaviour: no I/O, no threads, no clock.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
-use crate::egress::pattern::{HostPattern, HostPatternKind};
+use crate::egress::pattern::HostPattern;
 
 /// How an unmatched connection is handled; the `[sandbox.egress] approvals`
 /// key.
@@ -111,6 +111,12 @@ pub struct LocalRule {
 ///
 /// Ordering inside `allow`/`deny` carries no meaning; the evaluator's precedence
 /// (WS04-P1-03) is deny-first, and a deny rule always wins.
+///
+/// **The default denies everything.** Unlike the legacy `HostRules`, where an
+/// empty allow list means "no restriction", an empty `allow` here matches no
+/// name: with `approvals = off` (the default) every connection is refused, so
+/// an `Update` carrying `EgressPolicy::default()` fails closed. Allowing all
+/// hosts is the explicit pattern `*`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressPolicy {
     /// Host patterns whose match allows the connection.
@@ -131,44 +137,6 @@ pub struct EgressPolicy {
     pub require_sni: bool,
     /// Whether an unmatched host is denied or asks the user.
     pub approvals: EgressApprovals,
-}
-
-/// The canonical config string of a host pattern: `*`, `*.example.com` or
-/// `example.com`.
-fn canonical(pattern: &HostPattern) -> String {
-    match pattern.kind {
-        HostPatternKind::Any => "*".to_string(),
-        HostPatternKind::Subdomains => format!("*.{}", pattern.name),
-        HostPatternKind::Subtree => pattern.name.clone(),
-    }
-}
-
-// `HostPattern` lives in `egress::pattern` (WS01-P2-01, extended by WS04-P1-01);
-// its serde form is defined here so this item touches no other file. When
-// WS04-P1-01 lands the canonical-string impls move next to the type unchanged.
-
-impl Serialize for HostPattern {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&canonical(self))
-    }
-}
-
-impl<'de> Deserialize<'de> for HostPattern {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        match HostPattern::parse(&raw) {
-            Some(pattern) => Ok(pattern),
-            None => Err(serde::de::Error::custom(format!(
-                "malformed host pattern {raw:?}"
-            ))),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -204,6 +172,8 @@ mod tests {
             ("Example.COM.", "example.com"),
             ("*.Example.com.", "*.example.com"),
             ("*", "*"),
+            ("=Example.com", "=example.com"),
+            ("example.com:443", "example.com:443"),
         ] {
             let pattern = HostPattern::parse(raw).expect("valid pattern");
             let json = serde_json::to_string(&pattern).expect("pattern serialises");
@@ -241,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_allows_nothing() {
+    fn default_policy_denies_everything() {
         let policy = EgressPolicy::default();
         assert!(policy.allow.is_empty());
         assert!(policy.deny.is_empty());
@@ -250,6 +220,11 @@ mod tests {
         assert!(policy.guard_allow.is_empty());
         assert_eq!(policy.approvals, EgressApprovals::Off);
         assert!(!policy.require_sni);
+        // The meaning is deny-all: nothing can match, and an unmatched host is
+        // denied rather than asked about. Allow-all is only ever spelled `*`.
+        assert!(policy.ports.is_empty() && policy.tls_ports.is_empty());
+        let allow_all = HostPattern::parse("*").expect("valid pattern");
+        assert!(!policy.allow.contains(&allow_all));
     }
 
     #[test]

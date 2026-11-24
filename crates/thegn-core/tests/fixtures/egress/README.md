@@ -14,12 +14,14 @@ So a renamed field, a changed enum spelling or a reordered field fails the test,
 which is the point: these files are the wire, not an example of it
 (THE-2123 / WS04-P1-07).
 
-| File                      | Shape                                                                           |
-| ------------------------- | ------------------------------------------------------------------------------- |
-| `hello.json`              | `ControlRequestLine` + `ControlRequest::Hello`                                  |
-| `lease.json`              | `ControlRequestLine` + `ControlRequest::Lease(LeaseSpec)` (every field present) |
-| `approval_requested.json` | `ControlEvent::ApprovalRequested`                                               |
-| `audit_record.json`       | `AuditRecord`, schema `v: 1`                                                    |
+| File                      | Shape                                                                             |
+| ------------------------- | --------------------------------------------------------------------------------- |
+| `challenge.json`          | `ControlEvent::Challenge`, the server's first line (the `hello` MAC nonce)        |
+| `hello.json`              | `ControlRequestLine` + `ControlRequest::Hello`                                    |
+| `lease.json`              | `ControlRequestLine` + `ControlRequest::Lease(LeaseSpec)` (no credential `value`) |
+| `lease_grant.json`        | `LeaseGrantWire`, the `ok` payload of a `lease` reply (carries the token)         |
+| `approval_requested.json` | `ControlEvent::ApprovalRequested`                                                 |
+| `audit_record.json`       | `AuditRecord`, schema `v: 1`                                                      |
 
 Rules:
 

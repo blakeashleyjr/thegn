@@ -11,7 +11,7 @@
 //!   WS01-P2-01, extended to the full grammar by WS04-P1-01.
 //!
 //! Later items add their own submodules here: WS01-P2-01 added `pattern` (host
-//! patterns, today's semantics); WS04-P1-07 added `policy` (the frozen policy
+//! patterns, extended to the full grammar by WS04-P1-01); WS04-P1-07 added `policy` (the frozen policy
 //! data shape, presets to follow) and `wire` (the control wire, the lease spec
 //! and the audit record v1); WS04 adds `preset` and `resolve`. The reporting enum
 //! [`EgressKind`](crate::capabilities::EgressKind) stays in `capabilities`; its
