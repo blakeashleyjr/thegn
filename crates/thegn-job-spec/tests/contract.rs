@@ -1,7 +1,122 @@
-use thegn_job_spec::{Feature, JobSpec, RetryLimit, byte_quantity, duration_ms};
+use thegn_cas::Digest;
+use thegn_job_spec::{
+    Feature, JobSpec, Recipe, RetryLimit, RunnerDirectory, RunnerRefusal, SelectedCompletion,
+    SelectedJobResult, SelectedRunner, byte_quantity, duration_ms, selected_job_readback,
+    submit_selected,
+};
 
 const EXAMPLE: &str = include_str!("fixtures/web-e2e.yaml");
 const MINIMAL: &str = "apiVersion: thegn.dev/jobs/v0\nkind: Job\nmetadata: {name: build}\nenvironment: {image: ci}\nsteps: [{name: build, argv: [cargo, build]}]\n";
+const SELECTED: &str = include_str!("fixtures/selected-cargo-test.yaml");
+const SELECTED_BUILD: &str = include_str!("fixtures/selected-cargo-build.yaml");
+
+struct FixtureRunner;
+impl SelectedRunner for FixtureRunner {
+    fn submit(
+        &self,
+        runner_alias: &str,
+        recipe: Recipe,
+        source: &Digest,
+    ) -> Result<SelectedJobResult, RunnerRefusal> {
+        assert_eq!(runner_alias, "fixture-linux");
+        match recipe {
+            Recipe::CargoBuild => assert_eq!(recipe.argv(), ["cargo", "build"]),
+            Recipe::CargoTest => assert_eq!(recipe.argv(), ["cargo", "test"]),
+        }
+        Ok(SelectedJobResult {
+            runner: runner_alias.to_owned(),
+            recipe,
+            source: source.clone(),
+            completion: SelectedCompletion::Exited(0),
+            log_tail: "fixture passed".into(),
+        })
+    }
+}
+
+struct FixtureDirectory;
+impl RunnerDirectory for FixtureDirectory {
+    fn resolve(&self, alias: &str) -> Option<&dyn SelectedRunner> {
+        (alias == "fixture-linux").then_some(&FixtureRunner)
+    }
+}
+
+#[test]
+fn typed_selected_recipe_routes_only_to_owner_named_fixture_runner() {
+    let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
+    let source = Digest::of(b"");
+    let result = submit_selected(&spec, &source, &FixtureDirectory).unwrap();
+    assert_eq!(result.runner, "fixture-linux");
+    assert_eq!(result.recipe, Recipe::CargoBuild);
+    assert_eq!(result.source, source);
+    assert_eq!(result.completion, SelectedCompletion::Exited(0));
+    assert_eq!(result.log_tail, "fixture passed");
+}
+
+#[test]
+fn selected_runner_readback_distinguishes_accepted_unavailable_cancelled_and_failed() {
+    use thegn_job_spec::JobStatus;
+
+    let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
+    let source = Digest::of(b"");
+    let accepted = submit_selected(&spec, &source, &FixtureDirectory).unwrap();
+    let accepted = selected_job_readback("job-accepted", Ok(accepted));
+    assert!(matches!(accepted.status, JobStatus::Succeeded));
+    assert_eq!(accepted.log_tail, "fixture passed");
+    assert!(accepted.placement.is_empty());
+    assert!(accepted.artifacts.is_empty());
+
+    struct Empty;
+    impl RunnerDirectory for Empty {
+        fn resolve(&self, _: &str) -> Option<&dyn SelectedRunner> {
+            None
+        }
+    }
+    let unavailable = submit_selected(&spec, &source, &Empty).unwrap_err();
+    let unavailable = selected_job_readback("job-unavailable", Err(unavailable));
+    assert!(matches!(unavailable.status, JobStatus::Rejected { .. }));
+    assert_eq!(unavailable.log_tail, "");
+
+    let mut cancelled = FixtureRunner
+        .submit("fixture-linux", Recipe::CargoBuild, &source)
+        .unwrap();
+    cancelled.completion = SelectedCompletion::Cancelled;
+    let cancelled = selected_job_readback("job-cancelled", Ok(cancelled));
+    assert!(matches!(cancelled.status, JobStatus::Cancelled));
+    assert!(cancelled.summary.incomplete);
+
+    let mut failed = FixtureRunner
+        .submit("fixture-linux", Recipe::CargoBuild, &source)
+        .unwrap();
+    failed.completion = SelectedCompletion::Exited(17);
+    let failed = selected_job_readback("job-failed", Ok(failed));
+    assert!(matches!(failed.status, JobStatus::Failed { .. }));
+    assert!(failed.diagnostics[0].message.contains("status 17"));
+    let wire = serde_json::to_value(failed).unwrap();
+    assert_eq!(wire["jobId"], "job-failed");
+    assert_eq!(wire["status"]["kind"], "Failed");
+
+    let uncertain = selected_job_readback("job-indeterminate", Err(RunnerRefusal::Indeterminate));
+    assert!(matches!(uncertain.status, JobStatus::Indeterminate { .. }));
+}
+
+#[test]
+fn typed_selected_recipe_refuses_source_mismatch_and_missing_runner_without_fallback() {
+    let spec = JobSpec::parse_yaml(SELECTED).unwrap();
+    assert!(matches!(
+        submit_selected(&spec, &Digest::of(b"changed"), &FixtureDirectory),
+        Err(RunnerRefusal::SourceMismatch { .. })
+    ));
+    struct Empty;
+    impl RunnerDirectory for Empty {
+        fn resolve(&self, _: &str) -> Option<&dyn SelectedRunner> {
+            None
+        }
+    }
+    assert_eq!(
+        submit_selected(&spec, &Digest::of(b""), &Empty),
+        Err(RunnerRefusal::RunnerUnavailable("fixture-linux".into()))
+    );
+}
 
 #[test]
 fn portable_example_requires_one_offering_to_support_every_feature() {
@@ -100,7 +215,11 @@ fn schemas_and_a_terminal_result_are_available_without_a_daemon() {
         input["definitions"]["Digest"]["properties"]["hash"]["pattern"],
         "^[0-9a-f]{64}$"
     );
-    assert_eq!(input["properties"]["steps"]["minItems"], 1);
+    assert!(input["properties"]["steps"]["minItems"].is_null());
+    assert_eq!(
+        input["definitions"]["Recipe"]["enum"],
+        serde_json::json!(["cargo-build", "cargo-test"])
+    );
     let output = serde_json::to_value(result_schema()).unwrap();
     assert!(output["properties"]["artifacts"].is_object());
     let published_job: serde_json::Value =
