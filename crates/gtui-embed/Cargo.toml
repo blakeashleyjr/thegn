@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 license.workspace = true
+description = "Host-facing Observe dashboard tile integrating gtui queries, state, and renderers."
 
 
 [lints]

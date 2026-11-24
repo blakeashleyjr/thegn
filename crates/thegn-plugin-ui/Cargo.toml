@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+description = "Deterministic controller and renderer for plugin application views and input."
 
 [lints]
 workspace = true

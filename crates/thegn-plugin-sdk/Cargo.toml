@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+description = "Terminal-free helpers for native plugins, including framing, requests, and session runtime."
 
 [lints]
 workspace = true
