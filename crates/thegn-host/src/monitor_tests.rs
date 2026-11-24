@@ -2599,3 +2599,205 @@ fn overview_is_one_and_cpu_moves_to_two_while_saved_cpu_slug_still_opens() {
     let restored = MonitorOverlay::open(prefs.last_tab, prefs, &model, &ctx);
     assert_eq!(restored.tab(), MonitorTab::Cpu);
 }
+
+// --- GPU fallback plot width (THE-2591) ----------------------------------
+//
+// The fallback draws the Spark style, one eighth-block per CELL. Until these
+// tests the series was bucketed at the braille dot-column budget (two per
+// cell), so the plot could only show half the selected interval and the
+// renderer's surplus-trimming dropped the newest samples — the present.
+
+/// GPU history one sample per 500 ms across `window_secs`, with a transient
+/// early in the window and the newest sample near the top: a plot that clips
+/// either end is missing exactly one of them.
+fn gpu_spark_history(now_ms: u64, window_secs: u64) -> TelemetryHistory {
+    let mut hist = TelemetryHistory::default();
+    let start_ms = now_ms.saturating_sub(window_secs * 1000);
+    let samples = window_secs * 2;
+    for i in 0..samples {
+        let mut stats = full_snap();
+        stats.gpu_pct = Some(match i {
+            10 => 100,
+            i if i + 1 == samples => 90,
+            _ => 10,
+        });
+        hist.push(&stats, start_ms + i * 500);
+    }
+    hist
+}
+
+/// The sections the GPU tab builds when the machine exposes no engine devices —
+/// the fallback that renders the section stack instead of the GPU boards.
+fn gpu_fallback_sections(
+    hist: &TelemetryHistory,
+    model: &FrameModel,
+    prefs: &MonitorPrefs,
+    cols: usize,
+    now_ms: u64,
+) -> Vec<Section> {
+    super::build::tab(super::build::TabInput {
+        tab: MonitorTab::Gpu,
+        model,
+        hist,
+        prefs: prefs.tab(MonitorTab::Gpu),
+        cols,
+        now_ms,
+        sel: 0,
+        filter: "",
+        filtering: false,
+        tree: false,
+        proc_sort: ProcSort::default(),
+        proc_desc: false,
+        proc_rows: &[],
+        proc_invalid_terms: &[],
+        proc_primed: false,
+        disk_rows: &[],
+        disk_eta: None,
+    })
+    .sections
+}
+
+fn gpu_spark_prefs(window: Window) -> MonitorPrefs {
+    let mut prefs = MonitorPrefs::default();
+    prefs.tab_mut(MonitorTab::Gpu).style = GraphStyle::Spark;
+    prefs.tab_mut(MonitorTab::Gpu).window = window;
+    prefs
+}
+
+fn headline_graph(sections: &[Section]) -> &crate::sections::GraphSection {
+    sections
+        .iter()
+        .find_map(|section| match section {
+            Section::Graph(graph) => Some(graph),
+            _ => None,
+        })
+        .expect("every GPU fallback draws a headline graph")
+}
+
+#[test]
+fn gpu_fallback_spark_plots_one_bucket_per_cell_at_every_width() {
+    let now_ms = NOW_MS;
+    let hist = gpu_spark_history(now_ms, 60);
+    let model = model_with(full_snap());
+    let prefs = gpu_spark_prefs(Window::from_secs(60));
+    // A narrow body (50 cells) and a wide one (144): the bucket count has to
+    // follow the cells, not a fixed budget.
+    for cols in [50usize, 144] {
+        let sections = gpu_fallback_sections(&hist, &model, &prefs, cols, now_ms);
+        let graph = headline_graph(&sections);
+        assert_eq!(graph.style, GraphStyle::Spark);
+        assert_eq!(
+            graph.series.len(),
+            graph.plot_width(cols),
+            "one bucket per cell at {cols} cells"
+        );
+        assert_eq!(graph.series.len(), cols);
+        // The left edge is the oldest sample the window covers, and the newest
+        // sample is the rightmost cell — not trimmed off the end.
+        assert_eq!(
+            graph.series.first().copied(),
+            Some(0.1),
+            "window's oldest sample dropped at {cols} cells"
+        );
+        assert_eq!(
+            graph.series.last().copied(),
+            Some(0.9),
+            "newest sample dropped at {cols} cells"
+        );
+        let spikes: Vec<usize> = graph
+            .series
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| **value >= 0.9)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            spikes.first().is_some_and(|index| *index < cols / 4),
+            "early transient dropped at {cols} cells: {spikes:?}"
+        );
+        assert!(
+            spikes.last().is_some_and(|index| *index >= cols / 2),
+            "late transient dropped at {cols} cells: {spikes:?}"
+        );
+    }
+}
+
+#[test]
+fn gpu_fallback_spark_footer_describes_the_interval_it_plots() {
+    // `all` is bounded by the retention horizon, not by whatever the ring still
+    // holds: the sample before it and the sample stamped exactly at `now` are
+    // both off the plot, so neither may reach the footer.
+    let now_ms = 10_800_000u64;
+    let mut hist = TelemetryHistory::default();
+    for (offset_secs, gpu) in [(-5400i64, 100u8), (-3600, 20), (-1800, 60), (0, 100)] {
+        let mut stats = full_snap();
+        stats.gpu_pct = Some(gpu);
+        hist.push(&stats, (now_ms as i64 + offset_secs * 1000) as u64);
+    }
+    let model = model_with(full_snap());
+    let prefs = gpu_spark_prefs(Window::EVERYTHING);
+    for cols in [50usize, 144] {
+        let sections = gpu_fallback_sections(&hist, &model, &prefs, cols, now_ms);
+        let graph = headline_graph(&sections);
+        assert_eq!(graph.series.len(), graph.plot_width(cols));
+        assert_eq!(
+            graph.footer.as_deref(),
+            Some("min 20%  avg 40%  max 60%"),
+            "footer at {cols} cells"
+        );
+    }
+}
+
+#[test]
+fn gpu_fallback_spark_draws_the_plot_its_series_describes() {
+    // The renderer half of the same bug: one glyph per cell, oldest at the left
+    // edge, newest at the right. Rendering the whole overlay (rather than the
+    // block) is what proves the series the tab built is the series on screen.
+    let now_ms = NOW_MS;
+    let hist = gpu_spark_history(now_ms, 60);
+    let model = model_with(full_snap());
+    let prefs = gpu_spark_prefs(Window::from_secs(60));
+    let mut widths = Vec::new();
+    for (w, h) in [(56usize, 40usize), (180, 40)] {
+        let screen = Rect::full(w, h);
+        let mut overlay = {
+            let ctx = ctx_at(&hist, screen);
+            MonitorOverlay::open(MonitorTab::Gpu, prefs.clone(), &model, &ctx)
+        };
+        // No engine collector ⇒ `has_engine_devices()` is false ⇒ the tab paints
+        // the section stack, which is where the fallback plot lives.
+        let mut frame = thegn_metrics::collect::frame::MonitorFrame::default();
+        frame.health[thegn_metrics::collect::CollectorId::GpuEngines.index()] =
+            thegn_metrics::collect::health::Health::Absent(
+                thegn_metrics::collect::health::Absent::NoHardware,
+            );
+        assert!(overlay.ingest_frame(&frame), "no engine devices on {w}x{h}");
+        assert!(
+            matches!(overlay.view(), super::board::ActiveView::SectionStack(_)),
+            "without engine devices the tab paints the fallback stack"
+        );
+
+        let rect = overlay.body_rect();
+        let (index, graph) = overlay
+            .body
+            .iter()
+            .enumerate()
+            .find_map(|(index, section)| match section {
+                Section::Graph(graph) => Some((index, graph)),
+                _ => None,
+            })
+            .expect("headline graph");
+        assert_eq!(graph.series.len(), rect.cols, "one bucket per cell");
+        let plot_y = rect.y + crate::sections::stack_height(&overlay.body[..index]) + 1;
+        let text = render_text(&overlay, w, h);
+        let row = text.lines().nth(plot_y).expect("plot row is drawn");
+        let plot: String = row.chars().skip(rect.x).take(rect.cols).collect();
+        assert_eq!(
+            plot,
+            thegn_core::viz::sparkline(&graph.series),
+            "plot row at {w}x{h}"
+        );
+        widths.push(plot.chars().count());
+    }
+    assert_eq!(widths, vec![50, 144]);
+}
