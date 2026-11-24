@@ -476,6 +476,45 @@ impl TelemetryHistory {
             .collect()
     }
 
+    /// Finite `(unix_ms, value)` samples for `m` in `[start_ms, end_ms)`, in
+    /// chronological order. The right edge is exclusive to match [`Self::series`],
+    /// which never plots a sample stamped at `now_ms`.
+    ///
+    /// `O(retained)` like [`Self::raw_since`], and for the same reason: a
+    /// min/avg/max read off bucket peaks describes the buckets, not the
+    /// readings they folded together.
+    pub fn raw_in_range(&self, m: Metric, start_ms: u64, end_ms: u64) -> Vec<(u64, f32)> {
+        if end_ms <= start_ms {
+            return Vec::new();
+        }
+        let idx = self.start_index(start_ms);
+        let ring = &self.rings[m.index()];
+        self.at
+            .iter()
+            .skip(idx)
+            .zip(ring.q.iter().skip(idx))
+            .filter(|(at, value)| **at >= start_ms && **at < end_ms && value.is_finite())
+            .map(|(&t, &v)| (t, v))
+            .collect()
+    }
+
+    /// The half-open time bounds `[start_ms, end_ms)` a plot uses at `now_ms`:
+    /// the window's own span, or — for `All` — the oldest retained sample,
+    /// capped at the same retention horizon as the rings.
+    ///
+    /// One function so a plot and the footer that reports its bounds can never
+    /// disagree about which samples are on screen.
+    pub fn plot_interval(&self, now_ms: u64, window: Window) -> (u64, u64) {
+        let start_ms = match window.secs() {
+            Some(secs) => now_ms.saturating_sub(u64::from(secs) * 1000),
+            None => self
+                .oldest_ms()
+                .unwrap_or(now_ms)
+                .max(now_ms.saturating_sub(RETAIN_SECS * 1000)),
+        };
+        (start_ms, now_ms)
+    }
+
     /// Project time-to-full for the worktrees filesystem from all retained
     /// free-space history. `None` unless the trend is a real, sustained decline
     /// over enough span — the honesty gates live in [`thegn_core::disk_fill`].
@@ -595,18 +634,7 @@ impl TelemetryHistory {
         if buckets == 0 || self.at.is_empty() {
             return;
         }
-        let t1 = req.now_ms;
-        let span_ms = req.window.secs().map(|s| u64::from(s) * 1000);
-        let t0 = match span_ms {
-            Some(ms) => t1.saturating_sub(ms),
-            // `All` spans from the oldest retained sample, capped at the
-            // retention horizon so a paused-for-days session can't ask for a
-            // window the ring never held.
-            None => self
-                .oldest_ms()
-                .unwrap_or(t1)
-                .max(t1.saturating_sub(RETAIN_SECS * 1000)),
-        };
+        let (t0, t1) = self.plot_interval(req.now_ms, req.window);
         if t1 <= t0 {
             return;
         }
@@ -1239,6 +1267,38 @@ mod tests {
         for m in Metric::ALL {
             assert_eq!(h.rings[m.index()].q.len(), h.at.len(), "{m:?}");
         }
+    }
+
+    #[test]
+    fn raw_in_range_reads_a_wrapped_ring_and_plot_interval_spans_the_retained_history() {
+        let mut h = TelemetryHistory::default();
+        for i in 0..(CAP + 40) {
+            h.push(&snap(1, 1.0, 4.0, 0, 0), i as u64 * 500);
+        }
+        assert!(
+            !h.at.as_slices().1.is_empty(),
+            "the ring should be wrapped for this test to mean anything"
+        );
+        let now = (CAP as u64 + 40) * 500;
+
+        // A bounded window is `now` back over its own span, half-open at both
+        // ends so the sample stamped at `now` can never be plotted.
+        let (start, end) = h.plot_interval(now, Window::from_secs(60));
+        assert_eq!((start, end), (now - 60_000, now));
+        let pts = h.raw_in_range(Metric::Cpu, start, end);
+        assert_eq!(pts.len(), 120, "500 ms samples in a one-minute window");
+        assert!(pts.iter().all(|(at, _)| *at >= start && *at < end));
+        assert_eq!(pts.first().map(|(at, _)| *at), Some(start));
+        assert!(pts.last().is_some_and(|(at, _)| *at < now));
+        // An empty or reversed interval has nothing to report.
+        assert!(h.raw_in_range(Metric::Cpu, now, now).is_empty());
+        assert!(h.raw_in_range(Metric::Cpu, now, now - 1).is_empty());
+
+        // `all` spans the retained samples, never further back than retention.
+        let (all_start, all_end) = h.plot_interval(now, Window::EVERYTHING);
+        assert_eq!(all_end, now);
+        assert_eq!(all_start, h.oldest_ms().unwrap_or(now));
+        assert!(all_start >= now.saturating_sub(RETAIN_SECS * 1000));
     }
 
     #[test]

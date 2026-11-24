@@ -53,6 +53,21 @@ pub fn fit(vals: &[f32], cols: usize) -> Vec<f32> {
     out
 }
 
+/// The last `cols` values, front-padded with `0.0` — exactly what a
+/// `cols`-wide [`sparkline`] consumes.
+///
+/// The eighth-block styles draw one value per CELL where the braille styles
+/// draw two, so [`fit`]'s dot-column budget over-supplies a sparkline twofold.
+/// The surplus then comes off whichever end the renderer trims, and for a
+/// right-aligned series that is the newest sample — the present, which is the
+/// one thing a live plot may not drop.
+pub fn fit_samples(vals: &[f32], cols: usize) -> Vec<f32> {
+    let take = vals.len().min(cols);
+    let mut out = vec![0.0; cols - take];
+    out.extend_from_slice(&vals[vals.len() - take..]);
+    out
+}
+
 /// A precision horizontal bar: `frac` (0..=1) of `w` cells, full blocks plus
 /// an eighth-block remainder. Returns only the filled part (may be shorter
 /// than `w`); pair with [`bar_track`] for the dotted track.
@@ -654,6 +669,29 @@ mod tests {
         assert_eq!(sparkline(&[f32::NAN]), "▁");
         assert_eq!(hbar(f32::NAN, 4), "");
         assert_eq!(heat_index(f32::NAN), 0);
+    }
+
+    #[test]
+    fn fit_samples_is_one_value_per_cell_and_keeps_the_newest() {
+        assert_eq!(fit_samples(&[1.0, 2.0, 3.0], 3), vec![1.0, 2.0, 3.0]);
+        // An over-supplied series loses its OLDEST samples, never the newest.
+        assert_eq!(fit_samples(&[1.0, 2.0, 3.0, 4.0], 2), vec![3.0, 4.0]);
+        // A short series keeps its leading cells blank instead of shifting the
+        // plot: the last sample still lands on the right edge.
+        assert_eq!(fit_samples(&[1.0], 3), vec![0.0, 0.0, 1.0]);
+        assert_eq!(fit_samples(&[], 2), vec![0.0, 0.0]);
+        assert_eq!(fit_samples(&[1.0, 2.0], 0), Vec::<f32>::new());
+        for cols in 0..8usize {
+            for len in 0..12usize {
+                let v: Vec<f32> = (0..len).map(|i| i as f32).collect();
+                let fitted = fit_samples(&v, cols);
+                assert_eq!(fitted.len(), cols, "cols={cols} len={len}");
+                if len > 0 && cols > 0 {
+                    // Right-aligned: the newest sample owns the last cell.
+                    assert_eq!(fitted.last(), v.last(), "cols={cols} len={len}");
+                }
+            }
+        }
     }
 
     #[test]

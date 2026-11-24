@@ -157,6 +157,28 @@ impl GraphSection {
             _ => self.height,
         }
     }
+
+    /// Cells the plot itself spans inside a block `w` wide.
+    ///
+    /// The axis gutter is taken off the front of the plot, so a producer that
+    /// sizes a series by hand must ask this — not `w` — or the plot silently
+    /// loses its leading samples. The renderer asks the same question, from the
+    /// same `axis` labels, so the two cannot drift apart.
+    pub fn plot_width(&self, w: usize) -> usize {
+        w.saturating_sub(self.gutter())
+    }
+
+    /// Width the axis labels need, plus a separator space. Zero when the style
+    /// has no gutter ([`GraphStyle::Spark`] never does).
+    fn gutter(&self) -> usize {
+        let width = self
+            .axis
+            .iter()
+            .map(|s| crate::seg::cells(s))
+            .max()
+            .unwrap_or(0);
+        width + usize::from(width > 0)
+    }
 }
 
 impl Default for GraphSection {
@@ -269,15 +291,9 @@ pub(crate) fn draw_graph_block(
     let rows = g.plot_rows();
     // The axis gutter steals width from the plot, so it must be subtracted
     // BEFORE the series is drawn — otherwise the plot overruns the box.
-    let gutter = g
-        .axis
-        .iter()
-        .map(|s| crate::seg::cells(s))
-        .max()
-        .unwrap_or(0);
-    let gutter = if gutter > 0 { gutter + 1 } else { 0 };
+    let gutter = g.gutter();
     let plot_x = x + gutter.min(w);
-    let plot_w = w.saturating_sub(gutter);
+    let plot_w = g.plot_width(w);
     if rows > 0 && plot_w > 0 {
         for (i, label) in g.axis.iter().enumerate().take(rows) {
             put_line(
@@ -361,7 +377,10 @@ fn draw_plot(
     style: GraphStyle,
 ) {
     let rows = match style {
-        GraphStyle::Spark => vec![viz::sparkline(&viz::fit(vals, w))],
+        // One eighth-block per cell, so the series is fanned out over CELLS, not
+        // braille dot columns. `fit` would return twice the values and the
+        // surplus is dropped from the RIGHT — the newest samples.
+        GraphStyle::Spark => vec![viz::sparkline(&viz::fit_samples(vals, w))],
         GraphStyle::Line => viz::braille_line(vals, w, h),
         GraphStyle::Area => match lo {
             Some(lo) => viz::braille_band(lo, vals, w, h),

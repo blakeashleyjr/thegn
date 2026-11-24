@@ -443,6 +443,41 @@ across restarts.
 - **THEN** the push allocates no memory
 - **AND** a process restart begins with no persisted monitor history
 
+### Requirement: A Spark plot covers the interval it is labelled with
+
+A `Spark` (single-row) monitor plot SHALL draw the whole selected interval at
+any width: one sample per cell, with surplus values trimmed from the OLDEST
+end so the cell at the right edge always covers the newest sample. The GPU
+tab's fallback — the section stack shown when no engine devices are exposed —
+SHALL follow this like any other `Spark` plot. A graph's footer SHALL describe
+exactly the samples the plot covers: for `Spark`, `min`, `avg` and `max` are
+read off the retained samples inside the plotted interval, the same half-open
+interval the plot buckets, not off bucket peaks or samples outside it. `all`
+MUST resolve to the retained history, capped at the retention horizon. `Area`
+and `Line` keep their existing two-values-per-cell braille budgeting.
+
+#### Scenario: A Spark plot is narrow or wide
+
+- **WHEN** a `Spark` graph is laid out at a new cell width
+- **THEN** it buckets one sample per cell over the selected interval
+- **AND** the leftmost cell covers the oldest sample in that interval and the
+  rightmost the newest, with neither end dropped
+
+#### Scenario: The GPU fallback spark is drawn
+
+- **WHEN** the GPU tab has no engine devices and renders the section stack
+- **THEN** its headline plot spans the selected interval cell-for-cell
+- **AND** a transient early in the interval and the newest sample are both
+  visible at every width
+
+#### Scenario: The interval's bounds change
+
+- **WHEN** the window is narrowed, widened, or set to `all`
+- **THEN** the plot and its footer resolve their bounds from one shared
+  half-open interval
+- **AND** samples outside that interval, including one stamped exactly at
+  `now` and one older than the retention horizon, appear in neither
+
 ### Requirement: The monitor stays within its frame budget
 
 At 240×60, the monitor perf workload SHALL report Overview and CPU model
