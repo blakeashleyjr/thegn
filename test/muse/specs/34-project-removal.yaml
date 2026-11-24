@@ -1,0 +1,126 @@
+name: project_removal
+# Remove a *selected inactive* project through the palette's "Delete project"
+# action: it must act on the sidebar selection, not on the active project, and
+# must leave the active project usable. Then remove the final project (the
+# active one) and reopen it from the idle splash. This exercises the routing
+# and rendering of a project removal through a real terminal.
+#
+# The sidebar selection is what the action reads, so the fixture must present
+# the two projects in a known order: registration order (alpha first, then
+# beta), which is the default manual workspace sort.
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [kitty]
+  sizes: ["120x36"]
+spawn:
+  - sh
+  - -c
+  - |
+    set -e
+    export XDG_CONFIG_HOME="$XDG_STATE_HOME/config"
+    projects="$XDG_STATE_HOME/projects"
+    mkdir -p "$projects" "$XDG_CONFIG_HOME/thegn"
+    cat > "$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
+    repo_roots = ["$projects"]
+
+    [sandbox]
+    backend = "none"
+
+    [media]
+    enabled = false
+
+    [ui]
+    confirm_delete_workspace = false
+    EOF
+    for name in alpha beta; do
+      repo="$projects/$name"
+      mkdir -p "$repo"
+      git -C "$repo" init -q -b main
+      git -C "$repo" config user.email e2e@example.invalid
+      git -C "$repo" config user.name e2e
+      export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+      printf '%s\n' "$name" > "$repo/README.md"
+      git -C "$repo" add -A
+      git -C "$repo" commit -q -m init
+    done
+    cd "$projects/alpha"
+    exec thegn
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  THEGN_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 12000
+steps:
+  # Startup in alpha: the statusbar mode and the pane's (fixed, `$ `) prompt.
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  # Open beta through the workspace picker, so the case has one inactive
+  # (alpha) and one active (beta) project. The query is a path fragment: it
+  # matches only beta's row and the footer's count proves the row is there.
+  - key: {key: "w", mods: [alt, shift]}
+  - expect_visible: {text: "type to filter repos", timeout_ms: 10000}
+  - write: "projects/beta"
+  - expect_visible: {text: "1 repos", timeout_ms: 10000}
+  - key: {key: "enter"}
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  # beta is the live project: its shell echoes the marker twice, once as the
+  # typed line and once as output.
+  - write_line: "echo beta-pane-alive"
+  - expect_count: {text: "beta-pane-alive", min: 2, timeout_ms: 10000}
+  # Focus the sidebar (its footer hints prove the focus), park the cursor on
+  # the first project row — alpha, still inactive — and remove it through the
+  # palette. The status names the project, which is the assertion that the
+  # action followed the *selection* and not the active project.
+  - key: {key: "s", mods: [alt]}
+  - expect_visible: {text: "open / fold", timeout_ms: 5000}
+  - key: {key: "home"}
+  - key: {key: "space", mods: [ctrl]}
+  - expect_visible: {text: "type to search", timeout_ms: 5000}
+  - write: "delete project"
+  - expect_visible: {text: "Delete project", timeout_ms: 5000}
+  - key: {key: "enter"}
+  - expect_visible: {text: "Removed project 'alpha'", timeout_ms: 10000}
+  # Escape hands the keys back to the pane (the removal status is a transient
+  # TTL message, so it must not be mistaken for the sidebar row going away).
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 5000}
+  - write_line: "echo beta-still-usable"
+  - expect_count: {text: "beta-still-usable", min: 2, timeout_ms: 10000}
+  # alpha's row is gone: nothing else on screen names it once the removal
+  # status (8s TTL) has expired, so this waits that out and fails on a row
+  # that stayed behind.
+  - expect_not_visible: {text: "alpha", timeout_ms: 15000}
+  # The sole remaining project is the active one: remove it too.
+  - key: {key: "s", mods: [alt]}
+  - expect_visible: {text: "open / fold", timeout_ms: 5000}
+  - key: {key: "home"}
+  - key: {key: "space", mods: [ctrl]}
+  - expect_visible: {text: "type to search", timeout_ms: 5000}
+  - write: "delete project"
+  - expect_visible: {text: "Delete project", timeout_ms: 5000}
+  - key: {key: "enter"}
+  - expect_visible: {text: "Removed project 'beta'", timeout_ms: 10000}
+  # Removing the last project leaves the idle splash, not a quit: the tagline
+  # stands in for the empty center and the shell prompt is gone.
+  - expect_visible: {text: "git worktree IDE", timeout_ms: 10000}
+  - expect_not_visible: {regex: "│\\$ ", timeout_ms: 5000}
+  # The empty host still handles input: reopen beta from the workspace picker.
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - key: {key: "w", mods: [alt, shift]}
+  - expect_visible: {text: "type to filter repos", timeout_ms: 10000}
+  - write: "projects/beta"
+  - expect_visible: {text: "1 repos", timeout_ms: 10000}
+  - key: {key: "enter"}
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - write_line: "echo reopened-ok"
+  - expect_count: {text: "reopened-ok", min: 2, timeout_ms: 10000}
+  - check_file:
+      path: "{case_tmp}/thegn/logs/thegn.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"
