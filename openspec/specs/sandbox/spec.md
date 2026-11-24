@@ -61,6 +61,30 @@ entered, never what was requested.
 - **THEN** the launch is labelled `host`, is flagged as degraded, and carries a warning naming the
   backend that was unavailable
 
+### Requirement: Portable sandbox intents use a pinned, path-free wire
+
+A portable sandbox launch intent SHALL use wire version 1 until a separately
+specified version is introduced. A version-1 decoder MUST reject other wire
+versions and unknown fields. Mounts SHALL be named by role and configured name,
+not by host path; the intent MUST NOT carry host paths, credentials, or
+executable paths. A receiving target MAY raise the carried isolation floor but
+MUST NOT lower it.
+
+#### Scenario: Unsupported intent version is refused
+
+- **WHEN** a target decodes a portable intent with a version other than 1
+- **THEN** decoding fails before the intent can be resolved or launched
+
+#### Scenario: Role-based mounts cross targets
+
+- **WHEN** a portable intent describes its worktree and user mounts
+- **THEN** the wire contains mount roles and configured user-mount names without host paths
+
+#### Scenario: Receiving target keeps the floor
+
+- **WHEN** a portable intent reaches a target with a stricter local isolation floor
+- **THEN** resolution uses the stricter of the carried and local floors
+
 ### Requirement: Worktree stays on the host and is bind-mounted
 
 A sandboxed worktree SHALL remain on the host filesystem and MUST be bind-mounted into the container at its real host path, so host-side git reads and the compositor continue to operate on the same files.

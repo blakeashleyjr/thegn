@@ -513,6 +513,13 @@
       ]
     },
     {
+      "issue": "THE-2103",
+      "project": "Sandbox & Remote 00: Shared contracts",
+      "changes": [
+        "add-bounded-argv-template-tokenizer"
+      ]
+    },
+    {
       "issue": "THE-2131",
       "project": "Sandbox & Remote 05: macOS",
       "changes": [
