@@ -8,9 +8,13 @@
 //! - [`usage`]: CPU and reserved GB-hours from the Sprites usage API.
 //! - [`hold_api`]: the keep-awake Tasks-API hold constants.
 //! - [`inspect`]: a single sprite's status over the org API (never wakes it).
+//! - [`job`]: selected build/test attempts on a project-bound sprite — reserved
+//!   in a per-project ledger before dispatch, materialized and digest-verified,
+//!   fenced against silent reruns, and reported with a bounded receipt.
 
 pub mod hold_api;
 pub mod inspect;
+pub mod job;
 pub mod ledger;
 pub mod resources;
 pub mod usage;

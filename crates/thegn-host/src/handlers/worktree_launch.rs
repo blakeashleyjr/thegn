@@ -954,6 +954,7 @@ mod tests {
                     specs.as_ref().unwrap(),
                     center,
                     &[],
+                    None,
                 )
                 .unwrap();
 

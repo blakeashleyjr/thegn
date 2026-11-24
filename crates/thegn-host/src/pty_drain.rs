@@ -749,6 +749,17 @@ pub(crate) fn prune_output_degraded(
 /// channel, and mark pane damage. Moved verbatim from the run.rs drain
 /// (adapted to `ctx` borrows; per-chunk work now runs once per merged buffer).
 fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_generation: bool) {
+    // First output ⇒ THE-213 retire: the pane's spawn card (and, on the next
+    // derive, its sampler target) dies now, so a card can never outlive real
+    // content. A single hash lookup per chunk; a miss after the first retire.
+    if let Some(retired) = ctx.panes.spawn_progress.remove(&id) {
+        tracing::debug!(
+            target: "thegn::startup",
+            pane = id,
+            waited_ms = retired.since().elapsed().as_millis() as u64,
+            "spawn-progress card retired on first output"
+        );
+    }
     // Associate output with the session tree before borrowing the pane mutably.
     // Parsing this bounded tail is pure CPU; a full chrome repaint is raised
     // only when discovery/status changes, never for unrelated PTY bytes.

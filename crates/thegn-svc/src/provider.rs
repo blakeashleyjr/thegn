@@ -3709,6 +3709,22 @@ impl std::error::Error for ProxyConnectTimeout {}
 /// The wrapper could not enter the requested directory; the command did not run.
 pub const EXEC_CWD_FAILED_STATUS: i32 = 125;
 
+/// True when a failed exec open is a definitive provider rejection of the
+/// upgrade (an HTTP 4xx other than 408/429): the server answered before it
+/// dispatched anything, so the command provably never ran. A timeout, a
+/// transport error or a 5xx proves nothing, because the server may have
+/// accepted the request first.
+pub fn is_definite_exec_rejection(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+            Some(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status().is_client_error()
+                    && !matches!(response.status().as_u16(), 408 | 429)
+        )
+    })
+}
+
 fn exec_argv(spec: &ExecSpec) -> Result<Vec<String>> {
     let Some(cwd) = spec.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) else {
         return Ok(spec.argv.clone());
@@ -4015,6 +4031,37 @@ impl SpritesProvider {
             session,
             stderr: ExecStderr(stderr),
             verdict,
+        })
+    }
+
+    /// Like [`open_exec_streaming`](Self::open_exec_streaming), but the WebSocket
+    /// upgrade is attempted **exactly once**. The Sprites exec API starts the
+    /// command from the upgrade request, so the retrying cold-open loop could
+    /// start a non-idempotent command twice (a slow `101`, or a 5xx after the
+    /// server accepted it). Callers that must never run a command twice use this
+    /// and classify a failure with [`is_definite_exec_rejection`]; any other
+    /// failure leaves the dispatch outcome unknown.
+    pub async fn open_exec_streaming_once(
+        &self,
+        id: &str,
+        spec: &ExecSpec,
+    ) -> Result<StreamingExec> {
+        anyhow::ensure!(!spec.tty, "sprites: a streaming exec is non-tty");
+        let url = exec_ws_url(self.base()?, id, spec)?;
+        let stderr = Arc::new(Mutex::new(StderrTail::default()));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let session = Box::pin(self.connect_exec(
+            url,
+            false,
+            false,
+            Some(Arc::clone(&stderr)),
+            Some(done_tx),
+        ))
+        .await?;
+        Ok(StreamingExec {
+            session,
+            stderr: ExecStderr(stderr),
+            verdict: done_rx,
         })
     }
 
