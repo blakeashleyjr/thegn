@@ -16745,6 +16745,11 @@ async fn event_loop<T: Terminal>(
                             .title()
                             .filter(|t| !t.trim().is_empty())
                             .unwrap_or_else(|| p.program().to_string());
+                        // A pane near its memory cap carries a persistent badge.
+                        let name = match crate::mem_watch::badge(id) {
+                            Some(percent) => format!("{name} \u{26a0} mem {percent}%"),
+                            None => name,
+                        };
                         if title_leaf.is_empty() {
                             name
                         } else {

@@ -3,7 +3,7 @@
 ## 1. Shipped
 
 - [x] 1.1 Pure parsers, threshold state machine, restart guard and notice text
-- [x] 1.2 Sampler thread and toast delivery
+- [x] 1.2 Sampler thread and notification delivery
 - [x] 1.3 Exit handling keeps a split pane's leaf after an OOM exit; agent relaunch
 - [x] 1.4 Help page `sandbox-resources`
 

@@ -1536,24 +1536,11 @@ impl Panes {
                             p.set_pending_relaunch(Some(line));
                         }
                     }
-                    // A pane lost to an OOM kill comes back with its agent: the
-                    // watch recorded the harness's continue command while the
-                    // pane was alive. Typed into the shell just spawned (host
-                    // panes only, like the Enter-to-relaunch offer above), which
-                    // it replaces.
-                    let relaunch = crate::mem_watch::take_relaunch(*old, fresh);
-                    if spec.backend == "host"
-                        && let Some(cmd) = relaunch
-                        && let Some(p) = self.table.get_mut(&fresh)
-                    {
-                        p.set_pending_relaunch(None);
-                        if p.write_input(format!("{cmd}\r").as_bytes()).is_err() {
-                            tracing::debug!(
-                                target: "thegn::memwatch",
-                                "agent relaunch input not accepted by the fresh pane"
-                            );
-                        }
-                    }
+                    // A pane lost to an OOM kill keeps its cooldown and, when it was
+                    // running an agent with a fixed continue command, queues that
+                    // command for the fresh shell. It is typed later, only once the
+                    // pane is in the foreground tab (`mem_watch::deliver_relaunches`).
+                    crate::mem_watch::carry_over(*old, fresh, spec.backend == "host");
                     map.insert(*old, fresh);
                 }
                 Err(e) => {

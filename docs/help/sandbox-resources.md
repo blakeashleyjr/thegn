@@ -51,15 +51,20 @@ plain rustc.
 
 thegn watches each local pane's memory scope about every five seconds. When a
 pane reaches 85% of its `memory` cap, or the kernel starts throttling it at the
-soft limit, a toast shows the numbers (`memory 21.3G/24G, swap 3.1G`). It warns
-once per crossing and re-arms after usage falls below 75%. When the kernel
-kills a process in the pane's scope, a toast says `OOM-killed a process at 24G`.
+soft limit, a notification names the worktree and program with the numbers
+(`memory 21.3G/24G, swap 3.1G`); it reaches the inbox and desktop like any other
+alert. While the pane stays at or above 85% its title carries a
+`⚠ mem NN%` badge, cleared once usage falls below 75%. When the kernel kills a
+process in the pane's scope, an alert says `OOM-killed a process at 24G`.
 
 If the pane's shell then dies together with an out-of-memory kill, thegn
-restarts the pane in the same worktree and layout slot. A pane running a
-recognised agent (Claude, pi) gets the agent's continue command typed into the
-fresh shell; other agents are relaunched with their original command line, and
-any other program leaves you at a plain shell. A pane you closed, or a command
-that exited cleanly, is never restarted, and a pane is auto-restarted at most
-once every ten minutes. Warnings are for you: nothing is typed into a running
-pane. Only local panes with a cgroup v2 scope under `thegn.slice` are watched.
+restarts the pane in the same worktree and layout slot. A pane that was running
+Claude or pi gets that agent's own continue command (`claude --continue`,
+`pi --continue`, run from the directory the agent was in) typed into the fresh
+shell, but only once the pane is in the foreground tab and within two minutes;
+for any other program you are left at a plain shell and the status line names
+what was running. Nothing reconstructed from a dead process's command line is
+ever typed. A pane you closed, or typed into after the kill, or a command that
+exited cleanly, is never restarted, and a pane is auto-restarted at most once
+every ten minutes. Only local panes with a cgroup v2 scope under `thegn.slice`
+are watched.

@@ -123,8 +123,19 @@ pub enum Signal {
 pub struct WatchState {
     /// A warning is outstanding; cleared once usage drops below [`REARM_PERCENT`].
     warned: bool,
+    /// The persistent per-pane badge: set at [`WARN_PERCENT`], cleared below
+    /// [`REARM_PERCENT`]. Independent of `warned` (a rising `high` counter arms
+    /// the one-shot warning without making the pane "near the cap").
+    badged: bool,
     last_high: Option<u64>,
     last_oom_kill: Option<u64>,
+}
+
+impl WatchState {
+    /// Whether the pane should carry the near-cap indicator right now.
+    pub fn badged(&self) -> bool {
+        self.badged
+    }
 }
 
 /// Fold one sample into `state` and return the signals it raised. The first
@@ -148,6 +159,11 @@ pub fn step(state: &mut WatchState, sample: &MemSample) -> Vec<Signal> {
 
     let percent = sample.percent_of_max();
     let near_cap = percent.is_some_and(|p| p >= WARN_PERCENT);
+    if near_cap {
+        state.badged = true;
+    } else if percent.is_none_or(|p| p < REARM_PERCENT) {
+        state.badged = false;
+    }
     if state.warned {
         // Re-arm only on a real drop: a rising `high` counter or a reading
         // still in the band between the two thresholds keeps it armed-off.
@@ -219,8 +235,9 @@ pub enum RestartVerdict {
 ///
 /// A clean exit (`Some(0)`) never restarts — the user typed `exit` — and an
 /// exit with no `oom_kill` inside [`OOM_EXIT_WINDOW_MS`] is not ours to
-/// restart. The user-closed case never reaches this: an explicit close removes
-/// the pane from the session before its exit event arrives.
+/// restart. The caller must also pass `last_oom_ms = None` when the user typed
+/// into the pane after the `oom_kill` (an `exit`/Ctrl-D then returns the status
+/// of the last command, often 137): that exit is the user closing the pane.
 pub fn restart_verdict(
     enabled: bool,
     exit_code: Option<i32>,
@@ -240,38 +257,75 @@ pub fn restart_verdict(
     }
 }
 
-/// The command to type into a freshly restarted shell to bring a recognised
-/// agent back: the harness's id-free continue form when it has one, else the
-/// original argv (a cold relaunch). `None` when the foreground program is not a
-/// known harness — a plain shell restart is all that is offered then.
-pub fn relaunch_command(argv: &[String]) -> Option<String> {
+/// A recognised agent that was the pane's foreground program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSeen {
+    /// The program's short name, reduced to filename-safe characters; used only
+    /// in messages.
+    pub name: String,
+    /// The harness's own fixed, id-free continue command (`claude --continue`,
+    /// `pi --continue`); `None` for a harness without one.
+    pub continue_cmd: Option<String>,
+}
+
+/// Recognise a known agent harness in a foreground argv (looking past
+/// `node`/`bun`/`deno`/`python` to the script they run). `None` for anything
+/// else. Only the program NAME is kept: no argument ever leaves the argv.
+pub fn recognise_agent(argv: &[String]) -> Option<AgentSeen> {
     let stem_of = |word: &String| {
         std::path::Path::new(word)
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
     };
     let first = stem_of(argv.first()?)?;
-    // An agent shipped as a script runs as `node /path/to/agent`: look past the
-    // interpreter to the program it was given.
-    let found = match harness::harness(&first) {
-        Some(found) => found,
+    let (stem, found) = match harness::harness(&first) {
+        Some(found) => (first, found),
         None if matches!(
             first.as_str(),
             "node" | "bun" | "deno" | "python" | "python3"
         ) =>
         {
-            harness::harness(&stem_of(argv.get(1)?)?)?
+            let script = stem_of(argv.get(1)?)?;
+            let found = harness::harness(&script)?;
+            (script, found)
         }
         None => return None,
     };
-    harness::Harness::continue_command(found).or_else(|| {
-        Some(
-            argv.iter()
-                .map(|word| sh_quote(word))
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
+    let name: String = stem
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(32)
+        .collect();
+    Some(AgentSeen {
+        name,
+        continue_cmd: harness::Harness::continue_command(found),
     })
+}
+
+/// Whether `text` may be typed into a shell unattended: non-empty and free of
+/// control characters (which a line editor would act on: Ctrl-C, Ctrl-U, Tab,
+/// ESC sequences, newlines) and Unicode format controls.
+pub fn safe_to_type(text: &str) -> bool {
+    !text.is_empty()
+        && !text
+            .chars()
+            .any(|c| c.is_control() || crate::pipeline_report::is_format_control(c))
+}
+
+/// The line to type into a freshly restarted shell, or `None` when nothing may
+/// be typed. Only a harness's own fixed continue command is ever typed — never
+/// a command line reconstructed from the dead process — optionally preceded by
+/// `cd` into the directory the agent ran in (`claude --continue` resumes the
+/// latest session of the *current* directory).
+pub fn typed_relaunch(agent: &AgentSeen, cwd: Option<&str>) -> Option<String> {
+    let cont = agent.continue_cmd.as_deref().filter(|c| safe_to_type(c))?;
+    if let Some(dir) = cwd.filter(|d| safe_to_type(d)) {
+        let line = format!("cd -- {} && {cont}", sh_quote(dir));
+        if safe_to_type(&line) {
+            return Some(line);
+        }
+    }
+    Some(cont.to_string())
 }
 
 #[cfg(test)]
@@ -460,28 +514,61 @@ mod tests {
     }
 
     #[test]
-    fn relaunch_prefers_the_harness_continue_form() {
+    fn badge_sets_at_85_and_clears_below_75() {
+        let mut state = WatchState::default();
+        step(&mut state, &sample(10, Some(24)));
+        assert!(!state.badged());
+        step(&mut state, &sample(21, Some(24)));
+        assert!(state.badged());
+        // 19/24 = 79%: between the thresholds, the badge stays.
+        step(&mut state, &sample(19, Some(24)));
+        assert!(state.badged());
+        step(&mut state, &sample(17, Some(24)));
+        assert!(!state.badged());
+        // A rising `high` counter alone never badges.
+        let mut s = sample(5, Some(24));
+        step(&mut state, &s);
+        s.events.high = 4;
+        step(&mut state, &s);
+        assert!(!state.badged());
+    }
+
+    #[test]
+    fn only_the_fixed_continue_forms_are_typed() {
         let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let seen = recognise_agent(&argv(&["/usr/bin/claude", "--model", "x"])).unwrap();
+        assert_eq!(seen.name, "claude");
         assert_eq!(
-            relaunch_command(&argv(&["/usr/bin/claude", "--model", "x"])).as_deref(),
+            typed_relaunch(&seen, None).as_deref(),
             Some("claude --continue")
         );
         assert_eq!(
-            relaunch_command(&argv(&["pi"])).as_deref(),
-            Some("pi --continue")
+            typed_relaunch(&seen, Some("/home/u/my repo")).as_deref(),
+            Some("cd -- '/home/u/my repo' && claude --continue")
         );
-        // A harness with no continue form relaunches cold with its own argv.
+        // A directory with a control character is dropped, not typed.
         assert_eq!(
-            relaunch_command(&argv(&["codex", "--flag", "a b"])).as_deref(),
-            Some("codex --flag 'a b'")
+            typed_relaunch(&seen, Some("/tmp/a\u{3}b")).as_deref(),
+            Some("claude --continue")
         );
-        // An agent run through an interpreter is still recognised.
-        assert_eq!(
-            relaunch_command(&argv(&["node", "/opt/pi/bin/pi"])).as_deref(),
-            Some("pi --continue")
-        );
-        // Not an agent: plain shell restart only.
-        assert_eq!(relaunch_command(&argv(&["node", "x.js"])), None);
-        assert_eq!(relaunch_command(&[]), None);
+        let pi = recognise_agent(&argv(&["node", "/opt/pi/bin/pi"])).unwrap();
+        assert_eq!(typed_relaunch(&pi, None).as_deref(), Some("pi --continue"));
+        // A harness with no continue form types nothing, and its argv is
+        // never carried at all.
+        let codex = recognise_agent(&argv(&["codex", "--flag", "a\u{3}rm -rf ~"])).unwrap();
+        assert_eq!(codex.continue_cmd, None);
+        assert_eq!(typed_relaunch(&codex, Some("/tmp")), None);
+        // Not an agent.
+        assert_eq!(recognise_agent(&argv(&["node", "x.js"])), None);
+        assert_eq!(recognise_agent(&[]), None);
+    }
+
+    #[test]
+    fn typed_text_rejects_control_and_format_characters() {
+        assert!(safe_to_type("claude --continue"));
+        assert!(!safe_to_type(""));
+        assert!(!safe_to_type("a\nb"));
+        assert!(!safe_to_type("a\u{1b}[31m"));
+        assert!(!safe_to_type("a\u{202e}b"));
     }
 }

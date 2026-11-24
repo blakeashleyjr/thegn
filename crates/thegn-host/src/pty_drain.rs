@@ -347,7 +347,8 @@ pub(crate) struct DrainSummary {
     /// Panes whose child exited this pass (the onboarding wizard watches for
     /// its spawned `gh auth login` / agent-setup tab closing).
     pub exited: Vec<u32>,
-    /// An active tab's sole pane died and its dead leaf was left in the tree
+    /// An active tab's pane died (its sole pane, or a split pane lost to an OOM
+    /// kill) and its dead leaf was left in the tree
     /// for the off-thread materialize pipeline. The loop's lazy-materialize
     /// block runs BEFORE the drain each turn, so the caller pulses the waker
     /// on this to kick the respawn on the next (immediate) turn instead of
@@ -552,7 +553,10 @@ pub(crate) fn drain<T: Terminal>(
 ) -> DrainSummary {
     let budget = crate::loop_policy::drain_budget(input_at.is_some() || !pending_input.is_empty());
     // Hand the live pane set to the memory sampler (throttled, no I/O).
-    crate::mem_watch::publish(&ctx.panes.table);
+    crate::mem_watch::publish(&ctx.panes.table, ctx.session);
+    // Type a queued post-OOM agent relaunch into its respawned pane once that
+    // pane is in the foreground tab.
+    crate::mem_watch::deliver_relaunches(&mut ctx.panes.table, ctx.visible);
     // The receive phase and parser phase share this start. In particular, a
     // large ready channel cannot reset the parser's wall-clock allowance.
     let started = Instant::now();
@@ -1016,9 +1020,14 @@ fn apply_auto_exit_status(
 fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool {
     // Did this exit follow an `oom_kill` in the pane's scope? Only then does a
     // non-sole pane keep its leaf for respawn, and the agent get relaunched.
-    let oom_verdict = crate::mem_watch::on_pane_exit(id, exit_code);
+    let last_input = ctx
+        .panes
+        .table
+        .get(&id)
+        .and_then(|pane| pane.output_stamps().1);
+    let (oom_verdict, oom_ran) = crate::mem_watch::on_pane_exit(id, exit_code, last_input);
     let oom_restart = oom_verdict == thegn_core::pane_memwatch::RestartVerdict::Restart;
-    let oom_status = crate::mem_watch::exit_status(oom_verdict);
+    let oom_status = crate::mem_watch::exit_status(oom_verdict, oom_ran.as_deref());
     // Program name is needed for attention routing after the pane leaves the
     // table (item 524).
     let exited_program = ctx.panes.table.get(&id).map(|p| p.program().to_string());
@@ -1665,7 +1674,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         // rule), not the forced plain shell the old inline
                         // path spawned — an agent crash loop stays bounded by
                         // the 3-crash give-up above.
-                        ctx.model.status = if oom_restart && let Some(note) = oom_status {
+                        ctx.model.status = if oom_restart && let Some(note) = oom_status.as_ref() {
                             note.to_string()
                         } else if daemon_agent_exit {
                             crate::handlers::crash::agent_exit_status(
@@ -1688,8 +1697,11 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                 // A pane in a split lost to an OOM kill: keep its leaf, exactly
                 // like a sole pane, so the materialize pipeline respawns it in
                 // place (same worktree, same layout slot). `mem_watch::
-                // take_relaunch` then types the agent's continue command into
-                // the fresh shell. Rate-limited and clean exits never get here.
+                // carry_over` hands the agent's continue command to the fresh
+                // shell, typed once its tab is in the foreground. Rate-limited,
+                // user-closed and clean exits never get here. An inactive tab's
+                // leaf is respawned when the tab is switched to, like the sole
+                // pane's.
                 crate::handlers::crash::prep_leaf_for_respawn(
                     tab,
                     id,
@@ -1698,8 +1710,8 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     false,
                     respawn_tail,
                 );
-                left_for_materialize = true;
-                if is_active_tab && let Some(note) = oom_status {
+                left_for_materialize = is_active_tab;
+                if is_active_tab && let Some(note) = oom_status.as_ref() {
                     ctx.model.status = note.to_string();
                 }
             } else {
@@ -1719,7 +1731,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                 }
                 // Lost to an OOM kill again inside the cooldown: say why the
                 // pane is not coming back.
-                if is_active_tab && let Some(note) = oom_status {
+                if is_active_tab && let Some(note) = oom_status.as_ref() {
                     ctx.model.status = note.to_string();
                 }
             }

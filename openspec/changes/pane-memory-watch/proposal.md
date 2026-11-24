@@ -11,7 +11,7 @@ needed to see it coming.
 
 - The host samples each local pane scope's memory files about every five seconds,
   off the event loop.
-- Crossing 85% of the cap, or a rising `high` event counter, shows a toast with
+- Crossing 85% of the cap, or a rising `high` event counter, raises a notification (with a title badge while it lasts) with
   the numbers; it re-arms after usage falls below 75%.
 - An `oom_kill` increment shows an OOM notice.
 - A pane whose shell exits together with an `oom_kill` is restarted in place,
