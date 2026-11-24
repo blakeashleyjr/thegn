@@ -7,6 +7,33 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.125] — 2026-11-23
+
+### Added
+
+- A new pane that is still waiting for its shell prompt shows a small,
+  dim progress card after a short grace period: thegn's own stage
+  (resolving environment, starting sandbox, starting shell, waiting for the
+  prompt) and the processes the shell is running, each with elapsed time, plus
+  a hint when a known slow step (direnv, a version manager, prompt setup,
+  an agent waiting for a passphrase) is recognised. Arguments are redacted.
+- Selected build and test jobs can run on a project-bound Sprite
+  (fixture-backed executor): one dispatch per attempt, a durable attempt
+  ledger, a scrubbed environment and private home per attempt, a deadline that
+  kills the remote process group, secrets kept out of the transferred
+  snapshot, and one project per sprite. Not wired to terminals yet.
+
+### Fixed
+
+- `thegn env down --stop` on a Vercel sandbox sends the JSON body Vercel
+  requires instead of failing with HTTP 415.
+- `thegn fleet cost` marks a fresh sprite's zero usage as pending instead of
+  reporting a confident 0.0.
+- Opening a pane no longer reads the state database on the event loop, which
+  removes frame stalls of up to ~150 ms during spawns.
+- The remote-parity TUI probe runs against a throwaway config and can no
+  longer write its ready marker into the owner's real config.
+
 ## [0.1.0-alpha.124] — 2026-11-23
 
 ### Fixed
