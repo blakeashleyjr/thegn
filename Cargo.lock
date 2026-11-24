@@ -8063,6 +8063,7 @@ dependencies = [
  "thegn-core",
  "thegn-media",
  "thegn-proc",
+ "thegn-sandbox-proto",
  "toml 0.8.23",
  "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
@@ -8257,6 +8258,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "thegn-sandbox-proto"
+version = "0.1.0-alpha.127"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

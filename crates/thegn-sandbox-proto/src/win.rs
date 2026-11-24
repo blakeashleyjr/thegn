@@ -299,7 +299,11 @@ pub fn decode_request_env(
     if chunks.is_empty() {
         return Err(ProtoError::MissingRequest);
     }
-    if chunks.len() > REQ_MAX_BYTES.div_ceil(REQ_CHUNK_BYTES) {
+    // The encoder ends a chunk on a char boundary, so a chunk can be up to three
+    // bytes short of REQ_CHUNK_BYTES; bound the count by that shortest chunk so
+    // the decoder never refuses its own encoder's output. The total-size check
+    // below still applies.
+    if chunks.len() > REQ_MAX_BYTES.div_ceil(REQ_CHUNK_BYTES - 3) {
         return Err(ProtoError::RequestTooLarge);
     }
 
@@ -329,12 +333,18 @@ pub fn decode_request_env(
         json.push_str(&value);
     }
 
-    let request: WinSandboxRequest =
-        serde_json::from_str(&json).map_err(|_| ProtoError::InvalidJson)?;
-    if request.version != WIN_PROTO_VERSION {
-        return Err(ProtoError::UnsupportedVersion(request.version));
+    // Read the version leniently first: a newer request that also adds fields
+    // must report UnsupportedVersion, not InvalidJson, so the helper can take
+    // its version-mismatch exit.
+    #[derive(serde::Deserialize)]
+    struct VersionProbe {
+        version: u32,
     }
-    Ok(request)
+    let probe: VersionProbe = serde_json::from_str(&json).map_err(|_| ProtoError::InvalidJson)?;
+    if probe.version != WIN_PROTO_VERSION {
+        return Err(ProtoError::UnsupportedVersion(probe.version));
+    }
+    serde_json::from_str(&json).map_err(|_| ProtoError::InvalidJson)
 }
 
 /// The chunk-index suffix of a request-named environment entry, if `name` names
@@ -500,6 +510,20 @@ mod tests {
         let mut env = chunk_json(&json);
         assert_eq!(decode_request_env(&mut env), Err(ProtoError::InvalidJson));
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn newer_version_with_new_fields_reports_the_version() {
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("version".into(), (WIN_PROTO_VERSION + 1).into());
+        object.insert("added_in_v2".into(), true.into());
+        let json = serde_json::to_string(&value).unwrap();
+        let mut env = chunk_json(&json);
+        assert_eq!(
+            decode_request_env(&mut env),
+            Err(ProtoError::UnsupportedVersion(WIN_PROTO_VERSION + 1))
+        );
     }
 
     #[test]
