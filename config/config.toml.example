@@ -3703,7 +3703,6 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # [env.daytona.provider]
 # provider = "daytona"
 # id = "sb-1234"
-# down_command = ["daytona", "delete", "{id}"]         # run by `thegn env down`
 # # Daytona is in maintenance (closed-core upstream). Its CLI split into
 # # `daytona-v0` (legacy) and `daytona` (v2 alpha); thegn ships no verified CLI
 # # recipe. Vendor-documented legacy verbs, not executed by thegn's tests:
