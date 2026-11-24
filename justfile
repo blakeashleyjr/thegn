@@ -815,6 +815,7 @@ ratchets:
     # Guardrail: pre-rename brand tokens must not come back — this is thegn.
     # Token list + allowlist live in the script. See test/brand-guard.sh.
     bash test/brand-guard.sh
+    bash test/privacy-guard.sh
     # Guardrail: stale architecture claims (old emulator name, never-landed ssh crate,
     # removed per-file size limit, "e2e runs every push") must not come back.
     bash test/stale-docs-guard.sh
