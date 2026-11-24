@@ -7,6 +7,27 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.128] — 2026-11-24
+
+### Added
+
+- `wt disk --lanes --apply` reclaims the `target` directory of an idle lane
+  checkout whose ownership is verified, holding Cargo's lock across the removal
+  and failing the command if anything is left behind. Bare target lanes and
+  lanes with sources stay untouched until they carry an ownership proof.
+- Terminal search shows when results were capped and keeps the Tab and Esc
+  hints visible.
+
+### Changed
+
+- Library code imports names explicitly instead of through globs, and builds
+  formatted strings in place with `write!` instead of temporary strings.
+
+### Fixed
+
+- A Sprites conformance test no longer flakes when the mock closes its socket
+  before the client reads the exit frame.
+
 ## [0.1.0-alpha.127] — 2026-11-24
 
 Restart the daemon after upgrading: schema v117 adds durable CI-autofix and
