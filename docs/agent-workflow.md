@@ -12,7 +12,6 @@ For a current implementation question, search the symbol in the local CodeGraph 
 
 ```sh
 just graph-find poll_input
-rg -n 'poll_input' crates/thegn-host
 just agent-context THE-21
 ```
 
@@ -25,7 +24,7 @@ rg -n '## Decision|RepoConfigFile|AutomationEvent' \
 
 The handoff and OpenSpec files retain the decision and its evidence. `just agent-context` is the issue entry point, not a substitute for reading those sources.
 
-Tried at alpha.125: `rg -l 'poll_input' crates/thegn-host` matched 17 files and included the expected host input sites. The THE-21 `rg -l` above matched 7 files across the handoffs and `add-automation-rules`, and found the decision and the automation contract.
+Tried at alpha.125: `rg -l 'poll_input' crates/thegn-host` matched 17 files and included the expected host input sites. The THE-21 search above, run with `rg -l` in place of `rg -n`, matched 7 files across the handoffs and `add-automation-rules`, and found the decision and the automation contract.
 
 ### Keep the code index current
 
