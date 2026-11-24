@@ -685,10 +685,15 @@ no_model_login() {
 }
 
 local_log_has_commits() {
-  local n want="${1:-1}"
+  local n want="${1:-1}" artifact="$WT_PATH/rd-hold.txt"
   n="$(git -C "$WT_PATH" rev-list --count main..HEAD 2>/dev/null || echo 0)"
   echo "   commits ahead of main: $n"
-  [ "$n" -ge "$want" ]
+  [ "$n" -ge "$want" ] || return 1
+  [ -s "$artifact" ] || {
+    echo "pulled artifact is missing or empty: $artifact" >&2
+    return 1
+  }
+  echo "   pulled artifact: rd-hold.txt"
 }
 
 record_gone() { [ ! -f "$(ledger_dir)/${1:-$NAME}.json" ]; }
