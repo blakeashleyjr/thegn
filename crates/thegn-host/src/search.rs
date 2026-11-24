@@ -1210,7 +1210,7 @@ mod tests {
 
     #[test]
     fn result_rows_show_how_old_the_line_is() {
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
 
         let now = crate::e2e_freeze::clock();
         let mut buf = HistoryBuffer::new(100);
