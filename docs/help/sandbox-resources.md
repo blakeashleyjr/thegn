@@ -46,3 +46,20 @@ the Cargo build; a real compiler error is preserved and is never retried or
 reported as cache degradation. `thegn doctor` shows the host inputs and the last contained
 reachability/write probe separately. Backends without a proven transport use
 plain rustc.
+
+## Memory warnings and pane restart
+
+thegn watches each local pane's memory scope about every five seconds. When a
+pane reaches 85% of its `memory` cap, or the kernel starts throttling it at the
+soft limit, a toast shows the numbers (`memory 21.3G/24G, swap 3.1G`). It warns
+once per crossing and re-arms after usage falls below 75%. When the kernel
+kills a process in the pane's scope, a toast says `OOM-killed a process at 24G`.
+
+If the pane's shell then dies together with an out-of-memory kill, thegn
+restarts the pane in the same worktree and layout slot. A pane running a
+recognised agent (Claude, pi) gets the agent's continue command typed into the
+fresh shell; other agents are relaunched with their original command line, and
+any other program leaves you at a plain shell. A pane you closed, or a command
+that exited cleanly, is never restarted, and a pane is auto-restarted at most
+once every ten minutes. Warnings are for you: nothing is typed into a running
+pane. Only local panes with a cgroup v2 scope under `thegn.slice` are watched.

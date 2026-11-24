@@ -551,6 +551,8 @@ pub(crate) fn drain<T: Terminal>(
     input_at: &mut Option<Instant>,
 ) -> DrainSummary {
     let budget = crate::loop_policy::drain_budget(input_at.is_some() || !pending_input.is_empty());
+    // Hand the live pane set to the memory sampler (throttled, no I/O).
+    crate::mem_watch::publish(&ctx.panes.table);
     // The receive phase and parser phase share this start. In particular, a
     // large ready channel cannot reset the parser's wall-clock allowance.
     let started = Instant::now();
@@ -1012,6 +1014,11 @@ fn apply_auto_exit_status(
 /// [`DrainSummary::left_for_materialize`]). No spawn — and no sandbox
 /// resolution — happens here on the loop.
 fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool {
+    // Did this exit follow an `oom_kill` in the pane's scope? Only then does a
+    // non-sole pane keep its leaf for respawn, and the agent get relaunched.
+    let oom_verdict = crate::mem_watch::on_pane_exit(id, exit_code);
+    let oom_restart = oom_verdict == thegn_core::pane_memwatch::RestartVerdict::Restart;
+    let oom_status = crate::mem_watch::exit_status(oom_verdict);
     // Program name is needed for attention routing after the pane leaves the
     // table (item 524).
     let exited_program = ctx.panes.table.get(&id).map(|p| p.program().to_string());
@@ -1298,10 +1305,11 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         // Prefer the real exit code; fall back to the fast-crash heuristic
         // when the child status couldn't be reaped. A failed exit arms the
         // relaunch overlay on the respawned shell.
-        let failed = match exit_code {
-            Some(c) => c != 0,
-            None => crashes > 0,
-        };
+        let failed = oom_restart
+            || match exit_code {
+                Some(c) => c != 0,
+                None => crashes > 0,
+            };
         // A remote env's interactive pane is a `*-ssh` self-bridge subprocess, so a
         // fast failed exit is a connect/resolve failure the compositor can't observe
         // any other way. Mark the provider unhealthy so the respawn's off-thread
@@ -1657,7 +1665,9 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         // rule), not the forced plain shell the old inline
                         // path spawned — an agent crash loop stays bounded by
                         // the 3-crash give-up above.
-                        ctx.model.status = if daemon_agent_exit {
+                        ctx.model.status = if oom_restart && let Some(note) = oom_status {
+                            note.to_string()
+                        } else if daemon_agent_exit {
                             crate::handlers::crash::agent_exit_status(
                                 exited_program.as_deref().unwrap_or(""),
                                 exit_code,
@@ -1674,19 +1684,44 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                 }
             }
         } else if let Some(tab) = ctx.session.tab_mut(gi, ti) {
-            tab.remove_pane_and_refocus(id);
-            // An attached agent finishing inside a split still removes its leaf
-            // (a fan-out tab must not accumulate one husk per finished stage —
-            // design §D3's documented tradeoff) but is announced on the active
-            // tab's status line, never a silent vanish. No Enter/Esc hint:
-            // the leaf is gone — there is no respawned shell for the overlay
-            // to intercept in.
-            if daemon_agent_exit && is_active_tab {
-                ctx.model.status = crate::handlers::crash::agent_exit_status(
-                    exited_program.as_deref().unwrap_or(""),
-                    exit_code,
+            if oom_restart {
+                // A pane in a split lost to an OOM kill: keep its leaf, exactly
+                // like a sole pane, so the materialize pipeline respawns it in
+                // place (same worktree, same layout slot). `mem_watch::
+                // take_relaunch` then types the agent's continue command into
+                // the fresh shell. Rate-limited and clean exits never get here.
+                crate::handlers::crash::prep_leaf_for_respawn(
+                    tab,
+                    id,
+                    true,
+                    exit_code.is_none(),
                     false,
+                    respawn_tail,
                 );
+                left_for_materialize = true;
+                if is_active_tab && let Some(note) = oom_status {
+                    ctx.model.status = note.to_string();
+                }
+            } else {
+                tab.remove_pane_and_refocus(id);
+                // An attached agent finishing inside a split still removes its
+                // leaf (a fan-out tab must not accumulate one husk per finished
+                // stage — design §D3's documented tradeoff) but is announced on
+                // the active tab's status line, never a silent vanish. No
+                // Enter/Esc hint: the leaf is gone — there is no respawned shell
+                // for the overlay to intercept in.
+                if daemon_agent_exit && is_active_tab {
+                    ctx.model.status = crate::handlers::crash::agent_exit_status(
+                        exited_program.as_deref().unwrap_or(""),
+                        exit_code,
+                        false,
+                    );
+                }
+                // Lost to an OOM kill again inside the cooldown: say why the
+                // pane is not coming back.
+                if is_active_tab && let Some(note) = oom_status {
+                    ctx.model.status = note.to_string();
+                }
             }
             *ctx.need_relayout = true;
         }

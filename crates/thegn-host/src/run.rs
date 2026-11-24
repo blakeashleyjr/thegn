@@ -777,6 +777,7 @@ pub async fn main(
     crate::daemon::agent_error_cache::install_refresh(refresh_tx.clone(), waker.clone());
     crate::db_task::install_drop_notice(refresh_tx.clone(), waker.clone());
     crate::db_maintain::install_notice(refresh_tx.clone(), waker.clone());
+    crate::mem_watch::install_notice(refresh_tx.clone(), waker.clone());
     crate::mise_provider::install_refresh(refresh_tx.clone(), waker.clone());
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
