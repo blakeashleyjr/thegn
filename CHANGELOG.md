@@ -7,6 +7,32 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.127] — 2026-11-24
+
+### Changed
+
+- Terminal history search scores matches on a worker thread, streams results
+  as they are found, and keeps earlier results when you press Enter before the
+  search finishes; the event loop no longer stalls on long histories.
+- macOS no longer offers the rootful podman sandbox backend, and the gate is
+  tested through the real resolver.
+- The seven crates without a package description now have one.
+
+### Fixed
+
+- Closing the last pane of a nested stack removes the emptied stack from its
+  parent split instead of leaving a blank region.
+- Two load-sensitive host tests wait on observable conditions instead of
+  fixed sleeps.
+- The Daytona config example no longer names an unverified CLI command, and
+  `config validate` network-audit warnings are covered by tests.
+
+### Documentation
+
+- Contributor notes on unconventional host test assumptions, scoped
+  implementation and history searches for agents, and corrected optional-CI
+  guidance in the PR template.
+
 ## [0.1.0-alpha.126] — 2026-11-23
 
 ### Changed
