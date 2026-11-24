@@ -1,6 +1,6 @@
 //! Network tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, MAIN_H, heading, kv, trunc};
 use crate::chrome::S;
 use crate::sections::{Cell, GraphSection, Section, TableSection, spacer};
 use crate::seg::Tok;

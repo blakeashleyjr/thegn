@@ -5,7 +5,12 @@ use super::{
     format_bytes, format_cpu, format_time_plus, proc_row_caps,
 };
 
-use ColId::*;
+use ColId::{
+    Age, Average, Command, Container, ContextSwitches, Cpu, CpuBar, CpuHistory, CpuNumber, Delay,
+    Fds, IoTotal, MajorFaults, MemHistory, MemPercent, MinorFaults, Nice, Oom, Owner, Pid, Policy,
+    Priority, ReadRate, Rss, Shared, State, Swap, Threads, Time, Unit, User, Virt, Worktree,
+    WriteRate,
+};
 
 const G0: &[(ColId, usize)] = &[(Pid, 3), (Cpu, 5), (Rss, 5), (Command, 24)];
 const G1: &[(ColId, usize)] = &[

@@ -1,6 +1,6 @@
 //! Gpu tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, MAIN_H, heading, kv, temp_tone};
 use crate::chrome::S;
 use crate::sections::{Section, spacer};
 use crate::seg::Tok;

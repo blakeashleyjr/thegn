@@ -8314,7 +8314,10 @@ args = ["--verbose"]
     }
 
     const ALL_WORKER_READINESS: [thegn_core::sandbox_worker_ready::WorkerReadiness; 8] = {
-        use thegn_core::sandbox_worker_ready::WorkerReadiness::*;
+        use thegn_core::sandbox_worker_ready::WorkerReadiness::{
+            CallbackUnavailable, CannotWriteGitMetadata, CannotWriteWorktree, ContainmentAbsent,
+            ProviderHomeUnavailable, Ready, UnsupportedBackend, UnsupportedPlatform,
+        };
         [
             Ready,
             ContainmentAbsent,

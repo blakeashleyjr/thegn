@@ -1467,7 +1467,7 @@ fn lsp_workspace_symbols(
 
 /// Map a `TaskKind` to the short label shown in the Tasks search rows.
 fn task_kind_str(k: &thegn_core::config::TaskKind) -> &'static str {
-    use thegn_core::config::TaskKind::*;
+    use thegn_core::config::TaskKind::{Build, Custom, Lint, Run, Test};
     match k {
         Custom => "custom",
         Test => "test",
@@ -1479,7 +1479,7 @@ fn task_kind_str(k: &thegn_core::config::TaskKind) -> &'static str {
 
 /// Severity → the lowercase tag the Problems search rows key their glyph on.
 fn severity_str(s: crate::panel::Severity) -> &'static str {
-    use crate::panel::Severity::*;
+    use crate::panel::Severity::{Error, Hint, Info, Warning};
     match s {
         Error => "error",
         Warning => "warning",
@@ -1490,7 +1490,7 @@ fn severity_str(s: crate::panel::Severity) -> &'static str {
 
 /// TestState → the lowercase tag the Tests search rows key their glyph on.
 fn test_state_str(s: &crate::panel::TestState) -> &'static str {
-    use crate::panel::TestState::*;
+    use crate::panel::TestState::{Fail, Pass, Running, Skip, Unknown};
     match s {
         Pass => "pass",
         Fail => "fail",

@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn effective_zoom_is_fullscreen_only_while_the_center_owns_focus() {
-        use Zone::*;
+        use Zone::{Center, Panel, Sidebar};
         // A fullscreen tab with a focused center suppresses the chrome.
         assert_eq!(effective_zoom(None, Grow::Fullscreen, Center), Some(Center));
         // Focus elsewhere → the chrome comes back (non-destructively).

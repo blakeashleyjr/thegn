@@ -1,6 +1,6 @@
 //! Thermal tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, MAIN_H, heading, kv, temp_tone, trunc};
 use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection, spacer};
 use crate::seg::Tok;

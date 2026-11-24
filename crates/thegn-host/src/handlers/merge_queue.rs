@@ -2225,7 +2225,7 @@ mod tests {
 
     #[test]
     fn key_matrix_resolves_by_row_status() {
-        use MqAction::*;
+        use MqAction::{AddAll, AddCurrent, ClearLanded, Drain, Land, Remove, Retry};
         // Row-independent keys.
         for (k, want) in [
             ('a', AddCurrent),

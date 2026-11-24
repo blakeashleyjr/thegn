@@ -1,4 +1,4 @@
-use super::*;
+use super::{NumFmt, OverviewView, Reading, StateRole, Unit, kit, mem_health};
 use std::fmt::Write as _;
 
 pub(super) struct PanelText {

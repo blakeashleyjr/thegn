@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn plan_rearm_starts_the_new_and_stops_the_gone() {
-        use ProducerKind::*;
+        use ProducerKind::{Mentions, PrPoll, PrQueue, Tracker};
         assert_eq!(plan_rearm(&set(&[]), &set(&[])), (set(&[]), set(&[])));
         assert_eq!(
             plan_rearm(&set(&[]), &set(&[Tracker, PrQueue])),

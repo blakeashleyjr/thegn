@@ -1392,7 +1392,7 @@ pub struct IssueRepoQuery {
 
 /// Parse a comma-separated status list into `IssueStatus`es (unknowns dropped).
 pub(crate) fn parse_issue_statuses(s: &str) -> Vec<thegn_core::issue::IssueStatus> {
-    use thegn_core::issue::IssueStatus::*;
+    use thegn_core::issue::IssueStatus::{Backlog, Cancelled, Done, InProgress, Todo};
     s.split(',')
         .filter_map(|part| match part.trim() {
             "backlog" => Some(Backlog),

@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Buffer, Editor, Rect, UiEngine, actions, effective_field_height, field_height,
+    field_label_width, rows,
+};
 use tg_kit::Tok;
 use tg_kit::ratatui::{
     style::{Modifier, Style},
@@ -6,6 +9,7 @@ use tg_kit::ratatui::{
     widgets::{Block, Borders, Paragraph, Widget as RenderWidget, Wrap},
 };
 use thegn_core::plugin_api::StyleRole;
+use thegn_core::plugin_app::{FieldKind, PresentationState, TableColumn, Widget};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 

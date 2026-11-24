@@ -1903,7 +1903,7 @@ mod rm_tests {
 
     #[test]
     fn branch_for_delete_table() {
-        use BranchChoice::*;
+        use BranchChoice::{Live, Recorded, Skip};
         assert_eq!(
             branch_for_delete(Some("a"), "b", true, true),
             Live("a".into())
