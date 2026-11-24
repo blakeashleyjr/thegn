@@ -1507,13 +1507,14 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let td = private_tempdir();
-        let home = td.path().join("home");
-        let state = td.path().join("state");
-        let data = td.path().join("data");
+        let base = td.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let state = base.join("state");
+        let data = base.join("data");
         std::fs::create_dir_all(state.join("bash")).unwrap();
         std::fs::create_dir_all(&data).unwrap();
 
-        let symlink_root = td.path().join("state-link");
+        let symlink_root = base.join("state-link");
         symlink(&state, &symlink_root).unwrap();
         let symlink_env = |key: &str| match key {
             "XDG_STATE_HOME" => Some(symlink_root.as_os_str().to_owned()),
@@ -1549,7 +1550,7 @@ mod tests {
                 .any(|entry| entry.reason == XdgOmission::RelativeRoot)
         );
 
-        let missing = td.path().join("missing-state");
+        let missing = base.join("missing-state");
         let missing_env = |key: &str| match key {
             "XDG_STATE_HOME" => Some(missing.as_os_str().to_owned()),
             _ => None,
@@ -1561,7 +1562,7 @@ mod tests {
                 .any(|entry| { entry.path == missing && entry.reason == XdgOmission::MissingRoot })
         );
 
-        let file_root = td.path().join("state-file");
+        let file_root = base.join("state-file");
         std::fs::write(&file_root, "").unwrap();
         let file_env = |key: &str| match key {
             "XDG_STATE_HOME" => Some(file_root.as_os_str().to_owned()),
@@ -1620,16 +1621,17 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let td = private_tempdir();
-        let home = td.path().join("home");
-        let state = td.path().join("state");
-        let data = td.path().join("data");
-        let outside = td.path().join("outside");
+        let base = td.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let state = base.join("state");
+        let data = base.join("data");
+        let outside = base.join("outside");
         std::fs::create_dir_all(state.join("thegn/bash")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         symlink(state.join("thegn/bash"), state.join("bash")).unwrap();
         symlink(&outside, data.join("fish")).unwrap();
-        symlink(td.path().join("missing-leaf"), data.join("atuin")).unwrap();
+        symlink(base.join("missing-leaf"), data.join("atuin")).unwrap();
         std::fs::write(data.join("zoxide"), "").unwrap();
         let env = |key: &str| match key {
             "XDG_STATE_HOME" => Some(state.as_os_str().to_owned()),
@@ -1658,7 +1660,7 @@ mod tests {
                 .any(|entry| entry.reason == XdgOmission::UnresolvableLeaf)
         );
 
-        let runtime_state = td.path().join("runtime-state");
+        let runtime_state = base.join("runtime-state");
         std::fs::create_dir_all(runtime_state.join("bash/run")).unwrap();
         symlink(runtime_state.join("bash"), runtime_state.join("thegn")).unwrap();
         let runtime_env = |key: &str| match key {
@@ -1699,9 +1701,10 @@ mod tests {
     #[test]
     fn xdg_roots_mount_only_approved_existing_leaves_and_keep_destinations() {
         let td = tempfile::tempdir().unwrap();
-        let home = td.path().join("home");
-        let state = td.path().join("state");
-        let data = td.path().join("data");
+        let base = td.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let state = base.join("state");
+        let data = base.join("data");
         for path in [
             state.join("bash"),
             state.join("zsh"),
@@ -1756,7 +1759,7 @@ mod tests {
         let invalid = default_writable_carveouts_at(SandboxProfile::Hardened, &home, &relative);
         assert!(invalid.iter().all(|mount| !mount.dest.ends_with("/bash")));
 
-        let default_home = td.path().join("default-home");
+        let default_home = base.join("default-home");
         for path in [
             default_home.join(".local/state/bash"),
             default_home.join(".local/share/fish"),
