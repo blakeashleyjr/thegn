@@ -1436,11 +1436,12 @@ live-plan level="info" size_mb="20" files="5" *flags:
 # Update an instance from a verified GitHub release or a source build. No target
 # prints stable/dev/latest versions. `just update stable [VERSION|latest]
 # [--dry-run] [--force] [--no-attest] [--rollback]` swaps ~/.local/lib/thegn/thegn
-# atomically (previous kept as thegn.prev) and never stops the running stable
-# daemon. `just update dev [release[=VERSION]|main|checkout|<branch>]` installs via
+# atomically (previous kept as thegn.prev). Afterwards the instance's daemon is
+# restarted (prompt; --yes skips, --no-launch skips the relaunch) so a newer DB
+# schema can migrate. `just update dev [release[=VERSION]|main|checkout|<branch>]` installs via
 # scripts/dev_live.py --prebuilt; source targets build on the remote Mac first
 # (THEGN_REMOTE_BUILD) and compile locally only after an explicit yes. Extra
-# args (--here, --restart-daemon, --level debug) pass through to dev_live.py.
+# args (--level debug ...) pass through to dev_live.py --install-only.
 # See docs/just-recipes.md.
 [positional-arguments]
 update target="" *args:
