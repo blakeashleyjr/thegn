@@ -22,8 +22,8 @@ use thegn_svc::provider::SpritesProvider;
 use thegn_svc::sprites::job::{
     AttemptOptions, AttemptRecord, AttemptState, AttemptStore, CancelToken, Cleanup,
     DEFAULT_CHECKOUT_ROOT, DirSnapshot, KILL_SCRIPT, LAUNCH_FAILED_MARKER, LAUNCH_SCRIPT,
-    ProjectBinding, ReconcileOutcome, Reconciled, ReserveRefusal, ReserveRequest, Resume,
-    SNAPSHOT_MAX_FILE_BYTES, SnapshotContent, SnapshotSource, SpritesSelectedRunner,
+    OwnerLease, ProjectBinding, ReconcileOutcome, Reconciled, ReserveRefusal, ReserveRequest,
+    Resume, SNAPSHOT_MAX_FILE_BYTES, SnapshotContent, SnapshotSource, SpritesSelectedRunner,
 };
 
 // ---------------------------------------------------------------- the fixture
@@ -2369,4 +2369,120 @@ async fn a_cancel_racing_a_finished_exit_never_kills_a_proven_completion() {
         SelectedCompletion::Cancelled => assert_eq!(kills.len(), 1),
         other => panic!("unexpected completion {other:?}"),
     }
+}
+
+/// A lease whose owner is gone: a pid no process has, an old heartbeat.
+fn dead_lease() -> OwnerLease {
+    OwnerLease {
+        pid: u32::MAX - 1,
+        boot_id: OwnerLease::current(0).boot_id,
+        start_ticks: None,
+        started_at_ms: 0,
+        heartbeat_ms: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_with_a_live_owner_lease_is_never_reconciled_even_past_the_staleness_margin() {
+    let mock = start_mock(vec![]);
+    let (_dir, store) = store();
+    let mut record = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
+    store.mark(&record).unwrap();
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    let touched = runner
+        .reconcile_pending_at(1_000_000_000_000)
+        .await
+        .unwrap();
+
+    assert!(touched.is_empty());
+    assert_eq!(store.read(1).unwrap().unwrap(), record);
+    assert!(mock.execs.lock().unwrap().is_empty());
+
+    // The heartbeat is old, but this very process still owns the row: on Linux
+    // the pid and boot id alone keep it alive.
+    if cfg!(target_os = "linux") {
+        record.lease = Some(OwnerLease {
+            heartbeat_ms: 0,
+            ..OwnerLease::current(0)
+        });
+        store.mark(&record).unwrap();
+        let touched = runner
+            .reconcile_pending_at(1_000_000_000_000)
+            .await
+            .unwrap();
+        assert!(touched.is_empty());
+        assert_eq!(store.read(1).unwrap().unwrap(), record);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_whose_lease_owner_is_dead_and_heartbeat_old_is_reconciled() {
+    let mock = start_mock(vec![kill_reply(0)]);
+    let (_dir, store) = store();
+    let mut record = seeded(&store, 1, AttemptState::Dispatching, Cleanup::NotNeeded, 0);
+    record.lease = Some(dead_lease());
+    store.mark(&record).unwrap();
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    let touched = runner
+        .reconcile_pending_at(1_000_000_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        touched,
+        vec![Reconciled {
+            attempt: 1,
+            outcome: ReconcileOutcome::Cleaned
+        }]
+    );
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Indeterminate
+    );
+}
+
+#[test]
+fn a_lease_heartbeat_loses_to_a_concurrent_recovery_write_and_the_owner_fences() {
+    let (_dir, store) = store();
+    let mut owner = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    owner.lease = Some(OwnerLease::current(1_000));
+    store.mark(&owner).unwrap();
+
+    // While nothing intervenes the heartbeat moves and the held row follows it.
+    assert!(store.refresh_lease(&mut owner, 2_000).unwrap());
+    assert_eq!(owner.lease.as_ref().unwrap().heartbeat_ms, 2_000);
+    assert_eq!(store.read(1).unwrap().unwrap(), owner);
+
+    // A recovery settles the row between two heartbeats.
+    let mut recovery = owner.clone();
+    recovery.state = AttemptState::Indeterminate;
+    assert!(store.mark_if_unchanged(&owner, &recovery).unwrap());
+
+    // The next heartbeat is refused, writes nothing, and leaves the held row alone.
+    let held = owner.clone();
+    assert!(!store.refresh_lease(&mut owner, 3_000).unwrap());
+    assert_eq!(owner, held);
+    assert_eq!(store.read(1).unwrap().unwrap(), recovery);
+}
+
+#[test]
+fn a_lease_is_live_on_a_fresh_heartbeat_and_dead_with_a_gone_owner() {
+    let now = 1_000_000;
+    assert!(OwnerLease::current(now).is_live(now));
+    assert!(OwnerLease::current(now).is_live(now + 29_000));
+    assert!(!dead_lease().is_live(now));
+}
+
+#[test]
+fn a_row_without_a_lease_field_still_reads_and_stays_without_one() {
+    let (_dir, store) = store();
+    let record = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    let json = serde_json::to_string(&record).unwrap();
+    assert!(!json.contains("lease"), "{json}");
+    let back: AttemptRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.lease, None);
+    assert_eq!(store.read(1).unwrap().unwrap(), record);
 }

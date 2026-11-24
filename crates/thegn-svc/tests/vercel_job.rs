@@ -25,7 +25,7 @@ use thegn_core::vercel::api::Scope;
 use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCompletion};
 use thegn_svc::vercel::job::{
     AttemptOptions, AttemptReceipt, AttemptRecord, AttemptState, AttemptStore, Cleanup,
-    DEFAULT_CHECKOUT_ROOT, JobBinding, ReserveRefusal, ReserveRequest, SnapshotContent,
+    DEFAULT_CHECKOUT_ROOT, JobBinding, OwnerLease, ReserveRefusal, ReserveRequest, SnapshotContent,
     SnapshotSource, VercelSelectedRunner,
 };
 use thegn_svc::vercel::{VercelProvider, VercelSpec, VercelToken};
@@ -1208,4 +1208,92 @@ async fn the_sandbox_timeout_is_bounded_by_the_configured_lifetime_ceiling() {
         .unwrap();
     // 60 s transfer + 60 s deadline + 5 min slack = 420 s <= 600 s.
     assert_eq!(create.json()["timeout"], serde_json::json!(420_000u64));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_owner_lease_refuses_recovery_even_past_the_staleness_margin() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let mut record = store.read(1).unwrap().unwrap();
+    record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
+    store.mark(&record).unwrap();
+    let (kills, deletes) = (
+        mock.count("POST", "/kill"),
+        mock.count("DELETE", &receipt.sandbox),
+    );
+
+    for error in [
+        runner.reconcile(1).await.unwrap_err(),
+        runner.cancel(1).await.unwrap_err(),
+    ] {
+        assert!(format!("{error:#}").contains("live run"), "{error:#}");
+    }
+
+    assert_eq!(mock.count("POST", "/kill"), kills, "nothing was killed");
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes);
+    assert_eq!(store.read(1).unwrap().unwrap(), record);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_whose_lease_owner_is_dead_and_heartbeat_old_is_reconciled() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let mut record = store.read(1).unwrap().unwrap();
+    record.lease = Some(OwnerLease {
+        pid: u32::MAX - 1,
+        boot_id: OwnerLease::current(0).boot_id,
+        start_ticks: None,
+        started_at_ms: 0,
+        heartbeat_ms: 0,
+    });
+    store.mark(&record).unwrap();
+
+    let settled = runner.reconcile(1).await.unwrap();
+
+    assert_eq!(settled.state, AttemptState::Indeterminate);
+    assert_eq!(settled.cleanup, Cleanup::Done);
+}
+
+#[test]
+fn a_lease_heartbeat_loses_to_a_concurrent_recovery_write_and_the_owner_fences() {
+    let (_dir, store) = store();
+    let source = content().digest().unwrap();
+    let binding = JobBinding::new("proj", TEAM, PROJECT).unwrap();
+    let mut owner = store
+        .reserve(
+            &binding,
+            ReserveRequest {
+                attempt: None,
+                recipe: Recipe::CargoBuild,
+                source: &source,
+                checkout_root: DEFAULT_CHECKOUT_ROOT,
+                deadline_ms: 0,
+                spend_cap_micros: 0,
+                spend_envelope_micros: 0,
+            },
+        )
+        .unwrap();
+    owner.lease = Some(OwnerLease::current(1_000));
+    store.mark(&owner).unwrap();
+
+    assert!(store.refresh_lease(&mut owner, 2_000).unwrap());
+    assert_eq!(owner.lease.as_ref().unwrap().heartbeat_ms, 2_000);
+    assert_eq!(store.read(1).unwrap().unwrap(), owner);
+
+    let mut recovery = owner.clone();
+    recovery.state = AttemptState::Indeterminate;
+    assert!(store.mark_if_unchanged(&owner, &recovery).unwrap());
+
+    let held = owner.clone();
+    assert!(!store.refresh_lease(&mut owner, 3_000).unwrap());
+    assert_eq!(owner, held);
+    assert_eq!(store.read(1).unwrap().unwrap(), recovery);
 }

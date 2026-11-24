@@ -43,6 +43,14 @@
 //!    and command handle in the record for the reaper
 //!    ([`VercelSelectedRunner::reconcile`] and `thegn env reap`).
 //!
+//! Owner lease: the row carries the shared [`OwnerLease`] from the create step
+//! on, and the running owner refreshes its heartbeat every 15 s by
+//! compare-and-swap while it follows the logs and polls for the exit. Recovery
+//! ([`VercelSelectedRunner::reconcile`], [`VercelSelectedRunner::cancel`])
+//! refuses a row whose lease is live whatever its age; an owner whose heartbeat
+//! loses the compare-and-swap fences and never overwrites the settled row.
+//! Rows without a lease keep the age-only staleness rule.
+//!
 //! The ledger is a durable private file store
 //! (`$XDG_STATE_HOME/thegn/vercel-jobs/<project>/`), shaped like the Sprites
 //! one and sharing its state, cleanup and resume types.
@@ -70,11 +78,12 @@ use super::VercelProvider;
 use super::client::WAIT_COMMAND_DEADLINE;
 use crate::provider::{ProviderFiles, RemoteProvider, STDERR_TAIL_CAP, join_remote};
 pub use crate::sprites::job::{
-    AttemptState, Cleanup, DirSnapshot, Resume, SnapshotContent, SnapshotSource, root_digest,
+    AttemptState, Cleanup, DirSnapshot, OwnerLease, Resume, SnapshotContent, SnapshotSource,
+    root_digest,
 };
 use crate::sprites::job::{
-    Tail, alias_is_valid, attempt_file, attempt_from_file, bound_log, checked_component,
-    checked_rel_path, hex, millis_i64, nonce, signal_of, state_name,
+    LEASE_HEARTBEAT, Tail, alias_is_valid, attempt_file, attempt_from_file, bound_log,
+    checked_component, checked_rel_path, hex, millis_i64, nonce, signal_of, state_name,
 };
 
 /// The provider name written into every record and receipt.
@@ -114,8 +123,8 @@ const RECONCILE_SLACK: Duration = Duration::from_secs(60);
 /// Extra margin on the staleness test. The ledger deadline is wall-clock but a
 /// live owner times its stream on the monotonic clock, which stops while the
 /// host is suspended; the margin only absorbs small skew. A suspend longer than
-/// it can still make a live row look stale (an owner lease in the row would
-/// close that gap; it is tracked in the OpenSpec tasks).
+/// it can still make a live row look stale unless the owner lease in the row
+/// (live heartbeat or live owner process) vouches for it.
 const RECONCILE_CLOCK_MARGIN: Duration = Duration::from_secs(120);
 
 /// Consecutive command-status errors tolerated while waiting for an exit.
@@ -282,6 +291,9 @@ pub struct AttemptRecord {
     /// True once the sandbox delete was confirmed.
     pub sandbox_deleted: bool,
     pub error: Option<String>,
+    /// The running owner's lease; absent on rows written before leases existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<OwnerLease>,
 }
 
 impl AttemptRecord {
@@ -516,6 +528,24 @@ impl AttemptStore {
         Ok(())
     }
 
+    /// Move the owner's heartbeat to `now_ms` by compare-and-swap against
+    /// `record`, the row the owning run last wrote. False means the stored row
+    /// changed (a recovery settled it) and nothing was written: the owner must
+    /// stop trusting its own state. `record` is updated only on success.
+    pub fn refresh_lease(&self, record: &mut AttemptRecord, now_ms: i64) -> Result<bool> {
+        let Some(lease) = record.lease.as_ref() else {
+            return Ok(true);
+        };
+        let mut next = record.clone();
+        next.lease = Some(lease.refreshed(now_ms));
+        if self.mark_if_unchanged(record, &next)? {
+            *record = next;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Publish `record` only when the stored row still equals `expected` (the
     /// row as a recovery pass read it). The check and the write happen under the
     /// ledger lock, so a recovery never overwrites what the owning run wrote in
@@ -666,6 +696,7 @@ impl AttemptStore {
             outputs_fenced: false,
             sandbox_deleted: false,
             error: None,
+            lease: None,
         };
         store_error(self.mark(&record))?;
         Ok(record)
@@ -1031,6 +1062,7 @@ impl VercelSelectedRunner {
         // The sandbox name is durable before the create request: an ambiguous
         // create can be found (and reaped) by name.
         let name = self.binding.sandbox_name(&record.key);
+        record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
         record.sandbox = name.clone();
         record.cleanup = Cleanup::Pending;
         if let Err(error) = self.persist(&record).await {
@@ -1127,6 +1159,7 @@ impl VercelSelectedRunner {
                         SelectedCompletion::Indeterminate,
                         false,
                         (&empty, &empty),
+                        None,
                     )
                     .await);
             }
@@ -1146,6 +1179,7 @@ impl VercelSelectedRunner {
                     SelectedCompletion::Indeterminate,
                     false,
                     (&empty, &empty),
+                    None,
                 )
                 .await);
         }
@@ -1155,36 +1189,55 @@ impl VercelSelectedRunner {
         let mut stderr = Tail::new(STDERR_TAIL_CAP);
         let mut exit = None;
         let mut timed_out = false;
+        let mut fenced = false;
         match self.provider.api().logs(&session, &command).await {
-            Ok(mut logs) => loop {
-                match tokio::time::timeout_at(until, logs.receiver_mut().recv()).await {
-                    Ok(Some(LogLine::Stdout(bytes))) => stdout.push(&bytes),
-                    Ok(Some(LogLine::Stderr(bytes))) => stderr.push(&bytes),
-                    Ok(Some(LogLine::Command {
-                        exit_code: Some(code),
-                        ..
-                    })) => {
-                        exit = Some(code);
-                        break;
-                    }
-                    Ok(Some(LogLine::Command { .. })) => {}
-                    Ok(Some(LogLine::Error { code, .. })) => {
-                        record.error = Some(format!("the log stream reported {code:?}"));
-                        break;
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        timed_out = true;
-                        break;
+            Ok(mut logs) => {
+                let mut beat = tokio::time::interval_at(
+                    tokio::time::Instant::now() + LEASE_HEARTBEAT,
+                    LEASE_HEARTBEAT,
+                );
+                beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        _ = beat.tick() => {
+                            if !self.refresh_lease(&mut record).await {
+                                fenced = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        next = tokio::time::timeout_at(until, logs.receiver_mut().recv()) => next,
+                    };
+                    match next {
+                        Ok(Some(LogLine::Stdout(bytes))) => stdout.push(&bytes),
+                        Ok(Some(LogLine::Stderr(bytes))) => stderr.push(&bytes),
+                        Ok(Some(LogLine::Command {
+                            exit_code: Some(code),
+                            ..
+                        })) => {
+                            exit = Some(code);
+                            break;
+                        }
+                        Ok(Some(LogLine::Command { .. })) => {}
+                        Ok(Some(LogLine::Error { code, .. })) => {
+                            record.error = Some(format!("the log stream reported {code:?}"));
+                            break;
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            timed_out = true;
+                            break;
+                        }
                     }
                 }
-            },
+            }
             Err(error) => record.error = Some(format!("cannot follow the logs: {error:#}")),
         }
         // The stream ended without an exit (a dropped connection or an early
         // EOF says nothing about the build): poll the command API until the
         // exit arrives or the deadline passes, tolerating a few transient errors.
-        if exit.is_none() && !timed_out {
+        if exit.is_none() && !timed_out && !fenced {
             let mut errors = 0u32;
             loop {
                 let left = until.saturating_duration_since(tokio::time::Instant::now());
@@ -1192,10 +1245,20 @@ impl VercelSelectedRunner {
                     timed_out = true;
                     break;
                 }
+                // Each wait is capped at the heartbeat period so the lease keeps
+                // beating while the exit is polled.
+                if !self.refresh_lease(&mut record).await {
+                    fenced = true;
+                    break;
+                }
                 match self
                     .provider
                     .client
-                    .wait_command_exact(&session, &command, left.min(WAIT_COMMAND_DEADLINE))
+                    .wait_command_exact(
+                        &session,
+                        &command,
+                        left.min(WAIT_COMMAND_DEADLINE).min(LEASE_HEARTBEAT),
+                    )
                     .await
                 {
                     Ok(Some(Some(code))) => {
@@ -1228,6 +1291,15 @@ impl VercelSelectedRunner {
                 "attempt deadline reached; killing the command and stopping the sandbox"
             );
         }
+        if fenced {
+            tracing::warn!(
+                target: "thegn::vercel::job",
+                attempt = record.attempt,
+                "the ledger row was settled by another process; this run is fenced"
+            );
+            record.error =
+                Some("owner lease lost: the ledger row was settled by another process".to_owned());
+        }
         let launch_failed =
             !timed_out && exit == Some(125) && stderr.render().contains(LAUNCH_FAILED_MARKER);
         let completion = match (timed_out, exit) {
@@ -1239,6 +1311,8 @@ impl VercelSelectedRunner {
             },
             (false, None) => SelectedCompletion::Indeterminate,
         };
+        // A fenced run never overwrites the row whoever settled it wrote.
+        let guard = fenced.then(|| record.clone());
         Ok(self
             .conclude(
                 record,
@@ -1247,6 +1321,7 @@ impl VercelSelectedRunner {
                 completion,
                 launch_failed,
                 (&stdout, &stderr),
+                guard.as_ref(),
             )
             .await)
     }
@@ -1278,6 +1353,7 @@ impl VercelSelectedRunner {
         };
         record.outputs_fenced = true;
         record.finished_ms = Some(thegn_core::util::now_ms());
+        record.lease = None;
         record.error = Some(format!("{error:#}"));
         if let Err(write_error) = self.persist(&record).await {
             tracing::warn!(
@@ -1443,6 +1519,7 @@ impl VercelSelectedRunner {
         completion: SelectedCompletion,
         launch_failed: bool,
         (stdout, stderr): (&Tail, &Tail),
+        guard: Option<&AttemptRecord>,
     ) -> AttemptReceipt {
         let proven = matches!(
             completion,
@@ -1483,16 +1560,27 @@ impl VercelSelectedRunner {
             _ => None,
         };
         record.finished_ms = Some(thegn_core::util::now_ms());
+        record.lease = None;
         // A sandbox that may still bill keeps its whole cap committed.
         record.spent_micros = if deleted { cost_micros } else { None };
         record.outputs = outputs.clone();
-        if let Err(error) = self.persist(&record).await {
-            tracing::warn!(
+        let written = match guard {
+            None => self.persist(&record).await.map(|()| true),
+            Some(expected) => self.persist_if_unchanged(expected, &record).await,
+        };
+        match written {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                target: "thegn::vercel::job",
+                attempt = record.attempt,
+                "the ledger row changed under this run; its newer state is kept"
+            ),
+            Err(error) => tracing::warn!(
                 target: "thegn::vercel::job",
                 %error,
                 attempt = record.attempt,
                 "cannot record the attempt outcome"
-            );
+            ),
         }
         let stdout_tail = stdout.render();
         let stderr_tail = stderr.render();
@@ -1585,16 +1673,57 @@ impl VercelSelectedRunner {
         )
     }
 
+    /// False for a row whose owner lease is live, whatever its age; otherwise
+    /// the age-only rule (rows without a lease keep it).
     fn is_stale(&self, record: &AttemptRecord, now_ms: i64) -> bool {
+        if record
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.is_live(now_ms))
+        {
+            return false;
+        }
         now_ms >= record.deadline_ms.saturating_add(self.stale_after_ms())
+    }
+
+    /// Refresh the owner's heartbeat by compare-and-swap against the row this
+    /// run last wrote. False means a recovery settled the row: the owner must
+    /// stop trusting its own state. A failed write is retried on the next tick.
+    async fn refresh_lease(&self, record: &mut AttemptRecord) -> bool {
+        let store = self.store.clone();
+        let mut held = record.clone();
+        let now_ms = thegn_core::util::now_ms();
+        let result = tokio::task::spawn_blocking(move || {
+            let ours = store.refresh_lease(&mut held, now_ms)?;
+            anyhow::Ok((ours, held))
+        })
+        .await
+        .map_err(|error| anyhow!("ledger task failed: {error}"))
+        .and_then(|inner| inner);
+        match result {
+            Ok((true, held)) => {
+                *record = held;
+                true
+            }
+            Ok((false, _)) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::vercel::job",
+                    %error,
+                    attempt = record.attempt,
+                    "cannot refresh the owner lease heartbeat"
+                );
+                true
+            }
+        }
     }
 
     /// Cancel the owned work of `attempt` from outside the run that owns it:
     /// verify the recorded team/project, kill the command, stop and delete the
     /// sandbox, and record the result. A terminal attempt keeps its verdict (only
     /// its cleanup is settled); a live one becomes [`AttemptState::Cancelled`].
-    /// Subject to the same staleness rule as [`reconcile`](Self::reconcile):
-    /// there is no owner lease, so a row younger than its staleness age is
+    /// Subject to the same rule as [`reconcile`](Self::reconcile): a row whose
+    /// owner lease is live, or that is younger than its staleness age, is
     /// refused rather than killed under a run that may still be driving it.
     pub async fn cancel(&self, attempt: u64) -> Result<AttemptRecord> {
         self.settle(attempt, true).await
@@ -1663,6 +1792,7 @@ impl VercelSelectedRunner {
             };
             record.outputs_fenced = true;
             record.finished_ms = Some(thegn_core::util::now_ms());
+            record.lease = None;
         }
         record.cleanup = if gone {
             Cleanup::Done
@@ -1785,6 +1915,7 @@ mod tests {
             outputs_fenced: false,
             sandbox_deleted: false,
             error: None,
+            lease: None,
         };
         assert_eq!(
             record.resume(),

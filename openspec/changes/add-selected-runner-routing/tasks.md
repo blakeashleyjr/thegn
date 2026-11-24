@@ -57,10 +57,13 @@
       runner and reads back as `Cancelled` on the route (today a pre-dispatch
       cancel surfaces as `RunnerUnavailable`); schedule `reconcile_pending` and
       `reattach` on startup. 4.4-4.6 are runner-level only until this lands.
-- [ ] 4.10 Owner lease on non-terminal rows (pid, boot id from
-      `/proc/sys/kernel/random/boot_id`, heartbeat) so recovery skips a live
-      owner; until then a host suspended past the staleness margin can make a
-      live row look stale. Recovery writes are already compare-and-swap.
+- [x] 4.10 Owner lease on non-terminal rows (pid, boot id from
+      `/proc/sys/kernel/random/boot_id`, process start time, heartbeat) so
+      recovery skips a live owner. Shared `OwnerLease` in `sprites::job`, used
+      by both executors: the owner refreshes the heartbeat every 15 s by
+      compare-and-swap and fences when it loses; reconcile, reattach and
+      cancel treat a live lease (fresh heartbeat, or same boot and live pid on
+      Linux) as not stale. Recovery writes are already compare-and-swap.
 - [ ] 4.7 Run the new cancel, reconcile and reattach tests in
       `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
 - [ ] 4.8 Not in this slice: the credential broker, the CLI verb and a budgeted

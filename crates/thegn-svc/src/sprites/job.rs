@@ -51,11 +51,17 @@
 //! reconnects to a recorded exec session when the provider still holds it, and
 //! otherwise settles the attempt as `Indeterminate`. Neither touches a
 //! non-terminal row younger than its staleness age, and every recovery write is
-//! a compare-and-swap against the row it read. Known gap: there is no owner
-//! lease (pid, boot id, heartbeat) in the row, so a host suspended for longer
-//! than the staleness margin can make a live run look stale (its monotonic
-//! stream clock pauses while the wall clock does not); the lease is tracked in
-//! the OpenSpec tasks.
+//! a compare-and-swap against the row it read.
+//!
+//! Owner lease: the running attempt keeps an [`OwnerLease`] (pid, boot id,
+//! process start time, heartbeat) in its non-terminal row and refreshes the
+//! heartbeat every 15 s by compare-and-swap. Recovery skips a row whose lease
+//! is live (fresh heartbeat, or on Linux the same process still alive in the
+//! same boot) whatever its age, so a host suspended past the staleness margin
+//! no longer makes a live run look stale. A heartbeat that loses its
+//! compare-and-swap means a recovery settled the row: the owner fences, stops
+//! trusting its own state and never overwrites the row. Rows without a lease
+//! keep the age-only rule, and terminal rows carry none.
 //!
 //! Contract with the route: on the selected route every `Err` that
 //! [`SelectedRunner::submit`] returns reads back as *indeterminate*, because the
@@ -714,6 +720,119 @@ struct SpriteClaim {
     project: String,
 }
 
+/// How often a live owner refreshes its lease heartbeat. Recovery treats a
+/// heartbeat younger than twice this as proof of a live owner.
+pub(crate) const LEASE_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// The ownership lease a running attempt keeps in its non-terminal row, shared
+/// by the Sprites and Vercel executors.
+///
+/// Recovery treats a row as owned and live, and skips it whatever its age, when
+/// either the heartbeat is fresh or (Linux only) the recorded process still
+/// exists in the same boot with the same start time. A host suspended past the
+/// staleness margin therefore no longer makes a live run look stale: after the
+/// resume the pid is still there. A row with no lease (an older record) keeps
+/// the age-only staleness rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnerLease {
+    /// The owning process.
+    pub pid: u32,
+    /// `/proc/sys/kernel/random/boot_id` at the time the lease was taken; `None`
+    /// where the platform has none (pid checks are then skipped).
+    pub boot_id: Option<String>,
+    /// The owner's process start time (`/proc/<pid>/stat` field 22), so a
+    /// recycled pid is not mistaken for the owner.
+    pub start_ticks: Option<u64>,
+    pub started_at_ms: i64,
+    /// Refreshed every [`LEASE_HEARTBEAT`] by the owner, by compare-and-swap.
+    pub heartbeat_ms: i64,
+}
+
+/// What `/proc/<pid>/stat` says about a process.
+struct ProcStat {
+    zombie: bool,
+    start_ticks: u64,
+}
+
+/// Parse `/proc/<pid>/stat`; `None` off Linux or when the process is gone. The
+/// `comm` field may hold spaces and parentheses, so fields are read after the
+/// last `)`.
+fn proc_stat(pid: u32) -> Option<ProcStat> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?;
+    // Field 3 was the state; field 22 (start time) is the 19th after it.
+    let start_ticks = fields.nth(18)?.parse().ok()?;
+    Some(ProcStat {
+        zombie: state.starts_with('Z'),
+        start_ticks,
+    })
+}
+
+/// This boot's id (Linux), read once; `None` elsewhere.
+pub(crate) fn boot_id() -> Option<String> {
+    static BOOT_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            if !cfg!(target_os = "linux") {
+                return None;
+            }
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+        })
+        .clone()
+}
+
+impl OwnerLease {
+    /// A lease for this process, heartbeat now.
+    pub fn current(now_ms: i64) -> Self {
+        let pid = std::process::id();
+        Self {
+            pid,
+            boot_id: boot_id(),
+            start_ticks: proc_stat(pid).map(|stat| stat.start_ticks),
+            started_at_ms: now_ms,
+            heartbeat_ms: now_ms,
+        }
+    }
+
+    /// The same lease with its heartbeat moved to `now_ms`.
+    pub fn refreshed(&self, now_ms: i64) -> Self {
+        Self {
+            heartbeat_ms: now_ms,
+            ..self.clone()
+        }
+    }
+
+    /// True while the owner can still be driving the attempt: a fresh heartbeat,
+    /// or the same process (same boot, same start time, not a zombie) is alive.
+    pub fn is_live(&self, now_ms: i64) -> bool {
+        let window = millis_i64(LEASE_HEARTBEAT * 2);
+        if now_ms.saturating_sub(self.heartbeat_ms) <= window {
+            return true;
+        }
+        let Some(recorded) = self.boot_id.as_deref() else {
+            return false;
+        };
+        if boot_id().as_deref() != Some(recorded) {
+            return false;
+        }
+        proc_stat(self.pid).is_some_and(|stat| {
+            !stat.zombie
+                && self
+                    .start_ticks
+                    .is_none_or(|ticks| ticks == stat.start_ticks)
+        })
+    }
+}
+
 /// Durable record of one attempt. Everything a later reconciliation needs is
 /// here: who ran, where, under which handle, how it ended, what it cost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -760,6 +879,10 @@ pub struct AttemptRecord {
     pub checkout_removed: bool,
     /// Why the attempt was closed without a receipt, when that happened.
     pub error: Option<String>,
+    /// The running owner's lease; absent on rows written before leases existed
+    /// and on rows no run has started yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<OwnerLease>,
 }
 
 impl AttemptRecord {
@@ -1036,6 +1159,24 @@ impl AttemptStore {
         Ok(())
     }
 
+    /// Move the owner's heartbeat to `now_ms` by compare-and-swap against
+    /// `record`, the row the owning run last wrote. False means the stored row
+    /// changed (a recovery settled it) and nothing was written: the owner must
+    /// stop trusting its own state. `record` is updated only on success.
+    pub fn refresh_lease(&self, record: &mut AttemptRecord, now_ms: i64) -> Result<bool> {
+        let Some(lease) = record.lease.as_ref() else {
+            return Ok(true);
+        };
+        let mut next = record.clone();
+        next.lease = Some(lease.refreshed(now_ms));
+        if self.mark_if_unchanged(record, &next)? {
+            *record = next;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Publish `record` only when the stored row still equals `expected` (the
     /// row as a recovery pass read it). The check and the write happen under the
     /// ledger lock, so a recovery never overwrites what the owning run wrote in
@@ -1226,6 +1367,7 @@ impl AttemptStore {
             outputs_fenced: false,
             checkout_removed: false,
             error: None,
+            lease: None,
         };
         store_error(self.mark(&record))?;
         Ok(record)
@@ -1758,8 +1900,8 @@ const RECONCILE_SLACK: Duration = Duration::from_secs(60);
 /// Extra margin on the staleness test. The ledger deadline is wall-clock, but
 /// a live owner times its stream on the monotonic clock, which stops while the
 /// host is suspended; the margin only absorbs small skew. A suspend longer than
-/// it can still make a live row look stale (an owner lease would close that
-/// gap; see the module docs).
+/// it can still make a live row look stale (the owner lease in the row closes
+/// that gap: a live lease is never stale).
 const RECONCILE_CLOCK_MARGIN: Duration = Duration::from_secs(120);
 
 /// The `Instant` an attempt's build clock is read from when it is concluded
@@ -1888,8 +2030,50 @@ impl SpritesSelectedRunner {
         )
     }
 
+    /// False for a row whose owner lease is live, whatever its age; otherwise
+    /// the age-only rule (rows without a lease keep it).
     fn is_stale(&self, record: &AttemptRecord, now_ms: i64) -> bool {
+        if record
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.is_live(now_ms))
+        {
+            return false;
+        }
         now_ms >= record.deadline_ms.saturating_add(self.stale_after_ms())
+    }
+
+    /// Refresh the owner's heartbeat by compare-and-swap against the row this
+    /// run last wrote. False means the stored row is no longer ours (a recovery
+    /// settled it): the owner must stop trusting its own state. A failed write
+    /// is not a loss; the next tick retries.
+    async fn refresh_lease(&self, record: &mut AttemptRecord) -> bool {
+        let store = self.store.clone();
+        let mut held = record.clone();
+        let now_ms = thegn_core::util::now_ms();
+        let result = tokio::task::spawn_blocking(move || {
+            let ours = store.refresh_lease(&mut held, now_ms)?;
+            anyhow::Ok((ours, held))
+        })
+        .await
+        .map_err(|error| anyhow!("ledger task failed: {error}"))
+        .and_then(|inner| inner);
+        match result {
+            Ok((true, held)) => {
+                *record = held;
+                true
+            }
+            Ok((false, _)) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::sprites::job",
+                    %error,
+                    attempt = record.attempt,
+                    "cannot refresh the owner lease heartbeat"
+                );
+                true
+            }
+        }
     }
 
     async fn reserve(
@@ -2036,6 +2220,7 @@ impl SpritesSelectedRunner {
         // The fence. Written before the socket opens: a crash from here on reads
         // back as an unknown dispatch and is never rerun blindly.
         record.state = AttemptState::Dispatching;
+        record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
         if let Err(error) = self.persist(&record).await {
             return Err(self.reject(record, error, true).await);
         }
@@ -2109,7 +2294,11 @@ impl SpritesSelectedRunner {
         let verdict = streaming.verdict;
         record.session = session_handle(&mut session.session_id).await;
         record.state = AttemptState::Running;
+        // The heartbeat compare-and-swaps against the stored row, so it only runs
+        // while the stored row is the one this run wrote.
+        let mut beats = true;
         if let Err(error) = self.persist(&record).await {
+            beats = false;
             // A failed re-mark leaves the earlier `dispatching` fence, which is
             // already enough to forbid an implicit rerun.
             tracing::warn!(
@@ -2125,12 +2314,27 @@ impl SpritesSelectedRunner {
         let mut exit = None;
         let mut timed_out = false;
         let mut cancelled = false;
+        let mut fenced = false;
+        let mut beat = tokio::time::interval_at(
+            tokio::time::Instant::now() + LEASE_HEARTBEAT,
+            LEASE_HEARTBEAT,
+        );
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let next = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     cancelled = true;
                     break;
+                }
+                _ = beat.tick(), if beats => {
+                    if !self.refresh_lease(&mut record).await {
+                        // A recovery settled the row: stop trusting this run's
+                        // state and fence.
+                        fenced = true;
+                        break;
+                    }
+                    continue;
                 }
                 next = tokio::time::timeout_at(until, session.frames.recv()) => next,
             };
@@ -2219,12 +2423,24 @@ impl SpritesSelectedRunner {
                 "attempt cancelled; killing the owned command tree"
             );
         }
-        if exit.is_none() && !timed_out && !cancelled {
+        if fenced {
+            tracing::warn!(
+                target: "thegn::sprites::job",
+                attempt = record.attempt,
+                "the ledger row was settled by another process; this run is fenced"
+            );
+            record.error =
+                Some("owner lease lost: the ledger row was settled by another process".to_owned());
+        }
+        if exit.is_none() && !timed_out && !cancelled && !fenced {
             record.error = match tokio::time::timeout(VERDICT_WAIT, verdict).await {
                 Ok(Ok(Some(error))) => Some(error.to_string()),
                 Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
             };
         }
+        // A fenced run never overwrites the row whoever settled it wrote: the
+        // write is guarded by the (now stale) row this run last held.
+        let guard = fenced.then(|| record.clone());
         Ok(self
             .conclude(
                 record,
@@ -2234,7 +2450,7 @@ impl SpritesSelectedRunner {
                 launch_failed,
                 &stdout,
                 Some(&stderr),
-                None,
+                guard.as_ref(),
             )
             .await)
     }
@@ -2264,6 +2480,7 @@ impl SpritesSelectedRunner {
         record.spent_micros = Some(0);
         record.outputs_fenced = true;
         record.finished_ms = Some(thegn_core::util::now_ms());
+        record.lease = None;
         record.error = Some(format!("{error:#}"));
         if let Err(write_error) = self.persist(&record).await {
             tracing::warn!(
@@ -2528,6 +2745,7 @@ impl SpritesSelectedRunner {
             _ => None,
         };
         record.finished_ms = Some(thegn_core::util::now_ms());
+        record.lease = None;
         record.spent_micros = cost_micros;
         record.outputs_fenced = !matches!(completion, SelectedCompletion::Exited(_));
         let (outputs, outputs_missing) = if record.outputs_fenced {
@@ -3381,6 +3599,7 @@ mod tests {
             outputs_fenced: false,
             checkout_removed: false,
             error: None,
+            lease: None,
         };
         assert_eq!(
             record.resume(1),
