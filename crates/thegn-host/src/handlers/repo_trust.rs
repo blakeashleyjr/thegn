@@ -268,7 +268,7 @@ fn overlay_devcontainer(
     for w in &outcome.warnings {
         tracing::warn!(target: "thegn::config_trust", "{w}");
     }
-    surface(db, &root_s, worktree, &[], &outcome.pending);
+    surface(&db, &root_s, worktree, &[], &outcome.pending);
     for key in &outcome.substitution.blocked_local_env {
         tracing::warn!(
             target: "thegn::config_trust",
