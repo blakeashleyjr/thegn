@@ -351,8 +351,8 @@ fn provider_error(env: &str, detail: String) -> RunnerError {
     }
 }
 
-/// `provider_for_inventory` reports an unresolved token as "API token <ref> could
-/// not be resolved" (the ref name only); every other failure is a provider-spec
+/// `provider_for_inventory` reports an unresolved token as `"API token <ref> could
+/// not be resolved"` (the ref name only); every other failure is a provider-spec
 /// problem.
 fn classify_provider_error(env: &str, why: String) -> RunnerError {
     if why.ends_with("could not be resolved") {
