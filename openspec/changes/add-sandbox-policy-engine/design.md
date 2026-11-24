@@ -29,15 +29,33 @@ and a pane launched by a route are judged by one rule set.
 - Evaluation: hard denies first; then the rules in order, first match wins; then
   the configured default. A rule matches when every selector it carries matches.
 
+`LaunchClass` already exists in `thegn_core::launch_class`. The new module sits
+beside it, and like that module and `thegn_core::admission` it keeps a name
+outside the frozen `sandbox*.rs` glob (B7).
+
 The function does no I/O. It is unit-tested to the core coverage gate.
 
 ## Hard denies
 
 The hard denies are writes to git configuration, SSH and GPG material, and the
-canonical secret paths. They are **the same list the sandbox already enforces**
-(the sealed-home deny list and the git-config list), shared by reference rather
-than copied, so the two cannot drift. A user allow rule, a profile and a
-repository overlay cannot lift a hard deny.
+canonical secret paths. They are **the same lists the sandbox already enforces**,
+shared by reference rather than copied so the two cannot drift:
+
+- `SEALED_HOME_DENY` and `SEALED_ABS_DENY` in
+  `crates/thegn-core/src/sandbox_mounts.rs` (SSH, GPG, cloud and credential
+  material, and the absolute secret roots); and
+- the git-config entries of `SEALED_HOME_ALLOW` (`~/.gitconfig` and
+  `~/.config/git/config`), which `sealed_home_allowlist` binds read-only, so a
+  git config write is already impossible in a sealed home; and
+- the repository's own git config: the shared `<common dir>/config` that the
+  git mounts in `crates/thegn-core/src/sandbox.rs` pin read-only over the
+  read-write common dir, plus the `[sandbox.git]` `ro_after` pins. For a
+  repository-scoped tool this is the git config a write could actually reach.
+
+Those constants are private today. WS02-P5-12 exposes them `pub(crate)` (or
+behind a `pub(crate)` accessor) instead of copying the entries, so a new
+credential path cannot be added to one list and forgotten in the other. A user
+allow rule, a profile and a repository overlay cannot lift a hard deny.
 
 ## Rules and trust
 

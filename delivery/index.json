@@ -446,7 +446,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "A brokered sandbox operation-policy engine remains unstarted."
+      "summary": "An ordered operation policy in front of `tools.run` and launch admission is specified and unstarted; WS02-P5-12 implements it."
     },
     {
       "change": "add-sandboxed-merge-gate",
