@@ -892,6 +892,7 @@ def case_p20b():
         "python3", "-I", str(probe), "--bin", BIN, "--repo", REPO,
         "--samples", "12", "--timeout", "90",
     ]
+    command += ["--env", ENV_NAME]
     try:
         probe_env = os.environ.copy()
         probe_env["RP_TUI_SAMPLES_OUT"] = str(TMP / "tui-samples.json")

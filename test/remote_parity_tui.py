@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Measure interactive key echo latency through the real thegn TUI.
 
-The probe never touches the owner's thegn: it gives the TUI a throwaway
-HOME, `XDG_CONFIG_HOME` and `THEGN_CONFIG_DIR` (a caller's already-isolated
-state dir stays put, so the TUI still finds that run's daemon) and skips the
-first-run wizard. It refuses to start when the config path still resolves to
-the real user config, and it types the ready marker only once the pane shows
-a shell prompt, so keystrokes cannot land in a settings form that persists.
+The probe keeps the owner's thegn config out of reach: it gives the TUI a
+throwaway HOME, `XDG_CONFIG_HOME` and `THEGN_CONFIG_DIR` (a caller's
+already-isolated state dir stays put, so the TUI still finds that run's
+daemon) and skips the first-run wizard. `XDG_DATA_HOME`, `XDG_CACHE_HOME` and
+`XDG_RUNTIME_DIR` still pass through when the caller set them: they hold
+caches and sockets, not config. It refuses to start when the config path still
+resolves to the real user config, and it types the ready marker only once the
+pane shows a shell prompt, so keystrokes cannot land in a settings form that
+persists.
+
+With `--env NAME` the throwaway config is seeded with a read-only copy of ONLY
+the owner's `[env.NAME]` table and its sub-tables (the table that makes the
+worktree remote), and the probe then checks the pane really is remote: the
+hostname the pane reports must differ from this machine's, otherwise the
+probe FAILs instead of reporting local echo latency as remote parity.
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ import os
 import pty
 import re
 import shutil
+import socket
 import signal
 import struct
 import sys
@@ -30,10 +40,23 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: the seeded table is then not re-parsed.
+    tomllib = None
+
 
 READY = b"RPTUIREADY"
 WORD = b"zqxjkv"
 READY_COMMAND = b"printf '%s%s\\n' RP TUIREADY\r"
+# The echoed command carries `%s` right after the colon, so only the output
+# line (a real hostname) matches HOST_REPLY.
+HOST_COMMAND = b"printf 'RPHOST:%s\\n' \"$(uname -n)\"\r"
+HOST_REPLY = re.compile(rb"RPHOST:([A-Za-z0-9][A-Za-z0-9._-]*)")
+PROBE_PS1 = "RPPROBE$ "
+ENV_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+HEADER_LINE = re.compile(r"^\s*\[\[?\s*(.+?)\s*\]\]?\s*(?:#.*)?$")
+HEADER_KEY = re.compile(r'"([^"]*)"|\'([^\']*)\'|([A-Za-z0-9_-]+)')
 KEY_INTERVAL = 0.250
 AFTER_WORD_PAUSE = 0.500
 READ_WAIT = 0.050
@@ -166,6 +189,50 @@ def keep_throwaway(value: str, home: Path, fallback: Path) -> str:
     return str(fallback)
 
 
+def env_table_text(text: str, name: str) -> str:
+    """The `[env.<name>]` table and its sub-tables, lifted verbatim from `text`.
+
+    Header lines are matched line by line, which is enough for the shape
+    config.toml uses; the caller re-parses the result to prove it is whole.
+    """
+    keep = False
+    lines: list[str] = []
+    for line in text.splitlines():
+        match = HEADER_LINE.match(line)
+        if match:
+            keys = [a or b or c for a, b, c in HEADER_KEY.findall(match.group(1))]
+            keep = keys[:2] == ["env", name]
+        if keep:
+            lines.append(line)
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def seed_env_config(owner: Mapping[str, str], child_config_dir: Path, name: str) -> str | None:
+    """Copy only `[env.<name>]` from the owner's config; None on success, else why not.
+
+    The owner's file is only ever read. A copy, never a link, so nothing the TUI
+    writes can reach it.
+    """
+    if not ENV_NAME.fullmatch(name):
+        return f"{name!r} is not a usable environment name"
+    source = config_path_for(owner)
+    try:
+        table = env_table_text(source.read_text(encoding="utf-8"), name)
+    except OSError as error:
+        return f"cannot read {source}: {error.strerror or error}"
+    if not table:
+        return f"{source} has no [env.{name}] table, so the pane could not be remote"
+    if tomllib is not None:
+        try:
+            parsed = tomllib.loads(table)
+        except tomllib.TOMLDecodeError as error:
+            return f"the [env.{name}] table did not copy as valid TOML: {error}"
+        if name not in parsed.get("env", {}):
+            return f"the copied text does not define [env.{name}]"
+    (child_config_dir / "config.toml").write_text(table, encoding="utf-8")
+    return None
+
+
 def isolated_environment(base: Mapping[str, str], root: Path) -> dict[str, str]:
     """A child environment that cannot reach the owner's thegn.
 
@@ -174,17 +241,22 @@ def isolated_environment(base: Mapping[str, str], root: Path) -> dict[str, str]:
     control socket its state dir keys, so replacing a run's own state would
     detach the probe from that run instead of isolating anything.
     """
+    if not (base.get("HOME") or ""):
+        raise ValueError("HOME is not set, so the owner's home cannot be told apart")
     for name in ("home", "state", "thegn"):
         (root / name).mkdir(mode=0o700, parents=True, exist_ok=True)
     (root / "config" / "thegn").mkdir(mode=0o700, parents=True, exist_ok=True)
     env = dict(base)
-    home = Path(env.get("HOME") or "").resolve()
+    home = Path(env["HOME"]).resolve()
     env["HOME"] = str(root / "home")
     env["XDG_CONFIG_HOME"] = str(root / "config")
     env["THEGN_CONFIG_DIR"] = str(root / "config" / "thegn")
     # The first-run wizard and the keymap picker are modal: they swallow driven
     # keystrokes and write the ones still in a field into config.toml.
     env["THEGN_SKIP_ONBOARDING"] = "1"
+    # A known prompt for shells that honour it, so prompt detection is not left
+    # to whatever the owner's shell rc draws.
+    env["PS1"] = PROBE_PS1
     env["XDG_STATE_HOME"] = keep_throwaway(
         env.get("XDG_STATE_HOME") or "", home, root / "state"
     )
@@ -194,6 +266,8 @@ def isolated_environment(base: Mapping[str, str], root: Path) -> dict[str, str]:
     if env["XDG_STATE_HOME"] == str(root / "state"):
         # No daemon lives in a state dir this run just made, and starting one
         # would leave it behind: run panes in-process for this throwaway run.
+        # thegn treats any set THEGN_NO_DAEMON value as "no daemon", so a
+        # value the caller already set is left alone.
         env.setdefault("THEGN_NO_DAEMON", "1")
     return env
 
@@ -317,6 +391,19 @@ class PtyProbe:
                     return False
                 self._condition.wait(min(READ_WAIT, remaining))
 
+    def wait_for_match(
+        self, pattern: re.Pattern[bytes], offset: int, deadline: float
+    ) -> re.Match[bytes] | None:
+        while True:
+            with self._condition:
+                found = pattern.search(bytes(self.output[offset:]))
+                if found is not None:
+                    return found
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(min(READ_WAIT, remaining))
+
     def wait_for_prompt(self, deadline: float) -> str | None:
         """Wait until the pane draws a shell prompt, so nothing is typed blind.
 
@@ -381,6 +468,7 @@ def run_probe(
     samples: int,
     timeout: float,
     self_test: bool,
+    env_name: str | None = None,
 ) -> dict[str, Any]:
     first_key_ms: list[int] = []
     next_key_ms: list[int] = []
@@ -388,7 +476,10 @@ def run_probe(
     probe: PtyProbe | None = None
     try:
         root = Path(tempfile.mkdtemp(prefix="thegn-rp-tui-"))
-        child_env = isolated_environment(os.environ, root)
+        try:
+            child_env = isolated_environment(os.environ, root)
+        except ValueError as error:
+            return result("FAIL", f"refusing to drive the TUI: {error}")
         refusal = isolation_refusal(child_env, root, os.environ)
         if refusal is not None:
             return result(
@@ -397,6 +488,10 @@ def run_probe(
                 first_key_ms,
                 next_key_ms,
             )
+        if env_name and not self_test:
+            problem = seed_env_config(os.environ, root / "config" / "thegn", env_name)
+            if problem is not None:
+                return result("FAIL", f"cannot give the TUI the remote env: {problem}")
         probe = PtyProbe(executable, repo, self_test, child_env)
         probe.start()
         readiness_deadline = time.monotonic() + timeout
@@ -418,6 +513,28 @@ def run_probe(
                     f"command within {seconds_text(timeout)}s",
                 )
             probe.write(READY_COMMAND)
+
+        if env_name and not self_test:
+            offset, _ = probe.write(HOST_COMMAND)
+            reply = probe.wait_for_match(
+                HOST_REPLY, offset, min(readiness_deadline, time.monotonic() + 10.0)
+            )
+            if reply is None:
+                return result(
+                    "FAIL",
+                    "the pane did not report its hostname, so it cannot be shown remote",
+                )
+            pane_host = reply.group(1).decode("ascii", "replace")
+            local_host = socket.gethostname()
+            if pane_host.split(".")[0].lower() == local_host.split(".")[0].lower():
+                return result(
+                    "FAIL",
+                    f"the pane reports this machine's hostname ({pane_host}): "
+                    f"env '{env_name}' fell back to a local shell, so key latency "
+                    "would be local echo, not remote parity",
+                )
+            probe.write(b"\x15")
+            time.sleep(AFTER_WORD_PAUSE)
 
         for _ in range(samples):
             for index, value in enumerate(WORD):
@@ -471,6 +588,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=None, help="repository used as the child cwd")
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--timeout", type=float, default=90.0)
+    parser.add_argument(
+        "--env",
+        default=os.environ.get("RP_ENV_NAME") or None,
+        help="environment the pane must run in; its [env.NAME] table is copied "
+        "read-only from the owner's config and the pane is checked to be remote",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
 
@@ -490,6 +613,7 @@ def main(argv: list[str] | None = None) -> int:
             args.samples,
             args.timeout,
             args.self_test,
+            args.env,
         )
     if args.self_test and not compact_shape(payload):
         print("remote_parity_tui: self-test produced a non-compact result", file=sys.stderr)

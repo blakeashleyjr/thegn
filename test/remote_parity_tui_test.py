@@ -260,7 +260,9 @@ class RemoteParityTuiTests(unittest.TestCase):
             self.assertEqual(child["THEGN_DIR"], str(root / "thegn"))
             self.assertEqual(child["THEGN_NO_DAEMON"], "1")
 
-    def test_a_caller_that_already_isolated_panes_keeps_its_choice(self) -> None:
+    def test_any_caller_set_no_daemon_value_is_left_alone(self) -> None:
+        # thegn disables the daemon for ANY set THEGN_NO_DAEMON value, "0"
+        # included, so the probe only fills the variable in when it is unset.
         probe = load_probe()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "throwaway"
@@ -269,6 +271,115 @@ class RemoteParityTuiTests(unittest.TestCase):
                 {"HOME": "/home/owner", "THEGN_NO_DAEMON": "0"}, root
             )
             self.assertEqual(child["THEGN_NO_DAEMON"], "0")
+            self.assertEqual(child["PS1"], probe.PROBE_PS1)
+
+    def test_an_unset_home_is_an_error_not_the_cwd(self) -> None:
+        probe = load_probe()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "throwaway"
+            root.mkdir()
+            for base in ({}, {"HOME": ""}):
+                with self.assertRaises(ValueError):
+                    probe.isolated_environment(base, root)
+
+    def test_only_the_named_env_tables_are_copied(self) -> None:
+        probe = load_probe()
+        text = (
+            "[ui]\ntheme = 'x'\n\n"
+            "[env.box]\nprovider = 'sprites'\n\n"
+            "[env.box.provider_opts]\nregion = 'a'\n\n"
+            "[env.other]\nprovider = 'nope'\n\n"
+            '[env."box2"]\nprovider = "nope"\n\n'
+            "[host.h]\nx = 1\n"
+        )
+        table = probe.env_table_text(text, "box")
+        self.assertIn("[env.box]", table)
+        self.assertIn("[env.box.provider_opts]", table)
+        self.assertNotIn("other", table)
+        self.assertNotIn("box2", table)
+        self.assertNotIn("[ui]", table)
+        self.assertNotIn("[host.h]", table)
+        self.assertEqual(probe.env_table_text(text, "missing"), "")
+
+    def test_seeding_reads_the_owner_config_and_never_writes_it(self) -> None:
+        probe = load_probe()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            owner_dir = base / "owner" / "thegn"
+            owner_dir.mkdir(parents=True)
+            owner_file = owner_dir / "config.toml"
+            owner_file.write_text("[env.box]\nprovider = 'sprites'\n[ui]\nx = 1\n")
+            before = owner_file.read_bytes()
+            child_dir = base / "child"
+            child_dir.mkdir()
+            owner = {"HOME": "/home/o", "XDG_CONFIG_HOME": str(base / "owner")}
+            self.assertIsNone(probe.seed_env_config(owner, child_dir, "box"))
+            self.assertEqual(
+                (child_dir / "config.toml").read_text(), "[env.box]\nprovider = 'sprites'\n"
+            )
+            self.assertEqual(owner_file.read_bytes(), before)
+            self.assertIn("no [env.nope]", probe.seed_env_config(owner, child_dir, "nope") or "")
+
+    def _drive_env_probe(self, local_name: str) -> dict:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_home = root / "owner"
+            (config_home / "thegn").mkdir(parents=True)
+            (config_home / "thegn" / "config.toml").write_text(
+                "[env.box]\nprovider = 'sprites'\n", encoding="utf-8"
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            uname = bin_dir / "uname"
+            uname.write_text(f"#!/bin/sh\necho {local_name}\n", encoding="utf-8")
+            uname.chmod(0o755)
+            fixture = root / "fake-tui"
+            fixture.write_text(
+                "#!/bin/sh\nprintf 'probe$ '\nexec /bin/sh -i\n", encoding="utf-8"
+            )
+            fixture.chmod(0o755)
+            environment = {
+                "HOME": str(root),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "XDG_CONFIG_HOME": str(config_home),
+            }
+            completed = subprocess.run(
+                [
+                    sys.executable, "-I", str(SCRIPT), "--bin", str(fixture),
+                    "--repo", str(SCRIPT.parent.parent), "--samples", "1",
+                    "--timeout", "10", "--env", "box",
+                ],
+                capture_output=True, text=True, timeout=30, check=False, env=environment,
+            )
+            return json.loads(completed.stdout)
+
+    def test_a_pane_on_another_host_passes_the_remote_check(self) -> None:
+        payload = self._drive_env_probe("remote-box.internal")
+        self.assertEqual(payload["status"], "PASS", payload["note"])
+
+    def test_a_pane_on_this_host_fails_as_a_silent_local_fallback(self) -> None:
+        import socket
+
+        payload = self._drive_env_probe(socket.gethostname())
+        self.assertEqual(payload["status"], "FAIL")
+        self.assertIn("local shell", payload["note"])
+
+    def test_a_missing_env_table_fails_before_driving_the_tui(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "thegn").mkdir()
+            (root / "thegn" / "config.toml").write_text("[ui]\nx = 1\n")
+            completed = subprocess.run(
+                [
+                    sys.executable, "-I", str(SCRIPT), "--bin", "/bin/false",
+                    "--repo", str(root), "--env", "box", "--timeout", "2",
+                ],
+                capture_output=True, text=True, timeout=20, check=False,
+                env={"HOME": str(root), "XDG_CONFIG_HOME": str(root), "PATH": "/usr/bin:/bin"},
+            )
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["status"], "FAIL")
+            self.assertIn("[env.box]", payload["note"])
 
     def test_the_prompt_gate_ignores_repaints_without_a_prompt(self) -> None:
         probe = load_probe()
