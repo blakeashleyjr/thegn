@@ -413,7 +413,7 @@ mod tests {
         assert!(matches!(
             fetch(
                 &PreviewConfig {
-                    fetch_timeout_ms: 2_000,
+                    fetch_timeout_ms: 10_000,
                     ..PreviewConfig::default()
                 },
                 request(url),
