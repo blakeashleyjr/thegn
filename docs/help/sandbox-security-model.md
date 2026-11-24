@@ -8,8 +8,8 @@ parent: sandboxing
 
 Part of [[sandboxing]]. This page states what the sandbox protects, what it does
 not, and which launches still run on your host. It describes thegn at the first
-sandbox-hardening wave. A row marked ⚠ is a gap: it is not true yet, and it names
-the item that closes it.
+sandbox-hardening wave and states what is enforced today. A row marked ⚠ is a gap:
+it is not true yet.
 
 ## Posture
 
@@ -23,15 +23,18 @@ the item that closes it.
 - VM tiers add a guest kernel.
 
 `workspace.mode = "private-copy"` is not available yet. ⚠ No private copy exists
-today (WS11-P3-06), so `sealed` is the hardened tier and not yet the boundary
+today, so `sealed` is the hardened tier and not yet the boundary
 tier.
 
 ## What thegn protects
+
+These are the goals. The gaps below say where today's enforcement falls short.
 
 - **Your secrets**: `~/.ssh`, cloud credentials, the `gh` token, browser
   sessions, OS keyrings, and the OAuth refresh tokens of your agents.
 - **Your host's integrity**: files outside the worktree, and anything your host
   later executes: shell rc files, toolchains, caches, git hooks, agent hooks.
+  See the gaps for `standard` and `sealed` below.
 - **Other sessions**: keystrokes and output of other panes, and your clipboard.
 - **thegn's control plane**: the daemon control socket, the state directory, and
   pairing tokens.
@@ -64,14 +67,15 @@ physical access.
 
 - A repository can only tighten policy.
 - Every failure to set up enforcement refuses the launch. There is no silent
-  downgrade below your isolation floor (default: shared kernel).
+  downgrade below the default isolation floor (shared kernel). An explicit
+  `isolation_floor` may instead allow degrading.
 - The isolation class and egress label shown are derived from what actually
   launched.
 - Secrets are not placed in argv, and logs are redacted.
 - A repository's code runs on your host when you or thegn run it there: the merge
-  gate, queue agents, test discovery, and language servers. ⚠ Until batch jobs run
-  sandboxed, landing a sandbox-written branch runs its code on your host
-  (WS11-P3-12, WS11-P3-13).
+  gate, queue agents, test discovery, and language servers. ⚠ Today batch jobs do
+  not run sandboxed, so landing a sandbox-written branch runs its code on your
+  host.
 
 ## Profiles
 
@@ -80,7 +84,7 @@ physical access.
 | `open`                  | Not a sandbox.                    | No hardening.                           |
 | `standard`              | Accident guard.                   | Not a boundary against a hostile agent. |
 | `sealed`                | Hardened tier.                    | Shared kernel.                          |
-| `sealed` + private copy | Boundary tier on a shared kernel. | ⚠ Not available yet (WS11-P3-06).       |
+| `sealed` + private copy | Boundary tier on a shared kernel. | ⚠ Not available yet.                    |
 
 `standard` does not protect:
 
@@ -91,24 +95,35 @@ physical access.
 - The network namespace on bwrap. With `network = "nat"` it is the host's, so
   abstract unix sockets and localhost TCP are reachable.
 - ⚠ Shared read-write toolchain caches that your host later executes (`.rustup`,
-  the cargo registry and git caches, pre-commit caches). WS03-P2-05 closes this
-  for `standard` in W3.
+  the cargo registry and git caches, pre-commit caches).
+- ⚠ Writable `~/.keychain` (sourced by host login shells), `~/.claude-profiles`
+  (agent settings, hooks and credentials) and `~/.claude/projects`.
+- ⚠ A shared `.git` that stays writable in some launches (see Git and landing).
 
-`sealed` lists the shared kernel as its limit. Its package caches are private to
-the worktree and start cold. Its gaps:
+`sealed` lists the shared kernel as its limit. Its gaps:
 
-- ⚠ In linked mode a sandbox can rewrite the shared object store (WS11-P3-09).
-- ⚠ There is no private copy of the workspace yet (WS11-P3-06).
+- ⚠ Today sealed profiles share the host's read-write toolchain and package
+  caches (`.rustup`, the cargo registry and git caches, pre-commit and nix
+  caches), which your host later executes. Local tools work; the caches are warm
+  and not private.
+- ⚠ In linked mode a sandbox can rewrite the shared object store.
+- ⚠ There is no private copy of the workspace yet.
+
+Process limits and privilege locking vary by backend:
+
+- ⚠ The process-count limit (512 for `standard`, 256 for `sealed`) applies on
+  podman, docker and systemd only. bwrap has none, and Apple `container` drops it.
+- ⚠ Apple `container` also drops no-new-privileges.
 
 ## Tiers
 
-| Tier                              | Notes                                                     |
-| --------------------------------- | --------------------------------------------------------- |
-| Host process (`backend = "none"`) | Not a sandbox. Refused under the default isolation floor. |
-| bwrap                             | Shared kernel. No process-count cap yet.                  |
-| OCI (podman, docker)              | Shared kernel.                                            |
-| systemd                           | Shared kernel.                                            |
-| Apple `container`                 | Refuses `network = "none"` with `network-unexpressible`.  |
+| Tier                              | Notes                                                                                                              |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Host process (`backend = "none"`) | Not a sandbox. Choosing it opts out of the default isolation floor; only an explicit `isolation_floor` refuses it. |
+| bwrap                             | Shared kernel. No process-count cap yet.                                                                           |
+| OCI (podman, docker)              | Shared kernel.                                                                                                     |
+| systemd                           | Shared kernel.                                                                                                     |
+| Apple `container`                 | Refuses `network = "none"` with `network-unexpressible`.                                                           |
 
 Further tiers (Landlock, Seatbelt, MXC, microVMs, WSL) are not available yet. See
 [[sandbox-backends]] for the backends and the isolation floor.
@@ -116,21 +131,29 @@ Further tiers (Landlock, Seatbelt, MXC, microVMs, WSL) are not available yet. Se
 ## Egress
 
 - `network = "none"` is offline. There is no route out.
-- Allow and block lists are advisory, except on Sprites, which translates them to
-  its own policy API.
+- Allow and block lists are advisory, except on Sprites and Vercel, which
+  translate them to their own policy APIs.
 - A VPN sidecar is not an exclusive route.
-- ⚠ There is no allowlist proxy yet (WS04).
+- ⚠ There is no allowlist proxy yet.
 
 See [[sandbox-network]].
 
 ## Git and landing
 
-Git state is pinned read-only on every backend. ⚠ In linked mode a sandbox can
-still rewrite the object store and sibling lane refs (WS11-P3-09, WS11-P3-10).
+On local bwrap and container launches, `[sandbox.git]` (default `commit-only`)
+mounts the shared `.git` read-only apart from lane carve-outs, with `config` and
+hooks read-only.
+
+- ⚠ Remote placements and the systemd backend keep the shared `.git` writable
+  apart from `config`.
+- ⚠ `[sandbox.git] mode = "full"` and `file_access = all` or `host` keep it
+  writable.
+- ⚠ In linked mode a sandbox can still rewrite the object store and sibling lane
+  refs.
 
 ## Terminal channels
 
-⚠ A pane can set your clipboard with OSC 52 (WS11-P5-08).
+⚠ A pane can set your clipboard with OSC 52.
 
 ## Documented residual risks
 
@@ -150,24 +173,24 @@ Untrusted and headless launches are the untrusted classes of the sandbox securit
 programme ([THE-791](https://linear.app/example/issue/THE-791/sandbox-security-programme-private-workspaces-enforceable-policy)).
 
 The target default for every untrusted class is `sealed`, private copy, private
-home, `offline` (or the `agent` preset for agents), and no credentials. WS11-P6-05
+home, `offline` (or the `agent` preset for agents), and no credentials. A later change
 flips the defaults. Until then each class below runs as the W1 column says.
 
-| Launch class                                          | W1 state                                                                                  | Target after the flip                                            |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `InteractiveOwner` (your panes)                       | Sandboxed, default `standard`.                                                            | Unchanged: default stays `standard`.                             |
-| `QueueAgent`                                          | ⚠ Held on the host by default. Runs on the host only if you lower the floor (WS11-P3-11). | Sealed, private copy, private home, `agent` preset (WS11-P6-05). |
-| `Autopilot`                                           | ⚠ Runs on the host (WS11-P3-14).                                                          | Sealed, private copy, private home, `agent` preset (WS11-P6-05). |
-| `AgentRun` (`thegn agent run`, headless session open) | ⚠ Runs on the host (WS11-P3-11).                                                          | Sealed, private copy, private home, `agent` preset (WS11-P6-05). |
-| `MergeGate` (`gate_command`)                          | ⚠ Runs on the host under a CPU and memory slice only (WS11-P3-12).                        | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
-| `Regenerate`                                          | ⚠ Runs on the host (WS11-P3-12).                                                          | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
-| `TestDiscovery`                                       | ⚠ Runs on the host (WS11-P3-12).                                                          | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
-| `TestRun` (Tests panel)                               | ⚠ Runs on the host (WS11-P3-15).                                                          | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
-| `RepoLifecycle` (repo lifecycle scripts)              | ⚠ Runs on the host (WS11-P3-16).                                                          | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
-| `HeadlessTool` (headless configured tools)            | ⚠ Runs on the host (WS11-P3-16).                                                          | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
-| `Lsp` (language servers)                              | ⚠ Runs on the host under a CPU and memory slice only (WS11-P3-13).                        | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
-| `ProviderExec` (headless provider exec)               | ⚠ Runs outside the sandbox policy (WS08-P7-05).                                           | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
-| `Plugin` (untrusted plugins)                          | ⚠ Native, unsandboxed process (WS10-P3-02).                                               | Sealed, private copy, private home, `offline` (WS11-P6-05).      |
+| Launch class                                          | W1 state                                                                     | Target after the flip                               |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------- |
+| `InteractiveOwner` (your panes)                       | Sandboxed, default `standard`.                                               | Unchanged: default stays `standard`.                |
+| `QueueAgent`                                          | ⚠ Held on the host by default. Runs on the host only if you lower the floor. | Sealed, private copy, private home, `agent` preset. |
+| `Autopilot`                                           | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `agent` preset. |
+| `AgentRun` (`thegn agent run`, headless session open) | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `agent` preset. |
+| `MergeGate` (`gate_command`)                          | ⚠ Runs on the host under a CPU and memory slice only.                        | Sealed, private copy, private home, `offline`.      |
+| `Regenerate`                                          | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |
+| `TestDiscovery`                                       | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |
+| `TestRun` (Tests panel)                               | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |
+| `RepoLifecycle` (repo lifecycle scripts)              | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |
+| `HeadlessTool` (headless configured tools)            | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |
+| `Lsp` (language servers)                              | ⚠ Runs on the host under a CPU and memory slice only.                        | Sealed, private copy, private home, `offline`.      |
+| `ProviderExec` (headless provider exec)               | ⚠ Runs outside the sandbox policy.                                           | Sealed, private copy, private home, `offline`.      |
+| `Plugin` (untrusted plugins)                          | ⚠ Native, unsandboxed process.                                               | Sealed, private copy, private home, `offline`.      |
 
 These host-trust exceptions run on the host as explicit user-owned trust, by
 design:

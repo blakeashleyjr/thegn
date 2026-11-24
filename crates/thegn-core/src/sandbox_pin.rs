@@ -74,14 +74,14 @@ pub const fn explain(profile: SandboxProfile) -> ProfileExplain {
             agents: "SSH needs a remote runtime; providers and bare host shells are refused.",
             extra: &[
                 "An unsealable launch is refused, never downgraded.",
-                "API-backed agent CLIs fail; local tools work; package caches are private to this worktree and start cold.",
-                "Root is read-only; new privileges are blocked; 256 process limit.",
+                "API-backed agent CLIs fail; local tools work; package caches are shared with your host and read-write.",
+                "Root is read-only; new privileges are blocked (not on Apple container); 256-process limit on podman, docker and systemd only.",
             ],
             how_to_change: "Change via palette > Isolation profile or the CLI.",
         },
         SandboxProfile::Hardened => ProfileExplain {
             title: "Standard",
-            one_liner: "Accident guard: files outside this worktree are read-only.",
+            one_liner: "Accident guard, not a hostile-agent boundary.",
             hides: &[
                 "Files outside the worktree are read-only.",
                 "Home stays readable, including credentials, ~/.ssh and cloud tokens.",
@@ -90,7 +90,7 @@ pub const fn explain(profile: SandboxProfile) -> ProfileExplain {
             credentials: "Credentials in your read-only home remain visible.",
             agents: "Local, SSH and provider work; default capabilities remain.",
             extra: &[
-                "Root is read-only; new privileges blocked; a 512-process limit on container and systemd backends (bwrap has none yet).",
+                "Root is read-only; new privileges blocked (not on Apple container); a 512-process limit on podman, docker and systemd only.",
             ],
             how_to_change: "Change via palette > Isolation profile or the CLI.",
         },
