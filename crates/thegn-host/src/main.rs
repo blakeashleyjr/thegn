@@ -94,6 +94,8 @@ mod escape;
 mod fd_limit;
 mod fff_backend;
 mod fleet_read;
+#[cfg(test)]
+mod flood_sched_tests;
 mod fly_reaper;
 mod focus;
 mod font;
@@ -318,11 +320,8 @@ mod ssh_shim;
 mod stage_prompt;
 mod stage_worker_hold;
 mod startup_heal;
-mod worktree_discovery;
-#[rustfmt::skip]
-#[cfg(test)]
-mod flood_sched_tests;
 mod state_gc;
+mod worktree_discovery;
 // THE-603 is an unwired capture primitive; THE-592 owns future startup admission.
 #[allow(dead_code)]
 mod state_host_capture;
