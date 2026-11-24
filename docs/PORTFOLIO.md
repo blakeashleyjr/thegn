@@ -27,8 +27,8 @@ The ongoing lifecycle and closure rules are in
 - There are no cycles or invented delivery dates. Project order expresses
   dependency and readiness; it does not promise a calendar schedule.
 
-| Alpha project                                                                                                                            | State       | Priority | Outcome                                                                                               |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ----------- | -------- | ----------------------------------------------------------------------------------------------------- |
+| Alpha project                                                                                                                        | State       | Priority | Outcome                                                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------ | ----------- | -------- | ----------------------------------------------------------------------------------------------------- |
 | [Alpha Reliability & State Compatibility](https://linear.app/example/project/alpha-reliability-and-state-compatibility-d52ec69b3c57) | In Progress | Urgent   | Shared state fails closed, compatibility is operation-aware, and important runtime modes are visible. |
 | [Client API & Remote Access](https://linear.app/example/project/client-api-and-remote-access-fb8407005605)                           | Planned     | High     | Remote control has an explicit trust boundary and published client contracts are truthful.            |
 | [Plugin UI Platform](https://linear.app/example/project/plugin-ui-platform-cc32c0028759)                                             | Planned     | Medium   | Plugin vocabulary, permissions, documentation, and actual UI extension points agree.                  |
@@ -40,8 +40,8 @@ demonstrated shipped-path correctness or security failure, billable-resource
 leak risk, or release/support evidence. Low is reserved for blocked speculative
 work and proposal retirement.
 
-| Post-alpha project                                                                                                                   | State   | Priority | Outcome                                                                                                                     |
-| ------------------------------------------------------------------------------------------------------------------------------------ | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Post-alpha project                                                                                                               | State   | Priority | Outcome                                                                                                                     |
+| -------------------------------------------------------------------------------------------------------------------------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
 | [Agent & Workflow Platform](https://linear.app/example/project/agent-and-workflow-platform-a0f5c2e165d2)                         | Planned | Medium   | Harness, tracker, pipeline, CI, review, and SCM capabilities share explicit foundations and dependency order.               |
 | [Workspace Product & Observability](https://linear.app/example/project/workspace-product-and-observability-fb0f99380fed)         | Planned | Medium   | Multi-repo navigation, search, dashboards, terminal UX, media, voice, and visible state evolve as independent product work. |
 | [Runtime Security & Host Architecture](https://linear.app/example/project/runtime-security-and-host-architecture-8dfde99f448e)   | Planned | High     | Credential, containment, crash, host, session, proxy, and provisioning residuals are separated by risk.                     |
@@ -108,8 +108,8 @@ the work shipped.
 
 ### Alpha Reliability & State Compatibility
 
-| Milestone                                 | Issue                                                 | State / priority | Remaining outcome                                                                                   | Spec/change                                                                               |
-| ----------------------------------------- | ----------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Milestone                                 | Issue                                             | State / priority | Remaining outcome                                                                                   | Spec/change                                                                               |
+| ----------------------------------------- | ------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | R2: Contained toolchain and visible state | [THE-97](https://linear.app/example/issue/THE-97) | Backlog / Medium | Continuously prove that a staged agent can commit without escaping the configured worktree sandbox. | [`verify-stage-worker-containment`](../openspec/changes/verify-stage-worker-containment/) |
 
 The shared-state safety and sandbox cache remediations are complete. THE-97 is
@@ -117,8 +117,8 @@ the separate continuous worker-containment proof, not a substitute for either.
 
 ### Client API & Remote Access
 
-| Milestone                        | Issue                                                   | State / priority | Remaining outcome                                                                                                                   | Spec/change                                                                                         |
-| -------------------------------- | ------------------------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Milestone                        | Issue                                               | State / priority | Remaining outcome                                                                                                                   | Spec/change                                                                                         |
+| -------------------------------- | --------------------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | C1: Remote control security      | [THE-41](https://linear.app/example/issue/THE-41)   | Backlog / High   | Close the remote-access epic only after its four bounded children establish the transport, identity, routing, and parity decisions. | Children THE-98–THE-101                                                                             |
 | C1: Remote control security      | [THE-98](https://linear.app/example/issue/THE-98)   | Backlog / Medium | Persist a generated surface map and make explicit product-parity decisions for remote consumers.                                    | [`audit-remote-surface-map`](../openspec/changes/audit-remote-surface-map/)                         |
 | C2: Client contract truthfulness | [THE-104](https://linear.app/example/issue/THE-104) | Done / Medium    | None: the outbound-only boundary is published (owner decision 2026-10-20: inbound IDE/OS handoff is deferred).                      | `define-external-ide-inbound-boundary` (archived in batch 81; the outbound-only boundary is public) |
@@ -129,8 +129,8 @@ published promises to what current surfaces can actually do.
 
 ### Plugin UI Platform
 
-| Milestone               | Issue                                                   | State / priority | Remaining outcome                                                                                                               | Spec/change                                                                                       |
-| ----------------------- | ------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Milestone               | Issue                                               | State / priority | Remaining outcome                                                                                                               | Spec/change                                                                                       |
+| ----------------------- | --------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | P1: Contract baseline   | [THE-51](https://linear.app/example/issue/THE-51)   | Todo / Medium    | Complete runtime TUI localization and define how plugin-provided user-visible strings participate.                              | [`extend-localization-surfaces`](../openspec/changes/extend-localization-surfaces/)               |
 | P2: Runtime UI surfaces | [THE-108](https://linear.app/example/issue/THE-108) | Backlog / Medium | Wire the already-declared `PanelSection` contribution end to end with lifecycle, safety, and tests.                             | [`add-ui-component-contract`](../openspec/changes/add-ui-component-contract/)                     |
 | P2: Runtime UI surfaces | [THE-107](https://linear.app/example/issue/THE-107) | Backlog / Medium | Decide bounded contracts for sidebar, themes, and key zones without promising arbitrary rendering.                              | [`decide-plugin-ui-extension-surfaces`](../openspec/changes/decide-plugin-ui-extension-surfaces/) |
@@ -142,8 +142,8 @@ unrestricted DOM, terminal-frame, or arbitrary-code UI layer.
 
 ### Distribution & Release Readiness
 
-| Milestone                 | Issue                                                 | State / priority | Remaining outcome                                                                                                              | Spec/change                                                                             |
-| ------------------------- | ----------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| Milestone                 | Issue                                             | State / priority | Remaining outcome                                                                                                              | Spec/change                                                                             |
+| ------------------------- | ------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | D1: Platform bundles      | [THE-15](https://linear.app/example/issue/THE-15) | Todo / High      | Define and build complete, supported platform bundles with terminal, fonts, dependencies, config, and clean-host verification. | [`add-batteries-included-bundles`](../openspec/changes/add-batteries-included-bundles/) |
 | D2: Publication rehearsal | [THE-52](https://linear.app/example/issue/THE-52) | Todo / High      | Produce reproducible artifacts, metadata, attestations, and rehearsed publication evidence for each supported channel.         | [`add-package-manager-releases`](../openspec/changes/add-package-manager-releases/)     |
 
@@ -153,8 +153,8 @@ possible operating system or package manager is supportable.
 
 ### Spec & Tracker Reconciliation
 
-| Milestone             | Issue                                                 | State / priority     | Remaining outcome                                                                                                                              | Spec/change                                                         |
-| --------------------- | ----------------------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Milestone             | Issue                                             | State / priority     | Remaining outcome                                                                                                                              | Spec/change                                                         |
+| --------------------- | ------------------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | S1: One-time truth-up | [THE-21](https://linear.app/example/issue/THE-21) | In Progress / Medium | Make the shipped typed-event/catalog-action automation model normative and explicitly retain or reject missing triggers and operator controls. | [`add-automation-rules`](../openspec/changes/add-automation-rules/) |
 
 ## Whole-repository OpenSpec state

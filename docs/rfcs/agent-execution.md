@@ -404,8 +404,8 @@ The [platform initiative](https://linear.app/example/initiative/thegn-agent-plat
 
 ### Begin with the five local-terminal offload issues
 
-| Ready issue                                               | Responsible discipline    | First deliverable                                                                                                                            | Handoff                                                  |
-| --------------------------------------------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Ready issue                                           | Responsible discipline    | First deliverable                                                                                                                            | Handoff                                                  |
+| ----------------------------------------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
 | [THE-2316](https://linear.app/example/issue/THE-2316) | Execution API and storage | Draft public receipts and golden vectors with the current Job, CAS and lease types. Agree on required errors and idempotency scopes.         | Unblocks queue, workspace roots, guest protocol and MCP. |
 | [THE-2333](https://linear.app/example/issue/THE-2333) | Harness and containment   | Trace supported stock shell entry points in pinned CLIs against a harmless test delegate. Record login and interactive vs headless coverage. | Select the first passing harness profile.                |
 | [THE-2416](https://linear.app/example/issue/THE-2416) | Project routing           | Resolve each project’s authorized runner and qualify automatic routing from the stock CLI with a stub.                                       | Hands one request to either adapter.                     |
@@ -416,15 +416,15 @@ The architecture review [THE-2315](https://linear.app/example/issue/THE-2315) is
 
 ### Release gates and dependencies
 
-| Gate                                                 | Evidence for release                                                                                                                                                                      | Responsible issues                                                                                                                                                                                                                                                                                                                                                    |
-| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| First release · local terminal, two remote providers | A stock agent runs pinned build/test inputs on a different vendor per project. Both live records show local CPU relief, terminal fidelity and scoped cleanup.                             | [THE-2416](https://linear.app/example/issue/THE-2416) · [THE-2417](https://linear.app/example/issue/THE-2417) · [THE-2418](https://linear.app/example/issue/THE-2418) · [THE-2419](https://linear.app/example/issue/THE-2419)                                                                                                                         |
+| Gate                                                 | Evidence for release                                                                                                                                                                      | Responsible issues                                                                                                                                                                                                                                                                                                                            |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| First release · local terminal, two remote providers | A stock agent runs pinned build/test inputs on a different vendor per project. Both live records show local CPU relief, terminal fidelity and scoped cleanup.                             | [THE-2416](https://linear.app/example/issue/THE-2416) · [THE-2417](https://linear.app/example/issue/THE-2417) · [THE-2418](https://linear.app/example/issue/THE-2418) · [THE-2419](https://linear.app/example/issue/THE-2419)                                                                                                                 |
 | Local contracts and execution                        | Real local shell and MCP receipts against a dirty workspace and pinned root. Framing, cancellation, cursor and exact-epoch fixtures survive contention.                                   | [THE-2316](https://linear.app/example/issue/THE-2316) · [THE-2317](https://linear.app/example/issue/THE-2317) · [THE-2318](https://linear.app/example/issue/THE-2318) · [THE-2335](https://linear.app/example/issue/THE-2335) · [THE-2319](https://linear.app/example/issue/THE-2319) · [THE-2336](https://linear.app/example/issue/THE-2336) |
-| Complete local product                               | A stock harness and a durable coding loop run the same test. Crash after publication, redeliver and observe one continued turn, correct spend and zero waiting agent compute.             | [THE-2320](https://linear.app/example/issue/THE-2320) · [THE-2321](https://linear.app/example/issue/THE-2321) · [THE-2322](https://linear.app/example/issue/THE-2322) · [THE-2323](https://linear.app/example/issue/THE-2323) · [THE-2324](https://linear.app/example/issue/THE-2324)                                                             |
-| Optional gateway releases                            | Native wire fidelity and spend first. Qualify translation and retained evidence next, then cross-harness comparison and deferrable automation. Local Jobs can use an offline fixture.     | [THE-2267](https://linear.app/example/issue/THE-2267) · [THE-2301](https://linear.app/example/issue/THE-2301) · [THE-2302](https://linear.app/example/issue/THE-2302)                                                                                                                                                                                     |
-| Public remote contract                               | Exercise remote builders, shards, patches, cache domains, park/resume and leased ports. A separate repo pins published compatible versions and the released conformance suite.            | [THE-2326](https://linear.app/example/issue/THE-2326) · [THE-2327](https://linear.app/example/issue/THE-2327) · [THE-2328](https://linear.app/example/issue/THE-2328)                                                                                                                                                                                     |
-| Independent hosted offers                            | Run the standard server with user resources and enroll a self-hosted server in Hosted Compute. Drill backup/restore, a single eligible pool, origin durability and all four combinations. | [THE-2345](https://linear.app/example/issue/THE-2345) · [THE-2346](https://linear.app/example/issue/THE-2346) · [THE-2330](https://linear.app/example/issue/THE-2330) · [THE-2331](https://linear.app/example/issue/THE-2331) · [THE-2347](https://linear.app/example/issue/THE-2347)                                                             |
-| Phone and scale claims                               | A physical phone drives 100 sessions and survives reconnect. Distinguish mixed and burst results. An independent managed-pool-loss test gates later availability claims.                  | [THE-2348](https://linear.app/example/issue/THE-2348) · [THE-2349](https://linear.app/example/issue/THE-2349) · [THE-2343](https://linear.app/example/issue/THE-2343) · [THE-2350](https://linear.app/example/issue/THE-2350) · [THE-2332](https://linear.app/example/issue/THE-2332)                                                             |
+| Complete local product                               | A stock harness and a durable coding loop run the same test. Crash after publication, redeliver and observe one continued turn, correct spend and zero waiting agent compute.             | [THE-2320](https://linear.app/example/issue/THE-2320) · [THE-2321](https://linear.app/example/issue/THE-2321) · [THE-2322](https://linear.app/example/issue/THE-2322) · [THE-2323](https://linear.app/example/issue/THE-2323) · [THE-2324](https://linear.app/example/issue/THE-2324)                                                         |
+| Optional gateway releases                            | Native wire fidelity and spend first. Qualify translation and retained evidence next, then cross-harness comparison and deferrable automation. Local Jobs can use an offline fixture.     | [THE-2267](https://linear.app/example/issue/THE-2267) · [THE-2301](https://linear.app/example/issue/THE-2301) · [THE-2302](https://linear.app/example/issue/THE-2302)                                                                                                                                                                         |
+| Public remote contract                               | Exercise remote builders, shards, patches, cache domains, park/resume and leased ports. A separate repo pins published compatible versions and the released conformance suite.            | [THE-2326](https://linear.app/example/issue/THE-2326) · [THE-2327](https://linear.app/example/issue/THE-2327) · [THE-2328](https://linear.app/example/issue/THE-2328)                                                                                                                                                                         |
+| Independent hosted offers                            | Run the standard server with user resources and enroll a self-hosted server in Hosted Compute. Drill backup/restore, a single eligible pool, origin durability and all four combinations. | [THE-2345](https://linear.app/example/issue/THE-2345) · [THE-2346](https://linear.app/example/issue/THE-2346) · [THE-2330](https://linear.app/example/issue/THE-2330) · [THE-2331](https://linear.app/example/issue/THE-2331) · [THE-2347](https://linear.app/example/issue/THE-2347)                                                         |
+| Phone and scale claims                               | A physical phone drives 100 sessions and survives reconnect. Distinguish mixed and burst results. An independent managed-pool-loss test gates later availability claims.                  | [THE-2348](https://linear.app/example/issue/THE-2348) · [THE-2349](https://linear.app/example/issue/THE-2349) · [THE-2343](https://linear.app/example/issue/THE-2343) · [THE-2350](https://linear.app/example/issue/THE-2350) · [THE-2332](https://linear.app/example/issue/THE-2332)                                                         |
 
 External blocking work retains its existing owner: authenticated proxy attribution [THE-151](https://linear.app/example/issue/THE-151), supervisor reload [THE-180](https://linear.app/example/issue/THE-180), sandbox allowlist enforcement [THE-2119](https://linear.app/example/issue/THE-2119) and future plugin runtime contracts [THE-200](https://linear.app/example/issue/THE-200). The first three affect claims about the launch gateway. The plugin gate applies to later extensions.
 
@@ -434,8 +434,8 @@ The index covers 88 issues across nine projects. The first-release additions cov
 
 #### [Thegn Jobs and durable agents — local execution](https://linear.app/example/project/thegn-jobs-and-durable-agents-local-execution-35f7517cb9f7)
 
-| Issue                                                     | Priority | Deliverable                                                                           |
-| --------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------- |
+| Issue                                                 | Priority | Deliverable                                                                           |
+| ----------------------------------------------------- | -------- | ------------------------------------------------------------------------------------- |
 | [THE-2315](https://linear.app/example/issue/THE-2315) | High     | Review the two agent paths and the shared execution contract                          |
 | [THE-2316](https://linear.app/example/issue/THE-2316) | High     | Define the portable agent, command and event receipts                                 |
 | [THE-2317](https://linear.app/example/issue/THE-2317) | High     | Seal workspace inputs and publish verified local object roots                         |
@@ -470,16 +470,16 @@ The index covers 88 issues across nine projects. The first-release additions cov
 
 #### [Hosted Thegn — managed server](https://linear.app/example/project/hosted-thegn-managed-server-d45773ac0e39)
 
-| Issue                                                     | Priority | Deliverable                                                                     |
-| --------------------------------------------------------- | -------- | ------------------------------------------------------------------------------- |
+| Issue                                                 | Priority | Deliverable                                                                     |
+| ----------------------------------------------------- | -------- | ------------------------------------------------------------------------------- |
 | [THE-2345](https://linear.app/example/issue/THE-2345) | Medium   | Operate the standard Thegn server with durable state and customer-owned workers |
 | [THE-2346](https://linear.app/example/issue/THE-2346) | Medium   | Restore and upgrade a managed Thegn server without replaying external effects   |
 | [THE-2347](https://linear.app/example/issue/THE-2347) | High     | Qualify Hosted Thegn and Hosted Compute as independently selectable offers      |
 
 #### [Thegn hosted execution — pools and recovery](https://linear.app/example/project/thegn-hosted-execution-pools-and-recovery-eed468759dd1)
 
-| Issue                                                     | Priority | Deliverable                                                                    |
-| --------------------------------------------------------- | -------- | ------------------------------------------------------------------------------ |
+| Issue                                                 | Priority | Deliverable                                                                    |
+| ----------------------------------------------------- | -------- | ------------------------------------------------------------------------------ |
 | [THE-2330](https://linear.app/example/issue/THE-2330) | Medium   | Implement hosted event ingress and Postgres state parity                       |
 | [THE-2331](https://linear.app/example/issue/THE-2331) | High     | Qualify one hosted microVM pool with end-to-end result durability              |
 | [THE-2332](https://linear.app/example/issue/THE-2332) | Low      | Recover execution and data after losing an independent managed pool            |
@@ -490,16 +490,16 @@ The index covers 88 issues across nine projects. The first-release additions cov
 
 #### [Thegn mobile fleet control](https://linear.app/example/project/thegn-mobile-fleet-control-def7fcdf9b7d)
 
-| Issue                                                     | Priority | Deliverable                                                                     |
-| --------------------------------------------------------- | -------- | ------------------------------------------------------------------------------- |
+| Issue                                                 | Priority | Deliverable                                                                     |
+| ----------------------------------------------------- | -------- | ------------------------------------------------------------------------------- |
 | [THE-2348](https://linear.app/example/issue/THE-2348) | Medium   | Serve a fleet overview and resumable event feed from any Thegn endpoint         |
 | [THE-2349](https://linear.app/example/issue/THE-2349) | Medium   | Ship the phone experience for review, approval, input and cancellation          |
 | [THE-2350](https://linear.app/example/issue/THE-2350) | Medium   | Measure 100 phone-directed agents under mixed activity and a simultaneous burst |
 
 #### [Model gateway — identity, policy and launch](https://linear.app/example/project/model-gateway-identity-policy-and-launch-59d902764599)
 
-| Issue                                                     | Priority | Deliverable                                                                          |
-| --------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------ |
+| Issue                                                 | Priority | Deliverable                                                                          |
+| ----------------------------------------------------- | -------- | ------------------------------------------------------------------------------------ |
 | [THE-2251](https://linear.app/example/issue/THE-2251) | High     | Ratify the gateway launch contract against the restored proxy                        |
 | [THE-2252](https://linear.app/example/issue/THE-2252) | High     | Bind managed request attribution to the authenticated launch principal               |
 | [THE-2253](https://linear.app/example/issue/THE-2253) | High     | Apply one effective policy generation to each admitted request                       |
@@ -510,8 +510,8 @@ The index covers 88 issues across nine projects. The first-release additions cov
 
 #### [Model gateway — pricing and budget enforcement](https://linear.app/example/project/model-gateway-pricing-and-budget-enforcement-4bc88e0c5fe9)
 
-| Issue                                                     | Priority | Deliverable                                                                 |
-| --------------------------------------------------------- | -------- | --------------------------------------------------------------------------- |
+| Issue                                                 | Priority | Deliverable                                                                 |
+| ----------------------------------------------------- | -------- | --------------------------------------------------------------------------- |
 | [THE-2256](https://linear.app/example/issue/THE-2256) | High     | Version the price book and normalize provider usage without double counting |
 | [THE-2257](https://linear.app/example/issue/THE-2257) | High     | Migrate model usage into an idempotent attempt and receipt ledger           |
 | [THE-2258](https://linear.app/example/issue/THE-2258) | High     | Reserve maximum billable exposure atomically before upstream dispatch       |
@@ -521,8 +521,8 @@ The index covers 88 issues across nine projects. The first-release additions cov
 
 #### [Model gateway — protocols, routing and providers](https://linear.app/example/project/model-gateway-protocols-routing-and-providers-b6716b97f61d)
 
-| Issue                                                     | Priority | Deliverable                                                                          |
-| --------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------ |
+| Issue                                                 | Priority | Deliverable                                                                          |
+| ----------------------------------------------------- | -------- | ------------------------------------------------------------------------------------ |
 | [THE-2260](https://linear.app/example/issue/THE-2260) | High     | Resolve model aliases, exact pins and provider capabilities from a versioned catalog |
 | [THE-2261](https://linear.app/example/issue/THE-2261) | High     | Stream native Anthropic Messages and OpenAI Chat without lossy normalization         |
 | [THE-2262](https://linear.app/example/issue/THE-2262) | High     | Serve native Responses and qualify Codex continuation and tool streaming             |
@@ -537,8 +537,8 @@ The index covers 88 issues across nine projects. The first-release additions cov
 
 #### [Model gateway — visibility, retention and replay](https://linear.app/example/project/model-gateway-visibility-retention-and-replay-515ddee81948)
 
-| Issue                                                     | Priority | Deliverable                                                                       |
-| --------------------------------------------------------- | -------- | --------------------------------------------------------------------------------- |
+| Issue                                                 | Priority | Deliverable                                                                       |
+| ----------------------------------------------------- | -------- | --------------------------------------------------------------------------------- |
 | [THE-2264](https://linear.app/example/issue/THE-2264) | High     | Expose reconciled spend and a content-free request tail by worktree               |
 | [THE-2272](https://linear.app/example/issue/THE-2272) | Medium   | Implement scoped transcript retention, deletion and response-state storage policy |
 | [THE-2274](https://linear.app/example/issue/THE-2274) | Medium   | Export privacy-filtered GenAI spans and show live per-tab gateway signals         |
@@ -551,8 +551,8 @@ The index covers 88 issues across nine projects. The first-release additions cov
 
 #### [Model gateway — harnesses, automations and extensions](https://linear.app/example/project/model-gateway-harnesses-automations-and-extensions-1d539472af4d)
 
-| Issue                                                     | Priority | Deliverable                                                                     |
-| --------------------------------------------------------- | -------- | ------------------------------------------------------------------------------- |
+| Issue                                                 | Priority | Deliverable                                                                     |
+| ----------------------------------------------------- | -------- | ------------------------------------------------------------------------------- |
 | [THE-2266](https://linear.app/example/issue/THE-2266) | High     | Launch pinned Claude Code and Codex with scoped gateway configuration           |
 | [THE-2278](https://linear.app/example/issue/THE-2278) | Medium   | Publish per-release harness and protocol compatibility from executable fixtures |
 | [THE-2286](https://linear.app/example/issue/THE-2286) | Medium   | Compare harness and model trials from the same isolated task snapshot           |

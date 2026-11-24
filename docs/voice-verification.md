@@ -131,8 +131,8 @@ Read the live project, THE-148, THE-59, THE-449, existing voice/dictation issues
 and milestones on 2026-10-28 before creating this tree in
 [Workspace Product & Observability](https://linear.app/example/project/workspace-product-and-observability-fb0f99380fed):
 
-| Issue                                                     | Scope                                                       | Depends on                  |
-| --------------------------------------------------------- | ----------------------------------------------------------- | --------------------------- |
+| Issue                                                 | Scope                                                       | Depends on                  |
+| ----------------------------------------------------- | ----------------------------------------------------------- | --------------------------- |
 | [THE-1510](https://linear.app/example/issue/THE-1510) | First-party dictation parent                                | All children                |
 | [THE-1511](https://linear.app/example/issue/THE-1511) | Feasibility: Linux CPU and Apple Metal measurements         | none                        |
 | [THE-1512](https://linear.app/example/issue/THE-1512) | Contracts/UI, stale/cancel/focus/pane and safe final paste  | THE-1511                    |
