@@ -10,13 +10,14 @@ feature is experimental, so the stable channel never allows it, and nothing beco
 The variants and their ids are `SandboxBackends` (`sandbox_backends`), `LinuxConfine` (`linux_confine`),
 `EgressProxy` (`egress_proxy`), `Seatbelt` (`seatbelt`), `WinIsolation` (`win_isolation`), `PluginBackends`
 (`plugin_backends`), `AgentPresets` (`agent_presets`), `PrivateCopy` (`private_copy`) and `Escalation`
-(`escalation`). `Feature::ALL` then has 15 entries, the existing six first. The private-workspace gate is
-`PrivateCopy`; it was named `PrivateClone` in earlier drafts and the old name appears nowhere.
+(`escalation`). `Feature::ALL` then has 16 entries, the existing seven first (including the later-added
+`Lead` gate). The private-workspace gate is `PrivateCopy`; it was named `PrivateClone` in earlier drafts and
+the old name appears nowhere.
 
 ## What Changes
 
 - One ADDED requirement in the `release-channels` capability listing the nine ids as experimental, so the
-  stable channel disallows them and `thegn doctor` lists 15 features, the nine new ones reading
+  stable channel disallows them and `thegn doctor` lists 16 features, the nine new ones reading
   "experimental, not yet implemented".
 - `docs/help/release-channels.md` lists the nine features.
 

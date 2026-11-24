@@ -213,6 +213,15 @@ mod tests {
             seen |= bit;
         }
         assert_eq!(seen.count_ones() as usize, Feature::ALL.len());
+
+        // These persisted-in-process flag positions predate the programme and
+        // must remain stable when new features are appended.
+        for (index, feature) in Feature::ALL[..7].iter().enumerate() {
+            assert_eq!(feature_bit(*feature), 1u32 << index, "{feature}");
+        }
+        for (index, feature) in Feature::PROGRAMME.iter().enumerate() {
+            assert_eq!(feature_bit(*feature), 1u32 << (index + 7), "{feature}");
+        }
     }
 
     #[test]

@@ -3323,6 +3323,35 @@ mod tests {
     }
 
     #[test]
+    fn existing_channel_config_fixture_parses_and_keeps_its_channel_boundaries() {
+        use crate::channel::{Channel, Feature};
+
+        // This fixture predates the nine programme gates. Keep it source-backed
+        // so parser and clamp compatibility are exercised against a real TOML
+        // shape already in use, not a newly invented config schema.
+        let source = include_str!("../tests/fixtures/release-channel-compat.toml");
+        let mut stable: Config = toml::from_str(source).expect("legacy channel config parses");
+        let clamped = stable.clamp_to_channel(Channel::Stable);
+        assert_eq!(clamped, [Feature::Placement, Feature::Voice]);
+        assert!(
+            Feature::PROGRAMME
+                .iter()
+                .all(|feature| !clamped.contains(feature))
+        );
+        assert!(stable.observe.enabled, "Observe remains stable");
+        assert_eq!(stable.apps.default_tab, "plugin:legacy");
+        assert!(!stable.placement.enabled);
+        assert!(!stable.voice.enabled);
+
+        let mut dev: Config = toml::from_str(source).expect("legacy channel config parses");
+        assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
+        assert!(dev.observe.enabled);
+        assert!(dev.placement.enabled);
+        assert!(dev.voice.enabled);
+        assert_eq!(dev.apps.default_tab, "plugin:legacy");
+    }
+
+    #[test]
     fn repo_overlay_field_matrix_enforces_forbidden_and_floor_rules() {
         use crate::config::{
             DevcontainerMode, OnMissing, SandboxBackend, SandboxCompilerCache, SandboxProfile,

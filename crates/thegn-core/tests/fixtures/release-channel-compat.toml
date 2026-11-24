@@ -1,0 +1,13 @@
+# Existing release-channel config shape. The nine programme gates add no
+# config keys, so this remains valid and keeps its prior stable/dev semantics.
+[observe]
+enabled = true
+
+[placement]
+enabled = true
+
+[voice]
+enabled = true
+
+[apps]
+default_tab = "plugin:legacy"
