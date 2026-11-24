@@ -63,6 +63,8 @@ use, `./install.sh` (see the README's Install section).
 
 If something is off, `just doctor` diagnoses the dev environment.
 
+Every `just` recipe, which ones are heavy, and `just update stable|dev` are catalogued in [`docs/just-recipes.md`](docs/just-recipes.md).
+
 ## Dev loop
 
 Develop thegn in the dev instance (`just live` for a release build, `just devel` for a debug build), not in the stable instance you use for other projects. It has its own config, state and `THEGN_DIR`; seeding `~/.config/thegn-dev` is automatic on the first launch. See `thegn help two-instances` (`docs/help/two-instances.md`).
