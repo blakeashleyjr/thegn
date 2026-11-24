@@ -1,6 +1,7 @@
-use crate::{Cache, Env, Environment, Feature, JobSpec};
-use anyhow::{Context, Result, ensure};
+use crate::{Arch, Cache, Env, Environment, Feature, JobSpec, RetryLimit, Spot};
+use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 impl JobSpec {
     pub fn parse_yaml(input: &str) -> Result<Self> {
@@ -33,6 +34,9 @@ impl JobSpec {
                 matches!(&self.source.snapshot, crate::Snapshot::Pinned(_)),
                 "typed recipe requires a pinned source digest"
             );
+            if let Some(field) = self.unhonoured_recipe_field() {
+                bail!("typed recipes do not honour {field}");
+            }
         } else {
             ensure!(
                 self.runner.is_none(),
@@ -130,6 +134,64 @@ impl JobSpec {
             check_path(glob, false).context("results.junit")?;
         }
         Ok(())
+    }
+
+    /// Fields the typed selected-runner route cannot forward. A recipe spec
+    /// must leave them at their defaults so a value the user set is never
+    /// silently ignored. The deadline (`timeout`) is forwarded to the runner,
+    /// so it is deliberately absent.
+    fn unhonoured_recipe_field(&self) -> Option<&'static str> {
+        if !self.env.is_empty() {
+            return Some("env");
+        }
+        if !self.secrets.is_empty() {
+            return Some("secrets");
+        }
+        if !self.services.is_empty() {
+            return Some("services");
+        }
+        if !self.caches.is_empty() {
+            return Some("caches");
+        }
+        if self.shards != NonZeroU32::MIN {
+            return Some("shards");
+        }
+        let resources = &self.resources;
+        if resources.cpu.is_some()
+            || resources.memory.is_some()
+            || resources.shm.is_some()
+            || resources.disk.is_some()
+            || resources.arch != Arch::Any
+        {
+            return Some("resources");
+        }
+        if self.isolation.is_some() {
+            return Some("isolation");
+        }
+        let placement = &self.placement;
+        if placement.providers.is_some()
+            || placement.regions.is_some()
+            || placement.spot != Spot::Allowed
+            || !placement.affinity.is_empty()
+        {
+            return Some("placement");
+        }
+        if !self.artifacts.is_empty() {
+            return Some("artifacts");
+        }
+        if self.results.junit.is_some() || self.results.cargo {
+            return Some("results");
+        }
+        if self.retry.escalate.is_some()
+            || !matches!(self.retry.on_preempt, RetryLimit::Count { max: 2 })
+            || !matches!(self.retry.on_failure, RetryLimit::Count { max: 0 })
+        {
+            return Some("retry");
+        }
+        if !self.source.exclude.is_empty() {
+            return Some("source.exclude");
+        }
+        None
     }
 
     /// Return the unmet feature names for this particular offering. The caller

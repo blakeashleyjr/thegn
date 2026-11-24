@@ -66,6 +66,7 @@
       ]
     },
     "recipe": {
+      "description": "A small, closed set of build/test operations with fixed argv. A spec that names a recipe carries no command steps and must be dispatched only through the typed selected-runner route; generic executors must reject it.",
       "default": null,
       "anyOf": [
         { "$ref": "#/definitions/Recipe" },
@@ -114,6 +115,7 @@
       ]
     },
     "runner": {
+      "description": "Explicit owner-selected runner alias. Used only by typed recipes; it is independent of the worktree's interactive placement.",
       "default": null,
       "type": ["string", "null"]
     },
@@ -400,6 +402,11 @@
       },
       "additionalProperties": false
     },
+    "Recipe": {
+      "description": "Build/test commands admitted for explicit project-runner dispatch. These values never contain command text or shell fragments.",
+      "type": "string",
+      "enum": ["cargo-build", "cargo-test"]
+    },
     "Resources": {
       "type": "object",
       "properties": {
@@ -443,10 +450,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "Recipe": {
-      "type": "string",
-      "enum": ["cargo-build", "cargo-test"]
     },
     "Retry": {
       "type": "object",

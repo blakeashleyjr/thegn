@@ -463,6 +463,14 @@
       "summary": "Background signing safety is delivered; four bounded SCM workflow capabilities remain deferred."
     },
     {
+      "change": "add-selected-runner-routing",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2416 owns this fix round, but that issue is outside the checked-in active delivery inventory (the thegn daemon and Linear read were unavailable in the lane that produced it), so it is not mapped here.",
+      "summary": "Typed selected-runner submission, refusal/lost-after-submit split and JobResult readback are delivered as a contract slice; the terminal adapter, config lookup, recursion guard and argv/cwd forwarding remain open."
+    },
+    {
       "change": "add-skills-registry",
       "lifecycle": "proposed",
       "disposition": "strategic-unstarted",
