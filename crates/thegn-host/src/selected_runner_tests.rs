@@ -219,3 +219,26 @@ fn an_unconfigured_runner_starts_no_reconcile() {
     cfg.jobs.runner = "ghost".into();
     spawn_startup_reconcile(&cfg);
 }
+
+#[test]
+fn startup_reattach_skips_live_leases_and_rows_without_a_session() {
+    use sprites_job::{AttemptState, OwnerLease};
+    let now = thegn_core::util::now_ms();
+    let live = OwnerLease::current(now);
+    let mut dead = OwnerLease::current(now);
+    dead.heartbeat_ms = now - 3_600_000;
+    dead.boot_id = Some("some-other-boot".to_owned());
+    let orphan = |state, session, lease: Option<&OwnerLease>| {
+        is_orphaned_running(state, session, lease, now)
+    };
+    // A live owner (fresh heartbeat) is never touched.
+    assert!(!orphan(AttemptState::Running, Some("s"), Some(&live)));
+    // A dead owner, or a row with no lease at all, is reattached.
+    assert!(orphan(AttemptState::Running, Some("s"), Some(&dead)));
+    assert!(orphan(AttemptState::Running, Some("s"), None));
+    // Nothing to follow without a session handle, and only `Running` rows count.
+    assert!(!orphan(AttemptState::Running, None, None));
+    assert!(!orphan(AttemptState::Dispatching, Some("s"), None));
+    assert!(!orphan(AttemptState::Finished, Some("s"), None));
+    assert!(orphaned_running(&[], now).is_empty());
+}

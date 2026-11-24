@@ -156,12 +156,7 @@ fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
         if !interrupted && guard.fired() {
             interrupted = true;
             cancel.cancel();
-            thegn_core::msg::warn(if runner.cancels_mid_run() {
-                "interrupt received: cancelling the remote job"
-            } else {
-                "interrupt received: this runner cannot stop a running job yet; waiting for \
-                 it to end or reach its deadline"
-            });
+            thegn_core::msg::warn("interrupt received: cancelling the remote job");
         }
         if guard.count() >= 2 {
             thegn_core::msg::warn(
