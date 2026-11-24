@@ -34,12 +34,28 @@
 //!    the runner kills the owned process group on the sprite (a second,
 //!    idempotent exec), releases the keep-awake hold, and reports
 //!    [`SelectedCompletion::TimedOut`]; cleanup is `Done` only when the kill was
-//!    confirmed, otherwise `Pending`.
+//!    confirmed, otherwise `Pending`. A [`CancelToken`] stops the attempt the
+//!    same way ([`SpritesSelectedRunner::run_cancellable`]) and reports
+//!    [`SelectedCompletion::Cancelled`], which is never confused with a timeout.
 //! 5. **report** — provider identity, session handle, exit, signal, cleanup
 //!    state and the per-attempt cost estimate land in the ledger and in the
 //!    receipt, so a client that lost its channel can reconcile by attempt
 //!    number. Once cleanup is not pending the per-attempt checkout, home and
 //!    control file are deleted; only the project cache remains.
+//!
+//! Recovery: a crash can leave an attempt non-terminal or with cleanup pending.
+//! [`SpritesSelectedRunner::reconcile_pending`] re-issues the idempotent kill
+//! for the recorded control file and hold and marks cleanup `Done` only on a
+//! confirmed kill; it never dispatches, so a command whose dispatch outcome is
+//! unknown is never rerun as an implicit recovery. [`SpritesSelectedRunner::reattach`]
+//! reconnects to a recorded exec session when the provider still holds it, and
+//! otherwise settles the attempt as `Indeterminate`. Neither touches a
+//! non-terminal row younger than its staleness age, and every recovery write is
+//! a compare-and-swap against the row it read. Known gap: there is no owner
+//! lease (pid, boot id, heartbeat) in the row, so a host suspended for longer
+//! than the staleness margin can make a live run look stale (its monotonic
+//! stream clock pauses while the wall clock does not); the lease is tracked in
+//! the OpenSpec tasks.
 //!
 //! Contract with the route: on the selected route every `Err` that
 //! [`SelectedRunner::submit`] returns reads back as *indeterminate*, because the
@@ -63,7 +79,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -1018,6 +1035,27 @@ impl AttemptStore {
         Ok(())
     }
 
+    /// Publish `record` only when the stored row still equals `expected` (the
+    /// row as a recovery pass read it). The check and the write happen under the
+    /// ledger lock, so a recovery never overwrites what the owning run wrote in
+    /// between. False when the row changed or vanished; nothing is written.
+    pub fn mark_if_unchanged(
+        &self,
+        expected: &AttemptRecord,
+        record: &AttemptRecord,
+    ) -> Result<bool> {
+        let Some(root) = self.open(false)? else {
+            return Ok(false);
+        };
+        let _lock = lock_ledger(&root)?;
+        let current = self.read_record::<AttemptRecord>(&root, &attempt_file(expected.attempt))?;
+        if current.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        self.mark(record)?;
+        Ok(true)
+    }
+
     /// Confirm the owned command tree of a cancelled or indeterminate attempt is
     /// gone. Idempotent; a record that is not pending is left alone.
     pub fn mark_cleaned(&self, attempt: u64) -> Result<bool> {
@@ -1635,6 +1673,106 @@ fn signal_of(code: i32) -> Option<i32> {
     (129..=159).contains(&code).then_some(code - 128)
 }
 
+/// A user cancel handle for one running attempt. Clones share the flag; cancel
+/// is idempotent and may be called before, during or after the attempt.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken {
+    inner: Arc<CancelInner>,
+}
+
+#[derive(Debug, Default)]
+struct CancelInner {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation of the attempt this token was given to.
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        // `notify_one` stores a permit, so a cancel that lands before the
+        // runner starts waiting is not lost.
+        self.inner.notify.notify_one();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once [`cancel`](Self::cancel) was called.
+    async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            self.inner.notify.notified().await;
+        }
+    }
+}
+
+/// What one reconciliation pass did to one attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// The owned tree is confirmed gone and cleanup is now `Done`.
+    Cleaned,
+    /// The kill could not be confirmed; cleanup stays `Pending` for a later pass.
+    StillPending,
+    /// The row changed since the pass read it (its owner or another recovery
+    /// wrote it), so this pass left it alone.
+    Superseded,
+}
+
+/// One attempt a reconciliation pass touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reconciled {
+    pub attempt: u64,
+    pub outcome: ReconcileOutcome,
+}
+
+/// The result of [`SpritesSelectedRunner::reattach`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReattachReport {
+    pub attempt: u64,
+    pub completion: SelectedCompletion,
+    pub cleanup: Cleanup,
+    /// True when the provider still held the exec session and its stream was
+    /// followed to the end; false when the ledger (or a reconciliation) answered.
+    pub reattached: bool,
+    /// The settled receipt when this call observed or concluded the attempt.
+    pub receipt: Option<AttemptReceipt>,
+    /// Why this call left the row untouched (a live owner may hold it, or the
+    /// provider answered transiently), when it did.
+    pub note: Option<String>,
+}
+
+/// The smallest time a reattached stream may take to replay its scrollback and
+/// deliver the exit, even when the recorded deadline already passed.
+const REATTACH_MIN_WAIT: Duration = Duration::from_secs(5);
+
+/// Records younger than their deadline plus this are left to the process that
+/// may still own them: transfer budget, kill budget and slack.
+const RECONCILE_SLACK: Duration = Duration::from_secs(60);
+
+/// Extra margin on the staleness test. The ledger deadline is wall-clock, but
+/// a live owner times its stream on the monotonic clock, which stops while the
+/// host is suspended; the margin only absorbs small skew. A suspend longer than
+/// it can still make a live row look stale (an owner lease would close that
+/// gap; see the module docs).
+const RECONCILE_CLOCK_MARGIN: Duration = Duration::from_secs(120);
+
+/// The `Instant` an attempt's build clock is read from when it is concluded
+/// later, capped at its deadline window so downtime is never billed.
+fn begun_for(record: &AttemptRecord) -> tokio::time::Instant {
+    let window = u64::try_from(record.deadline_ms.saturating_sub(record.created_ms)).unwrap_or(0);
+    let since =
+        u64::try_from(thegn_core::util::now_ms().saturating_sub(record.created_ms)).unwrap_or(0);
+    let ago = Duration::from_millis(window.min(since));
+    tokio::time::Instant::now()
+        .checked_sub(ago)
+        .unwrap_or_else(tokio::time::Instant::now)
+}
+
 /// Sprites-side executor for the typed selected-runner route.
 ///
 /// One runner is bound to one project and one sprite. It holds a runtime handle
@@ -1715,6 +1853,44 @@ impl SpritesSelectedRunner {
             .map_err(|error| anyhow!("ledger task failed: {error}"))?
     }
 
+    /// [`persist`](Self::persist) guarded by [`AttemptStore::mark_if_unchanged`].
+    async fn persist_if_unchanged(
+        &self,
+        expected: &AttemptRecord,
+        record: &AttemptRecord,
+    ) -> Result<bool> {
+        let store = self.store.clone();
+        let expected = expected.clone();
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || store.mark_if_unchanged(&expected, &record))
+            .await
+            .map_err(|error| anyhow!("ledger task failed: {error}"))?
+    }
+
+    /// True while the stored row still equals what a recovery read. Checked
+    /// right before a kill, so a row its owner moved on is never killed.
+    async fn unchanged(&self, expected: &AttemptRecord) -> bool {
+        let store = self.store.clone();
+        let attempt = expected.attempt;
+        let current = tokio::task::spawn_blocking(move || store.read(attempt)).await;
+        matches!(current, Ok(Ok(Some(ref record))) if record == expected)
+    }
+
+    /// The age past which a non-terminal row can no longer belong to a live run:
+    /// deadline plus transfer budget, kill budget, slack and clock margin.
+    fn stale_after_ms(&self) -> i64 {
+        millis_i64(
+            self.options.transfer_budget
+                + CLEANUP_BUDGET
+                + RECONCILE_SLACK
+                + RECONCILE_CLOCK_MARGIN,
+        )
+    }
+
+    fn is_stale(&self, record: &AttemptRecord, now_ms: i64) -> bool {
+        now_ms >= record.deadline_ms.saturating_add(self.stale_after_ms())
+    }
+
     async fn reserve(
         &self,
         recipe: Recipe,
@@ -1767,6 +1943,24 @@ impl SpritesSelectedRunner {
         source: &Digest,
         content: &SnapshotContent,
         deadline: Duration,
+    ) -> Result<AttemptReceipt, RunnerRefusal> {
+        self.run_cancellable(recipe, source, content, deadline, &CancelToken::new())
+            .await
+    }
+
+    /// [`run`](Self::run) with a user cancel handle. Cancelling the token while
+    /// the command runs issues the same owned-tree kill as the deadline,
+    /// releases the hold, fences outputs and reports
+    /// [`SelectedCompletion::Cancelled`]; cleanup is `Done` on a confirmed kill
+    /// and `Pending` otherwise. A token cancelled before dispatch closes the
+    /// attempt as rejected: nothing was sent, so no command ran.
+    pub async fn run_cancellable(
+        &self,
+        recipe: Recipe,
+        source: &Digest,
+        content: &SnapshotContent,
+        deadline: Duration,
+        cancel: &CancelToken,
     ) -> Result<AttemptReceipt, RunnerRefusal> {
         let observed = content
             .digest()
@@ -1832,6 +2026,11 @@ impl SpritesSelectedRunner {
             return Err(self.reject(record, error, true).await);
         };
         record.hold = Some(hold.clone());
+
+        if cancel.is_cancelled() {
+            let error = anyhow!("cancelled before dispatch");
+            return Err(self.reject(record, error, true).await);
+        }
 
         // The fence. Written before the socket opens: a crash from here on reads
         // back as an unknown dispatch and is never rerun blindly.
@@ -1899,6 +2098,7 @@ impl SpritesSelectedRunner {
                         false,
                         &empty,
                         None,
+                        None,
                     )
                     .await);
             }
@@ -1923,8 +2123,17 @@ impl SpritesSelectedRunner {
         let mut stdout = Tail::new(MAX_SELECTED_LOG_BYTES);
         let mut exit = None;
         let mut timed_out = false;
+        let mut cancelled = false;
         loop {
-            match tokio::time::timeout_at(until, session.frames.recv()).await {
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                next = tokio::time::timeout_at(until, session.frames.recv()) => next,
+            };
+            match next {
                 Ok(Some(ExecFrame::Stdout(bytes))) => stdout.push(&bytes),
                 Ok(Some(ExecFrame::Exit(code))) => {
                     exit = Some(code);
@@ -1934,6 +2143,20 @@ impl SpritesSelectedRunner {
                 Err(_) => {
                     timed_out = true;
                     break;
+                }
+            }
+        }
+        if cancelled {
+            // A frame already queued when the cancel fired is not lost: when it
+            // is the exit, the attempt finished by itself and reports that.
+            while let Ok(frame) = session.frames.try_recv() {
+                match frame {
+                    ExecFrame::Stdout(bytes) => stdout.push(&bytes),
+                    ExecFrame::Exit(code) => {
+                        exit = Some(code);
+                        cancelled = false;
+                        break;
+                    }
                 }
             }
         }
@@ -1955,9 +2178,11 @@ impl SpritesSelectedRunner {
             "attempt output stream closed"
         );
         let launch_failed = !timed_out
+            && !cancelled
             && exit == Some(crate::provider::EXEC_CWD_FAILED_STATUS)
             && stderr.render().contains(LAUNCH_FAILED_MARKER);
         let completion = match (timed_out, exit) {
+            _ if cancelled => SelectedCompletion::Cancelled,
             (true, _) => SelectedCompletion::TimedOut,
             (false, Some(_)) if launch_failed => {
                 tracing::warn!(
@@ -1986,7 +2211,14 @@ impl SpritesSelectedRunner {
         // driver's verdict distinguishes a protocol violation from a plain
         // close, and lands in the record either way. The wait is bounded so a
         // missing verdict never stalls the attempt.
-        if exit.is_none() && !timed_out {
+        if cancelled {
+            tracing::warn!(
+                target: "thegn::sprites::job",
+                attempt = record.attempt,
+                "attempt cancelled; killing the owned command tree"
+            );
+        }
+        if exit.is_none() && !timed_out && !cancelled {
             record.error = match tokio::time::timeout(VERDICT_WAIT, verdict).await {
                 Ok(Ok(Some(error))) => Some(error.to_string()),
                 Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
@@ -2001,6 +2233,7 @@ impl SpritesSelectedRunner {
                 launch_failed,
                 &stdout,
                 Some(&stderr),
+                None,
             )
             .await)
     }
@@ -2178,6 +2411,12 @@ impl SpritesSelectedRunner {
     /// Kill the attempt's owned process group and release its keep-awake hold,
     /// through one idempotent exec. True only when the kill is confirmed.
     async fn kill_tree(&self, record: &AttemptRecord) -> bool {
+        self.kill_tree_in(record, false).await
+    }
+
+    /// [`kill_tree`](Self::kill_tree); with `nothing_ok`, exit 4 (no control
+    /// file, so no command was ever launched) also counts as confirmed.
+    async fn kill_tree_in(&self, record: &AttemptRecord, nothing_ok: bool) -> bool {
         let Some(hold) = record.hold.as_deref() else {
             return false;
         };
@@ -2191,6 +2430,7 @@ impl SpritesSelectedRunner {
             .await
         {
             Ok((0, _)) => true,
+            Ok((4, _)) if nothing_ok => true,
             Ok((code, output)) => {
                 tracing::warn!(
                     target: "thegn::sprites::job",
@@ -2252,7 +2492,11 @@ impl SpritesSelectedRunner {
         launch_failed: bool,
         stdout: &Tail,
         stderr: Option<&ExecStderr>,
+        expected: Option<&AttemptRecord>,
     ) -> AttemptReceipt {
+        // A recovery of a `Dispatching` row that left no control file has
+        // nothing to kill: the launcher never ran.
+        let never_started = expected.is_some() && record.state == AttemptState::Dispatching;
         let proven = matches!(
             completion,
             SelectedCompletion::Exited(_) | SelectedCompletion::Signalled(_)
@@ -2261,7 +2505,7 @@ impl SpritesSelectedRunner {
         // release the hold now rather than letting it bill until the ceiling.
         record.cleanup = if proven || launch_failed {
             Cleanup::NotNeeded
-        } else if self.kill_tree(&record).await {
+        } else if self.kill_tree_in(&record, never_started).await {
             Cleanup::Done
         } else {
             Cleanup::Pending
@@ -2298,13 +2542,23 @@ impl SpritesSelectedRunner {
         } else {
             self.remove_attempt_dirs(&record).await
         };
-        if let Err(error) = self.persist(&record).await {
-            tracing::warn!(
+        let written = match expected {
+            None => self.persist(&record).await.map(|()| true),
+            Some(expected) => self.persist_if_unchanged(expected, &record).await,
+        };
+        match written {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                target: "thegn::sprites::job",
+                attempt = record.attempt,
+                "the ledger row changed during recovery; its newer state is kept"
+            ),
+            Err(error) => tracing::warn!(
                 target: "thegn::sprites::job",
                 %error,
                 attempt = record.attempt,
                 "cannot record the attempt outcome"
-            );
+            ),
         }
         let stdout_tail = stdout.render();
         let stderr_tail = stderr.map(ExecStderr::render).unwrap_or_default();
@@ -2338,6 +2592,406 @@ impl SpritesSelectedRunner {
             elapsed_ms: u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX),
             cost_micros,
             cost_basis,
+        }
+    }
+
+    /// Re-issue the kill for every attempt a crash left unsettled, and mark
+    /// cleanup `Done` only when the kill is confirmed. See
+    /// [`reconcile_pending_at`](Self::reconcile_pending_at).
+    pub async fn reconcile_pending(&self) -> Result<Vec<Reconciled>> {
+        self.reconcile_pending_at(thegn_core::util::now_ms()).await
+    }
+
+    /// One reconciliation pass at `now_ms`. It handles, for this binding only:
+    ///
+    /// - terminal attempts whose cleanup is `Pending`: the recorded control file
+    ///   and hold are killed again (a rejected attempt only has its directories
+    ///   removed, since nothing ever ran), and cleanup becomes `Done` on a
+    ///   confirmed kill;
+    /// - attempts still `Dispatching` or `Running` once their deadline plus the
+    ///   transfer budget, kill budget, a minute of slack and a clock margin have
+    ///   passed (an earlier record may still belong to a live run): they are
+    ///   killed and closed as `Indeterminate`, because their outcome is unknown.
+    ///   A `Dispatching` row that left no control file has nothing to kill.
+    ///
+    /// Every write is compare-and-swap: the row is re-read before the kill and
+    /// published only if it still equals what the pass scanned, so a write by
+    /// the owning run or another recovery in between is kept
+    /// ([`ReconcileOutcome::Superseded`]).
+    ///
+    /// This never opens a job exec. The only provider calls are the idempotent
+    /// kill and the deletion of per-attempt paths, so a command whose dispatch
+    /// outcome is unknown is never rerun as an implicit recovery.
+    pub async fn reconcile_pending_at(&self, now_ms: i64) -> Result<Vec<Reconciled>> {
+        let store = self.store.clone();
+        let records = tokio::task::spawn_blocking(move || store.records())
+            .await
+            .map_err(|error| anyhow!("ledger task failed: {error}"))??;
+        let mut touched = Vec::new();
+        for record in records {
+            if record.project != self.binding.project()
+                || record.sprite != self.binding.sprite()
+                || record.account != self.binding.account()
+            {
+                continue;
+            }
+            let attempt = record.attempt;
+            let outcome = if record.is_terminal() {
+                if record.cleanup != Cleanup::Pending {
+                    continue;
+                }
+                self.settle_pending(record).await
+            } else {
+                if record.state == AttemptState::Reserved || !self.is_stale(&record, now_ms) {
+                    continue;
+                }
+                self.settle_unknown(record).await
+            };
+            touched.push(Reconciled { attempt, outcome });
+        }
+        Ok(touched)
+    }
+
+    /// Kill again and finish the cleanup of a terminal attempt.
+    async fn settle_pending(&self, mut record: AttemptRecord) -> ReconcileOutcome {
+        let expected = record.clone();
+        if !self.unchanged(&expected).await {
+            return ReconcileOutcome::Superseded;
+        }
+        let (confirmed, removed) = if record.state == AttemptState::Rejected {
+            let removed = self.remove_attempt_dirs(&record).await;
+            (removed, removed)
+        } else if self.kill_tree(&record).await {
+            (true, self.remove_attempt_dirs(&record).await)
+        } else {
+            (false, false)
+        };
+        if !confirmed {
+            return ReconcileOutcome::StillPending;
+        }
+        record.cleanup = Cleanup::Done;
+        record.checkout_removed = removed;
+        match self.persist_if_unchanged(&expected, &record).await {
+            Ok(true) => ReconcileOutcome::Cleaned,
+            Ok(false) => ReconcileOutcome::Superseded,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::sprites::job",
+                    %error,
+                    attempt = record.attempt,
+                    "cannot record the reconciled cleanup"
+                );
+                ReconcileOutcome::StillPending
+            }
+        }
+    }
+
+    /// Close a non-terminal attempt whose outcome is unknown: kill what may
+    /// still run and record `Indeterminate`. Never dispatches.
+    async fn settle_unknown(&self, record: AttemptRecord) -> ReconcileOutcome {
+        let expected = record.clone();
+        if !self.unchanged(&expected).await {
+            return ReconcileOutcome::Superseded;
+        }
+        let mut record = record;
+        record.error.get_or_insert_with(|| {
+            "reconciled after an interruption: the dispatch outcome is unknown".to_owned()
+        });
+        let receipt = self
+            .conclude_recovered(
+                record,
+                expected,
+                SelectedCompletion::Indeterminate,
+                false,
+                &Tail::new(1),
+            )
+            .await;
+        if receipt.cleanup == Cleanup::Done {
+            ReconcileOutcome::Cleaned
+        } else {
+            ReconcileOutcome::StillPending
+        }
+    }
+
+    /// [`conclude`](Self::conclude) for an attempt this call did not dispatch:
+    /// no transfer is claimed, the cost window is capped at the deadline, and
+    /// the write only lands when the row still equals `expected`.
+    async fn conclude_recovered(
+        &self,
+        record: AttemptRecord,
+        expected: AttemptRecord,
+        completion: SelectedCompletion,
+        launch_failed: bool,
+        stdout: &Tail,
+    ) -> AttemptReceipt {
+        let begun = begun_for(&record);
+        let transfer = Transfer {
+            digest: record
+                .materialized
+                .clone()
+                .unwrap_or_else(|| record.source.clone()),
+            transferred: 0,
+            bytes: 0,
+        };
+        self.conclude(
+            record,
+            transfer,
+            begun,
+            completion,
+            launch_failed,
+            stdout,
+            None,
+            Some(&expected),
+        )
+        .await
+    }
+
+    /// Reconnect to a persisted attempt.
+    ///
+    /// - A terminal attempt is replayed from the ledger (its pending cleanup is
+    ///   finished first).
+    /// - A non-terminal row younger than the reconciler's staleness age may
+    ///   still belong to a live run, so nothing is killed and nothing is
+    ///   written for it unless the followed stream proves an exit; the report
+    ///   carries a `note` instead.
+    /// - A `Running` attempt with a session handle is reattached through the
+    ///   provider; when the provider still holds the session its stream is
+    ///   followed to the exit or the owner's real deadline (`deadline_ms` plus
+    ///   the transfer budget) and the attempt is concluded as a normal run
+    ///   would.
+    /// - A definite 4xx from the provider means the session is gone: when the
+    ///   row is stale the owned tree is killed and the attempt is closed as
+    ///   `Indeterminate`. A timeout, 5xx or transport error proves nothing, so
+    ///   the row is left untouched.
+    /// - A stale `Dispatching` row (or `Running` without a handle) is killed
+    ///   and closed as `Indeterminate`.
+    ///
+    /// Nothing is ever dispatched again.
+    pub async fn reattach(&self, attempt: u64) -> Result<ReattachReport> {
+        let store = self.store.clone();
+        let (record, epoch) = tokio::task::spawn_blocking(move || {
+            let record = store.read(attempt)?;
+            let epoch = store.binding()?.map_or(1, |binding| binding.epoch.max(1));
+            anyhow::Ok((record, epoch))
+        })
+        .await
+        .map_err(|error| anyhow!("ledger task failed: {error}"))??;
+        let record = record.ok_or_else(|| anyhow!("attempt {attempt} is not in the ledger"))?;
+        ensure!(
+            record.project == self.binding.project()
+                && record.sprite == self.binding.sprite()
+                && record.account == self.binding.account(),
+            "attempt {attempt} belongs to another project, account or sprite"
+        );
+        let stale = self.is_stale(&record, thegn_core::util::now_ms());
+        match record.resume(epoch) {
+            Resume::Rejected => {
+                bail!("attempt {attempt} was rejected before any command ran; submit a new attempt")
+            }
+            Resume::Reserved | Resume::Fresh => bail!(
+                "attempt {attempt} was reserved but never dispatched; there is nothing to reattach"
+            ),
+            Resume::StaleEpoch => bail!("attempt {attempt} predates the current binding epoch"),
+            Resume::Terminal(completion) => {
+                let cleanup = if record.cleanup == Cleanup::Pending {
+                    match self.settle_pending(record.clone()).await {
+                        ReconcileOutcome::Cleaned => Cleanup::Done,
+                        ReconcileOutcome::StillPending | ReconcileOutcome::Superseded => {
+                            Cleanup::Pending
+                        }
+                    }
+                } else {
+                    record.cleanup
+                };
+                Ok(ReattachReport {
+                    attempt,
+                    completion,
+                    cleanup,
+                    reattached: false,
+                    receipt: None,
+                    note: None,
+                })
+            }
+            Resume::UnknownDispatch => {
+                if !stale {
+                    return Ok(Self::left_alone(
+                        &record,
+                        false,
+                        "the dispatch outcome is unknown but the attempt may still be owned by a \
+                         live run",
+                    ));
+                }
+                Ok(self
+                    .settle_indeterminate(record, "reattach: the dispatch outcome is unknown")
+                    .await)
+            }
+            Resume::Running => {
+                let Some(handle) = record.session.clone() else {
+                    if !stale {
+                        return Ok(Self::left_alone(
+                            &record,
+                            false,
+                            "no session handle is recorded yet and the attempt may still be \
+                             owned by a live run",
+                        ));
+                    }
+                    return Ok(self
+                        .settle_indeterminate(record, "reattach: no session handle was recorded")
+                        .await);
+                };
+                let attached = self
+                    .provider
+                    .attach_exec(self.binding.sprite(), &handle, 80, 24)
+                    .await;
+                match attached {
+                    Ok(session) => Ok(self.follow_reattached(record, session, stale).await),
+                    Err(error) if is_definite_exec_rejection(&error) => {
+                        if !stale {
+                            return Ok(Self::left_alone(
+                                &record,
+                                false,
+                                "the provider no longer holds the session but the attempt may \
+                                 still be owned by a live run",
+                            ));
+                        }
+                        let reason =
+                            format!("reattach: the provider does not hold the session: {error:#}");
+                        Ok(self.settle_indeterminate(record, &reason).await)
+                    }
+                    Err(error) => Ok(Self::left_alone(
+                        &record,
+                        false,
+                        &format!("cannot reach the session ({error:#}); the row is untouched"),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// A report for a row this call deliberately did not touch.
+    fn left_alone(record: &AttemptRecord, reattached: bool, note: &str) -> ReattachReport {
+        ReattachReport {
+            attempt: record.attempt,
+            completion: SelectedCompletion::Indeterminate,
+            cleanup: record.cleanup,
+            reattached,
+            receipt: None,
+            note: Some(note.to_owned()),
+        }
+    }
+
+    /// Conclude as `Indeterminate` (kill, cleanup) and report it.
+    async fn settle_indeterminate(&self, record: AttemptRecord, reason: &str) -> ReattachReport {
+        let attempt = record.attempt;
+        let expected = record.clone();
+        if !self.unchanged(&expected).await {
+            return Self::left_alone(&record, false, "the ledger row changed during reattach");
+        }
+        let mut record = record;
+        record.error = Some(reason.to_owned());
+        let receipt = self
+            .conclude_recovered(
+                record,
+                expected,
+                SelectedCompletion::Indeterminate,
+                false,
+                &Tail::new(1),
+            )
+            .await;
+        ReattachReport {
+            attempt,
+            completion: receipt.completion,
+            cleanup: receipt.cleanup,
+            reattached: false,
+            receipt: Some(receipt),
+            note: None,
+        }
+    }
+
+    /// Follow a reattached stream to its exit or the owner's real deadline
+    /// (`deadline_ms` is reserve time plus the deadline; the owner's own clock
+    /// starts after the transfer, so the transfer budget is added). Only a
+    /// proven exit, or a stale row, is concluded; anything else is left to the
+    /// owner.
+    async fn follow_reattached(
+        &self,
+        record: AttemptRecord,
+        mut session: crate::provider::ExecSession,
+        stale: bool,
+    ) -> ReattachReport {
+        let attempt = record.attempt;
+        let expected = record.clone();
+        let owner_deadline = record
+            .deadline_ms
+            .saturating_add(millis_i64(self.options.transfer_budget));
+        let remaining = Duration::from_millis(
+            u64::try_from(owner_deadline.saturating_sub(thegn_core::util::now_ms())).unwrap_or(0),
+        )
+        .max(REATTACH_MIN_WAIT);
+        let until = tokio::time::Instant::now() + remaining;
+        let mut stdout = Tail::new(MAX_SELECTED_LOG_BYTES);
+        let mut exit = None;
+        let mut timed_out = false;
+        loop {
+            match tokio::time::timeout_at(until, session.frames.recv()).await {
+                Ok(Some(ExecFrame::Stdout(bytes))) => stdout.push(&bytes),
+                Ok(Some(ExecFrame::Exit(code))) => {
+                    exit = Some(code);
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+        if let Err(error) = session.control.send(ExecControl::Close).await {
+            tracing::debug!(
+                target: "thegn::sprites::job",
+                %error,
+                attempt,
+                "reattached exec session was already gone"
+            );
+        }
+        // A reattached stream is a PTY stream: stderr is merged into stdout.
+        let launch_failed = !timed_out
+            && exit == Some(crate::provider::EXEC_CWD_FAILED_STATUS)
+            && stdout.render().contains(LAUNCH_FAILED_MARKER);
+        let completion = match (timed_out, exit) {
+            (true, _) => SelectedCompletion::TimedOut,
+            (false, Some(_)) if launch_failed => SelectedCompletion::Indeterminate,
+            (false, Some(code)) => match signal_of(code) {
+                Some(signal) => SelectedCompletion::Signalled(signal),
+                None => SelectedCompletion::Exited(code),
+            },
+            (false, None) => SelectedCompletion::Indeterminate,
+        };
+        let proven = matches!(
+            completion,
+            SelectedCompletion::Exited(_) | SelectedCompletion::Signalled(_)
+        );
+        if !proven && !stale {
+            return Self::left_alone(
+                &record,
+                true,
+                "the stream ended without a proven exit and the attempt may still be owned by a \
+                 live run; nothing was killed",
+            );
+        }
+        if !self.unchanged(&expected).await {
+            return Self::left_alone(&record, true, "the ledger row changed during reattach");
+        }
+        let receipt = self
+            .conclude_recovered(record, expected, completion, launch_failed, &stdout)
+            .await;
+        ReattachReport {
+            attempt,
+            completion: receipt.completion,
+            cleanup: receipt.cleanup,
+            reattached: true,
+            receipt: Some(receipt),
+            note: None,
         }
     }
 

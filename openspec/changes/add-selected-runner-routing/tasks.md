@@ -42,6 +42,26 @@
       scrubbed per-attempt environment.
 - [ ] 4.3 Run `cargo nextest run -p thegn-svc --test sprites_job` and the
       `sprites::job` unit tests on the Mac builder.
-- [ ] 4.4 Not in this slice: user-initiated cancel, a reconciler that calls
-      `mark_cleaned`, reattach by handle, the credential broker, the CLI verb
-      and a budgeted live run.
+- [ ] 4.4 User cancel: a `CancelToken` on a running attempt issues the same
+      owned-tree kill as the deadline, records `Cancelled` (distinct from
+      `TimedOut`), fences outputs, releases the hold and marks cleanup `Done` on
+      a confirmed kill or `Pending` otherwise.
+- [ ] 4.5 Pending-row reconciler: scan the ledger for unsettled attempts,
+      re-issue the kill for the recorded control file and hold, and mark cleanup
+      `Done` only on confirmation. It never dispatches, so a command with an
+      unknown dispatch outcome is never rerun as an implicit recovery.
+- [ ] 4.6 Reattach by session handle: follow the stream while the provider still
+      holds it, otherwise reconcile to `Indeterminate`; never redispatch.
+- [ ] 4.9 Route wiring: `submit` (the `SelectedRunner` trait) takes a
+      `CancelToken` so a user cancel before or during dispatch reaches the
+      runner and reads back as `Cancelled` on the route (today a pre-dispatch
+      cancel surfaces as `RunnerUnavailable`); schedule `reconcile_pending` and
+      `reattach` on startup. 4.4-4.6 are runner-level only until this lands.
+- [ ] 4.10 Owner lease on non-terminal rows (pid, boot id from
+      `/proc/sys/kernel/random/boot_id`, heartbeat) so recovery skips a live
+      owner; until then a host suspended past the staleness margin can make a
+      live row look stale. Recovery writes are already compare-and-swap.
+- [ ] 4.7 Run the new cancel, reconcile and reattach tests in
+      `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
+- [ ] 4.8 Not in this slice: the credential broker, the CLI verb and a budgeted
+      live run.
