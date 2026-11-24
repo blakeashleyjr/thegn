@@ -261,6 +261,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
 
     fn serve(count: usize, handler: impl Fn(usize, &str) -> String + Send + 'static) -> String {
@@ -344,9 +345,16 @@ mod tests {
 
     #[test]
     fn times_out_and_does_not_replay_cookies() {
+        // `Connection: close` on the redirect keeps the follow-up request on a
+        // fresh connection, which `serve(2, ..)` is waiting to accept. Without
+        // it hyper may hand the redirect's connection back to the pool and race
+        // the server's close, turning a loaded-machine timeout into a spurious
+        // transport error.
         let url = serve(2, |index, request| {
             if index == 0 {
-                "HTTP/1.1 302 Found\r\nSet-Cookie: secret=leak\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n".into()
+                "HTTP/1.1 302 Found\r\nSet-Cookie: secret=leak\r\nLocation: /next\r\n\
+                 Connection: close\r\nContent-Length: 0\r\n\r\n"
+                    .into()
             } else {
                 assert!(!request.to_ascii_lowercase().contains("cookie:"));
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".into()
@@ -359,17 +367,59 @@ mod tests {
             "ok"
         );
 
-        let url = serve(1, |_, _| {
-            thread::sleep(Duration::from_millis(1500));
+        // Hold the response open so the only thing that can end this fetch is
+        // its own deadline: the server has already read the request and will
+        // not answer until the test releases it, which happens only after
+        // `fetch` returned. A slow machine can then delay the deadline but can
+        // no longer hand back a closed or half-written response instead.
+        let (request_seen_tx, request_seen_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let url = serve(1, move |_, _| {
+            request_seen_tx
+                .send(())
+                .expect("test observes the held preview request");
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("test releases the held preview response");
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".into()
         });
         let config = PreviewConfig {
             fetch_timeout_ms: 200,
             ..PreviewConfig::default()
         };
+        let (result_tx, result_rx) = mpsc::channel::<Result<PreviewFetchReply, FetchError>>();
+        let fetch_thread = thread::spawn(move || {
+            result_tx
+                .send(fetch(&config, request(url), None))
+                .expect("test receives the fetch result");
+        });
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("server read the preview request");
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("fetch returns within the test bound");
+        release_tx
+            .send(())
+            .expect("server still holds the response");
+        fetch_thread.join().expect("fetch thread joins");
+        assert!(matches!(result, Err(FetchError::Timeout)));
+
+        // A peer that closes before sending any response is a transport
+        // failure, and must stay distinguishable from the deadline above: with
+        // a generous budget the error arrives long before the deadline, so only
+        // the close can explain it.
+        let url = serve(1, |_, _| String::new());
         assert!(matches!(
-            fetch(&config, request(url), None),
-            Err(FetchError::Timeout)
+            fetch(
+                &PreviewConfig {
+                    fetch_timeout_ms: 10_000,
+                    ..PreviewConfig::default()
+                },
+                request(url),
+                None,
+            ),
+            Err(FetchError::Transport(_))
         ));
     }
 
