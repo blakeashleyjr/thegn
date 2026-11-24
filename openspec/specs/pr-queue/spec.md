@@ -158,6 +158,24 @@ entries. An entry MUST be recorded against the repository and PR number rather
 than a worktree path, so a queued PR without a checkout is representable, and the
 queue MUST survive across invocations.
 
+An admission refusal from the shared PR-agent safety policy SHALL be stored on
+the queue row as its typed reason plus the head it was observed at. The CLI JSON
+row, the CLI text row, and the sidebar section SHALL expose that reason and SHALL
+still expose it after a restart. A later agent admission, a new observed head, or
+a re-queue SHALL clear the prior refusal.
+
+#### Scenario: A refusal is still readable after a restart
+
+- **WHEN** an agent admission is refused and thegn is restarted before anything
+  else moves the pull request's head
+- **THEN** the row still reports the typed refusal and its detail
+
+#### Scenario: A stale refusal cannot outlive its head
+
+- **WHEN** the pull request's head advances past the head a refusal was recorded
+  against
+- **THEN** the row no longer reports that refusal
+
 #### Scenario: Queueing the current worktree's pull request
 
 - **WHEN** a user runs `pr queue add` inside a worktree whose branch has an open

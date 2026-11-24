@@ -27,7 +27,12 @@ use std::fmt;
 
 /// What kind of blocker an agent is being asked to fix. The kind selects the
 /// default prompt and the set of variables that prompt may reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `as_str` is the durable wire id: the config key, the `THEGN_TASK_KIND`
+/// value, and (via `rename_all`) the id stored in a typed PR-queue admission
+/// refusal. Renaming a variant is therefore a wire-format break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     /// A merge-queue branch that conflicts textually with the target.
     MergeConflict,
@@ -2095,6 +2100,24 @@ mod tests {
         assert_eq!(TaskKind::MergeConflict.as_str(), "merge_conflict");
         assert_eq!(TaskKind::GateFailure.as_str(), "gate_failure");
         assert_eq!(TaskKind::GateFailure.to_string(), "gate_failure");
+    }
+
+    #[test]
+    fn task_kind_serde_id_matches_its_wire_id() {
+        // A typed PR-queue refusal stores the kind as JSON, so the serde id and
+        // `as_str` must not drift apart.
+        for kind in [
+            TaskKind::MergeConflict,
+            TaskKind::GateFailure,
+            TaskKind::PrCiFailure,
+            TaskKind::PrConflict,
+            TaskKind::PrReview,
+            TaskKind::Issue,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.as_str()));
+            assert_eq!(serde_json::from_str::<TaskKind>(&json).unwrap(), kind);
+        }
     }
 
     // --- agent resolution ---------------------------------------------------

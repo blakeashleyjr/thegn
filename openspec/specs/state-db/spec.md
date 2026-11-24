@@ -273,15 +273,25 @@ whose old start dates still generate current occurrences.
 The state database SHALL carry a `pr_queue` table keyed by repository and pull
 request number, recording the branch, base branch, forge, status, current
 blocker, the worktree the entry was queued from (which MAY be absent), the agent
-attempt count, and the last head commit thegn observed. The table SHALL be added
-by an additive migration with a `user_version` bump, so an existing database
-upgrades in place without losing its other caches.
+attempt count, the last head commit thegn observed, and an optional typed
+PR-agent admission refusal together with the head it was observed at. The
+table SHALL be added by an additive migration with a `user_version` bump, so an
+existing database upgrades in place without losing its other caches. The refusal
+columns SHALL likewise be additive, so rows written before them read as having
+no refusal.
 
 #### Scenario: An older database gains the table on open
 
 - **WHEN** a database created before the PR queue existed is opened
 - **THEN** the `pr_queue` table is created, `user_version` is advanced, and every
   pre-existing row in other tables is preserved
+
+#### Scenario: Existing rows have no refusal after migration
+
+- **WHEN** a database whose PR queue rows predate the refusal columns is
+  upgraded
+- **THEN** those rows keep their status, blocker, and attempt count and report no
+  admission refusal
 
 #### Scenario: A queued pull request survives a restart
 

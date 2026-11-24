@@ -2713,6 +2713,29 @@ pub(crate) fn verify_v116_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v117: pr_queue.admission_refusal + admission_refusal_head, the typed reason
+/// the last PR-agent dispatch for a head was refused, and the head it
+/// describes (THE-1991). Purely additive: a pre-v117 row reads back as no
+/// refusal, which is exactly the pre-change behaviour, so no vacuum entry.
+pub(crate) fn migrate_v117(conn: &Connection) -> Result<()> {
+    for column in ["admission_refusal", "admission_refusal_head"] {
+        if !has_column(conn, "pr_queue", column) {
+            let sql = format!("ALTER TABLE pr_queue ADD COLUMN {column} TEXT");
+            conn.execute(&sql, [])?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v117_schema(conn: &Connection) -> Result<()> {
+    for column in ["admission_refusal", "admission_refusal_head"] {
+        if !has_column(conn, "pr_queue", column) {
+            bail!("schema v117 migration did not add pr_queue.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -5207,6 +5230,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(states, 1);
+    }
+
+    #[test]
+    fn v117_adds_the_typed_refusal_columns_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v116.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            // Roll the row back to the v116 shape: the refusal columns are new.
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE pr_queue DROP COLUMN admission_refusal;
+                     ALTER TABLE pr_queue DROP COLUMN admission_refusal_head;
+                     PRAGMA user_version=116;",
+                )
+                .unwrap();
+            assert!(!super::has_column(
+                db.conn(),
+                "pr_queue",
+                "admission_refusal"
+            ));
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let conn = upgraded.conn();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v117_schema(conn).unwrap();
+        // A row written in the pre-v117 column shape reads back as no refusal:
+        // the upgrade is additive and backfills nothing.
+        conn.execute(
+            "INSERT INTO pr_queue
+               (key,repo_root,number,branch,base_branch,forge,status,agent_attempts,
+                queued_at,updated_at)
+             VALUES ('/repo#7','/repo',7,'feat','main','github','blocked_ci',2,1,1)",
+            [],
+        )
+        .unwrap();
+        let (status, attempts, refusal, head): (String, i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status,agent_attempts,admission_refusal,admission_refusal_head \
+                 FROM pr_queue WHERE key='/repo#7'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), attempts), ("blocked_ci", 2));
+        assert_eq!(refusal, None, "a pre-v117 row reads back as no refusal");
+        assert_eq!(head, None);
+        super::migrate_v117(conn).unwrap(); // a second pass is a no-op
+        super::verify_v117_schema(conn).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pr_queue", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the migration preserves rows");
     }
 
     #[test]

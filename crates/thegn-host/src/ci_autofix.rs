@@ -9,7 +9,7 @@ use std::path::Path;
 use thegn_core::ci_log::CiLogEntry;
 use thegn_core::config::{CiAutofixMode, Config};
 use thegn_core::forge::{FetchedPr, Forge, PrRef};
-use thegn_core::pr_queue::{Blocker, PrQueueFacts, PrqStatus};
+use thegn_core::pr_queue::{AgentAdmissionRefusal, Blocker, PrQueueFacts, PrqStatus};
 use thegn_core::store::{CacheStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
 
 /// Consider one newly cached failed-job log.  Missing or stale context is
@@ -252,6 +252,27 @@ fn consider_candidate(
     consider_candidate_with_forge(full, db, entry, human_authorized, None);
 }
 
+/// Persist the typed reason this candidate was held, so the refusal outlives the
+/// notification and is visible on the board and in `pr queue list --json`.
+/// Best-effort: the refusal is diagnostic state, so a write failure is logged
+/// and the hold still stands.
+fn record_refusal(
+    db: &thegn_core::db::Db,
+    key: &str,
+    row_head: Option<&str>,
+    refusal_head: Option<&str>,
+    refusal: &AgentAdmissionRefusal,
+) {
+    if let Err(error) = db.record_pr_agent_refusal(key, row_head, refusal_head, refusal) {
+        tracing::debug!(
+            target: "thegn::ci_autofix",
+            %key,
+            %error,
+            "could not record the PR-agent refusal"
+        );
+    }
+}
+
 fn consider_candidate_with_forge(
     full: &Config,
     db: &thegn_core::db::Db,
@@ -356,18 +377,34 @@ fn consider_candidate_with_forge(
             status
         }
         Some(status) => {
+            let refusal = AgentAdmissionRefusal::RowState(status.as_str().to_owned());
             notify(format!(
                 "CI autofix for PR #{} held: PR queue row is `{}`; agent dispatch refused",
                 item.number,
                 status.as_str()
             ));
+            record_refusal(
+                db,
+                &item.key,
+                item.last_head_oid.as_deref(),
+                item.last_head_oid.as_deref(),
+                &refusal,
+            );
             return;
         }
         None => {
+            let refusal = AgentAdmissionRefusal::UnknownStatus(item.status.clone());
             notify(format!(
                 "CI autofix for PR #{} held: unknown PR queue status `{}`; agent dispatch refused",
                 item.number, item.status
             ));
+            record_refusal(
+                db,
+                &item.key,
+                item.last_head_oid.as_deref(),
+                item.last_head_oid.as_deref(),
+                &refusal,
+            );
             return;
         }
     };
@@ -389,10 +426,22 @@ fn consider_candidate_with_forge(
     let pq = full.repo_pr_queue(&root);
     let agent = thegn_core::agent_task::resolve_agent(full, &pq.agent, &pq.agent_command);
     if !pq.enabled || agent.is_none() {
+        let refusal = if pq.enabled {
+            AgentAdmissionRefusal::NoAgent
+        } else {
+            AgentAdmissionRefusal::Disabled
+        };
         notify(format!(
             "CI job {} failed for PR #{}; configure the PR-queue agent to enable autofix",
             entry.job_name, item.number
         ));
+        record_refusal(
+            db,
+            &item.key,
+            item.last_head_oid.as_deref(),
+            item.last_head_oid.as_deref(),
+            &refusal,
+        );
         return;
     }
     if item.agent_attempts >= pq.agent_max_attempts {
@@ -485,6 +534,13 @@ fn consider_candidate_with_forge(
         }
         Err(reason) => {
             notify(format!("CI autofix for PR #{} held: {reason}", item.number));
+            record_refusal(
+                db,
+                &item.key,
+                item.last_head_oid.as_deref(),
+                Some(fetched.pr.head_ref_oid.as_str()),
+                &reason,
+            );
             return;
         }
     }
@@ -547,6 +603,13 @@ fn consider_candidate_with_forge(
         &isolation,
     ) {
         notify(format!("CI autofix for PR #{} held: {reason}", item.number));
+        record_refusal(
+            db,
+            &item.key,
+            item.last_head_oid.as_deref(),
+            Some(fetched.pr.head_ref_oid.as_str()),
+            &reason,
+        );
         return;
     }
     let sandbox = sandbox.expect("admitted isolation carries a sandbox spec");
@@ -569,7 +632,7 @@ fn consider_candidate_with_forge(
         &blocker,
         log,
     );
-    if let Err(_reason) = thegn_core::pr_queue::admit_prepared_dispatch(
+    if let Err(reason) = thegn_core::pr_queue::admit_prepared_dispatch(
         thegn_core::agent_task::TaskKind::PrCiFailure,
         prepared.is_some(),
         &thegn_core::pr_queue::IsolationAdmission::Admitted,
@@ -578,6 +641,13 @@ fn consider_candidate_with_forge(
             "CI autofix for PR #{} was not dispatched: prompt is invalid",
             item.number
         ));
+        record_refusal(
+            db,
+            &item.key,
+            item.last_head_oid.as_deref(),
+            Some(fetched.pr.head_ref_oid.as_str()),
+            &reason,
+        );
         return;
     }
     let (vars, prompt) = prepared.expect("prepared dispatch admitted only with a prompt");
@@ -2534,7 +2604,23 @@ mod tests {
 
         assert!(!prompt_path.exists());
         assert!(!handoff.sentinel.exists());
-        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.agent_attempts, 0);
+        // The refusal is durable state, not just a notification: the typed
+        // reason survives readback and says why nothing was dispatched.
+        assert_eq!(
+            row.admission_refusal,
+            Some(thegn_core::pr_queue::AgentAdmissionRefusal::PromptInvalid {
+                kind: thegn_core::agent_task::TaskKind::PrCiFailure,
+            })
+        );
+        assert!(
+            row.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("template")),
+            "detail={:?}",
+            row.detail
+        );
         assert!(
             handoff
                 .db

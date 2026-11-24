@@ -138,7 +138,16 @@ fn list(json: bool) -> Result<()> {
     }
     for entry in &listed {
         let r = entry.row;
-        let detail = r.detail.as_deref().unwrap_or("");
+        // `detail` carries the refusal wording when one was recorded; fall back
+        // to the typed refusal so a row that was never refreshed still explains
+        // itself instead of reading as an unexplained hold.
+        let detail = r
+            .detail
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| r.admission_refusal.as_ref().map(ToString::to_string))
+            .unwrap_or_default();
         let wt = match r.worktree.as_deref() {
             Some(w) if !w.is_empty() => format!(" ({w})"),
             _ => " (no worktree)".to_string(),
@@ -977,6 +986,49 @@ mod list_outcome_tests {
             "committed locally, nothing pushed"
         );
         assert!(value["agent_outcome"]["recorded_at"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn listed_row_json_exposes_the_typed_refusal() {
+        let db = Db::open_memory().unwrap();
+        let row = watching_row(&db, 1);
+        // The refusal records itself against the row's head and mirrors itself
+        // into `detail`; the JSON carries the type, not just the wording.
+        assert!(
+            db.record_pr_agent_refusal(
+                &row.key,
+                None,
+                None,
+                &thegn_core::pr_queue::AgentAdmissionRefusal::PromptInvalid {
+                    kind: thegn_core::agent_task::TaskKind::PrCiFailure,
+                },
+            )
+            .unwrap()
+        );
+        let stored = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.number == 1)
+            .unwrap();
+        let listed = listed_rows(&db, std::slice::from_ref(&stored)).unwrap();
+        let value = serde_json::to_value(&listed[0]).unwrap();
+
+        assert_eq!(
+            value["admission_refusal"]["PromptInvalid"]["kind"], "pr_ci_failure",
+            "the durable encoding keeps the task kind's wire id"
+        );
+        assert!(
+            value["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("template")),
+            "detail={:?}",
+            value["detail"]
+        );
+        assert!(
+            value.get("admission_refusal_head").is_none(),
+            "the head is internal bookkeeping, not part of the JSON surface"
+        );
     }
 
     #[test]

@@ -619,6 +619,21 @@ pub trait WorktreeAuxStore {
     /// live PR-agent lease exactly like [`Self::update_pr_status`].
     fn update_pr_detail(&self, key: &str, detail: &str) -> Result<()>;
 
+    /// Persist the typed reason a PR-agent dispatch was refused, so the refusal
+    /// survives a restart instead of living only in a notification. The write is
+    /// fenced on `row_head` (the head the caller observed) so a stale pass cannot
+    /// overwrite a newer observation, and it records `refusal_head` as the head
+    /// this refusal is about — a later head change clears it. `detail` is set to
+    /// the refusal's own wording. Fenced by a live PR-agent lease as well: the
+    /// lease holder owns the row. Returns false when nothing was written.
+    fn record_pr_agent_refusal(
+        &self,
+        key: &str,
+        row_head: Option<&str>,
+        refusal_head: Option<&str>,
+        refusal: &crate::pr_queue::AgentAdmissionRefusal,
+    ) -> Result<bool>;
+
     /// Record agent-dispatch cycles spent on a PR, so the budget belongs to the
     /// pull request rather than to one drain. A live PR-agent lease fences this
     /// write; the lease holder updates attempts only through its fenced release,
