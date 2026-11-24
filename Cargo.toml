@@ -257,6 +257,8 @@ sysinfo = { version = "0.39", default-features = false, features = [
 starship-battery = "0.11"
 # --- internal crates ---
 thegn-core = { path = "crates/thegn-core" }
+thegn-cas = { path = "crates/thegn-cas" }
+thegn-job-spec = { path = "crates/thegn-job-spec" }
 thegn-plugin-ui = { path = "crates/thegn-plugin-ui" }
 thegn-plugin-sdk = { path = "crates/thegn-plugin-sdk" }
 tg-kit = { path = "crates/tg-kit" }
