@@ -484,6 +484,13 @@
       "no_spec_rationale": "Not started: its proposal follows the add-plugin-app-tabs landing (THE-1673)."
     },
     {
+      "issue": "THE-2065",
+      "project": "Sandbox & Remote 06: Windows",
+      "changes": [
+        "fix-windows-backend-gates"
+      ]
+    },
+    {
       "issue": "THE-2067",
       "project": "Sandbox & Remote 01: Truth and fixes",
       "changes": [

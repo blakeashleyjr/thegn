@@ -14,7 +14,8 @@
     "Proposal Retirement & Cleanup",
     "Sandbox & Remote 00: Shared contracts",
     "Sandbox & Remote 01: Truth and fixes",
-    "Sandbox & Remote 05: macOS"
+    "Sandbox & Remote 05: macOS",
+    "Sandbox & Remote 06: Windows"
   ],
   "entries": [
     {
@@ -1017,6 +1018,18 @@
         }
       ],
       "summary": "Sandbox reporting must never claim more enforcement than is applied; authored in W0, implemented by WS01 items."
+    },
+    {
+      "change": "fix-windows-backend-gates",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-2065",
+          "project": "Sandbox & Remote 06: Windows"
+        }
+      ],
+      "summary": "WS06 ladder scaffold: the D5 order, the evidence tags, the claim register and the verified() rule; later WS06 items attach their deltas here."
     },
     {
       "change": "fold-autopilot-into-rules",
