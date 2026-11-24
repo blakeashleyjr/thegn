@@ -164,8 +164,8 @@ without thegn proxying or re-rendering the app. thegn does not embed a browser
 engine, import a browser profile, or inject its own browser identity. If a
 future web surface offers an embedded view, it must also offer this ordinary
 tab; embedding is never the only way to open the app. Reopening with `o` (or
-copying with `↵`) snapshots the target's explicit source and last known state
-first: `up` needs no suffix, `seen`/`configured`/`unknown` say
+copying with `↵`) snapshots the target's last known state
+first: `up` needs no suffix, `seen`/`unknown` say
 `(not answering yet)`, and `down` says `(server stopped)` while a fresh probe
 runs. An unavailable target reports that no preview is selected (or that the
 selected preview target is unavailable).

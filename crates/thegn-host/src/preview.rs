@@ -1081,6 +1081,17 @@ mod tests {
         assert_eq!(sup.view("/repo").unwrap().status, PreviewStatus::Up);
     }
 
+    /// What `preview_watch::spawn_probe` checks: a real loopback connect.
+    async fn real_probe(request: ProbeRequest) -> ProbeResult {
+        let ok = within(async {
+            tokio::net::TcpStream::connect((request.host.as_str(), request.port))
+                .await
+                .is_ok()
+        })
+        .await;
+        ProbeResult { request, ok }
+    }
+
     async fn within<F: std::future::Future>(future: F) -> F::Output {
         tokio::time::timeout(std::time::Duration::from_secs(5), future)
             .await
@@ -1264,8 +1275,15 @@ mod tests {
                     let content = Arc::clone(&app_content);
                     let page = page.clone();
                     tokio::spawn(async move {
-                        let mut request = [0_u8; 4096];
-                        let _request = stream.read(&mut request).await;
+                        // Read the whole request head so closing never RSTs.
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 1024];
+                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => request.extend_from_slice(&chunk[..n]),
+                            }
+                        }
                         let body = content.lock().expect("fixture content").clone();
                         let document = format!("{page}<main>{body}</main>");
                         let response = format!(
@@ -1332,6 +1350,17 @@ mod tests {
         }
     }
 
+    impl DevFixture {
+        /// Stop both listeners and wait until they are really closed, so the
+        /// ports refuse connections afterwards.
+        async fn stop(&mut self) {
+            self.app_task.abort();
+            self.hmr_task.abort();
+            let _app = (&mut self.app_task).await;
+            let _hmr = (&mut self.hmr_task).await;
+        }
+    }
+
     impl Drop for DevFixture {
         fn drop(&mut self) {
             self.app_task.abort();
@@ -1341,7 +1370,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_app_targets_keep_independent_hmr_and_reopen_after_restart() {
-        let alpha = DevFixture::start("<h1>alpha one</h1>").await;
+        let mut alpha = DevFixture::start("<h1>alpha one</h1>").await;
         let beta = DevFixture::start("<h1>beta one</h1>").await;
 
         let mut sup = PreviewSupervisor::new();
@@ -1366,9 +1395,14 @@ mod tests {
         assert_eq!(sup.view("/beta").unwrap().status, PreviewStatus::Seen);
 
         let request = sup.probe_requests("/alpha").pop().expect("alpha probe");
-        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        let alpha_request = request.clone();
+        let result = real_probe(request).await;
+        assert!(result.ok, "fixture answers a real loopback connect");
+        assert!(sup.apply_probe(result));
         let request = sup.probe_requests("/beta").pop().expect("beta probe");
-        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        let result = real_probe(request).await;
+        assert!(result.ok, "fixture answers a real loopback connect");
+        assert!(sup.apply_probe(result));
         assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Up);
         assert_eq!(sup.view("/beta").unwrap().status, PreviewStatus::Up);
 
@@ -1406,11 +1440,15 @@ mod tests {
         );
         assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Seen);
         let request = sup.probe_requests("/alpha").pop().expect("re-probe");
-        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        let result = real_probe(request).await;
+        assert!(result.ok, "fixture answers a real loopback connect");
+        assert!(sup.apply_probe(result));
 
         // Stop alpha, then bring a replacement dev server up on a new port.
         let old_url = alpha.url();
-        drop(alpha);
+        alpha.stop().await;
+        let stale = real_probe(alpha_request).await;
+        assert!(!stale.ok, "the stopped server's port refuses connections");
         assert!(sup.pane_exit(101));
         assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Down);
         assert_eq!(sup.view("/alpha").unwrap().url, old_url);
@@ -1430,7 +1468,9 @@ mod tests {
         assert_eq!(sup.view("/beta").unwrap().url, beta.url());
 
         let request = sup.probe_requests("/alpha").pop().expect("restarted probe");
-        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        let result = real_probe(request).await;
+        assert!(result.ok, "fixture answers a real loopback connect");
+        assert!(sup.apply_probe(result));
         assert_eq!(sup.view("/alpha").unwrap().status, PreviewStatus::Up);
         assert!(restarted.served_page().await.contains("alpha restarted"));
     }

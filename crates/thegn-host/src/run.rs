@@ -23936,7 +23936,9 @@ async fn event_loop<T: Terminal>(
                                                         crate::preview::status_note(preview.status),
                                                     );
                                                 }
-                                            } else if panel_ui.cursor == 0 {
+                                            } else if model.preview.is_some()
+                                                && panel_ui.cursor == 0
+                                            {
                                                 model.status = "Preview target unavailable".into();
                                             }
                                         }

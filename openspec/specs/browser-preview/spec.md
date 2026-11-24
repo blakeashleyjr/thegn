@@ -57,7 +57,7 @@ not yet proven.
 #### Scenario: Open reports the last known target state
 
 - **WHEN** the user opens or copies a selected preview target
-- **THEN** the action reports the source and state the user saw, with a
+- **THEN** the action reports the state the user saw, with a
   stopped target distinguished from an unproven one
 
 ### Requirement: Diagnostic preview fetch is bounded and credential-free
