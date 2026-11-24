@@ -96,3 +96,6 @@
       `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
 - [ ] 4.8 Not in this slice: the credential broker and a budgeted live run. The
       CLI verb landed with task 3.1; it has not yet run against a real provider.
+- [ ] 4.11 Follow-up: Vercel `reconcile_pending_at` reports a compare-and-swap loss as
+      `Cleaned`/`StillPending`, never `ReconcileOutcome::Superseded` (Sprites reports it);
+      only the logged `settled` count is affected.

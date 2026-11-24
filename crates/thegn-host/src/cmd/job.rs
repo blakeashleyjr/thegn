@@ -14,7 +14,8 @@ use anyhow::{Result, anyhow, bail};
 use thegn_core::config::Config;
 use thegn_core::outln;
 use thegn_svc::selected_job::{
-    self, Recipe, SelectedCancel, SelectedCompletion, SelectedFailure, SelectedJobResult,
+    self, Recipe, RunnerRefusal, SelectedCancel, SelectedCompletion, SelectedFailure,
+    SelectedJobResult,
 };
 
 use crate::selected_runner::{self, AttemptSummary};
@@ -149,6 +150,7 @@ fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
             )
         })
     };
+    let started_ms = thegn_core::util::now_ms();
     let mut interrupted = false;
     while !work.is_finished() {
         if !interrupted && guard.fired() {
@@ -160,6 +162,14 @@ fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
                 "interrupt received: this runner cannot stop a running job yet; waiting for \
                  it to end or reach its deadline"
             });
+        }
+        if guard.count() >= 2 {
+            thegn_core::msg::warn(
+                "second interrupt: leaving now. A remote attempt may still be running; it \
+                 stops at its deadline, and the next daemon start (or a later `thegn job run`) \
+                 reconciles its ledger row",
+            );
+            std::process::exit(130);
         }
         std::thread::sleep(INTERRUPT_POLL);
     }
@@ -173,16 +183,24 @@ fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
     let summary = outcome
         .as_ref()
         .ok()
-        .and_then(|result| runner.latest_attempt(result));
+        .and_then(|result| runner.latest_attempt(result, started_ms));
     let result = match outcome {
         Ok(result) => result,
         Err(SelectedFailure::Refused(refusal)) => {
             bail!("job refused before dispatch, nothing ran: {refusal}")
         }
-        Err(SelectedFailure::Unproven(refusal)) => bail!(
-            "job outcome unproven: {refusal}. The recipe may have run; check the runner's \
-             ledger before retrying"
-        ),
+        Err(SelectedFailure::Unproven(refusal)) => {
+            if matches!(refusal, RunnerRefusal::SourceMismatch { .. }) {
+                bail!(
+                    "the worktree changed while the job was starting, so the runner refused \
+                     before dispatch: nothing ran ({refusal}). Run it again"
+                )
+            }
+            bail!(
+                "job outcome unproven: {refusal}. The recipe may have run; check the runner's \
+                 ledger before retrying"
+            )
+        }
     };
     outln!(
         "{}",

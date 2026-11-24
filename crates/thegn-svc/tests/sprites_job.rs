@@ -1675,6 +1675,8 @@ fn a_snapshot_carries_the_dirty_tree_and_its_allowed_untracked_input() {
     write(".env", b"SECRET=1\n");
     write(".env.local", b"SECRET=2\n");
     write(".ssh/id_ed25519", b"private\n");
+    write("certs/server.pem", b"-----BEGIN-----\n");
+    write(".envrc", b"export TOKEN=1\n");
     write(".thegn/state.json", b"{}\n");
     write("services/api/.env", b"SECRET=3\n");
     write("web/.npmrc", b"//registry:_authToken=x\n");

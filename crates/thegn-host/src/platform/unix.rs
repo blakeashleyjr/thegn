@@ -1472,9 +1472,11 @@ mod sandbox_floor_preflight_tests;
 mod capability_identity_tests;
 
 static INTERRUPT_SEEN: AtomicBool = AtomicBool::new(false);
+static INTERRUPT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 extern "C" fn note_interrupt(_sig: libc::c_int) {
     INTERRUPT_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    INTERRUPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// While alive, SIGINT/SIGTERM are recorded instead of terminating the
@@ -1489,6 +1491,7 @@ impl InterruptGuard {
     pub fn install() -> Self {
         use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
         INTERRUPT_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+        INTERRUPT_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         let action = SigAction::new(
             SigHandler::Handler(note_interrupt),
             SaFlags::empty(),
@@ -1507,6 +1510,11 @@ impl InterruptGuard {
     /// Whether SIGINT/SIGTERM arrived since [`InterruptGuard::install`].
     pub fn fired(&self) -> bool {
         INTERRUPT_SEEN.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many SIGINT/SIGTERM arrived since [`InterruptGuard::install`].
+    pub fn count(&self) -> u32 {
+        INTERRUPT_COUNT.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The flag the handler sets, for supervisors that take a cancel

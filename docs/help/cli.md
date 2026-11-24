@@ -562,7 +562,8 @@ On the dev channel, `thegn job run [--runner <env>] [--deadline <secs>]
 runner and exits with the job's exit code. The runner is `--runner`, else
 `[jobs] runner`: an `[env.<name>]` whose provider is `sprites` (its `id` names
 the one bound Sprite) or `vercel` (its `team_id` and `project_id`). It snapshots
-the current worktree (tracked and non-ignored files; a symlink refuses), pins
+the current worktree (tracked and non-ignored files, honouring your global
+gitignore, minus key, certificate and credential files; a symlink refuses), pins
 the snapshot's digest, and the runner verifies the files it received against
 that digest before running anything. There is no free-form command and no
 fallback to another runner. The recipe runs with a scrubbed environment and

@@ -122,8 +122,8 @@ pub(crate) fn project_key(repo_root: &Path) -> Option<String> {
 
 /// A built executor.
 pub(crate) enum Runner {
-    Sprites(sprites_job::SpritesSelectedRunner),
-    Vercel(vercel_job::VercelSelectedRunner),
+    Sprites(Box<sprites_job::SpritesSelectedRunner>),
+    Vercel(Box<vercel_job::VercelSelectedRunner>),
 }
 
 /// What the ledger recorded about the attempt behind a receipt.
@@ -168,8 +168,8 @@ impl Runner {
 
     pub(crate) fn selected(&self) -> &dyn SelectedRunner {
         match self {
-            Self::Sprites(runner) => runner,
-            Self::Vercel(runner) => runner,
+            Self::Sprites(runner) => runner.as_ref(),
+            Self::Vercel(runner) => runner.as_ref(),
         }
     }
 
@@ -182,17 +182,27 @@ impl Runner {
         }
     }
 
-    /// The newest ledger row for the receipt's recipe and source: duration and
-    /// cost the route's receipt does not carry. `None` when the ledger cannot
-    /// be read or holds no such row.
-    pub(crate) fn latest_attempt(&self, result: &SelectedJobResult) -> Option<AttemptSummary> {
+    /// The newest ledger row for the receipt's recipe and source that was
+    /// created at or after `since_ms` (the run's start): duration and cost the
+    /// route's receipt does not carry. `None` when the ledger cannot be read or
+    /// this run created no such row, so an earlier run's numbers are never
+    /// shown as this run's.
+    pub(crate) fn latest_attempt(
+        &self,
+        result: &SelectedJobResult,
+        since_ms: i64,
+    ) -> Option<AttemptSummary> {
         match self {
             Self::Sprites(runner) => runner
                 .store()
                 .records()
                 .ok()?
                 .into_iter()
-                .rfind(|row| row.recipe == result.recipe && row.source == result.source)
+                .rfind(|row| {
+                    row.recipe == result.recipe
+                        && row.source == result.source
+                        && row.created_ms >= since_ms
+                })
                 .map(|row| {
                     summary(
                         row.attempt,
@@ -207,7 +217,11 @@ impl Runner {
                 .records()
                 .ok()?
                 .into_iter()
-                .rfind(|row| row.recipe == result.recipe && row.source == result.source)
+                .rfind(|row| {
+                    row.recipe == result.recipe
+                        && row.source == result.source
+                        && row.created_ms >= since_ms
+                })
                 .map(|row| {
                     summary(
                         row.attempt,
@@ -287,7 +301,7 @@ pub(crate) fn build_from(
                 Box::new(sprites_job::DirSnapshot::new(root)),
                 handle,
             )
-            .map(Runner::Sprites)
+            .map(|runner| Runner::Sprites(Box::new(runner)))
             .map_err(|error| provider_error(&env, format!("{error:#}")))
         }
         EnvProviderKind::Vercel => {
@@ -320,7 +334,7 @@ pub(crate) fn build_from(
                 Box::new(vercel_job::DirSnapshot::new(root)),
                 handle,
             )
-            .map(Runner::Vercel)
+            .map(|runner| Runner::Vercel(Box::new(runner)))
             .map_err(|error| provider_error(&env, format!("{error:#}")))
         }
         _ => Err(RunnerError::UnsupportedProvider {

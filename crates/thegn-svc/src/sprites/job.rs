@@ -193,6 +193,19 @@ fn is_ssh_key_name(part: &str) -> bool {
     lower.starts_with("id_") && !lower.ends_with(".pub")
 }
 
+/// Secret-shaped file names by pattern, case-insensitive: private keys and
+/// certificates, direnv files, Terraform variables and state, and service
+/// account key files.
+fn is_secret_shaped_name(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    [".pem", ".key", ".p12", ".pfx", ".tfvars"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+        || lower.starts_with(".envrc")
+        || lower.contains(".tfstate")
+        || (lower.starts_with("service-account") && lower.ends_with(".json"))
+}
+
 /// True when `rel` is content a job snapshot must never carry. Every component
 /// is checked, so `services/api/.env` and `pkg/.claude/x` are denied exactly
 /// like their root-level forms.
@@ -202,6 +215,7 @@ fn denied_path(rel: &str) -> bool {
         if DENIED_DIRS.contains(part)
             || DENIED_NAMES.contains(part)
             || is_ssh_key_name(part)
+            || is_secret_shaped_name(part)
             || (part.starts_with(".env.") && part.len() > ".env.".len())
         {
             return true;
@@ -464,8 +478,11 @@ pub trait SnapshotSource: Send + Sync {
 /// executable bit is preserved.
 ///
 /// Ignore rules come from the tree itself (`.gitignore`, `.git/info/exclude`,
-/// `.ignore`); the user's global gitignore is deliberately not consulted, so
-/// the captured set (and its digest) does not depend on the host.
+/// `.ignore`) and from the user's global gitignore, so a file the user keeps
+/// out of version control only through their global excludes is never
+/// uploaded. The pin and the executor capture on the same host with this same
+/// walker, so their digests still match. Secret-shaped names (keys,
+/// certificates, `.envrc`, `*.tfvars`, ...) are denied regardless.
 #[derive(Debug, Clone)]
 pub struct DirSnapshot {
     root: PathBuf,
@@ -495,7 +512,7 @@ impl SnapshotSource for DirSnapshot {
             .hidden(false)
             .git_ignore(true)
             .git_exclude(true)
-            .git_global(false)
+            .git_global(true)
             .parents(false)
             .require_git(false)
             .follow_links(false)
@@ -3462,6 +3479,14 @@ mod tests {
             ".npmrc",
             ".pypirc",
             ".git-credentials",
+            "certs/server.pem",
+            "keys/Deploy.KEY",
+            "bundle.p12",
+            ".envrc",
+            "app/.envrc.local",
+            "infra/prod.tfvars",
+            "infra/terraform.tfstate.backup",
+            "gcp/service-account-prod.json",
             "services/api/.env",
             "web/.npmrc",
             "web/.env.production",

@@ -25,8 +25,8 @@ use thegn_core::vercel::api::Scope;
 use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCompletion};
 use thegn_svc::vercel::job::{
     AttemptOptions, AttemptReceipt, AttemptRecord, AttemptState, AttemptStore, Cleanup,
-    DEFAULT_CHECKOUT_ROOT, JobBinding, OwnerLease, ReserveRefusal, ReserveRequest, SnapshotContent,
-    SnapshotSource, VercelSelectedRunner,
+    DEFAULT_CHECKOUT_ROOT, JobBinding, OwnerLease, ReconcileOutcome, Reconciled, ReserveRefusal,
+    ReserveRequest, SnapshotContent, SnapshotSource, VercelSelectedRunner,
 };
 use thegn_svc::vercel::{VercelProvider, VercelSpec, VercelToken};
 
@@ -1260,6 +1260,102 @@ async fn a_row_whose_lease_owner_is_dead_and_heartbeat_old_is_reconciled() {
 
     assert_eq!(settled.state, AttemptState::Indeterminate);
     assert_eq!(settled.cleanup, Cleanup::Done);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_pending_skips_a_live_lease_and_a_young_row() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let mut record = store.read(1).unwrap().unwrap();
+    record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
+    store.mark(&record).unwrap();
+    let (kills, deletes) = (
+        mock.count("POST", "/kill"),
+        mock.count("DELETE", &receipt.sandbox),
+    );
+
+    assert!(runner.reconcile_pending().await.unwrap().is_empty());
+
+    // A younger row (deadline far in the future) is skipped too.
+    let mut young = store.read(1).unwrap().unwrap();
+    young.lease = None;
+    young.deadline_ms = thegn_core::util::now_ms() + 3_600_000;
+    store.mark(&young).unwrap();
+    assert!(runner.reconcile_pending().await.unwrap().is_empty());
+
+    assert_eq!(mock.count("POST", "/kill"), kills, "nothing was killed");
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes);
+    assert_eq!(store.read(1).unwrap().unwrap(), young);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_pending_settles_a_stale_row_and_skips_a_reserved_one() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let mut reserved = store.read(1).unwrap().unwrap();
+    reserved.state = AttemptState::Reserved;
+    store.mark(&reserved).unwrap();
+
+    assert!(runner.reconcile_pending().await.unwrap().is_empty());
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Reserved
+    );
+
+    let mut running = store.read(1).unwrap().unwrap();
+    running.state = AttemptState::Running;
+    store.mark(&running).unwrap();
+
+    let touched = runner.reconcile_pending().await.unwrap();
+
+    assert_eq!(
+        touched,
+        vec![Reconciled {
+            attempt: 1,
+            outcome: ReconcileOutcome::Cleaned
+        }]
+    );
+    let settled = store.read(1).unwrap().unwrap();
+    assert_eq!(settled.state, AttemptState::Indeterminate);
+    assert_eq!(settled.cleanup, Cleanup::Done);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_pending_cleans_a_terminal_row_whose_cleanup_is_pending() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    // Finished, but its sandbox delete did not complete.
+    fs.lock().unwrap().deleted = false;
+    let mut record = store.read(1).unwrap().unwrap();
+    record.cleanup = Cleanup::Pending;
+    record.sandbox_deleted = false;
+    store.mark(&record).unwrap();
+    let (state, deletes) = (record.state, mock.count("DELETE", &receipt.sandbox));
+
+    let touched = runner.reconcile_pending().await.unwrap();
+
+    assert_eq!(
+        touched,
+        vec![Reconciled {
+            attempt: 1,
+            outcome: ReconcileOutcome::Cleaned
+        }]
+    );
+    let settled = store.read(1).unwrap().unwrap();
+    assert_eq!(settled.state, state, "a terminal state is never rewritten");
+    assert_eq!(settled.cleanup, Cleanup::Done);
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes + 1);
 }
 
 #[test]

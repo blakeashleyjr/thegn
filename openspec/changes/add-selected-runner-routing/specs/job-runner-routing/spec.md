@@ -59,7 +59,7 @@ deadline, `128 + n` for signal `n`, and `1` when no outcome was proven.
 #### Scenario: Started inside a selected job
 
 - **WHEN** `thegn job run` runs with `THEGN_SELECTED_JOB` set
-- **THEN** it refuses before reading any configuration or snapshot
+- **THEN** it refuses before any runner is built, any token is resolved or any snapshot is taken
 
 ### Requirement: Results identify the submitted operation
 
