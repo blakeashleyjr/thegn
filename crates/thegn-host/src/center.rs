@@ -271,29 +271,36 @@ impl CenterTree {
         }
     }
 
-    /// Remove leaf `target` from a split, collapsing a now-single-child split
-    /// into that child. Returns `true` if removed. Returns `false` when the tree
-    /// is just `Leaf(target)` (the caller closes the whole tab instead).
+    /// Remove `target` from the tree, collapsing a now-single-child split into
+    /// that child. A nested stack emptied by the removal is dropped from its
+    /// parent split. Returns `true` if removed. Returns `false` (tree untouched)
+    /// when `target` is absent or is the root-level last pane (`Leaf(target)` or
+    /// a root `Stack` holding only `target`); the caller closes the tab instead.
     pub fn remove(&mut self, target: PaneId) -> bool {
         match self {
             CenterTree::Leaf(_) => false,
             CenterTree::Stack { panes, active } => {
                 if let Some(i) = panes.iter().position(|p| *p == target) {
+                    if panes.len() == 1 {
+                        // Would empty the stack: the parent split (if any) drops it.
+                        return false;
+                    }
                     panes.remove(i);
                     if *active >= panes.len() {
                         *active = panes.len().saturating_sub(1);
                     }
-                    !panes.is_empty()
+                    true
                 } else {
                     false
                 }
             }
             CenterTree::Split { children, .. } => {
-                // Direct child leaf == target?
-                if let Some(i) = children
-                    .iter()
-                    .position(|b| matches!(&b.child, CenterTree::Leaf(p) if *p == target))
-                {
+                // Direct child leaf (or a nested stack holding only `target`)?
+                if let Some(i) = children.iter().position(|b| match &b.child {
+                    CenterTree::Leaf(p) => *p == target,
+                    CenterTree::Stack { panes, .. } => *panes == [target],
+                    CenterTree::Split { .. } => false,
+                }) {
                     children.remove(i);
                     if children.len() == 1 {
                         let only = children.pop().unwrap().child;
@@ -1056,6 +1063,61 @@ mod tests {
         assert_eq!(t, CenterTree::Leaf(1));
         // Removing the sole leaf returns false (caller closes the tab).
         assert!(!t.remove(1));
+    }
+
+    #[test]
+    fn remove_drops_emptied_nested_stack() {
+        let mut t = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(1),
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Stack {
+                        panes: vec![2],
+                        active: 0,
+                    },
+                },
+            ],
+        };
+        assert!(t.remove(2));
+        assert_eq!(t, CenterTree::Leaf(1));
+    }
+
+    #[test]
+    fn remove_from_multi_pane_stack_keeps_stack() {
+        let mut t = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(1),
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Stack {
+                        panes: vec![2, 3],
+                        active: 1,
+                    },
+                },
+            ],
+        };
+        assert!(t.remove(3));
+        assert_eq!(t.pane_ids(), vec![1, 2]);
+        assert!(!t.remove(99));
+    }
+
+    #[test]
+    fn remove_root_stack_last_pane_refuses() {
+        let mut t = CenterTree::Stack {
+            panes: vec![1],
+            active: 0,
+        };
+        assert!(!t.remove(1));
+        assert_eq!(t.pane_ids(), vec![1]);
     }
 
     #[test]
