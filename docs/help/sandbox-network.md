@@ -22,10 +22,12 @@ only enforced deny, and `*` in `network_block` means offline — see
 launch (standalone sandboxed terminals included), at `thegn env provision`, and
 in `thegn doctor`.
 
-On the `apple` backend, `network = "none"` (and therefore `sealed`) is refused
-with `network-unexpressible` until an internal-network implementation lands:
-Apple `container` has no offline network mode. Use podman or docker (they run in
-a VM on macOS) for offline or sealed worktrees, or set `network = "nat"`.
+On the `apple` backend, `network = "host"` is refused with
+`network-unexpressible` (Apple `container` has no host network; use `nat`).
+`network = "none"` (and therefore `sealed`) is refused too: Apple can create
+an internal network, but it still reaches services bound on your Mac, so thegn
+will not call it offline. Use podman or docker (they run in a VM on macOS) for
+offline or sealed worktrees.
 
 `[sandbox.vpn]` can put the sandbox on an overlay network (tailscale,
 headscale, wireguard, openvpn, netbird, zerotier). The `mode` decides how:

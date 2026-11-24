@@ -1267,7 +1267,69 @@ fn apple_nat_launches() {
 }
 
 #[test]
-fn podman_network_none_still_emits_flag() {
+fn apple_network_none_refusal_names_host_reachability() {
+    // Owner decision O21: Apple `none` stays refused while `container network
+    // create --internal` still reaches services bound on the Mac. The refusal
+    // must say so, not just "unexpressible".
+    let mut s = spec(Backend::Apple);
+    s.network = Network::None;
+    let message = network_unexpressible_refusal(&s).expect("apple none is unexpressible");
+    assert!(message.contains("reaches your Mac's services"), "{message}");
+    assert!(message.contains("podman"), "{message}");
+    assert!(message.contains("docker"), "{message}");
+    assert!(message.contains("no interface"), "{message}");
+}
+
+#[test]
+fn apple_network_host_refused_before_argv() {
+    let mut s = spec(Backend::Apple);
+    s.network = Network::Host;
+    for result in [
+        enter_argv(&s, "true").map(|_| ()),
+        launchable_with(&s, &[]).map(|_| ()),
+    ] {
+        match result {
+            Err(EnterError::Refused(refusal)) => {
+                assert_eq!(refusal.class, RefusalClass::NetworkUnexpressible);
+                assert_eq!(refusal.backend, "apple");
+                assert!(refusal.path.is_none());
+                assert!(
+                    refusal.message.contains("no host network"),
+                    "{}",
+                    refusal.message
+                );
+                assert!(refusal.message.contains("`nat`"), "{}", refusal.message);
+            }
+            other => panic!("expected network-unexpressible refusal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn apple_network_host_not_emitted() {
+    // Even a direct argv compose (past the launch gate) must not hand Apple a
+    // `--network host` or `--network none` it has no keyword for.
+    for network in [Network::Host, Network::None] {
+        let mut s = spec(Backend::Apple);
+        s.network = network;
+        let argv = oci_create_opts_in(&s, &[], None).expect("valid volume names");
+        assert!(
+            !argv.iter().any(|arg| arg == "--network"),
+            "{network:?}: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg == "host"),
+            "{network:?}: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg == "none"),
+            "{network:?}: {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn oci_network_none_unchanged_for_podman_docker() {
     for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
         let mut s = spec(backend);
         s.network = Network::None;

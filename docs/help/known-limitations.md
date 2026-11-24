@@ -19,9 +19,12 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   download, set Option as Meta/Alt in your terminal, and treat CPU caps as
   unavailable; the `apple` sandbox backend has no automated runtime coverage.
   See [[terminal-compatibility]] and [[sandboxing]].
-- **The `apple` sandbox backend cannot run offline.** `network = "none"`, and
-  therefore the `sealed` profile, is refused with `network-unexpressible`; use
-  podman or docker for offline or sealed worktrees. See [[sandbox-network]].
+- **The `apple` sandbox backend cannot run offline and has no host network.**
+  `network = "none"`, and therefore the `sealed` profile, is refused with
+  `network-unexpressible` because Apple's internal network still reaches
+  services bound on your Mac; `network = "host"` is refused too (`nat` is the
+  supported mode). Use podman or docker for offline or sealed worktrees. See
+  [[sandbox-network]].
 - **Windows is deferred, with no published binary.** Use a supported Linux
   build instead.
 - **Windows hosts: Win32-OpenSSH has no connection sharing (ControlMaster).**

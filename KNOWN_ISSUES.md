@@ -19,9 +19,11 @@ reproducible problems that are not listed here.
   See [terminal compatibility](docs/help/terminal-compatibility.md). For a
   browser-downloaded archive, clear quarantine before first launch with
   `xattr -dr com.apple.quarantine ./thegn`.
-- **The `apple` sandbox backend cannot run offline.** `network = "none"`, and
-  therefore the `sealed` profile, is refused with `network-unexpressible`; use
-  podman or docker for offline or sealed worktrees.
+- **The `apple` sandbox backend cannot run offline and has no host network.**
+  `network = "none"`, and therefore the `sealed` profile, is refused with
+  `network-unexpressible` because Apple's internal network still reaches
+  services bound on the Mac; `network = "host"` is refused too (`nat` is the
+  supported mode). Use podman or docker for offline or sealed worktrees.
 - **Windows is deferred.** No Windows binary is published. To run thegn on a
   Windows host, use WSL2 with the supported Linux x86_64 archive; see the
   [Windows and WSL test handoff](docs/superpowers/guides/windows-wsl-test-handoff.md).
