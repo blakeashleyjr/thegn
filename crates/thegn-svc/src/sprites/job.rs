@@ -771,7 +771,7 @@ pub struct OwnerLease {
     /// recycled pid is not mistaken for the owner.
     pub start_ticks: Option<u64>,
     pub started_at_ms: i64,
-    /// Refreshed every [`LEASE_HEARTBEAT`] by the owner, by compare-and-swap.
+    /// Refreshed every `LEASE_HEARTBEAT` by the owner, by compare-and-swap.
     pub heartbeat_ms: i64,
 }
 
@@ -1531,7 +1531,7 @@ pub struct AttemptOptions {
     /// Where per-attempt checkouts live on the sprite.
     pub checkout_root: String,
     /// How often the running owner refreshes its lease heartbeat
-    /// ([`LEASE_HEARTBEAT`] by default); injectable so a test can use a short one.
+    /// (`LEASE_HEARTBEAT` by default); injectable so a test can use a short one.
     pub lease_heartbeat: Duration,
 }
 

@@ -740,7 +740,7 @@ pub struct AttemptOptions {
     /// smaller of this and the env's `max_lifetime_secs`.
     pub max_sandbox_timeout: Duration,
     /// How often the running owner refreshes its lease heartbeat
-    /// ([`LEASE_HEARTBEAT`] by default); injectable so a test can use a short one.
+    /// (`LEASE_HEARTBEAT` by default); injectable so a test can use a short one.
     pub lease_heartbeat: Duration,
 }
 
