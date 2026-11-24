@@ -1279,11 +1279,12 @@ async fn read_log_stream(mut resp: reqwest::Response, tx: tokio::sync::mpsc::Sen
 /// The exit code a get-command response reports (`{"command": {…}}` or bare):
 /// `None` while `exitCode` is absent or null. A response naming a different
 /// command is refused; a code outside `i32` is [`EXEC_EXIT_STATUS_UNKNOWN`].
+#[cfg(test)]
 fn command_exit(v: &serde_json::Value, cmd: &str) -> Result<Option<i32>, &'static str> {
     Ok(command_exit_exact(v, cmd)?.map(|code| code.unwrap_or(EXEC_EXIT_STATUS_UNKNOWN)))
 }
 
-/// [`command_exit`] keeping "outside `i32`" distinct (`Some(None)`).
+/// `command_exit` keeping "outside `i32`" distinct (`Some(None)`).
 fn command_exit_exact(
     v: &serde_json::Value,
     cmd: &str,

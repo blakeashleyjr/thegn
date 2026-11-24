@@ -1947,8 +1947,9 @@ async fn a_user_cancel_kills_the_owned_tree_and_reports_cancelled_not_timed_out(
     let content = content();
     let token = CancelToken::new();
 
+    let pin = pinned();
     let (receipt, ()) = tokio::join!(
-        runner.run_cancellable(Recipe::CargoBuild, &pinned(), &content, DEADLINE, &token),
+        runner.run_cancellable(Recipe::CargoBuild, &pin, &content, DEADLINE, &token),
         cancel_when_running(store.clone(), token.clone()),
     );
     let receipt = receipt.unwrap();
@@ -1989,8 +1990,9 @@ async fn a_cancel_whose_group_survives_the_kill_leaves_cleanup_pending() {
     let content = content();
     let token = CancelToken::new();
 
+    let pin = pinned();
     let (receipt, ()) = tokio::join!(
-        runner.run_cancellable(Recipe::CargoBuild, &pinned(), &content, DEADLINE, &token),
+        runner.run_cancellable(Recipe::CargoBuild, &pin, &content, DEADLINE, &token),
         cancel_when_running(store.clone(), token.clone()),
     );
     let receipt = receipt.unwrap();
@@ -2354,8 +2356,9 @@ async fn a_cancel_racing_a_finished_exit_never_kills_a_proven_completion() {
             token.cancel();
         }
     };
+    let pin = pinned();
     let (receipt, ()) = tokio::join!(
-        runner.run_cancellable(Recipe::CargoBuild, &pinned(), &content, DEADLINE, &token),
+        runner.run_cancellable(Recipe::CargoBuild, &pin, &content, DEADLINE, &token),
         canceller,
     );
     let receipt = receipt.unwrap();
