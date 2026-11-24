@@ -4,9 +4,10 @@
 
 thegn's sandbox decides how a process is contained, but nothing yet lets the
 user say _which operations_ may start at all. This change adds a **declarative
-operation policy**: an ordered list of allow, deny and ask rules, evaluated by a
-pure decision function in `thegn-core`, in front of the two places where thegn
-starts work on a caller's behalf:
+operation policy**: an ordered list of allow, deny and ask rules in
+`[[sandbox.policy]]` (user config only), evaluated by a pure decision function in
+`thegn-core` (planned module `op_policy.rs`), in front of the two places where
+thegn starts work on a caller's behalf:
 
 - the `tools.run` row of `capability::CATALOG` ("Run one trusted configured tool
   by name in a worktree"), reached by automations, MCP and the control API; and
