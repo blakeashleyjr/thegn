@@ -29536,7 +29536,7 @@ fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32
         }
     }
     tab.center.remap(&mut |old| map[&old]);
-    tab.remap_focus_history(&mut |old| map.get(&old).copied().unwrap_or(old));
+    tab.remap_focus_history(&mut |old| map.get(&old).copied());
     if let Some(&new) = map.get(&focus) {
         tab.focus_pane(new);
     } else {

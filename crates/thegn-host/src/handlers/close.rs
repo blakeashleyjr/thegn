@@ -40,15 +40,10 @@ pub(crate) fn close_pane(cx: &mut CloseCtx<'_>) {
         let removed = cx
             .session
             .active_tab_mut()
-            .map(|t| t.center.remove(focused))
+            .map(|t| t.remove_pane_and_refocus(focused))
             .unwrap_or(false);
         if removed {
             cx.panes.table.remove(&focused);
-            // Focus the pane the user was on before this one, when it is still
-            // in the tree; otherwise keep the old first-pane fallback.
-            if let Some(tab) = cx.session.active_tab_mut() {
-                tab.after_pane_closed(focused);
-            }
             *cx.need_relayout = true;
             persist_session_layout_cached(cx.session);
         }

@@ -1526,7 +1526,7 @@ impl Panes {
         let old_focus = tab.focused_pane;
         tab.center
             .remap(&mut |old| map.get(&old).copied().unwrap_or(old));
-        tab.remap_focus_history(&mut |old| map.get(&old).copied().unwrap_or(old));
+        tab.remap_focus_history(&mut |old| map.get(&old).copied());
         let next = map
             .get(&old_focus)
             .copied()

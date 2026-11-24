@@ -373,7 +373,7 @@ pub(crate) fn remap_group_ids(g: &mut crate::session::WorktreeGroup, panes: &mut
             .get(&tab.focused_pane)
             .copied()
             .unwrap_or(tab.focused_pane);
-        tab.remap_focus_history(&mut |id| map.get(&id).copied().unwrap_or(id));
+        tab.remap_focus_history(&mut |id| map.get(&id).copied());
         tab.pane_cwds = std::mem::take(&mut tab.pane_cwds)
             .into_iter()
             .map(|(id, cwd)| (map.get(&id).copied().unwrap_or(id), cwd))

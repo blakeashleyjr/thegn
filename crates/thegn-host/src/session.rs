@@ -120,15 +120,27 @@ impl PartialEq for Tab {
     fn eq(&self, other: &Self) -> bool {
         // `focus_history` is runtime-only focus bookkeeping (like
         // `WorktreeGroup::epoch`): two tabs with the same layout and focus are
-        // equal regardless of which panes were visited before.
-        self.title == other.title
-            && self.center == other.center
-            && self.focused_pane == other.focused_pane
-            && self.pane_cwds == other.pane_cwds
-            && self.pane_cmds == other.pane_cmds
-            && self.pane_sessions == other.pane_sessions
-            && self.pane_scrollback == other.pane_scrollback
-            && self.grow == other.grow
+        // equal regardless of which panes were visited before. The exhaustive
+        // destructure makes a newly added field a compile error here.
+        let Tab {
+            title,
+            center,
+            focused_pane,
+            focus_history: _,
+            pane_cwds,
+            pane_cmds,
+            pane_sessions,
+            pane_scrollback,
+            grow,
+        } = self;
+        *title == other.title
+            && *center == other.center
+            && *focused_pane == other.focused_pane
+            && *pane_cwds == other.pane_cwds
+            && *pane_cmds == other.pane_cmds
+            && *pane_sessions == other.pane_sessions
+            && *pane_scrollback == other.pane_scrollback
+            && *grow == other.grow
     }
 }
 
@@ -206,6 +218,15 @@ impl Tab {
         }
     }
 
+    /// Remove `pane` from the tree and move focus per `after_pane_closed`. The
+    /// single entry point for every close path (explicit close, pane exit).
+    /// Returns whether the tree dropped the pane.
+    pub fn remove_pane_and_refocus(&mut self, pane: u32) -> bool {
+        let removed = self.center.remove(pane);
+        self.after_pane_closed(pane);
+        removed
+    }
+
     /// Forget `closed`, which has just left the tree. When it was the focused
     /// pane, move focus to the most recently focused pane still in the tree
     /// (activating it if it is a collapsed stack member), or to the tree's
@@ -223,6 +244,10 @@ impl Tab {
             .retain(|pane| *pane != closed && live.contains(pane));
         // Closing a pane that was not focused leaves focus where it is.
         if self.focused_pane != closed {
+            // Removing a stack member before the active one shifts the active
+            // index; re-activate the focused pane's member so the displayed
+            // member still matches focus.
+            self.center.activate_stack_member(self.focused_pane);
             return false;
         }
         let remembered = self.focus_history.last().copied();
@@ -237,10 +262,13 @@ impl Tab {
 
     /// Rewrite the runtime focus history through `f` alongside the pane tree
     /// and `focused_pane` when a tab's ids move (resurrect or cold restore).
-    pub fn remap_focus_history(&mut self, f: &mut impl FnMut(u32) -> u32) {
-        for pane in &mut self.focus_history {
-            *pane = f(*pane);
-        }
+    /// Ids `f` maps to `None` (not part of the remapped tree) are dropped so a
+    /// stale old-namespace id can never collide with a fresh one.
+    pub fn remap_focus_history(&mut self, f: &mut impl FnMut(u32) -> Option<u32>) {
+        self.focus_history = std::mem::take(&mut self.focus_history)
+            .into_iter()
+            .filter_map(|pane| f(pane))
+            .collect();
     }
 
     /// Serialize this tab to a persistable row at the given position. Stale cwd
@@ -932,9 +960,11 @@ impl Session {
     pub fn remap_pane_ids(&mut self, mut f: impl FnMut(u32) -> u32) {
         for g in &mut self.worktrees {
             for tab in &mut g.tabs {
+                let live = tab.center.pane_ids();
+                tab.focus_history.retain(|id| live.contains(id));
                 tab.center.remap(&mut |id| f(id));
                 tab.focused_pane = f(tab.focused_pane);
-                tab.remap_focus_history(&mut |id| f(id));
+                tab.remap_focus_history(&mut |id| Some(f(id)));
                 tab.pane_cwds = tab
                     .pane_cwds
                     .iter()
@@ -1779,6 +1809,59 @@ mod tests {
         assert!(tab.after_pane_closed(2));
         assert_eq!(tab.focused_pane, 3);
         assert_eq!(tab.focus_history, vec![1, 3]);
+    }
+
+    #[test]
+    fn remove_pane_and_refocus_removes_then_applies_the_mru_rule() {
+        // The helper the close handlers call: dropping it from a handler (or
+        // reverting to a bare `center.remove`) changes this observable result.
+        let mut tab = tab_with_panes(&[1, 2, 3], 3);
+        for pane in [1, 3, 2] {
+            tab.focus_pane(pane);
+        }
+        assert!(tab.remove_pane_and_refocus(2));
+        assert_eq!(tab.center.pane_ids(), vec![1, 3]);
+        assert_eq!(tab.focused_pane, 3, "MRU survivor, not the first pane");
+    }
+
+    #[test]
+    fn closing_a_stack_member_before_the_active_one_keeps_the_focused_member_shown() {
+        let mut tab = Tab::new("1");
+        tab.center = CenterTree::Stack {
+            panes: vec![1, 2, 3],
+            active: 1,
+        };
+        tab.focus_pane(2);
+        assert!(tab.remove_pane_and_refocus(1));
+        assert_eq!(tab.focused_pane, 2);
+        assert_eq!(
+            tab.center,
+            CenterTree::Stack {
+                panes: vec![2, 3],
+                active: 0
+            },
+            "the displayed member is the focused pane"
+        );
+    }
+
+    #[test]
+    fn remap_drops_history_ids_that_are_not_in_the_tree() {
+        let mut s = Session::default();
+        let mut g = group("a");
+        g.tabs[0].center = CenterTree::Leaf(3);
+        g.tabs[0].focused_pane = 3;
+        g.tabs[0].focus_history = vec![99, 3];
+        s.add_group(g);
+        s.remap_pane_ids(|id| id + 100);
+        assert_eq!(s.worktrees[0].tabs[0].focus_history, vec![103]);
+    }
+
+    #[test]
+    fn tabs_differing_only_in_focus_history_are_equal() {
+        let a = tab_with_panes(&[1, 2], 1);
+        let mut b = a.clone();
+        b.focus_history = vec![2, 1];
+        assert_eq!(a, b);
     }
 
     #[test]
