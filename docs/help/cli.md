@@ -258,6 +258,9 @@ new path. `wt rm` runs `pre_destroy` before teardown, then `git worktree
 remove`, `post_destroy`, and DB cleanup. A failed blocking destroy hook leaves
 the worktree in place and names `--force`; that existing flag is also the
 explicit confirmation and skips the veto. Repo hooks are still warn-only.
+`<target>` is a path or a branch; a short name such as `fix-parser` also matches the
+branch `<branch_prefix>fix-parser` (for example `tg/fix-parser`) when no branch is literally
+that name, and several matches are refused as ambiguous.
 `thegn wt rm <target> --delete-branch` also force-deletes the worktree's branch
 with `git branch -D`, without checking whether it is merged. It refuses with
 the reason if that branch differs from the one recorded at creation, is the

@@ -5267,6 +5267,30 @@ fn split_image_line_keeps_judge_inspect_input_unchanged() {
     );
 }
 
+/// Observed on macOS (Docker 29.5.2 via colima): `docker container inspect
+/// --format` appends its own newline after the template's trailing `\n`, so the
+/// image line was no longer final and every fresh container read as drifted.
+#[test]
+fn split_image_line_survives_docker_double_trailing_newline() {
+    let id = "2bf225230f05881b6a36d20f484088f408c9a1309edc730c0bf01f15e635d411";
+    let stdout =
+        format!("RUNNING\n0\nfp\n/Users/u/repo\n/Users/u/repo/.git\nthegn-image:sha256:{id}\n\n");
+    let (inspect, image) = split_image_line(&stdout);
+    assert_eq!(
+        inspect,
+        "RUNNING\n0\nfp\n/Users/u/repo\n/Users/u/repo/.git\n"
+    );
+    let expected_image = format!("sha256:{id}");
+    assert_eq!(image.as_deref(), Some(expected_image.as_str()));
+    assert!(image_reusable(
+        image.as_deref(),
+        Some(&format!("sha256:{id}\n"))
+    ));
+    // A missing image line still yields no id, never a guessed one.
+    let (_, none) = split_image_line("RUNNING\n0\nfp\n/wt\n\n");
+    assert_eq!(none, None);
+}
+
 #[test]
 fn expected_policy_is_stable_across_sealed_view() {
     let mut s = spec(Backend::Podman);

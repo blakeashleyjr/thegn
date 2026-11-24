@@ -1624,8 +1624,19 @@ pub(super) fn rm_with(
             .and_then(|observation| observation.branch().map(str::to_owned))
     };
     let matches: Vec<_> = path_match.map(|row| vec![row]).unwrap_or_else(|| {
-        rows.iter()
+        let exact: Vec<_> = rows
+            .iter()
             .filter(|row| live_branch(row).as_deref() == Some(target))
+            .collect();
+        if !exact.is_empty() {
+            return exact;
+        }
+        // `wt list` and the docs show the short name (`fix-one` for the branch
+        // `tg/fix-one`): accept `{branch_prefix}{target}` when no branch is
+        // literally `target`. Several hits still fall to the ambiguity error.
+        let prefixed = worktree::human_base(target, cfg);
+        rows.iter()
+            .filter(|row| live_branch(row).as_deref() == Some(prefixed.as_str()))
             .collect()
     });
     // (path, live branch, repo root, the matched row's own tab, recorded branch)

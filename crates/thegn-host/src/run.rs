@@ -20887,7 +20887,7 @@ async fn event_loop<T: Terminal>(
                     // by itself a complete quit binding counts (never a chord
                     // prefix), and the matcher is reset either way.
                     let open_quit = crate::handlers::quit_confirm::is_quit_prompt(m);
-                    if open_quit.is_some() {
+                    if open_quit.is_some() || k.modifiers.contains(Modifiers::CTRL) {
                         let single = match keymap
                             .dispatch(mode, crate::sequence::Key::modified(k.key, k.modifiers))
                         {
@@ -20895,6 +20895,39 @@ async fn event_loop<T: Terminal>(
                             _ => None,
                         };
                         keymap.reset();
+                        // The quit key also works from any other modal menu
+                        // (e.g. the sandbox-failure menu): open the quit prompt
+                        // over it, or quit at once when confirmation is off.
+                        if let Some(kind) = crate::handlers::quit_confirm::modal_quit_request(
+                            open_quit,
+                            k.modifiers,
+                            single.as_ref(),
+                        ) {
+                            if !crate::handlers::quit_confirm::request(
+                                current_config.ui.confirm_quit,
+                                &mut active_menu,
+                                kind,
+                                || {
+                                    crate::handlers::daemon_lifecycle::pane_survival_counts(
+                                        &session,
+                                        &workspace_pool,
+                                        &panes,
+                                    )
+                                },
+                            ) {
+                                dirty = true;
+                                continue;
+                            }
+                            run_quit_body(
+                                kind,
+                                &mut share_supervisor,
+                                &mut session,
+                                &panes,
+                                &workspace_pool,
+                                &current_config.daemon,
+                            );
+                            return Ok(());
+                        }
                         if let Some(kind) =
                             crate::handlers::quit_confirm::second_press(open_quit, single.as_ref())
                         {

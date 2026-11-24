@@ -1859,7 +1859,14 @@ fn feature_state_line(
     } else {
         "disabled (dev-only)"
     };
-    if thegn_core::channel::Feature::PROGRAMME.contains(&feature) {
+    if feature == thegn_core::channel::Feature::SandboxBackends {
+        // The row names the FUTURE config-defined/plugin backends. It never gated
+        // the built-in podman/docker/apple/bwrap sandbox, which a stable launch
+        // still uses per `[sandbox]`; say so, or the row reads as "no sandbox".
+        format!(
+            "{state}; experimental, not yet implemented (new backend kinds only; the built-in podman, docker, apple and bwrap backends are unaffected)"
+        )
+    } else if thegn_core::channel::Feature::PROGRAMME.contains(&feature) {
         format!("{state}; experimental, not yet implemented")
     } else {
         state.to_string()
@@ -9130,12 +9137,17 @@ args = ["--verbose"]
     fn programme_features_read_not_yet_implemented() {
         use thegn_core::channel::{Channel, Feature};
         for f in Feature::PROGRAMME {
-            assert_eq!(
-                feature_state_line(f, Channel::Stable),
-                "disabled (dev-only); experimental, not yet implemented"
+            let stable = feature_state_line(f, Channel::Stable);
+            assert!(
+                stable.starts_with("disabled (dev-only); experimental, not yet implemented"),
+                "{f}: {stable}"
             );
             assert!(feature_state_line(f, Channel::Dev).starts_with("enabled;"));
         }
+        assert!(
+            feature_state_line(Feature::SandboxBackends, Channel::Stable)
+                .contains("built-in podman, docker, apple and bwrap backends are unaffected")
+        );
         assert_eq!(
             feature_state_line(Feature::Remote, Channel::Stable),
             "disabled (dev-only)"

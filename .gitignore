@@ -96,3 +96,6 @@ Thumbs.db
 .ruff_cache/
 .venv/
 node_modules/
+
+# Agent-pipeline handoff notes are local working state, not project history.
+/.thegn/pipeline/

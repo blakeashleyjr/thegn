@@ -2,9 +2,9 @@
 
 **A terminal-native Git worktree IDE that is its own multiplexer.**
 
-> **Status: public alpha** (`0.1.0-alpha.131`). **x86_64 Linux is the supported
-> platform.** macOS on Apple silicon is best-effort: use the flake or source
-> setup until a release archive is published. Pull requests run lean CI checks
+> **Status: public alpha** (`0.1.0-alpha.131`). **x86_64 Linux and macOS on
+> Apple silicon are supported;** on macOS install with `brew install blakeashleyjr/thegn/thegn`,
+> the release tarball (see [Install](#install)), the flake, or a source build. Pull requests run lean CI checks
 > (format, lint, test, smoke); the full gate runs nightly and on demand, and
 > the interactive on-device checklist is unfinished. Windows is deferred and
 > has no release binary.
@@ -24,8 +24,7 @@ and it is now a from-scratch native compositor.)
 
 ## Quickstart (Linux x86_64)
 
-Linux x86_64 is the supported platform; macOS on Apple silicon is best-effort
-and Windows is deferred. See [Install](#install) for platform details.
+Linux x86_64 and macOS on Apple silicon are supported; Windows is deferred. See [Install](#install) for platform details.
 
 ### 1. Install
 
@@ -285,7 +284,7 @@ supported until its clean-host rehearsal is recorded.
 | --------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | Linux, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | shipped x86_64 Linux path; run `nix run github:blakeashleyjr/thegn#batteries`                      |
 | Linux, standalone installer | host terminal; host Alacritty reused or pinned user-local Alacritty 0.17.0 with `--batteries` | host, or verified FiraCode Nerd Font v3.5.0 user-local with `--batteries` | generated Thegn config; writable user-local Alacritty config with `--batteries` | installed source build                | partial; no clean-host rehearsal; use the ordinary current-terminal path or the Nix batteries path |
-| macOS, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | composition exists, but remains best-effort until the macOS clean-host checklist passes            |
+| macOS, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | composition exists; the macOS clean-host checklist is still open                                   |
 | macOS app launcher          | selected host terminal                                                                        | host                                                                      | generated Thegn config and local `.app` launcher                                | installed source build or PATH binary | partial; use Nix or the source install while signing and full bundle rehearsal remain open         |
 | Windows native              | host Windows Terminal                                                                         | host                                                                      | host                                                                            | source build only                     | deferred; use a supported x86_64 Linux host when verified behavior is required                     |
 
@@ -352,13 +351,13 @@ archive and sidecar in a browser and run the verification commands locally.
 inspector, Git UI and GitHub PR/CI fallback; `delta` is not needed because diff
 highlighting is built in. The flake wraps these optional tools onto `PATH`.
 
-**On macOS, prefer Nix or a local source build.** Homebrew and AUR publication
-are pending owner setup and a clean-host rehearsal. If a macOS archive is
-published, it is deliberately unsigned, and a tarball downloaded through a
-browser is quarantined by Gatekeeper — it needs
-`xattr -dr com.apple.quarantine ./thegn` before it will launch. Homebrew formula
-downloads, if published, Nix store paths, and the locally generated `thegn.app`
-are not quarantined, so none of them hit that. The reasoning is in
+**macOS (Apple silicon):** `brew install blakeashleyjr/thegn/thegn`. Homebrew
+does not quarantine its downloads, so this needs no extra step. The
+`aarch64-apple-darwin` release tarball works too, but it is not yet signed or
+notarized, so a copy downloaded through a browser is quarantined by
+Gatekeeper; run `xattr -d com.apple.quarantine ./thegn` once before it will
+launch. AUR publication is pending owner setup. Nix store paths and the locally generated `thegn.app` are
+not quarantined, so neither hits that. The reasoning is in
 [`RELEASING.md`](RELEASING.md), which also covers the release process and the
 crates.io / `cargo binstall` status.
 
@@ -420,9 +419,8 @@ prebuilt `.app` would need Developer ID signing and notarization first. Re-run
 after moving or reinstalling the binary (the launcher falls back to searching
 the usual prefixes, but the baked path is what it prefers).
 
-**macOS is best-effort; Windows is deferred.** Until a macOS release archive
-is published, use the flake or source setup;
-pull requests run lean CI checks, the full gate runs nightly and on demand,
+**macOS (Apple silicon) is supported; Windows is deferred.** Use the release
+tarball, the flake or the source setup; pull requests run lean CI checks, the full gate runs nightly and on demand,
 and the interactive on-device checklist is unfinished (see
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Windows has no release binary; source
 build notes below are for contributors, not a supported install path:

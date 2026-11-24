@@ -84,6 +84,27 @@ pub(crate) fn second_press(open: Option<QuitKind>, action: Option<&Action>) -> O
     }
 }
 
+/// A quit key pressed while ANOTHER modal menu (the sandbox-failure menu, a
+/// picker, ...) is open. Those menus swallow every Ctrl chord, so without this
+/// the documented quit key was dead until the menu was dismissed. Only a Ctrl
+/// chord counts: plain keys belong to the menu (`q` cancels it). Returns the
+/// quit to request, which still goes through [`request`] and so honours
+/// `ui.confirm_quit`. Pure.
+pub(crate) fn modal_quit_request(
+    open: Option<QuitKind>,
+    mods: termwiz::input::Modifiers,
+    action: Option<&Action>,
+) -> Option<QuitKind> {
+    if open.is_some() || !mods.contains(termwiz::input::Modifiers::CTRL) {
+        return None;
+    }
+    match action? {
+        Action::Quit => Some(QuitKind::Detach),
+        Action::QuitKill => Some(QuitKind::Kill),
+        _ => None,
+    }
+}
+
 /// The loop's quit-key decision: `true` = run the quit body now; `false` =
 /// the prompt was opened into `active_menu` (caller marks dirty and
 /// continues). `counts` is only evaluated when a prompt opens.
@@ -170,5 +191,38 @@ mod tests {
         let mut off = None;
         assert!(request(false, &mut off, QuitKind::Detach, || (1, 0)));
         assert!(off.is_none());
+    }
+
+    #[test]
+    fn ctrl_q_quits_from_another_open_modal_menu() {
+        use termwiz::input::{KeyCode, Modifiers};
+        let failure = crate::menu::sandbox_ask_menu(
+            "local",
+            "sandbox entry refused [mount-drift]: a mount source changed",
+        );
+        assert_eq!(is_quit_prompt(&failure), None);
+        // The real default keymap resolves Ctrl-q to Quit; the menu itself
+        // swallows that key, so the loop consults this hook first.
+        let action = crate::keymap::map_key(&KeyCode::Char('q'), Modifiers::CTRL);
+        assert_eq!(action, Some(Action::Quit));
+        assert_eq!(
+            modal_quit_request(is_quit_prompt(&failure), Modifiers::CTRL, action.as_ref()),
+            Some(QuitKind::Detach)
+        );
+        // Plain `q` stays the menu's own cancel key; an open quit prompt is
+        // handled by `second_press`, not re-requested.
+        assert_eq!(
+            modal_quit_request(None, Modifiers::NONE, Some(&Action::Quit)),
+            None
+        );
+        assert_eq!(
+            modal_quit_request(Some(QuitKind::Detach), Modifiers::CTRL, Some(&Action::Quit)),
+            None
+        );
+        assert_eq!(
+            modal_quit_request(None, Modifiers::CTRL, Some(&Action::QuitKill)),
+            Some(QuitKind::Kill)
+        );
+        assert_eq!(modal_quit_request(None, Modifiers::CTRL, None), None);
     }
 }

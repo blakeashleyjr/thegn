@@ -3539,7 +3539,11 @@ fn image_reusable(container: Option<&str>, expected: Option<&str>) -> bool {
 /// Only the final line is metadata: a bind source named `thegn-image:x` earlier
 /// in the output remains an ordinary mount source.
 fn split_image_line(stdout: &str) -> (String, Option<String>) {
-    let without_final_newline = stdout.strip_suffix('\n').unwrap_or(stdout);
+    // Docker 29 appends its own newline after the template's trailing `\n`
+    // (`…thegn-image:sha256:…\n\n`); Podman does not. Drop every trailing
+    // line break so both shapes expose the image line as the final line —
+    // otherwise the id was lost and every fresh container read as drifted.
+    let without_final_newline = stdout.trim_end_matches(['\n', '\r']);
     let Some((rest, final_line)) = without_final_newline.rsplit_once('\n') else {
         return (stdout.to_string(), None);
     };
