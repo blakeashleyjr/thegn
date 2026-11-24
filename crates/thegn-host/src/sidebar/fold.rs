@@ -2,10 +2,10 @@
 use crate::sidebar::{ActivityState, RowKind, SidebarRow, ViewState};
 
 /// A [`RowKind::BatchGroup`] row's rollup over its members.
-#[allow(dead_code)] // lane 4 renders it; drop this allow then
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupStats {
     /// Members in the batch.
+    #[allow(dead_code)] // only the fold tests read it; the row shows `child_count`
     pub lanes: usize,
     /// Members whose activity is `Active` or `Loading`.
     pub active: usize,
@@ -25,7 +25,6 @@ pub(crate) enum LooseItem {
     /// The loose worktree at this index, emitted as a plain row.
     Single(usize),
     /// A batch row for token `key` holding the loose worktrees at `members`.
-    #[allow(dead_code)] // spine stub: lane 2 constructs it; drop this allow then
     Batch { key: String, members: Vec<usize> },
 }
 
@@ -582,6 +581,15 @@ mod tests {
         );
     }
 
+    /// An empty loose run emits nothing, with grouping on or off.
+    #[test]
+    fn plan_loose_of_no_worktrees_is_empty() {
+        let labels: Vec<&str> = Vec::new();
+        let keep: Vec<bool> = Vec::new();
+        assert!(plan_loose(&labels, &keep, 2).is_empty());
+        assert!(plan_loose(&labels, &keep, 0).is_empty());
+    }
+
     fn batch(
         view: &ViewState,
         parent_collapsed: bool,
@@ -844,5 +852,22 @@ mod tests {
             rows.iter().filter(|r| r.visible && r.depth == 2).count(),
             20
         );
+    }
+
+    /// Eight members is one past the default limit, but a batch row counts as
+    /// a single entry: the limit never reaches inside it.
+    #[test]
+    fn a_batch_just_over_the_limit_is_one_entry() {
+        let mut view = view7();
+        view.batch_open.insert("batch:app/b1".into());
+        let mut rows = with_batch(0, lanes(8), &view);
+        apply_row_limits(&mut rows, &view);
+        assert!(more(&rows).is_none());
+        let h = rows
+            .iter()
+            .find(|r| r.kind == RowKind::BatchGroup)
+            .expect("batch");
+        assert_eq!(h.child_count, 8);
+        assert_eq!(rows.iter().filter(|r| r.visible && r.depth == 2).count(), 8);
     }
 }
