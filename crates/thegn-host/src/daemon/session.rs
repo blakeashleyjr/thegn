@@ -26,7 +26,7 @@ use thegn_core::attention::{AttentionTier, PaneAgentState, pane_agent_state};
 use thegn_core::config::Config;
 use thegn_core::control_wire::EventFrame;
 use thegn_core::graveyard::Graveyard;
-use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
+use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history_at};
 use thegn_core::osc_attention::{AttentionSignal, OscAttentionScanner};
 use thegn_core::session_activity::{Observation, SessionActivity};
 use thegn_core::term_snapshot::{ScreenSnapshot, SnapCell, SnapColor, encode_ansi};
@@ -636,11 +636,12 @@ impl SessionActor {
 
         self.emulator.advance(bytes);
         let pushed_before = self.history.total_pushed();
-        feed_bytes_to_history(
+        feed_bytes_to_history_at(
             bytes,
             &mut self.history,
             &mut self.history_partial,
             &mut self.history_stripper,
+            crate::e2e_freeze::clock(),
         );
         self.seq += 1;
 
@@ -1558,6 +1559,7 @@ pub(crate) fn snapshot_of(
 mod tests {
     use super::*;
     use thegn_core::control_wire::EventFrame;
+    use thegn_core::history::feed_bytes_to_history;
 
     fn meta_running(id: &str, program: &str) -> SessionMeta {
         SessionMeta {

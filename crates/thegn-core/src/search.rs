@@ -15,8 +15,13 @@
 use neo_frizbee::{Config, match_list};
 use regex::RegexBuilder;
 use std::collections::HashMap;
+use std::time::SystemTime;
 
 use crate::history::HistoryBuffer;
+
+/// One flattened source line plus the metadata ranking and rows need:
+/// `(pane_id, idx, line, label, from_tail, captured_at)`.
+type FlatLine<'a> = (u32, usize, &'a str, &'a str, usize, SystemTime);
 
 /// Lines between cancellation polls inside a scan. Small enough that a stale
 /// search stops within a frame, large enough that the atomic load disappears
@@ -99,6 +104,10 @@ pub struct SearchMatch {
     pub span: Option<(usize, usize)>,
     /// Lines between this line and its source's newest line (0 = newest).
     pub from_tail: usize,
+    /// Wall-clock capture time recorded when this history line was written
+    /// (the pane's history ring stamps it per line). The overlay shows it as a
+    /// relative age; nothing derives a time from line order.
+    pub captured_at: SystemTime,
     /// Number of identical lines grouped into this result (1 = single line).
     pub repeat: u32,
 }
@@ -424,18 +433,22 @@ impl SearchEngine {
             .collect();
 
         // Flatten every source line, keeping back-references.
-        // (pane_id, idx, line, label, from_tail)
-        let flat: Vec<(u32, usize, &str, &str, usize)> = sources
+        let flat: Vec<FlatLine<'_>> = sources
             .iter()
             .flat_map(|&(pane_id, label, buf)| {
                 let n = buf.len();
-                buf.iter()
-                    .enumerate()
-                    .map(move |(idx, line)| (pane_id, idx, line, label, n - 1 - idx))
+                buf.iter().enumerate().map(move |(idx, line)| {
+                    // `line_times` is kept parallel to `lines`, so the stamp is
+                    // there for every index this iterator yields; falling back
+                    // to `now` rather than skipping keeps a real line from
+                    // vanishing out of the results.
+                    let captured_at = buf.captured_at(idx).unwrap_or_else(SystemTime::now);
+                    (pane_id, idx, line, label, n - 1 - idx, captured_at)
+                })
             })
             .collect();
 
-        let mk = |f: &(u32, usize, &str, &str, usize), score: u32, span, repeat| SearchMatch {
+        let mk = |f: &FlatLine<'_>, score: u32, span, repeat| SearchMatch {
             pane_id: f.0,
             line_idx: f.1,
             line: f.2.to_string(),
@@ -443,6 +456,7 @@ impl SearchEngine {
             pane_label: f.3.to_string(),
             span,
             from_tail: f.4,
+            captured_at: f.5,
             repeat,
         };
 
@@ -657,16 +671,17 @@ mod tests {
     ) -> Vec<SearchMatch> {
         let trimmed = query.trim().to_string();
         let empty = trimmed.is_empty();
-        let flat: Vec<(u32, usize, &str, &str, usize)> = sources
+        let flat: Vec<FlatLine<'_>> = sources
             .iter()
             .flat_map(|&(pane_id, label, buf)| {
                 let n = buf.len();
-                buf.iter()
-                    .enumerate()
-                    .map(move |(idx, line)| (pane_id, idx, line, label, n - 1 - idx))
+                buf.iter().enumerate().map(move |(idx, line)| {
+                    let captured_at = buf.captured_at(idx).unwrap_or_else(SystemTime::now);
+                    (pane_id, idx, line, label, n - 1 - idx, captured_at)
+                })
             })
             .collect();
-        let mk = |f: &(u32, usize, &str, &str, usize), score: u32, span, repeat| SearchMatch {
+        let mk = |f: &FlatLine<'_>, score: u32, span, repeat| SearchMatch {
             pane_id: f.0,
             line_idx: f.1,
             line: f.2.to_string(),
@@ -674,6 +689,7 @@ mod tests {
             pane_label: f.3.to_string(),
             span,
             from_tail: f.4,
+            captured_at: f.5,
             repeat,
         };
 
@@ -815,6 +831,27 @@ mod tests {
         eng.set_query("same", &sources);
         assert_eq!(eng.matches()[0].line_idx, 2);
         assert_eq!(eng.matches()[0].from_tail, 0);
+    }
+
+    #[test]
+    fn matches_carry_the_capture_time_of_their_history_line() {
+        use std::time::Duration;
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut buf = HistoryBuffer::new(100);
+        buf.push_line_at("older needle", base);
+        buf.push_line_at("newer needle", base + Duration::from_secs(7));
+        let sources: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
+        let mut eng = engine(SearchScope::Pane(1));
+        eng.set_query("needle", &sources);
+
+        let mut stamps: Vec<_> = eng
+            .matches()
+            .iter()
+            .map(|m| (m.line_idx, m.captured_at))
+            .collect();
+        stamps.sort_by_key(|&(idx, _)| idx);
+        assert_eq!(stamps, [(0, base), (1, base + Duration::from_secs(7))]);
     }
 
     #[test]

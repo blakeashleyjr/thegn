@@ -13,6 +13,11 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::SystemTime;
+
+/// Capture time of a line whose real time is unknown (a replayed or restored
+/// scrollback line). Search renders no age for it rather than inventing one.
+pub const UNKNOWN_CAPTURE: SystemTime = SystemTime::UNIX_EPOCH;
 
 // ── ANSI stripping ────────────────────────────────────────────────────────────
 
@@ -187,7 +192,14 @@ impl AnsiStripper {
     }
 
     /// Strip input while applying terminal line-editing events to history.
-    fn feed_lines(&mut self, input: &[u8], partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
+    /// Every line this chunk completes is stamped with `captured_at`.
+    fn feed_lines(
+        &mut self,
+        input: &[u8],
+        partial: &mut Vec<u8>,
+        buf: &mut HistoryBuffer,
+        captured_at: SystemTime,
+    ) {
         for &b in input {
             let Some(event) = self.consume_byte(b) else {
                 continue;
@@ -200,10 +212,10 @@ impl AnsiStripper {
                     self.cr_pending = false;
                 }
                 _ if self.alt => {}
-                AnsiEvent::Byte(byte) => self.append_byte(byte, partial, buf),
+                AnsiEvent::Byte(byte) => self.append_byte(byte, partial, buf, captured_at),
                 AnsiEvent::Spaces(count) => {
                     for _ in 0..count {
-                        self.append_byte(b' ', partial, buf);
+                        self.append_byte(b' ', partial, buf, captured_at);
                     }
                 }
                 AnsiEvent::CarriageReturn => {
@@ -211,7 +223,7 @@ impl AnsiStripper {
                 }
                 AnsiEvent::Newline => {
                     self.cr_pending = false;
-                    self.finish_line(partial, buf);
+                    self.finish_line(partial, buf, captured_at);
                 }
                 AnsiEvent::CursorUp(count) => {
                     self.rewind = self.rewind.saturating_add(count).min(buf.len()).min(64);
@@ -226,7 +238,13 @@ impl AnsiStripper {
         }
     }
 
-    fn append_byte(&mut self, byte: u8, partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
+    fn append_byte(
+        &mut self,
+        byte: u8,
+        partial: &mut Vec<u8>,
+        buf: &mut HistoryBuffer,
+        captured_at: SystemTime,
+    ) {
         const MAX_PARTIAL: usize = 4096;
 
         if self.cr_pending {
@@ -235,19 +253,29 @@ impl AnsiStripper {
         }
         partial.push(byte);
         if partial.len() >= MAX_PARTIAL {
-            self.flush_partial(partial, buf);
+            self.flush_partial(partial, buf, captured_at);
         }
     }
 
-    fn finish_line(&mut self, partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
+    fn finish_line(
+        &mut self,
+        partial: &mut Vec<u8>,
+        buf: &mut HistoryBuffer,
+        captured_at: SystemTime,
+    ) {
         let text = String::from_utf8_lossy(partial);
         let text = text.strip_suffix('\r').unwrap_or(&text);
         let line: Arc<str> = Arc::from(text);
-        self.store_line(line, buf);
+        self.store_line(line, buf, captured_at);
         partial.clear();
     }
 
-    fn flush_partial(&mut self, partial: &mut Vec<u8>, buf: &mut HistoryBuffer) {
+    fn flush_partial(
+        &mut self,
+        partial: &mut Vec<u8>,
+        buf: &mut HistoryBuffer,
+        captured_at: SystemTime,
+    ) {
         let cut = utf8_flush_cut(partial);
         if cut == 0 {
             return;
@@ -256,17 +284,17 @@ impl AnsiStripper {
         let text = String::from_utf8_lossy(&partial[..cut]);
         let text = text.strip_suffix('\r').unwrap_or(&text);
         let line: Arc<str> = Arc::from(text);
-        self.store_line(line, buf);
+        self.store_line(line, buf, captured_at);
         partial.drain(..cut);
     }
 
-    fn store_line(&mut self, line: Arc<str>, buf: &mut HistoryBuffer) {
+    fn store_line(&mut self, line: Arc<str>, buf: &mut HistoryBuffer, captured_at: SystemTime) {
         if self.rewind > 0 && self.rewind <= buf.len() {
-            buf.replace_from_end(self.rewind, line);
+            buf.replace_from_end_at(self.rewind, line, captured_at);
             self.rewind -= 1;
         } else {
             self.rewind = 0;
-            buf.push_line(line);
+            buf.push_line_at(line, captured_at);
         }
     }
 
@@ -292,6 +320,10 @@ pub struct HistoryBuffer {
     /// `Arc<str>` so cloning a buffer (the search snapshot) bumps one refcount
     /// per line instead of copying every line's bytes.
     lines: VecDeque<Arc<str>>,
+    /// Capture time of each stored line, parallel to `lines`. Only the search
+    /// overlay reads it (relative age in the result rows); nothing derives a
+    /// time from line order.
+    line_times: VecDeque<SystemTime>,
     capacity: usize,
     /// Monotonically increasing count of all lines ever pushed (even after eviction).
     total: u64,
@@ -302,19 +334,28 @@ impl HistoryBuffer {
         let cap = capacity.max(1);
         Self {
             lines: VecDeque::with_capacity(cap.min(4096)),
+            line_times: VecDeque::with_capacity(cap.min(4096)),
             capacity: cap,
             total: 0,
         }
     }
 
-    /// Push one already-stripped line. Empty lines are stored as-is so that
-    /// blank lines in output are searchable and the line indices stay in sync
-    /// with the vt100 scrollback.
+    /// Push one already-stripped line, stamped with the wall clock. Empty lines
+    /// are stored as-is so that blank lines in output are searchable and the
+    /// line indices stay in sync with the vt100 scrollback.
     pub fn push_line(&mut self, line: impl Into<Arc<str>>) {
+        self.push_line_at(line, SystemTime::now());
+    }
+
+    /// [`Self::push_line`] with an explicit capture time, for a caller that
+    /// owns a pinned clock (the host's `THEGN_E2E` freeze) or a test.
+    pub fn push_line_at(&mut self, line: impl Into<Arc<str>>, captured_at: SystemTime) {
         if self.lines.len() >= self.capacity {
             self.lines.pop_front();
+            self.line_times.pop_front();
         }
         self.lines.push_back(line.into());
+        self.line_times.push_back(captured_at);
         self.total += 1;
     }
 
@@ -322,11 +363,23 @@ impl HistoryBuffer {
     /// Returns `false` when `k` is out of range. A replacement counts as one
     /// line write in `total_pushed`, so new-line consumers rescan it.
     pub fn replace_from_end(&mut self, k: usize, line: impl Into<Arc<str>>) -> bool {
+        self.replace_from_end_at(k, line, SystemTime::now())
+    }
+
+    /// [`Self::replace_from_end`] with an explicit capture time. A spinner
+    /// redraw is a new capture of that line, so its age restarts.
+    pub fn replace_from_end_at(
+        &mut self,
+        k: usize,
+        line: impl Into<Arc<str>>,
+        captured_at: SystemTime,
+    ) -> bool {
         if k == 0 || k > self.lines.len() {
             return false;
         }
         let index = self.lines.len() - k;
         self.lines[index] = line.into();
+        self.line_times[index] = captured_at;
         self.total += 1;
         true
     }
@@ -357,6 +410,12 @@ impl HistoryBuffer {
         self.lines.get(idx).map(|line| &**line)
     }
 
+    /// Capture time of the `idx`-th stored line (0 = oldest surviving), stamped
+    /// when that line was written. Returns `None` if out of range.
+    pub fn captured_at(&self, idx: usize) -> Option<SystemTime> {
+        self.line_times.get(idx).copied()
+    }
+
     /// Capacity (max lines stored at once).
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -376,7 +435,20 @@ pub fn feed_bytes_to_history(
     partial: &mut Vec<u8>,
     stripper: &mut AnsiStripper,
 ) {
-    stripper.feed_lines(bytes, partial, buf);
+    feed_bytes_to_history_at(bytes, buf, partial, stripper, SystemTime::now());
+}
+
+/// [`feed_bytes_to_history`] with an explicit capture time for every line this
+/// chunk completes. The host passes its freezable clock so `THEGN_E2E` frames
+/// carry pinned line timestamps.
+pub fn feed_bytes_to_history_at(
+    bytes: &[u8],
+    buf: &mut HistoryBuffer,
+    partial: &mut Vec<u8>,
+    stripper: &mut AnsiStripper,
+    captured_at: SystemTime,
+) {
+    stripper.feed_lines(bytes, partial, buf, captured_at);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -540,6 +612,48 @@ mod tests {
         assert!(!buf.replace_from_end(0, "nope"));
         assert!(!buf.replace_from_end(3, "nope"));
         assert_eq!(buf.total_pushed(), total + 1);
+    }
+
+    #[test]
+    fn capture_times_follow_eviction_and_replacement() {
+        use std::time::Duration;
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut buf = make_buf(2);
+        buf.push_line_at("old", base);
+        buf.push_line_at("kept", base + Duration::from_secs(1));
+        buf.push_line_at("new", base + Duration::from_secs(2));
+
+        // The evicted line took its stamp with it: index 0 is `kept`.
+        assert_eq!(buf.get(0), Some("kept"));
+        assert_eq!(buf.captured_at(0), Some(base + Duration::from_secs(1)));
+        assert_eq!(buf.captured_at(1), Some(base + Duration::from_secs(2)));
+        assert_eq!(buf.captured_at(2), None);
+
+        // A replacement is a new capture of that line.
+        let rewritten = base + Duration::from_secs(30);
+        assert!(buf.replace_from_end_at(1, "rewritten", rewritten));
+        assert_eq!(buf.captured_at(1), Some(rewritten));
+        assert_eq!(buf.captured_at(0), Some(base + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn feed_stamps_every_completed_line_with_the_given_time() {
+        use std::time::Duration;
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut buf = make_buf(10);
+        let mut partial = Vec::new();
+        let mut st = AnsiStripper::default();
+        feed_bytes_to_history_at(b"one\ntwo\n", &mut buf, &mut partial, &mut st, base);
+        assert_eq!(buf.get(0), Some("one"));
+        assert_eq!(buf.captured_at(0), Some(base));
+        assert_eq!(buf.captured_at(1), Some(base));
+
+        // A later chunk carries its own time.
+        let later = base + Duration::from_secs(5);
+        feed_bytes_to_history_at(b"three\n", &mut buf, &mut partial, &mut st, later);
+        assert_eq!(buf.captured_at(2), Some(later));
     }
 
     // ── feed_bytes_to_history ─────────────────────────────────────────────────

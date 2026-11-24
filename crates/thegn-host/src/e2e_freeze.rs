@@ -5,6 +5,8 @@
 //! What it pins (and where the pin is applied):
 //! - system stats (`run.rs` stats ingestion, and the Observe feed in `apps::feed_if_armed`) → a fixed [`stats`] snapshot;
 //! - the masthead clock/date (`chrome::masthead_widget`) → [`now`];
+//! - the history-search rows' relative ages (`search::draw` and the pane
+//!   history stamps `Pane::feed` writes) → [`clock`];
 //! - the version in the brand widget → [`VERSION`];
 //! - the activity-dot FSM (`hydrate.rs`) → not polled, so dots never decay
 //!   and the needs-you chip (derived from it) never appears;
@@ -122,6 +124,22 @@ pub fn now() -> chrono::DateTime<chrono::Local> {
         .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
         .single()
         .unwrap_or_else(chrono::Local::now)
+}
+
+/// [`now`] as a `SystemTime`, which is what the history ring stamps lines with
+/// and what the search overlay measures relative ages from. Both sides read
+/// this one clock, so a frozen run shows a pinned age instead of ticking
+/// between frames.
+pub fn clock() -> std::time::SystemTime {
+    clock_when(active())
+}
+
+fn clock_when(frozen: bool) -> std::time::SystemTime {
+    if frozen {
+        std::time::SystemTime::from(now())
+    } else {
+        std::time::SystemTime::now()
+    }
 }
 
 /// The clipboard image-paste drop filename while frozen — the generated name
@@ -388,6 +406,16 @@ mod tests {
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert_eq!(now(), now());
+    }
+
+    #[test]
+    fn frozen_clock_is_the_pinned_instant_and_the_live_one_is_now() {
+        use std::time::SystemTime;
+
+        assert_eq!(clock_when(true), SystemTime::from(now()));
+        let before = SystemTime::now();
+        let live = clock_when(false);
+        assert!(live >= before, "the live clock is the real wall clock");
     }
 
     /// The freeze must be a no-op when it isn't active — `apply_to_config` runs

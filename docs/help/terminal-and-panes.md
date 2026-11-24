@@ -217,7 +217,8 @@ something thegn shows you for a companion to open; neither is a link handler.
   visible pane when nothing is selected. Mouse drags select and copy on
   release.
 - `Ctrl-Alt-/` — search the focused pane's history; `Ctrl-/` searches
-  across panes.
+  across panes. Every hit says which worktree, tab and program it came from,
+  and how long ago the line was captured.
 - `Alt-r` — time-travel replay of the focused pane (needs `[replay]`
   enabled); `Ctrl-Alt-r` toggles the session recorder.
 - Inside replay, `e` (or the **export-cast** palette action) writes the

@@ -28,11 +28,15 @@ hundreds of thousands of lines: matching runs on a background thread and the
 list says `searching…` until the ranked results are in. Pressing `↵` in the
 meantime jumps to the best hit as soon as it is found.
 
-Each hit is labelled **worktree · tab · program**, so two panes running the
-same program in different tabs are told apart. Opening the overlay with an
+Each hit is labelled **worktree · tab · program**, followed by how long ago the
+line was captured (`now`, `3m`, `2d`), so two panes running the same program in
+different tabs are told apart and an error from three days ago does not look
+like one from three minutes ago. The panel under the list previews the matched
+line with the two lines either side of it, the match highlighted, so you can
+recognise the context before you jump. Opening the overlay with an
 empty query lists the pane's most recent lines instead of an empty box.
-Identical lines from one pane are grouped into a single row, and `↵` goes to
-the newest of them.
+Identical lines from one pane are grouped into a single row labelled with the
+repeat count, and `↵` goes to the newest of them.
 
 `↵` scrolls the pane to the exact grid line when the terminal emulator still
 holds it. When the line has already scrolled out of the emulator's grid, the
