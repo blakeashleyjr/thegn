@@ -6,6 +6,59 @@ TBD - created by archiving change harden-pipeline-slot-accounting. Update Purpos
 
 ## Requirements
 
+### Requirement: MCP can launch and durably track one configured agent
+
+thegn SHALL expose a write-scoped `agent.dispatch` MCP action that accepts a
+configured agent, an existing worktree, a non-empty task, and a real dispatch
+identity. It SHALL run the offline admission checks of `thegn agent run --track` (dispatch
+identity, stage and task) and its plain-open tracking path, without worktree
+agent binding or the CLI preflight, and SHALL leave harness command construction,
+model selection, environment composition, credentials, resource caps and
+sandbox selection to trusted configuration and the daemon launch path. It MUST
+NOT accept raw argv or caller environment, and MUST use the caller-supplied
+issue identity rather than inventing an authority id. It MUST validate the
+identity's canonical syntax and require an absolute worktree path before
+launch, and MUST NOT be offered or run over a scoped control token (the Lead). A
+configured stage MAY supply the agent's model, environment and permission
+policy. A successful response SHALL include `status`, `final_message`, and
+`duration_ms`; when the action only starts a worker, status MUST say `running`
+and final_message MUST be null. The MCP audit event for the call MUST NOT carry
+the task text: it MUST use the same length-and-digest marker as the other
+free-text arguments, while the identifying fields survive unchanged.
+
+#### Scenario: A write-scoped MCP caller dispatches a configured worker
+
+- **WHEN** a caller with write scope supplies a configured agent, an existing
+  isolated worktree, a valid issue identity and a non-empty prompt
+- **THEN** the daemon launches through native sandbox/environment composition,
+  the session is associated with a durable running dispatch row, and the MCP
+  response identifies the session and dispatch row
+
+#### Scenario: Read-only MCP scope cannot launch a worker
+
+- **WHEN** a caller without write scope invokes `agent.dispatch`
+- **THEN** scope admission rejects the call before any session or roster row is
+  created
+
+#### Scenario: Malformed dispatch identity is refused before launch
+
+- **WHEN** a caller supplies a malformed issue identity
+- **THEN** local dispatch identity admission refuses before the daemon launch
+
+#### Scenario: A tracked launch whose roster write fails is cleaned up
+
+- **WHEN** the agent session opens but durable dispatch tracking cannot be
+  recorded
+- **THEN** the launch path attempts to kill the session and returns the
+  tracking failure rather than reporting success
+
+#### Scenario: The audit trail never carries the dispatch task text
+
+- **WHEN** a write-scoped caller invokes `agent.dispatch` with a task
+- **THEN** the MCP audit event records the task as a length-and-digest marker,
+  never its text, while `agent`, `worktree`, `issue_id` and `stage` are logged
+  unchanged
+
 ### Requirement: A roster row distinguishes a live worker from an exited one
 
 thegn SHALL record a dispatch row's worker exit — the exit code when it was

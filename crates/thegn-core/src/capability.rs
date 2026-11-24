@@ -844,6 +844,12 @@ pub const CATALOG: &[HostCapability] = &[
         "Record a new dispatch on the roster",
     ),
     cap(
+        "agent.dispatch",
+        Verb::AgentDispatch,
+        SurfaceSet::of(&[Surface::Mcp]),
+        "Launch one configured agent in a worktree and record its durable dispatch",
+    ),
+    cap(
         "dispatches.set_status",
         Verb::DispatchesSetStatus,
         SurfaceSet::ALL,

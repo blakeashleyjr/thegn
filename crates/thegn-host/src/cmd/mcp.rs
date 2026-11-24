@@ -329,7 +329,11 @@ fn serve(
         if csv.is_empty() { "none" } else { &csv },
         clamp.as_str()
     ));
-    let allowed = allowed_state_caps(scope_set, allow_session_input);
+    let token_addressed = super::session::env_control_addr(&|k| std::env::var(k).ok()).is_some();
+    let allowed = without_local_orchestration(
+        allowed_state_caps(scope_set, allow_session_input),
+        token_addressed,
+    );
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -463,6 +467,59 @@ fn allowed_state_caps(
                     || thegn_core::control::route_to_host_token_allows_worktree(scopes, "", ""))
         })
         .collect()
+}
+
+/// `agent.dispatch` writes its roster row from this MCP process, so it is
+/// neither listed nor runnable when the server reaches the daemon through a
+/// scoped control token (`THEGN_CONTROL_ADDR`, the Lead's path). Pure.
+fn without_local_orchestration(
+    mut caps: Vec<&'static str>,
+    token_addressed: bool,
+) -> Vec<&'static str> {
+    if token_addressed {
+        caps.retain(|id| *id != "agent.dispatch");
+    }
+    caps
+}
+
+/// Admission for `agent.dispatch`, before any daemon contact: refuses a
+/// token-addressed caller, a non-absolute worktree, a bad identity, an unknown
+/// stage or a blank task. Returns `(agent, worktree, issue_id, prompt, stage)`.
+/// Pure over `cfg` and `args`.
+fn agent_dispatch_admit<'a>(
+    cfg: &Config,
+    args: &'a serde_json::Value,
+    token_addressed: bool,
+) -> Result<(&'a str, &'a str, &'a str, &'a str, Option<&'a str>), String> {
+    if token_addressed {
+        return Err(
+            "agent.dispatch is not available over a scoped control token; \
+             the Lead opens a configured agent with sessions.open"
+                .to_string(),
+        );
+    }
+    let worktree = str_arg(args, "worktree").ok_or("missing `worktree`")?;
+    if !std::path::Path::new(worktree).is_absolute() {
+        return Err("`worktree` must be an absolute path".to_string());
+    }
+    let agent = str_arg(args, "agent").ok_or("missing `agent`")?;
+    let issue_id = str_arg(args, "issue_id").ok_or("missing `issue_id`")?;
+    let prompt = str_arg(args, "prompt").ok_or("missing `prompt`")?;
+    let stage = str_arg(args, "stage");
+    super::session::open_preflight(
+        cfg,
+        stage,
+        None,
+        Some(issue_id),
+        Some(worktree),
+        prompt,
+        true,
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(stage) = stage {
+        super::session::policy_admission(cfg, agent, stage).map_err(|e| e.to_string())?;
+    }
+    Ok((agent, worktree, issue_id, prompt, stage))
 }
 
 /// The control call for an issue write. The route reads `repo` and `account`
@@ -680,6 +737,15 @@ async fn fetch_state(
         "semantic.blast_radius" => return semantic_blast_radius(args),
         _ => {}
     }
+    // Admit a dispatch (token path, worktree, identity, stage, task) before
+    // connecting: nothing here touches the daemon or the roster.
+    let dispatch = if cap == "agent.dispatch" {
+        let token_addressed =
+            super::session::env_control_addr(&|k| std::env::var(k).ok()).is_some();
+        Some(agent_dispatch_admit(cfg, args, token_addressed)?)
+    } else {
+        None
+    };
     let client = super::session::connect(cfg).await;
     match cap {
         "worktrees.list" => match client {
@@ -884,6 +950,41 @@ async fn fetch_state(
             let spec = open_spec_from_args(args)?;
             let info = c.open(&spec).await.map_err(|e| e.to_string())?;
             serde_json::to_value(&info).map_err(|e| e.to_string())
+        }
+        "agent.dispatch" => {
+            let (agent, worktree, issue_id, prompt, stage) =
+                dispatch.ok_or("agent.dispatch was not admitted")?;
+            let started = std::time::Instant::now();
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let (info, dispatch_id) = super::session::open_plain(
+                cfg,
+                &c,
+                super::session::PlainOpen {
+                    agent: Some(agent.to_string()),
+                    stage: stage.map(str::to_string),
+                    worktree: Some(worktree.to_string()),
+                    prompt: prompt.to_string(),
+                    headless: true,
+                    // Unlike `agent run --track`: no worktree agent binding, no
+                    // headless provisioning, env pin or CLI preflight.
+                    bind: false,
+                    adopt: false,
+                    track: Some(issue_id),
+                    permissions: Vec::new(),
+                    widen_permissions: false,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let elapsed_ms = started.elapsed().as_millis();
+            Ok(json!({
+                "status": "running",
+                "session_id": info.id,
+                "dispatch_id": dispatch_id,
+                "final_message": null,
+                "duration_ms": thegn_core::time_policy::saturating_i64(elapsed_ms),
+                "exit_status": null,
+            }))
         }
         "sessions.fork" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
@@ -1957,5 +2058,43 @@ api_key = "mcp-token-sentinel-9e0"
         assert!(calendar.contains("khal-thegn"), "{calendar}");
         assert!(calendar.contains("KHAL_AUTH"), "{calendar}");
         assert!(token.contains(thegn_core::redact::PLACEHOLDER), "{token}");
+    }
+
+    #[test]
+    fn agent_dispatch_admission_refuses_before_the_daemon() {
+        let cfg = thegn_core::config::Config::default();
+        let ok = serde_json::json!({
+            "agent": "worker",
+            "worktree": "/tmp/not-a-worktree",
+            "issue_id": "linear:THE 2586",
+            "prompt": "private task text"
+        });
+        let err = super::agent_dispatch_admit(&cfg, &ok, false).expect_err("bad identity");
+        assert!(err.contains("invalid pipeline issue id"), "got {err}");
+        assert!(!err.contains("private task text"), "got {err}");
+
+        let relative = serde_json::json!({
+            "agent": "worker",
+            "worktree": "relative/wt",
+            "issue_id": "linear:THE-2586",
+            "prompt": "task"
+        });
+        let err = super::agent_dispatch_admit(&cfg, &relative, false).expect_err("relative");
+        assert!(err.contains("absolute"), "got {err}");
+
+        // A scoped-token caller (the Lead) is refused before anything else.
+        let err = super::agent_dispatch_admit(&cfg, &ok, true).expect_err("token");
+        assert!(err.contains("scoped control token"), "got {err}");
+    }
+
+    #[test]
+    fn agent_dispatch_is_not_listed_over_a_scoped_token() {
+        let write = allowed_state_caps(ScopeSet::parse("write"), false);
+        assert!(write.contains(&"agent.dispatch"));
+        let local = super::without_local_orchestration(write.clone(), false);
+        assert!(local.contains(&"agent.dispatch"));
+        let token = super::without_local_orchestration(write, true);
+        assert!(!token.contains(&"agent.dispatch"));
+        assert!(token.contains(&"sessions.open"));
     }
 }

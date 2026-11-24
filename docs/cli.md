@@ -449,6 +449,7 @@ until its scope is granted.
 | `worktrees_open`            | `write`       | focus a workspace in the running instance (`repo`, optional `branch`)     |
 | `dispatches_put`            | `write`       | append a roster row (`issue_id`, `worktree_path`, `agent_name`, ...)      |
 | `dispatches_set_status`     | `write`       | set a roster row's status (`id`, `status`, optional `lead` proof)         |
+| `agent_dispatch`            | `write`       | launch a configured agent in a worktree and track its dispatch row        |
 | `issues_update`             | `write`       | patch an issue (`id`, optional `status`, `assignee`, `priority`, `title`) |
 | `issues_comment`            | `write`       | comment on an issue (`id`, `body` up to 64 KiB)                           |
 | `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session              |
@@ -471,12 +472,13 @@ thegn mcp serve --scopes write --allow-session-input
 
 Every mutating tool call is audited (`tracing`, target `thegn::mcp`) with its
 capability id and a redacted view of its arguments — terminal input bytes and
-launch environment values are replaced by a size descriptor, never logged
+launch environment values are replaced by a size descriptor, and free text (an
+issue comment body, a dispatch task) by a length-and-digest marker, never logged
 verbatim.
 
 Every tool in `tools/list` carries MCP `annotations`: the docs tools and the
 `read`-scope state tools (including `sessions_snapshot`) are `readOnlyHint: true`; `sessions_kill`,
-`sessions_input`, `dispatches_set_status`, `issues_update` and `tools_run` are `destructiveHint: true`; `folders_assign`,
+`sessions_input`, `agent_dispatch`, `dispatches_set_status`, `issues_update` and `tools_run` are `destructiveHint: true`; `folders_assign`,
 `editor_open`, `merge_add`, `notify_push`, `sessions_open`, `sessions_fork`,
 `sessions_resize`, `sessions_split`, `worktrees_open`, `dispatches_put` and `issues_comment` are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
 reviewed. The hints help clients ask before acting; the scopes above are what
