@@ -107,6 +107,9 @@ pub struct SearchOverlay {
     /// Spawning or running the worker failed once: score on the loop from now on
     /// instead of retrying a thread on every keystroke.
     worker_failed: bool,
+    /// The worker died mid-search and nothing has been rescored since; the
+    /// results panel says so instead of showing an empty list.
+    worker_stopped: bool,
     /// Enter was pressed before the first batch of the typed query arrived; jump
     /// to its best hit as soon as it does.
     pending_jump: bool,
@@ -145,6 +148,7 @@ impl SearchOverlay {
             searching: false,
             snapshot: Vec::new(),
             worker_failed: false,
+            worker_stopped: false,
             pending_jump: false,
             ready: None,
         }
@@ -373,6 +377,7 @@ impl SearchOverlay {
     /// score here rather than leave the panel claiming it is searching forever.
     fn score_on_loop(&mut self, sources: &[SearchSource<'_>]) {
         self.searching = false;
+        self.worker_stopped = false;
         self.snapshot.clear();
         self.engine.rescore(sources);
         self.refresh_preview(sources);
@@ -403,8 +408,16 @@ impl SearchOverlay {
             self.worker = None;
             self.worker_failed = true;
             self.searching = false;
-            self.engine
-                .finish_async_results(0, Some("search worker stopped".to_string()));
+            self.worker_stopped = true;
+            self.engine.finish_async_results(0, None);
+            if self.pending_jump {
+                // Enter is waiting on this query: rank its snapshot here rather
+                // than dismiss without a jump.
+                let snapshot = self.snapshot.clone();
+                let refs = source_refs(&snapshot);
+                self.engine.rescore(&refs);
+                self.worker_stopped = false;
+            }
         }
         // The preview's context lines come out of the snapshot the matches were
         // scored against, not the live buffers.
@@ -682,6 +695,8 @@ impl SearchOverlay {
         if matches.is_empty() && inner.rows > 3 && result_rows > 0 {
             let placeholder = if let Some(error) = engine.error() {
                 format!("regex error: {error}")
+            } else if self.worker_stopped {
+                "search unavailable: worker stopped".to_string()
             } else if self.searching() {
                 "searching…".to_string()
             } else if engine.query().trim().is_empty() {
@@ -1377,6 +1392,29 @@ mod tests {
     }
 
     #[test]
+    fn enter_pending_when_the_worker_dies_ranks_on_the_loop() {
+        let buf = buf_from(&["cargo build", "cargo test", "ninja"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        for c in "ninja".chars() {
+            ov.handle_key_async(&KeyCode::Char(c), Modifiers::NONE, &srcs);
+        }
+        // A wake callback that panics kills the worker thread after delivery.
+        ov.start_pending_search_with(
+            &srcs,
+            Box::new(|| {
+                panic!("boom");
+            }),
+        );
+        let r = ov.handle_key_async(&KeyCode::Enter, Modifiers::NONE, &srcs);
+        assert!(matches!(r, SearchOutcome::Pending));
+        match pump(&mut ov) {
+            Some(SearchOutcome::Jump(m)) => assert_eq!(m.line, "ninja"),
+            other => panic!("expected a loop-side jump, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn enter_before_results_dismisses_when_nothing_matches() {
         let buf = buf_from(&["cargo build", "ninja"]);
         let srcs = sources(1, &buf);
@@ -1417,7 +1455,7 @@ mod tests {
         assert!(pump(&mut ov).is_none());
         // The live pane moves on (lines evicted/rewritten); the preview must
         // still describe the lines the match index points into.
-        assert!(buf.replace_from_end(1, "REWRITTEN".into()));
+        assert!(buf.replace_from_end(1, "REWRITTEN"));
         ov.handle_key_async(&KeyCode::DownArrow, Modifiers::NONE, &sources(1, &buf));
         assert_eq!(ov.preview, ["alpha", "gamma"]);
     }

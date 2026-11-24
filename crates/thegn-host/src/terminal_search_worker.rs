@@ -574,18 +574,18 @@ mod tests {
     fn snapshots_reuse_unchanged_panes_and_reclone_changed_ones() {
         let mut quiet = HistoryBuffer::new(10);
         let mut busy = HistoryBuffer::new(10);
-        quiet.push_line("one".into());
-        busy.push_line("two".into());
+        quiet.push_line("one");
+        busy.push_line("two");
         let first = take_snapshot(&[(1, "quiet", &quiet), (2, "busy", &busy)], &[]);
 
-        busy.push_line("three".into());
+        busy.push_line("three");
         let second = take_snapshot(&[(1, "quiet", &quiet), (2, "busy", &busy)], &first);
         assert!(Arc::ptr_eq(&first[0], &second[0]), "unchanged pane shared");
         assert!(!Arc::ptr_eq(&first[1], &second[1]), "changed pane re-taken");
         assert_eq!(second[1].history.len(), 2);
 
         // A rewrite keeps the line count but bumps the write count.
-        assert!(busy.replace_from_end(1, "THREE".into()));
+        assert!(busy.replace_from_end(1, "THREE"));
         let third = take_snapshot(&[(1, "quiet", &quiet), (2, "busy", &busy)], &second);
         assert!(!Arc::ptr_eq(&second[1], &third[1]));
         assert_eq!(third[1].history.get(1), Some("THREE"));
