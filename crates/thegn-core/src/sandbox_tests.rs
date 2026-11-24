@@ -1586,18 +1586,32 @@ fn bwrap_local_keeps_host_matching_env_off_argv() {
     let i = argv.iter().position(|a| a == "--setenv").unwrap();
     assert_eq!(argv[i + 1], "THEGN_SANDBOX");
 
-    // Remote-wrapped bwrap keeps --setenv for everything: the argv is the
-    // only env carrier through ssh.
+    // Remote-wrapped bwrap has no launch environment on the far side, so it
+    // cannot inherit the pair and must not put the value on the command string
+    // that ssh carries. It omits the key with a keys-only warning instead.
     s.placement = Placement::Ssh(SshPlacement::plain(
         "box".into(),
         22,
         false,
         TransportKind::Ssh,
     ));
-    let remote = enter_argv(&s, "true")
-        .expect("valid volume names")
-        .join(" ");
-    assert!(remote.contains("--setenv PATH"));
+    let entered = enter_argv_guarded(&s, "true").expect("valid volume names");
+    let remote = entered.argv().join(" ");
+    let path_value = std::env::var("PATH").unwrap();
+    assert!(!remote.contains("--setenv PATH"), "remote argv: {remote}");
+    assert!(
+        !remote.contains(&path_value),
+        "remote argv leaked PATH: {remote}"
+    );
+    assert!(remote.contains("--setenv THEGN_SANDBOX 1"), "{remote}");
+    let warning = entered
+        .omitted_secrets_warning()
+        .expect("omitted remote secret should warn");
+    assert!(warning.contains("PATH"), "{warning}");
+    assert!(
+        !warning.contains(&path_value),
+        "warning leaked PATH: {warning}"
+    );
 }
 
 #[test]
@@ -4239,7 +4253,7 @@ fn remote_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
     ));
     let secret_env = remote_stdin_oci_secret_env(&s);
     let opts = oci_create_opts_with_remote_stdin_secrets(&s, &secret_env).unwrap();
-    let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env);
+    let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env).unwrap();
     let j = argv.join(" ");
     assert!(!j.contains("ghp_secret"), "remote argv leaked secret: {j}");
     assert!(j.contains("--env-file /dev/stdin"), "stdin env-file: {j}");
@@ -4296,7 +4310,7 @@ fn k8s_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
     });
     let secret_env = remote_stdin_oci_secret_env(&s);
     let opts = oci_create_opts_with_remote_stdin_secrets(&s, &secret_env).unwrap();
-    let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env);
+    let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env).unwrap();
     let joined = argv.join(" ");
     assert!(
         !joined.contains("ghp_secret"),
@@ -4319,6 +4333,168 @@ fn k8s_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
         String::from_utf8(input.expect("K8s host secret stdin")).unwrap(),
         "GH_TOKEN=ghp_secret\n"
     );
+}
+
+#[test]
+fn provider_oci_omits_host_secrets_without_stdin() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("GH_TOKEN", Some("ghp_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Podman);
+    s.env = vec![
+        ("GH_TOKEN".into(), "ghp_secret".into()),
+        ("THEGN_SANDBOX".into(), "1".into()),
+    ];
+    s.placement = Placement::Provider(crate::placement::ProviderPlacement {
+        provider: "test".into(),
+        id: "sandbox".into(),
+        interactive_prefix: vec![],
+        control_prefix: vec!["provider".into(), "exec".into(), "--".into()],
+        up_command: vec![],
+        down_command: vec![],
+    });
+
+    // A provider transport has no stdin carrier, so the secret must be omitted
+    // rather than inlined into the create argv.
+    let secret_env = remote_stdin_oci_secret_env(&s);
+    assert!(secret_env.is_empty(), "provider must not claim stdin");
+    let opts = oci_create_opts_with_remote_stdin_secrets(&s, &secret_env).unwrap();
+    let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env).unwrap();
+    let joined = argv.join(" ");
+    assert!(
+        !joined.contains("ghp_secret"),
+        "provider argv leaked secret: {joined}"
+    );
+    assert!(
+        !joined.contains("--env-file"),
+        "provider has no env-file carrier: {joined}"
+    );
+    assert!(
+        joined.contains("-e THEGN_SANDBOX=1"),
+        "synthetic env inline: {joined}"
+    );
+    assert!(input.is_none(), "provider must not receive a stdin payload");
+    let env_dir = state.path().join("thegn/sandbox-env");
+    assert!(
+        !env_dir.exists(),
+        "a remote provider must not create a local env-file"
+    );
+}
+
+#[test]
+fn remote_systemd_omits_host_secret_without_argv_or_local_file() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("sk_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.image = None;
+    sandbox.name = "thegn-test-remote-systemd".into();
+    sandbox.env = vec![
+        ("API_KEY".into(), "sk_secret".into()),
+        ("THEGN_SANDBOX".into(), "1".into()),
+    ];
+    sandbox.placement = Placement::Ssh(SshPlacement::plain(
+        "box".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+
+    let entered =
+        backend_enter_argv_guarded_with_env(&sandbox, "exec true", SandboxArgvEnv::default())
+            .unwrap();
+    let argv = entered.argv().join(" ");
+    assert!(!argv.contains("sk_secret"), "secret leaked in argv: {argv}");
+    assert!(
+        !argv.contains("EnvironmentFile="),
+        "remote systemd must not reach for a host env-file: {argv}"
+    );
+    assert!(
+        argv.contains("--setenv THEGN_SANDBOX=1"),
+        "synthetic env inline: {argv}"
+    );
+    let warning = entered
+        .omitted_secrets_warning()
+        .expect("omitted secret warning");
+    assert!(
+        warning.contains("API_KEY"),
+        "warning omitted key: {warning}"
+    );
+    assert!(
+        !warning.contains("sk_secret"),
+        "warning leaked value: {warning}"
+    );
+    let env_dir = state.path().join("thegn/sandbox-env");
+    assert!(
+        !env_dir.exists(),
+        "a remote systemd pane must not create a local env-file"
+    );
+}
+
+#[test]
+fn remote_oci_secret_env_payload_rejects_invalid_records_without_echoing_values() {
+    let key = "GOOD".to_string();
+    let value = "value".to_string();
+    let good = [(&key, &value)];
+    assert_eq!(
+        remote_oci_secret_env_payload(&good).unwrap(),
+        Some(b"GOOD=value\n".to_vec())
+    );
+
+    let bad_key = "BAD-KEY".to_string();
+    let err = remote_oci_secret_env_payload(&[(&bad_key, &value)])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid record"), "{err}");
+    assert!(!err.contains("value"), "error leaked a value: {err}");
+
+    let multiline = "line1\nline2".to_string();
+    let err = remote_oci_secret_env_payload(&[(&key, &multiline)])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid record"), "{err}");
+    assert!(!err.contains("line1"), "error leaked a value: {err}");
+}
+
+#[test]
+fn remote_oci_secret_env_payload_enforces_variable_and_byte_limits() {
+    let value = "v".to_string();
+    let keys: Vec<String> = (0..=MAX_REMOTE_OCI_SECRET_ENV_VARS)
+        .map(|i| format!("KEY_{i}"))
+        .collect();
+    let pairs: Vec<(&String, &String)> = keys.iter().map(|key| (key, &value)).collect();
+    let err = remote_oci_secret_env_payload(&pairs)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("variable limit"), "{err}");
+
+    let key = "BIG".to_string();
+    let huge = "x".repeat(MAX_REMOTE_OCI_SECRET_ENV_BYTES);
+    let err = remote_oci_secret_env_payload(&[(&key, &huge)])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("byte limit"), "{err}");
+}
+
+#[test]
+fn oci_create_argv_and_stdin_error_does_not_echo_secret_value() {
+    let mut s = spec(Backend::Podman);
+    s.name = "thegn-test-argv-stdin-error".into();
+    let key = "GOOD".to_string();
+    let bad_value = "canary-value\n".to_string();
+    let err = oci_create_argv_and_stdin(&s, Vec::new(), &[(&key, &bad_value)])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid record"), "{err}");
+    assert!(!err.contains("canary-value"), "error leaked value: {err}");
 }
 
 #[cfg(unix)]

@@ -29,7 +29,12 @@ again inside the sandbox; a `systemd-run` launch without `bwrap` drops them.
 If the systemd backend cannot create a pane's protected environment file, the
 pane still starts without those host-sourced secrets. The launch warning names
 each omitted secret key, never its value; secrets are not put on the command
-line.
+line. A remote placement uses the same rule: ssh and Kubernetes OCI creates
+carry the env-file over stdin, while a placement with no confidential carrier
+(provider, or remote bwrap/systemd) omits the key with the same keys-only
+warning rather than inlining it. A host-matching sandbox environment value is
+treated as a secret, so it never rides `--setenv`, `-e` or the remote `sh -lc`
+command string.
 
 For local rootless Podman, the first thegn command is the `version` liveness
 probe, before container creation or the events client. The `podman events`
