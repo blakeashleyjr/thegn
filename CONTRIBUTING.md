@@ -427,32 +427,6 @@ probe `/bin/sh` at runtime, so they may run under Wine. A skipped test does
 not establish Windows behavior. Scope a run with
 `just test-windows-wine -p <crate>`.
 
-### Unconventional hosts (cloud VMs, containers)
-
-The test suite assumes a conventional Linux host. A cloud build VM differs in
-ways that fail correct tests, so treat these as host quirks rather than
-product bugs:
-
-- The root filesystem and `/tmp` may be an overlay, not a plain disk
-  filesystem. Tests that depend on rename, inotify or xattr behaviour can
-  differ there.
-- The init process may reap orphaned children slowly, so tests that wait for
-  orphan cleanup need a generous timeout on such hosts.
-- Home may live outside `/home`. Tests must derive paths from `$HOME`, never
-  from a literal `/home/...`.
-- A user namespace has no root-owned sticky `/tmp`, so tests that assert on
-  sticky-bit or ownership behaviour of `/tmp` cannot pass inside one.
-- If stdin is a tmux terminal, the PTY smoke test breaks. Run it with stdin
-  redirected (`just smoke < /dev/null`) or from a non-tmux shell.
-
-Running a box's jobs inside a pid and user namespace wrapper handles all of
-these. Two real test bugs that wrapper exposed are worth remembering when you
-write tests: use fake process ids that cannot collide with the test's own pid
-in a fresh pid namespace (pid 1 and low numbers are live there), and never
-pipe a landing command into `grep -q`, because `grep -q` exits on the first
-match and closes the pipe on the writer. Capture the output first, then
-grep it (see THE-2364 for the product side).
-
 ## Testing on other platforms
 
 Linux is the only platform the local gates run on. `just check-cross` proves
@@ -555,6 +529,34 @@ just windows-vm-down      # clean shutdown;  windows-vm-status / windows-vm-dest
 - **Tuning:** `THEGN_WINVM_CPUS` (8), `THEGN_WINVM_RAM` (16G),
   `THEGN_WINVM_DISK` (96G, sparse), `THEGN_WINVM_SSH_PORT` (22220), and
   `THEGN_WINVM_BOOT_TIMEOUT`.
+
+### Unconventional hosts (cloud VMs, containers)
+
+The test suite assumes a conventional Linux host. A cloud build VM differs in
+ways that fail correct tests, so treat these as host quirks rather than
+product bugs:
+
+- The root filesystem and `/tmp` may be an overlay, not a plain disk
+  filesystem. Tests that depend on rename, inotify or xattr behaviour can
+  differ there.
+- The init process may reap orphaned children slowly, so tests that wait for
+  orphan cleanup need a generous timeout on such hosts.
+- Home may live outside `/home`. Tests must derive paths from `$HOME`, never
+  from a literal `/home/...`.
+- A user namespace has no root-owned sticky `/tmp`, so tests that assert on
+  sticky-bit or ownership behaviour of `/tmp` cannot pass inside one.
+- If stdin is an interactive terminal, the PTY smoke test can hang until its
+  timeout. `pty-smoke.sh` runs `script` under `timeout` in its own process
+  group, and that group cannot use the terminal. `just smoke < /dev/null`
+  avoids the hang.
+
+A pid and user namespace wrapper works around some of these, but it does not
+change an overlay root filesystem. Two real test bugs that wrapper exposed are worth remembering when you
+write tests: use fake process ids that cannot collide with the test's own pid
+in a fresh pid namespace (pid 1 and low numbers are live there), and never
+pipe a landing command into `grep -q`, because `grep -q` exits on the first
+match and closes the pipe on the writer. Capture the output first, then
+grep it (see THE-2364 for the product side).
 
 ## Where things live
 
