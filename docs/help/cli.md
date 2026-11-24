@@ -267,6 +267,12 @@ configured prefix or numbering); it conflicts with `--from-issue` and
 removes lane worktrees and branches already merged into the target; without
 `--apply` it is a dry run. See [[workspaces-and-worktrees]].
 
+`thegn wt disk --lanes [--worktree PATH] [--json]` explains the build lane
+directories under one checkout's `target/lanes/`: apparent bytes, the
+regenerable build output, the lane's own git owner and branch, Cargo-lock and
+mtime activity, and whether that output is safe to reclaim — with the reason
+printed beside each row. It changes nothing and scans no other worktree.
+
 `thegn wt new --batch FILE` creates one lane for each non-comment, non-blank
 line in the file. Each line is `<name>` or `<name> <base>`; a per-line base
 overrides the shared `--base`. The complete file is validated before the first
