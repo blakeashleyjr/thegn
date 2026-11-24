@@ -23,9 +23,9 @@ use sha2::{Digest as _, Sha256};
 use thegn_core::vercel::api::Scope;
 use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCompletion};
 use thegn_svc::vercel::job::{
-    AttemptOptions, AttemptRecord, AttemptState, AttemptStore, Cleanup, DEFAULT_CHECKOUT_ROOT,
-    JobBinding, ReserveRefusal, ReserveRequest, SnapshotContent, SnapshotSource,
-    VercelSelectedRunner,
+    AttemptOptions, AttemptReceipt, AttemptRecord, AttemptState, AttemptStore, Cleanup,
+    DEFAULT_CHECKOUT_ROOT, JobBinding, ReserveRefusal, ReserveRequest, SnapshotContent,
+    SnapshotSource, VercelSelectedRunner,
 };
 use thegn_svc::vercel::{VercelProvider, VercelSpec, VercelToken};
 
@@ -268,6 +268,13 @@ struct Script {
     hold: Duration,
     /// Answer the detached `cmd` start with a 500 (an ambiguous start).
     start_fails: bool,
+    /// Answer the detached `cmd` start with a 400 (a definite refusal).
+    start_rejected: bool,
+    /// Create the sandbox, then answer the create with an unreadable body (an
+    /// ambiguous create: the sandbox exists but the reply says nothing).
+    create_unreadable: bool,
+    /// Run when the detached `cmd` start arrives.
+    on_start: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 fn stdout_line(text: &str) -> serde_json::Value {
@@ -335,6 +342,15 @@ fn router(
                 let name = body["name"].as_str().unwrap_or("").to_owned();
                 state.tags = body["tags"].clone();
                 state.created = true;
+                if script.create_unreadable {
+                    return Reply {
+                        status: "200 OK",
+                        ctype: "application/json",
+                        body: b"{".to_vec(),
+                        no_length: false,
+                        hold: Duration::ZERO,
+                    };
+                }
                 Reply::json("200 OK", sandbox_json(&name, &state.tags))
             }
             ("GET", "/v2/sandboxes") => Reply::json(
@@ -385,7 +401,15 @@ fn router(
                 }
             }
             ("POST", p) if p.ends_with("/cmd") => {
-                if script.start_fails {
+                if let Some(hook) = &script.on_start {
+                    hook();
+                }
+                if script.start_rejected {
+                    Reply::json(
+                        "400 Bad Request",
+                        serde_json::json!({"error": {"code": "bad_request"}}),
+                    )
+                } else if script.start_fails {
                     Reply::server_error()
                 } else {
                     Reply::json("200 OK", serde_json::json!({"command": {"id": "cmd_1"}}))
@@ -426,6 +450,9 @@ fn script(logs: Vec<serde_json::Value>) -> Script {
         logs,
         hold: Duration::ZERO,
         start_fails: false,
+        start_rejected: false,
+        create_unreadable: false,
+        on_start: None,
     }
 }
 
@@ -454,6 +481,10 @@ fn content() -> SnapshotContent {
 }
 
 fn provider(mock: &Mock) -> VercelProvider {
+    provider_with(mock, 0)
+}
+
+fn provider_with(mock: &Mock, max_lifetime_secs: u64) -> VercelProvider {
     VercelProvider::new(VercelSpec {
         api_base: mock.base.clone(),
         token: VercelToken::new(TOKEN.into()),
@@ -467,7 +498,7 @@ fn provider(mock: &Mock) -> VercelProvider {
         image: None,
         region: None,
         max_instances: 2,
-        max_lifetime_secs: 0,
+        max_lifetime_secs,
         interactive_host_suffixes: Vec::new(),
         model_credentials: thegn_core::config::ModelCredentials::None,
     })
@@ -506,6 +537,10 @@ fn runner_for(
 
 fn runner(mock: &Mock, store: AttemptStore) -> VercelSelectedRunner {
     runner_for(mock, TEAM, store, options())
+}
+
+fn runner_with(mock: &Mock, store: AttemptStore, options: AttemptOptions) -> VercelSelectedRunner {
+    runner_for(mock, TEAM, store, options)
 }
 
 // ---------------------------------------------------------------------- tests
@@ -669,7 +704,7 @@ async fn the_deadline_kills_the_command_stops_the_sandbox_and_fences_outputs() {
     let (mock, _fs) = start(Script {
         logs: vec![stdout_line("tick\n")],
         hold: Duration::from_secs(8),
-        start_fails: false,
+        ..script(Vec::new())
     });
     let (_dir, store) = store();
     let runner = runner(&mock, store.clone());
@@ -710,9 +745,8 @@ async fn the_deadline_kills_the_command_stops_the_sandbox_and_fences_outputs() {
 async fn an_ambiguous_command_start_is_indeterminate_and_never_redispatched() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let (mock, _fs) = start(Script {
-        logs: Vec::new(),
-        hold: Duration::ZERO,
         start_fails: true,
+        ..script(Vec::new())
     });
     let (_dir, store) = store();
     let runner = runner(&mock, store.clone());
@@ -842,4 +876,323 @@ fn the_ledger_is_pinned_to_the_first_team_and_project_it_served() {
         Err(ReserveRefusal::EnvelopeExhausted { committed: 600, .. })
     ));
     assert_eq!(store.records().unwrap().len(), 1);
+}
+
+// ------------------------------------------------- ceiling, spend and recovery
+
+/// Leave the finished attempt 1 looking like a crashed run: still running, its
+/// sandbox alive, with the given ledger deadline.
+fn revive(store: &AttemptStore, fs: &Arc<Mutex<State>>, deadline_ms: i64) {
+    fs.lock().unwrap().deleted = false;
+    let mut record = store.read(1).unwrap().unwrap();
+    record.state = AttemptState::Running;
+    record.exit = None;
+    record.finished_ms = None;
+    record.cleanup = Cleanup::Pending;
+    record.sandbox_deleted = false;
+    record.outputs.clear();
+    record.outputs_fenced = false;
+    record.deadline_ms = deadline_ms;
+    store.mark(&record).unwrap();
+}
+
+async fn finished_attempt(runner: &VercelSelectedRunner) -> AttemptReceipt {
+    let content = content();
+    runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_running_attempt_is_cancelled_with_a_kill_stop_and_delete() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let (kills, stops, deletes) = (
+        mock.count("POST", "/kill"),
+        mock.count("POST", "/stop"),
+        mock.count("DELETE", &receipt.sandbox),
+    );
+
+    let record = runner.cancel(1).await.unwrap();
+
+    assert_eq!(record.state, AttemptState::Cancelled);
+    assert_eq!(record.cleanup, Cleanup::Done);
+    assert!(record.sandbox_deleted);
+    assert!(record.outputs_fenced);
+    assert_eq!(mock.count("POST", "/kill"), kills + 1);
+    assert_eq!(mock.count("POST", "/stop"), stops + 1);
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes + 1);
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Cancelled
+    );
+    mock.assert_custody();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_settles_a_stale_running_attempt_as_indeterminate_and_never_reruns() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let (dispatches, deletes) = (
+        mock.count("POST", "/cmd"),
+        mock.count("DELETE", &receipt.sandbox),
+    );
+
+    let record = runner.reconcile(1).await.unwrap();
+
+    assert_eq!(record.state, AttemptState::Indeterminate);
+    assert_eq!(record.cleanup, Cleanup::Done);
+    assert_eq!(mock.count("POST", "/cmd"), dispatches, "never redispatched");
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes + 1);
+    mock.assert_custody();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_refuses_a_row_that_may_still_belong_to_a_live_run() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    let in_an_hour = thegn_core::util::now_ms() + 3_600_000;
+    revive(&store, &fs, in_an_hour);
+    let (kills, deletes) = (
+        mock.count("POST", "/kill"),
+        mock.count("DELETE", &receipt.sandbox),
+    );
+
+    for error in [
+        runner.reconcile(1).await.unwrap_err(),
+        runner.cancel(1).await.unwrap_err(),
+    ] {
+        assert!(format!("{error:#}").contains("live run"), "{error:#}");
+    }
+
+    assert_eq!(mock.count("POST", "/kill"), kills, "nothing was killed");
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes);
+    assert_eq!(store.read(1).unwrap().unwrap().state, AttemptState::Running);
+}
+
+#[test]
+fn a_ledger_write_is_refused_when_the_row_changed_since_it_was_read() {
+    let (_dir, store) = store();
+    let source = content().digest().unwrap();
+    let binding = JobBinding::new("proj", TEAM, PROJECT).unwrap();
+    let record = store
+        .reserve(
+            &binding,
+            ReserveRequest {
+                attempt: None,
+                recipe: Recipe::CargoBuild,
+                source: &source,
+                checkout_root: DEFAULT_CHECKOUT_ROOT,
+                deadline_ms: 0,
+                spend_cap_micros: 0,
+                spend_envelope_micros: 0,
+            },
+        )
+        .unwrap();
+    // The owner moves on after the recovery read `record`.
+    let mut owner = record.clone();
+    owner.state = AttemptState::Finished;
+    owner.exit = Some(0);
+    store.mark(&owner).unwrap();
+    let mut recovery = record.clone();
+    recovery.state = AttemptState::Indeterminate;
+
+    assert!(!store.mark_if_unchanged(&record, &recovery).unwrap());
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Finished
+    );
+    assert!(store.mark_if_unchanged(&owner, &recovery).unwrap());
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Indeterminate
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ambiguous_create_is_left_pending_and_never_dispatches() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, _fs) = start(Script {
+        create_unreadable: true,
+        ..script(vec![exit_line(0)])
+    });
+    let (_dir, store) = store();
+    let runner = runner_with(&mock, store.clone(), options());
+    let content = content();
+
+    let refusal = runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert_eq!(mock.count("POST", "/cmd"), 0, "nothing was dispatched");
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Rejected);
+    assert_eq!(record.cleanup, Cleanup::Pending, "the sandbox may exist");
+    assert_eq!(record.spent_micros, None, "its whole cap stays committed");
+    assert_eq!(record.committed_micros(), record.reserved_micros);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_handle_that_cannot_be_persisted_is_indeterminate_not_success() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (_dir, store) = store();
+    let ledger = store.dir().to_path_buf();
+    let moved = ledger.with_extension("moved");
+    let (hook_ledger, hook_moved) = (ledger.clone(), moved.clone());
+    // When the command start arrives the ledger has just recorded `Dispatching`:
+    // swap the ledger directory for a symlink so the next write is refused.
+    let (mock, _fs) = start(Script {
+        on_start: Some(Arc::new(move || {
+            std::fs::rename(&hook_ledger, &hook_moved).unwrap();
+            std::os::unix::fs::symlink(&hook_moved, &hook_ledger).unwrap();
+        })),
+        ..script(vec![exit_line(0)])
+    });
+    let runner = runner_with(&mock, store.clone(), options());
+
+    let receipt = finished_attempt(&runner).await;
+
+    std::fs::remove_file(&ledger).unwrap();
+    std::fs::rename(&moved, &ledger).unwrap();
+    assert_eq!(receipt.completion, SelectedCompletion::Indeterminate);
+    assert_eq!(mock.count("POST", "/cmd"), 1);
+    assert_eq!(mock.count("POST", "/kill"), 1, "the command was stopped");
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), 1);
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(
+        record.state,
+        AttemptState::Dispatching,
+        "no success on record"
+    );
+    assert_eq!(record.command, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_attempt_after_the_create_records_an_estimated_spend() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, _fs) = start(Script {
+        start_rejected: true,
+        ..script(Vec::new())
+    });
+    let (_dir, store) = store();
+    let runner = runner_with(
+        &mock,
+        store.clone(),
+        AttemptOptions {
+            micros_per_second: 1_000_000,
+            ..options()
+        },
+    );
+    let content = content();
+
+    let refusal = runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Rejected);
+    assert_eq!(record.cleanup, Cleanup::Done);
+    assert!(
+        record.spent_micros.is_some_and(|spent| spent > 0),
+        "the sandbox's elapsed time is billed: {:?}",
+        record.spent_micros
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sandbox_timeout_is_bounded_by_the_configured_lifetime_ceiling() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    // The default 15 min transfer budget + 60 s + 5 min slack > a 600 s ceiling.
+    let (mock, _fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = VercelSelectedRunner::with_options(
+        provider_with(&mock, 600),
+        JobBinding::new("proj", TEAM, PROJECT).unwrap(),
+        store.clone(),
+        Box::new(Fixed(content())),
+        tokio::runtime::Handle::current(),
+        options(),
+    )
+    .unwrap();
+    let content = content();
+
+    let refusal = runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(refusal, RunnerRefusal::InvalidSpec(_)),
+        "{refusal:?}"
+    );
+    assert!(mock.requests().is_empty(), "refused before any request");
+    assert!(store.records().unwrap().is_empty(), "and before the ledger");
+
+    // A budget that fits is sent as the create timeout.
+    let (mock, _fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = self::store();
+    let runner = VercelSelectedRunner::with_options(
+        provider_with(&mock, 600),
+        JobBinding::new("proj", TEAM, PROJECT).unwrap(),
+        store,
+        Box::new(Fixed(content.clone())),
+        tokio::runtime::Handle::current(),
+        AttemptOptions {
+            transfer_budget: Duration::from_secs(60),
+            ..options()
+        },
+    )
+    .unwrap();
+    runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+    let create = mock
+        .requests()
+        .into_iter()
+        .find(|req| req.method == "POST" && req.path() == "/v3/sandboxes")
+        .unwrap();
+    // 60 s transfer + 60 s deadline + 5 min slack = 420 s <= 600 s.
+    assert_eq!(create.json()["timeout"], serde_json::json!(420_000u64));
 }

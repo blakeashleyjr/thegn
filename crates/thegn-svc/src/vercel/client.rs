@@ -763,6 +763,22 @@ impl VercelClient {
         cmd: &str,
         deadline: Duration,
     ) -> Result<Option<i32>> {
+        Ok(self
+            .wait_command_exact(session, cmd, deadline)
+            .await?
+            .map(|code| code.unwrap_or(EXEC_EXIT_STATUS_UNKNOWN)))
+    }
+
+    /// [`wait_command`](Self::wait_command) without the sentinel: the outer
+    /// `None` is "no exit before the deadline", the inner `None` is a reported
+    /// exit code outside `i32`, so a genuine exit equal to the sentinel value is
+    /// never confused with it.
+    pub async fn wait_command_exact(
+        &self,
+        session: &str,
+        cmd: &str,
+        deadline: Duration,
+    ) -> Result<Option<Option<i32>>> {
         let p = retried("wait for command");
         let cmd = checked_id(cmd, "command")?;
         let url = self.url(
@@ -798,7 +814,8 @@ impl VercelClient {
                 Ok(result) => result?,
                 Err(_elapsed) => return Ok(None),
             };
-            let exit = command_exit(&v, cmd).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+            let exit =
+                command_exit_exact(&v, cmd).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
             if exit.is_some() {
                 return Ok(exit);
             }
@@ -1263,6 +1280,14 @@ async fn read_log_stream(mut resp: reqwest::Response, tx: tokio::sync::mpsc::Sen
 /// `None` while `exitCode` is absent or null. A response naming a different
 /// command is refused; a code outside `i32` is [`EXEC_EXIT_STATUS_UNKNOWN`].
 fn command_exit(v: &serde_json::Value, cmd: &str) -> Result<Option<i32>, &'static str> {
+    Ok(command_exit_exact(v, cmd)?.map(|code| code.unwrap_or(EXEC_EXIT_STATUS_UNKNOWN)))
+}
+
+/// [`command_exit`] keeping "outside `i32`" distinct (`Some(None)`).
+fn command_exit_exact(
+    v: &serde_json::Value,
+    cmd: &str,
+) -> Result<Option<Option<i32>>, &'static str> {
     let c = v.get("command").filter(|c| c.is_object()).unwrap_or(v);
     if !c.is_object() {
         return Err("response has no command object");
@@ -1276,9 +1301,7 @@ fn command_exit(v: &serde_json::Value, cmd: &str) -> Result<Option<i32>, &'stati
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(code) => {
             let code = code.as_i64().ok_or("exitCode is not an integer")?;
-            Ok(Some(
-                i32::try_from(code).unwrap_or(EXEC_EXIT_STATUS_UNKNOWN),
-            ))
+            Ok(Some(i32::try_from(code).ok()))
         }
     }
 }

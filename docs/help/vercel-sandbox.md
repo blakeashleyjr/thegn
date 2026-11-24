@@ -285,7 +285,10 @@ finish. The steps, in order:
 - The sandbox name is written before the create request, so an ambiguous
   create can be found by name. The sandbox uses the configured `size` as its
   vCPU ceiling and lives for the transfer budget plus the deadline plus five
-  minutes. It is never extended.
+  minutes. It is never extended. An attempt whose lifetime does not fit the
+  smaller of the env's `max_lifetime_secs` and the plan's session maximum (five
+  hours by default; the Hobby plan allows 45 minutes) is refused before
+  anything is created.
 - Every claim re-reads the sandbox and checks this controller's tag and the
   vCPU ceiling. Protected files (`.git`, `.thegn`, credential trees, `.env*`,
   agent homes) are never part of the snapshot.
@@ -303,11 +306,14 @@ finish. The steps, in order:
   is deleted. The attempt reports a timeout and its outputs are not read.
 
 Cleanup is reported `done` only when the sandbox delete is confirmed.
-Otherwise it stays `pending` with the sandbox name in the record, and
-`thegn env reap --provider vercel --apply` can remove it (only sandboxes that
-carry this controller's tag). Spend is an estimate from elapsed time at a
-configured rate; an attempt whose sandbox may still exist keeps its whole cap
-committed.
+Otherwise it stays `pending` with the sandbox name in the record. The job
+ledger's reconcile settles it (there is no command for it yet); only a row past
+its deadline, transfer budget and a safety margin is touched, and a row that
+changed in the meantime is left alone. The env reaper does not delete job
+sandboxes early: it stops them at `max_lifetime_secs` and deletes them seven
+days later. Spend is an estimate from elapsed time at a configured rate, also
+for an attempt rejected after its sandbox was created; an attempt whose sandbox
+may still exist, or an unpriced one, keeps its whole cap committed.
 
 This is the executor only. Wiring a project's runner choice to it, live runs
 and the usage report for job sandboxes are not done yet.

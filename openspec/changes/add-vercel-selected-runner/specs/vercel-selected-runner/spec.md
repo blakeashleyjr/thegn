@@ -40,7 +40,10 @@ token, agent home and model credentials MUST NOT enter the sandbox.
 Cancel and reconcile SHALL verify the recorded Vercel team and project against
 the provider, and the controller tag on the sandbox, before any provider call
 that changes state. A live attempt MUST become cancelled or indeterminate and
-MUST NOT be rerun.
+MUST NOT be rerun. A non-terminal row younger than its staleness age (deadline
+plus transfer budget, kill budget and a clock margin) MUST be refused, and every
+recovery write MUST be a compare-and-swap under the ledger lock that leaves a
+changed row as it is.
 
 #### Scenario: Recovery under another team is refused
 

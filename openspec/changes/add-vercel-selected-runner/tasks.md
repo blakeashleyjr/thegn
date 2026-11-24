@@ -22,6 +22,13 @@
 - [x] 2.1 Fixture tests: success with exit and digest, nonzero exit, deadline,
       ambiguous start, identity mismatch before any create, recovery identity,
       token custody.
+- [x] 2.1a Fixture tests: cancel, reconcile, live-row refusal, ambiguous create,
+      command-handle persistence failure, rejected-attempt spend, lifetime
+      ceiling.
 - [ ] 2.2 Route wiring and configuration of the runner choice.
 - [ ] 2.3 A live run on a Vercel account.
+- [ ] 2.5 An owner lease (pid, boot id, heartbeat) in the attempt row, so a
+      host suspended past the staleness margin cannot look stale.
+- [ ] 2.6 Verify live whether deleting a persistent sandbox right after a stop
+      is accepted.
 - [ ] 2.4 Job-sandbox usage and cost through the usage tracker.

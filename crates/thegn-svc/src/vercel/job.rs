@@ -67,9 +67,7 @@ use thegn_job_spec::{
 
 use super::VercelProvider;
 use super::client::WAIT_COMMAND_DEADLINE;
-use crate::provider::{
-    EXEC_EXIT_STATUS_UNKNOWN, ProviderFiles, RemoteProvider, STDERR_TAIL_CAP, join_remote,
-};
+use crate::provider::{ProviderFiles, RemoteProvider, STDERR_TAIL_CAP, join_remote};
 pub use crate::sprites::job::{
     AttemptState, Cleanup, DirSnapshot, Resume, SnapshotContent, SnapshotSource, root_digest,
 };
@@ -99,6 +97,28 @@ pub const DEFAULT_SPEND_CAP_MICROS: u64 = 60_000;
 
 /// Sandbox lifetime beyond the transfer budget and the deadline: teardown room.
 const SANDBOX_SLACK: Duration = Duration::from_secs(5 * 60);
+
+/// The default ceiling on one sandbox session's lifetime: the longest session
+/// Vercel documents for its paid plans (5 hours). The Hobby plan allows 45
+/// minutes; an operator on it sets [`AttemptOptions::max_sandbox_timeout`]
+/// accordingly. An attempt whose transfer budget, deadline and slack do not fit
+/// the effective ceiling is refused before anything is created, rather than
+/// letting the create request answer 4xx.
+pub const PLAN_MAX_SANDBOX_TIMEOUT: Duration = Duration::from_secs(5 * 60 * 60);
+
+/// Time a recovery pass leaves a non-terminal row alone beyond the owner's own
+/// budgets: the kill and delete budget may still be running in a live owner.
+const RECONCILE_SLACK: Duration = Duration::from_secs(60);
+
+/// Extra margin on the staleness test. The ledger deadline is wall-clock but a
+/// live owner times its stream on the monotonic clock, which stops while the
+/// host is suspended; the margin only absorbs small skew. A suspend longer than
+/// it can still make a live row look stale (an owner lease in the row would
+/// close that gap; it is tracked in the OpenSpec tasks).
+const RECONCILE_CLOCK_MARGIN: Duration = Duration::from_secs(120);
+
+/// Consecutive command-status errors tolerated while waiting for an exit.
+const WAIT_ERROR_LIMIT: u32 = 3;
 
 /// Files in flight at once while materializing.
 const TRANSFER_CONCURRENCY: usize = 8;
@@ -495,10 +515,37 @@ impl AttemptStore {
         Ok(())
     }
 
+    /// Publish `record` only when the stored row still equals `expected` (the
+    /// row as a recovery pass read it). The check and the write happen under the
+    /// ledger lock, so a recovery never overwrites what the owning run wrote in
+    /// between. False when the row changed or vanished; nothing is written.
+    pub fn mark_if_unchanged(
+        &self,
+        expected: &AttemptRecord,
+        record: &AttemptRecord,
+    ) -> Result<bool> {
+        let Some(root) = self.open(false)? else {
+            return Ok(false);
+        };
+        let _lock = lock_ledger(&root)?;
+        let current = self.read_record::<AttemptRecord>(&root, &attempt_file(expected.attempt))?;
+        if current.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        self.mark(record)?;
+        Ok(true)
+    }
+
     /// Confirm the sandbox of a cancelled or indeterminate attempt is gone.
-    /// Idempotent; a record that is not pending is left alone.
+    /// Idempotent; a record that is not pending is left alone. The re-read and
+    /// the write happen under the ledger lock.
     pub fn mark_cleaned(&self, attempt: u64) -> Result<bool> {
-        let Some(mut record) = self.read(attempt)? else {
+        let Some(root) = self.open(false)? else {
+            return Ok(false);
+        };
+        let _lock = lock_ledger(&root)?;
+        let Some(mut record) = self.read_record::<AttemptRecord>(&root, &attempt_file(attempt))?
+        else {
             return Ok(false);
         };
         if record.cleanup != Cleanup::Pending {
@@ -642,6 +689,10 @@ pub struct AttemptOptions {
     pub outputs: Vec<String>,
     /// Where per-attempt checkouts live in the sandbox.
     pub checkout_root: String,
+    /// The longest sandbox session the Vercel plan allows
+    /// ([`PLAN_MAX_SANDBOX_TIMEOUT`] by default); the effective ceiling is the
+    /// smaller of this and the env's `max_lifetime_secs`.
+    pub max_sandbox_timeout: Duration,
 }
 
 impl Default for AttemptOptions {
@@ -654,6 +705,7 @@ impl Default for AttemptOptions {
             micros_per_second: 0,
             outputs: Vec::new(),
             checkout_root: DEFAULT_CHECKOUT_ROOT.to_owned(),
+            max_sandbox_timeout: PLAN_MAX_SANDBOX_TIMEOUT,
         }
     }
 }
@@ -664,6 +716,10 @@ impl AttemptOptions {
         ensure!(
             !self.transfer_budget.is_zero(),
             "transfer budget must be nonzero"
+        );
+        ensure!(
+            !self.max_sandbox_timeout.is_zero(),
+            "the sandbox timeout ceiling must be nonzero"
         );
         ensure!(
             self.checkout_root.starts_with('/')
@@ -901,6 +957,15 @@ impl VercelSelectedRunner {
         .map_err(|error| ReserveRefusal::Store(anyhow!("ledger task failed: {error}")))?
     }
 
+    /// The longest a job sandbox may live: the env's `max_lifetime_secs` (its
+    /// default when 0) capped by the plan's session maximum.
+    fn sandbox_ceiling(&self) -> Duration {
+        let lifetime = Duration::from_secs(thegn_core::vercel::policy::max_lifetime_secs(
+            self.provider.spec.max_lifetime_secs,
+        ));
+        lifetime.min(self.options.max_sandbox_timeout)
+    }
+
     /// Run one attempt now, for at most `deadline` (clamped to the binding's
     /// supported maximum).
     ///
@@ -943,6 +1008,21 @@ impl VercelSelectedRunner {
                 "a selected attempt needs a nonzero deadline".to_owned(),
             ));
         }
+        // The sandbox lives for transfer + deadline + slack and is never extended:
+        // refuse up front when that cannot fit the operator's lifetime ceiling or
+        // the plan's session maximum, instead of letting the create answer 4xx.
+        let timeout_ms = self.options.sandbox_timeout_ms(deadline);
+        let ceiling = self.sandbox_ceiling();
+        if Duration::from_millis(timeout_ms) > ceiling {
+            return Err(RunnerRefusal::InvalidSpec(format!(
+                "the attempt needs a {}s sandbox (transfer budget {}s + deadline {}s + {}s                  slack) but the lifetime ceiling is {}s (the smaller of max_lifetime_secs and                  the plan's session maximum); lower the deadline or raise the ceiling",
+                timeout_ms / 1000,
+                self.options.transfer_budget.as_secs(),
+                deadline.as_secs(),
+                SANDBOX_SLACK.as_secs(),
+                ceiling.as_secs()
+            )));
+        }
         let begun = tokio::time::Instant::now();
         let mut record = self
             .reserve(recipe, source, deadline)
@@ -955,9 +1035,8 @@ impl VercelSelectedRunner {
         record.sandbox = name.clone();
         record.cleanup = Cleanup::Pending;
         if let Err(error) = self.persist(&record).await {
-            return Err(self.reject(record, error, Cleanup::NotNeeded).await);
+            return Err(self.reject(record, error, Cleanup::NotNeeded, None).await);
         }
-        let timeout_ms = self.options.sandbox_timeout_ms(deadline);
         if let Err(error) = self.provider.create_named(&name, timeout_ms).await {
             let cleanup = if super::definite_create_rejection(&error) {
                 Cleanup::NotNeeded
@@ -967,11 +1046,13 @@ impl VercelSelectedRunner {
                     Ok(Some(_)) | Err(_) => Cleanup::Pending,
                 }
             };
-            return Err(self.reject(record, error, cleanup).await);
+            // A definite rejection or a sandbox that is not there never billed;
+            // an ambiguous one keeps its cap committed (`Pending`).
+            return Err(self.reject(record, error, cleanup, None).await);
         }
         let (team, project) = (self.binding.team_id(), self.binding.project_id());
         if let Err(error) = self.claim(team, project, &name).await {
-            return Err(self.reject_and_teardown(record, error).await);
+            return Err(self.reject_and_teardown(record, error, begun).await);
         }
 
         let transferred = tokio::time::timeout(
@@ -981,13 +1062,13 @@ impl VercelSelectedRunner {
         .await;
         let transfer = match transferred {
             Ok(Ok(transfer)) => transfer,
-            Ok(Err(error)) => return Err(self.reject_and_teardown(record, error).await),
+            Ok(Err(error)) => return Err(self.reject_and_teardown(record, error, begun).await),
             Err(_) => {
                 let error = anyhow!(
                     "the transfer exceeded its {}s budget",
                     self.options.transfer_budget.as_secs()
                 );
-                return Err(self.reject_and_teardown(record, error).await);
+                return Err(self.reject_and_teardown(record, error, begun).await);
             }
         };
         if &transfer.digest != source {
@@ -996,7 +1077,7 @@ impl VercelSelectedRunner {
                 transfer.digest.hash(),
                 source.hash()
             );
-            return Err(self.reject_and_teardown(record, error).await);
+            return Err(self.reject_and_teardown(record, error, begun).await);
         }
         record.materialized = Some(transfer.digest.clone());
 
@@ -1010,11 +1091,11 @@ impl VercelSelectedRunner {
         );
         let body = match self.provider.command_body(&argv, None, &[], false) {
             Ok(body) => body,
-            Err(error) => return Err(self.reject_and_teardown(record, error).await),
+            Err(error) => return Err(self.reject_and_teardown(record, error, begun).await),
         };
         let session = match self.claim(team, project, &name).await {
             Ok(session) => session,
-            Err(error) => return Err(self.reject_and_teardown(record, error).await),
+            Err(error) => return Err(self.reject_and_teardown(record, error, begun).await),
         };
         record.session = Some(session.clone());
 
@@ -1022,7 +1103,7 @@ impl VercelSelectedRunner {
         // reads back as an unknown dispatch and is never rerun blindly.
         record.state = AttemptState::Dispatching;
         if let Err(error) = self.persist(&record).await {
-            return Err(self.reject_and_teardown(record, error).await);
+            return Err(self.reject_and_teardown(record, error, begun).await);
         }
         // The build clock starts at dispatch, after the transfer.
         let started = tokio::time::Instant::now();
@@ -1032,7 +1113,7 @@ impl VercelSelectedRunner {
                 if super::definite_create_rejection(&error)
                     || VercelProvider::is_session_stopped(&error) =>
             {
-                return Err(self.reject_and_teardown(record, error).await);
+                return Err(self.reject_and_teardown(record, error, begun).await);
             }
             Err(error) => {
                 // A timeout or 5xx can follow an accepted start, so the command
@@ -1101,22 +1182,42 @@ impl VercelSelectedRunner {
             },
             Err(error) => record.error = Some(format!("cannot follow the logs: {error:#}")),
         }
-        // The stream ended without an exit: ask the command API, bounded by what
-        // is left of the deadline.
+        // The stream ended without an exit (a dropped connection or an early
+        // EOF says nothing about the build): poll the command API until the
+        // exit arrives or the deadline passes, tolerating a few transient errors.
         if exit.is_none() && !timed_out {
-            let left = until.saturating_duration_since(tokio::time::Instant::now());
-            match self
-                .provider
-                .client
-                .wait_command(&session, &command, left.min(WAIT_COMMAND_DEADLINE))
-                .await
-            {
-                // The client maps an exit outside i32 to this sentinel.
-                Ok(Some(code)) if code != EXEC_EXIT_STATUS_UNKNOWN => exit = Some(code),
-                Ok(Some(_)) => {}
-                Ok(None) => timed_out = tokio::time::Instant::now() >= until,
-                Err(error) => {
-                    record.error = Some(format!("cannot read the command exit: {error:#}"));
+            let mut errors = 0u32;
+            loop {
+                let left = until.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    timed_out = true;
+                    break;
+                }
+                match self
+                    .provider
+                    .client
+                    .wait_command_exact(&session, &command, left.min(WAIT_COMMAND_DEADLINE))
+                    .await
+                {
+                    Ok(Some(Some(code))) => {
+                        exit = Some(code);
+                        break;
+                    }
+                    Ok(Some(None)) => {
+                        record.error =
+                            Some("the command exit code is outside the 32-bit range".to_owned());
+                        break;
+                    }
+                    Ok(None) => errors = 0,
+                    Err(error) => {
+                        errors += 1;
+                        record.error = Some(format!("cannot read the command exit: {error:#}"));
+                        if errors >= WAIT_ERROR_LIMIT {
+                            break;
+                        }
+                        let left = until.saturating_duration_since(tokio::time::Instant::now());
+                        tokio::time::sleep(left.min(Duration::from_secs(2))).await;
+                    }
                 }
             }
         }
@@ -1152,17 +1253,30 @@ impl VercelSelectedRunner {
     }
 
     /// Close a reservation that provably never ran a command.
+    ///
+    /// `billed_since` is when the attempt's sandbox was created, when it was:
+    /// every Vercel attempt bills its own sandbox, so that elapsed time is
+    /// charged at the configured rate. Unpriced, the whole cap stays committed
+    /// so repeated failures still exhaust the envelope.
     async fn reject(
         &self,
         mut record: AttemptRecord,
         error: anyhow::Error,
         cleanup: Cleanup,
+        billed_since: Option<tokio::time::Instant>,
     ) -> RunnerRefusal {
         record.state = AttemptState::Rejected;
         record.cleanup = cleanup;
         record.sandbox_deleted = cleanup == Cleanup::Done;
         // A sandbox that may still exist keeps its whole cap committed.
-        record.spent_micros = (cleanup != Cleanup::Pending).then_some(0);
+        record.spent_micros = if cleanup == Cleanup::Pending {
+            None
+        } else {
+            match billed_since {
+                None => Some(0),
+                Some(since) => self.cost(since.elapsed()).0,
+            }
+        };
         record.outputs_fenced = true;
         record.finished_ms = Some(thegn_core::util::now_ms());
         record.error = Some(format!("{error:#}"));
@@ -1182,13 +1296,14 @@ impl VercelSelectedRunner {
         &self,
         record: AttemptRecord,
         error: anyhow::Error,
+        begun: tokio::time::Instant,
     ) -> RunnerRefusal {
         let cleanup = if self.teardown(&record.sandbox).await {
             Cleanup::Done
         } else {
             Cleanup::Pending
         };
-        self.reject(record, error, cleanup).await
+        self.reject(record, error, cleanup, Some(begun)).await
     }
 
     /// Write the authorized bytes into the attempt checkout, read every file
@@ -1439,10 +1554,49 @@ impl VercelSelectedRunner {
         RunnerRefusal::RunnerUnavailable(format!("{}: {error:#}", self.alias))
     }
 
-    /// Cancel the owned work of `attempt`: verify the recorded team/project,
-    /// kill the command, stop and delete the sandbox, and record the result. A
-    /// terminal attempt keeps its verdict (only its cleanup is settled); a live
-    /// one becomes [`AttemptState::Cancelled`].
+    /// [`persist`](Self::persist) guarded by [`AttemptStore::mark_if_unchanged`].
+    async fn persist_if_unchanged(
+        &self,
+        expected: &AttemptRecord,
+        record: &AttemptRecord,
+    ) -> Result<bool> {
+        let store = self.store.clone();
+        let expected = expected.clone();
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || store.mark_if_unchanged(&expected, &record))
+            .await
+            .map_err(|error| anyhow!("ledger task failed: {error}"))?
+    }
+
+    async fn read_attempt(&self, attempt: u64) -> Result<Option<AttemptRecord>> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.read(attempt))
+            .await
+            .map_err(|error| anyhow!("ledger task failed: {error}"))?
+    }
+
+    /// The age past which a non-terminal row can no longer belong to a live run:
+    /// its deadline plus the transfer budget, kill budget, slack and clock margin.
+    fn stale_after_ms(&self) -> i64 {
+        millis_i64(
+            self.options.transfer_budget
+                + CLEANUP_BUDGET
+                + RECONCILE_SLACK
+                + RECONCILE_CLOCK_MARGIN,
+        )
+    }
+
+    fn is_stale(&self, record: &AttemptRecord, now_ms: i64) -> bool {
+        now_ms >= record.deadline_ms.saturating_add(self.stale_after_ms())
+    }
+
+    /// Cancel the owned work of `attempt` from outside the run that owns it:
+    /// verify the recorded team/project, kill the command, stop and delete the
+    /// sandbox, and record the result. A terminal attempt keeps its verdict (only
+    /// its cleanup is settled); a live one becomes [`AttemptState::Cancelled`].
+    /// Subject to the same staleness rule as [`reconcile`](Self::reconcile):
+    /// there is no owner lease, so a row younger than its staleness age is
+    /// refused rather than killed under a run that may still be driving it.
     pub async fn cancel(&self, attempt: u64) -> Result<AttemptRecord> {
         self.settle(attempt, true).await
     }
@@ -1450,22 +1604,35 @@ impl VercelSelectedRunner {
     /// Reconcile an attempt left ambiguous or with cleanup pending (a crashed
     /// client, an ambiguous create or start, a failed delete): verify the
     /// recorded team/project and ownership, settle the sandbox, and never rerun.
-    /// A live attempt becomes [`AttemptState::Indeterminate`].
+    /// A non-terminal row becomes [`AttemptState::Indeterminate`] only once it is
+    /// stale (deadline plus transfer budget, kill budget, slack and a clock
+    /// margin have passed); a younger one is refused. Every write is
+    /// compare-and-swap under the ledger lock: a row its owner or another
+    /// recovery changed in the meantime is left as it is (superseded) and
+    /// returned as found, so a terminal `Finished` record is never overwritten.
     pub async fn reconcile(&self, attempt: u64) -> Result<AttemptRecord> {
         self.settle(attempt, false).await
     }
 
     async fn settle(&self, attempt: u64, cancel: bool) -> Result<AttemptRecord> {
-        let store = self.store.clone();
-        let mut record = tokio::task::spawn_blocking(move || store.read(attempt))
-            .await
-            .map_err(|error| anyhow!("ledger task failed: {error}"))??
+        let record = self
+            .read_attempt(attempt)
+            .await?
             .ok_or_else(|| anyhow!("vercel job ledger: attempt {attempt} is not recorded"))?;
         // Recovery checks the recorded identity before any provider call.
         self.verify_scope(&record.team_id, &record.project_id)?;
         if record.is_terminal() && record.cleanup != Cleanup::Pending {
             return Ok(record);
         }
+        if !record.is_terminal() && !self.is_stale(&record, thegn_core::util::now_ms()) {
+            bail!(
+                "vercel job ledger: attempt {attempt} is still {} and may belong to a live run; \
+                 refusing to kill it before it is stale",
+                state_name(record.state)
+            );
+        }
+        let expected = record.clone();
+        let mut record = record;
         let name = record.sandbox.clone();
         let gone = if name.is_empty() {
             true
@@ -1479,6 +1646,11 @@ impl VercelSelectedRunner {
                         "vercel: sandbox {name} does not carry this controller's tag; \
                          refusing to touch it"
                     );
+                    // Re-read right before the kill: a row its owner moved on is
+                    // never killed.
+                    if self.read_attempt(attempt).await?.as_ref() != Some(&expected) {
+                        return self.superseded(attempt).await;
+                    }
                     self.kill_command(&record).await;
                     self.teardown(&name).await
                 }
@@ -1499,8 +1671,23 @@ impl VercelSelectedRunner {
             Cleanup::Pending
         };
         record.sandbox_deleted = gone;
-        self.persist(&record).await?;
-        Ok(record)
+        if self.persist_if_unchanged(&expected, &record).await? {
+            Ok(record)
+        } else {
+            self.superseded(attempt).await
+        }
+    }
+
+    /// The row as it stands after a recovery pass lost the compare-and-swap.
+    async fn superseded(&self, attempt: u64) -> Result<AttemptRecord> {
+        tracing::warn!(
+            target: "thegn::vercel::job",
+            attempt,
+            "the ledger row changed during recovery; its newer state is kept"
+        );
+        self.read_attempt(attempt)
+            .await?
+            .ok_or_else(|| anyhow!("vercel job ledger: attempt {attempt} vanished"))
     }
 }
 
