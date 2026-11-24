@@ -42,6 +42,17 @@
       scrubbed per-attempt environment.
 - [ ] 4.3 Run `cargo nextest run -p thegn-svc --test sprites_job` and the
       `sprites::job` unit tests on the Mac builder.
-- [ ] 4.4 Not in this slice: user-initiated cancel, a reconciler that calls
-      `mark_cleaned`, reattach by handle, the credential broker, the CLI verb
-      and a budgeted live run.
+- [x] 4.4 User cancel: a `CancelToken` on a running attempt issues the same
+      owned-tree kill as the deadline, records `Cancelled` (distinct from
+      `TimedOut`), fences outputs, releases the hold and marks cleanup `Done` on
+      a confirmed kill or `Pending` otherwise.
+- [x] 4.5 Pending-row reconciler: scan the ledger for unsettled attempts,
+      re-issue the kill for the recorded control file and hold, and mark cleanup
+      `Done` only on confirmation. It never dispatches, so a command with an
+      unknown dispatch outcome is never rerun as an implicit recovery.
+- [x] 4.6 Reattach by session handle: follow the stream while the provider still
+      holds it, otherwise reconcile to `Indeterminate`; never redispatch.
+- [ ] 4.7 Run the new cancel, reconcile and reattach tests in
+      `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
+- [ ] 4.8 Not in this slice: the credential broker, the CLI verb and a budgeted
+      live run.
