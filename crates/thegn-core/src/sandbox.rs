@@ -3725,7 +3725,18 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
         }
     }
 
-    let err = format!("could not start {rt} container '{}'", spec.name);
+    // Name the requested runtime and the placement when its create fails. On an
+    // unprobed placement (remote, or a macOS engine in a VM) this is the only
+    // honest feedback: thegn could not check that engine's PATH or /dev/kvm, so
+    // a silent substitution would be the alternative.
+    let err = match spec.oci_runtime.as_deref() {
+        Some(runtime) => crate::sandbox_runtime::create_failure_message(
+            runtime,
+            &spec.placement.label(),
+            create_err.trim(),
+        ),
+        None => format!("could not start {rt} container '{}'", spec.name),
+    };
     emit(SandboxPhase::PhaseFailed { err: err.clone() });
     anyhow::bail!(err)
 }

@@ -392,19 +392,42 @@ pub(crate) struct RemoteSyncPlan {
 }
 
 /// Degrade an unavailable strong OCI runtime and plan remote-OCI worktree
-/// materialization without contacting the remote host or changing mounts.
-/// Runtime degradation must happen before sandbox gates because those gates
-/// inspect the effective runtime and capabilities.
+/// materialization without contacting the remote host or changing mounts. The
+/// probe only runs for a local Linux placement (see [`probes_apply`]); a remote
+/// or macOS-local engine keeps the requested runtime. Runtime degradation must
+/// happen before sandbox gates because those gates inspect the effective runtime
+/// and capabilities.
 pub(crate) fn plan_spec_before_ensure(
     spec: &mut thegn_core::sandbox::SandboxSpec,
     worktree: &str,
     recursive_submodules: bool,
     warnings: &mut Vec<String>,
 ) -> Option<RemoteSyncPlan> {
-    if probes_apply(
-        spec.placement.is_local(),
+    plan_spec_before_ensure_with_host(
+        spec,
+        worktree,
+        recursive_submodules,
+        warnings,
         thegn_core::sandbox_backend::host_os(),
-    ) && let Some(w) = degrade_oci_runtime(spec)
+        &|binary| thegn_core::util::which_path(binary).is_some(),
+        &thegn_core::util::kvm_accessible,
+    )
+}
+
+/// [`plan_spec_before_ensure`] with the host OS and the runtime probes injected,
+/// so the "probe only the machine that runs the engine" rule is testable from
+/// any machine.
+fn plan_spec_before_ensure_with_host(
+    spec: &mut thegn_core::sandbox::SandboxSpec,
+    worktree: &str,
+    recursive_submodules: bool,
+    warnings: &mut Vec<String>,
+    os: thegn_core::sandbox_backend::HostOs,
+    binary_present: &dyn Fn(&str) -> bool,
+    kvm: &dyn Fn() -> bool,
+) -> Option<RemoteSyncPlan> {
+    if probes_apply(spec.placement.is_local(), os)
+        && let Some(w) = degrade_oci_runtime_with(spec, binary_present, kvm)
     {
         thegn_core::msg::warn(&format!("{w} for {worktree}"));
         warnings.push(w);
@@ -463,22 +486,9 @@ pub(crate) fn apply_remote_sync_with(
     }
 }
 
-/// If `spec` requests a strong OCI runtime (`runsc`/`krun`) that isn't usable on
-/// THIS host — the runtime binary is absent, or (for libkrun) `/dev/kvm` is
-/// missing — clear it so the container falls back to the daemon default runtime
-/// instead of failing `create --runtime …`. Returns the user-facing reason when
-/// it degraded, else `None`. The keep-or-degrade rule is the unit-tested pure
-/// [`thegn_core::sandbox_runtime::decide`]; here we only probe the host.
-pub(crate) fn degrade_oci_runtime(spec: &mut thegn_core::sandbox::SandboxSpec) -> Option<String> {
-    degrade_oci_runtime_with(
-        spec,
-        &|binary| thegn_core::util::which_path(binary).is_some(),
-        &thegn_core::host_probe::kvm_accessible,
-    )
-}
-
-/// Runtime probes describe this machine: only a local placement on a Linux
-/// host may use them.
+/// Runtime probes describe the machine that runs the engine: only a local
+/// placement on a Linux host may use them. A remote placement and a macOS-local
+/// engine (whose runtime lives in the podman machine) keep the requested runtime.
 pub(crate) fn probes_apply(
     placement_is_local: bool,
     os: thegn_core::sandbox_backend::HostOs,
@@ -486,7 +496,14 @@ pub(crate) fn probes_apply(
     placement_is_local && os == thegn_core::sandbox_backend::HostOs::Linux
 }
 
-/// Testable host-probe half of [`degrade_oci_runtime`].
+/// The keep-or-degrade probe half of [`plan_spec_before_ensure`]: when `spec`
+/// requests a strong OCI runtime (`runsc`/`krun`) that cannot run here — the
+/// runtime binary is absent, or (for libkrun) `/dev/kvm` cannot be opened
+/// read-write — clear it so the container falls back to the daemon default
+/// instead of failing `create --runtime …`. Returns the user-facing reason when
+/// it degraded, else `None`. The rule itself is the unit-tested pure
+/// [`thegn_core::sandbox_runtime::decide`]; the probes are injected so tests need
+/// neither `/dev/kvm` nor the runtime binary.
 pub(crate) fn degrade_oci_runtime_with(
     spec: &mut thegn_core::sandbox::SandboxSpec,
     binary_present: &dyn Fn(&str) -> bool,
@@ -717,9 +734,10 @@ mod tests {
     use super::{
         MAX_SYNC_BYTES, MAX_SYNC_FILES, SyncCache, UNTRACKED_STREAM_LIMIT, UntrackedSize,
         apply_diff_command, apply_remote_sync_with, claim_command, degrade_oci_runtime_with,
-        pipe_step_error, plan_spec_before_ensure, probes_apply, promote_command, record_command,
-        refresh_command, restore_command, should_apply_tracked_diff, ssh_none_guard, sync_key,
-        sync_once, untracked_budget, untracked_size,
+        pipe_step_error, plan_spec_before_ensure, plan_spec_before_ensure_with_host, probes_apply,
+        promote_command, record_command, refresh_command, restore_command,
+        should_apply_tracked_diff, ssh_none_guard, sync_key, sync_once, untracked_budget,
+        untracked_size,
     };
     use std::process::Command;
     use std::sync::{
@@ -1537,8 +1555,20 @@ mod tests {
         let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, true);
         spec.oci_runtime = Some("krun".into());
 
-        assert!(plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new()).is_some());
+        // Linux, and both probes would degrade: the remote placement must stop
+        // the probe from running at all, because PATH and /dev/kvm describe this
+        // machine, not the engine's.
+        let plan = plan_spec_before_ensure_with_host(
+            &mut spec,
+            "/wt/x",
+            false,
+            &mut Vec::new(),
+            thegn_core::sandbox_backend::HostOs::Linux,
+            &|_| false,
+            &|| false,
+        );
 
+        assert!(plan.is_some());
         assert_eq!(spec.oci_runtime.as_deref(), Some("krun"));
     }
 
@@ -1547,14 +1577,41 @@ mod tests {
         let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, false);
         spec.oci_runtime = Some("runsc".into());
 
-        if probes_apply(
-            spec.placement.is_local(),
+        // A macOS-local engine runs in the podman machine: this Mac's PATH says
+        // nothing about it, so the probe must not run and the request survives.
+        plan_spec_before_ensure_with_host(
+            &mut spec,
+            "/wt/x",
+            false,
+            &mut Vec::new(),
             thegn_core::sandbox_backend::HostOs::MacOs,
-        ) {
-            degrade_oci_runtime_with(&mut spec, &|_| false, &|| false);
-        }
+            &|_| false,
+            &|| false,
+        );
 
         assert_eq!(spec.oci_runtime.as_deref(), Some("runsc"));
+    }
+
+    #[test]
+    fn linux_local_spec_degrades_when_probes_fail() {
+        let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, false);
+        spec.oci_runtime = Some("krun".into());
+        let mut warnings = Vec::new();
+
+        let plan = plan_spec_before_ensure_with_host(
+            &mut spec,
+            "/wt/x",
+            false,
+            &mut warnings,
+            thegn_core::sandbox_backend::HostOs::Linux,
+            &|_| true,
+            &|| false,
+        );
+
+        assert!(plan.is_none());
+        assert_eq!(spec.oci_runtime, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("/dev/kvm"), "{warnings:?}");
     }
 
     #[test]

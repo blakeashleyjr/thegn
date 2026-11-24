@@ -43,3 +43,11 @@
 - [x] 7.2 Skip runtime host probes for engines without `--runtime`; align doctor
       reporting with the same predicate and add probe-skipping coverage
 - [x] 7.3 Document which engines accept `oci_runtime` in the isolation table
+
+## 8. WS07-P0-02: Probe the runtime host
+
+- [x] 8.1 Keep remote and macOS-local OCI runtime requests untouched; probe only local Linux placements
+- [x] 8.2 Centralize the `/dev/kvm` read/write capability probe in `thegn_core::util::kvm_accessible`
+- [x] 8.3 Report the requested runtime and placement when an unprobed create rejects it
+- [x] 8.4 Correct the gVisor default-platform note (`systrap`, not `ptrace`)
+- [ ] 8.5 Coordinator verifies a `krun` pane on a Linux host with `/dev/kvm` access

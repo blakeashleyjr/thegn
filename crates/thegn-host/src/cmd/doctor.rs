@@ -110,9 +110,9 @@ fn cfg_oci_runtime(cfg: &Config) -> Option<&str> {
 }
 
 /// A `" (…)"` availability suffix for the configured OCI runtime: whether its
-/// binary (and `/dev/kvm`, for libkrun) is present on THIS host, so the user
-/// learns a strong runtime would silently fall back before they rely on it.
-/// OCI engines without a `--runtime` flag never use the value, so probe
+/// binary (and read-write access to `/dev/kvm`, for libkrun) works on THIS host,
+/// so the user learns a strong runtime would silently fall back before they rely
+/// on it. OCI engines without a `--runtime` flag never use the value, so probe
 /// nothing and say it is ignored — the same predicate [`Capabilities`] derives
 /// from. `None` (an `auto` chain) still probes: each chain row below states
 /// which engines ignore the runtime.
@@ -123,12 +123,26 @@ fn oci_runtime_status(backend: Option<Backend>, rt: &str) -> String {
     {
         return format!(" (ignored: {} has no --runtime)", backend.label());
     }
+    oci_runtime_status_with(
+        rt,
+        &|binary| thegn_core::util::which_path(binary).is_some(),
+        &thegn_core::util::kvm_accessible,
+    )
+}
+
+/// [`oci_runtime_status`] with both probes injected, so the reported suffix is
+/// testable without a `/dev/kvm` node or a runtime binary on the runner.
+fn oci_runtime_status_with(
+    rt: &str,
+    binary_probe: &dyn Fn(&str) -> bool,
+    kvm_probe: &dyn Fn() -> bool,
+) -> String {
     use thegn_core::sandbox_runtime::{RuntimeDecision, decide, runtime_req};
     let Some(req) = runtime_req(rt.trim()) else {
         return String::new(); // runc/crun/unknown: no extra requirement to report.
     };
-    let binary_present = thegn_core::util::which_path(req.binary).is_some();
-    let kvm_present = thegn_core::host_probe::kvm_accessible();
+    let binary_present = binary_probe(req.binary);
+    let kvm_present = kvm_probe();
     match decide(Some(rt), binary_present, kvm_present) {
         RuntimeDecision::Keep => " (available)".to_string(),
         RuntimeDecision::Degrade(reason) => format!(" (unavailable — {reason})"),
@@ -6834,6 +6848,16 @@ mod pins;
 mod tests {
     use super::*;
     use thegn_core::notification::{Notification, NotificationKind};
+
+    #[test]
+    fn doctor_runtime_status_uses_kvm_accessible() {
+        let status = oci_runtime_status_with("krun", &|_| true, &|| false);
+        assert!(status.contains("unavailable"), "{status}");
+        assert!(status.contains("/dev/kvm"), "{status}");
+
+        let status = oci_runtime_status_with("krun", &|_| true, &|| true);
+        assert_eq!(status, " (available)");
+    }
 
     #[test]
     fn db_space_suffix_names_the_next_step() {
