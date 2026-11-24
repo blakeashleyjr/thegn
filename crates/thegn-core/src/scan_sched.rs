@@ -42,6 +42,7 @@ impl ScanTarget {
     }
 
     /// Builder: mark this target as the on-screen worktree.
+    #[must_use]
     pub fn active(mut self) -> ScanTarget {
         self.active = true;
         self

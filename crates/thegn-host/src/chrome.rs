@@ -9,6 +9,7 @@ use termwiz::surface::{Change, Position, Surface};
 
 use crate::compositor::{Rect, compose_pane};
 use crate::emulator::PaneEmulator;
+use crate::spawn_progress::SpawnBlock;
 use thegn_core::theme;
 use unicode_width::UnicodeWidthStr;
 
@@ -824,6 +825,14 @@ pub struct FrameModel {
     /// Keeping this small snapshot on the renderer model makes the widget
     /// pure and keeps it stable across hydration model swaps.
     pub drawer_bar: DrawerBarState,
+    /// Spawn-progress cards (THE-213) for the displayed tab, keyed by pane id
+    /// (or missing-leaf id before the fork): what each still-silent spawned
+    /// pane is doing — phase, sampled `/proc` descendant lines, culprit hint.
+    /// LOOP-owned (derived per frame in `run.rs` from `Panes::spawn_progress`/
+    /// `Panes::spawn_pending`, re-derived after every model swap like
+    /// `plugin_segments`); empty means no card anywhere. Rendered by
+    /// [`render_panes`] inside the pane's own frame, clipped to it.
+    pub spawn_hints: std::collections::HashMap<u32, crate::spawn_progress::SpawnBlock>,
 }
 
 /// The renderer-facing state of the bottom drawer indicator.
@@ -946,12 +955,14 @@ impl LoadStep {
         Self::new(label, StepState::Failed)
     }
     /// Attach a dim sub-line (status / error) under the step.
+    #[must_use]
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         let d = detail.into();
         self.detail = (!d.trim().is_empty()).then_some(d);
         self
     }
     /// Tag the step's stable identity (see [`StepKind`]).
+    #[must_use]
     pub fn with_kind(mut self, kind: StepKind) -> Self {
         self.kind = kind;
         self
@@ -2813,6 +2824,41 @@ fn draw_relaunch_overlay(surface: &mut Surface, content: Rect, cmd: &str) {
     );
 }
 
+/// Draw the spawn-progress card (THE-213) at the top-left of a pane's content
+/// rect: what a still-silent spawned pane is doing. The phase line renders
+/// dim, the sampled `/proc` descendant lines and the culprit hint faint; each
+/// line clips to the pane's width, and the card never draws outside its own
+/// frame. `SpawnBlock::lines` arrive redacted (`log_redact::redact_argv` at
+/// derivation) — argv can never reach a surface unredacted.
+fn draw_spawn_block(surface: &mut Surface, content: Rect, block: &SpawnBlock) {
+    if content.rows == 0 || content.cols < 4 {
+        return;
+    }
+    // One column of padding inside the frame ring, on both sides.
+    let budget = content.cols.saturating_sub(2);
+    if budget == 0 {
+        return;
+    }
+    let x = content.x + 1;
+    let mut y = content.y;
+    let mut row = |text: &str, fg: ColorAttribute| {
+        if y >= content.y + content.rows {
+            return;
+        }
+        draw_text(surface, x, y, text, fg, col(S::Panel), budget);
+        y += 1;
+    };
+    if let Some(phase) = block.lines.first() {
+        row(phase, col(S::Dim));
+    }
+    for line in block.lines.iter().skip(1) {
+        row(line, col(S::Faint));
+    }
+    if let Some(hint) = &block.hint {
+        row(hint, col(S::Faint));
+    }
+}
+
 /// Whether the center band shows the fullscreen loading splash instead of pane
 /// content, given the laid-out center leaves (`frames`, from
 /// [`crate::center::CenterTree::layout_framed`]) and the model.
@@ -2873,6 +2919,14 @@ pub fn render_panes<'a>(
             // or a crashed husk) shows a one-line prompt over its bottom row.
             if let Some(cmd) = relaunch_of(*id) {
                 draw_relaunch_overlay(surface, *content, &cmd);
+            }
+            // A still-silent spawned pane shows its spawn-progress card here
+            // instead of a blank cell (THE-213): phase, sampled descendant
+            // lines, culprit hint — keyed by the pane id, or by the missing
+            // leaf's id between the materialize kick and the fork (no pane is
+            // composed then; the card is the only thing drawn for that leaf).
+            if let Some(block) = model.spawn_hints.get(id) {
+                draw_spawn_block(surface, *content, block);
             }
         }
         // The focused pane keeps a distinct ring at all times: focus blue

@@ -72,6 +72,7 @@ impl<'a> DocsRouter<'a> {
     }
 
     /// Attach the live-state tool router (see [`crate::mcp::state`]).
+    #[must_use]
     pub fn with_state(mut self, state: StateRouter<'a>) -> Self {
         self.state = Some(state);
         self

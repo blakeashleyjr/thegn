@@ -22,8 +22,13 @@ while the process is contained.
 - [[sandbox-network]] — network modes and the allow and block lists
 - [[environments]] — named environments, worktree toolchains, lifecycle hooks, remote worktrees and how a remote pane behaves (terminal identity, close versus quit, background setup)
 - [[sandbox-profiles]] — pinning a profile per worktree
+- [[sandbox-security-model]] — what the sandbox protects, what it does not, and which launches run on the host
 
 ## Hardening profiles
+
+`standard` (the default) is an **accident guard**: it is **not a boundary against
+a hostile agent** (home readable, network direct by default, shared kernel).
+`sealed` is the hardened tier. See [[sandbox-security-model]].
 
 `[sandbox] profile` picks a bundle of isolation knobs. Set it globally,
 per repo via a `.thegn.toml` overlay, or per run with
@@ -33,7 +38,7 @@ per repo via a `.thegn.toml` overlay, or per run with
 | Profile         | What it does                                                                                                                                                                                                |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `open`          | no hardening — the escape hatch                                                                                                                                                                             |
-| `standard`      | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact                                                                                                              |
+| `standard`      | **default.** read-only root, no-new-privileges, a process cap on podman, docker and systemd only; network and capabilities intact                                                                           |
 | `sealed`        | full lockdown: `network=none`, drop ALL caps, tighter pids cap. For untrusted work                                                                                                                          |
 | `sealed-tunnel` | `sealed` plus a `[sandbox.vpn]` tunnel as the only route. **Refuses to launch while a VPN is configured**: thegn cannot yet enforce that the tunnel is the only route. With no VPN it behaves like `sealed` |
 
@@ -440,7 +445,7 @@ setting, run `thegn info` or press `I` on its sidebar row (see the Info screen s
 Workspaces and worktrees).
 
 The panel's **system → sandbox** section shows the live state for the
-focused worktree: the backend, image, mounts, DNS filtering, and the
+focused worktree: the backend, image, mounts, and the
 container's status and cpu/mem/net when one exists; the wider views add
 the activity timeline. Containers not proven to belong to this profile are
 listed read-only: ownership requires this profile's expected container name

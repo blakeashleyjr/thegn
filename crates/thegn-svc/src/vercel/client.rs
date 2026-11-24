@@ -357,6 +357,7 @@ impl VercelClient {
 
     /// Pin the interactive WebSocket ticket host to `suffixes` (empty ⇒ the
     /// built-in defaults).
+    #[must_use]
     pub fn with_interactive_hosts(mut self, suffixes: Vec<String>) -> Self {
         self.interactive_hosts = suffixes;
         self
@@ -510,7 +511,12 @@ impl VercelClient {
     pub async fn stop(&self, session: &str) -> Result<()> {
         let p = priority("stop session");
         let url = self.session_url(session, &["stop"])?;
-        let resp = self.send(p, || Ok(self.http.post(url.clone()))).await?;
+        // Vercel answers a body-less POST with 415 Unsupported Media Type, so
+        // send an empty JSON object (live run, THE-2234).
+        let body = serde_json::json!({});
+        let resp = self
+            .send(p, || Ok(self.http.post(url.clone()).json(&body)))
+            .await?;
         // OpenAPI lists 410; the SDK treats 410 on a session as stopped (sandbox.ts isSandboxStoppedError)
         if resp.status() == reqwest::StatusCode::GONE {
             drain_quietly(resp).await;

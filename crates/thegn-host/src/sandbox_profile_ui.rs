@@ -383,6 +383,7 @@ mod tests {
             &loc,
             root.path().to_string_lossy().as_ref(),
             &selection,
+            None,
         )
         .unwrap();
         assert_eq!(trusted.environment.sandbox.profile, SandboxProfile::Sealed);

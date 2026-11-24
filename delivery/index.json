@@ -463,6 +463,14 @@
       "summary": "Background signing safety is delivered; four bounded SCM workflow capabilities remain deferred."
     },
     {
+      "change": "add-selected-runner-routing",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2416 owns this fix round, but that issue is outside the checked-in active delivery inventory (the thegn daemon and Linear read were unavailable in the lane that produced it), so it is not mapped here.",
+      "summary": "Typed selected-runner submission, refusal/lost-after-submit split and JobResult readback are delivered as a contract slice; the terminal adapter, config lookup, recursion guard and argv/cwd forwarding remain open."
+    },
+    {
       "change": "add-skills-registry",
       "lifecycle": "proposed",
       "disposition": "strategic-unstarted",
@@ -1139,7 +1147,7 @@
     },
     {
       "change": "mark-unverified-backends",
-      "lifecycle": "active",
+      "lifecycle": "archived",
       "disposition": "verification-gated",
       "owners": [
         {
@@ -1147,7 +1155,8 @@
           "project": "Cross-Platform Support & Verification"
         }
       ],
-      "summary": "Truthful backend caveats shipped; smolvm and WSL remain unverified until real-host proof."
+      "summary": "Truthful backend caveats shipped; task 5.1 superseded by reserved smol, wsl and appcontainer (fix-truth-in-reporting); replacements owned by WS07-P2-04 and WS06.",
+      "archive_path": "openspec/changes/archive/2026-11-23-mark-unverified-backends/"
     },
     {
       "change": "monitor-framework",

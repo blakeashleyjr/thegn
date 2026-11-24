@@ -32,6 +32,7 @@ pub enum Health {
 }
 
 impl Health {
+    #[must_use]
     pub fn after_error(self, tick: u64) -> Self {
         let (since_tick, previous) = match self {
             Self::Failing {
@@ -52,6 +53,7 @@ impl Health {
             retry_at: tick.saturating_add(u64::from(backoff)),
         }
     }
+    #[must_use]
     pub fn after_ok(self) -> Self {
         Self::Ok
     }

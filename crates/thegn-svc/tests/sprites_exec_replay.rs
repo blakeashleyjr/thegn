@@ -18,6 +18,7 @@ enum Hs {
 enum Out {
     Text(&'static str),
     Bin(Vec<u8>),
+    WaitForStdinEof,
     Close,
 }
 
@@ -167,15 +168,41 @@ fn handle_connection(mut stream: TcpStream, script: Script, requests: Arc<Mutex<
 
     let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
     for output in script.out {
+        if matches!(&output, Out::WaitForStdinEof) {
+            loop {
+                match socket.read() {
+                    Ok(Message::Binary(bytes)) if bytes.as_ref() == [4] => break,
+                    Ok(Message::Close(_)) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+            continue;
+        }
         let message = match output {
             Out::Text(text) => Message::Text(text.into()),
             Out::Bin(bytes) => Message::Binary(bytes.into()),
+            Out::WaitForStdinEof => unreachable!("handled before message construction"),
             Out::Close => Message::Close(None),
         };
         if socket.send(message).is_err() {
             return;
         }
     }
+
+    // Drain what the client sends until it closes. Closing a socket that still
+    // holds unread received data makes Linux answer with an RST instead of a
+    // FIN and can discard the frames just written, so the scripted exit frame
+    // used to be lost to that race. Reading to the close handshake (the client
+    // answers our Close, or drops after an exit frame) settles it first; the
+    // read timeout bounds a client that keeps the stream open.
+    if socket
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return;
+    }
+    while socket.read().is_ok() {}
 }
 
 fn requests(mock: &Mock) -> Vec<Request> {
@@ -232,6 +259,49 @@ async fn tty_replay_matches_the_live_trace() {
 }
 
 #[tokio::test]
+async fn tty_replay_preserves_a_newline_split_across_sprite_frames() {
+    // Synthetic `tty && echo ok` output: Sprite may put the PTY's CRLF in its
+    // own text frame between binary output chunks. Keep this separate from the
+    // live symptom replay above, whose received bytes already lack that CRLF.
+    let mock = start_mock(vec![script(vec![
+        session_info(),
+        Out::Bin(b"\x1b[>4;2m/dev/pts/0".to_vec()),
+        Out::Text("\r\n"),
+        Out::Bin(b"ok\r\n".to_vec()),
+        Out::Text(r#"{"type":"exit","exit_code":0}"#),
+    ])]);
+    let mut session = provider(&mock)
+        .open_exec("tgtest1", &tty_spec())
+        .await
+        .unwrap();
+
+    let mut output = Vec::new();
+    let mut trace = Vec::new();
+    while let Some(frame) = session.frames.recv().await {
+        match frame {
+            ExecFrame::Stdout(bytes) => {
+                output.extend_from_slice(&bytes);
+                trace.push(bytes);
+            }
+            ExecFrame::Exit(code) => {
+                assert_eq!(code, 0);
+                break;
+            }
+        }
+    }
+
+    assert_eq!(
+        trace,
+        vec![
+            b"\x1b[>4;2m/dev/pts/0".to_vec(),
+            b"\r\n".to_vec(),
+            b"ok\r\n".to_vec(),
+        ]
+    );
+    assert_eq!(output, b"\x1b[>4;2m/dev/pts/0\r\nok\r\n");
+}
+
+#[tokio::test]
 async fn tty_forwards_plain_text_frames_as_output() {
     let mock = start_mock(vec![script(vec![
         Out::Text("hello"),
@@ -250,21 +320,120 @@ async fn tty_forwards_plain_text_frames_as_output() {
 }
 
 #[tokio::test]
-async fn non_tty_replay_separates_stdout_stderr_and_exit() {
+async fn non_tty_replay_preserves_exit_after_stdout_stderr_and_normal_close() {
     let mock = start_mock(vec![script(vec![
         session_info(),
         Out::Bin([vec![1], b"out\n".to_vec()].concat()),
         Out::Bin([vec![2], b"warn\n".to_vec()].concat()),
-        Out::Bin(vec![3, 0]),
+        Out::Bin(vec![3, 7]),
+        Out::Close,
     ])]);
 
     let (code, output) = provider(&mock)
         .run_exec("tgtest1", &["sh".into()], None, &[])
         .await
         .unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(output, "out\n");
-    assert!(!output.contains("warn"));
+    assert_eq!(code, 7);
+    assert_eq!(output, "out\n\n[stderr, last 5 bytes]\nwarn\n");
+    assert_eq!(
+        requests(&mock).len(),
+        1,
+        "replay must not retry the command"
+    );
+}
+
+#[tokio::test]
+async fn non_tty_streaming_owner_drop_half_closes_and_preserves_report() {
+    let mock = start_mock(vec![script(vec![
+        Out::Text(
+            r#"{"type":"session_info","session_id":"1847","command":"sh","created":1767609000,"cols":0,"rows":0,"is_owner":true,"tty":false}"#,
+        ),
+        Out::WaitForStdinEof,
+        Out::Bin([vec![1], b"out\n".to_vec()].concat()),
+        Out::Bin([vec![2], b"warn\n".to_vec()].concat()),
+        Out::Bin(vec![3, 7]),
+        Out::Close,
+    ])]);
+
+    let spec = ExecSpec {
+        argv: vec!["sh".into()],
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    };
+    let streaming = provider(&mock)
+        .open_exec_streaming("tgtest1", &spec)
+        .await
+        .unwrap();
+    let thegn_svc::provider::StreamingExec {
+        session,
+        stderr,
+        verdict,
+    } = streaming;
+    let thegn_svc::provider::ExecSession {
+        mut frames,
+        control,
+        session_id,
+    } = session;
+    drop(control);
+    drop(session_id);
+
+    let mut received = Vec::new();
+    while let Some(frame) = frames.recv().await {
+        received.push(frame);
+    }
+    assert_eq!(
+        received,
+        vec![ExecFrame::Stdout(b"out\n".to_vec()), ExecFrame::Exit(7)]
+    );
+    assert_eq!(stderr.total(), 5);
+    assert_eq!(stderr.render(), "warn\n");
+    assert_eq!(verdict.await.unwrap(), None);
+    assert_eq!(
+        requests(&mock).len(),
+        1,
+        "streaming must not retry the command"
+    );
+}
+
+#[tokio::test]
+async fn non_tty_streaming_owner_drop_preserves_typed_protocol_report() {
+    let mock = start_mock(vec![script(vec![
+        Out::WaitForStdinEof,
+        Out::Bin(vec![3, 7]),
+        Out::Bin(vec![3, 8]),
+        Out::Close,
+    ])]);
+    let spec = ExecSpec {
+        argv: vec!["sh".into()],
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    };
+    let streaming = provider(&mock)
+        .open_exec_streaming("tgtest1", &spec)
+        .await
+        .unwrap();
+    let thegn_svc::provider::StreamingExec {
+        session, verdict, ..
+    } = streaming;
+    let thegn_svc::provider::ExecSession {
+        mut frames,
+        control,
+        ..
+    } = session;
+    drop(control);
+
+    assert_eq!(frames.recv().await, Some(ExecFrame::Exit(7)));
+    assert_eq!(frames.recv().await, None);
+    assert_eq!(
+        verdict.await.unwrap(),
+        Some(ExecProtocolError::DuplicateExit)
+    );
 }
 
 #[tokio::test]

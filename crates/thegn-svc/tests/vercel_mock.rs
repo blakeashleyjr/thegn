@@ -517,6 +517,27 @@ fn delete_and_stop_treat_404_as_success_and_use_their_paths() {
 }
 
 #[test]
+fn stop_sends_a_json_body_or_the_mock_answers_415() {
+    let mock = Mock::start(|r| {
+        if r.header("content-type").starts_with("application/json") {
+            Reply::json("200 OK", serde_json::json!({}))
+        } else {
+            Reply::json(
+                "415 Unsupported Media Type",
+                serde_json::json!({"error": {"message": "Unsupported Media Type"}}),
+            )
+        }
+    });
+    rt().block_on(mock.client().stop("sess_1"))
+        .expect("stop sends a JSON content type");
+    let reqs = mock.requests();
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path(), "/v2/sandboxes/sessions/sess_1/stop");
+    assert_eq!(reqs[0].json(), serde_json::json!({}));
+    mock.assert_custody(&[]);
+}
+
+#[test]
 fn stop_and_kill_treat_410_as_already_stopped() {
     let mock = Mock::start(|_| {
         Reply::json(

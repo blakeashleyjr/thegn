@@ -322,7 +322,19 @@ name_from_ledger() { # exactly one record, safe charset
 egress_denied() {
   local out
   out="$("$THEGN_BIN" vercel-exec "$SANDBOX_NAME" -- sh -c 'curl -m 5 -sS -o /dev/null https://example.com; echo "curl_rc=$?"' </dev/null)" || return 1
-  case "$out" in *curl_rc=0* | *curl_rc=127*) return 1 ;; *curl_rc=*) return 0 ;; *) return 1 ;; esac
+  printf '%s\n' "$out" | grep 'curl_rc=' >&2 || echo "no curl_rc line in output: $out" >&2
+  case "$out" in
+  *curl_rc=0*)
+    echo "egress is OPEN: curl reached example.com (curl_rc=0)" >&2
+    return 1
+    ;;
+  *curl_rc=127*)
+    echo "curl missing in the sandbox image; egress not tested (curl_rc=127)" >&2
+    return 1
+    ;;
+  *curl_rc=*) return 0 ;;
+  *) return 1 ;;
+  esac
 }
 
 response_shapes_parsed() {

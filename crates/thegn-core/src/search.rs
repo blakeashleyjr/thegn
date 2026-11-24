@@ -45,6 +45,7 @@ impl SearchScope {
 
     /// Cycle to the next wider scope (wraps from Workspace → Pane). `Profile`
     /// is not part of the cycle (the variant stays; a stray one re-enters at Pane).
+    #[must_use]
     pub fn widen(self, pane_id: u32) -> SearchScope {
         match self {
             SearchScope::Pane(_) => SearchScope::Tab,
@@ -55,6 +56,7 @@ impl SearchScope {
     }
 
     /// Cycle to the next narrower scope (wraps from Pane → Workspace).
+    #[must_use]
     pub fn narrow(self, pane_id: u32) -> SearchScope {
         match self {
             SearchScope::Pane(_) => SearchScope::Workspace,

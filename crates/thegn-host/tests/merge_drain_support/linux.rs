@@ -36,7 +36,10 @@ fn lexical_tool(name: &str) -> PathBuf {
     };
     let target = path.canonicalize().unwrap();
     let metadata = target.metadata().unwrap();
-    assert!(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    assert!(
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        "lexical tool {name} must be an executable regular file"
+    );
     // Keep the lexical basename: Nix sh/sleep-style multicall entrypoints must
     // not be invoked using the canonical package binary's different argv[0].
     path
@@ -106,7 +109,11 @@ impl Fixture {
             .map(|e| e.unwrap().file_name())
             .collect::<Vec<_>>();
         bins.sort();
-        assert_eq!(bins, ["git", "sh"].map(std::ffi::OsString::from));
+        assert_eq!(
+            bins,
+            ["git", "sh"].map(std::ffi::OsString::from),
+            "fixture bin dir must hold exactly the git and sh symlinks, got {bins:?}"
+        );
         for name in [
             "nice",
             "ionice",
@@ -119,7 +126,10 @@ impl Fixture {
             "claude",
             "codex",
         ] {
-            assert!(!root.path().join("bin").join(name).exists());
+            assert!(
+                !root.path().join("bin").join(name).exists(),
+                "fixture bin dir must not provide {name} on PATH"
+            );
         }
         fs::write(root.path().join("gitconfig"), "").unwrap();
         fs::write(root.path().join("empty-rc"), "").unwrap();
@@ -226,20 +236,62 @@ agent_on_floor_miss = "fail"
             "private configuration errors: {errors:?}"
         );
         let cfg: Config = toml::from_str(&text).unwrap();
-        assert!(!cfg.automations.enabled && !cfg.daemon.enabled && !cfg.sandbox.enabled);
-        assert!(cfg.automations.rules.is_empty() && cfg.env.is_empty());
-        assert!(!cfg.sandbox.inject_devshell);
-        assert_eq!(cfg.sandbox.warm_direnv.as_str(), "off");
-        assert_eq!(cfg.sandbox.backend.as_str(), "none");
-        assert_eq!(cfg.sandbox.limits.cpu.as_deref(), Some(""));
-        assert_eq!(cfg.sandbox.limits.cpu_total.as_deref(), Some("off"));
-        assert_eq!(cfg.sandbox.limits.memory.as_deref(), Some(""));
-        assert_eq!(cfg.sandbox.limits.memory_total.as_deref(), Some("off"));
+        assert!(
+            !cfg.automations.enabled && !cfg.daemon.enabled && !cfg.sandbox.enabled,
+            "fixture config must disable automations, daemon and sandbox"
+        );
+        assert!(
+            cfg.automations.rules.is_empty() && cfg.env.is_empty(),
+            "fixture config must define no automation rules and no env overrides"
+        );
+        assert!(
+            !cfg.sandbox.inject_devshell,
+            "fixture config must disable devshell injection"
+        );
+        assert_eq!(
+            cfg.sandbox.warm_direnv.as_str(),
+            "off",
+            "fixture sandbox.warm_direnv must be off"
+        );
+        assert_eq!(
+            cfg.sandbox.backend.as_str(),
+            "none",
+            "fixture sandbox.backend must be none"
+        );
+        assert_eq!(
+            cfg.sandbox.limits.cpu.as_deref(),
+            Some(""),
+            "fixture sandbox cpu limit must be the empty string"
+        );
+        assert_eq!(
+            cfg.sandbox.limits.cpu_total.as_deref(),
+            Some("off"),
+            "fixture sandbox cpu_total limit must be off"
+        );
+        assert_eq!(
+            cfg.sandbox.limits.memory.as_deref(),
+            Some(""),
+            "fixture sandbox memory limit must be the empty string"
+        );
+        assert_eq!(
+            cfg.sandbox.limits.memory_total.as_deref(),
+            Some("off"),
+            "fixture sandbox memory_total limit must be off"
+        );
         let mq = &cfg.merge_queue;
-        assert!(mq.enabled && mq.gate_on);
+        assert!(
+            mq.enabled && mq.gate_on,
+            "fixture merge queue must be enabled with gate_on set"
+        );
         match options.agent {
-            AgentMode::HeldAtFloor => assert!(mq.agent_sandbox),
-            AgentMode::HostFifo => assert!(!mq.agent_sandbox),
+            AgentMode::HeldAtFloor => assert!(
+                mq.agent_sandbox,
+                "held-at-floor fixture must set merge_queue.agent_sandbox"
+            ),
+            AgentMode::HostFifo => assert!(
+                !mq.agent_sandbox,
+                "host-fifo fixture must clear merge_queue.agent_sandbox"
+            ),
         }
         if !options.auto_land && gate_command == GATE {
             assert!(
@@ -247,35 +299,83 @@ agent_on_floor_miss = "fail"
                     && !mq.snapshot_dirty
                     && !mq.organize_folders
                     && !mq.sign_commits
-                    && !mq.gate_reuse_worktree
+                    && !mq.gate_reuse_worktree,
+                "default gate fixture must disable auto_land, snapshot_dirty, organize_folders, sign_commits and gate_reuse_worktree"
             );
-            assert_eq!(mq.gate_command, GATE);
+            assert_eq!(
+                mq.gate_command, GATE,
+                "default gate fixture must use the GATE command"
+            );
         } else {
             assert!(
                 !mq.snapshot_dirty
                     && !mq.organize_folders
                     && !mq.sign_commits
-                    && !mq.gate_reuse_worktree
+                    && !mq.gate_reuse_worktree,
+                "custom gate fixture must disable snapshot_dirty, organize_folders, sign_commits and gate_reuse_worktree"
             );
-            assert_eq!(mq.auto_land, options.auto_land);
-            assert_eq!(mq.gate_command, gate_command);
+            assert_eq!(
+                mq.auto_land, options.auto_land,
+                "merge_queue.auto_land must match the fixture option"
+            );
+            assert_eq!(
+                mq.gate_command, gate_command,
+                "merge_queue.gate_command must match the fixture gate"
+            );
         }
-        assert_eq!(mq.on_landed, OnLanded::Off);
-        assert_eq!(mq.conflict_handoff, ConflictHandoff::Agent);
-        assert_eq!(mq.agent_isolation_floor, IsolationFloor::GuestKernel);
+        assert_eq!(
+            mq.on_landed,
+            OnLanded::Off,
+            "merge_queue.on_landed must be off"
+        );
+        assert_eq!(
+            mq.conflict_handoff,
+            ConflictHandoff::Agent,
+            "merge_queue.conflict_handoff must be agent"
+        );
+        assert_eq!(
+            mq.agent_isolation_floor,
+            IsolationFloor::GuestKernel,
+            "merge_queue.agent_isolation_floor must be guest-kernel"
+        );
         if options.agent == AgentMode::HostFifo {
-            assert_eq!(mq.agent_timeout_secs, 120);
-            assert_eq!(cfg.sandbox.isolation_floor, Some(IsolationFloor::Off));
+            assert_eq!(
+                mq.agent_timeout_secs, 120,
+                "host-fifo fixture must set agent_timeout_secs to 120"
+            );
+            assert_eq!(
+                cfg.sandbox.isolation_floor,
+                Some(IsolationFloor::Off),
+                "host-fifo fixture must set sandbox isolation_floor to off"
+            );
         } else {
-            assert_eq!(mq.agent_timeout_secs, 1);
-            assert_eq!(mq.agent_isolation_floor, IsolationFloor::GuestKernel);
+            assert_eq!(
+                mq.agent_timeout_secs, 1,
+                "held-at-floor fixture must set agent_timeout_secs to 1"
+            );
+            assert_eq!(
+                mq.agent_isolation_floor,
+                IsolationFloor::GuestKernel,
+                "held-at-floor fixture must keep agent_isolation_floor at guest-kernel"
+            );
         }
-        assert_eq!(mq.agent_on_floor_miss, OnFloorMiss::Fail);
-        assert_eq!(mq.agent_max_attempts, 3);
-        assert!(mq.regenerate_paths.is_empty() && mq.gate_target_dir.is_empty());
+        assert_eq!(
+            mq.agent_on_floor_miss,
+            OnFloorMiss::Fail,
+            "merge_queue.agent_on_floor_miss must be fail"
+        );
+        assert_eq!(
+            mq.agent_max_attempts, 3,
+            "merge_queue.agent_max_attempts must be 3"
+        );
+        assert!(
+            mq.regenerate_paths.is_empty() && mq.gate_target_dir.is_empty(),
+            "fixture must not regenerate paths or set a gate target dir"
+        );
         assert_eq!(
             thegn_core::agent_task::resolve_agent(&cfg, &mq.agent, &mq.agent_command),
-            Some(command)
+            Some(command),
+            "resolved agent command must match the fixture command"
         );
         let config = root.path().join("fixture.toml");
         fs::write(&config, text).unwrap();
@@ -290,7 +390,10 @@ agent_on_floor_miss = "fail"
             agent_guard: None,
             root,
         };
-        assert!(!fixture.db_path().exists());
+        assert!(
+            !fixture.db_path().exists(),
+            "fixture must start without a private database"
+        );
         fixture.record("manifest", json!({
             "kind":"THE219-private-actual-merge-drain", "native_platform":"linux",
             "binary":env!("CARGO_BIN_EXE_thegn"), "binary_sha256":fixture.binary_hash,
@@ -359,7 +462,10 @@ agent_on_floor_miss = "fail"
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        assert!(!environment.contains_key("HOME") && !environment.contains_key("THEGN_PROFILE"));
+        assert!(
+            !environment.contains_key("HOME") && !environment.contains_key("THEGN_PROFILE"),
+            "CLI environment must not inherit HOME or THEGN_PROFILE"
+        );
         let out = custody::run(cmd, Arc::clone(&self.root), self.serial);
         let cleanup: Value = serde_json::from_slice(
             &fs::read(
@@ -370,9 +476,18 @@ agent_on_floor_miss = "fail"
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(cleanup["leader_reaped"], true);
-        assert_eq!(cleanup["retained"], false);
-        assert_eq!(cleanup["identity_lost"], false);
+        assert_eq!(
+            cleanup["leader_reaped"], true,
+            "cleanup receipt must show the leader reaped"
+        );
+        assert_eq!(
+            cleanup["retained"], false,
+            "cleanup receipt must show the process was not retained"
+        );
+        assert_eq!(
+            cleanup["identity_lost"], false,
+            "cleanup receipt must not report a lost process identity"
+        );
         fs::write(self.root.path().join(format!("receipts/{}.json", self.serial)), serde_json::to_vec_pretty(&json!({"sequence":self.serial,"argv":argv,"environment":environment,"thegn_binary_sha256":self.binary_hash,"exit_code":out.status.code(),"elapsed_ms":out.elapsed_ms,"stdout":out.stdout,"stderr":out.stderr,"cleanup":cleanup})).unwrap()).unwrap();
         out
     }
@@ -395,7 +510,10 @@ agent_on_floor_miss = "fail"
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        assert!(!environment.contains_key("HOME") && !environment.contains_key("THEGN_PROFILE"));
+        assert!(
+            !environment.contains_key("HOME") && !environment.contains_key("THEGN_PROFILE"),
+            "CLI environment must not inherit HOME or THEGN_PROFILE"
+        );
         self.started.insert(self.serial, (rendered, environment));
         custody::start(command, Arc::clone(&self.root), self.serial)
     }
@@ -425,9 +543,18 @@ agent_on_floor_miss = "fail"
             .unwrap(),
         )
         .unwrap();
-        assert!(cleanup["leader_reaped"].as_bool().unwrap());
-        assert!(!cleanup["retained"].as_bool().unwrap());
-        assert!(!cleanup["identity_lost"].as_bool().unwrap());
+        assert!(
+            cleanup["leader_reaped"].as_bool().unwrap(),
+            "cleanup receipt {sequence} must show the leader reaped"
+        );
+        assert!(
+            !cleanup["retained"].as_bool().unwrap(),
+            "cleanup receipt {sequence} must show the process was not retained"
+        );
+        assert!(
+            !cleanup["identity_lost"].as_bool().unwrap(),
+            "cleanup receipt {sequence} must not report a lost process identity"
+        );
         fs::write(
             self.root.path().join(format!("receipts/{sequence}.json")),
             serde_json::to_vec_pretty(&json!({"sequence":sequence,"argv":argv,"environment":environment,"thegn_binary_sha256":self.binary_hash,"exit_code":out.status.code(),"elapsed_ms":out.elapsed_ms,"stdout":out.stdout,"stderr":out.stderr,"cleanup":cleanup})).unwrap(),
@@ -569,7 +696,11 @@ fn make_gate_fifo(root: &Path, name: &str) {
     let path = std::ffi::CString::new(root.join(name).to_str().unwrap()).unwrap();
     // SAFETY: path is a valid NUL-terminated private fixture path; mode limits
     // the FIFO to the test's owner.
-    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    assert_eq!(
+        unsafe { libc::mkfifo(path.as_ptr(), 0o600) },
+        0,
+        "mkfifo must create gate FIFO {name}"
+    );
 }
 
 struct GateReleaseGuard {
@@ -818,10 +949,22 @@ enum Case {
     RedGate,
 }
 fn assert_summary(doc: &Value, ready: &[&str], deferred: &[&str], agent_blocked: &[&str]) {
-    assert_eq!(doc["target"], "main");
-    assert_eq!(doc["ready"], json!(ready));
-    assert_eq!(doc["deferred"], json!(deferred));
-    assert_eq!(doc["agent_blocked"], json!(agent_blocked));
+    assert_eq!(doc["target"], "main", "drain summary target must be main");
+    assert_eq!(
+        doc["ready"],
+        json!(ready),
+        "drain summary ready list must be {ready:?}"
+    );
+    assert_eq!(
+        doc["deferred"],
+        json!(deferred),
+        "drain summary deferred list must be {deferred:?}"
+    );
+    assert_eq!(
+        doc["agent_blocked"],
+        json!(agent_blocked),
+        "drain summary agent_blocked list must be {agent_blocked:?}"
+    );
     for field in [
         "landed",
         "gate_error",
@@ -843,7 +986,10 @@ fn assert_summary(doc: &Value, ready: &[&str], deferred: &[&str], agent_blocked:
         ("persistence_errors", 0),
         ("bookkeeping_failed", 0),
     ] {
-        assert_eq!(doc["counts"][field], count);
+        assert_eq!(
+            doc["counts"][field], count,
+            "drain summary count {field} must be {count}"
+        );
     }
 }
 fn row<'a>(rows: &'a [MergeQueueRow], branch: &str) -> &'a MergeQueueRow {
@@ -911,16 +1057,21 @@ fn exercise(case: Case) {
         clean.to_str().unwrap(),
     ]);
     let listed = f.json(&["merge", "list", "--json"]);
-    assert_eq!(listed.as_array().unwrap().len(), 2);
+    assert_eq!(
+        listed.as_array().unwrap().len(),
+        2,
+        "merge list must report two rows"
+    );
     let initial = f.rows();
-    assert_eq!(initial.len(), 2);
+    assert_eq!(initial.len(), 2, "fixture must seed two queue rows");
     assert!(
         initial
             .iter()
-            .all(|r| r.agent_attempts == 0 && r.status == "queued")
+            .all(|r| r.agent_attempts == 0 && r.status == "queued"),
+        "both seeded rows must start queued with zero attempts"
     );
     let sql = Connection::open(f.db_path()).unwrap();
-    assert_eq!(sql.execute("UPDATE merge_queue SET agent_attempts=1,result_oid='stale',conflict_paths='stale-path',error_detail='stale-diagnostic' WHERE worktree=?1",[held.to_str().unwrap()]).unwrap(),1);
+    assert_eq!(sql.execute("UPDATE merge_queue SET agent_attempts=1,result_oid='stale',conflict_paths='stale-path',error_detail='stale-diagnostic' WHERE worktree=?1",[held.to_str().unwrap()]).unwrap(),1, "seeding the held row must update exactly one row");
     // Freeze explicit oldest-first ordering. Equal second-resolution enqueue
     // timestamps must not let clean execute before the held branch and mask a
     // regression that aborts the entire drain on its infrastructure hold.
@@ -931,7 +1082,8 @@ fn exercise(case: Case) {
             rusqlite::params![clean.to_str().unwrap(), first_time.checked_add(1).unwrap()]
         )
         .unwrap(),
-        1
+        1,
+        "moving the clean row enqueue time must update exactly one row"
     );
     sql.execute_batch("CREATE TABLE fixture_status_audit(seq INTEGER PRIMARY KEY,worktree TEXT NOT NULL,old_status TEXT NOT NULL,new_status TEXT NOT NULL,result_oid TEXT,conflict_paths TEXT,error_detail TEXT,attempts INTEGER); CREATE TRIGGER fixture_every_status AFTER UPDATE OF status ON merge_queue BEGIN INSERT INTO fixture_status_audit(worktree,old_status,new_status,result_oid,conflict_paths,error_detail,attempts) VALUES(NEW.worktree,OLD.status,NEW.status,NEW.result_oid,NEW.conflict_paths,NEW.error_detail,NEW.agent_attempts); END;").unwrap();
     drop(sql);
@@ -942,7 +1094,8 @@ fn exercise(case: Case) {
             .iter()
             .map(|r| r.branch.as_str())
             .collect::<Vec<_>>(),
-        ["held", "clean"]
+        ["held", "clean"],
+        "seeded queue must be held then clean, in that order"
     );
     f.record(
         "setup",
@@ -955,23 +1108,58 @@ fn exercise(case: Case) {
     let first = f.json(&["merge", "drain", "--json"]);
     assert_summary(&first, &["clean"], &[], &["held"]);
     let after = f.snapshot();
-    assert_eq!(after, before);
+    assert_eq!(
+        after, before,
+        "first drain must leave refs, registrations and files unchanged"
+    );
     let rows = f.rows();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.len(),
+        2,
+        "queue must still hold two rows after the first drain"
+    );
     let blocked = row(&rows, "held");
     let old = row(&rows_before, "held");
-    assert_eq!(blocked.status, "agent_blocked");
-    assert_eq!(blocked.agent_attempts, 1);
-    assert!(blocked.result_oid.is_none() && blocked.conflict_paths.is_none());
+    assert_eq!(
+        blocked.status, "agent_blocked",
+        "held row must be agent_blocked after the first drain"
+    );
+    assert_eq!(
+        blocked.agent_attempts, 1,
+        "held row must have consumed exactly one agent attempt"
+    );
+    assert!(
+        blocked.result_oid.is_none() && blocked.conflict_paths.is_none(),
+        "agent_blocked row must have no result oid or conflict paths"
+    );
     let detail = blocked.error_detail.as_deref().unwrap_or_default();
     assert!(detail.starts_with(HOLD), "{detail}");
     assert!(detail.contains("never fall back to the host"), "{detail}");
-    assert_eq!(blocked.queued_at, old.queued_at);
-    assert_eq!(blocked.worktree, old.worktree);
-    assert_eq!(blocked.branch, old.branch);
-    assert_eq!(blocked.target_branch, old.target_branch);
-    assert_eq!(blocked.location, old.location);
-    assert_eq!(row(&rows, "clean").status, "ready");
+    assert_eq!(
+        blocked.queued_at, old.queued_at,
+        "agent_blocked row must keep its original enqueue time"
+    );
+    assert_eq!(
+        blocked.worktree, old.worktree,
+        "agent_blocked row must keep its original worktree"
+    );
+    assert_eq!(
+        blocked.branch, old.branch,
+        "agent_blocked row must keep its original branch"
+    );
+    assert_eq!(
+        blocked.target_branch, old.target_branch,
+        "agent_blocked row must keep its original target branch"
+    );
+    assert_eq!(
+        blocked.location, old.location,
+        "agent_blocked row must keep its original location"
+    );
+    assert_eq!(
+        row(&rows, "clean").status,
+        "ready",
+        "clean row must be ready after the first drain"
+    );
     let audit = f.audit();
     for (path, statuses) in [
         (held.to_str().unwrap(), vec!["folding", "agent_blocked"]),
@@ -983,10 +1171,15 @@ fn exercise(case: Case) {
                 .filter(|(p, _)| p == path)
                 .map(|(_, s)| s.as_str())
                 .collect::<Vec<_>>(),
-            statuses
+            statuses,
+            "audit trail for {path} must be {statuses:?}"
         );
     }
-    assert_eq!(audit.len(), 4);
+    assert_eq!(
+        audit.len(),
+        4,
+        "audit trail must contain exactly four status transitions"
+    );
     assert_eq!(
         audit,
         vec![
@@ -994,9 +1187,13 @@ fn exercise(case: Case) {
             (held.to_str().unwrap().into(), "agent_blocked".into()),
             (clean.to_str().unwrap().into(), "folding".into()),
             (clean.to_str().unwrap().into(), "ready".into())
-        ]
+        ],
+        "audit trail must be folding then agent_blocked for held, folding then ready for clean"
     );
-    assert!(!f.root.path().join("agent-ran").exists());
+    assert!(
+        !f.root.path().join("agent-ran").exists(),
+        "agent sentinel must not run during the first drain"
+    );
     f.record(
         "phase1-after",
         json!({"summary":first,"snapshot":after,"rows":rows,"audit":audit}),
@@ -1023,13 +1220,16 @@ fn exercise(case: Case) {
     }
     f.git(&held, &["commit", "-qm", "private intentional repair"]);
     let new_tip = f.git(&repo, &["rev-parse", "held"]);
-    assert_ne!(new_tip, old_tip);
+    assert_ne!(new_tip, old_tip, "repair must move the held branch tip");
     let delta = f.git(&repo, &["diff", "--name-only", &old_tip, &new_tip]);
     let expected = match case {
         Case::Conflict => "conflict.txt\nrepaired.txt",
         Case::RedGate => "red-gate-marker\nrepaired.txt",
     };
-    assert_eq!(delta, expected);
+    assert_eq!(
+        delta, expected,
+        "repair must change exactly the expected paths"
+    );
     assert_eq!(
         f.rows(),
         rows,
@@ -1054,7 +1254,8 @@ fn exercise(case: Case) {
         after["registrations"]
             .as_str()
             .unwrap()
-            .replace(&format!("HEAD {old_tip}"), &format!("HEAD {new_tip}"))
+            .replace(&format!("HEAD {old_tip}"), &format!("HEAD {new_tip}")),
+        "repair must change only the HEAD line of worktree registrations"
     );
     let mut expected_files = after["files"].as_object().unwrap().clone();
     match case {
@@ -1072,7 +1273,11 @@ fn exercise(case: Case) {
         held.join("repaired.txt").to_str().unwrap().into(),
         json!(b"desired repair\n".to_vec()),
     );
-    assert_eq!(second_before["files"], Value::Object(expected_files));
+    assert_eq!(
+        second_before["files"],
+        Value::Object(expected_files),
+        "repair must change only the expected files"
+    );
     f.record(
         "repair",
         json!({"old_tip":old_tip,"new_tip":new_tip,"changed_paths":delta,"snapshot":second_before}),
@@ -1080,34 +1285,75 @@ fn exercise(case: Case) {
     let second = f.json(&["merge", "drain", "--json"]);
     assert_summary(&second, &["held"], &[], &[]);
     let second_after = f.snapshot();
-    assert_eq!(second_after, second_before);
+    assert_eq!(
+        second_after, second_before,
+        "second drain must leave the snapshot unchanged"
+    );
     let final_rows = f.rows();
     let ready = row(&final_rows, "held");
-    assert_eq!(ready.status, "ready");
-    assert_eq!(ready.agent_attempts, 1);
-    assert!(ready.conflict_paths.is_none());
+    assert_eq!(ready.status, "ready", "recovered held row must be ready");
+    assert_eq!(
+        ready.agent_attempts, 1,
+        "recovered held row must keep its consumed agent attempt"
+    );
+    assert!(
+        ready.conflict_paths.is_none(),
+        "recovered held row must have no conflict paths"
+    );
     assert_eq!(
         ready.error_detail.as_deref(),
-        Some("gated green — awaiting land")
+        Some("gated green — awaiting land"),
+        "recovered held row must report gated green, awaiting land"
     );
-    assert_eq!(ready.queued_at, blocked.queued_at);
-    assert_eq!(ready.worktree, blocked.worktree);
-    assert_eq!(ready.branch, blocked.branch);
-    assert_eq!(ready.target_branch, blocked.target_branch);
-    assert_eq!(ready.location, blocked.location);
-    assert_eq!(row(&final_rows, "clean"), row(&rows, "clean"));
+    assert_eq!(
+        ready.queued_at, blocked.queued_at,
+        "recovered held row must keep its original enqueue time"
+    );
+    assert_eq!(
+        ready.worktree, blocked.worktree,
+        "recovered held row must keep its original worktree"
+    );
+    assert_eq!(
+        ready.branch, blocked.branch,
+        "recovered held row must keep its original branch"
+    );
+    assert_eq!(
+        ready.target_branch, blocked.target_branch,
+        "recovered held row must keep its original target branch"
+    );
+    assert_eq!(
+        ready.location, blocked.location,
+        "recovered held row must keep its original location"
+    );
+    assert_eq!(
+        row(&final_rows, "clean"),
+        row(&rows, "clean"),
+        "clean row must be unchanged by the repair drain"
+    );
     let oid = ready.result_oid.as_ref().unwrap();
-    assert_eq!(f.git(&repo, &["cat-file", "-t", oid]), "commit");
+    assert_eq!(
+        f.git(&repo, &["cat-file", "-t", oid]),
+        "commit",
+        "result oid of the held row must name a commit"
+    );
     assert_eq!(
         f.audit(),
         vec![
             (held.to_str().unwrap().into(), "folding".into()),
             (held.to_str().unwrap().into(), "ready".into())
-        ]
+        ],
+        "held row audit must be folding then ready"
     );
-    assert!(!f.root.path().join("agent-ran").exists());
+    assert!(
+        !f.root.path().join("agent-ran").exists(),
+        "agent sentinel must not run during the repair drain"
+    );
     let final_list = f.json(&["merge", "list", "--json"]);
-    assert_eq!(final_list.as_array().unwrap().len(), 2);
+    assert_eq!(
+        final_list.as_array().unwrap().len(),
+        2,
+        "merge list must still report two rows"
+    );
     f.record("phase2-after",json!({"summary":second,"snapshot":second_after,"rows":final_rows,"audit":f.audit(),"list":final_list}));
     f.close();
 }
@@ -1143,39 +1389,89 @@ fn race_agent_two_cli_drains_dispatch_one_agent() {
     let root = f.root.path().to_path_buf();
     let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
     let owner = f.start_cli(&["merge", "drain", "--json"]);
-    assert!(owner.pid() > 0);
+    assert!(owner.pid() > 0, "owner drain must have a live process id");
     wait_gate_count(&root, "agent-runs", "agent-start ", 1);
     let owner_state = row_state(&f);
-    assert_eq!(owner_state.status, "agent_running");
-    assert_eq!(owner_state.agent_attempts, 1);
-    assert_eq!(owner_state.phase, "claimed_no_child");
+    assert_eq!(
+        owner_state.status, "agent_running",
+        "owner must hold the row in agent_running"
+    );
+    assert_eq!(
+        owner_state.agent_attempts, 1,
+        "owner must have consumed exactly one agent attempt"
+    );
+    assert_eq!(
+        owner_state.phase, "claimed_no_child",
+        "owner must have written claimed_no_child before the agent starts"
+    );
 
     let loser = f.json(&["merge", "drain", "--json"]);
-    assert!(loser["warnings"].as_array().unwrap().iter().any(|warning| {
-        warning.as_str().is_some_and(|warning| {
-            warning.contains("feature") && warning.contains("claimed by another drain")
-        })
-    }));
-    assert_eq!(gate_count(&root, "agent-runs", "agent-start "), 1);
+    assert!(
+        loser["warnings"].as_array().unwrap().iter().any(|warning| {
+            warning.as_str().is_some_and(|warning| {
+                warning.contains("feature") && warning.contains("claimed by another drain")
+            })
+        }),
+        "second drain must warn that the feature row is claimed by another drain"
+    );
+    assert_eq!(
+        gate_count(&root, "agent-runs", "agent-start "),
+        1,
+        "second drain must not start another agent"
+    );
     let after_loser = row_state(&f);
-    assert_eq!(after_loser.agent_attempts, owner_state.agent_attempts);
-    assert_eq!(after_loser.generation, owner_state.generation);
-    assert_eq!(after_loser.status, owner_state.status);
+    assert_eq!(
+        after_loser.agent_attempts, owner_state.agent_attempts,
+        "second drain must not consume agent attempts"
+    );
+    assert_eq!(
+        after_loser.generation, owner_state.generation,
+        "second drain must not change the claim generation"
+    );
+    assert_eq!(
+        after_loser.status, owner_state.status,
+        "second drain must not change the row status"
+    );
 
     release_gate(&root, "agent-hold", "agent-open");
     let winner = f.finish_cli(owner);
-    assert!(winner.status.success());
+    assert!(
+        winner.status.success(),
+        "owner drain must exit successfully after the agent is released"
+    );
     let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
-    assert_eq!(winner_json["needs_human"], json!(["feature"]));
+    assert_eq!(
+        winner_json["needs_human"],
+        json!(["feature"]),
+        "owner drain must report feature as needs_human"
+    );
     let final_row = row_state(&f);
-    assert_eq!(final_row.status, "needs_human");
-    assert_eq!(final_row.agent_attempts, 3);
-    assert_eq!(final_row.phase, "unclaimed");
-    assert_eq!(gate_count(&root, "agent-runs", "agent-start "), 3);
-    assert_eq!(gate_count(&root, "agent-runs", "agent-end "), 3);
+    assert_eq!(
+        final_row.status, "needs_human",
+        "row must end as needs_human"
+    );
+    assert_eq!(
+        final_row.agent_attempts, 3,
+        "row must have exhausted three agent attempts"
+    );
+    assert_eq!(
+        final_row.phase, "unclaimed",
+        "needs_human row must be unclaimed"
+    );
+    assert_eq!(
+        gate_count(&root, "agent-runs", "agent-start "),
+        3,
+        "exactly three agent attempts must start"
+    );
+    assert_eq!(
+        gate_count(&root, "agent-runs", "agent-end "),
+        3,
+        "every started agent attempt must end"
+    );
     assert_eq!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
-        target_before
+        target_before,
+        "needs_human run must leave main at its captured commit"
     );
     agent_release.disarm();
     f.close();
@@ -1202,11 +1498,24 @@ fn race_agent_killed_owner_row_is_not_recovered_after_lease_expiry() {
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "agent-runs", "agent-start ", 1);
     let killed = f.kill_cli(owner);
-    assert_eq!(killed.status.signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        killed.status.signal(),
+        Some(libc::SIGKILL),
+        "killed owner must die by SIGKILL"
+    );
     let crashed = row_state(&f);
-    assert_eq!(crashed.status, "agent_running");
-    assert_eq!(crashed.agent_attempts, 1);
-    assert_eq!(crashed.phase, "claimed_no_child");
+    assert_eq!(
+        crashed.status, "agent_running",
+        "crashed owner row must be agent_running"
+    );
+    assert_eq!(
+        crashed.agent_attempts, 1,
+        "crashed owner row must have consumed one agent attempt"
+    );
+    assert_eq!(
+        crashed.phase, "claimed_no_child",
+        "crashed owner row must be claimed_no_child"
+    );
 
     release_gate(&root, "agent-hold", "agent-open");
     wait_gate_count(&root, "agent-runs", "agent-end ", 1);
@@ -1221,17 +1530,35 @@ fn race_agent_killed_owner_row_is_not_recovered_after_lease_expiry() {
                 warning.as_str().is_some_and(|warning| {
                     warning.contains("feature: agent_running row is not claimable")
                 })
-            })
+            }),
+        "recovery drain must warn that the agent_running row is not claimable"
     );
     let after = row_state(&f);
-    assert_eq!(after.status, crashed.status);
-    assert_eq!(after.agent_attempts, crashed.agent_attempts);
-    assert_eq!(after.generation, crashed.generation);
-    assert_eq!(after.phase, crashed.phase);
-    assert_eq!(gate_count(&root, "agent-runs", "agent-start "), 1);
+    assert_eq!(
+        after.status, crashed.status,
+        "row status must be unchanged after the recovery refusal"
+    );
+    assert_eq!(
+        after.agent_attempts, crashed.agent_attempts,
+        "row agent attempts must be unchanged after the recovery refusal"
+    );
+    assert_eq!(
+        after.generation, crashed.generation,
+        "row generation must be unchanged after the recovery refusal"
+    );
+    assert_eq!(
+        after.phase, crashed.phase,
+        "row phase must be unchanged after the recovery refusal"
+    );
+    assert_eq!(
+        gate_count(&root, "agent-runs", "agent-start "),
+        1,
+        "the agent must still start only once"
+    );
     assert_eq!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
-        target_before
+        target_before,
+        "recovery refusal must leave main at its captured commit"
     );
     agent_release.disarm();
     f.close();
@@ -1258,16 +1585,23 @@ fn race_two_cli_drains_have_one_owner() {
     make_gate_fifo(&root, "gate-hold");
     let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
     let owner = f.start_cli(&["merge", "drain", "--json"]);
-    assert!(owner.pid() > 0);
+    assert!(owner.pid() > 0, "owner drain must have a live process id");
     wait_gate_count(&root, "gate-runs", "start ", 1);
     let owner_claimed = row_state(&f);
     let loser = f.json(&["merge", "drain", "--json"]);
-    assert!(loser["warnings"].as_array().unwrap().iter().any(|warning| {
-        warning.as_str().is_some_and(|warning| {
-            warning.contains("feature") && warning.contains("claimed by another drain")
-        })
-    }));
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert!(
+        loser["warnings"].as_array().unwrap().iter().any(|warning| {
+            warning.as_str().is_some_and(|warning| {
+                warning.contains("feature") && warning.contains("claimed by another drain")
+            })
+        }),
+        "second drain must warn that the feature row is claimed by another drain"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "second drain must not start a second gate"
+    );
     let after_loser = row_state(&f);
     assert_eq!(
         after_loser.agent_attempts, owner_claimed.agent_attempts,
@@ -1277,16 +1611,42 @@ fn race_two_cli_drains_have_one_owner() {
         after_loser.generation, owner_claimed.generation,
         "loser must not claim the row"
     );
-    assert_eq!(after_loser.status, owner_claimed.status);
+    assert_eq!(
+        after_loser.status, owner_claimed.status,
+        "second drain must not change the row status"
+    );
     release_gate(&root, "gate-hold", "gate-open");
     let winner = f.finish_cli(owner);
-    assert!(winner.status.success());
+    assert!(
+        winner.status.success(),
+        "owner drain must exit successfully after the gate is released"
+    );
     let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
-    assert_eq!(winner_json["ready"], json!(["feature"]));
-    assert_eq!(row_state(&f).status, "ready");
-    assert_eq!(row_state(&f).phase, "unclaimed");
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
-    assert_eq!(f.git(&repo, &["rev-parse", "refs/heads/main"]), before_ref);
+    assert_eq!(
+        winner_json["ready"],
+        json!(["feature"]),
+        "owner drain must report feature as ready"
+    );
+    assert_eq!(
+        row_state(&f).status,
+        "ready",
+        "row must be ready after the owner finishes"
+    );
+    assert_eq!(
+        row_state(&f).phase,
+        "unclaimed",
+        "ready row must be unclaimed"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "exactly one gate must start"
+    );
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        before_ref,
+        "drain must leave main at its captured commit with auto-land disabled"
+    );
     gate_release.disarm();
     f.close();
 }
@@ -1313,36 +1673,74 @@ fn race_worktree_delete_keeps_the_claimed_row() {
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "gate-runs", "start ", 1);
     let held = row_state(&f);
-    assert_eq!(held.status, "folding");
-    assert_ne!(held.phase, "unclaimed");
+    assert_eq!(
+        held.status, "folding",
+        "held row must be folding while the gate blocks"
+    );
+    assert_ne!(
+        held.phase, "unclaimed",
+        "held row must be claimed while the gate blocks"
+    );
 
     let removed = f.cli(&["wt", "rm", &worktree_s, "--force"]);
     assert!(removed.status.success(), "{}", removed.stderr);
-    assert!(!worktree.exists());
+    assert!(!worktree.exists(), "worktree must be removed from disk");
     let after_remove = row_state(&f);
-    assert_eq!(after_remove.status, held.status);
-    assert_eq!(after_remove.generation, held.generation);
-    assert_eq!(after_remove.phase, held.phase);
+    assert_eq!(
+        after_remove.status, held.status,
+        "wt rm must not change the row status"
+    );
+    assert_eq!(
+        after_remove.generation, held.generation,
+        "wt rm must not change the claim generation"
+    );
+    assert_eq!(
+        after_remove.phase, held.phase,
+        "wt rm must not change the claim phase"
+    );
     assert_eq!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
-        target_before
+        target_before,
+        "wt rm must not move main"
     );
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "wt rm must not start a second gate"
+    );
 
     release_gate(&root, "gate-hold", "gate-open");
     let finished = f.finish_cli(owner);
     assert!(finished.status.success(), "{}", finished.stderr);
     wait_gate_count(&root, "gate-runs", "end ", 1);
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "exactly one gate must start"
+    );
     let finished_json: Value = serde_json::from_str(&finished.stdout).unwrap();
     let final_row = row_state(&f);
-    assert_eq!(final_row.phase, "unclaimed");
-    assert_eq!(final_row.generation, held.generation);
+    assert_eq!(
+        final_row.phase, "unclaimed",
+        "finished row must be unclaimed"
+    );
+    assert_eq!(
+        final_row.generation, held.generation,
+        "finished row must keep the claim generation"
+    );
     let target_after = f.git(&repo, &["rev-parse", "refs/heads/main"]);
     if final_row.status == "landed" {
-        assert_ne!(target_after, target_before);
-        assert_eq!(final_row.result_oid.as_deref(), Some(target_after.as_str()));
-        assert_eq!(finished_json["landed"], json!(["feature"]));
+        assert_ne!(target_after, target_before, "landed run must advance main");
+        assert_eq!(
+            final_row.result_oid.as_deref(),
+            Some(target_after.as_str()),
+            "landed row must record the new main commit"
+        );
+        assert_eq!(
+            finished_json["landed"],
+            json!(["feature"]),
+            "landed run must report feature as landed"
+        );
     } else {
         assert!(
             matches!(
@@ -1355,13 +1753,18 @@ fn race_worktree_delete_keeps_the_claimed_row() {
             final_row
                 .error_detail
                 .as_deref()
-                .is_some_and(|detail| !detail.trim().is_empty())
+                .is_some_and(|detail| !detail.trim().is_empty()),
+            "held row must carry a non-empty diagnostic"
         );
-        assert_eq!(target_after, target_before);
+        assert_eq!(
+            target_after, target_before,
+            "non-landed run must leave main unchanged"
+        );
         assert!(
             finished_json["landed"]
                 .as_array()
-                .is_none_or(|landed| landed.iter().all(|branch| branch != "feature"))
+                .is_none_or(|landed| landed.iter().all(|branch| branch != "feature")),
+            "non-landed run must not report feature as landed"
         );
     }
     gate_release.disarm();
@@ -1396,8 +1799,14 @@ fn race_merge_sweep_skips_a_claimed_row() {
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "gate-runs", "start ", 1);
     let held = row_state(&f);
-    assert_eq!(held.status, "folding");
-    assert_ne!(held.phase, "unclaimed");
+    assert_eq!(
+        held.status, "folding",
+        "held row must be folding while the gate blocks"
+    );
+    assert_ne!(
+        held.phase, "unclaimed",
+        "held row must be claimed while the gate blocks"
+    );
 
     let db = Connection::open(f.db_path()).unwrap();
     db.execute(
@@ -1407,30 +1816,73 @@ fn race_merge_sweep_skips_a_claimed_row() {
     .unwrap();
     drop(db);
     let claimed_landed = row_state(&f);
-    assert_eq!(claimed_landed.status, "landed");
-    assert_eq!(claimed_landed.generation, held.generation);
-    assert_eq!(claimed_landed.phase, held.phase);
+    assert_eq!(
+        claimed_landed.status, "landed",
+        "row must be landed after the simulated land"
+    );
+    assert_eq!(
+        claimed_landed.generation, held.generation,
+        "simulated land must keep the claim generation"
+    );
+    assert_eq!(
+        claimed_landed.phase, held.phase,
+        "simulated land must keep the claim phase"
+    );
 
     let sweep = f.cli_failing(&["merge", "sweep", "--json"]);
     let sweep_json: Value = serde_json::from_str(&sweep.stdout).unwrap();
-    assert_eq!(sweep_json["collected"], json!([]));
-    assert_eq!(sweep_json["cleared_rows"], json!([]));
-    assert_eq!(sweep_json["kept"].as_array().unwrap().len(), 1);
-    assert_eq!(sweep_json["kept"][0]["branch"], "feature");
-    assert_eq!(sweep_json["kept"][0]["class"], "merge_claimed");
-    assert_eq!(row_state(&f), claimed_landed);
-    assert!(worktree.exists());
+    assert_eq!(
+        sweep_json["collected"],
+        json!([]),
+        "sweep must collect nothing while the claim is live"
+    );
+    assert_eq!(
+        sweep_json["cleared_rows"],
+        json!([]),
+        "sweep must clear no rows while the claim is live"
+    );
+    assert_eq!(
+        sweep_json["kept"].as_array().unwrap().len(),
+        1,
+        "sweep must keep exactly one row while the claim is live"
+    );
+    assert_eq!(
+        sweep_json["kept"][0]["branch"], "feature",
+        "sweep must keep the feature branch"
+    );
+    assert_eq!(
+        sweep_json["kept"][0]["class"], "merge_claimed",
+        "sweep must classify the kept row as merge_claimed"
+    );
+    assert_eq!(
+        row_state(&f),
+        claimed_landed,
+        "sweep must leave the claimed row untouched"
+    );
+    assert!(
+        worktree.exists(),
+        "sweep must leave the claimed checkout on disk"
+    );
     assert_eq!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
-        target_before
+        target_before,
+        "sweep must leave main unchanged"
     );
 
     release_gate(&root, "gate-hold", "gate-open");
     let finished = f.finish_cli(owner);
     assert!(finished.status.success(), "{}", finished.stderr);
     wait_gate_count(&root, "gate-runs", "end ", 1);
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
-    assert_eq!(row_state(&f).phase, "unclaimed");
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "exactly one gate must start"
+    );
+    assert_eq!(
+        row_state(&f).phase,
+        "unclaimed",
+        "owner must release the claim after the gate ends"
+    );
     gate_release.disarm();
     f.close();
 }
@@ -1456,37 +1908,73 @@ fn race_operator_verbs_are_refused_while_a_drain_holds_the_row() {
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "gate-runs", "start ", 1);
     let held = row_state(&f);
-    assert_ne!(held.phase, "unclaimed");
-    assert!(held.generation >= 1);
+    assert_ne!(
+        held.phase, "unclaimed",
+        "held row must be claimed while the gate blocks"
+    );
+    assert!(
+        held.generation >= 1,
+        "held row must carry a fencing generation"
+    );
     let wt = f.held.to_str().unwrap().to_owned();
 
     let rm = f.cli_failing(&["merge", "rm", "--worktree", &wt]);
     assert!(
         format!("{}{}", rm.stdout, rm.stderr)
-            .contains("is being worked by a drain; remove it after the drain finishes")
+            .contains("is being worked by a drain; remove it after the drain finishes"),
+        "rm refusal must name the active drain"
     );
-    assert_eq!(row_state(&f), held);
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        row_state(&f),
+        held,
+        "rm refusal must leave the row unchanged"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "rm refusal must not start a second gate"
+    );
 
     let retry = f.cli_failing(&["merge", "retry", "--worktree", &wt]);
     assert!(
         format!("{}{}", retry.stdout, retry.stderr)
-            .contains("is being worked by a drain; retry it after the drain finishes")
+            .contains("is being worked by a drain; retry it after the drain finishes"),
+        "retry refusal must name the active drain"
     );
-    assert_eq!(row_state(&f), held);
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        row_state(&f),
+        held,
+        "retry refusal must leave the row unchanged"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "retry refusal must not start a second gate"
+    );
 
     let clear = f.cli_failing(&["merge", "clear"]);
-    assert!(format!("{}{}", clear.stdout, clear.stderr).contains("claimed by an active drain"));
-    assert_eq!(row_state(&f), held);
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert!(
+        format!("{}{}", clear.stdout, clear.stderr).contains("claimed by an active drain"),
+        "clear refusal must name the active drain"
+    );
+    assert_eq!(
+        row_state(&f),
+        held,
+        "clear refusal must leave the row unchanged"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "clear refusal must not start a second gate"
+    );
 
     assert_eq!(
         event_rows(&f, "retry")
             .iter()
             .filter(|outcome| outcome.as_str() == "claimed")
             .count(),
-        1
+        1,
+        "exactly one retry must be recorded as claimed"
     );
     assert_eq!(
         event_rows(&f, "remove")
@@ -1499,20 +1987,41 @@ fn race_operator_verbs_are_refused_while_a_drain_holds_the_row() {
 
     release_gate(&root, "gate-hold", "gate-open");
     let winner = f.finish_cli(owner);
-    assert!(winner.status.success());
+    assert!(
+        winner.status.success(),
+        "owner drain must exit successfully after the gate is released"
+    );
     let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
-    assert_eq!(winner_json["ready"], json!(["feature"]));
+    assert_eq!(
+        winner_json["ready"],
+        json!(["feature"]),
+        "owner drain must report feature as ready"
+    );
     let after_drain = row_state(&f);
-    assert_eq!(after_drain.status, "ready");
-    assert_eq!(after_drain.phase, "unclaimed");
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        after_drain.status, "ready",
+        "row must be ready after the owner finishes"
+    );
+    assert_eq!(
+        after_drain.phase, "unclaimed",
+        "ready row must be unclaimed"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "exactly one gate must start"
+    );
     assert_eq!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
-        target_before
+        target_before,
+        "drain must leave main at its captured commit"
     );
 
     f.cli(&["merge", "rm", "--worktree", &wt]);
-    assert!(f.rows().is_empty());
+    assert!(
+        f.rows().is_empty(),
+        "rm after the drain must remove the only queue row"
+    );
     gate_release.disarm();
     f.close();
 }
@@ -1540,48 +2049,98 @@ fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "gate-runs", "start ", 1);
     let held = row_state(&f);
-    assert_ne!(held.phase, "unclaimed");
-    assert_eq!(held.status, "folding");
-    assert!(held.generation >= 1);
+    assert_ne!(
+        held.phase, "unclaimed",
+        "held row must be claimed while the gate blocks"
+    );
+    assert_eq!(
+        held.status, "folding",
+        "held row must be folding while the gate blocks"
+    );
+    assert!(
+        held.generation >= 1,
+        "held row must carry a fencing generation"
+    );
 
     let wt = worktree.to_str().unwrap().to_owned();
     let land = f.cli_failing(&["merge", "land", "--worktree", &wt]);
     assert!(
-        format!("{}{}", land.stdout, land.stderr).contains("merge-queue row is folding, not ready")
+        format!("{}{}", land.stdout, land.stderr).contains("merge-queue row is folding, not ready"),
+        "land refusal must report that the row is folding"
     );
-    assert_eq!(row_state(&f), held);
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        row_state(&f),
+        held,
+        "land refusal must leave the row unchanged"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "land refusal must not start a second gate"
+    );
     assert_eq!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
-        target_before
+        target_before,
+        "land refusal must leave main unchanged"
     );
     assert_eq!(
         f.git(&worktree, &["rev-parse", "HEAD"]),
-        worktree_tip_before
+        worktree_tip_before,
+        "land refusal must leave the worktree HEAD unchanged"
     );
-    assert_eq!(event_rows(&f, "land"), vec!["not_ready".to_string()]);
+    assert_eq!(
+        event_rows(&f, "land"),
+        vec!["not_ready".to_string()],
+        "land must record one not_ready event"
+    );
 
     release_gate(&root, "gate-hold", "gate-open");
     let winner = f.finish_cli(owner);
-    assert!(winner.status.success());
+    assert!(
+        winner.status.success(),
+        "owner drain must exit successfully after the gate is released"
+    );
     let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
-    assert_eq!(winner_json["ready"], json!(["feature"]));
+    assert_eq!(
+        winner_json["ready"],
+        json!(["feature"]),
+        "owner drain must report feature as ready"
+    );
     let after_drain = row_state(&f);
-    assert_eq!(after_drain.status, "ready");
-    assert_eq!(after_drain.phase, "unclaimed");
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        after_drain.status, "ready",
+        "row must be ready after the owner finishes"
+    );
+    assert_eq!(
+        after_drain.phase, "unclaimed",
+        "ready row must be unclaimed"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        1,
+        "exactly one gate must start"
+    );
     assert_eq!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
-        target_before
+        target_before,
+        "drain must leave main unchanged"
     );
     assert_eq!(
         f.git(&worktree, &["rev-parse", "HEAD"]),
-        worktree_tip_before
+        worktree_tip_before,
+        "drain must leave the worktree HEAD unchanged"
     );
-    assert_eq!(event_rows(&f, "land"), vec!["not_ready".to_string()]);
+    assert_eq!(
+        event_rows(&f, "land"),
+        vec!["not_ready".to_string()],
+        "land must still record exactly one not_ready event"
+    );
 
     f.cli(&["merge", "rm", "--worktree", &wt]);
-    assert!(f.rows().is_empty());
+    assert!(
+        f.rows().is_empty(),
+        "rm after the drain must remove the only queue row"
+    );
     gate_release.disarm();
     f.close();
 }
@@ -1611,10 +2170,20 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "gate-runs", "start ", 1);
     let killed = f.kill_cli(owner);
-    assert_eq!(killed.status.signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        killed.status.signal(),
+        Some(libc::SIGKILL),
+        "killed owner must die by SIGKILL"
+    );
     let crashed = row_state(&f);
-    assert_eq!(crashed.status, "folding");
-    assert_ne!(crashed.phase, "unclaimed");
+    assert_eq!(
+        crashed.status, "folding",
+        "crashed owner row must be folding"
+    );
+    assert_ne!(
+        crashed.phase, "unclaimed",
+        "crashed owner row must be claimed"
+    );
     // The gate runs in its own process group and outlives the killed drain.
     release_gate(&root, "gate-hold", "gate-open");
     wait_gate_count(&root, "gate-runs", "end ", 1);
@@ -1624,8 +2193,8 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
     fs::write(root.join("gate-open"), "open\n").unwrap();
     let recovered = f.json(&["merge", "drain", "--json"]);
     let after = row_state(&f);
-    assert_eq!(after.status, "ready");
-    assert_eq!(after.phase, "unclaimed");
+    assert_eq!(after.status, "ready", "recovered row must be ready");
+    assert_eq!(after.phase, "unclaimed", "recovered row must be unclaimed");
     assert!(
         after.generation > crashed.generation,
         "recovery must advance the fencing generation"
@@ -1643,10 +2212,19 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
                 warning
                     .as_str()
                     .is_none_or(|warning| !warning.contains("not claimable"))
-            })
+            }),
+        "recovery must not report the row as not claimable"
     );
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 2);
-    assert_eq!(gate_count(&root, "gate-runs", "end "), 2);
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        2,
+        "recovery must start the gate a second time"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "end "),
+        2,
+        "every gate start must end"
+    );
     gate_release.disarm();
     f.close();
 }
@@ -1679,24 +2257,38 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
     expire_lease(&f, &worktree);
     fs::write(root.join("gate-open"), "open\n").unwrap();
     let recovered = f.json(&["merge", "drain", "--json"]);
-    assert_eq!(recovered["landed"], json!(["feature"]));
+    assert_eq!(
+        recovered["landed"],
+        json!(["feature"]),
+        "recovered drain must report feature as landed"
+    );
     let after_recovery = row_state(&f);
-    assert_eq!(after_recovery.status, "landed");
+    assert_eq!(
+        after_recovery.status, "landed",
+        "recovered row must be landed"
+    );
     let result_oid = after_recovery
         .result_oid
         .clone()
         .expect("landed row records result oid");
-    assert_ne!(result_oid, "");
+    assert_ne!(result_oid, "", "landed row must record a result oid");
     assert_ne!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
         target_before,
         "recovered drain advances the target once"
     );
     let target_after_recovery = f.git(&repo, &["rev-parse", "refs/heads/main"]);
-    assert_eq!(target_after_recovery, result_oid);
+    assert_eq!(
+        target_after_recovery, result_oid,
+        "main must point at the recovered result oid"
+    );
     release_gate(&root, "gate-hold", "gate-open");
     let former = f.finish_cli(owner);
-    assert_eq!(former.status.code(), Some(0));
+    assert_eq!(
+        former.status.code(),
+        Some(0),
+        "late former owner must exit 0"
+    );
     let former_json: Value = serde_json::from_str(&former.stdout).unwrap();
     assert!(
         former_json["warnings"]
@@ -1706,20 +2298,42 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
             .any(|warning| {
                 warning.as_str()
                     == Some("feature: merge claim lost; another drain recovered the row")
-            })
+            }),
+        "late former owner must warn that its claim was lost"
     );
     let final_row = row_state(&f);
-    assert_eq!(final_row.status, "landed");
-    assert_eq!(final_row.phase, "unclaimed");
-    assert_eq!(final_row.result_oid.as_deref(), Some(result_oid.as_str()));
-    assert_eq!(final_row.generation, after_recovery.generation);
+    assert_eq!(
+        final_row.status, "landed",
+        "late former owner must leave the row landed"
+    );
+    assert_eq!(
+        final_row.phase, "unclaimed",
+        "late former owner must leave the row unclaimed"
+    );
+    assert_eq!(
+        final_row.result_oid.as_deref(),
+        Some(result_oid.as_str()),
+        "late former owner must keep the recovered result oid"
+    );
+    assert_eq!(
+        final_row.generation, after_recovery.generation,
+        "late former owner must keep the recovered generation"
+    );
     assert_eq!(
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
         target_after_recovery,
         "late former owner must not move target after recovery"
     );
-    assert_eq!(gate_count(&root, "gate-runs", "start "), 2);
-    assert_eq!(gate_count(&root, "gate-runs", "end "), 2);
+    assert_eq!(
+        gate_count(&root, "gate-runs", "start "),
+        2,
+        "exactly two gate starts must occur"
+    );
+    assert_eq!(
+        gate_count(&root, "gate-runs", "end "),
+        2,
+        "every gate start must end"
+    );
     gate_release.disarm();
     f.close();
 }

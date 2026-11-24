@@ -99,6 +99,11 @@ probe.rs
 # secret never lands in argv and is published owner-only. Production credential
 # installation is platform-free; the cfg gates only this OS-specific assertion.
 remote_enqueue_auth.rs
+# TEST-ONLY cfg: the fork tests spawn a real `/bin/sh` and `sleep` to prove a
+# spawn-progress tracker is re-keyed to the forked pane and that a program pane
+# gets no card; they need the host-private `Panes`/`Tab` fixtures, so a
+# `platform::` helper would stop them exercising the real fork seam.
+spawn_progress_tests.rs
 vps_bridge.rs
 # TEST-ONLY cfg: provider failure-path tests use a POSIX shell fixture and
 # executable permissions to verify stderr preservation and env sanitization;

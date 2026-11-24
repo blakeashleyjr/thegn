@@ -30,6 +30,7 @@ impl SnapshotKey {
     }
 
     /// The pre-encoder key used by snapshots created before lossless prefixes.
+    #[must_use]
     pub fn legacy(&self) -> SnapshotKey {
         SnapshotKey {
             repo_slug: legacy_segment(&self.repo_slug),
@@ -132,6 +133,7 @@ impl SnapshotManifest {
     }
 
     /// Add a lowercase hexadecimal capture generation to the chronological id.
+    #[must_use]
     pub fn with_generation(mut self, generation: &str) -> Self {
         debug_assert!(
             generation

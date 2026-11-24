@@ -87,6 +87,7 @@ fn report(cfg: &Config, worktree: &Path, json: bool, changed: bool) -> Result<()
         &loc,
         &worktree.to_string_lossy(),
         &selection,
+        Some(&db),
     )?;
     let profile = trusted.environment.sandbox.profile;
     let base_profile = cfg

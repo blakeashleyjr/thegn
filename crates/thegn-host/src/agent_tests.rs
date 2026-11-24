@@ -83,6 +83,7 @@ fn sealed_worktree_pin_refuses_a_disabled_sandbox_on_the_launch_path() {
             None,
             false,
             &EnvSelection::none(),
+            None,
         )
         .expect_err("a sealed worktree pin must refuse a disabled sandbox");
         let halt = error
@@ -126,6 +127,7 @@ fn unpinned_global_sealed_profile_opens_under_a_disabled_sandbox() {
             None,
             false,
             &EnvSelection::none(),
+            None,
         )
         .expect("an unpinned global sealed profile keeps its opt-out");
         assert!(
@@ -994,6 +996,8 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                 specs,
                 relaunch: crate::handlers::worktree_launch::RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
+                remote: false,
+                remembered_agent: None,
             })
             .unwrap();
 
@@ -3981,6 +3985,48 @@ fn launch_spec_full_refuses_on_an_unopenable_state_db_when_a_host_is_pinned() {
         },
     );
     assert!(matches!(result, Err(error) if format!("{error:#}").contains("pane launch refused")));
+}
+
+#[test]
+fn launch_spec_full_opens_the_state_database_once() {
+    use thegn_core::config::{Config, SandboxBackend, SandboxConfig};
+
+    let _state = crate::testenv::IsolatedState::new();
+    // The state DB must already exist: with none, the location read reports
+    // local without opening at all, and the double open this pins never
+    // happens. An install that has recorded anything is the real shape.
+    drop(thegn_core::db::Db::open().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let cfg = Config {
+        sandbox: SandboxConfig {
+            backend: SandboxBackend::None,
+            inject_devshell: false,
+            ..SandboxConfig::default()
+        },
+        ..Config::default()
+    };
+
+    let before = thegn_core::db_open_stats::total_opens();
+    let spec = launch_spec_full(
+        &cfg,
+        &wt,
+        None,
+        "shell",
+        false,
+        LaunchExtras {
+            suppress_agent_record: true,
+            ..Default::default()
+        },
+    )
+    .expect("a plain shell on a local worktree resolves");
+    let opens = thegn_core::db_open_stats::total_opens() - before;
+
+    assert_eq!(spec.backend, "host");
+    assert_eq!(
+        opens, 1,
+        "the location read, the state reads and the sandbox trust resolution must share one handle"
+    );
 }
 
 #[test]

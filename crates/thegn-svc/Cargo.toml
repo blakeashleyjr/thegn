@@ -48,6 +48,10 @@ protox.workspace = true
 [dependencies]
 thegn-core.workspace = true
 thegn-proc.workspace = true
+# Selected build/test attempts (src/sprites/job.rs) speak the provider-independent
+# typed job contract, whose identities are CAS digests.
+thegn-job-spec.workspace = true
+thegn-cas.workspace = true
 anyhow.workspace = true
 ignore.workspace = true
 serde.workspace = true

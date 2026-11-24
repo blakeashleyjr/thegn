@@ -55,6 +55,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/sandbox-network.md"),
     include_str!("../../../../docs/help/environments.md"),
     include_str!("../../../../docs/help/sandbox-profiles.md"),
+    include_str!("../../../../docs/help/sandbox-security-model.md"),
     include_str!("../../../../docs/help/vercel-sandbox.md"),
     include_str!("../../../../docs/help/plugins.md"),
     include_str!("../../../../docs/help/configuration.md"),

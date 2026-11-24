@@ -120,6 +120,7 @@ pub struct MyWorkFeed {
 impl MyWorkFeed {
     /// Scope cached rows without hiding local tracker work in a repository
     /// that has no origin. The global feed deliberately retains mixed origins.
+    #[must_use]
     pub fn for_scope(
         mut self,
         origin: Option<&crate::forge::model::ForgeRepoIdentity>,

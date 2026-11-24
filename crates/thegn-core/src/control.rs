@@ -217,6 +217,7 @@ impl ScopeSet {
 
     /// The intersection of two grants — the clamp-only primitive the MCP-serve
     /// ceiling resolution is built from.
+    #[must_use]
     pub fn intersect(self, other: ScopeSet) -> ScopeSet {
         ScopeSet(self.0 & other.0)
     }

@@ -685,10 +685,22 @@ no_model_login() {
 }
 
 local_log_has_commits() {
-  local n want="${1:-1}"
+  local n want="${1:-1}" size
   n="$(git -C "$WT_PATH" rev-list --count main..HEAD 2>/dev/null || echo 0)"
   echo "   commits ahead of main: $n"
-  [ "$n" -ge "$want" ]
+  [ "$n" -ge "$want" ] || return 1
+  # The artifact must be in the pulled HISTORY, not merely checked out: `env pull`
+  # only moves refs, so a working-tree file check would be checking something else.
+  if ! git -C "$WT_PATH" cat-file -e HEAD:rd-hold.txt 2>/dev/null; then
+    echo "pulled artifact is not in HEAD: rd-hold.txt" >&2
+    return 1
+  fi
+  size="$(git -C "$WT_PATH" cat-file -s HEAD:rd-hold.txt 2>/dev/null || echo 0)"
+  if [ "${size:-0}" -le 0 ]; then
+    echo "pulled artifact is empty in HEAD: rd-hold.txt" >&2
+    return 1
+  fi
+  echo "   pulled artifact: rd-hold.txt ($size bytes)"
 }
 
 record_gone() { [ ! -f "$(ledger_dir)/${1:-$NAME}.json" ]; }
