@@ -541,6 +541,18 @@
       "summary": "Vercel Sandbox as a remote provider; implemented and tested against a fake server, never run against Vercel."
     },
     {
+      "change": "add-vercel-selected-runner",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2418",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Selected-job executor for pinned build and test attempts on a project-selected Vercel Sandbox, fixture-tested; route wiring, live runs and usage reporting remain open."
+    },
+    {
       "change": "add-viewers-and-quick-open",
       "lifecycle": "active",
       "disposition": "residual-split",

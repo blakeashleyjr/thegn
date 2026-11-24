@@ -644,6 +644,13 @@
       "no_spec_rationale": "Bug fix with no OpenSpec change: it corrects behaviour to match an existing contract, recorded in the changelog."
     },
     {
+      "issue": "THE-2418",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "add-vercel-selected-runner"
+      ]
+    },
+    {
       "issue": "THE-2467",
       "project": "Client API & Remote Access",
       "changes": [],

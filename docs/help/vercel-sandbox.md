@@ -265,6 +265,53 @@ one-minute minimum increments; the estimate does not round up to them.
 A report built from a snapshot listing that did not finish is marked
 incomplete. Snapshots left behind by a sandbox that is gone are priced too.
 
+## Selected build and test Jobs
+
+A project can select a Vercel team and project as a runner for pinned build and
+test Jobs (runner alias `vercel-<project>`). Only the closed `cargo build` and
+`cargo test` recipes run, for the deadline the route forwards. The agent, its
+model login and the Vercel token stay on your machine.
+
+Each attempt gets its own fresh sandbox, so a fresh sandbox is enough to
+finish. The steps, in order:
+
+- The provider's team and project must equal the binding's. A mismatch is
+  refused before the ledger is written or any request is sent. The ledger
+  directory is pinned to the first team and project it served, and recovery and
+  cancel check the recorded pair again before touching a sandbox.
+- The attempt number and spend cap are written to
+  `$XDG_STATE_HOME/thegn/vercel-jobs/<project>/` first. An attempt that would
+  exceed the spend envelope is refused.
+- The sandbox name is written before the create request, so an ambiguous
+  create can be found by name. The sandbox uses the configured `size` as its
+  vCPU ceiling and lives for the transfer budget plus the deadline plus five
+  minutes. It is never extended.
+- Every claim re-reads the sandbox and checks this controller's tag and the
+  vCPU ceiling. Protected files (`.git`, `.thegn`, credential trees, `.env*`,
+  agent homes) are never part of the snapshot.
+- The snapshot, including tracked edits, untracked inputs and executable bits,
+  is written into a per-attempt checkout. Every file is read back and hashed,
+  and the root directory digest must equal the pinned source digest. A deleted
+  file is absent because the checkout starts empty.
+- The command starts detached, under `env -i`, with no environment in the
+  request. The sandbox id, session and command id are written to the ledger
+  before a result is trusted; if that write fails the attempt is
+  indeterminate, never a success.
+- An unclear start (a timeout or a server error) is never sent again. The
+  attempt reads back as indeterminate with its sandbox deleted or pending.
+- At the deadline the command is killed, the session is stopped and the sandbox
+  is deleted. The attempt reports a timeout and its outputs are not read.
+
+Cleanup is reported `done` only when the sandbox delete is confirmed.
+Otherwise it stays `pending` with the sandbox name in the record, and
+`thegn env reap --provider vercel --apply` can remove it (only sandboxes that
+carry this controller's tag). Spend is an estimate from elapsed time at a
+configured rate; an attempt whose sandbox may still exist keeps its whole cap
+committed.
+
+This is the executor only. Wiring a project's runner choice to it, live runs
+and the usage report for job sandboxes are not done yet.
+
 ## Unverified
 
 The client was checked against Vercel's published API document on 2026-11-19
