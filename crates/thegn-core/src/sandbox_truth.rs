@@ -33,7 +33,36 @@ const PASSTHROUGH: &[&str] = &[
 
 fn basename(s: &str) -> &str {
     let s = s.trim_matches(|c| c == '\'' || c == '"' || c == '(');
-    s.rsplit('/').next().unwrap_or(s)
+    s.rsplit(['/', '\\']).next().unwrap_or(s)
+}
+
+/// Is `tok` a Windows-style command token: a `\` in the path, or an `.exe`
+/// suffix (case-insensitive)? POSIX tokens never match, so Linux labels are
+/// unchanged.
+fn is_windows_style(tok: &str) -> bool {
+    let t = tok.trim_matches(|c| c == '\'' || c == '"' || c == '(');
+    t.contains('\\') || t.to_ascii_lowercase().ends_with(".exe")
+}
+
+/// The command word for `tok`: its basename, and for a Windows-style token the
+/// lowercased name with `.exe` stripped (`C:\...\DOCKER.EXE` -> `docker`).
+///
+/// `wsl`/`wslc` keep an `.exe` spelling so only the Windows binary maps to
+/// [`Backend::Wsl`] (a bare POSIX `wsl` is unchanged). `container` also keeps
+/// `.exe`, so it can never match Apple's `container` word.
+// [kb] `wslc` `container.exe` alias is unsourced; defensive: never map
+// `container.exe` to Apple on Windows.
+fn command_word(tok: &str) -> String {
+    let w = basename(tok);
+    if !is_windows_style(tok) {
+        return w.to_string();
+    }
+    let lower = w.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    match stem {
+        "wsl" | "wslc" | "container" => format!("{stem}.exe"),
+        _ => stem.to_string(),
+    }
 }
 
 /// Is `w` a token that decorates a command rather than naming one — a flag
@@ -61,12 +90,13 @@ fn script_command_words(script: &str) -> Vec<String> {
             if is_decoration(tok) {
                 continue;
             }
-            let w = basename(tok);
+            let w = command_word(tok);
             if w.is_empty() {
                 continue;
             }
-            out.push(w.to_string());
-            if !PASSTHROUGH.contains(&w) {
+            let passthrough = PASSTHROUGH.contains(&w.as_str());
+            out.push(w);
+            if !passthrough {
                 // The command for this part is named; the rest are its arguments.
                 break;
             }
@@ -81,7 +111,15 @@ fn command_words(argv: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut expect_command = true;
     for el in argv {
-        if el.contains(char::is_whitespace) {
+        // A Windows path with spaces (`C:\Program Files\Docker\docker.exe`) is
+        // one command word, not a script body.
+        let win_path = expect_command
+            && el.contains('\\')
+            && el
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_ascii_lowercase()
+                .ends_with(".exe");
+        if el.contains(char::is_whitespace) && !win_path {
             // A script body (`sh -lc <script>`, or the remote command an ssh
             // placement appends): scan inside it.
             out.extend(script_command_words(el));
@@ -103,7 +141,7 @@ fn command_words(argv: &[String]) -> Vec<String> {
             // A pass-through's own flags (`sudo -n`) keep the expectation open.
             continue;
         }
-        let w = basename(el).to_string();
+        let w = command_word(el);
         expect_command = PASSTHROUGH.contains(&w.as_str());
         out.push(w);
     }
@@ -144,7 +182,7 @@ pub fn observed(argv: &[String]) -> Backend {
             "container" => return Backend::Apple,
             // The reserved smol: the real smolvm binary and the legacy word.
             "smolvm" | "smolmachines" => return Backend::Smol,
-            "wsl.exe" => return Backend::Wsl,
+            "wsl.exe" | "wslc.exe" => return Backend::Wsl,
             _ => {}
         }
     }
