@@ -16,12 +16,21 @@ e.g. `feat(sidebar): ...` or `fix(merge): ...`.
 
 ## Optional CI
 
-<!-- Routine CI (build/test/lint/coverage/cross-check) runs automatically.
-     Add a marker to your commit message to opt into the heavier jobs: -->
+Routine pull request CI runs `fmt`, `lint`, `test`, and `smoke` on GitHub-hosted
+Linux runners. It does not run coverage or cross-target checks, and it does not
+provide native macOS or Windows coverage.
 
-- `[ci-macos]` — full macOS aarch64 build + tests (billed at 10x)
-- `[ci-windows]` — full Windows msvc build + kernel tests
-- `[ci-e2e]` — muse visual-regression suite
+To run the optional macOS, Windows (including artifact smoke), and e2e
+(visual-regression) jobs for a chosen branch or ref, manually dispatch the CI
+workflow with its `extras` input enabled:
+
+```sh
+gh workflow run ci.yml --ref <ref> -f extras=true
+```
+
+Dispatch is restricted to users with write access to this repository, so fork
+PR authors should ask a maintainer to run it. Find the resulting run in GitHub
+**Actions → CI**, listed for the selected ref.
 
 ## Notes for reviewers
 
