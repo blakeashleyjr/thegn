@@ -817,7 +817,7 @@ async fn pump(
                 Some(ExecFrame::Stdout(bytes)) => {
                     modes.observe(&bytes);
                     let began = Instant::now();
-                    let result = out.write_all(&bytes).and_then(|()| out.flush());
+                    let result = write_tty_frame(&mut out, &bytes);
                     let elapsed = began.elapsed();
                     stats.frames += 1;
                     stats.bytes += bytes.len() as u64;
@@ -881,6 +881,11 @@ async fn pump(
             },
         }
     }
+}
+
+/// Write one TTY output frame unchanged and make it visible immediately.
+fn write_tty_frame(out: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    out.write_all(bytes).and_then(|()| out.flush())
 }
 
 /// Blocking tty reader: owns the raw-mode terminal, forwards decoded input and
@@ -1056,6 +1061,33 @@ mod tests {
         let mut output = FlushCountingWriter { flushes: 0 };
         assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(0));
         assert!(output.flushes >= 2);
+    }
+
+    #[tokio::test]
+    async fn stream_frames_preserves_split_sprite_line_breaks_byte_for_byte() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        tx.send(ExecFrame::Stdout(b"\x1b[>4;2m/dev/pts/0".to_vec()))
+            .await
+            .unwrap();
+        tx.send(ExecFrame::Stdout(b"\r".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Stdout(b"\nok\r\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(ExecFrame::Exit(0)).await.unwrap();
+
+        let mut output = Vec::new();
+        assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(0));
+        assert_eq!(output, b"\x1b[>4;2m/dev/pts/0\r\nok\r\n");
+    }
+
+    #[test]
+    fn tty_frame_writer_preserves_split_sprite_line_breaks_byte_for_byte() {
+        let frames: [&[u8]; 3] = [b"\x1b[>4;2m/dev/pts/0", b"\r", b"\nok\r\n"];
+        let mut output = Vec::new();
+        for frame in frames {
+            write_tty_frame(&mut output, frame).unwrap();
+        }
+        assert_eq!(output, b"\x1b[>4;2m/dev/pts/0\r\nok\r\n");
     }
 
     #[tokio::test]
