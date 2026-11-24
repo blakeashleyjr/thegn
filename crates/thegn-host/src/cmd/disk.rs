@@ -322,6 +322,14 @@ fn lane_verdict(
             "held",
             format!("{activity_evidence}; a build may be running"),
         )
+    } else if kind == LaneKind::BuildDir {
+        // A bare target dir has no ownership proof today, and a directory that
+        // has a `.git` next to `debug/` is a checkout, not output. Neither is
+        // ever reclaimed whole.
+        (
+            "unknown",
+            "bare target dir: no ownership proof yet; never removed whole".to_string(),
+        )
     } else if owner.is_none() {
         (
             "unknown",
@@ -357,13 +365,13 @@ fn lane_identity(lane: &std::path::Path) -> Result<LaneIdentity> {
 }
 
 /// What `--apply` removes for a lane: the regenerable output only. A checkout
-/// copy keeps its sources, `.git` and `Cargo.toml`; a bare Cargo target dir is
-/// entirely output, so the lane directory itself goes.
+/// copy keeps its sources, `.git` and `Cargo.toml`. A bare Cargo target dir has
+/// no ownership proof yet, so nothing is removed from it: the lane directory is
+/// never a removal target, as it may hold `.git`, sources or evidence.
 fn lane_reclaim_target(kind: LaneKind, lane: &std::path::Path) -> Option<std::path::PathBuf> {
     match kind {
         LaneKind::Checkout => Some(lane.join("target")),
-        LaneKind::BuildDir => Some(lane.to_path_buf()),
-        LaneKind::Other => None,
+        LaneKind::BuildDir | LaneKind::Other => None,
     }
 }
 
@@ -377,7 +385,7 @@ fn verified_reclaim_target(
     row: &LaneRow,
     root: &std::path::Path,
     now: u64,
-) -> std::result::Result<(std::path::PathBuf, u64), String> {
+) -> std::result::Result<(std::path::PathBuf, u64, Vec<std::fs::File>), String> {
     let lane = std::path::Path::new(&row.path);
     if lane.parent() != Some(root) {
         return Err("lane is no longer a direct child of this target/lanes".into());
@@ -426,7 +434,10 @@ fn verified_reclaim_target(
     if usage.newest_mtime != row.newest_mtime {
         return Err("lane was written after the report".into());
     }
-    Ok((target, build_bytes))
+    // Hold every Cargo lock across the removal, so a build that starts now
+    // blocks on the lock instead of building into a half-deleted tree.
+    let guards = lock_all_cargo_locks(&target)?;
+    Ok((target, build_bytes, guards))
 }
 
 /// Remove the build output of every reported lane that still proves it is the
@@ -458,7 +469,7 @@ fn apply_lane_plan(root: &std::path::Path, report: &LaneReport, now: u64) -> Lan
             );
             continue;
         }
-        let (target, bytes) = match verified_reclaim_target(row, root, now) {
+        let (target, bytes, guards) = match verified_reclaim_target(row, root, now) {
             Ok(verified) => verified,
             Err(reason) => {
                 skip_details.insert(
@@ -474,7 +485,9 @@ fn apply_lane_plan(root: &std::path::Path, report: &LaneReport, now: u64) -> Lan
                 continue;
             }
         };
-        match std::fs::remove_dir_all(&target) {
+        let outcome = std::fs::remove_dir_all(&target);
+        drop(guards);
+        match outcome {
             Ok(()) => {
                 reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
                 removed.push(LaneRemoval {
@@ -536,8 +549,17 @@ fn apply_lane_plan(root: &std::path::Path, report: &LaneReport, now: u64) -> Lan
 /// Run the plan and print (or emit) the apply report.
 fn run_lane_apply(root: &std::path::Path, report: &LaneReport, now: u64, json: bool) -> Result<()> {
     let applied = apply_lane_plan(root, report, now);
+    let failed = applied
+        .skipped
+        .iter()
+        .filter(|skipped| skipped.reason.starts_with("removal failed"))
+        .count();
     if json {
-        return super::emit_json(&applied);
+        super::emit_json(&applied)?;
+        if failed > 0 {
+            anyhow::bail!("{failed} lane(s) could not be fully removed");
+        }
+        return Ok(());
     }
     if report.lanes.is_empty() {
         outln!("No build lanes under {}.", report.root);
@@ -563,8 +585,11 @@ fn run_lane_apply(root: &std::path::Path, report: &LaneReport, now: u64, json: b
         applied.apply_duration_ms
     );
     outln!(
-        "Only regenerable build output was removed; checkout sources, .git and Cargo.toml are kept. Cleanup is opt-in: do not pass --apply to stop it."
+        "Only regenerable build output was removed; checkout sources, .git and Cargo.toml are kept. Bare target lanes are never removed (no ownership proof yet). Cleanup is opt-in: do not pass --apply to stop it."
     );
+    if failed > 0 {
+        anyhow::bail!("{failed} lane(s) could not be fully removed");
+    }
     Ok(())
 }
 
@@ -694,16 +719,16 @@ fn lane_target(lane: &std::path::Path, kind: LaneKind) -> std::path::PathBuf {
     }
 }
 
-/// The first Cargo build lock a live build holds, if any.
+/// Every Cargo build lock file under a target dir.
 ///
 /// Cargo puts the lock at `target/<profile>/.cargo-lock`, and for a cross
 /// compilation at `target/<triple>/<profile>/.cargo-lock`. Only those two shapes
 /// are probed — a full second traversal of a 100 GiB target tree to find a lock
 /// would double the cost of the report.
-fn held_cargo_lock(target: &std::path::Path) -> Option<std::path::PathBuf> {
+fn cargo_lock_candidates(target: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
     let Ok(profiles) = std::fs::read_dir(target) else {
-        return None;
+        return candidates;
     };
     for profile in profiles.flatten() {
         let Ok(file_type) = profile.file_type() else {
@@ -737,7 +762,35 @@ fn held_cargo_lock(target: &std::path::Path) -> Option<std::path::PathBuf> {
         }
     }
     candidates.sort();
-    candidates.into_iter().find(|path| lock_is_held(path))
+    candidates
+}
+
+/// The first Cargo build lock a live build holds, if any.
+fn held_cargo_lock(target: &std::path::Path) -> Option<std::path::PathBuf> {
+    cargo_lock_candidates(target)
+        .into_iter()
+        .find(|path| lock_is_held(path))
+}
+
+/// Take every Cargo lock under `target` exclusively and return the open
+/// handles; dropping them releases the locks. A lock that cannot be opened or
+/// taken means a build may be live, so the lane is retained.
+fn lock_all_cargo_locks(
+    target: &std::path::Path,
+) -> std::result::Result<Vec<std::fs::File>, String> {
+    let mut guards = Vec::new();
+    for path in cargo_lock_candidates(target) {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("cargo lock {} unavailable: {error}", path.display()))?;
+        if file.try_lock().is_err() {
+            return Err(format!("cargo build lock held at {}", path.display()));
+        }
+        guards.push(file);
+    }
+    Ok(guards)
 }
 
 /// Whether another process (or another open handle) holds `path`'s lock. A lock
@@ -1299,6 +1352,79 @@ mod lane_tests {
             assert!(lane.owner.is_none(), "{name} has no resolvable checkout");
             assert_eq!(lane.eligibility, "unknown");
         }
+    }
+
+    #[test]
+    fn a_git_lane_with_a_debug_dir_is_never_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("target").join("lanes");
+        let lane = root.join("rehearsal");
+        fs::create_dir_all(lane.join(".git")).unwrap();
+        fs::write(lane.join(".git/HEAD"), b"ref: refs/heads/rehearsal\n").unwrap();
+        fs::create_dir_all(lane.join("debug")).unwrap();
+        fs::write(lane.join("debug/artifact.bin"), [1u8; 17]).unwrap();
+        fs::create_dir_all(lane.join("release-artifacts")).unwrap();
+        fs::write(lane.join("release-artifacts/evidence.txt"), b"keep").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+        backdate(&root, old);
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+
+        let report = report_for(&root, now);
+        assert_eq!(report.eligible_bytes, 0);
+        assert_eq!(row(&report.lanes, "rehearsal").eligibility, "unknown");
+        let applied = apply_lane_plan(&root, &report, now);
+        assert!(applied.removed.is_empty(), "{:?}", applied.removed);
+        assert!(lane.join(".git/HEAD").is_file());
+        assert!(lane.join("debug/artifact.bin").is_file());
+        assert!(lane.join("release-artifacts/evidence.txt").is_file());
+    }
+
+    #[test]
+    fn a_bare_target_lane_is_reported_unknown_and_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("target").join("lanes");
+        let lane = root.join("bare");
+        fs::create_dir_all(lane.join("debug")).unwrap();
+        fs::write(lane.join("debug/artifact.bin"), [1u8; 17]).unwrap();
+        fs::write(lane.join(".rustc_info.json"), b"{}").unwrap();
+        backdate(
+            &root,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400),
+        );
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+        let report = report_for(&root, now);
+        let bare = row(&report.lanes, "bare");
+        assert_eq!(bare.eligibility, "unknown");
+        assert!(bare.reason.contains("ownership proof"), "{}", bare.reason);
+        assert!(apply_lane_plan(&root, &report, now).removed.is_empty());
+        assert!(lane.join("debug/artifact.bin").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_removal_is_reported_retained_and_fails_the_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, root, _old) = two_idle_lanes();
+        let now = u64::try_from(thegn_core::util::now()).unwrap();
+        let report = report_for(&root, now);
+        // A read-only directory cannot have its entries unlinked.
+        let locked = root.join("second/target/debug");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::File::create(locked.join("probe")).is_ok() {
+            // Running as a user that ignores permissions (root): not testable.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let result = run_lane_apply(&root, &report, now, false);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "a failed removal must exit non-zero");
+        assert!(!root.join("first/target").exists());
+        assert!(
+            root.join("second/target/debug").exists(),
+            "the read-only directory survives the failed removal"
+        );
+        assert!(root.join("second/Cargo.toml").is_file());
     }
 
     #[test]

@@ -151,8 +151,11 @@ bytes for each candidate immediately before removal. A candidate whose evidence
 changed, or is ambiguous, SHALL be retained and reported with the reason.
 
 Removal SHALL take only regenerable build output: a checkout lane's `target/`
-subtree, leaving its `.git`, `Cargo.toml` and sources; a bare Cargo target dir
-whole. The selected checkout, other lanes, ordinary `target/` output, and lane
+subtree, leaving its `.git`, `Cargo.toml` and sources. A lane directory SHALL never be
+removed whole, and a bare Cargo target dir SHALL be reported `unknown` until an
+ownership proof exists (follow-up). Cargo build locks SHALL be held across each
+removal, and a failed or partial removal SHALL make the command exit non-zero.
+Rebuild-cost measurement is a manual operator step. The selected checkout, other lanes, ordinary `target/` output, and lane
 evidence outside the removed output MUST remain untouched. The apply report
 SHALL include removed lane IDs and paths, apparent bytes actually removed,
 every lane left untouched with its reason, and cleanup duration. Removal SHALL

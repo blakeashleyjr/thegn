@@ -281,7 +281,9 @@ worktree.
 `eligible`, re-checking each lane's identity, owner, activity and lock
 immediately before removal. A lane that started building or changed hands in the
 meantime is kept and its reason printed. Only build output is removed: a
-checkout lane keeps its `.git`, `Cargo.toml` and sources. Review the dry run
+checkout lane keeps its `.git`, `Cargo.toml` and sources. Bare target lanes need
+an ownership proof (a follow-up) and are never removed. A failed removal exits
+non-zero, and measuring rebuild cost is a manual step. Review the dry run
 first. Cleanup only happens when you pass `--apply`.
 
 `thegn wt new --batch FILE` creates one lane for each non-comment, non-blank

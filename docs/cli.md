@@ -240,7 +240,11 @@ touched and the new reason is printed. Ambiguous lanes are never reclaimed.
 
 Removal takes only the regenerable output. A checkout lane keeps its `.git`,
 `Cargo.toml` and sources; only its `target/` subtree goes. A lane that is itself
-a bare Cargo target dir is removed whole, because all of it is build output.
+a lane that is itself a bare Cargo target dir is never removed: it has no
+ownership proof yet (a follow-up), so it is reported `unknown`. The Cargo build
+locks are held across each removal, and any failed or partial removal makes the
+command exit non-zero. Measuring the next comparable build time is a manual
+operator step; nothing measures rebuild cost.
 Nothing outside the selected lane's output is touched: the checkout being
 scanned, other lanes, ordinary `target/` output, and the lane's git evidence all
 stay.
