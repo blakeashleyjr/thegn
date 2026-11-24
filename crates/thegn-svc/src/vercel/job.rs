@@ -78,8 +78,8 @@ use super::VercelProvider;
 use super::client::WAIT_COMMAND_DEADLINE;
 use crate::provider::{ProviderFiles, RemoteProvider, STDERR_TAIL_CAP, join_remote};
 pub use crate::sprites::job::{
-    AttemptState, Cleanup, DirSnapshot, OwnerLease, ReconcileOutcome, Reconciled, Resume,
-    SnapshotContent, SnapshotSource, root_digest,
+    AttemptState, CancelToken, Cleanup, DirSnapshot, OwnerLease, ReconcileOutcome, Reconciled,
+    Resume, SnapshotContent, SnapshotSource, root_digest,
 };
 use crate::sprites::job::{
     LEASE_HEARTBEAT, Tail, alias_is_valid, attempt_file, attempt_from_file, bound_log,
@@ -1035,6 +1035,25 @@ impl VercelSelectedRunner {
         content: &SnapshotContent,
         deadline: Duration,
     ) -> Result<AttemptReceipt, RunnerRefusal> {
+        self.run_cancellable(recipe, source, content, deadline, &CancelToken::new())
+            .await
+    }
+
+    /// [`run`](Self::run) with a user cancel handle. Cancelling the token while
+    /// the command runs kills the command and stops the sandbox through the same
+    /// path as the deadline, fences outputs and reports
+    /// [`SelectedCompletion::Cancelled`] (never `TimedOut`); cleanup is `Done`
+    /// on a confirmed teardown and `Pending` otherwise. A cancel that races an
+    /// exit already queued reports the natural exit. A token cancelled before
+    /// dispatch closes the attempt as rejected: no command was started.
+    pub async fn run_cancellable(
+        &self,
+        recipe: Recipe,
+        source: &Digest,
+        content: &SnapshotContent,
+        deadline: Duration,
+        cancel: &CancelToken,
+    ) -> Result<AttemptReceipt, RunnerRefusal> {
         // Identity first: no ledger write and no request for another team.
         self.verify_scope(self.binding.team_id(), self.binding.project_id())
             .map_err(|error| self.unavailable(error))?;
@@ -1152,6 +1171,11 @@ impl VercelSelectedRunner {
         };
         record.session = Some(session.clone());
 
+        if cancel.is_cancelled() {
+            let error = anyhow!("cancelled before dispatch");
+            return Err(self.reject_and_teardown(record, error, begun).await);
+        }
+
         // The fence. Written before the command starts: a crash from here on
         // reads back as an unknown dispatch and is never rerun blindly.
         record.state = AttemptState::Dispatching;
@@ -1211,6 +1235,7 @@ impl VercelSelectedRunner {
         let mut stderr = Tail::new(STDERR_TAIL_CAP);
         let mut exit = None;
         let mut timed_out = false;
+        let mut cancelled = false;
         let mut fenced = false;
         match self.provider.api().logs(&session, &command).await {
             Ok(mut logs) => {
@@ -1222,6 +1247,10 @@ impl VercelSelectedRunner {
                 loop {
                     let next = tokio::select! {
                         biased;
+                        () = cancel.cancelled() => {
+                            cancelled = true;
+                            break;
+                        }
                         _ = beat.tick() => {
                             if !self.refresh_lease(&mut record).await {
                                 fenced = true;
@@ -1253,13 +1282,32 @@ impl VercelSelectedRunner {
                         }
                     }
                 }
+                if cancelled {
+                    // A line already queued when the cancel fired is not lost:
+                    // when it is the exit, the attempt finished by itself.
+                    while let Ok(line) = logs.receiver_mut().try_recv() {
+                        match line {
+                            LogLine::Stdout(bytes) => stdout.push(&bytes),
+                            LogLine::Stderr(bytes) => stderr.push(&bytes),
+                            LogLine::Command {
+                                exit_code: Some(code),
+                                ..
+                            } => {
+                                exit = Some(code);
+                                cancelled = false;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             Err(error) => record.error = Some(format!("cannot follow the logs: {error:#}")),
         }
         // The stream ended without an exit (a dropped connection or an early
         // EOF says nothing about the build): poll the command API until the
         // exit arrives or the deadline passes, tolerating a few transient errors.
-        if exit.is_none() && !timed_out && !fenced {
+        if exit.is_none() && !timed_out && !cancelled && !fenced {
             let mut errors = 0u32;
             loop {
                 let left = until.saturating_duration_since(tokio::time::Instant::now());
@@ -1269,21 +1317,28 @@ impl VercelSelectedRunner {
                 }
                 // Each wait is capped at the heartbeat period so the lease keeps
                 // beating while the exit is polled.
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
                 if !self.refresh_lease(&mut record).await {
                     fenced = true;
                     break;
                 }
-                match self
-                    .provider
-                    .client
-                    .wait_command_exact(
+                let waited = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        cancelled = true;
+                        break;
+                    }
+                    waited = self.provider.client.wait_command_exact(
                         &session,
                         &command,
                         left.min(WAIT_COMMAND_DEADLINE)
                             .min(self.options.lease_heartbeat),
-                    )
-                    .await
-                {
+                    ) => waited,
+                };
+                match waited {
                     Ok(Some(Some(code))) => {
                         exit = Some(code);
                         break;
@@ -1314,6 +1369,13 @@ impl VercelSelectedRunner {
                 "attempt deadline reached; killing the command and stopping the sandbox"
             );
         }
+        if cancelled {
+            tracing::warn!(
+                target: "thegn::vercel::job",
+                attempt = record.attempt,
+                "attempt cancelled; killing the command and stopping the sandbox"
+            );
+        }
         if fenced {
             tracing::warn!(
                 target: "thegn::vercel::job",
@@ -1323,9 +1385,12 @@ impl VercelSelectedRunner {
             record.error =
                 Some("owner lease lost: the ledger row was settled by another process".to_owned());
         }
-        let launch_failed =
-            !timed_out && exit == Some(125) && stderr.render().contains(LAUNCH_FAILED_MARKER);
+        let launch_failed = !timed_out
+            && !cancelled
+            && exit == Some(125)
+            && stderr.render().contains(LAUNCH_FAILED_MARKER);
         let completion = match (timed_out, exit) {
+            _ if cancelled => SelectedCompletion::Cancelled,
             (true, _) => SelectedCompletion::TimedOut,
             (false, Some(_)) if launch_failed => SelectedCompletion::Indeterminate,
             (false, Some(code)) => match signal_of(code) {
@@ -1911,25 +1976,37 @@ impl SelectedRunner for VercelSelectedRunner {
         if runner_alias != self.alias {
             return Err(RunnerRefusal::WrongRunner);
         }
-        // The Vercel attempt has no in-flight cancel handle yet (task 4.9): only
-        // a cancel before dispatch is honoured, and nothing has been sent then.
+        let cancelled = |this: &Self| SelectedJobResult {
+            runner: this.alias.clone(),
+            recipe,
+            source: source.clone(),
+            completion: SelectedCompletion::Cancelled,
+            log_tail: String::new(),
+            truncated: false,
+        };
         if cancel.is_cancelled() {
-            return Ok(SelectedJobResult {
-                runner: self.alias.clone(),
-                recipe,
-                source: source.clone(),
-                completion: SelectedCompletion::Cancelled,
-                log_tail: String::new(),
-                truncated: false,
-            });
+            return Ok(cancelled(self));
         }
         let content = self
             .snapshot
             .capture()
             .map_err(|error| self.unavailable(format!("cannot capture the snapshot: {error:#}")))?;
-        let receipt = self
+        // Bridge the route's std-only token to the executor's own cancel handle.
+        let token = CancelToken::new();
+        let bridge = token.clone();
+        cancel.on_cancel(move || bridge.cancel());
+        let receipt = match self
             .handle
-            .block_on(self.run(recipe, source, &content, deadline))?;
+            .block_on(self.run_cancellable(recipe, source, &content, deadline, &token))
+        {
+            Ok(receipt) => receipt,
+            // A cancel that closed the attempt before dispatch is recorded as
+            // rejected; the route reads it back as a user cancel.
+            Err(RunnerRefusal::RunnerUnavailable(_)) if token.is_cancelled() => {
+                return Ok(cancelled(self));
+            }
+            Err(refusal) => return Err(refusal),
+        };
         Ok(SelectedJobResult {
             runner: self.alias.clone(),
             recipe,

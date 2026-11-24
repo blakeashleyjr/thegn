@@ -120,6 +120,35 @@ pub(crate) fn project_key(repo_root: &Path) -> Option<String> {
     (!key.is_empty()).then_some(key)
 }
 
+/// True for a row a startup pass may reattach: `Running` with a session handle
+/// and no live owner lease. A live lease (fresh heartbeat, or its process
+/// still alive) belongs to a running owner and is never touched.
+pub(crate) fn is_orphaned_running(
+    state: sprites_job::AttemptState,
+    session: Option<&str>,
+    lease: Option<&sprites_job::OwnerLease>,
+    now_ms: i64,
+) -> bool {
+    state == sprites_job::AttemptState::Running
+        && session.is_some()
+        && !lease.is_some_and(|lease| lease.is_live(now_ms))
+}
+
+/// The attempts of `rows` a startup pass may reattach.
+pub(crate) fn orphaned_running(rows: &[sprites_job::AttemptRecord], now_ms: i64) -> Vec<u64> {
+    rows.iter()
+        .filter(|row| {
+            is_orphaned_running(
+                row.state,
+                row.session.as_deref(),
+                row.lease.as_ref(),
+                now_ms,
+            )
+        })
+        .map(|row| row.attempt)
+        .collect()
+}
+
 /// A built executor.
 pub(crate) enum Runner {
     Sprites(Box<sprites_job::SpritesSelectedRunner>),
@@ -160,12 +189,6 @@ impl Runner {
         }
     }
 
-    /// Whether a user cancel reaches a running job. Sprites stops the owned
-    /// process tree; Vercel honours a cancel only before dispatch for now.
-    pub(crate) fn cancels_mid_run(&self) -> bool {
-        matches!(self, Self::Sprites(_))
-    }
-
     pub(crate) fn selected(&self) -> &dyn SelectedRunner {
         match self {
             Self::Sprites(runner) => runner.as_ref(),
@@ -180,6 +203,37 @@ impl Runner {
             Self::Sprites(runner) => runner.reconcile_pending().await,
             Self::Vercel(runner) => runner.reconcile_pending().await,
         }
+    }
+
+    /// Reattach Sprites attempts a dead owner left `Running` with a session
+    /// handle: follow the provider's stream while it still holds the session,
+    /// otherwise settle them as indeterminate. A row with a live owner lease is
+    /// never touched, and nothing is redispatched. Vercel has no session to
+    /// follow, so its `reconcile_pending` is the whole recovery. Async: call it
+    /// on a runtime, never from the thread that blocks inside `submit`.
+    pub(crate) async fn reattach_orphans(&self) -> anyhow::Result<Vec<u64>> {
+        let Self::Sprites(runner) = self else {
+            return Ok(Vec::new());
+        };
+        let now = thegn_core::util::now_ms();
+        let attempts = orphaned_running(&runner.store().records()?, now);
+        for attempt in &attempts {
+            match runner.reattach(*attempt).await {
+                Ok(report) => tracing::info!(
+                    target: "thegn::jobs",
+                    attempt = report.attempt,
+                    reattached = report.reattached,
+                    "reattached an orphaned selected-job attempt"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "thegn::jobs",
+                    attempt,
+                    %error,
+                    "cannot reattach an orphaned selected-job attempt"
+                ),
+            }
+        }
+        Ok(attempts)
     }
 
     /// The newest ledger row for the receipt's recipe and source that was
@@ -461,8 +515,18 @@ fn reconcile_configured(env_name: &str, pc: &EnvProviderConfig, handle: &tokio::
             }
         };
         // `reconcile_pending` is async; this is a blocking-pool thread, so
-        // blocking on the runtime handle is the sanctioned bridge.
-        match handle.block_on(runner.reconcile_pending()) {
+        // blocking on the runtime handle is the sanctioned bridge. Reattach runs
+        // after it, on the rows it left unsettled.
+        let reconciled = handle.block_on(runner.reconcile_pending());
+        if let Err(error) = handle.block_on(runner.reattach_orphans()) {
+            tracing::warn!(
+                target: "thegn::jobs",
+                project = project.as_str(),
+                %error,
+                "selected-job reattach pass failed"
+            );
+        }
+        match reconciled {
             Ok(settled) => tracing::info!(
                 target: "thegn::jobs",
                 project = project.as_str(),
