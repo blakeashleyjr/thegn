@@ -208,7 +208,7 @@ fn denied_path(rel: &str) -> bool {
 /// Validate a repo-relative path: relative, no traversal, no control bytes, a
 /// portable REAPI entry name per component, and not one of the credential
 /// trees. Every transferred path goes through here.
-fn checked_rel_path(path: &str) -> Result<()> {
+pub(crate) fn checked_rel_path(path: &str) -> Result<()> {
     ensure!(!path.is_empty(), "path must not be empty");
     ensure!(path.len() <= 1024, "path is longer than 1024 bytes");
     ensure!(!path.starts_with('/'), "path must be relative: {path}");
@@ -235,7 +235,7 @@ fn checked_rel_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn hex(bytes: impl AsRef<[u8]>) -> String {
+pub(crate) fn hex(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
     bytes
         .iter()
@@ -247,7 +247,7 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
 
 /// A short unique token for names that must not collide across attempts, ledger
 /// resets or hosts: wall clock, process id and a process-local counter.
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -542,7 +542,7 @@ pub struct ProjectBinding {
 }
 
 /// A single path component: no separators, no traversal, no control bytes.
-fn checked_component(value: &str, what: &str, max: usize) -> Result<()> {
+pub(crate) fn checked_component(value: &str, what: &str, max: usize) -> Result<()> {
     ensure!(!value.is_empty(), "{what} must not be empty");
     ensure!(value.len() <= max, "{what} is longer than {max} bytes");
     ensure!(
@@ -564,7 +564,7 @@ fn checked_component(value: &str, what: &str, max: usize) -> Result<()> {
 
 /// The job-spec alias rule (`thegn-job-spec` validates a `runner:` the same
 /// way): lowercase alphanumeric with interior dashes.
-fn alias_is_valid(alias: &str) -> bool {
+pub(crate) fn alias_is_valid(alias: &str) -> bool {
     !alias.is_empty()
         && alias.len() <= 128
         && alias
@@ -864,7 +864,7 @@ impl std::fmt::Display for ReserveRefusal {
     }
 }
 
-fn state_name(state: AttemptState) -> &'static str {
+pub(crate) fn state_name(state: AttemptState) -> &'static str {
     match state {
         AttemptState::Reserved => "reserved",
         AttemptState::Dispatching => "dispatching",
@@ -878,11 +878,11 @@ fn state_name(state: AttemptState) -> &'static str {
     }
 }
 
-fn attempt_file(attempt: u64) -> String {
+pub(crate) fn attempt_file(attempt: u64) -> String {
     format!("attempt-{attempt:010}.json")
 }
 
-fn attempt_from_file(name: &str) -> Option<u64> {
+pub(crate) fn attempt_from_file(name: &str) -> Option<u64> {
     name.strip_prefix("attempt-")?
         .strip_suffix(".json")?
         .parse()
@@ -1430,14 +1430,14 @@ pub struct AttemptReceipt {
 
 /// A bounded byte tail: the last `cap` bytes of a stream plus the total seen.
 #[derive(Debug)]
-struct Tail {
+pub(crate) struct Tail {
     bytes: std::collections::VecDeque<u8>,
     cap: usize,
     total: u64,
 }
 
 impl Tail {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             bytes: std::collections::VecDeque::new(),
             cap,
@@ -1445,7 +1445,7 @@ impl Tail {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
         self.total = self.total.saturating_add(chunk.len() as u64);
         if chunk.len() >= self.cap {
             self.bytes.clear();
@@ -1464,23 +1464,23 @@ impl Tail {
         self.bytes.extend(chunk.iter().copied());
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         String::from_utf8_lossy(&self.bytes.iter().copied().collect::<Vec<u8>>()).into_owned()
     }
 
-    fn total(&self) -> u64 {
+    pub(crate) fn total(&self) -> u64 {
         self.total
     }
 
     /// True when earlier bytes fell off the front.
-    fn truncated(&self) -> bool {
+    pub(crate) fn truncated(&self) -> bool {
         self.total > self.bytes.len() as u64
     }
 }
 
 /// Trim a log tail to the contract's bound from the front, on a char boundary.
 /// The flag says whether anything was trimmed.
-fn bound_log(mut log: String) -> (String, bool) {
+pub(crate) fn bound_log(mut log: String) -> (String, bool) {
     if log.len() <= MAX_SELECTED_LOG_BYTES {
         return (log, false);
     }
@@ -1669,7 +1669,7 @@ fn kill_argv(control_file: &str, hold: &str) -> Vec<String> {
 /// signalled child, and the Sprites exec API reports only an exit code. The
 /// runner cannot tell a signal from a recipe that genuinely exits with such a
 /// code, so it reports the conventional reading.
-fn signal_of(code: i32) -> Option<i32> {
+pub(crate) fn signal_of(code: i32) -> Option<i32> {
     (129..=159).contains(&code).then_some(code - 128)
 }
 
@@ -3020,7 +3020,7 @@ impl SpritesSelectedRunner {
     }
 }
 
-fn millis_i64(duration: Duration) -> i64 {
+pub(crate) fn millis_i64(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 

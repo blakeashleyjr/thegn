@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod files;
+pub mod job;
 pub mod login;
 pub mod pty;
 pub mod stream;
@@ -1070,160 +1071,8 @@ impl VercelProvider {
 impl RemoteProvider for VercelProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
-            let name = checked_name(&self.spec.name)?.to_string();
-            // 1. Controller id (refuses before any request when unreadable).
-            let controller = self.controller().await?;
-            // 2. The plan and its body, rendered before any ledger write.
-            let owner = self.owner.clone().unwrap_or_default();
-            let plan = policy::CreatePlan {
-                name: name.clone(),
-                vcpus: self.spec.vcpus,
-                image: self.spec.image.clone(),
-                region: self.spec.region.clone(),
-                timeout_ms: policy::INITIAL_TIMEOUT_MS,
-                tags: policy::tags_for(&controller, &owner, &crate::vps::host_label()),
-                egress: Vec::new(),
-            };
-            let body = api::create_body(&self.spec.scope, &plan);
-            if !body.is_object() {
-                bail!("vercel: could not render the create body");
-            }
-            let account = self.account()?;
-            let cap = policy::max_instances(self.spec.max_instances) as usize;
-
-            let create_lock = CREATE_LOCK.lock().await;
-            // The process-global hard cap: the ledger first (no request at
-            // all when it is already full), then the union with the
-            // controller-tagged sandboxes Vercel lists, which also sees
-            // sandboxes another host created.
-            let ledger = self.ledger_vercel_names(&account).await?;
-            if ledger.len() >= cap {
-                return Err(Self::at_cap(ledger.len(), cap));
-            }
-            let remote = match self.listed(&controller).await {
-                crate::vps::Inventory::Complete(rows) => rows,
-                crate::vps::Inventory::Partial { reason, .. } => {
-                    bail!(
-                        "vercel: cannot count existing sandboxes ({}); refusing to create",
-                        reason.message()
-                    );
-                }
-                crate::vps::Inventory::Unknown(reason) => {
-                    bail!("vercel: cannot count existing sandboxes ({reason}); refusing to create");
-                }
-            };
-            let occupied: BTreeSet<String> = ledger
-                .into_iter()
-                .chain(remote.into_iter().map(|view| view.name))
-                .collect();
-            if occupied.len() >= cap {
-                return Err(Self::at_cap(occupied.len(), cap));
-            }
-
-            // 3. Reserve capacity and publish the intent.
-            let dir = self.ledger_dir();
-            let intent = registry::VpsRecord {
-                name: name.clone(),
-                provider: LEDGER_PROVIDER.into(),
-                state: "creating".into(),
-                instance_id: String::new(),
-                ip: String::new(),
-                created_at: thegn_core::util::now(),
-                owner: owner.clone(),
-                account: account.clone(),
-            };
-            let reserve_dir = dir.clone();
-            let reserve_result = tokio::task::spawn_blocking(move || {
-                registry::reserve_at(
-                    &reserve_dir,
-                    &intent,
-                    cap,
-                    registry::ReserveScope::Provider(LEDGER_PROVIDER),
-                )
-            })
-            .await
-            .context("vercel: reservation worker failed")?;
-            match reserve_result {
-                Ok(()) => {}
-                Err(registry::ReserveError::AtCap { occupied, cap }) => {
-                    return Err(Self::at_cap(occupied, cap));
-                }
-                Err(error @ registry::ReserveError::OwnedByOther { .. }) => {
-                    return Err(anyhow!(error));
-                }
-                Err(error @ registry::ReserveError::OtherAccount { .. }) => {
-                    return Err(anyhow!(error));
-                }
-                Err(registry::ReserveError::Store(error)) => {
-                    return Err(error
-                        .context("vercel: could not reserve ledger capacity; refusing to create"));
-                }
-            }
-            let mut guard = IntentGuard {
-                dir: dir.clone(),
-                name: name.clone(),
-                armed: true,
-            };
-            drop(create_lock);
-
-            // 4. The POST. From here the intent survives unless the create was
-            // definitively refused or a cleanup DELETE landed.
-            guard.preserve();
-            let created = match self.api().create(&body).await {
-                Ok(view) => view,
-                Err(error) if error_status(&error) == Some(409) => {
-                    // The name already exists (perhaps ours from an earlier
-                    // attempt, perhaps another host's): never delete it, and
-                    // keep the intent so the reaper can reconcile it.
-                    return Err(error.context("vercel: a sandbox with this name already exists"));
-                }
-                Err(error) if definite_create_rejection(&error) => {
-                    self.remove_record(&name).await;
-                    return Err(error.context("vercel: create refused"));
-                }
-                Err(error) => {
-                    self.cleanup_after_failed_create(&name).await;
-                    return Err(error.context("vercel: create failed"));
-                }
-            };
-
-            // 5. Record the ready sandbox.
-            let ready = registry::VpsRecord {
-                name: name.clone(),
-                provider: LEDGER_PROVIDER.into(),
-                state: "ready".into(),
-                instance_id: name.clone(),
-                ip: String::new(),
-                created_at: created_at_secs(created.created_at_ms),
-                owner,
-                account,
-            };
-            let write_dir = dir.clone();
-            let written =
-                tokio::task::spawn_blocking(move || registry::write_at(&write_dir, &ready))
-                    .await
-                    .context("vercel: ledger worker failed")
-                    .and_then(|r| r);
-            if let Err(error) = written {
-                self.cleanup_after_failed_create(&name).await;
-                return Err(error.context("vercel: could not record the created sandbox"));
-            }
-            if created.status == SessionStatus::Running
-                && let Some(session) = created.session_id.as_deref()
-            {
-                self.remember_session(&name, session, true);
-            }
-
-            // 6. The handle rides the `vercel-exec` self-bridge.
-            Ok(SandboxHandle {
-                id: name.clone(),
-                exec: ExecKind::Command(vec![
-                    thegn_core::util::self_exe_str(),
-                    "vercel-exec".into(),
-                    name,
-                    "--".into(),
-                ]),
-            })
+            self.create_named(&self.spec.name, policy::INITIAL_TIMEOUT_MS)
+                .await
         })
     }
 
@@ -1242,6 +1091,167 @@ impl RemoteProvider for VercelProvider {
 }
 
 impl VercelProvider {
+    /// Create one managed sandbox called `name` whose session lives for
+    /// `timeout_ms`. [`RemoteProvider::create`] is this with the provider's own
+    /// name and the interactive default; a selected Job attempt passes its own
+    /// per-attempt name and a deadline-derived timeout.
+    pub(crate) async fn create_named(&self, name: &str, timeout_ms: u64) -> Result<SandboxHandle> {
+        let name = checked_name(name)?.to_string();
+        // 1. Controller id (refuses before any request when unreadable).
+        let controller = self.controller().await?;
+        // 2. The plan and its body, rendered before any ledger write.
+        let owner = self.owner.clone().unwrap_or_default();
+        let plan = policy::CreatePlan {
+            name: name.clone(),
+            vcpus: self.spec.vcpus,
+            image: self.spec.image.clone(),
+            region: self.spec.region.clone(),
+            timeout_ms,
+            tags: policy::tags_for(&controller, &owner, &crate::vps::host_label()),
+            egress: Vec::new(),
+        };
+        let body = api::create_body(&self.spec.scope, &plan);
+        if !body.is_object() {
+            bail!("vercel: could not render the create body");
+        }
+        let account = self.account()?;
+        let cap = policy::max_instances(self.spec.max_instances) as usize;
+
+        let create_lock = CREATE_LOCK.lock().await;
+        // The process-global hard cap: the ledger first (no request at
+        // all when it is already full), then the union with the
+        // controller-tagged sandboxes Vercel lists, which also sees
+        // sandboxes another host created.
+        let ledger = self.ledger_vercel_names(&account).await?;
+        if ledger.len() >= cap {
+            return Err(Self::at_cap(ledger.len(), cap));
+        }
+        let remote = match self.listed(&controller).await {
+            crate::vps::Inventory::Complete(rows) => rows,
+            crate::vps::Inventory::Partial { reason, .. } => {
+                bail!(
+                    "vercel: cannot count existing sandboxes ({}); refusing to create",
+                    reason.message()
+                );
+            }
+            crate::vps::Inventory::Unknown(reason) => {
+                bail!("vercel: cannot count existing sandboxes ({reason}); refusing to create");
+            }
+        };
+        let occupied: BTreeSet<String> = ledger
+            .into_iter()
+            .chain(remote.into_iter().map(|view| view.name))
+            .collect();
+        if occupied.len() >= cap {
+            return Err(Self::at_cap(occupied.len(), cap));
+        }
+
+        // 3. Reserve capacity and publish the intent.
+        let dir = self.ledger_dir();
+        let intent = registry::VpsRecord {
+            name: name.clone(),
+            provider: LEDGER_PROVIDER.into(),
+            state: "creating".into(),
+            instance_id: String::new(),
+            ip: String::new(),
+            created_at: thegn_core::util::now(),
+            owner: owner.clone(),
+            account: account.clone(),
+        };
+        let reserve_dir = dir.clone();
+        let reserve_result = tokio::task::spawn_blocking(move || {
+            registry::reserve_at(
+                &reserve_dir,
+                &intent,
+                cap,
+                registry::ReserveScope::Provider(LEDGER_PROVIDER),
+            )
+        })
+        .await
+        .context("vercel: reservation worker failed")?;
+        match reserve_result {
+            Ok(()) => {}
+            Err(registry::ReserveError::AtCap { occupied, cap }) => {
+                return Err(Self::at_cap(occupied, cap));
+            }
+            Err(error @ registry::ReserveError::OwnedByOther { .. }) => {
+                return Err(anyhow!(error));
+            }
+            Err(error @ registry::ReserveError::OtherAccount { .. }) => {
+                return Err(anyhow!(error));
+            }
+            Err(registry::ReserveError::Store(error)) => {
+                return Err(
+                    error.context("vercel: could not reserve ledger capacity; refusing to create")
+                );
+            }
+        }
+        let mut guard = IntentGuard {
+            dir: dir.clone(),
+            name: name.clone(),
+            armed: true,
+        };
+        drop(create_lock);
+
+        // 4. The POST. From here the intent survives unless the create was
+        // definitively refused or a cleanup DELETE landed.
+        guard.preserve();
+        let created = match self.api().create(&body).await {
+            Ok(view) => view,
+            Err(error) if error_status(&error) == Some(409) => {
+                // The name already exists (perhaps ours from an earlier
+                // attempt, perhaps another host's): never delete it, and
+                // keep the intent so the reaper can reconcile it.
+                return Err(error.context("vercel: a sandbox with this name already exists"));
+            }
+            Err(error) if definite_create_rejection(&error) => {
+                self.remove_record(&name).await;
+                return Err(error.context("vercel: create refused"));
+            }
+            Err(error) => {
+                self.cleanup_after_failed_create(&name).await;
+                return Err(error.context("vercel: create failed"));
+            }
+        };
+
+        // 5. Record the ready sandbox.
+        let ready = registry::VpsRecord {
+            name: name.clone(),
+            provider: LEDGER_PROVIDER.into(),
+            state: "ready".into(),
+            instance_id: name.clone(),
+            ip: String::new(),
+            created_at: created_at_secs(created.created_at_ms),
+            owner,
+            account,
+        };
+        let write_dir = dir.clone();
+        let written = tokio::task::spawn_blocking(move || registry::write_at(&write_dir, &ready))
+            .await
+            .context("vercel: ledger worker failed")
+            .and_then(|r| r);
+        if let Err(error) = written {
+            self.cleanup_after_failed_create(&name).await;
+            return Err(error.context("vercel: could not record the created sandbox"));
+        }
+        if created.status == SessionStatus::Running
+            && let Some(session) = created.session_id.as_deref()
+        {
+            self.remember_session(&name, session, true);
+        }
+
+        // 6. The handle rides the `vercel-exec` self-bridge.
+        Ok(SandboxHandle {
+            id: name.clone(),
+            exec: ExecKind::Command(vec![
+                thegn_core::util::self_exe_str(),
+                "vercel-exec".into(),
+                name,
+                "--".into(),
+            ]),
+        })
+    }
+
     /// After a create POST that may have taken effect: best-effort delete,
     /// clearing the intent only when the delete landed. A failed delete keeps
     /// the record so the reaper and `destroy` can reconcile the leak.
