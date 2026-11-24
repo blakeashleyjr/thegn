@@ -798,12 +798,9 @@ impl SearchOverlay {
             let count_str = if matches.is_empty() {
                 "no results".to_string()
             } else if engine.truncated() {
-                format!(
-                    "{} of {} (of {})",
-                    selected_idx + 1,
-                    matches.len(),
-                    engine.total()
-                )
+                // The cap hid hits: say so and point at both ways to narrow,
+                // rather than showing a count that looks complete.
+                "too many results; narrow query or scope".to_string()
             } else {
                 format!("{} of {}", selected_idx + 1, matches.len())
             };
@@ -813,7 +810,7 @@ impl SearchOverlay {
             } else {
                 count_str
             };
-            let mode_hint = "Alt+c case  Alt+w word  Alt+r regex  Alt+f fuzzy";
+            let mode_hint = "Alt+c Aa  Alt+w ab  Alt+r .*  Alt+f fuzzy  Ctrl+r recent";
             let footer = Line::split(
                 vec![
                     seg(Tok::Slot(S::Ghost2), "↑↓"),
@@ -1728,10 +1725,10 @@ mod tests {
         let srcs = sources(1, &buf);
         let mut ov = overlay(1);
         assert_eq!(ov.engine().mode(), MatchMode::Literal);
-        assert!(draw(&ov, 100, 30).contains("Alt+c case  Alt+w word  Alt+r regex  Alt+f fuzzy"));
+        assert!(draw(&ov, 100, 30).contains("Alt+c Aa  Alt+w ab  Alt+r .*  Alt+f fuzzy"));
         ov.handle_key(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
         assert_eq!(ov.engine().mode(), MatchMode::Fuzzy);
-        assert!(draw(&ov, 100, 30).contains("Alt+c case  Alt+w word  Alt+r regex  Alt+f fuzzy"));
+        assert!(draw(&ov, 100, 30).contains("Alt+c Aa  Alt+w ab  Alt+r .*  Alt+f fuzzy"));
         ov.handle_key(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
         assert_eq!(ov.engine().mode(), MatchMode::Literal);
     }
@@ -1751,6 +1748,34 @@ mod tests {
         assert_eq!(ov.engine().mode(), MatchMode::Regex);
         ov.handle_key(&KeyCode::Char('r'), Modifiers::ALT, &srcs);
         assert_eq!(ov.engine().mode(), MatchMode::Literal);
+    }
+
+    #[test]
+    fn regex_toggle_matches_only_matching_lines() {
+        let buf = buf_from(&["error: boom", "warn: boom", "err: fallback"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        ov.handle_key(&KeyCode::Char('r'), Modifiers::ALT, &srcs);
+        typed(&mut ov, r"err(or)?:", &srcs);
+        let mut lines: Vec<&str> = ov
+            .engine()
+            .matches()
+            .iter()
+            .map(|m| m.line.as_str())
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, ["err: fallback", "error: boom"]);
+    }
+
+    #[test]
+    fn whole_word_toggle_excludes_longer_words() {
+        let buf = buf_from(&["log file", "login prompt", "catalog"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        ov.handle_key(&KeyCode::Char('w'), Modifiers::ALT, &srcs);
+        typed(&mut ov, "log", &srcs);
+        assert_eq!(ov.engine().matches().len(), 1);
+        assert_eq!(ov.engine().matches()[0].line, "log file");
     }
 
     #[test]
@@ -1896,12 +1921,29 @@ mod tests {
     }
 
     #[test]
-    fn render_footer_shows_total_when_results_are_truncated() {
+    fn render_footer_explains_truncated_results() {
         let buf = buf_from(&["hit 1", "hit 2", "hit 3", "hit 4", "hit 5"]);
         let srcs = sources(1, &buf);
         let mut ov = SearchOverlay::new(SearchScope::Pane(1), 1, 2);
         typed(&mut ov, "hit", &srcs);
-        assert!(draw(&ov, 100, 30).contains("1 of 2 (of 5)"));
+        let out = draw(&ov, 100, 30);
+        assert!(
+            out.contains("too many results; narrow query or scope"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Alt+c Aa"),
+            "the toggle keys stay visible: {out}"
+        );
+    }
+
+    #[test]
+    fn render_empty_pane_search_suggests_widening_scope() {
+        let buf = buf_from(&["cargo build"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "needle", &srcs);
+        assert!(draw(&ov, 100, 30).contains("no matches in this pane: Tab to widen"));
     }
 
     #[test]

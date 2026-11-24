@@ -60,6 +60,8 @@ lists them:
 | `Ctrl+r` | cycle through your recent queries from this session |
 
 Recent queries are kept in memory only, so they are gone after a restart.
+The active controls show as `Aa`, `ab`, `.*` and `~` chips beside the scope
+in the overlay header.
 
 `Tab` widens the scope and `Shift-Tab` narrows it, through pane, tab, worktree
 and workspace. The `profile` scope is no longer in the cycle. These scopes are
@@ -70,8 +72,9 @@ ring of the lines the pane printed), not your shell history. A pane with no
 output yet shows "no history yet".
 
 `[search] max_results` caps how many hits are collected — raise it for a
-big scrollback, lower it if searching feels heavy. See
-[[configuration]].
+big scrollback, lower it if searching feels heavy. When the cap is reached
+the footer says there are too many results and asks you to narrow the query
+or scope. See [[configuration]].
 
 ## File search
 
