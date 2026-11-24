@@ -320,7 +320,7 @@ pub(crate) fn graft(
         panes.table.remove(&id);
         return false;
     }
-    tab.focused_pane = id;
+    tab.focus_pane(id);
     true
 }
 

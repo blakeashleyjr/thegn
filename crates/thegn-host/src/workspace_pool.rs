@@ -267,11 +267,7 @@ impl WorkspacePool {
         } else {
             let tab = &mut rw.worktrees[gi].tabs[ti];
             tab.center.remove(pane_id);
-            if tab.focused_pane == pane_id
-                && let Some(first) = tab.center.pane_ids().first()
-            {
-                tab.focused_pane = *first;
-            }
+            tab.after_pane_closed(pane_id);
         }
         let snapshot = crate::session::Session {
             id: donor.clone(),
@@ -377,6 +373,7 @@ pub(crate) fn remap_group_ids(g: &mut crate::session::WorktreeGroup, panes: &mut
             .get(&tab.focused_pane)
             .copied()
             .unwrap_or(tab.focused_pane);
+        tab.remap_focus_history(&mut |id| map.get(&id).copied().unwrap_or(id));
         tab.pane_cwds = std::mem::take(&mut tab.pane_cwds)
             .into_iter()
             .map(|(id, cwd)| (map.get(&id).copied().unwrap_or(id), cwd))

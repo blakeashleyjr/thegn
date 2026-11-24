@@ -258,7 +258,7 @@ pub(crate) fn repair_stale_focus(tab: &mut crate::session::Tab, center: Rect) {
         return;
     }
     if let Some((id, _)) = tab.center.layout(center).iter().min_by_key(|(_, r)| r.x) {
-        tab.focused_pane = *id;
+        tab.focus_pane(*id);
     }
 }
 

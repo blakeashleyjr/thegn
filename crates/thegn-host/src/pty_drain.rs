@@ -1664,11 +1664,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
             }
         } else if let Some(tab) = ctx.session.tab_mut(gi, ti) {
             tab.center.remove(id);
-            if tab.focused_pane == id
-                && let Some(first) = tab.center.pane_ids().first()
-            {
-                tab.focused_pane = *first;
-            }
+            tab.after_pane_closed(id);
             // An attached agent finishing inside a split still removes its leaf
             // (a fan-out tab must not accumulate one husk per finished stage —
             // design §D3's documented tradeoff) but is announced on the active

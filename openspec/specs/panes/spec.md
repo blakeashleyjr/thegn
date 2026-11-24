@@ -148,6 +148,35 @@ persisted: a restart comes back tiled.
 - **THEN** the original stack expands that same member and keyboard input
   targets the displayed pane, including stacks nested inside splits
 
+### Requirement: Closing a pane preserves useful focus
+
+Each tab SHALL keep a bounded, deduplicated, runtime-only history of the center
+panes it has focused, most recent last. Every focus change that lands on a
+center pane MUST record it. Closing the focused pane (by action or process exit)
+SHALL focus the most recently focused pane still in that tab's tree, activating
+it when it is a collapsed stack member. Closing an unfocused pane MUST leave
+focus where it is. Closed pane ids MUST be removed from the history. When no
+recorded pane survives, focus SHALL keep the existing first-pane fallback. The
+history is not persisted.
+
+#### Scenario: Closing the pane you just returned to
+
+- **WHEN** a tab holds panes A, B and C, the user focuses A, then C, then B,
+  and closes B
+- **THEN** focus lands on C rather than the first pane in tree order
+
+#### Scenario: Closing a background pane
+
+- **WHEN** the user closes a pane that is not focused
+- **THEN** focus stays on the same pane and the closed id is dropped from the
+  history
+
+#### Scenario: No remembered survivor
+
+- **WHEN** the focused pane closes and no other pane in the history remains in
+  the tree
+- **THEN** focus falls back to the tree's first pane, as before
+
 ### Requirement: A zoomed tab renders as a pane stack
 
 While a tab is maximized or full-window, thegn SHALL draw the focused pane

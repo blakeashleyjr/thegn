@@ -6484,7 +6484,7 @@ fn apply_layout_to_active_tab(
     let (tree, focus) = spec.apply(&mut spawn)?;
     if let Some(tab) = session.active_tab_mut() {
         tab.center = tree;
-        tab.focused_pane = focus;
+        tab.focus_pane(focus);
     }
     for id in old {
         panes.table.remove(&id);
@@ -6769,7 +6769,7 @@ fn attach_agent_pane(
                 panes.table.remove(&old);
             }
             tab.center = crate::center::CenterTree::Leaf(id);
-            tab.focused_pane = id;
+            tab.focus_pane(id);
             Some(id)
         }
         Err(e) => {
@@ -17652,7 +17652,7 @@ async fn event_loop<T: Terminal>(
                             // content-click path uses — and clear the hint.
                             focus.zone = crate::focus::Zone::Center;
                             if let Some(tab) = session.active_tab_mut() {
-                                tab.focused_pane = dragged;
+                                tab.focus_pane(dragged);
                             }
                             model.status.clear();
                         } else {
@@ -18304,7 +18304,7 @@ async fn event_loop<T: Terminal>(
                         }
                         focus.zone = crate::focus::Zone::Center;
                         if let Some(tab) = session.active_tab_mut() {
-                            tab.focused_pane = id;
+                            tab.focus_pane(id);
                         }
                         // Anchor in absolute grid lines (screen row - viewport
                         // offset) so the selection stays glued to its content as
@@ -26036,7 +26036,7 @@ async fn event_loop<T: Terminal>(
                                                 Ok(new) => {
                                                     if let Some(tab) = session.active_tab_mut() {
                                                         if tab.center.split(focused, dir, new) {
-                                                            tab.focused_pane = new;
+                                                            tab.focus_pane(new);
                                                             need_relayout = true;
                                                         } else {
                                                             panes.table.remove(&new);
@@ -27610,7 +27610,7 @@ async fn event_loop<T: Terminal>(
                                 let new = panes.reserve_ids(1);
                                 if let Some(tab) = session.active_tab_mut() {
                                     if tab.center.split(focused, dir, new) {
-                                        tab.focused_pane = new;
+                                        tab.focus_pane(new);
                                         need_relayout = true;
                                     } else {
                                         panes.table.remove(&new);
@@ -27881,7 +27881,7 @@ async fn event_loop<T: Terminal>(
                                 let new = panes.reserve_ids(1);
                                 if let Some(tab) = session.active_tab_mut() {
                                     if tab.center.split(focused, dir, new) {
-                                        tab.focused_pane = new;
+                                        tab.focus_pane(new);
                                         need_relayout = true;
                                     } else {
                                         // target not found (shouldn't happen); reap the pane
@@ -28501,7 +28501,7 @@ async fn event_loop<T: Terminal>(
                                     session.active_group_mut().and_then(|g| g.active_tab_mut())
                                 {
                                     tab.center = crate::center::CenterTree::Leaf(new);
-                                    tab.focused_pane = new;
+                                    tab.focus_pane(new);
                                 }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
@@ -28913,10 +28913,8 @@ async fn event_loop<T: Terminal>(
                                     .map(|t| t.center.remove(focused))
                                     .unwrap_or(false);
                                 if removed {
-                                    if let Some(tab) = session.active_tab_mut()
-                                        && let Some(first) = tab.center.pane_ids().first().copied()
-                                    {
-                                        tab.focused_pane = first;
+                                    if let Some(tab) = session.active_tab_mut() {
+                                        tab.after_pane_closed(focused);
                                     }
                                     let name = format!("promoted-{focused}");
                                     supervisor.promote(
@@ -29538,10 +29536,12 @@ fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32
         }
     }
     tab.center.remap(&mut |old| map[&old]);
+    tab.remap_focus_history(&mut |old| map.get(&old).copied().unwrap_or(old));
     if let Some(&new) = map.get(&focus) {
-        tab.focused_pane = new;
+        tab.focus_pane(new);
     } else {
-        tab.focused_pane = *map.values().next().unwrap_or(&0);
+        let next = *map.values().next().unwrap_or(&0);
+        tab.focus_pane(next);
     }
     true
 }

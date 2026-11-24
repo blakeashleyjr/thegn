@@ -351,7 +351,7 @@ pub(crate) fn forward_pane_mouse(
         // A press also focuses the pane.
         focus.zone = crate::focus::Zone::Center;
         if let Some(tab) = session.active_tab_mut() {
-            tab.focused_pane = id;
+            tab.focus_pane(id);
         }
         *mouse_sel = None;
         *dirty = true;

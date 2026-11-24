@@ -89,6 +89,11 @@ you want a direct key.
   → tiled (see Zoom below)
 - `Ctrl-Alt-y` — sync panes: broadcast typed input to every pane in the tab
 
+Closing the focused pane (or its process exiting) moves focus to the pane you
+most recently used in that tab that is still open, so a close lands you back
+where you were rather than on an arbitrary neighbour. Closing an unfocused pane
+leaves focus where it is.
+
 ### Zoom
 
 `Ctrl-Alt-z` grows the focused pane in two steps: **maximized** fills the

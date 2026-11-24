@@ -284,7 +284,7 @@ pub(crate) fn activate_stack_member(
     pane: PaneId,
 ) {
     if let Some(tab) = session.active_tab_mut() {
-        tab.focused_pane = pane;
+        tab.focus_pane(pane);
         tab.center.activate_stack_member(pane);
     }
     focus.zone = Zone::Center;
@@ -475,6 +475,7 @@ mod tests {
         assert_eq!(f.zone, Zone::Center);
         let t = session.active_tab().unwrap();
         assert_eq!(t.focused_pane, 3);
+        assert_eq!(t.focus_history.last().copied(), Some(3), "recorded");
         assert_eq!(t.grow, Grow::Fullscreen, "the zoom level is kept");
         assert_eq!(displayed_tree(&session).layout(center_rect())[0].0, 3);
     }
