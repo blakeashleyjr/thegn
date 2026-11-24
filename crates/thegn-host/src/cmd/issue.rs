@@ -295,7 +295,7 @@ pub(crate) fn no_tracker_message(skipped: &[String]) -> String {
 
 /// Parse a comma-separated tracker status list (unknown names dropped).
 fn parse_tracker_statuses(s: &str) -> Vec<thegn_core::issue::IssueStatus> {
-    use thegn_core::issue::IssueStatus::*;
+    use thegn_core::issue::IssueStatus::{Backlog, Cancelled, Done, InProgress, Todo};
     s.split(',')
         .filter_map(|p| match p.trim() {
             "backlog" => Some(Backlog),

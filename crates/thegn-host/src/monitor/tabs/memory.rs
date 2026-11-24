@@ -1,6 +1,6 @@
 //! Memory tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, MAIN_H, SUB_H, heading, kv};
 use crate::chrome::S;
 use crate::sections::{Section, spacer};
 use crate::seg::Tok;

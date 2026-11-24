@@ -1,6 +1,6 @@
 //! Cpu tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, MAIN_H, heading, kv, temp_tone};
 use super::super::{MonitorOutcome, MonitorOverlay};
 use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection, spacer};

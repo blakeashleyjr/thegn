@@ -1338,7 +1338,7 @@ mod tests {
 
     #[test]
     fn terminal_detection_prefers_the_running_terminal() {
-        use TerminalKind::*;
+        use TerminalKind::{Alacritty, Ghostty, Kitty, Unknown, Unsupported};
         // TERM_PROGRAM is the first-hand answer…
         assert_eq!(
             detect_terminal(Some("ghostty"), Some("xterm-256color")),

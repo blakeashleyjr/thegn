@@ -1,6 +1,6 @@
 //! Procs tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, TabBuild, heading, plain, row_ys};
 use super::super::procs_columns::{
     self, Availability, ColId, FitFlags, Preset, availability, format_bytes, format_cpu,
     proc_row_caps,

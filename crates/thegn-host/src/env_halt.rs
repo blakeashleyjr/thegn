@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn classify_halt_table() {
-        use HaltClass::*;
+        use HaltClass::{LocalRuntime, ProviderAuth, ProviderFunds, Remote, Unprovisioned};
         let cases = [
             ("provider:sprites", "INSUFFICIENT_FUNDS", ProviderFunds),
             ("provider:sprites", "available: $0.00", ProviderFunds),

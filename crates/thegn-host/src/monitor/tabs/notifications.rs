@@ -1,6 +1,6 @@
 //! Notifications tab renderer and tab-specific monitor actions.
 
-use super::super::build::*;
+use super::super::build::{Ctx, TabBuild, heading, plain, trunc};
 use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection};
 use crate::seg::Tok;

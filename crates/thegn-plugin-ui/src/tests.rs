@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use thegn_core::plugin_app::ChoiceOption;
 fn form(scope: &str, instance: &str, value: &str) -> AppView {
     serde_json::from_value(json!({"state_scope":scope,"revision":1,"root":{"kind":"form","id":"edit","instance":instance,"title":"Edit","fields":[{"id":"title","label":"Title","value":value}],"submit":"Save"}})).unwrap()
 }

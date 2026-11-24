@@ -1,6 +1,6 @@
 //! Per-tab monitor presentation, navigation metadata, keys and footer hints.
 
-use super::*;
+use super::{KeyCode, MonitorOutcome, MonitorOverlay, MonitorTab, StatsSnapshot, footer};
 use crate::seg::Seg;
 
 pub(super) mod containers;
