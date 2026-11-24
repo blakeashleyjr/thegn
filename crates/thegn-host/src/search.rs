@@ -1283,7 +1283,7 @@ mod tests {
 
     #[test]
     fn narrow_panel_drops_the_age_column_first() {
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
 
         let mut buf = HistoryBuffer::new(100);
         let old = crate::e2e_freeze::clock() - Duration::from_secs(3 * 3_600);

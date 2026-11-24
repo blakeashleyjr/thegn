@@ -421,7 +421,7 @@ mod tests {
                 limit: MAX_TEMPLATE_ELEMENT_BYTES,
             }
             .to_string(),
-            "argv template element exceeds 16384 bytes"
+            "argv template element exceeds 131072 bytes"
         );
 
         // Parsing is bounded by the template length; rendering is bounded by the
