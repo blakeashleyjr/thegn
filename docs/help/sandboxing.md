@@ -440,7 +440,7 @@ setting, run `thegn info` or press `I` on its sidebar row (see the Info screen s
 Workspaces and worktrees).
 
 The panel's **system → sandbox** section shows the live state for the
-focused worktree: the backend, image, mounts, DNS filtering, and the
+focused worktree: the backend, image, mounts, and the
 container's status and cpu/mem/net when one exists; the wider views add
 the activity timeline. Containers not proven to belong to this profile are
 listed read-only: ownership requires this profile's expected container name

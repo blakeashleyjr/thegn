@@ -548,8 +548,8 @@ panel, PR) keep working.
   `podman-rootless` → `podman-rootful` → `docker` → `apple` (macOS `container`)
   → `bwrap` → `jobobject` (Windows Job Objects). `apple` and `jobobject` probe
   absent off their respective OSes. There is no host fallback; a launch with
-  no usable backend refuses. `systemd` and `wsl` are also selectable
-  explicitly. Hardening presets: `open`, `standard` (the default: read-only
+  no usable backend refuses. `systemd` is also selectable
+  explicitly; `wsl`, `smol` and `appcontainer` are reserved and never selected. Hardening presets: `open`, `standard` (the default: read-only
   root, credentials readable), and `sealed` (opt-in: no network, read-only
   root, all caps dropped). Set `[sandbox] profile = "sealed"`,
   `[env.<name>.sandbox] profile = "sealed"`, or
