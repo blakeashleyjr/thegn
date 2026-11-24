@@ -83,7 +83,7 @@ run_case() {
   # bound by the three arguments below, not this shell's.
   # shellcheck disable=SC2016
   if "$TIMEOUT" 20s bash -c 'source "$0"; pty_run_to "$1" "$2"' \
-    "$HERE/lib/pty.sh" "$log" "$cmd" >/dev/null; then
+    "$HERE/lib/pty.sh" "$log" "$cmd" >/dev/null </dev/null; then
     if grep -Eiq 'panicked at|thread .* panicked|fatal runtime error' "$log"; then
       bad "PTY launch $name (${cols}x${rows}) produced panic text"
       tail -80 "$log" || true
