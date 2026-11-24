@@ -20,6 +20,10 @@ agent_run.rs
 agent_tests.rs
 clipboard.rs
 cmd/debug.rs
+# TEST-ONLY cfg: the partial-removal test relies on Unix directory permissions
+# (a read-only parent) to make `remove_dir_all` fail midway; reclaim itself is
+# platform-free.
+cmd/disk.rs
 # LINT-ONLY cfg, not per-OS behaviour (THE-505): the only platform predicates
 # here are `cfg_attr(…, allow(dead_code))` on `ConfigFileReadError` variants and
 # `FinalLinkResolvingReader`, which exist identically on every platform — only

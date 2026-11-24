@@ -1732,10 +1732,10 @@ mod tests {
         let srcs = sources(1, &buf);
         let mut ov = overlay(1);
         assert_eq!(ov.engine().mode(), MatchMode::Literal);
-        assert!(draw(&ov, 100, 30).contains("Alt+c Aa  Alt+w ab  Alt+r .*  Alt+f fuzzy"));
+        assert!(draw(&ov, 160, 30).contains("Alt+c Aa  Alt+w ab  Alt+r .*  Alt+f fuzzy"));
         ov.handle_key(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
         assert_eq!(ov.engine().mode(), MatchMode::Fuzzy);
-        assert!(draw(&ov, 100, 30).contains("Alt+c Aa  Alt+w ab  Alt+r .*  Alt+f fuzzy"));
+        assert!(draw(&ov, 160, 30).contains("Alt+c Aa  Alt+w ab  Alt+r .*  Alt+f fuzzy"));
         ov.handle_key(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
         assert_eq!(ov.engine().mode(), MatchMode::Literal);
     }
