@@ -1586,10 +1586,27 @@ mod tests {
             crate::config::SandboxBackend::PodmanRootful,
         ] {
             assert!(network_audit_warnings(&audit_cfg(backend, &[])).is_empty());
+            let diagnostics = validate_diagnostics(&format!(
+                "[sandbox]\nbackend = \"{}\"\nnetwork_audit = true\n",
+                backend.as_str()
+            ));
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("network_audit")),
+                "{diagnostics:?}"
+            );
         }
         // The default `auto` chain starts with podman.
         assert!(
             network_audit_warnings(&audit_cfg(crate::config::SandboxBackend::Auto, &[])).is_empty()
+        );
+        let diagnostics = validate_diagnostics("[sandbox]\nnetwork_audit = true\n");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("network_audit")),
+            "{diagnostics:?}"
         );
         // Off: nothing to say, whatever the backend.
         let mut off = audit_cfg(crate::config::SandboxBackend::Docker, &[]);
@@ -1605,6 +1622,17 @@ mod tests {
         ));
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("docker, bwrap"), "{warnings:?}");
+        // The warning reaches `config validate` for an explicit non-podman chain.
+        let diagnostics = validate_diagnostics(
+            "[sandbox]\nbackend_chain = [\"docker\", \"bwrap\"]\nnetwork_audit = true\n",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == ValidationSeverity::Warning
+                    && d.message.contains("network_audit")),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

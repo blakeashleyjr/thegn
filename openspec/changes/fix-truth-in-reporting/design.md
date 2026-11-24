@@ -122,11 +122,12 @@ are reported, not pinned.
 3. **`add-oci-runtime-tiers` is amended in place.** A MODIFIED or REMOVED delta cannot target it: the change
    is unarchived and its requirement is not in `openspec/specs/sandbox`, so strict validation would fail.
    Its proposal, design and delta text are edited directly, and its tasks are untouched.
-4. **Prior audit finding F14 is already closed** (verified at main `cbf36fe3a`; Linear THE-804). Podman audit filtering uses `OWNED_LABEL_FILTER =
-"label=thegn.managed=true"` (`sandbox_manage.rs`), the create path stamps `OWNED_LABEL`, and the tests
+4. **Prior audit finding F14 is already closed** (verified at main `cbf36fe3a`; Linear THE-804).
+   Podman audit filtering uses `OWNED_LABEL_FILTER = "label=thegn.managed=true"`
+   (`sandbox_manage.rs`), the create path stamps `OWNED_LABEL`, and the tests
    `argv_matches_the_moved_filters` and `create_label_and_events_filter_agree`
-   (`sandbox_events_podman.rs`) pin it. WS01-P1-06 records the closure; no code changes. The DNS-ring half
-   disappears with the DNS filter.
+   (`sandbox_events_podman.rs`) pin it. WS01-P1-06 records the closure; no code changes.
+   The DNS-ring half disappears with the DNS filter.
 5. **The stable clamp's `Providers` arm already works.** It drops provider envs and clears `[host.*]`; only
    the k8s condition is new.
 6. **The acceptance search for the deleted DNS filter excludes dated records** (`docs/audits/**`,
