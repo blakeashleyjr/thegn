@@ -1673,6 +1673,18 @@
       "archive_path": "openspec/changes/archive/2026-09-30-strict-state-host-capture/"
     },
     {
+      "change": "terminal-search-off-loop",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2244",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Terminal history search scores an owned snapshot on a worker with generation-safe results, deferred Enter and failure fallback; live frame-time check open."
+    },
+    {
       "change": "validate-sandbox-volume-sources",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",

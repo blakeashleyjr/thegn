@@ -23,6 +23,11 @@ Four search surfaces, one habit: type, arrow, `↵`.
 with the pane it came from, so it doubles as "which of these six
 terminals printed that error".
 
+Searching never stalls typing or redrawing, even at workspace scope over
+hundreds of thousands of lines: matching runs on a background thread and the
+list says `searching…` until the ranked results are in. Pressing `↵` in the
+meantime jumps to the best hit as soon as it is found.
+
 Each hit is labelled **worktree · tab · program**, so two panes running the
 same program in different tabs are told apart. Opening the overlay with an
 empty query lists the pane's most recent lines instead of an empty box.

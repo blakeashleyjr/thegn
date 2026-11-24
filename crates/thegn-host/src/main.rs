@@ -334,6 +334,7 @@ mod subsystem;
 mod tabbar_env;
 mod task;
 mod telemetry;
+mod terminal_search_worker;
 mod terminal_wizard;
 #[cfg(test)]
 mod testenv;

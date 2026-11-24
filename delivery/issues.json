@@ -612,6 +612,13 @@
       ]
     },
     {
+      "issue": "THE-2244",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "terminal-search-off-loop"
+      ]
+    },
+    {
       "issue": "THE-2351",
       "project": "Client API & Remote Access",
       "changes": [],

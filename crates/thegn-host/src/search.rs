@@ -5,6 +5,12 @@
 //! drives `SearchEngine` for fuzzy matching, and returns a typed `Outcome` so
 //! `run.rs` can take the right action (jump / dismiss / keep open).
 //!
+//! Scoring never runs on the event loop: a key edit only queues the new query/
+//! mode/options, and `start_pending_search` hands an owned history snapshot to
+//! the [`TerminalSearchWorker`], whose results `drain_search` folds back in.
+//! The synchronous paths (`handle_key`, `prime`, `apply_scope`) exist for tests
+//! and as the fallback when no worker thread can be spawned.
+//!
 //! Layout (approximate, actual size adapts to the screen):
 //!
 //! ```text
@@ -23,8 +29,15 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
+use termwiz::terminal::TerminalWaker;
 
-use thegn_core::search::{MatchMode, SearchEngine, SearchMatch, SearchScope, SearchSource};
+use thegn_core::search::{
+    MatchMode, MatchOptions, SearchEngine, SearchMatch, SearchScope, SearchSource,
+};
+
+use crate::terminal_search_worker::{
+    SearchRequest, SnapshotSources, TerminalSearchWorker, WakeFn, source_refs, take_snapshot,
+};
 
 use crate::chrome::S;
 use crate::compositor::Rect;
@@ -78,6 +91,44 @@ pub struct SearchOverlay {
     /// The pane id the overlay was opened for (used to wrap scope cycles back
     /// to `Pane(…)` so the correct pane id is preserved).
     anchor_pane: u32,
+    /// Result cap, re-applied on every worker request.
+    max_results: usize,
+    /// Scores the snapshot off the loop. Created on the first search; dropped
+    /// (which stops its thread) with the overlay.
+    worker: Option<TerminalSearchWorker>,
+    /// A query/mode/option/scope edit is waiting for `start_pending_search`.
+    search_pending: bool,
+    /// The worker has not delivered its final batch for the current query yet.
+    searching: bool,
+    /// Owned history snapshot the current results were scored against. Unchanged
+    /// panes are shared between keystrokes; previews read from it so they stay
+    /// consistent with the match indices.
+    snapshot: SnapshotSources,
+    /// Spawning or running the worker failed once: score on the loop from now on
+    /// instead of retrying a thread on every keystroke.
+    worker_failed: bool,
+    /// Enter was pressed before the first batch of the typed query arrived; jump
+    /// to its best hit as soon as it does.
+    pending_jump: bool,
+    /// An outcome produced while draining (a deferred Enter), for the loop to act on.
+    ready: Option<SearchOutcome>,
+}
+
+/// Where an edit is scored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scoring {
+    /// On this thread (tests, and the fallback when no worker can be spawned).
+    Now,
+    /// On the worker: the edit only queues state, and the caller follows with
+    /// `start_pending_search`.
+    Deferred,
+}
+
+/// One query edit.
+enum QueryEdit {
+    Set(String),
+    Push(char),
+    Pop,
 }
 
 impl SearchOverlay {
@@ -88,6 +139,14 @@ impl SearchOverlay {
             engine: SearchEngine::new(scope, max_results),
             preview: Vec::new(),
             anchor_pane: pane_id,
+            max_results: max_results.max(1),
+            worker: None,
+            search_pending: false,
+            searching: false,
+            snapshot: Vec::new(),
+            worker_failed: false,
+            pending_jump: false,
+            ready: None,
         }
     }
 
@@ -95,12 +154,25 @@ impl SearchOverlay {
         self.engine.scope()
     }
 
+    /// True while the worker still owes results for the current query.
+    pub fn searching(&self) -> bool {
+        self.searching
+    }
+
     /// Populate the result list before the user types. An empty query ranks
     /// the newest history lines first, so opening the overlay is useful on its
-    /// own and does not wait for the first keystroke.
+    /// own and does not wait for the first keystroke. Scores on this thread:
+    /// `run.rs` uses [`Self::queue_prime`] instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn prime(&mut self, sources: &[SearchSource<'_>]) {
-        self.engine.set_query("", sources);
-        self.refresh_preview(sources);
+        self.query_edit(Scoring::Now, QueryEdit::Set(String::new()), sources);
+    }
+
+    /// Queue the opening scan (empty query ⇒ newest lines first) for the
+    /// worker. Follow with `start_pending_search`.
+    pub fn queue_prime(&mut self) {
+        self.engine.queue_query("");
+        self.expect_scan();
     }
 
     #[allow(dead_code)] // used in tests
@@ -110,11 +182,36 @@ impl SearchOverlay {
 
     /// Feed a key event. `sources` must already be filtered to the current scope.
     /// Call `build_search_sources(self.scope(), …)` before calling this.
+    /// Scores on this thread: `run.rs` uses [`Self::handle_key_async`] instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn handle_key(
         &mut self,
         key: &KeyCode,
         mods: Modifiers,
         sources: &[SearchSource<'_>],
+    ) -> SearchOutcome {
+        self.handle_key_with(key, mods, sources, Scoring::Now)
+    }
+
+    /// Feed a key event without scoring on this thread: a query/mode/option
+    /// edit only queues the new state, so the caller must follow with
+    /// `start_pending_search`. `run.rs` uses this so a keystroke never scans
+    /// history on the event loop.
+    pub fn handle_key_async(
+        &mut self,
+        key: &KeyCode,
+        mods: Modifiers,
+        sources: &[SearchSource<'_>],
+    ) -> SearchOutcome {
+        self.handle_key_with(key, mods, sources, Scoring::Deferred)
+    }
+
+    fn handle_key_with(
+        &mut self,
+        key: &KeyCode,
+        mods: Modifiers,
+        sources: &[SearchSource<'_>],
+        scoring: Scoring,
     ) -> SearchOutcome {
         // Dismiss: Esc or Ctrl+g.
         if is_escape(key, mods) {
@@ -128,6 +225,12 @@ impl SearchOverlay {
                     record_recent(self.engine.query());
                     return SearchOutcome::Jump(m.clone());
                 }
+                if self.searching {
+                    // The typed query has no batch yet: wait for its best hit
+                    // instead of dismissing (or jumping to a stale one).
+                    self.pending_jump = true;
+                    return SearchOutcome::Pending;
+                }
                 // Enter on empty results → dismiss.
                 record_recent(self.engine.query());
                 return SearchOutcome::Dismiss;
@@ -135,10 +238,14 @@ impl SearchOverlay {
 
             KeyCode::UpArrow => {
                 self.engine.move_up();
+                // A selection move has no edit of its own: the preview follows
+                // the cursor without touching the result list.
+                self.refresh_preview_for(sources);
             }
 
             KeyCode::DownArrow => {
                 self.engine.move_down();
+                self.refresh_preview_for(sources);
             }
 
             KeyCode::Tab => {
@@ -156,19 +263,19 @@ impl SearchOverlay {
                     MatchMode::Literal | MatchMode::Regex => MatchMode::Fuzzy,
                     MatchMode::Fuzzy => MatchMode::Literal,
                 };
-                self.engine.set_mode(next, sources);
+                self.change_mode(scoring, next, sources);
             }
 
             KeyCode::Char('c') | KeyCode::Char('C') if mods == Modifiers::ALT => {
                 let mut options = self.engine.options();
                 options.exact_case = !options.exact_case;
-                self.engine.set_options(options, sources);
+                self.change_options(scoring, options, sources);
             }
 
             KeyCode::Char('w') | KeyCode::Char('W') if mods == Modifiers::ALT => {
                 let mut options = self.engine.options();
                 options.whole_word = !options.whole_word;
-                self.engine.set_options(options, sources);
+                self.change_options(scoring, options, sources);
             }
 
             KeyCode::Char('r') | KeyCode::Char('R') if mods == Modifiers::ALT => {
@@ -176,36 +283,240 @@ impl SearchOverlay {
                     MatchMode::Literal | MatchMode::Fuzzy => MatchMode::Regex,
                     MatchMode::Regex => MatchMode::Literal,
                 };
-                self.engine.set_mode(next, sources);
+                self.change_mode(scoring, next, sources);
             }
 
             KeyCode::Char('r') | KeyCode::Char('R') if mods == Modifiers::CTRL => {
                 if let Some(query) = recall_recent(self.engine.query()) {
-                    self.engine.set_query(&query, sources);
+                    self.query_edit(scoring, QueryEdit::Set(query), sources);
                 }
             }
 
             KeyCode::Backspace => {
-                self.engine.backspace(sources);
+                self.query_edit(scoring, QueryEdit::Pop, sources);
             }
 
             KeyCode::Char(c)
                 if (mods.is_empty() || mods == Modifiers::SHIFT) && !c.is_control() =>
             {
-                self.engine.push_char(*c, sources);
+                self.query_edit(scoring, QueryEdit::Push(*c), sources);
             }
 
             _ => {}
         }
 
-        self.refresh_preview(sources);
-
         SearchOutcome::Pending
     }
 
+    /// Apply a scope change and re-score on this thread. `run.rs` uses
+    /// [`Self::apply_scope_async`] instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn apply_scope(&mut self, scope: SearchScope, sources: &[SearchSource<'_>]) {
         self.engine.set_scope(scope, sources);
         self.refresh_preview(sources);
+    }
+
+    /// Apply a scope change without scoring: the caller must start the worker
+    /// search against the new sources.
+    pub fn apply_scope_async(&mut self, scope: SearchScope) {
+        self.engine.queue_scope(scope);
+        self.expect_scan();
+    }
+
+    /// Hand the pending edit to the worker. Cheap when nothing is pending, so
+    /// the loop can call it unconditionally after a key.
+    pub fn start_pending_search(&mut self, sources: &[SearchSource<'_>], waker: TerminalWaker) {
+        self.start_pending_search_with(
+            sources,
+            Box::new(move || {
+                if let Err(error) = waker.wake() {
+                    tracing::debug!(%error, "terminal search waker pulse failed");
+                }
+            }),
+        );
+    }
+
+    /// [`Self::start_pending_search`] with an explicit wake callback, used when
+    /// the worker is first spawned (and by tests, which have no terminal).
+    pub(crate) fn start_pending_search_with(&mut self, sources: &[SearchSource<'_>], wake: WakeFn) {
+        if !self.search_pending {
+            return;
+        }
+        self.search_pending = false;
+        if self.worker.is_none() && !self.worker_failed {
+            self.worker = TerminalSearchWorker::new(wake);
+            self.worker_failed = self.worker.is_none();
+        }
+        if self.worker.is_none() {
+            self.score_on_loop(sources);
+            return;
+        }
+        // Cheap on the loop: unchanged panes are shared, changed ones cost one
+        // refcount bump per line.
+        self.snapshot = take_snapshot(sources, &self.snapshot);
+        let request = SearchRequest {
+            generation: 0,
+            scope: self.engine.scope(),
+            max_results: self.max_results,
+            query: self.engine.query().to_string(),
+            mode: self.engine.mode(),
+            options: self.engine.options(),
+            sources: self.snapshot.clone(),
+        };
+        if let Some(worker) = self.worker.as_mut() {
+            worker.submit(request);
+            self.searching = true;
+        }
+    }
+
+    /// No worker thread is available (it could not be spawned, or it died):
+    /// score here rather than leave the panel claiming it is searching forever.
+    fn score_on_loop(&mut self, sources: &[SearchSource<'_>]) {
+        self.searching = false;
+        self.snapshot.clear();
+        self.engine.rescore(sources);
+        self.refresh_preview(sources);
+        self.settle_pending_jump();
+    }
+
+    /// Apply what the worker has produced. Returns true when what is on screen
+    /// changed, so the caller can mark the frame dirty.
+    pub fn drain_search(&mut self) -> bool {
+        let Some(worker) = self.worker.as_ref() else {
+            return false;
+        };
+        let drained = worker.drain();
+        if drained.is_empty() {
+            return false;
+        }
+        let finished = drained.done.is_some() || drained.disconnected;
+        for batch in drained.batches {
+            self.engine.append_async_matches(batch);
+        }
+        if let Some((total, error)) = drained.done {
+            self.searching = false;
+            self.engine.finish_async_results(total, error);
+        }
+        if drained.disconnected {
+            // The worker thread died (a panic while scoring). Say so, drop it,
+            // and stay on the loop-side path for the rest of this overlay.
+            self.worker = None;
+            self.worker_failed = true;
+            self.searching = false;
+            self.engine
+                .finish_async_results(0, Some("search worker stopped".to_string()));
+        }
+        // The preview's context lines come out of the snapshot the matches were
+        // scored against, not the live buffers.
+        let snapshot = self.snapshot.clone();
+        let refs = source_refs(&snapshot);
+        self.refresh_preview(&refs);
+        if finished || !self.engine.matches().is_empty() {
+            self.settle_pending_jump();
+        }
+        true
+    }
+
+    /// Take the outcome a deferred Enter produced while draining, if any.
+    pub fn take_ready(&mut self) -> Option<SearchOutcome> {
+        self.ready.take()
+    }
+
+    /// Resolve an Enter that arrived before any result: jump to the best hit
+    /// once there is one, dismiss if the finished query matched nothing.
+    fn settle_pending_jump(&mut self) {
+        if !self.pending_jump {
+            return;
+        }
+        if let Some(m) = self.engine.selected() {
+            self.pending_jump = false;
+            record_recent(self.engine.query());
+            self.ready = Some(SearchOutcome::Jump(m.clone()));
+        } else if !self.searching {
+            self.pending_jump = false;
+            record_recent(self.engine.query());
+            self.ready = Some(SearchOutcome::Dismiss);
+        }
+    }
+
+    /// A worker scan is now needed, and the preview's rows belong to the query
+    /// being replaced, so drop them instead of showing stale context. A further
+    /// edit also withdraws a deferred Enter: the user is still typing.
+    fn expect_scan(&mut self) {
+        self.search_pending = true;
+        self.pending_jump = false;
+        self.preview.clear();
+    }
+
+    fn query_edit(&mut self, scoring: Scoring, edit: QueryEdit, sources: &[SearchSource<'_>]) {
+        match scoring {
+            Scoring::Now => {
+                match edit {
+                    QueryEdit::Set(query) => self.engine.set_query(&query, sources),
+                    QueryEdit::Push(c) => self.engine.push_char(c, sources),
+                    QueryEdit::Pop => self.engine.backspace(sources),
+                }
+                self.refresh_preview(sources);
+            }
+            Scoring::Deferred => {
+                match edit {
+                    QueryEdit::Set(query) => self.engine.queue_query(&query),
+                    QueryEdit::Push(c) => {
+                        let mut query = self.engine.query().to_string();
+                        query.push(c);
+                        self.engine.queue_query(&query);
+                    }
+                    QueryEdit::Pop => {
+                        let mut query = self.engine.query().to_string();
+                        query.pop();
+                        self.engine.queue_query(&query);
+                    }
+                }
+                self.expect_scan();
+            }
+        }
+    }
+
+    fn change_mode(&mut self, scoring: Scoring, mode: MatchMode, sources: &[SearchSource<'_>]) {
+        match scoring {
+            Scoring::Now => {
+                self.engine.set_mode(mode, sources);
+                self.refresh_preview(sources);
+            }
+            Scoring::Deferred => {
+                self.engine.queue_mode(mode);
+                self.expect_scan();
+            }
+        }
+    }
+
+    fn change_options(
+        &mut self,
+        scoring: Scoring,
+        options: MatchOptions,
+        sources: &[SearchSource<'_>],
+    ) {
+        match scoring {
+            Scoring::Now => {
+                self.engine.set_options(options, sources);
+                self.refresh_preview(sources);
+            }
+            Scoring::Deferred => {
+                self.engine.queue_options(options);
+                self.expect_scan();
+            }
+        }
+    }
+
+    /// Refresh the preview from the snapshot the matches came from when there is
+    /// one (worker path), else from `sources`.
+    fn refresh_preview_for(&mut self, sources: &[SearchSource<'_>]) {
+        if self.snapshot.is_empty() {
+            self.refresh_preview(sources);
+        } else {
+            let snapshot = self.snapshot.clone();
+            self.refresh_preview(&source_refs(&snapshot));
+        }
     }
 
     fn refresh_preview(&mut self, sources: &[SearchSource<'_>]) {
@@ -371,6 +682,8 @@ impl SearchOverlay {
         if matches.is_empty() && inner.rows > 3 && result_rows > 0 {
             let placeholder = if let Some(error) = engine.error() {
                 format!("regex error: {error}")
+            } else if self.searching() {
+                "searching…".to_string()
             } else if engine.query().trim().is_empty() {
                 "no history yet".to_string()
             } else if matches!(engine.scope(), SearchScope::Pane(_)) {
@@ -421,6 +734,12 @@ impl SearchOverlay {
                 )
             } else {
                 format!("{} of {}", selected_idx + 1, matches.len())
+            };
+            // The worker may still be streaming: the count is a lower bound.
+            let count_str = if self.searching() {
+                format!("{count_str} · searching…")
+            } else {
+                count_str
             };
             let mode_hint = "Alt+c case  Alt+w word  Alt+r regex  Alt+f fuzzy";
             let footer = Line::split(
@@ -985,6 +1304,122 @@ mod tests {
         assert_eq!(ov.engine().mode(), MatchMode::Regex);
         ov.handle_key(&KeyCode::Char('r'), Modifiers::ALT, &srcs);
         assert_eq!(ov.engine().mode(), MatchMode::Literal);
+    }
+
+    #[test]
+    fn async_keys_queue_without_scoring() {
+        let buf = buf_from(&["cargo build", "cargo test", "ninja"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+
+        for c in "cargo".chars() {
+            let r = ov.handle_key_async(&KeyCode::Char(c), Modifiers::NONE, &srcs);
+            assert!(matches!(r, SearchOutcome::Pending));
+        }
+        // The loop holds the query only; the worker owns the scan.
+        assert_eq!(ov.engine().query(), "cargo");
+        assert!(ov.engine().matches().is_empty());
+        assert_eq!(ov.engine().total(), 0);
+        assert!(!ov.searching(), "not searching until a worker is started");
+
+        // A mode toggle defers too, and a scope change only queues the scope.
+        ov.handle_key_async(&KeyCode::Char('f'), Modifiers::ALT, &srcs);
+        assert_eq!(ov.engine().mode(), MatchMode::Fuzzy);
+        assert!(ov.engine().matches().is_empty());
+        ov.apply_scope_async(SearchScope::Tab);
+        assert_eq!(ov.scope(), SearchScope::Tab);
+
+        // Nothing to fold in before a worker exists.
+        assert!(!ov.drain_search());
+    }
+
+    /// Fold worker output in until the deferred outcome (or the end of the
+    /// search) arrives.
+    fn pump(ov: &mut SearchOverlay) -> Option<SearchOutcome> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            ov.drain_search();
+            if let Some(outcome) = ov.take_ready() {
+                return Some(outcome);
+            }
+            if !ov.searching() {
+                return None;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn enter_before_the_first_batch_jumps_to_the_best_hit() {
+        let buf = buf_from(&["cargo build", "cargo test", "ninja"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        for c in "ninja".chars() {
+            ov.handle_key_async(&KeyCode::Char(c), Modifiers::NONE, &srcs);
+        }
+        ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        assert!(ov.searching());
+
+        // Nothing has been drained yet, so there is no hit to jump to.
+        let r = ov.handle_key_async(&KeyCode::Enter, Modifiers::NONE, &srcs);
+        assert!(
+            matches!(r, SearchOutcome::Pending),
+            "Enter waits, not dismisses"
+        );
+        match pump(&mut ov) {
+            Some(SearchOutcome::Jump(m)) => assert_eq!(m.line, "ninja"),
+            other => panic!("expected a jump to the best hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_before_results_dismisses_when_nothing_matches() {
+        let buf = buf_from(&["cargo build", "ninja"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        for c in "qqqq".chars() {
+            ov.handle_key_async(&KeyCode::Char(c), Modifiers::NONE, &srcs);
+        }
+        ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        let r = ov.handle_key_async(&KeyCode::Enter, Modifiers::NONE, &srcs);
+        assert!(matches!(r, SearchOutcome::Pending));
+        assert!(matches!(pump(&mut ov), Some(SearchOutcome::Dismiss)));
+    }
+
+    #[test]
+    fn typing_after_a_deferred_enter_withdraws_it() {
+        let buf = buf_from(&["cargo build", "ninja"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        ov.handle_key_async(&KeyCode::Char('n'), Modifiers::NONE, &srcs);
+        ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        ov.handle_key_async(&KeyCode::Enter, Modifiers::NONE, &srcs);
+        ov.handle_key_async(&KeyCode::Char('i'), Modifiers::NONE, &srcs);
+        ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        assert!(pump(&mut ov).is_none(), "the user kept typing: no jump");
+    }
+
+    #[test]
+    fn preview_reads_the_snapshot_not_the_live_buffer() {
+        let mut buf = buf_from(&["alpha", "beta needle", "gamma"]);
+        let mut ov = overlay(1);
+        {
+            let srcs = sources(1, &buf);
+            for c in "needle".chars() {
+                ov.handle_key_async(&KeyCode::Char(c), Modifiers::NONE, &srcs);
+            }
+            ov.start_pending_search_with(&srcs, Box::new(|| {}));
+        }
+        assert!(pump(&mut ov).is_none());
+        // The live pane moves on (lines evicted/rewritten); the preview must
+        // still describe the lines the match index points into.
+        assert!(buf.replace_from_end(1, "REWRITTEN".into()));
+        ov.handle_key_async(&KeyCode::DownArrow, Modifiers::NONE, &sources(1, &buf));
+        assert_eq!(ov.preview, ["alpha", "gamma"]);
     }
 
     #[test]
