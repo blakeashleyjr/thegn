@@ -177,6 +177,7 @@ impl TaskVars {
     }
 
     /// Bind a variable, replacing any previous value. Chainable.
+    #[must_use]
     pub fn set(mut self, key: &str, value: impl Into<String>) -> Self {
         self.0.insert(key.to_string(), value.into());
         self

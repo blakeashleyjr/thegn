@@ -61,9 +61,10 @@ pub struct HostConfig {
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub probe_ttl_secs: u64,
     /// ATTESTATION (taken on faith, never verified): the owner asserts this
-    /// machine enforces the egress/config posture a thegn-built image
-    /// guarantees, restoring the one-notch trust-class drop every unattested
-    /// user-owned host gets for packing. See `thegn_core::trust_class`.
+    /// box's container runtime/userns posture matches a thegn-built host,
+    /// restoring the one-notch trust drop for packing. No thegn image
+    /// enforces network egress; this key does not imply egress control.
+    /// See `thegn_core::trust_class`.
     pub trust_egress_enforced: bool,
     /// Declared machine size for the placement engine's capacity index
     /// (`capacity = { cpu = "8", memory = "16g" }`). Only `cpu`/`memory` are

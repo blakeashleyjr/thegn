@@ -126,6 +126,7 @@ impl Frame {
         }
     }
 
+    #[must_use]
     pub fn with_coverage(mut self, coverage: Coverage) -> Self {
         self.coverage = coverage;
         self

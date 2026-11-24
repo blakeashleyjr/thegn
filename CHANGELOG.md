@@ -7,6 +7,42 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.124] — 2026-11-23
+
+### Fixed
+
+- Clicking the Work or Observe tab in the masthead switches views again. A
+  click on a tab used to start a sidebar resize instead, because the resize
+  edge was matched by column only and sits under the tabs at the usual sidebar
+  width.
+- Docker and Podman are declined on Windows only for local placements, so a
+  Windows host can use them on an ssh, connector or provider placement.
+- Sandbox status words recognise Windows paths and `.exe` names (for example
+  `C:\...\docker.exe`, `wsl.exe`).
+- The hermetic Sprites exec replay no longer flakes with "exec stream ended
+  without an exit status": the test server reads the client's close before
+  dropping the connection.
+- Vercel session usage comes from the session's own figures.
+- A sandbox test that read `$HOME` while other tests changed it is hermetic,
+  so the coverage job passes again.
+
+### Changed
+
+- Help pages, the README and the config example no longer over-claim what the
+  sandbox enforces. A new **Sandbox security model** help page describes the
+  current protections and their gaps per profile and backend.
+- Builder-style methods that return `Self` are `#[must_use]`, and the
+  workspace lint denies new ones without it.
+- `ControlClient` methods document their error cases.
+- `.gitignore` ignores `.env` files, private keys, credential files and
+  editor/tool caches.
+
+### Added
+
+- The job spec gains a typed selected-runner route (the contract for sending a
+  project's build or test to its chosen runner); it is not wired to terminals
+  yet.
+
 ## [0.1.0-alpha.123] — 2026-11-23
 
 ### Fixed

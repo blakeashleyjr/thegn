@@ -33,7 +33,7 @@ exclude = ["apps", "vendor"]
 termwiz = { path = "vendor/termwiz" }
 
 [workspace.package]
-version = "0.1.0-alpha.123"
+version = "0.1.0-alpha.124"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Resolves cargo-binstall's `{ repo }` template variable (thegn-host's
@@ -281,6 +281,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # idiom itself.) The `let _ =` discipline is the file-level ratchet in
 # test/ignored-result-ratchet.txt.
 let_underscore_future = "deny"
+# Builder-style methods (`fn with_x(self, ..) -> Self`) are pure: dropping the
+# result silently discards the configuration. Public ones carry `#[must_use]`.
+return_self_not_must_use = "deny"
 
 [profile.dev]
 # Build-speed tuning for the inner loop. `line-tables-only` keeps backtraces

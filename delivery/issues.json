@@ -245,8 +245,7 @@
       "issue": "THE-141",
       "project": "Cross-Platform Support & Verification",
       "changes": [
-        "audit-sandbox-cross-platform",
-        "mark-unverified-backends"
+        "audit-sandbox-cross-platform"
       ]
     },
     {

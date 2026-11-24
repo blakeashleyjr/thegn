@@ -9,7 +9,7 @@
 //! host's stack from a pinned image, so a probed runtime there implies the
 //! enforcement posture that image carries. On a user-owned box the probe
 //! proves PRESENCE (podman exists, userns on) but can never prove
-//! ENFORCEMENT (that the egress/config posture actually holds), so the
+//! ENFORCEMENT (that the runtime/userns posture actually holds), so the
 //! effective class defaults ONE NOTCH DOWN — restorable only by the owner's
 //! explicit `trust_egress_enforced = true` attestation, which is taken on
 //! faith and never verified.
@@ -51,6 +51,7 @@ impl TrustClass {
     }
 
     /// One step weaker; T0 is the fixpoint.
+    #[must_use]
     pub fn one_notch_down(self) -> TrustClass {
         match self {
             TrustClass::T0HostShell | TrustClass::T1Container => TrustClass::T0HostShell,

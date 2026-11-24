@@ -39,6 +39,7 @@ impl PaletteItem {
     }
 
     /// Attach hidden search terms (folded into the fuzzy haystack, never shown).
+    #[must_use]
     pub fn with_search(mut self, search: impl Into<String>) -> Self {
         self.search = search.into();
         self

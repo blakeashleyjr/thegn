@@ -729,9 +729,10 @@ async fn drive(
     let mut modes = RemoteModes::default();
     let mut session_id: Option<String> = None;
     let mut attempt = 0usize;
+    let mut out = std::io::stdout();
     loop {
         let started = Instant::now();
-        let end = pump(&mut session, &mut tty_rx, &mut modes, &mut size).await;
+        let end = pump(&mut session, &mut tty_rx, &mut modes, &mut size, &mut out).await;
         // A reattached stream may not re-announce; keep the last id seen.
         let announced = session.session_id.borrow().clone();
         if announced.is_some() {
@@ -780,12 +781,14 @@ async fn await_exit(session: &mut ExecSession) -> Option<i32> {
     .flatten()
 }
 
-/// Move bytes for one exec stream until it ends.
+/// Move bytes for one exec stream until it ends. `out` is the local tty sink:
+/// every stdout frame is written verbatim and flushed immediately.
 async fn pump(
     session: &mut ExecSession,
     tty_rx: &mut tokio::sync::mpsc::Receiver<FromTty>,
     modes: &mut RemoteModes,
     size: &mut (u16, u16),
+    out: &mut dyn std::io::Write,
 ) -> StreamEnd {
     struct PumpStats {
         frames: u64,
@@ -810,14 +813,13 @@ async fn pump(
             "sprite-exec output pump"
         );
     };
-    let mut out = std::io::stdout();
     loop {
         tokio::select! {
             frame = session.frames.recv() => match frame {
                 Some(ExecFrame::Stdout(bytes)) => {
                     modes.observe(&bytes);
                     let began = Instant::now();
-                    let result = out.write_all(&bytes).and_then(|()| out.flush());
+                    let result = write_tty_frame(out, &bytes);
                     let elapsed = began.elapsed();
                     stats.frames += 1;
                     stats.bytes += bytes.len() as u64;
@@ -883,6 +885,11 @@ async fn pump(
     }
 }
 
+/// Write one TTY output frame unchanged and make it visible immediately.
+fn write_tty_frame(out: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    out.write_all(bytes).and_then(|()| out.flush())
+}
+
 /// Blocking tty reader: owns the raw-mode terminal, forwards decoded input and
 /// resizes (termwiz's SIGWINCH path) to the pump, and restores cooked mode as
 /// it ends — when `done` is set (pulsed via the waker) or the tty errors.
@@ -915,15 +922,16 @@ fn tty_loop<T: Terminal>(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXIT_REMOTE_LOST, ExecFrame, FromTty, REATTACH_BUDGET_RESET, RemoteModes,
+        EXIT_REMOTE_LOST, ExecFrame, FromTty, REATTACH_BUDGET_RESET, RemoteModes, StreamEnd,
         WAKE_NOTICE_AFTER, attempts_after_stream, coalesce_input, encode_input, hold_ceiling,
-        hold_task_from, lost_line, pick_sprites_env, pty_size, reconnect_delays, should_reattach,
-        stream_frames, tty_env, tty_mode, with_slow_notice,
+        hold_task_from, lost_line, pick_sprites_env, pty_size, pump, reconnect_delays,
+        should_reattach, stream_frames, tty_env, tty_mode, with_slow_notice,
     };
     use std::cell::Cell;
     use std::time::Duration;
     use termwiz::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
     use thegn_core::sprite_hold::{HOLD_ENV, HOLD_MAX_CEILING_SECS, HOLD_SCRIPT, wrap_argv};
+    use thegn_svc::provider::ExecSession;
 
     #[test]
     fn reconnect_delays_back_off_1_2_4_8_15() {
@@ -1056,6 +1064,61 @@ mod tests {
         let mut output = FlushCountingWriter { flushes: 0 };
         assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(0));
         assert!(output.flushes >= 2);
+    }
+
+    #[tokio::test]
+    async fn stream_frames_preserves_split_sprite_line_breaks_byte_for_byte() {
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        tx.send(ExecFrame::Stdout(b"\x1b[>4;2m/dev/pts/0".to_vec()))
+            .await
+            .unwrap();
+        tx.send(ExecFrame::Stdout(b"\r".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Stdout(b"\nok\r\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(ExecFrame::Exit(0)).await.unwrap();
+
+        let mut output = Vec::new();
+        assert_eq!(stream_frames(&mut frames, &mut output).await, Ok(0));
+        assert_eq!(output, b"\x1b[>4;2m/dev/pts/0\r\nok\r\n");
+    }
+
+    #[tokio::test]
+    async fn tty_pump_preserves_split_sprite_line_breaks_byte_for_byte() {
+        // A frame split inside a CRLF must reach the local tty unchanged: the
+        // pump writes and flushes each stdout frame verbatim.
+        let (tx, frames) = tokio::sync::mpsc::channel(8);
+        let (control, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (_session_id_tx, session_id) = tokio::sync::watch::channel(None::<String>);
+        let mut session = ExecSession {
+            frames,
+            control,
+            session_id,
+        };
+        let (_tty_tx, mut tty_rx) = tokio::sync::mpsc::channel(8);
+        let mut modes = RemoteModes::default();
+        let mut size = (80, 24);
+        let mut output = Vec::new();
+
+        tx.send(ExecFrame::Stdout(b"\x1b[>4;2m/dev/pts/0".to_vec()))
+            .await
+            .unwrap();
+        tx.send(ExecFrame::Stdout(b"\r".to_vec())).await.unwrap();
+        tx.send(ExecFrame::Stdout(b"\nok\r\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(ExecFrame::Exit(0)).await.unwrap();
+
+        let end = pump(
+            &mut session,
+            &mut tty_rx,
+            &mut modes,
+            &mut size,
+            &mut output,
+        )
+        .await;
+        assert_eq!(output, b"\x1b[>4;2m/dev/pts/0\r\nok\r\n");
+        assert!(matches!(end, StreamEnd::Exit(0)));
     }
 
     #[tokio::test]

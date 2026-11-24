@@ -37,6 +37,7 @@
 
 ## 5. Not done, deliberately
 
-- [ ] 5.1 Verify `smol`/`wsl` verbs against real installs and add `liveness_argv`
+- [x] 5.1 Verify `smol`/`wsl` verbs against real installs and add `liveness_argv`
       arms. Requires a real smolmachines install and a Windows host; guessing is
       the failure mode this change exists to avoid.
+      Superseded by fix-truth-in-reporting: smol, wsl and appcontainer are reserved; WS07-P2-04 (shipped smolvm) and WS06 (WSL connector, MXC) own the replacements.

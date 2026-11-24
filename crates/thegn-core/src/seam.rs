@@ -130,10 +130,12 @@ impl ProbeReport {
             notes: Vec::new(),
         }
     }
+    #[must_use]
     pub fn with_caps<C: Serialize>(mut self, caps: &C) -> Self {
         self.caps = serde_json::to_value(caps).unwrap_or(serde_json::Value::Null);
         self
     }
+    #[must_use]
     pub fn note(mut self, line: impl Into<String>) -> Self {
         self.notes.push(line.into());
         self

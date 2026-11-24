@@ -108,6 +108,7 @@ impl PaletteMode {
         )
     }
 
+    #[must_use]
     pub fn cycle(self) -> Self {
         match self {
             PaletteMode::All => PaletteMode::Worktrees,
