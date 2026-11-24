@@ -104,10 +104,33 @@ chrome too, keeping only the bars `[ui] fullscreen_keep_masthead` /
   switch / bars). `←/→` keep following the split.
 - Zoom is **per tab**: each worktree tab remembers its own zoom and pane. Leave
   a zoomed worktree and come back, and the same pane is still zoomed. Other
-  worktrees keep their own layout. Moving focus to the sidebar or panel from a
+  worktrees keep their own layouts. Moving focus to the sidebar or panel from a
   full-window tab brings the chrome back until focus returns. A restart comes
   back tiled.
 - Mouse selection, the wheel and pane apps all target the expanded pane.
+
+### While a pane is starting
+
+A pane that has been opened but has not printed its prompt yet is not blank:
+it shows a small dim card with what the pane is doing right now.
+
+- The first line is thegn's own phase — `resolving environment`, `starting
+sandbox`, `starting shell` or `waiting for shell prompt` — with the time
+  spent in that phase.
+- Under it, the live child processes under that pane's shell (up to three,
+  Linux only), each with its age: `direnv export bash 0.6 s`,
+  `nix print-dev-env 2.1 s`. Program names come from the kernel's process
+  table; arguments are clipped and anything token-shaped is redacted before
+  it is ever drawn.
+- When a known startup culprit is recognised, a one-line hint follows it, e.g.
+  `direnv is loading .envrc` (version-manager init, prompt framework init,
+  prompt git status, agent startup or key prompt, connecting, waiting for
+  input).
+
+The card appears only after a short grace (~150 ms) so a pane whose shell is
+promptly ready never flashes one, disappears on the pane's first output, and
+always retires itself within 30 s — a pane that stays silent past that is left
+alone. Nothing is polled while no pane is starting.
 
 ## Launch menu
 
