@@ -493,7 +493,10 @@ pub(crate) fn degrade_oci_runtime_with(
     kvm: &dyn Fn() -> bool,
 ) -> Option<String> {
     use thegn_core::sandbox_runtime::{RuntimeDecision, decide, runtime_req};
-    if !spec.backend.is_oci() {
+    // Engines without a `--runtime` flag never honor the value, so there is
+    // nothing to probe and nothing to degrade: keep the spec exactly as the
+    // user configured it and let the resolver warn.
+    if !spec.backend.accepts_runtime_flag() {
         return None;
     }
     let requested = spec.oci_runtime.clone();
@@ -1563,6 +1566,25 @@ mod tests {
 
         assert!(warning.is_some_and(|warning| warning.contains("/dev/kvm")));
         assert_eq!(spec.oci_runtime, None);
+    }
+
+    #[test]
+    fn degrade_oci_runtime_skips_engines_without_runtime_flag() {
+        for backend in [
+            thegn_core::sandbox::Backend::Apple,
+            thegn_core::sandbox::Backend::Smol,
+            thegn_core::sandbox::Backend::Wsl,
+        ] {
+            let mut spec = sandbox_spec(backend, false);
+            spec.oci_runtime = Some("runsc".into());
+            let warning = degrade_oci_runtime_with(
+                &mut spec,
+                &|_| panic!("unsupported engine must not probe PATH"),
+                &|| panic!("unsupported engine must not probe KVM"),
+            );
+            assert_eq!(warning, None, "{backend:?}");
+            assert_eq!(spec.oci_runtime.as_deref(), Some("runsc"), "{backend:?}");
+        }
     }
 
     #[test]

@@ -864,6 +864,9 @@ pub fn prepare_sandbox_env_with_selection(
             // A Ready host's assets (digest-pinned image, warm volumes, remote
             // OCI url) pin the spec; explicit user values win inside.
             crate::host_flow::apply_ready(worktree, &mut spec);
+            // An `oci_runtime` this engine cannot honor is ignored; say so
+            // rather than implying a class the runtime will not deliver.
+            thegn_core::sandbox::warn_unsupported_oci_runtime(&spec, &mut warnings);
             // Plan remote-OCI worktree sync only; the upload runs after admission.
             let recursive_submodules =
                 crate::git_worktree::recursive_submodules_allowed(cfg, Path::new(worktree));

@@ -706,7 +706,7 @@ impl IsolationFloor {
                 "start a container runtime (podman/docker/bwrap) — see `thegn doctor`"
             }
             IsolationFloor::UserspaceKernel => {
-                "set [sandbox] oci_runtime = \"runsc\" (gVisor) on an OCI backend"
+                "set [sandbox] oci_runtime = \"runsc\" (gVisor) on podman or docker"
             }
             IsolationFloor::GuestKernel => {
                 "set [sandbox] oci_runtime = \"krun\" (needs /dev/kvm), or use the `apple` backend on macOS"
@@ -4521,7 +4521,8 @@ pub struct SandboxConfig {
     /// useful when the daemon (not just the shell) lives on another box.
     pub oci_host: String,
     /// OCI runtime for worktree containers (`--runtime`): `"runsc"` (gVisor) / `"krun"`
-    /// (libkrun microVM); empty ⇒ default. OCI backends only. See config.toml.example.
+    /// (libkrun microVM); empty ⇒ default. Only podman, podman-rootful and docker
+    /// accept the flag; other backends ignore it and warn. See config.toml.example.
     pub oci_runtime: String,
     /// Minimum honest isolation class a launch may enter. Omitted means
     /// `shared-kernel` for enabled launches except deliberate host choices

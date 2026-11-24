@@ -374,6 +374,20 @@ impl Backend {
         matches!(self.profile().family, BackendFamily::Oci)
     }
 
+    /// True when this engine's CLI has a `--runtime` flag on container create.
+    ///
+    /// Apple's `container` rejects unknown flags (`create` exits 64), and the
+    /// reserved `smol`/`wsl` kinds have no such flag either, so a configured
+    /// `oci_runtime` must not be emitted for them — nor may it raise their
+    /// reported isolation class.
+    // WS02-P2-01: fold into OciDialect.
+    pub fn accepts_runtime_flag(self) -> bool {
+        matches!(
+            self,
+            Backend::Podman | Backend::PodmanRootful | Backend::Docker
+        )
+    }
+
     pub fn is_host_toolchain(self) -> bool {
         matches!(
             self.profile().family,
@@ -5470,8 +5484,9 @@ fn oci_create_opts_in(
     // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
     // when requested. podman/docker persist the runtime in the container config,
     // so only `create` needs the flag — `exec`/`inspect`/teardown via `oci_prefix`
-    // pick it up automatically.
-    if spec.backend.is_oci()
+    // pick it up automatically. Apple's `container` rejects the flag, so it is
+    // emitted only for the engines that accept it.
+    if spec.backend.accepts_runtime_flag()
         && let Some(rt) = spec
             .oci_runtime
             .as_deref()
@@ -5860,6 +5875,26 @@ pub fn unsupported_hardening(spec: &SandboxSpec) -> Vec<&'static str> {
         out.push("pids-limit");
     }
     out
+}
+
+/// Warn that `oci_runtime` was configured on an engine whose create command has
+/// no `--runtime` flag, so the value is ignored and the reported class is the
+/// one the backend provides on its own. Deduplicated within `warnings` so a
+/// resolve that calls this more than once reports it once.
+pub fn warn_unsupported_oci_runtime(spec: &SandboxSpec, warnings: &mut Vec<String>) {
+    let configured = spec
+        .oci_runtime
+        .as_deref()
+        .is_some_and(|rt| !rt.trim().is_empty());
+    if configured && spec.backend.is_oci() && !spec.backend.accepts_runtime_flag() {
+        let warning = format!(
+            "oci_runtime ignored: {} has no --runtime",
+            spec.backend.label()
+        );
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
 }
 
 /// `--cpus` as `backend` will accept it.

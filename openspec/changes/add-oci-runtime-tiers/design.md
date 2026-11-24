@@ -25,13 +25,15 @@ deferred; the provider seam already exists for it.
 1. **Config** — `[sandbox] oci_runtime: String` (mirrors `oci_host`: global
    `[sandbox]`, not overlayed). Empty ⇒ daemon default.
 2. **Spec** — `SandboxSpec.oci_runtime: Option<String>`, set in the resolver.
-3. **Compose** — `oci_create_opts` emits `--runtime <x>` at _create_ for OCI
-   backends only. podman/docker persist the runtime per-container, so
+3. **Compose** — `oci_create_opts` emits `--runtime <x>` at _create_ for
+   engines whose CLI accepts it (`Backend::accepts_runtime_flag`: podman,
+   podman-rootful, docker). podman/docker persist the runtime per-container, so
    `exec`/`inspect`/teardown (via `oci_prefix`) need no flag.
-4. **Honest class** — `capabilities::isolation_for` maps, for OCI backends,
-   `runsc → UserspaceKernel`, `krun → GuestKernel`, else the shared-kernel
-   default. Placement short-circuits (`Provider`/`K8s`) and `egress`/`projection`
-   are unchanged.
+4. **Honest class** — `capabilities::isolation_for` maps `runsc →
+UserspaceKernel`, `krun → GuestKernel` only for those engines; every other
+   backend falls through to its own arm (Apple stays `GuestKernel`, the docker
+   clone stays `SharedKernel`). Placement short-circuits (`Provider`/`K8s`) and
+   `egress`/`projection` are unchanged.
 5. **Detection** — the pure `sandbox_runtime::decide` (unit-tested) decides
    keep-or-degrade from `(runtime, binary_present, kvm_present)`; the host probes
    `PATH` + `/dev/kvm` and applies it (clear the runtime + warn) before create,
@@ -41,8 +43,12 @@ deferred; the provider seam already exists for it.
 
 - **Degrade, don't fail.** An unavailable runtime clears `oci_runtime` and warns
   (best-effort convention), so the pane still comes up on the default runtime.
-- **Non-OCI backends ignore it.** bwrap/systemd/none have no `--runtime`; the
-  flag and the class-raise are gated on `backend.is_oci()`.
+- **No `--runtime`, no claim.** Engines without the flag (bwrap/systemd/none,
+  and the OCI-family Apple `container`, Smol and WSL kinds) neither receive the
+  flag nor raise their class; the flag and the class-raise are gated on
+  `Backend::accepts_runtime_flag()`. A configured value on such an OCI-family
+  engine produces one `oci_runtime ignored: <label> has no --runtime` warning, so a
+  config string can never claim a boundary the engine did not deliver.
 - **Trust ladder.** `capabilities.rs` stays the source of truth the UI/doctor
   read; wiring a local guest-kernel sandbox into `trust_class` multi-host packing
   is a secondary follow-up, not required for single-host isolation.

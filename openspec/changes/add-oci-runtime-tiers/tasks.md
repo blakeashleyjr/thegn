@@ -35,3 +35,11 @@
 
 - [ ] 6.1 `just quick thegn-core` + `just quick thegn-host`
 - [ ] 6.2 `just ci` (fmt + lint + build + test + openspec-validate + coverage + smoke)
+
+## 7. Engine flag truthfulness (THE-2140)
+
+- [x] 7.1 Emit `--runtime` and raise the isolation class only for podman,
+      podman-rootful and docker; warn once when another engine ignores the value
+- [x] 7.2 Skip runtime host probes for engines without `--runtime`; align doctor
+      reporting with the same predicate and add probe-skipping coverage
+- [x] 7.3 Document which engines accept `oci_runtime` in the isolation table
