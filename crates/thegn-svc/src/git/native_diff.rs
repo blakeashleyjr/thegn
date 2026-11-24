@@ -284,6 +284,16 @@ pub(crate) fn parse_spec(s: &str) -> Spec<'_> {
 /// spawned at all for the driver shape git-lfs actually installs.
 struct ReapingCache(gix::diff::blob::Platform);
 
+impl ReapingCache {
+    /// The wrapped platform. This is a plain accessor, not `Deref`: the cache is
+    /// a long-lived owner whose extra behaviour is the drop-time reap, so
+    /// inheriting every platform method by autoderef would hide which calls
+    /// cross that boundary.
+    fn platform_mut(&mut self) -> &mut gix::diff::blob::Platform {
+        &mut self.0
+    }
+}
+
 /// Route a driver that offers **both** shapes through its one-shot program
 /// instead of its long-running `process`, because gix owns the one-shot child's
 /// lifetime and leaks the persistent one.
@@ -409,19 +419,6 @@ pub(super) fn discover_for_routed_status(
 ) -> Result<(gix::Repository, Option<status_route::StatusRoute>)> {
     let repo = gix::discover(path).context("gix discover")?;
     routed_status(repo)
-}
-
-impl std::ops::Deref for ReapingCache {
-    type Target = gix::diff::blob::Platform;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for ReapingCache {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
 }
 
 impl Drop for ReapingCache {
@@ -557,7 +554,7 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
             };
             // Directory changes are traversal bookkeeping, not numstat rows.
             if mode.is_tree() || source_mode.is_tree() {
-                cache.clear_resource_cache_keep_allocation();
+                cache.platform_mut().clear_resource_cache_keep_allocation();
                 return Ok(std::ops::ControlFlow::Continue(()));
             }
             // Git represents a changed gitlink as one added and one deleted line.
@@ -570,11 +567,13 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
                     deleted: 1,
                     binary: false,
                 });
-                cache.clear_resource_cache_keep_allocation();
+                cache.platform_mut().clear_resource_cache_keep_allocation();
                 return Ok(std::ops::ControlFlow::Continue(()));
             }
             let mut platform = match path_operation(raw_path, "diff", || {
-                change.diff(&mut cache).map_err(anyhow::Error::from)
+                change
+                    .diff(cache.platform_mut())
+                    .map_err(anyhow::Error::from)
             }) {
                 Ok(platform) => platform,
                 Err(error) => {
@@ -597,7 +596,7 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
                 deleted,
                 binary,
             });
-            cache.clear_resource_cache_keep_allocation();
+            cache.platform_mut().clear_resource_cache_keep_allocation();
             Ok::<_, anyhow::Error>(std::ops::ControlFlow::Continue(()))
         })
         .context("gix tree diff")?;
@@ -753,6 +752,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
         }
         path_operation(rela.as_ref(), "load old resource", || {
             cache
+                .platform_mut()
                 .set_resource(
                     old_id,
                     old_kind,
@@ -769,7 +769,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                 &workdir,
                 rela.as_ref(),
                 &path,
-                &mut cache.0,
+                cache.platform_mut(),
             )? {
                 Some(bytes) => {
                     let id =
@@ -779,8 +779,9 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                         bytes: &bytes,
                         inner: &repo.objects,
                     };
-                    let saved = cache.filter.roots.new_root.take();
-                    let set_result = cache
+                    let platform = cache.platform_mut();
+                    let saved = platform.filter.roots.new_root.take();
+                    let set_result = platform
                         .set_resource(
                             id,
                             gix::object::tree::EntryKind::Blob,
@@ -789,10 +790,11 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                             &overlay,
                         )
                         .map_err(anyhow::Error::from);
-                    cache.filter.roots.new_root = saved;
+                    platform.filter.roots.new_root = saved;
                     set_result
                 }
                 None => cache
+                    .platform_mut()
                     .set_resource(
                         repo.object_hash().null(),
                         gix::object::tree::EntryKind::Blob,
@@ -803,7 +805,9 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                     .map_err(anyhow::Error::from),
             }
         })?;
-        let prep = path_operation(rela.as_ref(), "prepare diff", || cache.prepare_diff())?;
+        let prep = path_operation(rela.as_ref(), "prepare diff", || {
+            cache.platform_mut().prepare_diff()
+        })?;
         match prep.operation {
             gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } => {
                 let input = prep.interned_input();
@@ -833,7 +837,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
         {
             remember_worktree_entry(key, entry.clone());
         }
-        cache.clear_resource_cache_keep_allocation();
+        cache.platform_mut().clear_resource_cache_keep_allocation();
     }
     Ok(out)
 }

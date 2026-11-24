@@ -175,39 +175,38 @@ impl fmt::Debug for InteractiveTicket {
     }
 }
 
-/// A followed command log. Derefs to the line receiver; the reader task ends on
-/// body EOF (dropping the sender, so `recv` yields `None`) and is aborted when
-/// this guard drops.
+/// A followed command log. The reader task ends on body EOF (dropping the
+/// sender, so `recv` yields `None`) and is aborted when this guard drops.
 pub struct LogStream {
     rx: tokio::sync::mpsc::Receiver<LogLine>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl LogStream {
+    /// A stream over `rx` with a reader task that has already finished: the
+    /// seam the stream driver's tests use instead of a live log request.
     #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    pub(crate) fn from_receiver(rx: tokio::sync::mpsc::Receiver<LogLine>) -> Self {
         LogStream {
             rx,
             task: tokio::spawn(async {}),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        Self::from_receiver(rx)
+    }
+
     /// Whether the reader task has finished (EOF, error or consumer gone).
     pub fn reader_finished(&self) -> bool {
         self.task.is_finished()
     }
-}
 
-impl std::ops::Deref for LogStream {
-    type Target = tokio::sync::mpsc::Receiver<LogLine>;
-    fn deref(&self) -> &Self::Target {
-        &self.rx
-    }
-}
-
-impl std::ops::DerefMut for LogStream {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+    /// The log lines this stream follows. The borrow keeps this guard alive, so
+    /// the reader task is still aborted when the stream drops.
+    pub fn receiver_mut(&mut self) -> &mut tokio::sync::mpsc::Receiver<LogLine> {
         &mut self.rx
     }
 }
