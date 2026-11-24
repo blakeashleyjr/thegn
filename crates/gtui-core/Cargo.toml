@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 license.workspace = true
+description = "Dashboard, datasource, and frame types for the gtui terminal monitoring UI."
 
 
 [lints]
