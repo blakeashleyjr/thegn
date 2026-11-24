@@ -1536,6 +1536,11 @@ impl Panes {
                             p.set_pending_relaunch(Some(line));
                         }
                     }
+                    // A pane lost to an OOM kill keeps its cooldown and, when it was
+                    // running an agent with a fixed continue command, queues that
+                    // command for the fresh shell. It is typed later, only once the
+                    // pane is in the foreground tab (`mem_watch::deliver_relaunches`).
+                    crate::mem_watch::carry_over(*old, fresh, spec.backend == "host");
                     map.insert(*old, fresh);
                 }
                 Err(e) => {

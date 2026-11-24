@@ -167,6 +167,7 @@ mod media_panel;
 mod media_secret;
 mod media_watch;
 mod mem;
+mod mem_watch;
 mod menu;
 mod merge_driver;
 mod merge_lifecycle;

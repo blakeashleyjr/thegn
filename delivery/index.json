@@ -1287,6 +1287,14 @@
       "summary": "THE-2486 owns direct Iroh control pairing; all proposal tasks remain unchecked, so delivery and protocol acceptance stay active."
     },
     {
+      "change": "pane-memory-watch",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2600 owns the pane memory cap hardening; this watch-and-restart follow-up is not mapped in the checked-in delivery inventory.",
+      "summary": "Per-pane memory warnings and OOM-exit restart are shipped; the live end-to-end check is open."
+    },
+    {
       "change": "pane-zoom-stack",
       "archive_path": "openspec/changes/archive/2026-10-22-pane-zoom-stack/",
       "lifecycle": "archived",

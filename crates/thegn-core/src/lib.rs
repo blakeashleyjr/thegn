@@ -291,6 +291,7 @@ pub mod outward_gate;
 // Bounded compilation of caller-supplied `wait --until match:<regex>` patterns.
 pub mod output_match;
 pub mod overview;
+pub mod pane_memwatch;
 pub mod paste_drop;
 pub mod patch;
 pub mod picker;
