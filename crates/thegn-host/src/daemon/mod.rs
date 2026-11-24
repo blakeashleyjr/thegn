@@ -1615,6 +1615,10 @@ async fn run(
     // filing its report used to leave a `running` row nobody would close until
     // a human ran `dispatch reap`. Slow timer, blocking work off the runtime.
     pipeline_reaper::spawn(svc.clone());
+    // Selected-job recovery: settle attempts a crash left behind for the
+    // configured `[jobs] runner`. One pass on the blocking pool; inert (no
+    // thread, no I/O) with no runner configured.
+    crate::selected_runner::spawn_startup_reconcile(cfg);
     crate::automation_runtime::subscribe_daemon_events(svc.events.subscribe(), cfg);
     // `schedule_due` producer (THE-2193): spawns nothing unless an enabled
     // rule has a schedule.

@@ -49,6 +49,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "host",
             "placement",
             "fleet",
+            "job",
             "sandbox",
             "debug",
             "mcp",

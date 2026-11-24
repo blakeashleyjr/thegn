@@ -294,6 +294,7 @@ mod search_worker;
 mod secret;
 mod sections;
 mod seg;
+mod selected_runner;
 mod sequence;
 mod session;
 mod share;
@@ -654,6 +655,12 @@ pub enum Command {
     Fleet {
         #[command(subcommand)]
         action: cmd::fleet::Action,
+    },
+    /// Run a typed build/test recipe on the project's explicitly selected
+    /// Sprites or Vercel runner (`[jobs] runner`) and exit with its exit code.
+    Job {
+        #[command(subcommand)]
+        action: cmd::job::Action,
     },
     /// Per-account AI usage (rate-limit windows) as a table or JSON.
     Usage(cmd::usage::Args),
@@ -1363,6 +1370,7 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
         Command::Fleet { .. } => ("fleet", Feature::Providers),
+        Command::Job { .. } => ("job", Feature::Providers),
         #[cfg(feature = "iroh")]
         Command::Serve {
             iroh_direct: true, ..
@@ -1641,6 +1649,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Fleet { action } => cmd::fleet::run(&cfg, action),
+        Command::Job { action } => cmd::job::run(&cfg, action),
         Command::Usage(args) => cmd::usage::run(&cfg, args),
         Command::Info(args) => cmd::info::run(&cfg, args, config_path.clone()),
         Command::Host { action } => cmd::host::run(&cfg, action),

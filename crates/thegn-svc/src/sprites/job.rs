@@ -51,11 +51,17 @@
 //! reconnects to a recorded exec session when the provider still holds it, and
 //! otherwise settles the attempt as `Indeterminate`. Neither touches a
 //! non-terminal row younger than its staleness age, and every recovery write is
-//! a compare-and-swap against the row it read. Known gap: there is no owner
-//! lease (pid, boot id, heartbeat) in the row, so a host suspended for longer
-//! than the staleness margin can make a live run look stale (its monotonic
-//! stream clock pauses while the wall clock does not); the lease is tracked in
-//! the OpenSpec tasks.
+//! a compare-and-swap against the row it read.
+//!
+//! Owner lease: the running attempt keeps an [`OwnerLease`] (pid, boot id,
+//! process start time, heartbeat) in its non-terminal row and refreshes the
+//! heartbeat every 15 s by compare-and-swap. Recovery skips a row whose lease
+//! is live (fresh heartbeat, or on Linux the same process still alive in the
+//! same boot) whatever its age, so a host suspended past the staleness margin
+//! no longer makes a live run look stale. A heartbeat that loses its
+//! compare-and-swap means a recovery settled the row: the owner fences, stops
+//! trusting its own state and never overwrites the row. Rows without a lease
+//! keep the age-only rule, and terminal rows carry none.
 //!
 //! Contract with the route: on the selected route every `Err` that
 //! [`SelectedRunner::submit`] returns reads back as *indeterminate*, because the
@@ -94,7 +100,7 @@ use thegn_core::fsperm::{PrivateDir, ensure_private_dir, open_private_dir, owned
 use thegn_core::sprite_hold::{HOLD_EXPIRE_SECS, hold_name, wrap_argv};
 use thegn_job_spec::selected::MAX_SELECTED_LOG_BYTES;
 use thegn_job_spec::{
-    Recipe, RunnerRefusal, SelectedCompletion, SelectedJobResult, SelectedRunner,
+    Recipe, RunnerRefusal, SelectedCancel, SelectedCompletion, SelectedJobResult, SelectedRunner,
 };
 
 use crate::provider::{
@@ -156,6 +162,11 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(45);
 /// launcher failure is never confused with a recipe that exits 125.
 pub const LAUNCH_FAILED_MARKER: &str = "thegn-job-launch-failed";
 
+/// The marker the launcher sets (to `1`) in the recipe's scrubbed environment so
+/// a `thegn job run` started inside a selected job refuses to recurse. Both
+/// executors' launch scripts set it literally.
+pub const SELECTED_JOB_ENV: &str = "THEGN_SELECTED_JOB";
+
 /// Directory names a snapshot never carries, at any depth: version control,
 /// thegn's own state, and agent/provider/cloud credentials. A directory is
 /// pruned with its whole subtree.
@@ -182,6 +193,19 @@ fn is_ssh_key_name(part: &str) -> bool {
     lower.starts_with("id_") && !lower.ends_with(".pub")
 }
 
+/// Secret-shaped file names by pattern, case-insensitive: private keys and
+/// certificates, direnv files, Terraform variables and state, and service
+/// account key files.
+fn is_secret_shaped_name(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    [".pem", ".key", ".p12", ".pfx", ".tfvars"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+        || lower.starts_with(".envrc")
+        || lower.contains(".tfstate")
+        || (lower.starts_with("service-account") && lower.ends_with(".json"))
+}
+
 /// True when `rel` is content a job snapshot must never carry. Every component
 /// is checked, so `services/api/.env` and `pkg/.claude/x` are denied exactly
 /// like their root-level forms.
@@ -191,6 +215,7 @@ fn denied_path(rel: &str) -> bool {
         if DENIED_DIRS.contains(part)
             || DENIED_NAMES.contains(part)
             || is_ssh_key_name(part)
+            || is_secret_shaped_name(part)
             || (part.starts_with(".env.") && part.len() > ".env.".len())
         {
             return true;
@@ -453,8 +478,11 @@ pub trait SnapshotSource: Send + Sync {
 /// executable bit is preserved.
 ///
 /// Ignore rules come from the tree itself (`.gitignore`, `.git/info/exclude`,
-/// `.ignore`); the user's global gitignore is deliberately not consulted, so
-/// the captured set (and its digest) does not depend on the host.
+/// `.ignore`) and from the user's global gitignore, so a file the user keeps
+/// out of version control only through their global excludes is never
+/// uploaded. The pin and the executor capture on the same host with this same
+/// walker, so their digests still match. Secret-shaped names (keys,
+/// certificates, `.envrc`, `*.tfvars`, ...) are denied regardless.
 #[derive(Debug, Clone)]
 pub struct DirSnapshot {
     root: PathBuf,
@@ -484,7 +512,7 @@ impl SnapshotSource for DirSnapshot {
             .hidden(false)
             .git_ignore(true)
             .git_exclude(true)
-            .git_global(false)
+            .git_global(true)
             .parents(false)
             .require_git(false)
             .follow_links(false)
@@ -714,6 +742,127 @@ struct SpriteClaim {
     project: String,
 }
 
+/// How often a live owner refreshes its lease heartbeat. Recovery treats a
+/// heartbeat younger than twice this as proof of a live owner.
+pub(crate) const LEASE_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// How far ahead of the reader's clock a heartbeat may sit and still count as
+/// fresh.
+const LEASE_CLOCK_SKEW_MS: i64 = 5_000;
+
+/// The ownership lease a running attempt keeps in its non-terminal row, shared
+/// by the Sprites and Vercel executors.
+///
+/// Recovery treats a row as owned and live, and skips it whatever its age, when
+/// either the heartbeat is fresh or (Linux only) the recorded process still
+/// exists in the same boot with the same start time. A host suspended past the
+/// staleness margin therefore no longer makes a live run look stale: after the
+/// resume the pid is still there. A row with no lease (an older record) keeps
+/// the age-only staleness rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnerLease {
+    /// The owning process.
+    pub pid: u32,
+    /// `/proc/sys/kernel/random/boot_id` at the time the lease was taken; `None`
+    /// where the platform has none (pid checks are then skipped).
+    pub boot_id: Option<String>,
+    /// The owner's process start time (`/proc/<pid>/stat` field 22), so a
+    /// recycled pid is not mistaken for the owner.
+    pub start_ticks: Option<u64>,
+    pub started_at_ms: i64,
+    /// Refreshed every `LEASE_HEARTBEAT` by the owner, by compare-and-swap.
+    pub heartbeat_ms: i64,
+}
+
+/// What `/proc/<pid>/stat` says about a process.
+struct ProcStat {
+    zombie: bool,
+    start_ticks: u64,
+}
+
+/// Parse `/proc/<pid>/stat`; `None` off Linux or when the process is gone. The
+/// `comm` field may hold spaces and parentheses, so fields are read after the
+/// last `)`.
+fn proc_stat(pid: u32) -> Option<ProcStat> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?;
+    // Field 3 was the state; field 22 (start time) is the 19th after it.
+    let start_ticks = fields.nth(18)?.parse().ok()?;
+    Some(ProcStat {
+        zombie: state.starts_with('Z'),
+        start_ticks,
+    })
+}
+
+/// This boot's id (Linux), read once; `None` elsewhere.
+pub(crate) fn boot_id() -> Option<String> {
+    static BOOT_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            if !cfg!(target_os = "linux") {
+                return None;
+            }
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+        })
+        .clone()
+}
+
+impl OwnerLease {
+    /// A lease for this process, heartbeat now.
+    pub fn current(now_ms: i64) -> Self {
+        let pid = std::process::id();
+        Self {
+            pid,
+            boot_id: boot_id(),
+            start_ticks: proc_stat(pid).map(|stat| stat.start_ticks),
+            started_at_ms: now_ms,
+            heartbeat_ms: now_ms,
+        }
+    }
+
+    /// The same lease with its heartbeat moved to `now_ms`.
+    #[must_use]
+    pub fn refreshed(&self, now_ms: i64) -> Self {
+        Self {
+            heartbeat_ms: now_ms,
+            ..self.clone()
+        }
+    }
+
+    /// True while the owner can still be driving the attempt: a fresh heartbeat,
+    /// or the same process (same boot, same start time, not a zombie) is alive.
+    pub fn is_live(&self, now_ms: i64) -> bool {
+        let window = millis_i64(LEASE_HEARTBEAT * 2);
+        // A heartbeat a little in the future is clock skew; one far in the future
+        // is a wrong clock or a corrupt row and proves nothing.
+        let age = now_ms.saturating_sub(self.heartbeat_ms);
+        if (-LEASE_CLOCK_SKEW_MS..=window).contains(&age) {
+            return true;
+        }
+        let Some(recorded) = self.boot_id.as_deref() else {
+            return false;
+        };
+        if boot_id().as_deref() != Some(recorded) {
+            return false;
+        }
+        proc_stat(self.pid).is_some_and(|stat| {
+            !stat.zombie
+                && self
+                    .start_ticks
+                    .is_none_or(|ticks| ticks == stat.start_ticks)
+        })
+    }
+}
+
 /// Durable record of one attempt. Everything a later reconciliation needs is
 /// here: who ran, where, under which handle, how it ended, what it cost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -760,6 +909,10 @@ pub struct AttemptRecord {
     pub checkout_removed: bool,
     /// Why the attempt was closed without a receipt, when that happened.
     pub error: Option<String>,
+    /// The running owner's lease; absent on rows written before leases existed
+    /// and on rows no run has started yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<OwnerLease>,
 }
 
 impl AttemptRecord {
@@ -1036,6 +1189,37 @@ impl AttemptStore {
         Ok(())
     }
 
+    /// Move the owner's heartbeat to `now_ms` by compare-and-swap against
+    /// `record`, under the ledger lock: the stored row must be non-terminal and
+    /// carry this run's lease; only the lease is rewritten. False means a
+    /// recovery took the row and nothing was written: the owner must stop
+    /// trusting its own state. `record.lease` is updated only on success.
+    pub fn refresh_lease(&self, record: &mut AttemptRecord, now_ms: i64) -> Result<bool> {
+        let Some(lease) = record.lease.clone() else {
+            return Ok(true);
+        };
+        let Some(root) = self.open(false)? else {
+            return Ok(false);
+        };
+        let _lock = lock_ledger(&root)?;
+        let Some(mut current) =
+            self.read_record::<AttemptRecord>(&root, &attempt_file(record.attempt))?
+        else {
+            return Ok(false);
+        };
+        // Ownership, not equality: the run changes other fields locally between
+        // persists. Recovery always clears or replaces the lease when it settles
+        // a row, so a changed lease or a terminal row means the run lost it.
+        if current.is_terminal() || current.lease.as_ref() != Some(&lease) {
+            return Ok(false);
+        }
+        let refreshed = lease.refreshed(now_ms);
+        current.lease = Some(refreshed.clone());
+        self.mark(&current)?;
+        record.lease = Some(refreshed);
+        Ok(true)
+    }
+
     /// Publish `record` only when the stored row still equals `expected` (the
     /// row as a recovery pass read it). The check and the write happen under the
     /// ledger lock, so a recovery never overwrites what the owning run wrote in
@@ -1226,6 +1410,7 @@ impl AttemptStore {
             outputs_fenced: false,
             checkout_removed: false,
             error: None,
+            lease: None,
         };
         store_error(self.mark(&record))?;
         Ok(record)
@@ -1345,6 +1530,9 @@ pub struct AttemptOptions {
     pub outputs: Vec<String>,
     /// Where per-attempt checkouts live on the sprite.
     pub checkout_root: String,
+    /// How often the running owner refreshes its lease heartbeat
+    /// (`LEASE_HEARTBEAT` by default); injectable so a test can use a short one.
+    pub lease_heartbeat: Duration,
 }
 
 impl Default for AttemptOptions {
@@ -1358,6 +1546,7 @@ impl Default for AttemptOptions {
             hold_ceiling_secs: 0,
             outputs: Vec::new(),
             checkout_root: DEFAULT_CHECKOUT_ROOT.to_owned(),
+            lease_heartbeat: LEASE_HEARTBEAT,
         }
     }
 }
@@ -1365,6 +1554,10 @@ impl Default for AttemptOptions {
 impl AttemptOptions {
     fn validate(&self) -> Result<()> {
         ensure!(!self.deadline.is_zero(), "attempt deadline must be nonzero");
+        ensure!(
+            !self.lease_heartbeat.is_zero(),
+            "lease heartbeat must be nonzero"
+        );
         ensure!(
             !self.transfer_budget.is_zero(),
             "transfer budget must be nonzero"
@@ -1557,7 +1750,8 @@ for v in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_pro
     [ -z "$val" ] || set -- "$v=$val" "$@"
 done
 set -- PATH="$PATH" HOME="$home" TMPDIR="$home/tmp" CARGO_HOME="$cache/cargo" \
-    CARGO_TARGET_DIR="$cache/target" RUSTUP_HOME="$rustup_home" LANG=C.UTF-8 "$@"
+    CARGO_TARGET_DIR="$cache/target" RUSTUP_HOME="$rustup_home" LANG=C.UTF-8 \
+    THEGN_SELECTED_JOB=1 "$@"
 exec setsid sh -c 'pidfile=$1; shift
 st=
 getst() { set -- $1; shift 19; st=$1; }
@@ -1758,8 +1952,8 @@ const RECONCILE_SLACK: Duration = Duration::from_secs(60);
 /// Extra margin on the staleness test. The ledger deadline is wall-clock, but
 /// a live owner times its stream on the monotonic clock, which stops while the
 /// host is suspended; the margin only absorbs small skew. A suspend longer than
-/// it can still make a live row look stale (an owner lease would close that
-/// gap; see the module docs).
+/// it can still make a live row look stale (the owner lease in the row closes
+/// that gap: a live lease is never stale).
 const RECONCILE_CLOCK_MARGIN: Duration = Duration::from_secs(120);
 
 /// The `Instant` an attempt's build clock is read from when it is concluded
@@ -1888,8 +2082,50 @@ impl SpritesSelectedRunner {
         )
     }
 
+    /// False for a row whose owner lease is live, whatever its age; otherwise
+    /// the age-only rule (rows without a lease keep it).
     fn is_stale(&self, record: &AttemptRecord, now_ms: i64) -> bool {
+        if record
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.is_live(now_ms))
+        {
+            return false;
+        }
         now_ms >= record.deadline_ms.saturating_add(self.stale_after_ms())
+    }
+
+    /// Refresh the owner's heartbeat by compare-and-swap against the row this
+    /// run last wrote. False means the stored row is no longer ours (a recovery
+    /// settled it): the owner must stop trusting its own state. A failed write
+    /// is not a loss; the next tick retries.
+    async fn refresh_lease(&self, record: &mut AttemptRecord) -> bool {
+        let store = self.store.clone();
+        let mut held = record.clone();
+        let now_ms = thegn_core::util::now_ms();
+        let result = tokio::task::spawn_blocking(move || {
+            let ours = store.refresh_lease(&mut held, now_ms)?;
+            anyhow::Ok((ours, held))
+        })
+        .await
+        .map_err(|error| anyhow!("ledger task failed: {error}"))
+        .and_then(|inner| inner);
+        match result {
+            Ok((true, held)) => {
+                *record = held;
+                true
+            }
+            Ok((false, _)) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::sprites::job",
+                    %error,
+                    attempt = record.attempt,
+                    "cannot refresh the owner lease heartbeat"
+                );
+                true
+            }
+        }
     }
 
     async fn reserve(
@@ -2036,6 +2272,7 @@ impl SpritesSelectedRunner {
         // The fence. Written before the socket opens: a crash from here on reads
         // back as an unknown dispatch and is never rerun blindly.
         record.state = AttemptState::Dispatching;
+        record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
         if let Err(error) = self.persist(&record).await {
             return Err(self.reject(record, error, true).await);
         }
@@ -2109,7 +2346,11 @@ impl SpritesSelectedRunner {
         let verdict = streaming.verdict;
         record.session = session_handle(&mut session.session_id).await;
         record.state = AttemptState::Running;
+        // The heartbeat compare-and-swaps against the stored row, so it only runs
+        // while the stored row is the one this run wrote.
+        let mut beats = true;
         if let Err(error) = self.persist(&record).await {
+            beats = false;
             // A failed re-mark leaves the earlier `dispatching` fence, which is
             // already enough to forbid an implicit rerun.
             tracing::warn!(
@@ -2125,12 +2366,27 @@ impl SpritesSelectedRunner {
         let mut exit = None;
         let mut timed_out = false;
         let mut cancelled = false;
+        let mut fenced = false;
+        let mut beat = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.options.lease_heartbeat,
+            self.options.lease_heartbeat,
+        );
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let next = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     cancelled = true;
                     break;
+                }
+                _ = beat.tick(), if beats => {
+                    if !self.refresh_lease(&mut record).await {
+                        // A recovery settled the row: stop trusting this run's
+                        // state and fence.
+                        fenced = true;
+                        break;
+                    }
+                    continue;
                 }
                 next = tokio::time::timeout_at(until, session.frames.recv()) => next,
             };
@@ -2219,12 +2475,24 @@ impl SpritesSelectedRunner {
                 "attempt cancelled; killing the owned command tree"
             );
         }
-        if exit.is_none() && !timed_out && !cancelled {
+        if fenced {
+            tracing::warn!(
+                target: "thegn::sprites::job",
+                attempt = record.attempt,
+                "the ledger row was settled by another process; this run is fenced"
+            );
+            record.error =
+                Some("owner lease lost: the ledger row was settled by another process".to_owned());
+        }
+        if exit.is_none() && !timed_out && !cancelled && !fenced {
             record.error = match tokio::time::timeout(VERDICT_WAIT, verdict).await {
                 Ok(Ok(Some(error))) => Some(error.to_string()),
                 Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
             };
         }
+        // A fenced run never overwrites the row whoever settled it wrote: the
+        // write is guarded by the (now stale) row this run last held.
+        let guard = fenced.then(|| record.clone());
         Ok(self
             .conclude(
                 record,
@@ -2234,7 +2502,7 @@ impl SpritesSelectedRunner {
                 launch_failed,
                 &stdout,
                 Some(&stderr),
-                None,
+                guard.as_ref(),
             )
             .await)
     }
@@ -2264,6 +2532,7 @@ impl SpritesSelectedRunner {
         record.spent_micros = Some(0);
         record.outputs_fenced = true;
         record.finished_ms = Some(thegn_core::util::now_ms());
+        record.lease = None;
         record.error = Some(format!("{error:#}"));
         if let Err(write_error) = self.persist(&record).await {
             tracing::warn!(
@@ -2528,6 +2797,7 @@ impl SpritesSelectedRunner {
             _ => None,
         };
         record.finished_ms = Some(thegn_core::util::now_ms());
+        record.lease = None;
         record.spent_micros = cost_micros;
         record.outputs_fenced = !matches!(completion, SelectedCompletion::Exited(_));
         let (outputs, outputs_missing) = if record.outputs_fenced {
@@ -2784,7 +3054,20 @@ impl SpritesSelectedRunner {
                 && record.account == self.binding.account(),
             "attempt {attempt} belongs to another project, account or sprite"
         );
-        let stale = self.is_stale(&record, thegn_core::util::now_ms());
+        let now = thegn_core::util::now_ms();
+        if !record.is_terminal()
+            && record
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.is_live(now))
+        {
+            return Ok(Self::left_alone(
+                &record,
+                false,
+                "the attempt is owned by a live run (lease); nothing was touched",
+            ));
+        }
+        let stale = self.is_stale(&record, now);
         match record.resume(epoch) {
             Resume::Rejected => {
                 bail!("attempt {attempt} was rejected before any command ran; submit a new attempt")
@@ -3032,17 +3315,43 @@ impl SelectedRunner for SpritesSelectedRunner {
         recipe: Recipe,
         source: &Digest,
         deadline: Duration,
+        cancel: &SelectedCancel,
     ) -> Result<SelectedJobResult, RunnerRefusal> {
         if runner_alias != self.alias {
             return Err(RunnerRefusal::WrongRunner);
+        }
+        let cancelled = |this: &Self| SelectedJobResult {
+            runner: this.alias.clone(),
+            recipe,
+            source: source.clone(),
+            completion: SelectedCompletion::Cancelled,
+            log_tail: String::new(),
+            truncated: false,
+        };
+        if cancel.is_cancelled() {
+            return Ok(cancelled(self));
         }
         let content = self
             .snapshot
             .capture()
             .map_err(|error| self.unavailable(format!("cannot capture the snapshot: {error:#}")))?;
-        let receipt = self
+        // Bridge the route's std-only token to the executor's own cancel handle.
+        let token = CancelToken::new();
+        let bridge = token.clone();
+        cancel.on_cancel(move || bridge.cancel());
+        let receipt = match self
             .handle
-            .block_on(self.run(recipe, source, &content, deadline))?;
+            .block_on(self.run_cancellable(recipe, source, &content, deadline, &token))
+        {
+            Ok(receipt) => receipt,
+            // A cancel that closed the attempt before dispatch is recorded as
+            // rejected (nothing was sent, so no command ran); the route reads it
+            // back as a user cancel rather than an unavailable runner.
+            Err(RunnerRefusal::RunnerUnavailable(_)) if token.is_cancelled() => {
+                return Ok(cancelled(self));
+            }
+            Err(refusal) => return Err(refusal),
+        };
         Ok(SelectedJobResult {
             runner: self.alias.clone(),
             recipe,
@@ -3170,6 +3479,14 @@ mod tests {
             ".npmrc",
             ".pypirc",
             ".git-credentials",
+            "certs/server.pem",
+            "keys/Deploy.KEY",
+            "bundle.p12",
+            ".envrc",
+            "app/.envrc.local",
+            "infra/prod.tfvars",
+            "infra/terraform.tfstate.backup",
+            "gcp/service-account-prod.json",
             "services/api/.env",
             "web/.npmrc",
             "web/.env.production",
@@ -3381,6 +3698,7 @@ mod tests {
             outputs_fenced: false,
             checkout_removed: false,
             error: None,
+            lease: None,
         };
         assert_eq!(
             record.resume(1),

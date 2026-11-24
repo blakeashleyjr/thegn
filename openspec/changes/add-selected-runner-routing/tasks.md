@@ -27,8 +27,18 @@
 
 ## 3. Follow-up (not this change)
 
-- [ ] 3.1 Terminal and configured-runner adapter that invokes the route.
-- [ ] 3.2 Config lookup for a project's selected runner and recursion guard.
+- [x] 3.1 Configured-runner adapter that invokes the route: a factory builds
+      the Sprites or Vercel executor from the env's provider config
+      (`thegn-host` `selected_runner`), and `thegn job run [--runner <env>]
+[--deadline <secs>] <cargo-build|cargo-test>` snapshots the worktree,
+      pins the digest, submits through `submit_selected` with Ctrl-C wired to
+      `SelectedCancel`, prints the receipt and exits with the job's exit code.
+      Interception of arbitrary terminal commands stays out of scope (a recipe
+      is chosen by name, never parsed from a command line).
+- [x] 3.2 Config lookup for the selected runner (`[jobs] runner`, validated to
+      name a sprites or vercel env) and the recursion guard (the launchers set
+      `THEGN_SELECTED_JOB=1` in the recipe environment; `job run` refuses when
+      it is set).
 - [ ] 3.3 Argv, cwd, stdio and per-step deadline forwarding.
 
 ## 4. Sprites executor (THE-2417)
@@ -57,11 +67,35 @@
       runner and reads back as `Cancelled` on the route (today a pre-dispatch
       cancel surfaces as `RunnerUnavailable`); schedule `reconcile_pending` and
       `reattach` on startup. 4.4-4.6 are runner-level only until this lands.
-- [ ] 4.10 Owner lease on non-terminal rows (pid, boot id from
-      `/proc/sys/kernel/random/boot_id`, heartbeat) so recovery skips a live
-      owner; until then a host suspended past the staleness margin can make a
-      live row look stale. Recovery writes are already compare-and-swap.
+      Partly done: `SelectedRunner::submit` takes a std-only `SelectedCancel`
+      (hooks bridge it to the Sprites `CancelToken`); a cancel before dispatch
+      reads back as `Cancelled` on both executors and mid-run on Sprites. The
+      executors are now built from provider config (task 3.1), and the daemon
+      runs one background `reconcile_pending` pass at start for the configured
+      `[jobs] runner` (Vercel gained a `reconcile_pending` wrapper over its
+      per-attempt `reconcile`; the pass scans only ledgers with unsettled rows,
+      so an idle ledger resolves no secret). Still open: Vercel mid-run cancel
+      (no `run_cancellable` yet), scheduling `reattach` on startup, and
+      reconciling ledgers of envs other than the configured runner.
+- [x] 4.10 Owner lease on non-terminal rows (pid, boot id from
+      `/proc/sys/kernel/random/boot_id`, process start time, heartbeat) so
+      recovery skips a live owner. Shared `OwnerLease` in `sprites::job`, used
+      by both executors: the owner refreshes the heartbeat every 15 s by
+      compare-and-swap and fences when it loses; reconcile, reattach and
+      cancel treat a live lease (fresh heartbeat, or same boot and live pid on
+      Linux) as not stale. Recovery writes are already compare-and-swap.
+      The heartbeat checks ownership (stored row non-terminal and carrying this
+      run's lease) and rewrites only the lease, never the whole row; reattach
+      leaves a live-leased row alone before any provider call; a heartbeat more
+      than 5 s in the future is not fresh. Known limits: `OwnerLease` and
+      `AttemptRecord` use `deny_unknown_fields`, so an older binary sharing the
+      ledger cannot read an in-flight (non-terminal) row written by a newer one
+      (terminal rows clear the lease); and a row whose owning task panicked in a
+      still-running process stays unrecovered until that process exits.
 - [ ] 4.7 Run the new cancel, reconcile and reattach tests in
       `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
-- [ ] 4.8 Not in this slice: the credential broker, the CLI verb and a budgeted
-      live run.
+- [ ] 4.8 Not in this slice: the credential broker and a budgeted live run. The
+      CLI verb landed with task 3.1; it has not yet run against a real provider.
+- [ ] 4.11 Follow-up: Vercel `reconcile_pending_at` reports a compare-and-swap loss as
+      `Cleaned`/`StillPending`, never `ReconcileOutcome::Superseded` (Sprites reports it);
+      only the logged `settled` count is affected.

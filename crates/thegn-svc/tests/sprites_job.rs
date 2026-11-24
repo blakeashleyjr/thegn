@@ -17,13 +17,13 @@ use std::time::Duration;
 
 use thegn_cas::{Digest, Entry, encode_directory};
 use thegn_core::sprite_hold::HOLD_SCRIPT;
-use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCompletion, SelectedRunner};
+use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCancel, SelectedCompletion, SelectedRunner};
 use thegn_svc::provider::SpritesProvider;
 use thegn_svc::sprites::job::{
     AttemptOptions, AttemptRecord, AttemptState, AttemptStore, CancelToken, Cleanup,
     DEFAULT_CHECKOUT_ROOT, DirSnapshot, KILL_SCRIPT, LAUNCH_FAILED_MARKER, LAUNCH_SCRIPT,
-    ProjectBinding, ReconcileOutcome, Reconciled, ReserveRefusal, ReserveRequest, Resume,
-    SNAPSHOT_MAX_FILE_BYTES, SnapshotContent, SnapshotSource, SpritesSelectedRunner,
+    OwnerLease, ProjectBinding, ReconcileOutcome, Reconciled, ReserveRefusal, ReserveRequest,
+    Resume, SNAPSHOT_MAX_FILE_BYTES, SnapshotContent, SnapshotSource, SpritesSelectedRunner,
 };
 
 // ---------------------------------------------------------------- the fixture
@@ -1364,6 +1364,7 @@ async fn the_sync_runner_contract_forwards_the_route_deadline_and_reaches_the_pr
                 Recipe::CargoBuild,
                 &submitted,
                 Duration::from_secs(30),
+                &SelectedCancel::new(),
             )
             .unwrap_err();
         assert!(matches!(wrong, RunnerRefusal::WrongRunner));
@@ -1372,12 +1373,14 @@ async fn the_sync_runner_contract_forwards_the_route_deadline_and_reaches_the_pr
             Recipe::CargoBuild,
             &submitted,
             Duration::from_secs(30),
+            &SelectedCancel::new(),
         );
         let timed_out = runner.submit(
             "sprites-tgtest1",
             Recipe::CargoTest,
             &submitted,
             Duration::from_millis(300),
+            &SelectedCancel::new(),
         );
         (ok, timed_out)
     });
@@ -1672,6 +1675,8 @@ fn a_snapshot_carries_the_dirty_tree_and_its_allowed_untracked_input() {
     write(".env", b"SECRET=1\n");
     write(".env.local", b"SECRET=2\n");
     write(".ssh/id_ed25519", b"private\n");
+    write("certs/server.pem", b"-----BEGIN-----\n");
+    write(".envrc", b"export TOKEN=1\n");
     write(".thegn/state.json", b"{}\n");
     write("services/api/.env", b"SECRET=3\n");
     write("web/.npmrc", b"//registry:_authToken=x\n");
@@ -1821,6 +1826,13 @@ fn the_launcher_scrubs_the_environment_and_records_the_recipes_group() {
     assert!(
         seen.contains(&format!("CARGO_HOME={}/cargo\n", cache.display())),
         "{seen}"
+    );
+    assert!(
+        seen.contains(&format!(
+            "{}=1\n",
+            thegn_svc::sprites::job::SELECTED_JOB_ENV
+        )),
+        "the recursion marker must reach the recipe: {seen}"
     );
     assert!(
         seen.trim_end().ends_with(&checkout.display().to_string()),
@@ -2369,4 +2381,280 @@ async fn a_cancel_racing_a_finished_exit_never_kills_a_proven_completion() {
         SelectedCompletion::Cancelled => assert_eq!(kills.len(), 1),
         other => panic!("unexpected completion {other:?}"),
     }
+}
+
+/// A lease whose owner is gone: a pid no process has, an old heartbeat.
+fn dead_lease() -> OwnerLease {
+    OwnerLease {
+        pid: u32::MAX - 1,
+        boot_id: OwnerLease::current(0).boot_id,
+        start_ticks: None,
+        started_at_ms: 0,
+        heartbeat_ms: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_with_a_live_owner_lease_is_never_reconciled_even_past_the_staleness_margin() {
+    let mock = start_mock(vec![]);
+    let (_dir, store) = store();
+    let mut record = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
+    store.mark(&record).unwrap();
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    // A realistic clock: ten seconds after the heartbeat, inside the window.
+    let touched = runner
+        .reconcile_pending_at(thegn_core::util::now_ms() + 10_000)
+        .await
+        .unwrap();
+
+    assert!(touched.is_empty());
+    assert_eq!(store.read(1).unwrap().unwrap(), record);
+    assert!(mock.execs.lock().unwrap().is_empty());
+
+    // The heartbeat is old, but this very process still owns the row: on Linux
+    // the pid and boot id alone keep it alive.
+    if cfg!(target_os = "linux") {
+        record.lease = Some(OwnerLease {
+            heartbeat_ms: 0,
+            ..OwnerLease::current(0)
+        });
+        store.mark(&record).unwrap();
+        let touched = runner
+            .reconcile_pending_at(1_000_000_000_000)
+            .await
+            .unwrap();
+        assert!(touched.is_empty());
+        assert_eq!(store.read(1).unwrap().unwrap(), record);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_whose_lease_owner_is_dead_and_heartbeat_old_is_reconciled() {
+    let mock = start_mock(vec![kill_reply(0)]);
+    let (_dir, store) = store();
+    let mut record = seeded(&store, 1, AttemptState::Dispatching, Cleanup::NotNeeded, 0);
+    record.lease = Some(dead_lease());
+    store.mark(&record).unwrap();
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    let touched = runner
+        .reconcile_pending_at(1_000_000_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        touched,
+        vec![Reconciled {
+            attempt: 1,
+            outcome: ReconcileOutcome::Cleaned
+        }]
+    );
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Indeterminate
+    );
+}
+
+#[test]
+fn a_lease_heartbeat_loses_to_a_concurrent_recovery_write_and_the_owner_fences() {
+    let (_dir, store) = store();
+    let mut owner = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    owner.lease = Some(OwnerLease::current(1_000));
+    store.mark(&owner).unwrap();
+
+    // While nothing intervenes the heartbeat moves and the held row follows it.
+    assert!(store.refresh_lease(&mut owner, 2_000).unwrap());
+    assert_eq!(owner.lease.as_ref().unwrap().heartbeat_ms, 2_000);
+    assert_eq!(store.read(1).unwrap().unwrap(), owner);
+
+    // A recovery settles the row between two heartbeats.
+    let mut recovery = owner.clone();
+    recovery.state = AttemptState::Indeterminate;
+    assert!(store.mark_if_unchanged(&owner, &recovery).unwrap());
+
+    // The next heartbeat is refused, writes nothing, and leaves the held row alone.
+    let held = owner.clone();
+    assert!(!store.refresh_lease(&mut owner, 3_000).unwrap());
+    assert_eq!(owner, held);
+    assert_eq!(store.read(1).unwrap().unwrap(), recovery);
+}
+
+#[test]
+fn a_lease_is_live_on_a_fresh_heartbeat_and_dead_with_a_gone_owner() {
+    let now = 1_000_000;
+    assert!(OwnerLease::current(now).is_live(now));
+    assert!(OwnerLease::current(now).is_live(now + 29_000));
+    assert!(!dead_lease().is_live(now));
+    // A little skew ahead is tolerated; a heartbeat far in the future is not
+    // proof of anything (the dead owner's pid fallback decides).
+    assert!(OwnerLease::current(now + 2_000).is_live(now));
+    let far = OwnerLease {
+        heartbeat_ms: now + 3_600_000,
+        ..dead_lease()
+    };
+    assert!(!far.is_live(now));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reattach_leaves_a_live_leased_row_untouched_before_any_provider_call() {
+    let mock = start_mock(vec![
+        script(vec![
+            session_info(),
+            Out::Info(r#"{"type":"exit","exit_code":0}"#),
+        ]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let mut record = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
+    store.mark(&record).unwrap();
+    let runner = runner(&mock, store.clone(), AttemptOptions::default());
+
+    let report = runner.reattach(1).await.unwrap();
+
+    assert!(!report.reattached);
+    assert!(report.note.is_some());
+    assert_eq!(store.read(1).unwrap().unwrap(), record);
+    assert!(
+        mock.execs.lock().unwrap().is_empty(),
+        "no attach and no kill"
+    );
+}
+
+/// Once the owner's heartbeat has advanced the stored lease, play a recovery
+/// pass that settles the row (a terminal row with no lease) and return it.
+async fn recover_after_heartbeat(store: AttemptStore) -> AttemptRecord {
+    for _ in 0..500 {
+        let beaten = store.read(1).ok().flatten().is_some_and(|record| {
+            record.state == AttemptState::Running
+                && record
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.heartbeat_ms > lease.started_at_ms)
+        });
+        if beaten {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut row = store.read(1).unwrap().unwrap();
+    row.state = AttemptState::Indeterminate;
+    row.cleanup = Cleanup::Done;
+    row.lease = None;
+    store.mark(&row).unwrap();
+    row
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_heartbeats_then_fences_when_a_recovery_settles_its_row() {
+    let mock = start_mock(vec![
+        script(vec![session_info(), Out::Silence]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(
+        &mock,
+        store.clone(),
+        AttemptOptions {
+            lease_heartbeat: Duration::from_millis(50),
+            ..outputs_options(DEADLINE)
+        },
+    );
+    let content = content();
+    let pin = pinned();
+
+    let (receipt, settled) = tokio::join!(
+        runner.run(Recipe::CargoBuild, &pin, &content, DEADLINE),
+        recover_after_heartbeat(store.clone()),
+    );
+    let receipt = receipt.unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Indeterminate);
+    assert!(receipt.outputs_fenced);
+    // The fenced owner never overwrote what the recovery settled.
+    assert_eq!(store.read(1).unwrap().unwrap(), settled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_selected_cancel_through_submit_reads_back_cancelled_and_sends_nothing() {
+    let mock = start_mock(Vec::new());
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let source = pinned();
+    let cancel = SelectedCancel::new();
+    cancel.cancel();
+
+    let worker = std::thread::spawn(move || {
+        runner.submit(
+            "sprites-tgtest1",
+            Recipe::CargoBuild,
+            &source,
+            Duration::from_secs(30),
+            &cancel,
+        )
+    });
+    let result = worker.join().unwrap().unwrap();
+
+    assert_eq!(result.completion, SelectedCompletion::Cancelled);
+    assert!(mock.execs.lock().unwrap().is_empty());
+    // The route short-circuits before reserving, so no attempt row exists.
+    assert!(store.read(1).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_selected_cancel_from_another_thread_kills_the_running_command_through_submit() {
+    let mock = start_mock(vec![
+        script(vec![session_info(), Out::Silence]),
+        kill_reply(0),
+    ]);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone(), outputs_options(DEADLINE));
+    let source = pinned();
+    let cancel = SelectedCancel::new();
+
+    let submitted = cancel.clone();
+    let worker = std::thread::spawn(move || {
+        runner.submit(
+            "sprites-tgtest1",
+            Recipe::CargoBuild,
+            &source,
+            Duration::from_secs(30),
+            &submitted,
+        )
+    });
+    for _ in 0..500 {
+        let running = store
+            .read(1)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.state == AttemptState::Running);
+        if running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    let result = worker.join().unwrap().unwrap();
+
+    assert_eq!(result.completion, SelectedCompletion::Cancelled);
+    let (jobs, kills) = execs_of(&mock);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(kills.len(), 1);
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Cancelled
+    );
+}
+
+#[test]
+fn a_row_without_a_lease_field_still_reads_and_stays_without_one() {
+    let (_dir, store) = store();
+    let record = seeded(&store, 1, AttemptState::Running, Cleanup::NotNeeded, 0);
+    let json = serde_json::to_string(&record).unwrap();
+    assert!(!json.contains("lease"), "{json}");
+    let back: AttemptRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.lease, None);
+    assert_eq!(store.read(1).unwrap().unwrap(), record);
 }

@@ -7,6 +7,28 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.129] — 2026-11-24
+
+### Added
+
+- `thegn job run [--runner ENV] [--deadline SECS] <cargo-build|cargo-test>`
+  (dev channel) runs a pinned build or test of the current worktree on the
+  project's selected Sprites or Vercel runner, set with `[jobs] runner`. The
+  provider token stays on this host; Ctrl-C cancels the attempt, a second
+  Ctrl-C exits at once, and the command exits with the job's own code.
+- The daemon reconciles interrupted job attempts on startup, only when a
+  ledger has unsettled rows.
+
+### Changed
+
+- Selected-job attempts carry an owner lease (pid, boot id, heartbeat), so
+  recovery never touches an attempt whose owner is still running, including
+  after the laptop sleeps.
+- A cancel reaches the selected runner and reads back as cancelled, before
+  or during dispatch (Vercel honours it before dispatch only).
+- Job snapshots skip files your global gitignore excludes and any key,
+  certificate, `.envrc`, Terraform state or credential file.
+
 ## [0.1.0-alpha.128] — 2026-11-24
 
 ### Added

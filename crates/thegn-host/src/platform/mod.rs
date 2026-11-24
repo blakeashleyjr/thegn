@@ -856,6 +856,10 @@ impl InterruptGuard {
     pub fn fired(&self) -> bool {
         false
     }
+    /// No handler is installed here, so nothing is ever counted.
+    pub fn count(&self) -> u32 {
+        0
+    }
     /// A flag that is never set: no handler is installed here.
     pub fn flag(&self) -> &'static std::sync::atomic::AtomicBool {
         static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

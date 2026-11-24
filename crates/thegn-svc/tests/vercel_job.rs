@@ -25,8 +25,8 @@ use thegn_core::vercel::api::Scope;
 use thegn_job_spec::{Recipe, RunnerRefusal, SelectedCompletion};
 use thegn_svc::vercel::job::{
     AttemptOptions, AttemptReceipt, AttemptRecord, AttemptState, AttemptStore, Cleanup,
-    DEFAULT_CHECKOUT_ROOT, JobBinding, ReserveRefusal, ReserveRequest, SnapshotContent,
-    SnapshotSource, VercelSelectedRunner,
+    DEFAULT_CHECKOUT_ROOT, JobBinding, OwnerLease, ReconcileOutcome, Reconciled, ReserveRefusal,
+    ReserveRequest, SnapshotContent, SnapshotSource, VercelSelectedRunner,
 };
 use thegn_svc::vercel::{VercelProvider, VercelSpec, VercelToken};
 
@@ -1208,4 +1208,236 @@ async fn the_sandbox_timeout_is_bounded_by_the_configured_lifetime_ceiling() {
         .unwrap();
     // 60 s transfer + 60 s deadline + 5 min slack = 420 s <= 600 s.
     assert_eq!(create.json()["timeout"], serde_json::json!(420_000u64));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_owner_lease_refuses_recovery_even_past_the_staleness_margin() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let mut record = store.read(1).unwrap().unwrap();
+    record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
+    store.mark(&record).unwrap();
+    let (kills, deletes) = (
+        mock.count("POST", "/kill"),
+        mock.count("DELETE", &receipt.sandbox),
+    );
+
+    for error in [
+        runner.reconcile(1).await.unwrap_err(),
+        runner.cancel(1).await.unwrap_err(),
+    ] {
+        assert!(format!("{error:#}").contains("live run"), "{error:#}");
+    }
+
+    assert_eq!(mock.count("POST", "/kill"), kills, "nothing was killed");
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes);
+    assert_eq!(store.read(1).unwrap().unwrap(), record);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_whose_lease_owner_is_dead_and_heartbeat_old_is_reconciled() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let mut record = store.read(1).unwrap().unwrap();
+    record.lease = Some(OwnerLease {
+        pid: u32::MAX - 1,
+        boot_id: OwnerLease::current(0).boot_id,
+        start_ticks: None,
+        started_at_ms: 0,
+        heartbeat_ms: 0,
+    });
+    store.mark(&record).unwrap();
+
+    let settled = runner.reconcile(1).await.unwrap();
+
+    assert_eq!(settled.state, AttemptState::Indeterminate);
+    assert_eq!(settled.cleanup, Cleanup::Done);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_pending_skips_a_live_lease_and_a_young_row() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let mut record = store.read(1).unwrap().unwrap();
+    record.lease = Some(OwnerLease::current(thegn_core::util::now_ms()));
+    store.mark(&record).unwrap();
+    let (kills, deletes) = (
+        mock.count("POST", "/kill"),
+        mock.count("DELETE", &receipt.sandbox),
+    );
+
+    assert!(runner.reconcile_pending().await.unwrap().is_empty());
+
+    // A younger row (deadline far in the future) is skipped too.
+    let mut young = store.read(1).unwrap().unwrap();
+    young.lease = None;
+    young.deadline_ms = thegn_core::util::now_ms() + 3_600_000;
+    store.mark(&young).unwrap();
+    assert!(runner.reconcile_pending().await.unwrap().is_empty());
+
+    assert_eq!(mock.count("POST", "/kill"), kills, "nothing was killed");
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes);
+    assert_eq!(store.read(1).unwrap().unwrap(), young);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_pending_settles_a_stale_row_and_skips_a_reserved_one() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    finished_attempt(&runner).await;
+    revive(&store, &fs, 0);
+    let mut reserved = store.read(1).unwrap().unwrap();
+    reserved.state = AttemptState::Reserved;
+    store.mark(&reserved).unwrap();
+
+    assert!(runner.reconcile_pending().await.unwrap().is_empty());
+    assert_eq!(
+        store.read(1).unwrap().unwrap().state,
+        AttemptState::Reserved
+    );
+
+    let mut running = store.read(1).unwrap().unwrap();
+    running.state = AttemptState::Running;
+    store.mark(&running).unwrap();
+
+    let touched = runner.reconcile_pending().await.unwrap();
+
+    assert_eq!(
+        touched,
+        vec![Reconciled {
+            attempt: 1,
+            outcome: ReconcileOutcome::Cleaned
+        }]
+    );
+    let settled = store.read(1).unwrap().unwrap();
+    assert_eq!(settled.state, AttemptState::Indeterminate);
+    assert_eq!(settled.cleanup, Cleanup::Done);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_pending_cleans_a_terminal_row_whose_cleanup_is_pending() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    // Finished, but its sandbox delete did not complete.
+    fs.lock().unwrap().deleted = false;
+    let mut record = store.read(1).unwrap().unwrap();
+    record.cleanup = Cleanup::Pending;
+    record.sandbox_deleted = false;
+    store.mark(&record).unwrap();
+    let (state, deletes) = (record.state, mock.count("DELETE", &receipt.sandbox));
+
+    let touched = runner.reconcile_pending().await.unwrap();
+
+    assert_eq!(
+        touched,
+        vec![Reconciled {
+            attempt: 1,
+            outcome: ReconcileOutcome::Cleaned
+        }]
+    );
+    let settled = store.read(1).unwrap().unwrap();
+    assert_eq!(settled.state, state, "a terminal state is never rewritten");
+    assert_eq!(settled.cleanup, Cleanup::Done);
+    assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes + 1);
+}
+
+#[test]
+fn a_lease_heartbeat_loses_to_a_concurrent_recovery_write_and_the_owner_fences() {
+    let (_dir, store) = store();
+    let source = content().digest().unwrap();
+    let binding = JobBinding::new("proj", TEAM, PROJECT).unwrap();
+    let mut owner = store
+        .reserve(
+            &binding,
+            ReserveRequest {
+                attempt: None,
+                recipe: Recipe::CargoBuild,
+                source: &source,
+                checkout_root: DEFAULT_CHECKOUT_ROOT,
+                deadline_ms: 0,
+                spend_cap_micros: 0,
+                spend_envelope_micros: 0,
+            },
+        )
+        .unwrap();
+    owner.lease = Some(OwnerLease::current(1_000));
+    store.mark(&owner).unwrap();
+
+    assert!(store.refresh_lease(&mut owner, 2_000).unwrap());
+    assert_eq!(owner.lease.as_ref().unwrap().heartbeat_ms, 2_000);
+    assert_eq!(store.read(1).unwrap().unwrap(), owner);
+
+    let mut recovery = owner.clone();
+    recovery.state = AttemptState::Indeterminate;
+    assert!(store.mark_if_unchanged(&owner, &recovery).unwrap());
+
+    let held = owner.clone();
+    assert!(!store.refresh_lease(&mut owner, 3_000).unwrap());
+    assert_eq!(owner, held);
+    assert_eq!(store.read(1).unwrap().unwrap(), recovery);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_exit_poll_after_an_unfinished_log_stream_keeps_the_owner_and_reads_exited() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let fs = Arc::new(Mutex::new(State::default()));
+    // The log stream ends with no exit line, so the exit is polled; the first
+    // poll fails and the next answers.
+    let base = router(fs, script(vec![stdout_line("compiling\n")]), b"built");
+    let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock = Mock::start(move |req| {
+        if req.method == "GET" && req.path().ends_with("/cmd/cmd_1") {
+            if waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Reply::not_found();
+            }
+            return Reply::json(
+                "200 OK",
+                serde_json::json!({"command": {"id": "cmd_1", "exitCode": 0}}),
+            );
+        }
+        base(req)
+    });
+    let (_dir, store) = store();
+    let runner = runner_with(
+        &mock,
+        store.clone(),
+        AttemptOptions {
+            lease_heartbeat: Duration::from_millis(100),
+            ..options()
+        },
+    );
+    let content = content();
+
+    let receipt = runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Exited(0));
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Finished);
+    assert_eq!(record.exit, Some(0));
+    assert!(record.lease.is_none(), "a terminal row carries no lease");
 }

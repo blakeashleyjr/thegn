@@ -10,10 +10,11 @@ that its receipt can be read back through the ordinary `JobResult`. Without a
 typed seam, a selected job would either fabricate provider placement or leave
 its outcome ambiguous.
 
-This change is the contract slice of THE-2416. It does not route terminal
-commands, read runner selection from config, guard against recursive dispatch,
-or forward argv, cwd, stdio or per-step deadlines. Those belong to later work
-and THE-2416 stays open.
+This change began as the contract slice of THE-2416. The CLI adapter
+(`thegn job run`), the `[jobs] runner` config lookup and the recursion guard
+have since landed (THE-2417/THE-2418). It still does not route arbitrary
+terminal commands or forward argv, cwd, stdio or per-step deadlines; those
+belong to later work and THE-2416 stays open.
 
 ## What changes
 
@@ -32,6 +33,6 @@ and THE-2416 stays open.
 ## Impact
 
 Roadmap BC 764 (bounded Jobs) owns the surrounding work. This increment is
-limited to `crates/thegn-job-spec` and its published schema; no daemon, host or
-provider reads the route yet. Terminal interception, config lookup, the
-recursion guard and argv/cwd plumbing remain follow-up work.
+limited to `crates/thegn-job-spec` and its published schema; the CLI adapter,
+config lookup and recursion guard now read it from `thegn-host`. Terminal
+interception and argv/cwd plumbing remain follow-up work.

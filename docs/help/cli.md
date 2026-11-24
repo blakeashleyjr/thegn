@@ -25,7 +25,7 @@ worktree):
 | Program       | `program list/create/rename/rm/assign` · `wt new --program`                                                                                   |
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                                               |
 | Automation    | `autopilot status [--repo PATH] [--json]`                                                                                                     |
-| Environments  | `env` · `zone` · `host` · `placement` · `fleet` · `debug` · `mcp` · `plugin`                                                                  |
+| Environments  | `env` · `zone` · `host` · `placement` · `fleet` · `job run` · `debug` · `mcp` · `plugin`                                                      |
 | Session       | `session list\|open\|snapshot\|attach\|wait` · `notify` · `logs` · `share` · `forward`                                                        |
 | Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                                                    |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `usage [--json] [--tokens]` · `db` · `setup` · `completions`                                         |
@@ -556,6 +556,32 @@ drops; resuming or reusing an existing sandbox is never refused. With a cap
 set, provisioning first reads that provider's fleet and refuses with "cannot
 verify fleet budget" when the read fails or is incomplete. `fleet list --env`
 reads one env only, so its JSON `cost.budget` is always empty.
+
+On the dev channel, `thegn job run [--runner <env>] [--deadline <secs>]
+<cargo-build|cargo-test>` runs a typed recipe on one explicitly selected
+runner and exits with the job's exit code. The runner is `--runner`, else
+`[jobs] runner`: an `[env.<name>]` whose provider is `sprites` (its `id` names
+the one bound Sprite) or `vercel` (its `team_id` and `project_id`). It snapshots
+the current worktree (tracked and non-ignored files, honouring your global
+gitignore, minus key, certificate and credential files; a symlink refuses), pins
+the snapshot's digest, and the runner verifies the files it received against
+that digest before running anything. There is no free-form command and no
+fallback to another runner. The recipe runs with a scrubbed environment and
+`THEGN_SELECTED_JOB=1`; `thegn job run` refuses to start inside such a job.
+Provider tokens stay on this machine and never reach the recipe. `--deadline`
+(default 1800, at most 86400) is clamped to the runner's own limit.
+
+Ctrl-C cancels the job: Sprites stops the recipe's process tree, while Vercel
+honours a cancel only before dispatch, so an interrupted Vercel run waits for
+the recipe to end or reach its deadline. The receipt shows the completion, the
+source digest, the duration and an estimated cost from the runner's ledger, and
+the last 16 KiB of output (marked when earlier output was dropped). Exit codes:
+the recipe's own code, `130` cancelled, `124` deadline, `128 + n` killed by
+signal `n`, and `1` when no outcome was proven or the run was refused; an
+unproven run may have executed, so check the ledger before retrying. The
+daemon settles attempts a crash left behind for the configured `[jobs] runner`
+when it starts. Not yet forwarded: custom argv, working directory and per-step
+deadlines.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller
