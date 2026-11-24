@@ -1902,7 +1902,9 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
     };
     {
         let mut cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(base) = cached_glyph_base(&mut cache, &key, &print, std::time::Instant::now()) {
+        if let Some(base) =
+            cached_glyph_base(&mut cache, &key, print.as_ref(), std::time::Instant::now())
+        {
             return base;
         }
     }
@@ -2121,14 +2123,14 @@ fn cached_glyph_base(
         (Option<String>, std::time::Instant, BaseKey),
     >,
     key: &RepoExecutionIdentity,
-    print: &BaseKey,
+    print: Option<&thegn_core::git_memo::BaseRefsPrint>,
     now: std::time::Instant,
 ) -> Option<Option<String>> {
     let (base, at, stored) = cache.get_mut(key)?;
-    if !base_entry_valid(print, stored, now.saturating_duration_since(*at)) {
+    if !base_entry_valid(print, stored.as_ref(), now.saturating_duration_since(*at)) {
         return None;
     }
-    if matches!((print, stored), (Some(current), Some(previous)) if current == previous) {
+    if matches!((print, stored.as_ref()), (Some(current), Some(previous)) if current == previous) {
         *at = now;
     }
     Some(base.clone())
@@ -2139,7 +2141,11 @@ type BaseKey = Option<thegn_core::git_memo::BaseRefsPrint>;
 
 /// Whether a cached resolution may be served: by an equal refs print when both
 /// sides have one, otherwise by the TTL. Pure.
-fn base_entry_valid(now: &BaseKey, stored: &BaseKey, age: std::time::Duration) -> bool {
+fn base_entry_valid(
+    now: Option<&thegn_core::git_memo::BaseRefsPrint>,
+    stored: Option<&thegn_core::git_memo::BaseRefsPrint>,
+    age: std::time::Duration,
+) -> bool {
     match (now, stored) {
         (Some(a), Some(b)) => a == b,
         _ => !should_reprobe_base(Some(age), GLYPH_BASE_TTL),
@@ -4480,16 +4486,17 @@ mod tests {
         assert!(a.is_some());
         let old = GLYPH_BASE_TTL * 10;
         // Equal prints: valid however old the entry is.
-        assert!(base_entry_valid(&a, &a, old));
+        assert!(base_entry_valid(a.as_ref(), a.as_ref(), old));
         // A moved print: invalid even when brand new.
         std::fs::write(dir.join(".git/refs/heads/main"), "0\n").unwrap();
         let b = thegn_core::git_memo::base_refs_print(&dir);
-        assert!(!base_entry_valid(&b, &a, std::time::Duration::ZERO));
+        let zero = std::time::Duration::ZERO;
+        assert!(!base_entry_valid(b.as_ref(), a.as_ref(), zero));
         // No print on either side: the TTL decides, as before.
-        assert!(base_entry_valid(&None, &None, std::time::Duration::ZERO));
-        assert!(!base_entry_valid(&None, &None, old));
+        assert!(base_entry_valid(None, None, zero));
+        assert!(!base_entry_valid(None, None, old));
         assert!(
-            !base_entry_valid(&a, &None, old),
+            !base_entry_valid(a.as_ref(), None, old),
             "mixed falls back to the TTL"
         );
     }
@@ -4570,7 +4577,7 @@ mod tests {
             ),
         )]);
         assert_eq!(
-            cached_glyph_base(&mut bases, &key, &print, now),
+            cached_glyph_base(&mut bases, &key, print.as_ref(), now),
             Some(Some("main".into()))
         );
 

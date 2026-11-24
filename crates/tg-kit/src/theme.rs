@@ -246,10 +246,10 @@ impl Theme {
         fn set(
             slot: &mut Rgb,
             field: &'static str,
-            hex: &Option<String>,
+            hex: Option<&String>,
             issues: &mut Vec<ThemeIssue>,
         ) {
-            if let Some(raw) = hex.as_deref() {
+            if let Some(raw) = hex.map(String::as_str) {
                 match parse_hex(raw) {
                     Some(rgb) => *slot = rgb,
                     None => issues.push(ThemeIssue::InvalidColor {
@@ -275,31 +275,46 @@ impl Theme {
         }
         match t.focus_border.as_deref() {
             Some(raw) if DEFAULTISH_FOCUS.contains(&raw) => {}
-            _ => set(&mut self.focus, "focus_border", &t.focus_border, issues),
+            _ => set(
+                &mut self.focus,
+                "focus_border",
+                t.focus_border.as_ref(),
+                issues,
+            ),
         }
         let c = &t.colors;
-        set(&mut self.bg0, "colors.bg0", &c.bg0, issues);
-        set(&mut self.bg1, "colors.bg1", &c.bg1, issues);
-        set(&mut self.panel, "colors.panel", &c.panel, issues);
-        set(&mut self.panel2, "colors.panel2", &c.panel2, issues);
-        set(&mut self.raise, "colors.raise", &c.raise, issues);
-        set(&mut self.border, "colors.border", &c.border, issues);
-        set(&mut self.text, "colors.text", &c.text, issues);
-        set(&mut self.dim, "colors.dim", &c.dim, issues);
-        set(&mut self.faint, "colors.faint", &c.faint, issues);
-        set(&mut self.ghost, "colors.ghost", &c.ghost, issues);
-        set(&mut self.ghost2, "colors.ghost2", &c.ghost2, issues);
-        set(&mut self.ghost3, "colors.ghost3", &c.ghost3, issues);
-        set(&mut self.chip_fg, "colors.chip_fg", &c.chip_fg, issues);
+        set(&mut self.bg0, "colors.bg0", c.bg0.as_ref(), issues);
+        set(&mut self.bg1, "colors.bg1", c.bg1.as_ref(), issues);
+        set(&mut self.panel, "colors.panel", c.panel.as_ref(), issues);
+        set(&mut self.panel2, "colors.panel2", c.panel2.as_ref(), issues);
+        set(&mut self.raise, "colors.raise", c.raise.as_ref(), issues);
+        set(&mut self.border, "colors.border", c.border.as_ref(), issues);
+        set(&mut self.text, "colors.text", c.text.as_ref(), issues);
+        set(&mut self.dim, "colors.dim", c.dim.as_ref(), issues);
+        set(&mut self.faint, "colors.faint", c.faint.as_ref(), issues);
+        set(&mut self.ghost, "colors.ghost", c.ghost.as_ref(), issues);
+        set(&mut self.ghost2, "colors.ghost2", c.ghost2.as_ref(), issues);
+        set(&mut self.ghost3, "colors.ghost3", c.ghost3.as_ref(), issues);
+        set(
+            &mut self.chip_fg,
+            "colors.chip_fg",
+            c.chip_fg.as_ref(),
+            issues,
+        );
         let h = &t.hues;
-        set(&mut self.teal, "hues.teal", &h.teal, issues);
-        set(&mut self.magenta, "hues.magenta", &h.magenta, issues);
-        set(&mut self.purple, "hues.purple", &h.purple, issues);
-        set(&mut self.green, "hues.green", &h.green, issues);
-        set(&mut self.amber, "hues.amber", &h.amber, issues);
-        set(&mut self.red, "hues.red", &h.red, issues);
-        set(&mut self.blue, "hues.blue", &h.blue, issues);
-        set(&mut self.orange, "hues.orange", &h.orange, issues);
+        set(&mut self.teal, "hues.teal", h.teal.as_ref(), issues);
+        set(
+            &mut self.magenta,
+            "hues.magenta",
+            h.magenta.as_ref(),
+            issues,
+        );
+        set(&mut self.purple, "hues.purple", h.purple.as_ref(), issues);
+        set(&mut self.green, "hues.green", h.green.as_ref(), issues);
+        set(&mut self.amber, "hues.amber", h.amber.as_ref(), issues);
+        set(&mut self.red, "hues.red", h.red.as_ref(), issues);
+        set(&mut self.blue, "hues.blue", h.blue.as_ref(), issues);
+        set(&mut self.orange, "hues.orange", h.orange.as_ref(), issues);
     }
 }
 

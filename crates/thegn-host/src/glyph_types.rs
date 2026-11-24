@@ -90,6 +90,9 @@ mod diff_pair_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeSeq};
     use thegn_svc::git::DiffCount;
 
+    // serde's `serialize_with` calls this with `&Option<T>`; the signature is
+    // fixed by the derive, so `Option<&T>` is not an option here.
+    #[allow(clippy::ref_option)]
     pub(super) fn serialize<S>(
         pair: &Option<(DiffCount, DiffCount)>,
         serializer: S,

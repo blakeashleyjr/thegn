@@ -8004,7 +8004,7 @@ async fn event_loop<T: Terminal>(
     let mut media_watch: Option<tokio::task::JoinHandle<()>> = None;
     restart_media_watch(
         &mut media_watch,
-        media_effective_cfg(&keymap.config().media, &media_player_override),
+        media_effective_cfg(&keymap.config().media, media_player_override.as_ref()),
         &media_generation,
         &media_tx,
         &waker,
@@ -9418,7 +9418,7 @@ async fn event_loop<T: Terminal>(
         // below happens only after publishing the latest attribution inputs.
         if !(crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes)
             || (current_config.monitor.processes
-                && crate::detail::cpu_attrib::is_open(&bar_detail)))
+                && crate::detail::cpu_attrib::is_open(bar_detail.as_ref())))
             && let Some(control) = &process_control
         {
             control.set_enabled(false);
@@ -13361,7 +13361,7 @@ async fn event_loop<T: Terminal>(
         // Revoke old publication rights before the final take. One latest
         // snapshot replaces the former unbounded channel; hydration preserves it.
         // The cpu/mem popup's attribution tree samples only while it is open.
-        let attrib_open = crate::detail::cpu_attrib::is_open(&bar_detail);
+        let attrib_open = crate::detail::cpu_attrib::is_open(bar_detail.as_ref());
         let processes_live =
             crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes)
                 || (current_config.monitor.processes && attrib_open);
@@ -13463,13 +13463,13 @@ async fn event_loop<T: Terminal>(
         // closed (`refresh_open` is title-guarded and returns immediately), and
         // adds no wake source — this rides drains that already happened.
         if status_data_moved
-            && (crate::detail::status_modal::is_open(&bar_detail) || monitor.is_some())
+            && (crate::detail::status_modal::is_open(bar_detail.as_ref()) || monitor.is_some())
         {
             // Re-run the session probe on the stats cadence while the modal is
             // open, so the table tracks sessions opening/closing instead of
             // freezing at the one-shot taken on open. Monitor-only opens keep
             // whatever the cache holds — this probe is the modal's contract.
-            if crate::detail::status_modal::is_open(&bar_detail)
+            if crate::detail::status_modal::is_open(bar_detail.as_ref())
                 && panel_ui
                     .docs
                     .daemon_sessions_at
@@ -14225,7 +14225,7 @@ async fn event_loop<T: Terminal>(
             media_generation.current(),
         );
         if media_position_visible {
-            let cfg = media_effective_cfg(&current_config.media, &media_player_override);
+            let cfg = media_effective_cfg(&current_config.media, media_player_override.as_ref());
             if let Some(request) = panel_ui
                 .media
                 .take_queue_request(model.panel.media.as_ref())
@@ -14603,7 +14603,10 @@ async fn event_loop<T: Terminal>(
                     if reload_outcome.restart_media {
                         restart_media_watch(
                             &mut media_watch,
-                            media_effective_cfg(&current_config.media, &media_player_override),
+                            media_effective_cfg(
+                                &current_config.media,
+                                media_player_override.as_ref(),
+                            ),
                             &media_generation,
                             &media_tx,
                             &waker,
@@ -15175,7 +15178,7 @@ async fn event_loop<T: Terminal>(
                                 .fleet
                                 .as_deref()
                                 .map(crate::hydrate_fleet::LastRead::of),
-                            popup_open: crate::detail::fleet::is_open(&bar_detail),
+                            popup_open: crate::detail::fleet::is_open(bar_detail.as_ref()),
                             now_ms: thegn_core::util::now_ms(),
                         });
                     }
@@ -15192,7 +15195,7 @@ async fn event_loop<T: Terminal>(
                         // The badge is the bars' damage class, like weather.
                         bars_dirty = true;
                     }
-                    if crate::detail::fleet::is_open(&bar_detail) {
+                    if crate::detail::fleet::is_open(bar_detail.as_ref()) {
                         dirty |= crate::detail::fleet::refresh_open(
                             &mut bar_detail,
                             &model,
@@ -18835,7 +18838,7 @@ async fn event_loop<T: Terminal>(
                                     crate::media_ctl::spawn_media_action(
                                         media_effective_cfg(
                                             &current_config.media,
-                                            &media_player_override,
+                                            media_player_override.as_ref(),
                                         ),
                                         action,
                                         &media_generation,
@@ -18887,7 +18890,7 @@ async fn event_loop<T: Terminal>(
                                             spawn_media_op(
                                                 media_effective_cfg(
                                                     &current_config.media,
-                                                    &media_player_override,
+                                                    media_player_override.as_ref(),
                                                 ),
                                                 MediaOp::PlayQueueItem(lease),
                                                 &media_generation,
@@ -18904,7 +18907,7 @@ async fn event_loop<T: Terminal>(
                                             &mut media_watch,
                                             media_effective_cfg(
                                                 &current_config.media,
-                                                &media_player_override,
+                                                media_player_override.as_ref(),
                                             ),
                                             &media_generation,
                                             &media_tx,
@@ -22031,7 +22034,7 @@ async fn event_loop<T: Terminal>(
                             crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
-                                &file_index,
+                                file_index.as_ref(),
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
@@ -22533,7 +22536,7 @@ async fn event_loop<T: Terminal>(
                                             if current_config.media.enabled {
                                                 let cfg = media_effective_cfg(
                                                     &current_config.media,
-                                                    &media_player_override,
+                                                    media_player_override.as_ref(),
                                                 );
                                                 crate::media_ctl::spawn_media_playlist(
                                                     cfg,
@@ -22557,7 +22560,7 @@ async fn event_loop<T: Terminal>(
                                         &mut media_watch,
                                         media_effective_cfg(
                                             &current_config.media,
-                                            &media_player_override,
+                                            media_player_override.as_ref(),
                                         ),
                                         &media_generation,
                                         &media_tx,
@@ -22680,7 +22683,7 @@ async fn event_loop<T: Terminal>(
                             crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
-                                &file_index,
+                                file_index.as_ref(),
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
@@ -22694,7 +22697,7 @@ async fn event_loop<T: Terminal>(
                             crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
-                                &file_index,
+                                file_index.as_ref(),
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
@@ -23929,7 +23932,7 @@ async fn event_loop<T: Terminal>(
                                                         &mut media_watch,
                                                         media_effective_cfg(
                                                             &current_config.media,
-                                                            &media_player_override,
+                                                            media_player_override.as_ref(),
                                                         ),
                                                         &media_generation,
                                                         &media_tx,
@@ -23943,7 +23946,7 @@ async fn event_loop<T: Terminal>(
                                                     spawn_media_op(
                                                         media_effective_cfg(
                                                             &current_config.media,
-                                                            &media_player_override,
+                                                            media_player_override.as_ref(),
                                                         ),
                                                         MediaOp::PlayQueueItem(lease),
                                                         &media_generation,
@@ -25719,7 +25722,7 @@ async fn event_loop<T: Terminal>(
                                 crate::media_ctl::spawn_media_action(
                                     media_effective_cfg(
                                         &current_config.media,
-                                        &media_player_override,
+                                        media_player_override.as_ref(),
                                     ),
                                     action,
                                     &media_generation,
@@ -29135,7 +29138,7 @@ async fn event_loop<T: Terminal>(
                                     spawn_media_op(
                                         media_effective_cfg(
                                             &current_config.media,
-                                            &media_player_override,
+                                            media_player_override.as_ref(),
                                         ),
                                         op,
                                         &media_generation,
@@ -29159,7 +29162,7 @@ async fn event_loop<T: Terminal>(
                                     spawn_media_pick(
                                         media_effective_cfg(
                                             &current_config.media,
-                                            &media_player_override,
+                                            media_player_override.as_ref(),
                                         ),
                                         players,
                                         media_pick_slot.clone(),

@@ -333,7 +333,7 @@ fn parse_capacity(
     }
 }
 
-fn parse_volumes(name: &str, volumes: &Option<Vec<String>>) -> Vec<VolumeSpec> {
+fn parse_volumes(name: &str, volumes: Option<&[String]>) -> Vec<VolumeSpec> {
     match volumes {
         None => default_volumes(),
         Some(names) => {
@@ -559,7 +559,7 @@ impl Config {
             reach,
             consent: hc.install_runtime,
             image: parse_image(name, &hc.image, &self.default_host_image()),
-            volumes: parse_volumes(name, &hc.volumes),
+            volumes: parse_volumes(name, hc.volumes.as_deref()),
             delivery_prefs: parse_delivery(name, &hc.delivery),
             probe_ttl_secs: if hc.probe_ttl_secs == 0 {
                 DEFAULT_PROBE_TTL_SECS

@@ -345,10 +345,10 @@ fn interval(period: std::time::Duration) -> tokio::time::Interval {
 }
 
 fn should_deliver(
-    last: &Option<MediaSnapshot>,
+    last: Option<&MediaSnapshot>,
     last_epoch: u64,
     current_epoch: u64,
-    new: &Option<MediaSnapshot>,
+    new: Option<&MediaSnapshot>,
     last_health: MediaHealth,
     health: MediaHealth,
 ) -> bool {
@@ -468,8 +468,8 @@ async fn read_snapshot(client: &thegn_media::MediaClient) -> Result<Option<Media
 }
 
 /// Whether a snapshot would render a badge (i.e. an active player).
-fn shows_badge(snap: &Option<MediaSnapshot>) -> bool {
-    snap.as_ref().and_then(|s| s.state.badge()).is_some()
+fn shows_badge(snap: Option<&MediaSnapshot>) -> bool {
+    snap.and_then(|s| s.state.badge()).is_some()
 }
 
 /// Read a snapshot and push it to the loop, suppressing a *transient*
@@ -506,12 +506,12 @@ async fn push_snapshot(
             None => return Some(was_showing),
         },
     };
-    if should_confirm_flap(read_ok, was_showing, shows_badge(&snap)) {
+    if should_confirm_flap(read_ok, was_showing, shows_badge(snap.as_ref())) {
         tokio::time::sleep(CONFIRM_DELAY).await;
         match read_snapshot(client).await {
             Ok(confirm) => {
                 state.freshness.on_success();
-                if shows_badge(&confirm) {
+                if shows_badge(confirm.as_ref()) {
                     tracing::debug!(target: "thegn::media", "media badge held (transient empty ignored)");
                 } else {
                     tracing::debug!(target: "thegn::media", "media badge cleared (empty confirmed)");
@@ -532,13 +532,13 @@ async fn push_snapshot(
             },
         }
     }
-    let active = shows_badge(&snap);
+    let active = shows_badge(snap.as_ref());
     let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
     if !should_deliver(
-        &state.last_sent,
+        state.last_sent.as_ref(),
         state.last_epoch,
         epoch,
-        &snap,
+        snap.as_ref(),
         state.last_health,
         health,
     ) {
@@ -609,13 +609,13 @@ async fn run_with<R, F>(
                 if let Some((snapshot, health)) =
                     failure_delivery(&mut state, tokio::time::Instant::now())
                 {
-                    active = shows_badge(&snapshot);
+                    active = shows_badge(snapshot.as_ref());
                     let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
                     if should_deliver(
-                        &state.last_sent,
+                        state.last_sent.as_ref(),
                         state.last_epoch,
                         epoch,
-                        &snapshot,
+                        snapshot.as_ref(),
                         state.last_health,
                         health,
                     ) && deliver(&tx, &waker, generation, &mut state, snapshot, health, epoch)
@@ -1042,26 +1042,26 @@ mod tests {
             caps: MediaCaps::default(),
         });
         assert!(!should_deliver(
-            &snapshot,
+            snapshot.as_ref(),
             4,
             4,
-            &snapshot,
+            snapshot.as_ref(),
             MediaHealth::Fresh,
             MediaHealth::Fresh
         ));
         assert!(should_deliver(
-            &snapshot,
+            snapshot.as_ref(),
             4,
             5,
-            &snapshot,
+            snapshot.as_ref(),
             MediaHealth::Fresh,
             MediaHealth::Fresh
         ));
         assert!(should_deliver(
-            &snapshot,
+            snapshot.as_ref(),
             4,
             4,
-            &None,
+            None,
             MediaHealth::Fresh,
             MediaHealth::Fresh
         ));
@@ -1123,18 +1123,18 @@ mod tests {
             caps: MediaCaps::default(),
         });
         assert!(should_deliver(
-            &snapshot,
+            snapshot.as_ref(),
             4,
             4,
-            &snapshot,
+            snapshot.as_ref(),
             MediaHealth::Degraded,
             MediaHealth::Fresh
         ));
         assert!(!should_deliver(
-            &snapshot,
+            snapshot.as_ref(),
             4,
             4,
-            &snapshot,
+            snapshot.as_ref(),
             MediaHealth::Fresh,
             MediaHealth::Fresh
         ));

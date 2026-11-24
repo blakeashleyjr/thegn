@@ -208,22 +208,21 @@ pub(crate) fn on_left_press(
     // text. The layout chip beside it toggles flat/grouped, like `g`.
     if my == rect.y {
         let chips = crate::sidebar_view::header_chips(model, rect);
-        let over = |chip: &Option<(String, usize, usize)>| {
-            chip.as_ref()
-                .is_some_and(|(_, cx, ccols)| mx >= *cx && mx < cx + ccols)
+        let over = |chip: Option<&(String, usize, usize)>| {
+            chip.is_some_and(|(_, cx, ccols)| mx >= *cx && mx < cx + ccols)
         };
-        if over(&chips.sort) {
+        if over(chips.sort.as_ref()) {
             return PressOut::Outcome(SidebarOutcome::SortMenu);
         }
         // The mode chip cycles the sidebar full → rail → hidden, exactly
         // like the `ToggleSidebar` binding (the same synthesis as the
         // EmptyHint's `NewTerminal` below).
-        if over(&chips.mode) {
+        if over(chips.mode.as_ref()) {
             return PressOut::Outcome(SidebarOutcome::Synthetic(
                 crate::keymap::Action::ToggleSidebar,
             ));
         }
-        if over(&chips.layout) {
+        if over(chips.layout.as_ref()) {
             return match sb.toggle_flat(model, session) {
                 SidebarOutcome::Redraw => PressOut::Consumed,
                 out => PressOut::Outcome(out),

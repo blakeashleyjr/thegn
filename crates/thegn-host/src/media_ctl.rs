@@ -649,7 +649,7 @@ pub(crate) fn pick_note(pick: &MediaPick) -> Option<String> {
 /// override (the "Select player" pick) floated to the front of the priority list.
 pub(crate) fn media_effective_cfg(
     base: &thegn_core::config::MediaConfig,
-    player_override: &Option<String>,
+    player_override: Option<&String>,
 ) -> thegn_core::config::MediaConfig {
     let mut cfg = base.clone();
     if let Some(p) = player_override {

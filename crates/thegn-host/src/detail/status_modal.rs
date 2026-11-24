@@ -354,8 +354,8 @@ const SESSIONS_STALE_SECS: u64 = 15;
 
 /// Whether `slot` currently holds the status modal (for the loop's
 /// re-probe-while-open cadence).
-pub(crate) fn is_open(slot: &Option<DetailOverlay>) -> bool {
-    slot.as_ref().is_some_and(|ov| ov.title == TITLE)
+pub(crate) fn is_open(slot: Option<&DetailOverlay>) -> bool {
+    slot.is_some_and(|ov| ov.title == TITLE)
 }
 
 /// One row per daemon session. `att` is the real attached-client count the

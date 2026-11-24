@@ -286,6 +286,10 @@ let_underscore_future = "deny"
 # Builder-style methods (`fn with_x(self, ..) -> Self`) are pure: dropping the
 # result silently discards the configuration. Public ones carry `#[must_use]`.
 return_self_not_must_use = "deny"
+# `&Option<T>` parameters force every caller to borrow the `Option`; pass
+# `Option<&T>` instead. Serde's `serialize_with` contract is the one exception
+# and carries a local allow.
+ref_option = "deny"
 
 [profile.dev]
 # Build-speed tuning for the inner loop. `line-tables-only` keeps backtraces

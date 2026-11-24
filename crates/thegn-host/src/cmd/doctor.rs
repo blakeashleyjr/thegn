@@ -3892,8 +3892,8 @@ pub fn run(
     let probe = crate::probe::probe_outer_terminal_cli();
     let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
 
-    let show = |k: &str, v: &Option<String>| {
-        outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
+    let show = |k: &str, v: Option<&String>| {
+        outln!("  {k:<13} {}", v.map(String::as_str).unwrap_or("(unset)"));
     };
     instance_report(cfg);
     super::doctor_exposure::report(cfg);
@@ -3949,19 +3949,19 @@ pub fn run(
     core_deps_report();
     outln!("");
     outln!("Terminal environment");
-    show("TERM", &env.term);
-    show("COLORTERM", &env.colorterm);
-    show("TERM_PROGRAM", &env.term_program);
-    show("TERM_PROG_VER", &env.term_program_version);
+    show("TERM", env.term.as_ref());
+    show("COLORTERM", env.colorterm.as_ref());
+    show("TERM_PROGRAM", env.term_program.as_ref());
+    show("TERM_PROG_VER", env.term_program_version.as_ref());
     // The one that survives ssh, so it explains an otherwise-baffling
     // "why is my iTerm2 detected as a plain 256-color terminal" one hop away.
-    show("LC_TERMINAL", &env.lc_terminal);
-    show("VTE_VERSION", &env.vte_version);
+    show("LC_TERMINAL", env.lc_terminal.as_ref());
+    show("VTE_VERSION", env.vte_version.as_ref());
     outln!("  {:<13} {}", "NO_COLOR", yn(env.no_color));
-    show("WT_SESSION", &env.wt_session);
-    show("LANG", &env.lang);
-    show("LC_ALL", &env.lc_all);
-    show("LC_CTYPE", &env.lc_ctype);
+    show("WT_SESSION", env.wt_session.as_ref());
+    show("LANG", env.lang.as_ref());
+    show("LC_ALL", env.lc_all.as_ref());
+    show("LC_CTYPE", env.lc_ctype.as_ref());
 
     outln!("");
     outln!("Config modes ([theme])");

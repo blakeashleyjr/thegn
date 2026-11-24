@@ -55,34 +55,40 @@ pub fn apply_config_overrides(
     accent: &str,
     focus: &str,
 ) {
-    set(&mut palette.bg0, &colors.bg0);
-    set(&mut palette.bg1, &colors.bg1);
-    set(&mut palette.panel, &colors.panel);
-    set(&mut palette.panel_alt, &colors.panel_alt);
-    set(&mut palette.panel2, &colors.panel2);
-    set(&mut palette.raise, &colors.raise);
-    set(&mut palette.border, &colors.border);
-    set(&mut palette.text, &colors.text);
-    set(&mut palette.dim, &colors.dim);
-    set(&mut palette.faint, &colors.faint);
-    set(&mut palette.ghost, &colors.ghost);
-    set(&mut palette.ghost2, &colors.ghost2);
-    set(&mut palette.ghost3, &colors.ghost3);
-    set(&mut palette.shadow_bg, &colors.shadow_bg);
-    set(&mut palette.shadow_fg, &colors.shadow_fg);
-    set(&mut palette.chip_fg, &colors.chip_fg);
-    set(&mut palette.activity_active, &colors.activity_active);
-    set(&mut palette.activity_waiting, &colors.activity_waiting);
-    set(&mut palette.activity_done, &colors.activity_done);
+    set(&mut palette.bg0, colors.bg0.as_ref());
+    set(&mut palette.bg1, colors.bg1.as_ref());
+    set(&mut palette.panel, colors.panel.as_ref());
+    set(&mut palette.panel_alt, colors.panel_alt.as_ref());
+    set(&mut palette.panel2, colors.panel2.as_ref());
+    set(&mut palette.raise, colors.raise.as_ref());
+    set(&mut palette.border, colors.border.as_ref());
+    set(&mut palette.text, colors.text.as_ref());
+    set(&mut palette.dim, colors.dim.as_ref());
+    set(&mut palette.faint, colors.faint.as_ref());
+    set(&mut palette.ghost, colors.ghost.as_ref());
+    set(&mut palette.ghost2, colors.ghost2.as_ref());
+    set(&mut palette.ghost3, colors.ghost3.as_ref());
+    set(&mut palette.shadow_bg, colors.shadow_bg.as_ref());
+    set(&mut palette.shadow_fg, colors.shadow_fg.as_ref());
+    set(&mut palette.chip_fg, colors.chip_fg.as_ref());
+    set(
+        &mut palette.activity_active,
+        colors.activity_active.as_ref(),
+    );
+    set(
+        &mut palette.activity_waiting,
+        colors.activity_waiting.as_ref(),
+    );
+    set(&mut palette.activity_done, colors.activity_done.as_ref());
 
-    set(&mut palette.hues.teal, &hues.teal);
-    set(&mut palette.hues.magenta, &hues.magenta);
-    set(&mut palette.hues.purple, &hues.purple);
-    set(&mut palette.hues.green, &hues.green);
-    set(&mut palette.hues.amber, &hues.amber);
-    set(&mut palette.hues.red, &hues.red);
-    set(&mut palette.hues.blue, &hues.blue);
-    set(&mut palette.hues.orange, &hues.orange);
+    set(&mut palette.hues.teal, hues.teal.as_ref());
+    set(&mut palette.hues.magenta, hues.magenta.as_ref());
+    set(&mut palette.hues.purple, hues.purple.as_ref());
+    set(&mut palette.hues.green, hues.green.as_ref());
+    set(&mut palette.hues.amber, hues.amber.as_ref());
+    set(&mut palette.hues.red, hues.red.as_ref());
+    set(&mut palette.hues.blue, hues.blue.as_ref());
+    set(&mut palette.hues.orange, hues.orange.as_ref());
 
     // The defaults intentionally do not clobber the accent/focus selected by
     // a preset. This preserves the long-standing cycle behavior.
@@ -156,8 +162,8 @@ pub fn palette_with_user_theme(
     Ok(palette)
 }
 
-fn set(slot: &mut String, value: &Option<String>) {
-    if let Some(rgb) = value.as_deref().and_then(parse_hex_rgb) {
+fn set(slot: &mut String, value: Option<&String>) {
+    if let Some(rgb) = value.map(String::as_str).and_then(parse_hex_rgb) {
         *slot = rgb;
     }
 }
