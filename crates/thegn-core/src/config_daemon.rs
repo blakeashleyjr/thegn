@@ -555,6 +555,67 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn raw_unix_state_path_identities_and_endpoint_keys_are_lossless() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // Two invalid UTF-8 byte sequences decode to the same replacement
+        // character under lossy display. Identity must not: distinct raw
+        // bytes have to keep distinct scopes and endpoints.
+        let first = Path::new(std::ffi::OsStr::from_bytes(b"/s/\xff"));
+        let second = Path::new(std::ffi::OsStr::from_bytes(b"/s/\xfe"));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+
+        let first_scope = state_scope_identity(first);
+        let second_scope = state_scope_identity(second);
+        let first_endpoint = state_endpoint_key(first);
+        let second_endpoint = state_endpoint_key(second);
+        assert_eq!(state_scope_identity(first), first_scope);
+        assert_eq!(state_endpoint_key(first), first_endpoint);
+        assert_ne!(first_scope, second_scope);
+        assert_ne!(first_endpoint, second_endpoint);
+        // Endpoint and registry scope come from one digest, never a display
+        // string: the key is the `v1-` scope's hex prefix.
+        assert_eq!(first_endpoint, &first_scope[3..35]);
+        assert_eq!(second_endpoint, &second_scope[3..35]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_state_path_identity_preserves_case_prefix_and_utf16() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        // Windows folds case and verbatim prefixes at the filesystem layer; the
+        // identity deliberately keeps them distinct instead of normalizing to a
+        // display string, so two spellings can never cross-connect by accident.
+        let upper = Path::new(r"C:\State\thegn");
+        let lower = Path::new(r"c:\state\thegn");
+        let plain = Path::new(r"C:\State\thegn");
+        let verbatim = Path::new(r"\\?\C:\State\thegn");
+
+        assert_ne!(state_scope_identity(upper), state_scope_identity(lower));
+        assert_ne!(state_endpoint_key(upper), state_endpoint_key(lower));
+        assert_ne!(state_scope_identity(plain), state_scope_identity(verbatim));
+        assert_ne!(state_endpoint_key(plain), state_endpoint_key(verbatim));
+
+        // Windows paths are UTF-16. Distinct unpaired surrogates both become
+        // U+FFFD under lossy display, but remain distinct in the path identity.
+        let mut first_units: Vec<u16> = "C:\\State\\".encode_utf16().collect();
+        first_units.push(0xD800);
+        let mut second_units: Vec<u16> = "C:\\State\\".encode_utf16().collect();
+        second_units.push(0xD801);
+        let first_os = OsString::from_wide(&first_units);
+        let second_os = OsString::from_wide(&second_units);
+        let first = Path::new(&first_os);
+        let second = Path::new(&second_os);
+
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(state_scope_identity(first), state_scope_identity(second));
+        assert_ne!(state_endpoint_key(first), state_endpoint_key(second));
+    }
+
     #[test]
     fn socket_path_limit_is_per_platform_and_boundary_exact() {
         assert_eq!(max_socket_path_len(true), 107, "Linux sun_path[108]");

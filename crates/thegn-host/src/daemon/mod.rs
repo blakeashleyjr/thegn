@@ -2377,6 +2377,41 @@ mod tests {
         assert_ne!(second, legacy);
     }
 
+    #[test]
+    fn runtime_socket_key_is_the_shared_scope_identity() {
+        let config = thegn_core::config::DaemonConfig::default();
+        let state = std::path::Path::new("/state/one");
+        let other = std::path::Path::new("/state/two");
+        let socket = socket_path_for(&config, Some("/run/user/1000"), state, 1000, None);
+        let key = thegn_core::config_daemon::state_endpoint_key(state);
+        assert_eq!(
+            socket,
+            std::path::PathBuf::from("/run/user/1000")
+                .join("thegn")
+                .join(&key)
+                .join("daemon.sock"),
+            "the runtime endpoint must be keyed by the state identity"
+        );
+        let scope = scope_key_for(state);
+        assert_eq!(
+            key,
+            &scope[3..35],
+            "endpoint key and registry scope share one digest"
+        );
+        // The derived endpoint stays distinct per state root on every platform,
+        // including the Windows named-pipe derivation.
+        assert_ne!(
+            thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket),
+            thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket_path_for(
+                &config,
+                Some("/run/user/1000"),
+                other,
+                1000,
+                None,
+            )),
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn existing_private_fallback_directory_must_have_private_mode() {

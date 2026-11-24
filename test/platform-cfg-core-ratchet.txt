@@ -13,6 +13,11 @@
 account.rs
 activity.rs
 bundle.rs
+# TEST-ONLY cfg, not per-OS production code (THE-301): daemon state-path
+# identity is platform-neutral — it hashes `OsStr` encoded bytes — but proving
+# the Unix raw-byte and Windows UTF-16/case/verbatim-prefix semantics needs the
+# per-OS `OsStr` constructors, so only the two identity fixtures are cfg-gated.
+config_daemon.rs
 config_write.rs
 fsperm.rs
 merge_guard.rs
