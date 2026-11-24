@@ -723,7 +723,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
     },
     StateToolSpec {
         cap: "agent.dispatch",
-        description: "Launch one configured agent headlessly in an existing isolated worktree and durably track it against a real issue identity. Uses the same native launch, sandbox, environment, credential and roster path as `thegn agent run --track`; no argv or caller environment. Write-scoped (`--scopes write`); requires a running daemon.",
+        description: "Launch one configured agent headlessly in an existing isolated worktree and durably track it against a real issue identity. Launches through the daemon's native open path (sandbox, environment, credentials) and records a tracked roster row, as `thegn agent run --track` does for the launch itself; unlike it, the session is not bound to the worktree and no CLI preflight runs. No argv or caller environment. Not offered over a scoped control token (the Lead). Write-scoped (`--scopes write`); requires a running daemon.",
         args: &[
             ArgSpec {
                 name: "agent",
@@ -735,7 +735,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                 name: "worktree",
                 kind: ArgKind::String,
                 required: true,
-                description: "Absolute path of the isolated worktree to launch in",
+                description: "Absolute path (relative paths are refused) of the isolated worktree to launch in",
             },
             ArgSpec {
                 name: "issue_id",
@@ -1683,6 +1683,12 @@ fn validate_semantics(cap: &str, args: &Value) -> Result<(), String> {
                 ));
             }
         }
+        "agent.dispatch" => {
+            let worktree = args.get("worktree").and_then(Value::as_str).unwrap_or("");
+            if !std::path::Path::new(worktree).is_absolute() {
+                return Err("`worktree` must be an absolute path".into());
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -1734,6 +1740,10 @@ pub fn redact_for_audit(cap: &str, args: &Value) -> Value {
             }
         }
         "sessions.open" | "sessions.split" => {
+            if let Some(v) = out.get("prompt").and_then(Value::as_str) {
+                let digest = text_digest(v);
+                out.insert("prompt".to_string(), json!(digest));
+            }
             if let Some(Value::Object(env)) = out.get("env") {
                 let n = env.len();
                 out.insert("env".to_string(), json!(format!("<{n} vars>")));
@@ -2966,6 +2976,32 @@ mod tests {
         let env = red["env"].as_str().unwrap();
         assert!(!env.contains("sk-verysecret"), "{env}");
         assert!(env.contains("2 vars"), "{env}");
+    }
+
+    #[test]
+    fn redact_for_audit_digests_session_open_prompt() {
+        let args = json!({"argv": ["node"], "prompt": "private task text"});
+        let red = redact_for_audit("sessions.open", &args);
+        let prompt = red["prompt"].as_str().unwrap();
+        assert_eq!(prompt, text_digest("private task text"));
+        assert!(!prompt.contains("private task text"), "{prompt}");
+        assert_eq!(red["argv"], json!(["node"]));
+    }
+
+    #[test]
+    fn agent_dispatch_refuses_a_relative_worktree() {
+        let r = StateRouter::new(vec!["agent.dispatch"], |_, _| -> Result<Value, String> {
+            panic!("a relative worktree must not reach fetch")
+        });
+        let args = json!({
+            "agent": "worker",
+            "worktree": "relative/wt",
+            "issue_id": "linear:THE-123",
+            "prompt": "task"
+        });
+        let (code, message) = r.call("agent_dispatch", &args).unwrap().unwrap_err();
+        assert_eq!(code, -32602);
+        assert!(message.contains("absolute"), "{message}");
     }
 
     #[test]

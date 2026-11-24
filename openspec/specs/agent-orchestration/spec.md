@@ -10,13 +10,15 @@ TBD - created by archiving change harden-pipeline-slot-accounting. Update Purpos
 
 thegn SHALL expose a write-scoped `agent.dispatch` MCP action that accepts a
 configured agent, an existing worktree, a non-empty task, and a real dispatch
-identity. It SHALL use the same offline admission and plain-open implementation
-as `thegn agent run --track`, and SHALL leave harness command construction,
+identity. It SHALL run the offline admission checks of `thegn agent run --track` (dispatch
+identity, stage and task) and its plain-open tracking path, without worktree
+agent binding or the CLI preflight, and SHALL leave harness command construction,
 model selection, environment composition, credentials, resource caps and
 sandbox selection to trusted configuration and the daemon launch path. It MUST
 NOT accept raw argv or caller environment, and MUST use the caller-supplied
 issue identity rather than inventing an authority id. It MUST validate the
-identity's canonical syntax and the local worktree root before launch. A
+identity's canonical syntax and require an absolute worktree path before
+launch, and MUST NOT be offered or run over a scoped control token (the Lead). A
 configured stage MAY supply the agent's model, environment and permission
 policy. A successful response SHALL include `status`, `final_message`, and
 `duration_ms`; when the action only starts a worker, status MUST say `running`

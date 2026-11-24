@@ -91,6 +91,7 @@ const EXEC_ONLY: &str =
     "runs a configured command on the host (exec scope); never reachable by the Lead";
 const NO_ATTACH: &str = "an interactive attach can type into the session; the Lead reads screens with sessions.snapshot";
 const NO_FORK: &str = "a fork can re-run the source session's raw command; the Lead opens a configured agent with sessions.open instead";
+const NO_AGENT_DISPATCH: &str = "agent.dispatch tracks its roster row from the MCP process; the Lead opens a configured agent with sessions.open and the daemon binds rows itself";
 const NO_SPLIT: &str = "a split launches a caller-supplied argv or a login shell on the host";
 const NO_HOST_UI: &str = "hands a host path to the compositor, which opens it outside any sandbox";
 const NO_HOST_GIT: &str =
@@ -179,11 +180,7 @@ pub fn rule(verb: Verb) -> Rule {
 
         // Shape-checked. `sessions.input` is further held, in the daemon, to
         // sessions a Lead opened.
-        // `agent.dispatch` is MCP-local orchestration, but its launch still
-        // crosses the ordinary confined `sessions.open` boundary.
-        Verb::OpenSession | Verb::DispatchesPut | Verb::AgentDispatch | Verb::SendInput => {
-            Rule::AllowIf
-        }
+        Verb::OpenSession | Verb::DispatchesPut | Verb::SendInput => Rule::AllowIf,
         // b155 (6d): outward tracker writes go through the daemon's
         // `issues_*_confined` path, which needs an owner approval per call.
         // (THE-2222): a profile's env is returned only for the Lead's own
@@ -198,6 +195,9 @@ pub fn rule(verb: Verb) -> Rule {
         Verb::MergeAdd | Verb::MergeDrain => Rule::Refuse(NO_LAND),
 
         Verb::ForkSession => Rule::Refuse(NO_FORK),
+        // MCP-only, and its roster write happens in the MCP process, outside
+        // the daemon's `dispatches.put` confinement.
+        Verb::AgentDispatch => Rule::Refuse(NO_AGENT_DISPATCH),
         Verb::Split => Rule::Refuse(NO_SPLIT),
         Verb::Attach | Verb::Detach | Verb::Resize => Rule::Refuse(NO_ATTACH),
         Verb::OpenWorktree | Verb::OpenEditor => Rule::Refuse(NO_HOST_UI),
@@ -613,7 +613,7 @@ mod tests {
         (Verb::IssuesComment, AllowIf),
         (Verb::DispatchesList, Allow),
         (Verb::DispatchesPut, AllowIf),
-        (Verb::AgentDispatch, AllowIf),
+        (Verb::AgentDispatch, Refuse),
         (Verb::DispatchesSetStatus, Allow),
         (Verb::DispatchesVerify, Allow),
         (Verb::DispatchesWait, Allow),
