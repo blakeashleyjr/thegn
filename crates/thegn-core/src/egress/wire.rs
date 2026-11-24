@@ -1564,9 +1564,11 @@ mod tests {
             .expect("reply serialises"),
         };
         let json = serde_json::to_string(&ok).expect("ok serialises");
+        // Compare as JSON values: `serde_json::Value` objects sort their keys
+        // (no `preserve_order` feature), and key order carries no meaning on the wire.
         assert_eq!(
-            json,
-            r#"{"id":3,"ok":{"proto":1,"git_sha":"eefb04b29","features":["approvals"]}}"#
+            serde_json::from_str::<serde_json::Value>(&json).expect("ok is json"),
+            serde_json::json!({"id":3,"ok":{"proto":1,"git_sha":"eefb04b29","features":["approvals"]}})
         );
         assert_eq!(
             serde_json::from_str::<ControlResponse>(&json).expect("ok parses"),

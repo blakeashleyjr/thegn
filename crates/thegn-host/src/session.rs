@@ -267,7 +267,7 @@ impl Tab {
     pub fn remap_focus_history(&mut self, f: &mut impl FnMut(u32) -> Option<u32>) {
         self.focus_history = std::mem::take(&mut self.focus_history)
             .into_iter()
-            .filter_map(|pane| f(pane))
+            .filter_map(&mut *f)
             .collect();
     }
 
