@@ -10,15 +10,15 @@ You can run a **stable** thegn for your daily work and a **dev** thegn built
 from a checkout, side by side, as one user on one machine. The dev instance
 can be rebuilt and restarted freely without touching the stable one.
 
-| Item        | stable                                             | dev                                                                             |
-| ----------- | -------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Binary      | the Nix/home-manager package (a published release) | `~/.thegn-devel/bin/thegn` (`just live`) or `target/debug/thegn` (`just devel`) |
-| Launch      | `thegn` or the app launcher                        | `just live` or `just devel`                                                     |
-| Config dir  | `~/.config/thegn`                                  | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`)                                      |
-| State       | the default state dir                              | `~/.thegn-devel/state` (`XDG_STATE_HOME`)                                       |
-| Runtime     | the login runtime dir (not overridden)             | the login runtime dir (not overridden)                                          |
-| `THEGN_DIR` | `~/.thegn`                                         | `~/.thegn-devel/home`                                                           |
-| Channel     | stable                                             | dev (`THEGN_CHANNEL=dev`)                                                       |
+| Item        | stable                                            | dev                                                                             |
+| ----------- | ------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Binary      | `~/.local/lib/thegn/thegn` (`just update stable`) | `~/.thegn-devel/bin/thegn` (`just live`) or `target/debug/thegn` (`just devel`) |
+| Launch      | `thegn` or the app launcher                       | `just live` or `just devel`                                                     |
+| Config dir  | `~/.config/thegn`                                 | `~/.config/thegn-dev` (`THEGN_CONFIG_DIR`)                                      |
+| State       | the default state dir                             | `~/.thegn-devel/state` (`XDG_STATE_HOME`)                                       |
+| Runtime     | the login runtime dir (not overridden)            | the login runtime dir (not overridden)                                          |
+| `THEGN_DIR` | `~/.thegn`                                        | `~/.thegn-devel/home`                                                           |
+| Channel     | stable                                            | dev (`THEGN_CHANNEL=dev`)                                                       |
 
 Each instance has its own daemon, database, worktrees and config.
 
@@ -44,8 +44,20 @@ Each instance has its own daemon, database, worktrees and config.
 
 `just live` never touches the stable installation. Its old flags
 `--relink-launchers`, `--install-dir`, `--yes` and `--no-scope` are refused with
-a message pointing at home-manager: stable is updated through Nix (see the
-README). `just devel` is the debug-build variant and runs `target/debug/thegn`.
+a message pointing at `just update stable`: stable is the binary at
+`~/.local/lib/thegn/thegn`, installed from a verified release. `just devel` is the debug-build variant and runs `target/debug/thegn`.
+
+## Updating an instance
+
+`just update stable` and `just update dev` replace the binary, then restart that
+instance's daemon: a newer database schema refuses to migrate while a process
+still uses the old one (`refusing database schema migration ... another thegn
+process is still using the old schema`). The command asks first ("This closes N
+open panes"); `--yes` skips the question and `--no-launch` skips reopening
+thegn. Run non-interactively without `--yes` it restarts nothing and prints the
+commands. Re-running it also repairs an instance whose daemon still runs a
+replaced binary, and `just update` (status) lists such daemons. Only processes of
+that instance (same state dir and binary) are stopped. See [[just-recipes]].
 
 ## Launching the dev instance from a desktop entry
 

@@ -14,6 +14,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import instance_procs  # noqa: E402
+
 if sys.platform == "linux":
     import fcntl
 
@@ -242,26 +245,8 @@ def validate_config(binary: Path, env: dict) -> None:
 
 
 def dev_daemons(state: Path, proc: Path = Path("/proc")) -> list[tuple[int, str]]:
-    daemons = []
-    for entry in proc.iterdir():
-        if not entry.name.isdigit() or int(entry.name) == os.getpid():
-            continue
-        try:
-            argv = (entry / "cmdline").read_bytes().split(b"\0")
-            if len(argv) < 2 or argv[1] != b"daemon":
-                continue
-            executable = os.readlink(entry / "exe")
-            exe_name = os.path.basename(executable.removesuffix(" (deleted)"))
-            argv_name = os.path.basename(argv[0]).decode(errors="replace")
-            if argv_name not in ("thegn", "tg") and exe_name not in ("thegn", "tg"):
-                continue
-            environment = (entry / "environ").read_bytes().split(b"\0")
-            if b"XDG_STATE_HOME=" + os.fsencode(state) not in environment:
-                continue
-            daemons.append((int(entry.name), executable or ""))
-        except OSError:
-            continue
-    return daemons
+    """Daemons of the instance whose XDG_STATE_HOME is `state` (detection shared via instance_procs)."""
+    return [(p.pid, p.exe) for p in instance_procs.thegn_processes(state, None, proc) if p.kind == "daemon"]
 
 
 def _prebuilt(path: str) -> Path:
@@ -292,6 +277,7 @@ def main(argv: list[str] | None = None, home: Path | None = None) -> int:
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--prebuilt", metavar="BINARY")
     parser.add_argument("--restart-daemon", action="store_true")
+    parser.add_argument("--install-only", action="store_true", help="install the binary and stop there (just update dev restarts and launches itself)")
     parser.add_argument("--here", action="store_true", help="start in this terminal even inside a thegn pane")
     for flag in REMOVED_FLAGS:
         parser.add_argument(flag, action="store_true", help=argparse.SUPPRESS)
@@ -299,7 +285,7 @@ def main(argv: list[str] | None = None, home: Path | None = None) -> int:
 
     for flag in REMOVED_FLAGS:
         if getattr(args, flag[2:].replace("-", "_")):
-            raise Refusal(f"{flag} belonged to the old in-place installer. The stable instance is now installed by Nix/home-manager (docs/help/two-instances.md); just live only builds and starts the dev instance")
+            raise Refusal(f"{flag} belonged to the old in-place installer. The stable instance is installed by `just update stable` (docs/help/two-instances.md); just live only builds and starts the dev instance")
     if not 1 <= args.size_mb <= 1024 or not 1 <= args.files <= 100:
         raise Refusal("Log limits must be 1..1024 MiB and 1..100 rotations; pass limits within the stated ranges")
     if sys.platform != "linux" or os.getuid() == 0:
@@ -376,11 +362,15 @@ def main(argv: list[str] | None = None, home: Path | None = None) -> int:
             install_binary(built, paths, install_record)
         fcntl.flock(lock, fcntl.LOCK_UN)
 
+    if args.install_only:
+        print("installed; not stopping or launching (--install-only)")
+        return 0
     observed = dev_daemons(paths["state"])
     if args.restart_daemon and observed:
         print("stopping the dev daemon: every dev pane (shells, agent workers) ends")
-        result = subprocess.run([str(paths["bin"]), "daemon", "stop"], env=denv, timeout=90, check=False)
-        print(f"dev daemon stop exited with code {result.returncode}")
+        stopped = instance_procs.stop_instance(
+            paths["bin"], denv, lambda: instance_procs.thegn_processes(paths["state"], None), say=print)
+        print("dev daemon stopped" if stopped else "dev daemon did not stop")
     elif not args.restart_daemon:
         for pid, executable in observed:
             if executable.endswith(" (deleted)") or executable != str(paths["bin"]):

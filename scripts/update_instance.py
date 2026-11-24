@@ -4,7 +4,7 @@
   just update                                  status: stable, dev and latest release versions
   just update stable [VERSION|latest]          install a verified GitHub release as the stable binary
   just update stable --rollback                swap the previous stable binary back in
-  just update dev [release[=VERSION]|main|checkout|<branch>] [dev_live args]
+  just update dev [release[=VERSION]|main|checkout|<branch>] [--yes] [--no-launch] [dev_live args]
 
 Stable is the binary at ~/.local/lib/thegn/thegn. It is replaced by an atomic rename,
 so a running stable daemon and open panes keep the old inode until the user restarts
@@ -29,13 +29,17 @@ import tarfile
 import tempfile
 import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import dev_live  # noqa: E402
+import instance_procs  # noqa: E402
+
 REPO = "blakeashleyjr/thegn"
 WORKFLOW = "release.yml"
 TARGET = "x86_64-unknown-linux-gnu"
 DEFAULT_REMOTE_BUILD = "/home/user/.local/share/thegn-devbox/rbuild.sh"
 ROOT = Path(__file__).resolve().parent.parent
 DEV_LIVE_VALUE_FLAGS = ("--level", "--size-mb", "--files", "--prebuilt")
-RESTART_COMMAND = "thegn daemon stop"
+LOG_NAME = "update-restart.log"
 
 
 class Refusal(Exception):
@@ -84,6 +88,10 @@ class Ctx:
         self.isatty = lambda: sys.stdin.isatty() and sys.stdout.isatty()
         self.ask = input
         self.root = ROOT
+        self.procs = lambda state, binary, unset_ok=False: instance_procs.thegn_processes(state, binary, unset_state_ok=unset_ok)
+        self.stop = instance_procs.stop_instance
+        self.spawn = self._spawn
+        self.state_of_env = lambda: self.environ
 
     # -- paths
     @property
@@ -101,6 +109,23 @@ class Ctx:
     @property
     def remote_build(self) -> Path:
         return Path(self.environ.get("THEGN_REMOTE_BUILD") or DEFAULT_REMOTE_BUILD)
+
+    @property
+    def stable_state(self) -> Path:
+        return self.home / ".local" / "state"
+
+    @property
+    def dev_state(self) -> Path:
+        return dev_live.dev_paths(self.home)["state"]
+
+    def _spawn(self, argv, env, log: Path | None = None, cwd=None) -> None:
+        """Start a detached process (new session, no stdin); stdout/stderr go to `log` or nowhere."""
+        out = subprocess.DEVNULL
+        if log is not None:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            out = open(log, "ab")
+        subprocess.Popen(argv, env=env, cwd=cwd, start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=out, stderr=subprocess.STDOUT if log is not None else subprocess.DEVNULL)
 
     def say(self, message: str = "") -> None:
         print(message, file=self.out)
@@ -264,6 +289,123 @@ def fetch_release_binary(ctx: Ctx, tag: str, workdir: Path, no_attest: bool) -> 
     return binary
 
 
+# ---------------------------------------------------------------- restart
+def instance(ctx: Ctx, name: str) -> dict:
+    """Binary, state dir and the environment `thegn daemon stop` / the launcher need, for one instance."""
+    base = {k: v for k, v in ctx.environ.items() if k not in dev_live.PANE_VARS}
+    if name == "dev":
+        paths = dev_live.dev_paths(ctx.home)
+        env = dev_live.dev_env(ctx.environ, paths, "info", 20, 5)
+        return {"name": name, "binary": paths["bin"], "state": paths["state"], "env": env, "unset_ok": False}
+    base.pop("XDG_STATE_HOME", None)
+    return {"name": name, "binary": ctx.stable_bin, "state": ctx.stable_state, "env": base, "unset_ok": True}
+
+
+def instance_procs_of(ctx: Ctx, inst: dict):
+    return ctx.procs(inst["state"], inst["binary"], inst["unset_ok"])
+
+
+def stale_report(ctx: Ctx, inst: dict) -> list:
+    """Say which daemon/client pids run the instance's binary; return the processes."""
+    procs = instance_procs_of(ctx, inst)
+    daemons = [p for p in procs if p.kind == "daemon"]
+    clients = [p for p in procs if p.kind == "client"]
+    if procs:
+        ctx.say(f"{inst['name']} processes: daemon pid(s) {[p.pid for p in daemons] or 'none'}, "
+                f"client pid(s) {[p.pid for p in clients] or 'none'}"
+                + ("; run a replaced binary" if any(p.replaced for p in procs) else ""))
+    return procs
+
+
+def in_own_pane(ctx: Ctx, inst: dict) -> bool:
+    """True when this command runs inside a pane of the instance about to be restarted."""
+    if not ctx.environ.get("THEGN_SESSION_ID"):
+        return False
+    state = ctx.environ.get("XDG_STATE_HOME")
+    return Path(state) == inst["state"] if state else inst["unset_ok"]
+
+
+def count_panes(ctx: Ctx, inst: dict) -> int | None:
+    """Open panes per `thegn session list --json`; None when the daemon cannot say."""
+    try:
+        result = ctx.run([str(inst["binary"]), "session", "list", "--json"], text=True, env=inst["env"], timeout=20)
+        data = json.loads(result.stdout or "")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    if isinstance(data, dict):
+        data = next((v for v in data.values() if isinstance(v, list)), None)
+    return len(data) if isinstance(data, list) else None
+
+
+def manual_commands(ctx: Ctx, inst: dict) -> list[str]:
+    if inst["name"] == "dev":
+        return ["eval \"$(just devel-env)\"", "thegn daemon stop", "just live"]
+    return ["thegn daemon stop", "tg"]
+
+
+def launch_instance(ctx: Ctx, inst: dict) -> None:
+    if not ctx.which("alacritty"):
+        ctx.say("no terminal window available (alacritty not found): " + ("run `just live`" if inst["name"] == "dev" else "run tg") + " to start it")
+        return
+    if inst["name"] == "dev":
+        launcher = ctx.root / "scripts" / "devel-launch.sh"
+        ctx.spawn([str(launcher), "--standalone"], inst["env"], cwd=str(ctx.root))
+        ctx.say("dev instance opened in a new window")
+        return
+    tg = ctx.home / ".local" / "bin" / "tg"
+    if not tg.exists():
+        ctx.say("stable launcher ~/.local/bin/tg not found: run tg to start")
+        return
+    ctx.spawn([str(tg), "--standalone"], inst["env"])
+    ctx.say("stable instance opened in a new window")
+
+
+def do_restart(ctx: Ctx, inst: dict, launch: bool) -> int:
+    stopped = ctx.stop(inst["binary"], inst["env"], lambda: instance_procs_of(ctx, inst), say=ctx.say)
+    if not stopped:
+        ctx.warn(f"the {inst['name']} instance did not stop; nothing was relaunched")
+        return 1
+    ctx.say(f"{inst['name']} daemon stopped")
+    if launch:
+        launch_instance(ctx, inst)
+    else:
+        ctx.say("--no-launch: not starting it again")
+    return 0
+
+
+def restart_after_update(ctx: Ctx, name: str, yes: bool, no_launch: bool) -> int:
+    """Restart `name` so its daemon runs the installed binary. 0 also when nothing needed restarting."""
+    inst = instance(ctx, name)
+    procs = stale_report(ctx, inst)
+    if not any(p.replaced for p in procs):
+        return 0
+    for p in procs:
+        if p.replaced:
+            ctx.say(f"{name} {p.kind} pid {p.pid} runs a replaced binary")
+    panes = count_panes(ctx, inst)
+    what = f"{panes} open panes" if panes is not None else f"all open {name} panes"
+    question = f"Restart the {name} daemon now? This closes {what} (shells, agent workers). [Y/n] "
+    if not yes:
+        if not ctx.isatty():
+            ctx.warn(f"non-interactive: the {name} daemon was NOT restarted and still runs the old binary. Restart it with --yes, or run:")
+            for line in manual_commands(ctx, inst):
+                ctx.warn(f"  {line}")
+            return 1
+        if ctx.ask(question).strip().lower() not in ("", "y", "yes"):
+            ctx.say("not restarting; the new schema cannot migrate until the old daemon stops. Commands: "
+                    + "; ".join(manual_commands(ctx, inst)))
+            return 0
+    if in_own_pane(ctx, inst):
+        log = inst["state"] / LOG_NAME
+        argv = [sys.executable, "-B", str(Path(__file__).resolve()), "_restart", name] + (["--no-launch"] if no_launch else [])
+        ctx.say(f"this shell is a pane of the {name} instance and will end with the daemon; the stop and relaunch run from a detached helper, log: {log}")
+        ctx.spawn(argv, ctx.environ, log=log)
+        return 0
+    return do_restart(ctx, inst, not no_launch)
+
+
 # ---------------------------------------------------------------- stable
 def _atomic_copy(source: Path, destination: Path) -> None:
     temporary = destination.with_name(f".{destination.name}.new.{os.getpid()}")
@@ -293,15 +435,8 @@ def _keep_previous(current: Path, prev: Path) -> None:
             temporary.unlink()
 
 
-def restart_notice(ctx: Ctx, what: str) -> None:
-    ctx.say("")
-    ctx.say(f"The running {what} daemon and any open panes keep the OLD binary until you restart thegn.")
-    ctx.say(f"To switch: quit thegn, run `{RESTART_COMMAND}` (the repo-documented way to stop the pane daemon,")
-    ctx.say("see docs/help/upgrading-and-uninstalling.md), then launch thegn again. This command did not stop anything.")
-    ctx.say("The state database schema only moves forward; `thegn doctor` shows build vs on-disk versions.")
-
-
-def cmd_stable(ctx: Ctx, version: str | None, dry_run: bool, force: bool, no_attest: bool, rollback: bool) -> int:
+def cmd_stable(ctx: Ctx, version: str | None, dry_run: bool, force: bool, no_attest: bool, rollback: bool,
+               yes: bool = False, no_launch: bool = False) -> int:
     current = ctx.stable_bin
     prev = current.with_name("thegn.prev")
     current_version = binary_version(ctx, current)
@@ -326,8 +461,7 @@ def cmd_stable(ctx: Ctx, version: str | None, dry_run: bool, force: bool, no_att
             if swap.exists():
                 swap.unlink()
         ctx.say(f"stable is now thegn {previous_version}")
-        restart_notice(ctx, "stable")
-        return 0
+        return restart_after_update(ctx, "stable", yes, no_launch)
 
     tag = resolve_tag(ctx, version)
     target_version = version_of_tag(tag)
@@ -336,15 +470,15 @@ def cmd_stable(ctx: Ctx, version: str | None, dry_run: bool, force: bool, no_att
         if order < 0 and not force:
             raise Refusal(f"{tag} is older than the installed {current_version}; refusing to downgrade (use --force, or --rollback for the previous binary)")
         if order == 0 and not force:
-            ctx.say(f"stable is already at {current_version}; nothing to do (--force reinstalls)")
-            return 0
+            ctx.say(f"stable is already at {current_version}; nothing to install (--force reinstalls)")
+            return 0 if dry_run else restart_after_update(ctx, "stable", yes, no_launch)
     archive_name, _ = asset_names(tag)
     plan = [
         f"resolve:  {tag}",
         f"download: {archive_name} (+ .sha256) from github.com/{REPO}, into a fresh temp dir",
         "verify:   sha256" + ("" if no_attest else " + gh attestation"),
         f"install:  {current}  (previous kept as {prev.name})",
-        "never:    stop, signal or restart the running stable daemon",
+        "restart:  afterwards, ask before restarting the stable daemon (--yes skips, --no-launch skips relaunch)",
     ]
     for line in plan:
         ctx.say(("plan  " if dry_run else "step  ") + line)
@@ -358,13 +492,12 @@ def cmd_stable(ctx: Ctx, version: str | None, dry_run: bool, force: bool, no_att
             _keep_previous(current, prev)
         _atomic_copy(binary, current)
     ctx.say(f"stable is now thegn {target_version} at {current}")
-    restart_notice(ctx, "stable")
-    return 0
+    return restart_after_update(ctx, "stable", yes, no_launch)
 
 
 # ---------------------------------------------------------------- dev
 def dev_live_argv(ctx: Ctx, prebuilt: Path | None, passthrough: list[str]) -> list[str]:
-    argv = [sys.executable, "-B", str(ctx.root / "scripts" / "dev_live.py")]
+    argv = [sys.executable, "-B", str(ctx.root / "scripts" / "dev_live.py"), "--install-only"]
     if prebuilt is not None:
         argv += ["--prebuilt", str(prebuilt)]
     return argv + passthrough
@@ -427,10 +560,31 @@ def confirm_local_build(ctx: Ctx, reason: str) -> bool:
 
 
 def cmd_dev(ctx: Ctx, args: list[str]) -> int:
+    args = list(args)
+    yes, no_launch = False, False
+    for flag in ("--yes", "-y", "--no-launch", "--restart-daemon"):
+        while flag in args:
+            args.remove(flag)
+            yes |= flag in ("--yes", "-y", "--restart-daemon")
+            no_launch |= flag == "--no-launch"
+    if "--here" in args:
+        args.remove("--here")
+        ctx.warn("--here is ignored: just update dev relaunches the dev instance in its own window")
     target, dry_run, no_attest, passthrough = split_dev_args(args)
+    code = _install_dev(ctx, target, dry_run, no_attest, passthrough)
+    if code != 0 or dry_run:
+        return code
+    return restart_after_update(ctx, "dev", yes, no_launch)
+
+
+def _install_dev(ctx: Ctx, target: str, dry_run: bool, no_attest: bool, passthrough: list[str]) -> int:
     if target == "release" or target.startswith("release="):
         want = target.partition("=")[2] or None
         tag = resolve_tag(ctx, want)
+        if (not dry_run and binary_version(ctx, ctx.dev_bin) == version_of_tag(tag)
+                and any(p.replaced for p in instance_procs_of(ctx, instance(ctx, "dev")))):
+            ctx.say(f"dev binary is already at {version_of_tag(tag)}; only restarting the stale daemon")
+            return 0
         ctx.say(f"dev <- release {tag}: download+verify, then scripts/dev_live.py --prebuilt")
         if dry_run:
             ctx.say("dry-run: " + " ".join(dev_live_argv(ctx, Path("<verified-binary>"), passthrough)))
@@ -497,6 +651,9 @@ def cmd_status(ctx: Ctx) -> int:
             except ValueError:
                 pass
         ctx.say(f"{name:7} thegn {version}{note}{extra}")
+        for p in instance_procs_of(ctx, instance(ctx, name)):
+            if p.replaced:
+                ctx.say(f"{name} {p.kind} pid {p.pid} runs a replaced binary; run just update {name} to restart it")
     ctx.say("update with: just update stable | just update dev [release|main|checkout|<branch>]")
     return 0
 
@@ -508,6 +665,10 @@ def main(argv: list[str] | None = None, ctx: Ctx | None = None) -> int:
     if not args or args == ["status"]:
         return cmd_status(ctx)
     command, rest = args[0], args[1:]
+    if command == "_restart":  # detached helper spawned by restart_after_update from inside a pane
+        inst = instance(ctx, rest[0])
+        ctx.say(f"restart helper for the {rest[0]} instance")
+        return do_restart(ctx, inst, "--no-launch" not in rest)
     if command == "stable":
         parser = argparse.ArgumentParser(prog="just update stable", description="Install a verified release as the stable binary.")
         parser.add_argument("version", nargs="?", default="latest", help="tag/version or 'latest' (default)")
@@ -515,8 +676,11 @@ def main(argv: list[str] | None = None, ctx: Ctx | None = None) -> int:
         parser.add_argument("--force", action="store_true", help="allow downgrade / reinstall of the same version")
         parser.add_argument("--no-attest", action="store_true", help="skip gh attestation verification")
         parser.add_argument("--rollback", action="store_true", help="swap thegn.prev back in")
+        parser.add_argument("--yes", "-y", action="store_true", help="restart the stable daemon without asking")
+        parser.add_argument("--no-launch", action="store_true", help="do not open thegn again after the restart")
         options = parser.parse_args(rest)
-        return cmd_stable(ctx, options.version, options.dry_run, options.force, options.no_attest, options.rollback)
+        return cmd_stable(ctx, options.version, options.dry_run, options.force, options.no_attest, options.rollback,
+                          options.yes, options.no_launch)
     if command == "dev":
         return cmd_dev(ctx, rest)
     raise Refusal(f"unknown target {command!r}: use `just update` (status), `just update stable` or `just update dev`")

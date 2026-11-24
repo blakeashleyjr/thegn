@@ -66,6 +66,20 @@ class FakeCtx(upd.Ctx):
         self.attest_ok = True
         self.builder_code = 0
         self.fail_list = False
+        self.proc_list = []   # fake processes: instance_procs.Proc; shrinks as pids "exit"
+        self.signals = []
+        self.spawned = []
+        self.stop_code = 0
+        self.session_json = None
+        self.procs = lambda state, binary, unset_ok=False: list(self.proc_list)
+        self.stop = self._fake_stop
+        self.spawn = lambda argv, env, log=None, cwd=None: self.spawned.append((list(argv), log))
+        self.environ = {"PATH": "/usr/bin"}
+
+    def _fake_stop(self, binary, env, find, say=print, **kw):
+        self.calls.append(("stop", str(binary)))
+        self.proc_list = []
+        return True
 
     def _ask(self, prompt):
         self.asked.append(prompt)
@@ -77,6 +91,8 @@ class FakeCtx(upd.Ctx):
 
     def _fake_run(self, argv, **kwargs):
         self.calls.append(("run", list(argv)))
+        if argv[1:3] == ["session", "list"]:
+            return done(self.session_json or "", 0 if self.session_json else 1)
         if argv[:3] == ["gh", "release", "list"]:
             if self.fail_list:
                 return done("boom", 1)
@@ -159,7 +175,7 @@ class TagResolutionTests(Base):
 
 
 class StableTests(Base):
-    def test_installs_keeps_prev_and_never_signals(self):
+    def test_installs_keeps_prev_and_signals_nothing_without_a_stale_daemon(self):
         self.stable("0.1.0-alpha.100")
         release = make_release(self.root, "v0.1.0-alpha.130", "0.1.0-alpha.130")
         ctx = self.ctx(release_dir=release)
@@ -167,8 +183,7 @@ class StableTests(Base):
         installed = self.home / ".local/lib/thegn/thegn"
         self.assertEqual(upd.binary_version(ctx, installed), "0.1.0-alpha.130")
         self.assertEqual(upd.binary_version(ctx, installed.with_name("thegn.prev")), "0.1.0-alpha.100")
-        self.assertIn("thegn daemon stop", ctx.out.getvalue())
-        self.assertFalse([c for c in ctx.calls if c[0] == "run" and "daemon" in c[1]])
+        self.assertFalse([c for c in ctx.calls if c[0] == "stop"])
         self.assertTrue(any(c[0] == "run" and c[1][:3] == ["gh", "attestation", "verify"] for c in ctx.calls))
 
     def test_sha_mismatch_refuses_and_leaves_stable_alone(self):
@@ -254,12 +269,12 @@ class DevTests(Base):
     def test_release_target_hands_the_verified_binary_to_dev_live(self):
         release = make_release(self.root, "v0.1.0-alpha.130", "0.1.0-alpha.130")
         ctx = self.ctx(release_dir=release)
-        self.assertEqual(upd.cmd_dev(ctx, ["release", "--here"]), 0)
+        self.assertEqual(upd.cmd_dev(ctx, ["release", "--level", "debug"]), 0)
         (argv,) = ctx.inherits()
         self.assertIn("--prebuilt", argv)
         self.assertTrue(argv[0].endswith("python3") or "python" in os.path.basename(argv[0]))
         self.assertTrue(argv[2].endswith("scripts/dev_live.py"))
-        self.assertEqual(argv[-1], "--here")
+        self.assertEqual(argv[-2:], ["--level", "debug"])
 
     def test_release_dry_run_does_not_download(self):
         ctx = self.ctx()
@@ -373,6 +388,240 @@ class ArchiveTests(Base):
         with self.assertRaises(upd.Refusal):
             upd.extract_binary(archive, self.root)
         self.assertFalse((self.root.parent / "escape").exists())
+
+
+P = upd.instance_procs.Proc
+
+
+def proc_tree(root: Path, entries):
+    """entries: (pid, state or None, exe, cmdline bytes). Builds a fake /proc."""
+    proc = root / "proc"
+    for pid, state, exe, cmd in entries:
+        entry = proc / str(pid)
+        entry.mkdir(parents=True)
+        (entry / "cmdline").write_bytes(cmd)
+        env = b"HOME=/h\0" + (b"XDG_STATE_HOME=" + os.fsencode(state) + b"\0" if state else b"")
+        (entry / "environ").write_bytes(env)
+        os.symlink(exe, entry / "exe")
+    return proc
+
+
+class DetectionTests(Base):
+    def test_matches_only_the_instance_state_and_binary(self):
+        ip = upd.instance_procs
+        dev_state, dev_bin = Path("/d/state"), Path("/d/bin/thegn")
+        proc = proc_tree(self.root, [
+            (11, dev_state, "/d/bin/thegn (deleted)", b"thegn\0daemon\0"),
+            (12, dev_state, "/d/bin/thegn", b"thegn\0"),
+            (13, Path("/other/state"), "/d/bin/thegn", b"thegn\0daemon\0"),
+            (14, dev_state, "/x/stable/thegn", b"thegn\0daemon\0"),
+            (15, None, "/d/bin/thegn", b"thegn\0daemon\0"),
+        ])
+        got = ip.thegn_processes(dev_state, dev_bin, proc)
+        self.assertEqual([(p.pid, p.kind, p.replaced) for p in got], [(11, "daemon", True), (12, "client", False)])
+
+    def test_unset_state_counts_as_default_only_when_allowed(self):
+        proc = proc_tree(self.root, [(21, None, "/s/thegn", b"thegn\0daemon\0"),
+                                     (22, Path("/d/state"), "/s/thegn", b"thegn\0daemon\0")])
+        ip = upd.instance_procs
+        self.assertEqual([p.pid for p in ip.thegn_processes(Path("/s/state"), Path("/s/thegn"), proc, True)], [21])
+        self.assertEqual(ip.thegn_processes(Path("/s/state"), Path("/s/thegn"), proc, False), [])
+
+
+class StopEscalationTests(unittest.TestCase):
+    def run_stop(self, survive_term, survive_kill, foreign=True):
+        ip = upd.instance_procs
+        now = [0.0]
+        alive = {1, 2}
+        signals = []
+        order = []
+
+        def find():
+            ours = [P(p, "daemon", "/b/thegn (deleted)", True) for p in sorted(alive)]
+            return ours
+
+        def run(argv, **kw):
+            order.append("stop")
+            return done("", 0)
+
+        def kill(pid, sig):
+            assert pid in (1, 2), "signalled a pid that does not match the instance"
+            signals.append((pid, sig))
+            order.append(sig.name)
+            if sig.name == "SIGTERM" and not survive_term:
+                alive.discard(pid)
+            if sig.name == "SIGKILL" and not survive_kill:
+                alive.discard(pid)
+
+        def sleep(sec):
+            now[0] += sec
+
+        ok = ip.stop_instance(Path("/b/thegn"), {}, find, say=lambda m: None, run=run, kill=kill,
+                              sleep=sleep, clock=lambda: now[0])
+        return ok, order, signals, now[0]
+
+    def test_clean_exit_after_daemon_stop_never_signals(self):
+        ip = upd.instance_procs
+        state = {"alive": True}
+        ok = ip.stop_instance(Path("/b"), {}, lambda: [P(1, "daemon", "/b", True)] if state["alive"] else [],
+                              say=lambda m: None, run=lambda *a, **k: (state.update(alive=False), done())[1],
+                              kill=lambda *a: self.fail("signalled"), sleep=lambda s: None)
+        self.assertTrue(ok)
+
+    def test_escalates_term_then_kill_and_waits_before_each(self):
+        ok, order, signals, elapsed = self.run_stop(True, False)
+        self.assertTrue(ok)
+        self.assertEqual(order, ["stop", "SIGTERM", "SIGTERM", "SIGKILL", "SIGKILL"])
+        self.assertGreaterEqual(elapsed, 20)
+
+    def test_term_is_enough_when_it_works(self):
+        ok, order, signals, _ = self.run_stop(False, False)
+        self.assertTrue(ok)
+        self.assertNotIn("SIGKILL", order)
+
+    def test_gives_up_reporting_failure(self):
+        ok, order, signals, _ = self.run_stop(True, True)
+        self.assertFalse(ok)
+
+    def test_foreign_pids_are_never_signalled(self):
+        ip = upd.instance_procs
+        # the finder only ever returns matching processes; pid 99 (foreign) is not in it
+        killed = []
+        ip.stop_instance(Path("/b"), {}, lambda: [P(5, "daemon", "/b", True)], say=lambda m: None,
+                         run=lambda *a, **k: done(), kill=lambda pid, sig: killed.append(pid),
+                         sleep=lambda s: None, clock=iter(range(0, 10000)).__next__)
+        self.assertTrue(killed and set(killed) == {5})
+
+
+class RestartTests(Base):
+    def stale(self, ctx, name="dev"):
+        ctx.proc_list = [P(7, "daemon", "/x/thegn (deleted)", True), P(8, "client", "/x/thegn (deleted)", True)]
+
+    def test_yes_skips_the_prompt_and_restarts_and_launches(self):
+        ctx = self.ctx(tty=True)
+        self.stale(ctx)
+        self.assertEqual(upd.restart_after_update(ctx, "dev", True, False), 0)
+        self.assertEqual(ctx.asked, [])
+        self.assertIn(("stop", str(ctx.dev_bin)), ctx.calls)
+
+    def test_prompt_names_pane_count_and_default_is_yes(self):
+        ctx = self.ctx(tty=True, answers=[""])
+        ctx.session_json = json.dumps({"sessions": [{"id": 1}, {"id": 2}, {"id": 3}]})
+        self.stale(ctx)
+        upd.restart_after_update(ctx, "dev", False, True)
+        self.assertIn("Restart the dev daemon now? This closes 3 open panes", ctx.asked[0])
+        self.assertIn(("stop", str(ctx.dev_bin)), ctx.calls)
+
+    def test_prompt_without_a_count_says_all_open_panes(self):
+        ctx = self.ctx(tty=True, answers=["n"])
+        self.stale(ctx)
+        self.assertEqual(upd.restart_after_update(ctx, "stable", False, False), 0)
+        self.assertIn("all open stable panes", ctx.asked[0])
+        self.assertNotIn("stop", [c[0] for c in ctx.calls])
+
+    def test_no_means_no_restart(self):
+        ctx = self.ctx(tty=True, answers=["no"])
+        self.stale(ctx)
+        upd.restart_after_update(ctx, "dev", False, False)
+        self.assertNotIn("stop", [c[0] for c in ctx.calls])
+
+    def test_non_interactive_without_yes_prints_commands_and_fails(self):
+        ctx = self.ctx(tty=False)
+        self.stale(ctx)
+        self.assertEqual(upd.restart_after_update(ctx, "stable", False, False), 1)
+        self.assertIn("thegn daemon stop", ctx.err.getvalue())
+        self.assertEqual(ctx.asked, [])
+        self.assertNotIn("stop", [c[0] for c in ctx.calls])
+
+    def test_nothing_stale_does_nothing(self):
+        ctx = self.ctx(tty=False)
+        self.assertEqual(upd.restart_after_update(ctx, "stable", False, False), 0)
+        ctx.proc_list = [P(7, "daemon", "/x/thegn", False)]
+        self.assertEqual(upd.restart_after_update(ctx, "stable", False, False), 0)
+        self.assertNotIn("stop", [c[0] for c in ctx.calls])
+
+    def test_in_pane_uses_a_detached_helper(self):
+        ctx = self.ctx(tty=True)
+        ctx.environ.update(THEGN_SESSION_ID="s1", XDG_STATE_HOME=str(ctx.dev_state))
+        self.stale(ctx)
+        self.assertEqual(upd.restart_after_update(ctx, "dev", True, True), 0)
+        self.assertNotIn("stop", [c[0] for c in ctx.calls])
+        ((argv, log),) = ctx.spawned
+        self.assertEqual(argv[-3:], ["_restart", "dev", "--no-launch"])
+        self.assertEqual(log, ctx.dev_state / "update-restart.log")
+
+    def test_pane_of_the_other_instance_restarts_inline(self):
+        ctx = self.ctx(tty=True)
+        ctx.environ.update(THEGN_SESSION_ID="s1", XDG_STATE_HOME=str(ctx.dev_state))
+        self.stale(ctx)
+        upd.restart_after_update(ctx, "stable", True, True)
+        self.assertIn(("stop", str(ctx.stable_bin)), ctx.calls)
+        self.assertEqual(ctx.spawned, [])
+
+    def test_no_launch_skips_relaunch_and_launch_spawns_standalone(self):
+        ctx = self.ctx(tty=True)
+        self.stale(ctx)
+        upd.restart_after_update(ctx, "dev", True, True)
+        self.assertEqual(ctx.spawned, [])
+        self.assertIn("--no-launch", ctx.out.getvalue())
+        ctx2 = self.ctx(tty=True)
+        ctx2.which = lambda name: "/usr/bin/" + name
+        self.stale(ctx2)
+        upd.restart_after_update(ctx2, "dev", True, False)
+        self.assertEqual(ctx2.spawned[0][0][-1], "--standalone")
+        self.assertTrue(ctx2.spawned[0][0][0].endswith("devel-launch.sh"))
+
+    def test_stable_launch_uses_tg_standalone(self):
+        ctx = self.ctx(tty=True)
+        ctx.which = lambda name: "/usr/bin/" + name
+        tg = self.home / ".local/bin/tg"
+        tg.parent.mkdir(parents=True)
+        tg.write_text("#!/bin/sh\n")
+        self.stale(ctx)
+        upd.restart_after_update(ctx, "stable", True, False)
+        self.assertEqual(ctx.spawned[0][0], [str(tg), "--standalone"])
+
+    def test_already_current_stable_with_stale_daemon_restarts(self):
+        self.stable("0.1.0-alpha.130")
+        ctx = self.ctx(tty=True)
+        self.stale(ctx)
+        self.assertEqual(upd.cmd_stable(ctx, "0.1.0-alpha.130", False, False, False, False, yes=True, no_launch=True), 0)
+        self.assertIn("nothing to install", ctx.out.getvalue())
+        self.assertIn(("stop", str(ctx.stable_bin)), ctx.calls)
+        self.assertEqual([c for c in ctx.calls if c[0] == "download"], [])
+
+    def test_install_then_restart_for_stable(self):
+        self.stable("0.1.0-alpha.101")
+        release = make_release(self.root, "v0.1.0-alpha.130", "0.1.0-alpha.130")
+        ctx = self.ctx(release_dir=release, tty=False)
+        self.stale(ctx)
+        self.assertEqual(upd.cmd_stable(ctx, "latest", False, False, False, False, yes=True, no_launch=True), 0)
+        self.assertIn(("stop", str(ctx.stable_bin)), ctx.calls)
+
+    def test_dev_install_only_then_restart(self):
+        release = make_release(self.root, "v0.1.0-alpha.130", "0.1.0-alpha.130")
+        ctx = self.ctx(release_dir=release)
+        self.stale(ctx)
+        self.assertEqual(upd.cmd_dev(ctx, ["release", "--yes", "--no-launch", "--here"]), 0)
+        (argv,) = ctx.inherits()
+        self.assertIn("--install-only", argv)
+        self.assertNotIn("--here", argv)
+        self.assertIn(("stop", str(ctx.dev_bin)), ctx.calls)
+
+    def test_dev_already_current_with_stale_daemon_skips_download(self):
+        script_binary(self.home / ".thegn-devel/bin/thegn", "0.1.0-alpha.130")
+        ctx = self.ctx()
+        self.stale(ctx)
+        self.assertEqual(upd.cmd_dev(ctx, ["release", "--yes", "--no-launch"]), 0)
+        self.assertEqual(ctx.inherits(), [])
+        self.assertIn(("stop", str(ctx.dev_bin)), ctx.calls)
+
+    def test_status_flags_replaced_binary(self):
+        script_binary(self.home / ".thegn-devel/bin/thegn", "0.1.0-alpha.130")
+        ctx = self.ctx()
+        self.stale(ctx)
+        upd.cmd_status(ctx)
+        self.assertIn("dev daemon pid 7 runs a replaced binary; run just update dev to restart it", ctx.out.getvalue())
 
 
 if __name__ == "__main__":

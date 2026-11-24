@@ -47,10 +47,23 @@ by `test/update_instance_test.py`, wired into `just test` as `test-update-instan
   when already current. `--rollback` swaps `thegn.prev` back in (and keeps the
   replaced binary as the new `thegn.prev`). `--dry-run` prints the plan and downloads
   nothing.
-- **A running stable daemon and open panes keep the old binary** (the rename leaves
-  the old inode alone). The recipe never stops anything. To switch, quit thegn, run
-  `thegn daemon stop` (documented in `docs/help/upgrading-and-uninstalling.md`), and
-  launch again. The state database schema only moves forward.
+- **After an install the instance is restarted**, because a newer database schema
+  refuses to migrate while a daemon (or client) of the old binary still uses the old
+  schema. The recipe finds the instance's processes (`/proc/<pid>/environ`
+  `XDG_STATE_HOME` equal to the instance's state dir AND `exe` equal to its binary,
+  including the ` (deleted)` form), and prompts once: `Restart the <instance> daemon
+now? This closes N open panes (shells, agent workers). [Y/n]` (N from `thegn session
+list --json`, else "all open <instance> panes"). `--yes` skips the prompt;
+  non-interactive without `--yes` restarts nothing, prints the commands and exits 1.
+  It runs `<new binary> daemon stop` with the instance's environment, waits up to 20 s,
+  then SIGTERM, then SIGKILL, signalling only pids that still match the instance. Run
+  from a pane of that same instance, the stop and relaunch go through a detached helper
+  (log: `<state>/update-restart.log`). It then relaunches: dev through
+  `scripts/devel-launch.sh --standalone`, stable through `~/.local/bin/tg --standalone`
+  (both need alacritty; otherwise it says to run `just live` / `tg`). `--no-launch`
+  skips the relaunch. The same restart repairs an instance whose daemon still runs a
+  replaced binary when the binary is already current (a plain re-run). `just update`
+  (status) lists such daemons. The state database schema only moves forward.
 - **Dev** goes through `scripts/dev_live.py --prebuilt <binary>`, so the new binary is
   validated against the dev config before it replaces `~/.thegn-devel/bin/thegn`.
   `release[=VERSION]` (default) uses the same verified download. `main`, `checkout`
@@ -59,7 +72,7 @@ by `test/update_instance_test.py`, wired into `just test` as `test-update-instan
   If that is missing or fails it asks `Mac build failed (<reason>). Build locally
 instead? This compiles on this machine. [y/N]`; non-interactive runs refuse, and
   `yes` falls back to the local `dev_live.py` build of the checked-out branch.
-  `--here`, `--restart-daemon` and `--level debug` style arguments pass through.
+  `--level debug` style arguments pass through to `dev_live.py --install-only`; `--restart-daemon` means `--yes`, and `--here` is ignored (the dev instance reopens in its own window).
 - `latest` means the highest version among published releases: every release is a
   pre-release, so GitHub's `releases/latest` endpoint returns 404.
 
