@@ -703,6 +703,7 @@ impl VpsProvider {
         &self.spec
     }
 
+    #[must_use]
     pub fn with_owner(mut self, owner: String) -> Self {
         self.owner = Some(owner);
         self
@@ -712,6 +713,7 @@ impl VpsProvider {
         self.owner.as_deref()
     }
 
+    #[must_use]
     pub fn with_credential_ref(mut self, credential_ref: &str) -> Self {
         self.credential_ref = Some(credential_ref.to_owned());
         self

@@ -567,6 +567,7 @@ impl VercelProvider {
         self.ledger_dir.clone().unwrap_or_else(registry::dir)
     }
 
+    #[must_use]
     pub fn with_owner(mut self, owner: String) -> Self {
         self.owner = Some(owner);
         self

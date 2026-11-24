@@ -673,6 +673,7 @@ impl ControlClient {
     }
 
     /// Override the request bounds (tests, or callers with a tighter budget).
+    #[must_use]
     pub fn with_limits(mut self, limits: ControlLimits) -> Self {
         self.limits = limits;
         self

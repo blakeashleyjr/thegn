@@ -132,6 +132,7 @@ impl SnapshotManifest {
     }
 
     /// Add a lowercase hexadecimal capture generation to the chronological id.
+    #[must_use]
     pub fn with_generation(mut self, generation: &str) -> Self {
         debug_assert!(
             generation

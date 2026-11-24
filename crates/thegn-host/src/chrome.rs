@@ -946,12 +946,14 @@ impl LoadStep {
         Self::new(label, StepState::Failed)
     }
     /// Attach a dim sub-line (status / error) under the step.
+    #[must_use]
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         let d = detail.into();
         self.detail = (!d.trim().is_empty()).then_some(d);
         self
     }
     /// Tag the step's stable identity (see [`StepKind`]).
+    #[must_use]
     pub fn with_kind(mut self, kind: StepKind) -> Self {
         self.kind = kind;
         self

@@ -167,6 +167,7 @@ impl CiLogEntry {
 
     /// Reapply current redaction and hard bounds to an entry from an older
     /// policy. Entries produced by a newer policy are preserved unchanged.
+    #[must_use]
     pub fn revalidated(mut self) -> Self {
         if self.policy_version < REDACTION_POLICY_VERSION {
             let redacted = redact(&self.text);

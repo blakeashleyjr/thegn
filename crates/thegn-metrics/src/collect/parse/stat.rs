@@ -30,6 +30,7 @@ impl CpuTicks {
             .saturating_add(self.steal)
     }
 
+    #[must_use]
     pub fn corrected(self) -> Self {
         Self {
             user: self.user.saturating_sub(self.guest),

@@ -348,6 +348,7 @@ impl AdmittedConfig {
 
     /// Downgrade to [`AdmissionHealth::HostsUnavailable`]. There is no
     /// inverse: a host-less candidate can never be upgraded to healthy.
+    #[must_use]
     pub fn mark_hosts_unavailable(mut self) -> Self {
         self.health = AdmissionHealth::HostsUnavailable;
         self

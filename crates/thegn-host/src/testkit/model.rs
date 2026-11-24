@@ -51,12 +51,14 @@ impl TestTask {
 
     // Used by the JSON/Report matchers landing in later phases.
     #[allow(dead_code)]
+    #[must_use]
     pub fn with_ingestion(mut self, ingestion: Ingestion) -> Self {
         self.ingestion = ingestion;
         self
     }
 
     #[allow(dead_code)]
+    #[must_use]
     pub fn with_report_glob(mut self, glob: impl Into<String>) -> Self {
         self.report_glob = Some(glob.into());
         self
