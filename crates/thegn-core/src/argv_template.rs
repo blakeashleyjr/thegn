@@ -27,8 +27,10 @@
 
 use std::fmt;
 
-/// Largest accepted template or rendered argv element, in UTF-8 bytes.
-pub const MAX_TEMPLATE_ELEMENT_BYTES: usize = 16 * 1024;
+/// Largest accepted template or rendered argv element, in UTF-8 bytes. This
+/// matches Linux's per-argument limit (`MAX_ARG_STRLEN`, 32 pages), so agent
+/// prompts passed as one element (up to ~100 KiB today) still fit.
+pub const MAX_TEMPLATE_ELEMENT_BYTES: usize = 128 * 1024;
 
 /// One parsed piece of an argv element.
 #[derive(Debug, Clone, PartialEq, Eq)]
