@@ -133,8 +133,19 @@ pub(crate) fn resolve_env_trusted(
     loc: &GitLoc,
     worktree: &str,
     selected_env: &EnvSelection,
+    db: Option<&Db>,
 ) -> anyhow::Result<TrustedEnvironment> {
-    let db = Db::open().map_err(|error| unreadable_worktree_isolation(worktree, &error))?;
+    // Share the caller's already-open handle when it has one (a launch resolves
+    // its whole spec through a single handle); only a caller without one pays
+    // for the open here.
+    let opened;
+    let db = match db {
+        Some(db) => db,
+        None => {
+            opened = Db::open().map_err(|error| unreadable_worktree_isolation(worktree, &error))?;
+            &opened
+        }
+    };
     let root_s = repo_root.to_string_lossy().to_string();
     let worktree_selection = db
         .effective_env_selection(worktree, &root_s)

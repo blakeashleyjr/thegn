@@ -1491,6 +1491,7 @@ pub fn run_worker(
             Some(backend),
             true,
             &selection,
+            None,
         )
     };
     // The auto chain's host fallback is visible in the step detail; an

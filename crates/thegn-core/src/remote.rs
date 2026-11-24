@@ -411,8 +411,23 @@ impl GitLoc {
     /// DB is never created here.
     #[track_caller]
     pub fn for_worktree_op(path: &Path, op: &str) -> Result<GitLoc, String> {
+        Self::for_worktree_op_shared(path, op).map(|(loc, _)| loc)
+    }
+
+    /// [`GitLoc::for_worktree_op`] that also hands back the handle it read
+    /// through, so a caller with more state to read shares that open instead of
+    /// paying for a second one (each open re-runs the pragmas). The same
+    /// refusal rules apply: an absent state DB means no placement was ever
+    /// recorded, so the path is local (`Ok` with no handle — the DB is never
+    /// created here), while a DB that exists but cannot be opened or read
+    /// refuses.
+    #[track_caller]
+    pub fn for_worktree_op_shared(
+        path: &Path,
+        op: &str,
+    ) -> Result<(GitLoc, Option<crate::db::Db>), String> {
         match crate::db::db_path().try_exists() {
-            Ok(false) => return Ok(GitLoc::Local(path.to_path_buf())),
+            Ok(false) => return Ok((GitLoc::Local(path.to_path_buf()), None)),
             Ok(true) => {}
             Err(error) => {
                 return Err(format!(
@@ -422,7 +437,7 @@ impl GitLoc {
             }
         }
         match crate::db::Db::open() {
-            Ok(db) => Self::for_worktree_op_in(&db, path, op),
+            Ok(db) => Self::for_worktree_op_in(&db, path, op).map(|loc| (loc, Some(db))),
             Err(error) => Err(Self::op_refusal(
                 path,
                 op,
@@ -2269,6 +2284,54 @@ mod tests {
             GitLoc::for_worktree_op(Path::new("/wt/x"), "commit"),
             Ok(GitLoc::Provider { path, .. }) if path == "/workspace"
         ));
+    }
+
+    #[test]
+    fn for_worktree_op_shared_hands_back_the_handle_it_opened() {
+        let _state = crate::testenv::IsolatedState::new();
+        let location = GitLoc::provider_db_string(&["sprite".into(), "exec".into()], "/workspace");
+        {
+            let db = crate::db::Db::open().unwrap();
+            db.put_worktree("tab", "/repo", "/wt/x", "feat", Some(&location), None)
+                .unwrap();
+        }
+        let opens_before = crate::db_open_stats::total_opens();
+        let (loc, db) = GitLoc::for_worktree_op_shared(Path::new("/wt/x"), "pane launch")
+            .expect("the recorded location is readable");
+        assert!(
+            matches!(loc, GitLoc::Provider { path, .. } if path == "/workspace"),
+            "the shared variant resolves exactly like the opening one"
+        );
+        assert_eq!(
+            crate::db_open_stats::total_opens() - opens_before,
+            1,
+            "one open, whose handle the caller reuses"
+        );
+        let db = db.expect("an existing state DB hands its handle back");
+        assert!(matches!(
+            GitLoc::for_worktree_op_in(&db, Path::new("/wt/x"), "pane launch"),
+            Ok(GitLoc::Provider { path, .. }) if path == "/workspace"
+        ));
+        assert_eq!(
+            crate::db_open_stats::total_opens() - opens_before,
+            1,
+            "the caller's further reads through the handed-back handle open nothing"
+        );
+    }
+
+    #[test]
+    fn for_worktree_op_shared_reports_no_handle_for_an_absent_state_database() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db_path = crate::db::db_path();
+        assert!(!db_path.exists());
+        let (loc, db) = GitLoc::for_worktree_op_shared(Path::new("/wt/x"), "pane launch")
+            .expect("an absent state DB means no placement was recorded");
+        assert!(matches!(loc, GitLoc::Local(path) if path == Path::new("/wt/x")));
+        assert!(
+            db.is_none(),
+            "nothing was recorded, so there is nothing to read through"
+        );
+        assert!(!db_path.exists(), "the shared variant never creates the DB");
     }
 
     #[test]
