@@ -23,7 +23,7 @@ fn clean_part(value: &str) -> String {
     out
 }
 
-/// "worktree · tab · program"; parts omitted by scope. Pure.
+/// "worktree · tab · program", skipping whichever parts are empty. Pure.
 pub(crate) fn source_label(worktree: Option<&str>, tab_title: &str, pane_name: &str) -> String {
     let worktree = worktree.map(clean_part).filter(|s| !s.is_empty());
     let tab = clean_part(tab_title);
@@ -52,8 +52,25 @@ pub(crate) fn pane_display_name(title: Option<String>, program: &str) -> String 
     title.unwrap_or_else(|| clean_part(program))
 }
 
+/// The live `(worktree group, tab)` that owns `pane_id`. A pane can briefly
+/// outlive its tab during teardown, hence the `Option`.
+fn owner(
+    session: &crate::session::Session,
+    pane_id: u32,
+) -> Option<(&crate::session::WorktreeGroup, &crate::session::Tab)> {
+    session.worktrees.iter().find_map(|group| {
+        group
+            .tabs
+            .iter()
+            .find(|tab| tab.center.pane_ids().contains(&pane_id))
+            .map(|tab| (group, tab))
+    })
+}
+
 /// Build the list of `(pane_id, label, &HistoryBuffer)` sources for the search
-/// engine. The scope determines which live panes from `session` contribute.
+/// engine. The scope determines which live panes from `session` contribute;
+/// every row is labelled with the worktree, tab and program it came from so a
+/// result is never just a bare line (THE-2241).
 pub(crate) fn build_search_sources<'a>(
     scope: thegn_core::search::SearchScope,
     session: &crate::session::Session,
@@ -70,11 +87,18 @@ pub(crate) fn build_search_sources<'a>(
     };
 
     match scope {
-        SearchScope::Pane(id) => push(id, None, ""),
+        // A pane-scoped search can still be read a day later (the overlay
+        // restores its query), so the row says where it came from too.
+        SearchScope::Pane(id) => match owner(session, id) {
+            Some((group, tab)) => push(id, Some(group.name.as_str()), &tab.title),
+            // Mid-teardown: name the pane alone rather than invent a scope.
+            None => push(id, None, ""),
+        },
         SearchScope::Tab => {
             if let Some(tab) = session.active_tab() {
+                let worktree = session.active_group().map(|g| g.name.as_str());
                 for pane_id in tab.center.pane_ids() {
-                    push(pane_id, None, &tab.title);
+                    push(pane_id, worktree, &tab.title);
                 }
             }
         }
@@ -82,17 +106,18 @@ pub(crate) fn build_search_sources<'a>(
             if let Some(group) = session.active_group() {
                 for tab in &group.tabs {
                     for pane_id in tab.center.pane_ids() {
-                        push(pane_id, None, &tab.title);
+                        push(pane_id, Some(group.name.as_str()), &tab.title);
                     }
                 }
             }
         }
+        // A workspace/profile search spans groups, so the worktree name is the
+        // part that cannot be guessed: two tabs can share a title.
         SearchScope::Workspace | SearchScope::Profile => {
             for group in &session.worktrees {
-                let worktree = thegn_core::util::basename(&group.path);
                 for tab in &group.tabs {
                     for pane_id in tab.center.pane_ids() {
-                        push(pane_id, Some(worktree), &tab.title);
+                        push(pane_id, Some(group.name.as_str()), &tab.title);
                     }
                 }
             }
@@ -186,6 +211,102 @@ pub(crate) fn apply_search_jump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::center::CenterTree;
+    use crate::session::{GroupKind, Session, Tab, WorktreeGroup};
+
+    fn fixture() -> (Session, Panes) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = Panes::new(tx);
+        panes.insert_test_pane(1);
+        panes.insert_test_pane(2);
+        panes.insert_test_pane(3);
+
+        let mut group = WorktreeGroup::new("app/feat", GroupKind::Branch, "/wt/app");
+        group.tabs = vec![tab("home", 1), tab("review", 2)];
+        let mut other = WorktreeGroup::new("app/main", GroupKind::Home, "/wt/main");
+        other.tabs = vec![tab("home", 3)];
+
+        let mut session = Session::default();
+        session.add_group(group);
+        session.add_group(other);
+        session.active = 0;
+        (session, panes)
+    }
+
+    fn tab(title: &str, pane: u32) -> Tab {
+        let mut tab = Tab::new(title);
+        tab.center = CenterTree::Leaf(pane);
+        tab.focused_pane = pane;
+        tab
+    }
+
+    fn rows(scope: SearchScope, session: &Session, panes: &Panes) -> Vec<(u32, String)> {
+        build_search_sources(scope, session, panes, 1)
+            .into_iter()
+            .map(|(id, label, _)| (id, label))
+            .collect()
+    }
+
+    #[test]
+    fn worktree_scope_names_each_tabs_worktree_tab_and_program() {
+        let (session, mut panes) = fixture();
+        // The second tab runs something other than a plain shell.
+        if let Some(pane) = panes.table.get_mut(&2) {
+            pane.feed(b"\x1b]0;claude\x07");
+        }
+        assert_eq!(
+            rows(SearchScope::Worktree, &session, &panes),
+            [
+                (1, "app/feat · home · shell".to_string()),
+                (2, "app/feat · review · claude".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_scope_disambiguates_equal_tab_titles_by_worktree() {
+        let (session, panes) = fixture();
+        let labels = rows(SearchScope::Workspace, &session, &panes);
+        let home: Vec<_> = labels
+            .iter()
+            .filter(|(_, label)| label.contains("· home ·"))
+            .map(|(_, label)| label.to_string())
+            .collect();
+        assert_eq!(
+            home,
+            [
+                "app/feat · home · shell".to_string(),
+                "app/main · home · shell".to_string(),
+            ],
+            "two tabs share the title `home`; the worktree part must separate them"
+        );
+    }
+
+    #[test]
+    fn pane_and_tab_scopes_still_say_where_the_line_came_from() {
+        let (session, panes) = fixture();
+        assert_eq!(
+            rows(SearchScope::Pane(2), &session, &panes),
+            [(2, "app/feat · review · shell".to_string())]
+        );
+        assert_eq!(
+            rows(SearchScope::Tab, &session, &panes),
+            [(1, "app/feat · home · shell".to_string())]
+        );
+    }
+
+    #[test]
+    fn pane_scope_names_a_pane_outside_the_active_group() {
+        let (session, panes) = fixture();
+        // 3 lives in the non-active group: a pane-scoped row still names it.
+        assert_eq!(
+            rows(SearchScope::Pane(3), &session, &panes),
+            [(3, "app/main · home · shell".to_string())]
+        );
+        // A pane that is no longer live contributes no source at all, so the
+        // overlay never shows a row it cannot jump to.
+        assert_eq!(rows(SearchScope::Pane(99), &session, &panes), []);
+    }
 
     #[test]
     fn source_label_by_scope_table() {

@@ -11,22 +11,30 @@
 //! The synchronous paths (`handle_key`, `prime`, `apply_scope`) exist for tests
 //! and as the fallback when no worker thread can be spawned.
 //!
+//! A row says where the line came from. Every result carries the worktree ·
+//! tab · program label of the pane whose scrollback holds that line
+//! (`search_sources::build_search_sources`), the capture age the history ring
+//! stamped on it (`now`, `5m`, `3h`), and — for the selected row — the lines
+//! around it in the preview strip. History search is retrospective ("where did
+//! I see that?"), so a bare line is not an answer.
+//!
 //! Layout (approximate, actual size adapts to the screen):
 //!
 //! ```text
-//! ┌─ Search history ──────────────────── worktree ▾ ─┐
+//! ┌─ Search history ───────────────────── worktree ▾ ─┐
 //! │ ❯ query_____________                              │
 //! ├───────────────────────────────────────────────────┤
-//! │ ● tab 2 · feat/auth   cargo build --release       │
-//! │   tab 1 · main        error: linker `cc` not found│
-//! │   tab 2 · feat/auth   warning: unused variable    │
+//! │ ● tab 2 · feat/auth  3m  cargo build --release    │
+//! │   tab 1 · main      12h  error: linker `cc` not   │
+//! │   tab 2 · feat/auth  2d  warning: unused vars     │
 //! ├───────────────────────────────────────────────────┤
-//! │ ↑↓ move   ↵ jump   Tab scope   esc dismiss   3 ✓ │
+//! │ ↑↓ move   ↵ jump   Tab scope   esc dismiss   3 ✓  │
 //! └───────────────────────────────────────────────────┘
 //! ```
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::SystemTime;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 use termwiz::terminal::TerminalWaker;
@@ -86,8 +94,9 @@ pub enum SearchOutcome {
 /// The live search overlay. Lives in `run.rs` as `Option<SearchOverlay>`.
 pub struct SearchOverlay {
     engine: SearchEngine,
-    /// Context lines around the selected result, in before/after order.
-    preview: Vec<String>,
+    /// Context around the selected result: the matched line plus the lines
+    /// above and below it, in source order.
+    preview: Vec<PreviewRow>,
     /// The pane id the overlay was opened for (used to wrap scope cycles back
     /// to `Pane(…)` so the correct pane id is preserved).
     anchor_pane: u32,
@@ -544,15 +553,19 @@ impl SearchOverlay {
             return;
         };
 
-        if let Some(idx) = selected.line_idx.checked_sub(1)
-            && let Some(line) = history.get(idx)
-        {
-            self.preview.push(preview_line(line));
-        }
-        if let Some(idx) = selected.line_idx.checked_add(1)
-            && let Some(line) = history.get(idx)
-        {
-            self.preview.push(preview_line(line));
+        // A window centred on the match; the ends simply run out at the top or
+        // bottom of the buffer. The matched line is included so the preview
+        // shows *what* matched, not only its neighbours.
+        let first = selected.line_idx.saturating_sub(PREVIEW_CONTEXT_LINES);
+        let last = selected.line_idx.saturating_add(PREVIEW_CONTEXT_LINES);
+        for idx in first..=last {
+            let Some(line) = history.get(idx) else {
+                continue;
+            };
+            self.preview.push(PreviewRow {
+                text: preview_line(line),
+                hit: idx == selected.line_idx,
+            });
         }
     }
 
@@ -565,7 +578,7 @@ impl SearchOverlay {
         let max_rows = (screen.rows * 2 / 3).saturating_sub(4);
         let shown = matches.len().min(max_rows).max(3);
         let width = screen.cols.saturating_sub(4).clamp(40, 120);
-        let preview_reserve = if self.preview.is_empty() { 0 } else { 2 };
+        let preview_reserve = self.preview.len().min(PREVIEW_MAX_ROWS);
         // rows: prompt(1) + rule(1) + results(shown) + preview + rule(1) + footer(1)
         let content_rows = 4 + shown.max(1) + preview_reserve;
 
@@ -634,6 +647,13 @@ impl SearchOverlay {
         let preview_rows = preview_reserve.min(inner.rows.saturating_sub(4));
         let result_rows = inner.rows.saturating_sub(4 + preview_rows); // prompt + 2 rules + preview + footer
         let first = selected_idx.saturating_sub(result_rows.saturating_sub(1));
+        // The capture-age column costs five extra cells; on a narrow panel the
+        // matched text is worth more than the age, so it drops first.
+        let show_age = inner.cols >= 60;
+        let label_cols = if show_age { 26 } else { 22 };
+        // bullet(2) + label + [space + age(4)] + gap(2)
+        let prefix_cols = 2 + label_cols + if show_age { 7 } else { 2 };
+        let age_now = crate::e2e_freeze::clock();
         for (row, (i, m)) in matches
             .iter()
             .enumerate()
@@ -644,23 +664,33 @@ impl SearchOverlay {
             let selected = i == selected_idx;
             let bg = if selected { Tok::SelAccent } else { panel };
 
-            // Label column: "● label" or "  label"
+            // Label column: "● label age" or "  label age"
             let (bullet, label_tok) = if selected {
                 (
                     seg(Tok::Slot(S::Accent), "● ").bold(),
-                    seg(Tok::Slot(S::Text), truncate_label(&m.pane_label, 22)).bold(),
+                    seg(
+                        Tok::Slot(S::Text),
+                        truncate_label(&m.pane_label, label_cols),
+                    )
+                    .bold(),
                 )
             } else {
                 (
                     seg(Tok::Slot(S::Ghost3), "  "),
-                    seg(Tok::Slot(S::Ghost2), truncate_label(&m.pane_label, 22)),
+                    seg(
+                        Tok::Slot(S::Ghost2),
+                        truncate_label(&m.pane_label, label_cols),
+                    ),
                 )
             };
 
             // Content column: the matched line, windowed around the hit.
             let repeat_suffix = repeat_suffix(m.repeat);
             let suffix_width = repeat_suffix.as_ref().map_or(0, String::len);
-            let line_avail = inner.cols.saturating_sub(26).saturating_sub(suffix_width); // 24 label + 2 sep + suffix
+            let line_avail = inner
+                .cols
+                .saturating_sub(prefix_cols)
+                .saturating_sub(suffix_width);
             let (lcut, pre, hit, post, rcut) =
                 window_around(&m.line, m.span.unwrap_or((0, 0)), line_avail);
             let text_tok = if selected {
@@ -668,7 +698,13 @@ impl SearchOverlay {
             } else {
                 Tok::Slot(S::Dim)
             };
-            let mut segs = vec![bullet, label_tok, sp(2)];
+            let mut segs = vec![bullet, label_tok];
+            if show_age {
+                // How old the line was when captured: "now", "5m", "3h", "2d".
+                segs.push(sp(1));
+                segs.push(seg(Tok::Slot(S::Ghost3), age_cell(m.captured_at, age_now)));
+            }
+            segs.push(sp(2));
             if lcut {
                 segs.push(seg(Tok::Slot(S::Ghost3), ellipsis().to_string()));
             }
@@ -723,14 +759,27 @@ impl SearchOverlay {
         // on a tiny screen may not have room for all requested rows.
         let preview_start = inner.y + inner.rows - 2 - preview_rows;
         for (row, line) in self.preview.iter().take(preview_rows).enumerate() {
-            let line = seg::clip_end(line, inner.cols.saturating_sub(2));
+            let text = seg::clip_end(&line.text, inner.cols.saturating_sub(2));
+            // The matched line wears the same highlight as its result row, so
+            // the eye lands on it instead of scanning the neighbours.
+            let (tok, bg) = if line.hit {
+                (Tok::Slot(S::Text), Tok::SelAccent)
+            } else {
+                (Tok::Slot(S::Ghost3), panel)
+            };
+            let text_seg = if line.hit {
+                seg(tok, text).bold()
+            } else {
+                seg(tok, text)
+            };
+            let row_segs = vec![sp(2), text_seg];
             seg::draw_line(
                 surface,
                 inner.x,
                 preview_start + row,
                 inner.cols,
-                &Line::segs(vec![sp(2), seg(Tok::Slot(S::Ghost3), line)]),
-                panel,
+                &Line::segs(row_segs),
+                bg,
             );
         }
 
@@ -794,16 +843,56 @@ fn is_escape(key: &KeyCode, mods: Modifiers) -> bool {
 
 const PREVIEW_MAX_COLS: usize = 120;
 
+/// Lines of context shown above and below the matched line in the preview.
+const PREVIEW_CONTEXT_LINES: usize = 2;
+
+/// Rows the preview area may claim (the matched line plus both context blocks).
+const PREVIEW_MAX_ROWS: usize = 2 * PREVIEW_CONTEXT_LINES + 1;
+
+/// Width of the result row's capture-age column ("now", "5m", "3h", "52w").
+const ROW_AGE_COLS: usize = 4;
+
+/// How old a captured history line is, coarsely: `now`, `5m`, `3h`, `2d`,
+/// `52w`. Orientation, not a timestamp — a result row has four cells for it.
+/// A stamp in the future (clock skew, or a frozen clock that moved) reads
+/// `now` rather than wrapping to a nonsense age.
+fn relative_age(captured_at: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(captured_at).map_or(0, |d| d.as_secs());
+    match secs {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        86_400..=604_799 => format!("{}d", secs / 86_400),
+        _ => format!("{}w", secs / 604_800),
+    }
+}
+
+/// The result row's age cell: [`relative_age`], right-aligned in its column.
+fn age_cell(captured_at: SystemTime, now: SystemTime) -> String {
+    format!(
+        "{:>width$}",
+        relative_age(captured_at, now),
+        width = ROW_AGE_COLS
+    )
+}
+
 fn preview_line(line: &str) -> String {
     let filtered: String = line.chars().filter(|c| !c.is_control()).collect();
     seg::clip_end(&filtered, PREVIEW_MAX_COLS)
+}
+
+/// One context row under the results: the line to draw and whether it is the
+/// matched line (drawn highlighted) rather than a neighbour.
+struct PreviewRow {
+    text: String,
+    hit: bool,
 }
 
 fn repeat_suffix(repeat: u32) -> Option<String> {
     if repeat <= 1 {
         return None;
     }
-    Some(format!(" x{repeat}"))
+    Some(format!(" ×{repeat}"))
 }
 
 /// Truncate `s` to at most `max_cols` display columns, appending `…` if
@@ -965,7 +1054,69 @@ mod tests {
         typed(&mut ov, "repeat", &srcs);
 
         let out = draw(&ov, 100, 30);
-        assert!(out.contains("repeat x2"), "{out}");
+        assert!(out.contains("repeat ×2"), "{out}");
+    }
+
+    #[test]
+    fn relative_age_is_coarse_and_never_negative() {
+        use std::time::{Duration, SystemTime};
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let ago = |secs: u64| now - Duration::from_secs(secs);
+        assert_eq!(relative_age(now, now), "now");
+        assert_eq!(relative_age(ago(59), now), "now");
+        assert_eq!(relative_age(ago(60), now), "1m");
+        assert_eq!(relative_age(ago(3_599), now), "59m");
+        assert_eq!(relative_age(ago(3_600), now), "1h");
+        assert_eq!(relative_age(ago(86_399), now), "23h");
+        assert_eq!(relative_age(ago(86_400), now), "1d");
+        assert_eq!(relative_age(ago(604_799), now), "6d");
+        assert_eq!(relative_age(ago(604_800), now), "1w");
+        // A stamp ahead of the wall clock (skew) is not a negative age.
+        assert_eq!(relative_age(now + Duration::from_secs(60), now), "now");
+    }
+
+    #[test]
+    fn result_rows_show_how_old_the_line_is() {
+        use std::time::{Duration, SystemTime};
+
+        let now = SystemTime::now();
+        let mut buf = HistoryBuffer::new(100);
+        buf.push_line_at("needle fresh", now);
+        buf.push_line_at("needle old", now - Duration::from_secs(3 * 3_600));
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "needle", &srcs);
+
+        let out = draw(&ov, 100, 30);
+        assert!(out.contains(" now"), "{out}");
+        assert!(out.contains(" 3h"), "{out}");
+    }
+
+    #[test]
+    fn narrow_panel_drops_the_age_column_first() {
+        use std::time::{Duration, SystemTime};
+
+        let mut buf = HistoryBuffer::new(100);
+        let old = SystemTime::now() - Duration::from_secs(3 * 3_600);
+        buf.push_line_at("needle old", old);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "needle", &srcs);
+
+        // Below 60 inner columns the matched text keeps the cells.
+        let out = draw(&ov, 50, 30);
+        assert!(!out.contains("3h"), "{out}");
+        assert!(out.contains("needle"), "{out}");
+    }
+
+    /// The preview as `(text, is the matched line)` so a test can assert both
+    /// the context and which row is highlighted.
+    fn preview(ov: &SearchOverlay) -> Vec<(&str, bool)> {
+        ov.preview
+            .iter()
+            .map(|row| (row.text.as_str(), row.hit))
+            .collect()
     }
 
     #[test]
@@ -981,14 +1132,47 @@ mod tests {
         let mut ov = overlay(1);
         typed(&mut ov, "target", &srcs);
         assert_eq!(
-            ov.preview,
-            vec![String::from("between"), String::from("after second")]
+            preview(&ov),
+            [
+                ("first target", false),
+                ("between", false),
+                ("second target", true),
+                ("after second", false),
+            ]
         );
 
         ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE, &srcs);
         assert_eq!(
-            ov.preview,
-            vec![String::from("before first"), String::from("between")]
+            preview(&ov),
+            [
+                ("before first", false),
+                ("first target", true),
+                ("between", false),
+                ("second target", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_shows_two_lines_each_side_of_the_match() {
+        let buf = buf_from(&["a", "b", "c", "match", "e", "f", "g"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        typed(&mut ov, "match", &srcs);
+        assert_eq!(
+            preview(&ov),
+            [
+                ("b", false),
+                ("c", false),
+                ("match", true),
+                ("e", false),
+                ("f", false),
+            ]
+        );
+        assert_eq!(
+            ov.preview.len(),
+            PREVIEW_MAX_ROWS,
+            "the preview stops at its row budget"
         );
     }
 
@@ -1000,8 +1184,8 @@ mod tests {
         let mut ov = overlay(2);
         typed(&mut ov, "target", &srcs);
 
-        assert_eq!(ov.preview, vec![String::from("second before")]);
-        assert!(!ov.preview.iter().any(|line| line.starts_with("first")));
+        assert_eq!(preview(&ov), [("second before", false), ("target", true)]);
+        assert!(!ov.preview.iter().any(|row| row.text.starts_with("first")));
     }
 
     #[test]
@@ -1010,11 +1194,19 @@ mod tests {
         let srcs = sources(1, &buf);
         let mut ov = overlay(1);
         typed(&mut ov, "oldest", &srcs);
-        assert_eq!(ov.preview, vec![String::from("middle")]);
+        // Nothing above the oldest line: the window just starts at the hit.
+        assert_eq!(
+            preview(&ov),
+            [
+                ("oldest target", true),
+                ("middle", false),
+                ("newest target", false)
+            ]
+        );
 
         ov = overlay(1);
         typed(&mut ov, "newest", &srcs);
-        assert_eq!(ov.preview, vec![String::from("middle")]);
+        assert_eq!(preview(&ov).last(), Some(&("newest target", true)));
     }
 
     #[test]
@@ -1457,7 +1649,10 @@ mod tests {
         // still describe the lines the match index points into.
         assert!(buf.replace_from_end(1, "REWRITTEN"));
         ov.handle_key_async(&KeyCode::DownArrow, Modifiers::NONE, &sources(1, &buf));
-        assert_eq!(ov.preview, ["alpha", "gamma"]);
+        assert_eq!(
+            preview(&ov),
+            [("alpha", false), ("beta needle", true), ("gamma", false)]
+        );
     }
 
     #[test]

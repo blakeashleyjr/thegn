@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
+use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history_at};
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession};
 
 use crate::emulator::{AlacrittyEmulator, PaneEmulator};
@@ -693,11 +693,12 @@ impl PtyPane {
         };
         self.predictor
             .on_server_output(now, (cursor.0 as usize, cursor.1 as usize), &cell);
-        feed_bytes_to_history(
+        feed_bytes_to_history_at(
             bytes,
             &mut self.history,
             &mut self.history_partial,
             &mut self.history_stripper,
+            crate::e2e_freeze::clock(),
         );
         // Time-travel recording tap: a third sink beside the emulator and the
         // history ring. `None` (replay disabled) ⇒ one null check, zero alloc.

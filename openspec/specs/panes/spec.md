@@ -6,6 +6,55 @@ TBD - created by archiving change add-multiplexer-parity. Update Purpose after a
 
 ## Requirements
 
+### Requirement: History search results identify their source
+
+History search result rows SHALL identify the source pane using the current
+display-safe worktree name, tab title, and pane title (falling back to the
+pane's program name), and SHALL show how long before the search the line was
+captured. The active scope SHALL filter which panes contribute without removing
+available provenance from each result: pane- and tab-scoped rows carry the same
+worktree, tab and pane parts as wider scopes, and no row SHALL expose an
+internal pane id. History lines SHALL retain their capture time, stamped when
+the line was written, so rows can show relative age; search SHALL NOT derive
+timestamps from line order or invent time evidence. The selected result's
+preview SHALL show up to two surrounding lines before and after the match, with
+the matched line highlighted. Identical lines from one pane SHALL group into a
+single row that reports its occurrence count and resolves to the newest
+occurrence.
+
+#### Scenario: Worktree search distinguishes tabs and panes
+
+- **WHEN** a worktree search returns lines from tabs with different titles or
+  pane titles/programs
+- **THEN** each result labels the actual worktree, tab, and pane source in that
+  order, without exposing an internal pane id
+
+#### Scenario: Narrower scopes retain full source provenance
+
+- **WHEN** a pane- or tab-scoped search returns a result
+- **THEN** its row identifies the owning worktree, tab, and pane title or
+  program name
+
+#### Scenario: Compact results retain time and nearby context
+
+- **WHEN** a search result has a recorded capture time and nearby history
+- **THEN** its compact row shows the relative age, and the selected result's
+  preview shows up to two surrounding lines on either side with the matched line
+  highlighted
+
+#### Scenario: A pane out of the session tree has no invented provenance
+
+- **WHEN** a pane history remains searchable after its owning tab leaves the
+  live session tree
+- **THEN** its row may be labelled by the pane's safe title or program name, but
+  SHALL NOT invent a worktree or tab label
+
+#### Scenario: Repeated lines group into one row
+
+- **WHEN** the same pane printed one identical line six times
+- **THEN** search shows a single row reporting six occurrences, and confirming it
+  jumps to the newest of them
+
 ### Requirement: Pane splits are resizable from the keyboard
 
 thegn SHALL provide keyboard resize actions (`resize-left`, `resize-right`,
