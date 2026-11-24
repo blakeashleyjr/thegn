@@ -134,7 +134,7 @@ class DevLiveTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     def test_removed_flags_are_refused(self):
-        with self.assertRaisesRegex(live.Refusal, "Nix"):
+        with self.assertRaisesRegex(live.Refusal, "just update stable"):
             live.main(["--relink-launchers"], home=self.root / "home")
 
     def test_dev_env_scrubs_panes_preserves_runtime_and_maps_old_run(self):

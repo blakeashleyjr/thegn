@@ -970,7 +970,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: test-dev-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro test-remote-parity-tui
+test: test-dev-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro test-remote-parity-tui test-update-instance
     #!/usr/bin/env bash
     set -euo pipefail
     if ! cargo nextest run --workspace; then
@@ -1432,6 +1432,24 @@ live level="info" size_mb="20" files="5" *flags:
 [positional-arguments]
 live-plan level="info" size_mb="20" files="5" *flags:
     a="$1"; b="$2"; c="$3"; shift 3; python3 -B scripts/dev_live.py --plan --level "$a" --size-mb "$b" --files "$c" "$@"
+
+# Update an instance from a verified GitHub release or a source build. No target
+# prints stable/dev/latest versions. `just update stable [VERSION|latest]
+# [--dry-run] [--force] [--no-attest] [--rollback]` swaps ~/.local/lib/thegn/thegn
+# atomically (previous kept as thegn.prev). Afterwards the instance's daemon is
+# restarted (prompt; --yes skips, --no-launch skips the relaunch) so a newer DB
+# schema can migrate. `just update dev [release[=VERSION]|main|checkout|<branch>]` installs via
+# scripts/dev_live.py --prebuilt; source targets build on the remote Mac first
+# (THEGN_REMOTE_BUILD) and compile locally only after an explicit yes. Extra
+# args (--level debug ...) pass through to dev_live.py --install-only.
+# See docs/just-recipes.md.
+[positional-arguments]
+update target="" *args:
+    python3 -B scripts/update_instance.py "$@"
+
+# `just update` helper tests; no network, no real home.
+test-update-instance:
+    python3 -B test/update_instance_test.py
 
 # Live Vercel Sandbox run (spends money; plan-only without flags). Not in ci/smoke.
 [positional-arguments]
