@@ -812,6 +812,12 @@ impl ControlClient {
     /// Generic request for the catalog-driven client (`thegn api call`):
     /// verb → route resolution happens in `routes::api_call_for`; this just
     /// performs it. Method is `GET`/`POST`/`DELETE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn call_raw(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
         // A `/wait` route is a long-poll; derive its budget from the body.
         let deadline = if path.ends_with("/wait") {
@@ -822,20 +828,48 @@ impl ControlClient {
         self.request_with(method, path, body, deadline).await
     }
 
+    /// `GET /health` liveness probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn health(&self) -> Result<()> {
         self.request("GET", "/health", None).await.map(|_| ())
     }
 
+    /// `GET /v1/me` — the caller identity and scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn me(&self) -> Result<Value> {
         self.request("GET", "/v1/me", None).await
     }
 
+    /// `GET /v1/sessions` — the session roster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the roster reply is malformed.
     pub async fn sessions(&self) -> Result<Vec<SessionInfo>> {
         let v = self.request("GET", "/v1/sessions", None).await?;
         parse_session_roster(v)
     }
 
     /// `GET /v1/worktrees` — the worktrees registered with the instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply has no `worktrees` array or
+    /// it does not decode.
     pub async fn worktrees(&self) -> Result<Vec<super::WorktreeInfo>> {
         let v = self.request_long("GET", "/v1/worktrees", None).await?;
         Ok(serde_json::from_value(
@@ -847,6 +881,14 @@ impl ControlClient {
     /// this is where the daemon-skew rule (WS00-P1-11, [`super::open_fields`])
     /// is enforced: a security-relevant field the daemon did not echo in
     /// `honoured` kills the fresh session and refuses with `daemon-skew`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode; or the
+    /// daemon did not echo a security-relevant field in `honoured` (a typed
+    /// [`DaemonSkew`](super::open_fields::DaemonSkew) refusal; the fresh session is killed).
     pub async fn open(&self, spec: &OpenSpec) -> Result<SessionInfo> {
         let v = self
             .request_long("POST", "/v1/sessions", Some(serde_json::to_value(spec)?))
@@ -880,6 +922,13 @@ impl ControlClient {
         }
     }
 
+    /// `POST /v1/sessions/fork` — fork a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn fork(&self, spec: &ForkSpec) -> Result<SessionInfo> {
         let v = self
             .request_long(
@@ -892,6 +941,14 @@ impl ControlClient {
     }
 
     /// One-shot snapshot: `(seq, rows, cols, ansi_bytes)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply lacks or mismatches the
+    /// session identity, `seq`, `rows`, `cols` or `ansi_b64`, a dimension exceeds `u16`, or the
+    /// payload is not valid base64.
     pub async fn snapshot(&self, session: &str) -> Result<(u64, u16, u16, Vec<u8>)> {
         let v = self
             .request_long("GET", &format!("/v1/sessions/{session}/snapshot"), None)
@@ -928,6 +985,13 @@ impl ControlClient {
         Ok((seq, rows, cols, bytes))
     }
 
+    /// Send `bytes` to `session` as input, optionally followed by Enter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn send_input(&self, session: &str, bytes: &[u8], enter: bool) -> Result<()> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         self.request(
@@ -939,6 +1003,13 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    /// Resize `session` to `rows` x `cols`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn resize(&self, session: &str, rows: u16, cols: u16) -> Result<()> {
         self.request(
             "POST",
@@ -952,6 +1023,12 @@ impl ControlClient {
     /// Block until `session` reaches `condition` (a JSON `WaitCondition`), or
     /// `timeout_ms` elapses. Returns the `WaitOutcome` JSON (`matched`,
     /// `condition`, `exit_code`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn wait(
         &self,
         session: &str,
@@ -972,6 +1049,12 @@ impl ControlClient {
 
     /// Split `session`: open a sibling pane running `argv` (empty = a shell) in
     /// direction `dir` (`right`/`down`). Returns the new [`SessionInfo`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn split(&self, session: &str, dir: &str, argv: &[String]) -> Result<SessionInfo> {
         let v = self
             .request_long(
@@ -986,6 +1069,12 @@ impl ControlClient {
     /// Start/stop/query a daemon-side asciicast recording of `session`. `op` is
     /// `"start"`, `"stop"` or `"status"`. Returns the [`RecordStatus`] (path +
     /// byte count; never the recorded contents).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn record(&self, session: &str, op: &str) -> Result<RecordStatus> {
         let v = self
             .request(
@@ -997,6 +1086,13 @@ impl ControlClient {
         Ok(serde_json::from_value(v)?)
     }
 
+    /// Detach `client_id` from `session`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn detach(&self, session: &str, client_id: &str) -> Result<()> {
         self.request(
             "POST",
@@ -1007,12 +1103,26 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    /// Kill `session`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn kill(&self, session: &str) -> Result<()> {
         self.request_long("DELETE", &format!("/v1/sessions/{session}"), None)
             .await
             .map(|_| ())
     }
 
+    /// `GET /v1/leases` — current control leases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn leases(&self) -> Result<Value> {
         self.request("GET", "/v1/leases", None).await
     }
@@ -1021,6 +1131,12 @@ impl ControlClient {
     /// `route_to_host` remote_mode path. `worktree` is the **host-canonical**
     /// path the host resolves (the sprite's `$THEGN_WORKTREE`), not the sprite's
     /// local mount. Returns the server's `{ "queued": … }` envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn merge_add(&self, worktree: &str) -> Result<Value> {
         self.request_long(
             "POST",
@@ -1032,12 +1148,25 @@ impl ControlClient {
 
     /// `GET /v1/pr/status` — cached PR status, one row per worktree with a
     /// `pr_cache` entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply has no `prs` array or it
+    /// does not decode.
     pub async fn pr_status(&self) -> Result<Vec<super::PrStatusRow>> {
         let v = self.request_long("GET", "/v1/pr/status", None).await?;
         Ok(serde_json::from_value(required_array(&v, "prs")?.clone())?)
     }
 
     /// `GET /v1/ci/runs` — cache-first CI run history for a worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn ci_runs(&self, worktree: &str, limit: Option<usize>) -> Result<CiRunsReply> {
         let mut path = format!("/v1/ci/runs?worktree={}", query_escape(worktree));
         if let Some(limit) = limit {
@@ -1048,6 +1177,12 @@ impl ControlClient {
     }
 
     /// `GET /v1/ci/logs` — one bounded, redacted job-log projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn ci_logs(
         &self,
         worktree: &str,
@@ -1070,6 +1205,12 @@ impl ControlClient {
 
     /// `POST /v1/notify` — push a notification into the tray. Returns the
     /// stored notification's row id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply carries no integer `id`.
     pub async fn notify_push(&self, note: &super::PushedNote) -> Result<i64> {
         let v = self
             .request("POST", "/v1/notify", Some(serde_json::to_value(note)?))
@@ -1079,6 +1220,14 @@ impl ControlClient {
             .ok_or_else(|| anyhow!("malformed notify reply: {v}"))
     }
 
+    /// `GET /v1/automations` — the automation rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply has no `rules` array or it
+    /// does not decode.
     pub async fn automations_list(&self) -> Result<Vec<super::AutomationRuleInfo>> {
         let value = self.request("GET", "/v1/automations", None).await?;
         Ok(serde_json::from_value(
@@ -1086,6 +1235,13 @@ impl ControlClient {
         )?)
     }
 
+    /// `POST /v1/automations/test` — dry-run a rule against a sample event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn automations_test(
         &self,
         request: &super::AutomationTestRequest,
@@ -1100,6 +1256,13 @@ impl ControlClient {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// `POST /v1/tools/run` — run a tool in a new session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn tools_run(&self, request: &super::ToolRunRequest) -> Result<SessionInfo> {
         let value = self
             .request_long(
@@ -1112,12 +1275,24 @@ impl ControlClient {
     }
 
     /// `GET /v1/mcp_proxy/status` — the mcp-proxy hub's per-upstream state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn mcp_proxy_status(&self) -> Result<super::McpProxyStatus> {
         let v = self.request("GET", "/v1/mcp_proxy/status", None).await?;
         Ok(serde_json::from_value(v)?)
     }
 
     /// `POST /v1/mcp_proxy/reload` — re-read config and reconcile the hub.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn mcp_proxy_reload(&self) -> Result<super::McpProxyReloadReport> {
         let v = self
             .request_long("POST", "/v1/mcp_proxy/reload", None)
@@ -1126,11 +1301,24 @@ impl ControlClient {
     }
 
     /// `GET /v1/plugins/status` — the UI's published per-plugin counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn plugins_status(&self) -> Result<super::PluginsStatusReply> {
         let value = self.request("GET", "/v1/plugins/status", None).await?;
         Ok(serde_json::from_value(value)?)
     }
 
+    /// `POST /v1/worktrees/open` — open a worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {
         self.request_long(
             "POST",
@@ -1142,6 +1330,13 @@ impl ControlClient {
     }
 
     /// Queue a safe editor handoff through `POST /v1/editor/open`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or `request` is not a safe editor
+    /// target; or the daemon does not confirm `queued: true`.
     pub async fn open_editor(&self, request: &EditorOpenRequest) -> Result<()> {
         request.target()?;
         let value = self
@@ -1159,6 +1354,12 @@ impl ControlClient {
     }
 
     /// `POST /v1/preview/fetch` — one bounded, credential-free preview GET.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn preview_fetch(
         &self,
         req: &super::PreviewFetchRequest,
@@ -1176,6 +1377,12 @@ impl ControlClient {
     // --- agent orchestration (THE-57) ---------------------------------------
 
     /// `POST /v1/worktrees` — create a worktree, optionally from an issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn worktree_create(
         &self,
         req: &super::WorktreeCreateReq,
@@ -1187,6 +1394,12 @@ impl ControlClient {
     }
 
     /// `POST /v1/worktrees/folder` — assign or clear a repo-local folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn folder_assign(&self, req: &super::FolderAssignReq) -> Result<()> {
         self.request(
             "POST",
@@ -1198,6 +1411,12 @@ impl ControlClient {
     }
 
     /// `GET /v1/worktrees/sandbox-profile` — a worktree's pinned sandbox profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn worktree_sandbox_profile(
         &self,
         worktree: &str,
@@ -1211,6 +1430,13 @@ impl ControlClient {
     }
 
     /// `GET /v1/issues` — tracker issues, filtered by status/limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply has no `issues` array or it
+    /// does not decode.
     pub async fn issues_list(
         &self,
         statuses: &[thegn_core::issue::IssueStatus],
@@ -1244,6 +1470,13 @@ impl ControlClient {
     }
 
     /// `GET /v1/issues/{id}` — one issue with detail/comments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or `id` is not a valid control issue id;
+    /// or the reply does not decode.
     pub async fn issue_get(
         &self,
         id: &str,
@@ -1255,6 +1488,13 @@ impl ControlClient {
     }
 
     /// `POST /v1/issues/{id}` — patch an issue; returns the updated issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or `id` is not a valid control issue id;
+    /// or the reply does not decode.
     pub async fn issue_update(
         &self,
         id: &str,
@@ -1269,6 +1509,12 @@ impl ControlClient {
     }
 
     /// `POST /v1/issues/{id}/comment` — add a comment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or `id` is not a valid control issue id.
     pub async fn issue_comment(&self, id: &str, body: &str, repo: Option<&str>) -> Result<()> {
         let path = with_repo_query(encoded_issue_path(id, "/comment")?, repo);
         self.request_long("POST", &path, Some(json!({ "body": body })))
@@ -1277,6 +1523,13 @@ impl ControlClient {
     }
 
     /// `GET /v1/dispatches` — one page of the durable dispatch roster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply has no `dispatches` array
+    /// or it does not decode.
     pub async fn dispatches_list(
         &self,
         limit: Option<usize>,
@@ -1304,6 +1557,12 @@ impl ControlClient {
     }
 
     /// `POST /v1/dispatches` — record a new dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn dispatch_put(
         &self,
         req: &super::DispatchPutReq,
@@ -1315,6 +1574,12 @@ impl ControlClient {
     }
 
     /// `POST /v1/dispatches/{id}/status` — advance a dispatch's status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn dispatch_set_status(
         &self,
         id: i64,
@@ -1329,6 +1594,13 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    /// `POST /v1/dispatches/{id}/report` — worker report on a dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn dispatch_report(
         &self,
         id: i64,
@@ -1344,6 +1616,13 @@ impl ControlClient {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// `POST /v1/dispatches/{id}/note` — worker note on a dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused); or the reply does not decode.
     pub async fn dispatch_note(
         &self,
         id: i64,
@@ -1359,6 +1638,13 @@ impl ControlClient {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// `POST /v1/pair` — redeem a pairing `code` for `label`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails: transport failure, a connect or request deadline
+    /// ([`ControlBoundError`]), an over-cap response, or a non-2xx status
+    /// ([`ControlRequestError`]; redirects are refused).
     pub async fn pair(&self, code: &str, label: &str) -> Result<Value> {
         self.request(
             "POST",
@@ -1375,6 +1661,10 @@ impl ControlClient {
     /// first); the `control` half is unused (the feed takes no client input) but
     /// keeping the [`AttachStream`] alive keeps the pump running. Dropping it
     /// ends the subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::subscribe_events_opts`].
     pub async fn subscribe_events(&self) -> Result<AttachStream> {
         self.subscribe_events_opts(&FeedFilter::default()).await
     }
@@ -1382,6 +1672,12 @@ impl ControlClient {
     /// Subscribe with per-connection narrowing and optional lag signaling.
     /// The server-side filter is still constrained to the read-scoped feed;
     /// this method only adds query parameters and keeps the 256-frame buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the WebSocket upgrade cannot be set up: the endpoint is unreachable
+    /// or the connect deadline elapses, the request cannot be built, the origin URL is invalid,
+    /// or the server refuses the upgrade (for example a bad token or an unknown session).
     pub async fn subscribe_events_opts(&self, filter: &FeedFilter) -> Result<AttachStream> {
         let path = events_path(filter);
         let (host, token, uri) = match &self.addr {
@@ -1509,6 +1805,10 @@ impl ControlClient {
 
     /// Owned-options convenience form for callers that construct a filter at
     /// the call site.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::subscribe_events_opts`].
     pub async fn subscribe_events_with(&self, filter: FeedFilter) -> Result<AttachStream> {
         self.subscribe_events_opts(&filter).await
     }
@@ -1518,6 +1818,10 @@ impl ControlClient {
     /// scrollback history tail (a fresh client emulator wants the context);
     /// reconnect paths use [`Self::attach_opts`] with `include_history =
     /// false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::attach_opts`].
     pub async fn attach(
         &self,
         session: &str,
@@ -1534,6 +1838,12 @@ impl ControlClient {
     /// context: a reconnect re-feeds an emulator that already holds the
     /// history, so it passes `include_history = false` and the daemon omits
     /// the tail (repaint only — no duplicated scrollback).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the WebSocket upgrade cannot be set up: the endpoint is unreachable
+    /// or the connect deadline elapses, the request cannot be built, the origin URL is invalid,
+    /// or the server refuses the upgrade (for example a bad token or an unknown session).
     pub async fn attach_opts(
         &self,
         session: &str,
