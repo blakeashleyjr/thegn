@@ -293,6 +293,15 @@ crate graph. Three things now hold it down, and they are defaults, not knobs:
   `[disk] warn_threshold_gb` is a `thegn disk` **reporting** threshold only — an
   absolute total is permanently red on a machine like this, so nothing behaves
   off it.
+- **`thegn wt disk --lanes`** — a read-only inventory of one checkout's
+  `target/lanes/` build lanes: apparent bytes and reclaimable build output per
+  lane, the lane's own verified git owner and branch, Cargo-lock and mtime
+  activity, an eligibility class with its reason, and the scan duration. It
+  deletes nothing, writes no `worktree_disk` cache row, and scans no other
+  worktree. Ownership is never inferred from the enclosing checkout and a lane
+  with no verifiable owner is never called eligible — the audit's 129 GiB was
+  unowned as much as it was large. Classification rules are in `docs/cli.md`;
+  it reuses `disk::measure_tree` so lane and worktree bytes stay one unit.
 - **`just clean-aux`** — `just coverage`, `just check-cross` and `just doc` each
   leave a whole extra crate graph in `target/` (llvm-cov-target, the cross
   triples, `doc/`, `advisory-dbs/`: ~5 GiB here) that nothing ever reaps.

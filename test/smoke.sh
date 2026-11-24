@@ -739,6 +739,17 @@ check "host list --json includes the seeded host" \
   "'$SZ' host list --json | grep -q smoke-local"
 check "disk --json emits a JSON array" \
   "'$SZ' disk --json | head -c1 | grep -q '\['"
+# Build lanes (THE-2279): a read-only inventory of one checkout's
+# target/lanes/ — sized, attributed, and classified, with nothing removed.
+mkdir -p "$R/target/lanes/smoke-lane/target/debug"
+printf 'artifact' >"$R/target/lanes/smoke-lane/target/debug/artifact.bin"
+check "wt disk --lanes inventories a build lane" \
+  "'$SZ' wt disk --lanes --worktree '$R' | grep -q 'smoke-lane'"
+check "wt disk --lanes --json emits one object per lane" \
+  "'$SZ' wt disk --lanes --worktree '$R' --json | grep -q '\"lane\":\"smoke-lane\"'"
+check "wt disk --lanes leaves lane contents alone" \
+  "[[ -f '$R/target/lanes/smoke-lane/target/debug/artifact.bin' ]]"
+rm -rf "$R/target"
 check "share list --json parses" \
   "'$SZ' share list --json | head -c1 | grep -q '\['"
 check "forward list --json parses" \

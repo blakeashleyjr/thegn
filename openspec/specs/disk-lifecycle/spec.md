@@ -104,3 +104,40 @@ lifecycle are separate settings.
 - **THEN** the size cache row for that worktree is dropped, a `disk_cleaned`
   notification carrying the byte count and the reason is written, and the UI is
   woken to repaint
+
+### Requirement: Build-lane inventory is read-only and evidence-based
+
+`thegn wt disk --lanes` SHALL inventory the immediate subdirectories of one
+checkout's `target/lanes/` and report, per lane, its apparent-byte size, the
+regenerable build output inside it, the owning worktree it can verify, its
+activity evidence, an eligibility class, and a reason. Per-lane and aggregate
+sizes MUST use the same apparent-byte accounting as `thegn disk`, so a lane's
+`target/` and a worktree's `target/` are the same unit; only lanes classified
+`eligible` contribute to the eligible total.
+
+Ownership MUST come from the lane's own git checkout. A lane with no checkout of
+its own SHALL be reported with unknown ownership rather than attributed to the
+checkout that contains it, because ownership is what makes a lane reclaimable.
+A checkout whose git dir does not resolve or has no readable `HEAD` SHALL also be
+unknown. The owner is the lane's own checkout path, not a job.
+Activity MUST be Cargo's own per-profile `.cargo-lock` — held, never waited on —
+or the newest write anywhere in the lane, using the same recent-activity window
+as low-disk eviction. A lane SHALL be eligible only when it is a build lane, has
+a verifiable owner, holds no build lock, and has been idle longer than that
+window; every other lane MUST be reported `held` or `unknown` with its reason.
+
+The command MUST NOT remove or modify lane contents, write the `worktree_disk`
+cache, or scan any other worktree.
+
+#### Scenario: Active, idle, locked, and unowned lanes
+
+- **WHEN** the inventory reads a lane written moments ago, one idle for days, one
+  whose Cargo lock is held, and one with no checkout of its own
+- **THEN** it reports the fresh and locked lanes as `held`, the verified idle
+  lane as `eligible`, and the unowned lane as `unknown`, prints a reason for
+  each, and leaves every lane's contents byte for byte intact
+
+#### Scenario: A checkout has never coordinated a lane
+
+- **WHEN** the selected checkout has no `target/lanes/` directory
+- **THEN** the inventory reports no lanes and exits successfully

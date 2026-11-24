@@ -42,11 +42,17 @@ pub struct DiskArgs {
     #[arg(long)]
     pub worktree: Option<String>,
     /// Scan every known worktree (the default when no `--worktree` is given).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "lanes")]
     pub all: bool,
-    /// Emit one JSON array instead of the human table.
+    /// Emit one JSON array instead of the human table (`--lanes` emits one
+    /// object instead).
     #[arg(long)]
     pub json: bool,
+    /// Inventory this checkout's `target/lanes/` build lanes instead of
+    /// worktrees: bytes, build output, verified owner, activity, and whether
+    /// each lane's output is safe to reclaim. Read-only.
+    #[arg(long)]
+    pub lanes: bool,
 }
 
 /// Args shared by `clean` and `wt clean`.
@@ -162,7 +168,8 @@ pub enum Action {
     },
     /// Emit a syntax-highlighted diff of a worktree against its branch point.
     Diff(DiffArgs),
-    /// Report per-worktree disk usage (checkout + reclaimable `target/`).
+    /// Report per-worktree disk usage (checkout + reclaimable `target/`), or
+    /// inventory one checkout's build lanes with `--lanes`.
     Disk(DiskArgs),
     /// Reclaim a worktree's `target/` build artifacts (keeps the checkout).
     Clean(CleanArgs),
@@ -250,7 +257,13 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
         Action::Diff(a) => {
             super::diff::run(cfg, a.target.worktree, a.base, a.stat, a.file, a.structural)
         }
-        Action::Disk(a) => super::disk::disk(cfg, a.worktree, a.all, a.json),
+        Action::Disk(a) => {
+            if a.lanes {
+                super::disk::lanes(a.worktree, a.json)
+            } else {
+                super::disk::disk(cfg, a.worktree, a.all, a.json)
+            }
+        }
         Action::Clean(a) => super::disk::clean(cfg, a.worktree, a.all, a.force),
         Action::Prune(a) => super::wt_prune::run(cfg, a),
         Action::Reopen { path } => reopen(&path),

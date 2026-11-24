@@ -179,6 +179,51 @@ the shared `--base`. The complete file is validated before the first checkout.
 The batch form accepts the usual `--repo`, `--env`, `--isolation`,
 `--exact-branch`, `--folder` and `--json` options.
 
+## Build lanes (`wt disk --lanes`)
+
+```sh
+thegn wt disk --lanes [--worktree PATH] [--json]
+```
+
+Build lanes are the coordinator's per-lane build sandboxes: the immediate
+subdirectories of a checkout's `target/lanes/` — the 129 GiB the repository
+hygiene audit found with no owner attached. `--lanes` inventories exactly one
+checkout's lanes, largest first. It is a report: it removes nothing, rewrites
+nothing, does not touch the `worktree_disk` cache, and visits no other worktree.
+`--all` is a usage error here, because a lane inventory is scoped to one
+checkout.
+
+Each lane is measured with the same apparent-byte walk as `thegn disk`, so the
+two surfaces agree byte for byte. `BYTES` is the whole lane directory and
+`BUILD` is the regenerable output inside it: a lane that is a copy of the
+repository contributes its `target/` subtree, a directory that is itself a
+Cargo target dir contributes itself, and anything else contributes nothing.
+
+Classification is evidence-based, and every row prints its reason:
+
+- **Owner** — the lane's own git checkout (`HEAD`'s branch), read from a `.git`
+  directory or a linked worktree's `gitdir:` file. A directory with no checkout
+  of its own is reported as `owner unknown`; it is never attributed to the
+  checkout that happens to contain it, because ownership is what makes a lane
+  reclaimable. The owner field is the lane's own checkout path (the same as
+  `path`), not a coordinating job: no job attribution is recorded. The checkout
+  must resolve: a `gitdir:` file pointing at a missing directory, or a git dir
+  with no readable `HEAD`, is an orphan and reports `owner unknown`. Symlinked
+  lane entries are listed as unknown and never followed.
+- **Activity** — Cargo's per-profile `.cargo-lock` first (a `try_lock` that
+  fails means a build is running; the probe never waits and releases
+  immediately), then the newest write anywhere in the lane, compared against the
+  same one-hour recency window the low-disk rule uses.
+- **Eligibility** — `eligible` only for a build lane with a verified owner, no
+  held lock, and no write inside that window. A held lock or a recent write is
+  `held`; unknown ownership, an unreadable lane, or a non-build directory is
+  `unknown`. Only `eligible` lanes contribute to the eligible total.
+
+The report ends with lane count, total bytes, build output, eligible bytes and
+the scan duration. `--json` emits one object with the same fields; each `lanes`
+row carries `lane`, `path`, `bytes`, `build_bytes`, `kind`, `owner`, `branch`,
+`activity`, `activity_evidence`, `eligibility` and `reason`.
+
 ## Vercel orphan reap (`env reap`)
 
 `thegn env reap --provider vercel [--apply] [--yes] [--json]` finds Vercel
@@ -305,7 +350,8 @@ Most list-shaped read surfaces accept `--json` and emit exactly **one
 compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
 `repo list`, `repo recent`, `repo provenance`, `env list`, `host list`,
 `ci runs`, `share list`, `forward list`, `merge list`, `session list`,
-`pair list`, `disk`, `map`,
+`pair list`, `disk` (and `wt disk --lanes`, which emits the lane inventory as
+one object), `map`,
 `dispatch list` (the agent-dispatch roster; `--active` keeps only rows that
 occupy a slot; rows carry the daemon-written retry `note` — headless workers
 that died of a transport failure are relaunched by the daemon per
