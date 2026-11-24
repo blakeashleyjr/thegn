@@ -24,7 +24,9 @@ by a test of a recipe yet: embedding, the generated `INDEX.md` and the CLI verbs
 
 ## Header
 
-Every recipe starts with a `[recipe]` table, the same for all three kinds. Unknown keys are rejected.
+Every recipe starts with a `[recipe]` table, the same for all three kinds. Unknown keys inside that table
+are rejected. The rest of the file holds the tables of its own kind (for example `[sandbox]`), which the
+kind's owner defines; nothing outside `[recipe]` is part of the header.
 
 | Key              | Type                                                       | Meaning                                                                                                     |
 | ---------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |

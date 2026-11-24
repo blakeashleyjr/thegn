@@ -129,9 +129,8 @@ impl AdmissionStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn current_generation(state: &Option<State>) -> u64 {
+    fn current_generation(state: Option<&State>) -> u64 {
         state
-            .as_ref()
             .and_then(|state| state.current.as_ref())
             .map_or(0, |current| current.revision().generation)
     }
@@ -146,7 +145,7 @@ impl AdmissionStore {
         expected_generation: u64,
     ) -> Result<Arc<AdmittedConfig>, StaleConfigError> {
         let mut guard = self.lock();
-        let current = Self::current_generation(&guard);
+        let current = Self::current_generation(guard.as_ref());
         if current != expected_generation {
             return Err(StaleConfigError {
                 reason: StaleConfigReason::Superseded,
@@ -210,7 +209,7 @@ impl AdmissionStore {
     /// The current snapshot only while the store is healthy.
     pub fn current(&self) -> Result<Arc<AdmittedConfig>, StaleConfigError> {
         let guard = self.lock();
-        let generation = Self::current_generation(&guard);
+        let generation = Self::current_generation(guard.as_ref());
         let Some(state) = guard.as_ref() else {
             return Err(StaleConfigError {
                 reason: StaleConfigReason::NoSnapshot,
@@ -257,7 +256,7 @@ impl AdmissionStore {
 
     pub fn health(&self) -> StoreHealth {
         let guard = self.lock();
-        let generation = Self::current_generation(&guard);
+        let generation = Self::current_generation(guard.as_ref());
         match guard.as_ref() {
             None => StoreHealth::Empty,
             Some(State {

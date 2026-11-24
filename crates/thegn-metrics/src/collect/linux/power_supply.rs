@@ -339,7 +339,7 @@ impl<F: SupplyFs> SupplyReader<F> {
             }
             let status = read_slot(
                 fs,
-                &supply.handles[0],
+                supply.handles[0].as_ref(),
                 &mut buffer,
                 signal_critical_errors,
                 #[cfg(test)]
@@ -348,7 +348,7 @@ impl<F: SupplyFs> SupplyReader<F> {
             .and_then(SupplyStatus::parse);
             let capacity = read_slot(
                 fs,
-                &supply.handles[1],
+                supply.handles[1].as_ref(),
                 &mut buffer,
                 signal_critical_errors,
                 #[cfg(test)]
@@ -362,7 +362,7 @@ impl<F: SupplyFs> SupplyReader<F> {
             );
             let energy = read_optional(
                 fs,
-                &supply.handles[2],
+                supply.handles[2].as_ref(),
                 &mut buffer,
                 #[cfg(test)]
                 counters,
@@ -371,7 +371,7 @@ impl<F: SupplyFs> SupplyReader<F> {
             let charge = if energy.is_none() {
                 read_optional(
                     fs,
-                    &supply.handles[3],
+                    supply.handles[3].as_ref(),
                     &mut buffer,
                     #[cfg(test)]
                     counters,
@@ -385,15 +385,17 @@ impl<F: SupplyFs> SupplyReader<F> {
                 self.fail_next_power_read = false;
                 None
             } else {
-                read_optional(fs, &supply.handles[6], &mut buffer, counters).and_then(parse_u64)
+                read_optional(fs, supply.handles[6].as_ref(), &mut buffer, counters)
+                    .and_then(parse_u64)
             };
             #[cfg(not(test))]
-            let power = read_optional(fs, &supply.handles[6], &mut buffer).and_then(parse_u64);
+            let power =
+                read_optional(fs, supply.handles[6].as_ref(), &mut buffer).and_then(parse_u64);
             let needs_iv = power.is_none() || (energy.is_none() && charge.is_some());
             let current = if needs_iv {
                 read_optional(
                     fs,
-                    &supply.handles[5],
+                    supply.handles[5].as_ref(),
                     &mut buffer,
                     #[cfg(test)]
                     counters,
@@ -405,7 +407,7 @@ impl<F: SupplyFs> SupplyReader<F> {
             let voltage = if needs_iv {
                 read_optional(
                     fs,
-                    &supply.handles[4],
+                    supply.handles[4].as_ref(),
                     &mut buffer,
                     #[cfg(test)]
                     counters,
@@ -441,7 +443,7 @@ impl<F: SupplyFs> SupplyReader<F> {
                     }
                     if read_optional(
                         fs,
-                        &supply.handles[7],
+                        supply.handles[7].as_ref(),
                         &mut buffer,
                         #[cfg(test)]
                         counters,
@@ -557,7 +559,7 @@ impl<F: SupplyFs> Collector for PowerSupplyCollector<F> {
 
 fn read_slot<'a, F: SupplyFs>(
     fs: &mut F,
-    handle: &Option<F::Handle>,
+    handle: Option<&F::Handle>,
     buffer: &'a mut [u8],
     signal_critical_errors: bool,
     #[cfg(test)] counters: &mut Counters,
@@ -577,7 +579,7 @@ fn read_slot<'a, F: SupplyFs>(
 }
 fn read_optional<'a, F: SupplyFs>(
     fs: &mut F,
-    handle: &Option<F::Handle>,
+    handle: Option<&F::Handle>,
     buffer: &'a mut [u8],
     #[cfg(test)] counters: &mut Counters,
 ) -> Option<&'a [u8]> {

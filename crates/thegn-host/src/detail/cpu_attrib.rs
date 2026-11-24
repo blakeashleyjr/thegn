@@ -58,9 +58,8 @@ fn sort_for(title: &str) -> Option<SortKey> {
 
 /// Whether `slot` holds the `cpu` or `mem` popup (the loop's
 /// sample-while-open gate).
-pub(crate) fn is_open(slot: &Option<DetailOverlay>) -> bool {
-    slot.as_ref()
-        .is_some_and(|ov| sort_for(&ov.title).is_some())
+pub(crate) fn is_open(slot: Option<&DetailOverlay>) -> bool {
+    slot.is_some_and(|ov| sort_for(&ov.title).is_some())
 }
 
 fn usage(cpu: Option<f32>, rss: Option<u64>) -> Usage {
@@ -804,7 +803,7 @@ mod tests {
             rows: 1,
         };
         let mut slot = None;
-        assert!(!is_open(&slot));
+        assert!(!is_open(slot.as_ref()));
         for (widget, title) in [("cpu", TITLE), ("mem", MEM_TITLE)] {
             let ov = open_detail_for(&BarItemId::Widget(widget.into()), item, &model(), &ctx)
                 .expect("popup");
@@ -820,7 +819,7 @@ mod tests {
                     .any(|l| l.starts_with("alpha|"))
             );
             slot = Some(ov);
-            assert!(is_open(&slot));
+            assert!(is_open(slot.as_ref()));
         }
 
         // A refresh replaces only the tree: the graph stays, the new pane shows.
@@ -843,7 +842,7 @@ mod tests {
 
         // Any other popup is left alone and closes the gate.
         let mut other = Some(keyval("Other", Vec::new(), 40, Placement::Center));
-        assert!(!is_open(&other));
+        assert!(!is_open(other.as_ref()));
         assert!(!refresh_open(&mut other, &fresh, &ctx));
         let mut none = None;
         assert!(!refresh_open(&mut none, &fresh, &ctx));
@@ -907,7 +906,7 @@ mod tests {
             rows: 1,
         };
         let mut slot = open_detail_for(&BarItemId::Widget("cpu".into()), item, &model(), &ctx);
-        let trend_of = |slot: &Option<crate::detail::DetailOverlay>, label: &str| {
+        let trend_of = |slot: Option<&crate::detail::DetailOverlay>, label: &str| {
             let Some(ov) = slot else { unreachable!() };
             let DetailContent::Sections(d) = &ov.content else {
                 panic!("sectioned")
@@ -918,20 +917,24 @@ mod tests {
                 .map(|l| l.rsplit('|').next().unwrap_or("").to_string())
                 .expect("row")
         };
-        assert_eq!(trend_of(&slot, "alpha|"), "", "one sample: no trend");
+        assert_eq!(
+            trend_of(slot.as_ref(), "alpha|"),
+            "",
+            "one sample: no trend"
+        );
         assert!(refresh_open(&mut slot, &model(), &ctx));
-        assert!(!trend_of(&slot, "alpha|").is_empty());
-        assert!(!trend_of(&slot, "alpha|").is_ascii());
+        assert!(!trend_of(slot.as_ref(), "alpha|").is_empty());
+        assert!(!trend_of(slot.as_ref(), "alpha|").is_ascii());
         crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
             assert!(refresh_open(&mut slot, &model(), &ctx));
-            let t = trend_of(&slot, "alpha|");
+            let t = trend_of(slot.as_ref(), "alpha|");
             assert!(!t.is_empty() && t.is_ascii(), "{t:?}");
         });
         // A row that appears only now has a single sample.
         let mut fresh = model();
         fresh.pane_owners = Vec::<PaneOwner>::new().into();
         assert!(refresh_open(&mut slot, &fresh, &ctx));
-        assert_eq!(trend_of(&slot, "unattributed panes|"), "");
+        assert_eq!(trend_of(slot.as_ref(), "unattributed panes|"), "");
         assert_eq!(row_ids(&[]).len(), 0);
         reset_history();
     }

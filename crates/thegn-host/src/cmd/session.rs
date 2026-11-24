@@ -549,7 +549,7 @@ pub(crate) async fn connect(cfg: &Config) -> Result<ControlClient> {
 /// bearer-token TCP control address that takes precedence over discovery.
 /// Either one alone is ignored (a lone `THEGN_CONTROL_TOKEN` is the sprite
 /// `route_to_host` pair's half, which `merge add` reads with its URL).
-fn env_control_addr(get: &dyn Fn(&str) -> Option<String>) -> Option<ControlAddr> {
+pub(crate) fn env_control_addr(get: &dyn Fn(&str) -> Option<String>) -> Option<ControlAddr> {
     let nonempty = |k: &str| get(k).filter(|v| !v.trim().is_empty());
     let addr = nonempty("THEGN_CONTROL_ADDR")?;
     let token = nonempty("THEGN_CONTROL_TOKEN")?;

@@ -356,7 +356,7 @@ pub fn mount_failure(p: &MountProbe<'_>, have: &dyn Fn(&str) -> bool) -> MountFa
              root, not your Mac's. Use `[sandbox] file_access = \"worktree\"`."
                 .to_string()
         }
-        (HostOs::MacOs, Backend::Podman | Backend::PodmanRootful) if !already_shared => format!(
+        (HostOs::MacOs, Backend::Podman) if !already_shared => format!(
             "podman runs Linux containers in a VM that only shares {}. `podman machine set` \
              has no --volume, so widening it means recreating the machine: `podman machine rm` \
              then `podman machine init -v {root}:{root}`. Or move the worktree under /Users.",
@@ -364,7 +364,7 @@ pub fn mount_failure(p: &MountProbe<'_>, have: &dyn Fn(&str) -> bool) -> MountFa
         ),
         // Already inside the share set ⇒ a different cause. Do NOT tell someone
         // to re-add a directory the VM already shares.
-        (HostOs::MacOs, Backend::Podman | Backend::PodmanRootful) => format!(
+        (HostOs::MacOs, Backend::Podman) => format!(
             "{root} is already shared by podman's VM, so the share is not the problem — check \
              the VM itself with `podman machine ssh ls {}`.",
             p.worktree

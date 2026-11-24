@@ -6,8 +6,12 @@
 
 thegn SHALL decide whether a `tools.run` call or a launch may start by evaluating
 an ordered operation policy, in `thegn-core`, before any process is created. The
-policy yields allow, deny or ask. A rule MATCHES when every selector it carries
-matches; the selectors are bounded to the tool name, the argv shape,
+two decision points SHALL be the `tools.run` row of `capability::CATALOG`,
+reached by automations, MCP and the control API, and the launch-admission handle
+(`sandbox_admission::admit_launch`, planned by WS02-P5-08), reached by every
+launch route. The rule table SHALL be `[[sandbox.policy]]` in user config only.
+The policy yields allow, deny or ask. A rule MATCHES when every selector it
+carries matches; the selectors are bounded to the tool name, the argv shape,
 worktree-relative paths, the resolved profile, the placement and the launch
 class. The first matching rule wins, and when no rule matches the configured
 default applies. The decision function MUST be pure and MUST name the rule that
@@ -41,8 +45,10 @@ policy MAY only narrow what starts; it MUST NOT widen a sandbox ceiling.
 The operation policy SHALL evaluate its hard denies before any rule. The hard
 denies are writes to git configuration, SSH and GPG material, and the canonical
 secret paths, and they MUST be the same list the sandbox enforces rather than a
-copy. A user allow rule, a profile, a repository overlay and a persisted
-always-choice MUST NOT lift a hard deny.
+copy (`SEALED_HOME_DENY`, `SEALED_ABS_DENY` and the read-only git-config entries
+of `SEALED_HOME_ALLOW` in `sandbox_mounts.rs`, plus the repository's shared git
+config and `[sandbox.git]` `ro_after` paths the sandbox pins read-only). A user allow rule, a profile, a
+repository overlay and a persisted always-choice MUST NOT lift a hard deny.
 
 #### Scenario: A repository overlay cannot lift a hard deny
 

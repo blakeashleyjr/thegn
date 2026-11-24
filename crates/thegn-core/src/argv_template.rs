@@ -11,13 +11,26 @@
 //! The grammar of one argv element:
 //! - `{a.b.c}` is a token path; each segment matches `[a-z][a-z0-9_]*`;
 //! - `{{` is a literal `{` and `}}` a literal `}`;
-//! - everything else is literal text.
+//! - everything else is literal UTF-8 text, including spaces, quotes,
+//!   backslashes, dollar signs and NUL bytes.
+//!
+//! This is not a shell lexer: quote and escape characters are copied as argv
+//! content and have no grouping or evaluation semantics. The caller supplies the
+//! argv element boundaries. Process-launch APIs may reject a value such as NUL
+//! later; parsing and rendering never execute or normalise it.
 //!
 //! **One element in, exactly one string out.** A token's value is inserted
 //! verbatim: it is never split on whitespace and never re-parsed, so a value
 //! containing spaces or braces cannot become extra argv elements or new tokens.
+//! Parsing and rendering are each capped at [`MAX_TEMPLATE_ELEMENT_BYTES`] per
+//! element, so configured input and token expansion have an explicit bound.
 
 use std::fmt;
+
+/// Largest accepted template or rendered argv element, in UTF-8 bytes. This
+/// matches Linux's per-argument limit (`MAX_ARG_STRLEN`, 32 pages), so agent
+/// prompts passed as one element (up to ~100 KiB today) still fit.
+pub const MAX_TEMPLATE_ELEMENT_BYTES: usize = 128 * 1024;
 
 /// One parsed piece of an argv element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +90,11 @@ pub enum TemplateError {
         /// The offending segment.
         seg: String,
     },
+    /// The template input or the rendered element exceeds the per-element cap.
+    TooLarge {
+        /// The maximum accepted byte length.
+        limit: usize,
+    },
     /// A token the token set does not allow, or the source cannot supply.
     UnknownToken {
         /// The dotted token path.
@@ -91,6 +109,9 @@ impl fmt::Display for TemplateError {
             TemplateError::EmptyToken { at } => write!(f, "empty token at byte {at}"),
             TemplateError::BadSegment { at, seg } => {
                 write!(f, "bad token segment {seg:?} at byte {at}")
+            }
+            TemplateError::TooLarge { limit } => {
+                write!(f, "argv template element exceeds {limit} bytes")
             }
             TemplateError::UnknownToken { path } => write!(f, "unknown token {{{path}}}"),
         }
@@ -119,6 +140,11 @@ fn valid_segment(seg: &str) -> bool {
 
 /// Parse one argv element. `{{` → `{`, `}}` → `}`; `{a.b}` is a token.
 pub fn parse_element(s: &str) -> Result<Element, TemplateError> {
+    if s.len() > MAX_TEMPLATE_ELEMENT_BYTES {
+        return Err(TemplateError::TooLarge {
+            limit: MAX_TEMPLATE_ELEMENT_BYTES,
+        });
+    }
     let bytes = s.as_bytes();
     let mut pieces = Vec::new();
     let mut lit = String::new();
@@ -197,14 +223,15 @@ pub fn validate(e: &Element, set: &dyn TokenSet) -> Result<(), TemplateError> {
 
 /// Render `e` to exactly one string: literals and scalar values concatenated
 /// verbatim (never split, never re-parsed). A token without a value is
-/// [`TemplateError::UnknownToken`].
+/// [`TemplateError::UnknownToken`]; a result above [`MAX_TEMPLATE_ELEMENT_BYTES`]
+/// is [`TemplateError::TooLarge`].
 pub fn render_element(e: &Element, src: &dyn TokenSource) -> Result<String, TemplateError> {
     let mut out = String::new();
     for piece in &e.0 {
         match piece {
-            Piece::Lit(text) => out.push_str(text),
+            Piece::Lit(text) => push_bounded(&mut out, text)?,
             Piece::Tok(path) => match src.scalar(path) {
-                Some(value) => out.push_str(&value),
+                Some(value) => push_bounded(&mut out, &value)?,
                 None => {
                     return Err(TemplateError::UnknownToken {
                         path: path.to_string(),
@@ -214,6 +241,17 @@ pub fn render_element(e: &Element, src: &dyn TokenSource) -> Result<String, Temp
         }
     }
     Ok(out)
+}
+
+/// Append `text` to `out`, refusing to cross the per-element cap.
+fn push_bounded(out: &mut String, text: &str) -> Result<(), TemplateError> {
+    if text.len() > MAX_TEMPLATE_ELEMENT_BYTES - out.len() {
+        return Err(TemplateError::TooLarge {
+            limit: MAX_TEMPLATE_ELEMENT_BYTES,
+        });
+    }
+    out.push_str(text);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -359,6 +397,48 @@ mod tests {
             render("--workdir={worktree.path}", &map).unwrap(),
             "--workdir=/home/u/my repo"
         );
+    }
+
+    #[test]
+    fn shell_syntax_characters_remain_literal_argv_content() {
+        let template = r#"'two words' "quoted" C:\tmp $HOME `echo unsafe`"#;
+        let element = parse_element(template).unwrap();
+        assert_eq!(element.pieces(), &[Piece::Lit(template.into())]);
+        assert_eq!(render_element(&element, &Map::new(&[])).unwrap(), template);
+    }
+
+    #[test]
+    fn template_and_rendered_element_are_bounded() {
+        let too_long = "x".repeat(MAX_TEMPLATE_ELEMENT_BYTES + 1);
+        assert_eq!(
+            parse_element(&too_long),
+            Err(TemplateError::TooLarge {
+                limit: MAX_TEMPLATE_ELEMENT_BYTES,
+            })
+        );
+        assert_eq!(
+            TemplateError::TooLarge {
+                limit: MAX_TEMPLATE_ELEMENT_BYTES,
+            }
+            .to_string(),
+            "argv template element exceeds 131072 bytes"
+        );
+
+        // Parsing is bounded by the template length; rendering is bounded by the
+        // expansion, so a short template over a large value still fails.
+        let at_cap = "y".repeat(MAX_TEMPLATE_ELEMENT_BYTES);
+        assert_eq!(parse_element(&at_cap).unwrap().pieces().len(), 1);
+        let element = parse_element("{value}").unwrap();
+        let wide = Map::new(&[("value", too_long.as_str())]);
+        assert_eq!(
+            render_element(&element, &wide),
+            Err(TemplateError::TooLarge {
+                limit: MAX_TEMPLATE_ELEMENT_BYTES,
+            })
+        );
+        let exact = Map::new(&[("value", at_cap.as_str())]);
+        let rendered = render_element(&element, &exact).unwrap();
+        assert_eq!(rendered.len(), MAX_TEMPLATE_ELEMENT_BYTES);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use thegn_core::attention::{AttentionTier, PaneAgentState, pane_agent_state};
 use thegn_core::config::Config;
 use thegn_core::control_wire::EventFrame;
 use thegn_core::graveyard::Graveyard;
-use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
+use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history_at};
 use thegn_core::osc_attention::{AttentionSignal, OscAttentionScanner};
 use thegn_core::session_activity::{Observation, SessionActivity};
 use thegn_core::term_snapshot::{ScreenSnapshot, SnapCell, SnapColor, encode_ansi};
@@ -636,11 +636,12 @@ impl SessionActor {
 
         self.emulator.advance(bytes);
         let pushed_before = self.history.total_pushed();
-        feed_bytes_to_history(
+        feed_bytes_to_history_at(
             bytes,
             &mut self.history,
             &mut self.history_partial,
             &mut self.history_stripper,
+            crate::e2e_freeze::clock(),
         );
         self.seq += 1;
 
@@ -1558,6 +1559,7 @@ pub(crate) fn snapshot_of(
 mod tests {
     use super::*;
     use thegn_core::control_wire::EventFrame;
+    use thegn_core::history::feed_bytes_to_history;
 
     fn meta_running(id: &str, program: &str) -> SessionMeta {
         SessionMeta {
@@ -1994,7 +1996,12 @@ mod tests {
     /// reattach snapshot, and the first live delta is exactly snapshot.seq+1.
     #[tokio::test(flavor = "multi_thread")]
     async fn pane_survives_detach_and_warm_reattaches() {
-        let h = spawn_actor("echo marker1; sleep 0.3; echo marker2; cat", None);
+        // The child holds its second line until the test feeds stdin, so the
+        // detached-period output is released by the test rather than raced
+        // against a fixed `sleep 0.3`. On a loaded box the spawn → first attach
+        // window can outlast that sleep, letting marker2 land before `seq0` and
+        // making `seq1 > seq0` fail even though the pane behaved correctly.
+        let h = spawn_actor("echo marker1; read go; echo marker2; cat", None);
         let first = attach(&h, "c1", AttachKind::Interactive, 24, 80).await;
         let (seq0, _) = snapshot_parts(&first.snapshot);
         h.msg_tx
@@ -2003,9 +2010,15 @@ mod tests {
             })
             .await
             .unwrap();
-        // The child keeps writing while detached (marker2 after 300ms). Poll
-        // through observer snapshots so this remains a load proof without a
-        // fixed wait that needlessly extends the test.
+        // Nobody is attached now: everything the child writes from here on
+        // advances the sequence with no subscriber to receive it.
+        h.msg_tx
+            .send(SessionMsg::Stdin(b"go\n".to_vec()))
+            .await
+            .unwrap();
+        // Bounded poll on the observable condition (marker2 in a detached
+        // observer snapshot). The attach is bounded by the same deadline, so a
+        // wedged actor fails the test instead of hanging it.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut probe_number = 0;
         loop {
@@ -2014,7 +2027,12 @@ mod tests {
                 "marker2 did not reach a detached observer snapshot"
             );
             let probe_id = format!("probe-{probe_number}");
-            let probe = attach(&h, &probe_id, AttachKind::Observer, 24, 80).await;
+            let probe = tokio::time::timeout_at(
+                deadline,
+                attach(&h, &probe_id, AttachKind::Observer, 24, 80),
+            )
+            .await
+            .expect("observer attach completes before the detach-output deadline");
             let (_, screen) = snapshot_parts(&probe.snapshot);
             h.msg_tx
                 .send(SessionMsg::Detach {

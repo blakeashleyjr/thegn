@@ -188,13 +188,31 @@ impl Ctx<'_> {
         self.cols.saturating_sub(AXIS_W + 1).max(8) * 2
     }
 
+    /// Bucket budget for the tab's configured plot style.
+    ///
+    /// [`Self::buckets`] counts braille dot columns (two per cell); the `Spark`
+    /// style draws one value per CELL, so asking it for a doubled budget would
+    /// describe twice the width it can show and the plot would cover only part
+    /// of the selected interval. Ask for exactly the cells the renderer has.
+    fn plot_buckets(&self) -> usize {
+        if self.prefs.style == GraphStyle::Spark {
+            self.cols.max(1)
+        } else {
+            self.buckets()
+        }
+    }
+
     /// Fetch one metric under the tab's current window and scale.
     pub(super) fn series(&self, m: Metric) -> SeriesOut {
+        self.series_for(m, self.plot_buckets())
+    }
+
+    fn series_for(&self, m: Metric, buckets: usize) -> SeriesOut {
         self.hist.series(&SeriesReq {
             metric: m,
             window: self.prefs.window,
             scale: TelemetryHistory::scale_for(m, self.prefs.scale),
-            buckets: self.buckets(),
+            buckets,
             // A band is only meaningful when a column spans several samples;
             // Area draws it, the other styles have no second edge to show.
             agg: if self.prefs.style == GraphStyle::Area {
@@ -228,7 +246,11 @@ impl Ctx<'_> {
             } else {
                 "—".into()
             },
-            footer: Some(summary(out, unit)),
+            footer: Some(if self.prefs.style == GraphStyle::Spark {
+                self.spark_summary(m, unit)
+            } else {
+                summary(out, unit)
+            }),
             series: out.hi.clone(),
             lo: (self.prefs.style == GraphStyle::Area).then(|| out.lo.clone()),
             axis: axis_for(out, unit, self.prefs.style, height),
@@ -239,9 +261,30 @@ impl Ctx<'_> {
         })
     }
 
+    /// The footer for a `Spark` plot, read straight off the retained samples.
+    ///
+    /// The plot draws one bucket per cell, so its bucket peaks are already the
+    /// extremes of each cell and `min` over them would describe the quietest
+    /// *cell*, not the quietest reading. Bounds come from the same interval the
+    /// plot uses ([`TelemetryHistory::plot_interval`]), so the numbers can never
+    /// disagree with the drawn range.
+    fn spark_summary(&self, m: Metric, unit: Unit) -> String {
+        let (start_ms, end_ms) = self.hist.plot_interval(self.now_ms, self.prefs.window);
+        let values: Vec<f32> = self
+            .hist
+            .raw_in_range(m, start_ms, end_ms)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        summary_values(&values, unit)
+    }
+
     /// A one-row inline trend.
+    ///
+    /// The row is one cell per eighth-block over a fixed 16-cell budget, so it
+    /// keeps the dot-column count regardless of the plot style above it.
     pub(super) fn sparkrow(&self, m: Metric, label: &str, tone: Tok) -> Section {
-        let out = self.series(m);
+        let out = self.series_for(m, self.buckets());
         Section::Sparkrow {
             label: label.into(),
             spark: viz::fit(&out.hi, 16),
@@ -279,6 +322,11 @@ pub(super) fn summary(out: &SeriesOut, unit: Unit) -> String {
         .copied()
         .filter(|v| v.is_finite())
         .collect();
+    summary_values(&vals, unit)
+}
+
+/// The `min`/`avg`/`max` line for an already-filtered sample list.
+fn summary_values(vals: &[f32], unit: Unit) -> String {
     if vals.is_empty() {
         return "no samples in window".into();
     }

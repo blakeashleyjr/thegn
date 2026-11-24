@@ -17,7 +17,7 @@ use thegn_core::vercel::admit::valid_sandbox_name;
 use thegn_core::vercel::api::{self, LogLine};
 
 use super::VercelProvider;
-use super::client::WAIT_COMMAND_DEADLINE;
+use super::client::{LogStream, WAIT_COMMAND_DEADLINE};
 use super::pty::{CHANNEL_CAPACITY, send_chunked};
 use crate::provider::{EXEC_EXIT_STATUS_UNKNOWN, ExecControl, ExecFrame, ExecSession, ExecSpec};
 
@@ -108,10 +108,11 @@ impl VercelProvider {
 }
 
 /// Spawn [`drive_stream`] and hand back the channel handle.
-pub(super) fn spawn_stream<O: StreamOps, L>(ops: O, logs: L, session_id: String) -> ExecSession
-where
-    L: std::ops::DerefMut<Target = tokio::sync::mpsc::Receiver<LogLine>> + Send + 'static,
-{
+pub(super) fn spawn_stream<O: StreamOps>(
+    ops: O,
+    logs: LogStream,
+    session_id: String,
+) -> ExecSession {
     let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<ExecFrame>(CHANNEL_CAPACITY);
     let (control_tx, control_rx) = tokio::sync::mpsc::channel::<ExecControl>(256);
     let session_rx = tokio::sync::watch::channel(Some(session_id)).1;
@@ -159,21 +160,19 @@ async fn send_exit(frames_tx: &tokio::sync::mpsc::Sender<ExecFrame>, code: i32) 
 /// resize ignored, close → SIGTERM then SIGKILL. A log stream that ends
 /// cleanly asks [`StreamOps::wait_exit`] for the code; an errored log stream
 /// closes the frames without an exit (the bridge decides).
-pub(super) async fn drive_stream<O: StreamOps, L>(
+pub(super) async fn drive_stream<O: StreamOps>(
     ops: O,
-    mut logs: L,
+    mut logs: LogStream,
     frames_tx: tokio::sync::mpsc::Sender<ExecFrame>,
     mut control_rx: tokio::sync::mpsc::Receiver<ExecControl>,
-) where
-    L: std::ops::DerefMut<Target = tokio::sync::mpsc::Receiver<LogLine>> + Send + 'static,
-{
+) {
     loop {
         tokio::select! {
-            line = logs.recv() => match line.map(log_step) {
+            line = logs.receiver_mut().recv() => match line.map(log_step) {
                 Some(LogStep::Output(bytes)) => {
                     if !send_chunked(&frames_tx, bytes).await {
                         // The consumer is gone: stop the command.
-                        terminate(&ops, &mut logs, &frames_tx).await;
+                        terminate(&ops, logs.receiver_mut(), &frames_tx).await;
                         return;
                     }
                 }
@@ -204,7 +203,7 @@ pub(super) async fn drive_stream<O: StreamOps, L>(
                 }
                 Some(ExecControl::Resize { .. }) => {}
                 Some(ExecControl::Close) | None => {
-                    terminate(&ops, &mut logs, &frames_tx).await;
+                    terminate(&ops, logs.receiver_mut(), &frames_tx).await;
                     return;
                 }
             },
@@ -305,7 +304,11 @@ mod tests {
             ..Fake::default()
         };
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(8);
-        let mut sess = spawn_stream(fake.clone(), Box::new(log_rx), "sess_9".into());
+        let mut sess = spawn_stream(
+            fake.clone(),
+            LogStream::from_receiver(log_rx),
+            "sess_9".into(),
+        );
         assert_eq!(sess.session_id.borrow().as_deref(), Some("sess_9"));
         for line in [
             LogLine::Stdout(b"a".to_vec()),
@@ -327,7 +330,7 @@ mod tests {
     async fn a_command_line_with_an_exit_code_ends_the_session() {
         let fake = Fake::default();
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(8);
-        let mut sess = spawn_stream(fake.clone(), Box::new(log_rx), "s".into());
+        let mut sess = spawn_stream(fake.clone(), LogStream::from_receiver(log_rx), "s".into());
         log_tx
             .send(LogLine::Command {
                 id: "cmd_1".into(),
@@ -343,7 +346,7 @@ mod tests {
     async fn unknown_exit_after_a_clean_log_end_is_the_sentinel() {
         let fake = Fake::default();
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(8);
-        let mut sess = spawn_stream(fake, Box::new(log_rx), "s".into());
+        let mut sess = spawn_stream(fake, LogStream::from_receiver(log_rx), "s".into());
         drop(log_tx);
         assert_eq!(
             drain(&mut sess).await,
@@ -355,7 +358,7 @@ mod tests {
     async fn a_log_error_closes_the_frames_without_an_exit() {
         let fake = Fake::default();
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(8);
-        let mut sess = spawn_stream(fake, Box::new(log_rx), "s".into());
+        let mut sess = spawn_stream(fake, LogStream::from_receiver(log_rx), "s".into());
         log_tx
             .send(LogLine::Error {
                 code: "x".into(),
@@ -373,7 +376,7 @@ mod tests {
             ..Fake::default()
         };
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(8);
-        let mut sess = spawn_stream(fake.clone(), Box::new(log_rx), "s".into());
+        let mut sess = spawn_stream(fake.clone(), LogStream::from_receiver(log_rx), "s".into());
         sess.control
             .send(ExecControl::Stdin(b"hi\n".to_vec()))
             .await
@@ -410,7 +413,7 @@ mod tests {
     async fn close_sends_sigterm_then_sigkill_after_the_grace() {
         let fake = Fake::default();
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(8);
-        let mut sess = spawn_stream(fake.clone(), Box::new(log_rx), "s".into());
+        let mut sess = spawn_stream(fake.clone(), LogStream::from_receiver(log_rx), "s".into());
         sess.control.send(ExecControl::Close).await.expect("close");
         // The command never ends: the paused clock auto-advances past the grace.
         assert_eq!(drain(&mut sess).await, (Vec::new(), None));
@@ -422,7 +425,7 @@ mod tests {
     async fn close_skips_sigkill_when_the_command_exits_in_the_grace() {
         let fake = Fake::default();
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(8);
-        let mut sess = spawn_stream(fake.clone(), Box::new(log_rx), "s".into());
+        let mut sess = spawn_stream(fake.clone(), LogStream::from_receiver(log_rx), "s".into());
         sess.control.send(ExecControl::Close).await.expect("close");
         for _ in 0..10_000 {
             if fake.calls() == vec![Call::Kill(15)] {
@@ -454,7 +457,7 @@ mod tests {
     async fn dropping_the_control_sender_also_terminates() {
         let fake = Fake::default();
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(8);
-        let sess = spawn_stream(fake.clone(), Box::new(log_rx), "s".into());
+        let sess = spawn_stream(fake.clone(), LogStream::from_receiver(log_rx), "s".into());
         let ExecSession {
             mut frames,
             control,

@@ -17,16 +17,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::capacity::HostSpec;
 
-/// True when this process can open `/dev/kvm` for read and write (existence is
-/// not access).
-pub fn kvm_accessible() -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
-}
-
 /// One headroom sample, parsed from the script's KEY=VALUE output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Headroom {

@@ -47,12 +47,12 @@ fn probe_absent(error: &GitTextError) -> bool {
     )
 }
 
-fn authority_check(loc: &GitLoc, approved: &Option<String>) -> Result<(), String> {
+fn authority_check(loc: &GitLoc, approved: Option<&String>) -> Result<(), String> {
     let changed = || {
         "submodules not initialized: .gitmodules changed at the execution authority after approval; retry"
             .to_string()
     };
-    if authority_blob(loc)?.as_ref() != approved.as_ref() {
+    if authority_blob(loc)?.as_ref() != approved {
         return Err(changed());
     }
     let current = loc
@@ -60,7 +60,7 @@ fn authority_check(loc: &GitLoc, approved: &Option<String>) -> Result<(), String
         .map_err(|error| {
             format!("submodule metadata unavailable at the execution authority: {error}")
         })?;
-    if Some(current.as_str()) != approved.as_deref() {
+    if Some(current.as_str()) != approved.map(String::as_str) {
         return Err(changed());
     }
     Ok(())
@@ -203,7 +203,7 @@ pub(crate) fn initialize(
         ));
     }
     if let Some(location) = loc.filter(|location| location.is_remote()) {
-        authority_check(location, &metadata.blob)?;
+        authority_check(location, metadata.blob.as_ref())?;
     }
     let location = match loc {
         Some(location) => location.clone(),
@@ -359,7 +359,7 @@ mod tests {
         std::fs::write(provider_dir.path().join(".gitmodules"), MODULES_B)
             .expect("write uncommitted metadata");
 
-        let result = authority_check(&location, &metadata.blob);
+        let result = authority_check(&location, metadata.blob.as_ref());
         assert!(
             matches!(result, Err(message) if message.contains("changed at the execution authority"))
         );
@@ -429,7 +429,7 @@ mod tests {
         let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
         let location = failing_provider(wrapper_dir.path(), repo.path(), "hash-object", 255);
 
-        let result = authority_check(&location, &Some(approved));
+        let result = authority_check(&location, Some(&approved));
         assert!(matches!(result, Err(message) if message.contains("Connection refused")));
     }
 

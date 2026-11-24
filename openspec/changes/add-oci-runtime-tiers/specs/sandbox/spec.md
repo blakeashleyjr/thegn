@@ -5,24 +5,29 @@
 ### Requirement: Selectable OCI runtime raises the isolation tier honestly
 
 The sandbox SHALL accept a `[sandbox] oci_runtime` value that runs a worktree's
-OCI container under a named OCI runtime. When set for an OCI backend, thegn MUST
-pass `--runtime <value>` at container create, and MUST report the honest
-isolation class the runtime provides: `runsc` (gVisor) as `userspace-kernel` and
+OCI container under a named OCI runtime. When set for an OCI engine that accepts
+`--runtime` (Podman, PodmanRootful or Docker), thegn MUST pass
+`--runtime <value>` at container create and MUST report the honest isolation
+class the runtime provides: `runsc` (gVisor) as `userspace-kernel` and
 `krun` (libkrun) as `guest-kernel`; an empty value or `runc`/`crun` stays
-`shared-kernel` (today's behavior). Non-OCI backends (bwrap/systemd/none) MUST
+`shared-kernel` (today's behavior). An engine that does not accept `--runtime`
+MUST ignore the value and warn, never emit the flag, and never let the value
+raise its reported class. Non-OCI backends (bwrap/systemd/none) MUST also
 ignore the value. The worktree bind MUST remain path-preserving, and egress
 reporting MUST be unchanged by the runtime (`unmanaged` for allow/block lists,
 `offline` for `network = "none"`), exactly as for the default runtime.
 
 #### Scenario: gVisor is reported as a userspace kernel
 
-- **WHEN** `[sandbox] oci_runtime = "runsc"` and the backend is an OCI runtime
+- **WHEN** `[sandbox] oci_runtime = "runsc"` and the backend is an engine that
+  accepts `--runtime` (podman, podman-rootful or docker)
 - **THEN** the container is created with `--runtime runsc` and its resolved
   isolation class is `userspace-kernel`
 
 #### Scenario: libkrun is reported as a guest kernel
 
-- **WHEN** `[sandbox] oci_runtime = "krun"` and the backend is an OCI runtime
+- **WHEN** `[sandbox] oci_runtime = "krun"` and the backend is an engine that
+  accepts `--runtime` (podman, podman-rootful or docker)
 - **THEN** the container is created with `--runtime krun` and its resolved
   isolation class is `guest-kernel`
 
@@ -31,6 +36,14 @@ reporting MUST be unchanged by the runtime (`unmanaged` for allow/block lists,
 - **WHEN** `[sandbox] oci_runtime = "krun"` but the resolved backend is bwrap
 - **THEN** no `--runtime` flag is emitted and the isolation class is unchanged
   (shared kernel)
+
+#### Scenario: runtime ignored on engines without `--runtime`
+
+- **WHEN** `[sandbox] oci_runtime` is set and the resolved engine is Apple
+  `container`, Smol or reserved WSL
+- **THEN** no `--runtime` flag is emitted, the value does not raise the
+  reported isolation class, and one warning says
+  `oci_runtime ignored: <label> has no --runtime`
 
 #### Scenario: The worktree bind and egress reporting are preserved
 

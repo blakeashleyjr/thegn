@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 license.workspace = true
+description = "Datasource clients and response parsers for host metrics, Prometheus, and Loki."
 
 
 [lints]

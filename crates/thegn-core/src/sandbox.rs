@@ -374,6 +374,20 @@ impl Backend {
         matches!(self.profile().family, BackendFamily::Oci)
     }
 
+    /// True when this engine's CLI has a `--runtime` flag on container create.
+    ///
+    /// Apple's `container` rejects unknown flags (`create` exits 64), and the
+    /// reserved `smol`/`wsl` kinds have no such flag either, so a configured
+    /// `oci_runtime` must not be emitted for them — nor may it raise their
+    /// reported isolation class.
+    // WS02-P2-01: fold into OciDialect.
+    pub fn accepts_runtime_flag(self) -> bool {
+        matches!(
+            self,
+            Backend::Podman | Backend::PodmanRootful | Backend::Docker
+        )
+    }
+
     pub fn is_host_toolchain(self) -> bool {
         matches!(
             self.profile().family,
@@ -3646,7 +3660,7 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
     });
     let remote_stdin_secret_env = remote_stdin_oci_secret_env(spec);
     let (argv, stdin) =
-        oci_create_argv_and_stdin(spec, oci_create_opts(spec)?, &remote_stdin_secret_env);
+        oci_create_argv_and_stdin(spec, oci_create_opts(spec)?, &remote_stdin_secret_env)?;
     // Keep the create's stderr: it is the only place the runtime says WHY, and
     // for the commonest macOS failure (a bind the VM cannot resolve) it names the
     // exact path. `run_control_owned` would drop it.
@@ -3696,7 +3710,7 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
             spec,
             oci_create_opts_with_keep_id(spec, false)?,
             &remote_stdin_secret_env,
-        );
+        )?;
         let retry_envfile = oci_env_file_arg(&retry);
         match stdin {
             Some(input) => drop(stderr_with_timeout_stdin(&retry, RUN_TIMEOUT, input)),
@@ -3711,7 +3725,18 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
         }
     }
 
-    let err = format!("could not start {rt} container '{}'", spec.name);
+    // Name the requested runtime and the placement when its create fails. On an
+    // unprobed placement (remote, or a macOS engine in a VM) this is the only
+    // honest feedback: thegn could not check that engine's PATH or /dev/kvm, so
+    // a silent substitution would be the alternative.
+    let err = match spec.oci_runtime.as_deref() {
+        Some(runtime) => crate::sandbox_runtime::create_failure_message(
+            runtime,
+            &spec.placement.label(),
+            create_err.trim(),
+        ),
+        None => format!("could not start {rt} container '{}'", spec.name),
+    };
     emit(SandboxPhase::PhaseFailed { err: err.clone() });
     anyhow::bail!(err)
 }
@@ -4671,15 +4696,30 @@ fn backend_enter_argv_guarded_with_env(
                 // Keep host-sourced passthrough values (tokens, API keys) off
                 // the argv — `--setenv K V` is world-readable in /proc/*/cmdline.
                 // Local bwrap inherits the launcher's process env (the pane
-                // spawn path injects spec.env there), so pairs matching the
-                // host env can simply be omitted. Synthetic pairs
-                // (THEGN_SANDBOX, NIX_REMOTE) don't match and still ride
-                // --setenv; remote-wrapped bwrap keeps it for everything, as
-                // the argv is the only env carrier through ssh.
-                if spec.placement.is_local() && std::env::var(k).ok().as_deref() == Some(val) {
+                // spawn path injects spec.env there), so pairs matching the host
+                // env can simply be omitted. A remote-wrapped bwrap has no
+                // launch environment on the other side and this argv is its only
+                // carrier, so those values are omitted with a keys-only warning
+                // rather than exposed. Synthetic pairs (THEGN_SANDBOX,
+                // NIX_REMOTE) don't match and still ride --setenv.
+                if std::env::var(k).ok().as_deref() == Some(val.as_str()) {
+                    if !spec.placement.is_local() {
+                        omitted_secrets.push(k.clone());
+                    }
                     continue;
                 }
                 v.extend(["--setenv".into(), k.clone(), val.clone()]);
+            }
+            if !spec.placement.is_local() && !omitted_secrets.is_empty() {
+                omitted_secrets.sort();
+                omitted_secrets.dedup();
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    name = %spec.name,
+                    placement = %spec.placement.kind(),
+                    keys = %omitted_secrets.join(","),
+                    "remote bwrap placement cannot carry host-sourced secrets; omitting them from the pane"
+                );
             }
             // The session bus is host command authority. Unset it after every
             // explicit --setenv so a passthrough cannot restore the address;
@@ -4852,54 +4892,65 @@ fn backend_enter_argv_guarded_with_env(
             // Host-sourced secrets go to a 0600 `EnvironmentFile=` property so
             // they stay off systemd-run's argv, which persists for the pane's
             // whole lifetime in `/proc/*/cmdline`; synthetic/non-secret pairs
-            // stay inline as `--setenv K=V`. (Remote specs keep everything
-            // inline — see `partition_secret_env`.)
+            // stay inline as `--setenv K=V`. A remote systemd-run executes on the
+            // other side, where this host's env-file does not exist, so those
+            // values are omitted with a keys-only warning instead of being
+            // inlined into the remote command string.
             let (inline_env, secret_env) = partition_secret_env(spec);
-            let state_home = util::xdg_state_home();
-            if let Some(envfile) = write_secret_env_file_in(
-                &state_home,
-                std::path::Path::new("thegn/sandbox-env"),
-                &spec.name,
-                &secret_env,
-                true,
-            ) {
-                let dir = state_home.join("thegn/sandbox-env");
-                let guard = SecretEnvFile::adopt(dir, envfile);
-                v.extend([
-                    "-p".into(),
-                    format!("EnvironmentFile={}", guard.path().display()),
-                ]);
-                match util::which_path("rm")
-                    .and_then(|rm| systemd_env_cleanup_prop(&rm, guard.path()))
-                {
-                    Some(property) => v.extend(["-p".into(), property]),
-                    None => {
-                        return Err(refusal(
-                            spec,
-                            RefusalClass::SystemdMountPath,
-                            Some(guard.path().display().to_string()),
-                            "the systemd secret env file path cannot be expressed in an ExecStopPost cleanup (it contains $, % , ; or a control character, or rm was not found as a plain absolute path); refusing to launch rather than leave the secret file behind".into(),
-                        ));
+            if spec.placement.is_local() {
+                let state_home = util::xdg_state_home();
+                if let Some(envfile) = write_secret_env_file_in(
+                    &state_home,
+                    std::path::Path::new("thegn/sandbox-env"),
+                    &spec.name,
+                    &secret_env,
+                    true,
+                ) {
+                    let dir = state_home.join("thegn/sandbox-env");
+                    let guard = SecretEnvFile::adopt(dir, envfile);
+                    v.extend([
+                        "-p".into(),
+                        format!("EnvironmentFile={}", guard.path().display()),
+                    ]);
+                    match util::which_path("rm")
+                        .and_then(|rm| systemd_env_cleanup_prop(&rm, guard.path()))
+                    {
+                        Some(property) => v.extend(["-p".into(), property]),
+                        None => {
+                            return Err(refusal(
+                                spec,
+                                RefusalClass::SystemdMountPath,
+                                Some(guard.path().display().to_string()),
+                                "the systemd secret env file path cannot be expressed in an ExecStopPost cleanup (it contains $, % , ; or a control character, or rm was not found as a plain absolute path); refusing to launch rather than leave the secret file behind".into(),
+                            ));
+                        }
                     }
+                    env_file = Some(guard);
+                } else if !secret_env.is_empty() {
+                    // Never put host-sourced secrets back on argv if the protected
+                    // file cannot be created. A failed tool is safer than a
+                    // credential leak.
+                    omitted_secrets.extend(secret_env.iter().map(|(key, _)| key.to_string()));
+                    omitted_secrets.sort();
+                    omitted_secrets.dedup();
+                    tracing::error!(
+                        target: "thegn::sandbox",
+                        name = %spec.name,
+                        keys = %omitted_secrets.join(","),
+                        "unable to create protected systemd environment file; omitting host-sourced secrets"
+                    );
                 }
-                env_file = Some(guard);
             } else if !secret_env.is_empty() {
-                // Never put host-sourced secrets back on argv if the protected
-                // file cannot be created. A failed tool is safer than a
-                // credential leak.
                 omitted_secrets.extend(secret_env.iter().map(|(key, _)| key.to_string()));
                 omitted_secrets.sort();
                 omitted_secrets.dedup();
-                tracing::error!(
+                tracing::warn!(
                     target: "thegn::sandbox",
                     name = %spec.name,
+                    placement = %spec.placement.kind(),
                     keys = %omitted_secrets.join(","),
-                    "unable to create protected systemd environment file; omitting host-sourced secrets"
+                    "remote systemd placement cannot carry host-sourced secrets; omitting them from the pane"
                 );
-            } else {
-                for (k, val) in &secret_env {
-                    v.extend(["--setenv".into(), format!("{k}={val}")]);
-                }
             }
             for (k, val) in &inline_env {
                 v.extend(["--setenv".into(), format!("{k}={val}")]);
@@ -4926,6 +4977,8 @@ fn backend_enter_argv_guarded_with_env(
             vec!["/bin/sh".into(), "-lc".into(), body]
         }
     };
+    omitted_secrets.sort();
+    omitted_secrets.dedup();
     Ok(EnterArgv {
         argv,
         env_file,
@@ -4937,27 +4990,34 @@ fn backend_enter_argv_guarded_with_env(
 /// Borrowed `(key, value)` env pairs from a spec's `env` map.
 type EnvPairs<'a> = Vec<(&'a String, &'a String)>;
 
-/// Split `spec.env` into inline and secret pairs for local placement.
-/// A pair whose value matches the launcher's own process env is a
-/// host-sourced passthrough secret (GH_TOKEN, API keys — see `resolve`'s
-/// env_passthrough) and MUST NOT ride the world-readable argv (`-e K=V` /
-/// `--setenv K=V` are visible in `/proc/*/cmdline`); it goes to a 0600
-/// env-file instead. Synthetic pairs (THEGN_SANDBOX, NIX_REMOTE — values absent
-/// from the host env) are not secrets and stay inline. SSH OCI secrets are
-/// classified separately for stdin delivery; other remote placements retain
-/// inline delivery.
+/// Split `spec.env` into inline and secret pairs. A pair whose value matches
+/// the launcher's own process env is a host-sourced passthrough secret
+/// (GH_TOKEN, API keys — see `resolve`'s env_passthrough) and MUST NOT ride the
+/// world-readable argv (`-e K=V` / `--setenv K=V` are visible in
+/// `/proc/*/cmdline`). Local placements deliver it through a 0600 env-file;
+/// stdin-capable OCI placements deliver it on the control process stdin; a
+/// placement that can carry neither omits it rather than inlining it. Synthetic
+/// pairs (THEGN_SANDBOX, NIX_REMOTE — values absent from the host env) are not
+/// secrets and stay inline.
 fn partition_secret_env(spec: &SandboxSpec) -> (EnvPairs<'_>, EnvPairs<'_>) {
     let mut inline: EnvPairs = Vec::new();
     let mut secret: EnvPairs = Vec::new();
-    let local = spec.placement.is_local();
     for (k, val) in &spec.env {
-        if local && std::env::var(k).ok().as_deref() == Some(val) {
+        if std::env::var(k).ok().as_deref() == Some(val) {
             secret.push((k, val));
         } else {
             inline.push((k, val));
         }
     }
     (inline, secret)
+}
+
+/// A sorted, deduplicated, comma-joined key list for a keys-only diagnostic.
+fn secret_keys(secret: &[(&String, &String)]) -> String {
+    let mut keys: Vec<&str> = secret.iter().map(|(key, _)| key.as_str()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.join(",")
 }
 
 fn remote_stdin_oci_secret_env(spec: &SandboxSpec) -> EnvPairs<'_> {
@@ -4971,6 +5031,45 @@ fn remote_stdin_oci_secret_env(spec: &SandboxSpec) -> EnvPairs<'_> {
         .collect()
 }
 
+/// Bound the env-file a remote OCI runtime reads from stdin. The input is
+/// confidential, but it still needs a strict size and record boundary before it
+/// is written to a pipe or parsed by the remote runtime.
+const MAX_REMOTE_OCI_SECRET_ENV_BYTES: usize = 64 * 1024;
+const MAX_REMOTE_OCI_SECRET_ENV_VARS: usize = 128;
+
+fn remote_oci_secret_env_payload(
+    secret_env: &[(&String, &String)],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if secret_env.is_empty() {
+        return Ok(None);
+    }
+    if secret_env.len() > MAX_REMOTE_OCI_SECRET_ENV_VARS {
+        anyhow::bail!("remote OCI secret environment exceeds the variable limit");
+    }
+
+    let mut payload = Vec::new();
+    for (key, value) in secret_env {
+        let mut chars = key.bytes();
+        let valid_key = chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == b'_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == b'_');
+        if !valid_key || value.contains('\n') || value.contains('\r') {
+            anyhow::bail!("remote OCI secret environment contains an invalid record");
+        }
+
+        let record_len = key.len().saturating_add(value.len()).saturating_add(2);
+        if payload.len().saturating_add(record_len) > MAX_REMOTE_OCI_SECRET_ENV_BYTES {
+            anyhow::bail!("remote OCI secret environment exceeds the byte limit");
+        }
+        payload.extend_from_slice(key.as_bytes());
+        payload.push(b'=');
+        payload.extend_from_slice(value.as_bytes());
+        payload.push(b'\n');
+    }
+    Ok(Some(payload))
+}
+
 /// Add the final run command and wrap it for its placement. The returned stdin
 /// is present only for stdin-capable remote OCI host-sourced secrets, and is consumed by the
 /// same control call that carries the command.
@@ -4978,7 +5077,7 @@ fn oci_create_argv_and_stdin(
     spec: &SandboxSpec,
     opts: Vec<String>,
     secret_env: &[(&String, &String)],
-) -> (Vec<String>, Option<Vec<u8>>) {
+) -> anyhow::Result<(Vec<String>, Option<Vec<u8>>)> {
     let mut argv = oci_prefix(spec);
     argv.extend([
         "run".into(),
@@ -4990,13 +5089,8 @@ fn oci_create_argv_and_stdin(
     argv.extend(entrypoint_override());
     argv.push(effective_image(spec));
     argv.push("infinity".into());
-    let input = secret_env
-        .iter()
-        .map(|(key, value)| format!("{key}={value}\n"))
-        .collect::<String>()
-        .into_bytes();
-    let input = (!input.is_empty()).then_some(input);
-    (spec.placement.control_argv(&argv), input)
+    let input = remote_oci_secret_env_payload(secret_env)?;
+    Ok((spec.placement.control_argv(&argv), input))
 }
 
 /// Write host-sourced secret env pairs to a 0600 per-sandbox env-file and return
@@ -5376,12 +5470,12 @@ impl EnterArgv {
         &self.argv
     }
 
-    /// A warning naming host-sourced secrets left out because their protected
-    /// env file could not be created (keys only, never values), or `None`.
+    /// A warning naming host-sourced secrets left out because they could not be
+    /// delivered confidentially (keys only, never values), or `None`.
     pub fn omitted_secrets_warning(&self) -> Option<String> {
         (!self.omitted_secrets.is_empty()).then(|| {
             format!(
-                "the protected environment file for sandbox {} could not be created, so these host-sourced secrets were left out of the pane: {}; the pane runs without them (check that $XDG_STATE_HOME/thegn/sandbox-env is a private directory you own)",
+                "these host-sourced secrets could not be delivered confidentially to sandbox {}, so they were left out of the pane: {}; the pane runs without them (a remote placement has no carrier for them, and a local pane needs $XDG_STATE_HOME/thegn/sandbox-env to be a private directory you own)",
                 self.sandbox_name,
                 self.omitted_secrets.join(", ")
             )
@@ -5470,8 +5564,9 @@ fn oci_create_opts_in(
     // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
     // when requested. podman/docker persist the runtime in the container config,
     // so only `create` needs the flag — `exec`/`inspect`/teardown via `oci_prefix`
-    // pick it up automatically.
-    if spec.backend.is_oci()
+    // pick it up automatically. Apple's `container` rejects the flag, so it is
+    // emitted only for the engines that accept it.
+    if spec.backend.accepts_runtime_flag()
         && let Some(rt) = spec
             .oci_runtime
             .as_deref()
@@ -5565,8 +5660,10 @@ fn oci_create_opts_in(
         v.extend(["-v".into(), "/nix:/nix:ro".into()]);
     }
     // Host-sourced secrets stay off argv. Local creates use a protected file;
-    // Stdin-capable remote placements feed the env-file body over the control
-    // process stdin. Other remote placement kinds keep their existing inline delivery.
+    // stdin-capable remote placements feed the env-file body over the control
+    // process stdin. A placement that can carry neither (provider, or any other
+    // remote kind without stdin forwarding) omits them: a pane without the
+    // secret is safer than a credential in a process argument.
     let (inline_env, secret_env) = partition_secret_env(spec);
     let inline_env: EnvPairs<'_> = if remote_stdin_secret_env.is_empty() {
         inline_env
@@ -5578,16 +5675,31 @@ fn oci_create_opts_in(
     };
     if spec.placement.control_forwards_stdin() && !remote_stdin_secret_env.is_empty() {
         v.extend(["--env-file".into(), "/dev/stdin".into()]);
-    } else if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env, true) {
-        v.extend(["--env-file".into(), envfile.to_string_lossy().into_owned()]);
+    } else if spec.placement.is_local() {
+        if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env, true) {
+            v.extend(["--env-file".into(), envfile.to_string_lossy().into_owned()]);
+        } else if !secret_env.is_empty() {
+            // Never put host-sourced secrets back on argv if the protected file
+            // cannot be created. The sandbox runs without the secret in that rare
+            // case; a failed tool is safer than a credential leak.
+            let keys = secret_keys(&secret_env);
+            tracing::error!(
+                target: "thegn::sandbox",
+                name = %spec.name,
+                keys = %keys,
+                "unable to create protected OCI environment file; omitting host-sourced secrets"
+            );
+        }
     } else if !secret_env.is_empty() {
-        // Never put host-sourced secrets back on argv if the protected file
-        // cannot be created. The sandbox runs without the secret in that rare
-        // case; a failed tool is safer than a credential leak.
-        tracing::error!(
+        // The runtime lives behind a transport that cannot carry a confidential
+        // env-file. Keys only: a value must never reach a log line either.
+        let keys = secret_keys(&secret_env);
+        tracing::warn!(
             target: "thegn::sandbox",
             name = %spec.name,
-            "unable to create protected OCI environment file; omitting host-sourced secrets"
+            placement = %spec.placement.kind(),
+            keys = %keys,
+            "remote OCI placement cannot carry host-sourced secrets; omitting them from the container create"
         );
     }
     for (k, val) in &inline_env {
@@ -5860,6 +5972,26 @@ pub fn unsupported_hardening(spec: &SandboxSpec) -> Vec<&'static str> {
         out.push("pids-limit");
     }
     out
+}
+
+/// Warn that `oci_runtime` was configured on an engine whose create command has
+/// no `--runtime` flag, so the value is ignored and the reported class is the
+/// one the backend provides on its own. Deduplicated within `warnings` so a
+/// resolve that calls this more than once reports it once.
+pub fn warn_unsupported_oci_runtime(spec: &SandboxSpec, warnings: &mut Vec<String>) {
+    let configured = spec
+        .oci_runtime
+        .as_deref()
+        .is_some_and(|rt| !rt.trim().is_empty());
+    if configured && spec.backend.is_oci() && !spec.backend.accepts_runtime_flag() {
+        let warning = format!(
+            "oci_runtime ignored: {} has no --runtime",
+            spec.backend.label()
+        );
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
 }
 
 /// `--cpus` as `backend` will accept it.

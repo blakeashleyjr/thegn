@@ -619,6 +619,21 @@ fn enqueue_merge_row(
     Ok(())
 }
 
+/// Decode a stored typed PR-agent admission refusal.
+///
+/// The column is diagnostic cache, never authority: a payload this build cannot
+/// read (corrupt, truncated, or written by a newer build) reads as no refusal
+/// rather than failing the whole queue snapshot.
+fn decode_pr_admission_refusal(
+    raw: Option<String>,
+) -> Option<crate::pr_queue::AgentAdmissionRefusal> {
+    let raw = raw?;
+    let Ok(refusal) = serde_json::from_str(&raw) else {
+        return None;
+    };
+    Some(refusal)
+}
+
 impl WorktreeAuxStore for Db {
     // --- registers (persisted yank registers, v27) ------------------------
     /// Persist a register's value (upsert). The single-char `name` is the
@@ -1842,6 +1857,8 @@ impl WorktreeAuxStore for Db {
                blocker=NULL,
                detail=NULL,
                agent_attempts=0,
+               admission_refusal=NULL,
+               admission_refusal_head=NULL,
                updated_at=excluded.updated_at",
             // SQLite integers are signed; a PR number never approaches i64::MAX.
             params![
@@ -1897,7 +1914,7 @@ impl WorktreeAuxStore for Db {
                 old_worktree.as_deref() == worktree && old_branch == branch,
                 "PR queue checkout changed; run `thegn pr queue rebind --pr {number}`"
             );
-            tx.execute("UPDATE pr_queue SET base_branch=?2,forge_host=?3,project=?4,pr_url=?5,status='watching',blocker=NULL,detail=NULL,agent_attempts=0,updated_at=?6 WHERE key=?1",
+            tx.execute("UPDATE pr_queue SET base_branch=?2,forge_host=?3,project=?4,pr_url=?5,status='watching',blocker=NULL,detail=NULL,agent_attempts=0,admission_refusal=NULL,admission_refusal_head=NULL,updated_at=?6 WHERE key=?1",
                 params![key,base_branch,host,project,pr_url,now])?;
             tx.commit()?;
             return Ok(());
@@ -1961,7 +1978,7 @@ impl WorktreeAuxStore for Db {
         );
         let host = identity.host.to_ascii_lowercase();
         let project = identity.path.to_ascii_lowercase();
-        tx.execute("UPDATE pr_queue SET key=?2,worktree=?3,branch=?4,base_branch=?5,forge=?6,pr_url=?7,forge_host=?8,project=?9,checkout_gen=checkout_gen+1,status='watching',blocker=NULL,detail=NULL,ci_rerun_head=NULL,updated_at=?10 WHERE key=?1",
+        tx.execute("UPDATE pr_queue SET key=?2,worktree=?3,branch=?4,base_branch=?5,forge=?6,pr_url=?7,forge_host=?8,project=?9,checkout_gen=checkout_gen+1,status='watching',blocker=NULL,detail=NULL,ci_rerun_head=NULL,admission_refusal=NULL,admission_refusal_head=NULL,updated_at=?10 WHERE key=?1",
             params![old_key,new_key,binding.worktree,binding.branch,binding.base_branch,binding.forge,binding.pr_url,host,project,util::now()])?;
         tx.commit()?;
         Ok(new_key)
@@ -1978,6 +1995,11 @@ impl WorktreeAuxStore for Db {
         // COALESCE semantics: `None` leaves the column alone. A failed refresh
         // can record a note without clobbering the last known-good head, which
         // is what `foreign_push` compares against.
+        //
+        // An admission refusal describes one observed head, so a status write
+        // that moves the head past it drops the refusal: the reason no longer
+        // applies to what the branch now is. (All `SET` expressions read the
+        // pre-update row, exactly like the `ci_rerun_head` clear below.)
         self.conn().execute(
             "UPDATE pr_queue SET
                status=?2,
@@ -1985,6 +2007,12 @@ impl WorktreeAuxStore for Db {
                detail=COALESCE(?4, detail),
                ci_rerun_head=CASE WHEN ?5 IS NOT NULL AND last_head_oid IS NOT ?5
                                   THEN NULL ELSE ci_rerun_head END,
+               admission_refusal=CASE
+                   WHEN ?5 IS NOT NULL AND admission_refusal_head IS NOT ?5
+                   THEN NULL ELSE admission_refusal END,
+               admission_refusal_head=CASE
+                   WHEN ?5 IS NOT NULL AND admission_refusal_head IS NOT ?5
+                   THEN NULL ELSE admission_refusal_head END,
                last_head_oid=COALESCE(?5, last_head_oid),
                updated_at=?6
              WHERE key=?1
@@ -2001,6 +2029,43 @@ impl WorktreeAuxStore for Db {
             ],
         )?;
         Ok(())
+    }
+
+    fn record_pr_agent_refusal(
+        &self,
+        key: &str,
+        row_head: Option<&str>,
+        refusal_head: Option<&str>,
+        refusal: &crate::pr_queue::AgentAdmissionRefusal,
+    ) -> Result<bool> {
+        // One statement, so the fence and the write cannot interleave. The
+        // reason is stored as JSON: the typed enum is the durable form (a
+        // pre-v117 row reads `NULL`, i.e. no refusal) and `detail` mirrors it
+        // for readers that only render text.
+        let Ok(encoded) = serde_json::to_string(refusal) else {
+            anyhow::bail!("PR agent refusal for {key} is not serializable");
+        };
+        let changed = self.conn().execute(
+            "UPDATE pr_queue SET
+               admission_refusal=?2,
+               admission_refusal_head=?3,
+               detail=?4,
+               updated_at=?5
+             WHERE key=?1
+               AND last_head_oid IS ?6
+               AND (agent_claim_owner IS NULL OR agent_claim_lease_until_ms IS NULL
+                    OR agent_claim_lease_until_ms < ?7)",
+            params![
+                key,
+                encoded,
+                refusal_head,
+                refusal.to_string(),
+                util::now(),
+                row_head,
+                util::now_ms()
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     fn update_pr_detail(&self, key: &str, detail: &str) -> Result<()> {
@@ -2116,7 +2181,8 @@ impl WorktreeAuxStore for Db {
             "UPDATE pr_queue SET status='agent_running',blocker=?1,detail=?2,last_head_oid=?3,
                agent_attempts=agent_attempts+1,agent_claim_owner=?4,
                agent_claim_generation=agent_claim_generation+1,agent_claim_lease_until_ms=?5,
-               agent_claim_owner_hint=?6,updated_at=?7
+               agent_claim_owner_hint=?6,updated_at=?7,
+               admission_refusal=NULL,admission_refusal_head=NULL
              WHERE key=?8 AND agent_claim_generation=?9",
             params![
                 request.blocker,
@@ -2280,8 +2346,19 @@ impl WorktreeAuxStore for Db {
         expected_head: Option<&str>,
         head: &str,
     ) -> Result<bool> {
+        // Reserving a rerun for a head the row has not seen yet is another way
+        // the observed head moves, so it drops an admission refusal the same way
+        // [`Self::update_pr_status`] does: a reason recorded for one head does not
+        // describe the next one.
         let changed = self.conn().execute(
-            "UPDATE pr_queue SET ci_rerun_head=?3, last_head_oid=?3, updated_at=?4
+            "UPDATE pr_queue SET ci_rerun_head=?3, last_head_oid=?3,
+                    admission_refusal=CASE
+                        WHEN admission_refusal_head IS NOT ?3 THEN NULL
+                        ELSE admission_refusal END,
+                    admission_refusal_head=CASE
+                        WHEN admission_refusal_head IS NOT ?3 THEN NULL
+                        ELSE admission_refusal_head END,
+                    updated_at=?4
              WHERE key=?1 AND last_head_oid IS ?2
                AND (ci_rerun_head IS NULL OR ci_rerun_head <> ?3)",
             params![key, expected_head, head, util::now()],
@@ -2349,7 +2426,7 @@ impl WorktreeAuxStore for Db {
         let mut stmt = self.conn().prepare(
             r#"SELECT key,repo_root,number,worktree,branch,base_branch,forge,status,
                       blocker,detail,agent_attempts,ci_rerun_head,last_head_oid,queued_at,updated_at,pr_url,
-                      forge_host,project,checkout_gen
+                      forge_host,project,checkout_gen,admission_refusal,admission_refusal_head
                FROM pr_queue ORDER BY queued_at"#,
         )?;
         let rows = stmt.query_map([], |r| {
@@ -2373,6 +2450,8 @@ impl WorktreeAuxStore for Db {
                 forge_host: r.get(16)?,
                 project: r.get(17)?,
                 checkout_gen: r.get(18)?,
+                admission_refusal: decode_pr_admission_refusal(r.get(19)?),
+                admission_refusal_head: r.get(20)?,
             })
         })?;
         let mut v = Vec::new();

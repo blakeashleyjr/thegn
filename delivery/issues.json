@@ -484,6 +484,13 @@
       "no_spec_rationale": "Not started: its proposal follows the add-plugin-app-tabs landing (THE-1673)."
     },
     {
+      "issue": "THE-2065",
+      "project": "Sandbox & Remote 06: Windows",
+      "changes": [
+        "fix-windows-backend-gates"
+      ]
+    },
+    {
       "issue": "THE-2067",
       "project": "Sandbox & Remote 01: Truth and fixes",
       "changes": [
@@ -507,6 +514,20 @@
     },
     {
       "issue": "THE-2099",
+      "project": "Sandbox & Remote 05: macOS",
+      "changes": [
+        "fix-macos-oci-runtimes"
+      ]
+    },
+    {
+      "issue": "THE-2103",
+      "project": "Sandbox & Remote 00: Shared contracts",
+      "changes": [
+        "add-bounded-argv-template-tokenizer"
+      ]
+    },
+    {
+      "issue": "THE-2131",
       "project": "Sandbox & Remote 05: macOS",
       "changes": [
         "fix-macos-oci-runtimes"
@@ -605,6 +626,20 @@
       ]
     },
     {
+      "issue": "THE-2242",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "fix-exact-terminal-search-jumps"
+      ]
+    },
+    {
+      "issue": "THE-2244",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "terminal-search-off-loop"
+      ]
+    },
+    {
       "issue": "THE-2351",
       "project": "Client API & Remote Access",
       "changes": [],
@@ -621,6 +656,13 @@
       "project": "Alpha Reliability & State Compatibility",
       "changes": [],
       "no_spec_rationale": "Bug fix with no OpenSpec change: it corrects behaviour to match an existing contract, recorded in the changelog."
+    },
+    {
+      "issue": "THE-2418",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "add-vercel-selected-runner"
+      ]
     },
     {
       "issue": "THE-2467",

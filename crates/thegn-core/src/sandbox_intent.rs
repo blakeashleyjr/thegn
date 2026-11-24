@@ -19,8 +19,27 @@
 //!   network are canonical config strings, so the wire stays independent of
 //!   config-enum churn; WS02-P5-06 validates them against the target's
 //!   `from_str_validated`.
+//! - **The v1 wire is pinned.** The decoder accepts only
+//!   [`SANDBOX_INTENT_VERSION`] and refuses every unknown field, so a newer peer
+//!   cannot be silently misread by an older one.
 
 use serde::{Deserialize, Serialize};
+
+fn deserialize_v1<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let version = u16::deserialize(deserializer)?;
+    if version == SANDBOX_INTENT_VERSION {
+        Ok(version)
+    } else {
+        Err(D::Error::custom(format!(
+            "unsupported sandbox intent version {version}; expected {SANDBOX_INTENT_VERSION}"
+        )))
+    }
+}
 
 /// The wire version this build writes (`SandboxIntent::version`).
 pub const SANDBOX_INTENT_VERSION: u16 = 1;
@@ -31,6 +50,7 @@ pub const SANDBOX_INTENT_VERSION: u16 = 1;
 #[serde(deny_unknown_fields)]
 pub struct SandboxIntent {
     /// The wire version ([`SANDBOX_INTENT_VERSION`]).
+    #[serde(deserialize_with = "deserialize_v1")]
     pub version: u16,
     /// Canonical profile id, e.g. `"standard"`.
     pub profile: String,
@@ -161,6 +181,19 @@ mod tests {
 
         let unknown_role = serde_json::json!({ "role": "home" });
         assert!(serde_json::from_value::<IntentMount>(unknown_role).is_err());
+    }
+
+    #[test]
+    fn intent_rejects_unknown_versions() {
+        for version in [0, 2, u16::MAX] {
+            let mut value: serde_json::Value = serde_json::from_str(GOLDEN_V1).unwrap();
+            value["version"] = serde_json::json!(version);
+            let wire = serde_json::to_string(&value).unwrap();
+            assert!(
+                serde_json::from_str::<SandboxIntent>(&wire).is_err(),
+                "accepted unsupported version {version}"
+            );
+        }
     }
 
     #[test]

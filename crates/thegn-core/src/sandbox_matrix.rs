@@ -396,6 +396,9 @@ mod tests {
         assert!(!c(Backend::Bwrap).reachable);
         assert!(!c(Backend::Systemd).reachable);
         assert!(c(Backend::Apple).reachable);
+        // podman-rootful needs a host root podman: Linux-only, so unreachable here.
+        assert!(!c(Backend::PodmanRootful).reachable);
+        assert!(row(Backend::PodmanRootful, HostOs::Linux).reachable);
     }
 
     #[test]

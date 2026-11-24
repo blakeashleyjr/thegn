@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 license.workspace = true
+description = "Observe dashboard state and background query orchestration for the gtui terminal UI."
 
 
 [lints]

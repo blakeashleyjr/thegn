@@ -74,7 +74,10 @@ write` as `POST /v1/dispatches` and its status route, with no extra flag:
 `dispatches_put` appends a row (`issue_id`, `worktree_path`, `agent_name`,
 optional `stage`, `parent_id`, `session_id`, `artifact_path`, `lead`), and
 `dispatches_set_status` sets row `id` to `status` (optional `lead` proof).
-The daemon checks the status name.
+The daemon checks the status name. `agent_dispatch` (`agent`, absolute
+`worktree`, `issue_id`, `prompt`, optional `stage`) launches a configured agent
+and records a tracked row; it is not offered to the Lead's scoped token, and
+its audit record carries the prompt's length and a hash, never its text.
 Tracker writes are MCP tools under the same `--scopes write`: `issues_update`
 patches issue `id` (at least one of `status`, `assignee` as `me` or `none`,
 `priority` 0-4, `title`) and `issues_comment` appends `body` (non-empty, up to
@@ -266,6 +269,12 @@ configured prefix or numbering); it conflicts with `--from-issue` and
 `--program`. `thegn wt prune --merged [--target <branch>] [--apply] [--json]`
 removes lane worktrees and branches already merged into the target; without
 `--apply` it is a dry run. See [[workspaces-and-worktrees]].
+
+`thegn wt disk --lanes [--worktree PATH] [--json]` explains the build lane
+directories under one checkout's `target/lanes/`: apparent bytes, the
+regenerable build output, the lane's own git owner and branch, Cargo-lock and
+mtime activity, and whether that output is safe to reclaim — with the reason
+printed beside each row. It changes nothing and scans no other worktree.
 
 `thegn wt new --batch FILE` creates one lane for each non-comment, non-blank
 line in the file. Each line is `<name>` or `<name> <base>`; a per-line base

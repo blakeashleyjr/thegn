@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 license.workspace = true
+description = "Ratatui layout and panel renderers for gtui dashboards."
 
 
 [lints]

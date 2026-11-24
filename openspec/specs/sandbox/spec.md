@@ -61,6 +61,30 @@ entered, never what was requested.
 - **THEN** the launch is labelled `host`, is flagged as degraded, and carries a warning naming the
   backend that was unavailable
 
+### Requirement: Portable sandbox intents use a pinned, path-free wire
+
+A portable sandbox launch intent SHALL use wire version 1 until a separately
+specified version is introduced. A version-1 decoder MUST reject other wire
+versions and unknown fields. Mounts SHALL be named by role and configured name,
+not by host path; the intent MUST NOT carry host paths, credentials, or
+executable paths. A receiving target MAY raise the carried isolation floor but
+MUST NOT lower it.
+
+#### Scenario: Unsupported intent version is refused
+
+- **WHEN** a target decodes a portable intent with a version other than 1
+- **THEN** decoding fails before the intent can be resolved or launched
+
+#### Scenario: Role-based mounts cross targets
+
+- **WHEN** a portable intent describes its worktree and user mounts
+- **THEN** the wire contains mount roles and configured user-mount names without host paths
+
+#### Scenario: Receiving target keeps the floor
+
+- **WHEN** a portable intent reaches a target with a stricter local isolation floor
+- **THEN** resolution uses the stricter of the carried and local floors
+
 ### Requirement: Worktree stays on the host and is bind-mounted
 
 A sandboxed worktree SHALL remain on the host filesystem and MUST be bind-mounted into the container at its real host path, so host-side git reads and the compositor continue to operate on the same files.
@@ -1424,3 +1448,47 @@ runtime's verbs in order to clear the mark.
 
 - **WHEN** a backend whose runtime has been verified is reported
 - **THEN** no verification caveat appears and no warning is emitted
+
+### Requirement: Host-sourced secrets never ride a command line
+
+thegn SHALL treat an env pair whose value equals the launcher's own environment
+as a host-sourced secret and MUST NOT place its value in any argv, local or
+remote. Delivery SHALL use the strongest carrier the placement has: a 0600
+`EnvironmentFile` for local OCI and systemd launches, the control process's
+stdin for stdin-capable remote OCI placements (ssh and Kubernetes), and no
+delivery at all for a placement that has neither. Omission MUST be reported with
+the secret keys only; a value MUST NOT appear in a warning, error or log line,
+including runtime stderr.
+
+Before any stdin-delivered env payload is written, thegn SHALL validate every
+record as `NAME=value\n` with a shell identifier name and no CR/LF in the value,
+and SHALL refuse the launch when the payload exceeds 128 variables or 64 KiB.
+The refusal SHALL name no secret value. Captured stderr from the stdin
+carrier SHALL remain bounded and SHALL redact every delivered value. Synthetic
+pairs whose values are absent from the host environment (for example
+`THEGN_SANDBOX`) are not secrets and MAY stay inline.
+
+#### Scenario: Local launch keeps a passthrough token off argv
+
+- **WHEN** a local OCI or systemd pane inherits a host token through env passthrough
+- **THEN** the value is delivered through a private env-file and does not appear
+  in the launch argv
+
+#### Scenario: Remote stdin carrier is used when available
+
+- **WHEN** an ssh or Kubernetes OCI container is created with a host-sourced secret
+- **THEN** the env-file body is written to the control process's stdin and the
+  create argv names only `/dev/stdin`
+
+#### Scenario: A placement without a confidential carrier omits the secret
+
+- **WHEN** a provider placement, or a remote bwrap or systemd placement, receives
+  a host-sourced secret
+- **THEN** the value is omitted from the launch, argv contains no secret value,
+  and the warning names the omitted key but not its value
+
+#### Scenario: A malformed payload is refused without echoing it
+
+- **WHEN** a stdin-delivered env payload contains an invalid name, a CR/LF in a
+  value, too many variables, or too many bytes
+- **THEN** the launch is refused with an error that names no secret value

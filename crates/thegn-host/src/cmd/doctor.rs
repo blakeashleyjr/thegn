@@ -72,7 +72,8 @@ fn keyboard_remedy(in_tmux: bool) -> Vec<&'static str> {
 }
 
 /// The honest boundary class a named backend resolves to at `Local` placement,
-/// under the configured OCI runtime (`runsc`/`krun` raise it for OCI backends).
+/// under the configured OCI runtime (`runsc`/`krun` raise it only for engines
+/// that accept `--runtime`).
 fn isolation_of(backend_name: &str, oci_runtime: Option<&str>) -> Option<IsolationClass> {
     isolation_of_on(
         backend_name,
@@ -109,15 +110,39 @@ fn cfg_oci_runtime(cfg: &Config) -> Option<&str> {
 }
 
 /// A `" (…)"` availability suffix for the configured OCI runtime: whether its
-/// binary (and `/dev/kvm`, for libkrun) is present on THIS host, so the user
-/// learns a strong runtime would silently fall back before they rely on it.
-fn oci_runtime_status(rt: &str) -> String {
+/// binary (and read-write access to `/dev/kvm`, for libkrun) works on THIS host,
+/// so the user learns a strong runtime would silently fall back before they rely
+/// on it. OCI engines without a `--runtime` flag never use the value, so probe
+/// nothing and say it is ignored — the same predicate [`Capabilities`] derives
+/// from. `None` (an `auto` chain) still probes: each chain row below states
+/// which engines ignore the runtime.
+fn oci_runtime_status(backend: Option<Backend>, rt: &str) -> String {
+    if let Some(backend) = backend
+        && backend.is_oci()
+        && !backend.accepts_runtime_flag()
+    {
+        return format!(" (ignored: {} has no --runtime)", backend.label());
+    }
+    oci_runtime_status_with(
+        rt,
+        &|binary| thegn_core::util::which_path(binary).is_some(),
+        &thegn_core::util::kvm_accessible,
+    )
+}
+
+/// [`oci_runtime_status`] with both probes injected, so the reported suffix is
+/// testable without a `/dev/kvm` node or a runtime binary on the runner.
+fn oci_runtime_status_with(
+    rt: &str,
+    binary_probe: &dyn Fn(&str) -> bool,
+    kvm_probe: &dyn Fn() -> bool,
+) -> String {
     use thegn_core::sandbox_runtime::{RuntimeDecision, decide, runtime_req};
     let Some(req) = runtime_req(rt.trim()) else {
         return String::new(); // runc/crun/unknown: no extra requirement to report.
     };
-    let binary_present = thegn_core::util::which_path(req.binary).is_some();
-    let kvm_present = thegn_core::host_probe::kvm_accessible();
+    let binary_present = binary_probe(req.binary);
+    let kvm_present = kvm_probe();
     match decide(Some(rt), binary_present, kvm_present) {
         RuntimeDecision::Keep => " (available)".to_string(),
         RuntimeDecision::Degrade(reason) => format!(" (unavailable — {reason})"),
@@ -3892,8 +3917,8 @@ pub fn run(
     let probe = crate::probe::probe_outer_terminal_cli();
     let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
 
-    let show = |k: &str, v: &Option<String>| {
-        outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
+    let show = |k: &str, v: Option<&String>| {
+        outln!("  {k:<13} {}", v.map(String::as_str).unwrap_or("(unset)"));
     };
     instance_report(cfg);
     super::doctor_exposure::report(cfg);
@@ -3949,19 +3974,19 @@ pub fn run(
     core_deps_report();
     outln!("");
     outln!("Terminal environment");
-    show("TERM", &env.term);
-    show("COLORTERM", &env.colorterm);
-    show("TERM_PROGRAM", &env.term_program);
-    show("TERM_PROG_VER", &env.term_program_version);
+    show("TERM", env.term.as_ref());
+    show("COLORTERM", env.colorterm.as_ref());
+    show("TERM_PROGRAM", env.term_program.as_ref());
+    show("TERM_PROG_VER", env.term_program_version.as_ref());
     // The one that survives ssh, so it explains an otherwise-baffling
     // "why is my iTerm2 detected as a plain 256-color terminal" one hop away.
-    show("LC_TERMINAL", &env.lc_terminal);
-    show("VTE_VERSION", &env.vte_version);
+    show("LC_TERMINAL", env.lc_terminal.as_ref());
+    show("VTE_VERSION", env.vte_version.as_ref());
     outln!("  {:<13} {}", "NO_COLOR", yn(env.no_color));
-    show("WT_SESSION", &env.wt_session);
-    show("LANG", &env.lang);
-    show("LC_ALL", &env.lc_all);
-    show("LC_CTYPE", &env.lc_ctype);
+    show("WT_SESSION", env.wt_session.as_ref());
+    show("LANG", env.lang.as_ref());
+    show("LC_ALL", env.lc_all.as_ref());
+    show("LC_CTYPE", env.lc_ctype.as_ref());
 
     outln!("");
     outln!("Config modes ([theme])");
@@ -5643,7 +5668,8 @@ fn sandbox_report(cfg: &Config) {
         );
     }
     if let Some(rt) = cfg_oci_runtime(cfg) {
-        outln!("  oci_runtime   {rt}{}", oci_runtime_status(rt));
+        let status = oci_runtime_status(Backend::from_config(cfg.sandbox.backend), rt);
+        outln!("  oci_runtime   {rt}{status}");
     }
     let chain = shell_chain(cfg);
     // Actually PROBE, rather than listing the chain and calling it unknown. A
@@ -5678,6 +5704,21 @@ fn sandbox_report(cfg: &Config) {
             class,
             class.escape_note()
         );
+        // A configured runtime this engine cannot honor is stated in the
+        // engine's own row, not just the header line above (which only knows
+        // the concrete `backend` setting, not an `auto` chain).
+        if cfg_oci_runtime(cfg).is_some()
+            && let Some(backend) = Backend::parse(&row.name)
+            && backend.is_oci()
+            && !backend.accepts_runtime_flag()
+        {
+            outln!(
+                "    {:<16} {:<11} oci_runtime ignored: {} has no --runtime",
+                "",
+                "",
+                backend.label()
+            );
+        }
         if let Some(remedy) = &row.remedy {
             outln!("    {:<16} {:<11} \u{21b3} {remedy}", "", "");
         }
@@ -6807,6 +6848,16 @@ mod pins;
 mod tests {
     use super::*;
     use thegn_core::notification::{Notification, NotificationKind};
+
+    #[test]
+    fn doctor_runtime_status_uses_kvm_accessible() {
+        let status = oci_runtime_status_with("krun", &|_| true, &|| false);
+        assert!(status.contains("unavailable"), "{status}");
+        assert!(status.contains("/dev/kvm"), "{status}");
+
+        let status = oci_runtime_status_with("krun", &|_| true, &|| true);
+        assert_eq!(status, " (available)");
+    }
 
     #[test]
     fn db_space_suffix_names_the_next_step() {
@@ -8028,6 +8079,12 @@ agent = "plain-agent"
             isolation_of("podman", Some("krun")),
             Some(IsolationClass::GuestKernel)
         );
+        // Apple's `container` has no `--runtime` flag, so a configured runtime
+        // must not change its real per-container VM class on macOS.
+        assert_eq!(
+            isolation_of_on("apple", Some("runsc"), HostOs::MacOs),
+            Some(IsolationClass::GuestKernel)
+        );
         // …but a non-OCI backend ignores it, and runc/crun stay shared-kernel.
         assert_eq!(
             isolation_of("bwrap", Some("krun")),
@@ -8037,6 +8094,19 @@ agent = "plain-agent"
             isolation_of("podman", Some("crun")),
             Some(IsolationClass::SharedKernel)
         );
+    }
+
+    #[test]
+    fn doctor_marks_runtime_ignored_for_unsupported_engine() {
+        assert_eq!(
+            oci_runtime_status(Some(Backend::Apple), "runsc"),
+            " (ignored: apple has no --runtime)"
+        );
+        // An `auto` chain (no concrete backend) keeps the availability probe
+        // instead of going silent; runc needs nothing, so it reports nothing.
+        assert_eq!(oci_runtime_status(None, "runc"), "");
+        // A non-OCI engine never had a runtime to ignore.
+        assert_eq!(oci_runtime_status(Some(Backend::Bwrap), "runc"), "");
     }
 
     #[test]

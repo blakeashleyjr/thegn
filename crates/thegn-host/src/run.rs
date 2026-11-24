@@ -7953,6 +7953,10 @@ async fn event_loop<T: Terminal>(
     let _file_index_gen: u64 = 0;
     // Search overlay state: lives here so it survives across loop iterations.
     let mut search: Option<crate::search::SearchOverlay> = None;
+    // The hits of the search that was just activated: `n`/`N` step through them
+    // after the overlay closes, and the mark lasts only until the next key or
+    // scroll (THE-2242).
+    let mut search_walk: Option<crate::search::SearchWalk> = None;
     // Time-travel replay: a modal overlay (sibling of `search`) that scrubs the
     // focused pane's recording, plus the playback clock (a thread that pulses the
     // waker only while playing, otherwise parked — zero idle wakeups).
@@ -8004,7 +8008,7 @@ async fn event_loop<T: Terminal>(
     let mut media_watch: Option<tokio::task::JoinHandle<()>> = None;
     restart_media_watch(
         &mut media_watch,
-        media_effective_cfg(&keymap.config().media, &media_player_override),
+        media_effective_cfg(&keymap.config().media, media_player_override.as_ref()),
         &media_generation,
         &media_tx,
         &waker,
@@ -9418,7 +9422,7 @@ async fn event_loop<T: Terminal>(
         // below happens only after publishing the latest attribution inputs.
         if !(crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes)
             || (current_config.monitor.processes
-                && crate::detail::cpu_attrib::is_open(&bar_detail)))
+                && crate::detail::cpu_attrib::is_open(bar_detail.as_ref())))
             && let Some(control) = &process_control
         {
             control.set_enabled(false);
@@ -10472,6 +10476,7 @@ async fn event_loop<T: Terminal>(
                 drawer == Some(sp) || tree.layout(chrome.center).iter().any(|(id, _)| *id == sp);
             if crate::copymode::selection_is_stale(sel_size_before, size_after, visible) {
                 mouse_sel = None;
+                search_walk = None;
                 mouse_selecting = false;
                 dirty = true;
             }
@@ -12547,6 +12552,45 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Terminal history search (THE-2244): the overlay's worker scores an
+        // owned snapshot off the loop, so all this pump does is fold in what it
+        // produced. Streamed batches land in rank order; a stale generation's
+        // batches are discarded inside `drain`; an idle wake touches nothing.
+        if let Some(o) = search.as_mut()
+            && o.drain_search()
+        {
+            dirty = true;
+        }
+        // An Enter pressed before the first batch landed resolves here, once the
+        // best hit (or an empty answer) is in.
+        if let Some(outcome) = search.as_mut().and_then(|o| o.take_ready()) {
+            let walk = match &outcome {
+                crate::search::SearchOutcome::Jump(_) => search
+                    .take()
+                    .and_then(crate::search::SearchWalk::from_overlay),
+                _ => None,
+            };
+            search = None;
+            search_walk = walk;
+            if let crate::search::SearchOutcome::Jump(m) = outcome {
+                let jump = crate::search_sources::apply_search_jump(
+                    m,
+                    &mut session,
+                    &mut panes,
+                    &mut focus,
+                    &mut model,
+                    &mut sb,
+                    &mut need_relayout,
+                );
+                if jump.switched_group {
+                    search_sel_after_switch = jump.highlight;
+                } else {
+                    mouse_sel = jump.highlight;
+                }
+            }
+            dirty = true;
+        }
+
         let mut pending_focus: Option<thegn_core::store::IntentRow> = None;
         // `open --preset` mailbox rows, applied right after the focus intent.
         let mut pending_preset = crate::workspace_switch_prep::seed_deferred_preset(
@@ -13361,7 +13405,7 @@ async fn event_loop<T: Terminal>(
         // Revoke old publication rights before the final take. One latest
         // snapshot replaces the former unbounded channel; hydration preserves it.
         // The cpu/mem popup's attribution tree samples only while it is open.
-        let attrib_open = crate::detail::cpu_attrib::is_open(&bar_detail);
+        let attrib_open = crate::detail::cpu_attrib::is_open(bar_detail.as_ref());
         let processes_live =
             crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes)
                 || (current_config.monitor.processes && attrib_open);
@@ -13463,13 +13507,13 @@ async fn event_loop<T: Terminal>(
         // closed (`refresh_open` is title-guarded and returns immediately), and
         // adds no wake source — this rides drains that already happened.
         if status_data_moved
-            && (crate::detail::status_modal::is_open(&bar_detail) || monitor.is_some())
+            && (crate::detail::status_modal::is_open(bar_detail.as_ref()) || monitor.is_some())
         {
             // Re-run the session probe on the stats cadence while the modal is
             // open, so the table tracks sessions opening/closing instead of
             // freezing at the one-shot taken on open. Monitor-only opens keep
             // whatever the cache holds — this probe is the modal's contract.
-            if crate::detail::status_modal::is_open(&bar_detail)
+            if crate::detail::status_modal::is_open(bar_detail.as_ref())
                 && panel_ui
                     .docs
                     .daemon_sessions_at
@@ -14225,7 +14269,7 @@ async fn event_loop<T: Terminal>(
             media_generation.current(),
         );
         if media_position_visible {
-            let cfg = media_effective_cfg(&current_config.media, &media_player_override);
+            let cfg = media_effective_cfg(&current_config.media, media_player_override.as_ref());
             if let Some(request) = panel_ui
                 .media
                 .take_queue_request(model.panel.media.as_ref())
@@ -14603,7 +14647,10 @@ async fn event_loop<T: Terminal>(
                     if reload_outcome.restart_media {
                         restart_media_watch(
                             &mut media_watch,
-                            media_effective_cfg(&current_config.media, &media_player_override),
+                            media_effective_cfg(
+                                &current_config.media,
+                                media_player_override.as_ref(),
+                            ),
                             &media_generation,
                             &media_tx,
                             &waker,
@@ -15175,7 +15222,7 @@ async fn event_loop<T: Terminal>(
                                 .fleet
                                 .as_deref()
                                 .map(crate::hydrate_fleet::LastRead::of),
-                            popup_open: crate::detail::fleet::is_open(&bar_detail),
+                            popup_open: crate::detail::fleet::is_open(bar_detail.as_ref()),
                             now_ms: thegn_core::util::now_ms(),
                         });
                     }
@@ -15192,7 +15239,7 @@ async fn event_loop<T: Terminal>(
                         // The badge is the bars' damage class, like weather.
                         bars_dirty = true;
                     }
-                    if crate::detail::fleet::is_open(&bar_detail) {
+                    if crate::detail::fleet::is_open(bar_detail.as_ref()) {
                         dirty |= crate::detail::fleet::refresh_open(
                             &mut bar_detail,
                             &model,
@@ -18123,6 +18170,12 @@ async fn event_loop<T: Terminal>(
                 if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
                     let up = m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE);
                     if let Some((id, _)) = hit_pane {
+                        // A wheel scroll ends a search walk and its mark (the
+                        // next key would have done the same).
+                        if search_walk.take().is_some() {
+                            mouse_sel = None;
+                            search_sel_after_switch = None;
+                        }
                         // Coalesce all same-direction wheel ticks that are
                         // already queued: one render pass for the whole
                         // gesture, never one render per tick.
@@ -18381,6 +18434,7 @@ async fn event_loop<T: Terminal>(
                         need_relayout = true;
                     }
                     mouse_sel = None;
+                    search_walk = None;
                     if let Some((id, content)) = hit_pane {
                         // Interacting with the terminal clears selections
                         // everywhere else (sidebar marks included).
@@ -18835,7 +18889,7 @@ async fn event_loop<T: Terminal>(
                                     crate::media_ctl::spawn_media_action(
                                         media_effective_cfg(
                                             &current_config.media,
-                                            &media_player_override,
+                                            media_player_override.as_ref(),
                                         ),
                                         action,
                                         &media_generation,
@@ -18887,7 +18941,7 @@ async fn event_loop<T: Terminal>(
                                             spawn_media_op(
                                                 media_effective_cfg(
                                                     &current_config.media,
-                                                    &media_player_override,
+                                                    media_player_override.as_ref(),
                                                 ),
                                                 MediaOp::PlayQueueItem(lease),
                                                 &media_generation,
@@ -18904,7 +18958,7 @@ async fn event_loop<T: Terminal>(
                                             &mut media_watch,
                                             media_effective_cfg(
                                                 &current_config.media,
-                                                &media_player_override,
+                                                media_player_override.as_ref(),
                                             ),
                                             &media_generation,
                                             &media_tx,
@@ -20064,10 +20118,50 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                // Typing clears any lingering mouse selection highlight.
+                // Typing clears any lingering selection highlight and ends the
+                // search walk. `n`/`N` are the exception: they step the walk to
+                // the next/previous hit and move the mark with it (THE-2242).
+                let search_step = search.is_none()
+                    && search_replace.is_none()
+                    && search_walk.is_some()
+                    && matches!(k.key, KeyCode::Char('n') | KeyCode::Char('N'))
+                    && (k.modifiers.is_empty() || k.modifiers == Modifiers::SHIFT);
                 if mouse_sel.take().is_some() {
                     dirty = true;
                 }
+                if search_sel_after_switch.take().is_some() {
+                    dirty = true;
+                }
+                if search_step {
+                    let forward = match k.key {
+                        KeyCode::Char('n') => !k.modifiers.contains(Modifiers::SHIFT),
+                        KeyCode::Char('N') => false,
+                        _ => true,
+                    };
+                    if let Some(walk) = search_walk.as_mut() {
+                        let (m, position, total) = walk.step(forward);
+                        let jump = crate::search_sources::apply_search_jump(
+                            m,
+                            &mut session,
+                            &mut panes,
+                            &mut focus,
+                            &mut model,
+                            &mut sb,
+                            &mut need_relayout,
+                        );
+                        if jump.switched_group {
+                            search_sel_after_switch = jump.highlight;
+                        } else {
+                            mouse_sel = jump.highlight;
+                        }
+                        if jump.highlight.is_some() {
+                            model.status = format!("search: match {position} of {total}");
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
+                search_walk = None;
                 // Top-level app tabs. Switch chords (Alt+1 = work, Alt+2.. =
                 // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
                 // focused it owns every other key (its own quit returns here).
@@ -21849,12 +21943,14 @@ async fn event_loop<T: Terminal>(
                         .iter()
                         .map(|(id, label, buf)| (*id, label.as_str(), *buf))
                         .collect();
-                    match ov.handle_key(&k.key, k.modifiers, &srcs_ref) {
+                    match ov.handle_key_async(&k.key, k.modifiers, &srcs_ref) {
                         crate::search::SearchOutcome::Pending => {
+                            ov.start_pending_search(&srcs_ref, waker.clone());
                             dirty = true;
                             continue;
                         }
                         crate::search::SearchOutcome::Rescope(scope) => {
+                            search_walk = None;
                             let srcs = crate::search_sources::build_search_sources(
                                 scope, &session, &panes, focused,
                             );
@@ -21862,17 +21958,21 @@ async fn event_loop<T: Terminal>(
                                 srcs.iter()
                                     .map(|(id, label, buf)| (*id, label.as_str(), *buf))
                                     .collect();
-                            ov.apply_scope(scope, &srcs_ref);
+                            ov.apply_scope_async(scope);
+                            ov.start_pending_search(&srcs_ref, waker.clone());
                             dirty = true;
                             continue;
                         }
                         crate::search::SearchOutcome::Dismiss => {
                             search = None;
+                            search_walk = None;
                             dirty = true;
                             continue;
                         }
                         crate::search::SearchOutcome::Jump(m) => {
-                            search = None;
+                            search_walk = search
+                                .take()
+                                .and_then(crate::search::SearchWalk::from_overlay);
                             let jump = crate::search_sources::apply_search_jump(
                                 m,
                                 &mut session,
@@ -22031,7 +22131,7 @@ async fn event_loop<T: Terminal>(
                             crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
-                                &file_index,
+                                file_index.as_ref(),
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
@@ -22533,7 +22633,7 @@ async fn event_loop<T: Terminal>(
                                             if current_config.media.enabled {
                                                 let cfg = media_effective_cfg(
                                                     &current_config.media,
-                                                    &media_player_override,
+                                                    media_player_override.as_ref(),
                                                 );
                                                 crate::media_ctl::spawn_media_playlist(
                                                     cfg,
@@ -22557,7 +22657,7 @@ async fn event_loop<T: Terminal>(
                                         &mut media_watch,
                                         media_effective_cfg(
                                             &current_config.media,
-                                            &media_player_override,
+                                            media_player_override.as_ref(),
                                         ),
                                         &media_generation,
                                         &media_tx,
@@ -22680,7 +22780,7 @@ async fn event_loop<T: Terminal>(
                             crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
-                                &file_index,
+                                file_index.as_ref(),
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
@@ -22694,7 +22794,7 @@ async fn event_loop<T: Terminal>(
                             crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
-                                &file_index,
+                                file_index.as_ref(),
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
@@ -23863,14 +23963,20 @@ async fn event_loop<T: Terminal>(
                                         }
                                         Section::Forward => {
                                             // Enter copies the focused preview/forward URL.
-                                            if panel_ui.cursor == 0
-                                                && let Some((worktree, port)) =
-                                                    model.preview.as_ref().map(|preview| {
-                                                        (preview.worktree.clone(), preview.port)
-                                                    })
-                                            {
-                                                preview_supervisor.rearm_port(&worktree, port);
-                                                model.preview = preview_supervisor.view(&worktree);
+                                            // Snapshot the preview before re-arming so the
+                                            // copied target keeps the status the user saw.
+                                            if panel_ui.cursor == 0 {
+                                                let worktree = model
+                                                    .preview
+                                                    .as_ref()
+                                                    .map(|preview| preview.worktree.clone());
+                                                if let Some(worktree) = worktree {
+                                                    // A missing supervisor target is
+                                                    // unavailable: do not leave a stale
+                                                    // preview that would open anyway.
+                                                    model.preview =
+                                                        preview_supervisor.open_view(&worktree);
+                                                }
                                             }
                                             if let Some(url) =
                                                 forward_url_at(&model, panel_ui.cursor)
@@ -23888,10 +23994,10 @@ async fn event_loop<T: Terminal>(
                                                 };
                                                 if panel_ui.cursor == 0
                                                     && let Some(preview) = &model.preview
-                                                    && preview.status
-                                                        != thegn_core::preview::PreviewStatus::Up
                                                 {
-                                                    model.status.push_str(" (not answering yet)");
+                                                    model.status.push_str(
+                                                        crate::preview::status_note(preview.status),
+                                                    );
                                                 }
                                             } else if model.preview.is_some()
                                                 && panel_ui.cursor == 0
@@ -23929,7 +24035,7 @@ async fn event_loop<T: Terminal>(
                                                         &mut media_watch,
                                                         media_effective_cfg(
                                                             &current_config.media,
-                                                            &media_player_override,
+                                                            media_player_override.as_ref(),
                                                         ),
                                                         &media_generation,
                                                         &media_tx,
@@ -23943,7 +24049,7 @@ async fn event_loop<T: Terminal>(
                                                     spawn_media_op(
                                                         media_effective_cfg(
                                                             &current_config.media,
-                                                            &media_player_override,
+                                                            media_player_override.as_ref(),
                                                         ),
                                                         MediaOp::PlayQueueItem(lease),
                                                         &media_generation,
@@ -24859,14 +24965,19 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- forward: open the focused preview in the browser --
                         (Section::Forward, KeyCode::Char('o')) => {
-                            if panel_ui.cursor == 0
-                                && let Some((worktree, port)) = model
+                            // Re-arm after snapshotting: the opened URL and its
+                            // feedback keep the source/status of the selected
+                            // target, while a fresh probe may update them later.
+                            if panel_ui.cursor == 0 {
+                                let worktree = model
                                     .preview
                                     .as_ref()
-                                    .map(|preview| (preview.worktree.clone(), preview.port))
-                            {
-                                preview_supervisor.rearm_port(&worktree, port);
-                                model.preview = preview_supervisor.view(&worktree);
+                                    .map(|preview| preview.worktree.clone());
+                                if let Some(worktree) = worktree {
+                                    // A missing supervisor target is unavailable: do
+                                    // not leave a stale preview that would open.
+                                    model.preview = preview_supervisor.open_view(&worktree);
+                                }
                             }
                             if let Some(url) =
                                 forward_url_at(&model, panel_ui.cursor).map(str::to_owned)
@@ -24880,9 +24991,10 @@ async fn event_loop<T: Terminal>(
                                 );
                                 if panel_ui.cursor == 0
                                     && let Some(preview) = &model.preview
-                                    && preview.status != thegn_core::preview::PreviewStatus::Up
                                 {
-                                    model.status.push_str(" (not answering yet)");
+                                    model
+                                        .status
+                                        .push_str(crate::preview::status_note(preview.status));
                                 }
                             } else {
                                 model.status = "No preview selected".into();
@@ -25719,7 +25831,7 @@ async fn event_loop<T: Terminal>(
                                 crate::media_ctl::spawn_media_action(
                                     media_effective_cfg(
                                         &current_config.media,
-                                        &media_player_override,
+                                        media_player_override.as_ref(),
                                     ),
                                     action,
                                     &media_generation,
@@ -28758,7 +28870,8 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::SearchPane => {
                                 // Open an incremental search overlay scoped to
-                                // the focused pane's history.
+                                // the focused pane's history. The prime scan runs
+                                // on the search worker, not this loop.
                                 let max = keymap.config().search.max_results;
                                 let mut overlay = crate::search::SearchOverlay::new(
                                     thegn_core::search::SearchScope::Pane(focused),
@@ -28779,7 +28892,8 @@ async fn event_loop<T: Terminal>(
                                     .iter()
                                     .map(|(id, label, buf)| (*id, label.as_str(), *buf))
                                     .collect();
-                                overlay.prime(&srcs_ref);
+                                overlay.queue_prime();
+                                overlay.start_pending_search(&srcs_ref, waker.clone());
                                 search = Some(overlay);
                             }
                             Action::SearchGlobal => {
@@ -28805,7 +28919,8 @@ async fn event_loop<T: Terminal>(
                                     .iter()
                                     .map(|(id, label, buf)| (*id, label.as_str(), *buf))
                                     .collect();
-                                overlay.prime(&srcs_ref);
+                                overlay.queue_prime();
+                                overlay.start_pending_search(&srcs_ref, waker.clone());
                                 search = Some(overlay);
                             }
                             Action::SearchReplace => {
@@ -29133,7 +29248,7 @@ async fn event_loop<T: Terminal>(
                                     spawn_media_op(
                                         media_effective_cfg(
                                             &current_config.media,
-                                            &media_player_override,
+                                            media_player_override.as_ref(),
                                         ),
                                         op,
                                         &media_generation,
@@ -29157,7 +29272,7 @@ async fn event_loop<T: Terminal>(
                                     spawn_media_pick(
                                         media_effective_cfg(
                                             &current_config.media,
-                                            &media_player_override,
+                                            media_player_override.as_ref(),
                                         ),
                                         players,
                                         media_pick_slot.clone(),

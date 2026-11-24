@@ -23,16 +23,28 @@ Four search surfaces, one habit: type, arrow, `↵`.
 with the pane it came from, so it doubles as "which of these six
 terminals printed that error".
 
-Each hit is labelled **worktree · tab · program**, so two panes running the
-same program in different tabs are told apart. Opening the overlay with an
+Searching never stalls typing or redrawing, even at workspace scope over
+hundreds of thousands of lines: matching runs on a background thread and the
+list says `searching…` until the ranked results are in. Pressing `↵` in the
+meantime jumps to the best hit as soon as it is found.
+
+Each hit is labelled **worktree · tab · program**, followed by how long ago the
+line was captured (`now`, `3m`, `2d`), so two panes running the same program in
+different tabs are told apart and an error from three days ago does not look
+like one from three minutes ago. The panel under the list previews the matched
+line with the two lines either side of it, the match highlighted, so you can
+recognise the context before you jump. Opening the overlay with an
 empty query lists the pane's most recent lines instead of an empty box.
-Identical lines from one pane are grouped into a single row, and `↵` goes to
-the newest of them.
+Identical lines from one pane are grouped into a single row labelled with the
+repeat count, and `↵` goes to the newest of them.
 
 `↵` scrolls the pane to the exact grid line when the terminal emulator still
-holds it. When the line has already scrolled out of the emulator's grid, the
-status line says so and points you to replay (`Alt r`), which has the full
-history.
+holds it and highlights the match. The mark stays until the next key or a
+scroll. `n` and `N` step to the next and previous hit without reopening the
+overlay; the status line shows which match you are on. When the line has
+already scrolled out of the emulator's grid, or came from a full-screen app,
+the status line says so and points you to replay (`Alt r`), which has the full
+history, instead of scrolling to an unrelated line.
 
 Matching is **literal** by default: the query is a substring, case-insensitive
 unless it contains an uppercase letter (smart case). Hits are ranked by match

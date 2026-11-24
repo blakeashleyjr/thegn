@@ -36,6 +36,30 @@ credentials.
 - **WHEN** any preview surface is used
 - **THEN** no installed-browser profile or OS-keychain material is accessed
 
+### Requirement: Live app opening preserves its own top-level session
+
+thegn SHALL open the selected development app URL unchanged in an ordinary
+top-level page of the external browser by default. App navigation, forms,
+cookies, and the app's own hot-reload WebSocket SHALL remain the app's traffic;
+thegn MUST NOT proxy or re-render app traffic for this path. Any future
+embedded web surface SHALL also offer the ordinary-tab action and MUST NOT make
+embedding the only way to open the app. Opening and copying SHALL use the
+selected target's source and last known status before re-arming one bounded
+probe, and SHALL distinguish a stopped target from one whose reachability is
+not yet proven.
+
+#### Scenario: Edit triggers the app's own hot reload
+
+- **WHEN** the user edits a file served by a running development app and the
+  app publishes an HMR update
+- **THEN** the opened top-level app applies that update over its own WebSocket
+
+#### Scenario: Open reports the last known target state
+
+- **WHEN** the user opens or copies a selected preview target
+- **THEN** the action reports the state the user saw, with a
+  stopped target distinguished from an unproven one
+
 ### Requirement: Diagnostic preview fetch is bounded and credential-free
 
 `preview.fetch` SHALL fetch an explicitly selected preview URL without ambient

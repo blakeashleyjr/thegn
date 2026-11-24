@@ -210,7 +210,7 @@ fn elapsed_text(elapsed: Duration) -> String {
     }
 }
 
-/// One descendant line: `direnv export bash 0.6 s` — argv[0] basename, up to
+/// One descendant line: `direnv export bash 0.6 s` — `argv[0]` basename, up to
 /// [`ARGS_BUDGET`] chars of the rest (redacted first: this is pane argv, and
 /// pane argv never reaches a surface unredacted — URL userinfo masked, flag
 /// and assignment values redacted, URL query tokens redacted), then the
@@ -294,7 +294,7 @@ fn clip_args(args: &[String]) -> String {
 
 /// (program-name set, one-line hint) rows, in priority order: the first row
 /// matching *any* candidate name wins, so `direnv` outranks a coincidental
-/// `git`. Candidates are argv[0] basenames — the pane's own program first,
+/// `git`. Candidates are `argv[0]` basenames — the pane's own program first,
 /// then the sampled descendants leaf-most (a pane running `ssh` answers
 /// `connecting` before any descendant is even sampled).
 pub(crate) const CULPRITS: &[(&[&str], &str)] = &[
@@ -328,7 +328,7 @@ const PROGRAM_ROWS: &[&str] = &["connecting", "waiting for input"];
 /// and input rows only (an `ssh` pane answers `connecting` even while a
 /// descendant runs), then the sampled descendants with row priority —
 /// `direnv` outranks a coincidental `git`. A descendant that *is* the pane's
-/// own program is never a startup culprit. Candidates are argv[0] basenames.
+/// own program is never a startup culprit. Candidates are `argv[0]` basenames.
 pub(crate) fn culprit_hint(program: Option<&str>, procs: &[ProcSample]) -> Option<&'static str> {
     if let Some(program) = program {
         for (keys, hint) in CULPRITS {
@@ -510,7 +510,7 @@ impl SpawnSamplerHub {
 /// The spawn-progress ticker — the exact idle contract the splash ticker
 /// keeps (`crate::loading::ticker`): `set_visible(true)` spawns a
 /// short-lived `thegn-spawn` thread that fires `tick` every
-/// [`PERIOD`] and parks itself out of existence (no send, no wake) within
+/// `PERIOD` and parks itself out of existence (no send, no wake) within
 /// one period of `false`. A session whose panes all print promptly never
 /// has the thread at all.
 ///

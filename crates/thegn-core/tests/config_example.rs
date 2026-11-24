@@ -255,6 +255,37 @@ fn example_config_parses_as_config() {
     }
 }
 
+/// THE-2118: the Daytona example must not hand the user a CLI recipe thegn has
+/// not verified. Its legacy `daytona-v0` verbs stay double-commented (`# #` is
+/// documentation; a single `#` is the config the reader is invited to
+/// uncomment), so an undoubled `exec_command` / `up_command` / `down_command`
+/// line inside the block is a regression.
+#[test]
+fn daytona_example_names_no_unverified_cli_recipe() {
+    let path = example_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim_start_matches([' ', '#']) == "[env.daytona]")
+        .expect("Example 3 has a [env.daytona] block");
+    let end = lines[start..]
+        .iter()
+        .position(|line| line.contains("(b) API"))
+        .map_or(lines.len(), |offset| start + offset);
+    for line in lines[start..end].iter() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.contains("datonya"), "typo'd env name: {line}");
+        if trimmed.contains("_command") {
+            assert!(
+                trimmed.starts_with("# #"),
+                "Daytona ships no verified CLI recipe; keep it double-commented: {line}"
+            );
+        }
+    }
+}
+
 /// Values that intentionally illustrate an example instead of the schema
 /// default. Each entry must name a schema-defaulted field and its comment must
 /// say that it is an example or optional value.

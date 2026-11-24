@@ -1244,6 +1244,98 @@ fn pr_ci_rerun_reservation_is_atomic_and_head_changes_rearm_it() {
 }
 
 #[test]
+fn pr_agent_refusal_is_durable_and_cleared_by_a_new_head_or_an_admission() {
+    use crate::pr_queue::{AgentAdmissionRefusal, PrAgentAdmission, PrAgentAdmit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pr-refusal.db");
+    let refusal = AgentAdmissionRefusal::RowState("agent_running".into());
+    {
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_pr("/repo", 7, Some("/wt"), "feat", "main", "github")
+            .unwrap();
+        db.update_pr_status(
+            "/repo#7",
+            "blocked_ci",
+            Some("ci"),
+            Some("checks red"),
+            Some("head-a"),
+        )
+        .unwrap();
+        assert!(
+            db.record_pr_agent_refusal("/repo#7", Some("head-a"), Some("head-a"), &refusal)
+                .unwrap()
+        );
+    }
+
+    // A refusal is state, not an event: reopening the database keeps it.
+    let db = Db::open_at(&path).unwrap();
+    let by = |key: &str| -> crate::db::PrQueueRow {
+        db.list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.key == key)
+            .unwrap()
+    };
+    let row = by("/repo#7");
+    assert_eq!(row.admission_refusal, Some(refusal.clone()));
+    assert_eq!(row.admission_refusal_head.as_deref(), Some("head-a"));
+    assert_eq!(row.detail, Some(refusal.to_string()));
+
+    // The write is fenced on the head the caller observed, so a stale pass
+    // cannot overwrite a newer observation.
+    assert!(
+        !db.record_pr_agent_refusal(
+            "/repo#7",
+            Some("head-0"),
+            Some("head-a"),
+            &AgentAdmissionRefusal::Disabled
+        )
+        .unwrap()
+    );
+    assert_eq!(by("/repo#7").admission_refusal, Some(refusal.clone()));
+
+    // Observing the same head again keeps the reason (that pass did not move
+    // the branch), but a new head clears it: the reason described the old one.
+    db.update_pr_status("/repo#7", "blocked_ci", None, None, Some("head-a"))
+        .unwrap();
+    assert_eq!(by("/repo#7").admission_refusal, Some(refusal.clone()));
+    db.update_pr_status("/repo#7", "blocked_ci", None, None, Some("head-b"))
+        .unwrap();
+    let moved = by("/repo#7");
+    assert_eq!(moved.admission_refusal, None);
+    assert_eq!(moved.admission_refusal_head, None);
+
+    // A successful admission is the other clear: the row is now an agent's, so
+    // the last refusal is spent.
+    assert!(
+        db.record_pr_agent_refusal("/repo#7", Some("head-b"), Some("head-b"), &refusal)
+            .unwrap()
+    );
+    let row = by("/repo#7");
+    assert_eq!(row.admission_refusal, Some(refusal.clone()));
+    let lease_until_ms = crate::util::now_ms() + 60_000;
+    let admitted = db
+        .admit_pr_agent(&PrAgentAdmit {
+            key: row.key.as_str(),
+            expected_attempts: row.agent_attempts,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "head-b",
+            blocker: "ci",
+            detail: "PR driver",
+            lease_until_ms,
+            owner_hint: Some("PR driver"),
+            ci_candidate: None,
+        })
+        .unwrap();
+    assert!(matches!(admitted, PrAgentAdmission::Admitted(_)));
+    let admitted_row = by("/repo#7");
+    assert_eq!(admitted_row.admission_refusal, None);
+    assert_eq!(admitted_row.admission_refusal_head, None);
+}
+
+#[test]
 fn pr_queue_enqueue_update_list_and_remove() {
     let db = db();
     assert!(db.list_pr_queue().unwrap().is_empty());

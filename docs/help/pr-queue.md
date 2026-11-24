@@ -216,7 +216,12 @@ repo other people push to:
 - **An agent that never starts** (sandbox entry refused, a broken command
   template, an unwritable prompt) does not spend an attempt: the row is held
   `needs_human` with the reason, for the PR queue and CI autofix alike, like the
-  merge queue.
+  merge queue. The reason is stored on the row itself, so it survives a restart
+  and is still there after the notification is dismissed — `list --json` adds an
+  `admission_refusal` object (or null), and the section shows it beside the row.
+  It is cleared when the branch's head changes (the reason described that head),
+  when an agent is finally admitted, and when the row is re-queued or rebound.
+  Restart the daemon after upgrading (schema v117 adds the refusal columns).
 
 After each agent run thegn also compares the PR head with the head the agent
 started on and says what happened in the pass warnings: the agent changed

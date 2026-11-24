@@ -240,7 +240,7 @@ async fn read(pipe: &mut Option<Output>, bytes: &mut [u8], live: bool) -> io::Re
 }
 async fn write(
     pipe: &mut Option<Input>,
-    active: &Option<(Vec<u8>, usize, Instant)>,
+    active: Option<&(Vec<u8>, usize, Instant)>,
 ) -> io::Result<usize> {
     if let (Some(pipe), Some((bytes, offset, _))) = (pipe, active) {
         return pipe.write(&bytes[*offset..]).await;
@@ -320,7 +320,7 @@ async fn running(
                 Ok(len) => stderr.feed(&error[..len]),
                 Err(error) => { process.errors.push(format!("stderr read: {error}")); return CloseReason::Protocol; }
             },
-            result = write(&mut process.stdin, &active) => match result {
+            result = write(&mut process.stdin, active.as_ref()) => match result {
                 Ok(0) => return CloseReason::WriteFailed,
                 Ok(len) => if let Some((bytes, offset, _)) = &mut active {
                     *offset += len;

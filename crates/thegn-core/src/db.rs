@@ -239,7 +239,10 @@ mod db_open_memo;
 /// v113: lane rule id, automation proposals, approval push nonces (THE-2200/2202).
 /// v114: producer leases (single headless producer per kind, THE-2208).
 /// v116: producer kinds beyond the four (the CHECK list dropped; ProducerKind::parse gates rows) and inbox account state (THE-2214).
-pub const SCHEMA_VERSION: i64 = 116;
+/// v117: pr_queue.admission_refusal + admission_refusal_head, the typed reason
+/// the last PR-agent dispatch for a head was refused (THE-1991). Purely
+/// additive; a pre-v117 row reads back as no refusal.
+pub const SCHEMA_VERSION: i64 = 117;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1245,6 +1248,15 @@ pub struct PrQueueRow {
     /// The head commit thegn last observed. A change it did not cause means a
     /// teammate pushed — see [`crate::pr_queue::foreign_push`].
     pub last_head_oid: Option<String>,
+    /// Why the last PR-agent dispatch was refused, typed. Recorded for one
+    /// observed head (`admission_refusal_head`) and cleared when the head
+    /// moves, when an agent is admitted, and on re-queue/rebind. A pre-v117
+    /// row — and a row that was never refused — reads `None`.
+    pub admission_refusal: Option<crate::pr_queue::AgentAdmissionRefusal>,
+    /// The head OID `admission_refusal` describes. Internal bookkeeping for the
+    /// clear-on-head-change rule, not part of the row's rendered surface.
+    #[serde(skip)]
+    pub admission_refusal_head: Option<String>,
     pub queued_at: i64,
     pub updated_at: i64,
 }
@@ -1897,6 +1909,7 @@ impl Db {
                     // Read-only: a plain open takes no write lock. The
                     // insert probe runs on the migration path below.
                     crate::db_migrate::verify_v116_shape(&conn)?;
+                    crate::db_migrate::verify_v117_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2596,6 +2609,7 @@ impl Db {
         crate::db_migrate::migrate_v113(&conn)?;
         crate::db_migrate::migrate_v114(&conn)?;
         crate::db_migrate::migrate_v116(&conn)?;
+        crate::db_migrate::migrate_v117(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2649,6 +2663,7 @@ impl Db {
             crate::db_migrate::verify_v113_schema(&conn)?;
             crate::db_migrate::verify_v114_schema(&conn)?;
             crate::db_migrate::verify_v116_schema(&conn)?;
+            crate::db_migrate::verify_v117_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

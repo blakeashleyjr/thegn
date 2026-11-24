@@ -14,7 +14,8 @@
     "Proposal Retirement & Cleanup",
     "Sandbox & Remote 00: Shared contracts",
     "Sandbox & Remote 01: Truth and fixes",
-    "Sandbox & Remote 05: macOS"
+    "Sandbox & Remote 05: macOS",
+    "Sandbox & Remote 06: Windows"
   ],
   "entries": [
     {
@@ -65,6 +66,18 @@
         }
       ],
       "summary": "Complete reproducible batteries-included platform bundles and clean-host proof."
+    },
+    {
+      "change": "add-bounded-argv-template-tokenizer",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2103",
+          "project": "Sandbox & Remote 00: Shared contracts"
+        }
+      ],
+      "summary": "One pure, bounded argv-element tokenizer is in thegn-core as the WS00-P1-07 stub; structural constructs and consumers remain with WS02-P4-02, so the change stays open until the first consumer lands."
     },
     {
       "change": "add-ci-logs-and-autofix",
@@ -433,7 +446,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "A brokered sandbox operation-policy engine remains unstarted."
+      "summary": "An ordered operation policy in front of `tools.run` and launch admission is specified and unstarted; WS02-P5-12 implements it."
     },
     {
       "change": "add-sandboxed-merge-gate",
@@ -527,6 +540,18 @@
         }
       ],
       "summary": "Vercel Sandbox as a remote provider; implemented and tested against a fake server, never run against Vercel."
+    },
+    {
+      "change": "add-vercel-selected-runner",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2418",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Selected-job executor for pinned build and test attempts on a project-selected Vercel Sandbox, fixture-tested; route wiring, live runs and usage reporting remain open."
     },
     {
       "change": "add-viewers-and-quick-open",
@@ -659,6 +684,14 @@
         }
       ],
       "summary": "Activity and attention parity require on-machine Windows validation."
+    },
+    {
+      "change": "add-windows-sandbox-helper-protocol",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2138 owns this crate, but its project (Sandbox & Remote 06: Windows) is outside the checked-in delivery inventory, so it is not mapped here.",
+      "summary": "The helper wire protocol and argv quoting still need Wine and Windows CI proof."
     },
     {
       "change": "add-workspace-search-replace",
@@ -946,6 +979,18 @@
       "summary": "THE-2491 owns pipeline worktree filing; implementation landed, with coordinator Mac sidebar proof and rendered evidence still unchecked."
     },
     {
+      "change": "fix-exact-terminal-search-jumps",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2242",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "THE-2242 resolves duplicate terminal matches by logical line distance, keeps the post-Enter mark steppable with n/N, and preserves the missing-line replay fallback; live wrapped-history proof remains unchecked."
+    },
+    {
       "change": "fix-macos-oci-runtimes",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -953,9 +998,13 @@
         {
           "issue": "THE-2099",
           "project": "Sandbox & Remote 05: macOS"
+        },
+        {
+          "issue": "THE-2131",
+          "project": "Sandbox & Remote 05: macOS"
         }
       ],
-      "summary": "THE-2099 owns the macOS OCI evidence runner; owner Mac capture and review of runtime decisions remain unchecked before enforcement changes."
+      "summary": "THE-2099 owns the macOS OCI evidence runner; owner Mac capture and review of runtime decisions remain unchecked before enforcement changes. THE-2131 landed the podman-rootful OS gate (Linux-only; not offered or probed on macOS)."
     },
     {
       "change": "fix-macos-process-group-drain",
@@ -993,6 +1042,18 @@
         }
       ],
       "summary": "Sandbox reporting must never claim more enforcement than is applied; authored in W0, implemented by WS01 items."
+    },
+    {
+      "change": "fix-windows-backend-gates",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-2065",
+          "project": "Sandbox & Remote 06: Windows"
+        }
+      ],
+      "summary": "WS06 ladder scaffold: the D5 order, the evidence tags, the claim register and the verified() rule; later WS06 items attach their deltas here."
     },
     {
       "change": "fold-autopilot-into-rules",
@@ -1667,6 +1728,18 @@
       ],
       "summary": "THE-603 additive strict WAL capture and Linux stable-namespace admission delivered on local main c6191b2a after root and independent review, source-bound positive/strict-lint evidence and two isolated counterfactual failures. THE-592/THE-607 integration remains separate.",
       "archive_path": "openspec/changes/archive/2026-09-30-strict-state-host-capture/"
+    },
+    {
+      "change": "terminal-search-off-loop",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2244",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Terminal history search scores an owned snapshot on a worker with generation-safe results, deferred Enter and failure fallback; live frame-time check open."
     },
     {
       "change": "validate-sandbox-volume-sources",

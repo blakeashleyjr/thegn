@@ -282,8 +282,9 @@ impl Capabilities {
     /// be `sshfs` *or* `in_env`, which the placement alone cannot distinguish.
     ///
     /// `oci_runtime` is the resolved `[sandbox] oci_runtime` (e.g. `"runsc"`,
-    /// `"krun"`); it raises the honest isolation class for OCI backends that run
-    /// under a stronger runtime, and is ignored by non-OCI backends.
+    /// `"krun"`); it raises the honest isolation class for engines that accept
+    /// `--runtime` (`podman`, `podman-rootful`, `docker`), and is ignored by
+    /// every other backend.
     ///
     /// `network` is the resolved `[sandbox] network`; callers that read only
     /// `isolation` pass [`Network::Nat`].
@@ -361,9 +362,12 @@ fn isolation_for(
     }
     // A stronger OCI runtime raises the honest class: gVisor's `runsc` services
     // syscalls in a userspace kernel; libkrun's `krun` boots the container inside
-    // a hardware-virtualized microVM. Only the OCI backends honor `--runtime`;
-    // `runc`/`crun`/unset fall through to the shared-kernel default below.
-    if backend.is_oci() {
+    // a hardware-virtualized microVM. Only engines whose create command accepts
+    // `--runtime` honor it (Apple's `container` rejects the flag); every other
+    // backend falls through to its normal arm, so a config string can never
+    // claim a boundary the engine did not deliver. `runc`/`crun`/unset also fall
+    // through to the shared-kernel default below.
+    if backend.accepts_runtime_flag() {
         match oci_runtime.map(str::trim) {
             Some("runsc") => return IsolationClass::UserspaceKernel,
             Some("krun") => return IsolationClass::GuestKernel,
@@ -1024,6 +1028,47 @@ mod tests {
             .isolation,
             IsolationClass::ProviderManaged
         );
+    }
+
+    #[test]
+    fn apple_runsc_stays_guest_kernel_not_userspace() {
+        // Apple's `container` has no `--runtime` flag, so a configured `runsc`
+        // is never delivered. Its real boundary is the per-container VM, and
+        // reporting `UserspaceKernel` because of a config string would
+        // under-report the engine's actual isolation.
+        let apple = Capabilities::from_parts_on(
+            Backend::Apple,
+            &Placement::Local,
+            Network::Nat,
+            false,
+            Some("runsc"),
+            HostOs::MacOs,
+        );
+        assert_eq!(apple.isolation, IsolationClass::GuestKernel);
+    }
+
+    #[test]
+    fn smol_runsc_class_unchanged() {
+        // `smol` is a reserved docker clone with no `--runtime` flag; setting
+        // the config value must not invent a class the backend never delivered.
+        let with_runtime = Capabilities::from_parts_on(
+            Backend::Smol,
+            &Placement::Local,
+            Network::Nat,
+            false,
+            Some("runsc"),
+            HostOs::Linux,
+        );
+        let without_runtime = Capabilities::from_parts_on(
+            Backend::Smol,
+            &Placement::Local,
+            Network::Nat,
+            false,
+            None,
+            HostOs::Linux,
+        );
+        assert_eq!(with_runtime.isolation, without_runtime.isolation);
+        assert_eq!(with_runtime.isolation, IsolationClass::SharedKernel);
     }
 
     #[test]

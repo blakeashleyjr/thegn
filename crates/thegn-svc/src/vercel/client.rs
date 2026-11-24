@@ -175,39 +175,38 @@ impl fmt::Debug for InteractiveTicket {
     }
 }
 
-/// A followed command log. Derefs to the line receiver; the reader task ends on
-/// body EOF (dropping the sender, so `recv` yields `None`) and is aborted when
-/// this guard drops.
+/// A followed command log. The reader task ends on body EOF (dropping the
+/// sender, so `recv` yields `None`) and is aborted when this guard drops.
 pub struct LogStream {
     rx: tokio::sync::mpsc::Receiver<LogLine>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl LogStream {
+    /// A stream over `rx` with a reader task that has already finished: the
+    /// seam the stream driver's tests use instead of a live log request.
     #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    pub(crate) fn from_receiver(rx: tokio::sync::mpsc::Receiver<LogLine>) -> Self {
         LogStream {
             rx,
             task: tokio::spawn(async {}),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        Self::from_receiver(rx)
+    }
+
     /// Whether the reader task has finished (EOF, error or consumer gone).
     pub fn reader_finished(&self) -> bool {
         self.task.is_finished()
     }
-}
 
-impl std::ops::Deref for LogStream {
-    type Target = tokio::sync::mpsc::Receiver<LogLine>;
-    fn deref(&self) -> &Self::Target {
-        &self.rx
-    }
-}
-
-impl std::ops::DerefMut for LogStream {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+    /// The log lines this stream follows. The borrow keeps this guard alive, so
+    /// the reader task is still aborted when the stream drops.
+    pub fn receiver_mut(&mut self) -> &mut tokio::sync::mpsc::Receiver<LogLine> {
         &mut self.rx
     }
 }
@@ -764,6 +763,22 @@ impl VercelClient {
         cmd: &str,
         deadline: Duration,
     ) -> Result<Option<i32>> {
+        Ok(self
+            .wait_command_exact(session, cmd, deadline)
+            .await?
+            .map(|code| code.unwrap_or(EXEC_EXIT_STATUS_UNKNOWN)))
+    }
+
+    /// [`wait_command`](Self::wait_command) without the sentinel: the outer
+    /// `None` is "no exit before the deadline", the inner `None` is a reported
+    /// exit code outside `i32`, so a genuine exit equal to the sentinel value is
+    /// never confused with it.
+    pub async fn wait_command_exact(
+        &self,
+        session: &str,
+        cmd: &str,
+        deadline: Duration,
+    ) -> Result<Option<Option<i32>>> {
         let p = retried("wait for command");
         let cmd = checked_id(cmd, "command")?;
         let url = self.url(
@@ -799,7 +814,8 @@ impl VercelClient {
                 Ok(result) => result?,
                 Err(_elapsed) => return Ok(None),
             };
-            let exit = command_exit(&v, cmd).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+            let exit =
+                command_exit_exact(&v, cmd).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
             if exit.is_some() {
                 return Ok(exit);
             }
@@ -1263,7 +1279,16 @@ async fn read_log_stream(mut resp: reqwest::Response, tx: tokio::sync::mpsc::Sen
 /// The exit code a get-command response reports (`{"command": {…}}` or bare):
 /// `None` while `exitCode` is absent or null. A response naming a different
 /// command is refused; a code outside `i32` is [`EXEC_EXIT_STATUS_UNKNOWN`].
+#[cfg(test)]
 fn command_exit(v: &serde_json::Value, cmd: &str) -> Result<Option<i32>, &'static str> {
+    Ok(command_exit_exact(v, cmd)?.map(|code| code.unwrap_or(EXEC_EXIT_STATUS_UNKNOWN)))
+}
+
+/// `command_exit` keeping "outside `i32`" distinct (`Some(None)`).
+fn command_exit_exact(
+    v: &serde_json::Value,
+    cmd: &str,
+) -> Result<Option<Option<i32>>, &'static str> {
     let c = v.get("command").filter(|c| c.is_object()).unwrap_or(v);
     if !c.is_object() {
         return Err("response has no command object");
@@ -1277,9 +1302,7 @@ fn command_exit(v: &serde_json::Value, cmd: &str) -> Result<Option<i32>, &'stati
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(code) => {
             let code = code.as_i64().ok_or("exitCode is not an integer")?;
-            Ok(Some(
-                i32::try_from(code).unwrap_or(EXEC_EXIT_STATUS_UNKNOWN),
-            ))
+            Ok(Some(i32::try_from(code).ok()))
         }
     }
 }

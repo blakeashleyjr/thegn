@@ -168,6 +168,19 @@ pub fn measure_worktree(path: &Path) -> DiskUsage {
     walk_usage(path)
 }
 
+/// Measure an arbitrary directory tree with exactly [`measure_worktree`]'s walk
+/// and units: apparent bytes, symlinks not followed, `target/` split out.
+///
+/// Build lanes live under a checkout's `target/lanes/` rather than being
+/// registered worktrees, but a lane that is a copy of the repository has the
+/// same shape — a checkout plus a `target/` subtree — so one traversal answers
+/// both "how big is this lane" and "how much of it is regenerable output".
+/// Keeping the walk here rather than in the lane report is what makes a lane's
+/// bytes and a worktree's bytes the same unit.
+pub fn measure_tree(path: &Path) -> DiskUsage {
+    measure_worktree(path)
+}
+
 /// Threads for the size walk. Bounded well below the core count: this runs on
 /// the background measurement lane beside builds and the compositor, and the
 /// walk is dominated by `stat` latency rather than CPU, so more threads buy

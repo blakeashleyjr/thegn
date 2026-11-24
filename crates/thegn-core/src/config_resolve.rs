@@ -1672,11 +1672,11 @@ const HINT_FIELDS: &[(&str, HintRule)] = &[
 ];
 
 fn limit_is_not_raised(
-    base: &Option<String>,
-    hinted: &Option<String>,
+    base: Option<&String>,
+    hinted: Option<&String>,
     parse: fn(&str) -> Option<u64>,
 ) -> bool {
-    match (base.as_deref(), hinted.as_deref()) {
+    match (base.map(String::as_str), hinted.map(String::as_str)) {
         (None, None) => true,
         (None, Some(hinted)) => parse(hinted).is_some(),
         (Some(_), None) => false,
@@ -1812,17 +1812,22 @@ fn repo_hint_weakens(
                 _ => false,
             },
             HintRule::Limits => {
-                !limit_is_not_raised(&base.limits.cpu, &hinted.limits.cpu, parse_cpu_millis)
-                    || !limit_is_not_raised(&base.limits.memory, &hinted.limits.memory, parse_bytes)
+                !limit_is_not_raised(
+                    base.limits.cpu.as_ref(),
+                    hinted.limits.cpu.as_ref(),
+                    parse_cpu_millis,
+                ) || !limit_is_not_raised(
+                    base.limits.memory.as_ref(),
+                    hinted.limits.memory.as_ref(),
+                    parse_bytes,
+                ) || !limit_is_not_raised(
+                    base.limits.cpu_total.as_ref(),
+                    hinted.limits.cpu_total.as_ref(),
+                    parse_cpu_millis,
+                ) || (base.limits.cpu_total.is_none() && hinted.limits.cpu_total.is_some())
                     || !limit_is_not_raised(
-                        &base.limits.cpu_total,
-                        &hinted.limits.cpu_total,
-                        parse_cpu_millis,
-                    )
-                    || (base.limits.cpu_total.is_none() && hinted.limits.cpu_total.is_some())
-                    || !limit_is_not_raised(
-                        &base.limits.memory_total,
-                        &hinted.limits.memory_total,
+                        base.limits.memory_total.as_ref(),
+                        hinted.limits.memory_total.as_ref(),
                         parse_bytes,
                     )
             }
@@ -3315,6 +3320,35 @@ mod tests {
         );
         assert!(matches!(env.placement, Placement::Ssh(_)));
         assert!(!env.unresolved_selection);
+    }
+
+    #[test]
+    fn existing_channel_config_fixture_parses_and_keeps_its_channel_boundaries() {
+        use crate::channel::{Channel, Feature};
+
+        // This fixture predates the nine programme gates. Keep it source-backed
+        // so parser and clamp compatibility are exercised against a real TOML
+        // shape already in use, not a newly invented config schema.
+        let source = include_str!("../tests/fixtures/release-channel-compat.toml");
+        let mut stable: Config = toml::from_str(source).expect("legacy channel config parses");
+        let clamped = stable.clamp_to_channel(Channel::Stable);
+        assert_eq!(clamped, [Feature::Placement, Feature::Voice]);
+        assert!(
+            Feature::PROGRAMME
+                .iter()
+                .all(|feature| !clamped.contains(feature))
+        );
+        assert!(stable.observe.enabled, "Observe remains stable");
+        assert_eq!(stable.apps.default_tab, "plugin:legacy");
+        assert!(!stable.placement.enabled);
+        assert!(!stable.voice.enabled);
+
+        let mut dev: Config = toml::from_str(source).expect("legacy channel config parses");
+        assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
+        assert!(dev.observe.enabled);
+        assert!(dev.placement.enabled);
+        assert!(dev.voice.enabled);
+        assert_eq!(dev.apps.default_tab, "plugin:legacy");
     }
 
     #[test]

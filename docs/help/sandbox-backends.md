@@ -29,7 +29,12 @@ again inside the sandbox; a `systemd-run` launch without `bwrap` drops them.
 If the systemd backend cannot create a pane's protected environment file, the
 pane still starts without those host-sourced secrets. The launch warning names
 each omitted secret key, never its value; secrets are not put on the command
-line.
+line. A remote placement uses the same rule: ssh and Kubernetes OCI creates
+carry the env-file over stdin, while a placement with no confidential carrier
+(provider, or remote bwrap/systemd) omits the key with the same keys-only
+warning rather than inlining it. A host-matching sandbox environment value is
+treated as a secret, so it never rides `--setenv`, `-e` or the remote `sh -lc`
+command string.
 
 For local rootless Podman, the first thegn command is the `version` liveness
 probe, before container creation or the events client. The `podman events`
@@ -43,6 +48,12 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > **NixOS tip:** set `backend = "bwrap"` to skip the podman probes and get
 > instant panes.
 
+> **macOS note:** `podman-rootful` (`sudo -n podman`) is not offered on a Mac:
+> podman runs rootless inside its own Linux VM there, so the default chain skips
+> it without probing, and pinning it reports it unavailable on macOS. It is
+> Linux-only, so BSD and other hosts do not offer it either. Use
+> `podman machine set --rootful` with the `podman-rootless` backend instead.
+>
 > **macOS tip:** `apple` is Apple's `container` CLI. Each container gets its
 > own Linux VM, so it is the strongest isolation any backend here offers.
 > Without `apple`, podman, or docker, a Mac has no backend meeting the default
@@ -133,12 +144,15 @@ the same check.
 
 The honest **isolation class**, weakest to strongest:
 
-| Class              | Escape needs…                               | Backends                                             |
-| ------------------ | ------------------------------------------- | ---------------------------------------------------- |
-| `host-process`     | nothing — no boundary                       | `none`, and the Windows Job Object (scoping only)    |
-| `shared-kernel`    | a host-kernel exploit in an allowed syscall | podman/docker/bwrap/systemd                          |
-| `userspace-kernel` | a gVisor Sentry bug (`oci_runtime="runsc"`) | OCI + runsc                                          |
-| `guest-kernel`     | a VMM/KVM bug                               | `apple`, `oci_runtime="krun"`, macOS VM-mediated OCI |
+| Class              | Escape needs…                               | Backends                                                            |
+| ------------------ | ------------------------------------------- | ------------------------------------------------------------------- |
+| `host-process`     | nothing — no boundary                       | `none`, and the Windows Job Object (scoping only)                   |
+| `shared-kernel`    | a host-kernel exploit in an allowed syscall | podman/docker/bwrap/systemd                                         |
+| `userspace-kernel` | a gVisor Sentry bug (`oci_runtime="runsc"`) | podman/podman-rootful/docker + runsc                                |
+| `guest-kernel`     | a VMM/KVM bug                               | `apple`, podman/podman-rootful/docker + krun, macOS VM-mediated OCI |
+
+`oci_runtime` applies to podman, podman-rootful and docker only; other
+backends ignore it and say so.
 
 A Windows Job Object is process-tree lifetime + resource scoping with **no**
 filesystem or network boundary, so it is honestly `host-process`, never a
@@ -151,7 +165,9 @@ Only a local placement on a Linux host probes the runtime binary and
 the runtime you requested, because the local machine cannot tell whether it
 exists there. On a local Linux host, `oci_runtime = "krun"` needs `/dev/kvm`
 to open read-write; otherwise it degrades and `thegn doctor` reports the
-resulting isolation class.
+resulting isolation class. When an unprobed engine still rejects the runtime at
+create, the failure names the runtime and the placement instead of a generic
+container error.
 
 ## Isolation floor
 

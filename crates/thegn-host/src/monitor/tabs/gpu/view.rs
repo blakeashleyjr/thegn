@@ -310,9 +310,9 @@ fn copy_gpu_devices(
             destination_row.gtt_total = source_row.gtt_total;
             destination_row.boot_vga = source_row.boot_vga;
             destination_row.slot.clone_from(&source_row.slot);
-            clone_optional_string(&mut destination_row.driver, &source_row.driver);
-            clone_optional_string(&mut destination_row.pci_id, &source_row.pci_id);
-            clone_optional_string(&mut destination_row.family, &source_row.family);
+            clone_optional_string(&mut destination_row.driver, source_row.driver.as_ref());
+            clone_optional_string(&mut destination_row.pci_id, source_row.pci_id.as_ref());
+            clone_optional_string(&mut destination_row.family, source_row.family.as_ref());
         } else {
             destination.push(source_row.clone());
         }
@@ -320,7 +320,7 @@ fn copy_gpu_devices(
     destination.truncate(count);
 }
 
-fn clone_optional_string(destination: &mut Option<String>, source: &Option<String>) {
+fn clone_optional_string(destination: &mut Option<String>, source: Option<&String>) {
     match source {
         Some(source) => match destination {
             Some(destination) => destination.clone_from(source),

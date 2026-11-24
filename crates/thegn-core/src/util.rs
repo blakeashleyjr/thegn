@@ -16,6 +16,29 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+/// True when this process can open `/dev/kvm` for reading and writing.
+///
+/// Existence is not access: the node is present on many hosts where the user is
+/// not in the `kvm` group (or the node is `0600`), and a container started with
+/// libkrun then fails at create. Opening the node read-write is the real test;
+/// it issues no ioctl and changes no device state. This is the one KVM probe the
+/// sandbox runtime gate and `thegn doctor` share.
+///
+/// Callers must only use it for a local Linux engine: a remote placement or a
+/// macOS podman machine runs the engine on another machine, where this host's
+/// answer means nothing.
+pub fn kvm_accessible() -> bool {
+    can_open_read_write(Path::new("/dev/kvm"))
+}
+
+fn can_open_read_write(path: &Path) -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .is_ok()
+}
+
 fn env_os(key: &str) -> Option<OsString> {
     std::env::var_os(key)
 }
@@ -2176,6 +2199,12 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kvm_probe_opens_read_write_without_touching_the_device() {
+        let synthetic_device = tempfile::NamedTempFile::new().unwrap();
+        assert!(can_open_read_write(synthetic_device.path()));
+    }
 
     #[test]
     fn path_resolvers_match_each_host_convention_and_fallback() {

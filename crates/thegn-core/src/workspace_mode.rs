@@ -20,14 +20,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceMode {
-    /// A fresh private repository with a captured copy of the worktree; files
-    /// return to the host only through quarantine export and patch review.
+    /// The workload edits its own private repository and only reviewed file
+    /// changes return to the host.
     PrivateCopy,
-    /// The linked git worktree itself (today's behaviour).
+    /// The workload edits a linked worktree that shares the host repository's
+    /// objects and refs.
     #[default]
     GitWorktree,
-    /// An existing host tree mounted at its own path (terminal tabs on
-    /// arbitrary directories, devcontainer live mounts).
+    /// The workload edits the host directory in place.
     LiveMount,
 }
 
@@ -39,18 +39,16 @@ impl WorkspaceMode {
         WorkspaceMode::LiveMount,
     ];
 
-    /// One line on what the mode exposes to the host, for labels and help.
-    pub const fn exposure_note(self) -> &'static str {
-        match self {
+    /// One factual sentence on the files the workload can edit.
+    pub const fn exposure_note(&self) -> &'static str {
+        match *self {
             WorkspaceMode::PrivateCopy => {
-                "private copy: the sandbox works on its own copy; files reach the host only as reviewed patches"
+                "The workload edits its own private repository and only reviewed file changes return to the host."
             }
             WorkspaceMode::GitWorktree => {
-                "git worktree: the sandbox writes the linked worktree directly; the git guards apply"
+                "The workload edits a linked worktree that shares the host repository's objects and refs."
             }
-            WorkspaceMode::LiveMount => {
-                "live mount: a host directory is mounted at its own path; writes land on the host at once"
-            }
+            WorkspaceMode::LiveMount => "The workload edits the host directory in place.",
         }
     }
 }
@@ -85,7 +83,13 @@ mod tests {
         assert!(
             WorkspaceMode::PrivateCopy
                 .exposure_note()
-                .starts_with("private copy")
+                .starts_with("The workload edits its own private repository")
+        );
+        assert!(
+            WorkspaceMode::ALL
+                .iter()
+                .all(|mode| mode.exposure_note().ends_with('.')),
+            "each note is one plain sentence"
         );
     }
 
