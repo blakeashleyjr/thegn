@@ -48,3 +48,35 @@ verified on the selected runtime.
 - **THEN** the runner records the count as observed evidence
 - **AND** it does not infer that `nproc` enforcement is disabled or approved
   without a suitable user/control comparison
+
+### Requirement: Apple never receives a host or none network keyword
+
+Apple's `container` CLI SHALL NOT be invoked with `--network host` or
+`--network none`. `none` is read as a network name rather than removing the
+network, and Apple has no host-network mode at all. A launch that resolves
+either mode on the `apple` backend MUST be refused with `network-unexpressible`
+before any argv is composed. `network = "none"` (and therefore the `sealed`
+profile) stays refused while an Apple internal network still reaches services
+bound on the Mac, so thegn SHALL NOT report an Apple launch as `Offline` or as
+`network = "none"` enforced.
+
+#### Scenario: Apple host is refused before argv
+
+- **WHEN** an `apple` launch resolves `network = "host"`
+- **THEN** admission refuses with `network-unexpressible` and no container is
+  created
+- **AND** no composed argv carries `--network host`
+
+#### Scenario: Apple none names the host-reachability caveat
+
+- **WHEN** an `apple` launch resolves `network = "none"` (including through the
+  `sealed` profile)
+- **THEN** admission refuses with `network-unexpressible`
+- **AND** the reason says the Apple internal network still reaches services
+  bound on the Mac, and points at podman or docker for offline work
+
+#### Scenario: Podman and Docker network none is unchanged
+
+- **WHEN** a local podman or docker launch resolves `network = "none"`
+- **THEN** its create argv still carries `--network none`
+- **AND** the launch is not refused by the Apple-only gate
