@@ -74,9 +74,13 @@ pub fn remedy(backend: Backend, state: BackendState) -> Option<String> {
 }
 
 fn remedy_for(backend: Backend, state: BackendState) -> Option<String> {
+    remedy_for_on(host_os(), backend, state)
+}
+
+fn remedy_for_on(os: HostOs, backend: Backend, state: BackendState) -> Option<String> {
     match (backend, state) {
         // An explicit `podman-rootful` on a Mac: say where the right route is.
-        (Backend::PodmanRootful, BackendState::Unsupported) if host_os() == HostOs::MacOs => Some(
+        (Backend::PodmanRootful, BackendState::Unsupported) if os == HostOs::MacOs => Some(
             "podman-rootful is not available on macOS; use `podman machine set --rootful` \
                  and the `podman-rootless` backend"
                 .into(),
@@ -205,6 +209,29 @@ pub fn first_ready(report: &[BackendSupport]) -> Option<&BackendSupport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rootful_remedy_on_macos_points_at_machine_rootful() {
+        let on_mac = remedy_for_on(
+            HostOs::MacOs,
+            Backend::PodmanRootful,
+            BackendState::Unsupported,
+        );
+        let text = on_mac.expect("macOS remedy");
+        assert!(
+            text.contains("podman-rootful is not available on macOS"),
+            "{text}"
+        );
+        assert!(text.contains("podman machine set --rootful"), "{text}");
+        assert_eq!(
+            remedy_for_on(
+                HostOs::Linux,
+                Backend::PodmanRootful,
+                BackendState::Unsupported
+            ),
+            None
+        );
+    }
 
     #[test]
     fn os_support_is_decided_before_installation() {

@@ -950,7 +950,7 @@
           "project": "Sandbox & Remote 05: macOS"
         }
       ],
-      "summary": "THE-2099 owns the macOS OCI evidence runner; owner Mac capture and review of runtime decisions remain unchecked before enforcement changes."
+      "summary": "THE-2099 owns the macOS OCI evidence runner; owner Mac capture and review of runtime decisions remain unchecked before enforcement changes. THE-2131 landed the podman-rootful OS gate (Linux-only; not offered or probed on macOS)."
     },
     {
       "change": "fix-macos-process-group-drain",

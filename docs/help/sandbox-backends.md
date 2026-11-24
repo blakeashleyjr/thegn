@@ -45,7 +45,8 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 
 > **macOS note:** `podman-rootful` (`sudo -n podman`) is not offered on a Mac:
 > podman runs rootless inside its own Linux VM there, so the default chain skips
-> it without probing, and pinning it reports it unavailable on macOS. Use
+> it without probing, and pinning it reports it unavailable on macOS. It is
+> Linux-only, so BSD and other hosts do not offer it either. Use
 > `podman machine set --rootful` with the `podman-rootless` backend instead.
 >
 > **macOS tip:** `apple` is Apple's `container` CLI. Each container gets its
