@@ -1430,7 +1430,9 @@ mod tests {
         assert_eq!(scope_slug(""), "wt");
         assert_eq!(scope_slug("/"), "wt");
         assert_eq!(scope_slug("ünï"), "n");
-        let long = "a".repeat(39) + "-" + &"b".repeat(30);
+        let mut long = "a".repeat(39);
+        long.push('-');
+        long.push_str(&"b".repeat(30));
         let slug = scope_slug(&long);
         assert!(slug.len() <= SCOPE_SLUG_MAX);
         // Truncation never leaves a trailing dash.

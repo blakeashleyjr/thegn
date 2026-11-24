@@ -22,6 +22,7 @@ use thegn_core::remote::GitLoc;
 use thegn_core::secretref::BareAs;
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -2643,7 +2644,7 @@ fn encode_project_segment(project: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             encoded.push(byte as char);
         } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+            write!(encoded, "%{byte:02X}").expect("writing to String cannot fail");
         }
     }
     encoded
@@ -2783,7 +2784,7 @@ mod tests {
     fn log_collector_matches_collect_log_for_any_chunking() {
         let mut many_lines = String::new();
         for n in 0..2100 {
-            many_lines.push_str(&format!("line {n}\n"));
+            writeln!(many_lines, "line {n}").expect("writing to String cannot fail");
         }
         let inputs: [&[u8]; 3] = [
             b"before\n-----BEGIN PRIVATE KEY-----\nsecret-body\n-----END PRIVATE KEY-----\nafter\n",
@@ -3479,7 +3480,7 @@ mod tests {
     fn collector_redacts_all_retained_lines_after_prefix_eviction() {
         let mut input = String::from("SYNTHETIC_EVICTED_BODY\n");
         for line in 0..PROVIDER_LOG_MAX_LINES {
-            input.push_str(&format!("ordinary {line}\n"));
+            writeln!(input, "ordinary {line}").expect("writing to String cannot fail");
         }
         input.push_str("-----END PRIVATE KEY-----\n");
 
@@ -6232,7 +6233,7 @@ esac
             }
         }
         text.push(' ');
-        text.push_str(&format!("{cmd:?}"));
+        write!(text, "{cmd:?}").expect("writing to String cannot fail");
         text
     }
 

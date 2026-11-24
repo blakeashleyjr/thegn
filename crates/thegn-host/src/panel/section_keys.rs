@@ -947,7 +947,9 @@ mod tests {
             } else {
                 output.extend(violations.iter().cloned());
             }
-            std::fs::write(allow_path, output.join("\n") + "\n").unwrap();
+            let mut text = output.join("\n");
+            text.push('\n');
+            std::fs::write(allow_path, text).unwrap();
             return;
         }
         let pinned =

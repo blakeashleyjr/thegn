@@ -22,6 +22,7 @@
 use super::Config;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 /// How a changed key reaches a running instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -527,9 +528,9 @@ fn push_section(out: &mut String, label: &str, items: &[String], budget: usize) 
     let hidden = items.len() - shown;
     if hidden > 0 {
         if shown == 0 {
-            section.push_str(&format!("{hidden} keys"));
+            write!(section, "{hidden} keys").expect("writing to String cannot fail");
         } else {
-            section.push_str(&format!(" +{hidden} more"));
+            write!(section, " +{hidden} more").expect("writing to String cannot fail");
         }
     }
     out.push_str(&section);

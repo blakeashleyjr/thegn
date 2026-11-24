@@ -7,6 +7,7 @@
 //! binary, so the allocator affects nothing else.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -50,9 +51,11 @@ fn peak_growth<T>(f: impl FnOnce() -> T) -> (T, usize) {
 fn feed(n: usize) -> String {
     let mut s = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..n {
-        s.push_str(&format!(
-            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:Event number {i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
-        ));
+        writeln!(
+            s,
+            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:Event number {i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r"
+        )
+        .expect("writing to String cannot fail");
     }
     s.push_str("END:VCALENDAR\r\n");
     s

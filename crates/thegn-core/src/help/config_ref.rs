@@ -7,6 +7,7 @@
 //! whose prose is the comment block immediately above the header, and the
 //! table's keys (with their inline comments) become a fenced `toml` block.
 
+use std::fmt::Write as _;
 /// The page id the generated reference is registered under.
 pub const PAGE_ID: &str = "config-reference";
 
@@ -110,7 +111,7 @@ pub fn page(example: &str) -> String {
 
     let mut out = String::new();
     out.push_str("---\n");
-    out.push_str(&format!("id: {PAGE_ID}\n"));
+    writeln!(out, "id: {PAGE_ID}").expect("writing to String cannot fail");
     out.push_str("title: Config reference\n");
     out.push_str("parent: configuration\n");
     out.push_str("order: 99\n");
@@ -138,7 +139,7 @@ pub fn page(example: &str) -> String {
         if body.is_empty() {
             continue;
         }
-        out.push_str(&format!("\n## `{}`\n\n", section.title));
+        write!(out, "\n## `{}`\n\n", section.title).expect("writing to String cannot fail");
         for line in &section.prose {
             out.push_str(&escape_wikilinks(line));
             out.push('\n');

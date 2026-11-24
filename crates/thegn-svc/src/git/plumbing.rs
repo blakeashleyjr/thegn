@@ -9,6 +9,7 @@
 
 use super::{GitBackend, gpg_args, run, run_background_commit_stdin, run_w};
 use anyhow::{Context, Result};
+use std::fmt::Write as _;
 use thegn_core::fold::{Author, CommitMeta};
 use thegn_core::git_operand as op;
 use thegn_core::remote::GitLoc;
@@ -509,9 +510,10 @@ pub trait PlumbingOps: GitBackend {
         for (name, oid) in sources {
             let name = op::revision(name)?;
             let oid = op::revision(oid)?;
-            transaction.push_str(&format!("verify {name} {oid}\n"));
+            writeln!(transaction, "verify {name} {oid}").expect("writing to String cannot fail");
         }
-        transaction.push_str(&format!("update {target} {new} {old}\nprepare\ncommit\n"));
+        writeln!(transaction, "update {target} {new} {old}\nprepare\ncommit")
+            .expect("writing to String cannot fail");
         let args = fenced(loc, &["update-ref", "--stdin"]);
         match super::output_bounded_with_input(
             loc.git_command(&args),
@@ -969,11 +971,15 @@ mod tests {
         let oid_b = repo.head();
         let date = repo.out(&["show", "-s", "--format=%aI", &oid_b]);
         let record = |oid: &str, parent: &str, name: &str, date: &str, message: &str| {
-            [oid, parent, name, "author@example.test", date, message].join("\0") + "\0"
+            let mut rec = [oid, parent, name, "author@example.test", date, message].join("\0");
+            rec.push('\0');
+            rec
         };
         let valid_a = record(&oid_a, "", "first", &date, "one\u{1f}\u{1e}");
         let valid_b = record(&oid_b, &oid_a, "second", &date, "two");
-        let parsed = parse_commit_metas(&(valid_a.clone() + &valid_b)).unwrap();
+        let mut paired = valid_a.clone();
+        paired.push_str(&valid_b);
+        let parsed = parse_commit_metas(&paired).unwrap();
         assert_eq!(
             parsed,
             vec![
@@ -1002,6 +1008,9 @@ mod tests {
             ]
         );
 
+        // Two records glued without the separator the parser splits on.
+        let mut doubled = valid_a.clone();
+        doubled.push_str(&valid_a);
         for malformed in [
             // A truncated final record has no NUL terminator.
             format!("{oid_a}\0\0name\0author@example.test\0{date}\0message"),
@@ -1009,7 +1018,7 @@ mod tests {
             format!("{oid_a}\0\0name\0author@example.test\0{date}\0"),
             record("bad-oid", "", "name", &date, "message"),
             record(&oid_a, "bad-parent", "name", &date, "message"),
-            valid_a.clone() + &valid_a,
+            doubled,
             record(&oid_a, "", "name", "", "message"),
         ] {
             assert!(parse_commit_metas(&malformed).is_err(), "{malformed:?}");

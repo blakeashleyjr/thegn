@@ -4,6 +4,7 @@
 //! and accepts a deliberately narrow flat YAML grammar or a strict JSON object.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use crate::theme::{Hue, Palette, blend_over, contrast_ratio, extend_palette};
 use crate::theme_resolve::normalize_hex;
@@ -453,12 +454,14 @@ mod tests {
             "name: \"Test Gogh\"\nvariant: dark\nbackground: \"#101820\"\nforeground: \"#f0f0f0\"\ncursor: \"#00ffcc\"\n",
         );
         for index in 1..=16 {
-            text.push_str(&format!(
-                "color_{index:02}: \"#{:02x}{:02x}{:02x}\"\n",
+            writeln!(
+                text,
+                "color_{index:02}: \"#{:02x}{:02x}{:02x}\"",
                 index,
                 index + 1,
                 index + 2
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         text
     }

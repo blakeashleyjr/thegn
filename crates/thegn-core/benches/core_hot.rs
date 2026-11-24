@@ -11,6 +11,7 @@
 //! Run: `cargo bench -p thegn-core --bench core_hot`.
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use std::fmt::Write as _;
 use std::hint::black_box;
 use thegn_core::preview::{MAX_PORT_HINT_CHARS, parse_pane_port_hints_wrapped};
 use thegn_core::theme::{Palette, extend_palette, preset};
@@ -43,7 +44,8 @@ fn spinner_tail(len: usize) -> String {
     let mut second = 0usize;
     while text.len() < MAX_PORT_HINT_CHARS {
         let frame = frames[second % frames.len()];
-        text.push_str(&format!("\r{frame} building… {second}s {}", "·".repeat(24)));
+        write!(text, "\r{frame} building… {second}s {}", "·".repeat(24))
+            .expect("writing to String cannot fail");
         second += 1;
     }
     let mut start = text.len().saturating_sub(len);

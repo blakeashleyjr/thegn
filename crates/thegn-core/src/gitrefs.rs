@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn commits_root_merge_and_octopus_parents() {
-        let out = [
+        let mut out = [
             rec(&[
                 "a".repeat(40).as_str(),
                 "aaaaaaa",
@@ -608,8 +608,8 @@ mod tests {
                 "octopus",
             ]),
         ]
-        .join("\0")
-            + "\0";
+        .join("\0");
+        out.push('\0');
         let v = parse_commits(&out).unwrap();
         assert_eq!(v.len(), 3);
         assert!(v[0].parents.is_empty());
@@ -697,15 +697,15 @@ mod tests {
 
     #[test]
     fn branches_every_track_form() {
-        let out = [
+        let mut out = [
             branch_row("*", "main", "origin/main", ""),
             branch_row(" ", "feat", "origin/feat", "[ahead 1]"),
             branch_row(" ", "fix", "origin/fix", "[behind 2]"),
             branch_row(" ", "both", "origin/both", "[ahead 1, behind 2]"),
             branch_row(" ", "old", "origin/old", "[gone]"),
         ]
-        .join("\n")
-            + "\n";
+        .join("\n");
+        out.push('\n');
         let v = parse_branches(&out).unwrap();
         assert_eq!(v.len(), 5);
         assert!(v[0].is_head);
@@ -725,12 +725,12 @@ mod tests {
 
     #[test]
     fn branches_no_upstream_and_weird_names() {
-        let out = [
+        let mut out = [
             branch_row(" ", "feature/deep/dotted.name", "", ""),
             branch_row("*", "release-1.2.x", "origin/release-1.2.x", "[ahead 3]"),
         ]
-        .join("\n")
-            + "\n";
+        .join("\n");
+        out.push('\n');
         let v = parse_branches(&out).unwrap();
         assert_eq!(v[0].name, "feature/deep/dotted.name");
         assert_eq!(v[0].upstream, None);
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn stashes_indices_and_messy_messages() {
-        let out = [
+        let mut out = [
             stash_row(
                 "stash@{0}",
                 &"a".repeat(40),
@@ -785,8 +785,8 @@ mod tests {
             ),
             stash_row("stash@{2}", &"c".repeat(40), "30", "plain"),
         ]
-        .join("\0")
-            + "\0";
+        .join("\0");
+        out.push('\0');
         let v = parse_stashes(&out).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].index, 0);

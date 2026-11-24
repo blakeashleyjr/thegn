@@ -663,7 +663,8 @@ fn file_ratchet_with<R: RatchetIo>(
         } else {
             output.extend(found.iter().cloned());
         }
-        let contents = output.join("\n") + "\n";
+        let mut contents = output.join("\n");
+        contents.push('\n');
         reader
             .write(&path, contents.as_bytes())
             .map_err(|error| io_failure("write allowlist", &path, error))?;

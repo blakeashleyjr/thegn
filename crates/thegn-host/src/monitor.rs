@@ -24,6 +24,7 @@
 //! Pausing freezes the *view* only: masthead history keeps filling underneath,
 //! so resuming shows a continuous timeline rather than a gap.
 
+use std::fmt::Write as _;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
@@ -1601,19 +1602,24 @@ impl MonitorOverlay {
                         "sent SIGTERM to {sent} of {total} processes in the tree of {label}"
                     );
                     if vanished > 0 {
-                        status.push_str(&format!(" ({vanished} vanished"));
+                        write!(status, " ({vanished} vanished")
+                            .expect("writing to String cannot fail");
                         if refused > 0 {
-                            status.push_str(&format!(
+                            write!(
+                                status,
                                 ", {refused} refused: {}",
                                 first_error.as_deref().unwrap_or("unknown error")
-                            ));
+                            )
+                            .expect("writing to String cannot fail");
                         }
                         status.push(')');
                     } else if refused > 0 {
-                        status.push_str(&format!(
+                        write!(
+                            status,
                             " ({refused} refused: {})",
                             first_error.as_deref().unwrap_or("unknown error")
-                        ));
+                        )
+                        .expect("writing to String cannot fail");
                     }
                     if excluded > 0 {
                         if vanished > 0 || refused > 0 {

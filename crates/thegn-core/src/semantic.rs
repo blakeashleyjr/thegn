@@ -11,6 +11,7 @@
 //! We replicate the capability of the (license-encumbered) `sem`/`weave` tools
 //! ourselves on the permissive `tree-sitter` ecosystem.
 
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
@@ -554,7 +555,7 @@ pub fn derive_commit_message(per_file: &[(String, Vec<EntityChange>)]) -> String
         .collect();
     let mut subject = subject_parts.join(", ");
     if flat.len() > 3 {
-        subject.push_str(&format!(", +{} more", flat.len() - 3));
+        write!(subject, ", +{} more", flat.len() - 3).expect("writing to String cannot fail");
     }
 
     // Body: one section per file with entity bullets.
@@ -563,16 +564,18 @@ pub fn derive_commit_message(per_file: &[(String, Vec<EntityChange>)]) -> String
         if changes.is_empty() {
             continue;
         }
-        body.push_str(&format!("\n\n{file}:"));
+        write!(body, "\n\n{file}:").expect("writing to String cannot fail");
         for c in changes {
-            body.push_str(&format!(
+            write!(
+                body,
                 "\n  - {} {} `{}` (+{} -{})",
                 verb(c.touch),
                 c.kind.label(),
                 c.name,
                 c.added,
                 c.deleted
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
     }
     format!("{subject}{body}")

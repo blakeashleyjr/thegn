@@ -16,6 +16,7 @@
 //! Lifecycle (lazy start, warm reuse, host-initiated graceful shutdown) is owned a layer up by
 //! the host's `LspSupervisor`; this module is just one connection.
 
+use std::fmt::Write as _;
 pub mod diagnostics_queue;
 pub mod framing;
 pub mod registry;
@@ -1275,7 +1276,7 @@ fn percent_encode_path(path: &str) -> String {
         if keep {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            write!(out, "%{b:02X}").expect("writing to String cannot fail");
         }
     }
     out
@@ -5069,10 +5070,9 @@ mod tests {
 
     #[test]
     fn over_budget_response_fails_its_request_promptly() {
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","id":42,"result":{}}}"#,
-            "[".repeat(limits::MAX_JSON_DEPTH + 1) + &"]".repeat(limits::MAX_JSON_DEPTH + 1)
-        );
+        let mut nested = "[".repeat(limits::MAX_JSON_DEPTH + 1);
+        nested.push_str(&"]".repeat(limits::MAX_JSON_DEPTH + 1));
+        let body = format!(r#"{{"jsonrpc":"2.0","id":42,"result":{nested}}}"#);
         assert_eq!(top_level_id(body.as_bytes()), Some(42));
         assert_eq!(
             top_level_id(br#"{"result":{"id":7},"x":"\"id\":9","id":-3}"#),

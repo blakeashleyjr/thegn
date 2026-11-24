@@ -12,6 +12,7 @@
 //! its content, size, and placement; the data is snapshotted at open time so the
 //! overlay owns it (no borrow of the model held across frames).
 
+use std::fmt::Write as _;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
@@ -2263,7 +2264,8 @@ fn badge_detail(
                     // · dur" — the context that used to be hidden behind the glyph.
                     let mut text = format!("{} \u{00b7} {}", r.name, ci_state_word(r.state));
                     if !r.title.is_empty() && r.title != r.name {
-                        text.push_str(&format!(" \u{2014} {}", r.title));
+                        write!(text, " \u{2014} {}", r.title)
+                            .expect("writing to String cannot fail");
                     }
                     let mut note_parts: Vec<String> = Vec::new();
                     if let Some(n) = r.run_number {

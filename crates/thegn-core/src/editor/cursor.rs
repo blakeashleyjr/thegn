@@ -4,6 +4,7 @@ use super::{
 };
 use crate::config::EditorOpenIn;
 use crate::seam::{Probe, ProbeReport};
+use std::fmt::Write as _;
 
 const ID: &str = "cursor";
 const EXECUTABLE: &str = "cursor";
@@ -40,9 +41,9 @@ impl Editor for Cursor {
     fn open_file(&self, target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
         let mut location = target.path().to_string_lossy().into_owned();
         if let Some(line) = target.line() {
-            location.push_str(&format!(":{line}"));
+            write!(location, ":{line}").expect("writing to String cannot fail");
             if let Some(col) = target.col() {
-                location.push_str(&format!(":{col}"));
+                write!(location, ":{col}").expect("writing to String cannot fail");
             }
         }
         Ok(EditorLaunch::direct(

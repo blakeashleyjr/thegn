@@ -18,6 +18,7 @@ use crate::help::search::{self, Ranker};
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::mcp::state::StateRouter;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 
 /// A long-form document served as an MCP resource (README, CLI grammar, …).
 /// `id` is the `thegn://doc/<id>` slug; `body` is markdown.
@@ -219,11 +220,11 @@ impl<'a> DocsRouter<'a> {
         }
         let mut out = String::new();
         for h in hits.iter().take(20) {
-            out.push_str(&format!("{} — {}", h.page, h.title));
+            write!(out, "{} — {}", h.page, h.title).expect("writing to String cannot fail");
             if let Some(s) = &h.snippet
                 && let Some(sec) = &s.section
             {
-                out.push_str(&format!("  [{sec}]"));
+                write!(out, "  [{sec}]").expect("writing to String cannot fail");
             }
             out.push('\n');
         }
@@ -234,7 +235,8 @@ impl<'a> DocsRouter<'a> {
         let mut out = String::new();
         for p in self.reg.pages() {
             let tag = if p.meta.generated { " (generated)" } else { "" };
-            out.push_str(&format!("{} — {}{}\n", p.meta.id, p.meta.title, tag));
+            writeln!(out, "{} — {}{}", p.meta.id, p.meta.title, tag)
+                .expect("writing to String cannot fail");
         }
         out
     }

@@ -18,6 +18,7 @@
 //! risky override is the builder's job (THE-7), not a config error.
 
 use crate::theme::{Hue, Palette, contrast_ratio};
+use std::fmt::Write as _;
 
 /// Which bar a palette is held to. The shipped default (prism) carries a
 /// stricter `text` floor (AAA 7.0); every other preset uses the AA 4.5 floor.
@@ -385,10 +386,12 @@ mod tests {
         for name in PRESETS {
             let findings = audit(&resolved(name), bar_for(name));
             for f in &findings {
-                failures.push_str(&format!(
+                write!(
+                    failures,
                     "\n  {name}: [{}] {} on {} = {:.2}:1 (want >= {})",
                     f.rule, f.fg, f.bg, f.ratio, f.min
-                ));
+                )
+                .expect("writing to String cannot fail");
             }
         }
         assert!(

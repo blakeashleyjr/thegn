@@ -4,6 +4,7 @@
 //! from `agent.rs` (kept flat); re-exported from
 //! `crate::agent` so call sites are unchanged.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use thegn_core::config::{Config, ManagedKeyScope};
@@ -319,12 +320,14 @@ fn sprite_ssh_argv_inner(
         thegn_core::util::sh_quote(worktree),
     );
     if let Some((provider, account, instance)) = custody {
-        proxy.push_str(&format!(
+        write!(
+            proxy,
             " --expected-provider {} --expected-account {} --expected-instance {}",
             thegn_core::util::sh_quote(provider),
             thegn_core::util::sh_quote(account),
             thegn_core::util::sh_quote(instance),
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     // Run the user's login shell, not the sprite's default `$SHELL` (which is
     // bash → no zsh / no host-parity prompt). The same runtime probe chain the

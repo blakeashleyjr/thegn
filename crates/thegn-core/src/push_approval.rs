@@ -7,6 +7,7 @@
 //! hands them to [`nonce_from_bytes`].
 
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 /// Nonce length in raw bytes (128 bits).
 pub const NONCE_BYTES: usize = 16;
@@ -19,7 +20,7 @@ pub const MAX_BODY_BYTES: usize = 1024;
 pub fn nonce_from_bytes(bytes: &[u8; NONCE_BYTES]) -> String {
     let mut out = String::with_capacity(NONCE_HEX_LEN);
     for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
+        write!(out, "{byte:02x}").expect("writing to String cannot fail");
     }
     out
 }
@@ -35,7 +36,7 @@ pub fn nonce_hash(n: &str) -> String {
     let digest = Sha256::digest(n.as_bytes());
     let mut out = String::with_capacity(64);
     for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+        write!(out, "{byte:02x}").expect("writing to String cannot fail");
     }
     out
 }

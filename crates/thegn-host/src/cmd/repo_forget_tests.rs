@@ -2,6 +2,7 @@ use super::{ForgetArgs, ForgetEnv, ForgetReport, forget, run};
 use crate::handlers::sidebar_persist::SIDEBAR_SCOPE;
 use crate::testenv::IsolatedState;
 use clap::Parser;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
@@ -138,7 +139,8 @@ fn dump(path: &Path) -> Vec<String> {
         while let Some(row) = rows.next().unwrap() {
             let mut line = format!("{table}:");
             for index in 0..columns {
-                line.push_str(&format!("{:?}|", row.get_ref(index).unwrap()));
+                write!(line, "{:?}|", row.get_ref(index).unwrap())
+                    .expect("writing to String cannot fail");
             }
             out.push(line);
         }

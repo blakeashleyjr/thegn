@@ -18,6 +18,7 @@
 //! Everything is async (`tokio::process` + streamed bodies) so a multi-GB NAR
 //! never blocks the event loop; concurrent dumps are bounded by a semaphore.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -266,21 +267,21 @@ fn narinfo_for(
         .unwrap_or_default();
 
     let mut s = String::new();
-    s.push_str(&format!("StorePath: {}\n", path.display()));
-    s.push_str(&format!("URL: nar/{hash}.nar\n"));
+    writeln!(s, "StorePath: {}", path.display()).expect("writing to String cannot fail");
+    writeln!(s, "URL: nar/{hash}.nar").expect("writing to String cannot fail");
     s.push_str("Compression: none\n");
-    s.push_str(&format!("NarHash: {nar_hash}\n"));
-    s.push_str(&format!("NarSize: {nar_size}\n"));
-    s.push_str(&format!("References: {}\n", refs.join(" ")));
+    writeln!(s, "NarHash: {nar_hash}").expect("writing to String cannot fail");
+    writeln!(s, "NarSize: {nar_size}").expect("writing to String cannot fail");
+    writeln!(s, "References: {}", refs.join(" ")).expect("writing to String cannot fail");
     if let Some(d) = rec
         .get("deriver")
         .and_then(|x| x.as_str())
         .filter(|d| !d.is_empty())
     {
-        s.push_str(&format!("Deriver: {}\n", basename(d)));
+        writeln!(s, "Deriver: {}", basename(d)).expect("writing to String cannot fail");
     }
     for signature in signatures {
-        s.push_str(&format!("Sig: {signature}\n"));
+        writeln!(s, "Sig: {signature}").expect("writing to String cannot fail");
     }
     Ok(s)
 }

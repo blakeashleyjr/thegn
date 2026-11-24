@@ -17,6 +17,7 @@
 use anyhow::{Context, Result, anyhow};
 use futures_util::future::BoxFuture;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -3428,7 +3429,8 @@ fn append_stderr_tail(mut output: String, code: i32, stderr: &StderrSink) -> Str
         return output;
     }
     let n = tail.total.min(STDERR_TAIL_CAP as u64);
-    output.push_str(&format!("\n[stderr, last {n} bytes]\n{}", tail.render()));
+    write!(output, "\n[stderr, last {n} bytes]\n{}", tail.render())
+        .expect("writing to String cannot fail");
     output
 }
 

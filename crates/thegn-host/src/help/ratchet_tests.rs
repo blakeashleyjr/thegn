@@ -229,8 +229,9 @@ fn help_section_keys_ratchet_update() {
         }
     }
     lines.extend(debt);
-    std::fs::write(panel_keys_ratchet_path(), lines.join("\n") + "\n")
-        .expect("write panel key ratchet");
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(panel_keys_ratchet_path(), text).expect("write panel key ratchet");
 }
 
 #[test]
@@ -673,8 +674,9 @@ fn help_prose_ratchet_update() {
         }
     }
     lines.extend(silent);
-    std::fs::write(prose_ratchet_path(), lines.join("\n") + "\n")
-        .expect("write help-prose-ratchet.txt");
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(prose_ratchet_path(), text).expect("write help-prose-ratchet.txt");
 }
 
 /// Regenerate the panel-prose allowlist. Same gate as `help_ratchet_update`.
@@ -708,8 +710,9 @@ fn help_panel_prose_ratchet_update() {
         }
     }
     lines.extend(silent);
-    std::fs::write(panel_prose_ratchet_path(), lines.join("\n") + "\n")
-        .expect("write help-panel-prose-ratchet.txt");
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(panel_prose_ratchet_path(), text).expect("write help-panel-prose-ratchet.txt");
 }
 
 /// The one sanctioned write: regenerate the allowlist from the current
@@ -736,5 +739,7 @@ fn help_ratchet_update() {
             .filter(|id| !documented.contains(id))
             .collect::<BTreeSet<_>>(),
     );
-    std::fs::write(ratchet_path(), lines.join("\n") + "\n").expect("write help-ratchet.txt");
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(ratchet_path(), text).expect("write help-ratchet.txt");
 }

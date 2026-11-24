@@ -5,6 +5,7 @@
 //! an untrusted value from becoming a path segment, a CLI option, or an
 //! opaque plugin control value.
 
+use std::fmt::Write as _;
 const BUILTIN_SEGMENT_MAX: usize = 128;
 const BUILTIN_ID_MAX: usize = 256;
 const PLUGIN_NATIVE_MAX: usize = 384;
@@ -212,7 +213,7 @@ pub(crate) fn encode_control_segment(value: &str) -> Result<String, String> {
             out.push(*byte as char);
         } else {
             out.push('%');
-            out.push_str(&format!("{byte:02X}"));
+            write!(out, "{byte:02X}").expect("writing to String cannot fail");
         }
     }
     Ok(out)

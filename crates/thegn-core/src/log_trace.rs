@@ -18,6 +18,7 @@ use crate::config::{LogConfig, LogFormat, LogLevel};
 use crate::diagnostics;
 use crate::theme;
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -533,7 +534,7 @@ where
         // so it is not repeated per line here.
         let mut original = format!("{ts}  {:<5} {}  ", meta.level().as_str(), meta.target());
         if let Some(w) = &wt {
-            original.push_str(&format!("wt={w}  "));
+            write!(original, "wt={w}  ").expect("writing to String cannot fail");
         }
         original.push_str(&v.msg);
         diagnostics::ring_push(crate::log::parser::ParsedLog {
@@ -729,7 +730,9 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                write!(out, "\\u{:04x}", c as u32).expect("writing to String cannot fail")
+            }
             c => out.push(c),
         }
     }

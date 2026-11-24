@@ -21,6 +21,7 @@
 //! MagicDNS name, mitigating a control-plane MagicDNS spoof.
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 
 use crate::host_config::{HostConfig, HostReach};
 use crate::remote::SshTarget;
@@ -917,9 +918,11 @@ mod tests {
             if i > 0 {
                 peers.push(',');
             }
-            peers.push_str(&format!(
+            write!(
+                peers,
                 r#""k{i}":{{"HostName":"h{i}","DNSName":"h{i}.ts.net."}}"#
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         let json = format!(r#"{{"BackendState":"Running","Peer":{{{peers}}}}}"#);
         let st = parse_status_json(&json).unwrap();

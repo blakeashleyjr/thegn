@@ -20,6 +20,7 @@
 
 use anyhow::{Result, anyhow};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use thegn_core::forward::parse_ss_listening;
 
 use crate::vpn::{OciRuntime, exec_in};
@@ -141,10 +142,12 @@ fn pick_runtime(
 
     let mut message = format!("no OCI runtime could reach {container}");
     for (runtime, reason) in unknown {
-        message.push_str(&format!(
+        write!(
+            message,
             "; '{}' probe failed: {reason}",
             runtime.prefix.join(" ")
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     Err(anyhow!(message))
 }

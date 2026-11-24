@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
@@ -1738,11 +1739,11 @@ fn share_state_dir_at(
         repo_bytes.len()
     );
     for byte in repo_bytes {
-        identity.push_str(&format!("{byte:02x}"));
+        write!(identity, "{byte:02x}").expect("writing to String cannot fail");
     }
     identity.push('\n');
     for byte in path_bytes {
-        identity.push_str(&format!("{byte:02x}"));
+        write!(identity, "{byte:02x}").expect("writing to String cannot fail");
     }
     let digest = Sha256::digest(identity.as_bytes());
     let digest = digest

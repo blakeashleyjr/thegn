@@ -1,5 +1,6 @@
 use super::*;
 use chrono::{NaiveDate, Timelike};
+use std::fmt::Write as _;
 
 fn d(y: i32, m: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -428,9 +429,11 @@ use crate::calendar::admission::{
 fn feed(n: usize) -> String {
     let mut s = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..n {
-        s.push_str(&format!(
-            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:Event {i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
-        ));
+        writeln!(
+            s,
+            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:Event {i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r"
+        )
+        .expect("writing to String cannot fail");
     }
     s.push_str("END:VCALENDAR\r\n");
     s
@@ -627,7 +630,7 @@ fn child_values_are_bounded_per_event() {
     admitted(&doc, 10).0.unwrap();
     let mut doc = String::from("BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\n");
     for chunk in dates.chunks(1_000) {
-        doc.push_str(&format!("RDATE:{}\r\n", chunk.join(",")));
+        writeln!(doc, "RDATE:{}\r", chunk.join(",")).expect("writing to String cannot fail");
     }
     doc.push_str("END:VEVENT\r\n");
     // Each child also carries bookkeeping bytes, so whichever per-event
@@ -641,7 +644,7 @@ fn child_values_are_bounded_per_event() {
     assert!(per_event(admitted(&doc, 10).0.unwrap_err().limit));
     let mut doc = String::from("BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\n");
     for i in 0..20_000 {
-        doc.push_str(&format!("X-K{i}:v\r\n"));
+        writeln!(doc, "X-K{i}:v\r").expect("writing to String cannot fail");
     }
     doc.push_str("END:VEVENT\r\n");
     assert!(per_event(admitted(&doc, 10).0.unwrap_err().limit));

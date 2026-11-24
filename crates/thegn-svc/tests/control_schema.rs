@@ -121,7 +121,8 @@ fn snapshot_path() -> std::path::PathBuf {
 
 #[test]
 fn control_wire_matches_the_committed_snapshot() {
-    let current = serde_json::to_string_pretty(&wire_schema()).unwrap() + "\n";
+    let mut current = serde_json::to_string_pretty(&wire_schema()).unwrap();
+    current.push('\n');
     let path = snapshot_path();
     if std::env::var_os("THEGN_UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(&path, &current).expect("write snapshot");

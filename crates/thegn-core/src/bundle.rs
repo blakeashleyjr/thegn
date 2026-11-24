@@ -29,6 +29,7 @@ use crate::sandbox::Mount;
 use crate::store::{WorkspaceStore, ZoneStore};
 use crate::util;
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 
 /// The resolved product of composing the active bundle(s) for a pane. Maps 1:1
 /// onto [`crate::sandbox::SandboxSpec`]`.{env_overrides, env_block, mounts}`.
@@ -934,11 +935,13 @@ pub fn materialize_dotfiles(
             let mut publish_error = format!("cannot publish dotfile {}: {error}", from.display());
             if old_target_moved && let Err(restore_error) = std::fs::rename(&old, target) {
                 tracing::warn!(target: "thegn::bundle", %restore_error, path = %target.display(), old_path = %old.display(), "could not restore dotfile target after publish failure");
-                publish_error.push_str(&format!(
+                write!(
+                    publish_error,
                     "; also could not restore previous target {} from {}: {restore_error}",
                     target.display(),
                     old.display()
-                ));
+                )
+                .expect("writing to String cannot fail");
             }
             first_error = Some(publish_error);
             break;

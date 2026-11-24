@@ -355,6 +355,7 @@ mod tests {
         frame::MonitorFrame,
         health::{Absent, Health},
     };
+    use std::fmt::Write as _;
     use std::fs;
     #[test]
     fn missing_file_is_absent_and_bad_rows_are_parse_errors() {
@@ -728,9 +729,11 @@ mod tests {
             let device = sys.join(&name);
             fs::create_dir_all(device.join("device")).unwrap();
             fs::write(device.join("dev"), format!("8:{index}\n")).unwrap();
-            rows.push_str(&format!(
-                "8 {index} {name} 1 0 10 1 1 0 20 1 0 10 10 0 0 0 0 0 0\n"
-            ));
+            writeln!(
+                rows,
+                "8 {index} {name} 1 0 10 1 1 0 20 1 0 10 10 0 0 0 0 0 0"
+            )
+            .expect("writing to String cannot fail");
         }
         fs::write(&proc, &rows).unwrap();
         let mut collector = DiskstatsCollector::at(&proc, &sys);

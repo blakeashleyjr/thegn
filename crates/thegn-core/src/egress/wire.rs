@@ -1669,8 +1669,10 @@ mod tests {
 
         // A multibyte character straddling the bound is dropped whole, never
         // split: the stored text is always valid UTF-8.
+        let mut straddling = "p".repeat(MAX_AUDIT_PATH_LEN - 1);
+        straddling.push('\u{e9}');
         let split = AuditRecord {
-            path: Some("p".repeat(MAX_AUDIT_PATH_LEN - 1) + "\u{e9}"),
+            path: Some(straddling),
             ..bounded
         }
         .bounded();

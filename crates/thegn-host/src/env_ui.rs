@@ -5,6 +5,7 @@
 //! (mirroring `host_ui::host_snapshots` → `model.panel.hosts`), so the render
 //! path just reads the precomputed list.
 
+use std::fmt::Write as _;
 use thegn_core::config::{Config, EnvProviderConfig, PlacementMode};
 
 /// Build environment snapshots together with the checked worktree selection.
@@ -88,7 +89,7 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                 PlacementMode::Ssh => {
                     let mut target = e.ssh.host.clone();
                     if !target.is_empty() && e.ssh.port != 22 {
-                        target.push_str(&format!(":{}", e.ssh.port));
+                        write!(target, ":{}", e.ssh.port).expect("writing to String cannot fail");
                     }
                     if !e.ssh.jump_host.is_empty() {
                         target.push_str(if target.is_empty() { "" } else { " via " });

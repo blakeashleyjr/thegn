@@ -21,6 +21,7 @@
 //!   transcripts carry no account, so these are never per-account.
 
 use anyhow::Result;
+use std::fmt::Write as _;
 use thegn_core::config::Config;
 use thegn_core::outln;
 use thegn_core::pipeline_report::display_cell;
@@ -207,7 +208,8 @@ fn render_tokens(t: &TokensRow) -> String {
         t.records,
     );
     if t.skipped > 0 {
-        line.push_str(&format!(" (floor: {} transcripts skipped)", t.skipped));
+        write!(line, " (floor: {} transcripts skipped)", t.skipped)
+            .expect("writing to String cannot fail");
     }
     line
 }

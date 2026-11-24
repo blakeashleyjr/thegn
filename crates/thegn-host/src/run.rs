@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -2357,10 +2358,12 @@ pub(crate) fn delete_groups_with_mode(
         status.push_str(" (home checkout skipped)");
     }
     if already_deleting > 0 {
-        status.push_str(&format!(" ({already_deleting} already deleting)"));
+        write!(status, " ({already_deleting} already deleting)")
+            .expect("writing to String cannot fail");
     }
     if !spawn_errors.is_empty() {
-        status.push_str(&format!(" (failed to start: {})", spawn_errors.join("; ")));
+        write!(status, " (failed to start: {})", spawn_errors.join("; "))
+            .expect("writing to String cannot fail");
     }
     (status, scheduled_paths)
 }

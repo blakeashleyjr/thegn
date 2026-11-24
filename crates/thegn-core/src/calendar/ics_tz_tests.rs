@@ -1,6 +1,7 @@
 use super::*;
 use crate::calendar::GapPolicy;
 use chrono::{TimeZone, Utc};
+use std::fmt::Write as _;
 
 fn parse_reported(input: &str) -> (Vec<CalEvent>, IcsReport) {
     parse_reported_in(input, "UTC")
@@ -144,9 +145,11 @@ fn timezone_definition_without_observances_quarantines_its_event() {
 fn timezone_prescan_caps_bindings_and_oversized_metadata() {
     let mut input = String::from("BEGIN:VCALENDAR\n");
     for index in 0..65 {
-        input.push_str(&format!(
-            "BEGIN:VTIMEZONE\nTZID:Vendor/Zone{index}\nBEGIN:STANDARD\nDTSTART:20250101T000000\nTZOFFSETFROM:+0000\nTZOFFSETTO:+0000\nEND:STANDARD\nEND:VTIMEZONE\n"
-        ));
+        writeln!(
+            input,
+            "BEGIN:VTIMEZONE\nTZID:Vendor/Zone{index}\nBEGIN:STANDARD\nDTSTART:20250101T000000\nTZOFFSETFROM:+0000\nTZOFFSETTO:+0000\nEND:STANDARD\nEND:VTIMEZONE"
+        )
+        .expect("writing to String cannot fail");
     }
     input.push_str(&event("kept", "TZID=Vendor/Zone0:20250115T090000"));
     input.push_str(&event("over-cap", "TZID=Vendor/Zone64:20250115T090000"));

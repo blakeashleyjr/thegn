@@ -24,6 +24,7 @@
 //! - **Bottom-up edits.** Multiple accepted matches on one line apply
 //!   right-to-left so an earlier edit never invalidates a later span's offsets.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -600,10 +601,11 @@ impl ApplyReport {
             self.files_changed()
         );
         if self.total_skipped() > 0 {
-            s.push_str(&format!("; {} skipped (drifted)", self.total_skipped()));
+            write!(s, "; {} skipped (drifted)", self.total_skipped())
+                .expect("writing to String cannot fail");
         }
         if self.files_failed() > 0 {
-            s.push_str(&format!("; {} failed", self.files_failed()));
+            write!(s, "; {} failed", self.files_failed()).expect("writing to String cannot fail");
         }
         s
     }

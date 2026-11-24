@@ -6,6 +6,7 @@
 //! **and the API recorded zero calls** (the spec's "rejected without
 //! performing the action"), not merely rejected.
 
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -81,7 +82,7 @@ impl ControlApi for FakeApi {
             |repo| format!("issues_get:{id}:repo={repo}"),
         );
         if let Some(account) = account {
-            call.push_str(&format!(":account={account}"));
+            write!(call, ":account={account}").expect("writing to String cannot fail");
         }
         self.record(&call);
         Box::pin(async {
@@ -104,7 +105,7 @@ impl ControlApi for FakeApi {
             |repo| format!("issues_update:{id}:repo={repo}"),
         );
         if let Some(account) = account {
-            call.push_str(&format!(":account={account}"));
+            write!(call, ":account={account}").expect("writing to String cannot fail");
         }
         self.record(&call);
         Box::pin(async {
@@ -126,7 +127,7 @@ impl ControlApi for FakeApi {
             |repo| format!("issues_comment:{id}:repo={repo}"),
         );
         if let Some(account) = account {
-            call.push_str(&format!(":account={account}"));
+            write!(call, ":account={account}").expect("writing to String cannot fail");
         }
         self.record(&call);
         Box::pin(async {

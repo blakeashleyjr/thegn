@@ -5,6 +5,7 @@
 //! discovery, bounded version probing, `up`, and `exec` argv construction.
 //! Callers receive an opaque session and never need to know CLI-specific flags.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1657,9 +1658,11 @@ mod tests {
         .unwrap();
         let mut compose = String::from("services:\n  app:\n    env_file:\n");
         for index in 0..257 {
-            compose.push_str(&format!(
-                "      - path: missing-{index}.env\n        required: false\n"
-            ));
+            writeln!(
+                compose,
+                "      - path: missing-{index}.env\n        required: false"
+            )
+            .expect("writing to String cannot fail");
         }
         std::fs::write(config_dir.join("compose.yml"), compose).unwrap();
         let error = config_digest(&config_path).unwrap_err().to_string();

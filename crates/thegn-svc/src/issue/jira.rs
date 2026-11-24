@@ -5,6 +5,7 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use thegn_core::issue::{
     Issue, IssueComment, IssueDetail, IssueDraft, IssueFilter, IssuePatch, IssuePriority,
     IssueStatus,
@@ -1030,7 +1031,7 @@ fn urlencoding_simple(s: &str) -> String {
             ' ' => out.push('+'),
             _ => {
                 for byte in c.to_string().as_bytes() {
-                    out.push_str(&format!("%{byte:02X}"));
+                    write!(out, "%{byte:02X}").expect("writing to String cannot fail");
                 }
             }
         }

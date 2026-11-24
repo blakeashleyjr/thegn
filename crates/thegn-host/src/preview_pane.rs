@@ -8,6 +8,7 @@
 //! draws over the panel via the kitty path. Every fetch runs on the bounded preview supervisor
 //! worker and pulses the waker; nothing here touches the loop or the AI layer.
 
+use std::fmt::Write as _;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use thegn_core::preview::{self, CsvTable, Notebook, PreviewRoute};
@@ -506,7 +507,7 @@ pub(crate) fn hex_dump_lines(bytes: &[u8], total_known_more: bool) -> Vec<String
         let mut line = format!("{:08x}  ", row * 16);
         for column in 0..16 {
             if let Some(byte) = chunk.get(column) {
-                line.push_str(&format!("{byte:02x} "));
+                write!(line, "{byte:02x} ").expect("writing to String cannot fail");
             } else {
                 line.push_str("   ");
             }

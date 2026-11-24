@@ -8,6 +8,7 @@
 //! document models are unit-tested in the core-coverage gate; the host owns the
 //! off-loop read/rasterize and the actual rendering.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use once_cell::sync::Lazy;
@@ -1071,7 +1072,7 @@ mod tests {
     fn csv_row_cap_truncates() {
         let mut s = String::new();
         for i in 0..(MAX_ROWS + 50) {
-            s.push_str(&format!("{i}\n"));
+            writeln!(s, "{i}").expect("writing to String cannot fail");
         }
         let t = CsvTable::parse(&p("a.csv"), &s);
         assert!(t.truncated);

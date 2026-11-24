@@ -14,6 +14,7 @@
 //! The host applies the plan to a placement via its exec/fs APIs (the only
 //! backend-specific seam). Everything here is pure + unit-tested.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::toolchain_activation::DetectedToolchainFiles;
@@ -1126,35 +1127,41 @@ fn nix_install_script(
     let mut conf = String::from("experimental-features = nix-command flakes\\n");
     if let Some(n) = parallel {
         // Parallelize the download-bound devShell substitution — the biggest win.
-        conf.push_str(&format!(
+        write!(
+            conf,
             "http-connections = {n}\\nmax-substitution-jobs = {n}\\n"
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     if let Some(c) = cache.filter(|c| !c.url.trim().is_empty()) {
-        conf.push_str(&format!(
+        write!(
+            conf,
             "extra-substituters = {}\\n",
             printf_fmt_escape(c.url.trim())
-        ));
+        )
+        .expect("writing to String cannot fail");
         if !c.key.trim().is_empty() {
-            conf.push_str(&format!(
+            write!(
+                conf,
                 "extra-trusted-public-keys = {}\\n",
                 printf_fmt_escape(c.key.trim())
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
     }
     // `nix` accumulates `extra-substituters` lines, so the host cache coexists
     // with `cache` above. Trust only its installation key and keep signature
     // verification enforced even when the key is absent.
     if let Some(url) = host_cache_url.map(str::trim).filter(|u| !u.is_empty()) {
-        conf.push_str(&format!(
-            "extra-substituters = {}\\n",
-            printf_fmt_escape(url)
-        ));
+        write!(conf, "extra-substituters = {}\\n", printf_fmt_escape(url))
+            .expect("writing to String cannot fail");
         if let Some(key) = host_cache_key.map(str::trim).filter(|key| !key.is_empty()) {
-            conf.push_str(&format!(
+            write!(
+                conf,
                 "extra-trusted-public-keys = {}\\n",
                 printf_fmt_escape(key)
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         conf.push_str("require-sigs = true\\n");
         // Graceful degradation for a cache reachable ONLY over the per-sprite reverse

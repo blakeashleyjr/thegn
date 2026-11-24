@@ -4,6 +4,7 @@
 //! worth testing at the seam that actually writes.
 
 use super::*;
+use std::fmt::Write as _;
 use thegn_core::calendar::{CalEvent, EventTime, TzRef};
 
 #[test]
@@ -1128,9 +1129,11 @@ fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
     );
     let mut feed = String::from("BEGIN:VCALENDAR\r\n");
     for i in 0..5 {
-        feed.push_str(&format!(
-            "BEGIN:VEVENT\r\nUID:new{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
-        ));
+        writeln!(
+            feed,
+            "BEGIN:VEVENT\r\nUID:new{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r"
+        )
+        .expect("writing to String cannot fail");
     }
     feed.push_str("END:VCALENDAR\r\n");
     let file = t.dir.join("feed.ics");

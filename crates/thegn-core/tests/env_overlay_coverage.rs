@@ -101,7 +101,9 @@ fn every_shallow_key_has_an_env_knob_or_is_pinned() {
         let mut out = header;
         out.push(String::new());
         out.extend(in_scope.iter().filter(|p| !covered(p)).cloned());
-        std::fs::write(&path, out.join("\n") + "\n").unwrap();
+        let mut text = out.join("\n");
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
         return;
     }
     let unpinned: Vec<&String> = in_scope

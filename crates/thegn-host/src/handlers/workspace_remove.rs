@@ -11,6 +11,7 @@
 //! loop retains live groups until each worker reports success, then only
 //! performs the in-memory prune; cache writes stay on the worker.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use thegn_core::store::WorkspaceStore;
@@ -168,10 +169,12 @@ pub(crate) fn remove_workspace(
 
     let mut status = workspace_removed_status(display, keep_files, live_dirs.len());
     if !session_end_errors.is_empty() {
-        status.push_str(&format!(
+        write!(
+            status,
             "; session_end failed to start: {}",
             session_end_errors.join("; ")
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     status
 }

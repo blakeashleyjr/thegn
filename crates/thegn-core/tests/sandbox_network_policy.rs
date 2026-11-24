@@ -45,7 +45,9 @@ fn run_in(spec: &SandboxSpec, cmd: &str) -> String {
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
     let out = bounded_run::output(&mut command).unwrap_or_else(|_| panic!("exec failed: {argv:?}"));
-    String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text
 }
 
 // G1: configured hostname rules remain labelled; the unit test

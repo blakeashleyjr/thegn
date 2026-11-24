@@ -23,6 +23,7 @@
 
 use anyhow::{Result, bail};
 use base64::Engine as _;
+use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use thegn_core::config::Config;
@@ -401,7 +402,7 @@ fn explain_key(key: &str, path: PathBuf) -> String {
         origin.origin.as_str()
     );
     for (layer, val) in &origin.trace {
-        s.push_str(&format!("    {}: {val}\n", layer.as_str()));
+        writeln!(s, "    {}: {val}", layer.as_str()).expect("writing to String cannot fail");
     }
     s
 }

@@ -4,6 +4,7 @@
 //! see `crate::env_ui`). Read-only today — authoring is the palette "New
 //! environment…" wizard and `thegn env create`; binding is `thegn env set`.
 
+use std::fmt::Write as _;
 use thegn_core::pipeline_report::{display_cell, display_clip};
 use thegn_core::theme::Hue;
 
@@ -21,13 +22,11 @@ fn toolchain_label(toolchain: &crate::toolchain_ui::ToolchainStatus) -> String {
         toolchain.provider, toolchain.tier, toolchain.state
     );
     if !toolchain.missing_tools.is_empty() {
-        label.push_str(&format!(
-            " · missing {}",
-            toolchain.missing_tools.join(", ")
-        ));
+        write!(label, " · missing {}", toolchain.missing_tools.join(", "))
+            .expect("writing to String cannot fail");
     }
     if let Some(reason) = &toolchain.reason {
-        label.push_str(&format!(" · {reason}"));
+        write!(label, " · {reason}").expect("writing to String cannot fail");
     }
     label
 }
