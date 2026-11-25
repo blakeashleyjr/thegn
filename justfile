@@ -444,6 +444,12 @@ perf-flood *args: release _perf-guard
 perf-t3 *args: release _perf-guard
     bash test/perf/t3-workspace-switch.sh {{args}}
 
+# Quiet-session keystroke echo: types N keys at fixed spacing into `cat` and
+# reports p50/p95/p99 of key → first PTY output (submission, not paint).
+# Advisory, machine-dependent. --tool thegn|tmux.
+perf-echo *args: release _perf-guard
+    bash test/perf/echo.sh {{args}}
+
 # Criterion micro-benchmarks across the workspace (hot git path, core models).
 # `cargo bench` uses the release-grade bench profile. For a debug-vs-release
 # A/B, append `--profile dev`. Pass extra criterion args after `--`.

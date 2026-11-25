@@ -11,7 +11,12 @@
 # switch_p99_us (worktree-switch → first frame) and input_p99_us (keystroke →
 # frame) staying under THEGN_INPUT_BUDGET_US while pty_bytes_per_s is high.
 #
-# Usage: flood.sh [--bin PATH] [--worktrees N] [--floods N] [--switches N] [--json]
+# Tab switches (Alt+Right = nav-right, next tab) are fired in a second burst
+# after the worktree burst. Both feed the same switch_* histograms (the rollup
+# records tab and worktree switches together), so the rollup cannot separate them.
+#
+# Usage: flood.sh [--bin PATH] [--worktrees N] [--floods N] [--switches N]
+#                 [--tab-switches N] [--json]
 # TG_PERF_SANDBOX=1 opts into measuring sandboxed panes.
 #
 # Exit status: 0 ok (numbers printed); 1 harness error.
@@ -27,8 +32,9 @@ source "$HERE/../lib/pty.sh"
 
 BIN="${TG_PERF_BIN:-target/release/thegn}"
 WORKTREES="${TG_PERF_WORKTREES:-8}"
-FLOODS=3    # how many worktrees' shells run a flood
-SWITCHES=30 # Alt+Down burst size, fired mid-flood
+FLOODS=3        # how many worktrees' shells run a flood
+SWITCHES=30     # Alt+Down burst size, fired mid-flood
+TAB_SWITCHES=30 # Alt+Right burst size, fired after the worktree burst
 JSON_ONLY=0
 
 while [ $# -gt 0 ]; do
@@ -47,6 +53,10 @@ while [ $# -gt 0 ]; do
     ;;
   --switches)
     SWITCHES="$2"
+    shift 2
+    ;;
+  --tab-switches)
+    TAB_SWITCHES="$2"
     shift 2
     ;;
   --json)
@@ -90,7 +100,7 @@ PIDFILE="$PERF_TMP/thegn.pid"
 # keys land mid-storm and pollute the input percentiles.
 SETTLE_MS="${TG_PERF_SETTLE_MS:-3000}"
 BURST_GAP_MS=120
-RUN_MS=$((SETTLE_MS + FLOODS * 800 + SWITCHES * BURST_GAP_MS + 4000))
+RUN_MS=$((SETTLE_MS + FLOODS * 800 + (SWITCHES + TAB_SWITCHES) * BURST_GAP_MS + 4000))
 DEADLINE_S=$(((RUN_MS / 1000) + 15))
 
 printf -v INNER \
@@ -159,6 +169,12 @@ for _ in $(seq 1 "$SWITCHES"); do
   sleep "$(awk "BEGIN{print $BURST_GAP_MS/1000}")"
 done
 
+# Mid-flood tab burst: Alt+Right = nav-right (next tab), same gap as above.
+for _ in $(seq 1 "$TAB_SWITCHES"); do
+  keys '\x1b[1;3C'
+  sleep "$(awk "BEGIN{print $BURST_GAP_MS/1000}")"
+done
+
 exec 3>&- # close the key channel; thegn exits on its bench window
 wait "$LAUNCHER" 2>/dev/null || true
 
@@ -189,13 +205,13 @@ FLUSH_P99="$(extract flush_p99_us)"
 RENDER_P99="$(extract render_p99_us)"
 PTY_BPS="$(extract pty_bytes_per_s)"
 
-RESULT="{\"scenario\":\"flood\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"floods\":$FLOODS,\"switches\":$SWITCHES,\"switch_p50_us\":${SWITCH_P50:-0},\"switch_p99_us\":${SWITCH_P99:-0},\"input_p50_us\":${INPUT_P50:-0},\"input_p99_us\":${INPUT_P99:-0},\"drain_p99_us\":${DRAIN_P99:-0},\"flush_p99_us\":${FLUSH_P99:-0},\"render_p99_us\":${RENDER_P99:-0},\"pty_bytes_per_s\":${PTY_BPS:-0},\"rollups\":$ROLLUPS,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
+RESULT="{\"scenario\":\"flood\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"floods\":$FLOODS,\"switches\":$SWITCHES,\"tab_switches\":$TAB_SWITCHES,\"switch_p50_us\":${SWITCH_P50:-0},\"switch_p99_us\":${SWITCH_P99:-0},\"input_p50_us\":${INPUT_P50:-0},\"input_p99_us\":${INPUT_P99:-0},\"drain_p99_us\":${DRAIN_P99:-0},\"flush_p99_us\":${FLUSH_P99:-0},\"render_p99_us\":${RENDER_P99:-0},\"pty_bytes_per_s\":${PTY_BPS:-0},\"rollups\":$ROLLUPS,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 if [ "$JSON_ONLY" = 1 ]; then
   printf '%s\n' "$RESULT"
 else
-  echo "scenario=flood build=$BUILD worktrees=$WORKTREES floods=$FLOODS switches=$SWITCHES (sha=$GIT_SHA host=$HOST_TAG)"
-  echo "  switch→frame  p50=${SWITCH_P50:-–}us  p99=${SWITCH_P99:-–}us   (worst rollup)"
+  echo "scenario=flood build=$BUILD worktrees=$WORKTREES floods=$FLOODS switches=$SWITCHES tab_switches=$TAB_SWITCHES (sha=$GIT_SHA host=$HOST_TAG)"
+  echo "  switch→frame (worktree+tab)  p50=${SWITCH_P50:-–}us  p99=${SWITCH_P99:-–}us   (worst rollup)"
   echo "  input→frame   p50=${INPUT_P50:-–}us  p99=${INPUT_P99:-–}us"
   echo "  drain p99=${DRAIN_P99:-–}us  flush p99=${FLUSH_P99:-–}us  render p99=${RENDER_P99:-–}us"
   echo "  pty_bytes_per_s=${PTY_BPS:-0}  rollups=$ROLLUPS"
