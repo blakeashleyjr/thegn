@@ -2572,6 +2572,10 @@ visible = true
 # pane, move pane, lock) at the bottom of the panel when there is room. The
 # chords follow your keybinds. Set false to hide it.
 # layout_hints = true
+# Fill the panel's blank rows with the keys for whatever has focus: the pane,
+# the drawer, the bars, or the panel itself. Chords follow your keybinds. Set
+# false to show only the panel's own NAVIGATE footer while it has focus.
+# context_hints = true
 
 # In-pane scrollback / copy-mode search AND the workspace-wide Search & Replace
 # surface (Ctrl+Shift+H — streamed, cancellable, with per-match preview and a

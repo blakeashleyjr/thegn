@@ -597,6 +597,10 @@ pub struct FrameModel {
     /// `[panel] layout_hints` inverted (default `false` = hint block shown), so
     /// the derived `Default` matches the config default. Set in `build_model`.
     pub layout_hints_off: bool,
+    /// `[panel] context_hints` inverted (default `false` = the focused zone's
+    /// keys fill the panel's blank rows; see `panel::context_hints`). Set in
+    /// `build_model`.
+    pub context_hints_off: bool,
     /// Active worktree's total size (bytes), for the bottom `disk` widget next
     /// to LOC. From the off-loop scan cache; `None` until first scanned.
     pub active_worktree_disk: Option<u64>,
@@ -633,6 +637,9 @@ pub struct FrameModel {
     /// from the center) — the bar renders raised so the focus is visible.
     pub masthead_focused: bool,
     pub statusbar_focused: bool,
+    /// True while the bottom drawer owns the keyboard (the panel's context-keys
+    /// block titles itself for it). Mirrored from the focus state each frame.
+    pub drawer_focused: bool,
     /// Index of the selected item in the masthead's navigable cluster (when the
     /// masthead owns focus). Clamped to the visible item count each frame.
     pub masthead_sel: usize,
@@ -2365,11 +2372,22 @@ pub fn draw_panel(
             &layout_pairs,
         );
     }
-    if model.panel_focused {
-        let pairs: Vec<(String, String)> = model.keyhints.iter().take(6).cloned().collect();
-        let hint_h = pairs.len() + 1; // rule/title + one row per tip
+    // Context keys: the focused zone's live keys (`model.keyhints`, the same
+    // pairs the statusbar shows) fill the rows left above the Layout block —
+    // NAVIGATE while the panel has focus, PANE / DRAWER / BAR KEYS otherwise
+    // (`[panel] context_hints`). Chords the Layout block already shows are
+    // skipped.
+    if let Some(title) = crate::panel::context_hints::title(model) {
         let avail = body.rows.saturating_sub(frame.rows.len() + layout_h);
-        // Require a one-row gap between the last panel row and the footer.
+        // `avail - 1` keeps a one-row gap between the last panel row and the
+        // block, so `hint_h` (title + one row per tip) is always `< avail`.
+        let pairs = crate::panel::context_hints::rows(
+            model,
+            rect.cols,
+            avail.saturating_sub(1),
+            &layout_pairs,
+        );
+        let hint_h = pairs.len() + 1;
         if !pairs.is_empty() && avail > hint_h {
             draw_panel_hints(
                 surface,
@@ -2379,7 +2397,7 @@ pub fn draw_panel(
                     cols: rect.cols,
                     rows: hint_h,
                 },
-                " NAVIGATE ",
+                title,
                 &pairs,
             );
         }

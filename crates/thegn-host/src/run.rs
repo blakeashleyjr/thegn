@@ -15859,6 +15859,7 @@ async fn event_loop<T: Terminal>(
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
+        model.drawer_focused = focus.drawer();
         let drawer_bar = drawer_bar_state(&current_config, &drawer_runtime, drawer);
         if model.drawer_bar != drawer_bar {
             model.drawer_bar = drawer_bar;

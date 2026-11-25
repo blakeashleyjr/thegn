@@ -132,6 +132,7 @@ impl FrameModel {
             && self.disk_warn_threshold_gb == other.disk_warn_threshold_gb
             && self.procs_disabled == other.procs_disabled
             && self.layout_hints_off == other.layout_hints_off
+            && self.context_hints_off == other.context_hints_off
             && self.active_worktree_disk == other.active_worktree_disk
     }
 }

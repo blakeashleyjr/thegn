@@ -2981,6 +2981,39 @@ fn panel_shows_layout_keys_block_and_follows_a_rebind() {
 }
 
 #[test]
+fn panel_shows_the_focused_panes_keys_below_content_and_skips_layout_dupes() {
+    use crate::panel::PanelUi;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 40,
+    };
+    let mut model = layout_hint_model();
+    model.panel_focused = false;
+    model.center_focused = true;
+    model.keyhints = vec![
+        ("chord-zoom".to_string(), "zoom twice".to_string()),
+        ("Alt-n".to_string(), "new pane here".to_string()),
+    ];
+    let mut s = Surface::new(44, 40);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    let text = s.screen_chars_to_string();
+    assert!(text.contains("PANE KEYS"), "title missing: {text:?}");
+    assert!(text.contains("new pane here"), "pane key missing: {text:?}");
+    assert!(
+        !text.contains("zoom twice"),
+        "a chord the Layout block shows must not repeat: {text:?}"
+    );
+    assert!(text.contains("LAYOUT KEYS"), "layout block kept: {text:?}");
+
+    model.context_hints_off = true;
+    let mut s = Surface::new(44, 40);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    assert!(!s.screen_chars_to_string().contains("PANE KEYS"));
+}
+
+#[test]
 fn panel_layout_keys_block_hides_when_disabled_or_cramped() {
     use crate::panel::PanelUi;
     let mut model = layout_hint_model();

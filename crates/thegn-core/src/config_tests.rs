@@ -1266,6 +1266,15 @@ fn panel_layout_hints_defaults_true_and_parses() {
 }
 
 #[test]
+fn panel_context_hints_defaults_true_and_parses() {
+    assert!(PanelConfig::default().context_hints);
+    let cfg: Config = toml::from_str("").unwrap();
+    assert!(cfg.panel.context_hints);
+    let cfg: Config = toml::from_str("[panel]\ncontext_hints = false\n").unwrap();
+    assert!(!cfg.panel.context_hints);
+}
+
+#[test]
 fn panel_collapse_on_escape_defaults_true_and_parses() {
     // Default (both the Rust `Default` and the absent-table serde path).
     assert!(PanelConfig::default().collapse_on_escape);

@@ -20,6 +20,7 @@
 
 pub mod budget;
 pub mod confirm;
+pub(crate) mod context_hints;
 pub mod docs;
 pub mod frame;
 pub mod gitfull;

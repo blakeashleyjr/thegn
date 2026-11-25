@@ -5304,6 +5304,11 @@ pub struct PanelConfig {
     /// chords are read from the live keymap. `false` hides it.
     #[serde(default = "default_true")]
     pub layout_hints: bool,
+    /// Show the focused zone's keys (pane, drawer, bars; the panel's own when
+    /// it has focus) in the panel's otherwise-blank rows, read from the live
+    /// keymap. `false` keeps only the panel's own NAVIGATE footer.
+    #[serde(default = "default_true")]
+    pub context_hints: bool,
 }
 
 impl Default for PanelConfig {
@@ -5314,6 +5319,7 @@ impl Default for PanelConfig {
             width: None,
             half_ratio: None,
             layout_hints: true,
+            context_hints: true,
         }
     }
 }

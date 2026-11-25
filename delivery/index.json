@@ -960,6 +960,18 @@
       "summary": "Classify active Ethernet, Wi-Fi, and generic network fallback semantics truthfully."
     },
     {
+      "change": "dynamic-key-discovery",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2704",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Panel blank rows teach the focused zone's live keys (slice 1 shipped); finer contexts, fading learned chords and a which-key overlay remain."
+    },
+    {
       "change": "expand-media-surfaces",
       "lifecycle": "proposed",
       "disposition": "superseded-retire",

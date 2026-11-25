@@ -48,6 +48,15 @@ row, read from your live keybinds so a rebind shows up. On a short or narrow
 panel the lowest-priority rows drop and long text is cut; set
 `[panel] layout_hints = false` to hide it. See [[terminal-and-panes]].
 
+Above it, the rows still blank show the keys for whatever has focus, read from
+your live keybinds: **PANE KEYS** while a terminal pane has focus, **DRAWER
+KEYS** for the drawer, **BAR KEYS** for the masthead or statusbar, and
+**NAVIGATE** while the panel itself has focus. They are the same keys the
+statusbar lists, as many as fit (up to 12), and a chord already in the Layout
+keys block is not repeated. The block shrinks as panel content grows and
+hides when there is no room. The sidebar keeps its own footer. Set
+`[panel] context_hints = false` to show only the panel's NAVIGATE block.
+
 ## Keys
 
 - `Tab` / `Shift-Tab` — cycle tabs; `1`–`9`, `0` jump to the tab's first ten
@@ -151,6 +160,8 @@ those workflows.
   `s` squash at resting width) widens the panel and performs the action in
   one press instead of printing a "widen first" note.
 - **`[panel] layout_hints`** — show (default) or hide the Layout keys block.
+- **`[panel] context_hints`** — show (default) or hide the focused zone's keys
+  in the panel's blank rows.
 - **`[panel] width` / `half_ratio`** — the resting column count and the
   half-screen fraction are configurable (see the configuration reference).
 - **Drag** — at the resting width, drag the panel's left separator to resize;

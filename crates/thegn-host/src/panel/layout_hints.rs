@@ -26,7 +26,7 @@ pub(crate) const ROWS: &[(&str, &str)] = &[
 /// The block's title row.
 pub(crate) const TITLE: &str = " LAYOUT KEYS ";
 
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
