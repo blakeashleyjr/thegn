@@ -4,7 +4,10 @@
 //! directory with filesystem metadata before asking Git for its authoritative
 //! NUL-framed listing. The exclusion list is deliberately conservative:
 //! bare, prunable, locked, detached-without-branch, and thegn's internal gate
-//! worktrees never become sidebar rows. Discovery never opens a pane, runs a
+//! worktrees never become sidebar rows — and neither does a checkout claimed
+//! by a live creation worker: discovery adopts worktrees made outside thegn,
+//! so a checkout thegn itself is mid-creating becomes a row through the
+//! worker's own registration instead. Discovery never opens a pane, runs a
 //! hook, provisions an environment, checks out a branch, or changes the
 //! active view. Existing rows retain their tab identity, order, folder,
 //! hidden/closed state, and other cached metadata.
@@ -51,6 +54,73 @@ fn fingerprint_cache() -> &'static Mutex<HashMap<PathBuf, Fingerprint>> {
 fn failure_cache() -> &'static Mutex<HashMap<PathBuf, (Fingerprint, u8)>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Fingerprint, u8)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Checkout paths claimed by live creation workers (the Alt+w wizard and its
+/// preset sibling): path → outstanding claims.
+///
+/// Discovery exists to adopt worktrees made OUTSIDE thegn; a checkout this
+/// process is itself mid-creating is not one. The wizard's speculative
+/// `git worktree add` exists on disk from the moment the dialog opens, so a
+/// hydration pass could register it and render a `tg/…` sidebar row that
+/// outlived Esc's rollback until the next hydration reaped it (THE-2684).
+/// A worker claims its allocated path until it exits, so discovery never
+/// adopts a live creation; a leftover (shutdown or crash) is adopted by the
+/// next session's fresh fingerprint cache.
+fn creation_claims() -> &'static Mutex<HashMap<PathBuf, u32>> {
+    static CLAIMS: OnceLock<Mutex<HashMap<PathBuf, u32>>> = OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A live creation worker's claim on one checkout path, released on drop.
+/// Claims are reference-counted, so a rename that re-claims the moved path
+/// overlaps the old claim briefly without ever leaving the checkout
+/// unclaimed.
+#[must_use = "a claim dropped immediately protects nothing"]
+pub(crate) struct CreationClaim {
+    path: PathBuf,
+}
+
+/// Claim `path` for a live creation worker (see [`creation_claims`]).
+pub(crate) fn claim_creation_path(path: &Path) -> CreationClaim {
+    let claims = creation_claims()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *claims.entry(path.to_path_buf()).or_insert(0) += 1;
+    CreationClaim {
+        path: path.to_path_buf(),
+    }
+}
+
+impl Drop for CreationClaim {
+    fn drop(&mut self) {
+        let claims = creation_claims()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match claims.get_mut(&self.path) {
+            Some(count) if *count > 1 => *count -= 1,
+            _ => {
+                claims.remove(&self.path);
+            }
+        }
+    }
+}
+
+/// Paths currently claimed by live creation workers — the snapshot a
+/// discovery pass adopts against.
+fn claimed_creation_paths() -> HashSet<PathBuf> {
+    creation_claims()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Test observability into [`creation_claims`] for worker-side tests.
+#[cfg(test)]
+pub(crate) fn claimed_creation_paths_snapshot() -> HashSet<PathBuf> {
+    claimed_creation_paths()
 }
 
 fn metadata(path: &Path) -> Result<Option<MetadataFingerprint>> {
@@ -158,6 +228,7 @@ fn add_missing(
     db: &thegn_core::db::Db,
     root: &Path,
     known: &HashSet<String>,
+    claimed: &HashSet<PathBuf>,
     entries: Vec<WorktreeEntry>,
 ) -> Result<usize> {
     let root_string = root.to_string_lossy().into_owned();
@@ -165,20 +236,35 @@ fn add_missing(
         .iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
         .collect();
+    // Both spellings, for the same reason as `known_canonical`: git lists the
+    // checkout's path as recorded in its admin dir, and either side of a
+    // symlinked parent can disagree about spelling.
+    let claimed_canonical: HashSet<PathBuf> = claimed
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect();
     db.transaction(|db| {
         let mut added = 0;
         for entry in entries {
+            let path = Path::new(&entry.path);
             if excluded(root, &entry)
                 || known.contains(&entry.path)
                 || std::fs::canonicalize(&entry.path)
-                    .is_ok_and(|path| known_canonical.contains(&path))
+                    .is_ok_and(|canonical| known_canonical.contains(&canonical))
+                // A live creation worker owns this checkout: not an external
+                // worktree. The worker registers the row itself on completion
+                // or rolls the checkout back on cancel — adopting it mid-flight
+                // would surface a `tg/…` sidebar row that outlives the
+                // rollback (THE-2684).
+                || claimed.contains(path)
+                || std::fs::canonicalize(path)
+                    .is_ok_and(|canonical| claimed_canonical.contains(&canonical))
             {
                 continue;
             }
             if db.worktree_record(&entry.path)?.is_some() {
                 continue;
             }
-            let path = Path::new(&entry.path);
             let keys = match thegn_core::worktree_suppress::keys_for(path) {
                 Ok(keys) => keys,
                 Err(error) => {
@@ -245,6 +331,7 @@ fn discover_root<F>(
     db: &thegn_core::db::Db,
     root: &Path,
     known: &HashSet<String>,
+    claimed: &HashSet<PathBuf>,
     cache: &mut HashMap<PathBuf, Fingerprint>,
     failures: &mut HashMap<PathBuf, (Fingerprint, u8)>,
     list: &F,
@@ -272,7 +359,7 @@ fn discover_root<F>(
         tracing::debug!(target: "thegn::worktree", root = %root.display(), "git worktree listing failed; discovery will retry");
         return;
     };
-    let result = add_missing(db, root, known, entries);
+    let result = add_missing(db, root, known, claimed, entries);
     match result {
         Ok(added) => {
             cache.insert(root.to_path_buf(), current);
@@ -307,8 +394,12 @@ where
         .into_iter()
         .map(|WorktreeRow { worktree, .. }| worktree)
         .collect();
+    // Snapshot the live-creation claims once per pass: a worker that claims
+    // its path mid-pass loses only to this race, which the wizard's cancel
+    // sweep and the next hydration's reap both heal.
+    let claimed = claimed_creation_paths();
     for root in roots {
-        discover_root(db, &root, &known, cache, failures, &list);
+        discover_root(db, &root, &known, &claimed, cache, failures, &list);
     }
     Ok(())
 }
@@ -450,6 +541,41 @@ mod tests {
         })
         .unwrap();
         assert!(db.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_checkout_claimed_by_a_live_creation_is_not_adopted() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let (_temp, root, worktree) = fixture();
+        let db = db_for(&_state, &root);
+        let mut cache = HashMap::new();
+        let mut failures = HashMap::new();
+        // Two claims overlap briefly across a rename: dropping one must not
+        // release the path while the other still owns it.
+        let first = claim_creation_path(&worktree);
+        let reheld = claim_creation_path(&worktree);
+        drop(first);
+        discover_with(&db, &mut cache, &mut failures, |_| {
+            Some(vec![entry(&worktree, Some("feature"))])
+        })
+        .unwrap();
+        assert!(
+            db.worktrees().unwrap().is_empty(),
+            "a checkout a live creation owns is not registered mid-flight"
+        );
+        drop(reheld);
+        // The guarded pass recorded this metadata state as seen, so a fresh
+        // cache stands in for the next pass that lists the repo again.
+        let mut cache = HashMap::new();
+        discover_with(&db, &mut cache, &mut failures, |_| {
+            Some(vec![entry(&worktree, Some("feature"))])
+        })
+        .unwrap();
+        assert_eq!(
+            db.worktrees().unwrap().len(),
+            1,
+            "once the creation releases its claim, discovery adopts the checkout"
+        );
     }
 
     #[test]
