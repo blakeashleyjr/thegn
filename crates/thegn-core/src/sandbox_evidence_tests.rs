@@ -1,5 +1,8 @@
-//! THE-792 runtime-evidence regressions; see
-//! `docs/audits/sandbox-security-2026-10-13/runtime-evidence.md`.
+//! THE-792 runtime-evidence regressions: canaries for the sandbox admission
+//! contract — env selection, the isolation floor, and container-reuse policy.
+//! The evidence audit behind them is a private dated record; the public
+//! contract these tests keep is documented in
+//! `docs/help/sandbox-security-model.md`.
 
 use super::*;
 use crate::capabilities::IsolationClass;

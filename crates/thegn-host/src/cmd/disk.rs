@@ -129,7 +129,7 @@ impl LaneKind {
 /// build lanes beneath one checkout's `target/lanes/`, and (with `--apply`) the
 /// explicit reclaim of the build output the inventory can still prove is idle.
 ///
-/// The audit (`docs/audits/2026-11-18-repository-hygiene.md`) found 129 GiB in
+/// A repository-hygiene audit (a private dated record) found 129 GiB in
 /// `target/lanes/` with no way to say which lane was large, whose it was, or
 /// whether it could be reclaimed. Each immediate subdirectory is measured with
 /// the same parallel walk — and therefore the same apparent-byte accounting —

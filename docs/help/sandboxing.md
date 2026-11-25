@@ -30,6 +30,10 @@ while the process is contained.
 a hostile agent** (home readable, network direct by default, shared kernel).
 `sealed` is the hardened tier. See [[sandbox-security-model]].
 
+**Interactive panes are sandboxed. Headless `thegn agent run`, queue, merge-gate
+and test launches run on the host in this alpha.** The ⚠ table in
+[[sandbox-security-model]] lists each launch and its gap.
+
 In plain terms:
 
 - `standard` leaves `~/.ssh`, cloud credentials (`~/.aws` and similar), the
